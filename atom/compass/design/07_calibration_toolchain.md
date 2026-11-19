@@ -78,9 +78,10 @@ parallel layout only for a collective leaf; any other leaf's point answers at ev
 layout, and `fit ops` keys a price list at the layout of the runs that listed its points
 (D41).
 
-**Revised 2026-11-18 by [#3668](https://github.com/jgong5/ATOM/issues/3668):** a step
-linear law may be calibrated from designed load on the real server, a candidate beside
-`19` D113's record list, which `compass advice` keeps printing (D118).
+**Revised 2026-11-18 by [#3668](https://github.com/jgong5/ATOM/issues/3668) and the
+owner's [Ruling on it](https://github.com/jgong5/ATOM/issues/3668#issuecomment-6974348636):** a step linear law may be calibrated from designed load
+on the real server, every feature it fits moved apart in each scenario it supports, a
+candidate beside `19` D113's record list, which `compass advice` keeps printing (D118).
 
 **Depends on:** `04_model_capture_and_cost_ir.md` (what is traced and priced),
 `05_machine_spec_and_probes.md` (the machine artifact and its probes).
@@ -1662,147 +1663,300 @@ what it leaves.
 Decided 2026-11-18 by [#3668](https://github.com/jgong5/ATOM/issues/3668): a candidate
 beside [`19` D113](19_adoption.md#d113-calibrating-what-the-search-lacks)'s record list,
 which `compass advice` keeps printing until the validation below says otherwise (T115).
+Widened the same day by the owner's
+[Ruling on #3668](https://github.com/jgong5/ATOM/issues/3668#issuecomment-6974348636):
+it covers every feature the law fits in each scenario the law supports, prefill and
+decode, target and draft, each parallel layout, and settles the levels' cap.
 
 ### Problem
 
 D113's list records each decode rung on a server of its own, an 1800 s client run starting
 every trajectory at its first turn (`atom/compass/backends/step_linear_plan.py::records`,
 `scripts/compass/calibrate.sh`), which reaches its rung only while those sessions decode
-together at the start; #3668 tabulates the hours a law takes so. A rung's decode vector has
-three base coefficients (`atom/compass/backends/step_linear.py`), which a few steps varying
-both its features settle.
+together at the start; #3668 tabulates the hours a law takes so. Its prefill comes from
+trace runs of real traffic (`step_linear_plan.py::TRACE_RUNS`), which move the prefill
+features as the traffic happens to. Each of the law's vectors is linear in a few features (`atom/compass/backends/step_linear.py`),
+and a few steps that move each feature apart from the rest settle it.
 
 ### Decision
 
-**A calibration** takes the warm record and `measure memory` as today, then one ordinary
-record at the space's top concurrency, sampled starts, 600 s (the real record), `design 1`,
-`design 2`, `trace 16` and `trace 4`. Every record replays the calibration traces
-`calibrate.sh`'s `CAL_TRACES` names, apart from those a law is graded on (`13` D80), and the
-design records cut their prompts from them. Where the top concurrency passes their count,
-the real record's RECORD names `--cache-bust first_turn_suffix`: aiperf
-0.12.0 refuses more lanes than traces otherwise
-(`aiperf/timing/trajectory_source.py::validate_dataset_wrap_policy`). Each is a `compass
-record` directory, so `fit steps` and `fit host` read them unchanged and the
-leave-one-run-out folds hold the real record: `19` D112's 5% gate is judged on real load too.
+**A calibration** takes the warm record and `measure memory` as today, then these records:
 
-**A design record is one server** at the configuration's arguments and the arm's widest
+| Record | What it is | What the fits take from it |
+|---|---|---|
+| the real record | an ordinary record at the space's top concurrency, sampled starts, 600 s | decode and host labels on real load; the levels |
+| `design 1`, `design 2` | a decode design record each, by its own seed | decode, draft decode and host labels |
+| `trace 16` | as today, the c=16 record under the profiler | prefill and draft prefill labels on real load |
+| `trace design 1`, `trace design 2` | a prefill design record each under the profiler, by its own seed | prefill and draft prefill labels |
+
+Every record replays the calibration traces `calibrate.sh`'s `CAL_TRACES` names, apart from
+those a law is graded on (`13` D80), and the design records cut their prompts from them.
+Where the top concurrency passes their count, the real record's RECORD names `--cache-bust
+first_turn_suffix`: aiperf 0.12.0 refuses more lanes than traces otherwise
+(`aiperf/timing/trajectory_source.py::validate_dataset_wrap_policy`). Each is a `compass
+record` directory, so `fit steps` and `fit host` read them unchanged, and the
+leave-one-run-out folds hold the real record and `trace 16`: `19` D112's 5% gate is judged
+on real load too. `fit host` takes the untraced records, as `calibrate.sh` passes them.
+
+**The levels.** Three context levels per rank, the real record's decode rows' p10, p50 and
+p90 there, each session's context drawn within ten percentiles of its level by the record's
+own seed. In a group of n rows a rank, the three are scaled by min(1, 0.8 P / (n p90)), P
+the rank's KV pool in tokens: the top level holds each row at 80% of the pool over n, and
+the others keep their ratio to it. A trace design record's history levels are the real
+record's prefill rows' cached history, N_KV - N_Q, at p10, p50 and p90 over the rows that
+have one, scaled the same way over a point's rows.
+
+**A design record** is one server at the configuration's arguments and the arm's widest
 `--max-num-seqs`, since a law's key holds neither the scheduler's bounds nor
 `enable_prefix_caching` (`atom/compass/backends/step_grid_plan.py::UNKEYED`):
 
-1. *Levels.* Three context levels per rank, the real record's decode rows' p10, p50 and p90
-   there; each session's context drawn from those rows within ten percentiles of its level
-   by the record's own seed, and in a group of r rows a rank at most 80% of the rank's KV
-   pool over r.
-2. *Groups.* At each rung `step_linear_plan.py::scheduled_rungs` gives, the eager one at the
-   bound, and on a gap in the ladder also at the smallest batch that replays it, four
-   groups: all rows at each level, and one at the top level over the rest at the bottom.
-3. *Fill, then send.* Before each group the driver sends its sessions' prompts, each with
+1. *Groups.* At each rung `step_linear_plan.py::scheduled_rungs` gives, the eager one at the
+   bound, every rank at the rung's rows:
+   - each level alone, every row at it;
+   - one row at the top level over the rest at the bottom;
+   - at a rung of four rows or more, half at the top level and half at the bottom, twice
+     from one fill: alternating, and in halves, the top half first.
+
+   On a gap in the ladder, the first two kinds again at the smallest batch that replays the
+   rung.
+2. *Fill, then send.* Before each group the driver sends its sessions' prompts, each with
    one output token, and waits for all of them; a session an earlier group left cached
-   fills at a cache hit. Then the group's rows go at once, each its session's prompt and a
-   few new tokens, `ignore_eos`, `max_tokens` about 40 decode steps at the forced
-   acceptance length.
-4. *DP.* Every request names its rank by `data_parallel_rank`, which the chat route takes
+   fills at a cache hit. Then the group's rows go at once, in the group's order, each its
+   session's prompt and a few new tokens, `ignore_eos`, `max_tokens` about 40 decode steps
+   at the forced acceptance length.
+3. *DP.* Every request names its rank by `data_parallel_rank`, which the chat route takes
    ahead of session affinity
    (`atom/model_engine/engine_core_mgr.py::CoreManager._select_dp_rank_for_seq_locked`).
-   A rung also gets a group of uneven rows and one with an empty rank, and the costliest
-   rank rotates from group to group.
-5. *Requests* are chat completions. The driver writes the record's client-run export as
+   At each rung the middle level's group runs again with the other ranks at half its rows,
+   at one row, with one rank empty and with every other rank empty; the full rank rotates
+   from group to group.
+4. *Requests* are chat completions. The driver writes the record's client-run export as
    `atom/compass/parity/client_run.py` writes aiperf's, since a fit refuses a record without
    one (`atom/compass/fit/publish.py`), and each phase's and group's wall time.
-6. *Cover.* Once the server stops, steps per rung and group are read from the record; a
+5. *Cover.* Once the server stops, steps per rung and group are read from the record; a
    group short of half its planned steps is resent in a new record, three rounds at most,
    as D106 resends.
 
-Pacing is the deployment's own. `calibrate.sh` takes `design K` as it takes `trace C`; the
-planner sits in `step_linear_plan.py` (D37), the driver beside `atom/compass/drive/sweep.py`,
-and the law's provenance names its design records.
+A design record's pacing is the deployment's own.
 
-**Reason.** A level's group moves Sum N_KV with r.max N_KV - Sum N_KV near 0, the one-long
-group the second, so a rung's coefficients separate. A fold prices no step at a rung its
-law has no vector for, counting it refused (`step_linear_fit.py::_held_out`,
-`fold_figures`), so two design records give every rung a held-out error, and drawn
-contexts make it a held-out test, not a repeat. A decode row's context is what admission
-and its turn's output make of a trace's messages, which only a step record states, so the
-levels come from a served record; replaying the calibration traces, it carries their
-contexts, which may sit apart from the graded traces' (T119). The fill goes group by
-group: the cap keeps one group's sessions within 80% of the pool, but a rung's three level
-groups take r(p10 + p50 + p90) tokens a rank, past S1's pool from about r = 20
-([#3344](https://github.com/jgong5/ATOM/issues/3344)'s c=16 calibration record: 36,579
-blocks of 256 tokens, decode rows at 94k, 152k and 230k). Sending the rows only once their
-fill has finished makes each row's prefill a few tokens, so a group's rows enter decode in
-one step on every rank. The record states each row's tokens, which the fit reads, so chat
-requests need no exact count and feed `fit host`'s tokenizer and intake terms (Phase 1c).
-An explicit rank chooses rows that load-aware affinity would not, and rotation spreads the
-card mix a law prices (README principle 12). D106's parked decodes would join the very
-batches a group designs. Sessions are made up, so no trajectory count bounds a rung.
+**A trace design record** is a `compass record --trace` server at the same arguments, at DP
+1 and PP 1 only, where `--trace` runs. A point is n rows of q new tokens, each on a cached
+history of h tokens:
 
-**Rejected.** Token-id completions, as `drive/sweep.py` sends: no tokenizer or template
-runs, so a design record feeds neither term. Both design records at the percentiles
-exactly: each fold re-prices the other's points. Dataset wrap for the real record in place
-of a cache-bust target: wrapped lanes replay one trace's prompts byte for byte, each lane's
-prefill a cache hit no graded run gets.
+- q doubling from 1 to the batched-token budget, h at 0 and at each history level, and n
+  doubling from 1 while n q fits the budget;
+- at each history level, one row of the budget, and one past it, whose first chunk is a
+  middle chunk;
+- where the runner records prefill token graphs (`PREFILL_BUCKETS`), one row at each
+  bucket's tokens and one past it.
+
+The points go as D106 sends a designed step (`atom/compass/drive/sweep.py::send`): under
+D106's pacing variables, the prompts a point's rows reuse sent first and read to their end,
+then parked decodes, then the rows; every request asks for two output tokens. Prompts are
+token ids cut from the calibration traces' tokenized messages. A point is covered when a
+step ran its rows (`atom/compass/drive/sweep_plan.py::covered`); missing points are resent
+in a new record, three rounds at most.
+
+`calibrate.sh` takes `design K` and `trace design K` as it takes `trace C`; the planner sits
+in `step_linear_plan.py` (D37), the decode driver beside `drive/sweep.py`, the prefill
+points on its sender, and the law's provenance names the design records.
+
+### Coverage
+
+Each feature the law's vectors fit and the steps that move it apart from the rest, or the
+item that holds it. A row holds for the target and, under a drafter, the draft, unless it
+names one.
+
+| Vector and feature | Scenario | Steps that move it apart |
+|---|---|---|
+| decode, each rung and `eager`: `step`, `context` (Sum N_KV) | TP, DP, EP | the level groups: Sum N_KV at three values, `graph_padding` near 0 |
+| `graph_padding` (r.max N_KV - Sum N_KV) | TP, DP, EP | the one-long group, and the gap batch's groups |
+| `moe_tokens`, `moe_experts` | one rank: TP, or EP at DP 1 | the gap batch's groups; at a rung with no gap the tokens are fixed under any load |
+| `moe_tokens`, `moe_experts` | DP, or EP above DP 1 | the middle level's group with its other ranks at half, one row and empty: the group's tokens move at the full rank's own rows, and each empty rank's dummy moves `moe_experts` apart from `moe_tokens` |
+| `rowmod(k)` | TP, DP, EP | the half-long pair, one multiset in two orders, which moves rowmod(k) at fixed Sum N_KV and max N_KV for every k from 2 to r/2; T122 |
+| the draft's decode vectors | MTP, DSpark | the target's groups; the draft law adopts no MoE column (`step_linear_fit.py::_draft_options`) |
+| `draft_kv`: `step`, `seqs` | MTP, DSpark | the rungs and the gap batches |
+| `forward` per pass: `step`, `tokens`, `query_square`, `query_cached`; `propose`: `step`, `seqs` | EAGLE3 | the target's groups: rows and levels per pass, and the first pass's K+1-token rows against the later passes' one-token rows, which tell `tokens` from `query_square` (`step_linear.py::serial_passes`) |
+| prefill: `step`, `tokens`, `query_square` | DP 1, PP 1 | the points at h = 0: q alone, and n rows at one total |
+| `query_cached`, `history` | DP 1, PP 1 | the points over q and h |
+| `cached_seqs`, in the `cached_seqs` form | DP 1, PP 1 | the points over n and h: it moves with n, `history` with h too |
+| `seqs`, `out` | a drafter | every point an output prefill, against the budget rows' middle chunks |
+| `padding` | recorded buckets | the bucket points and the points one past |
+| the draft's prefill vector, `propose`, `output_prefill_kv` | MTP, DSpark | the same points' draft, propose and draft-KV passes (`step_labels.py`) |
+| `short_propose` | | none: no fit writes it, T125 |
+| prefill under DP: `moe_rows`, `serial_moe_rows`; the draft's prefill and `propose` | DP | none yet: `--trace` refuses DP ([#3010](https://github.com/jgong5/ATOM/issues/3010)), T123 |
+| host laws: each kind's `[1, tokens, seqs]` per segment; `admit`; tokenizer; HTTP intake; hops | untraced records | decode from the rungs and gap batches; prefill and middle from the fills; `admit` from fills, uncached, against rows, cached; lone calls and requests from the real record and the one-row groups; hops from the client-run exports |
+
+The layouts and the step kinds no vector fits:
+
+| Scenario | Coverage |
+|---|---|
+| TP | every row above, at one rank |
+| DP attention | decode as above; prefill, T123 |
+| EP | as DP above DP 1 and as TP at DP 1, its law keyed apart by `enable_expert_parallel` (`15` D92.1); its validation, T128 |
+| two-batch overlap | a decode splits by request count into halves in scheduled order (`atom/utils/tbo/ubatching.py::_precompute_decode`), so a group splits as a real batch of its size, and the half-long pair gives it balanced and unbalanced halves, T120; prefill splits, T123 |
+| DP dummy forwards, and decodes beside a prefilling peer | no record fits either: a dummy rank gives no row, and a step whose ranks fall to different vectors is cut (`step_linear_fit.py::_groups`); T126 |
+| a pipeline stage | `fit steps` reads a record's stage 0 alone (`atom/compass/fit/samples.py::_record`), and `--trace` refuses PP (`atom/compass/drive/record.py::refuse_trace`); T124 |
+| a 1P1D side | T116 |
+| context parallel | out: the fit refuses it (`step_linear_fit.py::refuse_context_parallel`) |
+
+### Reason
+
+- **The levels.** A rung's decode vector tells its intercept from its Sum N_KV slope only
+  where its groups hold Sum N_KV apart. Capped row by row, a level sat at 0.8 P / n once
+  n times it passed 0.8 P: on S1 ([#3344](https://github.com/jgong5/ATOM/issues/3344)'s
+  c=16 calibration record: 36,579 blocks of 256 tokens, decode rows at p10 94k, p50 152k,
+  p90 230k), p50 met p90 from rung 64 and all three met from about rung 128. Scaled
+  together, a wide rung's level groups hold 0.33, 0.53 and 0.8 of the pool, and every row
+  stays within the cap, which keeps a group resident, since ATOM's pool preempts a row it
+  cannot hold (`03` D13).
+- **The groups.** A level group moves Sum N_KV with `graph_padding` near 0, the one-long
+  group `graph_padding`. On a full level or one-long group, rowmod(k) is about Sum N_KV / k
+  plus (1 - 1/k) / (r - 1) times `graph_padding`, so those groups cannot tell the column from
+  the base features; the half-long pair moves it alone, and shuffling its rows undoes that,
+  the test its rule applies (`step_linear_fit.py::_rowmod`). At one rank a rung's MoE
+  tokens move only with its rows; under DP they are the group's, so peers' rows move them
+  at a rank's fixed features (`step_linear.py::moe_tokens`).
+- **Two design records** give every rung a held-out error: a fold prices no step at a rung
+  its law has no vector for, counting it refused (`step_linear_fit.py::_held_out`,
+  `fold_figures`), and a rung one record reaches adopts no MoE column (`_moe_column`).
+  Drawn contexts make the fold a held-out test, not a repeat.
+- **Levels from a served record.** A decode row's context is what admission and its turn's
+  output make of a trace's messages, which only a step record states; replaying the
+  calibration traces, it carries their contexts, which may sit apart from the graded
+  traces' (T119).
+- **Fill group by group.** A rung's three level groups take r (p10 + p50 + p90) tokens a
+  rank, past S1's pool from about r = 20. Sending a group's rows once their fill has
+  finished makes each row's prefill a few tokens, so its rows enter decode in one step on
+  every rank.
+- **Chat requests.** The record states each row's tokens, which the fit reads, so a decode
+  row needs no exact count, and chat requests feed `fit host`'s tokenizer and intake terms
+  (Phase 1c). An explicit rank chooses rows that load-aware affinity would not, and
+  rotation spreads the card mix a law prices (README principle 12). D106's parked decodes
+  would join the very batches a group designs, so the decode groups keep the deployment's
+  pacing.
+- **Prefill under the profiler.** A prefill label is a trace run's busy time alone, since
+  a prefill window holds the device's idle between launches the host paced
+  (`step_labels.py`), so the prefill points run in trace records, whose decodes are cut
+  and which give no host label. A point's rows must share one step: under D106's pacing
+  variables, which select no kernel or shape, #2650's first round ran 17,038 of 17,046
+  designed points right first time, and the parked decodes touch no label in a trace
+  record. Token ids give each point its exact tokens, bucket edges included, and cut from
+  the traces they route the MoE as served text does.
+- **Two trace design records**, each the other's fold, as the design records are;
+  `trace 16` checks both on real prefill, and `trace 4` leaves the list.
+
+### Rejected
+
+- Each level capped alone: from rung 64 on S1 the levels merge, and a wide rung's
+  intercept and slope do not separate.
+- Fixed fractions of the pool at wide rungs: they place the levels where the workload may
+  never run, where scaling keeps its spread.
+- One prefix shared by a group's rows, filled once: every row would read one row's KV,
+  from cache, where real rows read their own.
+- Token-id completions for decode rows, as `drive/sweep.py` sends: no tokenizer or
+  template runs, so a design record feeds neither term.
+- Fresh token ids for prefill points, as D106 sends them: they route the MoE as no served
+  text does.
+- One trace design record beside `trace 16`: its fold is priced by `trace 16` alone,
+  extrapolating over the designed extremes, and one figure past 5% fails `19` D112.
+- Both design records at the percentiles exactly: each fold re-prices the other's points.
+- Dataset wrap for the real record in place of a cache-bust target: wrapped lanes replay
+  one trace's prompts byte for byte, each lane's prefill a cache hit no graded run gets.
 
 **D39 is not amended.** Its replay rule binds the step bench's measurements, and a design
 record's steps are a real server's. Its reason still bears: hand-built rows may miss real
 row order and raggedness, which T119 holds until the real record's fold and the S1 and S2
 validation show them.
 
-**Unchanged.** The law's key; `19` D112 and D113's list; prefill from trace runs, which
-`compass record --trace` refuses under DP ([#3010](https://github.com/jgong5/ATOM/issues/3010));
-1P1D on `deploy.sh record` (T116). A kernel variant the warm record leaves uncompiled is
-built in a design record, which the fit then refuses whole, every rung it holds
-([#3618](https://github.com/jgong5/ATOM/issues/3618)).
+**Unchanged.** The law's key; `19` D112 and D113's list. A kernel variant the warm record
+leaves uncompiled is built in a design record, which the fit then refuses whole, every rung
+it holds ([#3618](https://github.com/jgong5/ATOM/issues/3618)).
 
 ### Scenarios
 
-**A calibration**, MiniMax-M3 TP4:
+**A calibration with MTP at TP**, S1 (`19` D116, TP8 MTP3):
 
 ```
- DURATION_S=600 calibrate.sh OUT 48 'design 1' 'design 2' 'trace 16' 'trace 4'
-   warm, memory    as today
-   real record     c=48, sampled starts, 600 s, CAL_TRACES
-                     -> decode rows' contexts per rank
-   design 1        plan: memory reading + real record -> levels, sessions, groups
-                   one server, then per group: its fill, waited for
-                     -> its rows at once, ~40 steps; the next group's fill
-                   stop; cover: a group under half its steps -> a new record,
-                     <= 3 rounds
-   design 2        the same, its own seed
-   trace 16, 4     prefill, as today
-   fit steps       folds: the real record, each design record, each trace run
-                     -> a vector and a held-out error at every scheduled rung
-   fit host        the real record and the design records
-   status          each step's wall time (#3467); beside each design record's
-                   plan, each phase's and group's
+ calibrate.sh OUT '256 --cache-bust first_turn_suffix' 'design 1' 'design 2'
+                  'trace 16' 'trace design 1' 'trace design 2'
+   warm, memory      as today
+   real record       c=256, sampled starts, 600 s, CAL_TRACES
+                       -> decode rows' contexts, prefill rows' histories
+   design K          plan: pool + real record -> levels, scaled per group
+                     one server; per rung, per group: its fill, waited for
+                       -> its rows at once, in order, ~40 steps; the next fill
+                     stop; cover: a group under half its steps -> a new record,
+                       <= 3 rounds
+   trace 16          as today: real prefill under the profiler
+   trace design K    one --trace server under D106's pacing; per point:
+                       its histories' prompts -> parked decodes -> its rows
+                     stop; cover by rows; missing points -> a new record
+   fit steps         folds: real, design 1 and 2, trace 16, trace design 1 and 2
+                       -> decode and draft decode vectors at every rung, a MoE
+                          column or rowmod where its rule adopts one, draft_kv;
+                          prefill, draft prefill, propose, output_prefill_kv;
+                          a held-out error at every rung and on prefill
+   fit host          real, design 1 and 2: each kind's segments, admit,
+                     tokenizer, intake, hops
+   status            each step's wall time (#3467); each phase's and group's
    -> a step_linear_law naming its design records; compass advice reuses it as
       any law (D112) and still prints D113's list
 ```
 
-**Under DP**, S2's DPA8 for one:
+**Under DP**, S2 (DPA8 MTP3, TBO on):
 
 ```
- calibrate.sh OUT 256 'design 1' 'design 2'   no trace run: --trace refuses DP
-   real record     RECORD '256 --cache-bust first_turn_suffix', past CAL_TRACES
-                   its decode rows' contexts, rank by rank
+ calibrate.sh OUT '256 --cache-bust first_turn_suffix' 'design 1' 'design 2'
+                                   no trace record: --trace refuses DP (#3010)
+   real record     decode rows' contexts, rank by rank
    design K        per group: each rank's fill, data_parallel_rank on each,
                      waited for on every rank -> the group's rows at once
-                   per rung: the four groups, every rank at its rows; one group
-                     uneven over the ranks; one with an empty rank (dummies)
-                   the costliest rank rotating from group to group
-   fit steps       decode vectors, a MoE column where the fit adopts one, over
-                   each group's real tokens; prefill unfitted, as a DP list's
-                   is today (#3010)
+                   per rung: the groups, every rank at the rung's rows; the
+                     middle level again, peers at half, one row, one empty,
+                     all empty; the full rank rotating
+                   TBO splits a rank's rows into scheduled halves, the
+                     half-long pair's balanced and unbalanced
+   fit steps       decode vectors at each rank's rows, priced at the costliest;
+                   a MoE column over the group's tokens and dummies where its
+                   rule adopts one; prefill unfitted (T123)
+   fit host        as at TP
 ```
 
-**Acceptance**, once the planner and driver exist:
+**An EAGLE3 drafter**, MiniMax-M3 TP4 (`19` D117):
 
 ```
- mechanism [GPU]   QUICKSTART's Qwen3.8-27B on one card: each group holds its
-                   rung, its fill stays cached, group time against the estimate
- validation [GPU]  S1, S2 on crsuse2-m2m-v3-005 and -013, at #3468's ATOM digest:
-   >= 2 real records neither law saw, 600 s, the lowest and top concurrency
-     -> 08 D47's three figures under the designed-load law and #3468's
-        law from D113's list
+   design K          the groups; each decode times its draft's passes
+   trace design K    middle chunks: the draft's prefill vector
+   fit steps         the draft's forward per pass, the first at K+1 tokens a
+                     row and the rest at one; propose over [1, seqs]
+```
+
+**What stays out:**
+
+```
+ prefill under DP    --trace refuses DP          -> T123, #3509's gated record
+ a pipeline stage    the fit reads stage 0 alone -> T124
+ a 1P1D side         D113 defers a 1P1D law      -> T116
+ context parallel    the fit refuses it          -> out
+ short_propose       no fit writes it            -> T125
+```
+
+**Acceptance**, once the planner and drivers exist:
+
+```
+ mechanism [GPU]   QUICKSTART's Qwen3.8-27B on one card: a group holds its
+                   rung, its fill stays cached, a point's rows share a step,
+                   the trace record stays readable (T117, T118, T121, T127);
+                   group time against the estimate
+ validation [GPU]  on crsuse2-m2m-v3-005 and -013, each calibrated at the ATOM
+                   digest of the law from D113's list it is held against:
+   S1                 decode and draft, prefill and draft prefill, host
+   S2                 decode under DP, the MoE column, TBO splits
+   M3 TP4 EAGLE3      the draft's forward passes, against D117's law
+   >= 2 real records neither law saw, 600 s, at the lowest and the top
+   concurrency, and 2 trace runs of the graded traces, c=4 and c=16
+     -> 08 D47's three figures under both laws
      pass: both under 5%, each designed-load figure within that figure's
            range under the D113 law across the records
    -> T115: whether compass advice prints the designed-load list
@@ -1810,48 +1964,53 @@ built in a design record, which the fit then refuses whole, every rung it holds
 
 ### Simpler alternative
 
-No fill: each row a fresh prompt, its whole context prefilled once the group is sent. On
-one rank ATOM's prefill-first schedule (`atom/model_engine/scheduler.py::Scheduler._schedule`)
-keeps the group's rows out of decode until every one has prefilled, at the fill's prefill
-cost. Under DP it fails a group holding its rung: a rank whose rows have prefilled decodes
-beside a peer still prefilling unless the runner recorded prefill token graphs
-(`Scheduler._group_prefill_tick`), so the rows enter decode rank by rank. D113's own list on
-one server with shorter client runs is no designed load, and leaves the widest rung to the
-one record at the bound, so with no held-out error there.
+The decode design alone, with prefill from today's `trace 16` and `trace 4`: one start
+fewer and no prefill plan. It fails the Ruling on #3668, which has the design cover every
+feature the law fits: real traffic moves the prefill features as it happens to, so for
+`padding`, `cached_seqs` or `seqs` no step can be named that moves it apart. No fill, each
+row a fresh prompt prefilled once its group is sent, fails a DP group holding its rung: a
+rank whose rows have prefilled decodes beside a peer still prefilling unless the runner
+recorded prefill token graphs (`atom/model_engine/scheduler.py::Scheduler._group_prefill_tick`),
+so the rows enter decode rank by rank.
 
 ### Low confidence
 
-None. T117 to T121 are what the acceptance measures, each resting on a decision above; none
-chooses between designs before the planner and driver exist.
+None. T117 to T121 and T127 are what the mechanism check and the validation measure, each
+resting on a decision above; none chooses between designs before the planner and drivers
+exist.
 
 ### Dependencies
 
-No spike and no sync issue. The validation waits on #3468's S1 and S2 laws; its bar is
+No spike and no sync issue. The validation waits on [#3468](https://github.com/jgong5/ATOM/issues/3468)'s
+S1 and S2 laws and on `19` D117's law of MiniMax-M3's TP4 EAGLE3 arm; its bar is
 [#2678](https://github.com/jgong5/ATOM/issues/2678)'s second, within the measurement's own
-repeatability. The levels' cap, which on S1 merges p50 with p90 from rung 64 and all three
-from about rung 128, waits on the owner's ruling on
-[#3668](https://github.com/jgong5/ATOM/issues/3668).
+repeatability. Designed prefill under DP waits on
+[#3509](https://github.com/jgong5/ATOM/issues/3509)'s gated record (T123).
 
 ### Summary
 
-**Deliverable.** Laws from designed load beside D113's list. **Not in scope:** the printed
-list (T115), 1P1D (T116), prefill. **Estimate**, derived and unmeasured: on S1, over the
-ladder 1, 2, 4 to 512 with its gap batches, a design record's fills prefill about 280M
-tokens, 2.4 to 3.2 h at the 24.5k to 32.6k tokens/s of #3344's prefill-side 16,384-token
-chunks (medians by context); with the other records and seven starts at 10 to 15 min,
-about 6 to 8 h. M3 TP4's waits on its pool and contexts.
+**Deliverable.** Laws from designed load beside D113's list, every feature the law fits
+moved apart in each scenario above. **Not in scope:** the printed list (T115); prefill under
+DP (T123); a pipeline stage (T124); a 1P1D side (T116); context parallel; `short_propose`
+(T125). **Estimate**, derived and unmeasured, on S1: a design record's fills prefill about
+236M tokens over the ladder 1, 2, 4 to 512 and its gap batches with no reuse counted, 2.0
+to 2.7 h at the 24.5k to 32.6k tokens/s of #3344's prefill-side 16,384-token chunks
+(medians by context); with the second design record, a start for each record at 10 to 15
+min and the other records, about 6 to 8 h. MiniMax-M3's waits on its pool and contexts.
 
 | Where | Change | Task |
 |---|---|---|
-| `atom/compass/backends/step_linear_plan.py` | the design plan: configuration, memory reading and real record in; levels, sessions and groups out; CPU tests | 1 |
+| `atom/compass/backends/step_linear_plan.py` | the design plans: configuration, memory reading and real record in; levels, groups and prefill points out; CPU tests | 1 |
 | beside `atom/compass/drive/sweep.py` | each group's fill and send, stop and cover; the client-run export; phase and group times | 2 |
-| `scripts/compass/calibrate.sh` | a `design K` record; the law's provenance names its design records | 3 |
-| one card [GPU] | the mechanism check | 4 |
-| 005 and 013 [GPU] | the S1 and S2 validation, after #3468 | 5 |
+| `atom/compass/drive/sweep.py` | the prefill points sent and covered on its sender, in a trace record | 3 |
+| `scripts/compass/calibrate.sh` | `design K` and `trace design K`; the law's provenance names them | 4 |
+| one card [GPU] | the mechanism check | 5 |
+| 005 and 013 [GPU] | the S1 and S2 validation after #3468, and MiniMax-M3's TP4 EAGLE3 arm after D117's law | 6 |
 
-**Acceptance.** The validation passes on S1 and S2; every scheduled rung has a vector and a
-held-out error; each step's wall time is recorded
-([#3467](https://github.com/jgong5/ATOM/issues/3467)); the mechanism holds on one card.
+**Acceptance.** The validation passes on S1, S2 and the EAGLE3 arm; every scheduled rung
+has a vector and a held-out error, and at DP 1 the prefill vector one too; each step's wall
+time is recorded ([#3467](https://github.com/jgong5/ATOM/issues/3467)); the mechanism holds
+on one card.
 
 ---
 
@@ -1870,7 +2029,7 @@ held-out error; each step's wall time is recorded
 | D38.1 | One recommended flow per half: steps (`measure memory`, `record`, `trace steps`, `measure steps` with the step grid's planner, `fit host` and `fit steps`, `run --coverage`, then grading outside the CLI), each server driven by a client started apart, and ops, after the steps half's `measure memory`, `record`, `trace steps` and `fit host` (`trace ops --population`, `measure ops --plan` over the record directories of `record` or `trace steps --out`, `fit ops` publishing a `price_list` only, then `run` and grading). Phases unchanged; the op bench, ATOM's runner preparing each point and running no forward, hosts 1b and the step bench 1c, Phase 2 is a plain startup `measure memory` runs. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); ops half 2026-10-18 (#1489); `measure ops --plan` reads record directories 2026-10-18 (#1527); op bench without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)) |
 | D40.1 | Classes (a) and p2p ride `measure ops` unchanged. Classes (b) and (c) share one new stated-entry-point benchmark inside the same multi-rank op bench, also run by `measure ops`. KV transfer is never priced. Collective prices are labelled upper bounds. | 2026-09-19; one command 2026-10-13 (#851); the multi-rank op bench 2026-10-18 (#1489) |
 | D106 | A container is warmed for a graded run by a constructed JIT sweep and a per-stack cache library; a compile in a graded run still voids it. A client against the cell's own deployment, no ATOM hook point; only pacing variables that select no kernel or shape differ, set by `compass record --sweep` and checked by `client.sh --sweep`: `ATOM_ENABLE_PREFILL_DELAYER=1`, `ATOM_PREFILL_DELAYER_COST_GATE=0`, `ATOM_PREFILL_DELAYER_TARGET_FILL=1.0`, `ATOM_PREFILL_DELAYER_STALL_TICKS=16`, `ATOM_PREFILL_DECODE_INTERVAL=1` at DP 1 and PP 1, and `ATOM_DP_PREFILL_BALANCE_MIN_TOKENS` at the batched-token budget, so balancing cuts no designed row. The ranks share one walk, each count once per container on a rank the count chooses. A: one single-row request per prefill token count from 1 to the budget, no parked decode, covered by any rank's step of that count TBO did not split. B: lockstep steps, a designed point per rank, the product of the second row's offset mod 16, 1 to 16 parked decodes and TBO on or off, plus chunked rows over the product of query size, its residue mod 16 (and, from the chunk alignment up, each multiple of 16 below it) and context level up to the longest prompt, balancing's aligned cuts below the budget included, a step's rows on as many earlier chunks; TBO points split inside a long first row too, and in split steps other ranks' rows cut into halves of 256 to 511 tokens at every offset mod 16; the costly row last or every rank's first alike; covered by exact rows and split. Parked decodes keep the PrefillDelayer's alignment gate armed, so a step's rows release together; no blocker. Two output tokens a request; axes and ranges from the cell's engine and workload, sampling arguments copied. Missing points resent unchanged, three rounds at most. PP above 1 and rapidserve run A only, not marked swept; a PD cell's decode side and KV connector path are warmed by one unscored run and the library. One library per stack (ROCm, aiter's commit, RCCL, torch, Triton, FlyDSL, gfx arch) at `<store>/jit`, `compass record --store` optional, merged in at a real server's start and written back at its stop, finished artifacts only, per compiler, atomically. Coverage is read from the step record after the stop and kept in the library per stack and cell; a cell is swept only when all its points are covered. Preemption, recompute and error paths are not swept: a build there is recorded, not a defect. Streaming the real record is deferred. | 2026-11-02 ([#2640](https://github.com/jgong5/ATOM/issues/2640#issuecomment-6568381628)); shared walk, delayer coalescing, pacing variables 2026-11-02 ([#2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6579531822)); balancing floor, stall 16 2026-11-02 ([#2687](https://github.com/jgong5/ATOM/issues/2687#issuecomment-6591321600)); chunked grid, split inside a first row 2026-11-03 ([#2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6607750609)); TBO halves 2026-11-04 ([#2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6619270702)); KV residues 2026-11-06 ([#2689](https://github.com/jgong5/ATOM/issues/2689#issuecomment-6686630693)) |
-| D118 | A candidate beside `19` D113's record list, which `compass advice` keeps printing: a step linear law from the warm record and `measure memory`, one real record at the space's top concurrency (sampled starts, 600 s), two design records and the trace runs, fitted and gated as any law's records. A design record is one server at the arm's widest bound: sessions filled at the real record's decode-row p10, p50 and p90 per rank, drawn by its own seed and capped at 80% of the rank's KV pool over a group's rows; at every scheduled rung four groups sent at once, each level alone and one long row over short ones, `ignore_eos`, about 40 decode steps; under DP every request names its rank, with uneven and empty ranks and the costliest rotated; chat completions with a client-run export; groups under half their steps resent, three rounds at most. Pacing is the deployment's own. Each group's sessions are filled just before it and waited for. The real record names an aiperf cache-bust target past the calibration traces' count, and every record replays those traces. `calibrate.sh` takes `design K`; the law's provenance names them. | 2026-11-18 ([#3668](https://github.com/jgong5/ATOM/issues/3668)) |
+| D118 | A candidate beside `19` D113's record list, which `compass advice` keeps printing: a step linear law from the warm record and `measure memory`, a real record at the space's top concurrency (sampled starts, 600 s), two decode design records, `trace 16` and two trace design records, fitted and gated as any law's records; every feature the law fits is moved apart in each scenario it supports, or held in topic 12. The levels are the real record's decode-row p10, p50 and p90 per rank, drawn by each record's seed and in a group of n rows scaled together by min(1, 0.8 P / (n p90)). A design record is one server at the arm's widest bound: at every scheduled rung each level alone, one long row over short ones and a half-long pair in two orders, and a gap batch's groups; each group's sessions filled and waited for, then its rows at once, `ignore_eos`, about 40 decode steps; under DP every request names its rank, the middle level again over uneven and empty peers, the full rank rotated; chat completions with a client-run export; the deployment's pacing; groups under half their steps resent, three rounds at most. A trace design record, at DP 1 and PP 1, sends prefill points of n rows of q tokens on a cached history, the budget's middle chunks and the recorded buckets' edges, as D106 sends a designed step, its token ids cut from the calibration traces. The real record names an aiperf cache-bust target past the calibration traces' count, and every record replays those traces. `calibrate.sh` takes `design K` and `trace design K`; the law's provenance names them. | 2026-11-18 ([#3668](https://github.com/jgong5/ATOM/issues/3668), [Ruling](https://github.com/jgong5/ATOM/issues/3668#issuecomment-6974348636)) |
 
 ---
 
@@ -1895,6 +2054,13 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T116 | A designed-load calibration of a 1P1D side (D118) | a 1P1D law stays on `deploy.sh record`, which `19` D113 defers until a 1P1D configuration needs one |
 | T117 | A design group's tail: random forced acceptance ends its rows over several steps, at lower rungs (D118) | the mechanism check measures it |
 | T118 | Whether a design group's fill is still cached when its rows arrive: the cap leaves 20% of the pool for output and a model's other pools (D118) | the mechanism check measures it; an evicted session's row prefills its whole context |
-| T119 | Whether designed rows stand for real row order and raggedness, which alone move decode attention 1.77x (D39), and the calibration traces for the graded ones' contexts (D118). The rowmod rule needs 100 steps at a rung from every record, so a real record's few steps there keep the column off | the real record's fold and the S1 and S2 validation check it |
-| T120 | Decode two-batch-overlap splits of design groups at each rung (D118) | measured where the engine enables TBO |
-| T121 | Pacing of design groups: the deployment's own, with D106's parked decodes only if a group's rows do not enter decode together (D118) | the mechanism check measures it |
+| T119 | Whether designed rows stand for real raggedness and row order, which alone move decode attention 1.77x (D39), and the calibration traces for the graded ones' contexts (D118) | the real record's fold and the S1 and S2 validation check it |
+| T120 | Whether the law's features carry how a group's rows divide between a decode's two-batch-overlap halves, its scheduled order's first and second half; the half-long pair gives balanced and unbalanced halves (D118) | S2's validation measures it |
+| T121 | Pacing: whether a design group's rows enter decode together at the deployment's own pacing, else D106's parked decodes, and whether a trace design point's rows share one step at DP 1 under D106's pacing variables (D118) | the mechanism check measures both; D106 measured the second at DP 8 only |
+| T122 | The `rowmod` column at a rung the real record reaches with fewer steps than `ROWMOD_CELL_STEPS`: its rule holds every record to that many there, so the column stays off at that rung (D118) | a change to the rule of its own, if the S1 and S2 validation shows the column missing where it pays |
+| T123 | Designed prefill under DP: `moe_rows`, `serial_moe_rows`, and a DP drafter's prefill and `propose`, from the trace design points in #3509's gated record once it lands (D118) | `compass record --trace` refuses DP (#3010), so a DP law's prefill stays unfitted, as a DP list's is today |
+| T124 | Designed load at a pipeline stage (D118) | `fit steps` reads a record's stage 0 alone and `--trace` refuses PP; it waits until a PP configuration needs a law |
+| T125 | `short_propose`: once a fit writes it, the trace design's output prefills under its `below` move it (D118) | the law reads it, and no fit writes it |
+| T126 | DP dummy forwards and decodes beside a prefilling peer: no record fits either, so each stays at 0 s under its treatment or, under a law with an `eager` vector, on that vector (D118) | a dummy rank gives no row, and a step whose ranks fall to different vectors is cut; checking either needs DP prefill labels (T123) |
+| T127 | Whether a trace design record's profiler trace reduces to busy lines at the points' length, else its points split over more records (D118) | the mechanism check measures it on one card, S1's validation at TP8 |
+| T128 | An EP configuration's designed-load validation (D118) | no configuration of `19` D116's template runs EP, so none has a law from D113's list to hold one against |

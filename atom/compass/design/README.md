@@ -240,7 +240,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L4 | Harness contract, wire fields, adapter | [`06_workload_harness_contract.md`](06_workload_harness_contract.md) | D27–D35 (+ D35.1) |
 | L5 | The calibration phases, the measurement bench and the recommended flow | [`07_calibration_toolchain.md`](07_calibration_toolchain.md) | D36–D43 |
 | L5 | The JIT sweep and the per-stack cache library that warm a container before a graded run | [`07`](07_calibration_toolchain.md) | D106 |
-| L5 | A step linear law calibrated from designed load on the real server, a candidate beside `19` D113's record list | [`07`](07_calibration_toolchain.md) | D118 |
+| L5 | A step linear law calibrated from designed load on the real server, every feature it fits, a candidate beside `19` D113's record list | [`07`](07_calibration_toolchain.md) | D118 |
 | L5 | Machine spec layers, their schema, `measure device` and `fit device` | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
 | L5 | `compass advice`, a user's configuration space searched with calibration kept apart; each run's per-request split and report; the dashboard | [`19_adoption.md`](19_adoption.md) | D108–D117 |
 | L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
