@@ -73,6 +73,7 @@ ATOM's real code owns still never touch a device.
 | **KV *transfer* (PD disagg)** | **SIMULATED** | No RDMA, no real bytes on a fabric. A simulated connector registered in ATOM's existing factory charges `latency + bytes/bandwidth` from the machine spec, a rank pair's writes moved one at a time. `allocate_kv_cache` refuses, by name, any `kv_connector` other than `compass`, `lmcache_mp` and `lmcache_offload`, alone or in a `multi`, including a non-empty `kv_transfer_config` with no `kv_connector` key, which reads as `moriio`. A `kv_transfer_config` of `{}` (ATOM's default) or `None` builds no connector and refuses nothing; a config that lacks the field is refused by name. `01` D6 |
 | **KV offload server (`lmcache_mp`)** | **SIMULATED** | The lmcache MP server is LP `lmcache`: a Compass stand-in on the real ZMQ channels, holding a content index without bytes and pricing its work on two stations; stores and loads complete as stamped replies, which the engine's shell sends and takes on its step loop. `01` D6.1 |
 | **KV offload tier (`lmcache_offload`)** | **SIMULATED** | Each rank's CPU tier is a chunk index without bytes, evicted by ATOM's SLRU policy; lookup, store and load are priced, and ATOM's scheduler half runs as real code. `03` D13.1 |
+| **Shared KV offload Store (`mooncake_store`)** | **SIMULATED**, on `dsv41/dev` | The Mooncake Store's master is LP `mooncake_store`, holding objects without bytes, their leases and Mooncake's eviction; each rank's lookups are requests and replies to it, its saves and loads are priced on its own lanes, and ATOM's scheduler half runs as real code. `01` D6.2 |
 | **Prefix caching** | **REUSED, unmodified** | The hit *is* ATOM's hit, at ATOM's 64-token block granularity. Its effect on prefill cost is a cost-model term, not an inference. `03` |
 | **Scheduler / admission / chunking** | **REUSED, unmodified** | The whole point. Same decisions as a real run. `01`, `03` |
 | **API server, tokenizer** | **REUSED, real** | Real HTTP, real uvicorn, real tokenizer — run for its *effect*, with a modelled duration charged for its *time*. `06` D33 |
@@ -227,7 +228,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L1 | Arrival gate | [`01`](01_execution_and_time_model.md) | D8 |
 | L2 | `CompassModelRunner`, the seam | [`02_model_runner_and_cost_backend.md`](02_model_runner_and_cost_backend.md) | D10, D11 |
 | L2 | M1 fake model | [`02`](02_model_runner_and_cost_backend.md) | D12 |
-| L2 | Simulated KV connector | [`01`](01_execution_and_time_model.md) | D6, D6.1 |
+| L2 | Simulated KV connector, the shared offload servers | [`01`](01_execution_and_time_model.md) | D6, D6.1, D6.2 |
 | L2 | Atomesh handling | [`01`](01_execution_and_time_model.md), [`06`](06_workload_harness_contract.md) | D7, D30 |
 | L2 | Prometheus metrics under virtual time | [`11_metrics_support.md`](11_metrics_support.md) | D71–D77 |
 | L3 | `CostBackend` interface, granularity, the method vocabulary | [`02`](02_model_runner_and_cost_backend.md) | D11 |
@@ -610,7 +611,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Decisions | Document |
 |---|---|
-| D0 – D9 (+ D3.1–D3.5, D5.1, D6.1) | `01` Execution and Time Model |
+| D0 – D9 (+ D3.1–D3.5, D5.1, D6.1, D6.2) | `01` Execution and Time Model |
 | D10 – D12 (+ D10.1) | `02` Model Runner Seam and Cost Backend |
 | D13 – D16 (+ D13.1) | `03` Memory Model and the KV Pool |
 | D17 – D23 (+ D18.1) | `04` Model Capture and the Cost IR |

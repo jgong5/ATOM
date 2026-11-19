@@ -13,6 +13,9 @@ exist only at width).
 DeepSeek-V4.1-Flash at DTP2 and DEP2. How a request reaches its rank and how the group
 schedules a prefill there is D90.1; how the two MoE layouts key is D92.1.
 
+**Revised 2026-11-19 by [#3762](https://github.com/jgong5/ATOM/issues/3762):** D93's LP
+count names LP `router` and the shared servers' LPs, `lmcache` and `mooncake_store`.
+
 **Scope.** What each parallelism strategy changes for a simulator, answered in one frame
 so the four are comparable. It **applies** `01`'s clock protocol per strategy; it does not
 re-decide it.
@@ -851,15 +854,22 @@ Strategies compose, and the LP count is what the clock protocol pays for:
 
 ```
   LPs  =  1                                   the traffic source (the harness)
+        + router                              1 for LP router: Atomesh under --dp-aware or
+                                              with several instances per role (01 D7), else 0
         + (number of deployments)             1 aggregated, 2 for 1P1D (one per PD role)
           x ( 1                               its frontend: the API server's event loop
             + pp_size )                       its engine: one LP per PP stage; a DP group,
                                               and tp_size and ep_size, collapse into it
+        + (number of shared servers)          one per lmcache MP server (LP lmcache, 01 D6.1)
+                                              and Mooncake Store master (LP mooncake_store,
+                                              01 D6.2) its engines share
 ```
 
 So a TP8/EP8 single-node aggregated deployment is **3 LPs** (traffic, frontend, engine),
 the same as TP1; 1P1D is **5** (traffic, frontend-P, engine-P, frontend-D, engine-D); and
-a PP4 aggregated deployment is **6** (`01` D3, D3.1). **The protocol's cost tracks PP
+a PP4 aggregated deployment is **6** (`01` D3, D3.1). The 6P16D share-cache recipe, three
+prefill and four decode instances behind `--dp-aware` with one Mooncake Store, is **17**:
+traffic, router, seven frontends, seven engines and `mooncake_store`. **The protocol's cost tracks PP
 degree and PD roles,
 not GPU count**, which is the property that makes `01`'s single-CA decision hold as the
 milestones widen.
@@ -945,7 +955,7 @@ CPU-only path (`08` D43.1).
 | D91 | PP is one LP per stage at microsecond lookahead, and PP boundaries are never a hierarchical-CA cut point. The inter-stage transfer is a **size from the machine spec**, like KV transfer. Layer split comes from `get_pp_indices`, never re-derived; weights shard by that range but **KV shards by the paged-layer count inside it**, which on a hybrid is not proportional to it. Memory readings gain a PP-degree key. Revised: a send part completes on the sender's clock when eager and at `max(t_send, r_i - E × G) + T` when rendezvous, a threshold's bytes `E` leaving before the post (#1458), `r_i` the time its receive is posted, a per-carrier size threshold deciding which, and a send's `done` is the latest over its gloo parts, the only ones its host waits for, its RCCL parts holding the next send's (#1383) and, carried by the ack, the device start of the stage's later forwards, and posted no earlier than the receiving stage's device end (#1444), and a receive is posted at the receiving forward's prepare end (#1443); the receiver returns that completion, when a gloo part is rendezvous, on `stage(k+1)->stage(k):pp_ack#dp0`, lookahead `T_min - L_data`, and both waits receive it (K5). Confirmed by the owner on 2026-10-02: the send reaches the next stage on `stage(k)->stage(k+1):pp_data#dp0`, and the TP-rank-0 workers carry both channels' frames over the PP CPU group. | 2026-09-19, revised 2026-09-28 and 2026-09-30, confirmed 2026-10-02, revised 2026-10-18 and 2026-10-19 |
 | D92 | EP adds no LPs (inherits the TP group) but its all-to-all is invisible and must be a stated node; under TBO it overlaps the other micro-batch's compute, on the comm stream or as split send and receive (`04` D19). Expert sharding is Class A, remainder included. | 2026-09-19, revised 2026-10-18 ([#531](https://github.com/jgong5/ATOM/issues/531#issuecomment-6244543796)) |
 | D92.1 | DTP2 and DEP2, ruled by the owner for the DSv41-DPEP stage: V4.1's routed experts over TP and over EP2 key apart by `enable_expert_parallel`, each arm fitted on its own records; the slowest rank prices the step, through the step linear law's per-rank MoE column and the step grid's recorded routing. | 2026-11-14 (#3423) |
-| D93 | LP count = 1 traffic LP + per deployment (1 frontend LP + one engine LP per PP stage): 3 aggregated, 5 for 1P1D, independent of GPU count. The clock protocol's cost tracks PP degree and PD roles, not width. | 2026-09-19, revised 2026-09-28 |
+| D93 | LP count = 1 traffic LP + LP `router` where Atomesh is one + per deployment (1 frontend LP + one engine LP per PP stage) + one LP per shared lmcache server or Mooncake Store master: 3 aggregated, 5 for 1P1D, independent of GPU count. The clock protocol's cost tracks PP degree, PD roles, instances and shared servers, not width. | 2026-09-19, revised 2026-09-28; router and server LPs 2026-11-19 (#3762) |
 | D94 | Parallelism splits across `16` D95's milestones: TP and DP plumbing (LP structure, couplings, memory shape) at **M1**, with no parity test; at **M2**, scheduling parity and then cost accuracy. The parity test needs no cost model and runs TP2/DP2 as `-tp 2 --enable-dp-attention`, then DeepSeek-V4-Pro 1P+1D in the nightly DP-attention configuration with expert parallelism off; M2's EP8 step, which also carries EP's plumbing, repeats both with expert parallelism on, EP2 as `-tp 2 --enable-dp-attention --enable-expert-parallel`, then EP8. PP, its accuracy, and EP beyond one node come after v1. | 2026-09-19, revised 2026-10-10 (`16` D95) |
 
 ---
