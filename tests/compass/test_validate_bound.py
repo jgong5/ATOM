@@ -14,6 +14,7 @@ import json
 import math
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_backend_step_roofline import MACHINE, ROOFLINE, STACK
 from test_op_graph import g
@@ -206,7 +207,7 @@ def test_an_mtp_record_is_measured_by_its_target(tmp_path):
     assert refused == Refusal(bound.SOURCE, bound.UNSPLIT)
 
 
-def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1):
+def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1, document=ROOFLINE):
     config = SimpleNamespace(
         tensor_parallel_size=tp,
         kv_cache_dtype="bf16",
@@ -221,9 +222,9 @@ def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1):
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
     monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
     monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: graph)
-    spec = tmp_path / "spec.json"
-    spec.write_text(json.dumps(ROOFLINE))
-    argv = ["--model", "m", "--machine", str(spec), "--store", "s", *more]
+    store = tmp_path / "store"
+    platform = platforms.flags(store, document, tmp_path)
+    argv = ["--model", "m", *platform, "--store", str(store), *more]
     argv += map(str, records)
     bound.main(argv)
 
@@ -586,3 +587,24 @@ def test_ep_low_latency_split_under_tbo_refuses_at_both_levels(monkeypatch, tmp_
         r = report[level]
         assert (r["steps"], r["steps_refused"]) == (0, 8), level
         assert all("split send and receive" in k for k in r["refused"]), level
+
+
+def test_one_rank_under_tbo_prices_a_split_prefill_as_two_micro_batches(
+    monkeypatch, tmp_path
+):
+    # 9000 tokens on one rank clear the 8192-token bar; no peer vetoes it.
+    record(tmp_path, [{"rows": [[9000, 9000, False]], "rung": None}])
+    asked = []
+
+    def lookup(*shape, micro_batch=False):
+        asked.append((shape[1], micro_batch))
+        return graph(*shape)
+
+    priced = _backends(monkeypatch, tmp_path, _config(tbo=True), lookup=lookup)
+
+    report = bound.gate([tmp_path], priced, tbo=True)
+
+    [(_, view, _)] = bound.steps(tmp_path, tbo=True)
+    assert view.tbo_tokens == ((4500,), (4500,))
+    assert set(asked) == {(4500, True)}
+    assert [report[k]["steps_refused"] for k in ("step", "op")] == [0, 0]

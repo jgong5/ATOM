@@ -40,6 +40,20 @@ from atom.utils import forward_context as fctx
 
 pytestmark = pytest.mark.usefixtures("unpriced")
 
+
+@pytest.fixture(autouse=True)
+def seeded():
+    """torch's generator seeded for each test, and restored after. The stub
+    draws its planes and activations from it (`ops._random`), and torch's CPU
+    `randn` returns an exact zero wherever its Box-Muller transform draws a
+    uniform 0, about once in 11 million values. A test reading zeros as not
+    drawn takes one for a missed draw; unseeded, whether one lands in its rows
+    hangs on what ran before it in the process."""
+    with torch.random.fork_rng(devices=()):
+        torch.manual_seed(0)
+        yield
+
+
 F32 = "torch.float32"
 KEY = "model.layers.{L}.attn"
 TREE = pathlib.Path(__file__).resolve().parents[2]
@@ -679,11 +693,12 @@ def _picker(k):
     return picker
 
 
-def _v41_index(monkeypatch, visible, leaves, shape, context):
+def _v41_index(monkeypatch, visible, leaves, shape, context, fp4=False):
     """Each of `leaves`' first call at `shape` and `context` on V4.1's FP8
-    plane, a PAGE of 32 tokens 4 index blocks at ratio 1, under a pick of 4
-    candidate blocks, its step's rows seeing `visible` on blocks 3, 1 and 0, 2;
-    ATOM's cache binds its tables by its kernels' torch twins."""
+    plane, or its FP4 one, a PAGE of 32 tokens 4 index blocks at ratio 1,
+    under a pick of 4 candidate blocks, its step's rows seeing `visible` on
+    blocks 3, 1 and 0, 2; ATOM's cache binds its tables by its kernels' torch
+    twins. On FP4 the step packs its rows 64 columns apart."""
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
         V41PoolGeometry,
     )
@@ -702,6 +717,10 @@ def _v41_index(monkeypatch, visible, leaves, shape, context):
     runner = _Runner()
     runner.model.append(_picker(4))
     geometry = V41PoolGeometry(1, ((0, 1),), 32, 4, 512, 32, layer_ratios=(1,))
+    if fp4:  # whole 128-dim K tiles on 8-row pages
+        geometry = dataclasses.replace(
+            geometry, index_dim=128, index_block_rows=8, index_fp4=True
+        )
     runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
     runner.forward_vars["logits"] = torch.zeros(128)
     runner.forward_vars["block_tables"] = torch.zeros(64, dtype=i32)
@@ -719,6 +738,16 @@ def _v41_index(monkeypatch, visible, leaves, shape, context):
         tiles={},
         candidates={},
     )
+    if fp4:  # the scorer workspace's row starts and maxima, 8 blocks a row
+        cache.workspace = SimpleNamespace(
+            row_starts=lambda rows: torch.arange(rows + 1, dtype=i32),
+            packed_maxima=lambda: torch.full((16,), 7.0),
+        )
+        step.planned_host = {"v41_score_bands_1": ((0, len(visible)),)}
+        step.planned = {
+            f"v41_score_{name}_1": torch.arange(len(visible), dtype=i32) * apart
+            for name, apart in (("offsets", 64), ("block_offsets", 8))
+        }
     prepare = runner.prepare_model
 
     def prepare_model(batch):  # and the step V4.1's builder prepares
@@ -780,6 +809,185 @@ def test_v41_index_leaves_take_the_tables_atom_s_forward_writes_for_their_step(
     assert pick["row_starts"].tolist() == pick["row_ends"].tolist() == [7, 3]
 
 
+def test_v41_fp4_candidate_leaves_take_the_tables_atom_s_forward_writes(monkeypatch):
+    I32, fp4 = "torch.int32", "aiter.ops.flydsl.kernels.mqa_logits."
+    fp4 += "pa_mqa_logits_fp4_rowgroup:flydsl_pa_mqa_logits_fp4_rowgroup"
+    ends, staged = _t([2], "activation", dtype=I32), _t([2], "metadata", dtype=I32)
+    table = _t([2, 4], "activation", dtype=I32)
+    starts = ("query_start_loc", _t([3], "metadata", dtype=I32))
+    listed = _leaf(fp4, ("block_tables", table), starts, ("row_ends", ends))
+    # whole contexts: each request's PAGE table and its rows' bounds
+    paged = _leaf(
+        fp4,
+        ("block_tables", _t([2, 2], "metadata", dtype=I32)),
+        ("row_ends", staged),
+    )
+
+    def top_k(logits, starts, packed):
+        return _leaf(
+            ops._TOPK,
+            ("logits", logits),
+            *[("row_starts", starts), ("row_ends", ends), ("packed_rows", packed)],
+        )
+
+    flat = _t([2, 16], "metadata", [0, 1])  # each row the whole packed buffer
+    maxima = _leaf(
+        ops._MAXIMA,
+        *[("logits", _t([128], "metadata")), ("visible", staged)],
+        *[("maxima", _t([16], "metadata")), ("packed", (staged, staged))],
+    )
+    picked = "atom.model_ops.deepseek_v41.candidate_table:candidate_block_table"
+    picked = _leaf(picked, ("candidates", _t([2, 4], "activation", dtype=I32)))
+    # a candidate list's scorer and its top-k; the pick's block maxima and its
+    # top-k, on packed rows; the kept blocks' table build; a whole-context scorer
+    leaves = listed, top_k(_t([2, 32], "metadata"), ends, False), maxima
+    leaves += top_k(flat, staged, True), picked, paged
+    records = []
+    monkeypatch.setattr(ops, "_journal", lambda path, got: records.extend(got) or got)
+    # rows seeing 50 and 20 compressed rows: 7 and 3 blocks of 8
+    listed, its, maxima, pick, kept, paged = _v41_index(
+        monkeypatch, [50, 20], leaves, decode(2), 64, fp4=True
+    )
+
+    assert kept["candidates"].tolist() == [[0, 2, 4, 6], [0, 1, 2, -1]]
+    assert listed["block_tables"].tolist() == [[12, 14, 4, 6], [0, 1, 2, 0]]
+    assert listed["row_ends"].tolist() == [26, 20]
+    assert listed["query_start_loc"].tolist() == [0, 1, 2]
+    assert its["row_starts"].tolist() == its["row_ends"].tolist() == [26, 20]
+    # the pick's rows 64 columns and 8 blocks apart, its maxima the workspace's
+    assert [t.tolist() for t in maxima["packed"]] == [[0, 64], [0, 8]]
+    assert pick["row_starts"].tolist() == [0, 8]
+    assert pick["row_ends"].tolist() == [7, 3]
+    assert records[3]["metadata"]["logits"] == "workspace._maxima"
+    # a whole context's table is its request's PAGE table
+    assert paged["block_tables"].tolist() == [[3, 1], [0, 2]]
+
+
+def test_v41_fp4_whole_context_leaves_take_their_ratio_s_bounds_and_packed_starts(
+    monkeypatch,
+):
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
+        V41PoolGeometry,
+    )
+
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *a: {})
+    I32, i32 = "torch.int32", torch.int32
+    # PAGEs of 32 tokens, a block table 2 of them: at ratio 1 4 index blocks a
+    # PAGE and planes 64 rows wide, at ratio 2 2 blocks and 32 rows
+    geometry = V41PoolGeometry(
+        2, ((0, 1), (1, 2)), 32, 4, 512, 128, layer_ratios=(1, 2),
+        index_block_rows=8, index_fp4=True,
+    )  # fmt: skip
+    runner = _Runner()
+    runner.attn_metadata_builder = SimpleNamespace(
+        geometry=geometry, block_table_cols=2
+    )
+    # two rows, laid out in the packed logits a plane's width apart
+    step = SimpleNamespace(
+        batch_ids=torch.arange(2, dtype=i32),
+        visible={r: torch.tensor([50, 20], dtype=i32) // r for r in (1, 2)},
+        planned={
+            f"v41_score_offsets_{r}": torch.tensor([0, 64 // r], dtype=i32)
+            for r in (1, 2)
+        },
+    )
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        fctx._forward_context.attn_metadata.step = step
+        fctx._forward_context.attn_metadata.cache = SimpleNamespace()
+        return out
+
+    runner.prepare_model = prepare_model
+    rows = _t([2], "metadata", dtype=I32)
+    plan = "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup:"
+
+    def scorer(blocks):  # its plan's index blocks a PAGE: the ratio's
+        return _leaf(
+            ops._FP4,
+            ("plan", Reduced(f"{plan}Fp4MqaPlan", (("pages_per_block", blocks),))),
+            *[("row_ends", rows), ("out", _t([128], "metadata"))],
+            ("out_offsets", rows),
+        )
+
+    def top_k(width, packed=True):  # its rows standing for a plane that wide
+        return _leaf(
+            ops._TOPK,
+            ("logits", _t([2, 128] if packed else [2, width], "metadata")),
+            *[("row_starts", rows), ("row_ends", rows)],
+            ("stride0", 0 if packed else width),
+            *[("plane_width", width if packed else None), ("packed_rows", packed)],
+        )
+
+    # each ratio's scorer and top-k, packed, and ratio 2's on rows of their own
+    leaves = scorer(2), top_k(32), scorer(4), top_k(64), top_k(32, packed=False)
+    found = ops.leaves(_graph(*leaves, layers=1)["region"])
+    placed = SimpleNamespace(block_size=32, batch=lambda *a: a[1:])
+    got = ops.Stub(runner, 10_000).point(placed, decode(2), 64, found)
+
+    slots = "row_starts", "row_ends", "out_offsets"
+    named = [{s: r["metadata"][s] for s in slots if s in r["metadata"]} for r in got]
+    # each row's logits' start in the packed buffer, as ATOM's step lays it out
+    starts = "step.planned.v41_score_offsets_{}".format
+    assert named == [
+        {"row_ends": "step.visible.2", "out_offsets": starts(2)},
+        {"row_starts": starts(2), "row_ends": "step.visible.2"},
+        {"row_ends": "step.visible.1", "out_offsets": starts(1)},
+        {"row_starts": starts(1), "row_ends": "step.visible.1"},
+        {"row_starts": "step.visible.2", "row_ends": "step.visible.2"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "top_k, slot",
+    [
+        ("aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode", "seq_lens"),
+        (ops._PICK, "seqLens"),
+    ],
+)
+def test_a_v41_top_k_s_staged_bounds_are_its_ratio_s_with_and_without_its_scorer(
+    monkeypatch, top_k, slot
+):
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *a: {})
+    runner, rows = _Runner(), _t([2], "metadata", dtype="torch.int32")
+    # V4.1's FP8 index plane at ratios 1 and 2, PAGEs of 32 tokens
+    geometry = SimpleNamespace(layer_ratios=(1, 2), rows_per_page=lambda r: 32 // r)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    visible = {r: torch.tensor([50, 20], dtype=torch.int32) // r for r in (1, 2)}
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):  # and the step V4.1's builder prepares
+        out = prepare(batch)
+        fctx._forward_context.attn_metadata.step = SimpleNamespace(visible=visible)
+        return out
+
+    def stating(op, ratio):
+        said = (("compress_ratio", ratio),) if ratio else ()
+        return dataclasses.replace(op, stated=said)
+
+    def top(width, ratio=None):  # as aiter's decode top-k launches it
+        plane = ("logits", _t([2, width], "metadata"))
+        return stating(_leaf(top_k, plane, (slot, rows), ("stride0", width)), ratio)
+
+    runner.prepare_model = prepare_model
+    # ratio 2's scorer, its logits 32 wide
+    scorer = stating(_leaf(ops._LOGITS, ("out_logits", _t([2, 32], "metadata"))), 2)
+    placed, bound = SimpleNamespace(block_size=32, batch=lambda *a: a[1:]), []
+    # each top-k stating its ratio, alone; ratio 2's stating none beside its
+    # scorer, and alone
+    for leaves in [(top(64, 1), top(32, 2)), (scorer, top(32)), (top(32),)]:
+        found = ops.leaves(_graph(*leaves, layers=1)["region"])
+        got = ops.Stub(runner, 10_000).point(placed, decode(2), 64, found)
+        bound += [r["metadata"][slot] for r in got if r["op"] == top_k]
+
+    assert bound[:3] == ["step.visible.1", "step.visible.2", "step.visible.2"]
+    told = bound[3].rpartition("cannot tell which ratio's ")[-1]
+    assert told == "scorer writes its 32-wide logits: trace its shape again"
+
+
 def test_the_v41_candidate_lift_leaves_its_selection_as_built_past_twice_the_kept(
     monkeypatch,
 ):
@@ -831,6 +1039,145 @@ def test_a_v41_prefill_past_cached_tokens_picks_candidates_off_its_rows_blocks(
     assert units["block_tables"].shape == (1, 40)
 
 
+@pytest.mark.parametrize(
+    "ranked, llc, copies",
+    [(True, 10_000, 47), (False, 10_000, 47), (True, 150, 1)],
+    ids=["top_k", "scorer", "one_call_past_the_cache"],
+)
+def test_a_v41_fp4_packed_plane_counts_draws_and_copies_its_rows_from_their_starts(
+    ranked, llc, copies
+):
+    # V4.1's FP4 packed logits, 200 float32 flat, rows seeing 50, 20, 0 and 30
+    # rows packed 64 apart, as ATOM lays them out: a whole context's top-k
+    # ranks them, its scorer writes them. At twice a cache of 20000 bytes its
+    # copies sit a 256-column run apart in one buffer, a ranked one drawn; a
+    # call past twice a cache of 150 bytes takes one, its run cut at its end
+    runner = _Runner()
+    geometry = SimpleNamespace(
+        layer_ratios=(1,), rows_per_page=lambda r: 32,
+        index_fp4=True, index_blocks_per_page=lambda r: 4,
+    )  # fmt: skip
+    runner.attn_metadata_builder = SimpleNamespace(
+        geometry=geometry, block_table_cols=2
+    )
+    starts, bounds = [0, 64, 128, 128], [50, 20, 0, 30]
+    held = runner.forward_vars
+    held["logits"] = torch.zeros(200)
+    held["row_starts"] = held["out_offsets"] = torch.tensor(starts).int()
+    held["row_ends"] = torch.tensor(bounds).int()
+    rows = _t([4], "metadata", dtype="torch.int32")
+    top_k = _leaf(
+        ops._TOPK,
+        *[("logits", _t([4, 200], "metadata", [0, 1])), ("row_starts", rows)],
+        *[("row_ends", rows), ("packed_rows", True)],
+    )
+    scorer = _leaf(
+        ops._FP4,
+        *[("out", _t([200], "metadata")), ("out_offsets", rows)],
+        ("row_ends", rows),
+    )
+    leaf, slot = (top_k, "logits") if ranked else (scorer, "out")
+    stub = ops.Stub(runner, llc)
+    stub.leaves = ops.leaves(_graph(leaf, layers=1)["region"])
+    stub._prepare((0, 0))
+    [(sig, (op, instances))] = stub.leaves.items()
+
+    n, size, _, _ = stub._plan(op, instances, {}, 4, 4, sig=sig, decode=True)
+    planes = [stub._copy(op, sig, instances, c)[0][slot] for c in range(n)]
+    runs = [p.as_strided((min(256, ops._room(p)),), (1,)) for p in planes]
+
+    assert (n, size) == (copies, 4 * sum(bounds) + 32)
+    assert len({p.untyped_storage().data_ptr() for p in planes}) == 1
+    assert [p.storage_offset() for p in planes] == [256 * c for c in range(n)]
+    spans = [(s, s + b) for s, b in zip(starts, bounds) if b]
+    drawn = [r[a:b].ne(0).all() for r in runs for a, b in spans]
+    assert all(drawn) if ranked else not any(drawn)
+    assert all(r[a:b].eq(0).all() for r in runs for a, b in ((50, 64), (84, 128)))
+    assert all(r[158:].eq(0).all() for r in runs)
+
+
+@pytest.mark.parametrize("ranked", [True, False], ids=["top_k", "scorer"])
+def test_a_v41_fp4_unpacked_plane_counts_draws_and_copies_its_rows_as_fp8_s(ranked):
+    # V4.1's FP4 plane left unpacked, [4, 1024] float32, a row a stride apart,
+    # as a candidate list's or a prefill tail's scorer writes it and its top-k
+    # ranks it: rows reading 100 to 120 columns, at twice a cache of 20000
+    # bytes, take 12 copies 128 columns apart, 8 to a buffer, as on FP8
+    runner = _Runner()
+    geometry = SimpleNamespace(
+        layer_ratios=(1,), rows_per_page=lambda r: 32,
+        index_fp4=True, index_blocks_per_page=lambda r: 4,
+    )  # fmt: skip
+    runner.attn_metadata_builder = SimpleNamespace(
+        geometry=geometry, block_table_cols=2
+    )
+    bounds = [100, 120, 110, 120]
+    runner.forward_vars["logits"] = torch.zeros(4, 1024)
+    runner.forward_vars["row_ends"] = torch.tensor(bounds).int()
+    plane, rows = _t([4, 1024], "metadata"), _t([4], "metadata", dtype="torch.int32")
+    leaf = _leaf(ops._FP4, ("out", plane), ("row_ends", rows))
+    if ranked:
+        leaf = _leaf(
+            ops._TOPK, ("logits", plane), ("row_ends", rows), ("packed_rows", False)
+        )
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(leaf, layers=1)["region"])
+    stub._prepare((0, 0))
+    [(sig, (op, instances))] = stub.leaves.items()
+
+    n, size, _, _ = stub._plan(op, instances, {}, 4, 4, sig=sig, decode=True)
+    slot = "logits" if ranked else "out"
+    planes = [stub._copy(op, sig, instances, c)[0][slot] for c in range(n)]
+
+    assert (n, size) == (12, 4 * sum(bounds) + 16)
+    assert len({p.untyped_storage().data_ptr() for p in planes}) == 2
+    assert [p.storage_offset() for p in planes] == [128 * (c % 8) for c in range(n)]
+    reach = list(enumerate(bounds))
+    assert all(p[r, :b].ne(0).all() == ranked for p in planes for r, b in reach)
+    assert all(p[r, b:128].eq(0).all() for p in planes for r, b in reach)
+
+
+def test_v41_fp4_pick_s_block_maxima_and_top_k_count_and_rank_their_packed_rows(
+    monkeypatch,
+):
+    # the candidate pick's block maxima over packed logits, 128 float32 flat,
+    # rows seeing 50 and 20 rows 64 apart, writing their 7 and 3 blocks of 8
+    # rows 8 apart into packed maxima, 16 flat, and its top-k ranking those
+    I32 = "torch.int32"
+    staged = _t([2], "metadata", dtype=I32)
+    maxima = _leaf(
+        ops._MAXIMA,
+        *[("logits", _t([128], "metadata")), ("visible", staged)],
+        *[("maxima", _t([16], "metadata")), ("block_size", 8)],
+        ("packed", (staged, staged)),
+    )
+    pick = _leaf(
+        ops._TOPK,
+        *[("logits", _t([2, 16], "metadata", [0, 1])), ("row_starts", staged)],
+        *[("row_ends", _t([2], "activation", dtype=I32)), ("packed_rows", True)],
+    )
+    plans, plan = [], ops.Stub._plan
+
+    def planning(stub, *args, **kwargs):
+        plans.append(plan(stub, *args, **kwargs))
+        return plans[-1]
+
+    monkeypatch.setattr(ops.Stub, "_plan", planning)
+    maxima, pick = _v41_index(
+        monkeypatch, [50, 20], [maxima, pick], decode(2), 64, fp4=True
+    )
+
+    # their rows' columns, and blocks, beside 8 bytes of each row slot
+    assert [p[:2] for p in plans] == [(59, 4 * 70 + 4 * 10 + 24), (256, 4 * 10 + 16)]
+    logits, ranked = maxima["logits"], pick["logits"][0]
+    written = maxima["maxima"].untyped_storage().data_ptr()
+    assert logits.untyped_storage().data_ptr() != written
+    assert logits[:50].ne(0).all() and logits[64:84].ne(0).all()
+    assert logits[50:64].eq(0).all() and logits[84:].eq(0).all()
+    assert maxima["maxima"].eq(0).all()  # written, not drawn
+    assert ranked[:7].ne(0).all() and ranked[8:11].ne(0).all()
+    assert ranked[7:8].eq(0).all() and ranked[11:].eq(0).all()
+
+
 def _pick(monkeypatch, arch, k, env=None):
     """V4.1's pick's HIP top-k of k as a prefill of 256 tokens traced it, 32
     index blocks, on `arch` with aiter's FlyDSL switch at `env`; and the list
@@ -857,7 +1204,8 @@ def _pick(monkeypatch, arch, k, env=None):
         ("gfx1250", None, 160, ops._TOPK),
         ("gfx1250", "0", 160, ops._TOPK),  # which aiter reads as on
         ("gfx1250", None, 161, ops._PICK),
-        ("gfx950", None, 160, "its kernel on gfx950 is not known"),
+        ("gfx950", None, 160, ops._TOPK),  # no FlyDSL decode gate takes k 160
+        ("gfx942", None, 160, "its kernel on gfx942 is not known"),
         ("gfx1250", "1", 160, "gfx1250 under AITER_DISABLE_FLYDSL_TOPK_DECODE=1 is"),
     ],
 )
@@ -878,6 +1226,58 @@ def test_a_v41_prefill_pick_widened_to_its_k_runs_the_top_k_aiter_dispatches_the
     assert call["logits"].shape == (256, 160)
     bounds = ("row_starts", "row_ends") if want == ops._TOPK else ("seqLens",)
     assert [call[b].tolist() for b in bounds] == [ends] * len(bounds)
+
+
+def _wrapped(kernel, rows, width, k=512):
+    """A stable top-k of `rows` rows aiter's decode wrapper launched on `kernel`
+    over logits `width` wide, each row's bound the staged one."""
+    I32, plane = "torch.int32", ("logits", _t([rows, width], "activation"))
+    ends = _t([rows], "metadata", dtype=I32)
+    out = ("indices", _t([rows, k], "activation", dtype=I32))
+    ints = [("stride0", width), ("stride1", 1), ("k", k), ("stable", True)]
+    if kernel == ops._PICK:
+        scratch = ("workspace", _t([1], "activation", dtype="torch.uint8"))
+        args = [("next_n", 1), ("seqLens", ends), out, ("numRows", rows)]
+        return _leaf(kernel, plane, *args, *ints, scratch)
+    if kernel == ops._MULTI:
+        args = [("next_n", 1), ("seq_lens", ends), out, ("num_rows", rows)]
+        return _leaf(kernel, plane, *args, *ints, ("row_starts", None))
+    args = [("row_starts", ends), ("row_ends", ends), out, ("values", None)]
+    args += [("num_rows", rows), *ints, ("is_decode", True), ("next_n", 1)]
+    return _leaf(kernel, plane, *args, ("packed_rows", False))
+
+
+@pytest.mark.parametrize(
+    "kernel, rows, width, want",
+    [
+        (ops._MULTI, 128, 4000, ops._MULTI),  # 20000 columns, the gate's edge
+        (ops._MULTI, 128, 4008, ops._TOPK),
+        (ops._MULTI, 16, 6560, ops._MULTI),  # 32800 columns
+        (ops._MULTI, 17, 6560, ops._TOPK),
+        (ops._PICK, 128, 128, ops._MULTI),  # 640 columns, past k 512
+        (ops._PICK, 256, 128, ops._TOPK),
+        (ops._TOPK, 32, 20480, ops._MULTI),  # 102400 columns
+        (ops._TOPK, 33, 20480, ops._TOPK),
+    ],
+)
+def test_a_widened_gfx950_top_k_runs_the_kernel_aiter_s_gate_picks_by_width_and_rows(
+    monkeypatch, kernel, rows, width, want
+):
+    # a prefill of 256 tokens past 1024 cached ranks 5 times the columns it
+    # traced; aiter's gfx950 gate takes a stable call of k 512 to 20000
+    # columns at 128 rows, 32768 to 65535 at 16, 65536 to 131072 at 32
+    monkeypatch.setattr("atom.compass.capture.forward.device_arch", lambda: "gfx950")
+    monkeypatch.delenv("AITER_DISABLE_FLYDSL_TOPK_DECODE", raising=False)
+    records, visible = [], list(range(1025, 1281))
+    monkeypatch.setattr(ops, "_journal", lambda path, got: records.extend(got) or got)
+    top_k = _wrapped(kernel, rows, width)
+    [call] = _v41_index(monkeypatch, visible, [top_k], prefill(256, 1), 1024)
+
+    [record] = records
+    assert record.get("timed", kernel) == want
+    assert call["logits"].shape == (rows, 5 * width)
+    bounds = ("row_starts", "row_ends") if want == ops._TOPK else ("seq_lens",)
+    assert [call[b].tolist() for b in bounds] == [visible[:rows]] * len(bounds)
 
 
 def test_a_v41_prefill_pick_s_points_either_side_of_its_k_fit_one_family_by_context(
@@ -929,6 +1329,110 @@ def test_v41_index_leaves_rank_a_logits_plane_drawn_below_each_row_s_bound(
             assert row[:n].ne(0).all() and row[n:].eq(0).all()
 
 
+def test_a_v41_multi_cta_top_k_takes_its_bounds_and_ranks_a_plane_drawn_below_them(
+    monkeypatch,
+):
+    # gfx950's multi-CTA top-k at decode B=2: the page-wide one, a candidate
+    # list's and the pick's, on block maxima; no scorer or pick here
+    def top_k(width, logits, bounds):
+        return _leaf(
+            ops._MULTI,
+            ("logits", _t([2, width], logits)),
+            ("seq_lens", _t([2], bounds, dtype="torch.int32")),
+            ("stride0", width),
+        )
+
+    leaves = top_k(64, "metadata", "metadata"), top_k(32, "metadata", "activation")
+    leaves += (top_k(8, "activation", "activation"),)
+    taken = _v41_index(monkeypatch, [50, 20], leaves, decode(2), 64)
+
+    # rows seeing 50 and 20 compressed rows; the list keeps 26 and 20 of
+    # them, the pick ranks 7 and 3 blocks of 8
+    ends = [[50, 20], [26, 20], [7, 3]]
+    assert [call["seq_lens"].tolist() for call in taken] == ends
+    for call, bounds in zip(taken, ends[:2]):
+        for row, n in zip(call["logits"], bounds):
+            assert row[:n].ne(0).all() and row[n:].eq(0).all()
+    # a prefill of 256 past 1024 cached tokens ranks a plane as wide as its 40
+    # KV blocks, not the 8 it traced; a candidate list's stays as it was sized
+    leaves = top_k(8, "metadata", "metadata"), leaves[1]
+    taken = _v41_index(monkeypatch, [50, 20], leaves, prefill(256, 1), 1024)
+    assert [call["logits"].shape[1] for call in taken] == [40, 32]
+
+
+def test_a_v41_fp4_packed_multi_cta_top_k_takes_its_starts_and_ranks_from_them(
+    monkeypatch,
+):
+    # gfx950's multi-CTA top-k on V4.1's FP4 plane, its rows packed: a whole
+    # context's on its scorer's logits, the pick's on its block maxima
+    I32 = "torch.int32"
+    staged, ends = _t([2], "metadata", dtype=I32), _t([2], "activation", dtype=I32)
+
+    def top_k(width, bounds):  # each row the whole packed buffer
+        return _leaf(
+            ops._MULTI,
+            *[("logits", _t([2, width], "metadata", [0, 1])), ("seq_lens", bounds)],
+            *[("stride0", 0), ("row_starts", staged)],
+        )
+
+    records = []
+    monkeypatch.setattr(ops, "_journal", lambda path, got: records.extend(got) or got)
+    leaves = top_k(128, staged), top_k(16, ends)
+    whole, pick = _v41_index(monkeypatch, [50, 20], leaves, decode(2), 64, fp4=True)
+
+    # rows 64 columns and 8 blocks apart, a whole context's drawn from each start
+    run = whole["logits"][0]
+    assert whole["row_starts"].tolist() == [0, 64]
+    assert run[:50].ne(0).all() and run[64:84].ne(0).all()
+    assert run[50:64].eq(0).all() and run[84:].eq(0).all()
+    assert pick["row_starts"].tolist() == [0, 8] and pick["seq_lens"].tolist() == [7, 3]
+    assert records[1]["metadata"]["logits"] == "workspace._maxima"
+
+
+def test_gfx950_s_v41_fp8_scorer_takes_its_bounds_tables_and_plane_as_gfx1250_s(
+    monkeypatch,
+):
+    # gfx950's FP8 scorer, which ATOM calls as it calls gfx1250's: the
+    # page-wide one and a candidate list's, at ratio 1
+    I32 = "torch.int32"
+    triton = "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits"
+
+    def scorer(bounds, width):
+        leaf = _leaf(
+            triton,
+            ("out_logits", _t([2, width], "metadata")),
+            ("context_lens", _t([2], bounds, dtype=I32)),
+            ("kv_indices", _t([2, width // 8], bounds, dtype=I32)),
+            ("max_model_len", width),
+        )
+        return dataclasses.replace(leaf, stated=(("compress_ratio", 1),))
+
+    records = []
+    monkeypatch.setattr(ops, "_journal", lambda path, got: records.extend(got) or got)
+    leaves = scorer("metadata", 64), scorer("activation", 32)
+    page, listed = _v41_index(monkeypatch, [50, 20], leaves, decode(2), 64)
+
+    # at decode B=2, rows seeing 50 and 20 compressed rows on their 8 tiles;
+    # the list keeps 26 and 20 of them on 4
+    named = records[0]["metadata"]
+    assert named["context_lens"] == "step.visible.1"
+    assert named["kv_indices"] == "workspace._tiles.1"
+    assert page["context_lens"].tolist() == [50, 20]
+    assert page["kv_indices"].tolist() == [
+        [12, 13, 14, 15, 4, 5, 6, 7],
+        [0, 1, 2, 3, 8, 9, 10, 11],
+    ]
+    assert listed["context_lens"].tolist() == [26, 20]
+    assert listed["kv_indices"].tolist() == [[12, 14, 4, 6], [0, 1, 2, 0]]
+    # a prefill of 32 past 32 cached tokens scores on a plane as wide as its 2
+    # KV blocks, not the 1 it traced; a candidate list's stays as it was sized
+    leaves = scorer("metadata", 32), leaves[1]
+    page, listed = _v41_index(monkeypatch, [50, 20], leaves, prefill(32, 1), 32)
+    assert [page["max_model_len"], listed["max_model_len"]] == [64, 32]
+    assert [c["out_logits"].shape[1] for c in (page, listed)] == [64, 32]
+    assert page["kv_indices"].shape == (2, 8)
+
+
 def test_each_copy_of_a_v41_index_leaf_ranks_a_logits_plane_of_its_own():
     # V4.1's FP8 plane, which ATOM's preparation leaves as it was, at three
     # placements of decode B=2: they share one clone of it
@@ -972,6 +1476,137 @@ def test_each_copy_of_a_v41_index_scorer_writes_a_logits_plane_of_its_own():
     # copy c at placement c
     planes = [stub._copy(op, sig, instances, c)[0]["out_logits"] for c in range(3)]
     assert len({plane.data_ptr() for plane in planes}) == 3
+
+
+@pytest.mark.parametrize(
+    "bounds, copies, buffers",
+    [([100, 120, 110, 120], 11, 2), ([600] * 4, 3, 3), ([1000, 20, 20, 20], 5, 5)],
+    ids=["rows_alike", "rows_past_half", "one_long_row"],
+)
+def test_a_v41_plane_counts_and_copies_the_columns_below_its_rows_bounds(
+    bounds, copies, buffers
+):
+    # a top-k's FP8 plane, [4, 1024] float32, beside its 32-byte bounds, at
+    # twice a cache of 20000 bytes: 8 copies of rows alike share a buffer,
+    # 128 columns apart; rows past half its width take a buffer a copy, at
+    # most four times that, and read past it
+    runner = _Runner()
+    geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(4, 1024)
+    runner.forward_vars["ends"] = torch.tensor(bounds)
+    plane, ends = _t([4, 1024], "metadata"), _t([4], "metadata", dtype="torch.int64")
+    top_k = _leaf(ops._TOPK, ("logits", plane), ("row_ends", ends))
+    stub = ops.Stub(runner, 10_000)
+    stub.leaves = ops.leaves(_graph(top_k, layers=1)["region"])
+    stub._prepare((0, 0))
+    [(sig, (op, instances))] = stub.leaves.items()
+
+    n, size, _, _ = stub._plan(op, instances, {}, 4, 4, sig=sig, decode=True)
+    planes = [stub._copy(op, sig, instances, c)[0]["logits"] for c in range(n)]
+
+    assert (n, size) == (copies, 4 * sum(bounds) + 32)
+    assert n * size > 20_000
+    assert len({p.untyped_storage().data_ptr() for p in planes}) == buffers
+    reach = list(enumerate(bounds))
+    assert all(p[r, :b].ne(0).all() for p in planes for r, b in reach)
+    for c, p in enumerate(planes):  # no copy reaches another's columns
+        for r, b in reach:
+            p[r, :b] = c
+    assert all(p[r, :b].eq(c).all() for c, p in enumerate(planes) for r, b in reach)
+
+
+@pytest.mark.parametrize(
+    "llc, copies, buffers, starts",
+    [(10_000, 14, 4, [0, 512, 1152, 1664]), (5_000, 6, 3, [0, 384])],
+    ids=["stairs", "stairs_past_twice_cold"],
+)
+def test_a_v41_plane_s_copies_read_its_widest_row_beside_others_narrow_rows(
+    llc, copies, buffers, starts
+):
+    # a top-k's FP8 plane, [4, 1024] float32, its first row reading 300
+    # columns and the rest 20: a copy a row and 128 columns past another reads
+    # its first row beside the other's second, two such stairs to a buffer 512
+    # columns apart, and 14 copies read past twice the cache, where copies 384
+    # columns apart, two to a buffer, read under it; at half the cache a
+    # stair's buffer, 23040 bytes, would pass twice `COLD` times it
+    bounds = [300, 20, 20, 20]
+    runner = _Runner()
+    geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(4, 1024)
+    runner.forward_vars["ends"] = torch.tensor(bounds)
+    plane, ends = _t([4, 1024], "metadata"), _t([4], "metadata", dtype="torch.int64")
+    top_k = _leaf(ops._TOPK, ("logits", plane), ("row_ends", ends))
+    stub = ops.Stub(runner, llc)
+    stub.leaves = ops.leaves(_graph(top_k, layers=1)["region"])
+    stub._prepare((0, 0))
+    [(sig, (op, instances))] = stub.leaves.items()
+
+    n, size, _, _ = stub._plan(op, instances, {}, 4, 4, sig=sig, decode=True)
+    planes = [stub._copy(op, sig, instances, c)[0]["logits"] for c in range(n)]
+
+    assert (n, size) == (copies, 4 * sum(bounds) + 32)
+    assert (n * size > 2 * llc) == (llc == 10_000)
+    assert len({p.untyped_storage().data_ptr() for p in planes}) == buffers
+    reach = list(enumerate(bounds))
+    for c, p in enumerate(planes):  # no copy reaches another's columns
+        for r, b in reach:
+            p[r, :b] = c
+    assert all(p[r, :b].eq(c).all() for c, p in enumerate(planes) for r, b in reach)
+    first = planes[0].untyped_storage().data_ptr()
+    at = [p.storage_offset() for p in planes if p.untyped_storage().data_ptr() == first]
+    assert at == starts
+
+
+@pytest.mark.parametrize(
+    "call_ns, calls",
+    [(1.0, None), (ops.GRAPH_NS / 3.5, 3)],
+    ids=["copies_under_calls", "a_copy_a_call"],
+)
+def test_a_v41_plane_whose_copies_read_under_twice_the_cache_refuses_by_name(
+    monkeypatch, call_ns, calls
+):
+    # a top-k's FP8 plane, [8, 1024] float32, its first row reading 1000
+    # columns and the rest 20: no stair fits beside its widest row, so its
+    # copies stop at 3, where their buffers pass 4 * COLD times a cache of
+    # 10000 bytes, at 4624 bytes a call: 13872 bytes, under the 5 copies
+    # that pass twice the cache. Under 256 calls it refuses; where 3 calls
+    # fill `GRAPH_NS`, each call reads a copy of its own, and it is timed.
+    bounds = [1000] + [20] * 7
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner = _Runner()
+    geometry = SimpleNamespace(layer_ratios=(1,), rows_per_page=lambda ratio: 32)
+    runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
+    runner.forward_vars["logits"] = torch.zeros(8, 1024)
+    runner.forward_vars["ends"] = torch.tensor(bounds)
+    plane, ends = _t([8, 1024], "metadata"), _t([8], "metadata", dtype="torch.int64")
+    top_k = _leaf(ops._TOPK, ("logits", plane), ("row_ends", ends))
+    found = ops.leaves(_graph(top_k, layers=1)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    timed = []
+
+    def replay(fn, cycle, flush=None):
+        timed.append(len(cycle))
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], call_ns)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        [record] = ops.Stub(runner, 10_000).point(placed, decode(8), 20, found)
+
+    if calls is None:
+        assert record["refused"] == (
+            "ValueError: its 3 copies for 256 calls read 69% of twice the cache: "
+            "no cold layout fits its ragged rows"
+        )
+        assert timed == []
+    else:
+        assert "refused" not in record and timed == [calls]
+        assert (record["copies"], record["calls"]) == (3, calls)
+        assert record["footprint_bytes"] == 3 * (4 * sum(bounds) + 64)
 
 
 def test_an_embedding_reads_the_token_ids_atom_prepared():
@@ -1665,6 +2300,74 @@ def test_v41_attention_takes_the_lists_atom_s_index_build_writes_for_its_pass(
     # one copy a pass, its indptrs filled afresh into the cache's buffers
     assert len({f[0] for f in fills}) == 2
     assert all(f[1:] == ({}, None) for f in fills)
+
+
+def test_a_v41_attention_reads_the_pool_rows_its_pass_s_selection_names():
+    # V4.1's attention at ratio 2, top-k 8, over a prefill's 4 rows of one
+    # request from position 1199, seeing 600 and 601 rows, and over its
+    # replay's query, the last. The bench spreads each row's 8 over its own
+    # visible rows: the prefill's lists name 12 of the pool's rows of 16
+    # bytes, the query's its 8.
+    from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
+    from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
+
+    i32, runner = torch.int32, _Runner()
+    runner.config.kv_cache_block_size = 32
+    runner.model.append(torch.nn.Module())
+    runner.model[-1].spec = LayerAttentionSpec(2, 2, AttentionMode.FULL, 2, 2)
+    visible = {2: torch.tensor([600, 600, 601, 601], dtype=i32)}
+    spans = (RequestSpan(0, 1199, 0, 4, 0),)
+    step = BatchStep(spans, *(torch.zeros(4, dtype=i32),) * 4, None, visible=visible)
+    step.decoder = SimpleNamespace(
+        tail=step, tail_rows=torch.zeros(3), last=torch.zeros(1), filled_gpu=None,
+        finishing_gpu=None, query_ids=torch.tensor([-1, -1, -1, 0], dtype=i32),
+        query_ptrs=torch.tensor([3, 0], dtype=i32),
+    )  # fmt: skip
+    lists = [torch.zeros(4, dtype=i32)] * 4
+    cache = SimpleNamespace(attention_indices=lambda *_: lists)
+    cache.geometry = SimpleNamespace(batch_topk=lambda ratio: 8)
+    prepare = runner.prepare_model
+
+    def prepare_model(batch):
+        out = prepare(batch)
+        vars(fctx._forward_context.attn_metadata).update(step=step, cache=cache)
+        return out
+
+    def attend(rows, *slots):
+        args = [(s, _t([n], "activation", dtype="torch.int32")) for s, n in slots]
+        q, kv = _t([rows, 2, 4], "activation"), _t([999, 4], "kv")
+        leaf = _leaf(ops._ATTEND, ("q", q), ("unified_kv", kv), *args)
+        top = ("window_size", 128), ("compress_ratio", 2), ("index_topk", 8)
+        return dataclasses.replace(leaf, stated=top)
+
+    runner.prepare_model, stub = prepare_model, ops.Stub(runner, 10_000)
+    leaves = attend(4, ("kv_indices_prefix", 4))
+    leaves = leaves, attend(1, ("kv_indices_prefix", 1), ("kv_indptr_prefix", 2))
+    stub.leaves = ops.leaves(_graph(*leaves, layers=1)["region"])
+    stub._prepare((0, 0))
+
+    # by block, the prefill past the 8 a request its top-k reads at most
+    assert {
+        op["args"]["q"]["shape"][0]: stub._plan(op, i, {}, 99, 1, None, s)[3][0]
+        for s, (op, i) in stub.leaves.items()
+    } == {4: 12 * 16, 1: 8 * 16}
+
+
+@pytest.mark.parametrize(
+    "spans",
+    [((1199, 4),), ((0, 3), (8190, 6)), ((1199, 4), (1199, 4)), ((9000, 300),)],
+)
+def test_the_host_s_spread_counts_the_rows_the_bench_s_candidates_keep(spans):
+    # `_spread` off each request's (first position, rows), against the ids
+    # `_candidates` keeps over the rows' visible rows, a request's apart: two
+    # requests at the same rows name theirs twice
+    ratio, k = 4, 16
+    positions = torch.cat([torch.arange(p, p + n) for p, n in spans])
+    ids = ops._candidates((positions + 1) // ratio, k).long()
+    batch = torch.cat([torch.full((n,), i) for i, (_, n) in enumerate(spans)])
+    kept = ids >= 0
+    named = (batch[:, None].expand_as(ids)[kept] << 32 | ids[kept]).unique()
+    assert ops._spread(spans, ratio, k) == named.numel()
 
 
 def test_a_call_counts_its_module_s_tensors_and_cycles_over_every_layer():
@@ -2728,6 +3431,53 @@ def test_a_warm_call_takes_its_cold_call_s_occurrence_on_that_one_s_first_copy(
     assert len({c for c, _ in graphs[1]}) == 1 + queried
 
 
+@pytest.mark.parametrize(
+    "call_ns, copies, calls, other",
+    [(1.0, 12, ops.CALLS, ops.CALLS), (ops.GRAPH_NS // 11, 10, 10, 11)],
+)
+def test_each_occurrence_of_a_queried_leaf_takes_as_many_copies_and_calls(
+    monkeypatch, call_ns, copies, calls, other
+):
+    # Two leaves of two occurrences, 200 bytes a call: 11 copies pass twice
+    # 1000 bytes. The scan's later occurrence takes its own ids, all -1
+    # (`QUERIED`): its copies round up to 12, each on activations of its own,
+    # and where 11 calls fill `GRAPH_NS`, its calls down to 10, so each
+    # occurrence takes half the calls. The other, with no later binding,
+    # keeps 11 copies and its calls.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    args = ("ids", _t([25], "activation")), ("x", _t([25], "activation"))
+    leaves = _leaf("aiter.scan", *args), _leaf("aiter.other", *args)
+    found = ops.leaves(_graph(*leaves, layers=2)["region"])
+    [sig] = [s for s, (op, _) in found.items() if op["op"] == "aiter.scan"]
+    queries, prepare = torch.full((25,), -1.0), ops.Stub._prepare
+
+    def preparing(stub, batch):
+        prepare(stub, batch)
+        stub.later[len(stub.placed) - 1, sig, "ids"] = ("queries", queries)
+
+    monkeypatch.setattr(ops.Stub, "_prepare", preparing)
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    graphs = []
+
+    def replay(fn, calls, flush=None):
+        graphs.append([kwargs for kwargs, _ in calls])
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], call_ns)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        scan, rest = ops.Stub(_Runner(), 1000).point(placed, decode(2), 20, found)
+
+    taken = [bool((kwargs["ids"] == -1).all()) for kwargs in graphs[0]]
+    assert scan["later"] == {"ids": "queries"} and "later" not in rest
+    assert (taken.count(False), taken.count(True)) == (calls // 2, calls // 2)
+    assert len({id(kwargs["x"]) for kwargs in graphs[0]}) == copies
+    got = [(r["copies"], r["calls"], r["footprint_bytes"]) for r in (scan, rest)]
+    assert got == [(copies, calls, copies * 200), (11, other, 11 * 200)]
+
+
 def test_a_replay_rests_the_host_a_share_of_each_replay_after_it(monkeypatch):
     # Replay i takes i + 1 ms on a stand-in clock; the host idles `REST` of that
     # after every replay, warmups included, which keeps a leaf off the lower
@@ -3777,6 +4527,69 @@ def test_a_ragged_point_runs_its_rows_at_their_longest_or_refuses_past_the_pool(
     assert refused["refused"] == "its rows need more than the pool's 64 KV blocks"
 
 
+#: Five DSpark drafts: a decode row verifies six tokens.
+DSPARK5 = SimpleNamespace(num_speculative_tokens=5, use_dspark=lambda: True)
+
+
+@pytest.mark.parametrize("context", [2048, 65536])
+@pytest.mark.parametrize("rung", [2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 40, 48, 56, 64])
+def test_each_rung_s_least_mean_point_under_a_drafter_reaches_its_leaves(
+    rule, monkeypatch, rung, context  # noqa: F811
+):
+    # The least mean leaves a row past the first fewer tokens than the six it
+    # verifies, or none: it holds a cached token and its six, so ATOM's rule
+    # builds the batch.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    monkeypatch.setattr(ops.Stub, "_time", lambda *_: {"cold_ns": 1.0})
+    drafting = rule(blocks=1 << 15, max_model_len=1 << 17, speculative_config=DSPARK5)
+    built = []
+
+    def batch(view, block, slot):  # ATOM's rule builds it, the stand-in prepares
+        built.append(drafting.batch(view, block, slot))
+        return block, slot
+
+    placed = SimpleNamespace(block_size=16, drafts=drafting.drafts, batch=batch)
+    runner = _Runner()
+    runner.config.num_kvcache_blocks = 1 << 14
+    x = ("self", _t([2, 3], "activation"))
+    found = ops.leaves(_graph(_leaf("aten.neg.default", x), layers=1)["region"])
+    least = ops._means(rung)[0]
+
+    [record] = ops.Stub(runner, 10_000).point(
+        placed, decode(rung), (context, least), found
+    )
+
+    assert "refused" not in record and built
+    first, *rest = record["rows"]
+    assert first == [6, context + 5, True]
+    assert len(rest) == rung - 1 and all(q == 6 < c for q, c, _ in rest)
+
+
+@pytest.mark.parametrize(
+    "spec, context, rows",
+    [
+        # 62 permille of 65536 over 16 rows leaves the 15 past the first none:
+        # each holds its token, or, under 5 drafts, the 6 it verifies past a
+        # cached one.
+        (None, (65536, 62), [[1, 65536, True]] + [[1, 1, True]] * 15),
+        (DSPARK5, (65536, 62), [[6, 65541, True]] + [[6, 7, True]] * 15),
+        # 94 permille leaves them 2202 each, past either query.
+        (None, (65536, 94), [[1, 65536, True]] + [[1, 2202, True]] * 15),
+        (DSPARK5, (65536, 94), [[6, 65541, True]] + [[6, 2202, True]] * 15),
+    ],
+)
+def test_a_ragged_row_holds_its_share_of_the_mean_or_its_query_past_it(
+    rule, spec, context, rows  # noqa: F811
+):
+    drafts = spec.num_speculative_tokens if spec else 0
+
+    got = ops.point_rows(decode(16), context, 1 << 20, 16, drafts=drafts)
+
+    assert got == rows
+    built = rule(blocks=1 << 15, max_model_len=1 << 17, speculative_config=spec)
+    built.batch({"rows": got, "produces_output": True})
+
+
 @pytest.mark.parametrize(
     "argv, refusal",
     [
@@ -3797,7 +4610,7 @@ def test_a_measured_point_is_keyed_by_the_spec_of_the_platform_it_ran_on(
     tmp_path, monkeypatch
 ):
     spec = MachineSpec.from_mapping(
-        json.loads((TREE / "scripts/compass/machines/mi308x-hjbog39.json").read_text())
+        json.loads((TREE / "tests/compass/machines/mi308x-hjbog39.json").read_text())
     )
     stack = {c: spec.value(f"device.software_pinned_to.{c}") for c in PINNED}
     name, arch = spec.value("device.name"), spec.value("device.arch")

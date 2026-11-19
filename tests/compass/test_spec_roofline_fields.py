@@ -13,10 +13,10 @@ import pathlib
 import pytest
 from test_spec_schema import document, refusal_from
 
-from atom.compass.spec import MachineSpec, explain, validate
+from atom.compass.spec import MachineSpec
 from atom.compass.spec.rules import Rule
 
-MACHINES = pathlib.Path(__file__).resolve().parents[2] / "scripts/compass/machines"
+MACHINES = pathlib.Path(__file__).resolve().parents[2] / "tests/compass/machines"
 CURVE = [[4096, 1.1e11], [1048576, 3.0e12], [4294967296, 6.4e12]]
 
 
@@ -32,21 +32,12 @@ def roofline_document():
 
 def test_a_spec_with_the_new_fields_validates_and_echoes_them():
     written = roofline_document()
-    assert validate(written).ok
     spec = MachineSpec.from_mapping(written)
     assert spec.value("device.memory.bandwidth_curve") == tuple(CURVE)
     assert spec.value("device.kernel_floor_s") == 2.0e-6
     for fmt, derate in {"bf16": 0.70, "fp8": 0.70, "fp4": 0.60}.items():
         assert spec.value(f"device.compute.derate.{fmt}") == derate
     assert spec.echo() == written
-
-
-def test_each_compute_rate_is_explained_with_its_own_formats_derate():
-    spec = MachineSpec.from_mapping(roofline_document())
-    rows = {row.path: row for row in explain(spec, "device.compute").contributions}
-    assert rows["device.compute.fp4_flops"].derate == 0.60
-    assert rows["device.compute.fp4_flops"].effective == 1.0e16 * 0.60
-    assert rows["device.compute.bf16_flops"].derate == 0.70
 
 
 @pytest.mark.parametrize(
@@ -67,7 +58,6 @@ def test_a_curve_not_monotone_in_bytes_is_refused_by_name(curve):
     (size, rate), (more, then) = curve
     assert f"from {rate!r} B/s at {size} B to {then!r} B/s at {more} B" in refusal.what
     assert "not monotone in bytes" in refusal.what
-    assert [r.rule for r in validate(written).refusals] == [Rule.SHAPE]
 
 
 @pytest.mark.parametrize(
@@ -87,7 +77,6 @@ def test_a_single_compute_derate_is_refused_by_name():
     refusal = refusal_from(written)
     assert refusal.rule is Rule.SHAPE
     assert "`device.compute.derate` holds 0.7" in refusal.what
-    assert not validate(written).ok
 
 
 def test_a_compute_rate_without_its_formats_derate_is_refused():
@@ -96,7 +85,6 @@ def test_a_compute_rate_without_its_formats_derate_is_refused():
     refusal = refusal_from(written)
     assert refusal.rule is Rule.DERATE
     assert refusal.what.startswith("`device.compute.derate.fp4` is missing")
-    assert [r.rule for r in validate(written).refusals] == [Rule.DERATE]
 
 
 def test_an_fp4_derate_without_an_fp4_rate_is_refused():
@@ -105,7 +93,6 @@ def test_an_fp4_derate_without_an_fp4_rate_is_refused():
     refusal = refusal_from(written)
     assert refusal.rule is Rule.DERATE
     assert "`device.compute.fp4_flops`, the peak it derates, is not" in refusal.what
-    assert [r.rule for r in validate(written).refusals] == [Rule.DERATE]
 
 
 @pytest.mark.parametrize("machine", sorted(p.stem for p in MACHINES.glob("*.json")))
@@ -120,7 +107,7 @@ def test_each_machine_file_reads_the_new_fields_with_their_origins(machine):
         "device.memory.bandwidth_curve",
         "device.kernel_floor_s",
     ]
-    # Node 18's, the MI355X hosts' and MI455 A0's are probe_device.py's
+    # Node 18's, the MI355X hosts' and MI455 A0's are probed
     # readings; the others are still assumed.
     probed = (
         "mi308x-hjbog18",

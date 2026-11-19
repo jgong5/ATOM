@@ -158,7 +158,16 @@ def _measuring_rank(config, todo, refuse, rank):
     pc = config.parallel_config
     me = pc.data_parallel_rank * config.tensor_parallel_size + rank
     store = dist.TCPStore(pc.data_parallel_master_ip, pc.data_parallel_base_port)
-    # a rank left waiting fails, not hangs
+    # Both ranks up before the group, on the store's own timeout: a loaded
+    # host can start one spawned rank more than the group's timeout after
+    # the other, and the group's connect waits on that timeout.
+    store.set(f"up/{me}", "1")
+    store.wait(["up/0", "up/1"])
+    # Gloo binds the address the hostname resolves to, one DNS lookup per rank
+    # inside the group's timeout; loopback needs no lookup. The rank's process
+    # ends with its launch, so the variable dies with it.
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    # a rank left waiting in a call fails, not hangs
     wait = datetime.timedelta(seconds=RUNNER_WAIT if refuse == "runner" else 10)
     dist.init_process_group("gloo", store=store, rank=me, world_size=2, timeout=wait)
     runner, captures = _Runner(), []
@@ -770,11 +779,13 @@ def test_one_gpu_at_dp_attention_measures_a_rank_s_leaves_and_refuses_collective
     assert got[GATHER]["refused"].startswith(why)
     assert GATHER in str(refused.value)
     assert "refused" not in got[NEG] and got[NEG]["cold_ns"] == 1.0
-    # keyed by the deployed layout, two DP ranks of TP 1, not the runner's
+    # keyed by its signature alone, at the runner's layout as at the deployed
+    # one; its line states the deployed layout, two DP ranks of TP 1
     store, _, _, run = bench
     point = decode(2), 20, got[NEG]["leaf"]
     assert store.directory_for(ops.keys(config, run)(*point)).exists()
-    assert not store.directory_for(ops.keys(built, run)(*point)).exists()
+    assert ops.keys(built, run)(*point) == ops.keys(config, run)(*point)
+    assert got[NEG]["layout"] == ops.layout_of(config) != ops.layout_of(built)
 
 
 def test_one_gpu_refuses_a_tp_layout_wider_than_one_rank(

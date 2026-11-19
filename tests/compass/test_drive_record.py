@@ -30,6 +30,7 @@ from atom.compass import cli
 from atom.compass.backends.step_labels import TABLE_VERSION, label
 from atom.compass.drive import aiter_jit, gpu, identity, record, serve
 from atom.compass.fit.samples import load
+from atom.compass.parity import WRITE_THROUGH
 
 PLANTED = """\
 import http.server, os, shutil, sys
@@ -312,7 +313,7 @@ def test_a_record_s_server_keeps_triton_s_autotune_choices_unless_the_caller_say
 
     assert (tmp_path / "seen").read_text() == repr(held)
     run = json.loads((out / "run.json").read_text())
-    assert run["env"] == dict(zip(names, held))
+    assert run["env"] == dict(zip(names, held)) | {WRITE_THROUGH: "0"}
     assert [os.environ.get(name) for name in names] == list(caller)
 
 
@@ -433,14 +434,17 @@ def test_a_record_names_each_compile_its_server_ran_while_it_served(
 
 
 #: Put after the planted server: once `compass record` has read its card's PTL
-#: state while it serves (``PLANTED_READ``), PTL is disabled on that card.
+#: state while it serves (``PLANTED_READ``), PTL is disabled on that card by a
+#: file renamed over ``ptl_enable``, so no reading finds it empty, as on sysfs.
 FLIPS = """
 import os, pathlib, time
 for _ in range(600):
     if os.path.exists(os.environ["PLANTED_READ"]):
         break
     time.sleep(0.05)
-pathlib.Path(os.environ["PLANTED_PTL"]).write_text("disabled\\n")
+staged = pathlib.Path(os.environ["PLANTED_PTL"] + ".new")
+staged.write_text("disabled\\n")
+staged.replace(os.environ["PLANTED_PTL"])
 """
 
 

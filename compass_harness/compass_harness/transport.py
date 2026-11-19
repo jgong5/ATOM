@@ -12,8 +12,9 @@ and latency read simulated time measured from the send.
 
 When the traffic LP closes a request aiperf is cancelling, it publishes a
 stamp for the cancel; the worker that sent the request POSTs it to the
-request's URL, with the request's own seq in its body, reports it written, and
-reads the frontend's answer before it stops.
+request's URL, or on the request's path to the URL the stamp names, with the
+request's own seq in its body, reports it written, and reads the frontend's
+answer before it stops.
 
 The two sockets live under the path prefix in ``COMPASS_HARNESS_IPC``.
 """
@@ -88,19 +89,23 @@ class CompassTransport(AioHttpTransport):
             if cancel:
                 if key in self._sent:
                     self._cancels.append(
-                        asyncio.create_task(self._cancel(key, arrival, seq))
+                        asyncio.create_task(
+                            self._cancel(key, arrival, seq, *cancel[1:])
+                        )
                     )
             # A request that timed out waiting cancelled its future.
             elif not (fut := self._stamp(key)).done():
                 fut.set_result((arrival, seq))
 
-    async def _cancel(self, key: tuple, arrival: float, seq: int) -> None:
-        """Write `key`'s stamped cancel, report it, and read the answer."""
+    async def _cancel(self, key: tuple, arrival: float, seq: int, to=None) -> None:
+        """Write `key`'s stamped cancel, to its request's URL or on that URL's
+        path to `to`, report it, and read the answer."""
         url, cancelled = self._sent[key]
         u, body = urlsplit(url), cancel_body(cancelled)
-        reader, writer = await asyncio.open_connection(u.hostname, u.port or 80)
+        at = urlsplit(to or url)
+        reader, writer = await asyncio.open_connection(at.hostname, at.port or 80)
         writer.write(
-            f"POST {u.path} HTTP/1.1\r\nHost: {u.netloc}\r\n"
+            f"POST {u.path} HTTP/1.1\r\nHost: {at.netloc}\r\n"
             f"tracestate: {tracestate_with(None, arrival, seq)}\r\n"
             f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
             "Connection: close\r\n\r\n".encode() + body

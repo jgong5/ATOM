@@ -12,7 +12,7 @@ is refused by operator and slot.
 Each leaf carries its contract: its arguments by schema slot, a tensor as its
 shape, dtype, stride, role, the `is_shuffled` mark ATOM sets on a
 preshuffled weight, and its device when ATOM holds it on the host (a copy's
-host-staged source). A tensor's role is where its storage came from:
+host-staged source), pinned or not. A tensor's role is where its storage came from:
 the model's parameters, buffers and tensor attributes are weights, what
 `allocate_kv_cache` allocated is KV, what the model's forward and the sampler
 after it allocated is an activation, and anything else (the runner's buffers,
@@ -74,13 +74,14 @@ from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils import _pytree
 from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils.weak import WeakIdKeyDictionary
 
 import atom
 from atom.compass import ir
 from atom.compass.backends.op_graph import KV, gathered_off_default
 from atom.compass.ir.nodes import Reduced
 
-from . import driverless, peers
+from . import driverless, files_of, peers
 from .graph import LAYER, Fork, Join, Traced, _json, build, to_json
 
 #: The fewest KV blocks a capture allocates; a shape that needs more gets more.
@@ -129,9 +130,10 @@ V41_OPENED = (
     "v41_end_forward",
     "v41_record_tbo_expert_output",
 )
-#: DeepSeek-V4.1's sparse attention, and its indexer's scorers, gfx1250's
-#: and gfx950's.
+#: DeepSeek-V4.1's sparse attention, over its FP8 pool the second, and its
+#: indexer's scorers, gfx1250's and gfx950's.
 V41_ATTENTION = "aiter.pa_sparse_prefill_opus.default"
+V41_FP8_ATTENTION = "aiter.mla_sparse_prefill_v41.default"
 V41_SCORERS = (
     (
         "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
@@ -139,12 +141,65 @@ V41_SCORERS = (
     ),
     "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
 )
+#: DeepSeek-V4.1's top-k, as aiter's decode top-k launches it: FlyDSL's
+#: multi-CTA kernel where the arch's gates take the call's width and rows
+#: (gfx950's), else FlyDSL's one-block kernel, else, on logits narrower than
+#: k, its HIP kernel.
+V41_TOPKS = (
+    "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode",
+    "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
+    "aiter._top_k_per_row_decode.default",
+)
+#: DeepSeek-V4.1's RoPE, which its index keys take at their ratio's compress
+#: plan's positions: with no drafter both ratios' plans hold as many rows.
+V41_ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 #: Where a drafter's step ends its target's work: ATOM records `forward_done_event`.
 CUT = "forward_done_event"
+#: aiter's fused-MoE leaves, as its op and as ATOM's wrapper of it.
+FUSED_MOES = ("aiter.fused_moe_.default", "aiter.rocm_aiter_fused_moe.default")
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
 logger = logging.getLogger(__name__)
+#: The path of each data file this process opened to read since its first
+#: capture began (`watch_reads`); None before that.
+_READ: set | None = None
+#: Python's own files, which count as run when imported, not when read: ATOM's
+#: source reading, a traceback or `inspect` reads them without running them.
+_PYTHON = (".py", ".pyc")
+
+
+def watch_reads() -> set:
+    """The absolute path of each file but Python's own (`_PYTHON`) this process
+    opens to read from its first call on, as the `open` audit event names it
+    (`_opened`). An audit hook cannot be removed, so one serves the process."""
+    global _READ
+    if _READ is None:
+        _READ = set()
+        sys.addaudithook(_opened)
+    return _READ
+
+
+def _opened(event, args):
+    """A file opened to read by name, in an `open` audit event: its path is
+    `watch_reads`'s. A hook that raises fails the open, so an event of another
+    form is passed over."""
+    if event != "open" or len(args) != 3:
+        return
+    path, mode, flags = args
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        return
+    if (
+        mode is None
+        and isinstance(flags, int)
+        and flags & os.O_ACCMODE == os.O_RDONLY
+        or (isinstance(mode, str) and not set(mode) & set("wax+"))
+    ):
+        try:
+            if not (path := os.fsdecode(path)).endswith(_PYTHON):
+                _READ.add(os.path.abspath(path))
+        except (OSError, ValueError):
+            pass
 
 
 class Shape(NamedTuple):
@@ -153,7 +208,10 @@ class Shape(NamedTuple):
     `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`;
     and `width`, the batch a step that replays no graph pads to past its
     rows, None at its rows. `micro_batch` marks a two-batch-overlap
-    micro-batch, which its structure names (`structure`), not its text."""
+    micro-batch, which its structure names (`structure`), not its text.
+    `real` is how many of a padded decode's MoE rows are real, the rest pad
+    rows that route to no expert, None at all of them: a `measure ops` point
+    states it, and a graph is read at its shape without it."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
@@ -161,13 +219,15 @@ class Shape(NamedTuple):
     gathered: int | None = None
     width: int | None = None
     micro_batch: bool = False
+    real: int | None = None
 
     def __str__(self) -> str:
         text = f"{self.phase} T={self.tokens} B={self.seqs}"
         if self.phase == "decode" and self.tokens == self.seqs:
             text = f"decode B={self.seqs}"
         text += f" W={self.width}" * bool(self.width)
-        return text if self.gathered is None else f"{text} G={self.gathered}"
+        text += "" if self.gathered is None else f" G={self.gathered}"
+        return text + ("" if self.real is None else f" R={self.real}")
 
     def at(self, dp: int, drafts: int = 0) -> "Shape":
         """This shape in a DP group of `dp` under a drafter of `drafts`:
@@ -282,6 +342,18 @@ def device_arch() -> str:
     return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
 
 
+def graph_engine(config) -> dict:
+    """The engine config an `op_graph` of `config` is keyed by: the one a step
+    law is keyed by (`run.step_grid.keyed`) less its ladder and compilation
+    level, since every trace runs eager at level 0 and serves a run at any
+    level."""
+    from atom.compass.run.step_grid import LEVEL, keyed
+
+    engine = keyed(config, ladder=False)
+    engine.pop(LEVEL, None)
+    return engine
+
+
 def structure(
     config,
     phase: str,
@@ -294,10 +366,10 @@ def structure(
 ) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the arch of `device`, else
-    `device_arch()`, the engine config a step law is keyed by less its ladder
-    (`run.step_grid.keyed`), which names every variable that picks a kernel and
-    a drafter's method and width, its performance environment `env` when given,
-    as an engine file states one, else this process's, the TP width, the DP
+    `device_arch()`, its engine config (`graph_engine`), which names every
+    variable that picks a kernel and a drafter's method and width, its
+    performance environment `env` when given, as an engine file states one,
+    else this process's, the TP width, the DP
     width and the EP group's when they are set, the phase and the mode,
     `config`'s unless `eager` names it, ``no output`` unless the step produces
     output (`output`), and ``draft`` for the drafter's part of the step
@@ -306,10 +378,9 @@ def structure(
     two-batch-overlap micro-batch (`micro_batch`), which ATOM runs otherwise
     than a whole step of its shape."""
     from atom.compass.run import _file_digest
-    from atom.compass.run.step_grid import keyed
 
     digest = _file_digest(config.model, "config.json")
-    engine = keyed(config, ladder=False)
+    engine = graph_engine(config)
     if env is not None:
         engine["env"] = env
     engine = json.dumps(engine, sort_keys=True, separators=(",", ":"))
@@ -339,9 +410,12 @@ def _engine(text: str):
 def missed(store, key) -> str:
     """For an `op_graph` `key` `store` holds no entry at, each field in which
     a graph it holds at the key's shape and otherwise the key's structure
-    differs, as text: the ATOM source or torch it was traced under, then each
-    engine field (`step_grid.differ`); "" when it holds none."""
+    differs, as text: the ATOM source or torch it was traced under, or each
+    file of one keyed by its files that reads otherwise here (`changed`), then
+    each engine field (`step_grid.differ`); "" when it holds none."""
+    from atom.compass.artifacts import Key
     from atom.compass.artifacts.store import ENTRY_FILE
+    from atom.compass.capture import FILES, changed
     from atom.compass.run.step_grid import differ
 
     head, here, tail = _engine(key.values["structure"])
@@ -351,11 +425,17 @@ def missed(store, key) -> str:
         if there.get("shape") == key.values["shape"]:
             at = _engine(there.get("structure", ""))
             if at and (at[0], at[2]) == (head, tail):
+                files = str(there.get("source_root")).startswith(f"{FILES}-")
                 fields = [
                     f"{name} {there.get(name)!r} in the graph and {value!r} here"
                     for name, value in key.fields
-                    if name not in ("structure", "shape") and there.get(name) != value
+                    if name not in ("structure", "shape")
+                    and there.get(name) != value
+                    and not (files and name == "source_root")
                 ]
+                if files and (moved := changed(store, Key.of(key.kind, **there))):
+                    more = f" and {len(moved) - 5} more" * (len(moved) > 5)
+                    fields.append(f"files {', '.join(moved[:5])}{more}")
                 if engine := differ(at[1], here, "the graph"):
                     fields.append(f"engine config: {', '.join(engine)}")
                 named.append(", ".join(fields))
@@ -539,6 +619,7 @@ class _Recorder(TorchDispatchMode):
         self.counted = None  # what a size the step's data sets counts, if stated
         self.lands = False  # whether a device value read on the host reads zeros
         self.declined = []  # the mono refusals this shape's steps met (`_mono`)
+        self.pins, self.twins = {}, WeakIdKeyDictionary()  # ATOM pinned (`pin`)
         self.symbol = None  # G in a symbolic trace, else None
         self.start()
 
@@ -585,6 +666,19 @@ class _Recorder(TorchDispatchMode):
         finally:
             self.on = on
 
+    def pin(self, tensor):
+        """`tensor`, a host tensor ATOM asked to pin, held pinned with its views;
+        a real one's fake twin too, which the fake mode computes on, kept as
+        long as it is."""
+        if not isinstance(tensor, FakeTensor) and self.fake_mode is not None:
+            self.twins[tensor] = self.pin(self._fake(tensor))
+        self.pins[_storage(tensor)] = _storage(tensor)
+        return tensor
+
+    def pinned(self, tensor) -> bool:
+        held = self.pins.get(_storage(tensor))
+        return held is not None and not held.expired()
+
     def _fake(self, tensor):
         if not isinstance(tensor, FakeTensor):  # at its sizes, none symbolic
             return self.fake_mode.from_tensor(tensor, static_shapes=True)
@@ -607,6 +701,8 @@ class _Recorder(TorchDispatchMode):
             for dim in (d for t in outs for d in _concrete(t.shape)):
                 if isinstance(dim, torch.SymInt):
                     torch._check(dim == self.counted)
+        if kwargs.get("pin_memory"):
+            outs = [self.pin(t) for t in outs]
         if self.creating is not None:
             read = set(map(_storage, ins))
             for storage in map(_storage, outs):
@@ -802,7 +898,8 @@ class _Recorder(TorchDispatchMode):
             )
             shuffled = bool(getattr(value, "is_shuffled", False))
             host = value.device.type == "cpu"
-            return ir.Tensor(shape, str(value.dtype), stride, role, shuffled, host)
+            marks = shuffled, host, host and not self.pinned(value)
+            return ir.Tensor(shape, str(value.dtype), stride, role, *marks)
         if isinstance(value, torch.nn.Module) and id(value) in self.modules:
             return ir.ModuleRef(self._layered(self.modules[id(value)]))
         if isinstance(value, str) and value in self.contexts:
@@ -857,6 +954,20 @@ class _Recorder(TorchDispatchMode):
         return re.sub(rf"\blayers\.{self.layer}\b", f"layers.{{{LAYER}}}", path)
 
 
+class _Pinned(TorchDispatchMode):
+    """What ATOM allocates with `pin_memory=True` where the recorder is off, as
+    the runner is built and sizes its pools, held pinned (`_Recorder.pin`);
+    nothing else is touched, a host array headed for the device among it."""
+
+    def __init__(self, recorder):
+        super().__init__()
+        self.pin = recorder.pin
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        return self.pin(out) if (kwargs or {}).get("pin_memory") else out
+
+
 def _coordinator(group_name: str) -> str:
     """The aiter coordinator (`tp:0`) whose device group torch names
     `group_name`, or the name as it is when none is: torch numbers groups in
@@ -889,6 +1000,9 @@ def _patches(recorder):
       caches the constructors a default device places at their first call,
       made here before that patch: cached under it, they would leave every
       later `torch.zeros` of ATOM's on the host, not on the runner's device.
+    * A host tensor ATOM asks to pin (that host side, `pin_memory=True`, a
+      `pin_memory()` copy) is held pinned (`_Recorder.pin`), as `is_pinned`
+      answers.
     * GDN's causal-conv1d metadata is host arithmetic over the staged
       `cu_seqlens`, and it runs outside the fake mode too.
     * A GDN prefill under ReplaySSM parks the cursors of its live state
@@ -902,7 +1016,12 @@ def _patches(recorder):
     * ATOM's MoE wrappers run their bodies, not their fakes: inside are the
       collectives, the streams and the expert kernels. A two-batch-overlap
       micro-batch's MoE runs on one stream, as under overlap, where
-      `tbo_active()` turns the dual-stream MoE off.
+      `tbo_active()` turns the dual-stream MoE off. aiter's comm-fused MoE
+      runs as one leaf (`peers.comm_fused`).
+    * The aiter fused-MoE leaves (`FUSED_MOES`) of a layer whose top-k ids
+      aiter's table widens with its fused shared experts (`LEGACY_AITER`)
+      state the layer's `top_k` and `fused_shared_experts`: the ids' width
+      does not tell the router's columns from those.
     * The checkpoint's weights iterator yields nothing: ATOM's dummy load still
       runs it, which would open every shard, or download them for a hub name.
     * No KV connector is built (`get_kvconnector` answers none): under a P/D
@@ -938,6 +1057,7 @@ def _patches(recorder):
     from atom.model_loader import loader
     from atom.model_ops import module_dispatch_ops, moe, rejection_sampler
     from atom.model_ops.attentions import gdn_attn
+    from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
     from atom.utils import CpuGpuBuffer, forward_context
     from atom.utils.tbo import ubatching
     from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
@@ -994,7 +1114,8 @@ def _patches(recorder):
         if torch.device(kwargs.get("device") or "cpu").type != "cpu":
             return zeros(*size, **kwargs)
         with unset_fake_temporarily():
-            return zeros(*size, **kwargs)
+            out = zeros(*size, **kwargs)
+        return recorder.pin(out) if pin_memory else out
 
     def host_numpy(tensor, *args, **kwargs):
         with unset_fake_temporarily():
@@ -1015,6 +1136,16 @@ def _patches(recorder):
 
     def one_stream_in_micro_batch(moe, num_tokens):
         return not recorder.shape.micro_batch and dual_stream(moe, num_tokens)
+
+    def moe_forward(hidden_states, router_logits, layer_name):
+        layer = recorder.contexts[layer_name]
+        if layer.expert_layout.mode is not SharedExpertMode.LEGACY_AITER:
+            return moe.moe_forward(hidden_states, router_logits, layer_name)
+        shared = layer.num_fused_shared_experts
+        counts = ("top_k", layer.top_k), ("fused_shared_experts", shared)
+        stated = recorder.stated | dict.fromkeys(FUSED_MOES, counts)
+        with patch.object(recorder, "stated", stated):
+            return moe.moe_forward(hidden_states, router_logits, layer_name)
 
     def host_conv1d(*args, **kwargs):
         with unset_fake_temporarily():
@@ -1050,6 +1181,8 @@ def _patches(recorder):
         (ubatching, "sync_dp_metadata", host_sync),
         (gdn_attn.GDNStateMixin, "_attach_replayssm", replayssm),
         (torch.Tensor, "tolist", host_tolist),
+        (torch.Tensor, "pin_memory", lambda t, *a, **k: recorder.pin(t.clone())),
+        (torch.Tensor, "is_pinned", lambda t, *a, **k: recorder.pinned(t)),
         (FakeTensor, "tolist", host_tolist),
         (torch.Tensor, "numpy", lambda t, *a, **k: host_numpy(landed(t), *a, **k)),
         (loader, "safetensors_weights_iterator", lambda *a, **k: iter(())),
@@ -1057,7 +1190,7 @@ def _patches(recorder):
         (UBatchWrapper, "_run_ubatches", micro_batches),
         (topk, "topk_ob_workspace_size", lambda *a: 0),
         (topk, "topk_mb_workspace_size", lambda *a: 0),
-        (torch.ops.aiter, "moe_forward", moe.moe_forward),
+        (torch.ops.aiter, "moe_forward", moe_forward),
         (
             torch.ops.aiter,
             "maybe_dual_stream_forward",
@@ -1065,6 +1198,7 @@ def _patches(recorder):
         ),
         (module_dispatch_ops, "_dual_stream_is_active", one_stream_in_micro_batch),
         (rejection_sampler, "_synthetic_generator", lambda device: torch.Generator()),
+        *peers.comm_fused(recorder),
         *_mono(recorder, unpatched),
     ):
         stack.enter_context(patch.object(owner, name, value))
@@ -1262,17 +1396,22 @@ def _v41(recorder, hf):
     each request's state is where the scheduler put it has no values to
     judge.
 
-    Its sparse attention (`V41_ATTENTION`) states the layer's `window_size`,
+    Its sparse attention (`V41_ATTENTION`, `V41_FP8_ATTENTION`) states the
+    layer's `window_size`,
     `compress_ratio` and `index_topk` (None where it compresses nothing), and
     its indexer's scorers (`V41_SCORERS`) the `compress_ratio` and
     `index_candidates`, the most entries it scores where an earlier layer
     chose its candidates, else None: read off the layer `layer_name` names
-    and the model's config `hf`.
+    and the model's config `hf`. Its index keys' RoPE (`V41_ROPE`) states
+    their indexer's `compress_ratio`; its query's, on the step's positions
+    at every ratio, states none. Its top-k (`V41_TOPKS`) states the scorers'
+    `compress_ratio`.
     """
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.models.deepseek_v41.attention import Indexer
 
     bodies = {name: _implementation(name) for name in V41_OPENED}
-    attend = bodies["v41_attention"]
+    attend, project_keys = bodies["v41_attention"], Indexer.project_keys
 
     def attention(hidden, layer_name, *args, **kwargs):
         attn = recorder.contexts[layer_name][0].attn
@@ -1284,10 +1423,17 @@ def _v41(recorder, hf):
         scored = ("compress_ratio", ratio), ("index_candidates", candidates)
         stated = {
             V41_ATTENTION: (*geometry, ("index_topk", top)),
+            V41_FP8_ATTENTION: (*geometry, ("index_topk", top)),
             **dict.fromkeys(V41_SCORERS, scored),
+            **dict.fromkeys(V41_TOPKS, scored[:1]),
         }
         with patch.object(recorder, "stated", stated):
             return attend(hidden, layer_name, *args, **kwargs)
+
+    def keys(indexer, *args):
+        ratio = {V41_ROPE: (("compress_ratio", indexer.spec.ratio),)}
+        with patch.object(recorder, "stated", recorder.stated | ratio):
+            return project_keys(indexer, *args)
 
     bodies["v41_attention"] = attention
     recorder.lands = True
@@ -1297,6 +1443,7 @@ def _v41(recorder, hf):
     stack.enter_context(
         patch.object(PagedAttentionCache, "_report_stale_state", lambda *a: None)
     )
+    stack.enter_context(patch.object(Indexer, "project_keys", keys))
     return stack
 
 
@@ -1578,9 +1725,12 @@ class Tracer:
     `atom_args`, on a declared `arch` or the card `read` declares
     (`driverless.card`), stepped at shapes (`trace`). It is built at the first
     `trace`, once, and every later one steps the same runner. The capture's
-    patches hold until `close`; the declared device, for the process."""
+    patches hold until `close`; the declared device, for the process. Each
+    graph states the files its process ran and read up to its step
+    (`capture.files_of`), from the reads watched since this one was made."""
 
     def __init__(self, model, tp, tmpdir, atom_args=(), arch="gfx942", read=None):
+        self.reads = watch_reads()
         self.declared = driverless.install(tmpdir, arch, read)
         self.config = _config(model, tp, atom_args)
         self.stack, self.runner, self.blocks = contextlib.ExitStack(), None, 0
@@ -1628,7 +1778,9 @@ class Tracer:
                 stack.enter_context(patch.object(owner, name, value))
             if config.enable_expert_parallel:
                 peers.install_mori(recorder)
-        runner = _build_runner(config, fake_mode)
+        pinned = _Pinned(recorder)
+        with pinned:
+            runner = _build_runner(config, fake_mode)
         if v4 := sys.modules.get("atom.models.deepseek_v4"):
             stack.enter_context(_v4_attention(v4, recorder))
         if v41 := "atom.models.deepseek_v41.runtime" in sys.modules:
@@ -1659,7 +1811,7 @@ class Tracer:
         recorder.roles = dict.fromkeys(weights, ir.Role.WEIGHT)
         per_req = InputOutputProcessor._per_req_cache_model_types()
         self.stateful = config.hf_config.model_type in per_req
-        with fake_mode, torch.inference_mode():
+        with fake_mode, pinned, torch.inference_mode():
             runner.get_num_blocks()  # sizes the pools, as `EngineCore` does
         # A warmup copy whose bytes nobody reads, like `_maybe_warmup`.
         runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
@@ -1843,4 +1995,4 @@ class Tracer:
                 declared.pop("mono", None)
                 if mono := list({id(why): why for why in recorder.declined}.values()):
                     declared["mono"] = mono
-                yield graph, self.digest, dict(declared)
+                yield graph, self.digest, {**declared, "files": files_of(self.reads)}

@@ -21,15 +21,22 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   ``provenance``, with its report's as ``inputs``; a stub's, and an op graph's
   with no price list, is None, its digest over what the run file states.
 - ``--host-laws KEY``, a `host_laws` entry's params, as ``host``, and its
-  ``hops``, each at the run-file key of its name; without it the run charges
-  no host time and each hop its floor (`run.HOP_FLOOR_S`).
+  ``hops``, each at the run-file key of its name, ``router_s`` only in a
+  prefill-decode run's; without it the run charges no host time and each hop
+  its floor (`run.HOP_FLOOR_S`).
 - ``--step-linear`` and ``--host-laws`` repeat, one entry per engine config:
   the key then holds a list, each process installing its own config's entry,
   and where their hops differ, the hops are those of the entry fitted under the
   config ATOM's arguments resolve, as `drive.run.check` resolves one,
   and ``backend``'s digest is over every law's in any order, their provenance
   ``entries``.
-- ``--machine``, the spec; ``--store``'s root as ``store``; ``--on-refusal``;
+- ``--lmcache-offload FILE``, the ``lmcache_offload`` entry
+  `step_linear_fit`'s offload form writes, at that key; ``--lmcache FILE``,
+  the ``lmcache`` entry of a deployment offloading to an lmcache server, as
+  `compass advice` writes it, at that key.
+- ``--device``, ``--ptl``, ``--stack`` and ``--network``, the platform
+  flags, whose spec `spec` composes, as ``machine``; ``--store``'s root as
+  ``store``; ``--on-refusal``;
   ``--step-roofline``; ``--padding none``, which prices a replayed graph's
   real rows; ``--local-grants``, on unless ``--no-local-grants``, which gives
   grants their ceilings.
@@ -41,13 +48,17 @@ which `scripts/compass/deploy.sh` hands its clock authority and both instances.
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from atom.compass import run
 from atom.compass.artifacts import (
+    ArtifactRefusal,
     ArtifactStore,
     GateState,
     Key,
@@ -56,8 +67,11 @@ from atom.compass.artifacts import (
     machine_platform,
     member_name,
 )
+from atom.compass.backends.json_file import read_json
+from atom.compass.fit.device import compose
 from atom.compass.fit.publish import RANK
 from atom.compass.run.step_grid import readings
+from atom.compass.spec.layers import stack_of
 
 #: Each backend flag's store kind; the step stub's coefficients are a file.
 KINDS = {run.STEP_LINEAR: Kind.STEP_LINEAR_LAW, run.STEP_GRID: Kind.STEP_GRID_BUNDLE}
@@ -78,7 +92,14 @@ def add_arguments(parser) -> None:
     parser.add_argument(
         "--host-laws", metavar="KEY", action="append", help="a token or law file"
     )
-    parser.add_argument("--machine", required=True, help="the machine spec")
+    parser.add_argument("--lmcache", metavar="FILE", help="the lmcache entry")
+    parser.add_argument(
+        "--lmcache-offload", metavar="FILE", help="the lmcache_offload entry"
+    )
+    parser.add_argument("--device", required=True, help="the datasheet, SKU or path")
+    parser.add_argument("--ptl", required=True, choices=("enabled", "disabled"))
+    parser.add_argument("--stack", help="the readings' stack and torch, of several")
+    parser.add_argument("--network", help="a run across nodes' network file")
     parser.add_argument("--store", required=True, help="the artifact store's root")
     parser.add_argument("--on-refusal", choices=("mark", "abort"), default="mark")
     parser.add_argument("--step-roofline", action="store_true")
@@ -88,22 +109,67 @@ def add_arguments(parser) -> None:
     )
 
 
-def build(args, atom_args) -> dict:
+def spec(args, store: ArtifactStore, across: bool = False):
+    """The machine spec `args`' platform flags compose (`fit.device.compose`), at
+    the stack and torch the entries the run prices with state, else at
+    `--stack`; entries and `--stack` that state two refuse, naming each.
+    `--network` is for a run across nodes (`across`), which refuses without
+    one."""
+    if bool(args.network) != across:
+        raise ValueError(
+            "a run across nodes reads a network file and names none"
+            if across
+            else f"--network {args.network}: a run on one node reads no network"
+        )
+    stacks = _stacks(args, store) | ({"--stack": args.stack} if args.stack else {})
+    if len(set(stacks.values())) > 1:
+        each = "; ".join(f"{name}: {stack}" for name, stack in stacks.items())
+        raise ValueError(
+            f"the entries the run prices with state {len(set(stacks.values()))} "
+            f"stacks, and one run reads one platform: {each}"
+        )
+    stack = next(iter(stacks.values()), None)
+    return compose(args.device, store, args.ptl, stack, args.network)
+
+
+def _stacks(args, store) -> dict:
+    """The stack and torch, as `--stack` names them, of each store entry and
+    law file the backend and `--host-laws` name that states them, by token; a
+    token that names no entry states none, and `resolve` refuses it."""
+    stated = {}
+    for name, kind in (*KINDS.items(), ("host_laws", Kind.HOST_LAWS)):
+        tokens = getattr(args, name) or []
+        for token in [tokens] if isinstance(tokens, str) else tokens:
+            if (law := _law_file(token)) is None:
+                try:
+                    fields = store.key_from_token(kind, token).values
+                except ArtifactRefusal:
+                    continue
+            elif kind is Kind.HOST_LAWS:
+                fields = law.get("host", {}).get("key", {})
+            else:
+                fields = law.get("platform", {})
+            if {"software_stack", "torch"} <= fields.keys():
+                stated[token] = stack_of(fields)
+    return stated
+
+
+def build(args, atom_args, across: bool = False) -> dict:
     """The run file of `args`, parsed with `add_arguments`, for a server
-    started with ATOM's arguments `atom_args`."""
+    started with ATOM's arguments `atom_args`, across nodes when `across`."""
     store = ArtifactStore(Path(args.store).resolve())
     out = {
         **FIXED,
         "client_runs": None,
         "data_parallel_size": _dp_width(atom_args),
-        "machine": json.loads(Path(args.machine).read_text()),
+        "machine": spec(args, store, across).echo(),
         "store": str(store.root),
         "on_refusal": args.on_refusal,
         "step_roofline": args.step_roofline,
         run.LOCAL_GRANTS: args.local_grants,
     }
-    # Read as the runner and `compass fit` read it, so a spec they would
-    # refuse refuses before a server starts.
+    # Read back as the runner reads it, so a spec it would refuse refuses
+    # before a server starts.
     machine = run._machine(out)
     if stub := getattr(args, run.STEP_STUB):
         out[run.STEP_STUB] = json.loads(Path(stub).read_text())
@@ -142,9 +208,14 @@ def build(args, atom_args) -> dict:
             resolve(store, "host", k, machine, atom_args)[0] for k in args.host_laws
         ]
         out["host"] = hosts if len(hosts) > 1 else hosts[0]
-        out |= _hops(hosts, atom_args)
+        # A run file's router_s makes it prefill-decode: `prefill_decode` writes it.
+        hops = _hops(hosts, atom_args, machine.value("device.arch"))
+        out |= {k: v for k, v in hops.items() if k != "router_s"}
     if args.padding:
         out["padding"] = args.padding
+    for name in ("lmcache", "lmcache_offload"):
+        if entry := getattr(args, name, None):
+            out[name] = json.loads(Path(entry).read_text())
     return out
 
 
@@ -169,16 +240,27 @@ def resolve(store, name: str, token: str, machine, atom_args) -> tuple:
     return law, _backend(entry)
 
 
-def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
+def prefill_decode(args, prefill_args, decode_args, kv_link, decode_env=None) -> dict:
     """The run file `build` builds from `args` for one prefill and one decode
     instance, started with ATOM's arguments `prefill_args` and `decode_args`:
     each side's DP width read from its own, the router's per-request forward
-    cost the machine spec's ``interconnect.router_relay_s``, and the KV
-    transfers priced on the spec's `kv_link`, ``intra_node`` for two instances
-    on one node and ``inter_node`` across two. Its hops are the prefill side's
-    host entry's, its ``decode_hops`` the decode side's. A price list the
-    prefill side names that is not the decode side's refuses."""
-    out = build(args, prefill_args)
+    cost the prefill side's host entry's ``router_s`` hop, None for the floor
+    where it states none, and the KV transfers priced on the spec's
+    `kv_link`, ``intra_node`` for two instances on one node and
+    ``inter_node`` across two, which alone reads ``--network``. Its hops are
+    the prefill side's host entry's, its ``decode_hops`` the decode side's,
+    each side's config resolved from its arguments as deploy.sh starts its
+    instance, with its KV role on the simulated connector
+    (`drive.run.side_args`), the prefill side's in this process's environment
+    and the decode side's in the environment its instance starts in, which
+    `decode_env()`, when given, returns (`_hops`), else in this process's too.
+    A price list the prefill side names that is not the decode side's
+    refuses."""
+    from atom.compass.drive.run import SIMULATED, side_args
+
+    prefill_args = side_args("prefill", prefill_args, SIMULATED)
+    decode_args = side_args("decode", decode_args, SIMULATED)
+    out = build(args, prefill_args, across=kv_link == "inter_node")
     if run.PRICE_LIST in out:
         decode = _price_list_key(decode_args, run._machine(out)).values
         if decode != out[run.PRICE_LIST]:
@@ -190,9 +272,10 @@ def prefill_decode(args, prefill_args, decode_args, kv_link) -> dict:
     out[run.DP_WIDTHS["P"]] = _dp_width(prefill_args)
     out[run.DP_WIDTHS["D"]] = _dp_width(decode_args)
     if hosts := run.entries(out, "host"):
-        out[run.DECODE_HOPS] = _hops(hosts, decode_args)
+        arch = run._machine(out).value("device.arch")
+        out[run.DECODE_HOPS] = _hops(hosts, decode_args, arch, decode_env)
     return out | {
-        "router_s": run._machine(out).value("interconnect.router_relay_s"),
+        "router_s": _hops(hosts, prefill_args, arch).get("router_s") if hosts else None,
         "kv_link": kv_link,
     }
 
@@ -203,7 +286,7 @@ def law_readings(key: Key, machine, atom_args):
     under: its engine config as `key` states it, the one the runner then holds
     the resolved config to."""
     return readings(
-        machine,
+        machine_platform(machine),
         atom_src=run.atom_source(),
         model=_model_digest(_engine_args(atom_args).model),
         engine_config=key.values["engine_config"],
@@ -227,17 +310,19 @@ def _model_digest(model: str) -> str:
     return run._file_digest(model, "config.json")
 
 
-def _hops(hosts: list, atom_args) -> dict:
+def _hops(hosts: list, atom_args, arch: str, env=None) -> dict:
     """The ``hops`` of the entry of `hosts` fitted under the config ATOM's
-    arguments `atom_args` resolve, picked as the runner picks its own
+    arguments `atom_args` resolve on a device of `arch`, in the environment
+    `env()` gives, else this process's, picked as the runner picks its own
     (`run.pick_fitted`); the hops every entry states alike as they are, with no
-    config resolved."""
+    config resolved and `env` not called."""
     host = hosts[0]
     if any(h.get("hops") != host.get("hops") for h in hosts):
         from atom.compass.drive.run import _config
 
-        picked = {"host": hosts}
-        run.pick_fitted(picked, "host", _config(atom_args))
+        picked, here = {"host": hosts}, contextlib.nullcontext()
+        with patch.dict(os.environ, env(), clear=True) if env else here:
+            run.pick_fitted(picked, "host", _config(atom_args, arch))
         host = picked["host"]
     return host.get("hops", {})
 
@@ -270,15 +355,16 @@ def _backend(entry) -> dict:
 
 def _price_list_key(atom_args, machine) -> Key:
     """The `price_list` key of the model and parallel layout ATOM's arguments
-    serve, on `machine`, from this ATOM source."""
+    serve, as `CoreManager` lays it out under DP attention, each TP rank a DP
+    rank of TP 1, on `machine`, from this ATOM source."""
     engine = _engine_args(atom_args)
     return Key.of(
         Kind.PRICE_LIST,
         model=_model_digest(engine.model),
-        dp=engine.data_parallel_size,
+        dp=_dp_width(atom_args),
         pp=engine.pipeline_parallel_size,
         pcp=engine.prefill_context_parallel_size,
-        tp=engine.tensor_parallel_size,
+        tp=1 if engine.enable_dp_attention else engine.tensor_parallel_size,
         enable_expert_parallel=engine.enable_expert_parallel,
         enable_dp_attention=engine.enable_dp_attention,
         decode_context_parallel_size=engine.decode_context_parallel_size,
@@ -293,10 +379,10 @@ def _member(entry, stem: str):
 
 
 def _law_file(value: str) -> dict | None:
-    """The law file `value` names, read as JSON; None when it names no file,
-    as a token does not."""
+    """The law file `value` names, read as `read_json` reads it; None when it
+    names no file, as a token does not."""
     path = Path(value)
-    return json.loads(path.read_text()) if path.is_file() else None
+    return read_json(path) if path.is_file() else None
 
 
 def _host(store, value: str) -> dict:
@@ -313,12 +399,13 @@ def _host(store, value: str) -> dict:
     return law["host"]
 
 
-def _engine_args(atom_args):
-    """ATOM's arguments as its own parser reads them."""
+def _engine_args(atom_args, parser_class=None):
+    """ATOM's arguments as its own parser reads them, or as `parser_class`, a
+    subclass of it, does."""
     from atom.model_engine.arg_utils import EngineArgs
     from atom.utils.arg_parser import FlexibleArgumentParser
 
-    parser = FlexibleArgumentParser(add_help=False)
+    parser = (parser_class or FlexibleArgumentParser)(add_help=False)
     EngineArgs.add_cli_args(parser)
     return parser.parse_known_args(atom_args)[0]
 

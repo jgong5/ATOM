@@ -42,6 +42,18 @@
    "mechanism_why": "arithmetic inside the cost backend, which cannot park"
   },
   {
+   "id": "atom/compass/backends/op_work.py::_comm_fused::reduce(args[\"tp\"], nbytes)::collective#0",
+   "file": "atom/compass/backends/op_work.py",
+   "symbol": "_comm_fused",
+   "call": "reduce",
+   "expr": "reduce(args[\"tp\"], nbytes)",
+   "shape": "collective",
+   "peer": "none",
+   "why": "a work primitive that counts the bytes a captured comm-fused MoE reduces across its group, so the op-level backend can price it; nothing is sent",
+   "mechanism": "K9",
+   "mechanism_why": "arithmetic inside the cost backend, which cannot park"
+  },
+  {
    "id": "atom/compass/backends/step_roofline.py::_moe::reduce_scatter(dp, rows * hidden * act)::collective#0",
    "file": "atom/compass/backends/step_roofline.py",
    "symbol": "_moe",
@@ -246,16 +258,16 @@
    "mechanism_why": "after the finish, so outside the simulated window; the wall bound only turns a missing hand-in into an error naming it"
   },
   {
-   "id": "atom/compass/run/__init__.py::_planned_transfer::time.sleep(0.1)::sleep#0",
+   "id": "atom/compass/run/__init__.py::_published_plans::time.sleep(0.1)::sleep#0",
    "file": "atom/compass/run/__init__.py",
-   "symbol": "_planned_transfer",
+   "symbol": "_published_plans",
    "call": "time.sleep",
    "expr": "time.sleep(0.1)",
    "shape": "sleep",
    "peer": "process",
-   "why": "a prefill-decode engine building its KV connector waits, in tenths of a wall second up to a bound, for every engine's planned KV block file",
+   "why": "a prefill-decode engine building its KV connector, or LP lmcache at its first stamped request, waits, in tenths of a wall second up to a bound, for every engine's planned KV block file",
    "mechanism": "K9",
-   "mechanism_why": "at startup, while the engine is built and before its step loop's first clock request, so outside the simulated window; the wall bound only turns a missing block into an error naming the engine"
+   "mechanism_why": "the engine waits at startup, while it is built and before its step loop's first clock request, so outside the simulated window; LP lmcache's first stamped request comes after every engine it serves has published, before it said READY, so its wait cannot park; the wall bound only turns a missing block into an error naming the engine"
   },
   {
    "id": "atom/compass/run/__init__.py::_trace_process::ProcessPoolExecutor(1, mp_context=spawn, initializer=enable_orphan_reaping)::thread_start#0",
@@ -283,6 +295,19 @@
    "mechanism_why": "a hand-off onto the executor's queue cannot park; the wait for its result is `done.result()`'s row"
   },
   {
+   "id": "atom/compass/capture/__init__.py::_keyed_by_files::ThreadPoolExecutor(16)::thread_start#0",
+   "file": "atom/compass/capture/__init__.py",
+   "symbol": "_keyed_by_files",
+   "call": "ThreadPoolExecutor",
+   "expr": "ThreadPoolExecutor(16)",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "engine",
+   "why": "an op-graph run's lookup reads the documents of its store's op_graph entries it has not read yet from 16 threads, at its first shape no graph keyed by the whole ATOM source answers and when a publish moves the folder",
+   "mechanism": "K9",
+   "mechanism_why": "the threads only read files and end before the lookup returns; they price nothing and send nothing"
+  },
+  {
    "id": "atom/compass/run/__init__.py::_op_graphs.lazily::done.result()::event_wait#0",
    "file": "atom/compass/run/__init__.py",
    "symbol": "_op_graphs.lazily",
@@ -293,6 +318,18 @@
    "why": "the engine's worker waits while its lazy-trace process traces the shape, then prices the step from the graph",
    "mechanism": "K6",
    "mechanism_why": "a wait inside the engine's LP on the engine's own trace process: never reported to the clock authority and carries no cost; the step is priced from the traced graph, and the run summary reports the wait as lazy_trace_wall_seconds"
+  },
+  {
+   "id": "atom/compass/runner/overrides.py::gathers_by_shape.by_shape::gather(group, input_, use_custom, dim)::collective#0",
+   "file": "atom/compass/runner/overrides.py",
+   "symbol": "gathers_by_shape.by_shape",
+   "call": "gather",
+   "expr": "gather(group, input_, use_custom, dim)",
+   "shape": "collective",
+   "peer": "process",
+   "why": "aiter's own gather across a process group, for a tensor that holds bytes, while the post-load hooks run on a simulated start's meta tree; that tree holds none, so its gathers are answered by shape",
+   "mechanism": "K9",
+   "mechanism_why": "at startup, inside the worker's model build, before the engine's step loop: outside the simulated window"
   },
   {
    "id": "atom/compass/runner/overrides.py::_group_step_seconds::torch.distributed.all_gather(rows, mine, group=group)::collective#0",
@@ -317,6 +354,18 @@
    "why": "every data-parallel rank's worker takes the group's latest device end of its forward, on the group's CPU group, once per simulated step under host time; it stands in for the cross-rank collectives a real forward makes",
    "mechanism": "K6",
    "mechanism_why": "a wait inside the data-parallel group's LP: every rank is a member of that one LP, the exchange is never reported to the clock authority and carries no cost; the reduced device end only sets each rank's own release"
+  },
+  {
+   "id": "atom/compass/runner/overrides.py::_time_target::metrics.poll()::poll#0",
+   "file": "atom/compass/runner/overrides.py",
+   "symbol": "_time_target",
+   "call": "metrics.poll",
+   "expr": "metrics.poll()",
+   "shape": "poll",
+   "peer": "none",
+   "why": "TP rank 0 of a simulated engine observes the step it just timed in ATOM's GPU forward histograms before its forward replies; its events are complete once recorded",
+   "mechanism": "K9",
+   "mechanism_why": "cannot park: it queries events that are complete, inside the simulated runner's forward"
   },
   {
    "id": "atom/compass/runner/pp_send.py::StageSends.__call__::self.send(t0 + ready_s, parts)::p2p#0",
@@ -3394,7 +3443,7 @@
    "peer": "none",
    "why": "collects the GPU forward timings whose end events have completed, stopping at the first that has not; it queries, never waits",
    "mechanism": "K9",
-   "mechanism_why": "cannot park, and runs around the real runner's forward, which the simulated runner replaces"
+   "mechanism_why": "cannot park; a simulated runner times its step on events that are complete once recorded"
   },
   {
    "id": "atom/rollout/memory_manager.py::MemoryManagerMixin.clear_kv_cache::torch.cuda.synchronize()::device_sync#0",
@@ -3936,7 +3985,7 @@
    "peer": "none",
    "why": "drains completed GPU forward timings and stops at the first end event that has not completed; it queries and never waits",
    "mechanism": "K9",
-   "mechanism_why": "cannot park: the loop leaves at the first unfinished event, and a simulated run measures no forward, so nothing is pending"
+   "mechanism_why": "cannot park: the loop leaves at the first unfinished event, and a simulated runner's events are complete once recorded"
   },
   {
    "id": "atom/model_engine/async_proc.py::AsyncIOProc.__init__::threading.Thread(target=func, args=(addr, q), daemon=True)::thread_start#0",
@@ -5017,11 +5066,11 @@
    "mechanism_why": "LP lmcache's idle point: it asks NER with t its next job end and the eviction loop's next tick as a daemon deadline, and the wait ends at the grant"
   },
   {
-   "id": "atom/compass/run/__init__.py::_launch_lmcache::subprocess.Popen( [sys.executable, \"-c\", LMCACHE_MAIN, str(chunk_bytes)], env={**os.environ, \"PYTHONPATH\": os.pathsep.join(filter(None, paths))}, )::thread_start#0",
+   "id": "atom/compass/run/__init__.py::_launch_lmcache::subprocess.Popen( [sys.executable, \"-c\", LMCACHE_MAIN, str(block)], env={**os.environ, \"PYTHONPATH\": os.pathsep.join(filter(None, paths))}, )::thread_start#0",
    "file": "atom/compass/run/__init__.py",
    "symbol": "_launch_lmcache",
    "call": "subprocess.Popen",
-   "expr": "subprocess.Popen( [sys.executable, \"-c\", LMCACHE_MAIN, str(chunk_bytes)], env={**os.environ, \"PYTHONPATH\": os.pathsep.join(filter(None, paths))}, )",
+   "expr": "subprocess.Popen( [sys.executable, \"-c\", LMCACHE_MAIN, str(block)], env={**os.environ, \"PYTHONPATH\": os.pathsep.join(filter(None, paths))}, )",
    "shape": "thread_start",
    "peer": "none",
    "lp": "frontend",
@@ -5202,6 +5251,67 @@
    "mechanism_why": "in the measuring command, which is no LP, around a real engine start it makes; a GPU command serves no simulated run, so the bound stays real"
   },
   {
+   "id": "atom/compass/drive/measure_device.py::_child::subprocess.Popen( argv, env=env, stdout=f, stderr=subprocess.STDOUT, start_new_session=True )::thread_start#0",
+   "file": "atom/compass/drive/measure_device.py",
+   "symbol": "_child",
+   "call": "subprocess.Popen",
+   "expr": "subprocess.Popen( argv, env=env, stdout=f, stderr=subprocess.STDOUT, start_new_session=True )",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "none",
+   "why": "compass measure device starts each card's probe, and the PP carriers' torchrun, in a process of its own session that sees the cards it probes",
+   "mechanism": "K9",
+   "mechanism_why": "starting a process cannot park; in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so the bound stays real"
+  },
+  {
+   "id": "atom/compass/drive/measure_device.py::_child::probe.wait()::event_wait#0",
+   "file": "atom/compass/drive/measure_device.py",
+   "symbol": "_child",
+   "call": "probe.wait",
+   "expr": "probe.wait()",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "compass measure device reaps a probe process once its session is stopped, before it checks the cards and starts the next",
+   "mechanism": "K9",
+   "mechanism_why": "in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so the bound stays real"
+  },
+  {
+   "id": "atom/compass/drive/measure_device.py::_child::probe.poll()::poll#0",
+   "file": "atom/compass/drive/measure_device.py",
+   "symbol": "_child",
+   "call": "probe.poll",
+   "expr": "probe.poll()",
+   "shape": "poll",
+   "peer": "process",
+   "why": "compass measure device asks whether a probe process has exited while it waits for the probe or for SIGINT or SIGTERM",
+   "mechanism": "K9",
+   "mechanism_why": "a process poll returns at once and cannot park; in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so the bound stays real"
+  },
+  {
+   "id": "atom/compass/drive/measure_device.py::_child::time.sleep(serve.POLL_S)::sleep#0",
+   "file": "atom/compass/drive/measure_device.py",
+   "symbol": "_child",
+   "call": "time.sleep",
+   "expr": "time.sleep(serve.POLL_S)",
+   "shape": "sleep",
+   "peer": "process",
+   "why": "compass measure device's half-second cadence between its checks on a probe process",
+   "mechanism": "K9",
+   "mechanism_why": "in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so its cadence no simulated clock reads"
+  },
+  {
+   "id": "atom/compass/drive/measure_device.py::_freed::time.sleep(serve.POLL_S)::sleep#0",
+   "file": "atom/compass/drive/measure_device.py",
+   "symbol": "_freed",
+   "call": "time.sleep",
+   "expr": "time.sleep(serve.POLL_S)",
+   "shape": "sleep",
+   "peer": "none",
+   "why": "compass measure device's half-second cadence while it waits, up to SETTLE_S, for the driver to free an exited probe's memory before the next check",
+   "mechanism": "K9",
+   "mechanism_why": "in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so its cadence no simulated clock reads"
+  },
+  {
    "id": "atom/compass/kv/lmcache_mp.py::LMCacheMPShell._send::sock.send_multipart([pickle.dumps((ch, *rt.stamp_send(ch))), *frames])::p2p#0",
    "file": "atom/compass/kv/lmcache_mp.py",
    "symbol": "LMCacheMPShell._send",
@@ -5211,7 +5321,7 @@
    "peer": "process",
    "why": "the lmcache_mp shell sends a TP rank's STORE or RETRIEVE to LP lmcache from the step loop, in build_connector_meta",
    "mechanism": "K4",
-   "mechanism_why": "the engine end of transfer#dpN.tpK: the step loop stamps the request as it sends it"
+   "mechanism_why": "the engine end of transfer#dpN: the step loop stamps the request as it sends it"
   },
   {
    "id": "atom/compass/kv/lmcache_mp.py::LMCacheMPShell._take::sock.poll()::poll#0",
@@ -5233,9 +5343,9 @@
    "expr": "sock.recv_multipart(zmq.NOBLOCK)",
    "shape": "socket_recv",
    "peer": "process",
-   "why": "the lmcache_mp shell reads every transfer reply already at a writer rank's DEALER without blocking, and holds each until released",
+   "why": "the lmcache_mp shell reads every transfer reply already at its DP rank's DEALER without blocking, and holds each until released",
    "mechanism": "K5",
-   "mechanism_why": "the engine end of lmcache->engine:transfer#dpN.tpK, received inline by the step loop in process_completions"
+   "mechanism_why": "the engine end of lmcache->engine:transfer#dpN, received inline by the step loop in process_completions"
   },
   {
    "id": "atom/compass/kv/lmcache_mp.py::clocked_adapter.Future.wait::self.query()::event_poll#0",
@@ -6007,6 +6117,141 @@
    "why": "the all_gather a simulated DP process routes hands a call its group's shared memory leaves out to the all_gather it wraps",
    "mechanism": "K6",
    "mechanism_why": "passes its caller's collective on unchanged, so the wait is the caller's, classified at the caller's own site; in a simulated run those are the DP groups' collectives, waits inside the data-parallel group's LP"
+  },
+  {
+   "id": "atom/compass/advice/check.py::launched::server.wait(int(START_S / serve.POLL_S), lambda: ready.is_file() or until())::event_wait#0",
+   "file": "atom/compass/advice/check.py",
+   "symbol": "launched",
+   "call": "server.wait",
+   "expr": "server.wait(int(START_S / serve.POLL_S), lambda: ready.is_file() or until())",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "compass advice waits for a start with no traffic, or a point's server, to name itself in server.json, up to a wall bound",
+   "mechanism": "K9",
+   "mechanism_why": "no client has reached the server yet; the advice command is no LP: a start serves no request, and the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
+  },
+  {
+   "id": "atom/compass/advice/check.py::Command.__init__::subprocess.Popen( list(map(str, command)), stdout=written, stderr=subprocess.STDOUT, env=os.environ | env, start_new_session=True, )::thread_start#0",
+   "file": "atom/compass/advice/check.py",
+   "symbol": "Command.__init__",
+   "call": "subprocess.Popen",
+   "expr": "subprocess.Popen( list(map(str, command)), stdout=written, stderr=subprocess.STDOUT, env=os.environ | env, start_new_session=True, )",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "none",
+   "why": "compass advice starts a command in a process group of its own: a start with no traffic, a point's server, or the client.sh run that drives it",
+   "mechanism": "K9",
+   "mechanism_why": "starting a process cannot park; the advice command is no LP: a start serves no request, and the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
+  },
+  {
+   "id": "atom/compass/advice/check.py::Command.wait::time.sleep(serve.POLL_S)::sleep#0",
+   "file": "atom/compass/advice/check.py",
+   "symbol": "Command.wait",
+   "call": "time.sleep",
+   "expr": "time.sleep(serve.POLL_S)",
+   "shape": "sleep",
+   "peer": "process",
+   "why": "compass advice's half-second cadence between its checks on a command it started, up to the bound its caller gives",
+   "mechanism": "K9",
+   "mechanism_why": "the advice command is no LP: a start serves no request, and the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command; a bound only decides when a server is reported as not answering"
+  },
+  {
+   "id": "atom/compass/advice/check.py::Command.end::self.wait(int(START_S / serve.POLL_S), lambda: False)::event_wait#0",
+   "file": "atom/compass/advice/check.py",
+   "symbol": "Command.end",
+   "call": "self.wait",
+   "expr": "self.wait(int(START_S / serve.POLL_S), lambda: False)",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "compass advice waits for a command it started to leave after SIGTERM, up to a wall bound before SIGKILL",
+   "mechanism": "K9",
+   "mechanism_why": "the command is stopping; the advice command is no LP: a start serves no request, and the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
+  },
+  {
+   "id": "atom/compass/advice/check.py::Command.end::self.wait(None, lambda: False)::event_wait#0",
+   "file": "atom/compass/advice/check.py",
+   "symbol": "Command.end",
+   "call": "self.wait",
+   "expr": "self.wait(None, lambda: False)",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "compass advice reaps a command it started after it killed the command's process group",
+   "mechanism": "K9",
+   "mechanism_why": "the command has been killed; the advice command is no LP: a start serves no request, and the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
+  },
+  {
+   "id": "atom/compass/advice/simulate.py::_try::client.wait(None, stopping.is_set)::event_wait#0",
+   "file": "atom/compass/advice/simulate.py",
+   "symbol": "_try",
+   "call": "client.wait",
+   "expr": "client.wait(None, stopping.is_set)",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "compass advice waits for a point's client run to end, or for a stop signal to the command",
+   "mechanism": "K9",
+   "mechanism_why": "the client run's time is its server's simulated clock; the advice command is no LP: the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
+  },
+  {
+   "id": "atom/compass/advice/simulate.py::simulate::concurrent.futures.ThreadPoolExecutor(at_once)::thread_start#0",
+   "file": "atom/compass/advice/simulate.py",
+   "symbol": "simulate",
+   "call": "concurrent.futures.ThreadPoolExecutor",
+   "expr": "concurrent.futures.ThreadPoolExecutor(at_once)",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "none",
+   "why": "compass advice runs its points on threads, as many at once as the host's CPUs hold the widest point's ranks",
+   "mechanism": "K9",
+   "mechanism_why": "starting a thread cannot park; the advice command is no LP: the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
+  },
+  {
+   "id": "atom/compass/advice/simulate.py::simulate::concurrent.futures.wait(running, timeout=serve.POLL_S)::event_wait#0",
+   "file": "atom/compass/advice/simulate.py",
+   "symbol": "simulate",
+   "call": "concurrent.futures.wait",
+   "expr": "concurrent.futures.wait(running, timeout=serve.POLL_S)",
+   "shape": "event_wait",
+   "peer": "thread",
+   "why": "compass advice waits for its points' threads, half a second at a time, so a stop signal reaches each point's commands",
+   "mechanism": "K9",
+   "mechanism_why": "the advice command is no LP: the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
+  },
+  {
+   "id": "atom/compass/advice/simulate.py::simulate::f.result()::event_wait#0",
+   "file": "atom/compass/advice/simulate.py",
+   "symbol": "simulate",
+   "call": "f.result",
+   "expr": "f.result()",
+   "shape": "event_wait",
+   "peer": "thread",
+   "why": "compass advice reads each point's outcome once every point's thread has ended",
+   "mechanism": "K9",
+   "mechanism_why": "the future has resolved, so the call cannot park; the advice command is no LP: the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
+  },
+  {
+   "id": "atom/compass/advice/simulate.py::simulate::pool.submit(_simulated, plan, stopping, unset)::executor_handoff#0",
+   "file": "atom/compass/advice/simulate.py",
+   "symbol": "simulate",
+   "call": "pool.submit",
+   "expr": "pool.submit(_simulated, plan, stopping, unset)",
+   "shape": "executor_handoff",
+   "peer": "thread",
+   "why": "compass advice hands each point to its thread pool",
+   "mechanism": "K9",
+   "mechanism_why": "a hand-off onto the executor's queue cannot park; the advice command is no LP: the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
+  },
+  {
+   "id": "atom/compass/report/prometheus.py::_report::subprocess.Popen( [ prometheus, f\"--config.file={work / 'prometheus.yml'}\", f\"--storage.tsdb.path={work / 'data'}\", \"--web.listen-address=127.0.0.1:0\", ], stdou::thread_start#0",
+   "file": "atom/compass/report/prometheus.py",
+   "symbol": "_report",
+   "call": "subprocess.Popen",
+   "expr": "subprocess.Popen( [ prometheus, f\"--config.file={work / 'prometheus.yml'}\", f\"--storage.tsdb.path={work / 'data'}\", \"--web.listen-address=127.0.0.1:0\", ], stdou",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "none",
+   "why": "a run's Prometheus report starts a Prometheus that scrapes nothing, to serve the series the run's LPs wrote to CI's report",
+   "mechanism": "K9",
+   "mechanism_why": "starting a process cannot park; the report runs once the run has stopped, from client.sh or deploy.sh, and is no LP, so no simulated time passes in it"
   }
  ],
  "anchors": [

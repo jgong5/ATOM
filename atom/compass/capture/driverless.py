@@ -13,6 +13,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import types
 
 import torch
@@ -28,6 +29,13 @@ DEVICES = {
     # MI455X, assumed: AMD counts 256 work-group processors and 432 GB of HBM4.
     # Its capability is card 0's of the MI455 A0 node.
     "gfx1250": (256, (12, 5), 432 << 30),
+}
+#: The card's product name, by arch, as rocm-smi's series and the datasheet
+#: in `compass/devices` name it: aiter reads the model it keys its comm-fused
+#: MoE's winners on off the name. An arch without one is named by its arch.
+NAMES = {
+    "gfx942": "AMD Instinct MI308X",
+    "gfx950": "AMD Instinct MI355X",
 }
 #: The rest of a declared device, by arch, where a source states it: warp size,
 #: threads per CU, L2 bytes, registers per CU and shared memory per block.
@@ -92,7 +100,7 @@ def _props(arch, read=None):
     return types.SimpleNamespace(
         multi_processor_count=cus,
         gcnArchName=arch,
-        name=arch,
+        name=NAMES.get(arch, arch),
         major=major,
         minor=minor,
         total_memory=memory,
@@ -233,6 +241,8 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
     # No checkpoint is read, so a parameter's fill is arbitrary either way, and
     # the in-place RNG fills ask the device for a generator.
     torch.Tensor.uniform_ = torch.Tensor.normal_ = lambda self, *a, **k: self
+    # The allocator's note that another stream uses a block: none is allocated.
+    torch.Tensor.record_stream = lambda self, stream: None
 
     from torch._subclasses import fake_tensor
 
@@ -343,6 +353,35 @@ def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None, warp=None) ->
             raise RuntimeError(f"a device-free capture has no Triton driver: {name}")
 
     triton.runtime.driver.set_active(_DeclaredTarget())
+
+
+def import_aiter_on(arch: str) -> None:
+    """Import aiter in this process as on a device of `arch`, whatever device
+    this host has. aiter resolves its fp8 dtype at import, ``uint8`` where no
+    device is available, and caches each arch probe's first answer; those
+    answers stay, as does Triton's target (`_declare_arch`). The device query
+    and the environment are put back, so a process this one starts finds this
+    host's own."""
+    if arch not in DEVICES:
+        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
+    if "aiter" in sys.modules:
+        raise RuntimeError("aiter is loaded already, its fp8 dtype resolved")
+    environ = {name: os.environ.get(name) for name in ("PATH", "GPU_ARCHS")}
+    available, torch.cuda.is_available = torch.cuda.is_available, lambda: True
+    try:
+        with tempfile.TemporaryDirectory(prefix="compass-arch-") as tmpdir:
+            _declare_arch(tmpdir, arch)
+            from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+            from aiter.utility import dtypes  # noqa: F401  its fp8 resolves here
+
+            get_gfx(), get_gfx_runtime()
+    finally:
+        torch.cuda.is_available = available
+        for name, value in environ.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def group(tp: int, dp: int) -> dict:

@@ -400,3 +400,45 @@ def test_the_worker_that_sent_a_request_posts_its_stamped_cancel(tmp_path, monke
     written, cancels = _run(run())
     assert written == (_key(0),)
     assert cancels == [("compass=a:11.0;s:3", cancel_body(SENDS[0][1]))]
+
+
+def test_a_cancel_naming_a_url_is_posted_there_on_its_request_s_path(
+    tmp_path, monkeypatch
+):
+    """Behind a router that is no LP the traffic LP publishes credit 0's
+    cancel with frontend-P's URL: the worker posts it there, on credit 0's
+    path, and credit 0's URL, the router's, gets none."""
+
+    async def run():
+        prefill = []
+
+        async def take(request: web.Request) -> web.Response:
+            prefill.append((request.path, request.headers["tracestate"]))
+            prefill.append(await request.read())
+            return web.Response(status=204)
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", take)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        url = f"http://127.0.0.1:{runner.addresses[0][1]}"
+        try:
+            async with CancelHarness(tmp_path, monkeypatch) as h:
+                await h.stamp(0)
+                await h.send(0)
+                for _ in range(len(TOKENS[0]) + 1):
+                    await h.pull.recv_pyobj()
+                await h.pub.send_pyobj((_key(0), 11.0, 3, "cancel", url))
+                written = await h.pull.recv_pyobj()
+        finally:
+            await runner.cleanup()
+        return written, h.cancels, prefill
+
+    written, routed, prefill = _run(run())
+    assert written == (_key(0),)
+    assert routed == []
+    assert prefill == [
+        ("/v1/chat/completions", "compass=a:11.0;s:3"),
+        cancel_body(SENDS[0][1]),
+    ]
