@@ -316,6 +316,21 @@ def test_stop_stops_the_command_once_the_export_is_written(tmp_path):
     assert (out / "run.json").exists() and (out / "artifacts" / NAME).exists()
 
 
+def test_a_failed_aiperf_still_stops_the_command_and_names_its_own_failure(tmp_path):
+    out, env = _setup(tmp_path)
+    env["BREAK"] = "aiperf"
+    (tmp_path / "compass_command.py").write_text(COMMAND)
+    command = subprocess.Popen([sys.executable, tmp_path / "compass_command.py", out])
+    while not (out / "server.json").exists():
+        assert command.poll() is None
+        time.sleep(0.1)
+    done = _client(out, *GOOD, "--stop", env=env)
+    assert done.returncode == 1, done.stdout + done.stderr
+    last = done.stderr.splitlines()[-1]
+    assert fnmatchcase(last, "client: aiperf: exited 3; see */client/aiperf.log")
+    assert command.wait(timeout=10) == 0 and (out / "run.json").exists()
+
+
 @pytest.mark.parametrize("writes_run", [True, False])
 def test_stop_sets_the_exports_server_stopped_only_once_the_command_wrote_its_run(
     tmp_path, writes_run

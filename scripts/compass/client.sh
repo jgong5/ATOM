@@ -28,7 +28,8 @@
 #                    aiperf's scrape of its /metrics, which InferenceX takes
 #                    hit rates from
 #   --stop           then SIGTERM the command that started the server, wait
-#                    WAIT_S (default 600) for it to write OUT/run.json and leave,
+#                    WAIT_S (default 600) for it to write OUT/run.json and leave
+#                    (as a client run that fails once aiperf has run does too),
 #                    a trace run's (OUT/trace) serve.TRACE_STOP_S more, set
 #                    the export's server_stopped and, for an instance, write
 #                    each request's split, OUT/request_split.json
@@ -244,6 +245,12 @@ trap 'set +e; kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
     --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" "${scrape[@]}" \
     --export-level raw "${args[@]}") \
     >"$OUT/client/aiperf.log" 2>&1 &
+# A failure from here on stops a --stop server first: a caller waiting on the
+# command that started it, as a driver does, would otherwise wait for ever.
+stop_and_fail() {
+    ((stop)) && (stop_server)
+    fail "$1"
+}
 # The coverage check wants a first token or a request's end in the duration's
 # last 5%. A request in flight across that window, which aiperf cancels at the
 # cutoff and records nothing of, fails it with the export whole; and every run
@@ -251,13 +258,13 @@ trap 'set +e; kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
 wait $! || {
     rc=$? log=$OUT/client/aiperf.log
     errors=$(sed -n '/AIPerf System Exit Errors/,/╰/s/^│    Error: \([^ ]*\).*/\1/p' "$log" | sort -u)
-    ((rc == 1)) && [[ $errors == ProfileMetricCoverageError ]] || fail "aiperf: exited $rc; see $log"
+    ((rc == 1)) && [[ $errors == ProfileMetricCoverageError ]] || stop_and_fail "aiperf: exited $rc; see $log"
     echo "client: aiperf failed its coverage check alone: $(grep -om1 'Profiling metric coverage below .* duration' "$log")"
 }
 (cd / && python3 -m atom.compass.parity.client_run "$OUT/artifacts") ||
-    fail "export: atom.compass.parity.client_run exited $? on $OUT/artifacts"
-gzip "$OUT/artifacts/profile_export_raw.jsonl" || fail "export: cannot compress $OUT/artifacts/profile_export_raw.jsonl"
-python3 - "$OUT" "$TRACES" "$dynamo" "${args[@]}" <<'EOF' || fail "workload: cannot write $OUT/artifacts/workload.json"
+    stop_and_fail "export: atom.compass.parity.client_run exited $? on $OUT/artifacts"
+gzip "$OUT/artifacts/profile_export_raw.jsonl" || stop_and_fail "export: cannot compress $OUT/artifacts/profile_export_raw.jsonl"
+python3 - "$OUT" "$TRACES" "$dynamo" "${args[@]}" <<'EOF' || stop_and_fail "workload: cannot write $OUT/artifacts/workload.json"
 import hashlib, json, sys
 from pathlib import Path
 
