@@ -56,7 +56,9 @@ moves that many bytes per row. Where ranks' row counts can differ (``all_gatherv
 ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad every
 rank to the same rows and keep one row. A MORI combine's bytes are read from
 its leaf (`bench.ops.exchange`), the rows it moves: a point stored before
-`exchange` sized it so keeps MORI's whole buffer. Points at one
+`exchange` sized it so keeps MORI's whole buffer. A MORI point at a shape
+stating G is a family of its own, over EP times the rows its largest rank
+sends (`bench.ops.exchange_at`), whatever family it stored. Points at one
 coordinate, its other counts or contexts dropped, are one point at their mean
 time. `interpolate` prices a query at a measured point as
 that point; between points, multilinearly over the neighbours that bracket it
@@ -320,6 +322,7 @@ def fit(points) -> dict:
         _launched,
         _split,
         exchange,
+        exchange_at,
         routed_rows,
     )
     from atom.compass.capture.peers import MORI
@@ -330,14 +333,16 @@ def fit(points) -> dict:
     for p in points:
         if "exchange" in p:  # a collective: one family over its message bytes
             fam, nbytes = p["exchange"]
+            leaf, counts = json.loads(p["leaf"]), shape_counts(p["shape"])
             if p["op"] == f"{MORI}.combine":  # its input's, whatever it stored
-                nbytes = exchange(json.loads(p["leaf"]))[1]
+                nbytes = exchange(leaf)[1]
+            # MORI's at a G apart, whatever family it stored
+            fam, nbytes = exchange_at(leaf, [fam, nbytes], counts.get("G"))
             f = families.setdefault(
                 fam,
                 {"op": p["op"], "dims": ["bytes"], "points": {}, "row_bytes": set()},
             )
             f["points"].setdefault((nbytes,), []).append((p["cold_ns"], _launched(p)))
-            counts = shape_counts(p["shape"])
             gathered = p["op"].startswith(DP_GROUP + (MORI,))
             f["row_bytes"].add(
                 None if gathered else nbytes / counts.get("T", counts["B"])
@@ -572,7 +577,10 @@ class PriceList(CostSource):
     where the family was measured on ragged rows; ``pad`` the rows a decode's
     MoE leaf routes less the real ones the bound states last, 0 where it
     states none; a collective's family
-    (`bench.ops.exchange`) at its message bytes. A leaf asked at the list of
+    (`bench.ops.exchange`) at its message bytes, MORI's at a step stating G
+    its family apart, over EP times the rows its largest rank sends: the most
+    tokens a rank of its DP group scheduled, where the bound states them after
+    its real rows, else as the capture splits G. A leaf asked at the list of
     bounds it may have run at (`op_graph._ran_at_each`) takes the answer they
     all give, and is declined, naming them, where they differ. It also
     declines inside a gap the fit declined, and prefill rows whose cached
@@ -596,7 +604,8 @@ class PriceList(CostSource):
         self._signed: dict[int, tuple] = {}
 
     def price(self, request: tuple) -> CostTerm | Refusal:
-        from atom.compass.bench.ops import routed_rows
+        from atom.compass.bench.ops import exchange_at, routed_rows
+        from atom.compass.capture.peers import MORI
 
         if isinstance(request[1], list):  # each bound it may have run at
             leaf, bounds, work = request
@@ -610,6 +619,8 @@ class PriceList(CostSource):
         shape = f"{phase} T={t}" if phase == "prefill" else phase  # `_read`'s T
         shape += "" if at["G"] is None else f" G={at['G']}"
         ex, sig = self._sign(leaf)
+        if ex and kind.startswith(MORI) and g is not None:
+            ex = exchange_at(leaf, ex, g, real[1] if len(real) > 1 else None)
         if ex:  # a collective: its family over its message bytes
             name, at["bytes"] = ex
             name = name if name in self.params["families"] else None
