@@ -1707,18 +1707,26 @@ history levels are the real record's prefill rows' cached history, N_KV - N_Q, a
 and p90 over the rows that have one, scaled the same way over a point's n rows.
 
 **Sessions.** A rank's session i is one conversation of the calibration traces cut at three
-lengths, its draw at each level. Sessions cut from one trace differ from the end of its
-first turn on, where aiperf's `--cache-bust first_turn_suffix` marks each conversation, so
-no two share a KV block past the traces' common prompt. A group's rows are distinct
-sessions, the first ones of the rung's. A session's top cut fills first, and a lower cut's
-prompt starts with it, so the lower cut fills at a hit on its blocks and computes only
-past the last position a hit resumes from: on DeepSeek-V4, a state checkpoint, one every
-`--state-checkpoint-interval-tokens` and one at each prompt's end
-(`atom/model_engine/block_manager.py`). A cut an earlier group filled fills again at a hit
-while the pool keeps it, and the pool evicts its least recently freed cached block, and a
-vacant one before any (`atom/model_engine/block_pool.py::BlockPool`). Unscaled levels are
-the same at every rung, so one list of sessions serves every rung below the cap, each
-filled once; a rung past the cap fills its own.
+lengths, its draw at each level. Each session's first message opens with a marker of its
+own, where aiperf's `--cache-bust system_prefix` puts one
+(`aiperf/workers/worker.py::_apply_system_target_cache_bust`), so no two sessions share a
+KV block, two cut from one trace included, at a cut inside its first turn as anywhere. A
+group's rows are distinct sessions, the first ones of the rung's.
+
+A hit resumes as `atom/model_engine/block_manager.py` allows: over a cached prefix of whole
+blocks short of the prompt's last block (`BlockManager._walk_prefix`), and on DeepSeek-V4
+only at a state checkpoint (`_gated_hit`). A prefill forward keeps one interval
+checkpoint, the last multiple of `--state-checkpoint-interval-tokens` in its chunk
+(`checkpoint_cut`), so one every 16,384 tokens in S1's chunks; a prompt keeps one more, its
+anchor, at its last whole block, a block back when it ends on one
+(`_record_checkpoint_end`, `ATOM_STATE_CHECKPOINT_END_MARGIN` unset). So a session's cuts
+fill bottom first: each extends the one below and resumes at that cut's anchor, unless the
+lower cut's generation prompt, which the cut above renders otherwise, starts before it, and
+then at the checkpoint before. A cut an earlier group filled fills again at a hit while the
+pool keeps it, and the pool evicts its least recently freed cached block, and a vacant one
+before any (`atom/model_engine/block_pool.py::BlockPool`). Unscaled levels are the same at
+every rung, so one list of sessions serves every rung below the cap, each filled once; a
+rung past the cap fills its own.
 
 **A design record** is one server at the configuration's arguments and the arm's widest
 `--max-num-seqs`, since a law's key holds neither the scheduler's bounds nor
@@ -1735,10 +1743,10 @@ filled once; a rung past the cap fills its own.
    rung.
 2. *Fill, then send.* Before each group the driver sends its sessions' prompts, each with
    one output token, and waits for all of them. Then the group's rows go at once, in the
-   group's order, each its session's prompt and a few new tokens, `max_tokens` about 40
-   decode steps at the forced acceptance length. A rung runs its top level's group first,
-   then the groups holding top rows, then the middle level's and the bottom level's, each
-   kind's gap batch after it.
+   group's order, each its fill's prompt again with `max_tokens` about 40 decode steps at
+   the forced acceptance length, so a row computes at most a block, the last of its fill's.
+   A rung runs its bottom level's group first, then the middle level's and the top level's,
+   then the groups holding top rows, each kind's gap batch after it.
 3. *DP.* Every request names its rank by `data_parallel_rank`, which the chat route takes
    ahead of session affinity
    (`atom/model_engine/engine_core_mgr.py::CoreManager._select_dp_rank_for_seq_locked`).
@@ -1779,10 +1787,12 @@ history of h tokens:
 Histories are sessions as the decode design's, drawn the same way, in token ids cut from
 the calibration traces' tokenized messages at whole KV blocks. A point's rows take distinct
 histories, the first ones of its level, and points of one scaling share one list: each
-list's points run top level first, then the middle and the bottom, n and q ascending, so a
-history fills once while the pool keeps it. A point's rows are planned as ATOM admits a row
-on its history, its query from the last position a hit resumes from, as the step record
-states it.
+list's points run bottom level first, then the middle and the top, n and q ascending, so a
+history fills once, from the one below, while the pool keeps it. A history's fill is its
+tokens and the trace's next one, which puts the fill's anchor at the history's end, so a
+row on that history computes exactly its q tokens. A point's rows are planned as ATOM
+admits a row on its history, its query from the last position a hit resumes from, as the
+step record states it.
 
 The points go as D106 sends a designed step (`atom/compass/drive/sweep.py::send`): under
 D106's pacing variables, the prompts a point's rows reuse sent first and read to their end,
@@ -1861,14 +1871,17 @@ The layouts and the step kinds no vector fits:
   output make of a trace's messages, which only a step record states; replaying the
   calibration traces, it carries their contexts, which may sit apart from the graded
   traces' (T119).
-- **Fill group by group, a session one conversation.** A rung's three level groups take
-  r (p10 + p50 + p90) tokens a rank, past S1's pool from about r = 20, so they cannot all
-  stay cached. A session's lower cuts are prefixes of its top cut and a group's rows are
-  distinct sessions, so the fills compute about one top cut a session while no row of a
-  step reads another row's KV; filled group by group and point by point instead, S1's
-  fills prefill about twelve times as much (Summary). Sending a group's rows once their
-  fill has finished makes each row's prefill a few tokens, so its rows enter decode in one
-  step on every rank.
+- **Fill group by group, a session one conversation, from its bottom cut.** A rung's three
+  level groups take r (p10 + p50 + p90) tokens a rank, past S1's pool from about r = 20, so
+  they cannot all stay cached. A session's lower cuts are prefixes of its top cut and a
+  group's rows are distinct sessions, so the fills compute about one top cut a session
+  while no row of a step reads another row's KV; filled group by group and point by point
+  instead, S1's fills prefill twelve to thirteen times as much (Summary). From the bottom,
+  each cut resumes within a block of the cut below's end; from the top, a lower cut would
+  resume at the top cut's last interval checkpoint below it, up to a chunk back. A row
+  resending its fill's prompt computes at most a block, so up to 64 rows prefill in one
+  step of S1's budget and 512 in four to eight; whether a wide group's rows then enter
+  decode together at the deployment's pacing is T121.
 - **Chat requests.** The record states each row's tokens, which the fit reads, so a decode
   row needs no exact count, and chat requests feed `fit host`'s tokenizer and intake terms
   (Phase 1c). An explicit rank chooses rows that load-aware affinity would not, and
@@ -1899,7 +1912,14 @@ The layouts and the step kinds no vector fits:
 - Fresh token ids for prefill points, as D106 sends them: they route the MoE as no served
   text does.
 - Each level's sessions as conversations of their own: every level fills whole, on S1
-  about 1.7 times the fill of cuts of one conversation (Summary).
+  about twice the fill of cuts of one conversation (Summary).
+- A session's top cut filled first, its lower cuts at a hit on it: a lower cut resumes at
+  the top cut's last interval checkpoint below it, one a forward, and computes up to a
+  chunk, on S1 about 1.35 times the fill (Summary).
+- Each session's marker at the end of its first turn, where the real record's
+  `first_turn_suffix` puts one (`aiperf/workers/worker.py::_inject_marker_at_first_user`):
+  sessions cut from one trace share that turn, and the whole prompt at a cut inside it, as
+  a cut at S1's widest rungs, 6k to 15k tokens, can be.
 - An export of each request's payload less `NOT_SAMPLING`, as
   `atom/compass/parity/client_run.py` writes aiperf's: it keeps each request's rank and
   prompt token ids, so a record holds as many parameter sets as prompts, which `fit steps`
@@ -1930,19 +1950,22 @@ it holds ([#3618](https://github.com/jgong5/ATOM/issues/3618)).
    real record       c=256, sampled starts, 600 s, CAL_TRACES
                        -> decode rows' contexts, prefill rows' histories
    design K          plan: pool + real record -> levels, scaled per rung;
-                       sessions, each one conversation cut at its three levels
-                     one server; per rung, top level first; per group: its
-                       fill (a hit where filled before), waited for
-                       -> its rows at once, in order, ~40 steps; the next fill
+                       sessions, each one conversation cut at its three levels,
+                       its own marker at its head
+                     one server; per rung, bottom level first; per group: its
+                       fill (a cut from the anchor of the one below, a hit where
+                       filled before), waited for -> its rows at once, each its
+                       fill again, in order, ~40 steps; the next fill
                      each request: the real record's parameters; the export
                        names its trace, its sends and acks beside it
                      stop; cover: a group under half its steps -> a new record,
                        <= 3 rounds
    trace 16          as today: real prefill under the profiler
    trace design K    one --trace server under D106's pacing; points list by
-                       list, top level first; per point: its histories' prompts
-                       (a hit where filled) -> one parked decode -> its rows,
-                       at most --max-num-seqs less one; its export
+                       list, bottom level first; per point: its histories'
+                       prompts, each one token past its history (a hit where
+                       filled) -> one parked decode -> its rows, at most
+                       --max-num-seqs less one; its export
                      stop; cover by rows; missing points -> a new record
    fit steps         folds: real, design 1 and 2, trace 16, trace design 1 and 2
                        -> decode and draft decode vectors at every rung, a MoE
@@ -1983,16 +2006,6 @@ same, its law keyed apart:
                      row and the rest at one; propose over [1, seqs]
 ```
 
-**What stays out:**
-
-```
- prefill under DP    --trace refuses DP          -> T123, #3509's gated record
- a pipeline stage    the fit reads stage 0 alone -> T124
- a 1P1D side         D113 defers a 1P1D law      -> T116
- context parallel    the fit refuses it          -> out
- short_propose       no fit writes it            -> T125
-```
-
 **Acceptance**, once the planner and drivers exist:
 
 ```
@@ -2007,11 +2020,12 @@ same, its law keyed apart:
    M3 TP4 EAGLE3      the draft's forward passes, against D117's law
    held               EP, decode TBO, DSpark: no configuration runs them
                       with a law from D113's list (T128, T120, T129)
-   >= 2 real records neither law saw, 600 s, at the lowest and the top
-   concurrency, and at DP 1 2 trace runs of the graded traces, c=4 and c=16
-     -> 08 D47's three figures under both laws
-     pass: both under 5%, each designed-load figure within that figure's
-           range under the D113 law across the records
+   2 real records neither law saw at each of the lowest and the top
+   concurrency, 600 s, and at DP 1 2 trace runs of the graded traces, c=4
+   and c=16 -> 08 D47's three figures under both laws, 12 or more
+     pass: both under 5%, and the median of the designed-load figures'
+           differences from the D113 law's within the largest difference
+           between the D113 law's figures on a concurrency's two records
    -> T115: whether compass advice prints the designed-load list
 ```
 
@@ -2036,9 +2050,13 @@ DSpark with a law from D113's list.
 ### Dependencies
 
 No spike and no sync issue. The validation waits on [#3468](https://github.com/jgong5/ATOM/issues/3468)'s
-S1 and S2 laws and on `19` D117's law of MiniMax-M3's TP4 EAGLE3 arm; its bar is
-[#2678](https://github.com/jgong5/ATOM/issues/2678)'s second, within the measurement's own
-repeatability. Designed prefill under DP waits on
+S1 and S2 laws and on `19` D117's law of MiniMax-M3's TP4 EAGLE3 arm. Its bar is
+[#2678](https://github.com/jgong5/ATOM/issues/2678)'s second
+([#3752](https://github.com/jgong5/ATOM/pull/3752)), a median set against a largest at ten
+points or more: over the validation's figures, the median of the designed-load law's
+differences from the D113 law's within the largest difference between two passes of the
+old, here the D113 law's figures on two records of one concurrency. Designed prefill under
+DP waits on
 [#3509](https://github.com/jgong5/ATOM/issues/3509)'s gated record (T123), and the
 validation of decode TBO, EP and DSpark on a configuration that runs them (T120, T128,
 T129).
@@ -2050,9 +2068,9 @@ moved apart in each scenario above. **Not in scope:** the printed list (T115); p
 DP (T123); a pipeline stage (T124); a 1P1D side (T116); context parallel; `short_propose`
 (T125); the validation of decode TBO, EP and DSpark (T120, T128, T129).
 
-**Estimate**, derived and unmeasured, on S1: a law in about 3.7 to 5 h, against about 7.6
+**Estimate**, derived and unmeasured, on S1: a law in about 3.5 to 4.8 h, against about 7.6
 to 8.7 h for D113's list, at the ladder #3468 calibrates S1 at, 1, 2, 4 to 512
-([#3649](https://github.com/jgong5/ATOM/pull/3649)); about 3.8 to 5.2 h against 10.9 to
+([#3649](https://github.com/jgong5/ATOM/pull/3649)); about 3.6 to 5 h against 10.9 to
 12.5 h at ATOM's default, 1 to 8, 16, 32, 48, 64, 128, 256 and 512
 (`atom/model_engine/arg_utils.py::EngineArgs.cudagraph_capture_sizes`), which S1's space
 file keeps at e88f9c67c. D113's list counts the records past the calibration traces' count,
@@ -2064,18 +2082,22 @@ multiple of 16 to 512. MiniMax-M3's waits on its pool and contexts.
 - Basis: #3344's c=16 calibration record, a pool of 36,579 blocks of 256 tokens (9.36M) and
   decode rows at p10 94k, p50 152k, p90 230k, which stand for the prefill histories too;
   prefill at the 24.5k to 32.6k tokens/s of its prefill-side 16,384-token chunks (medians by
-  context); a start at 10 to 15 min (#3668); a lower cut's fill half a checkpoint interval,
-  4,096 tokens, or whole where shorter than one.
-- Fills, each session once: 46M tokens a decode design record at 1, 2, 4 to 512 (54M at
-  the default), 34M a trace design record, at points of up to 256 rows; all four records
-  160M (176M), 1.4 to 1.8 h (1.5 to 2.0 h). Each level a conversation of its own: 77M
-  (93M) and 62M. Each group and point filling its own: 236M (289M) and 699M.
+  context); a start at 10 to 15 min (#3668); a session's fill its top cut and half a block
+  past each lower cut's anchor, a row's and a refill's half a block.
+- Fills, each session once: 40M tokens a decode design record at 1, 2, 4 to 512 (47M at
+  the default), its rows and refills 2M of them, 30M a trace design record, at points of
+  up to 256 rows; all four records 139M (155M), 1.2 to 1.6 h (1.3 to 1.8 h). The top cut
+  first, at a rung every 16,384 tokens: 190M (207M). Each level a conversation of its own:
+  282M (313M). Each group and point filling its own: 1.8G (1.9G).
 - The rest: starts of warm, memory and six records, 1.3 to 2.0 h; client runs 22 min (warm
   and real 600 s each, `trace 16` 120 s); groups 3 to 5 min a decode design record, points
   15 to 20 min a trace design record.
 - D113's list: a start for warm, memory and each record, a first-turn record's 1800 s, a
   trace run's 120 s.
-- Not counted: a resend of uncovered groups or points, a record and a start of its own.
+- Not counted: a resend of uncovered groups or points, a record and a start of its own; a
+  cut that resumes before the anchor below it, the generation prompt starting first; the
+  tokenizer's time on a decode design record's chat requests, about 0.43G tokens (0.54G)
+  with their fills, which the mechanism check's group time includes.
 </details>
 
 | Where | Change | Task |
@@ -2109,7 +2131,7 @@ on one card.
 | D38.1 | One recommended flow per half: steps (`measure memory`, `record`, `trace steps`, `measure steps` with the step grid's planner, `fit host` and `fit steps`, `run --coverage`, then grading outside the CLI), each server driven by a client started apart, and ops, after the steps half's `measure memory`, `record`, `trace steps` and `fit host` (`trace ops --population`, `measure ops --plan` over the record directories of `record` or `trace steps --out`, `fit ops` publishing a `price_list` only, then `run` and grading). Phases unchanged; the op bench, ATOM's runner preparing each point and running no forward, hosts 1b and the step bench 1c, Phase 2 is a plain startup `measure memory` runs. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); ops half 2026-10-18 (#1489); `measure ops --plan` reads record directories 2026-10-18 (#1527); op bench without a forward 2026-10-21 ([#1868](https://github.com/jgong5/ATOM/issues/1868)) |
 | D40.1 | Classes (a) and p2p ride `measure ops` unchanged. Classes (b) and (c) share one new stated-entry-point benchmark inside the same multi-rank op bench, also run by `measure ops`. KV transfer is never priced. Collective prices are labelled upper bounds. | 2026-09-19; one command 2026-10-13 (#851); the multi-rank op bench 2026-10-18 (#1489) |
 | D106 | A container is warmed for a graded run by a constructed JIT sweep and a per-stack cache library; a compile in a graded run still voids it. A client against the cell's own deployment, no ATOM hook point; only pacing variables that select no kernel or shape differ, set by `compass record --sweep` and checked by `client.sh --sweep`: `ATOM_ENABLE_PREFILL_DELAYER=1`, `ATOM_PREFILL_DELAYER_COST_GATE=0`, `ATOM_PREFILL_DELAYER_TARGET_FILL=1.0`, `ATOM_PREFILL_DELAYER_STALL_TICKS=16`, `ATOM_PREFILL_DECODE_INTERVAL=1` at DP 1 and PP 1, and `ATOM_DP_PREFILL_BALANCE_MIN_TOKENS` at the batched-token budget, so balancing cuts no designed row. The ranks share one walk, each count once per container on a rank the count chooses. A: one single-row request per prefill token count from 1 to the budget, no parked decode, covered by any rank's step of that count TBO did not split. B: lockstep steps, a designed point per rank, the product of the second row's offset mod 16, 1 to 16 parked decodes and TBO on or off, plus chunked rows over the product of query size, its residue mod 16 (and, from the chunk alignment up, each multiple of 16 below it) and context level up to the longest prompt, balancing's aligned cuts below the budget included, a step's rows on as many earlier chunks; TBO points split inside a long first row too, and in split steps other ranks' rows cut into halves of 256 to 511 tokens at every offset mod 16; the costly row last or every rank's first alike; covered by exact rows and split. Parked decodes keep the PrefillDelayer's alignment gate armed, so a step's rows release together; no blocker. Two output tokens a request; axes and ranges from the cell's engine and workload, sampling arguments copied. Missing points resent unchanged, three rounds at most. PP above 1 and rapidserve run A only, not marked swept; a PD cell's decode side and KV connector path are warmed by one unscored run and the library. One library per stack (ROCm, aiter's commit, RCCL, torch, Triton, FlyDSL, gfx arch) at `<store>/jit`, `compass record --store` optional, merged in at a real server's start and written back at its stop, finished artifacts only, per compiler, atomically. Coverage is read from the step record after the stop and kept in the library per stack and cell; a cell is swept only when all its points are covered. Preemption, recompute and error paths are not swept: a build there is recorded, not a defect. Streaming the real record is deferred. | 2026-11-02 ([#2640](https://github.com/jgong5/ATOM/issues/2640#issuecomment-6568381628)); shared walk, delayer coalescing, pacing variables 2026-11-02 ([#2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6579531822)); balancing floor, stall 16 2026-11-02 ([#2687](https://github.com/jgong5/ATOM/issues/2687#issuecomment-6591321600)); chunked grid, split inside a first row 2026-11-03 ([#2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6607750609)); TBO halves 2026-11-04 ([#2650](https://github.com/jgong5/ATOM/issues/2650#issuecomment-6619270702)); KV residues 2026-11-06 ([#2689](https://github.com/jgong5/ATOM/issues/2689#issuecomment-6686630693)) |
-| D118 | A candidate beside `19` D113's record list, which `compass advice` keeps printing: a step linear law from the warm record and `measure memory`, a real record at the space's top concurrency (sampled starts, 600 s), two decode design records, `trace 16` and two trace design records, fitted and gated as any law's records; every feature the law fits is moved apart in each scenario it supports, or held in topic 12. The levels are the real record's decode-row p10, p50 and p90 per rank, drawn by each record's seed and at a rung of r rows scaled together by min(1, 0.8 P / (r p90)); a session is one conversation cut at its three levels, its lower cuts filling at a hit on its top cut, and a cut fills once while the pool keeps it. A design record is one server at the arm's widest bound: at every scheduled rung, top level first, each level alone, one long row over short ones and a half-long pair in two orders, and a gap batch's groups; each group's sessions filled and waited for, then its rows at once, about 40 decode steps; under DP every request names its rank, the middle level again over uneven and empty peers, the full rank rotated; chat completions carrying the real record's request parameters, and a client-run export naming each request's trace and those parameters, its sends and acks beside it; the deployment's pacing; groups under half their steps resent, three rounds at most. A trace design record, at DP 1 and PP 1, sends prefill points of n rows of q tokens on cached histories, n rows beside one parked decode within `--max-num-seqs`, the budget's middle chunks and the recorded buckets' edges, as D106 sends a designed step, its token ids cut from the calibration traces, with an export as a design record's. The real record names an aiperf cache-bust target past the calibration traces' count, and every record replays those traces. `calibrate.sh` takes `design K` and `trace design K`; the law's provenance names them. | 2026-11-18 ([#3668](https://github.com/jgong5/ATOM/issues/3668), [Ruling](https://github.com/jgong5/ATOM/issues/3668#issuecomment-6974348636)) |
+| D118 | A candidate beside `19` D113's record list, which `compass advice` keeps printing: a step linear law from the warm record and `measure memory`, a real record at the space's top concurrency (sampled starts, 600 s), two decode design records, `trace 16` and two trace design records, fitted and gated as any law's records; every feature the law fits is moved apart in each scenario it supports, or held in topic 12. The levels are the real record's decode-row p10, p50 and p90 per rank, drawn by each record's seed and at a rung of r rows scaled together by min(1, 0.8 P / (r p90)); a session is one conversation cut at its three levels, its own marker at its head, its cuts filling bottom first, each at a hit from the prompt-end checkpoint of the one below, and a cut fills once while the pool keeps it. A design record is one server at the arm's widest bound: at every scheduled rung, bottom level first, each level alone, one long row over short ones and a half-long pair in two orders, and a gap batch's groups; each group's sessions filled and waited for, then its rows at once, each its fill's prompt again, about 40 decode steps; under DP every request names its rank, the middle level again over uneven and empty peers, the full rank rotated; chat completions carrying the real record's request parameters, and a client-run export naming each request's trace and those parameters, its sends and acks beside it; the deployment's pacing; groups under half their steps resent, three rounds at most. A trace design record, at DP 1 and PP 1, sends prefill points of n rows of q tokens on cached histories, each history filled one token past its end, n rows beside one parked decode within `--max-num-seqs`, the budget's middle chunks and the recorded buckets' edges, as D106 sends a designed step, its token ids cut from the calibration traces, with an export as a design record's. The real record names an aiperf cache-bust target past the calibration traces' count, and every record replays those traces. `calibrate.sh` takes `design K` and `trace design K`; the law's provenance names them. | 2026-11-18 ([#3668](https://github.com/jgong5/ATOM/issues/3668), [Ruling](https://github.com/jgong5/ATOM/issues/3668#issuecomment-6974348636)) |
 
 ---
 
