@@ -114,11 +114,12 @@ $T/scripts/compass/compass run "${RUN[@]}" --check decode -- "${DECODE[@]}"
 
 Each lists what its side's run lacks, with the command that makes it, and exits 1
 when anything is lacking. Both lack one thing, `step linear law: stale (coverage)`:
-no decode vector for some captured batch sizes this configuration schedules (rungs
-8, 16 and 48 up on the prefill side, 32 up and eager on the decode side), since the
-calibration recorded no decode step at those rungs. A step at such a rung is
-refused, which the run reports; at concurrency 16 none is. Any other line is a
-trap (below).
+no decode vector for some rungs this configuration schedules, each a captured batch
+size or eager (8, 16 and 48 up on the prefill side, 32 up and eager on the decode
+side). Each side's calibration recorded no decode step at the rungs it lacks, except
+the decode side's eager ones, which the fit leaves out, as each ran beside a DP
+peer's prefill. A step at such a rung is refused, which the run reports; at
+concurrency 16 none is. Any other line is a trap (below).
 
 **2. Run** (11 min: a minute to start, then 1875 simulated seconds in 490 wall seconds):
 
