@@ -1941,8 +1941,11 @@ anchor, at its last whole block, or a block before its end when it ends on a blo
 (`_record_checkpoint_end`, `ATOM_STATE_CHECKPOINT_END_MARGIN` unset). So a session's cuts
 fill bottom first: each extends the one below and resumes at that cut's anchor, unless the
 lower cut's generation prompt, which the cut above renders otherwise, starts before it, and
-then at the checkpoint before. A cut an earlier group filled fills again at a hit while the
-pool keeps it, and the pool evicts its least recently freed cached block, and a vacant one
+then at the checkpoint before. A chat template that renders an earlier turn otherwise
+once a later user turn follows, as one dropping earlier turns' reasoning does, parts the
+two renderings at the first turn it changes instead, which can sit far below the anchor
+(T123). A cut an earlier group filled fills again at a hit while the pool keeps it, and the
+pool evicts its least recently freed cached block, and a vacant one
 before any (`atom/model_engine/block_pool.py::BlockPool`). Unscaled levels are the same at
 every rung, so one list of sessions serves every rung below the cap, each filled once; a
 rung past the cap fills its own.
@@ -2244,7 +2247,8 @@ same, its law keyed apart:
    and c=16 -> 08 D47's three figures under both laws, 12 or more
      pass: both under 5%, and the median of the designed-load figures'
            differences from the D113 law's within the largest difference
-           between the D113 law's figures on a concurrency's two records
+           between the D113 law's figures on a concurrency's two records,
+           a departure from D118's bar 2 that waits on a ruling (Dependencies)
    -> T120: whether compass advice prints the designed-load list
 ```
 
@@ -2269,11 +2273,18 @@ DSpark with a law from D113's list.
 ### Dependencies
 
 No spike and no sync issue. The validation waits on [#3468](https://github.com/jgong5/ATOM/issues/3468)'s
-S1 and S2 laws and on `19` D117's law of MiniMax-M3's TP4 EAGLE3 arm. Its bar is D118's
-bar 2, a median set against a largest at ten points or more: over the validation's figures,
-the median of the designed-load law's differences from the D113 law's within the largest
-difference between two passes of the old, here the D113 law's figures on two records of
-one concurrency. Designed prefill under DP waits on
+S1 and S2 laws and on `19` D117's law of MiniMax-M3's TP4 EAGLE3 arm, and its bar on a
+ruling asked on [#3668](https://github.com/jgong5/ATOM/issues/3668). D118 holds this
+candidate to its bar 2: the median of the designed-load figures' differences from the D113
+law's within the largest difference between two passes of the old way on the same points,
+which here takes a second calibration from D113's list at the same digest, priced on the
+same records: about 7.6 to 8.7 h more on S1 (Summary), S2's ten records again (#3468) and
+about 19 h on MiniMax-M3's TP4 arm (#3668). #3668's Acceptance takes instead each figure's
+range under the D113 law across the records, every figure within it. The validation above
+takes the largest difference between the D113 law's figures on a concurrency's two records,
+which is neither: one law's figures on two records differ by what each record holds, so a
+law worse than the D113 law's by less than that swing passes. Designed prefill under DP
+waits on
 [#3509](https://github.com/jgong5/ATOM/issues/3509)'s gated record (T128), and the
 validation of decode TBO, EP and DSpark on a configuration that runs them (T125, T133,
 T134).
@@ -2312,9 +2323,9 @@ multiple of 16 to 512. MiniMax-M3's waits on its pool and contexts.
 - D113's list: a start for warm, memory and each record, a first-turn record's 1800 s, a
   trace run's 120 s.
 - Not counted: a resend of uncovered groups or points, a record and a start of its own; a
-  cut that resumes before the anchor below it, the generation prompt starting first; the
-  tokenizer's time on a decode design record's chat requests, about 0.43G tokens (0.54G)
-  with their fills, which the mechanism check's group time includes.
+  cut that resumes before the anchor below it, the generation prompt or a re-rendered turn
+  starting first; the tokenizer's time on a decode design record's chat requests, about
+  0.43G tokens (0.54G) with their fills, which the mechanism check's group time includes.
 </details>
 
 | Where | Change | Task |
