@@ -200,6 +200,25 @@ def test_a_deploy_sh_out_names_its_prefill_instance_to_aiperf(tmp_path, deployed
     assert named == ("http://10.0.0.5:8010" if deployed else None)
 
 
+@pytest.mark.parametrize("simulated", [True, False])
+def test_a_simulated_run_s_export_names_its_send_order_seed_and_its_workload_not(
+    tmp_path, simulated
+):
+    """The seed reaches aiperf, whose traffic LP orders a simulated server's
+    sends at one instant by it; a real run has no such order, so the workload
+    a cell's runs share leaves it out."""
+    server = SIM if simulated else {k: SIM[k] for k in ("url", "pid")}
+    out, env = _setup(tmp_path, server)
+    done = _client(out, *GOOD, env=env | {"COMPASS_HARNESS_SEND_ORDER_SEED": "7"})
+    assert done.returncode == 0, done.stdout + done.stderr
+
+    _, aiperf_env, _ = json.loads((tmp_path / "seen.json").read_text())
+    assert aiperf_env["COMPASS_HARNESS_SEND_ORDER_SEED"] == "7"
+    export = json.loads((out / "artifacts" / NAME).read_text())
+    assert export.get("send_order_seed") == ("7" if simulated else None)
+    assert "send_order_seed" not in json.loads((out / WORKLOAD).read_text())
+
+
 #: The nightly's client arguments and aiperf timeouts client.sh has no default for.
 NIGHTLY = (
     "--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75"

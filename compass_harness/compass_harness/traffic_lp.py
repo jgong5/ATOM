@@ -25,6 +25,16 @@ aiperf withdraws the deadline, nothing it asked for keeps an LP running past
 that end. The Clock Authority's essential horizon only grows, so a wait asked
 for and then withdrawn, or a pacing timer aiperf pulls earlier, would.
 
+The requests aiperf sends at one instant are stamped together at the end of
+the hold, when it has sent them all, before the clock call. aiperf sends them
+in the order its tasks happen to run, which follows when, on the wall clock,
+each worker's return reached it; the frontend takes them in seq order, and its
+router places them in that order. So their seqs follow each one's rank
+(`router.send_rank`: its phase, conversation and turn), and a run repeats
+under the same inputs. With ``SEND_ORDER_SEED_ENV`` set, they follow a digest
+of the seed and the rank instead: each seed is one draw of that order, the
+same in every run, so the router's placements can be sampled on purpose.
+
 When aiperf cancels the requests in flight at its grace deadline, the traffic
 LP closes them at that time (`cancel`): each one's cancel is a stamped request
 of its own, which its worker sends and the frontend answers by hanging the
@@ -40,6 +50,7 @@ errored request is still open, the hold fails, naming those requests.
 """
 
 import asyncio
+import hashlib
 import logging
 import math
 import os
@@ -63,6 +74,9 @@ TRAFFIC = LpId("traffic")
 #: the URL of frontend-P, where a cancel on that channel goes.
 PREFILL_HTTP = "traffic->frontend-P:http"
 PREFILL_URL_ENV = "COMPASS_HARNESS_PREFILL_URL"
+#: The seed of the order the requests sent at one instant are stamped in; unset
+#: or empty, they follow their ranks.
+SEND_ORDER_SEED_ENV = "COMPASS_HARNESS_SEND_ORDER_SEED"
 #: Loop turns the hold waits for aiperf to block before it says so in the log.
 SPIN_DIAG = 100_000
 
@@ -85,10 +99,12 @@ class TrafficLP:
         http: str = HTTP,
         stream: str = STREAM,
         cancel_url: str | None = None,
+        seed: str | None = None,
     ) -> None:
         # cancel_url: where each cancel goes, if not to its request's URL.
+        # seed: the send order's (`SEND_ORDER_SEED_ENV`), or None.
         self.rt, self.http, self.stream = rt, http, stream
-        self.cancel_url = cancel_url
+        self.cancel_url, self.seed = cancel_url, seed
         stamps, reports = addresses(prefix)
         ctx = zmq.asyncio.Context.instance()
         self._pub = ctx.socket(zmq.XPUB)
@@ -97,7 +113,10 @@ class TrafficLP:
         self._pull = ctx.socket(zmq.PULL)
         self._pull.bind(reports)
         self._subscribers = 0
-        self.open: dict[tuple, None] = {}  # sent, return not yet passed to aiperf
+        # sent at this instant, not yet stamped: (rank, key), in aiperf's order
+        self._unstamped: list[tuple[tuple, tuple]] = []
+        # stamped, return not yet passed to aiperf; in seq order, as cancels go
+        self.open: dict[tuple, None] = {}
         self.cancelled: set[tuple] = set()  # closed by `cancel`
         self.closed: dict[tuple, None] = {}  # cancelled, return not yet passed
         self._written: set[tuple] = set()  # cancels a worker has written
@@ -142,6 +161,7 @@ class TrafficLP:
             http.name,
             stream.name,
             os.environ.get(PREFILL_URL_ENV) if http.name == PREFILL_HTTP else None,
+            os.environ.get(SEND_ORDER_SEED_ENV) or None,
         )
 
     # ---- the clock ClockPacedLoopScheduler paces on ----
@@ -170,8 +190,10 @@ class TrafficLP:
 
     # ---- the router's side ----
 
-    def send(self, key: tuple) -> None:
-        """Stamp one request on the HTTP channel and publish the stamp.
+    def send(self, key: tuple, rank: tuple | None = None) -> None:
+        """Take one request for the HTTP channel, ranked `rank` among those
+        sent at this instant (by default by `key`); the hold stamps it and
+        publishes the stamp (`_stamp_sends`).
 
         A send after `cancel` closed a request is refused and fails the run: the
         closed request's worker stopped reading, so a stream seq released for it
@@ -188,24 +210,45 @@ class TrafficLP:
             self._tasks.append(failed)  # the hold raises it, failing `done`
             self._changed.set()
             raise refused
-        arrival, seq = self.rt.stamp_send(self.http)
-        self.open[key] = None
-        self._pub.send_pyobj((key, arrival, seq))
+        self._unstamped.append((key if rank is None else rank, key))
         self._changed.set()
+
+    def _stamp_sends(self) -> None:
+        """Stamp the requests sent at this instant and publish their stamps.
+
+        Called once aiperf has caught up with the clock, before the clock call
+        or a cancel, so aiperf has sent every one: they take their seqs in
+        their ranks' order, or with a seed in the order of a digest of it and
+        each rank, never in the order aiperf sent them in.
+        """
+        for _, key in sorted(self._unstamped, key=lambda sent: self._place(sent[0])):
+            arrival, seq = self.rt.stamp_send(self.http)
+            self.open[key] = None
+            self._pub.send_pyobj((key, arrival, seq))
+        self._unstamped.clear()
+
+    def _place(self, rank: tuple):
+        """Where a send ranked `rank` goes among those at its instant: by its
+        rank, or with a seed by a digest of the seed and its rank, which no
+        hash seed or platform moves."""
+        if self.seed is None:
+            return rank
+        return hashlib.sha256(repr((self.seed, rank)).encode()).digest(), rank
 
     async def cancel(self) -> None:
         """aiperf cancels what is in flight: close every open request.
 
         Once aiperf has caught up with the clock, stamps one cancel per open
-        request, publishes it for the worker that sent the request, with
-        `cancel_url` when set, and returns once every one is written. The hold
-        passes each closed request's return before the next clock call; its
-        stream events still to come are dropped.
+        request, in their seqs' order, publishes it for the worker that sent
+        the request, with `cancel_url` when set, and returns once every one is
+        written. The hold passes each closed request's return before the next
+        clock call; its stream events still to come are dropped.
         """
         fut = asyncio.get_running_loop().create_future()
         self._caught_up.append(fut)
         self._changed.set()
         await fut
+        self._stamp_sends()  # none left by the hold; one sent since is closed too
         keys = list(self.open)
         self.open.clear()
         self.cancelled.update(keys)
@@ -373,6 +416,7 @@ class TrafficLP:
                 continue
             ready, self._alive, ended = _look(self._alive)
             if not ready and not ended:
+                self._stamp_sends()
                 if not self._caught_up:
                     return
                 for fut in self._caught_up:

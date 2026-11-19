@@ -56,6 +56,14 @@
 #                    or --extra-inputs there to client.sh's, and refuses any
 #                    other option given twice. aiperf reads its AIPERF_* settings,
 #                    its timeouts among them, from client.sh's environment
+#   COMPASS_HARNESS_SEND_ORDER_SEED  against a simulated server, the order its
+#                    traffic LP numbers the requests aiperf sends at one
+#                    instant in, which its router places them in: unset, by
+#                    each one's phase, conversation and turn, so a run repeats;
+#                    set, by a digest of the seed and those, one draw of that
+#                    order per seed, the same in every run. The client run's
+#                    export names it, send_order_seed; the workload does not,
+#                    as a real run has no such order (compass_harness/traffic_lp.py)
 #
 # A simulated server's client paces aiperf on the server's clock through this
 # tree's compass-harness; a real one's pins aiperf's benchmark id as
@@ -263,6 +271,16 @@ wait $! || {
 }
 (cd / && python3 -m atom.compass.parity.client_run "$OUT/artifacts") ||
     stop_and_fail "export: atom.compass.parity.client_run exited $? on $OUT/artifacts"
+if [[ -n $run_file && -n ${COMPASS_HARNESS_SEND_ORDER_SEED-} ]]; then
+    python3 - "$OUT/artifacts/client_run.json" <<'EOF' || stop_and_fail "export: cannot name the send order seed in $OUT/artifacts/client_run.json"
+import json, os, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+seed = {"send_order_seed": os.environ["COMPASS_HARNESS_SEND_ORDER_SEED"]}
+path.write_text(json.dumps(json.loads(path.read_text()) | seed, sort_keys=True))
+EOF
+fi
 gzip "$OUT/artifacts/profile_export_raw.jsonl" || stop_and_fail "export: cannot compress $OUT/artifacts/profile_export_raw.jsonl"
 python3 - "$OUT" "$TRACES" "$dynamo" "${args[@]}" <<'EOF' || stop_and_fail "workload: cannot write $OUT/artifacts/workload.json"
 import hashlib, json, sys

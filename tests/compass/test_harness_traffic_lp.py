@@ -69,7 +69,7 @@ from aiperf.controller.system_controller import SystemController
 from aiperf.credit.sticky_router import StickyCreditRouter
 from aiperf.plugin.enums import PluginType, ServiceType
 from compass_harness.controller import CompassSystemController
-from compass_harness.router import CompassCreditRouter
+from compass_harness.router import CompassCreditRouter, send_rank
 from compass_harness.scheduler import ClockPacedLoopScheduler
 from compass_harness.strategy import ClockPhaseRunner
 from compass_harness.timesource import ClockTimer
@@ -109,8 +109,17 @@ EVENTS = (0.5, 1.0)
 DELAY = 0.25  # the stand-in strategy's gap between a return and the next turn
 
 
-def _credit(num: int):
-    return SimpleNamespace(id=num, phase=CreditPhase.PROFILING, phase_index=0)
+def _credit(num: int, conversation: str | None = None, turn: int = 0):
+    """Credit `num`, as aiperf numbers them, sending `conversation`'s `turn`:
+    by default trace `num`'s first."""
+    return SimpleNamespace(
+        id=num,
+        phase=CreditPhase.PROFILING,
+        phase_index=0,
+        conversation_id=f"trace-{num}" if conversation is None else conversation,
+        turn_index=turn,
+        cache_bust_marker=None,
+    )
 
 
 def _key(num: int) -> tuple:
@@ -914,6 +923,7 @@ def test_a_1p1d_run_file_sends_to_frontend_p_and_reads_from_frontend_d(
         traffic = TrafficLP.from_env()
         try:
             traffic.send(_key(0))
+            traffic._stamp_sends()  # as the hold does once aiperf has caught up
             traffic.rt.check_arrival("frontend-D->traffic:stream", 1.0, 0)
             return traffic.rt.send_log, traffic.rt.unreleased
         finally:
@@ -1216,6 +1226,139 @@ def test_returns_whose_finals_share_a_grant_pass_in_stream_order(tmp_path):
         return passed
 
     assert _run(main()) == [0, 1]
+
+
+def _stamped(tmp_path, instants, seed=None) -> list[tuple]:
+    """aiperf sends the turns ``instants[k]`` lists, each (conversation, turn),
+    at ``k`` s in the order listed, numbering each one's credit as it sends it.
+    Each stamp as a worker reads it, its turn in place of its key: (arrival,
+    seq, conversation, turn), by seq."""
+
+    async def main():
+        prefix = str(tmp_path / f"lp-{uuid.uuid4().hex[:8]}")
+        # A stream event released at 100 s that no worker reports holds the
+        # traffic LP there, its requests open, while the stamps are read.
+        traffic = TrafficLP(ScriptedRuntime([(100.0, {0})]), prefix, seed=seed)
+        sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+        sub.connect(addresses(prefix)[0])
+        sub.subscribe(b"")
+        await traffic.subscribed(1)
+        turns = {}
+        for at, sends in enumerate(instants):
+            while traffic.now() < at:
+                await traffic.wait(float(at))
+            for conversation, turn in sends:
+                credit = _credit(len(turns), conversation, turn)
+                turns[_key(credit.id)] = conversation, turn
+                traffic.send(_key(credit.id), send_rank(credit))
+        stamps = [await sub.recv_pyobj() for _ in turns]
+        traffic.done.cancel()
+        sub.close(linger=0)
+        return sorted((arrival, seq, *turns[key]) for key, arrival, seq in stamps)
+
+    return _run(main())
+
+
+#: Turns aiperf sends at one instant, as (conversation, turn): two sessions'
+#: next turns, a subagent's first and a new session's first.
+BURST = (("s2", 9), ("s1", 4), ("s1::sa:0", 0), ("s3", 0))
+
+
+def test_one_instant_s_turns_take_the_same_seqs_whatever_order_aiperf_sends_them_in(
+    tmp_path,
+):
+    """aiperf sends one instant's turns in the order its tasks happen to run,
+    which follows the wall clock, and numbers their credits in that order:
+    each turn's seq follows its conversation and turn instead."""
+    runs = [
+        _stamped(tmp_path, [sends])
+        for sends in (BURST, BURST[::-1], BURST[2:] + BURST[:2])
+    ]
+    assert runs[1] == runs[0] and runs[2] == runs[0]
+    assert runs[0] == [
+        (ADMIT, 0, "s1", 4),
+        (ADMIT, 1, "s1::sa:0", 0),
+        (ADMIT, 2, "s2", 9),
+        (ADMIT, 3, "s3", 0),
+    ]
+
+
+def test_a_seed_draws_one_instant_s_order_the_same_whatever_order_aiperf_sends_in(
+    tmp_path,
+):
+    """Seeds 1 and 2 each give the burst's turns an order of their own,
+    neither the one their ranks give, whatever order aiperf sends them in; the
+    seqs and their arrival stay as they were."""
+    plain = _stamped(tmp_path, [BURST])
+    one = [_stamped(tmp_path, [sends], "1") for sends in (BURST, BURST[::-1])]
+    two = _stamped(tmp_path, [BURST], "2")
+    assert one[0] == one[1]
+    assert len({tuple(s[2:] for s in run) for run in (plain, one[0], two)}) == 3
+    assert [s[:2] for s in plain] == [s[:2] for s in one[0]] == [s[:2] for s in two]
+
+
+def test_turns_sent_at_a_later_instant_take_later_seqs_seeded_or_not(tmp_path):
+    """Traces z and y send a turn at 0 s, b and a at 1 s: each instant's turns
+    are stamped at the end of its own hold, so their ranks order them only
+    within it."""
+    instants = [[("z", 3), ("y", 1)], [("b", 0), ("a", 5)]]
+    assert _stamped(tmp_path, instants) == [
+        (ADMIT, 0, "y", 1),
+        (ADMIT, 1, "z", 3),
+        (1.0 + ADMIT, 2, "a", 5),
+        (1.0 + ADMIT, 3, "b", 0),
+    ]
+    seeded = _stamped(tmp_path, instants, "1")
+    assert [s[:2] for s in seeded] == [
+        (ADMIT, 0),
+        (ADMIT, 1),
+        (1.0 + ADMIT, 2),
+        (1.0 + ADMIT, 3),
+    ]
+    assert {s[2] for s in seeded[:2]} == {"y", "z"}
+
+
+def test_a_cancel_closes_one_instant_s_requests_in_their_seqs_order(tmp_path):
+    """aiperf sends trace b's turn, then trace a's, at 0 s, and cancels both
+    at the grace deadline, 2.0: a's request takes seq 0 and its cancel seq 2,
+    b's seq 1 and 3, whichever aiperf sent first."""
+
+    async def main():
+        prefix = str(tmp_path / "lp")
+        traffic = TrafficLP(ScriptedRuntime([(2.0, set())]), prefix)
+        stamps, reports = addresses(prefix)
+        sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+        sub.connect(stamps)
+        sub.subscribe(b"")
+        await traffic.subscribed(1)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(reports)
+
+        async def worker():
+            published = [await sub.recv_pyobj() for _ in range(4)]
+            for key, *_ in published[2:]:
+                push.send_pyobj((key,))
+            return published
+
+        worker = asyncio.ensure_future(worker())
+        for num, conversation in enumerate("ba"):
+            traffic.send(_key(num), send_rank(_credit(num, conversation)))
+        while traffic.now() < 2.0:
+            await traffic.wait(2.0)
+        await traffic.cancel()
+        published = await worker
+        traffic.done.cancel()  # the hold waits for their returns
+        push.close(linger=0)
+        sub.close(linger=0)
+        return published
+
+    a, b = _key(1), _key(0)
+    assert _run(main()) == [
+        (a, ADMIT, 0),
+        (b, ADMIT, 1),
+        (a, 2.0 + ADMIT, 2, "cancel"),
+        (b, 2.0 + ADMIT, 3, "cancel"),
+    ]
 
 
 def test_a_cancel_waits_for_a_released_final_s_return_before_it_stamps(tmp_path):
