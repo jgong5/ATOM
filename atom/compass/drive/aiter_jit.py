@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """The aiter JIT modules a real server built, or began to, while it served,
 which run.json names as ``aiter_jit_builds`` and times as ``jit_compiles``, one
-entry per compile with its artifact and its first and last file's mtime; grading, the fits and `validate.cost` cut the steps that overlap one,
-or refuse the record (`step_labels.refusal`).
+entry per compile with its artifact and its first and last file's mtime;
+grading, the fits and `validate.cost` cut the steps that overlap one, or refuse
+the record (`step_labels.refusal`).
 
 aiter builds a module the first time a process meets a kernel variant its
 image did not prebuild, and keeps it for every later process of that aiter
