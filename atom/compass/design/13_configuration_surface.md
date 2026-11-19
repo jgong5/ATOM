@@ -72,6 +72,11 @@ store holds no readings entry at the run's platform, `run` composes the copy com
 a shipped law's platform, so a host with no GPU runs a shipped law that carries memory
 readings (D80, `05` D24).
 
+**Revised 2026-11-19 by [#2678](https://github.com/jgong5/ATOM/issues/2678):**
+`measure steps --gpu` runs several benches into one store, each admitted by an agreement
+check (`07` D39), and grading takes an op-level run only after its coverage check (D80,
+`07` D118).
+
 **Depends on:** `05_machine_spec_and_probes.md` D24 (the separation rule this extends),
 and every other topic, each of which contributed a flag.
 
@@ -272,7 +277,8 @@ compass trace ops      --model M [--tp N] [--width W]... [--prefill T B]... [--w
                        [--population D]... [--symbolic] [--arch A] [--gpu G] --store S \
                        [-- <ATOM args>]
 compass measure steps  [<batches>...] [--grid <population>... --grid-definition F] \
-                       <sample> --sampling P --out D --store S -- <ATOM args> [GPU]
+                       <sample> --sampling P --gpu G... --out D --store S \
+                       -- <ATOM args>                                         [GPU]
 compass measure ops    [--width W]... [--prefill T B]... [--context C] --llc-mib M \
                        --gpu G --out D --store S -- <ATOM args>               [GPU]
 compass measure ops    --plan RECORD [--plan RECORD]... --llc-mib M --gpu G \
@@ -474,7 +480,9 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
   `--sampling`, the workload's request parameters, is required and joins the key. A
   measurement is keyed by its batch view's digest, so a batch is measured once and a
   stopped invocation resumes; it records the batch's origin, the planner or a record and
-  its traces. Its value is `07` D39's bench window.
+  its traces. Its value is `07` D39's bench window, over `17` D98's repeats. `--gpu` names
+  the TP width's cards or k times as many, which run k benches over its points into one
+  store, each admitted by `07` D39's agreement check.
 - **`measure memory`** starts the real engine with ATOM's arguments, reads the memory
   readings once the KV cache is allocated and the graphs are captured, publishes one
   `memory_readings` entry, and exits (`07` D38, Phase 2). `--beside` runs a command the
@@ -497,8 +505,9 @@ MEASURED    measure ops --out directories, whose points fit ops reads from --sto
   assumption of each assumed `memory_readings` member an engine read.
   `python -m atom.compass.validate` decides from them whether a client run is gradeable:
   not when the run skipped host segments, read an assumed `memory_readings` member, priced
-  with a backend fitted on the traces it grades or on profiled inputs, ran the step grid without a
-  coverage check, or refused a step of that client run (`08` D50.1). A backend fitted
+  with a backend fitted on the traces it grades or on profiled inputs, ran the step grid or the
+  op graph without a coverage check (`07` D118, bar 3), or refused a step of that client run
+  (`08` D50.1). A backend fitted
   under another engine configuration refuses to run: that is a mismatch, not a reason.
 
 **Deprecated, and removable.** The commands this topic first listed are deprecated; none
@@ -563,7 +572,7 @@ have changed.
 |---|---|---|
 | D78 | Three homes. A setting is Compass's only if it would be meaningless in a real ATOM run — which keeps the surface small by construction. The machine's values live in its layers: a device datasheet, a `platform_readings` entry and a network file, the host's, the router's hop included, in host laws. The tokenizer and the HTTP intake are the `host_laws` entry's terms. | 2026-09-19; layers 2026-11-03 (#2716); tokenizer and intake 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)) |
 | D79 | Precedence is CLI > artifact > **refuse**, with no environment level. No silent default for anything that changes a predicted number. The resolved configuration is echoed into every artifact. The run file `compass run` writes is its transport to ATOM, not a config file. | 2026-09-19; run file 2026-10-13 (#851); no environment level 2026-10-14 (#851) |
-| D80 | A simulated serve is configured by `compass run`'s flags, handed to ATOM's server in a run file by `--compass-run`. One `compass` entry, the only way users reach Compass, with the toolchain's commands: `record`, `trace steps\|ops`, `measure steps\|ops\|memory\|device`, `fit steps\|ops\|host\|device` and `run`, sharing ATOM's arguments after `--`, `--out` and `--store`, one step-record format, `run.json` and the GPU refusals, and `advice`, which takes a space file and OUT; no command but `advice` starts the client or takes a workload. One `record` or `run` serves one instance to any number of client runs, and a record splits per client run by its requests. `run` records what grading reads, and grading decides whether a run is gradeable; every run writes a per-request split and `report.html` when it ends, and a simulated run its Prometheus report beside it. `run` reads a law file's memory readings, assumed, when its store holds none; a shipped law and its readings load only at the tree their host key names, and its host laws predict the host they timed from any CPU. Where its store holds no readings entry at the run's platform, `run` composes a shipped law's platform from its committed copy. The commands first listed are deprecated and removable, each with where its work went; developers' quality tooling stays outside the CLI. Non-flags audited and recorded. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); backend flags named 2026-10-14 (#952); the step roofline setting made a switch 2026-10-15 (#1047); `trace ops` per shape, `op_measurement`, `fit ops` publishes a `price_list` only 2026-10-18 (#1489); several instances started by `scripts/compass/deploy.sh`, `run --join` and `record --host` 2026-10-19 (#1031); `run --check` 2026-10-28 (#2312); `measure device` and `fit device`, and the platform flags in place of `--machine` on the commands that price, 2026-11-03 (#2716); `record` times the served tokenizer and stamps the HTTP intake, which `fit host` fits, 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)); `advice`, `run --check` on a prefill or decode side and naming a step linear law's missing decode rungs, and the per-request split and `report.html` every run writes when it ends, 2026-11-13 ([#3355](https://github.com/jgong5/ATOM/issues/3355)); a simulated run's series and Prometheus report, 2026-11-16 ([#3584](https://github.com/jgong5/ATOM/issues/3584)); a law file's readings, the tree a shipped law loads at and the host it predicts 2026-11-10 ([#2899](https://github.com/jgong5/ATOM/issues/2899)); a shipped law's platform readings committed 2026-11-17 ([#3121](https://github.com/jgong5/ATOM/issues/3121)) |
+| D80 | A simulated serve is configured by `compass run`'s flags, handed to ATOM's server in a run file by `--compass-run`. One `compass` entry, the only way users reach Compass, with the toolchain's commands: `record`, `trace steps\|ops`, `measure steps\|ops\|memory\|device`, `fit steps\|ops\|host\|device` and `run`, sharing ATOM's arguments after `--`, `--out` and `--store`, one step-record format, `run.json` and the GPU refusals, and `advice`, which takes a space file and OUT; no command but `advice` starts the client or takes a workload. One `record` or `run` serves one instance to any number of client runs, and a record splits per client run by its requests. `run` records what grading reads, and grading decides whether a run is gradeable, a step grid or op-level run only after its coverage check; `measure steps --gpu` runs k benches into one store once they agree; every run writes a per-request split and `report.html` when it ends, and a simulated run its Prometheus report beside it. `run` reads a law file's memory readings, assumed, when its store holds none; a shipped law and its readings load only at the tree their host key names, and its host laws predict the host they timed from any CPU. Where its store holds no readings entry at the run's platform, `run` composes a shipped law's platform from its committed copy. The commands first listed are deprecated and removable, each with where its work went; developers' quality tooling stays outside the CLI. Non-flags audited and recorded. | 2026-09-19; revised 2026-10-13 and 2026-10-14 (#851); backend flags named 2026-10-14 (#952); the step roofline setting made a switch 2026-10-15 (#1047); `trace ops` per shape, `op_measurement`, `fit ops` publishes a `price_list` only 2026-10-18 (#1489); several instances started by `scripts/compass/deploy.sh`, `run --join` and `record --host` 2026-10-19 (#1031); `run --check` 2026-10-28 (#2312); `measure device` and `fit device`, and the platform flags in place of `--machine` on the commands that price, 2026-11-03 (#2716); `record` times the served tokenizer and stamps the HTTP intake, which `fit host` fits, 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)); `advice`, `run --check` on a prefill or decode side and naming a step linear law's missing decode rungs, and the per-request split and `report.html` every run writes when it ends, 2026-11-13 ([#3355](https://github.com/jgong5/ATOM/issues/3355)); a simulated run's series and Prometheus report, 2026-11-16 ([#3584](https://github.com/jgong5/ATOM/issues/3584)); a law file's readings, the tree a shipped law loads at and the host it predicts 2026-11-10 ([#2899](https://github.com/jgong5/ATOM/issues/2899)); a shipped law's platform readings committed 2026-11-17 ([#3121](https://github.com/jgong5/ATOM/issues/3121)); `measure steps` on several benches, and an op-level run graded only after its coverage check, 2026-11-19 ([#2678](https://github.com/jgong5/ATOM/issues/2678)) |
 | D81 | The resolved configuration is part of every artifact, by value and never by reference. | 2026-09-19 |
 
 ---
