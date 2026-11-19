@@ -123,7 +123,9 @@ COMPASS_COVERAGE_WHEEL=<wheel> COMPASS_GATE_SHARDS=16 $T/scripts/compass/gate_ma
 
 The map records, per test file, the functions whose bodies it ran in pytest's process
 or in any Python process started under it with the tree on its path. A process killed
-by a signal other than SIGTERM records nothing. A round stages and runs with it:
+by a signal other than SIGTERM records nothing. Its run's verdict is not the tree's:
+under coverage a test that waits a set time on a process, or counts what one prints as
+it exits, can fail, and its file holds what ran up to there. A round stages and runs with it:
 `COMPASS_GATE_SELECT=<map> scripts/compass/snapshot.sh <dir>`, then the gate with the same
 variable. The gate prints `select: <n> of <m>, map <sha>` and deselects the rest. A test
 file runs when it ran a function whose body the diff since the map's commit changes, or
