@@ -24,6 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import platforms
+import psutil
 import pytest
 from test_launcher_held_ports import HELD, SQUAT
 from test_memory_readings import DOCUMENT
@@ -193,9 +194,10 @@ def _until(path: Path, script) -> None:
             router.read_text() if router.exists() else "no router.log",
         )
         if time.monotonic() > deadline:
-            for pid in _tree(script.pid):
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGKILL)
+            top = psutil.Process(script.pid)
+            for proc in [top, *top.children(recursive=True)]:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    proc.kill()
             script.wait()
             pytest.fail(f"no {path} after {UNTIL_S} s")
         time.sleep(0.1)
@@ -203,19 +205,6 @@ def _until(path: Path, script) -> None:
 
 def _parent(pid: int) -> int:
     return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
-
-
-def _tree(pid: int) -> list[int]:
-    """Process `pid` and every process under it, each after its parent."""
-    parents = {}
-    for proc in Path("/proc").iterdir():
-        if proc.name.isdigit():
-            with contextlib.suppress(FileNotFoundError, ProcessLookupError):
-                parents[int(proc.name)] = _parent(int(proc.name))
-    tree = [pid]
-    for parent in tree:  # reaches each child it appends
-        tree.extend(child for child, of in parents.items() if of == parent)
-    return tree
 
 
 def test_a_deployment_joins_both_instances_to_its_authority_behind_the_router(
