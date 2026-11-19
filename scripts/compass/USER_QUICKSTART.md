@@ -44,9 +44,10 @@ needs its own laws, which take its GPUs (ADVICE.md, step 3).
   ```
 
   Every other block runs in that container, as root.
-- **CPUs.** The deployment runs a process per DP rank, sixteen in all, beside two API
-  servers, the router and the client. The times below were measured in a container
-  of 16 cores of an AMD EPYC 9575F host, on 2026-11-19.
+- **CPUs.** The deployment runs two processes per DP rank, its engine core
+  (`ATOM::EngineCore_DP<n>`) and its runner (`ATOM::DP<n>TP0`), 32 in all, beside the
+  clock authority, two API servers, the router and the client. The times below were
+  measured in a container of 16 cores of an AMD EPYC 9575F host, on 2026-11-19.
 - **Disk.** About 700 MB for the tree, the inputs and the client's Python, and 1.6 GB
   for the run below, 330 MB of it the client's copy of the traces.
 
@@ -136,8 +137,8 @@ wait $DEPLOY; echo "deploy.sh exit $?"
 - **`deploy.sh run`** starts each side as a `compass run`, both on one simulated
   clock, and the router between them.
 - **The decode's `--on` prefix** starts that side apart, without the prefill side's
-  two variables, as its law is keyed, and makes the KV link `inter_node`, priced by
-  `--network`, as the real pair spans two nodes.
+  `GPU_MAX_HW_QUEUES` and `ATOM_NUMA_BIND`, as its law is keyed, and makes the KV link
+  `inter_node`, priced by `--network`, as the real pair spans two nodes.
 - **The router's flags** switch its wall-clock detectors off, which a simulated
   router needs (`deploy.sh`'s header).
 - **`client.sh`** replays traces 0 to 255 at concurrency 16 for 1800 s on the
@@ -156,7 +157,7 @@ The trust table's figures are in `$OUT/summary.json`:
 
 ```bash
 jq '{coverage_report} + (.schedule | {seconds_by_method, treatments, refusals: .refusals.by_source})' $OUT/summary.json
-jq -r '.memory.readings[][] | [.name, .method, .nbytes] | @tsv' $OUT/lp-engine-P.dp0.json
+jq -r '(.memory.readings[][], .memory.predicts[]?) | [.name, .method, .nbytes] | @tsv' $OUT/lp-engine-P.dp0.json
 ```
 
 - **`seconds_by_method`** splits the predicted seconds by how they were priced:
@@ -165,7 +166,8 @@ jq -r '.memory.readings[][] | [.name, .method, .nbytes] | @tsv' $OUT/lp-engine-P
   below. A step outside a vector's fitted hull is priced by it all the same, and
   counted among the trust table's steps extrapolated.
 - **`treatments`** names what the steps assume: `uniform routing`, every step's MoE
-  priced as if routing spread tokens evenly over the experts, and the two below.
+  priced as if routing spread tokens evenly over the experts, and the treatments the
+  table below names.
 - **Refusals.** A host call outside the range its law was fitted on, such as an HTTP
   body larger than any the calibration sent, is charged 0 s and named in the report's
   refusal table, as is a step at a rung its law has no vector for. Any refusal makes
@@ -177,10 +179,10 @@ A `declared` term is stated, not fitted on this configuration's records.
 
 | Term | Where | Why |
 |---|---|---|
-| `dp_dummy`, treatment `eager DP dummy` | prefill steps, 0 s | a DP rank with no request runs a dummy forward beside its peers, replaying no graph; real DP records give it its busiest peer's device time, which the DP group's step already waits on |
-| `decode_beside_prefill`, treatment `eager decode beside prefill` | prefill steps, 0 s | a decode that replays no graph while a DP peer prefills ends before that peer; unchecked |
-| `load residue`, `persistent`, `activations`, `driver and collective reserve`, the graph `pool` | each engine's `memory`, in `$OUT/lp-engine-<P or D>.dp<rank>.json` | the readings the law file carries, stating `assumed`: `compass measure memory` on crsuse2-m2m-v3-005 for [#3498](https://github.com/jgong5/ATOM/issues/3498), at an earlier ATOM digest; a host with no GPU cannot start the engine to take its own. `prefill/run.json` and `decode/run.json` state that note under `memory_readings_assumed` |
-| `0.2 x peak activations` | each engine's `memory`, as `cudagraph_overhead` | ATOM's own coefficient for the CUDA graph overhead it reserves (`ModelRunner._estimate_cudagraph_overhead`), mirrored |
+| `dp_dummy`, treatment `eager DP dummy` | the prefill side's steps that prefill nothing, 0 s | a DP rank with no request runs a dummy forward beside its peers, replaying no graph; real DP records give it its busiest peer's device time, which the DP group's step already waits on |
+| `decode_beside_prefill`, treatment `eager decode beside prefill` | the prefill side's steps that prefill nothing, 0 s | a decode that replays no graph while a DP peer prefills ends before that peer; unchecked |
+| `load residue`, `persistent`, `activations`, `driver and collective reserve`, the graph `pool` | each engine's `memory`, in `$OUT/lp-engine-<P or D>.dp<rank>.json` | the readings the law file carries, stating `assumed`: `compass measure memory` on crsuse2-m2m-v3-005 for [#3498](https://github.com/jgong5/ATOM/issues/3498), at an earlier ATOM digest; a host with no GPU cannot start the engine to take its own. `prefill/run.json` and `decode/run.json` state that note at `.provenance.memory_readings_assumed` |
+| `0.2 x peak activations` | each engine's `memory`, as `cudagraph_overhead` | ATOM's coefficient for the CUDA graph overhead it reserves (`ModelRunner._estimate_cudagraph_overhead`), times the `activations` reading above, whose method it takes (`atom/compass/memory/graph_pool.py`: `reserves`); the law carries that reading `assumed` |
 
 A prefill side that decodes at rung 2 also prices it by the decode law's rung-2
 vector, `declared`, since the prefill side's records held too few such steps
