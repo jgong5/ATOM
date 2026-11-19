@@ -121,7 +121,8 @@ that admits a request, and absent from an entry whose ``E`` laws hold them;
 ``skip``, segments zeroed for a what-if run, which the graders refuse;
 ``columns``, per kind and segment, coefficients on launch features
 (`backends.launch_features`), predicted under the graph sets ``key``'s engine
-states, which the run takes as its own, since it records no graphs;
+states, which the run takes as its own, since it records no graphs; a key stating
+other prefill token-graph buckets than its runner's refuses (`refuse_other_buckets`);
 ``tokenizer``, the served tokenizer's ``backend`` (``fast`` or ``slow``), the
 ``fingerprint`` of the ``tokenizer.json`` it was fitted on, and, each
 optional, ``encode``, one-item calls, ``encode_batch``, a backend
@@ -525,17 +526,29 @@ def refuse_unfitted_law(run: dict, config) -> None:
         )
 
 
-def refuse_other_buckets(config, buckets: tuple[int, ...]) -> None:
+def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     """Refuse the run file's step linear law on a runner that records the
     prefill token-graph buckets `buckets`, ascending, where the law states none
     or others: in its engine config, which `refuse_unfitted_law` held to
     `config`'s, or else in its prefill vector, those its records' runner
     recorded. An engine config states them only off ATOM's default, which can
-    move between a fit and a run, so one stating none says nothing of them."""
-    if not buckets or (run := spec()) is None or STEP_LINEAR not in run:
+    move between a fit and a run, so one stating none says nothing of them. Host
+    laws refuse where their key's graph sets state others; `run` replaces `spec()`."""
+    if not buckets or (run := spec() if run is None else run) is None:
         return
+    from atom.compass.backends import launch_features
     from atom.compass.run.step_grid import BUCKETS
 
+    pick_fitted(run, "host", config)
+    host = run.get("host") or {}
+    graphs = host.get("laws") and launch_features.stated(host.get("key"))[1]
+    if graphs and (theirs := graphs["token"]["prefill"]) != list(buckets):
+        raise ValueError(
+            f"the host laws' key states the prefill token-graph buckets {theirs}, "
+            f"and this run's runner records {list(buckets)}"
+        )
+    if STEP_LINEAR not in run:
+        return
     pick_fitted(run, STEP_LINEAR, config)
     law = run[STEP_LINEAR]
     stated = sorted((law.get("prefill") or {}).get("buckets") or ())
