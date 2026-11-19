@@ -225,8 +225,9 @@ file with one needs such a deployment. `frontend(config)` then starts LP
 process of its own, given the deployment's KV block tokens, of which the
 server's chunk must be a whole number. The entry holds ``server``, the
 ``lmcache server`` flags; the request loop's laws, ``lookup_s`` (``[fixed, per
-prompt chunk]``) and ``request_s``; optional ``copy_width``, 1 when absent;
-and optional ``writers``, the writer ranks per DP rank, 1 when absent. At its
+prompt chunk]``) and ``request_s``; and optional ``copy_width``, 1 when absent.
+It states no ``writers`` or ``state_bytes``, which the launch refuses: every
+writer rank of a DP rank shares that rank's one transfer channel, and at its
 first stamped request LP ``lmcache`` sizes a chunk and a rank's state image
 from what each member of the engine it serves planned (`_lmcache_plan`), as a
 prefill-decode connector prices its transfer. The copy engine
@@ -785,7 +786,6 @@ def channel_table(run: dict):
             _lmcache_engine(run),
             run.get("lmcache_ipc_s", hop(run, "ipc_s")),
             _dp(run, "P" if pd else None),
-            run["lmcache"].get("writers", 1),
         )
     return table
 
@@ -856,7 +856,7 @@ def _members(table, dp: int | tuple[int, int]) -> dict | None:
     """Each engine LP's members at its DP width above one: rank ``dp<r>`` owns
     the channels whose ``#`` tag names it at that LP's end, ``#dp<r>`` or, on a
     channel between two engine LPs, ``#dp<sender rank>.dp<receiver rank>``. A
-    tag's other parts, as the ``tp<k>`` of ``#dp<r>.tp<k>``, name no member.
+    tag's parts other than ``dp<r>`` name no member.
     `dp` is every engine LP's width, or ``(prefill, decode)`` by side."""
 
     def rank(c, lp):
@@ -1084,12 +1084,12 @@ def _lmcache_plan(run: dict, blocks: int) -> tuple[int, int]:
 def _launch_lmcache(config, run: dict, side: str | None) -> None:
     """Start LP `lmcache`, the stand-in lmcache server, in a process of its own
     when this deployment offloads KV to one, given its KV block tokens; refuse
-    a deployment and a run file that disagree on whether one runs or on its
-    writer ranks, a decode side that would start it, or a server chunk that is
-    not a whole number of the deployment's KV blocks."""
+    a deployment and a run file that disagree on whether one runs, a decode
+    side that would start it, an entry stating ``writers`` or ``state_bytes``,
+    which nothing reads, or a server chunk that is not a whole number of the
+    deployment's KV blocks."""
     from atom.compass.kv.lmcache_server import parse_server_flags
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-    from atom.kv_transfer.offload.mp.deployment import _tp_replication_factor
 
     leaves = KVConnectorFactory.leaf_connectors(config) or ()
     lm = next((c for name, c in leaves if name == "lmcache_mp"), None)
@@ -1105,14 +1105,12 @@ def _launch_lmcache(config, run: dict, side: str | None) -> None:
         return
     if side == "D":
         raise ValueError("LP lmcache serves the prefill side; this is the decode side")
-    # Under DP-attention each DP rank runs at TP 1.
-    tp = 1 if config.enable_dp_attention else config.tensor_parallel_size
-    writers = tp // min(tp, _tp_replication_factor(lm))
-    if run["lmcache"].get("writers", 1) != writers:
+    if retired := sorted({"writers", "state_bytes"} & run["lmcache"].keys()):
         raise ValueError(
-            f"the run file's lmcache writers is {run['lmcache'].get('writers', 1)}; "
-            f"this deployment stores from {writers} rank(s) per DP rank, its TP "
-            "width per DP rank (1 under DP-attention) over its TP replication factor"
+            f"the run file's lmcache entry states {' and '.join(retired)}, which "
+            "nothing reads: every writer rank of a DP rank sends on that rank's "
+            "one transfer channel, and LP lmcache sizes a rank's state image from "
+            "its engine's plan"
         )
     _lmcache_stations(run)  # refused here, before the run starts
     chunk = parse_server_flags(run["lmcache"]["server"]).chunk_size
