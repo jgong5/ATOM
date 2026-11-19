@@ -175,6 +175,78 @@ def test_a_real_deployment_joins_its_decode_node_to_its_clients_clock(tmp_path):
     }
 
 
+def _two_prefills(run, ports=(17100, 17200)) -> None:
+    """A real 2P1D run on one node: each prefill instance's request 1 at DP
+    rank 0, request A on the first and B on the second, which the decode
+    side's transfers tell apart by their Mooncake handshake ports alone."""
+    run.mkdir()
+    instances = [
+        {"name": "prefill0", "side": "P", "index": 0, "handshake_port": 17100},
+        {"name": "prefill1", "side": "P", "index": 1, "handshake_port": 17200},
+        {"name": "decode", "side": "D", "index": 0},
+    ]
+    meta = {"kv_link": "intra_node", "across_nodes": False, "instances": instances}
+    (run / "run.json").write_text(json.dumps(meta))
+    _record(
+        run / "prefill0",
+        [_line(0, 1.2, 1.9, [(1, 136, 200)], [(1, "ka", "pa")])],
+        False,
+    )
+    _record(
+        run / "prefill1", [_line(0, 1.3, 2.2, [(1, 50, 50)], [(1, "kb", "pb")])], False
+    )
+    _record(
+        run / "decode",
+        [
+            _line(0, 2.3, 2.32, [(5, 1, 201)], [(5, 5, "a")]),
+            _line(1, 2.6, 2.62, [(5, 1, 202), (6, 1, 51)], [(6, 6, "b")]),
+            _line(2, 2.7, 2.72, is_dummy_run=True),
+        ],
+        False,
+    )
+    sent = [
+        {
+            "response_id": n,
+            "remote_dp_rank": 0,
+            "transfer_id": 1,
+            "remote_handshake_port": port,
+        }
+        for n, port in zip("ab", ports)
+    ]
+    (run / "decode" / "steps" / parity.TRANSFERS).write_text(
+        "".join(json.dumps(t) + "\n" for t in sent)
+    )
+    _export(run, [("xa", "a", 1.0, 1.64, 2.0), ("xb", "b", 1.1, 1.65, 1.8)])
+
+
+def test_a_deployment_of_two_prefill_instances_joins_each_transfer_to_its_sender(
+    tmp_path,
+):
+    run = tmp_path / "run"
+    _two_prefills(run)
+
+    out = split.write(run)
+
+    assert out["clock"] == "monotonic" and "decode_offset_s" not in out
+    a, b = out["requests"]
+    assert (a["response_id"], b["response_id"]) == ("a", "b")
+    for r, expected in (
+        (a, {"queue_s": 0.2, "prefill_s": 0.7, "kv_transfer_s": 0.4, "decode_s": 0.7}),
+        (b, {"queue_s": 0.2, "prefill_s": 0.9, "kv_transfer_s": 0.4, "decode_s": 0.3}),
+    ):
+        assert {k: r[k] for k in expected} == pytest.approx(expected)
+    assert out["unsplit"] == {}
+
+
+def test_a_transfer_naming_no_prefill_instance_refuses_the_split(tmp_path):
+    run = tmp_path / "run"
+    _two_prefills(run, ports=(17100, 17300))
+
+    out = split.write(run)
+
+    assert "names 0 of the 2 prefill instances" in out["refused"]
+
+
 def test_a_deployment_on_one_node_keeps_one_clock_and_refuses_events_out_of_order(
     tmp_path,
 ):
