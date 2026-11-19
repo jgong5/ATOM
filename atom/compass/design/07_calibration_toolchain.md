@@ -1781,7 +1781,7 @@ names one.
 | `query_cached`, `history` | DP 1, PP 1 | the points over q and h |
 | `cached_seqs`, in the `cached_seqs` form | DP 1, PP 1 | the points over n and h: it moves with n, `history` with h too |
 | `seqs`, `out` | a drafter | every point an output prefill, against the budget rows' middle chunks |
-| `padding` | recorded buckets | the bucket points and the points one past |
+| `padding` | the target, where the runner records buckets | the bucket points and the points one past |
 | the draft's prefill vector, `propose`, `output_prefill_kv` | MTP, DSpark | the same points' draft, propose and draft-KV passes (`step_labels.py`) |
 | `short_propose` | | none: no fit writes it, T125 |
 | prefill under DP: `moe_rows`, `serial_moe_rows`; the draft's prefill and `propose` | DP | none yet: `--trace` refuses DP ([#3010](https://github.com/jgong5/ATOM/issues/3010)), T123 |
@@ -1904,7 +1904,7 @@ it holds ([#3618](https://github.com/jgong5/ATOM/issues/3618)).
       any law (D112) and still prints D113's list
 ```
 
-**Under DP**, S2 (DPA8 MTP3, TBO on):
+**Under DP**, S2 (DPA8 MTP3, TBO on); EP above DP 1 runs the same, its law keyed apart:
 
 ```
  calibrate.sh OUT '256 --cache-bust first_turn_suffix' 'design 1' 'design 2'
@@ -1955,7 +1955,7 @@ it holds ([#3618](https://github.com/jgong5/ATOM/issues/3618)).
    S2                 decode under DP, the MoE column, TBO splits
    M3 TP4 EAGLE3      the draft's forward passes, against D117's law
    >= 2 real records neither law saw, 600 s, at the lowest and the top
-   concurrency, and 2 trace runs of the graded traces, c=4 and c=16
+   concurrency, and at DP 1 2 trace runs of the graded traces, c=4 and c=16
      -> 08 D47's three figures under both laws
      pass: both under 5%, each designed-load figure within that figure's
            range under the D113 law across the records
