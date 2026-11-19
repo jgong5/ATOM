@@ -39,8 +39,11 @@
 #                  its own from. run refuses --prefill and --decode, a worker more to
 #                  choose, and --max-concurrent-requests and
 #                  --rate-limit-tokens-per-second, a limiter on the wall
-#                  clock; it sets --request-timeout-secs (`_lib.sh`) and
-#                  refuses the caller's; the caller switches the router's
+#                  clock; it sets --request-timeout-secs,
+#                  --prepare-queue-timeout-ms and --prepare-timeout-ms
+#                  (`_lib.sh`: COMPASS_SIM_ROUTER_BOUNDS) and refuses the
+#                  caller's (compass_sim_router_refusal, which pd_sim.sh's
+#                  ROUTER_ARGS meets too); the caller switches the router's
 #                  wall-clock detectors off, as pd_sim.sh does:
 #                  --disable-health-check
 #                  --disable-circuit-breaker --disable-retries. run refuses
@@ -163,17 +166,9 @@ ATOMESH=${ATOMESH:-atomesh} ROUTER_LP=
 # A simulated router chooses among a side's instances as LP `router`, as a
 # --dp-aware one chooses among DP ranks.
 [[ $cmd == record ]] || { [[ " ${router[*]} " != *" --dp-aware "* ]] && ((NP == 1 && ND == 1)); } || ROUTER_LP=$ATOMESH
-[[ $cmd == record ]] || for word in "${router[@]}"; do
-    case ${word%%=*} in
-    --prefill | --decode) bad "the router's arguments carry ${word%%=*}, a worker more for a simulated router to choose" ;;
-    --max-concurrent-requests | --rate-limit-tokens-per-second) bad "the router's arguments carry ${word%%=*}, a limiter a simulated router leaves out" ;;
-    --request-timeout-secs) bad "the router's arguments carry ${word%%=*}, a wall-clock bound the script sets for a simulated router" ;;
-    esac
-done
-if [[ -n $ROUTER_LP && " ${router[*]} " != *" --disable-retries "* ]]; then
-    why="carry --dp-aware"
-    [[ " ${router[*]} " == *" --dp-aware "* ]] || why="choose among a side's instances as LP router"
-    bad "the router's arguments $why but not --disable-retries: a router LP's retry resends a request under its first seq, which the frontend refuses as arrived twice"
+if [[ $cmd == run ]]; then
+    why=$(compass_sim_router_refusal "$([[ -n $ROUTER_LP ]] && echo 1 || echo 0)" "${router[@]}")
+    [[ -z $why ]] || bad "$why"
 fi
 for path in "$(realpath -m "$OUT")" "$ROOT" "$PWD"; do
     ((!any_on)) || [[ $(printf %q "$path") == "$path" ]] || bad "--on's prefix may parse $path again, which a shell would split or expand"
@@ -366,7 +361,7 @@ for u in "${urls[@]}"; do u=${u#*://} && hosts+=,${u%:*}; done
 export NO_PROXY=$hosts${NO_PROXY:+,$NO_PROXY} no_proxy=$hosts${no_proxy:+,$no_proxy}
 
 ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-port "$PROMETHEUS_PORT")
-[[ -z $RUN_FILE ]] || ROUTER+=(--request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S")
+[[ -z $RUN_FILE ]] || ROUTER+=("${COMPASS_SIM_ROUTER_BOUNDS[@]}")
 ROUTER+=(--pd-disaggregation)
 for i in "${!sides[@]}"; do ROUTER+=("--${sides[i]}" "${urls[i]}"); done
 ROUTER+=("${router[@]}")

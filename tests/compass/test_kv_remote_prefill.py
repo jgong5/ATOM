@@ -58,6 +58,8 @@ from atom.utils.clock import LPRuntime
 MOONCAKE_SOURCE = (
     pathlib.Path(disaggregation.__file__).parent / "mooncake" / "mooncake_connector.py"
 )
+#: Where the blob's connection and page geometry come from (`producer_endpoint`).
+ENDPOINT_SOURCE = MOONCAKE_SOURCE.with_name("endpoint.py")
 
 #: The first sampled token the producer hands back; the consumer resumes on it.
 FIRST_TOKEN_ID = 7
@@ -597,6 +599,30 @@ def test_a_parked_request_is_not_counted_as_admittable_work(pd, seq_factory):
 # -- The blob ------------------------------------------------------------
 
 
+def _literal_keys(blob: ast.Dict, source: pathlib.Path) -> set:
+    """`blob`'s keys: its literal ones, and those of each `**producer_endpoint
+    (...)` it spreads, read from that function's returned literal."""
+    keys = set()
+    for key, value in zip(blob.keys, blob.values):
+        if key is None:
+            assert (
+                isinstance(value, ast.Call)
+                and getattr(value.func, "id", None) == "producer_endpoint"
+            ), f"{source.name} spreads {ast.unparse(value)} into its blob"
+            [built] = [
+                node.value
+                for node in ast.walk(ast.parse(ENDPOINT_SOURCE.read_text()))
+                if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
+            ]
+            keys |= _literal_keys(built, ENDPOINT_SOURCE)
+            continue
+        assert isinstance(key, ast.Constant) and isinstance(
+            key.value, str
+        ), f"{source.name} builds its blob with computed keys"
+        keys.add(key.value)
+    return keys
+
+
 def relayed_fields() -> frozenset:
     """The keys of Mooncake's own transfer blob, read from its source.
 
@@ -614,11 +640,7 @@ def relayed_fields() -> frozenset:
             for target in node.targets
         ):
             continue
-        assert all(
-            isinstance(key, ast.Constant) and isinstance(key.value, str)
-            for key in node.value.keys
-        ), f"{MOONCAKE_SOURCE.name} builds its blob with computed keys"
-        found.append(frozenset(key.value for key in node.value.keys))
+        found.append(frozenset(_literal_keys(node.value, MOONCAKE_SOURCE)))
     assert len(found) == 1, f"expected one blob assignment, found {len(found)}"
     return found[0]
 
