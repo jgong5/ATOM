@@ -32,6 +32,7 @@ from test_run_step_grid import deployment
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
+from atom.compass.backends.json_file import read_json
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import runfile
 from atom.model_engine import llm_engine
@@ -39,7 +40,7 @@ from atom.model_engine import llm_engine
 LAWS = Path(__file__).resolve().parents[2] / "scripts/compass/laws"
 #: The crs005 DPA8 pair, prefill then decode.
 PAIR = {
-    side: LAWS / f"deepseek-v4-pro-dpa8-mi355x-crs005-{side}.json"
+    side: LAWS / f"deepseek-v4-pro-dpa8-mi355x-crs005-{side}.json.xz"
     for side in ("prefill", "decode")
 }
 #: The machine of the pair's records: an MI355X at the stack their laws
@@ -107,7 +108,7 @@ def side_args(tmp_path, monkeypatch, side) -> list[str]:
     own, env = SIDES[side]
     for name, value in {**SHARED_ENV, **env}.items():
         monkeypatch.setenv(name, value)
-    cpu = json.loads(PAIR[side].read_text())["host"]["key"]["host_cpu"]
+    cpu = read_json(PAIR[side])["host"]["key"]["host_cpu"]
     monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
     tok = SimpleNamespace(is_fast=True, name_or_path=None)
     monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *args: tok)
@@ -228,3 +229,37 @@ def test_a_side_reads_a_network_file_across_nodes_and_a_lone_server_refuses_one(
     out = capsys.readouterr().out
     assert lacked(out) == ["platform: missing"]
     assert "a run on one node reads no network" in out
+
+
+@pytest.mark.parametrize("side", ["prefill", "decode"])
+def test_an_empty_aiter_log_level_is_unset_to_a_side_as_to_deploy_sh(
+    tmp_path, monkeypatch, capsys, side
+):
+    atom_args = side_args(tmp_path, monkeypatch, side)
+    flags = pair(tmp_path)
+    monkeypatch.setenv("AITER_LOG_LEVEL", "")
+
+    assert checked(flags, side, atom_args) == 1
+
+    out = capsys.readouterr().out
+    assert lacked(out) == [COVERAGE, "memory readings: missing"]
+    assert '"AITER_LOG_LEVEL": "WARNING"' in out
+    made = out.rsplit("made by: ", 1)[1]
+    assert made.startswith("AITER_LOG_LEVEL=WARNING compass measure memory ")
+    # The printed command, run in the shell the check ran in, under its prefix.
+    monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
+    words = shlex.split(made)
+    config = drive_run._config(words[words.index("--") + 1 :], "gfx950")
+    publish_readings(tmp_path / "store", config, MACHINE)
+    monkeypatch.setenv("AITER_LOG_LEVEL", "")
+    assert checked(flags, side, atom_args) == 1
+    assert lacked(capsys.readouterr().out) == [COVERAGE]
+
+
+@pytest.mark.parametrize("side", ["prefill", "decode"])
+def test_a_plain_check_of_a_side_s_arguments_names_that_side_s_check(tmp_path, side):
+    kv = json.dumps({"kv_role": ROLES[side], "kv_connector": "compass"})
+    flags = ["--step-stub", stub(tmp_path), *platform(tmp_path), "--check"]
+
+    with pytest.raises(ValueError, match=f"check it with --check {side}, without"):
+        drive_run.main([*flags, "--", "--model", "m", "--kv-transfer-config", kv])

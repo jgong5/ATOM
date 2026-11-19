@@ -4,7 +4,6 @@ decode rungs the 1P1D cell's decode side reaches, rung 12 among them, inside
 the hull each rung was fitted on; the gpu-45 decode law has no rung-12 vector.
 """
 
-import json
 from pathlib import Path
 
 import pytest
@@ -16,15 +15,14 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
+from atom.compass.backends.json_file import read_json
 from atom.compass.backends.step_linear import EXTRAPOLATED
 
 LAWS = Path(__file__).resolve().parents[2] / "scripts/compass/laws"
 
 
 def backend(host: str, side: str) -> StepLinearBackend:
-    law = json.loads(
-        (LAWS / f"deepseek-v4-pro-dpa8-mi355x-{host}-{side}.json").read_text()
-    )
+    law = read_json(LAWS / f"deepseek-v4-pro-dpa8-mi355x-{host}-{side}.json.xz")
     return StepLinearBackend(StepLinearLaw(law), dp=8)
 
 

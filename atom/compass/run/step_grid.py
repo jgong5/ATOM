@@ -29,10 +29,10 @@ is `keyed`, as JSON: the ladder the runner replays (none under
 ``enforce_eager``), the KV block size and dtype, the quantization with its
 layer names as the model's runner remaps them (`quantization`), the TP and
 DP widths, DP attention, expert parallelism, TBO, the MoE backend, the
-all-to-all backend, EPLB and DeepSeek-V4.1 decoder SWA bounded replay when
-off ATOM's default, the index cache's dtype where ATOM resolved it apart from
-the KV cache's, whether mori imports where it does not, MiniMax-M3's
-indexer-only context parallelism when on, the model config's
+all-to-all backend, EPLB, DeepSeek-V4.1 decoder SWA bounded replay and the
+compilation level when off ATOM's default, the index cache's dtype where ATOM
+resolved it apart from the KV cache's, whether mori imports where it does not,
+MiniMax-M3's indexer-only context parallelism when on, the model config's
 ``--hf-overrides`` when it states any, the performance environment, each
 variable of `READ_OFF_DEFAULT` in it when ATOM reads it off its default too,
 and, under speculation, its method and draft width, and the digest of the
@@ -111,6 +111,9 @@ OFF_DEFAULT = (
 )
 #: The index cache takes the KV cache's dtype unless ATOM resolves it apart.
 DERIVED = {"index_cache_dtype": "kv_cache_dtype"}
+#: `compilation_config.level`, keyed only off the default of ATOM's ``--level``
+#: (`EngineArgs.level`): from 1, Inductor fuses the torch ops between custom ops.
+LEVEL = "level"
 #: ATOM's prefill token buckets, an environment variable `keyed` the same way.
 BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
 #: ATOM's environment variables keyed only where ATOM reads them off their
@@ -142,13 +145,14 @@ DRAFT = "draft_model"
 
 def keyed(config, ladder: bool = True) -> dict:
     """The conditions a bundle is measured under, as the resolved config holds them,
-    `OFF_DEFAULT` only where it is off its default, `MORI` only where mori does
+    `OFF_DEFAULT` and `LEVEL` only off their default, `MORI` only where mori does
     not import, MiniMax-M3's indexer-only context parallelism only when on, the
     model config's overrides only when it states some, and the performance
     environment of this process less the client's and the device selection
     (`keyed_env`), and under speculation its method and draft width, and
     `DRAFT` (`_draft`); the ladder only with `ladder`."""
     from atom.config import Config
+    from atom.model_engine.arg_utils import EngineArgs
 
     spec = getattr(config, "speculative_config", None)
     drafts = {"speculative": [spec.method, spec.num_speculative_tokens]} if spec else {}
@@ -163,6 +167,9 @@ def keyed(config, ladder: bool = True) -> dict:
             default = getattr(config, DERIVED[name])
         if (value := getattr(config, name, None)) not in (None, default):
             drafts[name] = value
+    compilation = getattr(config, "compilation_config", None)
+    if getattr(compilation, LEVEL, None) not in (None, EngineArgs.level):
+        drafts[LEVEL] = compilation.level
     if getattr(getattr(config, "dcp_config", None), "indexer_dcp_only", False):
         drafts["indexer_dcp_only"] = True
     # ATOM applies them to the model config after it reads config.json.
