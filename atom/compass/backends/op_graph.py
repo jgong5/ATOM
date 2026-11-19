@@ -700,9 +700,9 @@ class OpGraphBackend(CostBackend):
         a leaf that leads with its rows alone or beside the target's tokens,
         as its anchors do, is asked at its rows. Last, a decode's target
         states the real rows its MoE runs (`real_rows`), and any other None;
-        then a target the most tokens a rank of its DP group scheduled
-        (`group_max_tokens`), which MORI's exchange at a G is priced by, and
-        a drafter None."""
+        a target at a step stating G then the most tokens a rank of its DP
+        group scheduled (`group_max_tokens`), where its view states them,
+        which MORI's exchange there is priced by."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
@@ -724,7 +724,8 @@ class OpGraphBackend(CostBackend):
         own = sum(r.query_tokens for r in view.requests)
         real = real_rows(own, view.moe_rows, view.moe_tokens, view.group_dummies)
         bound += (real if phase == "decode" and not draft else None,)
-        bound += (None if draft else view.group_max_tokens,)
+        if g is not None and not draft and view.group_max_tokens is not None:
+            bound += (view.group_max_tokens,)
         if not width:
             return bound
         if ran == t:

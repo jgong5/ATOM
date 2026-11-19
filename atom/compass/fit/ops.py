@@ -111,7 +111,7 @@ LIMIT = 0.05
 #: The leaves a `PriceList` keeps the signatures of; past it, it forgets them.
 SIGNED = 1 << 14
 #: The dimensions a bound states by place, as `op_graph.OpGraphBackend._bound`
-#: lays them out: (phase, T, B, G, context, last, real, largest).
+#: lays them out: (phase, T, B, G, context, last, real[, largest]).
 BOUND = (None, "T", "B", "G", "context")
 
 
@@ -582,7 +582,7 @@ class PriceList(CostSource):
     states none; a collective's family
     (`bench.ops.exchange`) at its message bytes, MORI's at a step stating G
     its family apart, over EP times the rows its largest rank sends: the most
-    tokens a rank of its DP group scheduled, where the bound states them past
+    tokens a rank of its DP group scheduled, where the bound states them after
     its real rows, else as the capture splits G. A leaf asked at the list of
     bounds it may have run at (`op_graph._ran_at_each`) takes the answer they
     all give, and is declined, naming them, where they differ. It also
@@ -620,7 +620,7 @@ class PriceList(CostSource):
                 return got[0]
             ran = _either(dict(zip("TBG", b[1:4])) for b in bounds)
             return self.refuse(f"{leaf['op']}: {ran}")
-        leaf, bound, _ = request  # (phase, T, B, G, context, last, real, largest)
+        leaf, bound, _ = request  # (phase, T, B, G, context, last, real[, largest])
         kind, phase = leaf["op"], bound[0]
         ex, sig = self._sign(leaf)
         if ex and kind.startswith(MORI) and bound[3] is not None:
