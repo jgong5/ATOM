@@ -176,16 +176,18 @@ def argv(tmp_path, flags, prefill=PREFILL, router=ROUTER_ARGS):
 
 
 def _until(path: Path, script) -> None:
+    """Return once deploy.sh `script` has written `path`, failing if it exits
+    first. No wall-clock bound of its own: the run-file build can take a
+    minute on a loaded host where it resolves each side's config in a process
+    of its own, and each wait the script makes after it ends within WAIT_S or
+    PREFIX_S."""
     router = path.with_name("router.log")
-    for _ in range(600):
-        if path.exists():
-            return
+    while not path.exists():
         assert script.poll() is None, (
             script.communicate(),
             router.read_text() if router.exists() else "no router.log",
         )
         time.sleep(0.1)
-    pytest.fail(f"no {path}")
 
 
 def _parent(pid: int) -> int:
