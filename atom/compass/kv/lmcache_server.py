@@ -47,6 +47,10 @@ from typing import Any
 EVICTION_INTERVAL_S = 1.0
 SESSION_TTL_S = 600.0  # lmcache's SessionManager.DEFAULT_SESSION_TTL
 SESSION_SWEEP_INTERVAL_S = 60.0
+#: The request loop's laws as a run file's ``lmcache`` entry states them,
+#: declared, not measured: a LOOKUP 2^-13 s plus 2^-17 s a prompt chunk, any
+#: other request 2^-14 s.
+DECLARED_LAWS = {"lookup_s": [2.0**-13, 2.0**-17], "request_s": 2.0**-14}
 
 
 class LMCacheRefusal(Exception):
