@@ -182,8 +182,8 @@ a shipped law that carries memory readings (`07` D41) has its platform's entry c
 under `scripts/compass/laws/platform_readings/`, as the readable copy `fit device` writes,
 unedited and named by its key's token: one copy per key, the entry `fit device` folds from
 every probe record published at that key, as D26 folds a platform's nodes, kept while
-such a law states its platform. The first is MI308X's at the Qwen3.8-27B TP1 law's
-platform. Every command that reads a readings entry reads the copy where its store holds
+such a law states its platform. The first is MI355X's at the DeepSeek-V4-Pro DPA8 1P1D
+laws' platform. Every command that reads a readings entry reads the copy where its store holds
 none at the device, PTL state and stack it reads (`atom/compass/fit/device.py::readings`),
 so a user's own entry comes first, and the composed spec names the store or file it
 read. The copy is the entry at the run's own key, which holds no ATOM source (`07` D43):
