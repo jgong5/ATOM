@@ -41,6 +41,7 @@ from atom.compass.artifacts import (
     machine_platform,
     member_name,
 )
+from atom.compass.artifacts.store import ENTRY_FILE
 from atom.compass.memory.readings import ASSUMED, MemoryReadings
 
 STEM, EXTENSION = "readings", "json"
@@ -125,15 +126,17 @@ def key_of(config, machine) -> Key:
 
 def load(store: str, config, machine, rank: int, carried=()) -> MemoryReadings:
     """Rank `rank`'s readings of `config` on the platform `machine` states, from
-    `store`, else from the law files' readings `carried` when `store` holds
-    none at their key, or a refusal naming what is missing or differs."""
+    `store`, else from the law files' readings `carried` when `store` has no
+    entry at their key, or a refusal naming what is missing or differs: an
+    entry there that does not read refuses, whatever a law file carries."""
     key, platform = key_of(config, machine), machine_platform(machine)
+    held = ArtifactStore(store)
     try:
-        entry = ArtifactStore(store).load(
+        entry = held.load(
             key, conditions=conditions(key.values, **platform), gates=GateState.of()
         )
     except ArtifactRefusal as refused:
-        if refused.rule is not Rule.RESOLUTION or not carried:
+        if not carried or (held.directory_for(key) / ENTRY_FILE).is_file():
             raise
         return _carried(carried, key, coords(config, rank), refused)
     member = entry.read_member(STEM, coords(config, rank), EXTENSION)

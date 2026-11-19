@@ -40,10 +40,10 @@ A verdict on a law found names, as ``run``, the ``--step-linear`` and
 law at the head's ATOM digest names that ``store``, whatever the verdict. A
 refusal the runner makes of the config under the law, as of context
 parallelism, propagates. `readings` gives the config's memory readings in a
-store, or where it holds none the assumed ones carried by the law files the
-config's law verdict names as ``run``, as a run of it reads them, `reuse`, or
-`measure` where none is at their key or the one there was
-measured at another ATOM digest (requirement 1), or where it lacks the PAGE
+store, or where it holds none and the config's law verdict is ``reuse`` the
+assumed ones carried by the law files it names as ``run``, as a run of it
+reads them, `reuse`, or `measure` where none is at their key or the one there
+was measured at another ATOM digest (requirement 1), or where it lacks the PAGE
 bound a start of the config reads, which `compass run --check` finds stale
 (`lacking.stale_page_bound`, requirement 2), ``held`` saying whether readings
 are at their key, since the store refuses a second publish there. `stores`
@@ -206,10 +206,11 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
 
 
 def readings(store: ArtifactStore, config, machine, law: dict) -> dict:
-    """The verdict on `config`'s memory readings in `store` on `machine`, else
-    in the law files `config`'s verdict `law` names to run with, as `compass
-    run` reads them."""
-    carried = runfile.carried(law.get("run") or ())
+    """The verdict on `config`'s memory readings in `store` on `machine`, else,
+    when `config`'s verdict `law` is ``reuse``, in the law files it names to run
+    with, as `compass run` reads them: a calibration runs with the store law it
+    publishes, which carries none."""
+    carried = runfile.carried(law["run"]) if law["verdict"] == "reuse" else ()
     try:
         read = memory.load(str(store.root), config, machine, 0, carried)
     except ArtifactRefusal as refused:

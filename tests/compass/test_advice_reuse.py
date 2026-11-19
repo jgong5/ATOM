@@ -20,6 +20,7 @@ import pytest
 from test_artifact_invalidation import STANZA, moved
 from test_capture_v4_pro import CONFIG as V4_PRO
 from test_drive_runfile import LAWS as HOST_LAWS
+from test_law_file_readings import law_member
 from test_memory_readings import READINGS, publish_readings
 from test_page_bound_reading import V41
 from test_run_check_side import (
@@ -239,6 +240,32 @@ def test_a_law_file_s_host_laws_fitted_on_another_cpu_are_reused(tmp_path, searc
     found = verdicts(advise(tmp_path), "law")
 
     assert [(v["verdict"], v["reason"]) for v in found] == [("reuse", where)] * 2
+
+
+@pytest.mark.parametrize("calibrated", [False, True], ids=["reused", "calibrated"])
+def test_a_law_file_s_readings_serve_only_where_its_law_is_reused(
+    tmp_path, searched, calibrated
+):
+    # A calibration runs with the store law it publishes, which carries none.
+    held = law(searched) | {memory.LAW_MEMBER: law_member(searched)}
+    if calibrated:
+        for source in held["sources"].values():
+            source["figures"] = {}
+    where = law_file(tmp_path, held)
+    shutil.rmtree(tmp_path / "store" / Kind.MEMORY_READINGS.value)
+
+    judged = advise(tmp_path)
+
+    laws = {(v["verdict"], v["requirement"]) for v in verdicts(judged, "law")}
+    found = verdicts(judged, "readings")
+    if not calibrated:
+        assert laws == {("reuse", None)}
+        reason = f"in {where}'s {memory.LAW_MEMBER}"
+        assert [(v["verdict"], v["reason"]) for v in found] == [("reuse", reason)] * 2
+        return
+    assert laws == {("calibrate", 4)}
+    assert [(v["verdict"], v["requirement"]) for v in found] == [("measure", 1)] * 2
+    assert "no entry for memory_readings" in found[0]["reason"]
 
 
 @pytest.mark.parametrize("invalidated", [True, False])
@@ -584,9 +611,9 @@ def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, a
         assert f"{PAIR[side]} has no decode vector for rungs {rungs}, which" in (
             found[0]["reason"]
         )
-        # Its readings are those the side's law carries, taken at the key a
-        # start of the side resolved, its fp8 index cache and WARNING included.
-        assert readings_found(judged, side) == {("reuse", carried(side))}
+        (reason,) = {v["reason"] for v in verdicts(judged, "readings", side)}
+        assert '"index_cache_dtype": "fp8"' in reason
+        assert '"AITER_LOG_LEVEL": "WARNING"' in reason
 
 
 @pytest.mark.parametrize(
@@ -618,30 +645,16 @@ def test_a_1p1d_side_runs_under_the_aiter_log_level_deploy_sh_starts_it_with(
 
     judged = advise(tmp_path, MACHINE, model=str(model), common=common)
 
-    # The pair's laws and the readings they carry are keyed WARNING: each side
-    # finds its own there, else none at its key.
+    # The pair's laws are keyed WARNING: each side finds its own there, else
+    # none at its key.
     requirement = 3 if level == "WARNING" else 1
     for side in UNCOVERED:
         found = verdicts(judged, "law", side)
         assert [(v["verdict"], v["requirement"]) for v in found] == [
             ("calibrate", requirement)
         ] * 2
-        if level == "WARNING":
-            assert readings_found(judged, side) == {("reuse", carried(side))}
-            continue
-        ((verdict, reason),) = readings_found(judged, side)
-        assert verdict == "measure"
+        (reason,) = {v["reason"] for v in verdicts(judged, "readings", side)}
         assert f'"AITER_LOG_LEVEL": "{level}"' in reason
-
-
-def readings_found(judged: dict, side: str) -> set:
-    """The readings verdicts of `side` in `judged`, with their reasons."""
-    return {(v["verdict"], v["reason"]) for v in verdicts(judged, "readings", side)}
-
-
-def carried(side: str) -> str:
-    """The reason of a readings verdict that reuses those `side`'s law carries."""
-    return f"in {PAIR[side]}'s {memory.LAW_MEMBER}"
 
 
 def test_a_side_s_own_kv_transfer_config_is_refused_as_deploy_sh_refuses_it(
