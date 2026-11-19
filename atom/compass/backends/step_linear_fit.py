@@ -6,11 +6,14 @@
     python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --platform JSON [--form FORM] [--moe-routing E,K] [--engine FILE]
     python -m atom.compass.backends.step_linear_fit offload LOG... --out ENTRY
     python -m atom.compass.backends.step_linear_fit figures RECORD... --law LAW [--source NAME] [--form FORM] [--moe-routing E,K] [--engine FILE]
+    python -m atom.compass.backends.step_linear_fit pack PATH...
 
 The second form fits a run file's ``lmcache_offload`` entry, beside the law of
 an arm whose records ran the connector, on those runs' server logs
 (`fit_offload`). The third writes the held-out figures (below) of the records
-into an existing law fitted on them (`figures_main`).
+into an existing law fitted on them (`figures_main`). The fourth stores law
+files xz-compressed, as the checked-in ones are (`pack_main`). A law is read
+and written by `json_file`, xz-compressed when its name ends in ``.xz``.
 
 Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 `ATOM_COMPASS_PARITY_RECORD`), labelled by `step_labels`, whose docstring
@@ -29,7 +32,8 @@ holds the runs it was fitted on, each vector's fit figures and hull, and, once
 `rowmod` shuffles, so the same samples and arguments give the same bytes.
 
 The law states the records' `engine_config`, read from the `.engine.json`
-beside each (`engine_config`) or from `--engine FILE` in their place, and a run
+beside each (`engine_config`) or from `--engine FILE` in their place, a record's
+over the compilation level its run.json names (`recorded_level`), and a run
 under another engine config refuses it, records whose ladders are prefixes of
 the longest read at it (`step_grid_plan.pooled`). At its `data_parallel_size` N above 1
 (EP off) the records come in runs of
@@ -263,6 +267,11 @@ ADMIT_FEATURES = ("admits", "uncached", "cached")
 FIGURES = ("steps", "on_totals", "held_out_step", "held_out", "median")
 #: Why a law fitted on records stating their prefill buckets nowhere has no `padding`.
 NO_BUCKETS = "no record states prefill buckets, so the prefill vector adds no padding"
+#: The engine config's field for the compilation level, and ATOM's ``--level``
+#: default (`EngineArgs.level`), which `run.step_grid.keyed` leaves unnamed;
+#: stated here, as this package imports nothing from the engine.
+LEVEL = "level"
+DEFAULT_LEVEL = 3
 
 
 def _rung_key(rung: int | None) -> str:
@@ -2086,7 +2095,7 @@ def engine_config(records) -> dict:
             raise ValueError(
                 f"{record} has no {engine.name}, the engine config it ran under"
             )
-        held.append(keyed_of(json.loads(engine.read_text())))
+        held.append(recorded_level(record) | keyed_of(json.loads(engine.read_text())))
     held = list(pooled(dict(enumerate(held))).values())
     names = sorted({k for e in held for k in e})
     if differ := [k for k in names if any(e.get(k) != held[0].get(k) for e in held)]:
@@ -2106,6 +2115,21 @@ def stated_buckets(record) -> list | None:
     key = Path(record).with_suffix(".key.json")
     graphs = launch_features.stated(key.exists() and json.loads(key.read_text()))[1]
     return None if graphs is None else graphs["token"]["prefill"]
+
+
+def recorded_level(record) -> dict:
+    """`keyed`'s compilation level of the record `record` (`dp<r>.jsonl`): the
+    ``--level`` of the ATOM arguments after -- in the run.json beside its
+    `steps`, off `DEFAULT_LEVEL`, for engine and host key files, which named
+    none at any level before `keyed` did."""
+    run = Path(record).resolve().parent.parent / "run.json"
+    argv = json.loads(run.read_text()).get("argv", []) if run.is_file() else []
+    if "--" not in argv:
+        return {}
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--level", type=int, default=DEFAULT_LEVEL)
+    level = parser.parse_known_args(argv[argv.index("--") + 1 :])[0].level
+    return {} if level == DEFAULT_LEVEL else {LEVEL: level}
 
 
 def recorded_buckets(stated: dict) -> tuple[int, ...] | None:
@@ -2234,12 +2258,13 @@ def _labelled(args) -> tuple[list, dict, dict, dict]:
             built := step_labels.refusal(json.loads(run.read_text()))
         ):
             raise ValueError(f"{record} is not fitted: {built}")
-    owns = [Path(r).with_suffix(".engine.json") for r in args.records]
+    owns = {Path(r).with_suffix(".engine.json"): r for r in args.records}
     stated = {r: stated_buckets(r) for r in args.records}
     if args.engine:
         engine = keyed_of(json.loads(Path(args.engine).read_text()))
         raw = {own: json.loads(own.read_text()) if own.exists() else {} for own in owns}
-        for own, held in pooled({o: keyed_of(r) for o, r in raw.items()}).items():
+        ran = {o: recorded_level(r) | keyed_of(raw[o]) for o, r in owns.items()}
+        for own, held in pooled(ran).items():
             refuse_context_parallel(held, str(own))
             refuse_contradicting(own, held, args.engine, engine)
         given = json.loads(Path(args.engine).read_text()).get(PREFILL_BUCKETS)
@@ -2299,7 +2324,7 @@ def figures_main(argv) -> None:
     parser.add_argument("--source", help="the entry of the law's sources folded")
     parser.set_defaults(form=None)
     args = parser.parse_args(argv)
-    law = json.loads(Path(args.law).read_text())
+    law = json_file.read_json(args.law)
     into, vectors, runs = law, None, law.get("runs")
     sources = law.get("sources", {})
     if args.source is not None or sources:
@@ -2351,8 +2376,30 @@ def figures_main(argv) -> None:
             + (f", and the fit cuts each step they price: {why}" if why else "")
         )
     into["figures"] = fold_figures(_fold_laws(samples, options, 0), vectors)
-    Path(args.law).write_text(json.dumps(law) + "\n")
+    json_file.write_json(law, args.law)
     print(_figures_table(into["figures"]))
+
+
+def pack_main(argv) -> None:
+    """``pack PATH...``: store each law file PATH, or each ``*.json`` in a
+    directory PATH, xz-compressed beside it under its name and ``.xz``, as
+    `json_file.write_json` writes it, and remove it, printing both sizes. A law
+    whose document did not change is stored in the same bytes. A PATH whose
+    name does not end in ``.json`` refuses, before any law is stored."""
+    parser = argparse.ArgumentParser(
+        prog="python -m atom.compass.backends.step_linear_fit pack",
+        description=pack_main.__doc__.split("\n\n")[0],
+    )
+    parser.add_argument("paths", nargs="+", type=Path, help="law files or directories")
+    paths = parser.parse_args(argv).paths
+    laws = [x for p in paths for x in (sorted(p.glob("*.json")) if p.is_dir() else [p])]
+    if named := [str(law) for law in laws if law.suffix != ".json"]:
+        parser.error(f"a law file packed is named *.json, and these are not: {named}")
+    for law in laws:
+        into = law.with_name(law.name + json_file.XZ)
+        json_file.write_json(json_file.read_json(law), into)
+        print(f"{into}: {law.stat().st_size} -> {into.stat().st_size} bytes")
+        law.unlink()
 
 
 def main(argv=None) -> None:
@@ -2363,11 +2410,16 @@ def main(argv=None) -> None:
     if argv[:1] == ["figures"]:
         figures_main(argv[1:])
         return
+    if argv[:1] == ["pack"]:
+        pack_main(argv[1:])
+        return
     parser = _records_parser(
         "python -m atom.compass.backends.step_linear_fit", __doc__.split("\n\n")[0]
     )
     parser.add_argument(
-        "--out", required=True, help="where the law is written, as JSON"
+        "--out",
+        required=True,
+        help="where the law is written, as JSON, xz-compressed when it ends in .xz",
     )
     parser.add_argument(
         "--platform",
@@ -2399,7 +2451,7 @@ def main(argv=None) -> None:
         }
     if len(args.records) > dp:
         mark_held_out(law, report, samples, options)
-    Path(args.out).write_text(json.dumps(law) + "\n")
+    json_file.write_json(law, args.out)
     print(f"cut: {json.dumps(law['cut'])}")
     print(f"unfitted: {json.dumps(law['unfitted'])}")
     for name, vector in [("prefill", law.get("prefill"))] + list(law["decode"].items()):

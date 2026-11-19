@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """A simulated run's Prometheus series: each engine and frontend LP samples
 its own processes' instruments on its own clock, and writes them as it hands
-in for the last time.
+in for the last time, after a final sample at its last finite clock.
 
 An engine and a frontend, each started by the run bootstrap on a standalone
 authority's run file and connected to none, their clocks moved by hand, drive
@@ -221,6 +221,20 @@ def _first_holding(held: dict) -> dict:
     return kept
 
 
+def _finish(rt, released=None) -> None:
+    """The ``+inf`` grant that ends `rt`'s run, releasing `released`, taken as
+    its loop takes a grant."""
+    rt.conn = SimpleNamespace(recv=lambda: (INF, released or {}))
+    rt.take_grant()
+
+
+def _held_now(files: Path) -> dict:
+    """What ``/metrics`` holds now of the multiprocess files in `files`."""
+    registry = CollectorRegistry()
+    MultiProcessCollector(registry, path=str(files))
+    return _held(generate_latest(registry).decode())
+
+
 def _whole_before_hand_in(renames: list, out: Path, lp: str) -> None:
     """LP `lp`'s file was renamed into place, onto no file of its name, before
     its hand-in was, and nothing part-written is left in `out`."""
@@ -311,14 +325,18 @@ def test_an_engine_writes_what_its_processes_held_at_each_push(
     """Each instant of the file is a push's, at the engine's clock, and holds
     what ``/metrics`` held of the families just before the push, from the
     engine's process and its worker's alone, each request's context once;
-    the file is renamed into place whole before the engine's hand-in."""
+    but the last push's, at the engine's last finite clock, where its final
+    sample's point, what ``/metrics`` held as it handed in, stands instead,
+    one per series. The file is renamed into place whole before the engine's
+    hand-in."""
 
     def loop(push, steps):
         steps()
         push(2.0)
-        clock.installed().now = INF  # the finish
+        _finish(clock.installed())
 
     rt, held = _engine(files, started, side, loop)
+    held[2.0] = _held_now(files)
     lp, frontend, role = SIDES[side]
     written = _instants(tmp_path / metrics.FILE.format(lp), role, frontend)
     print(f"\n{lp}: {sum(map(len, written.values()))} samples at {list(written)}")
@@ -333,9 +351,10 @@ def test_an_engine_writes_what_its_processes_held_at_each_push(
     for family in ("atom:unclassified", "atom:time_to_first_token_seconds"):
         assert any(k[0] == family for k in held[2.0])
     # The worker's device time of the prefill landed after the push at 1 s,
-    # and the decode's after the one at 2 s.
+    # and the decode's after the one at 2 s, which the final sample holds.
     count = "atom:gpu_forward_seconds", "atom:gpu_forward_seconds_count"
-    assert [v for k, v in written[2.0].items() if k[:2] == count] == [1.0]
+    assert [v for k, v in written[1.0].items() if k[:2] == count] == [0.0]
+    assert [v for k, v in written[2.0].items() if k[:2] == count] == [2.0]
     # Its point at 2 s, line by line: the buckets, then the count, then the
     # sum, an order the parser does not check.
     lines = gzip.decompress((tmp_path / metrics.FILE.format(lp)).read_bytes())
@@ -346,6 +365,9 @@ def test_an_engine_writes_what_its_processes_held_at_each_push(
     ]
     assert point == ["_bucket"] * (len(point) - 2) + ["_count", "_sum"]
     assert len(point) > 2
+    samples = [line.rsplit(" ", 2) for line in lines.decode().splitlines()]
+    points = [(s[0], s[2]) for s in samples if s[0][0] != "#"]
+    assert len(set(points)) == len(points)
     # Each request's context, at the first push after its dispatch alone.
     for family, at in (("prefill", [1.0]), ("decode", [2.0])):
         name = f"atom:{family}_request_context_tokens"
@@ -355,8 +377,9 @@ def test_an_engine_writes_what_its_processes_held_at_each_push(
 
 
 def test_an_engine_that_ends_early_keeps_what_it_sampled(files, started, tmp_path):
-    """An engine whose loop raises after its push at 1 s hands in the
-    exception, its file holding the pushes at 0 and 1 s."""
+    """An engine whose loop raises at 1.5 s, after its push at 1 s, hands in
+    the exception, its file holding the pushes at 0 and 1 s and its final
+    sample at 1.5 s, with the decode its scheduler recorded at 1.25 s."""
 
     def loop(push, steps):
         steps()
@@ -365,9 +388,12 @@ def test_an_engine_that_ends_early_keeps_what_it_sampled(files, started, tmp_pat
     with pytest.raises(RuntimeError, match="died"):
         _engine(files, started, None, loop)
     written = _instants(tmp_path / "metrics-engine.om.gz", "standalone", "frontend")
-    assert list(written) == [0.0, 1.0]
+    assert list(written) == [0.0, 1.0, 1.5]
+    decodes = "atom:decode_batch_size", "atom:decode_batch_size_count"
+    assert [v for k, v in written[1.0].items() if k[:2] == decodes] == [0.0]
+    assert [v for k, v in written[1.5].items() if k[:2] == decodes] == [1.0]
     said = json.loads((tmp_path / "lp-engine.json").read_text())
-    assert any("died" in r for r in said["refusals"])
+    assert [r for r in said["refusals"] if "died" not in r] == []
 
 
 def _snapshot(running: int, used: int, cached: int, full: int) -> dict:
@@ -399,10 +425,10 @@ def _no_gc(exposition: str) -> list:
 def _frontend(started, side, stop=None):
     """A frontend LP of `side` that refreshes at 0, 1 and 2 s, with a
     streamed and an unstreamed request's first output and an output interval
-    between them, then finishes at 2.5 s, or with `stop` is stopped by it then.
-    Returns its runtime and what ``/metrics`` held just after each refresh,
-    checking that it renders what an exporter ATOM's own update alone updates
-    does."""
+    between them and another after them, then finishes at 2.5 s, or with
+    `stop` is stopped by it then. Returns its runtime and what ``/metrics``
+    held just after each refresh and as it handed in at 2.5 s, checking that
+    it renders what an exporter ATOM's own update alone updates does."""
     from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
     from atom.entrypoints.openai.streaming_dispatch import longest_silence_seconds
 
@@ -430,11 +456,14 @@ def _frontend(started, side, stop=None):
     rt.now = 1.75
     requests.observe_time_to_first_token(1.25, False)
     refresh(2.0, _snapshot(0, 2, 64, 200))
+    rt.now = 2.25
+    streams.observe_inter_token_latency(0.5, 1)
     rt.now = 2.5
     if stop is None:
-        rt.now = INF  # the finish
+        _finish(rt)
     rt.loop.stopped = stop
     assert compass_run.frontend_done(SimpleNamespace(close=lambda: None))
+    held[2.5] = _held(exporter.render().decode())
     return rt, held
 
 
@@ -445,12 +474,20 @@ def test_a_frontend_writes_what_it_held_at_each_refresh(
     """Each instant of the file is a refresh's, at the frontend's clock, and
     holds what ``/metrics`` held of the families just after it: the snapshot
     families and the frontend's own latencies; ``/metrics`` itself is what
-    ATOM's own update gives."""
+    ATOM's own update gives. The last is the final sample's, at the clock the
+    frontend held before the finish, with the interval it observed after its
+    last refresh."""
     rt, held = _frontend(started, side)
     _, lp, role = SIDES[side]
     written = _instants(tmp_path / metrics.FILE.format(lp), role, lp)
     print(f"\n{lp}: {sum(map(len, written.values()))} samples at {list(written)}")
     assert written == _of_table(held, "frontend")
+    assert list(written) == [0.0, 1.0, 2.0, 2.5]
+    itl = "atom:inter_token_latency_seconds", "atom:inter_token_latency_seconds_count"
+    assert [[v for k, v in written[t].items() if k[:2] == itl] for t in (2.0, 2.5)] == [
+        [2.0],
+        [3.0],
+    ]
     assert any(k[0] == "atom:requests_running" for k in held[2.0])
     assert {k[0] for k in written[2.0]} == {
         "atom:scheduler_requests",
@@ -467,12 +504,64 @@ def test_a_frontend_writes_what_it_held_at_each_refresh(
 
 def test_a_stopped_frontend_keeps_what_it_sampled(started, files, tmp_path):
     """A frontend a signal stops at 2.5 s hands in the signal, its file holding
-    every refresh it took."""
+    every refresh it took and its final sample at 2.5 s."""
     _, held = _frontend(started, None, stop="SIGTERM")
     written = _instants(tmp_path / "metrics-frontend.om.gz", "standalone", "frontend")
     assert written == _of_table(held, "frontend")
     said = json.loads((tmp_path / "lp-frontend.json").read_text())
     assert said["stopped"] == "SIGTERM"
+
+
+def test_a_client_run_s_end_takes_no_final_sample(files, started, tmp_path):
+    """A client run that ends at 1.5 s, between the engine's pushes, hands in
+    with no sample and no series; the series the finish writes have no point
+    there."""
+
+    def loop(push, steps):
+        steps()
+        clock.installed().client_run_ended(0)
+        push(2.0)
+        _finish(clock.installed())
+
+    _engine(files, started, None, loop)
+    said = json.loads((tmp_path / "client-0" / "lp-engine.json").read_text())
+    assert said["refusals"] == []
+    assert not list((tmp_path / "client-0").glob("metrics-*"))
+    written = _instants(tmp_path / "metrics-engine.om.gz", "standalone", "frontend")
+    assert list(written) == [0.0, 1.0, 2.0]
+
+
+def test_a_final_sample_that_raises_is_skipped_and_named(
+    monkeypatch, files, started, tmp_path
+):
+    """An engine whose final sample raises still writes the series it sampled
+    and hands in, the final sample's error among its reasons."""
+
+    def vanished(pids):
+        raise FileNotFoundError("a worker's file went")
+
+    def loop(push, steps):
+        steps()
+        push(2.0)
+        monkeypatch.setattr(metrics, "_merged", vanished)
+        clock.installed().now = 2.25
+        _finish(clock.installed())
+
+    _engine(files, started, None, loop)
+    written = _instants(tmp_path / "metrics-engine.om.gz", "standalone", "frontend")
+    assert list(written) == [0.0, 1.0, 2.0]
+    said = json.loads((tmp_path / "lp-engine.json").read_text())
+    raised = 'FileNotFoundError("a worker\'s file went")'
+    assert said["refusals"] == [f"metrics:engine final sample at 2.25 raised {raised}"]
+
+
+def test_an_lp_keeps_the_clock_it_reached_before_the_end(started):
+    """The ``+inf`` grant that ends a frontend's run at 2.5 s and releases a
+    request arriving at 2.75 s leaves it the clock 2.75 s it walked to."""
+    rt = started("frontend")
+    rt.now = 2.5
+    _finish(rt, {"traffic->frontend:http": [(0, 2.75)]})
+    assert (rt.now, rt.before_inf) == (INF, 2.75)
 
 
 def test_a_sample_that_moves_its_lp_s_clock_is_refused(monkeypatch, files, started):
