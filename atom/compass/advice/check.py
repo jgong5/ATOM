@@ -520,7 +520,7 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                 verdicts = config, config
             else:
                 law = _or_refused(reuse.law, store, config, machine, args, atom)
-                readings = _or_refused(reuse.readings, store, config, machine)
+                readings = _or_refused(reuse.readings, store, config, machine, law)
                 if law["verdict"] == "calibrate" and side in drive_run.ROLES:
                     fits = lacking.FITS.values()
                     law["made_by"] = [

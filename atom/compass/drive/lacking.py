@@ -224,7 +224,9 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
         and met(grid, made, step_grid.load, run[STEP_GRID], config, machine)
     )
     made = measure_memory(args.store, real or atom_args, env)
-    read = met("memory readings", made, memory.load, run["store"], config, machine, 0)
+    carried = runfile.carried(runfile.priced_by(args))
+    given = run["store"], config, machine, 0, carried
+    read = met("memory readings", made, memory.load, *given)
     if read and (why := stale_page_bound(read, config)):
         lacks.append(("memory readings", "stale", why, made))
 
