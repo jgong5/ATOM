@@ -22,6 +22,7 @@ import pytest
 from test_drive_gpu import FREE, GPU45, LISTING, _kfd, _plant
 from test_launcher_held_ports import HELD, _squat
 
+from atom.compass.backends.step_labels import CLOCK
 from atom.compass.drive import gpu as drive_gpu
 from atom.compass.drive import serve
 from atom.compass.drive.gpu import GpuRefusal
@@ -124,6 +125,13 @@ def _ready(out: Path, driver, polls: int, poll_s: float) -> dict:
     pytest.fail(f"no {serve.READY_FILE} after {polls * poll_s} s")
 
 
+def _on_this_hosts_clocks(pair) -> bool:
+    """Does `pair`, wall and monotonic nanoseconds read together, place wall
+    time on the monotonic clock as this host does, to 1 ms?"""
+    wall, monotonic = pair
+    return abs(wall - monotonic - (time.time_ns() - time.monotonic_ns())) < 1_000_000
+
+
 def test_a_server_runs_atom_arguments_verbatim_on_its_gpus_between_the_checks(
     planted, monkeypatch
 ):
@@ -147,6 +155,7 @@ def test_a_server_runs_atom_arguments_verbatim_on_its_gpus_between_the_checks(
     assert (out / "gpu_before.txt").exists() and (out / "gpu_after.txt").exists()
     ready = json.loads((out / serve.READY_FILE).read_text())
     assert ready.pop("pid") > 0
+    assert _on_this_hosts_clocks(ready.pop(CLOCK))
     assert ready == {"url": f"http://127.0.0.1:{assigned['--server-port']}"}
     assert "planted server up" in (out / serve.LOG_FILE).read_text()
     engine = out / serve.STEPS / "dp0.engine.json"
@@ -293,6 +302,7 @@ def test_a_simulated_server_gets_its_run_file_and_clock_and_no_gpu_check(
     assert not (out / "gpu_before.txt").exists()
     ready = json.loads((out / serve.READY_FILE).read_text())
     assert ready.pop("pid") > 0
+    assert _on_this_hosts_clocks(ready.pop(CLOCK))
     assert ready == {
         "url": f"http://127.0.0.1:{assigned['--server-port']}",
         "clock_endpoint": run["clock_endpoint"],

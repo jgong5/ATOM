@@ -57,7 +57,7 @@ from atom.compass import parity
 from atom.compass.backends.step_labels import CLOCK, TRACE
 from atom.compass.drive import jit_cache
 from atom.compass.drive.gpu import KFD, hip_visible, quiet
-from atom.compass.drive.identity import _device, _stack, identity
+from atom.compass.drive.identity import _device, _stack, clock_ns, identity
 from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _machine, _write_whole
 from atom.utils.arg_parser import FlexibleArgumentParser
 
@@ -248,7 +248,7 @@ def serve(
                 if trace:
                     _post(host, server_port, "/start_profile", STOP_GRACE_S)
                 ready["pid"] = server.pid
-                ready[CLOCK] = [time.time_ns(), time.monotonic_ns()]
+                ready[CLOCK] = clock_ns()
                 _write_whole(out / READY_FILE, json.dumps(ready))
             while not stopped and server.poll() is None:
                 time.sleep(POLL_S)
