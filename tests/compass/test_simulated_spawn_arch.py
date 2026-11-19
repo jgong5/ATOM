@@ -118,7 +118,7 @@ def test_atom_s_own_simulated_engine_starts(model_dir, tmp_path):  # noqa: F811
         env=dict(os.environ, PYTHONPATH=str(serve.TREE)),
     )
     try:
-        assert _ready(out, driver, 600, 0.5)["pid"]
+        assert _ready(out, driver)["pid"]
     finally:
         driver.send_signal(signal.SIGTERM)
         driver.wait(timeout=120)

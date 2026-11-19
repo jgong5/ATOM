@@ -277,7 +277,7 @@ def test_a_trace_run_profiles_from_before_its_ready_file_to_its_stop(
         [sys.executable, "-c", DRIVE, str(planted / "server.py"), str(out), *ARGS],
         env=env,
     )
-    _ready(out, driver, 600, 0.05)
+    _ready(out, driver)
     assert (planted / "posts").read_text() == "/start_profile False\n"
     driver.send_signal(signal.SIGTERM)
     assert driver.wait(timeout=60) == 0
