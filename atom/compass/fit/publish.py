@@ -207,7 +207,7 @@ def _floor(store, runs, measurements, ptl) -> float:
         on = platform_of(device, run["stack"], run.get("ptl", ptl))
     else:
         on = _keyed(measurements)
-    key, entry = readings(store, on["device"], on["ptl"], stack_of(on))
+    key, entry, _ = readings(store, on["device"], on["ptl"], stack_of(on))
     if FLOOR not in entry:
         raise ValueError(f"{key} as {key.token()} states no {FLOOR}, which --ops takes")
     return entry[FLOOR]

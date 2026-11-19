@@ -14,16 +14,14 @@ in the stub tree `test_calibrate` runs `calibrate.sh` in. A side of a
 and host laws instead.
 """
 
-import json
 import os
 import re
 import shlex
 import subprocess
-import sys
 
 import platforms
 import pytest
-from test_calibrate import _tree
+from test_calibrate import _path, _tree
 from test_memory_readings import DOCUMENT
 from test_run_check_side import checked, pair, side_args
 from test_run_lacking import served
@@ -32,6 +30,7 @@ from test_run_step_grid import deployment
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
+from atom.compass.backends.json_file import read_json
 from atom.compass.drive import lacking
 from atom.compass.drive import run as drive_run
 from atom.compass.runner.overrides import schedulable_ladder
@@ -44,7 +43,7 @@ TEMPLATE |= {"max_num_batched_tokens": 16384, "speculative_config": mtp(3)}
 TP8 = ["-tp", "8", "--max-num-seqs", "512", "--max-num-batched-tokens", "16384"]
 #: A token no store entry has.
 ABSENT = "0123456789ab"
-UNKNOWN = "expected time: unknown, as calibrate.sh records no calibration's time"
+UNKNOWN = "expected time: unknown, as no earlier calibration's status is read for it"
 
 
 @pytest.fixture(autouse=True)
@@ -61,7 +60,7 @@ def printed(tmp_path, monkeypatch, capsys, atom_args, *flags, law=None, **config
     makes it, as printed, and each line printed after it."""
     r = deployment(tmp_path, **config)
     served(monkeypatch, r.config)
-    at = json.loads(law.read_text())["platform"] if law else None
+    at = read_json(law)["platform"] if law else None
     common = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path, at=at)
     common += ["--store", str(tmp_path / "store"), *flags]
     given = ["--step-linear", str(law or ABSENT), *common, "--check", "--"]
@@ -201,7 +200,7 @@ def test_the_printed_command_runs_as_printed(tmp_path, monkeypatch, capsys):
     # The command states the clients' variables: the shell it runs in has none.
     env = {k: v for k, v in os.environ.items() if k not in lacking.CLIENT_ENV}
     env |= {"LOG": str(tmp_path / "log")}
-    env["PATH"] = f"{os.path.dirname(sys.executable)}:{env['PATH']}"
+    env["PATH"] = _path(tmp_path)
 
     r = subprocess.run(
         ["bash", "-c", command],
@@ -244,8 +243,8 @@ def test_a_deployment_side_lacking_its_laws_prints_deploy_sh_record_and_a_fit(
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
     atom_args = side_args(tmp_path, monkeypatch, side)
-    # A host other than the host laws'.
-    monkeypatch.setattr(compass_run, "host_cpu", lambda: "another CPU")
+    # A tree other than the one the host laws' key states.
+    monkeypatch.setattr(compass_run, "atom_digest", lambda: "0" * 64)
 
     assert checked(pair(tmp_path), side, atom_args) == 1
 

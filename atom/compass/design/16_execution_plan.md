@@ -264,7 +264,7 @@ atom/compass/
   bench/      the step bench: replay by rule, the window, measure; the op bench
   fit/        samples for fit and publishing; each backend owns its fit
   validate/   grading: whether a client run is gradeable, the separable results
-  metrics/    per-step sampling, backfill
+  metrics/    not built: the series is run/metrics.py, its report in report/ (11 D74)
   kv/         simulated KV connector
   cli.py      the `compass` console script, registered in pyproject.toml (13 D80); it parses and dispatches only
 tests/compass/          mirrors the above
@@ -446,9 +446,11 @@ covered). The rule it applies: an `atom` module named by an excluded test is a b
 **unless a CPU-gate test that actually runs names it too**. A module both gates import is
 covered when the CPU gate runs, so triggering on it would make the gate cry wolf. A trailing
 `/` matches a subtree. `gate_cpu.sh` matches the diff against that file and **exits 98 unless
-`COMPASS_GPU_GATE_DONE` names this tree's own HEAD**; where it can compute neither a diff nor
-a supplied file list — a `git archive` snapshot with no `.git` — it refuses rather than
-reporting "not required", per principle 6.
+`COMPASS_GPU_GATE_DONE` names this tree's own HEAD, or a tree whose diff from this one touches
+no trigger**, read from git or from a snapshot's `.compass-gpu-carry` stamp (the
+[ruling on #3590](https://github.com/jgong5/ATOM/issues/3590#issuecomment-6910498913)); where
+it can compute neither a diff nor a supplied file list — a `git archive` snapshot with no
+`.git` — it refuses rather than reporting "not required", per principle 6.
 
 The rule has three parts. One was forced by a counter-example measured in this tree, one is
 what kept the headline example at `236abfd9a`, and one changed no path there:
@@ -592,7 +594,7 @@ Depends on Wave 1. The first three are the vertical slice.
 | **W2.3** | Simulated KV connector registered into ATOM's existing factory; `latency + bytes/bandwidth` from the spec | `kv/` | 250–400 | W1.7 |
 | **W2.4** | Artifact store: keys, digests, source-root fingerprints, the invalidation matrix | `artifacts/` | 500–700 | W1.7 |
 | **W2.5** | ~~`FakeTensorMode` capture with the three mandatory disciplines and post-trace assertions; guard-domain evaluation~~ **Superseded by concrete capture** since 2026-10-18 (#1489): one graph per decode width and prefill (T, B), with no disciplines and no guard domain (`04` D18, D19); carried by S3c.8 and S3d.12 | `capture/` | ~~500–800~~ | W1.10, **P0.4** |
-| **W2.6** | Metrics under virtual time: per-step sampling, the class taxonomy, OpenMetrics backfill | `metrics/` | 300–500 | W2.1 |
+| **W2.6** | Metrics under virtual time: ~~per-step sampling~~, the class taxonomy, OpenMetrics backfill. **Revised 2026-11-16** ([#3584](https://github.com/jgong5/ATOM/issues/3584)): each engine and frontend LP samples at ATOM's metrics timer, the class taxonomy as the sampler's class table, the backfill into CI's Prometheus report (`11` D74, D77, *The first build*); carried by #3585 to #3587 | ~~`metrics/`~~ `run/`, `runner/`, `report/` | 300–500 | W2.1 |
 | **W2.7** | Determinism test: byte-diff of two step tables from one configuration, in CI (`01` D3.4) | `tests/compass/` | ~100 | W2.1 |
 | **W2.8** | Model construction under `FakeTensorMode` with `--load_dummy empty` (`02` D10.1), including the buffer audit of T68 | `runner/` | 200–350 | W2.5 |
 

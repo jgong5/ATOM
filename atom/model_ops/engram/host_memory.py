@@ -5,7 +5,8 @@
 table's values and, when quantized, its block scales) and returns them as
 page-locked tensors -- copied into `hipHostMalloc` memory of exactly their
 size, or (`ATOM_ENGRAM_UVA_COPY=0`, or no HIP runtime) the checkpoint mapping
-registered in place.
+registered in place. `to_device` copies them into HBM instead
+(`ATOM_ENGRAM_UVA_HBM`); nothing below about releasing applies to that.
 
 Ownership: each returned tensor's storage holds the lease on its memory, so
 the memory is released when the last tensor viewing it is collected -- never
@@ -104,17 +105,31 @@ class _HipHostAllocator:
         self._free(ptr)
 
 
+def _torch_hip_runtime() -> str:
+    """The one `libamdhip64` file this process maps: torch's, since its
+    import. OSError when it maps none or several."""
+    with open("/proc/self/maps") as maps:
+        names = {"".join(line.split(maxsplit=5)[5:]).strip() for line in maps}
+    hip = [n for n in sorted(names) if os.path.basename(n).startswith("libamdhip64.so")]
+    if len(hip) != 1:
+        raise OSError(f"libamdhip64 files mapped: {hip}")
+    return hip[0]
+
+
 def _host_allocator():
     """The page-locked allocator a shard is copied into, or None to register
-    the checkpoint mapping in place (`ATOM_ENGRAM_UVA_COPY=0`, or no HIP
-    runtime to call)."""
+    the checkpoint mapping in place (`ATOM_ENGRAM_UVA_COPY=0`, or no single
+    HIP runtime of torch's to bind: one loaded by name can be a second
+    runtime, whose page-locked memory torch's copies fault on)."""
     if not envs.ATOM_ENGRAM_UVA_COPY or not torch.version.hip:
         return None
     try:
-        return _HipHostAllocator(
-            ctypes.CDLL("libamdhip64.so"), ctypes.CDLL(None, use_errno=True)
+        hip = ctypes.CDLL(_torch_hip_runtime(), mode=os.RTLD_NOLOAD)
+        return _HipHostAllocator(hip, ctypes.CDLL(None, use_errno=True))
+    except OSError as e:
+        logger.info(
+            "engram: torch's HIP runtime not bound, registering in place: %s", e
         )
-    except OSError:
         return None
 
 
@@ -415,6 +430,66 @@ def _copy(allocator, sources, leases):
     finally:
         if pool is not None:
             pool.shutdown()
+
+
+def to_device(sources: list[torch.Tensor], device) -> tuple[torch.Tensor, ...] | None:
+    """`sources` (contiguous row ranges) copied into HBM on `device`, as
+    tensors of the same dtype and shape; all-or-nothing, None on any failure
+    (no HBM, no page-locked bounce chunk) so the TP group can fall back as one.
+
+    The host holds one page-locked bounce chunk of at most `_HBM_BOUNCE_BYTES`:
+    each chunk of a source is copied into it (`_copy_into`), then to the
+    device, and its checkpoint pages are dropped (`_source_dropper`).
+    """
+    try:
+        return _to_device(sources, device)
+    except Exception:  # any failure is a fallback
+        logger.warning("engram: copying the UVA shard into HBM failed", exc_info=True)
+        return None
+
+
+# The most page-locked host memory an HBM copy holds at a time.
+_HBM_BOUNCE_BYTES = 1 << 30
+
+
+def _bounce(nbytes: int) -> torch.Tensor:
+    """`nbytes` page-locked by torch's own allocator.
+    `device="cpu"`: under the CUDA default device the model is built with, a
+    bare `pin_memory=True` asks for a CUDA tensor and raises.
+    """
+    return torch.empty(nbytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+
+
+def _to_device(sources, device):
+    largest = max(s.numel() * s.element_size() for s in sources)
+    size = max(1, min(_HBM_BOUNCE_BYTES, largest))
+    bounce = _bounce(size)
+    threads = copy_threads(size)
+    pool = ThreadPoolExecutor(threads) if threads > 1 else None
+    try:
+        out = []
+        for src in sources:
+            flat = _as_bytes(src)
+            dst = torch.empty(flat.numel(), dtype=torch.uint8, device=device)
+            drop = _source_dropper(src)
+            try:
+                for o, n in _chunks(flat.data_ptr(), flat.numel(), size):
+                    _copy_into(bounce[:n], flat[o : o + n], pool)
+                    # Synchronous, so the bounce chunk is free to refill.
+                    dst[o : o + n].copy_(bounce[:n])
+                    if drop is not None:
+                        drop(o, n)
+            finally:
+                if drop is not None:
+                    drop.close()
+            out.append(dst.view(src.dtype).view(src.shape))
+        return tuple(out)
+    finally:
+        if pool is not None:
+            pool.shutdown()
+        del bounce
+        # Free the bounce chunk now, not cache it page-locked for the process.
+        torch._C._host_emptyCache()
 
 
 def _register(sources, leases):

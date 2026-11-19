@@ -15,8 +15,10 @@ refuses them, and the clock endpoint flag, among ATOM's arguments; an op graph
 run's file also holds ATOM's arguments, from which its engines trace a shape
 the store lacks (`run.ATOM_ARGS`). A simulated server whose run file names
 a machine starts under `on_arch`, which imports aiter as on that machine's
-device first, so the server resolves its config, an FP8 quantization's dtype
-among it, as there, whatever device this host has. Each start
+device first, in the server and in every process it spawns, so the server
+resolves its config, an FP8 quantization's dtype among it, and its engines and
+workers start as there, whatever device this host has, a host with none
+included. Each start
 takes a free `ATOM_DP_MASTER_PORT`: the port keys ATOM's compiled-graph cache,
 and the first start that loads that cache autotunes every graph's kernels
 again, whose configs stay loaded and read in `non_torch`. No later start loads
@@ -294,18 +296,23 @@ def _model(atom_args) -> str:
     return model
 
 
-def log_more(atom_args) -> dict:
-    """`LOG_MORE` when ATOM's arguments run DP and TP both above 1, else
-    nothing, so any other start logs in the format its environment gives.
-    Under DP attention ATOM makes each TP rank a DP rank and runs TP 1."""
+def widths(atom_args) -> argparse.Namespace:
+    """The TP and DP sizes ATOM's arguments state, and whether they run DP
+    attention, under which ATOM makes each TP rank a DP rank and runs TP 1."""
     parser = FlexibleArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
     parser.add_argument("--data-parallel-size", "-dp", type=int, default=1)
     parser.add_argument("--enable-dp-attention", action="store_true")
-    widths = parser.parse_known_args(atom_args)[0]
-    if widths.enable_dp_attention:
+    return parser.parse_known_args(atom_args)[0]
+
+
+def log_more(atom_args) -> dict:
+    """`LOG_MORE` when ATOM's arguments run DP and TP both above 1, else
+    nothing, so any other start logs in the format its environment gives."""
+    stated = widths(atom_args)
+    if stated.enable_dp_attention:
         return {}
-    if widths.tensor_parallel_size > 1 and widths.data_parallel_size > 1:
+    if stated.tensor_parallel_size > 1 and stated.data_parallel_size > 1:
         return LOG_MORE
     return {}
 

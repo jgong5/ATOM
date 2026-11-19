@@ -4,9 +4,13 @@
 `lacking` resolves the run's inputs as `runfile.build`, the runner and the
 server do, calling per input the function whose refusal the run would meet,
 so one lacking input hides no other: the platform, its datasheet and readings
-(`runfile.spec`); each store key or law
-file a flag names (`runfile.resolve`); a step linear law and host laws held
-against this run's engine config, widths, platform and host key
+(`runfile.spec`); a step stub's file, read as `runfile.build` reads it, and its
+`Coefficients` as the runner builds them; an ``lmcache_offload`` entry's file,
+read as `runfile.build` reads it, or its absence, held to this deployment as
+the engine holds it (`run.refuse_offload_tier`, `lmcache_offload.tier_config`);
+each store key or law file a flag
+names (`runfile.resolve`); a step linear law and host laws held against this
+run's engine config, widths, platform and host key
 (`run.pick_fitted`, `run.refuse_unfitted_law`, `run.refuse_unfitted_host`),
 and to the prefill token-graph buckets it records (`run.refuse_other_buckets`),
 and the step linear law's decode vectors against the rungs this configuration
@@ -26,8 +30,8 @@ Each lacking input is printed with the command that makes it. A step linear
 law's is the `calibrate.sh` command that records and fits one for this
 configuration (`calibration`), into `--out`, or `cal` in the current directory
 without one, naming each client variable it requires that this environment
-does not set, with its expected time, unknown while no calibration records its
-time.
+does not set, with its expected time, unknown, as no earlier calibration's
+status is read for it.
 
 A prefill or decode instance's run reads a network file across nodes, as
 `deploy.sh run` hands it one, and its readings command takes the ATOM
@@ -60,9 +64,12 @@ from atom.compass.artifacts import (
     machine_platform,
 )
 from atom.compass.backends.step_linear_plan import records, scheduled_rungs
+from atom.compass.backends.step_stub import Coefficients
 from atom.compass.drive import runfile, serve
+from atom.compass.kv.lmcache_offload import ENTRY as OFFLOAD
+from atom.compass.kv.lmcache_offload import tier_config
 from atom.compass.memory.readings import PAGE_BOUND
-from atom.compass.run import OP_GRAPH, PRICE_LIST, STEP_GRID, STEP_LINEAR
+from atom.compass.run import OP_GRAPH, PRICE_LIST, STEP_GRID, STEP_LINEAR, STEP_STUB
 from atom.compass.runner.overrides import schedulable_bound, schedulable_ladder
 from atom.compass.spec import SpecRefusal
 
@@ -76,6 +83,9 @@ NAMES = {
 #: The commands that make each input.
 MADE_BY = {
     "platform": "compass measure device on each node, then compass fit device",
+    STEP_STUB: "a JSON file of the stated fields of backends.step_stub.Coefficients",
+    OFFLOAD: "python -m atom.compass.backends.step_linear_fit offload LOG... --out "
+    "ENTRY, on real runs' server logs at OFFLOAD_PROFILE=1",
     STEP_GRID: "compass trace steps, compass measure steps --grid, then compass "
     "fit steps --backend step-grid",
     "host": "compass record, then compass fit host",
@@ -162,6 +172,24 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     elif STEP_LINEAR in flags:
         out = args.out or CALIBRATION_OUT
         made_by[STEP_LINEAR] = calibration(out, atom_args, config)
+    if stub := getattr(args, STEP_STUB):
+        try:
+            Coefficients(**json.loads(Path(stub).read_text()))
+        except (OSError, TypeError, ValueError) as unread:
+            lacks.append(
+                (f"step stub {stub}", "missing", str(unread), made_by[STEP_STUB])
+            )
+    entry, path = {}, args.lmcache_offload
+    try:
+        if path:
+            entry[OFFLOAD] = json.loads(Path(path).read_text())
+        compass_run.refuse_offload_tier(config, entry)
+        if OFFLOAD in entry:
+            tier_config(entry[OFFLOAD], config)
+    except (OSError, TypeError, ValueError) as refused:
+        name = f"{OFFLOAD} entry" + (f" {path}" if path else "")
+        state = "stale" if entry else "missing"
+        lacks.append((name, state, str(refused), made_by[OFFLOAD]))
     for name, tokens in (flags | {"host": args.host_laws or []}).items():
         tokens, held = [tokens] if isinstance(tokens, str) else tokens, []
         for token in tokens:
@@ -204,13 +232,11 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
         met(grid, made, compass_run.refuse_context_parallel, STEP_GRID, config)
         and met(grid, made, step_grid.load, run[STEP_GRID], config, machine)
     )
-    made = MADE_BY["memory readings"].format(
-        store=args.store, atom=shlex.join(real or atom_args)
-    )
-    made = " ".join([*(f"{k}={shlex.quote(v)}" for k, v in (env or {}).items()), made])
-    read = met("memory readings", made, memory.load, run["store"], config, machine, 0)
-    if read and PAGE_BOUND not in read.values and _reads_page_bound(config):
-        why = f"{read.source} states no {PAGE_BOUND}, which an fp4 V4.1 start reads"
+    made = measure_memory(args.store, real or atom_args, env)
+    carried = runfile.carried(runfile.priced_by(args))
+    given = run["store"], config, machine, 0, carried
+    read = met("memory readings", made, memory.load, *given)
+    if read and (why := stale_page_bound(read, config)):
         lacks.append(("memory readings", "stale", why, made))
 
     if getattr(args, OP_GRAPH):
@@ -240,6 +266,22 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     if args.step_roofline or STEP_GRID in flags:
         apart += _unclassified(atom_args, arch)
     return lacks, apart
+
+
+def measure_memory(store, atom_args, env=None) -> str:
+    """The command that measures the memory readings of a start under ATOM's
+    arguments `atom_args` into `store`, run under the variables `env`."""
+    made = MADE_BY["memory readings"].format(store=store, atom=shlex.join(atom_args))
+    return " ".join([*(f"{k}={shlex.quote(v)}" for k, v in (env or {}).items()), made])
+
+
+def stale_page_bound(read, config) -> str | None:
+    """Why the memory readings `read` are stale for a start of `config`: it
+    reads the PAGE bound (`_reads_page_bound`), and they state none; else
+    None."""
+    if PAGE_BOUND in read.values or not _reads_page_bound(config):
+        return None
+    return f"{read.source} states no {PAGE_BOUND}, which an fp4 V4.1 start reads"
 
 
 def _reads_page_bound(config) -> bool:
@@ -318,15 +360,16 @@ def _ladder(config) -> list[int]:
     return [] if config.enforce_eager else schedulable_ladder(config)
 
 
-def calibration(out, atom_args, config) -> str:
+def calibration(out, atom_args, config, store=None) -> str:
     """The `calibrate.sh` command that records and fits a step linear law for
-    `config`, ATOM's arguments `atom_args` resolved, into `out`, then its
-    expected time: the records `step_linear_plan.records` plans, the trace
-    runs only where `compass record --trace` takes one; on as many GPUs as
-    ATOM's ranks use; under this process's environment as a law's key states
-    it (`keyed_env`), and each of `CLIENT_ENV` it sets, then a line naming each
-    it does not, which `calibrate.sh` refuses to run without. Where
-    `calibrate.sh` cannot take ATOM's arguments, why."""
+    `config`, ATOM's arguments `atom_args` resolved, into `out`, publishing
+    into `store` when given, else into its own, then its expected time: the
+    records `step_linear_plan.records` plans, the trace runs only where
+    `compass record --trace` takes one; on as many GPUs as ATOM's ranks use;
+    under this process's environment as a law's key states it (`keyed_env`),
+    and each of `CLIENT_ENV` it sets, then a line naming each it does not,
+    which `calibrate.sh` refuses to run without. Where `calibrate.sh` cannot
+    take ATOM's arguments, why."""
     from atom.compass.drive.record import refuse_trace
     from atom.compass.run.step_grid import keyed_env
 
@@ -362,13 +405,15 @@ def calibration(out, atom_args, config) -> str:
         "GPU": ",".join(map(str, range(gpus))),
         "SERVER_ARGS": " ".join(server),
     }
+    if store is not None:
+        env["STORE"] = str(store)
     words = [f"{k}={shlex.quote(v)}" for k, v in env.items()]
     words += map(shlex.quote, [str(CALIBRATE), str(Path(out).resolve()), *planned])
     return (
         " ".join(words)
         + unheld
         + untraced
-        + "\n  expected time: unknown, as calibrate.sh records no calibration's time"
+        + "\n  expected time: unknown, as no earlier calibration's status is read for it"
     )
 
 

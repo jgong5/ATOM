@@ -20,7 +20,9 @@ import pytest
 from test_artifact_invalidation import STANZA, moved
 from test_capture_v4_pro import CONFIG as V4_PRO
 from test_drive_runfile import LAWS as HOST_LAWS
+from test_law_file_readings import law_member
 from test_memory_readings import READINGS, publish_readings
+from test_page_bound_reading import V41
 from test_run_check_side import (
     DECODE_SIZES,
     MACHINE,
@@ -36,7 +38,7 @@ from test_run_step_grid import DOCUMENT, PLATFORM, deployment, host_laws_key, re
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import cli
 from atom.compass import run as compass_run
-from atom.compass.advice.check import REUSE
+from atom.compass.advice.check import REUSE, STATES
 from atom.compass.artifacts import (
     ArtifactStore,
     Axis,
@@ -47,8 +49,12 @@ from atom.compass.artifacts import (
     keyed_platform,
     member_name,
 )
+from atom.compass.backends.json_file import read_json
+from atom.compass.bench import ops
 from atom.compass.drive import reuse
+from atom.compass.drive import run as drive_run
 from atom.compass.fit.publish import RANK
+from atom.compass.memory.readings import PAGE_BOUND
 from atom.compass.run import memory
 from atom.compass.run.step_grid import keyed
 
@@ -72,9 +78,19 @@ def searched(tmp_path, monkeypatch, at_head):
     whose digest is the tree's, with no law file."""
     r = deployment(tmp_path, **COVERED)
     served(monkeypatch, r.config)
+    resolved_here(monkeypatch, lambda atom_args: r.config)
     monkeypatch.setattr(reuse, "LAWS", tmp_path / "laws")
     (tmp_path / "laws").mkdir()
     return r
+
+
+def resolved_here(monkeypatch, resolve):
+    """Each instance's config `resolve(atom_args)`, resolved in this process
+    rather than in the check's child."""
+    monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(
+        drive_run, "_declared", lambda atom_args, arch: resolve(atom_args)
+    )
 
 
 def advise(tmp_path, document=DOCUMENT, **fields) -> dict:
@@ -108,7 +124,7 @@ def law(r, **changed) -> dict:
     """The DPA8 decode law re-keyed to `r`'s config and platform at this
     tree's ATOM digest, each source's figures within the gate, with
     `changed`."""
-    held = json.loads(DPA8.read_text())
+    held = read_json(DPA8)
     held["engine_config"] = keyed(r.config)
     held["platform"] = keyed_platform(Kind.STEP_LINEAR_LAW, PLATFORM)
     held["host"]["key"] = compass_run.host_key(r.config)
@@ -177,11 +193,8 @@ def test_a_law_and_readings_at_the_head_s_key_are_reused_at_every_point(
 
     judged = advise(tmp_path)
 
-    assert (
-        verdicts(judged, "law")
-        == [{"verdict": "reuse", "requirement": None, "reason": where, "law": where}]
-        * 2
-    )
+    reused = {"verdict": "reuse", "requirement": None, "reason": where, "law": where}
+    assert verdicts(judged, "law") == [reused | {"run": [where, where]}] * 2
     assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
     assert judged["candidates"]["a"]["store"] == str(tmp_path / "store")
     out = capsys.readouterr().out
@@ -196,7 +209,6 @@ def test_a_law_and_readings_at_the_head_s_key_are_reused_at_every_point(
         ("a law file at another digest", "calibrate", "states ATOM digest 000000"),
         ("a store law at another digest", "calibrate", "never re-keyed"),
         ("no host laws beside a store law", "calibrate", "has no host laws beside"),
-        ("host laws of another CPU", "refused", "fitted on another CPU, and"),
     ],
 )
 def test_a_law_at_another_key_names_requirement_1(
@@ -211,17 +223,49 @@ def test_a_law_at_another_key_names_requirement_1(
         law_file(tmp_path, held)
     elif case == "a store law at another digest":
         stored(tmp_path, r, atom="0" * 64)
-    elif case == "no host laws beside a store law":
-        stored(tmp_path, r, host=False)
     else:
-        held = law(r)
-        held["host"]["key"]["host_cpu"] = "another CPU"
-        law_file(tmp_path, held)
+        stored(tmp_path, r, host=False)
 
     found = verdicts(advise(tmp_path), "law")
 
     assert [(v["verdict"], v["requirement"]) for v in found] == [(verdict, 1)] * 2
     assert named in found[0]["reason"]
+
+
+def test_a_law_file_s_host_laws_fitted_on_another_cpu_are_reused(tmp_path, searched):
+    held = law(searched)
+    held["host"]["key"]["host_cpu"] = "another CPU"
+    where = law_file(tmp_path, held)
+
+    found = verdicts(advise(tmp_path), "law")
+
+    assert [(v["verdict"], v["reason"]) for v in found] == [("reuse", where)] * 2
+
+
+@pytest.mark.parametrize("calibrated", [False, True], ids=["reused", "calibrated"])
+def test_a_law_file_s_readings_serve_only_where_its_law_is_reused(
+    tmp_path, searched, calibrated
+):
+    # A calibration runs with the store law it publishes, which carries none.
+    held = law(searched) | {memory.LAW_MEMBER: law_member(searched)}
+    if calibrated:
+        for source in held["sources"].values():
+            source["figures"] = {}
+    where = law_file(tmp_path, held)
+    shutil.rmtree(tmp_path / "store" / Kind.MEMORY_READINGS.value)
+
+    judged = advise(tmp_path)
+
+    laws = {(v["verdict"], v["requirement"]) for v in verdicts(judged, "law")}
+    found = verdicts(judged, "readings")
+    if not calibrated:
+        assert laws == {("reuse", None)}
+        reason = f"in {where}'s {memory.LAW_MEMBER}"
+        assert [(v["verdict"], v["reason"]) for v in found] == [("reuse", reason)] * 2
+        return
+    assert laws == {("calibrate", 4)}
+    assert [(v["verdict"], v["requirement"]) for v in found] == [("measure", 1)] * 2
+    assert "no entry for memory_readings" in found[0]["reason"]
 
 
 @pytest.mark.parametrize("invalidated", [True, False])
@@ -239,11 +283,13 @@ def test_a_store_law_the_store_refuses_to_load_names_requirement_2(
         assert found["reason"].startswith(f"{where}: ")
         assert f"`{Kind.STEP_LINEAR_LAW}` x `{Axis.ATOM_SRC}`" in found["reason"]
     else:
+        host = Key.of(Kind.HOST_LAWS, **host_laws_key(r)).token()
         assert found == {
             "verdict": "reuse",
             "requirement": None,
             "reason": where,
             "law": where,
+            "run": [where.split()[1], host],
             "store": str(tmp_path / "store"),
         }
 
@@ -297,11 +343,74 @@ def test_a_law_with_a_source_stating_no_figures_names_requirement_4(tmp_path, se
 
     found, _ = verdicts(advise(tmp_path), "law")
 
+    (made_by,) = found.pop("made_by")
+    assert made_by.startswith("no calibrate.sh command: ")
     assert found == {
         "verdict": "calibrate",
         "requirement": 4,
         "reason": f"{where} states no cost-accuracy figures of source lone",
         "law": where,
+        "run": [where, where],
+    }
+
+
+def host_alone(r) -> dict:
+    """`law` with source shipped holding host laws alone and stating no
+    figures, as the crs005 DPA8 prefill law's does, its prefill vector moved
+    to source refitted."""
+    held = law(r)
+    shipped = held["sources"]["shipped"]
+    shipped["vectors"].remove("prefill")
+    del shipped["figures"]
+    held["sources"]["refitted"]["vectors"].append("prefill")
+    return held
+
+
+def test_a_source_of_host_laws_alone_needs_no_figures(tmp_path, searched):
+    where = law_file(tmp_path, host_alone(searched))
+
+    found = verdicts(advise(tmp_path), "law")
+
+    reused = {"verdict": "reuse", "requirement": None, "reason": where, "law": where}
+    assert found == [reused | {"run": [where, where]}] * 2
+
+
+def test_a_law_whose_sources_price_no_step_needs_its_own_figures(tmp_path, searched):
+    held = host_alone(searched)
+    held["sources"] = {"shipped": held["sources"]["shipped"]}
+    where = law_file(tmp_path, held)
+
+    found, _ = verdicts(advise(tmp_path), "law")
+
+    (made_by,) = found.pop("made_by")
+    assert made_by.startswith("no calibrate.sh command: ")
+    assert found == {
+        "verdict": "calibrate",
+        "requirement": 4,
+        "reason": f"{where} states no cost-accuracy figures",
+        "law": where,
+        "run": [where, where],
+    }
+
+
+@pytest.mark.parametrize("vectors", [["prefill"], ["prefill", "host"]])
+def test_a_source_of_the_prefill_vector_needs_figures(tmp_path, searched, vectors):
+    held = law(searched)
+    shipped = held["sources"]["shipped"]
+    shipped["vectors"] = vectors
+    del shipped["figures"]
+    where = law_file(tmp_path, held)
+
+    found, _ = verdicts(advise(tmp_path), "law")
+
+    (made_by,) = found.pop("made_by")
+    assert made_by.startswith("no calibrate.sh command: ")
+    assert found == {
+        "verdict": "calibrate",
+        "requirement": 4,
+        "reason": f"{where} states no cost-accuracy figures of source shipped",
+        "law": where,
+        "run": [where, where],
     }
 
 
@@ -336,6 +445,36 @@ def test_readings_with_no_entry_or_measured_at_another_digest_are_measured(
         assert "no entry for memory_readings" in found[0]["reason"]
     else:
         assert f"`{Kind.MEMORY_READINGS}` x `{Axis.ATOM_SRC}`" in found[0]["reason"]
+
+
+@pytest.mark.parametrize(
+    "index, reading, judged, state",
+    [
+        ("fp4", None, ("measure", 2), "missing readings"),
+        ("fp4", 3, ("reuse", None), "searchable"),
+        ("fp8", None, ("reuse", None), "searchable"),
+    ],
+    ids=["fp4-v41-without", "fp4-v41-with", "fp8-v41"],
+)
+def test_an_fp4_v41_entry_without_the_page_bound_reading_is_measured_as_check_finds_it(
+    tmp_path, searched, monkeypatch, index, reading, judged, state
+):
+    # Each start answers: a point the check would start is searchable.
+    monkeypatch.setattr("atom.compass.advice.check._start", lambda *args: None)
+    vars(searched.config).update(index_cache_dtype=index, hf_config=V41)
+    member = READINGS[1] | ({} if reading is None else {PAGE_BOUND: reading})
+    publish_readings(tmp_path / "store", searched.config, readings=member)
+    law_file(tmp_path, law(searched))
+
+    found = verdicts(advise(tmp_path), "readings")
+
+    assert {(v["verdict"], v["requirement"]) for v in found} == {judged}
+    points = json.loads((tmp_path / "out" / STATES).read_text())["a"]["points"]
+    assert {p["state"] for p in points.values()} == {state}
+    if judged[0] == "measure":
+        assert f"states no {PAGE_BOUND}, which an fp4 V4.1 start" in found[0]["reason"]
+        (made,) = {c for p in points.values() for c in p["made_by"]}
+        assert made.startswith("compass measure memory --gpu G --out D --store ")
 
 
 def test_a_candidate_is_looked_up_in_the_latest_calibration_store_holding_all_it_reads(
@@ -398,7 +537,7 @@ def test_a_calibration_store_holding_every_input_at_its_key_is_looked_up_whateve
     "case, looked_up, verdict, named, readings_verdict",
     [
         ("a reusable law", "b", ("reuse", None), "", "measure"),
-        ("host laws of another CPU", "b", ("refused", 1), "on another CPU", "reuse"),
+        ("host laws of another CPU", "b", ("reuse", None), "", "reuse"),
         ("past 5%", "b", ("refused", 4), "run at the head", "measure"),
         ("an older store holding every input", "a", ("reuse", None), "", "reuse"),
     ],
@@ -437,16 +576,14 @@ def test_with_no_store_holding_every_input_the_latest_a_law_is_read_from_is_look
 def test_a_store_no_law_is_read_from_is_passed_over_for_the_shared_store(
     tmp_path, searched
 ):
-    held = law(searched)
-    held["host"]["key"]["host_cpu"] = "another CPU"
-    law_file(tmp_path, held)
+    law_file(tmp_path, past(searched)[0])
     platforms.flags(tmp_path / "out/cal/x/store", DOCUMENT, tmp_path)
 
     judged = advise(tmp_path)
 
     assert judged["candidates"]["a"]["store"] == str(tmp_path / "store")
     found = verdicts(judged, "law")
-    assert [(v["verdict"], v["requirement"]) for v in found] == [("refused", 1)] * 2
+    assert [(v["verdict"], v["requirement"]) for v in found] == [("refused", 4)] * 2
     assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
 
 
@@ -456,7 +593,7 @@ def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, a
     model = tmp_path / "DeepSeek-V4-Pro"
     model.mkdir()
     shutil.copy(V4_PRO, model / "config.json")
-    cpu = json.loads(PAIR["prefill"].read_text())["host"]["key"]["host_cpu"]
+    cpu = read_json(PAIR["prefill"])["host"]["key"]["host_cpu"]
     monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
     common = {"basis": "a recipe", "deployment": "1p1d", "env": SHARED_ENV}
     common["args"] = {"--tensor-parallel-size": 8, "--kv-cache-dtype": "fp8"}
@@ -477,6 +614,47 @@ def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, a
         (reason,) = {v["reason"] for v in verdicts(judged, "readings", side)}
         assert '"index_cache_dtype": "fp8"' in reason
         assert '"AITER_LOG_LEVEL": "WARNING"' in reason
+
+
+@pytest.mark.parametrize(
+    "exported, given, level",
+    [
+        ("", {}, "WARNING"),
+        (None, {"AITER_LOG_LEVEL": ""}, "WARNING"),
+        ("", {"AITER_LOG_LEVEL": "INFO"}, "INFO"),
+    ],
+    ids=["exported empty", "empty in the space", "set in the space"],
+)
+def test_a_1p1d_side_runs_under_the_aiter_log_level_deploy_sh_starts_it_with(
+    tmp_path, monkeypatch, at_head, exported, given, level
+):
+    for name in PERFORMANCE_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    if exported is not None:
+        monkeypatch.setenv("AITER_LOG_LEVEL", exported)
+    model = tmp_path / "DeepSeek-V4-Pro"
+    model.mkdir()
+    shutil.copy(V4_PRO, model / "config.json")
+    cpu = read_json(PAIR["prefill"])["host"]["key"]["host_cpu"]
+    monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
+    common = {"basis": "a recipe", "deployment": "1p1d", "env": SHARED_ENV | given}
+    common["args"] = {"--tensor-parallel-size": 8, "--kv-cache-dtype": "fp8"}
+    common["args"]["--enable-dp-attention"] = True
+    common["prefill"] = {"args": {"--enable-tbo": True}, "env": SIDES["prefill"][1]}
+    common["decode"] = {"args": {"--cudagraph-capture-sizes": DECODE_SIZES}}
+
+    judged = advise(tmp_path, MACHINE, model=str(model), common=common)
+
+    # The pair's laws are keyed WARNING: each side finds its own there, else
+    # none at its key.
+    requirement = 3 if level == "WARNING" else 1
+    for side in UNCOVERED:
+        found = verdicts(judged, "law", side)
+        assert [(v["verdict"], v["requirement"]) for v in found] == [
+            ("calibrate", requirement)
+        ] * 2
+        (reason,) = {v["reason"] for v in verdicts(judged, "readings", side)}
+        assert f'"AITER_LOG_LEVEL": "{level}"' in reason
 
 
 def test_a_side_s_own_kv_transfer_config_is_refused_as_deploy_sh_refuses_it(

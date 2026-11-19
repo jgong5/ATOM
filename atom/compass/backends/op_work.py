@@ -30,7 +30,8 @@ rows, a gather's or a graph's, under expert parallelism the busiest rank's
 expected share, a fused shared expert every row aiter's top-k table deals it,
 a gather's pad rows too, at the format the op quantizes its rows to, and read
 each activated expert once; a DP exchange's group width is read off its own
-shapes. ATOM's Triton experts run as aiter's grouped GEMMs, each priced so, at
+shapes. aiter's comm-fused MoE adds the reduction across the group it states.
+ATOM's Triton experts run as aiter's grouped GEMMs, each priced so, at
 the activation format its kind names; their expert-parallel width is the run's
 `ep`, the experts `ep` times a rank's. On one rank a leaf's real rows are at
 most the view's tokens: the op-level backend hands a `ROUTED` leaf of a
@@ -319,6 +320,19 @@ def _fused_moe(op, view, tp, kv, ep) -> Work:
     io = _boundary(op).bytes - weights
     ran = max(routed / top, dealt)
     return Work(flops.flops_by_format, weights * groups / local + io * ran / rows)
+
+
+def _comm_fused(op, view, tp, kv, ep) -> Work:
+    """aiter's comm-fused MoE: the experts on `hidden_states`' rows as
+    `_fused_moe` prices them, and the reduction its stage 2 fuses, across the
+    `tp` ranks aiter built it for, of the experts' output at the rows' dtype:
+    by `comm` "rs" a reduce-scatter of the rows it holds, every rank's,
+    else an all-reduce of them, this rank's."""
+    args = op["args"]
+    hidden = args["hidden_states"]
+    nbytes = math.prod(hidden["shape"]) * _size(hidden["dtype"])
+    reduce = reduce_scatter if args["comm"] == "rs" else allreduce
+    return _fused_moe(op, view, tp, kv, ep) + reduce(args["tp"], nbytes)
 
 
 def _experts(act: str):
@@ -815,6 +829,7 @@ EXTRACTORS = {
     "atom.model_ops.triton_hash_topk:hash_topk_triton": _gather("tid2eid"),
     "aiter.fused_moe_.default": _fused_moe,
     "aiter.rocm_aiter_fused_moe.default": _fused_moe,
+    "aiter.ops.comm_fused_moe_runtime:CommFusedMoeRuntime.run": _comm_fused,
     "aiter._topk_softmax.default": _in_place(
         "topk_weights", "topk_indices", "token_expert_indices"
     ),
@@ -953,7 +968,8 @@ EXTRACTORS |= {
 #: Every kind whose extractor takes the EP width, as a fifth parameter.
 SHARDED = {n for n, f in EXTRACTORS.items() if len(inspect.signature(f).parameters) > 4}
 #: Every kind whose experts run the rows that route (`_routing`).
-ROUTED = {n for n, f in EXTRACTORS.items() if f is _fused_moe} | EXPERTS.keys()
+ROUTED = {n for n, f in EXTRACTORS.items() if f in (_fused_moe, _comm_fused)}
+ROUTED |= EXPERTS.keys()
 
 
 def work(

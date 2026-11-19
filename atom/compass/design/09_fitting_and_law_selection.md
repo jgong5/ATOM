@@ -23,6 +23,14 @@ law, counted (D60).
 key the device, the software stack and torch in place of the machine-spec digest, as
 `07`'s artifact key table keys them (D54, `07` D41).
 
+**Revised 2026-11-10 by [#2899](https://github.com/jgong5/ATOM/issues/2899):** a run
+predicts the host its host laws timed, from any CPU (D54).
+
+**Revised 2026-11-14 by the [Ruling on #3383](https://github.com/jgong5/ATOM/issues/3383#issuecomment-6870431423):** each equation is
+divided by its price under the fitted coefficients, not its label, iterated until the
+prices settle, and the MAD test reads the same residuals (D53); host laws drop no sample
+([Ruling](https://github.com/jgong5/ATOM/issues/3383#issuecomment-6891448532), 2026-11-15; D54, D57).
+
 **Scope.** How measurements become a model: objective, feature construction, outlier
 handling, guards, and how a functional form is chosen and shown to be right. This is a
 separate concern from the toolchain that produces the data and from the protocol that
@@ -53,14 +61,26 @@ steps from **17% to 9%**, doubled the median token count to **13,008** — and m
 
 ### Decision
 
-**Every equation is divided by its own target before fitting, and the MAD outlier test runs
-on the same relative residuals.**
+**Every equation is divided by its price under the fitted coefficients, and the MAD outlier
+test runs on the same relative residuals, a sample's price less its label, over its price.**
+The solve divides each equation by its own target first, as this decision first read;
+then, until no kept sample's price moves by more than the square root of the float epsilon
+of the price it was divided by, it divides each by its price under the vector reached and
+solves again. That is iteratively reweighted least squares for a Gamma model with identity
+link, so a law prices its samples' mean ([Ruling on #3383](https://github.com/jgong5/ATOM/issues/3383#issuecomment-6870431423), 2026-11-14).
 
 | prefill prediction | absolute fit | relative fit | measured |
 |---|---|---|---|
 | at 512 tokens | −11.8% | **−5.3%** | 32.53 ms |
 | at 2512 tokens | +18.3% | **+3.9%** | 43.78 ms |
 | median over 121 rows | 9.51% | **9.03%** | |
+
+**Divided by its label, a fit prices scattered samples low.** One shape's samples at once
+and twice a price are priced at 1.2 times it, `sum(1/y) / sum(1/y^2)`, against their mean,
+1.5 times. MiniMax-M3 TP4's c=4 tokenizer encode law priced its calibration records' lone
+encodes' total 4.2% low with each divided by its label, and 0.9% low with each divided by
+its price and none dropped ([#3383](https://github.com/jgong5/ATOM/issues/3383)). A sample priced at no time,
+which no equation can be divided by, ends the reweighting, and its residual drops it.
 
 ---
 
@@ -137,8 +157,9 @@ TP4 run and is refused at any other width, like any other layout field
 - **The fit: line-searched alternating max-affine regression.** The ranks wait for each
   other inside the forward, so a rank's measured step is the group's step and its own
   cost is never seen: the observation is `y = max_r f(x_r)`. The fit minimises
-  `F(c) = sum_i (max_r x_ir.c / y_i - 1)^2`, each equation divided by its target (D53),
-  under non-negative coefficients. It starts from the fit on every rank's row and, per
+  `F(c) = sum_i ((max_r x_ir.c - y_i) / s_i)^2`, each equation divided by its scale
+  `s_i`, its label in the first round and its price under the vector reached after it
+  (D53), under non-negative coefficients. It starts from the fit on every rank's row and, per
   feature that differs between some step's ranks, from that feature's axis scaled to the
   labels ([#3042](https://github.com/jgong5/ATOM/issues/3042): the fit on every rank's
   row alone settles in a local minimum on a real DP record). Each start runs the first
@@ -149,9 +170,11 @@ TP4 run and is refused at any other width, like any other layout field
   on every pass and the passes cannot cycle. They end settled, the refit assigning
   each step the rank it was fitted on, or at a tie between ranks, when no step larger
   than a numerical tolerance (the square root of the float epsilon, on the relative
-  prices) lowers `F`. MAD drops are its outer loop. A fit whose passes reach
+  prices) lowers `F`. Each kept step's scale then becomes its price and the passes rerun,
+  until no price moves (D53); `F` falls on every pass at one scale. MAD drops are its
+  outer loop. A fit whose passes reach
   `step_linear_fit.FIT_PASSES`, over every round, ends there with stop `limit` and keeps
-  the vector it reached, the lowest `F` it found, since `F` falls every pass
+  the vector it reached, the lowest `F` it found at its scale, since `F` falls every pass
   ([Ruling on #3043](https://github.com/jgong5/ATOM/pull/3043#issuecomment-6841006184),
   2026-11-13, in place of refusing the fit): a start whose first round reaches the limit
   still competes on `F`, and a winner at the limit runs none of the MAD rounds left.
@@ -348,7 +371,10 @@ unpriced ([#2705](https://github.com/jgong5/ATOM/issues/2705)). Records with too
 forwards fit no `admit`, and a run refuses a forward that admits a request; an
 entry fitted before `admit` existed, whose `E` laws hold the admissions, charges
 none apart.
-They use the step linear law's solver: D53's relative error and MAD drops, D57's report, D58's hull. An
+They use the step linear law's solver, D53's relative error, with D57's report and D58's hull,
+and drop no sample: a host term slowed by an idle CPU keeps that sample (principle 11),
+which a MAD test cannot tell from scatter ([Ruling on #3383](https://github.com/jgong5/ATOM/issues/3383#issuecomment-6891448532)). The
+JIT cut below keeps its MAD test. An
 `E` sample whose gap spans an idle engine is cut as idle and counted apart.
 `W_launch` is the host's launch time: its wall time less the launch thread's time inside
 HIP's blocking calls, the stream, event and device synchronizes and the synchronous copies
@@ -362,7 +388,7 @@ space, or on an async copy from pageable memory, stays in the label
 ([#3071](https://github.com/jgong5/ATOM/issues/3071)). A record without the stamp labels
 `W_launch` by its wall time, and the fit's report names it
 ([Ruling on #2980](https://github.com/jgong5/ATOM/issues/2980#issuecomment-6729555447)).
-A forward whose `W_launch` its kind's fit drops above the law paid a first-use JIT
+A forward whose `W_launch` its kind's JIT solve, with D57's MAD drops, drops above the law paid a first-use JIT
 compile, on a decode only past five times its price, since a decode's launch
 of a millisecond or so drops on host noise. It and the forward after it, whose period
 takes up the stall, are left out of every host law, and the fit lists them per run. The
@@ -399,11 +425,19 @@ split, the cut names 0.3% of split middle chunks against 0.5% of plain ones, the
 and output prefill laws adopt the column at 193 and 197 ms, and a split middle chunk is priced
 6.1% low at p50 ([#3114](https://github.com/jgong5/ATOM/issues/3114)).
 
-- **Key:** the host CPU, the `atom` source digest, the model, the engine config, the
-  device, the software stack and torch (`07` D41). A mismatch refuses, save a run's
-  capture ladder that is a non-empty prefix of the key's, as for the step linear law,
-  whose fit pools records the same way; the graph sets a key states must agree. There is no transfer mode: the MI455 projection prices no host floor
-  (`08` D50.2).
+- **Key:** the host CPU they timed, the `atom` source digest, the model, the engine
+  config, the device, the software stack and torch (`07` D41). A mismatch refuses, save a
+  run's capture ladder that is a non-empty prefix of the key's, as for the step linear law,
+  whose fit pools records the same way; the graph sets a key states must agree. Nor does
+  the host CPU refuse: a run takes it from the laws it prices by and predicts that host from
+  any CPU, since the CPU it runs on moves only its wall time, never a predicted second
+  (`01` D4). Keyed by the CPU it ran on, a run refused every CPU but the one its laws
+  timed: on 2026-11-10, the Intel Xeon Platinum 8480C for the shipped Qwen3.8-27B TP1
+  MI308X law and the AMD EPYC 9575F for the DeepSeek-V4-Pro laws. `compass advice`'s reuse
+  check (`19` D112, requirement 1) takes the host CPU from the laws too, where it refused
+  another (`atom/compass/drive/reuse.py::_judged`, `19` D109). There is no transfer
+  mode: a prediction for another host needs that host's records, and the MI455 projection
+  prices no host floor (`08` D50.2).
 - **Home:** beside the step linear law; the entry also holds the tokenizer and HTTP
   intake terms (`05` D25), which the machine spec no longer states.
 - **Use:** the runner composes them with any backend's device time by `01` D4's
@@ -539,7 +573,8 @@ Before concluding "we need more samples", check the design matrix:
 ## D57. Outliers, and what a fit must report
 
 - **MAD rejection on relative residuals, then refit.** The number dropped is reported in
-  the fit's description, never silently.
+  the fit's description, never silently. A host law drops none, and the JIT cut keeps
+  the test (D54).
 - **A fit's description names its provenance** (`07` terminology), its sample count, the
   dropped count, the condition number, and the hull it is valid over.
 - **Report an interval or report nothing.** A difference smaller than ~5% needs repeats
@@ -870,11 +905,11 @@ choice that must be visible.
 
 | # | Decision | Date |
 |---|---|---|
-| D53 | Fit relative error, not absolute seconds. MAD outlier test on the same relative residuals. | 2026-09-18 |
-| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under TP, DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, pools records and serves runs at prefixes of its capture ladder, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by line-searched alternating max-affine regression, each vector on the rows it prices. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes cut and a decode's `propose` label cut where the device reached the pass before the host's draft copy wait, and on prefill a trace run's busy time per pass; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), and `admit`, `(admits, uncached, cached)` over every kind, on what a forward's `E` spends admitting requests, which its kind's `E` is fitted without, are fitted beside it, keyed by host CPU, `atom` digest, model, engine config, device, software stack and torch, with no transfer. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); machine-spec digest in the host-law key 2026-10-16 (#952); host-paced prefill cut 2026-10-24 (#1983); traced prefill 2026-10-24 (#2072); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080); output prefill draft-KV pass 2026-10-25 (#2100); a prefill launch the device held gives no `W_launch` 2026-10-26 (#2256); TP above 1 2026-10-30 (#2490); a short output prefill's propose pass split off 2026-10-31 (#2492), at the device's lag 2026-11-01 (#2572); a forward's admissions priced apart, `admit` 2026-11-02 (#2620), its intercept once a forward 2026-11-03 (#2705); device, software stack and torch in place of the machine-spec digest 2026-11-03 (#2716); the propose pass unsplit on trace runs 2026-11-06 (#2072); a decode's host-paced `propose` label cut 2026-11-06 (#2917); line-searched alternation, each vector on the rows it prices, 2026-11-06 (#2904); host-law columns from a model's launch features, the recorded graph sets in the host key, 2026-11-09 (#3068); `W_launch` less the launch thread's blocking HIP calls, the held cut gone, 2026-11-09 (#3069); the lead carried across the clocks' drift 2026-11-10 (#3096); a launch column's held-out error per launch path 2026-11-12 (#3088); DeepSeek-V4's split launch a launch feature 2026-11-12 (#3114); a fit at the pass limit ends there with its vector 2026-11-13 (#2906); a run at a prefix of the capture ladder served, and records at one pooled, 2026-11-15 (#3275) |
+| D53 | Fit relative error, not absolute seconds, each equation divided by its price under the fitted coefficients, from its label until the prices settle. MAD outlier test on the same relative residuals, price less label over price. | 2026-09-18; revised 2026-11-14 (fitted price, #3383) |
+| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under TP, DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, pools records and serves runs at prefixes of its capture ladder, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by line-searched alternating max-affine regression, each vector on the rows it prices. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes cut and a decode's `propose` label cut where the device reached the pass before the host's draft copy wait, and on prefill a trace run's busy time per pass; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), and `admit`, `(admits, uncached, cached)` over every kind, on what a forward's `E` spends admitting requests, which its kind's `E` is fitted without, are fitted beside it, keyed by host CPU, `atom` digest, model, engine config, device, software stack and torch, with no transfer; a run takes the host CPU from the laws, predicting the host they timed from any CPU. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); machine-spec digest in the host-law key 2026-10-16 (#952); host-paced prefill cut 2026-10-24 (#1983); traced prefill 2026-10-24 (#2072); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080); output prefill draft-KV pass 2026-10-25 (#2100); a prefill launch the device held gives no `W_launch` 2026-10-26 (#2256); TP above 1 2026-10-30 (#2490); a short output prefill's propose pass split off 2026-10-31 (#2492), at the device's lag 2026-11-01 (#2572); a forward's admissions priced apart, `admit` 2026-11-02 (#2620), its intercept once a forward 2026-11-03 (#2705); device, software stack and torch in place of the machine-spec digest 2026-11-03 (#2716); the propose pass unsplit on trace runs 2026-11-06 (#2072); a decode's host-paced `propose` label cut 2026-11-06 (#2917); line-searched alternation, each vector on the rows it prices, 2026-11-06 (#2904); host-law columns from a model's launch features, the recorded graph sets in the host key, 2026-11-09 (#3068); `W_launch` less the launch thread's blocking HIP calls, the held cut gone, 2026-11-09 (#3069); the lead carried across the clocks' drift 2026-11-10 (#3096); a launch column's held-out error per launch path 2026-11-12 (#3088); DeepSeek-V4's split launch a launch feature 2026-11-12 (#3114); a fit at the pass limit ends there with its vector 2026-11-13 (#2906); a run at a prefix of the capture ladder served, and records at one pooled, 2026-11-15 (#3275); host laws drop no sample 2026-11-15 (#3383); the host CPU taken from the laws, 2026-11-10 ([#2899](https://github.com/jgong5/ATOM/issues/2899)) |
 | D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61), and, given the model's routing, one MoE column, the step's real MoE tokens `n` or the experts `X` they reach, the step's DP dummy forwards counted in `X` as one token: the form of smallest step-weighted held-out error, no column among them, adopted with no bar. | 2026-09-18; revised 2026-10-14 (#941), 2026-11-01 (MoE column, #2493), 2026-11-03 (no bar, #2735; dummies in `X`, #2536) and 2026-11-06 (each form fitted on its own rows, #2904) |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
-| D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |
+| D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. MAD rejection drops no host-law sample; the JIT cut keeps it. | 2026-09-18; revised 2026-11-15 (#3383) |
 | D58 | Refuse rather than fall back on a step kind with no samples. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box; an out-of-hull step is priced `estimated` and unvalidated, its source naming the extrapolation, not refused, and graded by cost accuracy as well as reported apart. The step linear law refuses a discrete value it has no vector for, extrapolates outside its fitted hull, and is validated only inside the hull of its held-out steps; a vector it states `declared`, fitted on another subject, prices declared terms. | 2026-09-18; revised 2026-10-11 (#765), 2026-10-14 (#952), 2026-10-23 (#2011) and 2026-11-02 (#2660) |
 | D59 | A family is validated on independently gathered data, never by LOO. Rank at least three candidates and report all held-out errors. A law that fits one axis is tested on a second before it ships. | 2026-09-18 |
 | D60 | Laws are piecewise over dispatch bands read from recorded kernel identity. A query with no same-band bracket refuses. At the op level `measure ops` records each point's kernels and `fit ops` interpolates only between same-kernel neighbours, and across neither gap beside a hidden band or a point with a held-out error over 5%, holding out no point whose neighbours are one coordinate away on each side, one row's bytes for a collective whose ranks move the same rows (one byte for `all_gatherv`, `reduce_scatterv` and MORI); a declined leaf falls to its analytical law, counted. An interpolated leaf is validated inside a held-out bracket on each line it interpolates along. | 2026-09-18; op level 2026-10-18 (#1489); declined lines 2026-10-19 (#1493), per gap 2026-10-25 (#2107); adjacent neighbours 2026-10-20 (#1746), a collective's 2026-10-22 (#1908); validated brackets 2026-10-23 (#2011) |
