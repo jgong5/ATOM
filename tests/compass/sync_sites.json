@@ -258,16 +258,16 @@
    "mechanism_why": "after the finish, so outside the simulated window; the wall bound only turns a missing hand-in into an error naming it"
   },
   {
-   "id": "atom/compass/run/__init__.py::_planned_transfer::time.sleep(0.1)::sleep#0",
+   "id": "atom/compass/run/__init__.py::_published_plans::time.sleep(0.1)::sleep#0",
    "file": "atom/compass/run/__init__.py",
-   "symbol": "_planned_transfer",
+   "symbol": "_published_plans",
    "call": "time.sleep",
    "expr": "time.sleep(0.1)",
    "shape": "sleep",
    "peer": "process",
-   "why": "a prefill-decode engine building its KV connector waits, in tenths of a wall second up to a bound, for every engine's planned KV block file",
+   "why": "a prefill-decode engine building its KV connector, or LP lmcache at its first stamped request, waits, in tenths of a wall second up to a bound, for every engine's planned KV block file",
    "mechanism": "K9",
-   "mechanism_why": "at startup, while the engine is built and before its step loop's first clock request, so outside the simulated window; the wall bound only turns a missing block into an error naming the engine"
+   "mechanism_why": "the engine waits at startup, while it is built and before its step loop's first clock request, so outside the simulated window; LP lmcache's first stamped request comes after every engine it serves has published, before it said READY, so its wait cannot park; the wall bound only turns a missing block into an error naming the engine"
   },
   {
    "id": "atom/compass/run/__init__.py::_trace_process::ProcessPoolExecutor(1, mp_context=spawn, initializer=enable_orphan_reaping)::thread_start#0",
@@ -5066,11 +5066,11 @@
    "mechanism_why": "LP lmcache's idle point: it asks NER with t its next job end and the eviction loop's next tick as a daemon deadline, and the wait ends at the grant"
   },
   {
-   "id": "atom/compass/run/__init__.py::_launch_lmcache::subprocess.Popen( [sys.executable, \"-c\", LMCACHE_MAIN, str(chunk_bytes)], env={**os.environ, \"PYTHONPATH\": os.pathsep.join(filter(None, paths))}, )::thread_start#0",
+   "id": "atom/compass/run/__init__.py::_launch_lmcache::subprocess.Popen( [sys.executable, \"-c\", LMCACHE_MAIN, str(block)], env={**os.environ, \"PYTHONPATH\": os.pathsep.join(filter(None, paths))}, )::thread_start#0",
    "file": "atom/compass/run/__init__.py",
    "symbol": "_launch_lmcache",
    "call": "subprocess.Popen",
-   "expr": "subprocess.Popen( [sys.executable, \"-c\", LMCACHE_MAIN, str(chunk_bytes)], env={**os.environ, \"PYTHONPATH\": os.pathsep.join(filter(None, paths))}, )",
+   "expr": "subprocess.Popen( [sys.executable, \"-c\", LMCACHE_MAIN, str(block)], env={**os.environ, \"PYTHONPATH\": os.pathsep.join(filter(None, paths))}, )",
    "shape": "thread_start",
    "peer": "none",
    "lp": "frontend",

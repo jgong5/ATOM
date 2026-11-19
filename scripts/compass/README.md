@@ -795,7 +795,12 @@ join at. Records that ran before a run wrote that file, or wrote it without
 `data_parallel_size`, take an engine file stated from their `server.log` as
 `--engine FILE`; `compass fit steps` and `compass fit host` take it too, the
 host laws then keyed by it with the records' launch graph sets
-(`atom/compass/fit/samples.py`). `atom/compass/backends/step_labels.py` states the label
+(`atom/compass/fit/samples.py`). Engine and host key files name the compilation level only
+since [#3696](https://github.com/jgong5/ATOM/pull/3696), so these fits and `measure steps`
+read an older record's `--level` from the ATOM arguments after `--` in its `run.json`
+(`step_linear_fit.recorded_level`): a refit on cell A's, cell B's or gpu-40's records keys
+level 0. An older record whose `run.json` names none, as `calib_capture.sh` writes it, keys
+the default, and takes `--engine FILE` naming any other. `atom/compass/backends/step_labels.py` states the label
 and what is cut, and the command writes each record's labels beside it for
 reading, `dp0.cost.jsonl`; the module's docstring states how outliers are
 dropped. A prefill step's label is a trace run's busy time, which `calib_capture.sh`
@@ -1000,10 +1005,10 @@ run sets them and passes the acceptance length too. A record that built a Triton
 taken again; no record of the law built one.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json.xz` is the same law for
-cell A, TP4 with whole-expert EP4: `compass fit steps` and `compass fit host` both ran at ATOM
-ed5fa7697 on one `calibrate.sh` run's records at ed5fa7697 in the same image
-([#2744](https://github.com/jgong5/ATOM/issues/2744)), so its host laws place `L_mtp` before
-[#3096](https://github.com/jgong5/ATOM/issues/3096) ([#3273](https://github.com/jgong5/ATOM/issues/3273)),
+cell A, TP4 with whole-expert EP4: `compass fit steps` at ATOM ed5fa7697 and `compass fit host`
+at a tree that places `L_mtp` on the drifting host and device clocks
+([#3273](https://github.com/jgong5/ATOM/issues/3273)), on one `calibrate.sh` run's records at
+ed5fa7697 in the same image ([#2744](https://github.com/jgong5/ATOM/issues/2744)),
 under the same environment and the same `SERVER_ARGS` with `--enable-expert-parallel` added. Its engine config
 holds `AITER_LOG_LEVEL`, `OMP_NUM_THREADS` and `ATOM_TOKEN_GRAPH_SIZES` at ed5fa7697's
 default buckets; a run priced by it sets them and passes the acceptance length too. The
