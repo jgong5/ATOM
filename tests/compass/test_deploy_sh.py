@@ -348,6 +348,8 @@ def test_each_side_s_variables_reach_its_instances_alone_here_and_through_on(
     prefix = tmp_path / "bin" / "on"
     prefix.write_text('#!/bin/sh\nshift\necho "$*" >>"$PLANTED_ON"\nexec sh -c "$*"\n')
     prefix.chmod(0o755)
+    for name in (*PREFILL_ENV, *DECODE_ENV):  # none from the caller
+        env.pop(name, None)
     env |= {
         "PLANTED_ON": str(tmp_path / "on.log"),
         "PLANTED_BUILD": f"{_tree_commit()} clean",
@@ -407,6 +409,7 @@ def test_a_side_s_variable_that_is_no_name_value_word_exits_2(tmp_path, planted)
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
 
     assert done.returncode == 2, done.stderr
