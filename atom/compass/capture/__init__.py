@@ -197,7 +197,8 @@ def population_steps(names, tbo=False, drafters=False):
         paths = sorted((path / "steps").glob("dp*[0-9].jsonl"))
         ranks = [[json.loads(t) for t in p.read_text().splitlines()] for p in paths]
         dp, splits, dummies = len(ranks), {}, group_dummies(ranks)
-        peaks = group_peaks(ranks)
+        # a line that states no rows, as a bare dummy run's, runs none
+        peaks = group_peaks([s for s in lines if "rows" in s] for lines in ranks)
         if tbo and ranks:
             at = [{s["step"]: s for s in lines} for lines in ranks]
             for step in set.intersection(*map(set, at)):

@@ -427,7 +427,8 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
     # `trace ops --population` reads it.
     every = set.intersection(*map(set, at.values())) if tbo and at else ()
     splits = {n: _split([r[n] for r in at.values()]) for n in every}
-    peaks = group_peaks(list(r.values()) for r in at.values()) if len(at) > 1 else {}
+    ran = ([s for s in r.values() if "rows" in s] for r in at.values())
+    peaks = group_peaks(ran) if len(at) > 1 else {}
     return [
         (
             f"{name} dp{rank} step {n}",
