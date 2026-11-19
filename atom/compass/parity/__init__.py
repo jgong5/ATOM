@@ -191,15 +191,19 @@ class StepRecord:
         """Keep each lmcache offload load and save `meta` hands the worker:
         ``[request id, "load", HBM-cached tokens, offload-cached tokens]`` or
         ``[request id, "save", tokens already saved, tokens computed]``."""
+        from atom.kv_transfer.offload.mp.token_shipping import ShippedTokens
+
         for req in getattr(meta, "requests", ()):
             if (ls := req.load_spec) is not None:
                 span = (ls.hbm_cached_tokens, ls.lmcache_cached_tokens)
                 self.kv.append((req.req_id, "load", *span))
                 self.loaded[req.req_id] = span
             if (ss := req.save_spec) is not None:
-                self.kv.append(
-                    (req.req_id, "save", ss.skip_leading_tokens, len(req.token_ids))
-                )
+                # A real worker is handed the scheduler's shipment, which names
+                # the prefix's end, before it rebuilds the prefix.
+                tokens = req.token_ids
+                end = tokens.end if isinstance(tokens, ShippedTokens) else len(tokens)
+                self.kv.append((req.req_id, "save", ss.skip_leading_tokens, end))
 
     def add(self, batch, runner, forward=None):
         """Append `batch`'s line; with `forward`, run it inside the line's timestamps.

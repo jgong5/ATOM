@@ -110,6 +110,7 @@ class LMCacheMPShell:
 
     def __init__(self, config) -> None:
         from atom.kv_transfer.offload.mp import connector, deployment
+        from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
         from atom.utils import clock
 
         url = deployment._server_urls(config)[0]
@@ -127,6 +128,9 @@ class LMCacheMPShell:
         self._read: dict = {}  # (reply channel, seq) -> (arrival, frames), untaken
         self._ids = itertools.count()
         self._held = None  # what the ranks reported at the previous call
+        # Each request's prefix, rebuilt from the tokens the scheduler ships,
+        # as each real worker rebuilds its own; every rank's copy is this one.
+        self._tokens = WorkerTokens()
 
     def __getattr__(self, name: str):
         inner = self.__dict__.get("_inner")
@@ -167,6 +171,8 @@ class LMCacheMPShell:
     def build_connector_meta(self):
         """ATOM's metadata, after each rank has submitted its share of it."""
         meta = self._inner.build_connector_meta()
+        # As a worker's `start_load_kv` does before it submits.
+        self._tokens.resolve(meta)
         for rank in self._ranks:
             for req in getattr(meta, "requests", ()):
                 if req.load_spec is not None and rank._do_load:
