@@ -588,7 +588,7 @@ the run ends 98 unless `COMPASS_GPU_GATE_DONE` discharges it:
 | unset | **98** — run `gate_gpu.sh`, then re-run with that tree's HEAD |
 | set, but this tree has no commit (no `.git`, no `.compass-commit`) | **98** — an attestation names a tree; accepting an uncheckable one makes the rule bypassable in exactly the snapshot where the gate normally runs. Rebuild with `snapshot.sh`. |
 | set to another value G, and the diff from G to this tree touches a trigger, or a snapshot has no `.compass-gpu-carry` stamp from G to this HEAD, or G is not a full commit sha | **98** — the GPU gate passed on a different tree and does not carry here |
-| set to another full sha G, and the diff from G touches no trigger | discharged, `gpu: satisfied by <G> carried to <HEAD>`; the diff is `git diff --name-only G` in a checkout, or in a snapshot the stamp `snapshot.sh` writes when staged with the same `COMPASS_GPU_GATE_DONE` |
+| set to another full sha G, and the diff from G touches no trigger | discharged, `gpu: satisfied by <G> carried to <HEAD>`; the diff is `git -c core.quotePath=false diff --no-renames --name-only G` in a checkout, or in a snapshot the stamp `snapshot.sh` writes when staged with the same `COMPASS_GPU_GATE_DONE` |
 | equal to this tree's HEAD | discharged |
 
 The trigger match is *reported* before pytest and *enforced* after it, so one run
