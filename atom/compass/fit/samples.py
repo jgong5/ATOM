@@ -28,7 +28,8 @@ replay unprofiled.
 Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
 config.json's digest; `device`, each GPU's `<name> <arch>`, as a spec states
-it; `engine_config`, `keyed`'s fields, the parallel layout among them;
+it; `engine_config`, `keyed`'s fields, the parallel layout among them, over the
+level `step_linear_fit.recorded_level` reads, as is each sample's host key's;
 `prefill_buckets`, those `step_linear_fit.stated_buckets` reads, null where it
 states none; `source_root`, its host key's ``atom`` as `source_root` writes
 it; `sampling`, the request parameters, null for a record serving no client
@@ -59,6 +60,7 @@ from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, pooled
 from atom.compass.backends.step_labels import Sample, digest, label_run
 from atom.compass.backends.step_linear_fit import (
     recorded_buckets,
+    recorded_level,
     refuse_contradicting,
     stated_buckets,
 )
@@ -153,9 +155,10 @@ def _record(
         )
     traces = {(s["dp_rank"], s["step"]): s["traces"] for s in _steps(record)}
     own, buckets = steps / "dp0.engine.json", stated_buckets(steps / "dp0.jsonl")
-    engine = keyed_of(json.loads(own.read_text()))
+    level = recorded_level(steps / "dp0.jsonl")
+    engine = level | keyed_of(json.loads(own.read_text()))
     if stated is not None:
-        engine, buckets = _stated(own, held, buckets, stated)
+        engine, buckets = _stated(own, level | held, buckets, stated)
     files = sorted(steps.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
     name, samples = ", ".join(map(digest, files)), []
     for got, _ in label_run(files, name, _split, floored):
@@ -165,6 +168,8 @@ def _record(
             if stated is not None and (key := traced["config"]) is not None:
                 graphs = {k: v for k, v in key["engine"].items() if k == GRAPHS}
                 traced["config"] = {**key, "engine": engine | graphs}
+            elif level and (key := traced["config"]) is not None:
+                traced["config"] = {**key, "engine": level | key["engine"]}
             samples.append(dataclasses.replace(s, provenance=traced))
     host = run["host_key"]
     return samples, {

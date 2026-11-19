@@ -10,6 +10,7 @@ import pytest
 from test_backend_step_linear_fit import _fit, _record, _steps, traced
 from test_step_linear_draft import PROPOSE, SHARE
 
+from atom.compass import run as compass_run
 from atom.compass.backends import (
     BatchView,
     RequestShape,
@@ -82,10 +83,19 @@ def test_a_law_split_at_a_token_count_prices_the_pass_by_it(law):
         StepLinearLaw(old)
 
 
+#: What a law file of host laws alone holds: no step law, its `host` read by
+#: `--host-laws` alone.
+HOST_ONLY = {"provenance", "platform", "host", "host_fit"}
+
+
 def test_every_checked_in_law_loads():
     laws = sorted(
         (Path(__file__).parents[2] / "scripts/compass/laws").glob("*.json.xz")
     )
     assert laws
     for path in laws:
-        StepLinearLaw(read_json(path))
+        law = read_json(path)
+        if law.keys() <= HOST_ONLY:
+            compass_run._check_host(path, law["host"])
+        else:
+            StepLinearLaw(law)

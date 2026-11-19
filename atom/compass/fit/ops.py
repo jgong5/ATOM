@@ -108,6 +108,9 @@ TOKENS = ("T", "T+1")
 LIMIT = 0.05
 #: The leaves a `PriceList` keeps the signatures of; past it, it forgets them.
 SIGNED = 1 << 14
+#: The dimensions a bound states by place, as `op_graph.OpGraphBackend._bound`
+#: lays them out: (phase, T, B, G, context, last, real).
+BOUND = (None, "T", "B", "G", "context")
 
 
 class Declined(ValueError):
@@ -576,7 +579,9 @@ class PriceList(CostSource):
     bounds it may have run at (`op_graph._ran_at_each`) takes the answer they
     all give, and is declined, naming them, where they differ. It also
     declines inside a gap the fit declined, and prefill rows whose cached
-    tokens from that mean to their max cross into another kernel. An answer
+    tokens from that mean to their max cross into another kernel. It takes
+    each item of a bound only where its answer reads it, so a caller can
+    tell which items an answer read (`op_graph._Read`). An answer
     between points is validated when every line it interpolates along holds
     a bracket (`held_out`) around it; one whose rows' cached tokens differ
     was held out on no line, and is not."""
@@ -592,6 +597,7 @@ class PriceList(CostSource):
         self._term = functools.lru_cache(maxsize=1 << 14)(self._term)
         self._table = functools.cache(self._table)
         self._index = functools.cache(self._index)
+        self._brackets = functools.cache(self._brackets)
         # By leaf object, which each entry holds so its id names it alone
         self._signed: dict[int, tuple] = {}
 
@@ -605,29 +611,33 @@ class PriceList(CostSource):
                 return got[0]
             ran = _either(dict(zip("TBG", b[1:4])) for b in bounds)
             return self.refuse(f"{leaf['op']}: {ran}")
-        leaf, (phase, t, b, g, context, last, *real), _ = request
-        kind, at = leaf["op"], {"T": t, "B": b, "G": g, "context": context}
-        shape = f"{phase} T={t}" if phase == "prefill" else phase  # `_read`'s T
-        shape += "" if at["G"] is None else f" G={at['G']}"
+        leaf, bound, _ = request  # (phase, T, B, G, context, last, *real)
+        kind, phase = leaf["op"], bound[0]
         ex, sig = self._sign(leaf)
         if ex:  # a collective: its family over its message bytes
-            name, at["bytes"] = ex
+            name, at = ex[0], {"bytes": ex[1]}
             name = name if name in self.params["families"] else None
         elif phase == "prefill" and "tokens" not in self.params:
             why = "the price list keys prefill families as before; refit it"
             return self.refuse(f"{kind}: {why}")
         else:
-            name = self._family(shape, sig)
+            # `_read`'s T
+            shape = f"{phase} T={bound[1]}" if phase == "prefill" else phase
+            shape += "" if bound[3] is None else f" G={bound[3]}"
+            name, at = self._family(shape, sig), {}
         if name is None:
             return self.refuse(f"{kind}: no point of its signature was measured")
         dims, top = self.params["families"][name]["dims"], None
+        at |= {d: bound[i] for i, d in enumerate(BOUND) if d in dims}
         if "pad" in dims:  # the rows it routes past the step's real ones
+            real = bound[6:]
             stated = real[0] if real else None
             at["pad"] = 0 if stated is None else routed_rows(leaf) - stated
         if phase == "decode":
-            at["mean"] = PERMILLE * last / at["context"]
-        elif dims[-1:] == ["context"] and last != at["context"]:
-            top = last
+            if "mean" in dims:
+                at["mean"] = PERMILLE * bound[5] / bound[4]
+        elif dims[-1:] == ["context"] and bound[5] != at["context"]:
+            top = bound[5]
         got = self._lookup(name, tuple(at[d] for d in dims), top)
         if isinstance(got, str):
             return self.refuse(f"{kind}: {got}")
@@ -717,24 +727,25 @@ class PriceList(CostSource):
                 near.append({vs[i - 1] if i else x, vs[i] if i < len(vs) else x})
         return near
 
+    def _brackets(self, name: str) -> dict:
+        """A family's brackets (`held_out`), each its low and high, by its
+        dimension and the other coordinates."""
+        held: dict = {}
+        for d, rest, lo, hi in self.params["families"][name].get("brackets", ()):
+            held.setdefault((d, tuple(rest)), []).append((lo, hi))
+        return held
+
     def _validated(self, name: str, at: tuple) -> bool:
         """Whether every line `at` interpolates along holds a bracket around
         it: a line through `at`'s neighbours in the other dimensions that
         holds no point at `at`."""
-        f, (points, _) = self.params["families"][name], self._table(name)
-        near, held = self._near(name, at), f.get("brackets", ())
-        lines = [
-            (i, list(rest))
+        dims, (points, _) = self.params["families"][name]["dims"], self._table(name)
+        near, held = self._near(name, at), self._brackets(name)
+        return all(
+            any(lo < x < hi for lo, hi in held.get((dims[i], rest), ()))
             for i, x in enumerate(at)
             for rest in itertools.product(*near[:i], *near[i + 1 :])
             if (*rest[:i], x, *rest[i:]) not in points
-        ]
-        return all(
-            any(
-                d == f["dims"][i] and r == rest and lo < at[i] < hi
-                for d, r, lo, hi in held
-            )
-            for i, rest in lines
         )
 
     def _at(self, name: str, at: tuple):

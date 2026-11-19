@@ -40,6 +40,20 @@ from atom.utils import forward_context as fctx
 
 pytestmark = pytest.mark.usefixtures("unpriced")
 
+
+@pytest.fixture(autouse=True)
+def seeded():
+    """torch's generator seeded for each test, and restored after. The stub
+    draws its planes and activations from it (`ops._random`), and torch's CPU
+    `randn` returns an exact zero wherever its Box-Muller transform draws a
+    uniform 0, about once in 11 million values. A test reading zeros as not
+    drawn takes one for a missed draw; unseeded, whether one lands in its rows
+    hangs on what ran before it in the process."""
+    with torch.random.fork_rng(devices=()):
+        torch.manual_seed(0)
+        yield
+
+
 F32 = "torch.float32"
 KEY = "model.layers.{L}.attn"
 TREE = pathlib.Path(__file__).resolve().parents[2]

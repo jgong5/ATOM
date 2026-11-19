@@ -1069,24 +1069,42 @@ def publish_planned_transfer(runner: Any) -> None:
     """Publish one entry of the paged class `get_num_blocks` planned, the state
     slot a transfer moves beside a request's blocks (`_transferred_slot`),
     the staging row a second write moves after them (`_staging_row_bytes`),
-    and the runner's TP width, at the file `compass_block_file` names, which
-    `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
-    prices a transfer at them. Refused for a pipeline stage of Kimi's hybrid,
-    whose KDA state regions ATOM's builder refuses to publish there
+    the state image an lmcache save carries (`_saved_image_bytes`) and the
+    runner's TP width, at the file `compass_block_file` names, which
+    `run.runner` gives TP rank 0 of a prefill-decode deployment and of one that
+    offloads to an lmcache server: its connector prices a transfer at them, and
+    LP lmcache sizes a chunk and an image. A prefill-decode deployment is
+    refused for a pipeline stage of Kimi's hybrid, whose KDA state regions
+    ATOM's builder refuses to publish there
     (`_refuse_kda_regions_across_stages`), and for an MLA builder whose sparse
     indexer scores in FP4, whose regions no P/D backend parses
     (`_refuse_fp4_indexer_regions`)."""
     if path := getattr(runner, "compass_block_file", None):
         from atom.compass import run
 
-        _refuse_kda_regions_across_stages(runner)
-        _refuse_fp4_indexer_regions(runner)
+        if run._pd_side(runner.config) is not None:
+            _refuse_kda_regions_across_stages(runner)
+            _refuse_fp4_indexer_regions(runner)
         plan = runner.pool_plan
         tp = runner.config.tensor_parallel_size
         slot, after_blocks = _transferred_slot(runner)
         staging = _staging_row_bytes(runner)
         block = plan.entry_bytes[plan.paged_class]
-        run.publish_transfer(path, block, tp, slot, staging, after_blocks)
+        image = _saved_image_bytes(runner)
+        run.publish_transfer(path, block, tp, slot, staging, after_blocks, image)
+
+
+def _saved_image_bytes(runner: Any) -> int:
+    """The state image a native-state lmcache save carries beside its chunks:
+    that of the PAGE-backed checkpoint spec `get_num_blocks` planned, where
+    saves carry one at the engine's replay length (`stores_state_images`),
+    else 0, as for a runner that planned no checkpoint spec."""
+    from atom.kv_transfer.offload.mp.native_state_worker import stores_state_images
+
+    spec = runner.state_runtime.checkpoint_spec
+    if spec is None or not stores_state_images(runner.config.state_replay_tokens):
+        return 0
+    return int(spec.image_bytes)
 
 
 def _refuse_kda_regions_across_stages(runner: Any) -> None:
@@ -1111,7 +1129,8 @@ def _refuse_fp4_indexer_regions(runner: Any) -> None:
     with the reason ATOM's builder gives as it refuses to publish its regions to
     a P/D backend, which the simulated connector stands for: this runner
     allocates no cache, so the builder is never asked. A run whose only region
-    reader is `lmcache_mp` is no prefill-decode run and publishes nothing here."""
+    reader is `lmcache_mp`, which takes those regions, is no prefill-decode run
+    and is not refused here."""
     from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
 
     builder = runner.attn_metadata_builder
@@ -1554,9 +1573,10 @@ class NonAllocatingRunner(
         it is a coefficient somebody wrote down rather than a measurement of
         the card being modelled; `kv_pool_sizing` keeps the count beside the
         readings, so which terms those were is recoverable from the runner and
-        not only from a log line somebody kept. On a prefill-decode run the
-        planned block, transferred state slot and staging row are published as
-        well (`publish_planned_transfer`).
+        not only from a log line somebody kept. On a prefill-decode run, and on
+        one offloading to an lmcache server, the planned block, transferred
+        state slot, staging row and saved state image are published as well
+        (`publish_planned_transfer`).
 
         The decode process of intra-GPU prefill/decode disaggregation is
         refused rather than sized. ATOM's own runner for that answers a block

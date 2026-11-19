@@ -110,14 +110,26 @@
           "ATOM_ENABLE_PREFILL_DELAYER": "1",
           "ATOM_PREFILL_DECODE_INTERVAL": "10",
           "ATOM_KV_OFFLOAD": "lmcache_mp",
-          "ATOM_KV_OFFLOAD_EXTRA_CONFIG": "{\"lmcache.mp.host\": \"tcp://127.0.0.1\", \"lmcache.mp.port\": 5555}",
           "LMCACHE_CHUNK_SIZE": "256",
           "OFFLOAD_MAX_PENDING_SAVES": "8"
+        },
+        "lmcache_server": {
+          "--chunk-size": 256,
+          "--null-block-id": -1,
+          "--separate-object-groups": true,
+          "--supported-transfer-mode": "lmcache_driven",
+          "--l1-size-gb": 1200,
+          "--l1-use-lazy": true,
+          "--l1-read-ttl-seconds": 900,
+          "--eviction-policy": "LRU",
+          "--eviction-trigger-watermark": 0.98,
+          "--max-cpu-workers": 4
         },
         "departures": {
           "--served-model-name": "unset: ATOM then serves the model under its --model path, the value the recipe gives",
           "--cudagraph-capture-sizes": "S2's, the powers of two to 512, not ATOM's default the recipe keeps: S5 borrows S2's law, which serves a ladder only where it is a prefix of the law's",
-          "--max-num-seqs": "512, not twice the concurrency: one value keeps one memory-readings entry per configuration"
+          "--max-num-seqs": "512, not twice the concurrency: one value keeps one memory-readings entry per configuration",
+          "ATOM_KV_OFFLOAD_EXTRA_CONFIG": "unset: compass advice sets it to each point's own lmcache server, whose host and port it assigns"
         }
       },
       "P3": {
@@ -153,7 +165,8 @@
           "MC_ENABLE_DEST_DEVICE_AFFINITY": "unset: a real side on crsuse2-m2m-v3-005 and -013 takes scripts/compass/README.md's Mooncake variables instead",
           "ATOM_PD_RANK_MAPPING_POLICY": "unset: CI's router script reads it, and ATOM does not",
           "AITER_LOG_LEVEL": "unset: deploy.sh sets WARNING itself",
-          "PYTHONUNBUFFERED": "unset: it orders log lines, not the engine's work"
+          "PYTHONUNBUFFERED": "unset: it orders log lines, not the engine's work",
+          "--policy": "unset, not random: compass advice starts the router with its own flags, the same for every candidate, and with one worker a side no policy chooses"
         }
       }
     }

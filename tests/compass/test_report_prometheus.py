@@ -135,7 +135,7 @@ def test_an_instance_s_report_spans_its_series_with_the_standalone_panels(
     assert {p.name: p.read_bytes() for p in served.seen.iterdir()} == {
         p.name.removesuffix(".gz"): gzip.decompress(p.read_bytes()) for p in files
     }
-    assert {(q["start"], q["end"]) for q in served.queries} == {("0.5", "12.0")}
+    assert {(q["start"], q["end"]) for q in served.queries} == {("0.5", "15.5")}
     stepped = [q for q in served.queries if "max_over_time" not in q["query"]]
     assert {q["step"] for q in stepped} == {"5"}
     assert _windows(served.queries) == {"60s"}
@@ -178,6 +178,32 @@ def test_a_deployment_s_report_shows_both_sides_and_names_what_it_lacks(
     assert "No series from engine-D.dp1: none written." in meta["notes"]
     lacking = "No sampler writes atom:decode_batch_size: no series to query."
     assert lacking in meta["notes"]
+
+
+@pytest.mark.parametrize(
+    "times, end, window",
+    [
+        # a final sample 0.188 s after the timer's last, at a 1 s and a 20 s timer
+        ([1.0 + k for k in range(11)] + [11.188], "16.0", "60s"),
+        ([20.0 * k for k in range(1, 8)] + [140.188], "145.0", "80s"),
+        # the last instant on the grid, and one instant alone
+        ([1.0 + k for k in range(11)], "11.0", "60s"),
+        ([3.0], "4.0", "60s"),
+    ],
+)
+def test_the_query_ends_at_the_grid_point_at_or_past_the_last_instant(
+    tmp_path, monkeypatch, served, times, end, window
+):
+    """Each file's last step, its final sample's, is shorter than its
+    interval, and leaves the window at max(60, 4 x interval)."""
+    out = _out(tmp_path, {})
+    for lp in ("engine", "frontend"):
+        _series(monkeypatch, out, lp, "standalone", times)
+
+    assert prometheus.write(out) == out / prometheus.HTML
+
+    assert {(q["start"], q["end"]) for q in served.queries} == {(str(times[0]), end)}
+    assert _windows(served.queries) == {window}
 
 
 @pytest.mark.parametrize(

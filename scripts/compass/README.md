@@ -795,7 +795,12 @@ join at. Records that ran before a run wrote that file, or wrote it without
 `data_parallel_size`, take an engine file stated from their `server.log` as
 `--engine FILE`; `compass fit steps` and `compass fit host` take it too, the
 host laws then keyed by it with the records' launch graph sets
-(`atom/compass/fit/samples.py`). `atom/compass/backends/step_labels.py` states the label
+(`atom/compass/fit/samples.py`). Engine and host key files name the compilation level only
+since [#3696](https://github.com/jgong5/ATOM/pull/3696), so these fits and `measure steps`
+read an older record's `--level` from the ATOM arguments after `--` in its `run.json`
+(`step_linear_fit.recorded_level`): a refit on cell A's, cell B's or gpu-40's records keys
+level 0. An older record whose `run.json` names none, as `calib_capture.sh` writes it, keys
+the default, and takes `--engine FILE` naming any other. `atom/compass/backends/step_labels.py` states the label
 and what is cut, and the command writes each record's labels beside it for
 reading, `dp0.cost.jsonl`; the module's docstring states how outliers are
 dropped. A prefill step's label is a trace run's busy time, which `calib_capture.sh`
@@ -933,6 +938,45 @@ rung 2, which the 1P1D prefill side reaches at c=64 ([#2878](https://github.com/
 Host keys and the fp8 indexer key as the crs005 DPA-TP8 pair's, its lone cells fp4 and its 1P1D
 cells fp8; the gap between the two is unmeasured on this pair.
 
+`scripts/compass/laws/deepseek-v4-pro-tp8-mi355x-crs005-{prefill,decode}-host.json.xz` hold host
+laws alone (`host`, `host_fit`, `platform` and `provenance`, no step law), one per side of
+[#3179](https://github.com/jgong5/ATOM/issues/3179)'s TP cell on crsuse2-m2m-v3-005 (prefill) and
+-013 (decode): the crs005 DPA-TP8 cell less `--enable-dp-attention`, the prefill side at
+`--gpu-memory-utilization 0.65` and the decode side at 0.70. They are for a 1P1D run whose steps
+another backend prices, both entries in its run file, where each server's own start picks the
+entry keyed to its engine config. `deploy.sh run ... --host-laws P --host-laws D` builds that run
+file with the decode started through `--on "env -u GPU_MAX_HW_QUEUES -u ATOM_NUMA_BIND"`: the two
+entries' hops differ, and each side's are picked under the environment it starts in. Each
+law file is `compass fit host` on its side of three 1P1D `deploy.sh record` cells at ATOM
+259bc70f0, at c=1, 4 and 16 over traces 256 to 392 for 1800 s each, every server loading the
+blocking-call tool through `ROCP_TOOL_LIBRARIES`; the c=1 cell's prefill side ran at
+0.70 ([#3194](https://github.com/jgong5/ATOM/issues/3194#issuecomment-6869663548)). `host_fit.held_out`
+holds each band's errors with each record held out in turn. A term a side's records cannot give is
+the crs005 DPA8 law's of that side, as `provenance` names: `admission_s` and `stream_s`, since a
+side's requests and streams pass the router; `kv_write_req_s` and `router_s`, which `compass fit
+host` does not fit; the prefill side's `ipc_out_s`, since no output message ran alone on it; and the
+decode side's `http_intake`, since its requests render no chat template
+([#3229](https://github.com/jgong5/ATOM/issues/3229)). A decode side encodes no prompt and admits no
+request, so its entry states no encode term and `admit` null.
+
+`scripts/compass/laws/deepseek-v4-pro-tp8-mtp3-mi355x-crs005-{prefill,decode}.json.xz` and
+`deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-{prefill,decode}.json.xz` hold host laws alone, one per
+side of [#1499](https://github.com/jgong5/ATOM/issues/1499)'s two MTP cells on crsuse2-m2m-v3-005
+(prefill) and -013 (decode): [#3179](https://github.com/jgong5/ATOM/issues/3179)'s TP8 cell with
+`--method mtp --num-speculative-tokens 3` on both sides, and [#975](https://github.com/jgong5/ATOM/issues/975)'s
+DPA-TP8 cell with `--method mtp --num-speculative-tokens 1` on both sides, for a run whose step
+costs come from another backend, each side taking its own entry. Each is `compass fit host` on its
+side of three 1P1D `deploy.sh record` cells at c=1, 4 and 16 over traces 256 to 392, 1800 s each,
+every server started with `ROCP_TOOL_LIBRARIES` naming the blocking-call tool
+(`atom/compass/parity/README.md`), and states the `platform` its records ran on. The host key
+states the drafter (`speculative`), so a side started without it, or at another draft width,
+refuses the law. A term a side's records give none of, or that `compass fit host` does not fit,
+is the crs005 DPA8 law's of that side, copied without a refit; `provenance` names each, with why.
+Each prefill law's `prefill.L_mtp` is its own `decode.L_mtp`, copied the same way: the status
+copy it prices is the previous output forward's, whatever this forward's kind, and the prefill
+forwards waited on it too rarely to fit one. Each host key's `atom` is re-keyed without a refit
+from the digest its records ran at; `provenance` says why.
+
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json.xz` is DeepSeek-V4.1-Flash's
 law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed
 experts sharded across TP and DSpark with 5 speculative tokens, on one MI455 A0 node: the
@@ -944,7 +988,11 @@ records at ed5fa7697, taken in the image and aiter of that stack
 and 64, then 8, 12 and 56 from each trajectory's first turn for rungs 7, 8, 12 and 56. No
 c=256 record is in it: that take stalled the node
 ([#2922](https://github.com/jgong5/ATOM/issues/2922)), so decode rungs past 24 rest on the
-first-turn c=56 record. Each server ran with `ENABLE_CK=0
+first-turn c=56 record. The draft's `propose` vector is fitted apart, by `compass fit steps`
+at that later tree on two 120 s trace runs at c=16 and c=4 under the same settings, whose busy
+time labels an output prefill's propose pass; that tree's fit refuses the ed5fa7697 records
+beside them ([#3607](https://github.com/jgong5/ATOM/issues/3607)). Each server ran with
+`ENABLE_CK=0
 GPU_ARCHS=gfx1250 ATOM_ENGRAM_UVA=1 ATOM_ENGRAM_UVA_HBM=1 AITER_LOG_LEVEL=WARNING OMP_NUM_THREADS=4
 ATOM_DISABLE_MMAP=true AITER_REUSE_IDENTICAL_COMM_GROUPS=1`, `NCCL_MIN_NCHANNELS` unset, and
 `SERVER_ARGS` of `--trust-remote-code -tp 4 --kv_cache_dtype bf16 --index-cache-dtype fp8
@@ -957,10 +1005,10 @@ run sets them and passes the acceptance length too. A record that built a Triton
 taken again; no record of the law built one.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json.xz` is the same law for
-cell A, TP4 with whole-expert EP4: `compass fit steps` and `compass fit host` both ran at ATOM
-ed5fa7697 on one `calibrate.sh` run's records at ed5fa7697 in the same image
-([#2744](https://github.com/jgong5/ATOM/issues/2744)), so its host laws place `L_mtp` before
-[#3096](https://github.com/jgong5/ATOM/issues/3096) ([#3273](https://github.com/jgong5/ATOM/issues/3273)),
+cell A, TP4 with whole-expert EP4: `compass fit steps` at ATOM ed5fa7697 and `compass fit host`
+at a tree that places `L_mtp` on the drifting host and device clocks
+([#3273](https://github.com/jgong5/ATOM/issues/3273)), on one `calibrate.sh` run's records at
+ed5fa7697 in the same image ([#2744](https://github.com/jgong5/ATOM/issues/2744)),
 under the same environment and the same `SERVER_ARGS` with `--enable-expert-parallel` added. Its engine config
 holds `AITER_LOG_LEVEL`, `OMP_NUM_THREADS` and `ATOM_TOKEN_GRAPH_SIZES` at ed5fa7697's
 default buckets; a run priced by it sets them and passes the acceptance length too. The
@@ -1126,7 +1174,9 @@ A simulated deployment, `deploy.sh run`, runs both instances on 005: each
 reaches the clock authority and the write-request block at this node's
 127.0.0.1, which 013 cannot. A local prefix, such as `env -u GPU_MAX_HW_QUEUES
 -u ATOM_NUMA_BIND`, still starts the decode apart and makes the KV link
-`inter_node`, as the real pair spans. Its router arguments switch the router's
+`inter_node`, as the real pair spans. The run file then takes the decode side's
+hops from the host entry fitted under the environment that prefix gives it, as
+the prefill side's under the script's own. Its router arguments switch the router's
 wall-clock detectors off, `--disable-retries` among them, as `deploy.sh`'s
 header requires. The script
 sets `--request-timeout-secs` itself: a stream lasts the wall time the run
@@ -1198,6 +1248,72 @@ PYTHONPATH=$T python3 $T/scripts/compass/rdma_link.py fit BENCH RECORD
 prefill rank and per rail, each one write at a time or sharing the
 bandwidth, and prints each one's error on every `_rdma_write` call and on
 the contended ones.
+
+### The DPA-TP8 cell under the op-level backend
+
+The DPA-TP8 cell [as registered](https://github.com/jgong5/ATOM/issues/975#issuecomment-6570682669)
+runs simulated under the op-level backend by steps 10 to 13 of the stage-2 cell, below,
+each side apart: its own ATOM arguments, its environment and its Mooncake
+`--kv-transfer-config` (`kv_producer` on the prefill side, `kv_consumer` on the decode).
+Without the transfer config ATOM builds DeepSeek-V4's FP4 indexer where a transfer side
+runs the FP8 one, so its graphs and points would price kernels the cell never runs. One
+store `S` holds the node's `platform_readings`, which a run's `--device` composes its spec
+from, each side's `compass measure memory` readings, taken as the EP8 cell's
+are, the graphs, the points and one price list: a price list's key holds the model, the
+parallel layout, the platform the spec names and the ATOM source, and neither
+`--enable-tbo` nor a variable, so both sides' points key one list. Every command runs from one tree, the one
+the readings were taken at, since readings, graphs, points and price lists each refuse
+another ATOM source, under the side's environment and no other performance variable
+(`atom/benchmarks/results/metadata.py::PERFORMANCE_KEYS`): `OMP_NUM_THREADS` is one, so
+pin processes that run at once to cores with `taskset`.
+
+- **Graphs.** `compass trace ops --model <DeepSeek-V4-Pro> --tp 8 --arch gfx950
+  --population REC --store S -- <side's ATOM args>`, for each plan record and each real run
+  graded. Under DP-attention a graph is keyed by the rows its step's MoE gathers over the
+  group, `G=`, and under `--enable-tbo` a step the group split is its two micro-batches,
+  each traced on one stream and keyed apart from a whole step of its shape, so a real
+  run's prefill side holds far more shapes than its decode side, whose steps pad to the
+  ladder's rungs. A store refuses a second publish of one key, so trace each record into a
+  store of its own, then copy into `S` each entry it lacks, once no other process
+  publishes into `S`. For the same reason a trace cut short cannot be resumed into its
+  store: split a record whose trace would run for hours, a c=64 or 256 prefill side, by
+  step into part records, every rank's line of a step in one part, and trace each part
+  into a store of its own; together the parts hold the record's shapes. A trace builds
+  the model without its weights, and a graph keys `config.json`'s digest, not its path: a
+  container that does not mount the model, such as a CPU gate container, traces from a
+  copy of the model's directory less its weight files.
+- **Points.** `compass measure ops --plan REC --llc-mib 256 --gpu C --store S --out O --
+  <side's ATOM args> --enforce-eager --level 0 --cudagraph-capture-sizes "[R]"`, over each
+  side's plan record, `C` the cards the run takes and `R` the decode rungs it measures,
+  with that side's Mooncake variables, the node's own `ATOM_HOST_IP`,
+  and a `handshake_port` of its own for each bench that runs at once. One GPU runs one DP
+  rank and every leaf but the collectives, so one-GPU runs split the decode rungs between
+  them, the ladder in no graph's key; one run on all eight GPUs at every rung then
+  measures the collectives, the other points already held. The plan reads a split step as
+  its two micro-batches, the shapes `trace ops` publishes, and densifies a micro-batch's
+  points at its own graph. A bench a signal stops can leave its measuring child holding
+  the card ([#3224](https://github.com/jgong5/ATOM/issues/3224)): run each in a session of
+  its own, and once it ends, kill by PID what the session left before the card serves again.
+- **Price list.** `compass fit ops --store S --out F O...`, `F` the fit's own output
+  directory and `O...` every points run's `--out` of both sides.
+- **Runs.** `deploy.sh OUT run --op-graph --host-laws P --host-laws D --device mi355x
+  --ptl disabled --network crs005-013-ionic --store S`, the decode through a local
+  prefix as above, `P` and `D` the tree's
+  `laws/deepseek-v4-pro-dpa8-mi355x-crs005-prefill.json.xz` and `-decode.json.xz`, whose
+  host laws the run reads. Each engine traces a shape `S` lacks itself, a model build in a
+  process of its own, and the run's wall time pays for it. At c=64 and 256 a prefill side
+  meets thousands of shapes, so trace the real runs graded into `S` before the run: the
+  summary's `cost` counts the graphs it held and those it traced, `held_lookups` and
+  `lazy_traces`, and times each, `lookup_wall_seconds` and `lazy_trace_wall_seconds`.
+  Such a run is judged faster than real over a store so warmed, its lazy traces reported
+  apart ([Ruling](https://github.com/jgong5/ATOM/pull/3124#issuecomment-6768936508)).
+- **Grading.** Link `OUT` as `op_graph` beside the real runs and run `python -m
+  atom.compass.validate` on that directory: it reads each side's graphs under the
+  environment that side's engine file states. It labels a prefill step only from a
+  trace run's busy time, so on real runs recorded without a profiler, as the cell's are,
+  it leaves every prefill step of the prefill side out as `untraced`, counted per run in
+  that side's `left out` row, and that side's prefill has no cost row until a gated
+  record grades it ([#3028](https://github.com/jgong5/ATOM/issues/3028)).
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 

@@ -41,7 +41,7 @@
 #   WAIT_S         seconds each instance and the router have to answer, and
 #                  the deployment to leave once stopped (default 600)
 #   PREFIX_S       seconds --on's prefix has to start the decode's command,
-#                  and to send it a stop (default 60)
+#                  to show its environment, and to send it a stop (default 60)
 #
 # OUT gets run_file.json, the deployment's one run file, built from the run
 # flags and both sides' ATOM arguments (`runfile.prefill_decode`), whose
@@ -74,7 +74,10 @@
 # <pid>`, a second command under the first, so srun inside an allocation takes
 # --overlap. A shell may parse those words again, so OUT, this tree and the
 # caller's directory must be paths `printf %q` leaves as they are. That node
-# sees them at their paths, and, simulated, this node's 127.0.0.1.
+# sees them at their paths, and, simulated, this node's 127.0.0.1. Simulated,
+# where the host entries' hops differ, the decode's are picked under the
+# environment the prefix starts its command in, which `PREFIX env -0` shows,
+# one more command under it, as the prefill's are under this script's.
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -140,15 +143,19 @@ RUN_FILE= CLOCK=
 # listeners take one per rank from its handshake port. The decode's handshake
 # port, the prefill's plus its ranks as the nightly's 1P1D launch gives it, is
 # not held: its listeners bind ports the kernel hands out.
-ports=$(python3 - $$ "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
+ports=$(python3 - $$ "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${on[*]}" "$PREFIX_S" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
 import argparse, json, random, socket, subprocess, sys
 from pathlib import Path
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal
 from atom.compass.drive import runfile, serve
+from atom.compass.drive.run import side_env
 from atom.compass.spec import SpecRefusal
 
-script, run_file, kv_link, router_lp, n, *words = sys.argv[1:]
+# Python names a program read from stdin <stdin>, a file that a process this
+# one spawns to resolve a side's config would run as its main, and not find.
+globals().pop("__file__", None)
+script, run_file, kv_link, router_lp, on, prefix_s, n, *words = sys.argv[1:]
 flags, words = words[: int(n)], words[int(n) :]
 k = int(words[0])
 prefill, decode = words[1 : 1 + k], words[1 + k :]
@@ -179,18 +186,27 @@ if not run_file:
     ranks = engine.data_parallel_size * engine.tensor_parallel_size * engine.pipeline_parallel_size
     base = block(ranks)
     hand(router, prometheus, base, base + ranks)
+def decode_env():
+    """The environment --on's prefix starts the decode's command in, with what
+    compass_env sets over it there."""
+    shown = subprocess.run([*on.split(), "env", "-0"], stdin=subprocess.DEVNULL, capture_output=True, timeout=float(prefix_s))
+    if shown.returncode:
+        said = shown.stderr.decode(errors="replace").strip()
+        raise ValueError(f"--on's prefix exited {shown.returncode} showing the decode's environment: {said}")
+    env = dict(v.split("=", 1) for v in shown.stdout.decode(errors="surrogateescape").split("\0") if v)
+    return env | side_env(env)
 parser = argparse.ArgumentParser(prog="deploy.sh run")
 runfile.add_arguments(parser)
 args = parser.parse_args(flags)
 try:
-    run = runfile.prefill_decode(args, prefill, decode, kv_link)
+    run = runfile.prefill_decode(args, prefill, decode, kv_link, decode_env if on else None)
     lookaheads = "-"
     if router_lp:
         run["router"] = compass_run.router_binary(router_lp)
         run.setdefault("router_in_s", compass_run.hop(run, "ipc_s"))
         table = compass_run.channel_table(run)
         lookaheads = json.dumps({c.name: table.lookahead(c.name) for c in table.channels_from(compass_run.ROUTER)}, separators=(",", ":"))
-except (ValueError, OSError, ArtifactRefusal, SpecRefusal) as refused:
+except (ValueError, OSError, subprocess.TimeoutExpired, ArtifactRefusal, SpecRefusal) as refused:
     sys.exit(f"deploy: {refused}")
 clock = block(1)
 base = block(run["prefill_data_parallel_size"] * run["decode_data_parallel_size"])

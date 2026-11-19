@@ -57,8 +57,6 @@ DP = {
 }
 LMCACHE = {
     "ATOM_KV_OFFLOAD": "lmcache_mp",
-    "ATOM_KV_OFFLOAD_EXTRA_CONFIG": '{"lmcache.mp.host": "tcp://127.0.0.1", '
-    '"lmcache.mp.port": 5555}',
     "LMCACHE_CHUNK_SIZE": "256",
     "OFFLOAD_MAX_PENDING_SAVES": "8",
 }

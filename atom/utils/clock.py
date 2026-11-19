@@ -207,6 +207,9 @@ class LPRuntime:
         # Whether the owner holds work a bounded poll must not idle past: then
         # the poll's bound is an essential deadline, else a daemon one.
         self.holds_work = lambda: False
+        # The clock it held before the ``+inf`` grant that ended its run, once
+        # that grant came: its last finite clock.
+        self.before_inf: float | None = None
 
     def start_run(self) -> None:
         self.in_run = True
@@ -468,6 +471,8 @@ class LPRuntime:
                         )
                         reported = True
                         self.diagnostics += 1
+            if G == math.inf:
+                self.before_inf = self.now
             self.now = G
             late = [(a, ch, s) for (ch, s), a in self.unreleased.items() if a < G]
             if late:
