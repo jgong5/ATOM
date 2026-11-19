@@ -179,8 +179,8 @@ def _until(path: Path, script) -> None:
     """Return once deploy.sh `script` has written `path`, failing if it exits
     first. No wall-clock bound of its own: the run-file build can take a
     minute on a loaded host where it resolves each side's config in a process
-    of its own, and each wait the script makes after it ends within WAIT_S or
-    PREFIX_S."""
+    of its own, and after it the script gives each instance, the prefix and
+    the router WAIT_S or PREFIX_S."""
     router = path.with_name("router.log")
     while not path.exists():
         assert script.poll() is None, (
