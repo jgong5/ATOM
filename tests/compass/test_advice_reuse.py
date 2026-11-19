@@ -21,6 +21,7 @@ from test_artifact_invalidation import STANZA, moved
 from test_capture_v4_pro import CONFIG as V4_PRO
 from test_drive_runfile import LAWS as HOST_LAWS
 from test_law_file_readings import law_member
+from test_law_token_graph_buckets import RECORDED
 from test_memory_readings import READINGS, publish_readings
 from test_page_bound_reading import V41
 from test_run_check_side import (
@@ -86,8 +87,13 @@ def searched(tmp_path, monkeypatch, at_head):
 
 def resolved_here(monkeypatch, resolve):
     """Each instance's config `resolve(atom_args)`, resolved in this process
-    rather than in the check's child."""
-    monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
+    rather than in the check's child; any other child stays one."""
+    child = ops._child
+
+    def here(fn, *args):
+        return fn(*args) if args[:1] == (drive_run._declared,) else child(fn, *args)
+
+    monkeypatch.setattr(ops, "_child", here)
     monkeypatch.setattr(
         drive_run, "_declared", lambda atom_args, arch: resolve(atom_args)
     )
@@ -464,7 +470,9 @@ def test_an_fp4_v41_entry_without_the_page_bound_reading_is_measured_as_check_fi
     vars(searched.config).update(index_cache_dtype=index, hf_config=V41)
     member = READINGS[1] | ({} if reading is None else {PAGE_BOUND: reading})
     publish_readings(tmp_path / "store", searched.config, readings=member)
-    law_file(tmp_path, law(searched))
+    held = law(searched)
+    held["prefill"]["buckets"] = RECORDED
+    law_file(tmp_path, held)
 
     found = verdicts(advise(tmp_path), "readings")
 
