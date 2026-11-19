@@ -1712,14 +1712,12 @@ meets.
 
 ### Problem
 
-Calibration time goes to repeats, to points no step reads and to idle cards
-([#2678](https://github.com/jgong5/ATOM/issues/2678)):
-
-| Stage | Measured |
-|---|---|
-| step grid bench, stage 2 ([#1233](https://github.com/jgong5/ATOM/issues/1233)) | 845 measurements of 506 views in 27.2 device hours, 13.6 of them on views another GPU had measured; prefill 99.3% of it, 149 to 215 s a point at 45 repeats, decode 2.6 to 2.9 s |
-| op plan at TP 1 ([#2089](https://github.com/jgong5/ATOM/issues/2089), [#2289](https://github.com/jgong5/ATOM/issues/2289)) | 18,184 to 48,310 points at about 0.27 s each, 2.5 to 4.6 hours on one of eight cards; 41% of the context-dependent decode points on rungs no step reaches (Phase 1b) |
-| fits ([#2317](https://github.com/jgong5/ATOM/issues/2317)'s cal2) | 30 to 75 s each, but `fit ops`, whose token lookups grow with the square of its points: about 14 and 96 min at 18k and 48k points (estimated) |
+Calibration time goes to views measured twice, to 45 repeats a point where fewer settle, to
+points on decode rungs no step reaches, and to cards left idle: on stage 2's step grid,
+13.6 of 27.2 device hours were repeats of views another GPU had measured, and an op plan at
+TP 1 takes 2.5 to 4.6 hours on one of eight cards
+([#2678](https://github.com/jgong5/ATOM/issues/2678)). Each change below cites its own
+figure.
 
 ### Decision
 
@@ -1760,9 +1758,10 @@ see.
 | a prediction planned from its own simulated runs | D37, `17` D98 | 3 | real runs dropped as a planning input everywhere: cost grading then declines the steps at the 52 points only #1233's real runs reach |
 | byte-identical speed-ups of `measure ops`, `trace ops` and the fits (Summary) | none | 1 | none |
 
-`measure ops` keeps one bench an invocation: at a DP-attention layout `--gpu` naming eight
-cards is the layout itself, its ranks in lockstep (`atom/compass/bench/ops.py::main`), and
-no op point has been timed on two cards (T125).
+`measure ops` keeps one bench an invocation: `--gpu` names the layout's ranks, or one card
+at a DP-attention layout (`atom/compass/bench/ops.py::main`), and the ranks take a barrier
+before each replay (`atom/compass/bench/ranks.py`), so eight cards at DPA8 are one bench,
+not eight; and no op point has been timed on two cards (T125).
 
 ### Scenarios
 
@@ -1884,4 +1883,4 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T105 | Sweep B on cells the PrefillDelayer does not coalesce: PP above 1 and rapidserve run A only and are not marked swept (D106) | ATOM builds no delayer there, so nothing makes a designed step's rows one batch |
 | T122 | Plan a prediction from its simulated runs (D37) on a new engine configuration | its host laws need a real run, since their key holds the engine config (D41); the loop is shown only on a calibrated configuration ([#2678](https://github.com/jgong5/ATOM/issues/2678)) |
 | T123 | Plan a prediction from its simulated runs (D37) on day zero, where the step roofline alone prices the first round's populations ([#2661](https://github.com/jgong5/ATOM/issues/2661)) | not yet run |
-| T125 | `measure ops` on several cards (D39, D118): the same op points on two cards against one card's two passes, and how a split meets the DP-attention layout, where `--gpu` naming the layout's cards runs its ranks in lockstep (`atom/compass/bench/ops.py::main`). Until then one bench an invocation; `scripts/compass/README.md`'s op-level cell splits an op plan's decode rungs over one-card runs with no such check | no op point has been timed on two cards |
+| T125 | `measure ops` on several cards (D39, D118): the same op points on two cards against one card's two passes, and how a split meets a DP-attention layout, whose cards are one bench, its ranks taking a barrier before each replay (`atom/compass/bench/ops.py::main`, `atom/compass/bench/ranks.py`). Until then one bench an invocation; `scripts/compass/README.md`'s op-level cell splits an op plan's decode rungs over one-card runs with no such check | no op point has been timed on two cards |
