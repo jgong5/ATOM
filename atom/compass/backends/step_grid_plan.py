@@ -81,14 +81,21 @@ UNKEYED = (*BOUNDS, "num_kvcache_blocks", "enable_prefix_caching")
 #: The engine file's prefill token-graph buckets its runner recorded, where it
 #: recorded some, also beside `keyed`'s.
 PREFILL_BUCKETS = "prefill_buckets"
+#: Whether the engine's token processor defers each step's sampled ids a step
+#: (`scheduler.defers_output`), also beside `keyed`'s: `check_run` reads it.
+DEFERS_OUTPUT = "deferred_output"
 #: The grid definition's own fields.
 DEFINITION = ("prefill", "decode", "margin")
 
 
 def keyed_of(engine: dict) -> dict:
     """`run.step_grid.keyed`'s fields of an engine file's mapping `engine`, which
-    adds `UNKEYED` and `PREFILL_BUCKETS` to them."""
-    return {k: v for k, v in engine.items() if k not in (*UNKEYED, PREFILL_BUCKETS)}
+    adds `UNKEYED`, `PREFILL_BUCKETS` and `DEFERS_OUTPUT` to them."""
+    return {
+        k: v
+        for k, v in engine.items()
+        if k not in (*UNKEYED, PREFILL_BUCKETS, DEFERS_OUTPUT)
+    }
 
 
 def at_ladder(here: dict, there) -> dict:
