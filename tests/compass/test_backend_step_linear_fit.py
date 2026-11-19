@@ -26,10 +26,11 @@ from atom.compass.backends import (
     StepLinearLaw,
 )
 from atom.compass.backends.step_labels import BUILDS, label
-from atom.compass.backends.step_linear import EAGER_DUMMY
+from atom.compass.backends.step_linear import EAGER_DUMMY, EXTRAPOLATED
 from atom.compass.backends.step_linear_fit import (
     _fit_form,
     _solve,
+    fill_rungs,
     fit,
     fit_host,
     held_out,
@@ -364,6 +365,30 @@ def test_a_rung_too_thin_to_fit_is_named_and_its_steps_refused(tmp_path):
     assert "4" not in law["decode"]
     with pytest.raises(CostRefused, match="no decode vector for rung 4"):
         StepLinearBackend(StepLinearLaw(law)).price(_view([(1, 900, True)], 4))
+
+
+def test_a_captured_rung_no_record_reached_is_filled_declared_and_outside_its_hull(
+    tmp_path,
+):
+    # Rungs 2 and 4 fitted, 3 and 8 captured: 3 interpolates them coefficient by
+    # coefficient, 8 extrapolates them, and both price as declared, never inside
+    # a hull, as no step at either was fitted.
+    law = _fit([_record(tmp_path / "dp0.jsonl", _steps(9))])
+    filled = fill_rungs(law, [2, 3, 4, 8])
+
+    assert set(filled) == {"3", "8"} and law["filled"] == filled
+    assert "interpolated in the rung between rungs 2 and 4" in filled["3"]
+    assert "extrapolated in the rung from rungs 2 and 4" in filled["8"]
+    two, four = (law["decode"][r]["coefficients"] for r in ("2", "4"))
+    three, eight = (law["decode"][r]["coefficients"] for r in ("3", "8"))
+    for f in three:
+        assert three[f] == pytest.approx((two[f] + four[f]) / 2)
+        assert eight[f] == pytest.approx(max(0.0, two[f] + 3 * (four[f] - two[f])))
+    terms = StepLinearBackend(StepLinearLaw(law)).price(_view([(1, 900, True)], 3))
+    assert {t.provenance.method for t in terms.terms} == {Method.DECLARED}
+    assert {t.provenance.source for t in terms.terms} == {EXTRAPOLATED}
+    assert not any(t.provenance.validated for t in terms.terms)
+    assert fill_rungs(law, [2, 3, 4, 8]) == {} and law["filled"] == filled
 
 
 def test_the_outlier_scale_is_read_over_every_step_so_it_does_not_shrink(tmp_path):

@@ -36,7 +36,10 @@ names no routed experts gives none. It reads a block drafter's own routing too
 may adopt a MoE column. The law states,
 as `platform`, the platform fields of its key,
 and `engine_config`, as that command's does, and the key holds them, and
-`records_atom` as that command's states it. The report's
+`records_atom` as that command's states it. Each rung of the capture ladder
+no record reached gets a declared vector, filled from the fitted rungs beside
+it (`step_linear_fit.fill_rungs`), and the law and the report name each under
+`filled`. The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
 
@@ -132,6 +135,9 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
         law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
     if len({s.provenance["run"] for s in samples}) > 1:
         step_linear_fit.mark_held_out(law, report, samples, options, args.seed)
+    report["filled"] = step_linear_fit.fill_rungs(
+        law, config["engine_config"].get("ladder")
+    )
     report["provenance"] = publish.runs(samples)
     law["platform"] = keyed_platform(Kind.STEP_LINEAR_LAW, config["platform"])
     law["engine_config"] = config["engine_config"]
