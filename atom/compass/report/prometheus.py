@@ -16,9 +16,11 @@ renders again, to OUT/`DATA`.
   once.
 - The panels are those of the run's deployment kind, ``pd`` when OUT holds a
   deployment's two sides, else ``standalone``, from the series' first instant
-  to their last, at CI's step and window: ``max(60, 4 x interval)``, the
-  interval the shortest between two instants of one file, as each LP samples
-  at ATOM's metrics timer.
+  to the first grid point at or past their last, as CI's
+  ``wait_for_final_scrape`` ends its query, at CI's step and window:
+  ``max(60, 4 x interval)``, the interval the shortest between two instants of
+  one file at ATOM's metrics timer, each file's last step left out, since its
+  final sample lands under one interval after the timer's last.
 - It is titled simulated, and its notes say the times are the simulated
   clock's and the GPU panels' predicted, name each engine member or frontend
   that wrote no file and each family the panels query that no sampler writes,
@@ -121,6 +123,10 @@ def _report(out: Path) -> Path:
     with tempfile.TemporaryDirectory(prefix="compass-prometheus-") as work:
         work = Path(work)
         first, last, interval = _backfill(promtool, files, work / "data")
+        step = collect_metrics.REPORT_STEP
+        # query_range evaluates first + n x step: the end is the first of those
+        # at or past the last instant, and past first, as collect_report asks.
+        end = max(first + math.ceil((last - first) / step) * step, first + 1)
         window = max(60, math.ceil(4 * interval))
         notes.append(
             f"Histogram points summarize the preceding {window} seconds; queue"
@@ -147,9 +153,9 @@ def _report(out: Path) -> Path:
                 data = export_report.collect_report(
                     url,
                     first,
-                    max(last, first + 1),
+                    end,
                     deployment=deployment,
-                    step=collect_metrics.REPORT_STEP,
+                    step=step,
                     window=window,
                     title=TITLES[deployment],
                     diagnostics=errors,
@@ -192,7 +198,7 @@ def _ci():
 def _backfill(promtool: str, files: list, tsdb: Path) -> tuple:
     """Backfill each of `files` into `tsdb`, decompressed; the first and last
     instant of their samples, and the shortest step between two instants of
-    one file, 0 when none holds two."""
+    one file but its last step, its final sample's, 0 when none holds three."""
     first, last, steps = math.inf, -math.inf, []
     for path in files:
         text = tsdb.with_name(path.stem)
@@ -214,7 +220,7 @@ def _backfill(promtool: str, files: list, tsdb: Path) -> tuple:
         instants = sorted(stamps)
         if instants:
             first, last = min(first, instants[0]), max(last, instants[-1])
-            steps += [b - a for a, b in itertools.pairwise(instants)]
+            steps += [b - a for a, b in itertools.pairwise(instants[:-1])]
     if first > last:
         raise Unmade("no engine or frontend sampled any series")
     return first, last, min(steps, default=0)

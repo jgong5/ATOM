@@ -297,6 +297,16 @@ compass_gpu_skips() {
     done < <(grep -vE '^[[:space:]]*(#|$)' "$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_skip.txt")
 }
 
+# compass_cargo_lock MESH: copies into atomesh's directory MESH, unless it has
+# one, the lockfile the image built atomesh with (COMPASS_CARGO_LOCK, default
+# /app/ATOM/atom/mesh/Cargo.lock). The tree ignores Cargo.lock, and offline
+# cargo resolves atomesh's crates only under the lockfile the container's crate
+# cache was fetched for. Both gates call it before their cargo runs.
+compass_cargo_lock() {
+    local lock=${COMPASS_CARGO_LOCK:-/app/ATOM/atom/mesh/Cargo.lock}
+    [ -e "$1/Cargo.lock" ] || [ ! -r "$lock" ] || cp "$lock" "$1/Cargo.lock"
+}
+
 # compass_held_port [N]: the first of N ports in a row (default 1), each one
 # a free TCP port, held until this script exits, so no other process binds it
 # before its server does. A block of more than one is drawn below the

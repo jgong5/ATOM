@@ -59,7 +59,8 @@ command. Each other point starts with no traffic, as the search will run it,
 for what only a start shows, in the directory the check resolved its arguments
 in: `compass run`, or `deploy.sh run` on 1P1D with `ROUTER`'s router arguments,
 its decode side through a local ``--on`` prefix carrying its own variables where
-SPACE names a network. A point answers once the start's ``server.json`` names
+SPACE names a network; a point offloading to an lmcache server with the run
+file's ``lmcache`` entry, its server at the point's own port. A point answers once the start's ``server.json`` names
 it, and is ``searchable``; a start that leaves first, or does not answer in
 `START_S`, refuses the candidate with the start's last line and each log's
 first raised error. Points whose instances run alike start once. Nothing is
@@ -82,6 +83,7 @@ from atom.compass.artifacts import ArtifactRefusal, machine_platform
 from atom.compass.drive import lacking, reuse, runfile, serve
 from atom.compass.drive import run as drive_run
 from atom.compass.fit.device import compose
+from atom.compass.kv.lmcache_server import DECLARED_LAWS
 from atom.compass.run.step_grid import keyed
 from atom.compass.spec import SpecRefusal
 
@@ -130,6 +132,9 @@ ROUTER = (
     "--disable-circuit-breaker",
     "--disable-retries",
 )
+#: The variable ATOM reads its KV offload connector's extra config from, which
+#: names the lmcache server an offloading point reaches.
+EXTRA = "ATOM_KV_OFFLOAD_EXTRA_CONFIG"
 
 
 def check(expansion: dict, out: Path) -> dict:
@@ -303,14 +308,19 @@ def _start(machine, candidate, point, verdicts, store, at: Path) -> str | None:
 def serving(machine, candidate, point, verdicts, store, at: Path) -> tuple[list, dict]:
     """The command that serves `point` of `candidate` on `machine` from
     `store`, under the laws its `verdicts` name, into `at`, and the variables
-    it runs under: `compass run`, or `deploy.sh run` on 1P1D. A ValueError
-    says why `deploy.sh` cannot start a 1P1D point."""
+    it runs under: `compass run`, or `deploy.sh run` on 1P1D. A point with an
+    ``lmcache_port`` takes ``--lmcache``, its entry written beside `at`
+    (`_lmcache`). A ValueError says why `deploy.sh` cannot start a 1P1D
+    point, or why a point cannot reach its lmcache server."""
     flags = ["--device", machine["device"], "--ptl", machine["ptl"], "--store", store]
     flags += ["--stack", machine["stack"]] if machine.get("stack") else []
     for flag, i in (("--step-linear", 0), ("--host-laws", 1)):
         for value in dict.fromkeys(v["run"][i] for v in verdicts["law"].values()):
             flags += [flag, value]
     sides = point["instances"]
+    if "lmcache_port" in point:
+        entry, sides = _lmcache(candidate, point, at)
+        flags += ["--lmcache", entry]
     if candidate["deployment"] == "single":
         (one,) = sides.values()
         return [COMPASS, "run", *flags, "--out", at, "--", *one["args"]], one["env"]
@@ -335,6 +345,37 @@ def serving(machine, candidate, point, verdicts, store, at: Path) -> tuple[list,
     command = [DEPLOY, at, "run", *flags, "--prefill", "--", *sides["prefill"]["args"]]
     command += ["--decode", *on, "--", *sides["decode"]["args"]]
     return command + ["--router", "--", *ROUTER], prefill
+
+
+def _lmcache(candidate: dict, point: dict, at: Path) -> tuple[Path, dict]:
+    """The run file's ``lmcache`` entry of `point` of `candidate`, written
+    beside `at` in ``<at>.lmcache.json``: its lmcache server's flags, at
+    `serve.HOST` and the point's port, and the request loop's declared laws;
+    and the point's instances, each offloading through ``lmcache_mp`` reaching
+    that server through `EXTRA`, which a ValueError refuses when not a JSON
+    object or naming either. ATOM refuses `EXTRA` with no offload, so an
+    instance offloading through none keeps its variables."""
+    port = point["lmcache_port"]
+    server = [*candidate["lmcache_server"], "--host", serve.HOST, "--port", str(port)]
+    entry = at.with_name(at.name + ".lmcache.json")
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text(json.dumps({"server": server, **DECLARED_LAWS}))
+    reached = {"lmcache.mp.host": f"tcp://{serve.HOST}", "lmcache.mp.port": port}
+    sides = dict(point["instances"])
+    for side, one in sides.items():
+        if one["env"].get("ATOM_KV_OFFLOAD") != "lmcache_mp":
+            continue
+        try:
+            extra = json.loads(one["env"].get(EXTRA, "{}"))
+        except ValueError:
+            extra = None
+        if not isinstance(extra, dict) or reached.keys() & extra.keys():
+            raise ValueError(
+                f"{EXTRA} is {one['env'][EXTRA]}: compass advice takes a JSON "
+                f"object naming neither {' nor '.join(reached)}, which it assigns"
+            )
+        sides[side] = one | {"env": one["env"] | {EXTRA: json.dumps(extra | reached)}}
+    return entry, sides
 
 
 def launched(command: list, env: dict, at: Path, until) -> "Command":

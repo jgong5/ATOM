@@ -26,8 +26,9 @@ fingerprints recorded. An entry listed is one whose platform is not known, whose
 fingerprints are not the ones its kind's rows record today, a point whose
 digest is not its record's, or one NEW refuses, each with the reason.
 
-`--laws DIR` rewrites each law file there in place: its `machine_spec` becomes
-its `platform`, and its host key's the platform fields a `host_laws` key states.
+`--laws DIR` rewrites each law file there in place, a `.json.xz` one compressed
+again: its `machine_spec` becomes its `platform`, and its host key's the platform
+fields a `host_laws` key states.
 
 Each entry and law prints one line, MOVED or LISTED, and the counts end it.
 """
@@ -59,6 +60,7 @@ from atom.compass.artifacts import (
     rows_for,
 )
 from atom.compass.artifacts.keys import LAYOUT
+from atom.compass.backends.json_file import XZ, read_json, write_json
 from atom.compass.spec import MachineSpec
 
 #: The key field that stated the digest.
@@ -94,7 +96,7 @@ def _swap(mapping: dict, new: dict) -> dict:
 
 def law(path: Path, known: dict) -> str:
     """Rewrite the law file `path` with the platforms `known` by digest."""
-    document = json.loads(path.read_text())
+    document = read_json(path)
     digests = {document.get(OLD)}
     if "host" in document:
         digests.add(document["host"]["key"].get(OLD))
@@ -112,7 +114,7 @@ def law(path: Path, known: dict) -> str:
     document = _swap(document, {"platform": step})
     if host:
         document["host"]["key"] = _swap(document["host"]["key"], host)
-    path.write_text(json.dumps(document) + "\n")
+    write_json(document, path)
     return f"MOVED {path.name}"
 
 
@@ -210,7 +212,8 @@ def main(argv=None) -> None:
         for directory in sorted(old.glob("*/[!.]*")):
             if (directory / "entry.json").is_file():
                 lines.append(entry(directory, known, into, args.machines))
-    for path in sorted(args.laws.glob("*.json")) if args.laws else ():
+    globs = ("*.json", f"*.json{XZ}") if args.laws else ()
+    for path in sorted(p for g in globs for p in args.laws.glob(g)):
         lines.append(law(path, known))
     for line in lines:
         print(line)

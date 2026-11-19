@@ -10,7 +10,6 @@ keys the engine config both of its laws state.
 No device: aiter's arch probe answers a declared arch.
 """
 
-import json
 import pathlib
 
 import pytest
@@ -20,6 +19,7 @@ from test_drive_runfile import build, install, step_linear
 from test_run_step_grid import deployment
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
+from atom.compass.backends.json_file import read_json
 from atom.compass.capture.forward import structure
 from atom.compass.drive.run import _config
 from atom.compass.run.step_grid import BUCKETS, keyed
@@ -121,8 +121,8 @@ def test_an_index_cache_that_follows_the_kv_cache_keys_as_before(
 def test_a_v41_flash_mi455_server_keys_the_engine_config_its_law_states(
     tmp_path, monkeypatch, ep
 ):
-    law = f"deepseek-v4.1-flash-tp4-{'ep4-' * bool(ep)}dspark5-mi455-a0.json"
-    stated = json.loads((TREE / "scripts/compass/laws" / law).read_text())
+    law = f"deepseek-v4.1-flash-tp4-{'ep4-' * bool(ep)}dspark5-mi455-a0.json.xz"
+    stated = read_json(TREE / "scripts/compass/laws" / law)
     for name, value in V41_ENV.items():
         monkeypatch.setenv(name, value)
     config = served(tmp_path, monkeypatch, "gfx1250", V41, *V41_SERVER.split(), *ep)

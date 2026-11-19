@@ -45,7 +45,8 @@ The run file's `ENTRY` holds ``chunk_size``, ``tensor_parallel_size`` and
 ``chunk_bytes``, as the deployment it was fitted on logged them, and the
 priced terms `TERMS` names (`atom.compass.backends.step_linear_fit.fit_offload`). A
 deployment of another chunk size or TP width is refused, and so is an LMCache
-config with a tier or a lookup this does not model (`UNMODELLED`). Importing
+config with a tier or a lookup this does not model (`UNMODELLED`), by
+`tier_config`, which `compass run --check` calls too. Importing
 this module loads no third-party package; using it loads lmcache, numpy and
 torch.
 """
@@ -144,6 +145,40 @@ def check_entry(entry) -> None:
                 f"{ENTRY}.{name} is {term!r}, not [fixed, per chunk] seconds, "
                 "finite and non-negative"
             )
+
+
+def tier_config(entry, config):
+    """The LMCache config each TP rank's worker builds for ATOM's `config`, and
+    the ranks of its replica. Refused unless `entry` is an `ENTRY` this reads
+    (`check_entry`) and this simulates the deployment at its fit: a layout in
+    `LAYOUTS`, a CPU tier, no field of `UNMODELLED` set, and the chunk size and
+    TP replica width the entry was fitted at."""
+    from atom.kv_transfer.offload import config as offcfg
+
+    check_entry(entry)
+    if (layout := offcfg.select_offload_layout(config)) not in LAYOUTS:
+        raise ValueError(
+            f"lmcache_offload's {layout!r} layout keeps a state tier beside "
+            f"its chunks; only {', '.join(LAYOUTS)} are simulated"
+        )
+    # As each rank's worker builds its engine's config.
+    cfg = offcfg.build_lmcache_config(config.kv_transfer_config)
+    offcfg.scale_cpu_size_for_pp(cfg, config)
+    if not cfg.local_cpu:
+        raise ValueError("lmcache_offload is simulated with its CPU tier on")
+    if unmodelled := [f for f in UNMODELLED if getattr(cfg, f) not in (None, False)]:
+        raise ValueError(
+            f"lmcache_offload is simulated with a CPU tier alone; this "
+            f"deployment sets LMCache's {', '.join(unmodelled)}"
+        )
+    world = offcfg.lmcache_replica_world_size(config)
+    for name, value in zip(MATCHED, (cfg.chunk_size, world)):
+        if entry[name] != value:
+            raise ValueError(
+                f"the run file's {ENTRY} was fitted at {name} {entry[name]}, "
+                f"and this deployment runs {value}"
+            )
+    return cfg, world
 
 
 def chunk_keys(tokens, chunk: int) -> list[bytes]:
@@ -342,7 +377,6 @@ class OffloadShell:
 
         from atom.compass.run import spec
         from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
-        from atom.kv_transfer.offload import config as offcfg
         from atom.kv_transfer.offload.connector import (
             LMCacheOffloadConnectorScheduler,
             _build_worker,
@@ -353,31 +387,7 @@ class OffloadShell:
         if self._rt is None:
             raise RuntimeError("no LP runtime is installed to price the tier on")
         entry = spec()[ENTRY]
-        check_entry(entry)
-        if (layout := offcfg.select_offload_layout(config)) not in LAYOUTS:
-            raise ValueError(
-                f"lmcache_offload's {layout!r} layout keeps a state tier beside "
-                f"its chunks; only {', '.join(LAYOUTS)} are simulated"
-            )
-        # As each rank's worker builds its engine's config.
-        cfg = offcfg.build_lmcache_config(config.kv_transfer_config)
-        offcfg.scale_cpu_size_for_pp(cfg, config)
-        if not cfg.local_cpu:
-            raise ValueError("lmcache_offload is simulated with its CPU tier on")
-        if unmodelled := [
-            f for f in UNMODELLED if getattr(cfg, f) not in (None, False)
-        ]:
-            raise ValueError(
-                f"lmcache_offload is simulated with a CPU tier alone; this "
-                f"deployment sets LMCache's {', '.join(unmodelled)}"
-            )
-        world = offcfg.lmcache_replica_world_size(config)
-        for name, value in zip(MATCHED, (cfg.chunk_size, world)):
-            if entry[name] != value:
-                raise ValueError(
-                    f"the run file's {ENTRY} was fitted at {name} {entry[name]}, "
-                    f"and this deployment runs {value}"
-                )
+        cfg, world = tier_config(entry, config)
         self.chunk = cfg.chunk_size
         align = AddressManager.ALIGN_BYTES
         slots = int(cfg.max_local_cpu_size * 1024**3) // (
