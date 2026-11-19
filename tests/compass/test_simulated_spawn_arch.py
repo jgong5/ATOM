@@ -5,8 +5,10 @@ on a host with no driver.
 ATOM's API server spawns its engine cores, and each engine core its workers;
 each imports aiter again, whose Triton helpers probe the device for its arch.
 `serve` starts the server under `on_arch`, and every process below it declares
-the same arch before aiter loads. The planted server spawns as ATOM's does, two
-levels deep, and each level records the arch aiter's probe answers.
+the same arch before aiter loads, the server's module run as ``python -m`` runs
+it or by a wrapper that makes it ``__main__`` in its place, as `http_intake`
+runs ATOM's. The planted server spawns as ATOM's does, two levels deep, and
+each level records the arch aiter's probe answers.
 
 Then ATOM's own server, its engine core and TP1 worker, starts from `serve` on
 a step stub and answers ``/health``. Its worker asks `torch.cuda` about the
@@ -64,6 +66,12 @@ from planted_child import probe
 if __name__ == "__main__":
     probe(os.environ["PLANTED_DIR"], 0)
 """
+#: Runs the module argv[1] names as `http_intake serve` runs ATOM's server.
+WRAPPER = """\
+import runpy, sys
+
+runpy.run_module(sys.argv.pop(1), run_name="__main__", alter_sys=True)
+"""
 #: `serve` on the run file in argv[2], into argv[1], ATOM's arguments after.
 DRIVE = """\
 import json, sys
@@ -73,13 +81,17 @@ serve.serve(sys.argv[3:], sys.argv[1], run=json.loads(Path(sys.argv[2]).read_tex
 """
 
 
+@pytest.mark.parametrize("wrapped", [False, True], ids=["module", "wrapped"])
 @pytest.mark.parametrize("arch", sorted(FP8))
 def test_a_simulated_server_s_spawned_processes_probe_its_machine_s_arch(
-    planted, monkeypatch, arch  # noqa: F811
+    planted, monkeypatch, arch, wrapped  # noqa: F811
 ):
     monkeypatch.setenv("PLANTED_EXIT", "late:0")
     plant_module(planted, monkeypatch, SPAWNS + textwrap.indent(PLANTED, "    "))
     (planted / "planted_child.py").write_text(CHILD)
+    if wrapped:
+        (planted / "wrapper.py").write_text(WRAPPER)
+        monkeypatch.setattr(serve, "SERVER", (*serve.SERVER[:2], "wrapper", "planted"))
     run = {"bound_s": 1.0, "machine": machine(arch)}
 
     serve.serve(["--model", "m"], planted / "out", run=run)

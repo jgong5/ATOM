@@ -11,28 +11,44 @@ device queries answer as that device too (`driverless.answer_as`): a simulated
 runner asks them as it builds, its model and its attention metadata builder.
 
 Every process the server spawns, and each one those spawn, declares ARCH too,
-before it unpickles anything that imports aiter: this module stays the
-server's ``__main__``, which a spawned process imports first, as
-``__mp_main__``, and the arch is in its environment (`ARCH_ENV`).
+as the first step of its spawn command line: before it imports its parent's
+``__main__``, MODULE or a module MODULE runs in its place.
 """
 
-import os
 import runpy
 import sys
+from multiprocessing import spawn
+from pathlib import Path
 
 import torch
 
+import atom
 from atom.compass.capture.driverless import answer_as, import_aiter_on
 
-#: The arch a process started here declared, which the processes it spawns read.
-ARCH_ENV = "ATOM_COMPASS_ON_ARCH"
+#: Where a spawned process imports this `atom` from, before it takes its
+#: parent's `sys.path`.
+TREE = str(Path(atom.__file__).resolve().parents[1])
 
 
 def declare(arch: str) -> None:
-    """aiter, and with no driver here `torch.cuda`, as on a device of `arch`."""
+    """aiter, with no driver here `torch.cuda`, and every process this one
+    spawns, as on a device of `arch`."""
     import_aiter_on(arch)
     if not torch.cuda.is_available():
         answer_as(arch)
+    line = spawn.get_command_line
+
+    def get_command_line(**kwds) -> list[str]:
+        argv = line(**kwds)
+        i = argv.index("-c") + 1
+        argv[i] = (
+            f"import sys; sys.path.insert(0, {TREE!r}); "
+            f"from atom.compass.drive.on_arch import declare; declare({arch!r}); "
+            f"{argv[i]}"
+        )
+        return argv
+
+    spawn.get_command_line = get_command_line
 
 
 def main(argv: list[str]) -> None:
@@ -40,14 +56,9 @@ def main(argv: list[str]) -> None:
     if flag != "-m":
         raise SystemExit(f"usage: on_arch ARCH -m MODULE [ARGS...]; got {flag!r}")
     declare(arch)
-    os.environ[ARCH_ENV] = arch
     sys.argv = [module, *args]
-    # Not `alter_sys`, which would make MODULE the `__main__` a spawned process
-    # imports, and so import aiter there before anything declares the arch.
-    runpy.run_module(module, run_name="__main__")
+    runpy.run_module(module, run_name="__main__", alter_sys=True)
 
 
 if __name__ == "__main__":
     main(sys.argv[1:])
-elif __name__ == "__mp_main__":
-    declare(os.environ[ARCH_ENV])
