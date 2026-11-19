@@ -8,9 +8,10 @@
   gate_select.py stamp MAP ROOT   the .compass-select stamp of ROOT's HEAD
   gate_select.py build WORK ROOT SHA OUT   the map of gate_map.sh's run
 
-A test file is kept when it ran a function whose body changed since the map's
-commit, ran a function of a class that gained a definition, is itself changed,
-or is not in the map. Anything else a diff changes runs the whole gate.
+A test file is kept when it ran a function whose body the diff since the map's
+commit changes, or a method of a class that gains a definition; when the diff
+changes it or a file under tests/ it imports; or when the map does not hold it.
+Any other change runs the whole gate.
 
 Under gate_map.sh this module also starts coverage in every Python process
 (startup) and is the gate's pytest plugin (-p gate_select): a test file's
@@ -32,6 +33,7 @@ DESIGN = "atom/compass/design/"
 GATE = "scripts/compass/gate_select.py"
 EMPTY = {"code": [], "names": {}, "bodies": {}}
 SKIP_DIRS = {"__pycache__", "target", "build", "dist", "node_modules", "venv"}
+DIFF = ["-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", "-z"]
 _work = _root = _ctx = None
 
 
@@ -43,17 +45,29 @@ def _dump(nodes):
     return [ast.dump(n) for n in nodes if n is not None]
 
 
+def _code(body):
+    """`body` less its docstring, which is not code."""
+    doc = (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+    )
+    return body[1:] if doc else body
+
+
 def _bound(node):
-    """The names a module-level statement binds, or None when it does more than bind names."""
-    targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
-    names = [n for t in targets for n in (t.elts if isinstance(t, (ast.Tuple, ast.List)) else [t])]
-    return [n.id for n in names] if names and all(isinstance(n, ast.Name) for n in names) else None
+    """The names a module-level statement binds, or None when it does more than bind."""
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+        return None
+    targets = getattr(node, "targets", [getattr(node, "target", None)])
+    names = [n for t in targets for n in getattr(t, "elts", [t])]
+    return (
+        [n.id for n in names] if all(isinstance(n, ast.Name) for n in names) else None
+    )
 
 
 def _scan(body, prefix, s, spans, code):
-    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
-        body = body[1:]  # a docstring is not code
-    for node in body:
+    for node in _code(body):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             q = prefix + node.name
             head = ["class" if isinstance(node, ast.ClassDef) else "def"]
@@ -63,25 +77,31 @@ def _scan(body, prefix, s, spans, code):
                 _scan(node.body, q + ".", s, spans, inner)
                 head += _dump(node.bases) + _dump(node.keywords) + [h for h, _ in inner]
             else:
-                rest = node.body
-                if rest and isinstance(rest[0], ast.Expr) and isinstance(rest[0].value, ast.Constant):
-                    rest = rest[1:]
-                s["bodies"].setdefault(q, []).append(_h(_dump([node.args, node.returns, *rest])))
+                body_h = _h(_dump([node.args, node.returns, *_code(node.body)]))
+                s["bodies"].setdefault(q, []).append(body_h)
                 spans.append((node.body[0].lineno, node.end_lineno, q))
             s["names"].setdefault(q, []).append(_h(head))
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for a in node.names:  # one entry per name, so adding a name adds an entry
-                name = None if a.name == "*" else [a.asname or a.name.partition(".")[0]]
-                code.append([_h([getattr(node, "module", None), getattr(node, "level", 0), a.name, a.asname]), name])
-        elif not (isinstance(node, ast.If) and "TYPE_CHECKING" in ast.dump(node.test) and not node.orelse):
+                key = [getattr(node, "module", None), getattr(node, "level", 0)]
+                bound = (
+                    None if a.name == "*" else [a.asname or a.name.partition(".")[0]]
+                )
+                code.append([_h([*key, a.name, a.asname]), bound])
+        elif not (
+            isinstance(node, ast.If)
+            and "TYPE_CHECKING" in ast.dump(node.test)
+            and not node.orelse
+        ):
             code.append([_h(ast.dump(node)), _bound(node)])
 
 
 def structure(src):
-    """What a module's import runs, by part, and its functions' body spans; (None, []) unparsable.
+    """A module's shape and its functions' body spans; (None, []) when it does not parse.
 
     `code` holds each module-level statement other than a definition, with the
-    names it binds when binding is all it does."""
+    names it binds when binding is all it does; `names` each definition's hash
+    outside function bodies; `bodies` each function body's hash."""
     try:
         mod = ast.parse(src)
     except (SyntaxError, ValueError):
@@ -118,12 +138,15 @@ def _compare(p, old, new, funcs, grown):
 
 def _is_test(p):
     name = os.path.basename(p)
-    return p.startswith("tests/") and name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+    test = (
+        name.startswith("test_") and name.endswith(".py") or name.endswith("_test.py")
+    )
+    return p.startswith("tests/") and test
 
 
 def _files(root, top, keep):
     for d, dirs, names in os.walk(os.path.join(root, top)):
-        dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS and not x.startswith("."))
+        dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS and x[0] != ".")
         for name in sorted(names):
             p = os.path.relpath(os.path.join(d, name), root)
             if keep(p):
@@ -133,7 +156,7 @@ def _files(root, top, keep):
 def _importers(root, p):
     """The files under tests/ that import the module `p` by its name."""
     stem = re.escape(os.path.basename(p)[:-3])
-    pat = re.compile(rf"^\s*(from|import)\s+([\w.]+\.)?{stem}\b", re.M)
+    pat = re.compile(rf"^\s*(from|import)\s+([\w.]+\.)?{stem}\b", re.MULTILINE)
     found = set()
     for f in _files(root, "tests", lambda f: f.endswith(".py") and f != p):
         with open(os.path.join(root, f), encoding="utf-8", errors="replace") as fh:
@@ -143,34 +166,40 @@ def _importers(root, p):
 
 
 def _git(root, *args):
-    return subprocess.run(["git", "-C", root, *args], capture_output=True, text=True)
+    cmd = ["git", "-C", root, *args]
+    return subprocess.run(cmd, check=False, capture_output=True, text=True)
 
 
-def _since(root, sha, rev):
+def _since(root, sha, *rev):
     """(is sha an ancestor of HEAD, the paths changed from sha to `rev` or the work tree)."""
     if _git(root, "merge-base", "--is-ancestor", sha, "HEAD").returncode:
         return False, []
-    out = _git(root, "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", "-z", sha, *rev)
+    out = _git(root, *DIFF, sha, *rev)
     return out.returncode == 0, [p for p in out.stdout.split("\0") if p]
 
 
 def _changed(root, sha):
     """(why the whole gate runs, the paths changed since the map's sha)."""
     if _git(root, "rev-parse", "--git-dir").returncode == 0:
-        ok, paths = _since(root, sha, ())
+        ok, paths = _since(root, sha)
     else:
+        head = rest = commit = ""
         try:
             with open(os.path.join(root, ".compass-select"), encoding="utf-8") as f:
                 head, _, rest = f.read().partition("\n")
             with open(os.path.join(root, ".compass-commit"), encoding="utf-8") as f:
                 commit = f.read().strip()
         except OSError:
-            head = rest = commit = ""
+            pass
         if not head:
-            return "the snapshot has no .compass-select stamp; stage it with COMPASS_GATE_SELECT set", []
-        if head.split()[:2] != [sha, commit]:
-            return f"the .compass-select stamp is for map {head.split()[0][:9]} at {head.split()[1][:9]}", []
-        ok, paths = head.split()[2] == "1", [p for p in rest.split("\0") if p]
+            return (
+                "the snapshot has no .compass-select stamp; stage it with the map",
+                [],
+            )
+        stamped, at, ok = head.split()
+        if [stamped, at] != [sha, commit]:
+            return f"the .compass-select stamp is of map {stamped[:9]} at {at[:9]}", []
+        ok, paths = ok == "1", [p for p in rest.split("\0") if p]
     return (None if ok else f"the map's {sha[:9]} is not an ancestor of HEAD"), paths
 
 
@@ -196,11 +225,11 @@ def _keep(m, root):
         if new is None or old is None:
             return f"{p} does not parse", None
         why = _compare(p, old, new, funcs, grown)
-        if _is_test(p):
-            own.add(p)
+        mine = {p} if _is_test(p) else set()
+        own |= mine
         if why and p.startswith("tests/"):
             # A file under tests/ runs at the import of the test files that import it.
-            users = _importers(root, p) | ({p} if _is_test(p) else set())
+            users = _importers(root, p) | mine
             why = None if users and all(map(_is_test, users)) else why
             own |= users
         if why:
@@ -210,27 +239,26 @@ def _keep(m, root):
     return None, own | {t for t, ids in m["ran"].items() if hit.intersection(ids)}
 
 
-def select(path, root, ignored):
+def select(path, root, *ignored):
     with open(path, encoding="utf-8") as f:
         m = json.load(f)
     out = tuple(i.rstrip("/") + "/" for i in ["tests/plugin", *ignored])
-    tests = [t for t in _files(root, "tests", _is_test) if t not in ignored and not t.startswith(out)]
+    tests = [t for t in _files(root, "tests", _is_test) if not t.startswith(out)]
+    tests = [t for t in tests if t not in ignored]
     why, keep = _keep(m, root)
     if why:
         print(f"select: whole gate -- {why}")
         return
     keep = {t for t in tests if t in keep or t not in m["ran"]}
     print(f"select: {len(keep)} of {len(tests)}, map {m['sha'][:9]}")
-    for t in tests:
-        if t not in keep:
-            print(t)
+    print("".join(f"{t}\n" for t in tests if t not in keep), end="")
 
 
 def stamp(path, root):
     with open(path, encoding="utf-8") as f:
         sha = json.load(f)["sha"]
     head = _git(root, "rev-parse", "HEAD").stdout.strip()
-    ok, paths = _since(root, sha, ("HEAD",))
+    ok, paths = _since(root, sha, "HEAD")
     sys.stdout.write(f"{sha} {head} {int(ok)}\n" + "\0".join(paths))
 
 
@@ -263,10 +291,11 @@ def build(work, root, sha, out):
                 k = bisect.bisect_right(starts[p], n) - 1
                 if k >= 0 and n <= spans[p][k][1]:
                     got.add(ids.setdefault(f"{p}::{spans[p][k][2]}", len(ids)))
-    m = {"sha": sha, "funcs": list(ids), "ran": {t: sorted(v) for t, v in sorted(ran.items())}, "tree": tree}
+    ran = {t: sorted(v) for t, v in sorted(ran.items())}
     with open(out, "w", encoding="utf-8") as f:
-        json.dump(m, f)
-    print(f"map:    {out}: {len(ran)} test files, {len(ids)} functions, {bad} unreadable data files")
+        json.dump({"sha": sha, "funcs": list(ids), "ran": ran, "tree": tree}, f)
+    print(f"map:    {out}: {len(ran)} test files, {len(ids)} functions")
+    print(f"        {bad} coverage data files unreadable")
 
 
 def startup(work, root):
@@ -290,8 +319,10 @@ def startup(work, root):
     import coverage
 
     coverage.process_startup()
-    # A fork restarts coverage under the parent's static context: restore the test file's.
-    os.register_at_fork(after_in_child=lambda: _ctx and coverage.Coverage.current().switch_context(_ctx))
+    # A fork restarts coverage under the parent's static context: restore the file's.
+    os.register_at_fork(
+        after_in_child=lambda: _ctx and coverage.Coverage.current().switch_context(_ctx)
+    )
 
 
 def _switch(path):
@@ -317,5 +348,4 @@ def pytest_runtest_protocol(item):
 
 
 if __name__ == "__main__":
-    verb, args = sys.argv[1], sys.argv[2:]
-    {"select": lambda: select(args[0], args[1], args[2:]), "stamp": lambda: stamp(*args), "build": lambda: build(*args)}[verb]()
+    {"select": select, "stamp": stamp, "build": build}[sys.argv[1]](*sys.argv[2:])
