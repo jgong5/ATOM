@@ -21,7 +21,7 @@ from atom.compass.fit import device
 from atom.compass.fit.device import COPIES, compose
 from atom.compass.spec.layers import stack_of
 
-#: MI355X gfx950's copy, folded from crsuse2-m2m-v3-005's probe record.
+#: MI355X gfx950's copy, folded from every probe record at its key.
 COPY = COPIES / "8f44fdb6fc43.json"
 #: The law the first copy serves (#2893's DeepSeek-V4-Pro DPA8 1P1D).
 FIRST = COPIES.parent / "deepseek-v4-pro-dpa8-mi355x-crs005-prefill.json.xz"
