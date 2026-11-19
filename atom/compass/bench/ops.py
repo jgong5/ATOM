@@ -4882,5 +4882,16 @@ def _child(fn, *args):
     """`fn(*args)` in a spawned process of its own: the device is free again
     at its end, and a capture's process-wide patches end with it."""
     spawn = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(1, mp_context=spawn) as child:
-        return child.submit(fn, *args).result()
+    # A script read on stdin (`python3 -`, as deploy.sh builds its run file) names itself `<stdin>`, a file spawn
+    # cannot re-import in the child (BrokenProcessPool); `fn` is imported by name, so the child needs no main module.
+    main = sys.modules["__main__"]
+    path = getattr(main, "__file__", None)
+    hidden = path is not None and not os.path.exists(path)
+    if hidden:
+        del main.__file__
+    try:
+        with ProcessPoolExecutor(1, mp_context=spawn) as child:
+            return child.submit(fn, *args).result()
+    finally:
+        if hidden:
+            main.__file__ = path
