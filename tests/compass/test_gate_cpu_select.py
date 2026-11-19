@@ -85,7 +85,8 @@ def repo(tmp_path):
         f"import pathlib\ndef test_ok():\n    pathlib.Path({str(ran)!r}, 'ok').touch()\n"
     )
     (root / "scripts" / "compass" / "gpu_gate_triggers.txt").write_text("")
-    files = {"atom/m.py": MOD}
+    # As the project's own .gitignore does: bytecode is no change to the tree.
+    files = {".gitignore": "__pycache__/\n", "atom/m.py": MOD}
     files |= {
         p: TEST.format(name=n, ran=str(ran), call=CALLS[n]) for n, p in FILES.items()
     }
