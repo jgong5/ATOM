@@ -2845,7 +2845,10 @@ every request names its DP rank (--dp-aware), so share_cache only accounts
 
 #3762's option (a): an index in each rank's engine process, as `lmcache_offload`'s tier
 (`03` D13.1), about 520 code lines against this design's 830. No rank would load another's
-saves, which `share_cache` and the recipe exist for; the owner ruled (b).
+saves, which `share_cache` and the recipe exist for; the owner ruled (b). Within (b), the
+simplest is a master without eviction that refuses a run once its Store reaches the mark:
+the ruled option holds the master's eviction, and whether the recipe's Store reaches 90%
+at C1228 is what the run would tell, not something known before it.
 
 ### Low confidence
 
