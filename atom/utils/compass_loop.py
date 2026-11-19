@@ -733,6 +733,9 @@ class HttpChannel:
     charged on the loop once its body is read and the loop is idle at that
     instant, every tokenizer station job placed and all else due by then run
     (`SimExecutor.placed`), so a burst reaches the app one request at a time.
+    A request waits for that idle loop with no intake charged too: its body no
+    longer paces the turns, and without the wait the burst's tokenizer jobs
+    would reach the station in the wall order their awaits fall in.
     A request that arrives once the last intake has ended is charged ``idle_s``
     in place of ``fixed_s``. A ``host`` entry with no ``http_intake`` charges nothing.
     A body outside the bytes the term was fitted over
@@ -797,12 +800,15 @@ class HttpChannel:
                     # still waits on the socket.
                     body = await reading
                     cancelled = cancel_seq(body[0].get("body", b""))
-                    if self.intake is not None and cancelled is None:
+                    if cancelled is None:
                         # The clock may not pass a station job's completion
                         # before the job is placed, nor this instant before the
                         # requests handed on before this one have gone as far
-                        # as they can.
+                        # as they can: with no intake charged too, or their
+                        # tokenizer jobs reach the station in the wall order
+                        # their awaits fall in.
                         await loop.executor.placed()
+                    if self.intake is not None and cancelled is None:
                         fixed, per_byte, idle = self.intake
                         if arrival >= self.intake_end:
                             fixed = idle

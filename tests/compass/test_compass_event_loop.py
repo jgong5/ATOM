@@ -1124,6 +1124,31 @@ def test_a_burst_s_bodies_leave_the_socket_while_a_tokenizer_job_is_open(
     )
 
 
+def test_with_no_intake_a_burst_s_tokenizer_jobs_still_run_in_turn_order(
+    run, monkeypatch, tmp_path
+):
+    # Host laws with no http_intake charge no intake, and each body is read
+    # before its turn: what paces the turns is the wait for the idle loop alone.
+    # Each handler yields to the loop fewer times than the one before it, so
+    # without that wait request 2's tokenizer job would run first. The segment
+    # tokenizer's cache makes a job's charge depend on the jobs run before it.
+    _intake_run_file(monkeypatch, tmp_path, None)
+    ran = []
+
+    async def app(scope, receive, send):
+        loop, seq = asyncio.get_running_loop(), api_server._tracestate_stamp(scope)[1]
+        for _ in range(3 - seq):
+            await asyncio.sleep(0)
+
+        def do_preprocess():
+            ran.append(seq)
+
+        await loop.run_in_executor(None, do_preprocess)
+
+    _burst(run, monkeypatch, 3, app)
+    assert ran == [0, 1, 2]
+
+
 def test_a_body_outside_the_intake_hull_is_charged_nothing_and_named(
     run, monkeypatch, tmp_path
 ):
