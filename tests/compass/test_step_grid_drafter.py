@@ -259,7 +259,7 @@ def test_each_kv_limit_is_the_largest_context_the_replay_rule_fits_in_the_pool(
     for rung, bs in nodes["B"].items():
         for b in bs:
             limit = 16 * (30 // b) - width - lookahead
-            assert limit in nodes["c"][rung] or limit >= 2048 - width
+            assert limit in nodes["c"][rung] or limit >= 2048 - width - lookahead
             fits = {"rows": [[width, limit + width, True]] * b, "produces_output": True}
             rule.batch(fits)
             over = {**fits, "rows": [[width, limit + 1 + width, True]] * b}
@@ -267,7 +267,7 @@ def test_each_kv_limit_is_the_largest_context_the_replay_rule_fits_in_the_pool(
                 ValueError, match="KV blocks of 16 tokens, and the pool"
             ):
                 rule.batch(over)
-        assert 2048 - width in nodes["c"][rung]
+        assert 2048 - width - lookahead in nodes["c"][rung]
     assert planned["decode"]["pool"] == {
         "block_size": 16,
         "blocks": 30,
@@ -341,22 +341,29 @@ def target(line) -> float:
 
 def flash_nodes() -> list[dict]:
     """Every node batch of the grid the planner places for `BOUNDS` under
-    DSpark5: decode's top c node is max_model_len less a verify step's 6."""
+    DSpark5: both top c nodes are less the draft round's 4 positions past a
+    row, decode's max_model_len less a verify step's 6 too."""
     out = [
         grid_fit.batch([(K + 1, c + K + 1, True)] * b)
         for b in (1, 8)
-        for c in (0, 512, 1018)
+        for c in (0, 512, 1014)
     ]
-    return out + [x for x in grid_fit.nodes() if not x["rows"][0][2]]
+    prefill = [(b, t, c) for b in (1, 8) for t in (16, 256) for c in (0, 764)]
+    for output in (True, False):
+        out += [
+            grid_fit.batch([(t // b, c + t // b, False)] * b, output)
+            for b, t, c in prefill
+        ]
+    return out
 
 
 def flash_mixed(seed=1, n=20) -> list[dict]:
-    """`n` verify steps of 2 to 8 rows on cached contexts 0 to 1018, and
+    """`n` verify steps of 2 to 8 rows on cached contexts 0 to 1014, and
     `test_backend_step_grid_fit.mixed`'s prefill chunks."""
     rng = np.random.default_rng(seed)
     out = []
     for _ in range(n):
-        ks = rng.integers(K + 1, 1025, rng.integers(2, 9))
+        ks = rng.integers(K + 1, 1021, rng.integers(2, 9))
         out.append(grid_fit.batch([(K + 1, int(k), True) for k in ks]))
     return out + grid_fit.mixed(seed, n)[n:]
 
