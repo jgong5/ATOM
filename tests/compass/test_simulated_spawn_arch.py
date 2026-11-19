@@ -8,22 +8,33 @@ each imports aiter again, whose Triton helpers probe the device for its arch.
 the same arch before aiter loads. The planted server spawns as ATOM's does, two
 levels deep, and each level records the arch aiter's probe answers.
 
-A worker's meta build asks `torch.cuda` for the current device and whether its
-stream captures (DeepSeek-V4's HCA preparation); under a run file it is
-answered as the simulated device, and `torch.cuda` is the host's again after.
+Then ATOM's own server, its engine core and TP1 worker, starts from `serve` on
+a step stub and answers ``/health``. Its worker asks `torch.cuda` about the
+device as it builds, its attention metadata builder the CU count; with no
+driver the declared device answers.
 
 No device: each declares its machine's.
 """
 
+import dataclasses
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
 import textwrap
 
 import pytest
-import torch
-from test_check_fp8_arch import FP8, machine
-from test_drive_serve import PLANTED, planted  # noqa: F401  a fixture
+from test_check_fp8_arch import FP8, QWEN, machine
+from test_drive_runfile import build
+from test_drive_serve import PLANTED, _ready, planted  # noqa: F401  a fixture
 from test_drive_trace_steps import plant_module
-from test_weights_meta_build import TiedPacked, _built
+from test_filler_tokens import model_dir  # noqa: F401  a fixture
+from test_memory_readings import publish_readings
 
+from atom.compass.backends.step_stub import Coefficients
+from atom.compass.drive import run as drive_run
 from atom.compass.drive import serve
 
 #: Each level imports ATOM's model ops' fp8 helper, which probes the arch, and
@@ -53,6 +64,13 @@ from planted_child import probe
 if __name__ == "__main__":
     probe(os.environ["PLANTED_DIR"], 0)
 """
+#: `serve` on the run file in argv[2], into argv[1], ATOM's arguments after.
+DRIVE = """\
+import json, sys
+from pathlib import Path
+from atom.compass.drive import serve
+serve.serve(sys.argv[3:], sys.argv[1], run=json.loads(Path(sys.argv[2]).read_text()))
+"""
 
 
 @pytest.mark.parametrize("arch", sorted(FP8))
@@ -71,21 +89,25 @@ def test_a_simulated_server_s_spawned_processes_probe_its_machine_s_arch(
     assert {p.read_text() for p in levels} == {arch}
 
 
-def test_a_meta_build_asks_torch_cuda_about_the_simulated_device(monkeypatch, tmp_path):
-    host = torch.cuda.current_device
-    seen = []
-
-    class AsksTheDevice(TiedPacked):
-        def __init__(self, config):
-            super().__init__(config)
-            seen.append(
-                (
-                    torch.cuda.current_device(),
-                    torch.cuda.is_current_stream_capturing(),
-                    torch.cuda.get_device_properties(0).gcnArchName,
-                )
-            )
-
-    _built(monkeypatch, tmp_path, AsksTheDevice)
-    assert seen == [(0, False, "gfx950")]
-    assert torch.cuda.current_device is host
+def test_atom_s_own_simulated_engine_starts(model_dir, tmp_path):  # noqa: F811
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(model_dir / name, tmp_path / name)
+    shutil.copy(QWEN, tmp_path / "config.json")
+    (tmp_path / "stub.json").write_text(json.dumps(dataclasses.asdict(Coefficients())))
+    atom = ["--enforce-eager", "--max-model-len", "2048"]
+    run = build(tmp_path, "--step-stub", str(tmp_path / "stub.json"), atom=atom)
+    atom = ["--model", str(tmp_path), *atom]
+    publish_readings(tmp_path / "store", drive_run._config(atom, "gfx950"))
+    (tmp_path / "run.json").write_text(json.dumps(run))
+    (tmp_path / "drive.py").write_text(DRIVE)
+    out = tmp_path / "out"
+    driver = subprocess.Popen(
+        [sys.executable, tmp_path / "drive.py", out, tmp_path / "run.json", *atom],
+        env=dict(os.environ, PYTHONPATH=str(serve.TREE)),
+    )
+    try:
+        assert _ready(out, driver, 600, 0.5)["pid"]
+    finally:
+        driver.send_signal(signal.SIGTERM)
+        driver.wait(timeout=120)
+    assert "built on meta and no checkpoint read" in (out / "server.log").read_text()

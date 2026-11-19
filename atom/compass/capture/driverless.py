@@ -277,30 +277,15 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
     )
 
 
-@contextlib.contextmanager
-def cuda_substitutes(arch: str):
+def answer_as(arch: str) -> None:
     """`install`'s `torch.cuda` answers for a device of `arch`, and `torch._C`'s
-    device query, inside the block alone. `is_available` keeps this host's
-    answer, and nothing else `install` declares is declared."""
+    device query, for the life of this process. `is_available` keeps this
+    host's answer, and nothing else `install` declares is declared."""
     cuda = _cuda(_props(arch))
     del cuda["is_available"]
-    real = {name: torch.cuda.__dict__.get(name, _ABSENT) for name in cuda}
-    get_device = torch._C._cuda_getDevice
     for name, value in cuda.items():
         setattr(torch.cuda, name, value)
     torch._C._cuda_getDevice = lambda: 0
-    try:
-        yield
-    finally:
-        torch._C._cuda_getDevice = get_device
-        for name, value in real.items():
-            if value is _ABSENT:
-                delattr(torch.cuda, name)
-            else:
-                setattr(torch.cuda, name, value)
-
-
-_ABSENT = object()
 
 
 #: The operators outside torch that the fake mode's dispatch cache takes: each
