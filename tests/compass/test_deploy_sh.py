@@ -12,6 +12,7 @@ Every other `python3` is the real one, so the run file is
 `runfile.prefill_decode`'s. Nothing needs a driver.
 """
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -175,23 +176,46 @@ def argv(tmp_path, flags, prefill=PREFILL, router=ROUTER_ARGS):
     ]  # fmt: skip
 
 
+#: How long `_until` waits for deploy.sh's file: a few times the longest a
+#: deployment has taken to write it on a loaded host, its run-file build
+#: resolving each side's config in a process of its own.
+UNTIL_S = 300
+
+
 def _until(path: Path, script) -> None:
-    """Return once deploy.sh `script` has written `path`, failing if it exits
-    first. No wall-clock bound of its own: the run-file build can take a
-    minute on a loaded host where it resolves each side's config in a process
-    of its own, and after it the script gives each instance, the prefix and
-    the router WAIT_S or PREFIX_S."""
+    """Return once deploy.sh `script` has written `path`. Fail if it exits
+    first, or after UNTIL_S, once it and every process under it are killed."""
     router = path.with_name("router.log")
+    deadline = time.monotonic() + UNTIL_S
     while not path.exists():
         assert script.poll() is None, (
             script.communicate(),
             router.read_text() if router.exists() else "no router.log",
         )
+        if time.monotonic() > deadline:
+            for pid in _tree(script.pid):
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+            script.wait()
+            pytest.fail(f"no {path} after {UNTIL_S} s")
         time.sleep(0.1)
 
 
 def _parent(pid: int) -> int:
     return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+
+
+def _tree(pid: int) -> list[int]:
+    """Process `pid` and every process under it, each after its parent."""
+    parents = {}
+    for proc in Path("/proc").iterdir():
+        if proc.name.isdigit():
+            with contextlib.suppress(FileNotFoundError, ProcessLookupError):
+                parents[int(proc.name)] = _parent(int(proc.name))
+    tree = [pid]
+    for parent in tree:  # reaches each child it appends
+        tree.extend(child for child, of in parents.items() if of == parent)
+    return tree
 
 
 def test_a_deployment_joins_both_instances_to_its_authority_behind_the_router(
