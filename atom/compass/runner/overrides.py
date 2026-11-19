@@ -1675,7 +1675,7 @@ class NonAllocatingRunner(
         graph exists; the caller only formats it into a log line. The prefill
         token-graph buckets the base's capture would record are stated
         (`state_prefill_buckets`), so the scheduler and `decide` see them, and
-        the run file's step linear law is held to them (`run.refuse_other_buckets`).
+        the run file's laws are held to them (`run.refuse_other_buckets`).
 
         `EngineCore.__init__` reaches this method only when `not enforce_eager
         and not disagg_is_decode`, so on an eager deployment the override never
