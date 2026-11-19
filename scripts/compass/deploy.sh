@@ -56,6 +56,13 @@
 #                  the deployment to leave once stopped (default 600)
 #   PREFIX_S       seconds --on's prefix has to start the decode's command,
 #                  and to send it a stop (default 60)
+#   PREFILL_ENV DECODE_ENV
+#                  NAME=VALUE words, split on whitespace, set in that side's
+#                  instances only, as pd_sim.sh takes them: each instance's
+#                  command (OUT/<name>.sh, below) sets them, so --on carries
+#                  them, e.g. `ATOM_KV_OFFLOAD=mooncake_store
+#                  ATOM_KV_OFFLOAD_EXTRA_CONFIG=<JSON>` for a prefill side on
+#                  the Mooncake Store; a word that is no NAME=VALUE exits 2
 #
 # OUT gets run_file.json, the deployment's one run file, built from the run
 # flags and both sides' ATOM arguments (`runfile.prefill_decode`), whose
@@ -186,6 +193,11 @@ if [[ -n ${KV_EXTRA:-} ]]; then
     python3 -c 'import json, sys; assert isinstance(json.loads(sys.argv[1]), dict)' "$KV_EXTRA" 2>/dev/null ||
         bad "KV_EXTRA is no JSON object: $KV_EXTRA"
 fi
+read -ra prefill_env <<<"${PREFILL_ENV:-}"
+read -ra decode_env <<<"${DECODE_ENV:-}"
+for word in "${prefill_env[@]}" "${decode_env[@]}"; do
+    [[ $word =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || bad "PREFILL_ENV and DECODE_ENV take NAME=VALUE words, not $word"
+done
 
 compass_env "$ROOT"
 compass_require_tree "$ROOT" || exit $?
@@ -313,7 +325,7 @@ fi
 
 instance() { # I: write instance I's command, OUT/<name>.sh, and run it
     local i=$1 name=${names[$1]}
-    local -n atom=atom_$1 own=own_$1 prefix=on_$1
+    local -n atom=atom_$1 own=own_$1 prefix=on_$1 vars=${sides[$1]}_env
     local role=kv_consumer command=("$cmd" --join "$RUN_FILE") several=$ND
     [[ ${sides[i]} == decode ]] || role=kv_producer several=$NP
     local kv="{\"kv_role\":\"$role\",\"kv_connector\":\"compass\",\"compass_kv_write_req\":\"tcp://127.0.0.1:${KV_PORTS[i]}\""
@@ -329,6 +341,8 @@ print(json.dumps({**json.loads(sys.argv[2]), **json.loads(sys.argv[1])}))' "$kv"
     # Its process id, which exec keeps; then this tree, checked, and the caller's directory.
     printf 'echo $$ >%q\n. %q && compass_env %q && compass_require_tree %q && cd %q &&\n    exec' \
         "$OUT/$name.pid" "$ROOT/scripts/compass/_lib.sh" "$ROOT" "$ROOT" "$PWD" >"$OUT/$name.sh"
+    # Its side's variables, after compass_env so they win, quoted so a JSON value arrives whole.
+    ((${#vars[@]} == 0)) || printf ' %q' env "${vars[@]}" >>"$OUT/$name.sh"
     printf ' %q' python3 -c 'from atom.compass.cli import main; main()' "${command[@]}" >>"$OUT/$name.sh"
     "${prefix[@]}" bash "$OUT/$name.sh" >"$OUT/$name.log" 2>&1 &
     pids[i]=$!
