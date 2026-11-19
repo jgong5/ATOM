@@ -49,9 +49,11 @@ engine LP published, its renewals and the objects it evicted (`COUNTS`).
 
 What it does not model: contention at the owners, a get's own master call,
 failures, soft pins, tenants, the owners' allocator and its fragmentation, and
-the eviction thread's phase. A master flag outside `MODELLED` and `ACCEPTED` is
-refused, and so is one that sets no positive ``--rpc_thread_num``, since the
-master then runs as many handler threads as its host has cores, up to 16.
+the eviction thread's phase. The master flags it reads are
+``--default_kv_lease_ttl``, ``--eviction_high_watermark_ratio``,
+``--eviction_ratio`` and ``--rpc_thread_num``; it accepts `ACCEPTED` and
+refuses any other, and flags that set no positive ``--rpc_thread_num``, since
+the master then runs as many handler threads as its host has cores, up to 16.
 
 Importing this module loads lmcache's server module, which imports only the
 standard library.
@@ -86,13 +88,6 @@ MATCHED = (
     "load_slots",
     "save_workers",
     "load_workers",
-)
-#: Master flags that change what a requester is told.
-MODELLED = (
-    "--default_kv_lease_ttl",
-    "--eviction_high_watermark_ratio",
-    "--eviction_ratio",
-    "--rpc_thread_num",
 )
 #: Master flags that change nothing a requester is told: endpoints, a client's
 #: death, which no simulated client dies of, and the allocator, which is one
