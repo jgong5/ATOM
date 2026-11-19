@@ -64,6 +64,22 @@ def test_the_lookup_defer_expires_on_the_lp_clock(lp):
     assert sched.lookup_pending(seq) is False
 
 
+def test_the_defer_probe_answers_as_the_defer_on_the_lp_clock(lp):
+    """`lookup_would_defer` reads the window `lookup_pending` stamped on the LP
+    clock on that clock, not on the wall clock."""
+    client = SimpleNamespace(is_pending=lambda sid: True, poll=lambda sid: False)
+    sched = object.__new__(chunked_scheduler.ChunkedOffloadSchedulerBase)
+    sched._lookup_client = client
+    sched._lookup_defer_since = {}
+    seq = SimpleNamespace(id=7)
+
+    assert sched.lookup_pending(seq) is True
+    lp.t = envs.OFFLOAD_LOOKUP_DEFER_S
+    assert sched.lookup_would_defer(seq) is True
+    lp.t = envs.OFFLOAD_LOOKUP_DEFER_S + 1e-3
+    assert sched.lookup_would_defer(seq) is False
+
+
 def test_a_transfer_deadline_fires_on_the_lp_clock(lp):
     lp.t = 1e9 + 9.0
     transfer._enforce_transfer_deadline("op", 1e9, 10.0)
