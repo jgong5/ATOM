@@ -15,8 +15,10 @@ refuses them, and the clock endpoint flag, among ATOM's arguments; an op graph
 run's file also holds ATOM's arguments, from which its engines trace a shape
 the store lacks (`run.ATOM_ARGS`). A simulated server whose run file names
 a machine starts under `on_arch`, which imports aiter as on that machine's
-device first, so the server resolves its config, an FP8 quantization's dtype
-among it, as there, whatever device this host has. Each start
+device first, in the server and in every process it spawns, so the server
+resolves its config, an FP8 quantization's dtype among it, and its engines and
+workers start as there, whatever device this host has, a host with none
+included. Each start
 takes a free `ATOM_DP_MASTER_PORT`: the port keys ATOM's compiled-graph cache,
 and the first start that loads that cache autotunes every graph's kernels
 again, whose configs stay loaded and read in `non_torch`. No later start loads
