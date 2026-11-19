@@ -19,6 +19,7 @@ from test_drive_gpu import GPU45, SHOWHW
 from test_launcher_held_ports import HELD, SQUAT
 
 from atom.compass.artifacts import machine_platform
+from atom.compass.kv.lmcache_server import DECLARED_LAWS
 from atom.compass.runner.pp_send import carrier_models
 from atom.compass.spec import MachineSpec
 
@@ -247,10 +248,10 @@ def test_a_failed_measurement_starts_no_server(tmp_path):
     assert not run.exists()
 
 
-@pytest.mark.parametrize("config, writers", [("tp2", 1), ("tp2-plain", 2)])
-def test_lmcache_writes_from_each_dp_rank_under_dp_attention_else_each_tp_rank(
-    tmp_path, monkeypatch, config, writers
-):
+@pytest.mark.parametrize("config", ["tp2", "tp2-plain"])
+def test_lmcache_writes_the_entry_compass_advice_writes(tmp_path, monkeypatch, config):
+    """The server's flags and the declared laws, at DP attention or not, with
+    no writer count and no image read from the real run's log."""
     lm = tmp_path / "lm"
     lm.mkdir()
     (lm / "lmcache").write_text("#!/bin/bash\nexec sleep 60\n")
@@ -258,7 +259,8 @@ def test_lmcache_writes_from_each_dp_rank_under_dp_attention_else_each_tp_rank(
     monkeypatch.setenv("PATH", f"{lm}:{os.environ['PATH']}")
     r, _, run = _parity(tmp_path, CONFIG=config, LMCACHE="1")
     assert r.returncode == 0, r.stderr
-    assert json.loads(run.read_text())["lmcache"]["writers"] == writers
+    entry = json.loads(run.read_text())["lmcache"]
+    assert entry == {"server": entry["server"], **DECLARED_LAWS}
 
 
 def test_under_lmcache_the_measurement_offloads_to_a_server_of_its_own(
