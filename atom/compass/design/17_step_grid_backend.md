@@ -60,8 +60,9 @@ computes a verify step's `K + 1` tokens, and every point holds a target value an
 drafter value, each with its own residual (D97 to D100).
 
 **Revised 2026-11-19 by [#2678](https://github.com/jgong5/ATOM/issues/2678):** a point
-stops at ten repeats when two bursts a pass apart agree, and a prediction plans from its
-own simulated runs (D98, `07` D37, D118).
+stops at ten repeats when two bursts a pass apart agree, shown on its platform before it
+ships, and a prediction with no real run plans from its own simulated runs (D98, `07`
+D37, D118).
 
 **Depends on:** `02` (the backend interface, the forward's interval, the method
 vocabulary), `07` (the two granularities, the bench, artifact identity and invalidation), `08` (stage 2's
@@ -258,7 +259,14 @@ raggedness are covered before grading.
   #1233's store-v2, prefill taking 99.3% of the hours, bursts drawn from each point's
   consecutive repeats cut 13.30 hours to 4.55, every value within 0.27% of its 45-repeat
   median; a pass between the bursts adds its drift to their difference, which the
-  agreement test sees.
+  agreement test sees. That simulation drew both bursts from one pass, so the rule ships
+  only after its code task shows it on the platform it runs on
+  ([#3287](https://github.com/jgong5/ATOM/issues/3287)'s: MI355X, whose step bench has no
+  pass-to-pass spread on record): about 40 prefill points on one card, measured twice, a
+  pass apart, under the old protocol and once under the new, and the median of the new
+  values' differences from the old protocol's first pass within the largest difference
+  between its two passes, the form of `07` D39's agreement check. Where that fails, 45
+  repeats stay.
 - **Measurements are stored per point**, one `step_measurement` per batch (`07` D41),
   with the `07` D43 fingerprint. A grid definition selects points, so a new definition
   measures only the points not yet measured.
@@ -825,4 +833,4 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | ~~T95~~ | ~~Trial, not this design: extrapolate an out-of-cell step as #627's ruling 3 has the step linear law do, by one algorithm only, extending the nearest complete cell's interpolation, named in `source` with the distance, `estimated` and unvalidated, and reported apart, which is not a refusal. It includes extrapolation within rounding distance: a step outside every complete cell, and every T98 simplex, only by integer or block rounding (an equivalent shape's mean context can sit past `c_max(B)` while its ragged batch fits) is answered that far out, and a farther one declined. It would answer out-of-cell steps, which the step grid now declines (D102)~~ — ruled 2026-10-18 on #1464 and #1465: the residual extrapolates past its hull and a decode cell past the KV pool (D99, D100); other out-of-cell steps fall to the roofline (D102) | decide after the step grid's stage-2 evaluation shows how often steps fall outside complete cells |
 | ~~T96~~ | ~~Reconcile `13` D79 and D80 with the run file the code selects a backend by (`--compass-run`, `atom/compass/run/__init__.py::runner`): `13` rejects a Compass config file, the code reads one~~ — settled 2026-10-13 on #851: `compass run` takes flags only, and the run file is its internal transport (`13` D79, D80) | needs an owner choice between describing the run file in `13` and moving selection to flags |
 | T98 | Interpolate a step whose cell has a corner past a limit, or a prefill step cached past the top c node, in the simplex of measured points holding it, those points measured where the cell's edges cross the feasible boundary (D98); until then a decode one extrapolates past the KV pool (D99) and a prefill one falls to the roofline (D102) | taken up when the pre-run coverage check (D99) finds steps the boundary nodes miss, the prefill steps past the top c node counted on a run with prefix caching; #830's counts find none on #740's records, which hold neither kind |
-| T124 | Steps past a residual's hull on a new workload: about 8,200, 14,000, 2,400 and 1,500 of #1233's c1 to c64 steps extrapolate under both bundles of `07` D37's prediction loop, v2 and v3, whose gate counts the steps falling to the roofline, not these | a step past the hull places no point, so the loop does not reach it ([#2678](https://github.com/jgong5/ATOM/issues/2678)) |
+| T117 | Steps past a residual's hull on a new workload: about 8,200, 14,000, 2,400 and 1,500 of #1233's c1 to c64 steps extrapolate under both bundles of `07` D37's prediction loop, v2 and v3, whose gate counts the steps falling to the roofline, not these | a step past the hull places no point, so the loop does not reach it ([#2678](https://github.com/jgong5/ATOM/issues/2678)) |
