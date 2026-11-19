@@ -5,13 +5,18 @@ capture: a DeepSeek-V4.1 law stating none or others, or host laws whose key
 states other prefill buckets, is ``refused`` with the runner's refusal, before
 its coverage and figures are judged. A law stating the run's buckets is
 reused; a model whose attention builder records no token graph keeps its
-verdicts. Buckets the check cannot work out, ATOM's attention builder unread,
-refuse by name.
+verdicts. Buckets the check cannot work out, ATOM's attention builder failing
+to load in the child that reads it or the child dying, refuse by name; a defect
+of Compass's own code there fails `compass advice` with its traceback.
 
 The candidate is `test_advice_reuse`'s, its config DeepSeek-V4.1's. No device:
 which attention builder records token graphs is stated, V4.1's alone, as
-`test_check_token_graph_buckets` reads them where a device is declared.
+`test_check_token_graph_buckets` reads them where a device is declared, but
+where the child that reads it fails.
 """
+
+import os
+import tempfile
 
 import pytest
 from test_advice_reuse import (  # noqa: F401  fixtures
@@ -30,6 +35,11 @@ from test_law_token_graph_buckets import RECORDED, environment  # noqa: F401  fi
 from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.drive import lacking
 from atom.utils.selector import Family
+
+#: Whether a builder records token graphs, read in a child of its own.
+TOKEN_GRAPHS = lacking._token_graphs.__wrapped__
+#: Why the check cannot work out the buckets.
+UNWORKED = "the prefill token-graph buckets this run records cannot be worked out: "
 
 #: The runner's refusals at capture: of a step linear law stating no buckets,
 #: or others as its prefill vector's, and of host laws whose key states others.
@@ -131,17 +141,63 @@ def test_a_model_whose_builder_records_no_token_graph_keeps_its_verdict(
     assert judged(found) == [("reuse", None, where)] * 2
 
 
-def test_buckets_that_cannot_be_worked_out_refuse_by_name(tmp_path, monkeypatch, v41):
-    def unread(family, arch):
-        raise ModuleNotFoundError("No module named 'aiter'")
+def unimportable(family, arch):
+    """In the child: ATOM's attention builder failing to load, as without aiter."""
+    raise ModuleNotFoundError("No module named 'aiter'")
 
-    monkeypatch.setattr(lacking, "_token_graphs", unread)
+
+def dying(family, arch):
+    """In the child: the child dying."""
+    os._exit(1)
+
+
+def compass_failing(family, arch):
+    """In the child: Compass's own code failing, on a card reading with no
+    ``props``."""
+    from atom.compass.capture import driverless
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        driverless.install(tmpdir, arch, read={"card": 0})
+
+
+@pytest.mark.parametrize(
+    "reads, why",
+    [
+        (
+            unimportable,
+            "ATOM's attention builder: ModuleNotFoundError: No module named",
+        ),
+        (dying, "the child reading ATOM's attention builder died: A process in the"),
+    ],
+    ids=["atom-fails", "child-dies"],
+)
+def test_buckets_that_cannot_be_worked_out_refuse_by_name(
+    tmp_path, monkeypatch, v41, reads, why
+):
+    monkeypatch.setattr(lacking, "_token_graphs", TOKEN_GRAPHS)
+    monkeypatch.setattr(lacking, "_builder_records", reads)
     law_file(tmp_path, held(v41, RECORDED))
 
     found = verdicts(advise(tmp_path), "law")
 
-    reason = (
-        "the prefill token-graph buckets this run records cannot be worked out: "
-        "ModuleNotFoundError: No module named 'aiter'"
+    assert [(v["verdict"], v["requirement"]) for v in found] == [("refused", None)] * 2
+    assert found[0]["reason"].startswith(UNWORKED + why)
+
+
+def test_a_compass_defect_reading_the_builder_fails_compass_advice_with_its_traceback(
+    tmp_path, monkeypatch, v41
+):
+    monkeypatch.setattr(lacking, "_token_graphs", TOKEN_GRAPHS)
+    monkeypatch.setattr(lacking, "_builder_records", compass_failing)
+    law_file(tmp_path, held(v41, RECORDED))
+
+    with pytest.raises(RuntimeError) as failed:
+        advise(tmp_path)
+
+    said = str(failed.value)
+    assert said.startswith(
+        "Compass's own code raised reading ATOM's attention builder:\n"
+        "Traceback (most recent call last):\n"
     )
-    assert judged(found) == [("refused", None, reason)] * 2
+    assert ", in _props\n" in said
+    assert said.endswith("\nKeyError: 'props'\n")
