@@ -1,24 +1,35 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# A prefill-decode deployment: one prefill and one decode instance, each one
-# `compass run` with its own ATOM arguments that joins the clock authority this
-# script starts, or, real, one `compass record`, and the Atomesh router between
-# them, beside the prefill instance.
+# A prefill-decode deployment: one or more prefill and one or more decode
+# instances, each one `compass run` with its own ATOM arguments that joins the
+# clock authority this script starts, or, real, one `compass record`, and the
+# Atomesh router between them, beside the first prefill instance.
 #
-# Usage: deploy.sh OUT run|record <flags> --prefill [<own>] -- <ATOM args> --decode [<own>] -- <ATOM args> --router -- <router args>
+# Usage: deploy.sh OUT run|record <flags> --prefill [<own>] -- <ATOM args> [--prefill ...] --decode [<own>] -- <ATOM args> [--decode ...] --router -- <router args>
 #   OUT            the deployment's directory, absent or empty
 #   <flags>        run: `compass run`'s run-file flags: the backend, --device,
 #                  --ptl, --network across nodes,
 #                  --store, ... (atom/compass/drive/runfile.py); record: the
 #                  `compass record` flags both instances take, e.g. --gpu
 #   <own>          that instance's own `compass record` flags, e.g. --gpu, or
-#                  --host, an address the router reaches; and the decode's
-#                  --on PREFIX (below)
+#                  --host, an address the router reaches; and --on PREFIX
+#                  (below)
 #   <ATOM args>    each instance's ATOM arguments; the script adds its
 #                  --kv-transfer-config, the simulated connector and the
 #                  write-request address, or, real, Mooncake and a handshake
-#                  port, the prefill's free here, and refuses one among them
+#                  port, each prefill's free here, and refuses one among them.
+#                  Every instance of a side takes the same ATOM arguments, the
+#                  run file's one engine config of that side
+#   --prefill, --decode
+#                  repeated, each one more instance of that side, every
+#                  --prefill before the first --decode; above one instance of
+#                  a side each is named by its index, prefill0/ and prefill1/
+#                  in place of prefill/, and, simulated, names it in its
+#                  kv_transfer_config as `compass_instance`, so its LPs carry
+#                  it (engine-P1), and the router, choosing among them, runs as
+#                  LP `router` (the run file's `prefill_instances` and
+#                  `decode_instances`)
 #   <router args>  `atomesh launch` arguments, as given; the script adds the
 #                  router's host and ports, --pd-disaggregation and each
 #                  instance's URL; run with --dp-aware runs the router as LP
@@ -79,47 +90,79 @@
 # each real instance's Mooncake kv config, such as '{"protocol": "tcp"}' on a
 # node with no RDMA HCA; a simulated instance's connector takes none.
 # Each instance runs its
-# command, OUT/<side>.sh, which first writes its process id to OUT/<side>.pid;
-# the decode's as `PREFIX bash OUT/decode.sh`, stopped as `PREFIX kill -TERM
+# command, OUT/<name>.sh, which first writes its process id to OUT/<name>.pid;
+# one given --on as `PREFIX bash OUT/<name>.sh`, stopped as `PREFIX kill -TERM
 # <pid>`, a second command under the first, so srun inside an allocation takes
-# --overlap. A shell may parse those words again, so OUT, this tree and the
-# caller's directory must be paths `printf %q` leaves as they are. That node
-# sees them at their paths, and, simulated, this node's 127.0.0.1.
+# --overlap. --on on any instance makes the KV link inter_node. run.json's
+# `instances` names each instance, its side and index and, real, its Mooncake
+# handshake port, by which the split tells a decode's transfers apart by the
+# prefill instance they came from (atom/compass/report/split.py). A shell may
+# parse those words again, so OUT, this tree and the caller's directory must be
+# paths `printf %q` leaves as they are. That node sees them at their paths, and,
+# simulated, this node's 127.0.0.1.
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
-USAGE="usage: deploy.sh OUT run|record <flags> --prefill [<own>] -- <ATOM args> --decode [<own>] -- <ATOM args> --router -- <router args>"
+USAGE="usage: deploy.sh OUT run|record <flags> --prefill [<own>] -- <ATOM args> [--prefill ...] --decode [<own>] -- <ATOM args> [--decode ...] --router -- <router args>"
 bad() { echo "deploy: $1; $USAGE" >&2; exit 2; }
 fail() { echo "deploy: $1" >&2; exit 1; }
+push() { local -n into=$1; into+=("$2"); } # ARRAY WORD
+quoted() { local -n words=$1; printf '%q ' "${words[@]}"; } # ARRAY: its words, one string
 ROOT=$(compass_tree_root) || exit $?
 ARGV=("$0" "$@")
 (($# >= 2)) && [[ $1 != -* ]] || bad "no OUT"
 [[ $2 == run || $2 == record ]] || bad "the command after OUT is run or record"
-OUT=$1 cmd=$2 side=flags seen= head=0 KV_OVER_NETWORK=0
+OUT=$1 cmd=$2 state=flags seen= head=0 KV_OVER_NETWORK=0
 shift 2
-flags=() prefill=() decode=() router=() prefill_own=() decode_own=() on=()
+# Instance i: its side, sides[i], prefill or decode; its ATOM arguments atom_i,
+# its own flags own_i and its --on prefix on_i.
+flags=() router=() sides=()
 while (($#)); do
     # An instance's own flags run from its marker to its --; the router has none.
-    if [[ $side != router && ($1 == --prefill || $1 == --decode || $1 == --router && ${2-} == --) ]]; then
-        side=${1#--} seen+=" $side" head=1
+    if [[ $state != router && ($1 == --prefill || $1 == --decode || $1 == --router && ${2-} == --) ]]; then
+        state=${1#--} head=1
+        [[ $seen == *" $state" ]] || seen+=" $state"
+        if [[ $state != router ]]; then
+            i=${#sides[@]}
+            sides+=("$state")
+            declare -ga "atom_$i=()" "own_$i=()" "on_$i=()"
+        fi
     elif ((head)) && [[ $1 == -- ]]; then
         head=0
-    elif [[ $side$head$1 == decode1--on ]]; then
+    elif [[ $state$head$1 == prefill1--on || $state$head$1 == decode1--on ]]; then
         [[ ${2-} == [!-]* ]] || bad "--on takes a command prefix, a command and its words"
-        read -ra on <<<"$2"
+        read -ra "on_$i" <<<"$2"
         shift
     else
-        case $side$head in
-        flags0) [[ $1 == --kv-over-network ]] && KV_OVER_NETWORK=1 || flags+=("$1") ;; prefill0) prefill+=("$1") ;; decode0) decode+=("$1") ;;
-        router0) router+=("$1") ;; prefill1) prefill_own+=("$1") ;; decode1) decode_own+=("$1") ;;
+        case $state$head in
+        flags0) [[ $1 == --kv-over-network ]] && KV_OVER_NETWORK=1 || flags+=("$1") ;;
+        prefill0 | decode0) push "atom_$i" "$1" ;;
+        prefill1 | decode1) push "own_$i" "$1" ;;
+        router0) router+=("$1") ;;
         esac
     fi
     shift
 done
-[[ $seen == " prefill decode router" ]] || bad "--prefill --, --decode -- and --router -- come once each, in that order"
-[[ " ${prefill[*]} ${decode[*]} " != *" --kv-transfer-config"* ]] || bad "an instance's ATOM arguments carry --kv-transfer-config, which the script fills"
+[[ $seen == " prefill decode router" ]] || bad "--prefill -- (once or more), --decode -- (once or more) and --router -- come once each, in that order"
+NP=0 ND=0 names=() index=() any_on=0
+for i in "${!sides[@]}"; do
+    if [[ ${sides[i]} == prefill ]]; then index+=($((NP++))); else index+=($((ND++))); fi
+    declare -n on=on_$i
+    ((${#on[@]} == 0)) || any_on=1
+    unset -n on
+done
+for i in "${!sides[@]}"; do
+    n=$([[ ${sides[i]} == prefill ]] && echo $NP || echo $ND)
+    names+=("${sides[i]}$( ((n == 1)) || echo "${index[i]}")")
+    [[ " $(quoted "atom_$i") " != *" --kv-transfer-config"* ]] || bad "an instance's ATOM arguments carry --kv-transfer-config, which the script fills"
+    first=$([[ ${sides[i]} == prefill ]] && echo 0 || echo $NP)
+    [[ $(quoted "atom_$i") == "$(quoted "atom_$first")" ]] || bad "${names[i]}'s ATOM arguments differ from ${names[first]}'s: every instance of a side takes the same"
+done
+declare -n prefill=atom_0 decode=atom_$NP
 ATOMESH=${ATOMESH:-atomesh} ROUTER_LP=
-[[ $cmd == record || " ${router[*]} " != *" --dp-aware "* ]] || ROUTER_LP=$ATOMESH
+# A simulated router chooses among a side's instances as LP `router`, as a
+# --dp-aware one chooses among DP ranks.
+[[ $cmd == record ]] || { [[ " ${router[*]} " != *" --dp-aware "* ]] && ((NP == 1 && ND == 1)); } || ROUTER_LP=$ATOMESH
 [[ $cmd == record ]] || for word in "${router[@]}"; do
     case ${word%%=*} in
     --prefill | --decode) bad "the router's arguments carry ${word%%=*}, a worker more for a simulated router to choose" ;;
@@ -127,9 +170,13 @@ ATOMESH=${ATOMESH:-atomesh} ROUTER_LP=
     --request-timeout-secs) bad "the router's arguments carry ${word%%=*}, a wall-clock bound the script sets for a simulated router" ;;
     esac
 done
-[[ -z $ROUTER_LP || " ${router[*]} " == *" --disable-retries "* ]] || bad "the router's arguments carry --dp-aware but not --disable-retries: a router LP's retry resends a request under its first seq, which the frontend refuses as arrived twice"
+if [[ -n $ROUTER_LP && " ${router[*]} " != *" --disable-retries "* ]]; then
+    why="carry --dp-aware"
+    [[ " ${router[*]} " == *" --dp-aware "* ]] || why="choose among a side's instances as LP router"
+    bad "the router's arguments $why but not --disable-retries: a router LP's retry resends a request under its first seq, which the frontend refuses as arrived twice"
+fi
 for path in "$(realpath -m "$OUT")" "$ROOT" "$PWD"; do
-    ((${#on[@]} == 0)) || [[ $(printf %q "$path") == "$path" ]] || bad "--on's prefix may parse $path again, which a shell would split or expand"
+    ((!any_on)) || [[ $(printf %q "$path") == "$path" ]] || bad "--on's prefix may parse $path again, which a shell would split or expand"
 done
 mkdir -p "$OUT"
 [[ -z $(ls -A "$OUT") ]] || bad "$OUT holds an earlier deployment's files"
@@ -137,7 +184,7 @@ OUT=$(realpath "$OUT")
 WAIT_S=${WAIT_S:-600}
 PREFIX_S=${PREFIX_S:-60}
 KV_LINK=intra_node ACROSS_NODES=0
-((${#on[@]} == 0)) || KV_LINK=inter_node ACROSS_NODES=1
+((!any_on)) || KV_LINK=inter_node ACROSS_NODES=1
 ((!KV_OVER_NETWORK)) || KV_LINK=inter_node
 ((!ACROSS_NODES || !KV_OVER_NETWORK)) || bad "--kv-over-network keeps the decode on this node, and --on starts it on another"
 if [[ -n ${KV_EXTRA:-} ]]; then
@@ -156,7 +203,7 @@ RUN_FILE= CLOCK=
 # listeners take one per rank from its handshake port. The decode's handshake
 # port, the prefill's plus its ranks as the nightly's 1P1D launch gives it, is
 # not held: its listeners bind ports the kernel hands out.
-ports=$(python3 - $$ "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
+ports=$(python3 - $$ "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "$NP" "$ND" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
 import argparse, json, random, socket, subprocess, sys
 from pathlib import Path
 from atom.compass import run as compass_run
@@ -164,7 +211,8 @@ from atom.compass.artifacts import ArtifactRefusal
 from atom.compass.drive import runfile, serve
 from atom.compass.spec import SpecRefusal
 
-script, run_file, kv_link, router_lp, n, *words = sys.argv[1:]
+script, run_file, kv_link, router_lp, np_, nd, n, *words = sys.argv[1:]
+np_, nd = int(np_), int(nd)
 flags, words = words[: int(n)], words[int(n) :]
 k = int(words[0])
 prefill, decode = words[1 : 1 + k], words[1 + k :]
@@ -191,15 +239,20 @@ def hand(*ports):
     sys.exit()
 router, prometheus = block(1), block(1)
 if not run_file:
+    # Real: each prefill instance's Mooncake handshake block, one port a rank;
+    # each decode's, the first prefill's plus its ranks, then one more each.
     engine = runfile._engine_args(prefill)
     ranks = engine.data_parallel_size * engine.tensor_parallel_size * engine.pipeline_parallel_size
-    base = block(ranks)
-    hand(router, prometheus, base, base + ranks)
+    bases = [block(ranks) for _ in range(np_)]
+    hand(router, prometheus, "-", "-", *bases, *(bases[0] + ranks + k for k in range(nd)))
 parser = argparse.ArgumentParser(prog="deploy.sh run")
 runfile.add_arguments(parser)
 args = parser.parse_args(flags)
 try:
     run = runfile.prefill_decode(args, prefill, decode, kv_link)
+    for side, count in (("prefill_instances", np_), ("decode_instances", nd)):
+        if count > 1:
+            run[side] = count
     lookaheads = "-"
     if router_lp:
         run["router"] = compass_run.router_binary(router_lp)
@@ -209,29 +262,48 @@ try:
 except (ValueError, OSError, ArtifactRefusal, SpecRefusal) as refused:
     sys.exit(f"deploy: {refused}")
 clock = block(1)
-base = block(run["prefill_data_parallel_size"] * run["decode_data_parallel_size"])
+# One write-request port a (prefill instance, decode instance, prefill rank,
+# decode rank), from one base every instance is given (`kv.connector`).
+base = block(np_ * nd * run["prefill_data_parallel_size"] * run["decode_data_parallel_size"])
 run |= {"out_dir": str(Path(run_file).parent), "clock_endpoint": f"tcp://127.0.0.1:{clock}"}
 Path(run_file).write_text(json.dumps(run))
-hand(router, prometheus, base, base, clock, lookaheads)
+hand(router, prometheus, clock, lookaheads, *[base] * (np_ + nd))
 EOF
 )
 # Its last line; an import may print before it.
-read -r ROUTER_PORT PROMETHEUS_PORT PREFILL_KV_PORT DECODE_KV_PORT CLOCK_PORT LOOKAHEADS <<<"${ports##*$'\n'}"
+# Then each instance's KV port, in instance order.
+read -ra drawn <<<"${ports##*$'\n'}"
+ROUTER_PORT=${drawn[0]} PROMETHEUS_PORT=${drawn[1]} CLOCK_PORT=${drawn[2]} LOOKAHEADS=${drawn[3]}
+KV_PORTS=("${drawn[@]:4}")
 
-decode_pid() { # the decode's command's process id, waiting up to PREFIX_S while its prefix runs
-    local deadline=$((SECONDS + PREFIX_S))
-    until [[ -s $OUT/decode.pid ]]; do
-        [[ -n ${D-} ]] && kill -0 "$D" 2>/dev/null && ((SECONDS < deadline)) || return 1
+pids=()
+instance_pid() { # I: instance I's command's process id, waiting up to PREFIX_S while its prefix runs
+    local deadline=$((SECONDS + PREFIX_S)) file=$OUT/${names[$1]}.pid
+    until [[ -s $file ]]; do
+        [[ -n ${pids[$1]-} ]] && kill -0 "${pids[$1]}" 2>/dev/null && ((SECONDS < deadline)) || return 1
         sleep 0.2
     done
-    cat "$OUT/decode.pid"
+    cat "$file"
 }
-stop_decode() { # SIGTERM the decode instance's command, through its prefix
+stop_instance() { # I: SIGTERM instance I's command, through its prefix
+    local -n prefix=on_$1
     local pid
-    pid=$(decode_pid) || return 0
-    timeout "$PREFIX_S" "${on[@]}" kill -TERM "$pid" </dev/null 2>/dev/null || true
+    if ((${#prefix[@]} == 0)); then
+        [[ -z ${pids[$1]-} ]] || kill -TERM "${pids[$1]}" 2>/dev/null || true
+        return 0
+    fi
+    pid=$(instance_pid "$1") || return 0
+    timeout "$PREFIX_S" "${prefix[@]}" kill -TERM "$pid" </dev/null 2>/dev/null || true
 }
-trap 'stop_decode; kill $(jobs -p) 2>/dev/null || true' EXIT
+stop_remote() { # SIGTERM each instance an --on prefix runs elsewhere
+    local i
+    for i in "${!sides[@]}"; do
+        local -n prefix=on_$i
+        ((${#prefix[@]} == 0)) || stop_instance "$i"
+        unset -n prefix
+    done
+}
+trap 'stop_remote; kill $(jobs -p) 2>/dev/null || true' EXIT
 authority=
 if [[ $cmd == run ]]; then
     CLOCK=tcp://127.0.0.1:$CLOCK_PORT
@@ -244,63 +316,91 @@ if [[ $cmd == run ]]; then
     done
 fi
 
-instance() { # SIDE KV_ROLE KV_PORT: write the instance's command, OUT/SIDE.sh, and run it
-    local -n atom=$1 own=$1_own
-    local prefix=() command=("$cmd" --join "$RUN_FILE")
-    local kv="{\"kv_role\":\"$2\",\"kv_connector\":\"compass\",\"compass_kv_write_req\":\"tcp://127.0.0.1:$3\"}"
+instance() { # I: write instance I's command, OUT/<name>.sh, and run it
+    local i=$1 name=${names[$1]}
+    local -n atom=atom_$1 own=own_$1 prefix=on_$1
+    local role=kv_consumer command=("$cmd" --join "$RUN_FILE") several=$ND
+    [[ ${sides[i]} == decode ]] || role=kv_producer several=$NP
+    local kv="{\"kv_role\":\"$role\",\"kv_connector\":\"compass\",\"compass_kv_write_req\":\"tcp://127.0.0.1:${KV_PORTS[i]}\""
+    ((several == 1)) || kv+=",\"compass_instance\":${index[i]}"
+    kv+="}"
     if [[ $cmd == record ]]; then
         command=("$cmd" "${flags[@]}")
-        kv="{\"kv_role\":\"$2\",\"kv_connector\":\"mooncake\",\"handshake_port\":$3}"
+        kv="{\"kv_role\":\"$role\",\"kv_connector\":\"mooncake\",\"handshake_port\":${KV_PORTS[i]}}"
         [[ -z ${KV_EXTRA:-} ]] || kv=$(python3 -c 'import json, sys
 print(json.dumps({**json.loads(sys.argv[2]), **json.loads(sys.argv[1])}))' "$kv" "$KV_EXTRA")
     fi
-    [[ $1 == prefill ]] || prefix=("${on[@]}")
-    command+=("${own[@]}" --out "$OUT/$1" -- "${atom[@]}" --kv-transfer-config "$kv")
+    command+=("${own[@]}" --out "$OUT/$name" -- "${atom[@]}" --kv-transfer-config "$kv")
     # Its process id, which exec keeps; then this tree, checked, and the caller's directory.
     printf 'echo $$ >%q\n. %q && compass_env %q && compass_require_tree %q && cd %q &&\n    exec' \
-        "$OUT/$1.pid" "$ROOT/scripts/compass/_lib.sh" "$ROOT" "$ROOT" "$PWD" >"$OUT/$1.sh"
-    printf ' %q' python3 -c 'from atom.compass.cli import main; main()' "${command[@]}" >>"$OUT/$1.sh"
-    "${prefix[@]}" bash "$OUT/$1.sh" >"$OUT/$1.log" 2>&1 &
+        "$OUT/$name.pid" "$ROOT/scripts/compass/_lib.sh" "$ROOT" "$ROOT" "$PWD" >"$OUT/$name.sh"
+    printf ' %q' python3 -c 'from atom.compass.cli import main; main()' "${command[@]}" >>"$OUT/$name.sh"
+    "${prefix[@]}" bash "$OUT/$name.sh" >"$OUT/$name.log" 2>&1 &
+    pids[i]=$!
 }
-url() { # SIDE: the instance's URL, once its server.json names it, while both instances run
-    local deadline=$((SECONDS + WAIT_S))
-    until [[ -s $OUT/$1/server.json ]]; do
-        kill -0 $P 2>/dev/null || fail "the prefill instance exited before it answered; see $OUT/prefill.log"
-        kill -0 $D 2>/dev/null || fail "the decode instance exited before it answered; see $OUT/decode.log"
-        ((SECONDS < deadline)) || fail "no $1 instance after $WAIT_S s"
+url() { # I: instance I's URL, once its server.json names it, while every instance runs
+    local deadline=$((SECONDS + WAIT_S)) j
+    until [[ -s $OUT/${names[$1]}/server.json ]]; do
+        for j in "${!sides[@]}"; do
+            kill -0 "${pids[j]}" 2>/dev/null || fail "the ${names[j]} instance exited before it answered; see $OUT/${names[j]}.log"
+        done
+        ((SECONDS < deadline)) || fail "no ${names[$1]} instance after $WAIT_S s"
         sleep 1
     done
-    python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["url"])' "$OUT/$1/server.json"
+    python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["url"])' "$OUT/${names[$1]}/server.json"
 }
-instance prefill kv_producer "$PREFILL_KV_PORT"
-P=$!
-instance decode kv_consumer "$DECODE_KV_PORT"
-D=$!
-# Its process id first, so that any stop from here on reaches it.
-decode_pid >/dev/null || {
-    kill -0 $D 2>/dev/null || fail "the decode instance exited before it answered; see $OUT/decode.log"
-    fail "the decode instance wrote no process id in $PREFIX_S s; see $OUT/decode.log"
-}
-prefill_url=$(url prefill)
-decode_url=$(url decode)
+for i in "${!sides[@]}"; do
+    instance "$i"
+    # Its process id first, so that any stop from here on reaches it.
+    instance_pid "$i" >/dev/null || {
+        kill -0 "${pids[i]}" 2>/dev/null || fail "the ${names[i]} instance exited before it answered; see $OUT/${names[i]}.log"
+        fail "the ${names[i]} instance wrote no process id in $PREFIX_S s; see $OUT/${names[i]}.log"
+    }
+done
+urls=()
+for i in "${!sides[@]}"; do urls+=("$(url "$i")"); done
 # The router's requests to each instance, and the wait on the router, go
 # direct, never through a proxy the environment names.
 hosts=127.0.0.1
-for u in "$prefill_url" "$decode_url"; do u=${u#*://} && hosts+=,${u%:*}; done
+for u in "${urls[@]}"; do u=${u#*://} && hosts+=,${u%:*}; done
 export NO_PROXY=$hosts${NO_PROXY:+,$NO_PROXY} no_proxy=$hosts${no_proxy:+,$no_proxy}
 
 ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-port "$PROMETHEUS_PORT")
 [[ -z $RUN_FILE ]] || ROUTER+=(--request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S")
-ROUTER+=(--pd-disaggregation --prefill "$prefill_url" --decode "$decode_url" "${router[@]}")
+ROUTER+=(--pd-disaggregation)
+for i in "${!sides[@]}"; do ROUTER+=("--${sides[i]}" "${urls[i]}"); done
+ROUTER+=("${router[@]}")
 router_env=()
 [[ -z $ROUTER_LP ]] || router_env=(ATOM_COMPASS_CLOCK_ENDPOINT="$CLOCK" ATOM_COMPASS_SEED="${SEED:-20260707}" ATOM_COMPASS_ROUTER_LOOKAHEADS="$LOOKAHEADS")
+if [[ -n $ROUTER_LP ]] && ((NP > 1 || ND > 1)); then
+    # As pd_sim.sh gives them: the router LP's workers in the run file's
+    # worker_order as (URL, DP rank) pairs, and above one instance of a side
+    # each URL's frontend LP.
+    order=$(python3 - "$RUN_FILE" "$NP" "${urls[@]}" <<'EOF'
+import json, sys
+from atom.compass.run import worker_order
+
+run_file, np_, *urls = sys.argv[1:]
+url = {"P": urls[: int(np_)], "D": urls[int(np_) :]}
+try:
+    order = worker_order(json.load(open(run_file)))
+except Exception as e:
+    sys.exit(f"deploy: {e}")
+workers = {u: f"frontend-{s}{k}" for s in url if len(url[s]) > 1 for k, u in enumerate(url[s])}
+print(json.dumps([[url[s][k], r] for s in order for k, r in order[s]]))
+print(json.dumps(workers))
+EOF
+) || fail "the router LP's worker order: $order"
+    router_env+=(ATOM_COMPASS_ROUTER_ORDER="${order%%$'\n'*}" ATOM_COMPASS_ROUTER_WORKERS="${order#*$'\n'}")
+fi
 env "${router_env[@]}" "${ROUTER[@]}" >"$OUT/router.log" 2>&1 &
 R=$!
 compass_wait_up router $R "http://127.0.0.1:$ROUTER_PORT/v1/models"
 # A stop from here on, one server.json's reader sends included, also stops the
-# prefill instance, so the wait below ends even when the stop comes before it.
+# prefill instances, so the wait below ends even when the stop comes before it.
+prefills=("${pids[@]:0:NP}")
 stopped=0
-trap 'stopped=1; kill -TERM $P 2>/dev/null || true' TERM INT
+trap 'stopped=1; kill -TERM "${prefills[@]}" 2>/dev/null || true' TERM INT
 # server.json names a child of this script that lives as long as it does, so a
 # client's stop, sent to its parent, reaches the script whatever else has left.
 # It holds none of the script's output, which its caller may read to the end.
@@ -315,7 +415,7 @@ open(out + ".part", "w").write(json.dumps(ready))' \
 mv "$OUT/server.json.part" "$OUT/server.json"
 echo "deploy: ready at http://127.0.0.1:$ROUTER_PORT"
 
-wait -n $authority $P $D $R || true
+wait -n $authority "${pids[@]}" $R || true
 # A router LP leaves when the traffic closes its clock connection as aiperf
 # ends, which ends the run: no failure, so serve on until the stop.
 if ((!stopped)) && [[ -n $ROUTER_LP ]] && grep -qs 'ClockAbort: traffic closed its connection' "$OUT/router.log"; then
@@ -326,10 +426,9 @@ rc=$((!stopped))
 # Each instance stops its server, whose frontend ends a simulated run through
 # the authority; the authority leaves once it has written the summary.
 # The router stops last: a router LP's run needs it until then.
-kill -TERM $P 2>/dev/null || true
-stop_decode
+for i in "${!sides[@]}"; do stop_instance "$i"; done
 deadline=$((SECONDS + WAIT_S))
-for pid in $P $D $authority $R; do
+for pid in "${pids[@]}" $authority $R; do
     ((pid != R)) || kill -TERM $R 2>/dev/null || true
     while kill -0 $pid 2>/dev/null; do
         ((SECONDS < deadline)) || { kill -KILL $pid; rc=1; echo "deploy: process $pid killed after $WAIT_S s" >&2; }
@@ -338,13 +437,27 @@ for pid in $P $D $authority $R; do
     wait $pid || ((pid == R)) || rc=1
 done
 trap - EXIT
+# Each instance: its directory's name, side and index, and, real, its
+# Mooncake handshake port, which a prefill's transfers carry to the decode.
+instances=()
+for i in "${!sides[@]}"; do
+    instances+=("${names[i]} ${sides[i]:0:1} ${index[i]} $([[ $cmd == record ]] && echo "${KV_PORTS[i]}" || echo -)")
+done
 python3 -c 'import json, os, sys
-out, link, across, n, *rest = sys.argv[1:]
-run = {"command": rest[: int(n)], "kv_link": link, "across_nodes": across == "1", "router": rest[int(n) :]}
+out, link, across, k, *rest = sys.argv[1:]
+held, rest = rest[: int(k)], rest[int(k) :]
+n, rest = int(rest[0]), rest[1:]
+run = {"command": rest[:n], "kv_link": link, "across_nodes": across == "1", "router": rest[n:]}
+run["instances"] = []
+for line in held:
+    name, side, index, port = line.split()
+    run["instances"].append({"name": name, "side": side.upper(), "index": int(index)})
+    if port != "-":
+        run["instances"][-1]["handshake_port"] = int(port)
 if os.path.exists(out + "/run_file.json"):
     run["run_file"] = json.load(open(out + "/run_file.json"))
 open(out + "/run.json.part", "w").write(json.dumps(run))' \
-    "$OUT" "$KV_LINK" "$ACROSS_NODES" "${#ARGV[@]}" "${ARGV[@]}" "${ROUTER[@]}"
+    "$OUT" "$KV_LINK" "$ACROSS_NODES" "${#instances[@]}" "${instances[@]}" "${#ARGV[@]}" "${ARGV[@]}" "${ROUTER[@]}"
 mv "$OUT/run.json.part" "$OUT/run.json"
 if [[ -s $OUT/artifacts/client_run.json ]]; then
     (cd / && python3 -m atom.compass.report.split "$OUT") ||

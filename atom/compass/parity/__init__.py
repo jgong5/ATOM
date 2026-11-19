@@ -111,6 +111,10 @@ ARRIVALS = "arrivals.json"
 #: The file in a decode instance's record directory joining each request's
 #: response id to the prefill request its KV came from (`carry_response_ids`).
 TRANSFERS = "transfers.jsonl"
+#: A transfer's fields naming the prefill instance it came from: a simulated
+#: one's engine id (`kv.connector.engine_id`), a real one's host and Mooncake
+#: handshake port.
+INSTANCE_FIELDS = ("remote_engine_id", "remote_host", "remote_handshake_port")
 #: The file in a record directory with a line ``{key, rank, reqs, tokens}`` per
 #: request the frontend routed across DP ranks, in routing order: its whole
 #: prompt's digest, its rank, and each rank's in-flight requests and queued
@@ -475,7 +479,8 @@ def carry_response_ids() -> None:
 
     A sequence whose `kv_transfer_params` carry a `transfer_id`, a decode
     instance's request, also gets a line ``{response_id, remote_dp_rank,
-    transfer_id}`` in `TRANSFERS` of the record directory, which this replaces."""
+    transfer_id}``, with each of `INSTANCE_FIELDS` the parameters hold, in
+    `TRANSFERS` of the record directory, which this replaces."""
     from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 
     path = pathlib.Path(os.environ[ENV]) / TRANSFERS
@@ -493,6 +498,11 @@ def carry_response_ids() -> None:
                     "remote_dp_rank": params.get("remote_dp_rank", 0),
                     "transfer_id": params["transfer_id"],
                 }
+                # Which prefill instance sent it, where a deployment runs
+                # several: their transfer ids, each its own sequence ids, meet.
+                for field in INSTANCE_FIELDS:
+                    if params.get(field) is not None:
+                        line[field] = params[field]
                 with path.open("a") as f:
                     f.write(json.dumps(line) + "\n")
             return add(self, seqs)

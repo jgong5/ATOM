@@ -40,7 +40,13 @@ to OUT/`FILE`, one JSON document, and no other file changes:
 A real forward's entry and return are its step line's ``t_enter_ns`` and
 ``t_exit_ns``; a simulated one's are its cost line's ``t_s`` and that plus
 ``group_s``. A simulated client's stamps are `EPOCH_NS` past the virtual clock.
-A deployment's sides join through the decode side's `TRANSFERS`. In place of
+A deployment's sides join through the decode side's `TRANSFERS`. Above one
+instance of a side (`deploy.sh`'s ``prefill<k>/`` and ``decode<k>/``), each
+transfer names the prefill instance it came from (`parity.INSTANCE_FIELDS`): a
+simulated one by its engine id, a real one by the Mooncake handshake port
+`run.json`'s ``instances`` gives it; a real decode instance on another node
+takes its own ``decode_offset_s``, listed by instance as
+``decode_offsets_s``, the first field then spanning them all. In place of
 the split, ``refused`` says why there is none: a file it reads is missing or
 holds no step times, a side is a pipeline's, whose first tokens leave a stage
 whose forwards it does not read, or a request's events are out of order, each of
@@ -57,9 +63,9 @@ import sys
 from pathlib import Path
 
 from atom.benchmarks.results.records import from_aiperf
-from atom.compass.backends.json_file import read_json
+from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.carriers import EPOCH_NS
-from atom.compass.parity import TRANSFERS, transfers
+from atom.compass.parity import TRANSFERS
 from atom.compass.parity.client_run import RAW, response_id
 
 FILE = "request_split.json"
@@ -69,10 +75,56 @@ STEPS = "steps"
 RESOLUTION_S = 1e-9
 
 
-def _sides(run: Path) -> list[Path]:
-    """Where `run`'s servers recorded: a deployment's `prefill/` and `decode/`,
-    as `deploy.sh` lays them out, else `run` itself."""
-    return [run / "prefill", run / "decode"] if (run / "prefill").is_dir() else [run]
+def _side(run: Path, side: str) -> list[Path]:
+    """A deployment's instances of `side` as `deploy.sh` lays them out: its one
+    `side/`, or `side0/`, `side1/`, ... above one; none on one server."""
+    if (run / side).is_dir():
+        return [run / side]
+    held = {p.name[len(side) :]: p for p in run.glob(f"{side}[0-9]*") if p.is_dir()}
+    return [held[k] for k in sorted(held, key=int) if k.isdigit()]
+
+
+def _instances(run: Path, meta: dict, simulated: bool) -> tuple[list, list]:
+    """Where `run`'s servers recorded: a deployment's prefill instances, each
+    its directory and the `parity.INSTANCE_FIELDS` its transfers name it by
+    (none where it is the only one), and its decode instances' directories;
+    else `run` itself, one server, and no decode side."""
+    prefills, decodes = _side(run, "prefill"), _side(run, "decode")
+    if not prefills:
+        return [(run, {})], []
+    if len(prefills) == 1:
+        return [(prefills[0], {})], decodes
+    held = {i["name"]: i for i in meta.get("instances", ())}
+    named = []
+    for k, path in enumerate(prefills):
+        if simulated:
+            from atom.compass.kv.connector import engine_id
+
+            named.append((path, {"remote_engine_id": engine_id(f"engine-P{k}")}))
+        elif "handshake_port" in held.get(path.name, {}):
+            named.append(
+                (path, {"remote_handshake_port": held[path.name]["handshake_port"]})
+            )
+        else:
+            raise ValueError(f"run.json names no handshake port of {path.name}")
+    return named, decodes
+
+
+def _sender(transfer: dict, prefills: list) -> int:
+    """The index of the prefill instance `transfer` came from."""
+    if len(prefills) == 1:
+        return 0
+    hits = [
+        k
+        for k, (_, fields) in enumerate(prefills)
+        if all(transfer.get(f) == v for f, v in fields.items())
+    ]
+    if len(hits) != 1:
+        raise ValueError(
+            f"transfer {transfer} names {len(hits)} of the {len(prefills)} "
+            "prefill instances"
+        )
+    return hits[0]
 
 
 def _client(run: Path, simulated: bool) -> tuple[dict, dict]:
@@ -181,27 +233,39 @@ def split(run) -> dict:
     run = Path(run)
     meta = read_json(run / "run.json")
     simulated = "run_file" in meta
-    sides = _sides(run)
-    first, named, lmcache = _record(sides[0], simulated, every=True)
+    prefills, decodes = _instances(run, meta, simulated)
+    # Each prefill instance's forwards, by (instance, DP rank, request id).
+    first, named, lmcache = {}, {}, {}
+    for k, (path, _) in enumerate(prefills):
+        held = _record(path, simulated, every=True)
+        for into, got in zip((first, named, lmcache), held):
+            into |= {(k, *key): value for key, value in got.items()}
     done, unsplit = _client(run, simulated)
-    if len(sides) == 1:
+    # Each decode-side request's instance and forwards, by its response id.
+    own, decode = {}, {}
+    if not decodes:
         own = {name: key for key, (name, *_) in named.items()}
-    else:
-        if not (sides[1] / STEPS / TRANSFERS).exists():
-            raise ValueError(f"{sides[1] / STEPS} holds no {TRANSFERS}")
-        own = {name: key for key, name in transfers(sides[1] / STEPS).items()}
-        _, decoded, _ = _record(sides[1], simulated, every=False)
-        decode = {name: forwards for name, *forwards in decoded.values()}
-    events = {}
+    for j, path in enumerate(decodes):
+        if not (path / STEPS / TRANSFERS).exists():
+            raise ValueError(f"{path / STEPS} holds no {TRANSFERS}")
+        for t in read_jsonl(path / STEPS / TRANSFERS):
+            own[t["response_id"]] = (
+                _sender(t, prefills),
+                t["remote_dp_rank"],
+                t["transfer_id"],
+            )
+        _, decoded, _ = _record(path, simulated, every=False)
+        decode |= {name: (j, forwards) for name, *forwards in decoded.values()}
+    events, decoded_by = {}, {}
     for name, (record, (send, token, end)) in done.items():
         key = own.get(name)
-        if key not in named or (len(sides) == 2 and name not in decode):
+        if key not in named or (decodes and name not in decode):
             unsplit[record["request_id"]] = "no step names it on every side"
             continue
         e = {"send": send, "prefill entry": first[key]}
         e["prefill return"], forwards = named[key][2], named[key][1:]
-        if len(sides) == 2:
-            forwards = decode[name]
+        if decodes:
+            decoded_by[name], forwards = decode[name]
             e["decode entry"] = forwards[0]
         if len(forwards) < 3:
             unsplit[record["request_id"]] = (
@@ -213,12 +277,22 @@ def split(run) -> dict:
         raise ValueError("no request aiperf finished is named by its step records")
     clock = {"clock": "virtual" if simulated else "monotonic"}
     if not simulated and meta.get("across_nodes", meta.get("kv_link") == "inter_node"):
-        low = max(e["prefill return"] - e["decode entry"] for e in events.values())
-        high = min(e["first token"] - e["hand-over"] for e in events.values())
-        for e in events.values():
-            e["decode entry"] += high
-            e["hand-over"] += high
-        clock["decode_offset_s"] = [low, high]
+        offsets = []
+        for j in range(len(decodes)):
+            mine = [e for name, e in events.items() if decoded_by[name] == j]
+            if not mine:
+                offsets.append(None)
+                continue
+            low = max(e["prefill return"] - e["decode entry"] for e in mine)
+            high = min(e["first token"] - e["hand-over"] for e in mine)
+            for e in mine:
+                e["decode entry"] += high
+                e["hand-over"] += high
+            offsets.append([low, high])
+        held = [o for o in offsets if o]
+        clock["decode_offset_s"] = [min(o[0] for o in held), max(o[1] for o in held)]
+        if len(decodes) > 1:
+            clock["decode_offsets_s"] = offsets
     requests = []
     for name, e in events.items():
         for (a, x), (b, y) in itertools.pairwise(e.items()):

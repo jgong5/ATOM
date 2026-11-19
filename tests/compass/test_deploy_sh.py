@@ -40,8 +40,15 @@ out = os.path.dirname(run_file)
 json.dump(argv, open(out + "/authority.argv.json", "w"))
 endpoint = argv[argv.index("--compass-clock-endpoint") + 1]
 s = socket.create_server(("127.0.0.1", int(endpoint.rsplit(":", 1)[1])))
+run = json.load(open(run_file))
+# Each instance's directory: its side's name, with its index above one.
+names = [
+    f"{side}{k}" if n > 1 else side
+    for side, n in (("prefill", run.get("prefill_instances", 1)), ("decode", run.get("decode_instances", 1)))
+    for k in range(n)
+]
 deadline = time.monotonic() + 60
-while not all(os.path.exists(f"{out}/{side}/run.json") for side in ("prefill", "decode")):
+while not all(os.path.exists(f"{out}/{name}/run.json") for name in names):
     if time.monotonic() > deadline:
         sys.exit(9)
     time.sleep(0.1)
@@ -250,6 +257,95 @@ def test_a_deployment_joins_both_instances_to_its_authority_behind_the_router(
     assert written["command"][1:] == argv(tmp_path, flags)[2:]
     assert written["run_file"] == run
     assert written["router"][1:] == router["argv"]
+
+
+def test_two_prefill_instances_join_by_index_behind_a_router_lp_choosing_among_them(
+    tmp_path, planted
+):
+    env, flags = planted
+    env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
+    d = tmp_path / "d"
+    model = ["--model", str(tmp_path)]
+    words = argv(tmp_path, flags + router_hop(tmp_path), router=ROUTER_LP_ARGS)
+    at = words.index("--decode")
+    words[at:at] = ["--prefill", "--", *model, *PREFILL]
+    script = subprocess.Popen(
+        words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
+    )
+    _until(d / "server.json", script)
+
+    run = json.loads((d / "run_file.json").read_text())
+    assert run["prefill_instances"] == 2 and "decode_instances" not in run
+    lps = {lp.name for lp in compass_run.channel_table(run).registry.ids()}
+    assert {"frontend-P0", "engine-P0", "frontend-P1", "engine-P1"} <= lps
+    assert {"frontend-D", "engine-D", compass_run.ROUTER.name} <= lps
+    kvs, urls = {}, {}
+    for name in ("prefill0", "prefill1", "decode"):
+        seen = json.loads((d / f"{name}.argv.json").read_text())
+        assert seen[seen.index("--out") + 1] == str(d / name)
+        kvs[name] = json.loads(seen[-1])
+        urls[name] = json.loads((d / name / "server.json").read_text())["url"]
+    assert [kvs[f"prefill{k}"]["compass_instance"] for k in (0, 1)] == [0, 1]
+    assert "compass_instance" not in kvs["decode"]
+    # One base every instance is given, one port a rank pair and instance pair.
+    assert len({kv["compass_kv_write_req"] for kv in kvs.values()}) == 1
+    router = json.loads((tmp_path / "router.json").read_text())
+    workers = router["argv"][router["argv"].index("--pd-disaggregation") :][:7]
+    assert workers == [
+        "--pd-disaggregation", "--prefill", urls["prefill0"], "--prefill", urls["prefill1"],
+        "--decode", urls["decode"],
+    ]  # fmt: skip
+    assert json.loads(router["env"]["ATOM_COMPASS_ROUTER_WORKERS"]) == {
+        urls["prefill0"]: "frontend-P0",
+        urls["prefill1"]: "frontend-P1",
+    }
+    # The run file names no worker_order: the router LP sorts each side's
+    # workers by URL and rank, as under pd_sim.sh.
+    assert json.loads(router["env"]["ATOM_COMPASS_ROUTER_ORDER"]) == []
+
+    script.send_signal(signal.SIGTERM)
+    out, _ = script.communicate(timeout=60)
+
+    assert script.returncode == 0, out
+    written = json.loads((d / "run.json").read_text())
+    assert written["instances"] == [
+        {"name": "prefill0", "side": "P", "index": 0},
+        {"name": "prefill1", "side": "P", "index": 1},
+        {"name": "decode", "side": "D", "index": 0},
+    ]
+
+
+@pytest.mark.parametrize(
+    "where, refusal",
+    [
+        ("after decode", "in that order"),
+        ("other args", "prefill1's ATOM arguments differ from prefill0's"),
+        (
+            "no retries",
+            "choose among a side's instances as LP router but not --disable-retries",
+        ),
+    ],
+)
+def test_a_second_prefill_instance_out_of_place_exits_2_before_anything_starts(
+    tmp_path, planted, where, refusal
+):
+    env, flags = planted
+    model = ["--model", str(tmp_path)]
+    retries = (
+        ROUTER_ARGS if where == "no retries" else [*ROUTER_ARGS, "--disable-retries"]
+    )
+    words = argv(tmp_path, flags, router=retries)
+    args = [] if where == "other args" else PREFILL
+    at = words.index("--router" if where == "after decode" else "--decode")
+    words[at:at] = ["--prefill", "--", *model, *args]
+
+    done = subprocess.run(
+        words, env=env, cwd=tmp_path, capture_output=True, text=True, check=False
+    )
+
+    assert done.returncode == 2, done.stderr
+    assert refusal in done.stderr
+    assert not (tmp_path / "d" / "run_file.json").exists()
 
 
 def test_an_instance_that_exits_before_it_answers_fails_the_deployment_naming_it(
