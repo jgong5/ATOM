@@ -47,7 +47,9 @@ def _leading_slow(priced: list[tuple], law: dict | None) -> set[int]:
     out = set()
     for key in sorted({p[0] for p in priced}):
         mine = [p for p in priced if p[0] == key]
-        error = np.array([p[4] / p[3] - 1.0 for p in mine])
+        # The fit's residual: price less seconds, over the price.
+        with np.errstate(divide="ignore"):
+            error = np.array([1.0 - p[3] / p[4] for p in mine])
         centre = np.median(error)
         mad = 1.4826 * np.median(np.abs(error - centre))
         vector = {}

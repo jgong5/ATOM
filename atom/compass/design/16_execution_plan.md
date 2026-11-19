@@ -196,7 +196,8 @@ stage is named for the model; it is not the retired milestone M3 of D95.
   A law's key holds the capture ladder (`run/step_grid.py::keyed`), which ATOM clips at
   `--max-num-seqs`; a law, its host laws and a step grid bundle serve each point whose
   ladder is a prefix of their own ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)), so an arm's entry keyed at its
-  top point serves its lower ones. An indexer-CP arm's law
+  top point serves its lower ones. `fit steps` and `fit host` pool the arm's records at
+  every point into it; a bundle's plan and step measurements stay at one point. An indexer-CP arm's law
   waits on #3054's indexer-CP key, without which its runs would read a law fitted
   without indexer CP.
 
@@ -233,7 +234,9 @@ named for the model and the parallelism of its arms.
   key. Every point keeps ATOM's default `--max-num-seqs`; c=64 and c=128 share a capture
   ladder and c=256 adds 256. One step linear law and one `host_laws` entry each for DTP2
   c=64 and for DEP2, keyed at c=256's ladder, which serves c=128 at its prefix
-  ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)), with memory readings per point.
+  ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)), with memory readings per point. `fit host` compares the graph
+  sets V4.1's host key records exactly, so DEP2's two points pool into one `host_laws`
+  entry only where their decoder's graph keys agree.
 - **Two backends**, the step linear law and the step grid, each graded by `08` D45.1, as
   #3256 rules for M3-Agentic: the submission's inputs reach 525k tokens at p95, past a
   law's hull.
@@ -261,7 +264,7 @@ atom/compass/
   bench/      the step bench: replay by rule, the window, measure; the op bench
   fit/        samples for fit and publishing; each backend owns its fit
   validate/   grading: whether a client run is gradeable, the separable results
-  metrics/    per-step sampling, backfill
+  metrics/    not built: the series is run/metrics.py, its report in report/ (11 D74)
   kv/         simulated KV connector
   cli.py      the `compass` console script, registered in pyproject.toml (13 D80); it parses and dispatches only
 tests/compass/          mirrors the above
@@ -589,7 +592,7 @@ Depends on Wave 1. The first three are the vertical slice.
 | **W2.3** | Simulated KV connector registered into ATOM's existing factory; `latency + bytes/bandwidth` from the spec | `kv/` | 250–400 | W1.7 |
 | **W2.4** | Artifact store: keys, digests, source-root fingerprints, the invalidation matrix | `artifacts/` | 500–700 | W1.7 |
 | **W2.5** | ~~`FakeTensorMode` capture with the three mandatory disciplines and post-trace assertions; guard-domain evaluation~~ **Superseded by concrete capture** since 2026-10-18 (#1489): one graph per decode width and prefill (T, B), with no disciplines and no guard domain (`04` D18, D19); carried by S3c.8 and S3d.12 | `capture/` | ~~500–800~~ | W1.10, **P0.4** |
-| **W2.6** | Metrics under virtual time: per-step sampling, the class taxonomy, OpenMetrics backfill | `metrics/` | 300–500 | W2.1 |
+| **W2.6** | Metrics under virtual time: ~~per-step sampling~~, the class taxonomy, OpenMetrics backfill. **Revised 2026-11-16** ([#3584](https://github.com/jgong5/ATOM/issues/3584)): each engine and frontend LP samples at ATOM's metrics timer, the class taxonomy as the sampler's class table, the backfill into CI's Prometheus report (`11` D74, D77, *The first build*); carried by #3585 to #3587 | ~~`metrics/`~~ `run/`, `runner/`, `report/` | 300–500 | W2.1 |
 | **W2.7** | Determinism test: byte-diff of two step tables from one configuration, in CI (`01` D3.4) | `tests/compass/` | ~100 | W2.1 |
 | **W2.8** | Model construction under `FakeTensorMode` with `--load_dummy empty` (`02` D10.1), including the buffer audit of T68 | `runner/` | 200–350 | W2.5 |
 

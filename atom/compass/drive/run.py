@@ -15,7 +15,8 @@ reach it until it is stopped, with run.json recording what grading reads.
 `--device`'s datasheet and the readings `--store` holds for it at `--ptl` and
 at the stack the backend's and host laws' entries state, or `--stack` where
 they state none (`runfile.spec`), the backend exactly one with no default, and
-`serve` starts the server simulated from it with the step record on. `--out`
+`serve` starts the server simulated from it with the step record on, and
+ATOM's GPU forward timer unless the environment sets it (`timer_env`). `--out`
 holds what `serve` writes and what the run writes there: each DP rank's step
 record and cost lines, the step table, the run summary and each LP's hand-in.
 
@@ -25,7 +26,7 @@ step table, the run summary and the hand-ins in its ``out_dir``, and grading
 reads them there. `scripts/compass/deploy.sh` builds that file, starts the
 authority and joins each instance to it. A prefill or a decode instance shares a
 clock with its peer, so it refuses without `--join`, but under `--check` with
-its side named.
+its side named; a plain `--check` of its arguments refuses, naming that side's.
 
 `--coverage` names record directories and `shape_population` tokens whose steps
 the backend's coverage check reads before the server starts: the step grid's
@@ -49,9 +50,9 @@ directory a step linear law's printed calibration writes, and it writes none.
 flags and ATOM arguments as `deploy.sh run` takes them, so `--network` names a
 deployment across nodes. Its ATOM arguments gain the `--kv-transfer-config` the
 script adds, the side's KV role on the simulated connector, and it reads the
-environment the script starts the side in, `AITER_LOG_LEVEL` set when unset
-(`compass_env`), so it resolves the config the side's instance runs. A
-`--kv-transfer-config` among them refuses, as the script refuses one. The
+environment the script starts the side in, `AITER_LOG_LEVEL` WARNING when
+unset or empty (`side_env`), so it resolves the config the side's instance
+runs. A `--kv-transfer-config` among them refuses, as the script refuses one. The
 readings command it prints takes Mooncake's connector in the simulated one's
 place, as `deploy.sh record` starts the side: a real start has no clock to
 build the simulated one on. It names `AITER_LOG_LEVEL` when the check set it,
@@ -110,6 +111,9 @@ ROLES = {"prefill": "kv_producer", "decode": "kv_consumer"}
 SIMULATED, REAL = "compass", "mooncake"
 #: The ATOM argument naming a side's connector, which deploy.sh adds.
 KV_FLAG = "--kv-transfer-config"
+#: ATOM's GPU forward timer, which CI's `pd_server_atom.sh` turns on for both
+#: sides unless set, as a simulated server's start does (`timer_env`).
+DEVICE_TIMER = "ATOM_ENABLE_METRICS_DEVICE_TIMER"
 
 
 def main(argv: list[str]) -> None:
@@ -131,15 +135,20 @@ def main(argv: list[str]) -> None:
         )
     if args.check in ROLES:
         serve._refuse(atom_args)
-        # deploy.sh starts each side under `compass_env` (scripts/compass/_lib.sh).
-        env = {} if "AITER_LOG_LEVEL" in os.environ else {"AITER_LOG_LEVEL": "WARNING"}
+        env = side_env(os.environ)
         os.environ.update(env)
         sides = [side_args(args.check, atom_args, c) for c in (SIMULATED, REAL)]
         raise SystemExit(lacking.report(args, *sides, env))
-    runfile.pd_side(atom_args, refuse=True)
     if args.check:
+        if side := runfile.pd_side(atom_args):
+            name = lacking.SIDES[side]
+            raise ValueError(
+                f"{KV_FLAG} makes this a {name} instance: check it with --check "
+                f"{name}, without its {KV_FLAG}, which the check adds as deploy.sh does"
+            )
         serve._refuse(atom_args)
         raise SystemExit(lacking.report(args, atom_args))
+    runfile.pd_side(atom_args, refuse=True)
     if not args.out:
         parser.error("the following arguments are required: --out")
     run = runfile.build(args, atom_args)
@@ -152,20 +161,23 @@ def main(argv: list[str]) -> None:
         ]
         run[compass_run.ACCEPTANCE_RECORD] = str(Path(record).resolve())
     report = check(args.coverage, run, atom_args) if args.coverage else None
-    serve.serve(atom_args, args.out, run=run)
+    serve.serve(atom_args, args.out, run=run, extra_env=timer_env(os.environ))
     write_grading(args.out, report)
 
 
 def join(args, atom_args, side) -> None:
     """Serve one instance of a deployment whose authority already runs, from
-    its run file `args.join`, and record what grading reads for its `side`."""
+    its run file `args.join` and with `timer_env`'s variables, and record what
+    grading reads for its `side`."""
     run = json.loads(Path(args.join).read_text())
     if not {"clock_endpoint", "out_dir"} <= run.keys():
         raise ValueError(
             f"--join {args.join} names no clock_endpoint and out_dir; a "
             "deployment's run file names its authority and its directory"
         )
-    serve.serve(atom_args, args.out, run=run, joined=True)
+    serve.serve(
+        atom_args, args.out, run=run, extra_env=timer_env(os.environ), joined=True
+    )
     write_grading(args.out, None, side)
 
 
@@ -217,6 +229,20 @@ def side_args(side: str, atom_args, connector: str) -> list[str]:
     return [*atom_args, KV_FLAG, json.dumps(kv)]
 
 
+def side_env(env) -> dict:
+    """The variables deploy.sh's `compass_env` (scripts/compass/_lib.sh) sets
+    over the environment `env` it starts a side in: AITER_LOG_LEVEL WARNING
+    where `env` has it unset or empty."""
+    return {} if env.get("AITER_LOG_LEVEL") else {"AITER_LOG_LEVEL": "WARNING"}
+
+
+def timer_env(env) -> dict:
+    """The variables a simulated server starts with over the environment
+    `env`: `DEVICE_TIMER` 1 where `env` has it unset or empty, so the server's
+    GPU forward histograms hold each step's predicted device seconds."""
+    return {} if env.get(DEVICE_TIMER) else {DEVICE_TIMER: "1"}
+
+
 def measured(record, atom_args, ranks: int) -> list[float]:
     """The rates the accepted-draft histograms of `record` give over DP ranks
     ``0..ranks-1``: entry ``i`` the share of rows that accepted more than ``i``
@@ -233,8 +259,14 @@ def measured(record, atom_args, ranks: int) -> list[float]:
     files = sorted(
         (Path(record) / serve.STEPS).glob(compass_run.ACCEPTANCE_FILE.format("*"))
     )
+    names = {compass_run.ACCEPTANCE_FILE.format(r) for r in range(ranks)}
+    if files and (missing := sorted(names - {p.name for p in files})):
+        raise ValueError(
+            f"--acceptance-record: {record} holds no {', '.join(missing)}, and "
+            f"ATOM's arguments run {ranks} DP ranks"
+        )
     counts = Counter()
-    for path in files:
+    for path in (p for p in files if p.name in names):
         held = json.loads(path.read_text())
         if held["draft_tokens"] != width:
             raise ValueError(
@@ -247,12 +279,6 @@ def measured(record, atom_args, ranks: int) -> list[float]:
         raise ValueError(
             f"--acceptance-record: {record} holds no accepted-draft histogram; "
             "a speculative record writes one per DP rank in its steps"
-        )
-    names = {compass_run.ACCEPTANCE_FILE.format(r) for r in range(ranks)}
-    if missing := sorted(names - {p.name for p in files}):
-        raise ValueError(
-            f"--acceptance-record: {record} holds no {', '.join(missing)}, and "
-            f"ATOM's arguments run {ranks} DP ranks"
         )
     return [sum(n for a, n in counts.items() if a > i) / rows for i in range(width)]
 

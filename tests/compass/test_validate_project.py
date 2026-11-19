@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """`compass project`: real runs' steps priced on a device none of them
-ran on, published as a projection that ranks the cells and names each assumed
-spec field a price read; and `validate.bound --ratios-from`, a device that ran
-priced at another's probed ratios, the method's error on its own records.
+ran on, published as a projection that ranks the cells, names each assumed
+spec field a price read and each cell's engine as its op graphs are keyed by;
+and `validate.bound --ratios-from`, a device that ran priced at another's
+probed ratios, the method's error on its own records.
 """
 
 import json
@@ -13,10 +14,13 @@ import platforms
 import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_backend_step_roofline import STACK
+from test_key_index_cache_dtype import QWEN
 from test_validate_bound import LINES, _main, drafted, graph, record
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends.step_roofline import StepRooflineBackend
+from atom.compass.capture.forward import _config
+from atom.compass.run.step_grid import LEVEL, keyed
 from atom.compass.spec import MachineSpec
 from atom.compass.validate import bound, project
 
@@ -165,6 +169,28 @@ def test_a_cell_under_a_drafter_states_the_drafters_seconds_apart(
     op = cell["levels"]["op"]
     # The drafter costs more than the target, and is not in its seconds.
     assert op["draft_s"]["decode"] > op["analytical_s"]["decode"]["total"] > 0
+
+
+def test_a_cell_at_atoms_default_level_names_no_level_in_its_engine(
+    monkeypatch, tmp_path
+):
+    """A cell is built eager at level 0, as its op graphs are traced, and they
+    serve a run at any level: its engine is the one they are keyed by."""
+    _priced_here(monkeypatch)
+    monkeypatch.setattr("atom.compass.run.step_grid.keyed", keyed)
+    monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx", lambda: "gfx950")
+    tree = SimpleNamespace(modules=list)
+    monkeypatch.setattr(bound, "_build", lambda m, tp, a, *_: (_config(m, tp, a), tree))
+    model = tmp_path / "qwen3"
+    model.mkdir()
+    (model / "config.json").write_bytes(QWEN.read_bytes())
+    decode = ran(tmp_path / "decode", LINES[:1])
+    mi455 = json.loads(MI455.read_text())
+
+    cell = project.cell(str(model), 1, mi455, "s", str(decode), [])
+
+    assert cell["engine"]["tensor_parallel_size"] == 1
+    assert LEVEL not in cell["engine"]
 
 
 def test_main_reads_a_records_atom_arguments_from_its_run_json(monkeypatch, tmp_path):

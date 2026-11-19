@@ -41,9 +41,11 @@ LOOKUP_S = (2.0**-8, 2.0**-10)  # fixed, per prompt chunk
 REQUEST_S = 2.0**-9
 LATENCY_S, BANDWIDTH = 2.0**-6, 1e9
 CHUNK = 4
+#: The KV block each engine plans, in bytes; a chunk holds whole blocks.
+BLOCK_BYTES = 2**16
 TOKENS = tuple(range(1, 4 * CHUNK + 3))  # four whole chunks and a tail
-LOOK, XFER = "engine->lmcache:lookup#dp0", "engine->lmcache:transfer#dp0.tp0"
-XFER_BACK = "lmcache->engine:transfer#dp0.tp0"
+LOOK, XFER = "engine->lmcache:lookup#dp0", "engine->lmcache:transfer#dp0"
+XFER_BACK = "lmcache->engine:transfer#dp0"
 
 
 def _bound_port(proc) -> int:
@@ -121,16 +123,15 @@ def _key(rid, worker_id=None):
 
 
 @pytest.mark.parametrize("stated", [None, 2.0**-12])
-def test_the_rows_join_each_dp_rank_and_writer_to_lmcache(tmp_path, stated):
-    run = _run(tmp_path, writers=2)
+def test_the_rows_join_each_dp_rank_to_lmcache(tmp_path, stated):
+    run = _run(tmp_path)
     run["data_parallel_size"] = 2
     if stated is not None:
         run["lmcache_ipc_s"] = stated
     table = compass_run.channel_table(run)
     lm, engine = LpId("lmcache"), LpId("engine")
-    kinds = ["lookup#dp0", "lookup#dp1"] + [
-        f"transfer#dp{r}.tp{k}" for r in (0, 1) for k in (0, 1)
-    ]
+    # One transfer channel per DP rank, whatever its writer ranks.
+    kinds = ["lookup#dp0", "lookup#dp1", "transfer#dp0", "transfer#dp1"]
     assert {c.name for c in table.channels_into(lm)} == {
         f"engine->lmcache:{k}" for k in kinds
     }
@@ -146,8 +147,8 @@ def test_the_rows_join_each_dp_rank_and_writer_to_lmcache(tmp_path, stated):
     # Every channel is owned by the member of the DP rank it names.
     members = compass_run._members(table, 2)
     ClockAuthority(table, members=members)
-    assert "lmcache->engine:transfer#dp1.tp0" in members[engine]["dp1"]
-    assert "engine->lmcache:transfer#dp0.tp1" in members[engine]["dp0"]
+    assert "lmcache->engine:transfer#dp1" in members[engine]["dp1"]
+    assert "engine->lmcache:transfer#dp0" in members[engine]["dp0"]
     assert "lmcache" in compass_run._hand_ins(run)
 
 
@@ -166,7 +167,7 @@ def test_a_prefill_decode_run_joins_lmcache_to_the_prefill_engine(tmp_path, widt
 
 
 def test_a_zero_lmcache_ipc_s_is_refused_as_a_cycle(tmp_path):
-    run = _run(tmp_path, writers=1)
+    run = _run(tmp_path)
     run["lmcache_ipc_s"] = 0.0
     with pytest.raises(ValueError, match="lmcache_ipc_s is 0.0.*cycle"):
         compass_run.channel_table(run)
@@ -188,28 +189,27 @@ def test_the_decode_side_of_an_offloading_deployment_is_refused(tmp_path):
         compass_run._launch_lmcache(_config(MULTI), _run(tmp_path), "D")
 
 
-COLLAPSED = OFFLOAD | {
-    "kv_connector_extra_config": {"lmcache.mp.tp_rank_collapse": True}
-}
-
-
 @pytest.mark.parametrize(
-    "kv, tp, dp_attention, writers, ranks",
+    "stated, named",
     [
-        (OFFLOAD, 2, False, 1, 2),
-        (OFFLOAD, 1, False, 2, 1),
-        (OFFLOAD, 2, True, 2, 1),  # each DP rank runs at TP 1
-        (COLLAPSED, 2, True, 2, 1),  # its TP 1 collapses no further
+        ({"writers": 1}, "writers"),
+        ({"state_bytes": 0}, "state_bytes"),
+        ({"writers": 8, "state_bytes": 0}, "state_bytes and writers"),
     ],
-    ids=["fewer", "more", "dp-attention", "collapsed-dp-attention"],
+    ids=["writers", "state_bytes", "both"],
 )
-def test_writers_other_than_the_deployments_writer_ranks_are_refused(
-    tmp_path, kv, tp, dp_attention, writers, ranks
+def test_an_entry_stating_a_retired_key_is_refused_by_name(
+    tmp_path, monkeypatch, stated, named
 ):
-    run = _run(tmp_path, writers=writers)
-    config = _config(kv, tensor_parallel_size=tp, enable_dp_attention=dp_attention)
-    with pytest.raises(ValueError, match=f"writers is {writers}; .* from {ranks} rank"):
+    """Even at the value the deployment would have had; nothing starts."""
+    started = []
+    monkeypatch.setattr(
+        compass_run.subprocess, "Popen", lambda *a, **k: started.append(a)
+    )
+    run, config = _run(tmp_path, **stated), _config(kv_cache_block_size=CHUNK)
+    with pytest.raises(ValueError, match=f"lmcache entry states {named}, which"):
         compass_run._launch_lmcache(config, run, None)
+    assert started == []
 
 
 def test_an_lmcache_entry_with_no_deployment_to_start_it_is_refused(tmp_path):
@@ -266,9 +266,13 @@ def test_server_jobs_start_and_end_against_the_station_laws(tmp_path, monkeypatc
         "Popen",
         lambda *a, **k: started.append((a, real(*a, **k))),
     )
-    compass_run._launch_lmcache(_config(), run, None)
+    # The engine's plan, as its runner publishes it: a chunk holds two blocks.
+    now = tmp_path / compass_run.NOW_FILE.format("engine")
+    compass_run.publish_transfer(compass_run._block_file(now), BLOCK_BYTES, 1)
+    compass_run._launch_lmcache(_config(kv_cache_block_size=CHUNK // 2), run, None)
     (argv, *_), proc = started[0]
-    chunk_bytes = int(argv[-1])
+    assert argv[-1] == str(CHUNK // 2)
+    chunk_bytes = 2 * BLOCK_BYTES
     idle = [connect(LpId(lp), served.endpoint) for lp in ("traffic", "frontend")]
     for conn in idle:
         conn.send(("NER", math.inf, [], math.inf))
@@ -341,11 +345,11 @@ def test_server_jobs_start_and_end_against_the_station_laws(tmp_path, monkeypatc
     expected = [
         (back + "lookup#dp0", 0, end1 + IPC, None),
         (back + "lookup#dp0", 1, end2 + IPC, 0),  # nothing stored yet
-        (back + "transfer#dp0.tp0", 0, end3 + IPC, [b"", False]),
-        (back + "transfer#dp0.tp0", 1, end4 + IPC, [b"", True]),
+        (back + "transfer#dp0", 0, end3 + IPC, [b"", False]),
+        (back + "transfer#dp0", 1, end4 + IPC, [b"", True]),
         (back + "lookup#dp0", 2, end5 + IPC, None),
         (back + "lookup#dp0", 3, end6 + IPC, 4),  # the store's four chunks
-        (back + "transfer#dp0.tp0", 2, end7 + IPC, [b"", True]),
+        (back + "transfer#dp0", 2, end7 + IPC, [b"", True]),
     ]
     assert sorted(got, key=lambda g: g[2]) == got  # taken in timestamp order
     assert [g[:2] for g in got] == [e[:2] for e in expected]
@@ -384,7 +388,7 @@ def test_the_eviction_and_session_ticks_land_on_their_grids_as_daemon_deadlines(
     sock = ctx.socket(zmq.ROUTER)
     try:
         LMCacheLP(
-            rt, sock, server, lookup_s=LOOKUP_S, request_s=REQUEST_S, copy=None
+            rt, sock, server, lookup_s=LOOKUP_S, request_s=REQUEST_S, size_copy=None
         ).serve()
     finally:
         sock.close(linger=0)

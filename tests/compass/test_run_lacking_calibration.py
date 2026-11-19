@@ -14,7 +14,6 @@ in the stub tree `test_calibrate` runs `calibrate.sh` in. A side of a
 and host laws instead.
 """
 
-import json
 import os
 import re
 import shlex
@@ -32,6 +31,7 @@ from test_run_step_grid import deployment
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
+from atom.compass.backends.json_file import read_json
 from atom.compass.drive import lacking
 from atom.compass.drive import run as drive_run
 from atom.compass.runner.overrides import schedulable_ladder
@@ -44,7 +44,7 @@ TEMPLATE |= {"max_num_batched_tokens": 16384, "speculative_config": mtp(3)}
 TP8 = ["-tp", "8", "--max-num-seqs", "512", "--max-num-batched-tokens", "16384"]
 #: A token no store entry has.
 ABSENT = "0123456789ab"
-UNKNOWN = "expected time: unknown, as calibrate.sh records no calibration's time"
+UNKNOWN = "expected time: unknown, as no earlier calibration's status is read for it"
 
 
 @pytest.fixture(autouse=True)
@@ -61,7 +61,7 @@ def printed(tmp_path, monkeypatch, capsys, atom_args, *flags, law=None, **config
     makes it, as printed, and each line printed after it."""
     r = deployment(tmp_path, **config)
     served(monkeypatch, r.config)
-    at = json.loads(law.read_text())["platform"] if law else None
+    at = read_json(law)["platform"] if law else None
     common = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path, at=at)
     common += ["--store", str(tmp_path / "store"), *flags]
     given = ["--step-linear", str(law or ABSENT), *common, "--check", "--"]
