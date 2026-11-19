@@ -224,11 +224,15 @@ A deployment that offloads KV to an lmcache server (``lmcache_mp``), the
 prefill side of a prefill-decode run, needs an ``lmcache`` entry, and a run
 file with one needs such a deployment. `frontend(config)` then starts LP
 ``lmcache`` (`lmcache`, `atom.compass.kv.lmcache_server.LMCacheLP`) in a
-process of its own. The entry holds ``server``, the ``lmcache server`` flags;
-the request loop's laws, ``lookup_s`` (``[fixed, per prompt chunk]``) and
-``request_s``; optional ``copy_width``, 1 when absent; and optional
-``writers``, the writer ranks per DP rank, 1 when absent; and optional
-``state_bytes``, a rank's recurrent-state image, 0 when absent. The copy engine
+process of its own, given the deployment's KV block tokens, of which the
+server's chunk must be a whole number. The entry holds ``server``, the
+``lmcache server`` flags; the request loop's laws, ``lookup_s`` (``[fixed, per
+prompt chunk]``) and ``request_s``; and optional ``copy_width``, 1 when absent.
+It states no ``writers`` or ``state_bytes``, which the launch refuses: every
+writer rank of a DP rank shares that rank's one transfer channel, and at its
+first stamped request LP ``lmcache`` sizes a chunk and a rank's state image
+from what each member of the engine it serves planned (`_lmcache_plan`), as a
+prefill-decode connector prices its transfer. The copy engine
 prices on the machine's ``interconnect.host_link``. Its channels' lookahead is
 ``lmcache_ipc_s``, the run's ``ipc_s`` when absent (`add_lmcache`). `engine(config)`
 has the connector factory build ``lmcache_mp`` as Compass's
@@ -359,7 +363,8 @@ ACCEPTANCE_RECORD = "acceptance_record"
 AUTHORITY_FILE = "authority_endpoint.txt"
 #: Wall seconds the summary's writer waits for the server LPs' refusals.
 HAND_IN_WAIT_S = 300.0
-#: Wall seconds a prefill-decode engine waits for every engine's planned block.
+#: Wall seconds a prefill-decode engine, or LP lmcache, waits for every engine's
+#: planned block.
 PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
@@ -780,12 +785,17 @@ def channel_table(run: dict):
         pd = "router_s" in run
         add_lmcache(
             table,
-            "engine-P" if pd else ENGINE.name,
+            _lmcache_engine(run),
             run.get("lmcache_ipc_s", hop(run, "ipc_s")),
             _dp(run, "P" if pd else None),
-            run["lmcache"].get("writers", 1),
         )
     return table
+
+
+def _lmcache_engine(run: dict) -> str:
+    """The engine LP that LP `lmcache` serves: a prefill-decode run's prefill
+    side, else the run's one engine."""
+    return "engine-P" if "router_s" in run else ENGINE.name
 
 
 def _engines_table(run: dict):
@@ -848,7 +858,7 @@ def _members(table, dp: int | tuple[int, int]) -> dict | None:
     """Each engine LP's members at its DP width above one: rank ``dp<r>`` owns
     the channels whose ``#`` tag names it at that LP's end, ``#dp<r>`` or, on a
     channel between two engine LPs, ``#dp<sender rank>.dp<receiver rank>``. A
-    tag's other parts, as the ``tp<k>`` of ``#dp<r>.tp<k>``, name no member.
+    tag's parts other than ``dp<r>`` name no member.
     `dp` is every engine LP's width, or ``(prefill, decode)`` by side."""
 
     def rank(c, lp):
@@ -942,18 +952,38 @@ def publish_transfer(
     slot_bytes: int = 0,
     staging_bytes: int = 0,
     slot_after_blocks: bool = False,
+    image_bytes: int = 0,
 ) -> None:
     """Write one paged KV block's bytes, the state slot a transfer moves beside
-    a request's blocks, or after them, and the staging row it moves in a second
-    write, as a runner at TP `tp` planned them, where `_planned_transfer` reads them."""
+    a request's blocks, or after them, the staging row it moves in a second
+    write, and the state image an lmcache save carries, as a runner at TP `tp`
+    planned them, where `_planned_transfer` and `_lmcache_plan` read them."""
     planned = {
         "block_bytes": int(block_bytes),
         "tp": tp,
         "slot_bytes": int(slot_bytes),
         "staging_bytes": int(staging_bytes),
         "slot_after_blocks": bool(slot_after_blocks),
+        "image_bytes": int(image_bytes),
     }
     _write_whole(path, json.dumps(planned))
+
+
+def _published_plans(run: dict, names: list[str]) -> dict:
+    """By engine name, what each engine of `names` published
+    (`publish_transfer`), once every one has; refused, naming each that has
+    not, after `PLANNED_BLOCK_WAIT_S` wall seconds."""
+    out = Path(run["out_dir"])
+    files = {n: _block_file(out / NOW_FILE.format(n)) for n in names}
+    deadline = time.monotonic() + PLANNED_BLOCK_WAIT_S
+    while missing := [n for n, f in files.items() if not f.exists()]:
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"{', '.join(missing)} published no planned KV block in "
+                f"{PLANNED_BLOCK_WAIT_S} wall seconds"
+            )
+        time.sleep(0.1)
+    return {n: json.loads(f.read_text()) for n, f in files.items()}
 
 
 def _planned_transfer() -> tuple:
@@ -970,28 +1000,15 @@ def _planned_transfer() -> tuple:
     run = spec()
     if not _block_file(Path(os.environ[NOW_ENV])).exists():
         raise RuntimeError("this engine's runner published no planned KV block")
-    out = Path(run["out_dir"])
-    files = {
-        n: _block_file(out / NOW_FILE.format(n))
-        for n in _hand_ins(run)
-        if n.startswith(f"{ENGINE.name}-")
-    }
-    deadline = time.monotonic() + PLANNED_BLOCK_WAIT_S
-    while missing := [n for n, f in files.items() if not f.exists()]:
-        if time.monotonic() > deadline:
-            raise TimeoutError(
-                f"{', '.join(missing)} published no planned KV block in "
-                f"{PLANNED_BLOCK_WAIT_S} wall seconds"
-            )
-        time.sleep(0.1)
+    engines = [n for n in _hand_ins(run) if n.startswith(f"{ENGINE.name}-")]
     # Each deployment member's stages: engine-P1-pp0.dp2 is stage 0 of
     # engine-P1.dp2.
     planned: dict = {}
-    for n, f in files.items():
+    for n, published in _published_plans(run, engines).items():
         lp, dot, member = n.partition(".")
         deployment, _, stage = lp.partition("-pp")
         stages = planned.setdefault(deployment + dot + member, {})
-        stages[int(stage or 0)] = json.loads(f.read_text())
+        stages[int(stage or 0)] = published
     prefill = [u for u in planned if u.startswith(f"{ENGINE.name}-P")]
     for key, what in (
         ("block_bytes", "KV block"),
@@ -1026,11 +1043,10 @@ def _planned_transfer() -> tuple:
     )
 
 
-def _lmcache_stations(run: dict, chunk_bytes: int) -> dict:
-    """LP `lmcache`'s station laws, from the run file's ``lmcache`` entry and
-    the machine spec's host link, a chunk of `chunk_bytes` the copy's unit."""
-    from atom.compass.kv import TransferModel
-
+def _lmcache_stations(run: dict) -> dict:
+    """LP `lmcache`'s station laws, from the run file's ``lmcache`` entry, and
+    the link its copy engine prices a chunk on, the machine spec's host link,
+    as ``(latency, bandwidth)``."""
     entry = run["lmcache"]
     if missing := {"server", "lookup_s", "request_s"} - set(entry):
         raise ValueError(
@@ -1041,22 +1057,41 @@ def _lmcache_stations(run: dict, chunk_bytes: int) -> dict:
     return {
         "lookup_s": tuple(entry["lookup_s"]),
         "request_s": entry["request_s"],
-        "copy": TransferModel(
+        "link": (
             machine.value("interconnect.host_link.latency_s"),
             machine.value("interconnect.host_link.bandwidth_bytes_per_s"),
-            chunk_bytes,
         ),
         "copy_width": entry.get("copy_width", 1),
     }
 
 
+def _lmcache_plan(run: dict, blocks: int) -> tuple[int, int]:
+    """A chunk's bytes, `blocks` KV blocks, and a rank's state image, as every
+    member of the engine LP `lmcache` serves planned them (`publish_transfer`).
+    Refused, naming both, where two members plan different blocks or images."""
+    served = _lmcache_engine(run)
+    members = [n for n in _hand_ins(run) if n.partition(".")[0] == served]
+    (first, plan), *rest = _published_plans(run, members).items()
+    for name, other in rest:
+        for key, what in (("block_bytes", "KV block"), ("image_bytes", "state image")):
+            if other[key] != plan[key]:
+                raise ValueError(
+                    f"{name} plans a {what} of {other[key]} B and {first} one of "
+                    f"{plan[key]} B: LP lmcache sizes every object it holds at "
+                    "one chunk and one image"
+                )
+    return plan["block_bytes"] * blocks, plan["image_bytes"]
+
+
 def _launch_lmcache(config, run: dict, side: str | None) -> None:
     """Start LP `lmcache`, the stand-in lmcache server, in a process of its own
-    when this deployment offloads KV to one; refuse a deployment and a run file
-    that disagree on whether one runs or on its writer ranks, a decode side
-    that would start it, or a model whose chunk `KvGeometry` cannot size."""
+    when this deployment offloads KV to one, given its KV block tokens; refuse
+    a deployment and a run file that disagree on whether one runs, a decode
+    side that would start it, an entry stating ``writers`` or ``state_bytes``,
+    which nothing reads, or a server chunk that is not a whole number of the
+    deployment's KV blocks."""
+    from atom.compass.kv.lmcache_server import parse_server_flags
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-    from atom.kv_transfer.offload.mp.deployment import _tp_replication_factor
 
     leaves = KVConnectorFactory.leaf_connectors(config) or ()
     lm = next((c for name, c in leaves if name == "lmcache_mp"), None)
@@ -1072,55 +1107,64 @@ def _launch_lmcache(config, run: dict, side: str | None) -> None:
         return
     if side == "D":
         raise ValueError("LP lmcache serves the prefill side; this is the decode side")
-    # Under DP-attention each DP rank runs at TP 1.
-    tp = 1 if config.enable_dp_attention else config.tensor_parallel_size
-    writers = tp // min(tp, _tp_replication_factor(lm))
-    if run["lmcache"].get("writers", 1) != writers:
+    if retired := sorted({"writers", "state_bytes"} & run["lmcache"].keys()):
         raise ValueError(
-            f"the run file's lmcache writers is {run['lmcache'].get('writers', 1)}; "
-            f"this deployment stores from {writers} rank(s) per DP rank, its TP "
-            "width per DP rank (1 under DP-attention) over its TP replication factor"
+            f"the run file's lmcache entry states {' and '.join(retired)}, which "
+            "nothing reads: every writer rank of a DP rank sends on that rank's "
+            "one transfer channel, and LP lmcache sizes a rank's state image from "
+            "its engine's plan"
         )
-    from atom.compass.backends import KvGeometry, Parallelism
-    from atom.compass.kv.lmcache_server import parse_server_flags
-
-    chunk_bytes = KvGeometry.from_hf_config(
-        config.hf_config,
-        block_size=parse_server_flags(run["lmcache"]["server"]).chunk_size,
-        parallelism=Parallelism(tp_size=tp),
-        kv_dtype=config.kv_cache_dtype,
-    ).bytes_per_block
-    _lmcache_stations(run, chunk_bytes)  # refused here, before the run starts
+    _lmcache_stations(run)  # refused here, before the run starts
+    chunk = parse_server_flags(run["lmcache"]["server"]).chunk_size
+    block = config.kv_cache_block_size
+    if chunk % block:
+        raise ValueError(
+            f"the lmcache server's --chunk-size is {chunk} tokens, not a whole "
+            f"number of this deployment's {block}-token KV blocks "
+            "(kv_cache_block_size), which ATOM's lmcache_mp workers refuse"
+        )
     paths = [str(Path(atom.__file__).parents[1]), os.environ.get("PYTHONPATH")]
     subprocess.Popen(
-        [sys.executable, "-c", LMCACHE_MAIN, str(chunk_bytes)],
+        [sys.executable, "-c", LMCACHE_MAIN, str(block)],
         env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, paths))},
     )
 
 
-#: LP `lmcache`'s process, given a chunk's bytes.
+#: LP `lmcache`'s process, given the deployment's KV block tokens.
 LMCACHE_MAIN = "import sys; from atom.compass import run; run.lmcache(int(sys.argv[1]))"
 
 
-def lmcache(chunk_bytes: int) -> None:
+def lmcache(block_tokens: int) -> None:
     """LP `lmcache`: the stand-in server at its flags' URL, on the run's clock
-    until its ``+inf`` grant, then its hand-in."""
+    until its ``+inf`` grant, then its hand-in. At its first stamped request it
+    sizes a chunk, its ``--chunk-size`` over `block_tokens` KV blocks, and a
+    rank's state image from its engine's plan (`_lmcache_plan`), and its copy
+    engine's model with them."""
     import zmq
 
+    from atom.compass.kv import TransferModel
     from atom.compass.kv.lmcache_server import LMCacheLP, LMCacheServer
 
     run = spec()
     rt = _runtime(LMCACHE, run)
     rt.client_run_ended = lambda k: _hand_in(run, LMCACHE.name, rt.refusals, k)
-    lm = run["lmcache"]
-    server = LMCacheServer(
-        lm["server"], chunk_bytes=chunk_bytes, state_bytes=lm.get("state_bytes", 0)
-    )
+    stations = _lmcache_stations(run)
+    link = stations.pop("link")
+    # Unsized until `size_copy`: the startup frames before it need no bytes.
+    server = LMCacheServer(run["lmcache"]["server"], chunk_bytes=0)
+
+    def size_copy():
+        """Size the server's chunk and state image from the plan, and return
+        the copy engine's model at that chunk."""
+        blocks = server.chunk_size // block_tokens
+        server.chunk_bytes, server.state_bytes = _lmcache_plan(run, blocks)
+        return TransferModel(*link, server.chunk_bytes)
+
     sock = zmq.Context.instance().socket(zmq.ROUTER)
     sock.bind(server.url)
     ended = []
     try:
-        LMCacheLP(rt, sock, server, **_lmcache_stations(run, chunk_bytes)).serve()
+        LMCacheLP(rt, sock, server, size_copy=size_copy, **stations).serve()
     except BaseException as e:
         ended = [f"ended:{LMCACHE.name} raised {e!r}"]
         raise
@@ -1961,7 +2005,11 @@ def runner(model_runner, tree) -> None:
     if NOW_ENV in os.environ:
         now = Path(os.environ[NOW_ENV])
         model_runner.compass_raised_file = _raised_file(now, model_runner.rank)
-        if _pd_side(config) is not None and model_runner.rank == 0:
+        # What it planned prices a prefill-decode transfer and sizes LP lmcache.
+        planned = _pd_side(config) is not None or _offloads(
+            config.kv_transfer_config, "lmcache_mp"
+        )
+        if planned and model_runner.rank == 0:
             model_runner.compass_block_file = _block_file(now)
         slot = np.memmap(now, np.float64, "r", shape=(1,))
         host = run.get("host", {})
@@ -3120,8 +3168,9 @@ def _in_force_from(series: list, t: float) -> list:
 
 
 def _block_file(now: Path) -> Path:
-    """Where the engine whose clock file is `now` publishes its planned KV block
-    and the state slot and staging row a transfer moves (`publish_transfer`)."""
+    """Where the engine whose clock file is `now` publishes its planned KV block,
+    the state slot and staging row a transfer moves and the state image an
+    lmcache save carries (`publish_transfer`)."""
     return now.with_suffix(".kv_block")
 
 

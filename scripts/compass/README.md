@@ -22,13 +22,13 @@ its header.
 
 | Script | Where | What |
 |---|---|---|
-| `gate_cpu.sh` | CPU container | The CPU gate, run per task: every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, no driver **as a batch**: run alone, a file in it can still reach `rocminfo` (`tests/test_postprocess_width.py` did, through `atom.model_engine.model_runner`'s `from aiter import …`, measured on node 18 at `bdd244c57` while it was in the gate). `tests/compass` runs as `COMPASS_GATE_SHARDS` (default 4) pytest processes beside the rest of `tests/`, each printing its own summary, and shard k writing a caller's `--junitxml` or `--basetemp` path with `.shard<k>` appended; `0` runs one process. **Must be green.** Also exits 98 when the diff is in the blind spot below and the GPU gate has not run on *this* tree. Refuses a caller-supplied `-r`. |
+| `gate_cpu.sh` | CPU container | The CPU gate, run per task: every test file outside `tests/plugin/` and `cpu_gate_exclude.txt`, no driver **as a batch**: run alone, a file in it can still reach `rocminfo` (`tests/test_postprocess_width.py` did, through `atom.model_engine.model_runner`'s `from aiter import …`, measured on node 18 at `bdd244c57` while it was in the gate). `tests/compass` runs as `COMPASS_GATE_SHARDS` (default 4) pytest processes beside the rest of `tests/`, each printing its own summary, and shard k writing a caller's `--junitxml` or `--basetemp` path with `.shard<k>` appended; `0` runs one process. **Must be green.** Also exits 98 when the diff is in the blind spot below and the GPU gate has not run on *this* tree or on one it carries from (below). Refuses a caller-supplied `-r`. |
 | `gate_gpu.sh` | GPU container | The GPU gate, run per wave — and per task for a blind-spot diff. Superset (`--ignore=tests/plugin`), less any file `gpu_gate_skip.txt` names for the first card's GPU target, judged as a **delta** against the baseline of the first card's GPU target in `gpu_gate_baselines/<target>/gpu_gate_baseline.env`, with torch, HIP, ROCm and AITER recorded and compared. The failing node-ids are on file in `gpu_gate_known_failures.txt` beside it and compared **by name**. Calls `preflight.sh` itself, before and after. Runs the driver-run tests once, with the inputs it sets (see "The driver-run tests and their inputs" below). |
 | `preflight.sh` | GPU container | `rocminfo` reachability, compute use and VRAM use (checks 1–3), plus a D-state census (check 0), and a list of bookable devices. A gfx1250 card (MI455) reads 100% use with no process on it, so there a queue on the card (`rocm-smi --showpidgpus`) stands for compute use. Run **before and after**. The census states its own scope: in a container it can only see this PID namespace, and says so rather than reporting a clear node. Also worth running for a CPU-only task that imports ATOM's model layer: `import aiter` runs `rocminfo`, and so does any module that imports aiter at load time (`atom.model_engine.model_runner`, `atom.model_ops.linear`), so on a wedged node that import hangs. A bare `import atom` and `atom.compass` run no `rocminfo` and load no torch; `atom.config`, `atom.model_engine.llm_engine` and `atom.entrypoints.openai_server` load torch but run no `rocminfo`. Measured on node 18, 2026-09-23. |
 | `regen_cpu_gate_exclude.sh` | CPU container | Regenerate the **GENERATED** section of the exclusion list by iterating `--collect-only` to a fixed point (three passes at `83daf636d`: 37 errors, 1, clean). Preserves the MANUAL section verbatim. |
 | `regen_gpu_gate_triggers.sh` | CPU container | Re-derive `gpu_gate_triggers.txt` from the exclusion list and the tree. Run after **any** change to `cpu_gate_exclude.txt` — the two files are derived from the same tree and are wrong separately. Writes the whole file, **header counts included**; nothing in it is maintained by hand. |
 | `regen_gpu_gate_baseline.sh` | GPU container | Re-measure the GPU gate's baseline when `gate_gpu.sh` warns that the toolchain differs from it (a new image, a torch, HIP or AITER bump, another GPU): `git archive --prefix=ATOM/ -o BASE.tar <commit>` where the repository is, then `HIP_VISIBLE_DEVICES=<gpu> scripts/compass/regen_gpu_gate_baseline.sh BASE.tar`. Runs the suite `gate_gpu.sh` runs on its first card (outside `tests/plugin` and `tests/compass`) twice, each over a fresh extraction of the tarball, and rewrites `gpu_gate_baseline.env` and `gpu_gate_known_failures.txt` in `gpu_gate_baselines/<target>/` for the card's GPU target, leaving out what `gpu_gate_skip.txt` leaves out on it (`BASE_LEFT_OUT`). Writes nothing when the two runs pass different counts or fail different node-ids (exit 97, naming each node-id one run alone failed), when a run errors or does not complete (1), when torch, HIP or AITER reads `UNKNOWN` or torch reads no GPU target for the card (96), when pre-flight fails before or after (91), or when the tarball names no commit (94). |
-| `snapshot.sh` | either | Build the `git archive` tarball a gate runs against (never `rsync`). Stamps `.compass-commit` (so output names its tree, and a `COMPASS_GPU_GATE_DONE` attestation can be checked) and `.compass-changed` (so the blind-spot question is answerable without `.git`). Refuses a dirty tree. |
+| `snapshot.sh` | either | Build the `git archive` tarball a gate runs against (never `rsync`). Stamps `.compass-commit` (so output names its tree, and a `COMPASS_GPU_GATE_DONE` attestation can be checked) and `.compass-changed` (so the blind-spot question is answerable without `.git`); and `.compass-gpu-carry`: with `COMPASS_GPU_GATE_DONE=<G>` set and not HEAD, G, HEAD and the diff from G, else empty, refusing with 93 a G that is not a full commit sha. Refuses a dirty tree. |
 | `compass` | either | The `compass` console script, run from this tree, for an image whose ATOM install has none. The stage-2 cell below runs it. |
 | `pd_sim.sh` | GPU container | A simulated 1P1D run: the standalone clock authority (`python -m atom.compass.run`), a prefill and a decode API server on the simulated KV connector, and `atomesh` in PD mode between them. `tests/compass/test_pd_slice.py` drives one request through it. Its variables are in its header. |
 | `deploy.sh` | GPU container; with `--on`, one per node | A prefill-decode deployment with `atomesh` between its instances: simulated, one `compass run` per instance, joined to the clock authority the script starts, or real, one `compass record` per instance. `--on` starts the decode instance on another node through a command prefix (`ssh <host>`, `srun -w <host> ...`, or `spur exec <job> docker exec ...` as [the 005/013 pair](#a-1p1d-deployment-across-crsuse2-m2m-v3-005-and--013) runs it). Simulated with `--dp-aware` among the router's arguments, the router is the run's router LP, and `ATOMESH` must name an `atomesh` built from the tree being run (`cargo build --release` in `atom/mesh`); one built from other router source, as the containers' `/usr/local/bin/atomesh` is, is refused. A client drives it through `OUT/server.json` as it drives one server. Its usage is in its header. |
@@ -557,7 +557,8 @@ the run ends 98 unless `COMPASS_GPU_GATE_DONE` discharges it:
 |---|---|
 | unset | **98** — run `gate_gpu.sh`, then re-run with that tree's HEAD |
 | set, but this tree has no commit (no `.git`, no `.compass-commit`) | **98** — an attestation names a tree; accepting an uncheckable one makes the rule bypassable in exactly the snapshot where the gate normally runs. Rebuild with `snapshot.sh`. |
-| set to a sha other than this tree's HEAD | **98** — the GPU gate passed on a different tree |
+| set to another value G, and the diff from G to this tree touches a trigger, or a snapshot has no `.compass-gpu-carry` stamp from G to this HEAD, or G is not a full commit sha | **98** — the GPU gate passed on a different tree and does not carry here |
+| set to another full sha G, and the diff from G touches no trigger | discharged, `gpu: satisfied by <G> carried to <HEAD>`; the diff is `git diff --name-only G` in a checkout, or in a snapshot the stamp `snapshot.sh` writes when staged with the same `COMPASS_GPU_GATE_DONE` |
 | equal to this tree's HEAD | discharged |
 
 The trigger match is *reported* before pytest and *enforced* after it, so one run
@@ -795,7 +796,12 @@ join at. Records that ran before a run wrote that file, or wrote it without
 `data_parallel_size`, take an engine file stated from their `server.log` as
 `--engine FILE`; `compass fit steps` and `compass fit host` take it too, the
 host laws then keyed by it with the records' launch graph sets
-(`atom/compass/fit/samples.py`). `atom/compass/backends/step_labels.py` states the label
+(`atom/compass/fit/samples.py`). Engine and host key files name the compilation level only
+since [#3696](https://github.com/jgong5/ATOM/pull/3696), so these fits and `measure steps`
+read an older record's `--level` from the ATOM arguments after `--` in its `run.json`
+(`step_linear_fit.recorded_level`): a refit on cell A's, cell B's or gpu-40's records keys
+level 0. An older record whose `run.json` names none, as `calib_capture.sh` writes it, keys
+the default, and takes `--engine FILE` naming any other. `atom/compass/backends/step_labels.py` states the label
 and what is cut, and the command writes each record's labels beside it for
 reading, `dp0.cost.jsonl`; the module's docstring states how outliers are
 dropped. A prefill step's label is a trace run's busy time, which `calib_capture.sh`
@@ -1000,10 +1006,10 @@ run sets them and passes the acceptance length too. A record that built a Triton
 taken again; no record of the law built one.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi455-a0.json.xz` is the same law for
-cell A, TP4 with whole-expert EP4: `compass fit steps` and `compass fit host` both ran at ATOM
-ed5fa7697 on one `calibrate.sh` run's records at ed5fa7697 in the same image
-([#2744](https://github.com/jgong5/ATOM/issues/2744)), so its host laws place `L_mtp` before
-[#3096](https://github.com/jgong5/ATOM/issues/3096) ([#3273](https://github.com/jgong5/ATOM/issues/3273)),
+cell A, TP4 with whole-expert EP4: `compass fit steps` at ATOM ed5fa7697 and `compass fit host`
+at a tree that places `L_mtp` on the drifting host and device clocks
+([#3273](https://github.com/jgong5/ATOM/issues/3273)), on one `calibrate.sh` run's records at
+ed5fa7697 in the same image ([#2744](https://github.com/jgong5/ATOM/issues/2744)),
 under the same environment and the same `SERVER_ARGS` with `--enable-expert-parallel` added. Its engine config
 holds `AITER_LOG_LEVEL`, `OMP_NUM_THREADS` and `ATOM_TOKEN_GRAPH_SIZES` at ed5fa7697's
 default buckets; a run priced by it sets them and passes the acceptance length too. The

@@ -174,25 +174,27 @@ else
     fi
 fi
 
-if [ -z "$GPU_SRC_UNKNOWN" ]; then
+# Print `<path> -> <trigger>` for each path in $1 a trigger matches.
+trigger_hits() {
     while IFS= read -r pat; do
         pat=${pat%$'\r'}
         case "$pat" in ''|'#'*) continue ;; esac
         while IFS= read -r f; do
             [ -n "$f" ] || continue
             case "$pat" in
-            */) case "$f" in "$pat"*) GPU_NEEDED="$GPU_NEEDED$f -> $pat"$'\n' ;; esac ;;
-            *)  [ "$f" = "$pat" ] && GPU_NEEDED="$GPU_NEEDED$f -> $pat"$'\n' ;;
+            */) case "$f" in "$pat"*) printf '%s -> %s\n' "$f" "$pat" ;; esac ;;
+            *)  [ "$f" != "$pat" ] || printf '%s -> %s\n' "$f" "$pat" ;;
             esac
-        done <<<"$CHANGED"
+        done <<<"$1"
     done <"$TRIGGERS"
-fi
+}
+[ -n "$GPU_SRC_UNKNOWN" ] || GPU_NEEDED=$(trigger_hits "$CHANGED")
 
 if [ -n "$GPU_SRC_UNKNOWN" ]; then
     printf 'gpu:    UNKNOWN -- %s\n' "$GPU_SRC_UNKNOWN"
 elif [ -n "$GPU_NEEDED" ]; then
     printf 'gpu:    REQUIRED (%s)\n' "$SRC"
-    printf '%s' "$GPU_NEEDED" | sed 's/^/          /'
+    printf '%s\n' "$GPU_NEEDED" | sed 's/^/          /'
 else
     printf 'gpu:    not required (%s)\n' "$SRC"
 fi
@@ -373,7 +375,7 @@ if [ -n "$GPU_SRC_UNKNOWN" ]; then
 fi
 
 # A green pytest run is not a passed gate when the diff lands in the blind spot:
-# the GPU gate has to have run on this same tree, and to have said so.
+# the GPU gate has to have run on this same tree, or carry to it, and said so.
 if [ -n "$GPU_NEEDED" ]; then
     DONE=${COMPASS_GPU_GATE_DONE:-}
     if [ -z "$DONE" ]; then
@@ -391,11 +393,27 @@ if [ -n "$GPU_NEEDED" ]; then
         printf '  any tree. Rebuild the snapshot with scripts/compass/snapshot.sh.\n' >&2
         finish 98 "COMPASS_GPU_GATE_DONE cannot be checked; this tree has no commit"
     fi
-    if [ "$DONE" != "$HEAD_SHA" ]; then
+    # A GPU gate passed on full sha G carries here when the diff from G, git's or
+    # snapshot.sh's .compass-gpu-carry stamp (G, HEAD, the diff), hits no trigger.
+    G=$DONE CARRY= WHY= HITS=
+    if [ "$DONE" = "$HEAD_SHA" ]; then :
+    elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+        { [ "$(git -C "$ROOT" rev-parse --verify --quiet "$DONE^{commit}")" = "$DONE" ] &&
+            CARRY=$(git -C "$ROOT" diff --name-only "$G"); } || WHY="$DONE is not the full sha of a commit here"
+    elif [ -s "$ROOT/.compass-gpu-carry" ]; then
+        { read -r G; read -r TO; CARRY=$(cat); } <"$ROOT/.compass-gpu-carry"
+        [ "$G $TO" = "$DONE $HEAD_SHA" ] || WHY="the .compass-gpu-carry stamp carries $G to $TO"
+    else
+        WHY="the snapshot has no .compass-gpu-carry stamp; stage it with COMPASS_GPU_GATE_DONE set"
+    fi
+    [ -n "$WHY" ] || HITS=$(trigger_hits "$CARRY")
+    [ -z "$HITS" ] || WHY="the diff from ${G:0:9} touches a trigger: $(printf '%s' "$HITS" | tr '\n' ' ')"
+    if [ -n "$WHY" ]; then
         printf 'COMPASS_GPU_GATE_DONE=%s but this tree is %s.\n' "$DONE" "$HEAD_SHA" >&2
         printf '  The GPU gate passed on a different tree. Re-run it here.\n' >&2
-        finish 98 "COMPASS_GPU_GATE_DONE names a different tree; run gate_gpu.sh here"
+        finish 98 "COMPASS_GPU_GATE_DONE names a different tree and does not carry here: $WHY; run gate_gpu.sh here"
     fi
-    printf 'gpu:    satisfied by COMPASS_GPU_GATE_DONE=%s\n' "${DONE:0:9}"
+    [ "$G" = "$HEAD_SHA" ] && printf 'gpu:    satisfied by COMPASS_GPU_GATE_DONE=%s\n' "${DONE:0:9}" ||
+        printf 'gpu:    satisfied by %s carried to %s\n' "${G:0:9}" "${HEAD_SHA:0:9}"
 fi
 finish 0

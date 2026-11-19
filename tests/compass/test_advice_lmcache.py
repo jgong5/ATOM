@@ -17,6 +17,7 @@ from test_lmcache_lp import _config, _run
 from atom.compass import run as compass_run
 from atom.compass.advice import check, space
 from atom.compass.backends.step_stub import Coefficients
+from atom.compass.clock import LpId
 from atom.compass.drive import runfile
 from atom.compass.kv.lmcache_server import DECLARED_LAWS, parse_server_flags
 from atom.model_engine.arg_utils import kv_offload_connector_config
@@ -244,9 +245,12 @@ def test_a_1p1d_start_reaches_the_server_from_its_offloading_side_alone(tmp_path
     assert command[command.index("--router") :] == ["--router", "--", *check.ROUTER]
 
 
+@pytest.mark.parametrize("dp_attention", [True, False], ids=["dpa", "tp8"])
 def test_compass_run_takes_the_entry_and_lp_lmcache_launches_on_it(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, dp_attention
 ):
+    """At TP8, under DP attention or with every TP rank a writer: the entry
+    names no writer count, and neither does the channel table it builds."""
     expansion = expand(tmp_path, a_space())
     command, env = served(expansion, "tp8-on-c4", tmp_path / "at")
     entry = command[command.index("--lmcache") + 1]
@@ -271,10 +275,16 @@ def test_compass_run_takes_the_entry_and_lp_lmcache_launches_on_it(
     )
     # ATOM's own reading of the variables the point runs under.
     kv = kv_offload_connector_config(env["ATOM_KV_OFFLOAD"], env[check.EXTRA])
-    config = _config(kv, tensor_parallel_size=8, enable_dp_attention=True)
+    config = _config(kv, tensor_parallel_size=8, enable_dp_attention=dp_attention)
     compass_run._launch_lmcache(config, run, None)
     [argv] = started
-    stations = compass_run._lmcache_stations(run, int(argv[-1]))
+    assert argv[-1] == str(config.kv_cache_block_size)
+    lm = compass_run.channel_table(run).channels_into(LpId("lmcache"))
+    assert {c.name for c in lm} == {
+        "engine->lmcache:lookup#dp0",
+        "engine->lmcache:transfer#dp0",
+    }
+    stations = compass_run._lmcache_stations(run)
     assert stations["lookup_s"] == tuple(DECLARED_LAWS["lookup_s"])
     assert stations["request_s"] == DECLARED_LAWS["request_s"]
     lp = parse_server_flags(run["lmcache"]["server"])

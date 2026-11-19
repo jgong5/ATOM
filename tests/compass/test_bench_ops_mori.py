@@ -43,6 +43,9 @@ DISPATCH = {
         **LAUNCH,
         "num_ep_ranks": RANKS,
     },
+    # as the capture states it (`peers.install_mori`): every rank's rows
+    "out": [[RANKS * ROWS, HIDDEN], [RANKS * ROWS, TOP_K], [RANKS * ROWS, 2]]
+    + [[RANKS * ROWS, TOP_K], [1]],
     "occurrences": 1,
 }
 COMBINE = {

@@ -247,7 +247,7 @@ def _sends(run, rank) -> dict[str, list[float]]:
     for arrival, ch, _ in sorted(
         _releases(run["table"], "lmcache"), key=lambda r: r[1:]
     ):
-        if re.search(rf"#dp{rank}(\.|$)", ch):
+        if ch.endswith(f"#dp{rank}"):
             sent[ch].append(arrival - ipc)
     return sent
 
@@ -311,19 +311,19 @@ def test_each_server_job_and_reply_follows_the_constant_station_laws(runs):
 
 @NEEDS_A_RUN
 def test_each_offload_decision_is_sent_once_from_each_writer_before_its_forward(runs):
-    """A step line's load or save goes out once on each writer rank's transfer
-    channel, after the previous step starts and by its own step's start."""
+    """A step line's load or save goes out once from the one writer rank of
+    each DP rank (TP 1), on that rank's transfer channel, after the previous
+    step starts and by its own step's start."""
     _, (run, _) = runs
     record = read(run["out"] / "parity")
     starts = step_starts(run["table"], record)
-    writers = run["run"]["lmcache"].get("writers", 1)
     for rank, steps in record.items():
         decided = [k for k, step in enumerate(steps) for _ in step.get("kv", ())]
-        sent = _sends(run, rank)
-        for ch in (f"engine->lmcache:transfer#dp{rank}.tp{w}" for w in range(writers)):
-            assert len(sent[ch]) == len(decided), ch
-            for k, at in zip(decided, sent[ch]):
-                assert (starts[k - 1] if k else 0.0) <= at <= starts[k], (ch, k, at)
+        ch = f"engine->lmcache:transfer#dp{rank}"
+        sent = _sends(run, rank)[ch]
+        assert len(sent) == len(decided), ch
+        for k, at in zip(decided, sent):
+            assert (starts[k - 1] if k else 0.0) <= at <= starts[k], (ch, k, at)
 
 
 TAKEN = re.compile(

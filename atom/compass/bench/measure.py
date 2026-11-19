@@ -86,7 +86,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.step_grid_plan import plan
 from atom.compass.backends.step_labels import digest as file_digest
-from atom.compass.backends.step_linear_fit import token_band
+from atom.compass.backends.step_linear_fit import recorded_level, token_band
 from atom.compass.bench import ragged
 from atom.compass.drive.gpu import add_gpu_flag, hip_visible, kfd_pid, quiet
 from atom.compass.drive.identity import identity, phase
@@ -434,8 +434,9 @@ def grid_plan(args, read: dict, views=()) -> dict:
 
 def _read(name: str, store, client_runs, sessions, engine, sampling, against=AGAINST):
     """The input `name`: what names it as a source, its kept lines, and the
-    engine its rank states. One whose engine or sampling is not `engine` or
-    `sampling` refuses, naming what states those as `against` does."""
+    engine its rank states. One whose engine, a record's over its level
+    (`recorded_level`), or sampling is not `engine` or `sampling` refuses,
+    naming what states those as `against` does."""
     path = Path(name)
     with tempfile.TemporaryDirectory() as unpacked:
         if (path / "run.json").is_file():
@@ -458,7 +459,7 @@ def _read(name: str, store, client_runs, sessions, engine, sampling, against=AGA
             )
         ((rank, lines),) = record.items()
         stated = json.loads((steps / f"dp{rank}.engine.json").read_text())
-    ran = keyed_of(stated)
+    ran = recorded_level(path / "steps" / "dp0.jsonl") | keyed_of(stated)
     differ = [
         k for k in sorted(ran.keys() | engine.keys()) if ran.get(k) != engine.get(k)
     ]

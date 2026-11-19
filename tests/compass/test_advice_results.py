@@ -17,13 +17,12 @@ import re
 import shlex
 import subprocess
 import sys
-from pathlib import Path
 
 import platforms
 import pytest
 from test_advice_check import starts
 from test_advice_simulate import simulating, stubbed  # noqa: F401  the fixtures
-from test_calibrate import _tree
+from test_calibrate import _path, _tree
 from test_run_step_grid import DOCUMENT
 from test_validate_curves import INFERENCEX, _deployment, _run
 
@@ -485,7 +484,7 @@ def _calibrated(tmp_path, command: str, **env) -> tuple[int, list[str]]:
     at = words.index(str(lacking.CALIBRATE))
     log = tmp_path / "log"
     log.unlink(missing_ok=True)
-    path = f"{Path(sys.executable).parent}:{os.environ['PATH']}"
+    path = _path(tmp_path)
     given = dict(w.split("=", 1) for w in words[:at]) | env
     r = subprocess.run(
         ["bash", str(tmp_path / "ATOM" / "scripts" / "compass" / "calibrate.sh")]

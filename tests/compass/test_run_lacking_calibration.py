@@ -18,11 +18,10 @@ import os
 import re
 import shlex
 import subprocess
-import sys
 
 import platforms
 import pytest
-from test_calibrate import _tree
+from test_calibrate import _path, _tree
 from test_memory_readings import DOCUMENT
 from test_run_check_side import checked, pair, side_args
 from test_run_lacking import served
@@ -201,7 +200,7 @@ def test_the_printed_command_runs_as_printed(tmp_path, monkeypatch, capsys):
     # The command states the clients' variables: the shell it runs in has none.
     env = {k: v for k, v in os.environ.items() if k not in lacking.CLIENT_ENV}
     env |= {"LOG": str(tmp_path / "log")}
-    env["PATH"] = f"{os.path.dirname(sys.executable)}:{env['PATH']}"
+    env["PATH"] = _path(tmp_path)
 
     r = subprocess.run(
         ["bash", "-c", command],
