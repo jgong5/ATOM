@@ -161,8 +161,8 @@ TABLE_VERSION = 1
 #: it served (`atom.compass.drive.aiter_jit`); a server that compiled none has none.
 BUILDS = "aiter_jit_builds"
 #: run.json's entry timing each of those compiles: its ``compiler``, ``name``,
-#: artifact ``directory`` and the wall clock mtimes of its first and last file
-#: written, ``first_ns`` and ``last_ns``.
+#: ``artifact`` (the path its files share) and the wall clock mtimes of its
+#: first and last file written, ``first_ns`` and ``last_ns``.
 COMPILES = "jit_compiles"
 #: run.json's pair of wall clock and monotonic nanoseconds read together on the
 #: server's host when serving began, which places those mtimes on the step

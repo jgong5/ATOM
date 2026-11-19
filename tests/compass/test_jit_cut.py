@@ -44,7 +44,7 @@ def _compiled(run_dir, *spans):
     """run.json naming a kernel compiled over each of `spans`, (first, last)
     file written on the step record's clock, timed and with the clock pair."""
     compiles = [
-        {"compiler": "triton", "name": "_k", "directory": f"/c/{i}"}
+        {"compiler": "triton", "name": "_k", "artifact": f"/c/{i}"}
         | {"first_ns": WALL + a, "last_ns": WALL + b}
         for i, (a, b) in enumerate(spans)
     ]
@@ -125,14 +125,16 @@ def test_a_fit_takes_a_record_whose_compiles_are_timed_and_cuts_their_steps(
     assert member(tmp_path / "store", law_key(), "params")["cut"][JIT] == 1
 
 
-def test_builds_since_times_each_compile_by_its_artifact_directory(
-    tmp_path, monkeypatch
-):
+def test_builds_since_times_each_compile_by_its_artifact(tmp_path, monkeypatch):
     """Two compiles of one Triton kernel in two key directories, an aiter
-    module's nested build files as one, and no file written before."""
-    triton, jit = tmp_path / "triton", tmp_path / "jit"
-    monkeypatch.setattr(aiter_jit, "_roots", lambda: {triton: "triton", jit: "aiter"})
+    module's nested build files as one, two builds of one FlyDSL kernel apart
+    in its directory, as a cell A record's ``launch_radix_topk_one_block`` built
+    6 min apart, and no file written before."""
+    triton, jit, fly = tmp_path / "triton", tmp_path / "jit", tmp_path / "fly"
+    roots = {triton: "triton", jit: "aiter", fly: "flydsl"}
+    monkeypatch.setattr(aiter_jit, "_roots", lambda: roots)
     since = WALL
+    topk = fly / "launch_radix_topk_one_block"
     written = {
         triton / "A" / "_k.source": since + 1_000,
         triton / "A" / "__grp___k.json": since + 9_000,
@@ -141,6 +143,10 @@ def test_builds_since_times_each_compile_by_its_artifact_directory(
         triton / "C" / "_old.json": since - 1,
         jit / "build" / "mha" / "blob" / "k.cpp": since + 1_500,
         jit / "build" / "mha" / "build" / "k.o": since + 2_000,
+        topk / "407d.lock": since + 3_000,
+        topk / "407d.pkl": since + 4_000,
+        topk / "e7a7.lock": since + 400_000,
+        topk / "e7a7.pkl": since + 401_000,
     }
     for path, ns in written.items():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,17 +155,19 @@ def test_builds_since_times_each_compile_by_its_artifact_directory(
 
     got = aiter_jit.builds_since(since)
 
-    assert got[BUILDS] == ["_k", "mha"]
+    assert got[BUILDS] == ["_k", "launch_radix_topk_one_block", "mha"]
     expected = [
         ("triton", "_k", triton / "A", 1_000, 9_000),
         ("aiter", "mha", jit / "build" / "mha", 1_500, 2_000),
+        ("flydsl", topk.name, topk / "407d", 3_000, 4_000),
         ("triton", "_k", triton / "B", 50_000, 60_000),
+        ("flydsl", topk.name, topk / "e7a7", 400_000, 401_000),
     ]
     assert got[COMPILES] == [
         {
             "compiler": c,
             "name": n,
-            "directory": str(d),
+            "artifact": str(d),
             "first_ns": since + f,
             "last_ns": since + t,
         }
