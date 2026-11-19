@@ -14,14 +14,24 @@ no sample; its file still counts in the run's digest. An empty
 rank file lost its lines, and refuses.
 A record whose run.json names `aiter_jit_builds` or `ptl_changes` refuses,
 naming them, and so does one whose `source` counts uncommitted files.
-With `GRADED_ONLY_ENV` set to ``1``, a record's samples start at its graded
-window: the first step holding a request its client runs name as sent (their
-exports' ``requests``, the warmup's left out), every rank's earlier steps
-dropped after labelling, which still reads them. For a fit on the run it is
-compared against, where the warmup's transients (a page cache filling, the
-first touch of kernels) are not the graded window's. With `GRADED_SECONDS_ENV`
-also set to a number of seconds, they end that long after the window's first
-step entered (`graded_to`): a calibration timed on a shorter window, fitted from
+With `GRADED_ONLY_ENV` set to ``1``, a record's samples are its graded steps
+(`graded_steps`): those within some client run's graded span, from the first
+step in which a rank holds one of the requests it names as sent (its export's
+``requests``, the warmup's left out) to the last, every rank's other steps
+dropped after labelling, which still reads them. That drops the warmup before
+the first span and the tail after the last; and, on a record serving several
+client runs one after another, the steps between two spans, the drain of one
+client run and the warmup of the next, which a cut at the first graded step
+kept. A step inside a span stays whatever it holds: warmup and sent requests
+together, or only a request its export does not name (one the client cancelled
+when its run ended, in flight since). For a fit on the run it is compared
+against, where the warmup's transients (a page cache filling, the first touch
+of kernels, prefill on an empty KV cache) are not the graded window's: on
+#3720's E3 record, one server serving six client runs, the steps between the
+spans held 69% of the prefill device seconds that cut kept, and ran about 5%
+faster than graded steps of the same features. With `GRADED_SECONDS_ENV`
+also set to a number of seconds, they end that long after the first graded step
+entered (`graded_to`): a calibration timed on a shorter window, fitted from
 the same record. Its host laws' tokenizer, intake and hop terms still read the
 record's whole stamp files.
 
@@ -162,7 +172,7 @@ def _record(
             f"{steps} holds {ARRIVALS}, so its steps are not numbered as its lines"
         )
     record = served(steps, client_runs)
-    graded_from = graded_to = None
+    graded = graded_to = None
     seconds = os.environ.get(GRADED_SECONDS_ENV)
     if seconds and os.environ.get(GRADED_ONLY_ENV) != "1":
         raise ValueError(
@@ -170,15 +180,14 @@ def _record(
             "selects; set both"
         )
     if os.environ.get(GRADED_ONLY_ENV) == "1":
-        held = [s["step"] for s in _steps(record) if s["client_run"] is not None]
-        if not held:
+        graded = graded_steps(record)
+        if not graded:
             raise ValueError(
                 f"{GRADED_ONLY_ENV}=1, and no step of {directory} holds a request "
                 "its client runs name as sent"
             )
-        graded_from = min(held)
         if seconds:
-            graded_to = graded_to_step(record, graded_from, float(seconds))
+            graded_to = graded_to_step(record, min(graded), float(seconds))
     sampling = sorted({p for s in _steps(record) for p in s["sampling"]})
     if len(sampling) > 1:
         raise ValueError(
@@ -194,7 +203,7 @@ def _record(
     name, samples = ", ".join(map(digest, files)), []
     for got, _ in label_run(files, name, _split, floored):
         for s in got:
-            if graded_from is not None and s.step < graded_from:
+            if graded is not None and s.step not in graded:
                 continue
             if graded_to is not None and s.step >= graded_to:
                 continue
@@ -249,6 +258,22 @@ def run_fields(run: dict, record="run.json") -> dict:
 
 def _steps(record: dict) -> list[dict]:
     return [s for steps in record.values() for s in steps]
+
+
+def graded_steps(record: dict) -> frozenset[int]:
+    """The steps of `record`, as `parity.served` splits it, within some client
+    run's graded span: from the first step in which some DP rank holds one of
+    its sent requests to the last, whatever those in between hold."""
+    spans: dict[int, tuple[int, int]] = {}
+    for s in _steps(record):
+        if (k := s["client_run"]) is not None:
+            first, last = spans.get(k, (s["step"], s["step"]))
+            spans[k] = (min(first, s["step"]), max(last, s["step"]))
+    return frozenset(
+        s["step"]
+        for s in _steps(record)
+        if any(first <= s["step"] <= last for first, last in spans.values())
+    )
 
 
 def graded_to_step(record: dict, start: int, seconds: float) -> int | None:

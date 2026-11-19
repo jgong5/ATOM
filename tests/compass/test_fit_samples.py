@@ -14,6 +14,7 @@ import re
 import pytest
 from test_artifact_store import CONDITIONS, stanza
 from test_memory_readings import STACK
+from test_parity_record import _key, _prompt
 from test_parity_served import SAMPLING, client_run, recorded
 
 from atom.compass.artifacts import (
@@ -27,7 +28,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.step_labels import digest, label
 from atom.compass.fit.publish import platform
-from atom.compass.fit.samples import MEMBER, load
+from atom.compass.fit.samples import GRADED_ONLY_ENV, MEMBER, graded_steps, load
 from atom.compass.parity import ARRIVALS
 from atom.compass.parity.served import served
 from atom.compass.run.step_grid import keyed_of
@@ -312,3 +313,83 @@ def test_an_empty_rank_file_refuses_as_a_rank_whose_lines_never_reached_disk(
 
     with pytest.raises(ValueError, match="dp1.jsonl has no timed steps"):
         load({a: RUNS})
+
+
+def test_graded_only_drops_a_later_client_run_s_warmup_after_the_window_starts(
+    tmp_path, monkeypatch
+):
+    # Three groups served one after another, the client runs sending the first
+    # and the last: the middle group is the second client run's warmup, after
+    # the first graded step, which a cut at that step kept.
+    a = record(tmp_path, monkeypatch, groups=((0, 1), (2, 3), (4, 5)))
+    runs = [client_run([0, 1]), client_run([4, 5])]
+    every, config = load({a: runs})
+    split = served(a / "steps", runs)
+    warmup = {s["step"] for s in split[0] if s["client_run"] is None}
+    assert warmup and min(warmup) > min(graded_steps(split))
+
+    monkeypatch.setenv(GRADED_ONLY_ENV, "1")
+    graded, graded_config = load({a: runs})
+    assert [s.step for s in graded] == [
+        s.step for s in every if s.step in graded_steps(split)
+    ]
+    assert not {s.step for s in graded} & warmup
+    assert {s.step for s in every} & warmup
+    assert graded_config == config
+
+
+def test_graded_only_keeps_a_step_holding_warmup_and_sent_requests_together(
+    tmp_path, monkeypatch
+):
+    # Requests 1 and 3 are no client run's, and run beside 0 and 2.
+    a = record(tmp_path, monkeypatch)
+    runs = [client_run([0]), client_run([2])]
+    every, _ = load({a: runs})
+    unsent = {_key(_prompt(i)) for i in (1, 3)}
+    split = served(a / "steps", runs)
+    mixed = {
+        s["step"]
+        for s in split[0]
+        if s["client_run"] is not None and {r[0] for r in s["batch"]} & unsent
+    }
+    assert mixed & {s.step for s in every}
+
+    monkeypatch.setenv(GRADED_ONLY_ENV, "1")
+    graded, _ = load({a: runs})
+    assert mixed & {s.step for s in every} <= {s.step for s in graded}
+    assert [s.step for s in graded] == [
+        s.step for s in every if s.step in graded_steps(split)
+    ]
+
+
+def test_graded_only_keeps_every_step_of_one_client_run_sending_every_request(
+    tmp_path, monkeypatch
+):
+    a = record(tmp_path, monkeypatch)
+    runs = [client_run([0, 1, 2, 3])]
+    every, _ = load({a: runs})
+
+    monkeypatch.setenv(GRADED_ONLY_ENV, "1")
+    assert load({a: runs})[0] == every
+
+
+def test_the_graded_steps_are_each_client_run_s_span_whatever_its_steps_hold():
+    def line(step, client_run, *batch):
+        return {"step": step, "client_run": client_run, "batch": [[r] for r in batch]}
+
+    # Client run 0 sends a and c, client run 1 sends b, on rank 1 only; w and v
+    # are warmup requests, and x one in flight that run 0's export does not name.
+    record = {
+        0: [
+            line(0, None, "w"),
+            line(1, 0, "a", "w"),
+            line(2, None, "x"),
+            line(3, 0, "c"),
+            line(4, None, "v"),
+            line(5, None),
+            line(6, None),
+            line(7, None, "x"),
+        ],
+        1: [line(n, None) for n in range(6)] + [line(6, 1, "b"), line(7, None)],
+    }
+    assert graded_steps(record) == {1, 2, 3, 6}
