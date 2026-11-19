@@ -584,9 +584,9 @@ def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, a
         assert f"{PAIR[side]} has no decode vector for rungs {rungs}, which" in (
             found[0]["reason"]
         )
-        (reason,) = {v["reason"] for v in verdicts(judged, "readings", side)}
-        assert '"index_cache_dtype": "fp8"' in reason
-        assert '"AITER_LOG_LEVEL": "WARNING"' in reason
+        # Its readings are those the side's law carries, taken at the key a
+        # start of the side resolved, its fp8 index cache and WARNING included.
+        assert readings_found(judged, side) == {("reuse", carried(side))}
 
 
 @pytest.mark.parametrize(
@@ -618,16 +618,30 @@ def test_a_1p1d_side_runs_under_the_aiter_log_level_deploy_sh_starts_it_with(
 
     judged = advise(tmp_path, MACHINE, model=str(model), common=common)
 
-    # The pair's laws are keyed WARNING: each side finds its own there, else
-    # none at its key.
+    # The pair's laws and the readings they carry are keyed WARNING: each side
+    # finds its own there, else none at its key.
     requirement = 3 if level == "WARNING" else 1
     for side in UNCOVERED:
         found = verdicts(judged, "law", side)
         assert [(v["verdict"], v["requirement"]) for v in found] == [
             ("calibrate", requirement)
         ] * 2
-        (reason,) = {v["reason"] for v in verdicts(judged, "readings", side)}
+        if level == "WARNING":
+            assert readings_found(judged, side) == {("reuse", carried(side))}
+            continue
+        ((verdict, reason),) = readings_found(judged, side)
+        assert verdict == "measure"
         assert f'"AITER_LOG_LEVEL": "{level}"' in reason
+
+
+def readings_found(judged: dict, side: str) -> set:
+    """The readings verdicts of `side` in `judged`, with their reasons."""
+    return {(v["verdict"], v["reason"]) for v in verdicts(judged, "readings", side)}
+
+
+def carried(side: str) -> str:
+    """The reason of a readings verdict that reuses those `side`'s law carries."""
+    return f"in {PAIR[side]}'s {memory.LAW_MEMBER}"
 
 
 def test_a_side_s_own_kv_transfer_config_is_refused_as_deploy_sh_refuses_it(

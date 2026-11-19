@@ -244,8 +244,8 @@ def test_a_deployment_side_lacking_its_laws_prints_deploy_sh_record_and_a_fit(
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
     atom_args = side_args(tmp_path, monkeypatch, side)
-    # A host other than the host laws'.
-    monkeypatch.setattr(compass_run, "host_cpu", lambda: "another CPU")
+    # A tree other than the one the host laws' key states.
+    monkeypatch.setattr(compass_run, "atom_digest", lambda: "0" * 64)
 
     assert checked(pair(tmp_path), side, atom_args) == 1
 

@@ -18,8 +18,13 @@ the key its readings were measured at and their members, every one stating
 `assumed`, and their ATOM source is the `atom` digest of the law's host key,
 so a re-keyed law re-keys them. Readings at another key refuse, naming the
 fields they differ in, and readings at another ATOM digest name both.
+
+    python -m atom.compass.run.memory LAW --store S --token T --assumed NOTE
+
+writes a store's entry into the law file LAW (`main`).
 """
 
+import argparse
 import json
 
 from atom.compass.artifacts import (
@@ -36,7 +41,7 @@ from atom.compass.artifacts import (
     machine_platform,
     member_name,
 )
-from atom.compass.memory.readings import MemoryReadings
+from atom.compass.memory.readings import ASSUMED, MemoryReadings
 
 STEM, EXTENSION = "readings", "json"
 #: A law file's member holding its readings: ``key``, the `memory_readings`
@@ -147,13 +152,12 @@ def carried_by(law: dict, where: str) -> dict | None:
 def _differ(ours: dict, theirs: dict) -> list[str]:
     """The key fields `theirs` differs from `ours` in, the engine config's by
     name, as ``engine_config.<name>``."""
-    differ = sorted(
-        f for f in ours.keys() | theirs.keys() if theirs.get(f) != ours.get(f)
-    )
+    fields = sorted(ours.keys() | theirs.keys())
+    differ = [f for f in fields if theirs.get(f) != ours.get(f)]
     if "engine_config" not in differ:
         return differ
     mine, held = (json.loads(k.get("engine_config") or "{}") for k in (ours, theirs))
-    names = sorted(n for n in mine.keys() | held.keys() if mine.get(n) != held.get(n))
+    names = [n for n in sorted(mine.keys() | held.keys()) if mine.get(n) != held.get(n)]
     return [f for f in differ if f != "engine_config"] + [
         f"engine_config.{n}" for n in names
     ]
@@ -192,3 +196,43 @@ def _carried(carried, key: Key, at, missed: ArtifactRefusal) -> MemoryReadings:
         f"{', '.join(nearest[1])}",
         "compass measure memory takes readings at this key",
     )
+
+
+def main(argv=None) -> None:
+    """Write into the law file LAW the members of the `memory_readings` entry
+    the store S holds at token T, each stating `assumed` NOTE, with the
+    entry's key, as `LAW_MEMBER`: a run reads them where its store holds none,
+    at the ATOM digest of the law's host key. An entry measured under another
+    engine config than the law's refuses, naming the fields that differ."""
+    from atom.compass.backends.json_file import read_json, write_json
+
+    parser = argparse.ArgumentParser(
+        prog="python -m atom.compass.run.memory",
+        description=main.__doc__.split("\n\n")[0],
+    )
+    parser.add_argument("law", help="the law file written into")
+    parser.add_argument("--store", required=True, help="the artifact store's root")
+    parser.add_argument("--token", required=True, help="the readings entry's token")
+    parser.add_argument("--assumed", required=True, help="where they were taken")
+    args = parser.parse_args(argv)
+    store = ArtifactStore(args.store)
+    entry = store.read(store.key_from_token(Kind.MEMORY_READINGS, args.token))
+    law = read_json(args.law)
+    measured = json.loads(entry.key.values["engine_config"])
+    engine = law["engine_config"]
+    if differ := [n for n, v in engine.items() if measured.get(n) != v]:
+        parser.error(f"{args.token} was measured under another {differ} than the law")
+    members = {
+        member_name(STEM, at, EXTENSION): json.loads(
+            entry.read_member(STEM, at, EXTENSION)
+        )
+        | {ASSUMED: args.assumed}
+        for at in entry.topology.ranks()
+    }
+    law[LAW_MEMBER] = {"key": entry.key.values, "members": members}
+    write_json(law, args.law)
+    print(f"{args.law}: {len(members)} members of {entry.key.kind} {args.token}")
+
+
+if __name__ == "__main__":
+    main()

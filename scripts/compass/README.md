@@ -903,6 +903,10 @@ cells ran the fp4 indexer and its 1P1D cells the fp8 one. Each law is keyed to t
 states no `index_cache_dtype`, which then reads as `kv_cache_dtype`'s fp8, so a server that
 resolves fp4 refuses it. Its provenance states the gap that interleaved fp8 and fp4 lone cells
 measured ([#3073](https://github.com/jgong5/ATOM/issues/3073#issuecomment-6757202887)).
+Each carries, as `memory_readings`, the readings `compass measure memory` took of its side
+of [#3498](https://github.com/jgong5/ATOM/issues/3498)'s DPA8 1P1D deployment on
+crsuse2-m2m-v3-005, each member stating `assumed`, so a run of that side reads them from
+a store that holds none.
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-ptl-disabled-661ef7661-{prefill,decode}.json.xz`
 are the same pair with expert parallelism on (MORI): the `history` form, fitted by
@@ -1054,10 +1058,17 @@ side.
 A simulated run prices by a checked-in law when the law file stands in for both tokens:
 `compass run --step-linear LAW --host-laws LAW $M $S --out D -- $ATOM`, `LAW` a file in
 `scripts/compass/laws/` (or any law file `step_linear_fit` writes), and `$S` the store that
-holds the configuration's `memory_readings` and the platform's readings at the stack the file states. The run takes the step law at the platform
+holds the platform's readings at the stack the file states, and the configuration's
+`memory_readings` unless a law file named carries them. A law file carries a store
+entry's readings once
+`PYTHONPATH=$T python -m atom.compass.run.memory LAW --store S --token T --assumed NOTE`
+writes them in, each member stating NOTE, where and at which tree they were taken; a run
+whose store holds none at their key reads them, at the `atom` digest of the law's host
+key (`atom/compass/run/memory.py`). The run takes the step law at the platform
 and engine config the file states, and its `host` at the host key the file states, the
 `atom` digest it was last re-keyed at, so a law re-keyed to this tree runs here though its
-records ran at another; each refuses where a store entry's would. A law file names no fit
+records ran at another; each refuses where a store entry's would, but host laws serve a run
+on any host CPU, which predicts the host they timed. A law file names no fit
 inputs, so grading cannot check its fitted traces against the cell's; it takes the run,
 since calibration replays traces no cell is graded on (the
 [#2698 ruling](https://github.com/jgong5/ATOM/issues/2698#issuecomment-6591251259)).

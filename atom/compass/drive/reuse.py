@@ -40,8 +40,9 @@ A verdict on a law found names, as ``run``, the ``--step-linear`` and
 law at the head's ATOM digest names that ``store``, whatever the verdict. A
 refusal the runner makes of the config under the law, as of context
 parallelism, propagates. `readings` gives the config's memory readings in a
-store, or the assumed ones a law file under `LAWS` carries where the store
-holds none, `reuse`, or `measure` where none is at their key or the one there was
+store, or where it holds none the assumed ones carried by the law files the
+config's law verdict names as ``run``, as a run of it reads them, `reuse`, or
+`measure` where none is at their key or the one there was
 measured at another ATOM digest (requirement 1), or where it lacks the PAGE
 bound a start of the config reads, which `compass run --check` finds stale
 (`lacking.stale_page_bound`, requirement 2), ``held`` saying whether readings
@@ -163,7 +164,7 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
     engine, platform = keyed(config), machine_platform(machine)
     stated = keyed_platform(Kind.STEP_LINEAR_LAW, platform)
     found = []
-    for path in _law_files():
+    for path in sorted([*LAWS.glob("*.json"), *LAWS.glob(f"*.json{XZ}")]):
         held = read_json(path)
         host = held.get("host")
         at = host and (held.get("platform"), host["key"].get("model"))
@@ -204,14 +205,11 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
     return min(found, key=lambda v: PREFERRED.index(v["verdict"]))
 
 
-def readings(store: ArtifactStore, config, machine) -> dict:
+def readings(store: ArtifactStore, config, machine, law: dict) -> dict:
     """The verdict on `config`'s memory readings in `store` on `machine`, else
-    in a law file under `LAWS`, as `compass run` reads them."""
-    carried = [
-        c
-        for path in _law_files()
-        if (c := memory.carried_by(read_json(path), str(path)))
-    ]
+    in the law files `config`'s verdict `law` names to run with, as `compass
+    run` reads them."""
+    carried = runfile.carried(law.get("run") or ())
     try:
         read = memory.load(str(store.root), config, machine, 0, carried)
     except ArtifactRefusal as refused:
@@ -226,10 +224,6 @@ def readings(store: ArtifactStore, config, machine) -> dict:
         return _verdict("measure", 2, why, held=held)
     where = f"at their key in {store.root}" if held else f"in {read.source}"
     return _verdict("reuse", None, where)
-
-
-def _law_files() -> list[Path]:
-    return sorted([*LAWS.glob("*.json"), *LAWS.glob(f"*.json{XZ}")])
 
 
 def _law_file(where: str, held: dict, config, machine, atom: str) -> dict:

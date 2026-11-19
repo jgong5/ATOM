@@ -4,8 +4,8 @@ with, each stating `assumed`, which a run reads where its store holds none:
 keyed as a store entry is, at the ATOM digest of the law's host key. Readings at
 another key refuse, naming the fields they differ in, and readings at another
 ATOM digest name both. Host laws fitted on another host CPU serve a run, which
-predicts the host they timed. ``step_linear_fit readings`` writes a store
-entry's readings into a law file.
+predicts the host they timed. ``python -m atom.compass.run.memory`` writes a
+store entry's readings into a law file.
 """
 
 import json
@@ -15,9 +15,12 @@ import pytest
 from test_drive_run import stub
 from test_drive_runfile import LAWS
 from test_memory_readings import DOCUMENT, READINGS
-from test_run_lacking import checked, served
+from test_run_check_side import COVERAGE, pair, side_args
+from test_run_check_side import checked as side_checked
+from test_run_lacking import checked, lacked, served
 from test_run_step_grid import PLATFORM, deployment
 
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run as compass_run
 from atom.compass.artifacts import (
     ArtifactRefusal,
@@ -26,7 +29,6 @@ from atom.compass.artifacts import (
     machine_platform,
     member_name,
 )
-from atom.compass.backends import step_linear_fit
 from atom.compass.backends.json_file import read_json, write_json
 from atom.compass.run import memory
 from atom.compass.run.step_grid import keyed
@@ -134,15 +136,15 @@ def test_the_writer_carries_a_store_s_entry_into_the_law_file(tmp_path, capsys, 
     path, token = tmp_path / "law.json", memory.key_of(r.config, MACHINE).token()
     atom = {"key": {"atom": compass_run.atom_digest()}}
     write_json({"engine_config": keyed(r.config) | moved, "host": atom}, path)
-    argv = ["readings", str(path), "--store", str(tmp_path / "store")]
+    argv = [str(path), "--store", str(tmp_path / "store")]
     argv += ["--token", token, "--assumed", ASSUMED]
 
     if moved:
         with pytest.raises(SystemExit):
-            step_linear_fit.main(argv)
+            memory.main(argv)
         assert f"measured under another {list(moved)}" in capsys.readouterr().err
         return
-    step_linear_fit.main(argv)
+    memory.main(argv)
     shutil.rmtree(tmp_path / "store" / Kind.MEMORY_READINGS.value)
 
     given = [memory.carried_by(read_json(path), str(path))]
@@ -162,3 +164,20 @@ def test_check_lacks_no_readings_a_law_file_of_another_cpu_carries(
         checked(tmp_path, "--step-stub", stub(tmp_path), "--host-laws", str(path)) == 0
     )
     assert capsys.readouterr().out.startswith("nothing lacking")
+
+
+@pytest.mark.parametrize("side", ["prefill", "decode"])
+def test_each_crs005_side_reads_the_readings_its_law_file_carries(
+    tmp_path, monkeypatch, capsys, side
+):
+    # The side's environment alone, and AITER_LOG_LEVEL, which its check sets,
+    # restored after it.
+    for name in PERFORMANCE_KEYS:
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    atom_args = side_args(tmp_path, monkeypatch, side)
+
+    # The store holds the platform's readings and no memory readings.
+    assert side_checked(pair(tmp_path), side, atom_args) == 1
+
+    assert lacked(capsys.readouterr().out) == [COVERAGE]
