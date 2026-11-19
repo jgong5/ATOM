@@ -167,10 +167,17 @@ def _measure(out: Path, machine: Path, width: list, port: int) -> None:
 
 
 def run_scenario(
-    root: Path, seed: str, dp: int, server_port: int, ports: list[int], argv: list
+    root: Path,
+    seed: str,
+    dp: int,
+    server_port: int,
+    ports: list[int],
+    argv: list,
+    named: tuple = (),
 ) -> dict:
     """One run in its own process tree of a server of flags `argv`, reading
-    the readings in ``root/store``, its clock and server on `ports`."""
+    the readings in ``root/store``, its clock and server on `ports`; with
+    `named`, request k names DP rank ``named[k]``."""
     out = root / f"seed{seed}"
     out.mkdir()
     (clock_port, port), flags = ports, _server(server_port)
@@ -195,6 +202,8 @@ def run_scenario(
     )
     model = argv[argv.index("--model") + 1]
     requests = bodies(model, 1 + BURST * dp, PREFIX_WORDS)
+    for body, rank in zip(requests, named, strict=bool(named)):
+        body["data_parallel_rank"] = rank
     # As `serve` starts one: on its machine's arch, so it needs no driver.
     arch = machine["device"]["arch"]
     with open(out / "server.log", "w") as log:
@@ -262,25 +271,42 @@ def runs(request, tmp_path_factory, lmcache_port):  # noqa: F811
         ]
 
 
-@pytest.fixture(scope="module")
-def share_cache_runs(tmp_path_factory, lmcache_port):  # noqa: F811
+def _p_instance_runs(root: Path, port: int, named: tuple = ()) -> list[dict]:
     """Two seeds' runs of the recipe's prefill instance, `P_INSTANCE`, on
     `CRS005`, reading readings published for it, as `test_spec_scenario`'s
     DSpark run does. They need no driver."""
     if not DSV41:
         pytest.skip("a run needs ATOM_COMPASS_DSPARK_MODEL")
-    root = tmp_path_factory.mktemp("lmcache_share_cache")
     spec = _priced_machine(root, json.loads(CRS005.read_text()))
-    env = dict(os.environ, **_offload(lmcache_port), AITER_LOG_LEVEL="WARNING")
+    env = dict(os.environ, **_offload(port), AITER_LOG_LEVEL="WARNING")
     publish_entry(root / "store", spec, P_INSTANCE, env)
     with held_ports(4) as ports, pytest.MonkeyPatch.context() as mp:
         mp.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", str(METRICS_S))
         return [
             run_scenario(
-                root, seed, 2, lmcache_port, ports[2 * i : 2 * i + 2], P_INSTANCE
+                root, seed, 2, port, ports[2 * i : 2 * i + 2], P_INSTANCE, named
             )
             for i, seed in enumerate(("1", "2"))
         ]
+
+
+@pytest.fixture(scope="module")
+def share_cache_runs(tmp_path_factory, lmcache_port):  # noqa: F811
+    """`share_cache` choosing each request's rank."""
+    return _p_instance_runs(tmp_path_factory.mktemp("share_cache"), lmcache_port)
+
+
+#: Each request's DP rank as the recipe's ``--dp-aware`` router names one:
+#: request 0 and the burst's last on rank 0, the rest of the burst on rank 1,
+#: which holds no prefix of its own.
+NAMED = (0, *[1] * (2 * BURST - 1), 0)
+
+
+@pytest.fixture(scope="module")
+def named_runs(tmp_path_factory, lmcache_port):  # noqa: F811
+    """Each request naming its rank (`NAMED`), as the recipe's router does."""
+    root = tmp_path_factory.mktemp("share_cache_named")
+    return _p_instance_runs(root, lmcache_port, NAMED)
 
 
 def _releases(table: str, lp=None) -> list[tuple[float, str, int]]:
@@ -368,13 +394,25 @@ def test_each_run_meets_every_scenario_check_and_loads_the_prefix_back(runs):
     _meet_every_check_and_load_the_prefix_back(runs[1], runs[0])
 
 
-def _last(out: Path, family: str) -> float:
-    """The last value counter `family` holds in the frontend's metrics file."""
+def _last(out: Path, family: str) -> dict[str, float]:
+    """Each series of counter `family` in the frontend's metrics file at its
+    last sample, by its ``rank`` label, ``""`` for none."""
     text = gzip.decompress((out / metrics.FILE.format("frontend")).read_bytes())
-    head = family + "_total{"
-    return [
-        float(x.split()[-2]) for x in text.decode().splitlines() if x.startswith(head)
-    ][-1]
+    last = {}
+    for line in text.decode().splitlines():
+        if line.startswith(family + "_total{"):
+            rank = re.search(r'rank="(\d+)"', line)
+            last[rank[1] if rank else ""] = float(line.split()[-2])
+    return last
+
+
+def _decisions(run: dict) -> dict[str, float]:
+    """The frontend's `share_cache` decision counts at the run's last sample."""
+    families = {
+        key: "atom:dp_" + key.removesuffix("_total")
+        for key in ShareCacheRouter.DECISIONS
+    }
+    return {key: _last(run["out"], family)[""] for key, family in families.items()}
 
 
 def test_share_cache_runs_meet_every_scenario_check_and_place_a_hit(
@@ -385,12 +423,28 @@ def test_share_cache_runs_meet_every_scenario_check_and_place_a_hit(
     the frontend counts a placement on a prefix the shared tier holds."""
     _meet_every_check_and_load_the_prefix_back(share_cache_runs, 2)
     for run in share_cache_runs:
-        decisions = {
-            key: _last(run["out"], "atom:dp_" + key.removesuffix("_total"))
-            for key in ShareCacheRouter.DECISIONS
-        }
+        decisions = _decisions(run)
         print(f"\n{run['out'].name}: {decisions}")
         assert decisions["share_cache_hit_total"] > 0, decisions
+
+
+def test_named_runs_meet_every_scenario_check_and_keep_each_request_on_its_rank(
+    named_runs,
+):
+    """The recipe's prefill instance, each request naming its rank as the
+    recipe's ``--dp-aware`` router does: both seeds' runs meet every scenario
+    check, the router counts every request explicit and places each on the
+    rank it names, choosing none, and rank 1 loads the prefix rank 0 stored."""
+    _meet_every_check_and_load_the_prefix_back(named_runs, 2)
+    want = {str(r): float(NAMED.count(r)) for r in set(NAMED)}
+    for run in named_runs:
+        explicit = _last(run["out"], "atom:dp_route_explicit")[""]
+        routed = _last(run["out"], "atom:dp_requests_routed")
+        print(f"\n{run['out'].name}: explicit {explicit}, per rank {routed}")
+        print(f"{run['out'].name}: {_decisions(run)}")
+        assert explicit == len(NAMED)
+        assert routed == want
+        assert not any(_decisions(run).values())
 
 
 # --- (b) ----------------------------------------------------------------------
@@ -427,7 +481,7 @@ def test_each_offload_decision_is_sent_once_from_each_writer_before_its_forward(
 
 
 TAKEN = re.compile(
-    r"lmcache_mp (store|retrieve) of atom-offload-dp(\d+):(\d+) \w+: "
+    r"lmcache_mp (store|retrieve) of atom-offload-(?:\w+-)?dp(\d+):(\d+) \w+: "
     r"arrived at (\S+), taken at (\S+)"
 )
 REPORTED = re.compile(r"lmcache_mp reports at (\S+): (.*)")

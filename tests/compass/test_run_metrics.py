@@ -373,9 +373,14 @@ def test_an_engine_that_ends_early_keeps_what_it_sampled(files, started, tmp_pat
 def _snapshot(running: int, used: int, cached: int, full: int, hits: int) -> dict:
     """The engines' snapshot a frontend refresh takes: one DP rank's requests
     and KV blocks, the prefix cache's counters, and the DP router's
-    `share_cache` hits."""
+    `share_cache` hits, explicit routes and requests routed to rank 0, all
+    `hits`."""
     return {
-        "dp_router": {"share_cache_hit_total": hits},
+        "dp_router": {
+            "share_cache_hit_total": hits,
+            "explicit_total": hits,
+            "requests_per_rank": [hits],
+        },
         "enabled": True,
         "requests_running": running,
         "scheduler_metrics": [
@@ -465,11 +470,18 @@ def test_a_frontend_writes_what_it_held_at_each_refresh(
         "atom:dp_share_cache_source_rank",
         "atom:dp_share_cache_cold",
         "atom:dp_share_cache_stale",
+        "atom:dp_route_explicit",
+        "atom:dp_requests_routed",
         "atom:time_to_first_token_seconds",
         "atom:inter_token_latency_seconds",
     }
-    hit = "atom:dp_share_cache_hit"
-    assert [at[hit, hit + "_total", ()] for at in written.values()] == [0, 1, 1]
+    for family, labels in (
+        ("atom:dp_share_cache_hit", ()),
+        ("atom:dp_route_explicit", ()),
+        ("atom:dp_requests_routed", (("rank", "0"),)),
+    ):
+        key = family, family + "_total", labels
+        assert [at[key] for at in written.values()] == [0, 1, 1], family
     _whole_before_hand_in(renames, tmp_path, lp)
     assert rt.refusals == []
 
