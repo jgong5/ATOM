@@ -279,6 +279,22 @@ SHARDS=${COMPASS_GATE_SHARDS:-4}
 [[ $SHARDS =~ ^[0-9]+$ ]] || finish 95 "COMPASS_GATE_SHARDS=$SHARDS is not a count; pytest was not run"
 CF=()
 [ -d tests/compass ] && mapfile -t CF < <(find tests/compass \( -name 'test_*.py' -o -name '*_test.py' \) | sort)
+# COMPASS_GATE_SELECT names a map gate_map.sh wrote. gate_select.py prints how
+# many test files the diff since the map's commit reaches and then each file
+# every process deselects, or why the whole gate runs. Every process still
+# collects all of tests/, and a selection of none passes on that collection.
+UNSEL=()
+SEL_NONE=
+if [ -n "${COMPASS_GATE_SELECT:-}" ]; then
+    SEL=$(python "$ROOT/scripts/compass/gate_select.py" select "$COMPASS_GATE_SELECT" "$ROOT" "${IGN[@]#--ignore=}") ||
+        finish 94 "gate_select.py could not read COMPASS_GATE_SELECT=$COMPASS_GATE_SELECT; nothing was run"
+    printf '%s\n' "${SEL%%$'\n'*}"
+    [[ $SEL != "select: 0 of "* ]] || SEL_NONE=1
+    mapfile -t UNSEL < <(tail -n +2 <<<"$SEL")
+    [ "${#UNSEL[@]}" -eq 0 ] || [ "${#CF[@]}" -eq 0 ] ||
+        mapfile -t CF < <(printf '%s\n' "${CF[@]}" | grep -vxF -f <(printf '%s\n' "${UNSEL[@]}"))
+    [ "$SHARDS" -le "${#CF[@]}" ] || SHARDS=${#CF[@]}
+fi
 [ "${#CF[@]}" -gt 0 ] || SHARDS=0
 LOGS=$(mktemp -d) || finish 96 "mktemp failed; nothing was run"
 trap 'rm -rf "${HARNESS:-}" "$LOGS"' EXIT
@@ -296,7 +312,7 @@ if [ -n "$CARGO_BIN" ]; then
         chmod +x "$LOGS/bin/cargo" || finish 96 "cannot write the cargo wrapper; pytest was not run"
     export PATH=$LOGS/bin:$PATH
 fi
-PYTEST=(tests/ "${IGN[@]}" -q --no-header -p no:cacheprovider)
+PYTEST=(tests/ "${IGN[@]}" -q --no-header -p no:cacheprovider "${UNSEL[@]/#/--deselect=}")
 ARGS=("$@")
 own() {
     local a prev=
@@ -340,7 +356,7 @@ RAN=
 for c in "${CODES[@]}"; do
     case $c in 0) RAN=1 ;; 5) ;; *) [ "$RC" -ne 0 ] || RC=$c ;; esac
 done
-[ "$RC" -ne 0 ] || [ -n "$RAN" ] || RC=5
+[ "$RC" -ne 0 ] || [ -n "$RAN$SEL_NONE" ] || RC=5
 printf '\npytest: rc=%s\n' "$RC"
 
 if [ "$RC" -ne 0 ]; then

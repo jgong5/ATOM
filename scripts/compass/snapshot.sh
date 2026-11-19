@@ -18,6 +18,9 @@
 # neither can name a different commit than the one inside. The third,
 # .compass-gpu-carry, lets gate_cpu.sh carry the GPU gate of COMPASS_GPU_GATE_DONE=G
 # here: G, HEAD and the diff from G, or empty, so it replaces a stale extraction's.
+# The fourth, .compass-select, lets gate_cpu.sh select with the map
+# COMPASS_GATE_SELECT names: the map's commit, HEAD, whether the first is an
+# ancestor of the second, and the diff between them; or empty.
 #
 # Usage: snapshot.sh [<output-dir>]   (default: the current directory)
 #
@@ -85,10 +88,18 @@ if [ -n "${COMPASS_GPU_GATE_DONE:-}" ]; then
     }
     [ "$G" = "$SHA" ] || { printf '%s\n%s\n' "$G" "$SHA"; git -C "$ROOT" diff --name-only "$G" HEAD; } >"$STAGE/ATOM/.compass-gpu-carry"
 fi
+: >"$STAGE/ATOM/.compass-select"
+if [ -n "${COMPASS_GATE_SELECT:-}" ]; then
+    python3 "$ROOT/scripts/compass/gate_select.py" stamp "$COMPASS_GATE_SELECT" "$ROOT" >"$STAGE/ATOM/.compass-select" || {
+        printf 'REFUSED: COMPASS_GATE_SELECT=%s is not a map gate_map.sh wrote.\n' "$COMPASS_GATE_SELECT" >&2
+        exit 93
+    }
+fi
 
 git -C "$ROOT" archive --format=tar --prefix=ATOM/ HEAD >"$TAR"
 tar -rf "$TAR" -C "$STAGE" ATOM/.compass-commit ATOM/.compass-changed
 tar -rf "$TAR" -C "$STAGE" ATOM/.compass-gpu-carry
+tar -rf "$TAR" -C "$STAGE" ATOM/.compass-select
 
 printf 'wrote %s\n' "$TAR"
 printf '  commit:  %s\n' "$SHA"
