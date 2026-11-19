@@ -35,7 +35,9 @@ first, then refused, then calibrate. The requirement a verdict names:
 
 A verdict on a store's own step linear law at the head's ATOM digest names
 that ``store``, whatever the verdict. A refusal the runner makes of the config
-under the law, as of context parallelism, propagates. `readings` gives the config's memory readings in a
+under the law, as of context parallelism or of the prefill token-graph buckets
+it records (`lacking.recorded_buckets`), propagates; buckets that cannot be
+worked out refuse by name. `readings` gives the config's memory readings in a
 store `reuse`, or `measure` where none is at their key or the one there was
 measured at another ATOM digest (requirement 1). `stores` orders the stores a
 candidate is looked up in.
@@ -61,7 +63,7 @@ from atom.compass.artifacts.store import ENTRY_FILE
 from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.step_grid_plan import at_ladder
 from atom.compass.drive import runfile
-from atom.compass.drive.lacking import AXIS, uncovered_rungs
+from atom.compass.drive.lacking import AXIS, recorded_buckets, uncovered_rungs
 from atom.compass.run import STEP_LINEAR, memory
 from atom.compass.run.step_grid import differ, keyed
 
@@ -217,7 +219,8 @@ def _law_file(where: str, held: dict, config, machine, atom: str) -> dict:
 
 def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> dict:
     """The verdict on the step linear law `law` and host laws `host` found at
-    `where`, both at the head's key: their CPU, then requirements 3 and 4."""
+    `where`, both at the head's key: their CPU, the runner's refusals at
+    install and capture, then requirements 3 and 4."""
     if (cpu := host["key"].get("host_cpu")) != (here := compass_run.host_cpu()):
         why = f"{where}'s host laws were fitted on {cpu}, and this host is {here}"
         return _verdict("refused", 1, why, law=where)
@@ -225,6 +228,12 @@ def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> di
         {STEP_LINEAR: law, "machine": machine.echo()}, config
     )
     compass_run.refuse_unfitted_host(host, config, machine_platform(machine))
+    try:
+        buckets = recorded_buckets(config, machine.value("device.arch"))
+    except Exception as error:
+        why = "the prefill token-graph buckets this run records cannot be worked out"
+        raise ValueError(f"{why}: {type(error).__name__}: {error}") from error
+    compass_run.refuse_other_buckets(config, buckets, {STEP_LINEAR: law, "host": host})
     if rungs := [str(r) for r in uncovered_rungs(law, config)]:
         why = (
             f"{where} has no decode vector for rung{'s' * (len(rungs) > 1)} "
