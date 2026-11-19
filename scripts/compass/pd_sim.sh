@@ -217,9 +217,11 @@ for i in "${!specs[@]}"; do
     compass_wait_up "$role" "${servers[$i]}" "http://127.0.0.1:$port/health"
 done
 
-env "${router_env[@]}" "$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --pd-disaggregation \
-    "${urls[@]}" "${router[@]}" "${COMPASS_SIM_ROUTER_BOUNDS[@]}" \
-    --prometheus-port "$PROMETHEUS_PORT" >"$OUT/router.log" 2>&1 &
+launch=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --pd-disaggregation
+    "${urls[@]}" "${router[@]}" "${COMPASS_SIM_ROUTER_BOUNDS[@]}"
+    --prometheus-port "$PROMETHEUS_PORT")
+echo "pd_sim: router ${launch[*]}"
+env "${router_env[@]}" "${launch[@]}" >"$OUT/router.log" 2>&1 &
 compass_wait_up router $! "http://127.0.0.1:$ROUTER_PORT/v1/models"
 echo "pd_sim: ready"
 

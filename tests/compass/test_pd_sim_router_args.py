@@ -21,10 +21,10 @@ from tests.compass.held_ports import held_ports
 #: The 6P16D C1228 share-cache recipe's router flags, less those `pd_sim.sh`
 #: gives (host, ports, workers) or sets itself (its request and prepare
 #: deadlines), and with the wall-clock detectors off, as a simulated router
-#: needs them; `--dp-aware` aside, which only a router built from this tree takes.
+#: needs them; `--dp-aware` and `--model-path` aside, which a run adds.
 RECIPE = "--prefill-policy cache_aware --decode-policy cache_aware"
 RECIPE += " --cache-threshold 1.0 --balance-abs-threshold 0 --balance-rel-threshold 1.0"
-RECIPE += " --atom-pd-rank-mapping-policy none --backend atom --model-path /m"
+RECIPE += " --atom-pd-rank-mapping-policy none --backend atom"
 RECIPE += " --disable-circuit-breaker --disable-health-check --disable-retries"
 YEAR_MS = str(365 * 24 * 3600 * 1000)
 
@@ -69,10 +69,10 @@ def _pd_sim(tmp_path, router_args: str) -> tuple[subprocess.CompletedProcess, li
 def test_the_router_takes_a_recipe_s_arguments_as_given_and_a_year_s_bounds(
     tmp_path,
 ):
-    done, argv = _pd_sim(tmp_path, RECIPE)
+    done, argv = _pd_sim(tmp_path, f"{RECIPE} --model-path /m")
 
     assert done.returncode == 1, done.stderr
-    recipe = RECIPE.split()
+    recipe = [*RECIPE.split(), "--model-path", "/m"]
     at = argv.index(recipe[0])
     assert argv[at : at + len(recipe)] == recipe
     for flag, bound in (
@@ -83,6 +83,9 @@ def test_the_router_takes_a_recipe_s_arguments_as_given_and_a_year_s_bounds(
         assert argv.count(flag) == 1, flag
         assert argv[argv.index(flag) + 1] == bound, flag
     assert argv.count("--backend") == argv.count("--disable-retries") == 1
+    # The script states the command it launched.
+    [said] = [x for x in done.stdout.splitlines() if x.startswith("pd_sim: router ")]
+    assert said.split()[3:] == argv
 
 
 @pytest.mark.parametrize(
