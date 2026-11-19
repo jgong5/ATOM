@@ -19,7 +19,11 @@ window: the first step holding a request its client runs name as sent (their
 exports' ``requests``, the warmup's left out), every rank's earlier steps
 dropped after labelling, which still reads them. For a fit on the run it is
 compared against, where the warmup's transients (a page cache filling, the
-first touch of kernels) are not the graded window's.
+first touch of kernels) are not the graded window's. With `GRADED_SECONDS_ENV`
+also set to a number of seconds, they end that long after the window's first
+step entered (`graded_to`): a calibration timed on a shorter window, fitted from
+the same record. Its host laws' tokenizer, intake and hop terms still read the
+record's whole stamp files.
 
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
@@ -82,6 +86,9 @@ FORMAT_VERSION = 2
 #: The variable that, set to ``1``, keeps a record's samples from its graded
 #: window on (module docstring); unset, every labelled step is a sample.
 GRADED_ONLY_ENV = "COMPASS_FIT_GRADED_ONLY"
+#: The variable that, with `GRADED_ONLY_ENV`, keeps only that many seconds of
+#: a record's graded window, from its first step's entry (module docstring).
+GRADED_SECONDS_ENV = "COMPASS_FIT_GRADED_SECONDS"
 #: A step measurement's one member: the bench replies for the whole TP group.
 MEMBER = ("measurement", Topology().ranks()[0], "json")
 #: What names a GPU's model in run.json's `device`.
@@ -155,7 +162,13 @@ def _record(
             f"{steps} holds {ARRIVALS}, so its steps are not numbered as its lines"
         )
     record = served(steps, client_runs)
-    graded_from = None
+    graded_from = graded_to = None
+    seconds = os.environ.get(GRADED_SECONDS_ENV)
+    if seconds and os.environ.get(GRADED_ONLY_ENV) != "1":
+        raise ValueError(
+            f"{GRADED_SECONDS_ENV} cuts the graded window, which {GRADED_ONLY_ENV}=1 "
+            "selects; set both"
+        )
     if os.environ.get(GRADED_ONLY_ENV) == "1":
         held = [s["step"] for s in _steps(record) if s["client_run"] is not None]
         if not held:
@@ -164,6 +177,8 @@ def _record(
                 "its client runs name as sent"
             )
         graded_from = min(held)
+        if seconds:
+            graded_to = graded_to_step(record, graded_from, float(seconds))
     sampling = sorted({p for s in _steps(record) for p in s["sampling"]})
     if len(sampling) > 1:
         raise ValueError(
@@ -180,6 +195,8 @@ def _record(
     for got, _ in label_run(files, name, _split, floored):
         for s in got:
             if graded_from is not None and s.step < graded_from:
+                continue
+            if graded_to is not None and s.step >= graded_to:
                 continue
             at = traces[s.rank, s.step]
             traced = {**s.provenance, "traces": at, "profiled": run["profiled"]}
@@ -232,6 +249,25 @@ def run_fields(run: dict, record="run.json") -> dict:
 
 def _steps(record: dict) -> list[dict]:
     return [s for steps in record.values() for s in steps]
+
+
+def graded_to_step(record: dict, start: int, seconds: float) -> int | None:
+    """The first step that entered at least `seconds` after step `start` did,
+    each step's entry the earliest of its DP ranks' (they step together); None
+    when the record ends sooner. A step with no entry stamp is skipped."""
+    enter: dict[int, int] = {}
+    for s in _steps(record):
+        if "t_enter_ns" in s:
+            enter[s["step"]] = min(
+                enter.get(s["step"], s["t_enter_ns"]), s["t_enter_ns"]
+            )
+    if start not in enter:
+        raise ValueError(
+            f"step {start}, where the graded window starts, has no entry stamp"
+        )
+    cut = enter[start] + seconds * 1e9
+    later = [k for k, t in enter.items() if t >= cut]
+    return min(later) if later else None
 
 
 def _measurement(store: ArtifactStore, key) -> tuple[Sample, dict]:
