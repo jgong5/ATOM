@@ -346,6 +346,36 @@ def add_lmcache(
         table.mark_offering(*(c.name for c in into if c.name.endswith(ends)))
 
 
+def add_mooncake_store(
+    table: ChannelTable, engines: list[str], store_rpc_s: float, dp: int = 1
+) -> None:
+    """LP ``mooncake_store``, a shared Mooncake Store's master, and its channels
+    to and from each engine LP of `engines`.
+
+    Per engine and DP rank, ``lookup#dp<r>`` carries the step loop's queries
+    and renewals to the master and each reply back, and ``transfer#dp<r>``
+    every writer rank's put, in rank order, which gets no reply. Each end takes
+    its frames inline. Each is one hop of `store_rpc_s`, which must be
+    positive: a query and its reply are a cycle.
+    """
+    if not store_rpc_s > 0.0:
+        raise ValueError(
+            f"store_rpc_s is {store_rpc_s!r}; an engine queries the Mooncake Store "
+            "master and the master replies, a cycle that needs a positive lookahead"
+        )
+    store = table.registry.register(LpId("mooncake_store"))
+    for engine in engines:
+        eng = LpId(engine)
+        for r in range(dp):
+            for src, dst, kind in (
+                (eng, store, f"lookup#dp{r}"),
+                (store, eng, f"lookup#dp{r}"),
+                (eng, store, f"transfer#dp{r}"),
+            ):
+                name = f"{src.name}->{dst.name}:{kind}"
+                table.declare(name, src, dst, store_rpc_s, "inline")
+
+
 def prefill_decode_table(
     *,
     admission_s: float,
