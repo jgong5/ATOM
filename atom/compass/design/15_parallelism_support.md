@@ -869,10 +869,9 @@ So a TP8/EP8 single-node aggregated deployment is **3 LPs** (traffic, frontend, 
 the same as TP1; 1P1D is **5** (traffic, frontend-P, engine-P, frontend-D, engine-D); and
 a PP4 aggregated deployment is **6** (`01` D3, D3.1). The 6P16D share-cache recipe, three
 prefill and four decode instances behind `--dp-aware` with one Mooncake Store, is **17**:
-traffic, router, seven frontends, seven engines and `mooncake_store`. **The protocol's cost tracks PP
-degree and PD roles,
-not GPU count**, which is the property that makes `01`'s single-CA decision hold as the
-milestones widen.
+traffic, router, seven frontends, seven engines and `mooncake_store`. **The protocol's
+cost tracks PP degree, PD roles, instances and shared servers, not GPU count**, which
+is the property that makes `01`'s single-CA decision hold as the milestones widen.
 
 **The composition worth watching** is DP × PP: `dp_size × pp_size` engine cores means the
 shape collective of D90 runs *per stage*, across DP, at microsecond-lookahead boundaries.
