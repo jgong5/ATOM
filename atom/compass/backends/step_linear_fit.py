@@ -4,13 +4,14 @@
 """The step linear law fitted from real step records.
 
     python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --platform JSON [--form FORM] [--moe-routing E,K] [--engine FILE]
-    python -m atom.compass.backends.step_linear_fit offload LOG... --out ENTRY
+    python -m atom.compass.backends.step_linear_fit offload LOG... --out ENTRY [--master-flags FLAGS --capacity-bytes BYTES]
     python -m atom.compass.backends.step_linear_fit figures RECORD... --law LAW [--source NAME] [--form FORM] [--moe-routing E,K] [--engine FILE]
     python -m atom.compass.backends.step_linear_fit pack PATH...
 
 The second form fits a run file's ``lmcache_offload`` entry, beside the law of
 an arm whose records ran the connector, on those runs' server logs
-(`fit_offload`). The third writes the held-out figures (below) of the records
+(`fit_offload`), or a shared Mooncake Store's ``mooncake_store`` entry on its
+workers' logs. The third writes the held-out figures (below) of the records
 into an existing law fitted on them (`figures_main`). The fourth stores law
 files xz-compressed, as the checked-in ones are (`pack_main`). A law is read
 and written by `json_file`, xz-compressed when its name ends in ``.xz``.
@@ -213,6 +214,7 @@ import itertools
 import json
 import math
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -880,9 +882,27 @@ OFFLOAD_COPY = re.compile(
     r"\[OFFLOAD-(SAVE|LOAD)-PROF\] .*? chunks=(\d+) .*? total_ms=([\d.]+)"
 )
 OFFLOAD_PERF = "[OFFLOAD-PERF] "
+#: The Mooncake Store worker's start line, with the fields its entry matches
+#: against a deployment; ``nic`` names the protocol, or under rdma the NIC.
+STORE_WORKER = re.compile(
+    r"Mooncake Store offload worker rank=\d+ world=(?P<world>\d+): .*? "
+    r"nic=(?P<nic>\S+) .*? chunk=(?P<chunk_tokens>\d+) chunk_bytes=(?P<chunk_bytes>\d+) "
+    r".*? save_slots=(?P<save_slots>\d+) load_slots=(?P<load_slots>\d+) "
+    r".*? save_workers=(?P<save_workers>\d+) load_workers=(?P<load_workers>\d+)"
+)
+#: The Store worker's per-copy lines under `OFFLOAD_PROFILE` and its
+#: scheduler's per-lookup line at DEBUG, each of ``name=value`` fields.
+STORE_LINE = re.compile(r"\[OFFLOAD-(SAVE-PROF|LOAD-PROF|LOOKUP)\] (.*)")
+#: Per line of `STORE_LINE`: the law it fits, its count, its milliseconds and
+#: the parts of them the report keeps apart.
+STORE_LAWS = {
+    "SAVE-PROF": ("store_s", "chunks", "total_ms", ("pack_ms", "put_ms")),
+    "LOAD-PROF": ("load_s", "chunks", "total_ms", ("get_ms", "unpack_ms")),
+    "LOOKUP": ("lookup_s", "keys", "elapsed_ms", ()),
+}
 
 
-def fit_offload(logs) -> tuple[dict, dict]:
+def fit_offload(logs, master=None, capacity_bytes=None) -> tuple[dict, dict]:
     """The run file's ``lmcache_offload`` entry, fitted on the server logs of
     real runs `logs`, each at `OFFLOAD_PROFILE` (`atom.compass.kv.lmcache_offload`),
     and its report.
@@ -895,7 +915,15 @@ def fit_offload(logs) -> tuple[dict, dict]:
     it logs a minute apart: per minute with a lookup, the seconds its lookups
     took on ``(lookups, chunks)``, chunks counted as the prompt tokens they
     asked over the chunk size. The entry's ``fit`` holds the logs and the
-    report."""
+    report.
+
+    Logs of the Mooncake Store's workers give its ``mooncake_store`` entry
+    instead (`_fit_store`), with the master's flags `master`, as argv, and the
+    owners' mounted bytes `capacity_bytes`, which no log states."""
+    if any(STORE_WORKER.search(Path(log).read_text(errors="replace")) for log in logs):
+        return _fit_store(logs, master, capacity_bytes)
+    if master is not None or capacity_bytes is not None:
+        raise ValueError("lmcache_offload's logs state no Store master or owners")
     workers, copies, lookups = {}, {"SAVE": [], "LOAD": []}, []
     for log in logs:
         perf = []
@@ -940,6 +968,56 @@ def fit_offload(logs) -> tuple[dict, dict]:
     entry["lookup_s"], report["lookup_s"] = _host_law(
         x, rows[:, 2] * 1e-6, ["lookups", "chunks"]
     )
+    entry["fit"] = {"logs": [str(log) for log in logs], **report}
+    return entry, report
+
+
+def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
+    """`fit_offload`'s ``mooncake_store`` entry and report on the Store logs
+    `logs`, at `OFFLOAD_PROFILE` and ``ATOM_LOG_LEVEL=DEBUG``.
+
+    The fields `STORE_WORKER` matches are what each worker logs at its start,
+    ``protocol`` ``rdma`` where it names a NIC; logs that differ in any refuse.
+    Each law of `STORE_LAWS` is fitted by the host-law solver on its lines'
+    seconds over ``(1, count)``: ``store_s`` and ``load_s`` on each copy with
+    ``status=ok``, ``lookup_s`` on each lookup's call, per key it asked. The
+    report keeps each copy's parts apart, their p50 and p90 milliseconds."""
+    if master is None or capacity_bytes is None:
+        raise ValueError(
+            "no log states the Store master's flags or its owners' bytes: give "
+            "--master-flags and --capacity-bytes"
+        )
+    stated, rows, parts = {}, {}, {}
+    for log in logs:
+        for line in Path(log).read_text(errors="replace").splitlines():
+            if m := STORE_WORKER.search(line):
+                fields = {k: int(v) for k, v in m.groupdict().items() if k != "nic"}
+                fields["protocol"] = "tcp" if m["nic"] == "tcp" else "rdma"
+                stated.setdefault(log, set()).add(tuple(sorted(fields.items())))
+            elif m := STORE_LINE.search(line):
+                law, count, took, kept = STORE_LAWS[m[1]]
+                said = dict(re.findall(r"(\w+)=(\S+)", m[2]))
+                # A failed copy is not priced; other lookup lines time no call.
+                if said.get("status", "ok") == "ok" and took in said:
+                    seconds = float(said[took]) * 1e-3
+                    rows.setdefault(law, []).append((1, int(said[count]), seconds))
+                    for part in kept:
+                        parts.setdefault(part, []).append(float(said[part]))
+    matched = set().union(*stated.values())
+    if len(matched) != 1 or len(stated) != len(logs):
+        raise ValueError(
+            f"the logs' Store workers state {[dict(s) for s in sorted(matched)]}, "
+            f"and {len(logs) - len(stated)} state none; an entry is fitted on one"
+        )
+    [fields] = matched
+    entry, report = dict(fields), {}
+    for law, count, _, kept in STORE_LAWS.values():
+        x = np.array(rows.get(law, []), dtype=np.float64).reshape(-1, 3)
+        entry[law], report[law] = _host_law(x[:, :2], x[:, 2], ["fixed", count])
+        for part in kept:
+            p50, p90 = np.percentile(parts[part], [50, 90]).tolist()
+            report[law][part] = {"p50": p50, "p90": p90}
+    entry |= {"master": master, "capacity_bytes": capacity_bytes}
     entry["fit"] = {"logs": [str(log) for log in logs], **report}
     return entry, report
 
@@ -2551,16 +2629,32 @@ def _platform_arg(value: str) -> dict:
 
 
 def offload_main(argv) -> None:
-    """``offload LOG... --out ENTRY``: write `fit_offload`'s entry, and print
-    each term with its fit."""
+    """``offload LOG... --out ENTRY [--master-flags FLAGS --capacity-bytes
+    BYTES]``: write `fit_offload`'s entry, and print each term with its fit."""
     parser = argparse.ArgumentParser(
         prog="python -m atom.compass.backends.step_linear_fit offload",
         description=fit_offload.__doc__.split("\n\n")[0],
     )
-    parser.add_argument("logs", nargs="+", help="real server logs at OFFLOAD_PROFILE")
+    parser.add_argument(
+        "logs",
+        nargs="+",
+        help="real server logs at OFFLOAD_PROFILE, a Mooncake Store's also at "
+        "ATOM_LOG_LEVEL=DEBUG",
+    )
     parser.add_argument("--out", required=True, help="where the entry is written")
+    parser.add_argument(
+        "--master-flags",
+        type=shlex.split,
+        help="a Mooncake Store's mooncake_master flags, as one string; the entry "
+        "keeps them as argv",
+    )
+    parser.add_argument(
+        "--capacity-bytes",
+        type=int,
+        help="the bytes a Mooncake Store's owners mounted, summed",
+    )
     args = parser.parse_args(argv)
-    entry, report = fit_offload(args.logs)
+    entry, report = fit_offload(args.logs, args.master_flags, args.capacity_bytes)
     Path(args.out).write_text(json.dumps(entry) + "\n")
     for name, fit in report.items():
         print(f"{name}: {json.dumps(entry[name])} {json.dumps(fit)}")
