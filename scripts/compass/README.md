@@ -1328,24 +1328,34 @@ each side under the EP8 cell's arguments and environment, with these differences
   GPU the routed MoE over one rank's experts, and on all eight the collectives, MORI's
   dispatch and combine among them.
 - **MORI on the prefill side.** A prefill step's shape under DP-attention states its
-  group's rows, `G=`, and there `measure ops` times MORI's leaves at another exchange than
-  the step's, and a combine can fault the card
-  ([#3688](https://github.com/jgong5/ATOM/issues/3688)). The eight-GPU prefill run then
-  keeps halving the gaps beside those points, so bound it with `timeout`: `fit ops` reads
-  every round a run published and declines the gaps beside a point off its neighbours'
-  line. `measure ops --coverage`, as in step 11 of the stage-2 cell below, names the steps
-  the price list leaves out; its `--out` is a directory holding every run's `plan.jsonl`
-  lines of the side and one run's `run.json`.
+  group's rows, `G=`, and a MORI exchange there takes about what its largest rank sends,
+  not `G`. `measure ops` sends each rank its own share of `G` through MORI's dispatch and
+  combine, and `fit ops` prices MORI at a shape stating `G` as a family of its own, over
+  EP times the rows the step's largest rank scheduled, which the plan does not densify
+  ([#3729](https://github.com/jgong5/ATOM/issues/3729)). Bound the eight-GPU prefill run
+  with `timeout`: `fit ops` reads every round a run published and declines the gaps
+  beside a point off its neighbours' line. `measure ops --coverage`, as in step 11 of the
+  stage-2 cell below, names the steps the price list leaves out; its `--out` is a
+  directory holding every run's `plan.jsonl` lines of the side and one run's `run.json`.
 - **Runs.** As the DPA-TP8 cell's, with the EP8 cell's host laws,
   `laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json.xz` and `-decode.json.xz`.
-- **Ranking.** EP8 is ordered against the DPA-TP8 cell only as both are simulated at one
-  tree, the one the ranking's registration names (the ranking gate of
-  `atom/compass/design/08_validation_protocol.md`). A run at a tree that differs from it
-  only in its pricing counts as run there when every step it priced prices to the same
-  terms through that tree's `OpGraphBackend`
-  ([Ruling](https://github.com/jgong5/ATOM/issues/1499#issuecomment-6970448413)): a side's
+- **Trees.** Every run the cell adds, EP8's and EP off's at c=64 and 256, runs at the run
+  tree: `c92c36110` with the commits that closed #3688, #3729 and #3657, the last pricing
+  a step again only at the leaves whose reads moved. The replay tree is the run tree
+  without #3657's commit
+  ([Ruling](https://github.com/jgong5/ATOM/issues/3409#issuecomment-6999401243)). A side's
   `steps/dp<r>.cost.jsonl` holds the terms each line of its `steps/dp<r>.jsonl` was priced
-  at, and the run's price list and graphs price those lines again at that tree.
+  at; a replay prices those lines again with the run's price list and graphs through the
+  replay tree's `OpGraphBackend` and compares each term's name, seconds, method, validated
+  flag and source. A line that differs voids the run, and its cell runs at the replay
+  tree. Take #3729's commit onto the run tree as it landed, over #3657's: git merges
+  #3657 cleanly onto the replay tree's port of #3729, into a `PriceList.price` that reads
+  names #3657 removed.
+- **Ranking.** EP8 is ordered against the DPA-TP8 cell only as both are simulated at one
+  tree (the ranking gate of `atom/compass/design/08_validation_protocol.md`), the run tree.
+  The DPA-TP8 cell's runs at c=1, 4 and 16, simulated at `c92c36110`, count as run there
+  when every line of both sides replays through the run tree alike; a line that differs
+  is escalated, and the ranking waits for its ruling.
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
