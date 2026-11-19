@@ -1003,10 +1003,10 @@ def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
                     rows.setdefault(law, []).append((1, int(said[count]), seconds))
                     for part in kept:
                         parts.setdefault(part, []).append(float(said[part]))
-    matched = set().union(*stated.values())
+    matched = sorted(set().union(*stated.values()))
     if len(matched) != 1 or len(stated) != len(logs):
         raise ValueError(
-            f"the logs' Store workers state {[dict(s) for s in sorted(matched)]}, "
+            f"the logs' Store workers state {[dict(s) for s in matched]}, "
             f"and {len(logs) - len(stated)} state none; an entry is fitted on one"
         )
     [fields] = matched
