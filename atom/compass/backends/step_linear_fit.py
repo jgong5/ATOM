@@ -848,24 +848,44 @@ def _own_work(calls: list[dict], intake) -> list[tuple[int, int | None, float]]:
     ]
 
 
-def _intakes(path) -> tuple[list, list, list]:
+def _tokenizing(calls) -> dict:
+    """Each thread's tokenizer calls other than a decode, as sorted start and
+    end ns arrays, from the tokenizer record at `calls`; none when it names no
+    file."""
+    if calls is None or not Path(calls).is_file():
+        return {}
+    spans: dict = {}
+    _, *lines = Path(calls).read_text().splitlines()
+    for c in map(json.loads, lines):
+        if c["call"] != "decode":
+            spans.setdefault(c["thread"], []).append((c["t_start_ns"], c["t_end_ns"]))
+    return {t: np.array(sorted(v), dtype=np.int64).T for t, v in spans.items()}
+
+
+def _intakes(path, calls=None) -> tuple[list, list, list]:
     """The HTTP intake stamps `path` holds as each lone request's ``(body
     bytes, CPU seconds)``, each burst's ``(body bytes, template start CPU
     ns)`` per request, and every request's body bytes.
 
     A request is its app call and the body, template, pool job and engine send
-    that follow it. A lone one found every request whose body was read before
+    that follow it; one given its prompt's token ids, a prefill-decode decode
+    side's, renders no template. A lone one found every request whose body was read before
     its app call sent, and its own sent before the next app call, with nothing
     else stamped between: its seconds are the CPU time the loop's thread spent
     from the app call to the send's end, less what it spent from its pool job's
     submit to its resume (``wait``), the job's and other requests' work; and,
     where its template was rendered on another thread, that render's wall
     time, which the loop awaits and the template job, charging only its encode
-    calls, does not price. A burst is a run of requests each of whose app call
+    calls, does not price. The pool job of a request given its token ids,
+    during which its thread made no tokenizer call other than a decode by the
+    tokenizer record at `calls` (none where there is none), is priced by no
+    tokenizer law: its wall time, which the loop awaits, joins the request's
+    seconds. A burst is a run of requests each of whose app call
     came before the template of the one ahead of it began, the loop taking them
     in one after another, its templates rendered on the loop's thread, the only
     one whose CPU clock their gaps read."""
     ev = _stamps(path)
+    tokenized = _tokenizing(calls)
     # Arrays, searched once per request: np.searchsorted converts a list on
     # every call, which over a c=128 agentic record's two million stamps (an
     # `out` per streamed row) made this loop O(requests x stamps).
@@ -884,13 +904,20 @@ def _intakes(path) -> tuple[list, list, list]:
         skip = ("app", "recv", "wait", "out", "head")
         between = [e for e in span if e[2] not in skip]
         waits = sum(e[5] - e[4] for e in span if e[2] == "wait")
-        if np.searchsorted(sends, call) != np.searchsorted(read, call) or [
-            e[2] for e in between
-        ] != ["body", "tmpl", "prep", "send"]:
+        kinds = [e[2] for e in between]
+        if np.searchsorted(sends, call) != np.searchsorted(read, call) or kinds not in (
+            ["body", "tmpl", "prep", "send"],
+            ["body", "prep", "send"],
+        ):
             continue
-        body, tmpl, _, send = between
+        body, *rendered, prep, send = between
         start, loop = cpu[call]
-        seconds = send[5] - start - waits + (tmpl[1] - tmpl[0]) * (tmpl[6] != loop)
+        seconds = send[5] - start - waits
+        for tmpl in rendered:
+            seconds += (tmpl[1] - tmpl[0]) * (tmpl[6] != loop)
+        starts = np.asarray(tokenized.get(prep[6], ((), ()))[0])
+        if not rendered and not np.any((prep[0] <= starts) & (starts <= prep[1])):
+            seconds += prep[1] - prep[0]
         lone.append((body[3], seconds * 1e-9))
     # The loop renders each request's template as soon as its body is read;
     # since the API server hands it to a thread, no gap of theirs is the loop's.
@@ -909,9 +936,10 @@ def _intakes(path) -> tuple[list, list, list]:
     return lone, bursts, sizes
 
 
-def fit_intake(paths) -> tuple[dict, dict]:
+def fit_intake(paths, calls=None) -> tuple[dict, dict]:
     """The ``http_intake`` term over the intake stamps each record in `paths`
-    holds (`_intakes`), and its report: ``idle_s`` and ``per_byte_s`` by the
+    holds (`_intakes`), each beside the tokenizer record `calls` names in the
+    same order (none where `calls` is None), and its report: ``idle_s`` and ``per_byte_s`` by the
     host-law solver on the lone requests' CPU seconds over their body bytes;
     ``bytes`` spans every request's body; ``fixed_s`` the mean, over every
     burst's later requests, of the loop's CPU time from the template start
@@ -921,8 +949,8 @@ def fit_intake(paths) -> tuple[dict, dict]:
     report's ``fixed_s_is_idle_s`` saying which. Raises on too few lone
     requests."""
     lone, bursts, bodies = [], [], []
-    for path in paths:
-        got = _intakes(path)
+    for path, made in zip(paths, calls or [None] * len(paths)):
+        got = _intakes(path, made)
         lone += got[0]
         bursts += got[1]
         bodies += got[2]

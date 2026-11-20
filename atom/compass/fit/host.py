@@ -92,7 +92,7 @@ def host_laws(samples, records=(), client_runs=()) -> tuple[dict, dict]:
     ]
     for term, fit in (
         ("tokenizer", lambda: fit_tokenizer(calls, steps)),
-        ("http_intake", lambda: fit_intake(steps)),
+        ("http_intake", lambda: fit_intake(steps, calls)),
         ("hops", lambda: fit_hops(steps, clients)),
     ):
         try:
