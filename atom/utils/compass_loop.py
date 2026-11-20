@@ -746,7 +746,7 @@ class _Intake:
     """One stamped request's intake: its body read, shared on the loop with the
     reads in flight beside it, then its own fixed part, the loop's alone."""
 
-    __slots__ = ("arrival", "seq", "read_s", "fixed_s", "done")
+    __slots__ = ("arrival", "done", "fixed_s", "read_s", "seq")
 
     def __init__(self, arrival, seq, read_s, fixed_s, done) -> None:
         self.arrival, self.seq = arrival, seq
@@ -803,9 +803,13 @@ class HttpChannel:
     charged in stretches of at most `READ_SLICE_S`, each once the loop is idle
     at that instant, every tokenizer station job placed and all else due by
     then run (`SimExecutor.placed`), so what is due on the loop meanwhile runs
-    between them; a request released inside a stretch joins at its end. Where
-    the stretches fall depends on the LP clock alone, never on which requests
-    the wall has brought in ahead of their arrival. Once its read is done the request's own part, ``fixed_s``,
+    between them; a request released inside a stretch joins at its end. No
+    stretch is charged while a request released by then has not joined, its
+    request still unread on the socket or not yet woken (`_unjoined`): a charge
+    moves the clock, so were the reads charged on, the wall's delay in bringing
+    one in would set where it joins. Where the stretches fall depends on the LP
+    clock alone, never on which requests the wall has brought in, or when.
+    Once its read is done the request's own part, ``fixed_s``,
     is charged on the loop alone, at such an idle instant too, and the request
     then counts as handled and reaches the app; reads done at one instant go
     on in ``(arrival, seq)`` order. A request that arrives while no intake is
@@ -832,9 +836,10 @@ class HttpChannel:
         self.reads: list[_Intake] = []
         self.read: list[_Intake] = []
         # (channel, seq) -> its wake-up, for each stamped request not yet
-        # joined to the reads: one woken is waited for before any charge.
+        # joined to the reads: one released is waited for before any charge.
         self.joining: dict[tuple[str, int], asyncio.Future] = {}
-        self.joined: asyncio.Event | None = None  # set as one joins or leaves
+        self.joined: asyncio.Event | None = None  # set as one is read, joins or leaves
+        self.channels: set[str] = set()  # the channels its requests come on
         self.driver: asyncio.Task | None = None  # `_drive`, while intakes are open
         # http seq -> its hang-up, for each stamped request the app is serving
         self.hangups: dict[int, asyncio.Event] = {}
@@ -879,7 +884,10 @@ class HttpChannel:
             wake = loop.create_future()
             loop.held[ch, seq] = (arrival, wake)
             if self.intake is not None:
+                self.channels.add(ch)
                 self.joining[ch, seq] = wake
+                if self.joined:
+                    self.joined.set()  # read: the driver looks again
             # Its body leaves the socket as it comes, not at its turn.
             reading = asyncio.ensure_future(_body_messages(receive))
             intake = None
@@ -936,7 +944,6 @@ class HttpChannel:
             if hangup is not None:
                 del self.hangups[seq]
 
-
     def _join(self, loop, rt, arrival: float, seq: int, body: list) -> _Intake:
         """Join request `seq`'s intake to the reads in flight; returns it."""
         fixed, per_byte, idle = self.intake
@@ -968,21 +975,38 @@ class HttpChannel:
             if intake in queue_:
                 queue_.remove(intake)
 
+    def _unjoined(self, loop) -> bool:
+        """Whether a request released by the LP clock now has not joined the
+        reads yet: its request still unread on the socket, read and not woken,
+        or woken and not joined. A charge waits for it, since a charge moves
+        the clock and releases what arrives inside it; were the reads charged
+        on, a request whose request the wall brings in late would join them
+        where the wall put it, not at the end of the stretch it was released in."""
+        if any(w.done() for w in self.joining.values()):
+            return True
+        rt = loop.rt
+        with rt.lock:
+            if any(rt.unread.get(ch) for ch in self.channels):
+                return True
+            return any(
+                rt.is_released(ch, seq) for ch, seq in loop.held if ch in self.channels
+            )
+
     async def _drive(self, loop) -> None:
         """Charge the open intakes on the loop until none is left: the reads in
         flight shared, in stretches of at most `READ_SLICE_S`, each read done
         then its own part alone, each charge at an idle instant with every
-        request woken by then joined."""
+        request released by then joined (`_unjoined`)."""
         if self.joined is None:
             self.joined = asyncio.Event()
         try:
             while True:
-                while any(w.done() for w in self.joining.values()):
+                while self._unjoined(loop):
                     self.joined.clear()
                     await self.joined.wait()
                 await loop.executor.placed()
-                if any(w.done() for w in self.joining.values()):
-                    continue  # woken while the loop ran up to idle
+                if self._unjoined(loop):
+                    continue  # released, read or woken while the loop ran up to idle
                 if self.read:
                     intake = self.read.pop(0)
                     if intake.fixed_s > 0:

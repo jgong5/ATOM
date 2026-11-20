@@ -38,9 +38,9 @@ from atom.entrypoints.openai import api_server
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
 from atom.utils.compass_loop import (
+    READ_SLICE_S,
     CompassEventLoop,
     CompassSelector,
-    READ_SLICE_S,
     HttpChannel,
     Station,
     charge,
@@ -1149,9 +1149,7 @@ def test_a_burst_s_bodies_are_read_together_then_each_request_s_own_part_alone(
 
 
 @pytest.mark.parametrize("parts", [1, 3], ids=["whole", "in-parts"])
-def test_a_burst_reaches_the_app_smallest_body_first(
-    run, monkeypatch, tmp_path, parts
-):
+def test_a_burst_reaches_the_app_smallest_body_first(run, monkeypatch, tmp_path, parts):
     # Reads of 3, 1 and 2 ms share the loop, each request's own part 1 ms.
     # Body 1 is read at 3 ms (3 x 1 ms) and goes on at 4 ms; bodies 2 and 0
     # then share, body 2 read at 6 ms, on at 7 ms; body 0 read at 8 ms, on at
@@ -1342,6 +1340,91 @@ def test_a_request_that_finds_no_intake_on_the_loop_is_charged_the_idle_one(
     e3 = e2 + sizes[3] * per_byte - left2 + fixed
     print(f"\n  app entered at {entered}")
     assert [entered[seq] for seq in range(4)] == pytest.approx([e0, e1, e2, e3])
+
+
+@pytest.mark.parametrize("late", [False, True], ids=["read-at-once", "read-late"])
+def test_a_request_released_inside_a_read_stretch_joins_at_its_end_however_late_it_is_read(
+    run, monkeypatch, tmp_path, late
+):
+    # Request 0's 4 ms read is charged in 1 ms stretches. Request 1 is released
+    # 0.5 ms into the first one. Read at once, it joins the reads at that
+    # stretch's end; read late on the wall (its request comes over the socket
+    # once the clock is 2 ms past its arrival, or after 0.3 wall seconds with
+    # the clock standing still), it must join there too: no stretch is charged
+    # while a released request is unread, or where it joins follows the wall.
+    fixed, per_byte, idle = 1e-3, 1e-6, 5e-4
+    _intake_run_file(monkeypatch, tmp_path, (fixed, per_byte, idle))
+    sends, stamps = [0.0, 0.0005], queue.Queue()
+
+    def traffic():
+        rt = LPRuntime(TRAFFIC, TABLE, clock_transport.connect(TRAFFIC, run.endpoint))
+        rt.start_run()
+        for at in sends:
+            rt.advance_to(at)
+            stamps.put(rt.stamp_send(HTTP))
+        rt.next_event(INF)
+        rt.close()
+
+    thread = threading.Thread(target=traffic, name="traffic", daemon=True)
+    thread.start()
+    arrivals = [at + TABLE.lookahead(HTTP) for at in sends]
+    sizes, entered = [4000, 1000], {}
+    loop = CompassEventLoop()
+    gate = loop.create_future()
+
+    async def app(scope, receive, send):
+        entered[_stamp(scope)[1]] = asyncio.get_running_loop().time()
+
+    def request(seq):
+        scope = {
+            "type": "http",
+            "headers": [(b"x-test-stamp", b"%r %d" % (arrivals[seq], seq))],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"x" * sizes[seq]}
+
+        return scope, receive, None
+
+    def deliver():
+        def released():
+            with run.rt.lock:
+                return run.rt.is_released(HTTP, 1)
+
+        _until(released)
+        end = time.monotonic() + 0.3
+        while run.rt.now <= arrivals[1] + 2e-3 and time.monotonic() < end:
+            time.sleep(0.001)
+        loop.call_soon_threadsafe(gate.set_result, None)
+
+    async def go():
+        channel = HttpChannel(app, _stamp)
+
+        async def second():
+            if late:
+                await gate
+            await channel(*request(1))
+
+        await asyncio.gather(channel(*request(0)), second())
+
+    body = threading.Thread(target=deliver, name="body", daemon=True)
+    if late:
+        body.start()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        thread.join(10)
+        if late:
+            body.join(10)
+    loop.close()
+    # Read 0 alone for its first 1 ms stretch, request 1 released inside it;
+    # they then share: read 1's 1 ms ends 2 ms later, its fixed part 1 ms
+    # after; read 0's last 2 ms follow alone, then its idle part.
+    e1 = arrivals[0] + READ_SLICE_S + 2 * sizes[1] * per_byte + fixed
+    e0 = e1 + sizes[0] * per_byte - READ_SLICE_S - sizes[1] * per_byte + idle
+    print(f"\n  app entered at {entered}")
+    assert [entered[seq] for seq in range(2)] == pytest.approx([e0, e1])
 
 
 def test_an_intake_waits_for_the_open_tokenizer_job_so_its_result_is_not_late(
