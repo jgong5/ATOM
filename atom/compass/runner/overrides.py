@@ -1623,11 +1623,14 @@ class NonAllocatingRunner(
 
         An empty registry still goes through ATOM's `set_kv_cache_data`: it is
         the one call that builds the worker-side KV connector, which the engine
-        polls for transfer completions. An `lmcache_mp` or `lmcache_offload`
-        one, alone or in a `multi`, is built as `compass`'s worker half, which
-        moves nothing.
+        polls for transfer completions. An `lmcache_mp`, `lmcache_offload` or
+        `mooncake_store` one, alone or in a `multi`, is built as `compass`'s
+        worker half, which moves nothing. They substitute here, after
+        `get_num_blocks` has read the real worker class's HBM reserve
+        (`KVConnectorFactory.kv_budget_reserve_bytes`); the Store's simulated
+        worker keeps that reserve too.
         """
-        from atom.compass.kv import lmcache_mp, lmcache_offload
+        from atom.compass.kv import lmcache_mp, lmcache_offload, mooncake_store
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
         from atom.utils.forward_context import set_kv_cache_data
 
@@ -1636,13 +1639,18 @@ class NonAllocatingRunner(
             names = [
                 n for n, _ in KVConnectorFactory.leaf_connectors(self.config) or ()
             ]
-        simulated = {"lmcache_mp": lmcache_mp, "lmcache_offload": lmcache_offload}
+        simulated = {
+            "lmcache_mp": lmcache_mp,
+            "lmcache_offload": lmcache_offload,
+            "mooncake_store": mooncake_store,
+        }
         for name in names:
             if name != "compass" and name not in simulated:
                 raise RunnerRefusal(
                     f"kv_connector {name!r} is a real transfer backend; this "
-                    "runner simulates only 'compass', 'lmcache_mp' and "
-                    "'lmcache_offload', and an unset kv_connector means 'moriio'."
+                    "runner simulates only 'compass', 'lmcache_mp', "
+                    "'lmcache_offload' and 'mooncake_store', and an unset "
+                    "kv_connector means 'moriio'."
                 )
         for name in sorted(simulated.keys() & set(names)):
             simulated[name].substitute()
