@@ -1157,6 +1157,17 @@ def _launch_lmcache(config, run: dict, side: str | None) -> None:
     _start_lp(LMCACHE_MAIN, str(block))
 
 
+def _outlive_the_group_stop() -> None:
+    """A shared server's LP ignores SIGTERM. `compass run` stops its server's
+    whole process group (`drive/serve.py::_stop`), the LPs its frontend started
+    among it, while the frontend's stop is what finishes the run: an LP that
+    took the SIGTERM died before the ``+inf`` grant that ends it, its hand-in
+    unwritten, and the run summary waited `HAND_IN_WAIT_S` for it and failed.
+    The grant ends it, and the group's SIGKILL after the stop's grace one that
+    never gets the grant."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
 def _start_lp(main: str, *args: str) -> None:
     """Start a shared server's LP in a process of its own: `main` run with
     `args`, importing this tree's ATOM."""
@@ -1182,6 +1193,7 @@ def lmcache(block_tokens: int) -> None:
     from atom.compass.kv import TransferModel
     from atom.compass.kv.lmcache_server import LMCacheLP, LMCacheServer
 
+    _outlive_the_group_stop()
     run = spec()
     rt = _runtime(LMCACHE, run)
     rt.client_run_ended = lambda k: _hand_in(run, LMCACHE.name, rt.refusals, k)
@@ -1296,6 +1308,7 @@ def mooncake_store(block_tokens: int) -> None:
 
     from atom.compass.kv import mooncake_store_server as store
 
+    _outlive_the_group_stop()
     run = spec()
     entry = run[store.ENTRY]
     rt = _runtime(MOONCAKE_STORE, run)
