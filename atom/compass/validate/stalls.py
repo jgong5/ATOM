@@ -210,9 +210,10 @@ def group_pauses(
             if "t_enter_ns" in line
         }
     ranks = sorted(record)
-    if not ranks:
-        return [], 0.0, []
-    first = min(f.enter for mine in record.values() for f in mine.values())
+    entries = [f.enter for mine in record.values() for f in mine.values()]
+    if not entries:  # no rank, or a simulated record, which stamps no entry
+        return [], 0.0, ranks
+    first = min(entries)
     common = sorted(set.intersection(*(set(m) for m in record.values())))
     group = {s: [record[r][s] for r in ranks] for s in common}
     keys = {s: _key(fs) for s, fs in group.items()}
@@ -431,7 +432,9 @@ def _pause(p: dict, first: float) -> str:
         f"  step {p['step']} at {p['t_s'] - first:.1f} s: {p['seconds']:.2f} s "
         f"({p['span_s']:.2f} s span), {who}; waits: {waits}"
     )
-    if (k := p.get("kfd")) is not None:
+    if (k := p.get("kfd")) is not None and k["samples"] is None:
+        line += "; KFD: no sampler sample either side of it"
+    elif k is not None:
         top = ", ".join(f"{pid} {ms / 1e3:.1f} s" for pid, ms in k["evicted_ms"][:6])
         line += f"; KFD evicted over it: {len(k['evicted_ms'])} processes" + (
             f" ({top})" if top else ""
@@ -441,9 +444,11 @@ def _pause(p: dict, first: float) -> str:
 
 def text(found: dict) -> str:
     lines = [
-        f"record {found['record']}: {found['stalls']} stalled forwards, "
-        f"{found['seconds']:.1f} s past their group's launch"
-        f" (excess > {found['min_s']} s)"
+        (
+            f"record {found['record']}: {found['stalls']} stalled forwards, "
+            f"{found['seconds']:.1f} s past their group's launch"
+            f" (excess > {found['min_s']} s)"
+        )
     ]
     g = found.get("graded")
     if g:

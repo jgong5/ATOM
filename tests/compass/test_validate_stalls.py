@@ -188,6 +188,10 @@ def test_an_idle_engine_and_a_short_wait_are_no_pause(tmp_path):
             return 2, 2518, 20, True
 
     assert stalls.group_pauses(_group_record(tmp_path, pause=pause))[0] == []
+    # A simulated record stamps no entry: there is nothing to read a pause from.
+    for r in range(RANKS):
+        (tmp_path / f"dp{r}.jsonl").write_text(json.dumps({"step": 0}) + "\n")
+    assert stalls.group_pauses(tmp_path) == ([], 0.0, [0, 1, 2, 3])
 
 
 def test_the_replay_file_holds_a_device_side_pause_on_every_rank(tmp_path):
@@ -271,3 +275,12 @@ def test_each_pause_names_the_processes_kfd_evicted_over_it(tmp_path):
         "evicted_ms": [[11, 2900.0], [22, 250.0]],
         "samples": [1100.0, 1105.0],
     }
+    # One the sampler did not run over is said to be so.
+    early = {"t_s": 0.0, "span_s": 4.0, "step": 3, "seconds": 4.0, "rank": None}
+    early["waits"] = {}
+    stalls.kfd(evicted, [early], offset=1000.0)
+    assert early["kfd"] == {"evicted_ms": [], "samples": None}
+    assert "no sampler sample" in stalls._pause(early, 0.0)
+    assert "2 processes (11 2.9 s, 22 0.2 s)" in stalls._pause(
+        pause | {"step": 9, "seconds": 4.0, "rank": None, "waits": {}}, 0.0
+    )
