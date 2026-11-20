@@ -182,6 +182,131 @@ compass_ref_drift() {
     printf '        the base is the local branch; COMPASS_INTEGRATION_REF=%s uses the remote\n' "$up"
 }
 
+# compass_changed ROOT INTEGRATION: sets CHANGED to the paths this tree's change
+# touches and CHANGED_SRC to where that list came from, from the first source
+# that answers: the file COMPASS_CHANGED_FILES names, the diff since HEAD's
+# merge-base with INTEGRATION, or snapshot.sh's .compass-changed stamp. When
+# none answers, CHANGED_UNKNOWN says why instead. Returns 94 when
+# COMPASS_CHANGED_FILES names a file it cannot read.
+compass_changed() {
+    local root=$1 integration=$2 ref base
+    CHANGED= CHANGED_SRC= CHANGED_UNKNOWN=
+    if [ -n "${COMPASS_CHANGED_FILES:-}" ]; then
+        [ -r "$COMPASS_CHANGED_FILES" ] || return 94
+        CHANGED=$(cat "$COMPASS_CHANGED_FILES")
+        CHANGED_SRC="COMPASS_CHANGED_FILES"
+    elif git -C "$root" rev-parse --git-dir >/dev/null 2>&1 &&
+         ref=$(compass_resolve_ref "$root" "$integration") &&
+         base=$(git -C "$root" merge-base HEAD "$ref" 2>/dev/null); then
+        # Both sides of a rename, unquoted, here and in gate_cpu.sh's carry:
+        # else a renamed trigger file or a non-ASCII path under a trigger
+        # matches nothing.
+        CHANGED=$(git -C "$root" -c core.quotePath=false diff --no-renames --name-only "$base")
+        CHANGED_SRC="diff vs $ref (${base:0:9})"
+        # Announce the fallback the way snapshot.sh does. Without this the
+        # resolved name appears only inside the source string -- reported, not
+        # announced, so a caller who set nothing sees a prefix it never asked for.
+        [ "$ref" = "$integration" ] ||
+            printf 'ref:    %s is not a ref here; resolved it as %s\n' "$integration" "$ref"
+        compass_ref_drift "$root" "$ref"
+    elif [ -r "$root/.compass-changed" ]; then
+        # A snapshot built by snapshot.sh, which is how the gates normally run.
+        # The stamp was written from the same rev-parse that selected the
+        # archived tree, so it describes this tree and not whichever one the
+        # archiver happened to be sitting in.
+        #
+        # The drift line above does not reach here, and this is the path the
+        # gates normally run on. .compass-changed records the file list and
+        # .compass-commit the sha; neither records the *base*, so a stamp built
+        # on a stale local branch cannot be told from one built on the remote,
+        # and the announcement lives only in the staging log while this is the
+        # log that gets pasted. Closing it means recording the base in a stamp,
+        # which changes the stamp format and is not #102.
+        CHANGED=$(cat "$root/.compass-changed")
+        CHANGED_SRC=".compass-changed stamp"
+    elif ! git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+        # No supplied list, no usable diff, no stamp: the question cannot be
+        # answered, and the reason names which of the three ways in failed.
+        # Only a tree with no .git is a staging omission; a git checkout
+        # reaches here because the integration ref does not resolve, or shares
+        # no commit with HEAD.
+        CHANGED_UNKNOWN="this tree was never stamped (no .git, no .compass-changed); a staging omission, see snapshot.sh"
+    elif ref=$(compass_resolve_ref "$root" "$integration"); then
+        CHANGED_UNKNOWN="a git checkout with no .compass-changed, and $ref shares no commit with HEAD"
+    else
+        CHANGED_UNKNOWN="a git checkout with no .compass-changed, and $integration resolves to no commit here"
+    fi
+}
+
+# compass_cpu_ignores ROOT: sets IGN to the --ignore arguments for what the CPU
+# gate leaves out, tests/plugin and each file cpu_gate_exclude.txt lists, and
+# NEX to how many files the list names. Returns 94 with WHY set when the list
+# is unreadable or names a missing file.
+#
+# Parsed defensively: a trailing CR is stripped so a list that has been through
+# a Windows editor does not turn into --ignore=tests/foo.py^M, which pytest
+# accepts and silently matches nothing; inline comments are dropped; and each
+# file is checked to exist, because a renamed test would otherwise be excluded
+# forever by a stale line nobody can see failing.
+compass_cpu_ignores() {
+    local exclude=$1/scripts/compass/cpu_gate_exclude.txt line
+    NEX=0
+    IGN=(--ignore=tests/plugin)
+    [ -r "$exclude" ] || {
+        printf 'FATAL: cannot read %s\n' "$exclude" >&2
+        WHY="exclusion list unreadable"
+        return 94
+    }
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        line=${line%%#*}
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        [ -n "$line" ] || continue
+        [ -e "$1/$line" ] || {
+            printf 'FATAL: %s lists %s, which does not exist.\n' "$exclude" "$line" >&2
+            printf '       Re-run regen_cpu_gate_exclude.sh.\n' >&2
+            WHY="exclusion list names a missing file"
+            return 94
+        }
+        IGN+=(--ignore="$line")
+        NEX=$((NEX + 1))
+    done <"$exclude"
+}
+
+# compass_harness ROOT: when ROOT has a compass_harness, installs it, with the
+# aiperf wheel COMPASS_AGENTX_HARNESS names, into the run-local directory
+# HARNESS, removed at exit, and appends that to PYTHONPATH. Returns 96 with WHY
+# set when the install fails or the compass_harness tests would still skip.
+#
+# Those tests skip by name when compass-harness, or the aiperf it adapts, does
+# not import, and the CPU container has neither. So the gates install the
+# tree's own compass_harness every run, and refuse to run while the tests' own
+# skip condition still holds.
+compass_harness() {
+    [ -r "$1/compass_harness/pyproject.toml" ] || return 0
+    HARNESS=$(mktemp -d) || { WHY="mktemp failed"; return 96; }
+    trap 'rm -rf "$HARNESS"' EXIT
+    # A copy, because setuptools writes build/ and *.egg-info into the source.
+    cp -r "$1/compass_harness" "$HARNESS/src" || { WHY="cannot copy compass_harness"; return 96; }
+    python -m pip install -q --no-deps --no-build-isolation --no-index --target "$HARNESS/site" \
+        "$HARNESS/src" ${COMPASS_AGENTX_HARNESS:+"$COMPASS_AGENTX_HARNESS"} >&2 || {
+        WHY="pip could not install compass_harness${COMPASS_AGENTX_HARNESS:+ and $COMPASS_AGENTX_HARNESS}"
+        return 96
+    }
+    export PYTHONPATH=$PYTHONPATH:$HARNESS/site
+    WHY=$(cd / && python -c 'from importlib import metadata; metadata.version("compass-harness")
+import compass_harness, aiperf; print(aiperf.__file__, compass_harness.__file__)' 2>&1) || {
+        WHY="the compass_harness tests would skip (${WHY##*$'\n'}); set COMPASS_AGENTX_HARNESS to an agentx-harness 56a0cf70 wheel, see scripts/compass/README.md"
+        return 96
+    }
+    printf 'harness: %s\n' "$WHY"
+}
+
+# A SKIPPED line naming one of gate_gpu.sh's driver-run inputs: a driver-run
+# test that did not run for want of it.
+COMPASS_DRIVER_RUN_SKIP='^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK)_MODEL|ATOM_COMPASS_CCTRACES|COMPASS_AIPERF_PYTHON|atomesh)'
+
 # PYTHONPATH is set to the tree and nothing else. Inherited entries are not
 # merged: an inherited entry ahead of ours is exactly how a take2 script silently
 # ran another branch's engine, and an entry behind ours can still satisfy an

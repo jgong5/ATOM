@@ -91,90 +91,22 @@ compass_env "$ROOT"
 compass_require_tree "$ROOT" || finish $? "atom does not import from this tree; nothing was run"
 compass_describe "$ROOT"
 
-EXCLUDE=$ROOT/scripts/compass/cpu_gate_exclude.txt
+compass_cpu_ignores "$ROOT" || finish $? "$WHY; nothing was run"
 TRIGGERS=$ROOT/scripts/compass/gpu_gate_triggers.txt
-[ -r "$EXCLUDE" ] || { printf 'FATAL: cannot read %s\n' "$EXCLUDE" >&2; finish 94 "exclusion list unreadable; nothing was run"; }
 [ -r "$TRIGGERS" ] || { printf 'FATAL: cannot read %s\n' "$TRIGGERS" >&2; finish 94 "trigger list unreadable; nothing was run"; }
-
-# Parse defensively: strip a trailing CR so a list that has been through a
-# Windows editor does not turn into --ignore=tests/foo.py^M, which pytest
-# accepts and silently matches nothing; drop inline comments; and check the
-# file exists, because a renamed test would otherwise be excluded forever by a
-# stale line nobody can see failing.
-NEX=0
-IGN=(--ignore=tests/plugin)
-while IFS= read -r line || [ -n "$line" ]; do
-    line=${line%$'\r'}
-    line=${line%%#*}
-    line=${line#"${line%%[![:space:]]*}"}
-    line=${line%"${line##*[![:space:]]}"}
-    [ -n "$line" ] || continue
-    [ -e "$ROOT/$line" ] || {
-        printf 'FATAL: %s lists %s, which does not exist.\n' "$EXCLUDE" "$line" >&2
-        printf '       Re-run regen_cpu_gate_exclude.sh.\n' >&2
-        finish 94 "exclusion list names a missing file; nothing was run"
-    }
-    IGN+=(--ignore="$line")
-    NEX=$((NEX + 1))
-done <"$EXCLUDE"
 printf 'gate:   %s files excluded + tests/plugin\n' "$NEX"
 
 # --- does this change need the GPU gate? -------------------------------------
 # Answered here, enforced after pytest, so a run yields both answers rather than
 # trading one for the other. That includes the case where the question cannot be
-# answered at all: it is recorded, not exited on, so the suite still reports.
+# answered at all: it is recorded, not exited on, so the suite still reports,
+# and the run below exits 98 rather than passing -- reporting "GPU not
+# required" there would be a guess that reads as a clear.
 GPU_NEEDED=
-CHANGED=
-SRC=
-GPU_SRC_UNKNOWN=
-if [ -n "${COMPASS_CHANGED_FILES:-}" ]; then
-    [ -r "$COMPASS_CHANGED_FILES" ] ||
-        { printf 'FATAL: COMPASS_CHANGED_FILES=%s unreadable\n' "$COMPASS_CHANGED_FILES" >&2; finish 94 "COMPASS_CHANGED_FILES unreadable; nothing was run"; }
-    CHANGED=$(cat "$COMPASS_CHANGED_FILES")
-    SRC="COMPASS_CHANGED_FILES"
-elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 &&
-     REF=$(compass_resolve_ref "$ROOT" "$INTEGRATION") &&
-     BASE=$(git -C "$ROOT" merge-base HEAD "$REF" 2>/dev/null); then
-    # Both sides of a rename, unquoted, here and in the carry below: else a
-    # renamed trigger file or a non-ASCII path under a trigger matches nothing.
-    CHANGED=$(git -C "$ROOT" -c core.quotePath=false diff --no-renames --name-only "$BASE")
-    SRC="diff vs $REF (${BASE:0:9})"
-    # Announce the fallback the way snapshot.sh does. Without this the resolved
-    # name appears only inside the `gpu:` source string -- reported, not
-    # announced, so a caller who set nothing sees a prefix it never asked for.
-    [ "$REF" = "$INTEGRATION" ] ||
-        printf 'ref:    %s is not a ref here; resolved it as %s\n' "$INTEGRATION" "$REF"
-    compass_ref_drift "$ROOT" "$REF"
-elif [ -r "$ROOT/.compass-changed" ]; then
-    # A snapshot built by snapshot.sh, which is how this gate normally runs.
-    # The stamp was written from the same rev-parse that selected the archived
-    # tree, so it describes this tree and not whichever one the archiver
-    # happened to be sitting in.
-    #
-    # The drift line above does not reach here, and this is the path the gate
-    # normally runs on. .compass-changed records the file list and
-    # .compass-commit the sha; neither records the *base*, so a stamp built on
-    # a stale local branch cannot be told from one built on the remote, and the
-    # announcement lives only in the staging log while this is the log that
-    # gets pasted. Closing it means recording the base in a stamp, which
-    # changes the stamp format and is not #102.
-    CHANGED=$(cat "$ROOT/.compass-changed")
-    SRC=".compass-changed stamp"
-else
-    # No supplied list, no usable diff, no stamp: the question cannot be
-    # answered. It is recorded as unanswered, with which of the three ways in
-    # failed, and the run below exits 98 rather than passing -- reporting "GPU
-    # not required" here would be a guess that reads as a clear. Only a tree with
-    # no .git is a staging omission; a git checkout reaches here because the
-    # integration ref does not resolve, or shares no commit with HEAD.
-    if ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-        GPU_SRC_UNKNOWN="this tree was never stamped (no .git, no .compass-changed); a staging omission, see snapshot.sh"
-    elif REF=$(compass_resolve_ref "$ROOT" "$INTEGRATION"); then
-        GPU_SRC_UNKNOWN="a git checkout with no .compass-changed, and $REF shares no commit with HEAD"
-    else
-        GPU_SRC_UNKNOWN="a git checkout with no .compass-changed, and $INTEGRATION resolves to no commit here"
-    fi
-fi
+compass_changed "$ROOT" "$INTEGRATION" ||
+    { printf 'FATAL: COMPASS_CHANGED_FILES=%s unreadable\n' "$COMPASS_CHANGED_FILES" >&2; finish 94 "COMPASS_CHANGED_FILES unreadable; nothing was run"; }
+SRC=$CHANGED_SRC
+GPU_SRC_UNKNOWN=$CHANGED_UNKNOWN
 
 # Print `<path> -> <trigger>` for each path in $1 a trigger matches.
 trigger_hits() {
@@ -207,27 +139,8 @@ printf '\n'
 # cannot name.
 HEAD_SHA=$(compass_head_sha "$ROOT") || HEAD_SHA=UNKNOWN
 
-# The compass_harness tests skip by name when compass-harness, or the aiperf it
-# adapts, does not import, and the CPU container has neither. So this gate
-# installs the tree's own compass_harness into a run-local directory every run,
-# beside the aiperf wheel COMPASS_AGENTX_HARNESS names, and refuses to run when
-# the tests' own skip condition still holds.
-if [ -r "$ROOT/compass_harness/pyproject.toml" ]; then
-    HARNESS=$(mktemp -d) || finish 96 "mktemp failed; nothing was run"
-    trap 'rm -rf "$HARNESS"' EXIT
-    # A copy, because setuptools writes build/ and *.egg-info into the source.
-    cp -r "$ROOT/compass_harness" "$HARNESS/src" || finish 96 "cannot copy compass_harness; nothing was run"
-    python -m pip install -q --no-deps --no-build-isolation --no-index --target "$HARNESS/site" \
-        "$HARNESS/src" ${COMPASS_AGENTX_HARNESS:+"$COMPASS_AGENTX_HARNESS"} >&2 ||
-        finish 96 "pip could not install compass_harness${COMPASS_AGENTX_HARNESS:+ and $COMPASS_AGENTX_HARNESS}; nothing was run"
-    export PYTHONPATH=$PYTHONPATH:$HARNESS/site
-    WHY=$(cd / && python -c 'from importlib import metadata; metadata.version("compass-harness")
-import compass_harness, aiperf; print(aiperf.__file__, compass_harness.__file__)' 2>&1) || {
-        WHY=${WHY##*$'\n'}
-        finish 96 "the compass_harness tests would skip ($WHY); set COMPASS_AGENTX_HARNESS to an agentx-harness 56a0cf70 wheel, see scripts/compass/README.md; nothing was run"
-    }
-    printf 'harness: %s\n' "$WHY"
-fi
+# The compass_harness tests run, or the gate refuses (_lib.sh, compass_harness).
+compass_harness "$ROOT" || finish $? "$WHY; nothing was run"
 
 # atomesh's unit tests and every Compass cargo target (tests/compass_*.rs) run
 # here, offline, since the gate has no network: from the container's crate
