@@ -85,7 +85,8 @@ is refused: prefill when the law has no prefill vector, a decode rung with
 none, a step mixing prefill and decode rows, or one with image tokens. `compass
 fit steps` leaves no captured rung without one: a rung no record reached gets
 a declared vector filled from the fitted rungs beside it, under a hull holding
-no point (`step_linear_fit.fill_rungs`), named under the law's `filled`.
+no point (`step_linear_fit.fill_rungs`), named under the law's `filled` and, by
+law, its `filled_rungs`.
 
 A law fitted on an MTP record holds a draft law of its own form under `draft`.
 Its terms, named `draft.<kind>.<feature>`, are the step's `draft_terms`, priced from the

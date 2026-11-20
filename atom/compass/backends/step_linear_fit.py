@@ -214,6 +214,7 @@ import json
 import math
 import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -2208,13 +2209,19 @@ def fill_rungs(law: dict, ladder) -> dict:
     vector, and a run's step at it would be refused (D58); a filled vector
     prices it instead, `declared` and never validated, and outside its hull.
 
-    The rule, coefficient by coefficient, a coefficient a vector lacks read as
-    0: linear in the rung between the nearest fitted rungs on either side; past
-    the fitted rungs, linear through the two nearest on one side, clipped at 0;
-    with one fitted rung on that side, its vector. A step's cost at a rung is
-    its graph's, whose padded width the rung is, so a rung between two fitted
-    ones costs between theirs. Two vectors under different `rowmod` moduli
-    combine to no vector: the nearer one's is taken, ties to the wider."""
+    The rule: between two fitted rungs, coefficient by coefficient, a
+    coefficient a vector lacks read as 0, linear in the rung between the
+    nearest fitted rungs on either side; a step's cost at a rung is its
+    graph's, whose padded width the rung is, so a rung between two fitted ones
+    costs between theirs. Past the fitted rungs, the nearest fitted rung's
+    vector as it is: the widest fitted one's above them, the narrowest's below.
+    A line through the two nearest rungs on one side multiplies their
+    slopes' noise by the distance (#3796: rung 64 from rungs 24 and 32 priced
+    the steps it filled +56%), and a copy is off by the rungs' own spread only.
+    Two vectors under different `rowmod` moduli combine to no vector: the
+    nearer one's is taken, ties to the wider. The law names the rungs filled
+    under `filled`, each to its rule, and under `FILLED_RUNGS` by law
+    (`filled_rungs`)."""
     filled = {}
     for of in (law, law.get("draft")):
         if not of or "decode" not in of:
@@ -2228,10 +2235,8 @@ def fill_rungs(law: dict, ladder) -> dict:
             above = [r for r in fitted if r > rung]
             if below and above:
                 pair = (below[-1], above[0])
-            elif len(below) > 1 or len(above) > 1:
-                pair = tuple(below[-2:]) if below else tuple(above[:2])
             else:
-                pair = ((below or above)[0],) * 2
+                pair = ((below[-1:] or above[:1])[0],) * 2
             a, b = (decode[str(r)] for r in pair)
             w = 0.0 if pair[0] == pair[1] else (rung - pair[0]) / (pair[1] - pair[0])
             if a.get("rowmod") != b.get("rowmod"):
@@ -2250,15 +2255,15 @@ def fill_rungs(law: dict, ladder) -> dict:
             }
             free = len(hull_axes(tuple(coefficients)))
             lo, hi = pair
-            if lo == hi:
-                how = f"rung {lo}'s vector"
-            elif below and above:
-                how = f"interpolated in the rung between rungs {lo} and {hi}"
-            else:
-                how = f"extrapolated in the rung from rungs {lo} and {hi}"
-            rule = f"rung {rung} filled, no record reached it: {how}"
             if lo != hi:
-                rule += f" (weight {w:.4g} on rung {hi}), clipped at 0"
+                how = f"interpolated in the rung between rungs {lo} and {hi}"
+                how += f" (weight {w:.4g} on rung {hi}), clipped at 0"
+            elif not (below and above):
+                side = "widest" if lo < rung else "narrowest"
+                how = f"rung {lo}'s vector, the {side} fitted rung"
+            else:
+                how = f"rung {lo}'s vector"
+            rule = f"rung {rung} filled, no record reached it: {how}"
             vector = {
                 "coefficients": coefficients,
                 "hull": {
@@ -2275,7 +2280,55 @@ def fill_rungs(law: dict, ladder) -> dict:
         law["filled"] = {
             k: v for k, v in sorted(filled.items(), key=lambda kv: kv[0])
         }
+        law[FILLED_RUNGS] = filled_rungs(law)
     return filled
+
+
+#: The law's key naming its filled rungs by law, `{"decode": [...], "draft": [...]}`.
+FILLED_RUNGS = "filled_rungs"
+
+
+def filled_rungs(law: dict) -> dict[str, list[int]]:
+    """The decode rungs `fill_rungs` filled in `law`, by law: the target's under
+    ``decode`` and its draft law's under ``draft``, each ascending and each
+    empty when none was; a law written before `FILLED_RUNGS` is read from its
+    `filled` names. A preflight compares them with the rungs a target record's
+    steps ran at (`filled_share`)."""
+    out: dict[str, list[int]] = {"decode": [], "draft": []}
+    for name in law.get("filled") or {}:
+        of, _, rung = name.rpartition(" ")
+        out["draft" if of == "draft" else "decode"].append(int(rung))
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def filled_share(law: dict, rungs: Mapping) -> dict:
+    """The part of `rungs`, a target record's decode steps or seconds by the
+    rung they ran at, that `law` prices on a filled vector: its ``steps`` (or
+    seconds) there, the ``share`` of the whole and the filled ``rungs`` it ran
+    at, ascending; a share of 0 when `rungs` holds none."""
+    filled = set(filled_rungs(law)["decode"])
+    on = {int(r): v for r, v in rungs.items() if str(r).isdigit() and int(r) in filled}
+    total = sum(rungs.values())
+    return {
+        "steps": sum(on.values()),
+        "share": sum(on.values()) / total if total else 0.0,
+        "rungs": sorted(r for r, v in on.items() if v),
+    }
+
+
+def filled_warning(law: dict) -> str | None:
+    """A warning naming the rungs `fill_rungs` filled in `law`, or None: a step
+    a run takes at one is priced by a vector no record's step was fitted on."""
+    named = filled_rungs(law)
+    if not any(named.values()):
+        return None
+    parts = [f"{k} rungs {', '.join(map(str, v))}" for k, v in named.items() if v]
+    return (
+        f"WARNING: no record reached {'; '.join(parts)}: each is filled from the "
+        "fitted rungs beside it, declared and never validated, so a run whose "
+        "steps reach them is priced off its records; compare a target record's "
+        "rung histogram with the law's filled_rungs (step_linear_fit.filled_share)"
+    )
 
 
 def mark_held_out(
@@ -2792,6 +2845,8 @@ def main(argv=None) -> None:
     if len(args.records) > dp:
         mark_held_out(law, report, samples, options)
     fill_rungs(law, engine.get("ladder"))
+    if warning := filled_warning(law):
+        print(warning, file=sys.stderr)
     json_file.write_json(law, args.out)
     print(f"cut: {json.dumps(law['cut'])}")
     print(f"unfitted: {json.dumps(law['unfitted'])}")

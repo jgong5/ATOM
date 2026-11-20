@@ -39,7 +39,8 @@ and `engine_config`, as that command's does, and the key holds them, and
 `records_atom` as that command's states it. Each rung of the capture ladder
 no record reached gets a declared vector, filled from the fitted rungs beside
 it (`step_linear_fit.fill_rungs`), and the law and the report name each under
-`filled`. The report's
+`filled`; the law also lists them by law under `filled_rungs`, and the command
+warns on stderr naming them (`step_linear_fit.filled_warning`). The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
 
@@ -68,6 +69,7 @@ targets', naming the targets'. `--sessions A:B` keeps the `--grid` lines
 import copy
 import dataclasses
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -138,6 +140,8 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     report["filled"] = step_linear_fit.fill_rungs(
         law, config["engine_config"].get("ladder")
     )
+    if warning := step_linear_fit.filled_warning(law):
+        print(warning, file=sys.stderr)
     report["provenance"] = publish.runs(samples)
     law["platform"] = keyed_platform(Kind.STEP_LINEAR_LAW, config["platform"])
     law["engine_config"] = config["engine_config"]
