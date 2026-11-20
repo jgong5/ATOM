@@ -61,7 +61,6 @@ import logging
 import math
 import pickle
 import threading
-import time
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from pathlib import Path
@@ -89,8 +88,9 @@ COUNTS = (
 )
 #: The refusal a load whose lane starts past its lease hands in.
 PAST_LEASE = "mooncake_store:a load starts past its lease"
-#: Wall seconds a shell waits for LP mooncake_store to name its endpoint.
-ENDPOINT_WAIT_S = 300.0
+#: Wall seconds a shell waits for LP mooncake_store to name its endpoint, and
+#: how often it looks.
+ENDPOINT_WAIT_S, ENDPOINT_LOOK_S = 300.0, 0.05
 
 
 def substitute() -> None:
@@ -520,14 +520,18 @@ class StoreShell:
         import zmq
 
         if ch not in self._socks:
-            deadline = time.monotonic() + ENDPOINT_WAIT_S
+            # Named before the LP's first clock call, so before any grant lets
+            # a request reach this engine: the wait reads no clock, and its
+            # bound only turns a missing LP into an error naming the file.
+            looks = int(ENDPOINT_WAIT_S / ENDPOINT_LOOK_S)
             while not self._endpoint.exists():
-                if time.monotonic() > deadline:
+                if not looks:
                     raise RuntimeError(
                         f"LP mooncake_store named no endpoint in {self._endpoint} "
                         f"within {ENDPOINT_WAIT_S:.0f} s"
                     )
-                time.sleep(0.05)
+                looks -= 1
+                threading.Event().wait(ENDPOINT_LOOK_S)
             sock = zmq.Context.instance().socket(zmq.DEALER)
             sock.connect(self._endpoint.read_text().strip())
             self._socks[ch] = sock
