@@ -2,6 +2,7 @@
 repo: jgong5/ATOM
 integration_branch: feature/atomcompass_new
 gate_task: scripts/compass/gate_cpu.sh
+gate_targeted: scripts/compass/gate_targeted.sh
 gate_post_land: scripts/compass/gate_gpu.sh
 design_entry: atom/compass/design/README.md
 never_touch: ROCm/ATOM

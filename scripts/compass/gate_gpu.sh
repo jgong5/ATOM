@@ -328,7 +328,7 @@ PASSED=$((PASSED + COMPASS_N)) FAILED=$((FAILED + C_FAILED)) ERRORS=$((ERRORS + 
 printf '\nGATE_GPU passed=%s failed=%s errors=%s pytest_rc=%s (baseline %s/%s/0, expected %s passed)\n' \
     "$PASSED" "$FAILED" "$ERRORS" "$PYRC" "$BASE_PASSED" "$BASE_FAILED" "$EXPECT_PASSED"
 # A driver-run test that skipped did not run, whatever the counts say.
-SKIPS=$(grep -E '^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK)_MODEL|ATOM_COMPASS_CCTRACES|COMPASS_AIPERF_PYTHON|atomesh)' "$COUT")
+SKIPS=$(grep -E "$COMPASS_DRIVER_RUN_SKIP" "$COUT")
 cat "$COUT" >>"$OUT"
 rm -f "$COUT"
 
