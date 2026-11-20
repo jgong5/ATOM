@@ -103,7 +103,8 @@ Under a launch provider that declares features (`launch_features`), a step it
 predicts otherwise than its line observed refuses, naming it; each host law
 adopts features as columns on their held-out error per launch path
 (`_launch_columns`), their coefficients under the entry's
-`columns[kind][segment]`, and `_jit` solves `W_launch` with every one.
+`columns[kind][segment]`, and `_jit` solves `W_launch` with every one. A fit of
+one run holds out `RUN_BLOCKS` contiguous spans of its steps in place of runs.
 
 The same solver fits the host entry's ``tokenizer`` term on a recorded
 server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
@@ -466,13 +467,26 @@ def _host_x(s) -> tuple[int, int, int]:
     return 1, sum_tokens(s.view.requests), len(s.view.requests)
 
 
-def _host_rows(samples) -> list[tuple]:
+#: The spans of its steps a host fit on one run holds out in turn to choose
+#: launch columns (`_launch_columns`), each a contiguous part of its time.
+RUN_BLOCKS = 5
+
+
+def _host_rows(samples, blocks: int = 0) -> list[tuple]:
     """(kind, segment, (1, tokens, seqs), seconds, run, launch) per host label
-    of each sample, but the `E` of one that admits requests."""
-    rows = []
+    of each sample, but the `E` of one that admits requests. With `blocks`,
+    `run` is ``(run, block)``, the sample's step's block of `blocks` contiguous
+    spans of its run's steps."""
+    rows, last = [], {}
     for s in samples:
+        run = s.provenance["run"]
+        last[run] = max(last.get(run, 0), s.step + 1)
+    for s in samples:
+        run = s.provenance["run"]
+        if blocks:
+            run = (run, s.step * blocks // last[run])
         rows += [
-            (host_kind(s.view), k, _host_x(s), v, s.provenance["run"], s.launch)
+            (host_kind(s.view), k, _host_x(s), v, run, s.launch)
             for k, v in s.host.items()
             if k != "E" or not s.admitted[0]
         ]
@@ -565,7 +579,9 @@ def fit_host(samples) -> tuple[dict, dict]:
     kept = [
         s for s in samples if (s.provenance["run"], s.rank, s.step) not in jit | after
     ]
-    rows = _host_rows(kept)
+    # One run holds out spans of its own steps to choose its launch columns.
+    one = len({s.provenance["run"] for s in kept}) == 1
+    rows = _host_rows(kept, RUN_BLOCKS if one else 0)
     host = {"key": json.loads(keys[0]), "laws": {}}
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
     report["blocked"], report["unstamped"] = _blocked(samples)
@@ -1214,13 +1230,17 @@ def _launch_columns(members, features) -> tuple[list[str], dict]:
     launch path, its members of one value of every feature). One p50 over all
     of a run's members is its commonest path's, which a column a rarer path
     needs barely moves. A round adds the feature of least error while it is
-    below the last design's. Members of one run adopt none."""
+    below the last design's. A member's run is its `_host_rows` cell: on a
+    fit of one run, a span of its steps (`RUN_BLOCKS`), so a single record,
+    whose launch-path mix moves with its load over time, adopts the columns
+    its spans need too."""
     if not features:
         return [], {}
     x = np.array([r[2] for r in members], dtype=np.float64).reshape(-1, 3)
     if np.linalg.matrix_rank(x[:, 1:]) < 2:
         x[:, 2] = 0.0
-    y, cell = np.array([r[3] for r in members]), np.array([r[4] for r in members])
+    y = np.array([r[3] for r in members])
+    cell = np.unique([repr(r[4]) for r in members], return_inverse=True)[1]
     paths = [[r[5][f] for f in features] for r in members]
     path = np.unique(paths, axis=0, return_inverse=True)[1]
 
