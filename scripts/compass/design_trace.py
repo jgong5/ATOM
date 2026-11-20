@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Recipe C's designed workload R_d as cc-traces (weka_trace) for `client.sh --traces`.
 
-    design_trace.py OUT [--rows 52] [--dwell 40] [--step-ms JSON] [--period 7.5] [--waves N]
+    design_trace.py OUT [--rows 56] [--dwell 40] [--tail 10] [--step-ms JSON]
+                        [--spread 0.55,0.8,1.2,1.45] [--period 7.5] [--waves N]
 
 Writes OUT/s0.jsonl, s1.jsonl and s2.jsonl, one trace a line as TRACES holds them,
 and OUT/plan.json: each segment's traces (its concurrency and --num-conversations),
@@ -15,12 +16,16 @@ the previous turn's response ends (no `api_time` is written), as the dry run che
   S0  4 lanes, one 100k request each (out 64): warm-up, left out of the fit.
   S1  1 lane, 6 sessions of 8 turns: first prompt 2k..700k, deltas 128..16k, out
       32/512, 1 s apart: lone arrivals on one busy rank.
-  S2a ROWS groups of 4 identical lanes, one request each, prompt 8k..760k
-      (40/40/20 % log-uniform over 8-64k, 64-320k, 320-760k), each group ending
-      together: placed one a DP rank, a group's end takes each rank down a row,
-      so the decode rung sweeps 64..1 holding each rung DWELL seconds (its decode
-      steps at --step-ms), then the last group's lanes end one by one (3, 2, 1
-      busy ranks, TAIL seconds each). out = 1 + ACCEPT x decode steps to its end.
+  S2a ROWS groups of 4 lanes, one request each, a group's prompt P (40/40/20 %
+      log-uniform over 8-64k, 64-256k, 256-600k) times SPREAD's member m, at most
+      880k, members smallest first; a group's lanes end together. Under
+      cal_record.sh's routing (a new session to the rank with the fewest requests,
+      ties to the fewest prompt tokens queued) the members land one a DP rank,
+      member m always on the same rank: the ranks hold one row count and four
+      context mixes. A group's end takes each rank down a row, so the decode rung
+      sweeps 64..1 holding each rung DWELL seconds (its decode steps at
+      --step-ms), then the last group's lanes end one by one (3, 2, 1 busy ranks,
+      TAIL seconds each). out = 1 + ACCEPT x decode steps to its end.
   S2b 8 groups of 4 probe lanes (first prompt 16k/96k/256k/512k, out 16) on deep
       history, sent with S2a; then waves PERIOD apart: even waves every lane, odd
       ones k = 1..4 members of one group (k ranks prefilling), each turn a delta
@@ -34,9 +39,10 @@ from pathlib import Path
 
 BLOCK, MODEL, ACCEPT, K, RANKS = 64, "claude-opus-4-8", 3.51, 1024, 4
 RUNGS = (64, 48, 40, 32, 24, 16, 8, 4, 2, 1)  # args agg's capture sizes, widest first
-#: Decode group step seconds per rung, ms: the real records' medians, deeper.
-STEP_MS = {64: 40, 48: 34, 40: 31, 32: 28, 24: 25, 16: 20, 8: 16, 4: 13.5, 2: 12, 1: 11}
-MIX = ((0.4, 8 * K, 64 * K), (0.4, 64 * K, 320 * K), (0.2, 320 * K, 760 * K))
+#: Decode group step seconds per rung, ms: the dry run's (store_c128's law), 2026-11-19.
+STEP_MS = {64: 48, 48: 40, 40: 36, 32: 31, 24: 28, 16: 24, 8: 19, 4: 14.3, 2: 13.9, 1: 12}
+MIX = ((0.4, 8 * K, 64 * K), (0.4, 64 * K, 256 * K), (0.2, 256 * K, 600 * K))
+CAP = 880 * K  # a prompt, under the model's 1M context with the longest output
 S1_FIRST, S1_DELTA, S1_OUT = (2, 16, 64, 200, 400, 700), (128, K, 4 * K, 16 * K), (32, 512)
 PROBE_FIRST, PROBE_OUT = (16, 96, 256, 512), (16, 128)
 PROBE_DELTA = (128, 512, 2 * K, 8 * K, 32 * K)
@@ -99,15 +105,16 @@ def ladder(rows: int, dwell: float, step_ms: dict, tail: float):
     return steps, ends, last
 
 
-def s2(rows, dwell, step_ms, tail, period, waves):
+def s2(rows, dwell, step_ms, tail, spread, period, waves):
     steps, ends, last = ladder(rows, dwell, step_ms, tail)
     lanes = []
     for g, (n, end) in enumerate(zip(prompts(rows), ends)):
-        for m in range(RANKS):
+        for m, f in enumerate(spread):
             stop = last[m] if g == rows - 1 else end
-            lanes.append(trace(f"rc-s2a-g{g:02d}-m{m}", [(0.0, n, 1 + math.ceil(ACCEPT * stop))]))
+            size = min(CAP, BLOCK * round(n * f / BLOCK))
+            lanes.append(trace(f"rc-s2a-g{g:02d}-m{m}", [(0.0, size, 1 + math.ceil(ACCEPT * stop))]))
     ramp = sum(dwell for r in steps) + (RANKS - 1) * tail
-    waves = waves or int(0.8 * ramp / period)
+    waves = waves or int(ramp / period)
     for g in range(8):
         for m in range(RANKS):
             lane, mine = g * RANKS + m, []
@@ -134,12 +141,13 @@ def s2(rows, dwell, step_ms, tail, period, waves):
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("out", type=Path)
-    p.add_argument("--rows", type=int, default=52, help="S2a lanes a DP rank (groups)")
+    p.add_argument("--rows", type=int, default=56, help="S2a lanes a DP rank (groups)")
     p.add_argument("--dwell", type=float, default=40.0, help="seconds a decode rung")
-    p.add_argument("--tail", type=float, default=15.0, help="seconds at 3, 2, 1 busy ranks")
+    p.add_argument("--tail", type=float, default=10.0, help="seconds at 3, 2, 1 busy ranks")
+    p.add_argument("--spread", default="0.55,0.8,1.2,1.45", help="a group's member sizes")
     p.add_argument("--step-ms", type=json.loads, default=None, help="{rung: ms} over STEP_MS")
     p.add_argument("--period", type=float, default=7.5, help="seconds between probe waves")
-    p.add_argument("--waves", type=int, default=0, help="probe waves (0: 80 %% of the ramp)")
+    p.add_argument("--waves", type=int, default=0, help="probe waves (0: the ramp's)")
     a = p.parse_args(argv)
     step_ms = STEP_MS | {int(k): float(v) for k, v in (a.step_ms or {}).items()}
     s1 = [
@@ -148,7 +156,10 @@ def main(argv=None) -> None:
         for i, f in enumerate(S1_FIRST)
     ]
     s0 = [trace(f"rc-s0-{i}", [(0.0, BLOCK * blocks(100_000), 64)]) for i in range(RANKS)]
-    lanes, plan = s2(a.rows, a.dwell, step_ms, a.tail, a.period, a.waves)
+    spread = sorted(map(float, a.spread.split(",")))
+    if len(spread) != RANKS:
+        p.error(f"--spread names {len(spread)} sizes, one a member of {RANKS}")
+    lanes, plan = s2(a.rows, a.dwell, step_ms, a.tail, spread, a.period, a.waves)
     a.out.mkdir(parents=True, exist_ok=True)
     segments = {"s0": (s0, RANKS), "s1": (s1, 1), "s2": (lanes, len(lanes))}
     for name, (traces, _) in segments.items():

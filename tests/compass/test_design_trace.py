@@ -80,13 +80,18 @@ def test_s0_and_s1_are_the_recipe_s(made):
 
 def test_the_ladder_holds_every_rung_and_ends_a_group_a_row(made):
     dt, segments, plan = made
-    rows = 52
+    rows = 56
     lanes = [t for t in segments["s2"] if t["id"].startswith("rc-s2a")]
     assert len(lanes) == 4 * rows
     groups = [lanes[i : i + 4] for i in range(0, len(lanes), 4)]
     outs = [[m["requests"][0]["out"] for m in g] for g in groups]
     for g, out in zip(groups[:-1], outs):
-        assert len({m["requests"][0]["in"] for m in g}) == 1 and len(set(out)) == 1
+        assert len(set(out)) == 1
+    # Members smallest first, each its share of the group's prompt, under the cap.
+    for g, base in zip(groups, dt.prompts(rows)):
+        sizes = [m["requests"][0]["in"] for m in g]
+        assert sizes == sorted(sizes) and sizes[0] < sizes[-1] and max(sizes) <= dt.CAP
+        assert sizes == [min(dt.CAP, 64 * round(base * f / 64)) for f in (0.55, 0.8, 1.2, 1.45)]
     firsts = [o[0] for o in outs]
     assert firsts == sorted(firsts) and len(set(firsts)) == rows
     assert outs[-1] == sorted(set(outs[-1])) and outs[-1][0] == firsts[-1]
@@ -99,16 +104,16 @@ def test_the_ladder_holds_every_rung_and_ends_a_group_a_row(made):
 
 
 def test_the_prompt_mix_spans_its_bands(made):
-    _, segments, _ = made
-    first = [t["requests"][0]["in"] for t in segments["s2"] if "s2a" in t["id"]][::4]
+    dt, _, _ = made
+    first = dt.prompts(56)
     k = 1024
-    assert 8 * k <= min(first) and max(first) <= 760 * k
-    bands = [sum(lo <= x < hi for x in first) for lo, hi in ((0, 64 * k), (64 * k, 320 * k), (320 * k, 10**9))]
-    assert bands == [21, 21, 10]
+    assert 8 * k <= min(first) and max(first) <= 600 * k
+    bands = [sum(lo <= x < hi for x in first) for lo, hi in ((0, 64 * k), (64 * k, 256 * k), (256 * k, 10**9))]
+    assert bands == [22, 23, 11]
     # Any eight consecutive groups in the end order reach every band.
     for i in range(len(first) - 8):
         window = first[i : i + 8]
-        assert min(window) < 64 * k and max(window) >= 320 * k
+        assert min(window) < 64 * k and max(window) >= 256 * k
 
 
 def test_probe_lanes_join_every_even_wave_and_one_group_s_odd_ones(made):
@@ -138,6 +143,6 @@ def test_the_plan_counts_what_is_written_and_a_second_run_writes_the_same(made, 
 
 
 def test_step_times_and_rows_reshape_the_ladder(tmp_path):
-    _, segments, plan = _made(tmp_path, "--rows", "56", "--step-ms", '{"64": 80}', "--waves", "4")
-    assert sum("s2a" in t["id"] for t in segments["s2"]) == 4 * 56
+    _, segments, plan = _made(tmp_path, "--rows", "52", "--step-ms", '{"64": 80}', "--waves", "4")
+    assert sum("s2a" in t["id"] for t in segments["s2"]) == 4 * 52
     assert plan["decode_steps"]["64"] == 500 and plan["waves"] == 4
