@@ -31,6 +31,10 @@ from test_run_check_side import (
     UNCOVERED,
 )
 from test_run_lacking import served
+
+#: The requirement each side's law in the crs005 pair is calibrated for at its
+#: own key: the decode side's coverage, the prefill side's accuracy.
+COVERAGE_REQUIREMENT = {"prefill": 4, "decode": 3}
 from test_run_lacking_rungs import DPA8
 from test_run_step_grid import DOCUMENT, PLATFORM, deployment, host_laws_key, readings
 
@@ -573,14 +577,16 @@ def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, a
 
     judged = advise(tmp_path, MACHINE, model=str(model), common=common)
 
-    for side, rungs in UNCOVERED.items():
+    # The decode side lacks the rungs its ladder schedules (requirement 3); the
+    # prefill side, a producer, schedules none, so its law is held to accuracy
+    # (requirement 4), where a source of the pair's prefill law states none.
+    for side, requirement in COVERAGE_REQUIREMENT.items():
         found = verdicts(judged, "law", side)
         assert [(v["verdict"], v["requirement"]) for v in found] == [
-            ("calibrate", 3)
+            ("calibrate", requirement)
         ] * 2
-        assert f"{PAIR[side]} has no decode vector for rungs {rungs}, which" in (
-            found[0]["reason"]
-        )
+        uncovered = f"{PAIR[side]} has no decode vector for rungs {UNCOVERED}, which"
+        assert (uncovered in found[0]["reason"]) == (side == "decode")
         (reason,) = {v["reason"] for v in verdicts(judged, "readings", side)}
         assert '"index_cache_dtype": "fp8"' in reason
         assert '"AITER_LOG_LEVEL": "WARNING"' in reason
@@ -617,8 +623,8 @@ def test_a_1p1d_side_runs_under_the_aiter_log_level_deploy_sh_starts_it_with(
 
     # The pair's laws are keyed WARNING: each side finds its own there, else
     # none at its key.
-    requirement = 3 if level == "WARNING" else 1
-    for side in UNCOVERED:
+    for side, own in COVERAGE_REQUIREMENT.items():
+        requirement = own if level == "WARNING" else 1
         found = verdicts(judged, "law", side)
         assert [(v["verdict"], v["requirement"]) for v in found] == [
             ("calibrate", requirement)
