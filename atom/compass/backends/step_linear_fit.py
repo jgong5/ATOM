@@ -110,7 +110,10 @@ The same solver fits the host entry's ``tokenizer`` term on a recorded
 server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
 HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
 requests, ``fixed_s`` from the bursts or else ``idle_s``, and ``bytes`` over every
-request's body.
+request's body. On a prefill-decode deployment's two sides' stamps it fits the
+prefill host entry's ``relay`` term (`fit_relay`): what carrying a prefill's
+response through the router to decode's app call costs per request and per
+byte.
 
 Each equation is divided by its price, from its label until no price moves
 (`_fit_form`), and the coefficients are bound to be
@@ -298,6 +301,12 @@ HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
 #: What a lone HTTP request's intake costs: per request, and per body byte.
 INTAKE_FEATURES = ("idle", "bytes")
+#: What a prefill-decode relay costs a request: per request, and per byte of
+#: the request decode takes in.
+RELAY_FEATURES = ("fixed", "bytes")
+#: Output rows one output thread takes in within this of the row before are
+#: one burst's, the rows of the requests one prefill step finished.
+RELAY_BURST_S = 0.05
 #: What a lone tokenizer call costs: per call, per token, and for a segment
 #: tokenizer call per character its stored-prefix search compared.
 TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
@@ -983,6 +992,55 @@ def fit_intake(paths, calls=None) -> tuple[dict, dict]:
         "p90_s": p90,
     }
     return {"fixed_s": fixed, **term}, report
+
+
+def fit_relay(pairs) -> tuple[dict, dict]:
+    """The prefill host entry's ``relay`` term over `pairs`, each a
+    prefill-decode deployment's prefill and decode intake stamps
+    (`atom.compass.run.INTAKE_RECORD`), stamped on one host's clock, and its
+    report.
+
+    A relayed request leaves prefill's server once its output thread has
+    taken in the last of its output rows, its response carrying the prompt's
+    token ids, and reaches decode's server at the app call of the request the
+    router builds from it, the body that call reads holding those ids. A
+    request's rows come in a burst, its thread taking each within
+    `RELAY_BURST_S` of the one before, and a burst holds every request one
+    prefill step finished: it is sent from its last row's return. On each
+    request alone on the relay (`_alone`), one burst's, the host-law solver
+    fits ``fixed_s + body bytes x per_byte_s`` on the time from that return
+    to its app call over that body's bytes, which ``bytes`` spans. Raises on
+    too few requests alone on it."""
+    took, sizes = [], []
+    for prefill, decode in pairs:
+        threads: dict = {}
+        for e in _stamps(prefill):
+            if e[2] == "out":
+                threads.setdefault(e[6], []).append(e)
+        # Each burst's last row, (start, end), thread by thread.
+        lasts = sorted(
+            (a[0], a[1])
+            for rows in threads.values()
+            for a, b in zip(rows, rows[1:] + [None])
+            if b is None or b[0] - a[1] > RELAY_BURST_S * 1e9
+        )
+        ev = _stamps(decode)
+        calls, _ = _requests(ev)
+        bodies = sorted((e[0], e[3]) for e in ev if e[2] == "body")
+        starts = np.array([b[0] for b in bodies], dtype=np.int64)
+        if not lasts or not calls:
+            continue
+        got, seconds = _alone([a for a, _ in lasts], calls, [b for _, b in lasts])
+        for arrival, ns in zip(got, seconds):
+            # The body its app call reads, the first read after the call.
+            k = int(np.searchsorted(starts, arrival))
+            if k < len(bodies):
+                took.append(ns * 1e-9)
+                sizes.append(bodies[k][1])
+    x = np.column_stack([np.ones(len(sizes)), sizes])
+    (fixed, per_byte), report = _host_law(x, np.array(took), RELAY_FEATURES)
+    term = {"fixed_s": fixed, "per_byte_s": per_byte, "bytes": [min(sizes), max(sizes)]}
+    return term, report
 
 
 #: The host entry's ``hops`` `fit_hops` fits (`atom.compass.run.HOPS`).
