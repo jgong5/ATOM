@@ -49,7 +49,7 @@ from atom.kv_transfer.offload.mooncake_store.keys import (
     store_namespace,
 )
 from atom.model_engine.sequence import SequenceStatus
-from atom.utils import envs
+from atom.utils import clock, envs
 
 logger = logging.getLogger("atom")
 
@@ -506,7 +506,7 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         namespace = store_namespace(config, cfg.chunk_tokens)
         self._store_cfg = cfg
         self._namespace = namespace
-        # time.monotonic() of each request's last lookup; see `_ensure_lookup_pin`.
+        # `clock.now` of each request's last lookup; see `_ensure_lookup_pin`.
         self._looked_up_at: dict[str, float] = {}
         # Failed saves since the last stored one, and when saves may resume.
         self._failed_saves_in_a_row = 0
@@ -593,7 +593,7 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             return 0
         # Stamped before asking: the lease runs from the master's answer. An
         # answer the asynchronous lookup took earlier is as old as its query.
-        self._looked_up_at[sid] = time.monotonic()
+        self._looked_up_at[sid] = clock.now(time.monotonic)
         hit = super()._fresh_tier_lookup(seq, sid)
         started = self._lookup_client.query_started(sid)
         if started is not None and started < self._looked_up_at.get(sid, started):
@@ -623,7 +623,7 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             pending is not None
             and pending[0] is seq
             and looked_up_at is not None
-            and time.monotonic() - looked_up_at <= _LOOKUP_REUSE_S
+            and clock.now(time.monotonic) - looked_up_at <= _LOOKUP_REUSE_S
         ):
             return True
         start = int(spec.hbm_cached_tokens)
@@ -648,7 +648,7 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         self._looked_up_at.pop(sid, None)
 
     def _may_emit_save(self) -> bool:
-        if time.monotonic() < self._saves_paused_until:
+        if clock.now(time.monotonic) < self._saves_paused_until:
             return False
         cap = self._max_pending_saves
         return cap is None or len(self._save_inflight) < cap
@@ -675,7 +675,7 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             _SAVE_RETRY_BASE_S * 2 ** min(self._failed_saves_in_a_row - 1, 16),
         )
         self._saves_paused_until = max(
-            self._saves_paused_until, time.monotonic() + pause
+            self._saves_paused_until, clock.now(time.monotonic) + pause
         )
         return True
 
