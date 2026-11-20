@@ -232,14 +232,21 @@ def test_under_dp_every_rank_runs_the_rung_and_the_middle_runs_beside_uneven_pee
 def test_a_fill_resumes_at_the_last_block_cached_and_a_replaying_hit_one_before(
     tmp_path, model, atom_args, replay
 ):
-    # Every row at 1000 or 1001 tokens, so a session's first fill computes its
-    # prompt, and each later one from the last whole block it shares, 992.
-    record = _record(tmp_path, [[1000] * 20], model=model, atom_args=atom_args)
+    # Every row at 1008 or 1009 tokens, 1008 a whole number of blocks, all of
+    # which a 1008-token prompt leaves cached. A session's first fill computes
+    # its prompt; a later one of 1009 tokens resumes at 1008, and one of 1008,
+    # short of its own last block, at 992, a replaying hit a block before.
+    record = _record(tmp_path, [[1008] * 20], model=model, atom_args=atom_args)
     plan = design(record, 1)
     assert plan["hit_replay"] == replay
-    fills = [t for g in plan["groups"] if g["fill"] for _, t in g["rows"][0]]
-    later = len(fills) - 16
-    assert plan["fill_tokens"] == [sum(fills) - later * (992 - replay)]
+    resumed, filled, computed = {1008: 992, 1009: 1008}, set(), 0
+    for g in plan["groups"]:
+        for i, tokens in g["rows"][0] if g["fill"] else ():
+            later = i in filled
+            computed += tokens - (resumed[tokens] - replay if later else 0)
+            filled.add(i)
+    assert len(filled) == 16
+    assert plan["fill_tokens"] == [computed]
 
 
 def test_rows_ask_forty_steps_and_the_tokenizer_cache_holds_every_prompt(tmp_path):
