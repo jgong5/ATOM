@@ -5420,6 +5420,18 @@
    "mechanism_why": "the put of a relayed send on engine->lmcache:lookup#dpN: the clock owner stamps it here, as it stamps the engine's output queue"
   },
   {
+   "id": "atom/compass/kv/mooncake_store.py::StoreShell._flush::send()::p2p#0",
+   "file": "atom/compass/kv/mooncake_store.py",
+   "symbol": "StoreShell._flush",
+   "call": "send",
+   "expr": "send()",
+   "shape": "p2p",
+   "peer": "process",
+   "why": "on a runtime without LPRuntime.offer, the step loop makes the lookups the engine's input thread offered and the shell queued, before its next clock call",
+   "mechanism": "K4",
+   "mechanism_why": "the engine end of lookup#dpN: the clock owner stamps each offered query as it sends it, at its clock then; #3767's LPRuntime.offer takes this over where the runtime has it"
+  },
+  {
    "id": "atom/compass/kv/mooncake_store.py::StoreShell._send::self._socket(ch).send_multipart([header, pickle.dumps(payload)])::p2p#0",
    "file": "atom/compass/kv/mooncake_store.py",
    "symbol": "StoreShell._send",
@@ -5432,16 +5444,16 @@
    "mechanism_why": "the engine end of lookup#dpN and transfer#dpN: the step loop, the clock owner, stamps each as it sends it; an offer a handler queued is stamped by the owner at its next clock call"
   },
   {
-   "id": "atom/compass/kv/mooncake_store.py::StoreShell._socket::time.sleep(0.05)::sleep#0",
+   "id": "atom/compass/kv/mooncake_store.py::StoreShell._socket::threading.Event().wait(ENDPOINT_LOOK_S)::event_wait#0",
    "file": "atom/compass/kv/mooncake_store.py",
    "symbol": "StoreShell._socket",
-   "call": "time.sleep",
-   "expr": "time.sleep(0.05)",
-   "shape": "sleep",
+   "call": "threading.Event().wait",
+   "expr": "threading.Event().wait(ENDPOINT_LOOK_S)",
+   "shape": "event_wait",
    "peer": "process",
-   "why": "before the shell's first send it waits, in twentieths of a wall second up to a bound, for LP mooncake_store to name the endpoint it serves at",
+   "why": "before the shell's first send it looks, every twentieth of a wall second up to a bound, for LP mooncake_store to name the endpoint it serves at",
    "mechanism": "K9",
-   "mechanism_why": "the LP names its endpoint as it starts, before the engines it serves said READY, so the wait ends before it is read in a run, and no clock moves while it lasts; the wall bound only turns a missing LP into an error naming the file"
+   "mechanism_why": "the LP names its endpoint before its first clock call, so before any grant lets a request reach the engine: the wait ends before it is read in a run, reads no clock and moves none; the bound only turns a missing LP into an error naming the file"
   },
   {
    "id": "atom/compass/kv/mooncake_store.py::StoreShell._take::sock.poll()::poll#0",
