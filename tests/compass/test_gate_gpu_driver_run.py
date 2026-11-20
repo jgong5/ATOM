@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 from test_gate_gpu_verdict_through_pipe import (
+    BASE,
     BASH,
     EXPECT,
     GATE,
@@ -118,6 +119,8 @@ def _run(tmp_path, root, **env_over):
     env["COMPASS_HARNESS_PYTHON"] = env["COMPASS_AIPERF_PYTHON"] = sys.executable
     env["HIP_VISIBLE_DEVICES"] = "4,5,6,7"
     env["RUNS"] = str(root / "runs.txt")
+    # Every compass file, the superset; the scope tests below pass their own.
+    env["COMPASS_GPU_GATE_SCOPE"] = "all"
     env.update(env_over)
     out = subprocess.run(
         [BASH, "-c", f"{root / GATE} 2>&1"],
@@ -251,3 +254,164 @@ def test_which_tests_compass_exit_codes_are_a_completed_run(
     out, verdict = _run(tmp_path, root)
     assert out.returncode == rc, out.stdout[-3000:]
     assert verdict == verdict_is
+
+
+#: A compass test no driver-run input gates, which the CPU gate runs.
+CPU = RECORD + "\n\ndef test_cpu():\n    _record('cpu')\n"
+LIST = "scripts/compass/gpu_gate_driver_run.txt"
+
+
+def _scoped(tmp_path, *listed):
+    root = _tree(tmp_path)
+    (root / "tests/compass/test_cpu.py").write_text(CPU)
+    (root / LIST).write_text("# a comment\n" + "".join(f"{f}\n" for f in listed))
+    return root
+
+
+# An empty COMPASS_GPU_GATE_SCOPE reads as unset. The list names a file this tree
+# lacks, which batch drops, and the smoke, which runs apart and only there.
+@pytest.mark.parametrize(
+    "scope, runs",
+    [
+        ("", ["cctraces tree", "compass", "main"]),
+        ("batch", ["cctraces tree", "compass", "main"]),
+        ("all", ["cctraces tree", "compass", "cpu", "main"]),
+    ],
+)
+def test_batch_runs_only_the_listed_compass_files_and_all_runs_every_one(
+    tmp_path, scope, runs
+):
+    root = _scoped(
+        tmp_path,
+        "tests/compass/test_d.py",
+        "tests/compass/test_gone.py",
+        "tests/compass/test_cctraces_sim_smoke.py",
+    )
+    out, verdict = _run(tmp_path, root, COMPASS_GPU_GATE_SCOPE=scope)
+    assert verdict == "GATE_GPU_RC=0 PASSED", out.stdout[-3000:]
+    ran = (root / "runs.txt").read_text().splitlines()
+    assert sorted(line.rsplit(" ", 2)[0] for line in ran) == runs
+    # The expectation counts what the scope ran.
+    base = BASE["BASE_COMPASS_TESTS"]
+    counted = f"+ ({len(runs) - 1} - {base}) tests/compass, {scope or 'batch'} -"
+    assert counted in out.stdout
+
+
+def test_batch_drops_a_listed_file_left_out_on_the_target(tmp_path):
+    root = _scoped(tmp_path, "tests/compass/test_d.py", "tests/compass/test_cpu.py")
+    (root / "scripts/compass/gpu_gate_skip.txt").write_text(
+        "gfx950 tests/compass/test_cpu.py\n"
+    )
+    out, verdict = _run(tmp_path, root, COMPASS_GPU_GATE_SCOPE="batch")
+    assert verdict == "GATE_GPU_RC=0 PASSED", out.stdout[-3000:]
+    assert "cpu" not in (root / "runs.txt").read_text().split()
+
+
+@pytest.mark.parametrize(
+    "scope, drop, rc, why",
+    [
+        ("some", False, 95, "COMPASS_GPU_GATE_SCOPE=some is neither batch nor all"),
+        ("batch", True, 94, f"{LIST}; nothing was run"),
+    ],
+)
+def test_an_unknown_scope_or_an_unreadable_list_refuses_before_any_test(
+    tmp_path, scope, drop, rc, why
+):
+    root = _scoped(tmp_path, "tests/compass/test_d.py")
+    if drop:
+        (root / LIST).unlink()
+    out, verdict = _run(tmp_path, root, COMPASS_GPU_GATE_SCOPE=scope)
+    assert out.returncode == rc, out.stdout[-3000:]
+    assert why in verdict, verdict
+    assert not (root / "runs.txt").exists()
+
+
+def test_every_file_the_repositorys_list_names_is_a_compass_test_file():
+    lines = (REPO / LIST).read_text().splitlines()
+    listed = [line for line in lines if line.strip() and not line.startswith("#")]
+    assert listed
+    assert [f for f in listed if not f.startswith("tests/compass/test_")] == []
+    assert [f for f in listed if not (REPO / f).is_file()] == []
+
+
+# tests/compass/conftest.py, run over a throwaway tree of its own.
+def _pytest(tmp_path, listed, text):
+    root = tmp_path / "ATOM"
+    (root / "tests/compass").mkdir(parents=True)
+    shutil.copy(REPO / "tests/compass/conftest.py", root / "tests/compass")
+    (root / "tests/compass/test_a.py").write_text(text)
+    (root / "scripts/compass").mkdir(parents=True)
+    (root / LIST).write_text("tests/compass/test_a.py\n" if listed else "")
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "tests/compass",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    ).stdout
+
+
+SKIP = "import pytest\n\n\n@pytest.mark.skip(reason={!r})\ndef test_a():\n    pass\n"
+
+
+# A skip turned into a failure at setup or collection reads as an error, one in
+# the test's body as a failure.
+@pytest.mark.parametrize(
+    "listed, text, summary",
+    [
+        (False, SKIP.format("needs ATOM_COMPASS_SLICE_MODEL"), "1 error"),
+        (True, SKIP.format("needs ATOM_COMPASS_SLICE_MODEL"), "1 skipped"),
+        (False, SKIP.format("a run needs atomesh on PATH"), "1 error"),
+        (False, SKIP.format("needs COMPASS_HARNESS_PYTHON"), "1 error"),
+        (
+            False,
+            (
+                "import pytest\n\n\ndef test_a():\n"
+                "    pytest.skip('needs ATOM_COMPASS_MTP_MODEL')\n"
+            ),
+            "1 failed",
+        ),
+        (False, SKIP.format("needs bash"), "1 skipped"),
+        # The cargo probe's skip names no input: the CPU gate may lack the crates.
+        (
+            False,
+            SKIP.format("cargo cannot resolve atomesh's dependencies"),
+            "1 skipped",
+        ),
+        (
+            False,
+            (
+                "import pytest\n\npytest.skip('a 1P1D cell needs atomesh', "
+                "allow_module_level=True)\n"
+            ),
+            "1 error",
+        ),
+        (
+            False,
+            (
+                "import pytest\n\n\n@pytest.mark.xfail(reason='ATOM_COMPASS_SLICE_MODEL')\n"
+                "def test_a():\n    assert False\n"
+            ),
+            "1 xfailed",
+        ),
+    ],
+)
+def test_a_driver_run_skip_outside_the_list_fails_the_cpu_gate(
+    tmp_path, listed, text, summary
+):
+    out = _pytest(tmp_path, listed, text)
+    assert f"{summary} in" in out, out[-3000:]
+    if summary in ("1 error", "1 failed"):
+        assert (
+            f"tests/compass/test_a.py skipped for want of a driver-run input, but {LIST} does not list it"
+            in out
+        )
