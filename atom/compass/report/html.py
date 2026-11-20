@@ -174,7 +174,9 @@ def _run(run: Path, meta: dict) -> str:
         rows.append(("machine", _spec(run_file)))
     each = sides(run)
     if len(each) > 1:
-        rows.append(("deployment", f"1P1D, KV link {meta.get('kv_link')}"))
+        n = collections.Counter(s.name.rstrip("0123456789") for s in each)
+        shape = f"{n['prefill']}P{n['decode']}D"
+        rows.append(("deployment", f"{shape}, KV link {meta.get('kv_link')}"))
         rows.append(("router", " ".join(meta.get("router") or ["not stated"])))
     else:
         rows.append(("deployment", "one instance"))

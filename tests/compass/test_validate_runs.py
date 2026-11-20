@@ -35,6 +35,7 @@ from atom.compass.validate.runs import (
     _requests,
     grade,
     main,
+    sides,
 )
 
 EXPORT = {
@@ -88,6 +89,34 @@ def _cell(directory, schedule, keys, **export):
         out[name][stat] = value
     (directory / "artifacts" / "profile_export_aiperf.json").write_text(json.dumps(out))
     return directory
+
+
+def test_a_deployment_s_sides_are_each_instance_of_each_side_in_index_order(tmp_path):
+    """deploy.sh names each instance by its index above one of a side
+    (prefill0/, decode1/, ...), beside its command, log and pid files: every
+    one of those directories is a side, and the GPUs are summed over them."""
+    from atom.compass.validate import curves
+
+    run = tmp_path / "run"
+    names = ("prefill2", "prefill0", "prefill1", "decode1", "decode0", "decode10")
+    for name in names:
+        (run / name / "steps").mkdir(parents=True)
+        engine = {"tensor_parallel_size": 1}
+        engine["data_parallel_size"] = 2 if name.startswith("prefill") else 4
+        (run / name / curves.ENGINE_RECORD).write_text(json.dumps(engine))
+        for suffix in (".log", ".sh", ".pid"):
+            (run / (name + suffix)).write_text("")
+    (run / "prefill_extra").mkdir()
+    order = ("prefill0", "prefill1", "prefill2", "decode0", "decode1", "decode10")
+    assert sides(run) == [run / name for name in order]
+    assert curves.gpus(run) == 3 * 2 + 3 * 4
+    # One instance a side keeps its unindexed directories, and a server's own
+    # directory is its one side.
+    one = tmp_path / "one"
+    for side in SIDES:
+        (one / side).mkdir(parents=True)
+    assert sides(one) == [one / side for side in SIDES]
+    assert sides(tmp_path / "server") == [tmp_path / "server"]
 
 
 def test_counts_match_across_runs_whose_request_ids_differ(tmp_path):
