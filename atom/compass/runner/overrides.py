@@ -2091,7 +2091,11 @@ def _group_step_seconds(
             batch.compass_dummy = bool(view.dp_dummy and view.prefill)
         cost = backend.price(view)
         dummy = {EAGER_DP_DUMMY, IDLE_DP_GROUP} & set(cost.treatments)
-        if spec and not cost.draft_terms and not dummy:
+        # A draft whose work on this step is only its draft-KV pass (a producer's output prefill under a draft law
+        # with output_prefill_kv, step_linear's module text) is priced among the target's terms, as `draft.` terms,
+        # and states no draft_terms: that is a priced draft, not a missing one.
+        in_kv = any(t.name.startswith("draft.") for t in cost.terms)
+        if spec and not cost.draft_terms and not in_kv and not dummy:
             name = type(backend).__name__
             raise CostRefused(batch, [Refusal(name, "prices no draft")])
     except CostRefused as refusal:
