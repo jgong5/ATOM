@@ -46,6 +46,8 @@ its header.
 | `gpu_gate_baselines/<target>/gpu_gate_baseline.env` | — | The GPU gate's baseline for one GPU target (`gfx942`, `gfx950`, `gfx1250`), as the `BASE_*` lines `gate_gpu.sh` reads when torch names that target for the first card: the commit measured, its pass and fail counts, how many tests `gpu_gate_skip.txt` left out of the run (`BASE_LEFT_OUT`), and the torch, HIP and AITER versions it ran under. A target with no pair is refused with 93, naming it. Written by `regen_gpu_gate_baseline.sh`; a change is a reviewed edit. |
 | `gpu_gate_baselines/<target>/gpu_gate_known_failures.txt` | — | The known-failing GPU node-ids at the `BASE_COMMIT` of the `gpu_gate_baseline.env` beside it, verbatim, written by `regen_gpu_gate_baseline.sh`. Its line count and `BASE_FAILED` are two statements of one fact; `gate_gpu.sh` refuses to run if they disagree. |
 | `gpu_gate_skip.txt` | — | Hand-written `<target> <test file>` lines, read when torch names that GPU target for the first card: files whose result there the target's pair cannot record, the kinds listed in its header. `gate_gpu.sh` leaves each out, a suite file's collected tests coming off the expected passes and a `tests/compass` file only leaving its run; `regen_gpu_gate_baseline.sh` leaves a suite file out the same way and records the count as `BASE_LEFT_OUT`, which goes back on. A `<target> driver-run` line says that target's nodes hold no driver-run inputs (below). Each line goes when the issue or Ruling above it closes. |
+| `gate_map.sh` | CPU container | `COMPASS_COVERAGE_WHEEL=<coverage.py wheel> scripts/compass/gate_map.sh OUT`: the CPU gate under coverage.py, and to OUT the map `COMPASS_GATE_SELECT` reads, keyed by the tree's commit (below). |
+| `gate_select.py` | either | What a map selects for a tree: `gate_cpu.sh` asks it which test files to deselect, `snapshot.sh` writes the `.compass-select` stamp with it, and `gate_map.sh` starts coverage and builds the map with it. |
 | `_lib.sh` | — | Tree resolution, `PYTHONPATH`, the `import atom` assertion, commit stamp, and the pytest summary parse `gate_gpu.sh` and `regen_gpu_gate_baseline.sh` count with. |
 
 ## Gate a tree with its own `scripts/compass/` — four `test_snapshot_ref.py` failures mean you overlaid
@@ -110,6 +112,37 @@ over the preceding hour gave 41 / 31 / four, 43 / 33 / six and 45 / 35 / seven, 
 they move in both directions as branches are pushed and rebased. The `26` is the
 exposed population and is the figure that justifies this section. "Every tree is
 identical now" is what made the overlay look free.
+
+## Running the test files a diff reaches — `gate_map.sh` and `COMPASS_GATE_SELECT`
+
+Opt-in; without `COMPASS_GATE_SELECT` the gate runs as above. A map is built once per
+tip, from its snapshot, in the CPU container. The wheel is fetched once where `pip`
+reaches PyPI (`pip download --no-deps --only-binary=:all: coverage`):
+
+```
+COMPASS_COVERAGE_WHEEL=<wheel> COMPASS_GATE_SHARDS=16 $T/scripts/compass/gate_map.sh <map>
+```
+
+The map records, per test file, the functions whose bodies it ran in pytest's process
+or in any Python process started under it with the tree on its path, and the tree's `.py`
+files those processes opened and directories they listed, other than to import; what a
+helper under `tests/` reads as it is imported counts for each test file importing it. A process killed
+by a signal other than SIGTERM records nothing. Its run's verdict is not the tree's:
+under coverage a test that waits a set time on a process, or counts what one prints as
+it exits, can fail, and its file holds what ran up to there. A round stages and runs with it:
+`COMPASS_GATE_SELECT=<map> scripts/compass/snapshot.sh <dir>`, then the gate with the same
+variable. The gate prints `select: <n> of <m>, map <sha>` and deselects the rest. A test
+file runs when it ran a function whose body the diff since the map's commit changes; when
+it read a file the diff changes, or listed the directory of one the diff adds; when the
+diff changes it, or a file under `tests/` it imports; or when the map does not hold it. It
+prints `select: whole gate -- <why>` and runs everything when the map's commit is not an
+ancestor of HEAD, the map records no source reads, the snapshot was staged without the
+map, or the diff changes module-level code other than an added import or a new name's
+definition, changes a definition outside its body, adds a method to a class, or touches
+`compass_harness/` (the gate runs an installed copy), a `conftest.py`, `gate_select.py`,
+or a non-Python file outside `atom/compass/design/`. Every process still collects all of `tests/`, so a selection of
+none passes on that collection. A test that reads state an earlier file left, a session
+fixture's or a cache's, is held only by the file that first ran the code.
 
 ## Baselines — two gates, two commits, two provenances
 
