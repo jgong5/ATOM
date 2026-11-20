@@ -596,6 +596,31 @@ def test_an_offer_off_the_step_loop_is_sent_by_the_owner_at_its_next_call(
     engine.finish()
 
 
+def test_an_offer_goes_to_the_runtime_s_owner_stamped_send_where_it_has_one(
+    tmp_path, monkeypatch, factory
+):
+    """#3767's `LPRuntime.offer`: the input thread's offer is handed to it as a
+    callable, which the owner makes at the arrival it was offered at."""
+    engine = Engine(tmp_path, monkeypatch)
+    shell, rt = engine.shell, engine.rt
+    offered = []
+    shell._offer = offered.append  # as `LPRuntime.offer` queues it
+    engine.step()
+    b = _seq(2)
+    b.status = SequenceStatus.WAITING
+    thread = threading.Thread(target=shell._inner.offer_lookups, args=([b],))
+    thread.start()
+    thread.join()
+    assert len(offered) == 1 and not engine.sent and not shell._offered
+    at = rt.now
+    offered.pop()()  # the owner makes it, its clock still at the arrival
+    [(when, ch, (kind, _, _))] = engine.sent
+    assert (when, ch, kind) == (at, "engine->mooncake_store:lookup#dp0", "query")
+    assert shell.counts["offers"] == 1 and shell.counts["offers_late"] == 0
+    _answered(engine, shell._inner._lookup_client, str(b.id))
+    engine.finish()
+
+
 def test_the_store_s_hbm_reserve_is_the_real_worker_s_before_and_after_it_substitutes(
     monkeypatch,
 ):
