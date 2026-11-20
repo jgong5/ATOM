@@ -31,6 +31,7 @@ from atom.compass.backends.step_linear_fit import (
     _intakes,
     fit_host,
     fit_intake,
+    fit_relay,
     fit_tokenizer,
     label_records,
 )
@@ -734,3 +735,44 @@ def test_a_request_given_its_token_ids_takes_its_pool_job_in_with_its_intake(tmp
     assert _intakes(path)[0][-1] == pytest.approx(
         (sizes[-1], expect[-1][1] + 3e-9 * sizes[-1] + 1e-4)
     )
+
+
+def _relayed(directory, sizes, fixed, per_byte, rows=3, others=()):
+    """A prefill-decode deployment's two sides' intake stamps: each request's
+    `rows` output rows on prefill, one per 100 us, then decode's app call for
+    it `fixed + per_byte x bytes` after the last row's return, and its body;
+    `others`, app calls on decode with no output on prefill before them."""
+    pre, dec = [], [_stamp("app", t, t) for t in others]
+    t = 10**12
+    for k, size in enumerate(sizes):
+        t += 10**9
+        for r in range(rows):
+            pre.append(_stamp("out", t + r * 100_000, t + r * 100_000 + 1000, thread=7))
+        back = t + (rows - 1) * 100_000 + 1000
+        app = back + round((fixed + per_byte * size) * 1e9)
+        dec += [_stamp("app", app, app), _stamp("body", app + 100, app + 500, size)]
+        dec += [_stamp("send", app + 900, app + 1000)]
+    for side, lines in (("prefill", pre), ("decode", dec)):
+        (directory / side / "steps").mkdir(parents=True)
+        path = directory / side / "steps" / compass_run.INTAKE_RECORD
+        path.write_text("".join(line + "\n" for line in lines))
+    return [tuple(directory / s / "steps" / compass_run.INTAKE_RECORD for s in SIDES)]
+
+
+SIDES = ("prefill", "decode")
+
+
+def test_the_relay_term_is_fitted_from_prefill_s_last_output_row_to_decode_s_app_call(
+    tmp_path,
+):
+    sizes = np.linspace(20_000, 3_000_000, 12).astype(int).tolist()
+    pairs = _relayed(tmp_path, sizes, 1.5e-3, 11e-9, others=(10**11,))
+    term, report = fit_relay(pairs)
+    assert term["fixed_s"] == pytest.approx(1.5e-3, rel=1e-3)
+    assert term["per_byte_s"] == pytest.approx(11e-9, rel=1e-3)
+    assert term["bytes"] == [sizes[0], sizes[-1]] and report["samples"] == 12
+
+
+def test_a_relay_with_no_request_alone_on_it_is_left_unfitted(tmp_path):
+    with pytest.raises(ValueError, match="0 forwards for 2 coefficients"):
+        fit_relay(_relayed(tmp_path, [], 1.5e-3, 11e-9))

@@ -139,7 +139,12 @@ the characters its stored-prefix search compared, and a ``decode`` in their plac
 token counts outside which a decode is refused and charged 0 s; ``http_intake``,
 ``fixed_s`` and ``per_byte_s``, with ``idle_s`` optional and ``bytes``, the
 ``[lo, hi]`` body bytes it was fitted over, outside which an intake is refused
-and charged 0 s; a term an entry lacks, or every term with no entry, is
+and charged 0 s; a prefill-decode run's prefill entry's ``relay``,
+``fixed_s`` and ``per_byte_s``, with ``bytes`` optional, the time a response
+takes from prefill's server to decode's app call through the router, which
+delays a relayed response past ``router_s`` (`relay`), and which a
+prefill-decode run with no entry stating it names under
+``uncharged_host_terms``; a term an entry lacks, or every term with no entry, is
 charged 0 s and the run summary names it, a kind of tokenizer call as
 ``tokenizer.<kind>`` and a ``segment`` without ``chars_per_s`` as
 ``tokenizer.segment.chars_per_s``, under ``uncharged_host_terms``; ``hops``, the
@@ -403,6 +408,9 @@ SUMMARY_SCHEMA_VERSION = 14
 ATOM_PY = "atom_py"
 #: The terms of a ``host`` entry the frontend charges, each 0 s where it is absent.
 HOST_TERMS = ("http_intake", "tokenizer")
+#: A prefill-decode run's prefill host entry's term pricing the relay of its
+#: response through the router to decode (`relay`).
+RELAY_TERM = "relay"
 #: The kinds of call a ``tokenizer`` term prices, each 0 s where it is absent.
 TOKENIZER_KINDS = ("encode", "encode_batch", "decode", "segment")
 #: A ``host`` entry's ``hops``, each optional and the run-file key of its name:
@@ -671,7 +679,17 @@ def _check_host(path, host: dict) -> None:
     laws, columns = host.get("laws", {}), host.get("columns", {})
     if (
         set(host)
-        - {"laws", "skip", "key", "admit", "hops", "columns", *HOST_TERMS, INGRESS}
+        - {
+            "laws",
+            "skip",
+            "key",
+            "admit",
+            "hops",
+            "columns",
+            *HOST_TERMS,
+            INGRESS,
+            RELAY_TERM,
+        }
         or set(host.get("skip", ())) - set(SEGMENTS)
         or {*laws, *columns} - set(HOST_LAW_KINDS)
         or {s for v in (*laws.values(), *columns.values()) for s in v} - set(SEGMENTS)
@@ -684,8 +702,8 @@ def _check_host(path, host: dict) -> None:
             "columns, mapping them to segments to launch features' coefficients, "
             "admit, three coefficients on a forward's admissions or null, "
             "key, the host key the laws were fitted under, hops, the terms "
-            f"{' and '.join(HOST_TERMS)}, and {INGRESS}, the encoding ingress in "
-            "front of the deployment (atom.compass.ingress)"
+            f"{' and '.join(HOST_TERMS)}, {RELAY_TERM}, and {INGRESS}, the encoding "
+            "ingress in front of the deployment (atom.compass.ingress)"
         )
     if INGRESS in host:
         check_ingress(host[INGRESS], f"{path}: host's {INGRESS}")
@@ -727,6 +745,22 @@ def _check_host(path, host: dict) -> None:
             f"{path}: host's http_intake is {intake!r}; it takes fixed_s and "
             "per_byte_s, and idle_s optional, each a non-negative number, and "
             "bytes optional, the body bytes it was fitted over, [lo, hi]"
+        )
+    term = host.get(RELAY_TERM)
+    hull = term.get("bytes", [0, 0]) if isinstance(term, dict) else None
+    if term is not None and not (
+        _seconds(
+            {k: v for k, v in term.items() if k != "bytes"},
+            {"fixed_s", "per_byte_s"},
+        )
+        and isinstance(hull, list)
+        and _seconds(dict(enumerate(hull)), {0, 1})
+        and hull[0] <= hull[1]
+    ):
+        raise ValueError(
+            f"{path}: host's relay is {term!r}; it takes fixed_s and per_byte_s, "
+            "each a non-negative number, and bytes optional, the bytes of the "
+            "requests it was fitted over, [lo, hi]"
         )
 
 
@@ -3166,6 +3200,24 @@ def http_intake() -> tuple[float, float, float] | None:
     return term["fixed_s"], term["per_byte_s"], term.get("idle_s", term["fixed_s"])
 
 
+def relay() -> tuple[float, float, float] | None:
+    """``(fixed_s, per_byte_s, router_s)``: the relay's time to carry one of
+    this prefill server's responses to decode's app call, from the ``relay``
+    term of its ``host`` entry, the one `tokenizer` resolved among several,
+    and the lookahead of the relay's path through the router, which the
+    channels price already; None on a real run or with no term.
+    `atom.utils.compass_loop.HttpChannel` delays a relayed response of `n`
+    bytes past its channel's lookahead by ``fixed_s + n x per_byte_s -
+    router_s``, where that is positive. A run that is not prefill-decode
+    relays nothing: None."""
+    run = spec()
+    if run is None or "router_s" not in run:
+        return None
+    if (term := _host_term(RELAY_TERM)) is None:
+        return None
+    return term["fixed_s"], term["per_byte_s"], hop(run, "router_s")
+
+
 def http_intake_hull() -> tuple[float, float] | None:
     """The body bytes, ``(lo, hi)``, the ``http_intake`` term `http_intake`
     reads was fitted over, outside which `HttpChannel` refuses a request's
@@ -3175,6 +3227,12 @@ def http_intake_hull() -> tuple[float, float] | None:
 
 
 def _intake_term() -> dict | None:
+    return _host_term("http_intake")
+
+
+def _host_term(name: str) -> dict | None:
+    """The term `name` of this server's ``host`` entry, the one `tokenizer`
+    resolved among several; None on a real run or with no term."""
     run = spec()
     if run is None:
         return None
@@ -3186,7 +3244,7 @@ def _intake_term() -> dict | None:
                 "resolved for this server's: compass_run.tokenizer resolves it"
             )
         host = _frontend_host
-    return host.get("http_intake")
+    return host.get(name)
 
 
 def _fingerprint(tok) -> str | None:
@@ -3775,6 +3833,12 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
             if "segment" in h.get("tokenizer", {})
             and "chars_per_s" not in h["tokenizer"]["segment"]
         }
+        | (
+            {RELAY_TERM}
+            if "router_s" in run
+            and not any(RELAY_TERM in h for h in entries(run, "host"))
+            else set()
+        )
     )
     summary["unmeasured_hops"] = sorted(k for k, v in hops(run).items() if v is None)
     summary["schema_version"] = SUMMARY_SCHEMA_VERSION

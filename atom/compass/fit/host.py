@@ -13,7 +13,10 @@ intake stamps the recorded server wrote beside its steps
 (`step_linear_fit.fit_intake`); and from those stamps, the engine's queue
 handoffs and step lines, and the aiperf raw records beside each client run's
 export (`client_run.RAW`, gzipped or not), its ``hops``
-(`step_linear_fit.fit_hops`). A record whose server did not exit refuses: its
+(`step_linear_fit.fit_hops`). A prefill side's record beside its deployment's
+decode side's, both stamped on one host's clock, also gives the ``relay``
+term (`step_linear_fit.fit_relay`): a prefill response's time through the
+router to decode's app call, which a run delays past ``router_s``. A record whose server did not exit refuses: its
 server's lines are where ``steps/<name>.local`` names (`atom.compass.run.LOCAL`),
 not in its steps. A term the records cannot give, or a kind of
 tokenizer call as ``tokenizer.<kind>`` or a hop as ``hops.<hop>``, is left out
@@ -47,6 +50,7 @@ from atom.compass.backends.step_linear_fit import (
     fit_hops,
     fit_host,
     fit_intake,
+    fit_relay,
     fit_tokenizer,
 )
 from atom.compass.fit import publish
@@ -90,10 +94,18 @@ def host_laws(samples, records=(), client_runs=()) -> tuple[dict, dict]:
     clients = [
         _client(r, [e for d, e in client_runs if Path(d) == Path(r)]) for r in stamped
     ]
+    # A prefill side whose deployment's decode side stamped its intake too.
+    relayed = [
+        (d, sibling)
+        for r, d in zip(stamped, steps)
+        if Path(r).name == SIDES[0]
+        and (sibling := Path(r).parent / SIDES[1] / "steps" / INTAKE_RECORD).is_file()
+    ]
     for term, fit in (
         ("tokenizer", lambda: fit_tokenizer(calls, steps)),
         ("http_intake", lambda: fit_intake(steps, calls)),
         ("hops", lambda: fit_hops(steps, clients)),
+        *([("relay", lambda: fit_relay(relayed))] if relayed else []),
     ):
         try:
             if not steps:

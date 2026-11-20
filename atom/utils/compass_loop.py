@@ -841,7 +841,12 @@ class HttpChannel:
     An LP whose requests come in on a ``relay`` channel reads each one's stamp,
     a cancel's too, from its body's ``kv_transfer_params`` instead. An LP that
     sends on one stamps a send on it for each JSON response whose
-    ``kv_transfer_params`` is an object, and writes the stamp there.
+    ``kv_transfer_params`` is an object, and writes the stamp there; with a
+    ``relay`` term in its host entry (`atom.compass.run.relay`), the send
+    arrives that term's time, less ``router_s``, past the channel's lookahead,
+    where that is positive, for the bytes of decode's request, which the
+    router builds from the client's request and the prompt's token ids on the
+    response: the two bodies' bytes.
 
     During the run, each event of a ``text/event-stream`` response body leaves
     with a comment line carrying its stamp on the LP's stream channel
@@ -866,10 +871,11 @@ class HttpChannel:
     """
 
     def __init__(self, app, stamp) -> None:
-        from atom.compass.run import http_intake, http_intake_hull
+        from atom.compass.run import http_intake, http_intake_hull, relay
 
         self.app, self.stamp = app, stamp
         self.intake, self.hull = http_intake(), http_intake_hull()
+        self.relay = relay()
         self.intake_end = -math.inf  # the LP time the last intake ended
         # http seq -> its hang-up, for each stamped request the app is serving
         self.hangups: dict[int, asyncio.Event] = {}
@@ -877,12 +883,13 @@ class HttpChannel:
     async def __call__(self, scope, receive, send):
         rt = clock.installed()
         relay_in = relay_out = hangup = None
+        taken = [0]  # the request's body bytes, once taken in
         if rt is not None and scope["type"] == "http":
             relay_in = _relay(rt.table.channels_into(rt.me))
             relay_out = _relay(rt.table.channels_from(rt.me))
             send = _stamping_events(send, rt)
         if relay_out is not None:
-            send = _stamping(send, rt, relay_out)
+            send = _stamping(send, rt, relay_out, self.relay, taken)
         if relay_in is not None:
             body, receive = await _read_body(receive)
             got = relay_stamp(body)
@@ -924,11 +931,11 @@ class HttpChannel:
                     # still waits on the socket.
                     body = await reading
                     cancelled = cancel_seq(body[0].get("body", b""))
+                    nbytes = taken[0] = sum(len(m.get("body", b"")) for m in body)
                     if self.intake is not None and cancelled is None:
                         fixed, per_byte, idle = self.intake
                         if arrival >= self.intake_end:
                             fixed = idle
-                        nbytes = sum(len(m.get("body", b"")) for m in body)
                         lo, hi = self.hull or (0, math.inf)
                         if lo <= nbytes <= hi:
                             charge(fixed + per_byte * nbytes)
@@ -1080,9 +1087,14 @@ def _stamping_events(send, rt):
     return stamping
 
 
-def _stamping(send, rt, ch: str):
+def _stamping(send, rt, ch: str, relay=None, taken=(0,)):
     """`send`, holding a JSON response back until its body is whole, to stamp it
-    for `ch`."""
+    for `ch`; with `relay`, `atom.compass.run.relay`'s ``(fixed_s, per_byte_s,
+    router_s)``, arriving ``fixed_s + bytes x per_byte_s - router_s`` past the
+    channel's lookahead where that is positive. ``bytes`` are those of the
+    request the router builds for decode from the client's request, whose
+    body's bytes `taken` holds, and this response's prompt token ids: the
+    two bodies' bytes."""
     start, chunks = None, []
 
     async def stamping(message):
@@ -1098,7 +1110,12 @@ def _stamping(send, rt, ch: str):
         chunks.append(message.get("body", b""))
         if message.get("more_body", False):
             return
-        body = with_relay_stamp(b"".join(chunks), lambda: rt.stamp_send(ch))
+        raw, at = b"".join(chunks), None
+        if relay is not None:
+            fixed_s, per_byte_s, router_s = relay
+            extra = fixed_s + (taken[0] + len(raw)) * per_byte_s - router_s
+            at = rt.now + rt.table.lookahead(ch) + extra if extra > 0 else None
+        body = with_relay_stamp(raw, lambda: rt.stamp_send(ch, at))
         headers = [(k, v) for k, v in start["headers"] if k != b"content-length"]
         headers.append((b"content-length", str(len(body)).encode()))
         await send({**start, "headers": headers})
