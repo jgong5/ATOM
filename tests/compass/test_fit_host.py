@@ -697,3 +697,40 @@ def test_the_segment_term_takes_what_its_stored_prefix_search_compared(tmp_path)
     term, why = segment(zero)
     assert set(term) == {"fixed_s", "tokens_per_s"}
     assert why == "the records give no time per compared character"
+
+
+def test_a_request_given_its_token_ids_takes_its_pool_job_in_with_its_intake(tmp_path):
+    # A prefill-decode decode side's requests: no template, and a pool job
+    # that builds the sequence and calls no tokenizer, which no tokenizer law
+    # prices, so its wall joins the loop's CPU time. One whose job encodes
+    # (a text prompt) leaves its job to the tokenizer laws.
+    t, cpu, lines, expect, calls = 10**12, 0, [], [], [TOKENIZER]
+    for k, size in enumerate(np.linspace(30_000, 900_000, 6).astype(int).tolist()):
+        t += 10**9
+        loop, job = round((IDLE + PER_BYTE * size) * 1e9), 100_000 + 3 * size
+        p, e = t + 10_000, t + 20_000 + job
+        lines += [
+            _stamp("app", t, t, cpu=(cpu, cpu)),
+            _stamp("body", t + 1000, t + 2000, size, (cpu + 1000, cpu + 2000)),
+            _stamp("wait", p - 1000, p + job + 1000, 0, (cpu + 5000,) * 2),
+            _stamp("prep", p, p + job, thread=POOL[k % 2]),
+            _stamp("send", e, e + 10_000, 0, (cpu, cpu + loop)),
+        ]
+        encodes = k == 5
+        if encodes:
+            calls.append(
+                {"call": "encode", "tokens": 9, "items": 1, "thread": POOL[k % 2]}
+                | {"t_start_ns": p + 10, "t_end_ns": p + 20}
+            )
+        expect.append((size, (loop + (0 if encodes else job)) * 1e-9))
+        cpu += loop + 10**6
+    path = tmp_path / compass_run.INTAKE_RECORD
+    path.write_text("\n".join(lines) + "\n")
+    record = tmp_path / compass_run.TOKENIZER_RECORD
+    record.write_text("".join(json.dumps(c) + "\n" for c in calls))
+    lone, bursts, sizes = _intakes(path, record)
+    assert lone == pytest.approx(expect) and not bursts and len(sizes) == 6
+    # With no tokenizer record, no job is known to have called one.
+    assert _intakes(path)[0][-1] == pytest.approx(
+        (sizes[-1], expect[-1][1] + 3e-9 * sizes[-1] + 1e-4)
+    )
