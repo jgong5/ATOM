@@ -338,6 +338,33 @@ def test_graded_only_drops_a_later_client_run_s_warmup_after_the_window_starts(
     assert graded_config == config
 
 
+def test_graded_only_cuts_each_rank_s_dummy_forwards_to_the_graded_steps(
+    tmp_path, monkeypatch
+):
+    from atom.compass.fit import samples as fit_samples
+
+    a = record(tmp_path, monkeypatch, groups=((0, 1), (2, 3), (4, 5)))
+    runs = [client_run([0, 1]), client_run([4, 5])]
+    labelled = fit_samples.label_run
+    steps = tuple((n, None, {}, {}) for n in range(64))
+
+    def planted(*args):
+        return [
+            ([dataclasses.replace(s, dummy_host=steps) for s in got], table)
+            for got, table in labelled(*args)
+        ]
+
+    monkeypatch.setattr(fit_samples, "label_run", planted)
+    every = load({a: runs})[0]
+    assert all(s.dummy_host == steps for s in every)
+    monkeypatch.setenv(GRADED_ONLY_ENV, "1")
+    graded = load({a: runs})[0]
+    kept = graded_steps(served(a / "steps", runs))
+    assert graded and kept < {n for n, *_ in steps}
+    for s in graded:
+        assert [n for n, *_ in s.dummy_host] == sorted(kept)
+
+
 def test_graded_only_keeps_a_step_holding_warmup_and_sent_requests_together(
     tmp_path, monkeypatch
 ):

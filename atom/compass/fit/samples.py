@@ -32,8 +32,9 @@ spans held 69% of the prefill device seconds that cut kept, and ran about 5%
 faster than graded steps of the same features. With `GRADED_SECONDS_ENV`
 also set to a number of seconds, they end that long after the first graded step
 entered (`graded_to`): a calibration timed on a shorter window, fitted from
-the same record. Its host laws' tokenizer, intake and hop terms still read the
-record's whole stamp files.
+the same record. A sample's `dummy_host`, its rank's dummy forwards at a step
+its group prefills, is cut to the same steps. Its host laws' tokenizer, intake
+and hop terms still read the record's whole stamp files.
 
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
@@ -202,17 +203,27 @@ def _record(
     files = sorted(steps.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
     name, samples = ", ".join(map(digest, files)), []
     for got, _ in label_run(files, name, _split, floored):
+        dummies = None
         for s in got:
             if graded is not None and s.step not in graded:
                 continue
             if graded_to is not None and s.step >= graded_to:
                 continue
+            if dummies is None:  # the rank's dummy forwards, cut alike
+                dummies = tuple(
+                    d
+                    for d in s.dummy_host
+                    if (graded is None or d[0] in graded)
+                    and (graded_to is None or d[0] < graded_to)
+                )
             at = traces[s.rank, s.step]
             traced = {**s.provenance, "traces": at, "profiled": run["profiled"]}
             if stated is not None and (key := traced["config"]) is not None:
                 graphs = {k: v for k, v in key["engine"].items() if k == GRAPHS}
                 traced["config"] = {**key, "engine": engine | graphs}
-            samples.append(dataclasses.replace(s, provenance=traced))
+            samples.append(
+                dataclasses.replace(s, provenance=traced, dummy_host=dummies)
+            )
     host = run["host_key"]
     return samples, {
         **fields,
