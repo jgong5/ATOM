@@ -109,6 +109,11 @@ class TrafficLP:
         ctx = zmq.asyncio.Context.instance()
         self._pub = ctx.socket(zmq.XPUB)
         self._pub.setsockopt(zmq.XPUB_VERBOSE, 1)
+        # A PUB socket drops what passes its high-water mark, 1000 messages a
+        # subscriber by default, and a worker whose stamp is dropped never
+        # sends its request: the run waits for it for ever. One instant can
+        # stamp a request a lane, 1228 at the C1228 recipe's concurrency.
+        self._pub.setsockopt(zmq.SNDHWM, 0)
         self._pub.bind(stamps)
         self._pull = ctx.socket(zmq.PULL)
         self._pull.bind(reports)

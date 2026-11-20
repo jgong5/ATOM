@@ -39,6 +39,19 @@ def addresses(prefix: str) -> tuple[str, str]:
     return f"ipc://{prefix}.stamps", f"ipc://{prefix}.reports"
 
 
+def stamp_subscriber(ctx, stamps: str):
+    """A worker's socket for the traffic LP's stamps at `stamps`, taking every
+    one: a SUB socket drops what passes its receive high-water mark, 1000
+    messages by default, as a PUB drops what passes its send mark, and a
+    worker whose stamp is dropped never sends its request, so the run waits
+    for it for ever (`TrafficLP` lifts its own mark)."""
+    sub = ctx.socket(zmq.SUB)
+    sub.setsockopt(zmq.RCVHWM, 0)
+    sub.connect(stamps)
+    sub.subscribe(b"")
+    return sub
+
+
 def credit_key(phase, phase_index, num) -> tuple:
     """A credit's key: credit numbers restart in each phase."""
     return str(phase), phase_index, num
@@ -67,9 +80,7 @@ class CompassTransport(AioHttpTransport):
             )
         stamps, reports = addresses(prefix)
         ctx = zmq.asyncio.Context.instance()
-        self._sub = ctx.socket(zmq.SUB)
-        self._sub.connect(stamps)
-        self._sub.subscribe(b"")
+        self._sub = stamp_subscriber(ctx, stamps)
         self._push = ctx.socket(zmq.PUSH)
         self._push.connect(reports)
         self._reader = asyncio.create_task(self._read_stamps())
