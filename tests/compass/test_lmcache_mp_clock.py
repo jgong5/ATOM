@@ -151,3 +151,19 @@ def test_a_blocking_lookup_times_out_on_the_lp_clock(lp, monkeypatch, submitted)
 
     assert client.lookup([1] * 8, lookup_id="r") is None
     assert adapter.looks == 5
+
+
+def test_the_owned_lookup_driver_offers_one_pass_the_owner_makes():
+    from atom.compass.kv.lmcache_mp import _OwnedDriver
+
+    offered, passes = [], []
+    rt = SimpleNamespace(offer=offered.append)
+    client = SimpleNamespace(_drive=passes.append)
+    driver = _OwnedDriver(rt, client, 4)
+    driver.notify()
+    driver.notify()  # one pass sends whatever both offers queued
+    assert len(offered) == 1 and passes == []
+    offered.pop()()
+    assert passes == [4]
+    driver.notify()
+    assert len(offered) == 1

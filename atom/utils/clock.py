@@ -52,6 +52,10 @@ every stamped frame it reads, holds a frame back until `is_released`, and
 brackets handing one to ATOM with `handed_over` and `back_at_wait_point`. The
 send side stamps each frame with `stamp_send`, directly or through the
 `RelayQueue` that stands in for the engine's output queue.
+
+A handler, or a thread a handler wakes, that would send instead `offer`s the
+send: the owner makes it once the handler is back at its wait point, stamped at
+the arrival of the message the handler was given, before it releases the next.
 """
 
 import contextlib
@@ -207,6 +211,8 @@ class LPRuntime:
         # Whether the owner holds work a bounded poll must not idle past: then
         # the poll's bound is an essential deadline, else a daemon one.
         self.holds_work = lambda: False
+        # Sends offered off the owner (`offer`), in order, not yet made.
+        self.offers: list = []
 
     def start_run(self) -> None:
         self.in_run = True
@@ -245,6 +251,30 @@ class LPRuntime:
             arrival = self.now + self.table.lookahead(ch) if at is None else at
             self.send_log.append((ch, seq, arrival))
         return arrival, seq
+
+    def offer(self, send) -> None:
+        """Queue `send`, a call that sends on this LP's channels, for the clock
+        owner, which alone stamps a send: a handler's offer runs once the handler
+        is back at its wait point, the clock still at the arrival of the message
+        it was given, before the next one is released; any other offer, the
+        owner's own included, runs at the owner's next clock call. Outside the
+        run nothing is stamped, and `send` runs now, on the caller."""
+        if not self.in_run:
+            send()
+            return
+        with self.lock:
+            self.offers.append(send)
+
+    def _make_offers(self) -> None:
+        """The owner makes every offered send, in order; the caller holds
+        `lock`, which each send takes itself."""
+        while self.offers:
+            send = self.offers.pop(0)
+            self.lock.release()
+            try:
+                send()
+            finally:
+                self.lock.acquire()
 
     def advance_to(self, T: float, *later: float) -> None:
         """Price an event: block until granted `T`, releasing what arrives up
@@ -390,6 +420,7 @@ class LPRuntime:
         self, kind: str, t: float, t_daemon: float, ahead: bool = False, rounds=()
     ) -> None:
         with self.lock:
+            self._make_offers()
             log, self.send_log = self.send_log, []
         steps, self.steps = self.steps, []
         self.calls += 1
@@ -402,6 +433,7 @@ class LPRuntime:
         """Answer a call below the ceiling, as the authority would: walk the
         messages sent ahead up to `G`, and keep the step for the next call."""
         with self.lock:
+            self._make_offers()
             sent = len(self.send_log)
         self.steps.append((kind, t, G, sent))
         self.calls += 1
@@ -468,6 +500,7 @@ class LPRuntime:
                         )
                         reported = True
                         self.diagnostics += 1
+                self._make_offers()  # stamped at `a`, before the next release
             self.now = G
             late = [(a, ch, s) for (ch, s), a in self.unreleased.items() if a < G]
             if late:

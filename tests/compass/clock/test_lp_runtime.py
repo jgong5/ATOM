@@ -253,6 +253,55 @@ def test_a_send_or_clock_call_off_the_owner_thread_is_refused():
     assert rt.send_log == [] and rt.conn.sent == []
 
 
+def test_a_handlers_offer_is_sent_by_the_owner_at_its_arrival_before_the_next():
+    rt, call = _runtime(ENGINE, (10.2, {REQ: [(0, 10.1), (1, 10.15)]}), (10.3, {}))
+    rt.start_run()
+    made, seen = [], []
+
+    def send():
+        made.append((threading.current_thread(), rt.stamp_send(OUT), len(seen)))
+
+    handler = _receiver(rt, REQ, 2, seen, lambda: len(seen) == 1 and rt.offer(send))
+    call(rt.advance_to, 10.2)
+    assert made == [(rt.owner, (10.1 + IPC, 0), 1)]
+    call(rt.advance_to, 10.3)
+    assert rt.conn.sent[1] == ("TAR", 10.3, [(OUT, 0, 10.1 + IPC)], INF)
+    handler.join(5)
+    assert rt.refusals == []
+
+
+def test_an_offer_no_handler_brackets_is_made_at_the_owners_next_call():
+    rt, call = _runtime(ENGINE, (0.5, {}), (0.7, _under(0.9)), (1.0, {}))
+    rt.start_run()
+    call(rt.advance_to, 0.5)
+    rt.offer(lambda: rt.stamp_send(OUT))  # a thread no release waits on
+    call(rt.offer, lambda: rt.stamp_send(OUT))  # the owner's own
+    assert rt.send_log == []
+    call(rt.next_event, 0.7)
+    assert rt.conn.sent[1] == (
+        "NER",
+        0.7,
+        [(OUT, 0, 0.5 + IPC), (OUT, 1, 0.5 + IPC)],
+        INF,
+    )
+    rt.offer(lambda: rt.stamp_send(OUT))
+    call(rt.advance_to, 0.8)  # below the ceiling: its step counts the send
+    call(rt.advance_to, 1.0)
+    assert rt.conn.sent[2][2:] == (
+        [(OUT, 2, 0.7 + IPC)],
+        INF,
+        [("TAR", 0.8, 0.8, 1)],
+        False,
+    )
+
+
+def test_outside_the_run_an_offer_is_made_at_once_unstamped():
+    rt, _ = _runtime(ENGINE)
+    made = []
+    rt.offer(lambda: made.append(threading.current_thread()))
+    assert made == [threading.current_thread()] and rt.offers == []
+
+
 def test_a_duplicate_seq_is_refused():
     rt, _ = _runtime(ENGINE)
     rt.check_arrival(REQ, 1.0, 3)
