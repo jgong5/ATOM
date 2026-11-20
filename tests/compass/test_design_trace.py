@@ -22,11 +22,12 @@ def _module():
 def _made(out: Path, *args):
     dt = _module()
     dt.main([str(out), *args])
+    plan = json.loads((out / "plan.json").read_text())
     segments = {
         name: [json.loads(x) for x in (out / f"{name}.jsonl").read_text().splitlines()]
-        for name in ("s0", "s1", "s2")
+        for name in plan["segments"]
     }
-    return dt, segments, json.loads((out / "plan.json").read_text())
+    return dt, segments, plan
 
 
 @pytest.fixture(scope="module")
@@ -146,3 +147,20 @@ def test_step_times_and_rows_reshape_the_ladder(tmp_path):
     _, segments, plan = _made(tmp_path, "--rows", "52", "--step-ms", '{"64": 80}', "--waves", "4")
     assert sum("s2a" in t["id"] for t in segments["s2"]) == 4 * 52
     assert plan["decode_steps"]["64"] == 500 and plan["waves"] == 4
+
+
+def test_s3_holds_eight_sessions_a_rank_of_growing_context(made):
+    _, segments, plan = made
+    assert list(plan["segments"]) == ["s0", "s1", "s2", "s3"]
+    s3 = segments["s3"]
+    assert plan["segments"]["s3"]["concurrency"] == len(s3) == 32
+    first = [t["requests"][0]["in"] for t in s3]
+    assert first == sorted(first) and first[0] // 1024 == 8 and first[-1] // 1024 < 256
+    assert {len(t["requests"]) for t in s3} == {40}
+    gaps = {round(b["t"] - a["t"], 3) for t in s3 for a, b in zip(t["requests"], t["requests"][1:])}
+    assert gaps == {0.5, 1.0, 1.5, 3.0}
+
+
+def test_no_s3_leaves_it_out(tmp_path):
+    _, segments, plan = _made(tmp_path, "--s3", "0")
+    assert list(plan["segments"]) == list(segments) == ["s0", "s1", "s2"]

@@ -4,9 +4,11 @@
 
     design_trace.py OUT [--rows 56] [--dwell 40] [--tail 10] [--step-ms JSON]
                         [--spread 0.55,0.8,1.2,1.45] [--period 7.5] [--waves N]
+                        [--s3 32] [--s3-turns 40]
 
-Writes OUT/s0.jsonl, s1.jsonl and s2.jsonl, one trace a line as TRACES holds them,
-and OUT/plan.json: each segment's traces (its concurrency and --num-conversations),
+Writes OUT/s0.jsonl, s1.jsonl, s2.jsonl and s3.jsonl, one trace a line as TRACES
+holds them, and OUT/plan.json: each segment, in the order the server runs them, with
+its traces (its concurrency and --num-conversations),
 requests and S2's decode-step schedule. Every prompt is whole 64-token blocks and a
 follow-up turn's hash_ids extend its previous turn's, so it hits the prefix cache.
 Under aiperf's base mode with trajectory start ratios 0 a trace's first turn is sent
@@ -30,6 +32,9 @@ the previous turn's response ends (no `api_time` is written), as the dry run che
       history, sent with S2a; then waves PERIOD apart: even waves every lane, odd
       ones k = 1..4 members of one group (k ranks prefilling), each turn a delta
       of 128..32k (64k more every 4th turn of a 16k lane) and out 16/128.
+  S3  S3 lanes (8 a rank), first prompt 8k..256k, then S3_TURNS turns of delta
+      256..4k, out 64..1024, 0.5..3 s apart: rungs 1..8 under ever other mixes,
+      as low-concurrency agentic runs hold them, which the ladder passes once.
 """
 
 import argparse
@@ -46,6 +51,7 @@ CAP = 880 * K  # a prompt, under the model's 1M context with the longest output
 S1_FIRST, S1_DELTA, S1_OUT = (2, 16, 64, 200, 400, 700), (128, K, 4 * K, 16 * K), (32, 512)
 PROBE_FIRST, PROBE_OUT = (16, 96, 256, 512), (16, 128)
 PROBE_DELTA = (128, 512, 2 * K, 8 * K, 32 * K)
+S3_DELTA, S3_OUT, S3_GAP = (256, K, 4 * K, 2 * K, 512), (64, 256, 1024, 128), (0.5, 1.5, 3.0, 1.0)
 
 
 def blocks(n: int) -> int:
@@ -138,6 +144,19 @@ def s2(rows, dwell, step_ms, tail, spread, period, waves):
     return lanes, plan
 
 
+def s3(lanes: int, turns: int) -> list:
+    """S3's sessions: lane i's first prompt the (i + 1/2)/lanes quantile of
+    log-uniform 8k..256k, its turns' delta, out and gap cycling apart."""
+    return [
+        trace(f"rc-s3-{i:02d}", session(
+            BLOCK * round(8 * K * 32 ** ((i + 0.5) / lanes) / BLOCK),
+            [(S3_GAP[(i + j) % 4], S3_DELTA[(i + j) % 5], S3_OUT[(i + 2 * j) % 4])
+             for j in range(1, turns)],
+            S3_OUT[i % 4]))
+        for i in range(lanes)
+    ]
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("out", type=Path)
@@ -148,6 +167,8 @@ def main(argv=None) -> None:
     p.add_argument("--step-ms", type=json.loads, default=None, help="{rung: ms} over STEP_MS")
     p.add_argument("--period", type=float, default=7.5, help="seconds between probe waves")
     p.add_argument("--waves", type=int, default=0, help="probe waves (0: the ramp's)")
+    p.add_argument("--s3", type=int, default=32, help="S3 lanes (0: no S3)")
+    p.add_argument("--s3-turns", type=int, default=40, help="turns an S3 session")
     a = p.parse_args(argv)
     step_ms = STEP_MS | {int(k): float(v) for k, v in (a.step_ms or {}).items()}
     s1 = [
@@ -162,6 +183,8 @@ def main(argv=None) -> None:
     lanes, plan = s2(a.rows, a.dwell, step_ms, a.tail, spread, a.period, a.waves)
     a.out.mkdir(parents=True, exist_ok=True)
     segments = {"s0": (s0, RANKS), "s1": (s1, 1), "s2": (lanes, len(lanes))}
+    if a.s3:
+        segments["s3"] = (s3(a.s3, a.s3_turns), a.s3)
     for name, (traces, _) in segments.items():
         (a.out / f"{name}.jsonl").write_text("".join(json.dumps(t) + "\n" for t in traces))
     plan |= {"step_ms": step_ms, "args": {k: str(v) for k, v in vars(a).items()}}
