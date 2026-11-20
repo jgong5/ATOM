@@ -387,7 +387,7 @@ class StoreShell:
         self._held = None  # what the ranks reported at the previous call
         self._socks: dict = {}  # channel -> its DEALER
         self._read: dict = {}  # reply seq -> (arrival, payload), untaken
-        self._calls: dict = {}  # call id -> (kind, fn, args, future)
+        self._calls: dict = {}  # call id -> (kind, fn, args, future, keys)
         self._ids = itertools.count()
         # Per lookup id, its last reply's lease deadline and present keys.
         self._leases: collections.OrderedDict = collections.OrderedDict()
