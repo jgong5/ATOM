@@ -7,8 +7,8 @@ share-cache recipe's form (`-tp 2 --enable-dp-attention`, `--dp-load-balance
 share_cache`) and one decode instance at DP2, through `pd_sim.sh`, under a
 constant step stub. Each prefill side's environment (`PREFILL_ENV`) selects
 ``ATOM_KV_OFFLOAD=mooncake_store``; the run file's entry states declared laws,
-a lease of `TTL_MS` and a Store of `CAPACITY_CHUNKS` chunks, small enough to
-evict. The router LP takes the prefill instances in turn.
+a lease of `TTL_MS` and a Store of `CAPACITY_CHUNKS` chunks whose rounds run
+above `MARK`, small enough to evict. The router LP takes the prefill instances in turn.
 
 The workload (`TIMES`): a family-0 prompt, saved by the instance that serves
 it; the same prompt on the other instance, which loads it from the Store;
@@ -82,7 +82,11 @@ CHUNK = 256
 CHUNK_BYTES = 2 * 211200
 POOL_MIB = 64
 SLOTS = (POOL_MIB << 20) // (-(-CHUNK_BYTES // 4096) * 4096)
-CAPACITY_CHUNKS = 12
+CAPACITY_CHUNKS = 24
+#: Rounds run above half the Store, so each family's put, at most a few
+#: chunks, fits in what a round leaves: a put the capacity cannot hold is
+#: refused (Mooncake fails it, and ATOM's failed-save path is not modelled).
+MARK = 0.5
 TTL_MS = 100
 STORE_EXTRA = {
     "mooncake_store.master": "127.0.0.1:26051",
@@ -121,17 +125,17 @@ ENTRY = {
         "--rpc_port=26051",
         "--rpc_thread_num=32",
         f"--default_kv_lease_ttl={TTL_MS}",
-        "--eviction_high_watermark_ratio=0.90",
+        f"--eviction_high_watermark_ratio={MARK}",
         "--eviction_ratio=0.05",
     ],
     "capacity_bytes": CAPACITY_CHUNKS * CHUNK_BYTES,
 }
-PREFIX_WORDS = 600  # about three whole 256-token chunks
-FAMILIES = 5
+PREFIX_WORDS = 600  # two or three whole 256-token chunks
+FAMILIES = 8
 FILLERS = FAMILIES - 1
 #: When each request is sent: family 0, family 0 again on the other instance,
 #: one of each other family, then family 0 once more.
-TIMES = [0.0, 1.0, *(2.0 + 0.5 * k for k in range(FILLERS)), 6.0]
+TIMES = [0.0, 1.0, *(2.0 + 0.5 * k for k in range(FILLERS)), 3.0 + 0.5 * FILLERS]
 #: Each request's family.
 FAMILY = [0, 0, *range(1, FAMILIES), 0]
 #: The router LP takes the prefill instances in turn, and ATOM's share_cache
@@ -211,10 +215,15 @@ def run_store(out: Path, seed: str) -> dict:
             **{name: str(port) for name, port in ports.items()},
         )
         _publish(out / "store", DP_MACHINE, env)
-        # One prompt per family (`bodies` gives request k family k % FAMILIES),
-        # each request its family's, its output a few tokens.
-        prompts = bodies(DSV41, FAMILIES, PREFIX_WORDS, families=FAMILIES)
-        requests = [prompts[f] | {"max_tokens": 8 + k} for k, f in enumerate(FAMILY)]
+        # One prompt per family, its number and then the words every family
+        # shares (`bodies`' family form), all of one length; each request its
+        # family's, its output a few tokens.
+        [body] = bodies(DSV41, 1)
+        words = bodies(DSV41, 1, PREFIX_WORDS)[0]["prompt"].split()[:PREFIX_WORDS]
+        requests = [
+            body | {"prompt": f"{f} " + " ".join(words), "max_tokens": 8 + k}
+            for k, f in enumerate(FAMILY)
+        ]
         log = out / "pd_sim.log"
         with open(log, "w") as f:
             sim = subprocess.Popen(
