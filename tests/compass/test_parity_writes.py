@@ -8,7 +8,8 @@ producer's listener takes write requests off a scripted socket, and its send
 workers serve them through `_execute_transfer` into fake transfer engines that
 log each write they are handed; the two writes that move bytes are in flight
 at once. Its write-dones, which ATOM resends, reach the consumer's listener the
-same way.
+same way. A producer is recorded alike when a multi connector holds it beside
+an offload tier, as a prefill instance with the Mooncake Store runs.
 """
 
 import importlib
@@ -16,6 +17,7 @@ import json
 import sys
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -106,6 +108,8 @@ def _producer(mc, log, meet, matched):
         _per_block_bytes_list=BLOCK_BYTES,
         _block_region_roles=[None, None],
         _block_region_consumer_indices=None,
+        _block_unit_specs=None,
+        _block_head_major_runs=(),
         _num_local_layers=0,
         _start_layer=0,
         _MAX_RDMA_ENTRIES_PER_BATCH=2,
@@ -120,6 +124,13 @@ def _producer(mc, log, meet, matched):
         _completion_lock=threading.Lock(),
         _writes_in_flight={},
         _aborted_transfers={},
+        # The chunked transfer's state, which the listener polls between frames.
+        _pending_chunked_requests=[],
+        _chunked_prefills={},
+        _chunked_local_ids={},
+        _chunked_admissions={},
+        _retired_chunked_transfers=OrderedDict(),
+        _admission_results=set(),
         done_sending=set(),
         _send_executor=ThreadPoolExecutor(2),
         _side_channel_port=0,
@@ -187,9 +198,24 @@ def _consumer(mc, requests):
         failed_recving=set(),
         _scatter_slot=None,
         _release_targets={},
+        _pending_handoffs={},
+        _received_handoffs={},
         _publish_listener_state=lambda exc=None: None,
     )
     return c
+
+
+def _multi(producer):
+    """A multi connector holding an offload tier, then `producer`, as a prefill
+    instance beside the Mooncake Store builds it."""
+    from atom.kv_transfer.disaggregation.multi.multi_connector import MultiConnector
+
+    multi = object.__new__(MultiConnector)
+    offload = SimpleNamespace(is_offload=True, is_producer=False)
+    multi.__dict__.update(
+        _connectors=[offload, producer], is_producer=True, _state_tier=None
+    )
+    return multi
 
 
 def _runner(conn, monkeypatch):
@@ -229,6 +255,7 @@ def _listen(mc, monkeypatch, listener, frames):
         return frames.pop(0)
 
     sock = SimpleNamespace(
+        poll=lambda timeout=None: True,
         recv_multipart=recv_multipart,
         getsockopt=lambda _option: b"tcp://127.0.0.1:5555",
     )
@@ -256,14 +283,15 @@ def _lines(path):
     return by_request
 
 
+@pytest.mark.parametrize("multi", [False, True], ids=["mooncake", "multi"])
 @pytest.mark.parametrize("matched", [False, True], ids=["own-hca", "matched-rails"])
 def test_each_write_is_stamped_on_the_calls_that_serve_it(
-    mc, tmp_path, monkeypatch, matched
+    mc, tmp_path, monkeypatch, matched, multi
 ):
     log, requests = [], _requests()
     producer = _producer(mc, log, threading.Barrier(2, timeout=10), matched)
     monkeypatch.setenv(ENV, str(tmp_path / "prefill"))
-    prefill = _runner(producer, monkeypatch)
+    prefill = _runner(_multi(producer) if multi else producer, monkeypatch)
     before, after = _serve(mc, monkeypatch, producer, requests)
     prefill.exit()
 

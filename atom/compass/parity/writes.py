@@ -2,12 +2,13 @@
 """Each Mooncake KV write of a recorded P/D run, stamped on the calls that serve it.
 
 Once the recording runner's `allocate_kv_cache` has built a Mooncake connector,
-`install` wraps the connector's methods on the instance: ATOM's code is
-unchanged, and a run that does not record wraps nothing. Every worker, each TP
-rank included, records its own writes in ``dp<rank>.tp<rank>.writes.jsonl`` of
-the record directory (pipeline stage `k` above 0:
-``pp<k>.dp<rank>.tp<rank>.writes.jsonl``), named by its connector's ranks and
-replaced at install. Its lines are kept in memory and written at the runner's
+`install` wraps the connector's methods on the instance, or those of the one a
+multi connector holds (`kv_connector: multi`, as a prefill instance with an
+offload tier runs): ATOM's code is unchanged, and a run that does not record
+wraps nothing. Every worker, each TP rank included, records its own writes in
+``dp<rank>.tp<rank>.writes.jsonl`` of the record directory (pipeline stage `k`
+above 0: ``pp<k>.dp<rank>.tp<rank>.writes.jsonl``), named by its connector's
+ranks and replaced at install. Its lines are kept in memory and written at the runner's
 `exit`, so no file call or JSON encoding runs on the transfer path. Times are
 the runner's step clock, the worker's monotonic clock.
 
@@ -129,17 +130,26 @@ class WriteRecord:
         self.file.flush()
 
 
+def mooncake(connector):
+    """`connector` if it is Mooncake's P/D connector, else the one a multi
+    connector holds among its subs (a prefill instance writing KV to decode
+    beside an offload tier, the Mooncake Store's), else None."""
+    subs = getattr(connector, "_connectors", None) or [connector]
+    return next((c for c in subs if hasattr(c, "_serve_write")), None)
+
+
 def install(runner):
-    """The `WriteRecord` of `runner`'s Mooncake connector if the run records its
-    steps (`ENV`); else None, and nothing is wrapped."""
+    """The `WriteRecord` of `runner`'s Mooncake connector, its own or a multi
+    connector's, if the run records its steps (`ENV`); else None, and nothing
+    is wrapped."""
     from atom.compass.parity import ENV, record_dir
     from atom.utils.forward_context import get_kvconnector
 
-    directory, connector = os.environ.get(ENV), get_kvconnector()
-    if not directory or not hasattr(connector, "_serve_write"):  # Mooncake's
+    directory = os.environ.get(ENV)
+    c = mooncake(get_kvconnector()) if directory else None
+    if c is None:
         return None
-    c = connector
     name = (f"pp{c.pp_rank}." if c.pp_rank else "") + f"dp{c.dp_rank}.tp{c.tp_rank}"
     path = record_dir(directory, runner.config) / f"{name}.writes.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    return WriteRecord(connector, path, runner.step_clock_ns)
+    return WriteRecord(c, path, runner.step_clock_ns)
