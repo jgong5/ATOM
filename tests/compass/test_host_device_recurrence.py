@@ -199,6 +199,8 @@ def test_each_cost_line_reproduces_the_charge_of_its_step(
         assert (line["W_launch"], line["skipped"]) == (0.0, ["W_launch"])
         assert line["group_s"] == charge
         assert line["device_s"] == fold_seconds(t["seconds"] for t in line["terms"])
+        # A stub with no draft coefficient: every term is the target's.
+        assert line["target_terms"] == len(line["terms"]) > 0
         provenance = {(t["method"], t["validated"], t["source"]) for t in line["terms"]}
         assert (provenance, line["refused"]) == ({("declared", False, SOURCE)}, None)
     assert all(line["E"] > 0 for line in lines)

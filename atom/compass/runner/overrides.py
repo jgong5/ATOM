@@ -2044,7 +2044,9 @@ def _group_step_seconds(
     ``replayed_stall_s`` then states; `charge_s`, those composed with host
     time (their sum with no host);
     `group_s`, its DP group target; `terms`, each one's `name`, `seconds`
-    and its provenance's `method`, `validated` and `source`; and `refused`,
+    and its provenance's `method`, `validated` and `source`, the target's
+    then the draft's; `target_terms`, how many of them are the target's;
+    and `refused`,
     the ``cost:`` reason or None. Above them, `forward` starts the file with
     `{"version": COST_TABLE_VERSION}` as the record starts, replacing an
     earlier run's file, and keeps it open in `_cost_table` for the run.
@@ -2080,7 +2082,7 @@ def _group_step_seconds(
         mode = forward_mode(batch, runner)
     mix = vars(runner).setdefault("_priced", ProvenanceMix())
     spec = getattr(runner.config, "speculative_config", None)
-    terms, refused = (), None
+    terms, target_terms, refused = (), 0, None
     host = getattr(runner, "compass_host", None)
     if isinstance(host, HostDeviceRecurrence) and host.admit != ADMISSION_IN_E:
         # A block-table entry holds a block's tokens on each DCP rank.
@@ -2122,7 +2124,7 @@ def _group_step_seconds(
     else:
         mix.record(cost)
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
-        terms = (*cost.terms, *cost.draft_terms)
+        terms, target_terms = (*cost.terms, *cost.draft_terms), len(cost.terms)
     stall_s = 0.0 if refused else replayed_stall(runner, view, host)
     device_s += stall_s
     # `decide` returns the collective's rows for a group of one too.
@@ -2214,6 +2216,7 @@ def _group_step_seconds(
             }
             for t in terms
         ],
+        "target_terms": target_terms,
         "refused": refused,
     }
     runner._cost_table.write(json.dumps(line) + "\n")
