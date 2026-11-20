@@ -248,7 +248,10 @@ file with one needs such a deployment. Each such frontend checks its
 deployment against the entry, and the first prefill deployment's, or the one
 deployment's, starts LP ``mooncake_store`` (`mooncake_store`) in a process of
 its own. Its channels to each DP rank of each engine it serves take half the
-entry's fixed lookup term (`add_mooncake_store`). Each such engine has the
+entry's fixed lookup term, and each such engine's request channels are
+offering, as its input thread offers an arrival's lookup
+(`add_mooncake_store`); the run file alone sets both, so the authority's
+process marks them as each engine's does. Each such engine has the
 connector factory build ``mooncake_store`` as Compass's
 (`atom.compass.kv.mooncake_store`), whose scheduler half sends the Store's
 lookups and renewals to LP ``mooncake_store`` and prices its copies on each

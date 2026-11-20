@@ -28,8 +28,10 @@ stand-in, `StandInClient`, whose ``exists`` answers as the master's reply did.
   In a DP group the members park before their forwards (`run.engine`).
 - An offer from the engine's input thread (`offer_lookups`) cannot send: only
   the clock owner stamps a send in a run. It is handed to the owner, through
-  #3767's `LPRuntime.offer` where the runtime has it, and made there; this is
-  the one seam #3767 changes (`StoreShell._send_lookup`).
+  #3767's `LPRuntime.offer` where the runtime has it, and made there
+  (`StoreShell._send_lookup`). The engine's request channels are offering
+  (`add_mooncake_store`), so under #3767 (b) an arrival inside a forward is
+  granted first and its lookup stamped at that arrival.
 
 Each writer rank (``world`` of them, ATOM's replica world) keeps an ATOM
 `MooncakeStoreOffloadConnector` with no device: a stand-in slot pool
@@ -462,10 +464,11 @@ class StoreShell:
 
         - with #3767's `LPRuntime.offer`, the owner makes it once the handler
           is back at its wait point, stamped at that arrival, before it
-          releases the next message; (b) or (e) then lets an arrival inside a
-          forward's TAR be stamped there too;
-        - on a runtime without it, as on this branch until #3767's base is
-          merged, the shell queues it and the owner makes it at its next clock
+          releases the next message; as the engine's request channels are
+          offering (`add_mooncake_store`), (b) grants an arrival inside a
+          forward's TAR first, so it is stamped there too;
+        - on a runtime without it (a tree before #3767's base), the shell
+          queues it and the owner makes it at its next clock
           call (`_install_flush`), at the clock the releasing grant left it: the
           arrival when the engine was idle, the forward's end inside one,
           counted in ``offers_late``.
