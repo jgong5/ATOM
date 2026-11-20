@@ -315,10 +315,25 @@ def recorded_buckets(config, arch: str) -> tuple[int, ...]:
 @functools.cache
 def _token_graphs(family, arch: str) -> bool:
     """Whether ATOM's attention builder for `family` records token graphs, in a
-    process declaring a device of `arch`: its module imports aiter, which needs one."""
+    process declaring a device of `arch`: its module imports aiter, which needs one.
+    Compass's own defect there raises as a runtime error (`check._resolving`), and
+    anything else it raises, or the child dying, as a value error naming it."""
+    from concurrent.futures.process import BrokenProcessPool
+
+    from atom.compass.advice.check import _resolving
     from atom.compass.bench.ops import _child
 
-    return _child(_builder_records, family, arch)
+    of = "attention builder"
+    try:
+        records, raised, said = _child(_resolving, _builder_records, family, arch, of)
+    except BrokenProcessPool as died:
+        raised, said = "refused", f"the child reading ATOM's {of} died: {died}"
+    if raised == "defect":
+        raise RuntimeError(f"Compass's own code raised reading ATOM's {of}:\n{said}")
+    if raised:
+        why = "the prefill token-graph buckets this run records cannot be worked out"
+        raise ValueError(f"{why}: {said}")
+    return records
 
 
 def _builder_records(family, arch: str) -> bool:
