@@ -1144,6 +1144,104 @@ def test_a_burst_reaches_the_app_one_intake_charge_at_a_time(
     assert entered == pytest.approx([first, first + fixed + sizes[1] * per_byte])
 
 
+def test_a_same_instant_burst_reaches_the_app_smallest_body_first_whatever_ends_first(
+    run, monkeypatch, tmp_path
+):
+    # The real frontend reads a burst's sockets at once, so its small bodies
+    # are in first, and its loop then takes each one in at its intake's cost.
+    # Request 0's body, the largest, is read first on the wall; requests 1 and
+    # 3 tie, and keep seq order.
+    fixed, per_byte = 2e-3, 1e-6
+    _intake_run_file(monkeypatch, tmp_path, (fixed, per_byte))
+    sizes, entered = [3000, 1000, 2000, 1000], []
+
+    async def app(scope, receive, send):
+        seq = api_server._tracestate_stamp(scope)[1]
+        entered.append((seq, asyncio.get_running_loop().time()))
+
+    def receives(seq):
+        async def receive():
+            for _ in range(seq):  # a later seq's body takes more socket reads
+                await asyncio.sleep(0)
+            return {"type": "http.request", "body": b"x" * sizes[seq]}
+
+        return receive
+
+    arrival = _burst(run, monkeypatch, 4, app, receives=receives)
+    order, at, t = [1, 3, 2, 0], [], arrival
+    for seq in order:
+        t += fixed + per_byte * sizes[seq]
+        at.append(t)
+    print(f"\n  app entered {entered}")
+    assert [seq for seq, _ in entered] == order
+    assert [t for _, t in entered] == pytest.approx(at)
+
+
+def test_a_request_released_inside_an_intake_takes_its_place_among_those_waiting(
+    run, monkeypatch, tmp_path
+):
+    # Requests 0 and 1 arrive together. Request 2 arrives inside request 0's
+    # intake with an empty body, which takes 0.2 wall seconds to come: it is
+    # in before request 1's, 1 ms after it arrives. The loop is not idle until
+    # request 2 waits for its turn, so request 1's turn waits for it too, and
+    # request 2 goes first, whatever the wall.
+    fixed, per_byte = 2e-3, 1e-6
+    _intake_run_file(monkeypatch, tmp_path, (fixed, per_byte))
+    sends, stamps = [0.0, 0.0, 1e-3], queue.Queue()
+
+    def traffic():
+        rt = LPRuntime(TRAFFIC, TABLE, clock_transport.connect(TRAFFIC, run.endpoint))
+        rt.start_run()
+        for at in sends:
+            rt.advance_to(at)
+            stamps.put(rt.stamp_send(HTTP))
+        rt.next_event(INF)
+        rt.close()
+
+    thread = threading.Thread(target=traffic, name="traffic", daemon=True)
+    thread.start()
+    arrivals = [at + TABLE.lookahead(HTTP) for at in sends]
+    sizes, entered = [1000, 2000, 0], []
+
+    async def app(scope, receive, send):
+        entered.append((_stamp(scope)[1], asyncio.get_running_loop().time()))
+
+    def request(seq):
+        scope = {
+            "type": "http",
+            "headers": [(b"x-test-stamp", b"%r %d" % (arrivals[seq], seq))],
+        }
+
+        async def receive():
+            if seq == 2:
+                loop, body = asyncio.get_running_loop(), asyncio.Event()
+                threading.Timer(0.2, loop.call_soon_threadsafe, (body.set,)).start()
+                await body.wait()
+            return {"type": "http.request", "body": b"x" * sizes[seq]}
+
+        return scope, receive, None
+
+    async def go():
+        channel = HttpChannel(app, _stamp)
+        await asyncio.gather(*(channel(*request(seq)) for seq in range(len(sends))))
+
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        thread.join(10)
+    loop.close()
+    assert [stamps.get(timeout=10) for _ in sends] == list(zip(arrivals, range(3)))
+    t, at = arrivals[0], []
+    for seq in (0, 2, 1):
+        t += fixed + per_byte * sizes[seq]
+        at.append(t)
+    print(f"\n  app entered {entered}")
+    assert [seq for seq, _ in entered] == [0, 2, 1]
+    assert [t for _, t in entered] == pytest.approx(at)
+
+
 def test_a_burst_s_bodies_leave_the_socket_while_a_tokenizer_job_is_open(
     run, monkeypatch, tmp_path
 ):

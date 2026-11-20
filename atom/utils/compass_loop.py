@@ -478,12 +478,17 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         self.daemon = weakref.WeakSet()  # the daemon timers scheduled
         # listening socket -> its pending wall-clock `_start_serving` retry
         self.serving_again: dict = {}
-        # Requests read, not handed over: (channel, seq) -> (arrival, wake-up).
-        self.held: dict[tuple[str, int], tuple[float, asyncio.Future]] = {}
-        # `hand_over` wakes requests in (arrival, seq) order; each takes this
-        # lock as it wakes (asyncio locks are fair) and holds it until it is
-        # counted handled, so the app gets them in that order.
-        self.hand_on = asyncio.Lock()
+        # Requests read, not handed over: (channel, seq) -> (arrival, wake-up,
+        # when its body is in, once it is read).
+        self.held: dict[
+            tuple[str, int], tuple[float, asyncio.Future, asyncio.Future]
+        ] = {}
+        # Requests woken and waiting for their turn, a heap of (order, turn);
+        # `_give_turns` gives one turn at a time, and the request holds it
+        # until it is counted handled, so the app gets them in that order.
+        self.turns: list[tuple[tuple, asyncio.Future]] = []
+        self.giving: asyncio.Task | None = None
+        self.turn_over: asyncio.Future | None = None
         # Per output thread: its width-1 station, its open job, and the callbacks
         # that job posted.
         self.detok = threading.local()
@@ -616,22 +621,69 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
             self.rt.close()
 
     def hand_over(self) -> bool:
-        """Once every released request has been read, wake the released ones in
-        ``(arrival, seq)`` order; returns whether any was woken."""
+        """Once every released request has been read, each one's body to its
+        end, wake the released ones in the order they are ready
+        (`HttpChannel`), then ``(arrival, seq)``; returns whether any was woken."""
         rt = self.rt
         with rt.lock:
             if any(rt.unread[ch] for ch, _ in self.held):
                 return False
-            out = sorted(
-                (a, seq, ch)
-                for (ch, seq), (a, _) in self.held.items()
+            out = [
+                (ready, a, seq, ch)
+                for (ch, seq), (a, _, ready) in self.held.items()
                 if rt.is_released(ch, seq)
-            )
-        for _, seq, ch in out:
+            ]
+        if not all(ready.done() for ready, *_ in out):
+            return False
+        for *_, seq, ch in sorted((r.result(), a, s, c) for r, a, s, c in out):
             self.held.pop((ch, seq))[1].set_result(None)
         if out:
             self._write_to_self()  # so the select that woke them reports an fd
         return bool(out)
+
+    @contextlib.asynccontextmanager
+    async def turn(self, order: tuple):
+        """Hold a woken request's turn: wait until `_give_turns` gives it, and
+        end it on leaving. `order` places it among the requests waiting."""
+        mine = self.create_future()
+        heapq.heappush(self.turns, (order, mine))
+        if self.giving is None:
+            self.giving = self.create_task(self._give_turns())
+        try:
+            await mine
+            yield
+        finally:
+            if mine.done() and not mine.cancelled() and not self.turn_over.done():
+                self.turn_over.set_result(None)
+
+    async def _give_turns(self) -> None:
+        """Give the waiting requests their turns one at a time, each to the
+        first in order once the loop is idle at its instant (`SimExecutor.placed`):
+        every request released by then woken and waiting, so one released
+        while others wait takes its place among them; every station job
+        placed, since the clock may not pass a job's completion before it is;
+        and the request before it gone as far as it can at this instant, or
+        their tokenizer jobs reach the station in the wall order their awaits
+        fall in."""
+        try:
+            while self.turns:
+                await self.executor.placed()
+                _, turn = heapq.heappop(self.turns)
+                if turn.done():  # its request was cancelled waiting
+                    continue
+                self.turn_over = self.create_future()
+                turn.set_result(None)
+                await self.turn_over
+        finally:
+            self.giving = None
+
+    def handing_over(self) -> bool:
+        """Whether a released request waits to be woken: the loop is not idle
+        at this instant until `hand_over` has woken every one, so the set it
+        orders is all that is released when the clock moves on."""
+        rt = self.rt
+        with rt.lock:
+            return any(rt.is_released(ch, seq) for ch, seq in self.held)
 
     def unread(self) -> tuple[int, str] | None:
         """The released request with the lowest seq not yet read, as
@@ -670,7 +722,7 @@ class CompassSelector(selectors.DefaultSelector):
             if ready or loop.time() >= deadline:
                 return ready
             # A positive timeout: nothing is ready or due, the loop is idle now.
-            if loop.executor.idle():
+            if not loop.handing_over() and loop.executor.idle():
                 return ready
             if rt.inline_pending() or station.unresolved():
                 # The LP clock stands still here: only an fd event ends the wait.
@@ -748,13 +800,27 @@ class HttpChannel:
     to a `GENERATION_PATHS` endpoint during the run: that one is answered 400,
     naming it, and is a run-summary reason ``http:unstamped <method> <path>``. A
     stamped request waits until it is released and every released request has
-    been read; released requests are handed on in ``(arrival, seq)`` order and
-    count as handled once their body has been received. The body is read off
-    the socket as it comes, while the request waits its turn: the turns of a
-    burst pass on the wall one tokenizer job at a time, and a client whose send
-    stalls on an unread socket past its ``TCP_USER_TIMEOUT`` (aiperf's default
-    is 30 s) drops the connection. The app gets the received body messages
-    again from its ``receive``.
+    been read, its body to the end, and counts as handled once its turn has
+    come. The body is read off the socket as it comes, while the request waits
+    its turn: the turns of a burst pass on the wall one tokenizer job at a
+    time, and a client whose send stalls on an unread socket past its
+    ``TCP_USER_TIMEOUT`` (aiperf's default is 30 s) drops the connection. The
+    app gets the received body messages again from its ``receive``.
+
+    Released requests take their turns in the order their bodies are in, the
+    real frontend reading every socket at once: each one's arrival plus its own
+    intake, ``fixed_s + body bytes x per_byte_s`` (none with no
+    ``http_intake``), then ``(arrival, seq)``, the order the traffic LP makes
+    the same in every run (`compass_harness.traffic_lp`). Each turn goes to the
+    first of those waiting once the loop is idle at its instant
+    (`CompassEventLoop.turn`), and the loop is not idle until every request
+    released by then is waiting (`CompassEventLoop.handing_over`): a request
+    released while others wait, such as a burst's part the traffic LP sends
+    after a grant at the same instant, takes its place among them, and which
+    requests are ordered together never depends on the wall. So a burst sent
+    at one instant reaches the app smallest body first, as a real rank admits
+    it. A cancel takes its turn after every request waiting with it, among
+    them any it names.
 
     A stamped request whose body is a cancel
     (`atom.compass.carriers.cancel_seq`) goes to no app: it is answered 204,
@@ -774,9 +840,11 @@ class HttpChannel:
 
     Taking in a stamped request other than a cancel costs the event loop
     ``fixed_s + body bytes x per_byte_s`` (`atom.compass.run.http_intake`),
-    charged on the loop once its body is read and the loop is idle at that
-    instant, every tokenizer station job placed and all else due by then run
-    (`SimExecutor.placed`), so a burst reaches the app one request at a time.
+    charged on the loop at its turn, once the loop is idle at that instant,
+    every tokenizer station job placed and all else due by then run
+    (`SimExecutor.placed`), so a burst reaches the app one request at a time:
+    the term is the gap between the starts of a real burst's requests, which
+    its loop takes in one at a time.
     A request waits for that idle loop with no intake charged too: its body no
     longer paces the turns, and without the wait the burst's tokenizer jobs
     would reach the station in the wall order their awaits fall in.
@@ -833,25 +901,18 @@ class HttpChannel:
             )
             arrival, seq = got
             rt.check_arrival(ch, arrival, seq)
-            wake = loop.create_future()
-            loop.held[ch, seq] = (arrival, wake)
+            wake, ready = loop.create_future(), loop.create_future()
             # Its body leaves the socket as it comes, not at its turn.
             reading = asyncio.ensure_future(_body_messages(receive))
+            reading.add_done_callback(partial(self._ready, ready, arrival))
+            loop.held[ch, seq] = (arrival, wake, ready)
             try:
                 await wake
-                async with loop.hand_on:
+                async with loop.turn((ready.result(), arrival, seq, ch)):
                     # A request counts as handled only once nothing about it
                     # still waits on the socket.
                     body = await reading
                     cancelled = cancel_seq(body[0].get("body", b""))
-                    if cancelled is None:
-                        # The clock may not pass a station job's completion
-                        # before the job is placed, nor this instant before the
-                        # requests handed on before this one have gone as far
-                        # as they can: with no intake charged too, or their
-                        # tokenizer jobs reach the station in the wall order
-                        # their awaits fall in.
-                        await loop.executor.placed()
                     if self.intake is not None and cancelled is None:
                         fixed, per_byte, idle = self.intake
                         if arrival >= self.intake_end:
@@ -893,6 +954,22 @@ class HttpChannel:
         finally:
             if hangup is not None:
                 del self.hangups[seq]
+
+    def _ready(self, ready: asyncio.Future, arrival: float, reading) -> None:
+        """Resolve `ready` with when the request's body, read at once with the
+        others', is in: its arrival plus its own intake, ``fixed_s + body bytes
+        x per_byte_s``, which depends on nothing the wall decides; a cancel's
+        after every request it can name. A body never read is in at once."""
+        if ready.done():
+            return
+        if reading.cancelled() or reading.exception() is not None:
+            ready.set_result(arrival)
+        elif cancel_seq(reading.result()[0].get("body", b"")) is not None:
+            ready.set_result(math.inf)
+        else:
+            fixed, per_byte, _ = self.intake or (0.0, 0.0, 0.0)
+            nbytes = sum(len(m.get("body", b"")) for m in reading.result())
+            ready.set_result(arrival + fixed + per_byte * nbytes)
 
 
 async def _refuse_unstamped(rt, method: str, path: str, send) -> None:
