@@ -3,6 +3,13 @@
 `validate.cost` gives on a record, whose docstring states its rules, given the
 run's samples rather than read from its directory. The step linear fit grades
 each held-out run with it (`step_linear_fit.fold_figures`).
+
+Beside the graded group, which leaves out every step a declared term prices,
+the report's `PRICED` group holds every step the backend priced, graded and
+declared together, as a simulated run charges them, and under a law its
+``filled`` names, per kind, the steps priced at a rung the fit filled
+(#3796): a filled vector prices the steps no record reached, and the graded
+group alone does not show what they cost.
 """
 
 from __future__ import annotations
@@ -27,12 +34,16 @@ from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band
 from atom.compass.backends.step_roofline import StepFallbackBackend
 
 WITHIN = 0.10
-#: The report's groups a step enters, by its terms: a declared one only its own.
+#: The report's groups a step enters, by its terms: a declared one only its own
+#: and `PRICED`, which every priced step enters (#3796).
 GRADED = {
-    "validated": ("graded", "validated"),
-    "unvalidated": ("graded", "unvalidated"),
-    "declared": ("declared",),
+    "validated": ("graded", "validated", "priced"),
+    "unvalidated": ("graded", "unvalidated", "priced"),
+    "declared": ("declared", "priced"),
 }
+#: The group of every step the backend priced, graded or declared, warm and
+#: refused steps left out as from every group: what a simulated run charges.
+PRICED = "priced"
 
 
 def _is_grid(backend) -> bool:
@@ -127,7 +138,9 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
     if law is not None:
         backend = StepLinearBackend(StepLinearLaw(law))
     grid = _is_grid(backend)
-    groups = {g: {} for g in ("graded", "validated", "unvalidated", "declared")}
+    groups = {
+        g: {} for g in ("graded", PRICED, "validated", "unvalidated", "declared")
+    }
     declined: dict[str, dict] = {}
     fell: dict[str, dict] = {}
     warm, priced, extrapolated = [], [], 0
@@ -191,6 +204,7 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
         report[group] = {
             kind: _summary(rows) for kind, rows in sorted(kinds.items(), reverse=True)
         }
+    report["filled"] = _filled(groups[PRICED], law)
     report["warm"] = warm
     report["fallback"], report["refused"] = fell, declined
     report["extrapolated"] = extrapolated
@@ -223,6 +237,37 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
             for name, s in sorted(terms.items())
         }
     return report
+
+
+def _filled(priced: dict, law: dict | None) -> dict:
+    """Per kind of `priced`, the `PRICED` group's (band, step, real, price)
+    rows, the steps priced at a decode rung `law` filled
+    (`step_linear_fit.filled_rungs`, a draft's at its draft law's): their
+    ``steps``, ``real_s`` and ``priced_s``, their ``share`` of the kind's real
+    seconds and the ``rungs``, ascending. A kind with none, and every kind
+    under a backend that is no law, is left out."""
+    if law is None:
+        return {}
+    named = step_linear_fit.filled_rungs(law)
+    out = {}
+    for kind, rows in priced.items():
+        rungs = set(named["draft" if kind == "draft" else "decode"])
+        on = [r for r in rows if _rung(r[0]) in rungs]
+        if on:
+            out[kind] = {
+                "steps": len(on),
+                "real_s": float(sum(r[2] for r in on)),
+                "priced_s": float(sum(r[3] for r in on)),
+                "share": float(sum(r[2] for r in on) / sum(r[2] for r in rows)),
+                "rungs": sorted({_rung(r[0]) for r in on}),
+            }
+    return out
+
+
+def _rung(band: str) -> int | None:
+    """The rung a ``decode rung <n>`` band names, else None."""
+    head, _, rung = band.rpartition(" ")
+    return int(rung) if head == "decode rung" and rung.isdigit() else None
 
 
 def _count(into: dict, band: str, seconds: float, refusals) -> None:

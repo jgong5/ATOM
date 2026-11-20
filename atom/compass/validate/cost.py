@@ -27,7 +27,12 @@ validated steps and over its unvalidated ones: those whose terms are not all
 validated (outside the hull of the law's held-out steps, every step of a law
 that records none; for the grid, outside its residual's held-out hull). A step
 with a declared term is reported apart, in no graded figure; a draft is
-grouped by its draft terms alike. A step that ran more
+grouped by its draft terms alike. Every priced step, graded and declared
+together, is graded again as "priced, all" (#3796), as a simulated run charges
+them: its on-totals error prints on the line after each kind's graded one, and
+the graded header names the kind's steps a law priced at a decode rung its fit
+filled (`step_linear_fit.fill_rungs`), with their real seconds, their share of
+the kind's and the rungs. A step that ran more
 than `step_linear_fit.WARM_FACTOR` times its price is warm, a one-off first touch the
 law does not model: it is named with its seconds and enters no figure. So are,
 under a law or an op graph, the steps that lead a vector's priced steps, each
@@ -70,7 +75,7 @@ import json
 from pathlib import Path
 
 from atom.compass.backends import step_labels
-from atom.compass.backends.accuracy import run_accuracy
+from atom.compass.backends.accuracy import PRICED, run_accuracy
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.drive import aiter_jit
 from atom.compass.validate.bound import _split
@@ -148,33 +153,90 @@ def declined_text(r: dict) -> str:
     return f"{r['steps']} steps, real {r['real_s']:.2f} s; reasons {named}{more}"
 
 
+def _header(kind: str, s: dict) -> str:
+    """A group's first line for `kind`, its figures `s`."""
+    return (
+        f"{kind}  {s['steps']} steps  real {s['real_s']:.2f} s"
+        f"  priced {s['priced_s']:.2f} s"
+    )
+
+
+def _figures(s: dict) -> list[str]:
+    """A group's lines for one kind below its header, its figures `s`."""
+    held = "-" if s["held_out"] is None else f"{s['held_out']:+.2%}"
+    out = [
+        f"  holding out step {s['held_out_step']:<6}{held}",
+        f"  median per step        {s['median']:+.2%}",
+        "  band | steps | p10 | p50 | p90 | within 10%",
+    ]
+    for band, b in s["bands"].items():
+        out.append(
+            f"  {band} | {b['steps']} | {b['p10']:+.1%} | {b['p50']:+.1%}"
+            f" | {b['p90']:+.1%} | {b['within_10pct']:.1%}"
+        )
+    return out
+
+
+def _apart(report: dict, kind: str) -> str:
+    """What the graded header of `kind` adds: its steps priced at filled rungs,
+    or else declared, with their real seconds and share of the kind's."""
+    every = report.get(PRICED, {}).get(kind)
+    filled = report.get("filled", {}).get(kind)
+    if filled:
+        rungs = ", ".join(map(str, filled["rungs"]))
+        return (
+            f"; {filled['steps']} steps / {filled['real_s']:.2f} s"
+            f" ({filled['share']:.0%}) on filled rungs {rungs}"
+        )
+    declared = report["declared"].get(kind)
+    if declared and every:
+        share = declared["real_s"] / every["real_s"]
+        return (
+            f"; {declared['steps']} steps / {declared['real_s']:.2f} s"
+            f" ({share:.0%}) declared"
+        )
+    return ""
+
+
 def _text(report: dict) -> str:
     out = [f"record {report['record']}", f"law {report['backend']}"]
     out.append(f"not labelled: {json.dumps(report['cut'])}")
+    # Each kind's graded total, and on the line after it every priced step's,
+    # declared ones too (#3796), so the first `on totals` lines carry both.
+    out.append("\ngraded: every step with no declared term")
+    every = report.get(PRICED, {})
+    for kind in every or report["graded"]:
+        s = report["graded"].get(kind)
+        if s is None:
+            out += [
+                f"{kind}  0 steps  real 0.00 s  priced 0.00 s{_apart(report, kind)}",
+                "  on totals              -",
+            ]
+        else:
+            out += [
+                _header(kind, s) + _apart(report, kind),
+                f"  on totals              {s['on_totals']:+.2%}",
+            ]
+        if (a := every.get(kind)) is not None:
+            out.append(
+                f"  priced, all on totals  {a['on_totals']:+.2%}  ({a['steps']} steps,"
+                f" real {a['real_s']:.2f} s, priced {a['priced_s']:.2f} s)"
+            )
+        if s is not None:
+            out += _figures(s)
     for group, title in (
-        ("graded", "graded: every step with no declared term"),
         ("validated", "of which validated: inside the held-out hull"),
         ("unvalidated", "of which unvalidated"),
         ("declared", "declared, apart"),
+        (PRICED, "priced, all: graded and declared together"),
     ):
         out.append(f"\n{title}")
-        for kind, s in report[group].items():
-            held = "-" if s["held_out"] is None else f"{s['held_out']:+.2%}"
+        for kind, s in report.get(group, {}).items():
             out += [
-                (
-                    f"{kind}  {s['steps']} steps  real {s['real_s']:.2f} s"
-                    f"  priced {s['priced_s']:.2f} s"
-                ),
+                _header(kind, s),
                 f"  on totals              {s['on_totals']:+.2%}",
-                f"  holding out step {s['held_out_step']:<6}{held}",
-                f"  median per step        {s['median']:+.2%}",
-                "  band | steps | p10 | p50 | p90 | within 10%",
+                *_figures(s),
             ]
-            for band, b in s["bands"].items():
-                out.append(
-                    f"  {band} | {b['steps']} | {b['p10']:+.1%} | {b['p50']:+.1%}"
-                    f" | {b['p90']:+.1%} | {b['within_10pct']:.1%}"
-                )
     for kind, ranks in report["ranks"].items():
         out.append(f"\n{kind} by priced rank")
         out.append("  rank | cards | steps | on totals | median")
