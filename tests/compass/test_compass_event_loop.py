@@ -8,6 +8,7 @@ and uvicorn's server tick and keep-alive timeout.
 """
 
 import asyncio
+import errno
 import http.client
 import importlib.util
 import json
@@ -1013,6 +1014,68 @@ def test_a_cancel_on_the_relay_hangs_its_request_up_at_its_arrival_never_the_soc
         {"type": "http.response.start", "status": 204},
         {"type": "http.response.body", "body": b""},
     ]
+
+
+def test_a_released_request_whose_accept_ran_out_of_descriptors_is_still_read(
+    run, monkeypatch
+):
+    """The traffic LP's request is released before its connection reaches the
+    frontend, and the frontend's accept fails for want of a file descriptor, as
+    a c=512 cell's 756 cancels on top of its open streams made it fail.
+    asyncio takes the listening socket off the loop and serves it again a
+    second later: on the LP clock, which stands still while the request is
+    unread, that second never came and the run hung. It comes on the wall."""
+    stamps, failed, read = queue.Queue(), [], []
+    traffic = _traffic(run, stamps, before_ner=lambda: None)
+    arrival, seq = stamps.get(timeout=10)
+    accept, exhausted = socket.socket.accept, threading.Event()
+    exhausted.set()
+
+    def out_of_descriptors(sock):
+        # Every accept fails until the client, on the wall, closes streams and
+        # frees descriptors, 0.2 s after the first failure.
+        if not exhausted.is_set():
+            return accept(sock)
+        if not failed:
+            threading.Timer(0.2, exhausted.clear).start()
+        failed.append(time.monotonic())
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(socket.socket, "accept", out_of_descriptors)
+
+    class Frontend(asyncio.Protocol):
+        def data_received(self, data):
+            if read:  # the request's bytes came in more than one read
+                return
+            rt = clock.installed()
+            rt.check_arrival(HTTP, arrival, seq)
+            with rt.lock:
+                rt.count_done_locked(HTTP, seq)
+            read.append(time.monotonic())
+
+    listener = socket.create_server(("127.0.0.1", 0))
+
+    def client():
+        _until(lambda: seq in run.rt.released[HTTP])
+        with socket.create_connection(listener.getsockname()) as sock:
+            sock.sendall(b"request")
+            _until(lambda: read)
+
+    sending = threading.Thread(target=client, daemon=True)
+    sending.start()
+    loop = CompassEventLoop()
+    loop.set_exception_handler(lambda loop, context: None)  # asyncio logs the EMFILE
+    try:
+        server = loop.run_until_complete(loop.create_server(Frontend, sock=listener))
+        loop.run_forever()
+    finally:
+        traffic.join(10)
+        sending.join(10)
+    server.close()
+    loop.close()
+    # The first accept failed for the whole backlog; one retry, a wall second on.
+    assert len(read) == 1 and 1.0 <= read[0] - failed[0] < 10.0
+    assert run.conn.grants == [arrival, INF] and run.conn.unread == []
 
 
 def _intake_run_file(monkeypatch, tmp_path, intake) -> None:

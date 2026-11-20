@@ -49,6 +49,8 @@ A timer such a request sets earlier than the time asked for fires at the grant;
 a daemon one, such as uvicorn's keep-alive timeout, keeps the run alive no more
 than any other daemon timer. A cross-LP send such a handler makes is refused
 (`LPRuntime.stamp_send`).
+asyncio's retry of a listening socket whose accept ran out of file
+descriptors waits on the wall, not on the LP clock (`CompassEventLoop._serve_again_on_wall`).
 A SIGINT or SIGTERM ends the run as the ``+inf`` grant does, at the LP clock,
 and `CompassEventLoop.stopped` names it; uvicorn then cancels the requests still
 open rather than wait for them, since only a grant would finish them. A loop
@@ -62,6 +64,7 @@ found.
 
 import asyncio
 import collections
+import contextlib
 import heapq
 import itertools
 import json
@@ -457,6 +460,9 @@ class _Timer(asyncio.TimerHandle):
 
 #: The signals that stop a simulated server, as they stop a real one.
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+#: What asyncio calls to serve a listening socket again once an accept that ran
+#: out of file descriptors took it off the loop (`CompassEventLoop._serve_again_on_wall`).
+_START_SERVING = asyncio.selector_events.BaseSelectorEventLoop._start_serving
 
 
 class CompassEventLoop(asyncio.SelectorEventLoop):
@@ -470,6 +476,8 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
                 "LPRuntime with atom.utils.clock.install first"
             )
         self.daemon = weakref.WeakSet()  # the daemon timers scheduled
+        # listening socket -> its pending wall-clock `_start_serving` retry
+        self.serving_again: dict = {}
         # Requests read, not handed over: (channel, seq) -> (arrival, wake-up).
         self.held: dict[tuple[str, int], tuple[float, asyncio.Future]] = {}
         # `hand_over` wakes requests in (arrival, seq) order; each takes this
@@ -556,11 +564,47 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         if when is None:
             raise TypeError("when cannot be None")
         self._check_closed()
+        if getattr(callback, "__func__", None) is _START_SERVING:
+            return self._serve_again_on_wall(
+                when - self.time(), callback, args, context
+            )
         handle = _Timer(when, callback, args, self, context)
         heapq.heappush(self._scheduled, handle)
         handle._scheduled = True
         if _is_daemon(callback):
             self.daemon.add(handle)
+        return handle
+
+    def _serve_again_on_wall(self, delay, callback, args, context) -> asyncio.Handle:
+        """asyncio's `_start_serving` after `delay` wall seconds, not on the LP clock.
+
+        asyncio takes a listening socket whose accept ran out of file
+        descriptors off the loop and serves it again a second later, once for
+        each accept that failed (a whole backlog, 2048 under uvicorn). That
+        pause is the host's, not the run's: on the LP clock it would wait for
+        time the loop does not ask for while the request the accept is to take
+        in is released and unread, and the listener would never come back.
+        One retry per socket stands for them all.
+        """
+        sock = args[1]
+        if (pending := self.serving_again.get(sock)) is not None:
+            return pending
+        handle = self.serving_again[sock] = asyncio.Handle(
+            callback, args, self, context
+        )
+
+        def serve() -> None:
+            self.serving_again.pop(sock, None)
+            if not handle.cancelled():
+                handle._run()
+
+        def due() -> None:
+            with contextlib.suppress(RuntimeError):  # the loop closed meanwhile
+                self.call_soon_threadsafe(serve)
+
+        timer = threading.Timer(max(delay, 0.0), due)
+        timer.daemon = True
+        timer.start()
         return handle
 
     def close(self) -> None:
