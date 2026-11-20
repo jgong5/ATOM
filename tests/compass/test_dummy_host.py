@@ -160,12 +160,12 @@ DECODE = {"E": [1e-3, 0, 0], "W_pre": [6e-4, 0, 0], "W_launch": [2.3e-3, 0, 0]}
 DECODE |= {"W_post": [4e-4, 0, 0]}
 
 
-def _dummy_batch(dummy, eager):
+def _dummy_batch(dummy, eager, output=True):
     return SimpleNamespace(
         total_seqs_num_prefill=0,
         total_tokens_num=1,
         total_seqs_num=1,
-        produces_output=lambda: True,
+        produces_output=lambda: output,
         compass_dummy=dummy,
         compass_launch={"eager": eager},
     )
@@ -188,6 +188,10 @@ def test_a_dummy_is_priced_by_the_dummy_kind_and_decode_s_other_segments(eager):
     plain = HostDeviceRecurrence({"decode": DECODE}, (), lambda: 0.0)
     plain.charge(_dummy_batch(True, eager), 0.01, 0.0)
     assert plain.segments["W_launch"] == pytest.approx(DECODE["W_launch"][0])
+    # A dummy that produces no output is a middle chunk, whatever its laws.
+    laws["middle"] = {g: DECODE[g] for g in ("E", "W_pre", "W_launch")}
+    rec.charge(_dummy_batch(True, eager, output=False), 0.01, 0.0)
+    assert rec.segments["W_launch"] == pytest.approx(DECODE["W_launch"][0])
 
 
 def test_v41_runs_a_dummy_s_tail_where_its_group_s_runs():

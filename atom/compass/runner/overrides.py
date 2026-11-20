@@ -355,7 +355,9 @@ class HostDeviceRecurrence:
     A batch whose `compass_dummy` is true, a DP rank's dummy forward at a step
     its group prefills, is priced as `DUMMY_KIND` where the laws state it: each
     segment, and each column, `DUMMY_KIND` states, else `decode`'s, the kind
-    `forward_shape` gives an empty batch that produces output.
+    `forward_shape` gives an empty batch that produces output; one that
+    produces none, whose labels `DUMMY_KIND` holds no `W_post` of, stays a
+    middle chunk.
     """
 
     def __init__(
@@ -423,7 +425,8 @@ class HostDeviceRecurrence:
         first runs `PP_RECV_SEGMENT`. Once any kind's law has `OUT_SEGMENT`
         every kind runs it, as `out_s`, else None."""
         kind, x = forward_shape(batch)
-        if getattr(batch, "compass_dummy", False) and DUMMY_KIND in self.laws:
+        dummy = getattr(batch, "compass_dummy", False) and kind == "decode"
+        if dummy and DUMMY_KIND in self.laws:
             kind = DUMMY_KIND
         law = self._law(kind)
         ran = HOST_SEGMENTS[: 3 if kind == "middle" else 4]
