@@ -403,7 +403,7 @@ HAND_IN_WAIT_S = 300.0
 PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
-SUMMARY_SCHEMA_VERSION = 14
+SUMMARY_SCHEMA_VERSION = 15
 #: The reading kind of ATOM's source as `atom_digest` reads it.
 ATOM_PY = "atom_py"
 #: The terms of a ``host`` entry the frontend charges, each 0 s where it is absent.
@@ -3807,6 +3807,18 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     schedule["treatments"] = dict(sorted(counted("treatments").items()))
     # Each reason a source declined a step a fallback then priced, with its steps.
     schedule["fallback_reasons"] = dict(counted("fallback_reasons").most_common())
+    # The steps extrapolated on each DP group step's critical rank, apart from
+    # every rank's, off the step records in out_dir, over a client run's own
+    # span; or why there are none.
+    from atom.compass.report import extrapolation
+
+    span = None if record is a else (record.start, record.end)
+    try:
+        schedule[extrapolation.FIELD] = extrapolation.of_run(run["out_dir"], span)
+        schedule[extrapolation.REFUSED] = None
+    except (OSError, ValueError) as refused:
+        schedule[extrapolation.FIELD] = None
+        schedule[extrapolation.REFUSED] = str(refused)
     # An engine whose workers died, or that never handed in, priced steps no
     # one counted: they are absent, not 0.
     if any(
