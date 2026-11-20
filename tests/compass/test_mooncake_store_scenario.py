@@ -65,17 +65,21 @@ NEEDS_A_STORE_RUN = pytest.mark.skipif(
     not (DSV41 and shutil.which("atomesh")),
     reason="a run needs ATOM_COMPASS_DSPARK_MODEL and atomesh on PATH",
 )
-#: Every server: eager, the recipe's KV and index dtypes, block size and MoE path.
+#: Every server: eager, ROCm/ATOM main's recipe's (5effb67d4) KV and index
+#: dtypes, block size (V4.1 resolves 16 to 128) and MoE path.
 SERVER_ARGS = "--trust-remote-code -tp 2 --enable-dp-attention --enforce-eager"
-SERVER_ARGS += " --max-model-len 2048 --kv_cache_dtype bf16 --index-cache-dtype fp8"
-SERVER_ARGS += " --block-size 128 --moe-backend standard --all2all-backend none"
-SERVER_ARGS += " --enable_prefix_caching"
-#: The recipe's prefill policy, over the tier every rank of both instances shares.
-PREFILL_ARGS = "--dp-load-balance share_cache"
+SERVER_ARGS += " --max-model-len 2048 --kv_cache_dtype fp8 --index-cache-dtype fp8"
+SERVER_ARGS += " --block-size 16 --moe-backend standard"
+SERVER_ARGS += " --all2all-backend high-throughput --enable_prefix_caching"
+#: The recipe's prefill: EP over its two ranks, and its policy over the tier
+#: every rank of both instances shares.
+PREFILL_ARGS = "--enable-expert-parallel --dp-load-balance share_cache"
+#: The recipe's environment beside it: MoRI on, fp8 MoE activations off.
+RECIPE_ENV = {"ATOM_DSV41_MOE_FP8_ACTIVATIONS": "0", "NCCL_IB_DISABLE": "0"}
 CHUNK = 256
-#: DeepSeek-V4.1-Flash's planned 128-token KV block at bf16 KV and an fp8
+#: DeepSeek-V4.1-Flash's planned 128-token KV block at fp8 KV and an fp8
 #: index, as its runner publishes it, two to a chunk.
-CHUNK_BYTES = 2 * 369920
+CHUNK_BYTES = 2 * 211200
 POOL_MIB = 64
 SLOTS = (POOL_MIB << 20) // (-(-CHUNK_BYTES // 4096) * 4096)
 CAPACITY_CHUNKS = 12
@@ -193,7 +197,8 @@ def run_store(out: Path, seed: str) -> dict:
             **{store.ENTRY: ENTRY},
         )
         env = dict(
-            os.environ,
+            {k: v for k, v in os.environ.items() if k != "ATOM_DISABLE_MORI_EP"},
+            **RECIPE_ENV,
             PYTHONHASHSEED=seed,
             PYTHONPATH=str(TREE),
             AITER_LOG_LEVEL="WARNING",
