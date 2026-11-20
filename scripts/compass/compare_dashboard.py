@@ -263,18 +263,38 @@ def minutes(values: list, per_minute: int, gauge: bool) -> list:
     return out
 
 
-def paired_means(real: dict, sim: dict) -> dict:
+def common_minutes(runs: list) -> dict:
+    """For each panel series, the minutes the real run and every simulated run
+    holding that series all have a value in. One cell's runs are paired over
+    the same minutes, so one run's extra minute (the single minute a run
+    decodes anything in while the saturation sets in, say) moves no run's error
+    alone."""
+    out = {}
+    for pid, subs in runs[0].items():
+        for sub, vals in subs.items():
+            held = [r[pid][sub] for r in runs if sub in r.get(pid, {})]
+            out.setdefault(pid, {})[sub] = {
+                i
+                for i in range(len(vals))
+                if all(i < len(v) and v[i] is not None for v in held)
+            }
+    return out
+
+
+def paired_means(real: dict, sim: dict, keep: dict | None = None) -> dict:
     """For each panel series both runs hold, the real and the simulated mean
-    over the minutes both have a value in, and those minutes' count: a minute
-    one run has no value in (no decode output at all in a minute, say) would
-    otherwise weigh on one side alone."""
+    over the minutes both have a value in, and among `keep`'s for that series
+    where given, and those minutes' count: a minute one run has no value in (no
+    decode output at all in a minute, say) would otherwise weigh on one side
+    alone."""
     out = {}
     for pid in real.keys() & sim.keys():
         for sub in real[pid].keys() & sim[pid].keys():
+            mask = (keep or {}).get(pid, {}).get(sub)
             both = [
                 (a, b)
-                for a, b in zip(real[pid][sub], sim[pid][sub])
-                if a is not None and b is not None
+                for i, (a, b) in enumerate(zip(real[pid][sub], sim[pid][sub]))
+                if a is not None and b is not None and (mask is None or i in mask)
             ]
             if both:
                 out.setdefault(pid, {})[sub] = [
@@ -474,8 +494,9 @@ def build(cells: list[dict], window: float, args) -> dict:
                     "means": means,
                 }
             )
+        keep = common_minutes([r["minutes"] for r in out_runs])
         for run in out_runs[1:]:
-            run["pairs"] = paired_means(out_runs[0]["minutes"], run["minutes"])
+            run["pairs"] = paired_means(out_runs[0]["minutes"], run["minutes"], keep)
         files = [f for f in cell["one_real"] if f.is_file()]
         missing = [str(f) for f in cell["one_real"] if not f.is_file()]
         if not files and args.one_real_tree and all(r["run"] for r in runs):
@@ -775,7 +796,7 @@ dl.defs dd { margin: 0; color: var(--ink2); }
       <dt>Panel points</dt><dd>As in CI's report: a histogram point (latency, batch, token panels) is a histogram estimate of the statistic over the rate window before it (60 s here); the cache panel's point is the reuse ratio over that window; queue and KV curves are sampled state.</dd>
       <dt>Y axis</dt><dd>Fit cuts a panel whose peak is over 3&times; its 98th-percentile point at 1.25&times; that point and says so under the chart; Full shows every point; Log is logarithmic (zeros not drawn).</dd>
       <dt>60 s table</dt><dd>One row per minute: a histogram or cache panel's point at the minute's end (so the statistic over that minute), a queue or KV panel's mean over the minute's samples. The last row is the mean of the rows.</dd>
-      <dt>Panel matrix</dt><dd>The mean of a panel's one-minute values, the simulated run's against the real run's, over the minutes both runs have a value in; <b>*</b> marks fewer than all minutes (a minute with no decode output at all has no ITL point, say). Histogram panels use the selected statistic. A mean of per-minute P99s says in which minutes the long waits sit; it is not the run's P99. The "window mean" a panel's footer shows beside each run is that run's own mean over its minutes.</dd>
+      <dt>Panel matrix</dt><dd>The mean of a panel's one-minute values, the simulated run's against the real run's, over the minutes the real run and every simulated run of the cell have a value in, so the cell&#39;s runs are compared over the same minutes; <b>*</b> marks fewer than all minutes (a minute with no decode output at all has no ITL point, say). Histogram panels use the selected statistic. A mean of per-minute P99s says in which minutes the long waits sit; it is not the run's P99. The "window mean" a panel's footer shows beside each run is that run's own mean over its minutes.</dd>
       <dt>Request matrix</dt><dd><code>one_real.py</code>'s per-request metrics over the graded requests of each run (aiperf's TTFT, inter-token latency as TPOT, request latency, and InferenceX's agentic metrics). These are the figures the issues report. "in" / "OUT" marks a tail error inside or outside the real run's own 95% interval from 60 s send-block resamples; E2E paired is the median ratio over the requests both runs finished.</dd>
       <dt>Simulated GPU panels</dt><dd>A simulated run's GPU panels are the predicted target device time on TP rank 0; a real run whose collector took no samples of them shows none.</dd>
     </dl>
