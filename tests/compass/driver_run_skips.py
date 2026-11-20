@@ -19,22 +19,17 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 LIST = "scripts/compass/gpu_gate_driver_run.txt"
-#: A skip reason naming an input gate_gpu.sh sets, or the router it puts on PATH.
+#: A skip reason naming an input gate_gpu.sh sets, or the router it puts on PATH;
+#: `_lib.sh`'s COMPASS_DRIVER_RUN_SKIP matches a SKIPPED line by the same pattern.
 DRIVER_RUN = re.compile(
     r"ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK|CCTRACES)|COMPASS_(HARNESS|AIPERF)_PYTHON"
     r"|ATOMESH|needs atomesh|atomesh on PATH"
 )
 
 
-def _listed():
-    path = ROOT / LIST
-    if not path.exists():
-        return set()
-    lines = (line.split("#")[0].strip() for line in path.read_text().splitlines())
-    return {line for line in lines if line}
-
-
-LISTED = _listed()
+LISTED = {
+    line.split("#")[0].strip() for line in (ROOT / LIST).read_text().splitlines()
+} - {""}
 
 
 def _unlisted(report, path):

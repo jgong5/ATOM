@@ -343,6 +343,17 @@ def test_the_suites_conftest_loads_the_driver_run_hooks(request):
         assert getattr(driver_run_skips, name) in [i.function for i in impls]
 
 
+def test_the_gates_and_the_hooks_take_a_skip_for_driver_run_by_one_pattern():
+    shell = subprocess.run(
+        [BASH, "-c", '. scripts/compass/_lib.sh; printf %s "$COMPASS_DRIVER_RUN_SKIP"'],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert shell == f"^SKIPPED .*({driver_run_skips.DRIVER_RUN.pattern})"
+
+
 # The hooks, loaded as tests/conftest.py loads them, over a throwaway tree.
 def _pytest(tmp_path, listed, text):
     root = tmp_path / "ATOM"
