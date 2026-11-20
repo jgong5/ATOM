@@ -357,6 +357,14 @@ def add_mooncake_store(
     every writer rank's put, in rank order, which gets no reply. Each end takes
     its frames inline. Each is one hop of `store_rpc_s`, which must be
     positive: a query and its reply are a cycle.
+
+    Each rank's ``request#dp<r>`` into each engine is offering: the engine's
+    input thread offers an arrival's Store lookup (`offer_lookups`, which
+    ATOM's Store scheduler always defines), and the shell hands it to
+    `LPRuntime.offer` (`StoreShell._send_lookup`). The marking follows from
+    the run file alone, so the authority's process and each engine's agree.
+    The Store's replies are taken by the step loop at its next poll, so they
+    offer nothing.
     """
     if not store_rpc_s > 0.0:
         raise ValueError(
@@ -374,6 +382,9 @@ def add_mooncake_store(
             ):
                 name = f"{src.name}->{dst.name}:{kind}"
                 table.declare(name, src, dst, store_rpc_s, "inline")
+        ends = tuple(f":request#dp{r}" for r in range(dp))
+        into = table.channels_into(eng)
+        table.mark_offering(*(c.name for c in into if c.name.endswith(ends)))
 
 
 def prefill_decode_table(
