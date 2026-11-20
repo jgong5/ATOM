@@ -2,7 +2,8 @@
 """A P/D producer's output prefill under a draft law with `output_prefill_kv` and no `propose`: its drafter runs only
 the draft-KV pass, which the law prices among the step's target terms (step_linear's module text), so the step has no
 `draft_terms`. The speculative runner must charge it, not refuse it as a law that "prices no draft" and charge 0 s: that
-dropped the target's prefill too, 18.7% of a 1P1D producer's device time (cell B2 r1_c128, #3720)."""
+dropped the target's prefill too, 18.7% of a 1P1D producer's device time (cell B2 r1_c128, #3720).
+"""
 
 import pytest
 from test_backend_step_linear_fit import _steps
