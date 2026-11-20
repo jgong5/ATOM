@@ -103,6 +103,47 @@ def test_a_stated_hop_is_written_into_the_entry_s_hops_and_named_in_its_report(
     assert report["stated_hops"] == host["hops"]
 
 
+def test_a_stated_ingress_is_written_as_the_entry_s_term_and_named_in_its_report(
+    tmp_path,
+):
+    """`--ingress FILE`: the encoding ingress in front of the deployment, as
+    `compass fit ingress` wrote it from the ingress's stamps, which no record
+    holds; an entry stated with one goes to a run file as its ingress."""
+    r = deployment(tmp_path)
+    publish(tmp_path, r)
+    key = compass_run.host_key(r.config)
+    a = record(tmp_path / "a", 19, key=key, trace="trace-a")
+    term = {"fixed_s": 0.0, "per_byte_s": 4.4e-7, "workers": 64}
+    term |= {"router_per_byte_s": 1.2e-8, "bytes": [875, 3620123]}
+    (tmp_path / "ingress.json").write_text(json.dumps({"ingress": term}))
+    fit(
+        tmp_path,
+        "fit host",
+        a,
+        *clients(a),
+        "--ingress",
+        str(tmp_path / "ingress.json"),
+    )
+
+    host = member(tmp_path / "store", host_laws_key(key), "params")
+    assert host["ingress"] == term
+    report = member(tmp_path / "store", host_laws_key(key), "report")
+    assert report["stated_ingress"] == {
+        "file": str(tmp_path / "ingress.json"),
+        "ingress": term,
+    }
+    (tmp_path / "bad.json").write_text(json.dumps({"ingress": {**term, "workers": 0}}))
+    with pytest.raises(SystemExit, match="bad.json: its ingress is"):
+        fit(
+            tmp_path,
+            "fit host",
+            a,
+            *clients(a),
+            "--ingress",
+            str(tmp_path / "bad.json"),
+        )
+
+
 @pytest.mark.parametrize(
     "words, refusal",
     [

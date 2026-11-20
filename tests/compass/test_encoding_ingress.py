@@ -149,9 +149,10 @@ from starlette.routing import Route
 out = sys.argv[2]
 
 async def chat(request):
-    body = await request.json()
+    raw = await request.body()
+    body = json.loads(raw)
     seen = {"headers": dict(request.headers), "ids": len(body.get("prompt_token_ids") or []),
-            "keys": sorted(body)}
+            "keys": sorted(body), "bytes": len(raw)}
     open(out + ".request", "w").write(json.dumps(seen))
     async def events():
         try:
@@ -252,6 +253,7 @@ def test_a_streamed_chat_goes_through_with_its_ids_and_headers_and_a_hang_up_rea
         line = json.loads(next(tmp_path.glob("stamps.*")).read_text().splitlines()[-1])
         assert line["kind"] == "encoded" and line["cancelled"] is True
         assert line["recv"] <= line["sent"] <= line["head"] <= line["end"]
+        assert line["sent_bytes"] == seen["bytes"] > line["bytes"]
     finally:
         for p in procs:
             p.terminate()

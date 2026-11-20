@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """The encoding ingress's hop: the ``ingress`` term (`atom.compass.ingress`),
-the queue `Ingress` prices it on, and the run file a host entry stating one
-builds (`atom.compass.drive.runfile`), read back through `run.spec`.
+the queue `Ingress` prices it on, `compass fit ingress` on an ingress's stamps
+(`atom.compass.fit.ingress`), and the run file a host entry stating one builds
+(`atom.compass.drive.runfile`), read back through `run.spec`.
 
 The traffic LP's pricing on the clock, and the worker's size report, are
 `test_harness_traffic_lp.py`'s and `test_harness_transport.py`'s.
@@ -16,10 +17,12 @@ import platforms
 import pytest
 from test_memory_readings import DOCUMENT
 
+from atom.compass import cli
 from atom.compass import ingress as compass_ingress
 from atom.compass import run as compass_run
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.drive import runfile
+from atom.compass.fit.ingress import fit_ingress, router_term, samples, stamps
 from atom.compass.ingress import Ingress, check
 
 #: An ingress of two threads, its terms dyadic so its sums are exact.
@@ -183,3 +186,164 @@ def test_a_host_entry_s_ingress_goes_to_the_run_file_beside_its_router_hop(
     assert table.lookahead("traffic->frontend-P:http") == compass_run.channel_table(
         plain
     ).lookahead("traffic->frontend-P:http")
+
+
+# ---- compass fit ingress ----
+
+
+def _row(recv: int, nbytes: int, held_ns: int, proc=0, **more) -> dict:
+    """An encoded request's stamp line: received at `recv` ns, its body
+    `nbytes`, holding its thread `held_ns`, a fifth of it outside the encode."""
+    start = recv + 2_000
+    encode = held_ns - held_ns // 5
+    return {
+        "recv": recv,
+        "proc": proc,
+        "body": recv + 1_000,
+        "bytes": nbytes,
+        "start": start,
+        "parsed": start + held_ns // 10,
+        "rendered": start + held_ns // 5,
+        "encoded": start + held_ns // 5 + encode,
+        "serialized": start + held_ns,
+        "kind": "encoded",
+        "tokens": nbytes // 4,
+        "sent": start + held_ns + 3_000,
+        "status": 200,
+        **more,
+    }
+
+
+#: Encoded requests whose threads hold 1 ms + 250 ns a byte, and a cancel and
+#: a health probe the ingress passed through.
+LAW = (1e-3, 250e-9)
+ROWS = [
+    _row(k * 10**8, n, round(1e9 * (LAW[0] + LAW[1] * n)), proc=k % 2)
+    for k, n in enumerate([1000, 40_000, 400_000, 9_000, 120_000, 2_000_000])
+] + [
+    {"recv": 7, "kind": "passthrough", "bytes": 23, "sent": 9, "status": 204},
+    {"recv": 8, "kind": "passthrough", "bytes": 0, "path": "/health", "sent": 9},
+]
+
+
+def _write(tmp_path, rows, split=2) -> str:
+    """`rows` as the ingress's processes write them, ``<prefix>.<pid>``; the prefix."""
+    prefix = tmp_path / "stamps"
+    for k in range(split):
+        lines = [json.dumps(r) for r in rows[k::split]]
+        (tmp_path / f"stamps.{4000 + k}").write_text("\n".join(lines) + "\n")
+    return str(prefix)
+
+
+def test_a_linear_thread_law_fits_back_exactly_with_its_hull_and_threads():
+    term, report = fit_ingress(samples(ROWS), 64)
+    assert term["fixed_s"] == pytest.approx(LAW[0], rel=1e-6)
+    assert term["per_byte_s"] == pytest.approx(LAW[1], rel=1e-6)
+    assert term["workers"] == 64 and term["bytes"] == [1000, 2_000_000]
+    assert report["method"] == "least squares" and report["requests"] == 6
+    assert report["thread_ms"]["law"] == pytest.approx(report["thread_ms"]["measured"])
+    assert report["bytes_per_token"] == pytest.approx(4.0, rel=1e-3)
+    assert report["most_threads_busy"] == {"0": 1, "1": 1}
+
+
+def test_an_encode_growing_faster_than_its_body_fits_through_zero_at_its_mean():
+    """Threads that hold 1e-15 s a byte squared: least squares would put
+    fixed_s below 0, so it is 0 and per_byte_s keeps the samples' mean."""
+    sizes = [10_000 * k for k in range(1, 30)]
+    rows = [_row(k, n, round(1e9 * 1e-15 * n * n)) for k, n in enumerate(sizes)]
+    term, report = fit_ingress(samples(rows), 4)
+    held = [1e-15 * n * n for n in sizes]
+    assert term["fixed_s"] == 0.0
+    assert term["per_byte_s"] == pytest.approx(sum(held) / sum(sizes), rel=1e-6)
+    assert report["least_squares"]["fixed_s"] < 0
+    assert report["method"].startswith("least squares puts fixed_s at -")
+    assert report["thread_ms"]["law"]["mean"] == pytest.approx(
+        report["thread_ms"]["measured"]["mean"]
+    )
+
+
+def test_skip_leaves_out_the_first_requests_by_receipt():
+    chosen = samples(list(reversed(ROWS)), skip=2)
+    assert [r["bytes"] for r in chosen] == [400_000, 9_000, 120_000, 2_000_000]
+
+
+def test_stamps_read_a_prefix_s_files_and_a_last_line_cut_short(tmp_path):
+    prefix = _write(tmp_path, ROWS)
+    with open(f"{prefix}.4001", "a") as f:
+        f.write('{"recv": 99, "kind": "enc')  # the ingress was stopped mid-write
+    assert sorted(map(json.dumps, stamps([prefix]))) == sorted(map(json.dumps, ROWS))
+    assert len(stamps([f"{prefix}.4000"])) == 4
+    with pytest.raises(ValueError, match="neither a stamps file nor the prefix"):
+        stamps([str(tmp_path / "none")])
+    (tmp_path / "bad.1").write_text('{"recv": 1\n{}\n')
+    with pytest.raises(ValueError, match=r"bad.1:1: not a stamp line"):
+        stamps([str(tmp_path / "bad")])
+
+
+def test_a_sample_without_every_stage_refuses():
+    row = {k: v for k, v in ROWS[0].items() if k != "rendered"}
+    with pytest.raises(ValueError, match="1 encoded requests lack a stamp"):
+        samples([row, *ROWS[1:]])
+
+
+def _metrics(seconds: float, count: int) -> str:
+    return (
+        "# TYPE mesh_prepare_stage_seconds summary\n"
+        f'mesh_prepare_stage_seconds{{stage="json_parse",quantile="0.5"}} 0\n'
+        f'mesh_prepare_stage_seconds_sum{{stage="json_parse"}} {seconds}\n'
+        f'mesh_prepare_stage_seconds_count{{stage="json_parse"}} {count}\n'
+        'mesh_http_requests_total{method="POST",path="/v1/chat/completions"} 7\n'
+    )
+
+
+def test_the_router_term_is_atomesh_s_parse_seconds_over_the_client_bytes():
+    """atomesh parsed the six requests the ingress sent it, not the cancel it
+    answered itself; a fallback, sent on as it came, counts too."""
+    nbytes = sum(r["bytes"] for r in ROWS[:6])
+    per_byte, report = router_term(ROWS, _metrics(0.5, 6))
+    assert per_byte == 0.5 / nbytes
+    assert report["parsed"] == 6 and report["mean_parse_ms"] == pytest.approx(500 / 6)
+    fallback = {**ROWS[0], "kind": "fallback", "bytes": 10}
+    assert router_term([*ROWS, fallback], _metrics(1.0, 7))[0] == 1.0 / (nbytes + 10)
+    with pytest.raises(ValueError, match="atomesh parsed 5 requests .* sent it 6"):
+        router_term(ROWS, _metrics(0.5, 5))
+    with pytest.raises(ValueError, match="not atomesh's /metrics"):
+        router_term(ROWS, "mesh_http_requests_total 1\n")
+
+
+def test_a_forwarded_body_s_size_gives_the_router_its_rate_a_forwarded_byte():
+    rows = [{**r, "sent_bytes": 3 * r["bytes"]} for r in ROWS[:6]]
+    _, report = fit_ingress(samples(rows), 64)
+    assert report["forwarded_bytes_per_byte"] == 3.0
+    per_byte, router = router_term(rows, _metrics(0.5, 6))
+    assert router["per_forwarded_byte_s"] == pytest.approx(per_byte / 3)
+
+
+def test_compass_fit_ingress_writes_the_term_a_host_entry_states(tmp_path, capsys):
+    prefix = _write(tmp_path, ROWS)
+    (tmp_path / "metrics.prom").write_text(_metrics(0.5, 6))
+    out = tmp_path / "ingress.json"
+    cli.main(
+        [
+            *("fit", "ingress", prefix, "--skip", "1", "--processes", "2"),
+            *("--workers", "8", "--metrics", str(tmp_path / "metrics.prom")),
+            *("--out", str(out)),
+        ]
+    )
+    got = json.loads(out.read_text())
+    term = check(got["ingress"])
+    assert term["workers"] == 16 and term["bytes"] == [9_000, 2_000_000]
+    assert term["fixed_s"] == pytest.approx(LAW[0], rel=1e-6)
+    assert term["router_per_byte_s"] == 0.5 / sum(r["bytes"] for r in ROWS[:6])
+    assert got["report"]["skip"] == 1 and got["report"]["requests"] == 5
+    assert json.loads(capsys.readouterr().out)["ingress"] == term
+    cli.main(["fit", "ingress", prefix, "--out", str(out)])
+    got = json.loads(out.read_text())
+    assert "router_per_byte_s" not in got["ingress"] and got["ingress"]["workers"] == 64
+    assert got["report"]["unfitted"] == {"router_per_byte_s": "no --metrics"}
+    from atom.compass.fit.host import stated_ingress
+
+    assert stated_ingress(str(out)) == got["ingress"]
+    (tmp_path / "other.json").write_text(json.dumps({"host": {}}))
+    with pytest.raises(ValueError, match="holds no ingress term"):
+        stated_ingress(str(tmp_path / "other.json"))

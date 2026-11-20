@@ -42,10 +42,12 @@ none, so each prompt is tokenized whole.
 ``rendered``, ``encoded`` and ``serialized`` the job's stages, ``sent`` the
 upstream request handed to the pool, ``head`` the upstream response's head,
 ``first`` its first body chunk, ``end`` its last relayed; with ``tokens``,
-``bytes`` (body in), ``status`` and ``kind`` (``encoded``, ``passthrough`` or
-``fallback``), ``cancelled`` when the client left first. The ingress hop is
-``sent - recv``. `--bodies DIR` keeps the first chat bodies it takes (100 a
-process) in DIR, which the equivalence test replays.
+``bytes`` (body in), ``sent_bytes`` (body out), ``status`` and ``kind``
+(``encoded``, ``passthrough`` or ``fallback``), ``cancelled`` when the client
+left first. The ingress hop is ``sent - recv``. `compass fit ingress` fits a
+simulated run's ``ingress`` term on these stamps (`atom.compass.fit.ingress`).
+`--bodies DIR` keeps the first chat bodies it takes (100 a process) in DIR,
+which the equivalence test replays.
 """
 
 import argparse
@@ -245,6 +247,7 @@ def serve_process(args, index: int, ready) -> None:
             headers=headers,
             content=body,
         )
+        line["sent_bytes"] = len(body)
         line["sent"] = time.monotonic_ns()
         try:
             got = await client.send(upstream, stream=True)
