@@ -13,8 +13,13 @@
 #                  --store, ... (atom/compass/drive/runfile.py); record: the
 #                  `compass record` flags both instances take, e.g. --gpu
 #   <own>          that instance's own `compass record` flags, e.g. --gpu, or
-#                  --host, an address the router reaches; and --on PREFIX
-#                  (below)
+#                  --host, an address the router reaches; --on PREFIX
+#                  (below); and --env NAME=VALUE, repeated, a variable that
+#                  instance's command alone runs under, such as a prefill's
+#                  ATOM_KV_OFFLOAD=mooncake_store and its
+#                  ATOM_KV_OFFLOAD_EXTRA_CONFIG, which ATOM folds into the
+#                  instance's --kv-transfer-config as the recipe's `multi`
+#                  connector (atom/model_engine/arg_utils.py)
 #   <ATOM args>    each instance's ATOM arguments; the script adds its
 #                  --kv-transfer-config, the simulated connector and the
 #                  write-request address, or, real, Mooncake and a handshake
@@ -135,13 +140,17 @@ while (($#)); do
         if [[ $state != router ]]; then
             i=${#sides[@]}
             sides+=("$state")
-            declare -ga "atom_$i=()" "own_$i=()" "on_$i=()"
+            declare -ga "atom_$i=()" "own_$i=()" "on_$i=()" "env_$i=()"
         fi
     elif ((head)) && [[ $1 == -- ]]; then
         head=0
     elif [[ $state$head$1 == prefill1--on || $state$head$1 == decode1--on ]]; then
         [[ ${2-} == [!-]* ]] || bad "--on takes a command prefix, a command and its words"
         read -ra "on_$i" <<<"$2"
+        shift
+    elif [[ $state$head$1 == prefill1--env || $state$head$1 == decode1--env ]]; then
+        [[ ${2-} =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || bad "--env takes NAME=VALUE"
+        push "env_$i" "$2"
         shift
     else
         case $state$head in
@@ -325,7 +334,9 @@ fi
 
 instance() { # I: write instance I's command, OUT/<name>.sh, and run it
     local i=$1 name=${names[$1]}
-    local -n atom=atom_$1 own=own_$1 prefix=on_$1 vars=${sides[$1]}_env
+    local -n atom=atom_$1 own=own_$1 prefix=on_$1 side_vars=${sides[$1]}_env own_vars=env_$1
+    # Its side's variables (PREFILL_ENV, DECODE_ENV), then its own (--env), which win.
+    local vars=("${side_vars[@]}" "${own_vars[@]}")
     local role=kv_consumer command=("$cmd" --join "$RUN_FILE") several=$ND
     [[ ${sides[i]} == decode ]] || role=kv_producer several=$NP
     local kv="{\"kv_role\":\"$role\",\"kv_connector\":\"compass\",\"compass_kv_write_req\":\"tcp://127.0.0.1:${KV_PORTS[i]}\""
@@ -341,7 +352,7 @@ print(json.dumps({**json.loads(sys.argv[2]), **json.loads(sys.argv[1])}))' "$kv"
     # Its process id, which exec keeps; then this tree, checked, and the caller's directory.
     printf 'echo $$ >%q\n. %q && compass_env %q && compass_require_tree %q && cd %q &&\n    exec' \
         "$OUT/$name.pid" "$ROOT/scripts/compass/_lib.sh" "$ROOT" "$ROOT" "$PWD" >"$OUT/$name.sh"
-    # Its side's variables, after compass_env so they win, quoted so a JSON value arrives whole.
+    # Its variables, after compass_env so they win, quoted so a JSON value arrives whole.
     ((${#vars[@]} == 0)) || printf ' %q' env "${vars[@]}" >>"$OUT/$name.sh"
     printf ' %q' python3 -c 'from atom.compass.cli import main; main()' "${command[@]}" >>"$OUT/$name.sh"
     "${prefix[@]}" bash "$OUT/$name.sh" >"$OUT/$name.log" 2>&1 &
