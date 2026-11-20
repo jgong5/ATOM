@@ -56,7 +56,8 @@ class DeepseekV41(LaunchFeatures):
     `running_bs` or eagerly. A decode is neither. `install` counts what
     replayed; `recorded` states the decoder's buckets, None where it does not
     replay; `predict` reads `running_bs` off the view's `target_bs`, which
-    `ForwardMode.decide` settles. A step ATOM runs eagerly for a reason a view
+    `ForwardMode.decide` settles, and runs a DP dummy's tail where its group's
+    runs (`group_tail`). A step ATOM runs eagerly for a reason a view
     does not carry, a score workspace too small for one band among them,
     refuses its fit by name."""
 
@@ -118,7 +119,10 @@ class DeepseekV41(LaunchFeatures):
         # collectives being the group's (`BatchView.group_tail`).
         tokens = max(sum_tokens(view.requests), view.group_max_tokens or 0)
         decoder = graphs["decoder"]
-        tail = (bool(view.produces_output) or view.group_tail) and decoder is not None
+        # A DP dummy runs the decoder only beside a peer's tail: it samples
+        # nothing of its own, though its line produces output.
+        own = bool(view.produces_output) and not view.dp_dummy
+        tail = (own or view.group_tail) and decoder is not None
         running_bs = view.target_bs or len(view.requests)
         return {
             "eager_body": float(all(n < tokens for n in graphs["token"]["prefill"])),

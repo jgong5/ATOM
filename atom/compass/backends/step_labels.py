@@ -116,6 +116,16 @@ the event it waits for.
 pull, else exit, over the ranks before the same forward, where the group's
 `_sync_dp_state` releases each of them.
 
+A DP rank's dummy forward at a step some rank of its group prefills, its line
+holding the one prefill row `ModelRunner.dummy_execution` runs, gives no
+sample, but its segments, `W_pre`, `W_inputs`, `W_launch` and `W_post` as
+above, are its rank's samples' `dummy_host` (`_dummy_hosts`): it runs the
+group's launch path, eagerly past the largest prefill token graph, for as long
+as a prefill's own body, after waiting for the step before it at its MTP status
+wait, and the group's next forward enters only once it has left. Each holds its
+view (`step_linear.dummy_view` of the group's fields) and the launch features its
+line states.
+
 A step's `admitted` is what its `E` spent admitting requests (`admissions`):
 the scheduler allocates a request's whole prompt the first time it schedules
 it, walking its prefix-cache hit and taking a fresh block for each one past it.
@@ -130,6 +140,7 @@ the step has none.
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import hashlib
 import itertools
 import json
@@ -231,6 +242,10 @@ class Sample:
     `floor` names, per busy line field of a drafter part, why the profiler's
     floor left a kernel of it at its recorded length (`Floor.term`); empty on
     a cut step, without `floored` or with every term known.
+    `dummy_host` holds, per dummy forward its rank ran at a step its group
+    prefills, ``(step, view, host, launch)``: its view, its host segments in
+    seconds and its line's launch features (`_dummy_hosts`); the same tuple on
+    each of the rank's samples, empty on a trace run.
     """
 
     step: int
@@ -250,6 +265,7 @@ class Sample:
     blocked: dict | None = None
     floor: dict = field(default_factory=dict)
     passes_s: tuple | None = None
+    dummy_host: tuple = ()
 
 
 class Floor:
@@ -604,6 +620,62 @@ def label_run(
     ]
 
 
+def _segments(s: dict, output: bool) -> dict:
+    """A line's host segments within its forward, in ns, as the module says:
+    `W_pre`, `W_launch`, and where it stamps them `W_inputs`, `W_recv`,
+    `W_post` (on a forward with `output`) and `E_out`."""
+    enter, (l0, l1) = s["t_enter_ns"], s["t_launch_ns"]
+    g0, g1 = s.get("t_gate_ns", (l0, l0))
+    r0, r1 = s.get("t_recv_ns", s.get("t_read_ns", (l1, l1)))
+    m0, m1 = s.get("t_mtp_ns", (l0, l0))
+    blocked = s.get("blocked_ns")
+    host = {"W_pre": g0 - enter + m0 - g1}
+    host["W_launch"] = r0 - l0 - sum((blocked or {}).values())
+    if "t_mtp_ns" in s:
+        host["W_inputs"] = l0 - m1
+    if "t_pp_recv_ns" in s:
+        host["W_recv"] = s["t_pp_recv_ns"][0] - l0
+    if output:
+        d0, d1 = s.get("t_draft_recv_ns", s.get("t_draft_read_ns", (0, 0)))
+        host["W_post"] = s["t_exit_ns"] - r1 - (d1 - d0)
+    if "t_pull_ns" in s:
+        host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
+    return host
+
+
+#: The segments a dummy forward's `dummy_host` holds: those within its forward.
+DUMMY_SEGMENTS = ("W_pre", "W_inputs", "W_launch", "W_post")
+
+
+def _dummy_hosts(lines, peaks, tails) -> tuple:
+    """`Sample.dummy_host` of a rank's `lines`: each dummy forward at a step
+    its group prefills, its line holding a prefill row, with its view, the
+    group's fields from `peaks` and `tails` (`group_peaks`, `group_tails`), its
+    `DUMMY_SEGMENTS` in seconds and its line's launch features."""
+    from atom.compass.backends.step_linear import dummy_view
+
+    out = []
+    for s in lines:
+        rows = s.get("rows") or ()
+        if not (s["is_dummy_run"] and "t_launch_ns" in s and rows) or rows[0][2]:
+            continue
+        view = dummy_view(
+            BatchView(
+                (RequestShape(1, 1, False),),
+                moe_rows=s.get("moe_rows"),
+                moe_tokens=s.get("moe_tokens"),
+                dp_rank=s["dp_rank"],
+                group_max_tokens=peaks.get(s["step"]),
+                group_tail=s["step"] in tails,
+            )
+        )
+        view = dataclasses.replace(view, produces_output=s["produces_output"])
+        host = _segments(s, s["produces_output"])
+        host = {k: host[k] * 1e-9 for k in DUMMY_SEGMENTS if k in host}
+        out.append((s["step"], view, host, s.get("launch", {})))
+    return tuple(out)
+
+
 def _label(
     record,
     lines,
@@ -645,6 +717,13 @@ def _label(
             [read_jsonl(p) for p in _peers(path)] if "moe_rows" in steps[0] else [lines]
         )
     duties = prefill_duties(lines, prefills)
+    dummy_host = ()
+    if dummies and not traced and "moe_rows" in steps[0]:
+        if dummy_ranks is None:
+            peers = [read_jsonl(p) for p in _peers(path)]
+            dummy_ranks, peaks = group_dummies(peers), group_peaks(peers)
+            tails = group_tails(peers)
+        dummy_host = _dummy_hosts(lines, peaks, tails or frozenset())
     for i, s in enumerate(lines):
         if s["is_dummy_run"]:
             prev = s
@@ -725,22 +804,8 @@ def _label(
             device = target * 1e-9
             draft = None if draft is None else (draft - (draft_kv or 0)) * 1e-9
             propose = s.get("b_propose_ns") if view.produces_output else None
-        enter, (l0, l1) = s["t_enter_ns"], s["t_launch_ns"]
-        g0, g1 = s.get("t_gate_ns", (l0, l0))
-        r0, r1 = s.get("t_recv_ns", s.get("t_read_ns", (l1, l1)))
-        m0, m1 = s.get("t_mtp_ns", (l0, l0))
-        blocked = s.get("blocked_ns")
-        host = {"W_pre": g0 - enter + m0 - g1}
-        host["W_launch"] = r0 - l0 - sum((blocked or {}).values())
-        if "t_mtp_ns" in s:
-            host["W_inputs"] = l0 - m1
-        if "t_pp_recv_ns" in s:
-            host["W_recv"] = s["t_pp_recv_ns"][0] - l0
-        if host_kind(view) != "middle":
-            d0, d1 = s.get("t_draft_recv_ns", s.get("t_draft_read_ns", (0, 0)))
-            host["W_post"] = s["t_exit_ns"] - r1 - (d1 - d0)
-        if "t_pull_ns" in s:
-            host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
+        enter, blocked = s["t_enter_ns"], s.get("blocked_ns")
+        host = _segments(s, host_kind(view) != "middle")
         if copy.get(s["step"], (0, False))[1]:
             host["L_mtp"] = copy[s["step"]][0]
         idle = prev is not None and not busy[i]
@@ -774,6 +839,7 @@ def _label(
                 None if blocked is None else {k: v * 1e-9 for k, v in blocked.items()},
                 {} if cut else s.get("floor", {}),
                 passes,
+                dummy_host,
             )
         )
         gap_ns = s.get("d_gap_ns")

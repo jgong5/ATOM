@@ -282,6 +282,11 @@ OUT_SEGMENT = "E_out"
 #: Every segment a law may price.
 SEGMENTS = (*HOST_SEGMENTS, MTP_SEGMENT, MTP_COPY, PP_RECV_SEGMENT, OUT_SEGMENT)
 FORWARD_KINDS = ("decode", "prefill", "middle")
+#: The host-law kind of a DP rank's dummy forward at a step its group prefills
+#: (`step_linear_fit._fit_dummy`), which a batch's `compass_dummy` marks.
+DUMMY_KIND = "dummy"
+#: The kinds a host entry's laws and columns may name.
+HOST_LAW_KINDS = (*FORWARD_KINDS, DUMMY_KIND)
 #: `admit` for a host entry fitted before admissions were priced apart, whose
 #: `E` laws hold them: they cost nothing on top.
 ADMISSION_IN_E = (0.0, 0.0, 0.0)
@@ -347,6 +352,10 @@ class HostDeviceRecurrence:
     pipeline stage refuses any column.
     With `own_draft`, true unless it defers, an output forward that waits for its own
     target leaves no earlier than its device end, as one that reads its own draft ids does.
+    A batch whose `compass_dummy` is true, a DP rank's dummy forward at a step
+    its group prefills, is priced as `DUMMY_KIND` where the laws state it: each
+    segment, and each column, `DUMMY_KIND` states, else `decode`'s, the kind
+    `forward_shape` gives an empty batch that produces output.
     """
 
     def __init__(
@@ -414,7 +423,9 @@ class HostDeviceRecurrence:
         first runs `PP_RECV_SEGMENT`. Once any kind's law has `OUT_SEGMENT`
         every kind runs it, as `out_s`, else None."""
         kind, x = forward_shape(batch)
-        law = self.laws.get(kind, {})
+        if getattr(batch, "compass_dummy", False) and DUMMY_KIND in self.laws:
+            kind = DUMMY_KIND
+        law = self._law(kind)
         ran = HOST_SEGMENTS[: 3 if kind == "middle" else 4]
         mtp = self.mtp and kind != "middle"
         ran += (MTP_SEGMENT,) if mtp else ()
@@ -424,7 +435,7 @@ class HostDeviceRecurrence:
         ran += (OUT_SEGMENT,) if out else ()
         missing = [f"{kind}.{s}" for s in ran if s not in {*law, *self.skip}]
         features = getattr(batch, "compass_launch", None) or {}
-        columns = self.columns.get(kind, {})
+        columns = self._columns(kind)
         missing += [
             f"{kind}.{s}.{f}"
             for s in ran
@@ -457,6 +468,18 @@ class HostDeviceRecurrence:
         queued = launch_end if self.sync else self._exit(self.target_end)
         return max(self.target_end, queued) + draft_s
 
+    def _law(self, kind: str) -> dict:
+        """`kind`'s laws by segment, `DUMMY_KIND`'s over `decode`'s."""
+        if kind == DUMMY_KIND:
+            return {**self.laws.get("decode", {}), **self.laws.get(kind, {})}
+        return self.laws.get(kind, {})
+
+    def _columns(self, kind: str) -> dict:
+        """`kind`'s columns by segment, as `_law` takes its laws."""
+        if kind == DUMMY_KIND:
+            return {**self.columns.get("decode", {}), **self.columns.get(kind, {})}
+        return self.columns.get(kind, {})
+
     def predicted(self, view: Any) -> dict:
         """A step's launch features by `launch`'s provider, from its
         `BatchView` `view`; none where no law adopts a column."""
@@ -478,7 +501,7 @@ class HostDeviceRecurrence:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
         `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, and each column a segment
         adopts prices `features`' value of its feature, 0 where absent."""
-        law, columns = self.laws.get(kind, {}), self.columns.get(kind, {})
+        law, columns = self._law(kind), self._columns(kind)
         features = features or {}
         seg = {
             s: (
@@ -2062,6 +2085,7 @@ def _group_step_seconds(
             view = dataclasses.replace(view, prefill_duty=duty.at(entered))
         if isinstance(host, HostDeviceRecurrence):
             batch.compass_launch = host.predicted(view)
+            batch.compass_dummy = bool(view.dp_dummy and view.prefill)
         cost = backend.price(view)
         dummy = {EAGER_DP_DUMMY, IDLE_DP_GROUP} & set(cost.treatments)
         if spec and not cost.draft_terms and not dummy:

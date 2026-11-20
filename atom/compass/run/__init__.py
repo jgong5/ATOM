@@ -115,7 +115,9 @@ clock calls and reports them with its next one, a DP member at its settle,
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
-on ``(1, tokens, seqs)``; with any laws, a forward whose kind has none for a
+on ``(1, tokens, seqs)``, and per segment of ``dummy``, a DP rank's dummy
+forward at a step its group prefills, priced by ``decode``'s where it states
+none; with any laws, a forward whose kind has none for a
 segment it runs and ``skip`` does not name is refused, that segment costing 0 s
 (`HostDeviceRecurrence.device_end`); ``key``, the `host_key` they were
 fitted under and the platform fields of their store key, which a run with
@@ -635,20 +637,20 @@ def spec() -> dict | None:
 def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time, or
     whose ``tokenizer`` or ``http_intake`` term the frontend would misread."""
-    from atom.compass.runner.overrides import ADMISSION_IN_E, FORWARD_KINDS, SEGMENTS
+    from atom.compass.runner.overrides import ADMISSION_IN_E, HOST_LAW_KINDS, SEGMENTS
 
     laws, columns = host.get("laws", {}), host.get("columns", {})
     if (
         set(host) - {"laws", "skip", "key", "admit", "hops", "columns", *HOST_TERMS}
         or set(host.get("skip", ())) - set(SEGMENTS)
-        or {*laws, *columns} - set(FORWARD_KINDS)
+        or {*laws, *columns} - set(HOST_LAW_KINDS)
         or {s for v in (*laws.values(), *columns.values()) for s in v} - set(SEGMENTS)
         or {len(c) for v in laws.values() for c in v.values()} - {3}
         or len(host.get("admit") or ADMISSION_IN_E) != 3
     ):
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
-            f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
+            f"laws, mapping {HOST_LAW_KINDS} to segments to three coefficients, "
             "columns, mapping them to segments to launch features' coefficients, "
             "admit, three coefficients on a forward's admissions or null, "
             "key, the host key the laws were fitted under, hops, and the terms "

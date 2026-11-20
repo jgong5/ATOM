@@ -86,6 +86,11 @@ label leaves out the time its launch spent in HIP's blocking calls, which the
 report states per run and kind under `blocked` (`_blocked`); it names under
 `unstamped` the runs whose records state none, so their `W_launch` labels are
 wall times.
+A DP rank's dummy forward at a step its group prefills gives no sample, but its
+`W_pre`, `W_inputs`, `W_launch` and `W_post` (`step_labels.Sample.dummy_host`)
+fit the host laws' `dummy` kind (`_fit_dummy`), every launch feature a column,
+which a run prices such a dummy by, its other segments by `decode`'s
+(`HostDeviceRecurrence`).
 A forward's `E` that admits requests (`step_labels.admissions`) is left out of
 its kind's law: the law then prices the engine loop alone, and `admit`, seconds
 on `step_labels.admit_x`, prices what the forwards of every kind that admit spend
@@ -588,6 +593,7 @@ def fit_host(samples) -> tuple[dict, dict]:
                 c = dict(zip(adopted, coef[len(HOST_FEATURES) :]))
                 host.setdefault("columns", {}).setdefault(kind, {})[segment] = c
             report[f"{kind}.{segment}"] = fitted | figures
+    _fit_dummy(samples, launch, graphs, host, report)
     a, base, labels = list(zip(*_admit_rows(kept, host))) or [(), (), ()]
     try:
         host["admit"], report["admit"] = _host_law(a, labels, ADMIT_FEATURES, base)
@@ -595,6 +601,63 @@ def fit_host(samples) -> tuple[dict, dict]:
         host["admit"] = None  # a run refuses a forward that admits a request
         report["unfitted"]["admit"] = str(e).splitlines()[0]
     return host, report
+
+
+#: The host-law kind of a DP rank's dummy forward at a step its group
+#: prefills (`step_labels.Sample.dummy_host`).
+DUMMY = "dummy"
+
+
+def _fit_dummy(samples, launch, graphs, host, report) -> None:
+    """Fit `DUMMY`'s laws into `host`, each of `step_labels.DUMMY_SEGMENTS` on
+    the dummy forwards' labels the samples' `dummy_host` holds, one set per
+    run and rank, as `_host_law` fits a kind's, its `report` entry under
+    ``dummy.<segment>``, and every launch feature of `launch` a column: a
+    dummy runs its group's launch path, which sets its `W_launch` (DeepSeek-V4.1:
+    about 2 ms replayed, 27 ms past the largest prefill token graph or on an
+    eager tail, 51 ms on both), so no held-out choice is made. A dummy whose
+    features `launch` predicts otherwise than its line states refuses, as a
+    sample does; a segment too few dummies give is named under `unfitted`."""
+    from scipy.spatial import QhullError
+
+    held = {}
+    for s in samples:
+        held.setdefault((s.provenance["run"], s.rank), s.dummy_host)
+    rows = [row for hosts in held.values() for row in hosts]
+    if not rows:
+        return
+    for step, view, _, observed in rows:
+        if (predicted := launch.predict(view, graphs)) != observed:
+            raise ValueError(
+                f"a dummy forward at step {step} launched {observed}, and its "
+                f"launch provider predicts {predicted}"
+            )
+    for segment in step_labels.DUMMY_SEGMENTS:
+        members = [
+            (_host_x_view(view), h[segment], observed)
+            for _, view, h, observed in rows
+            if h.get(segment, 0) > 0
+        ]
+        columns = [(f, [m[2][f] for m in members]) for f in launch.features]
+        try:
+            coef, fitted = _host_law(
+                [m[0] for m in members],
+                [m[1] for m in members],
+                HOST_FEATURES,
+                columns=columns,
+            )
+        except (ValueError, QhullError) as e:
+            report["unfitted"][f"{DUMMY}.{segment}"] = str(e).splitlines()[0]
+            continue
+        host["laws"].setdefault(DUMMY, {})[segment] = coef[: len(HOST_FEATURES)]
+        if columns:
+            c = dict(zip(launch.features, coef[len(HOST_FEATURES) :]))
+            host.setdefault("columns", {}).setdefault(DUMMY, {})[segment] = c
+        report[f"{DUMMY}.{segment}"] = fitted | {"forwards": len(members)}
+
+
+def _host_x_view(view) -> tuple[int, int, int]:
+    return 1, sum_tokens(view.requests), len(view.requests)
 
 
 def _blocked(samples) -> tuple[dict, list[str]]:
