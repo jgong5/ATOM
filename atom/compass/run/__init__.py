@@ -241,6 +241,15 @@ has the connector factory build ``lmcache_mp`` as Compass's
 (`atom.compass.kv.lmcache_mp`), whose scheduler half sends each transfer to LP
 ``lmcache`` from the step loop.
 
+A deployment that offloads KV to a shared Mooncake Store (``mooncake_store``),
+the prefill side of a prefill-decode run or the run's one deployment, needs a
+``mooncake_store`` entry (`atom.compass.kv.mooncake_store_server`), and a run
+file with one needs such a deployment. Each such frontend checks its
+deployment against the entry, and the first prefill deployment's, or the one
+deployment's, starts LP ``mooncake_store`` (`mooncake_store`) in a process of
+its own. Its channels to each DP rank of each engine it serves take half the
+entry's fixed lookup term (`add_mooncake_store`).
+
 A deployment that offloads KV through ATOM's in-process ``lmcache_offload``
 needs an ``lmcache_offload`` entry, which `atom.compass.kv.lmcache_offload`
 states, and a run file with one needs such a deployment, at DP and pipeline
@@ -313,7 +322,7 @@ from atom.compass.clock import (
     prefill_decode_table,
     single_engine_table,
 )
-from atom.compass.clock.channels import add_lmcache
+from atom.compass.clock.channels import add_lmcache, add_mooncake_store
 from atom.compass.clock_transport import connect, connect_here, serve
 from atom.compass.detect.determinism import StepTable
 from atom.compass.ingress import KEY as INGRESS
@@ -329,6 +338,7 @@ CLOCK_ENV = "ATOM_COMPASS_CLOCK_ENDPOINT"
 NOW_ENV, NOW_FILE = "ATOM_COMPASS_NOW", "now-{}.bin"
 FRONTEND, ENGINE, TRAFFIC = LpId("frontend"), LpId("engine"), LpId("traffic")
 ROUTER, LMCACHE = LpId("router"), LpId("lmcache")
+MOONCAKE_STORE = LpId("mooncake_store")
 #: Run-file keys for how many deployments of each prefill-decode side run.
 INSTANCES = {"P": "prefill_instances", "D": "decode_instances"}
 #: Run-file keys for each prefill-decode side's DP width.
@@ -373,8 +383,8 @@ ACCEPTANCE_RECORD = "acceptance_record"
 AUTHORITY_FILE = "authority_endpoint.txt"
 #: Wall seconds the summary's writer waits for the server LPs' refusals.
 HAND_IN_WAIT_S = 300.0
-#: Wall seconds a prefill-decode engine, or LP lmcache, waits for every engine's
-#: planned block.
+#: Wall seconds a prefill-decode engine, LP lmcache or LP mooncake_store waits
+#: for every engine's planned block.
 PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
@@ -790,14 +800,20 @@ def _pp(run: dict, side: str | None = None) -> int:
 
 
 def channel_table(run: dict):
+    from atom.compass.kv import mooncake_store_server as store
+
+    pd = "router_s" in run
+    for entry, why in (
+        ("lmcache", "ATOM's lmcache_mp does not run under PP"),
+        (store.ENTRY, "LP mooncake_store serves no pipelined prefill"),
+    ):
+        if entry in run and _pp(run, "P") > 1:
+            raise ValueError(
+                f"the run file's {entry} entry and a pipeline above one stage: "
+                f"{why}"
+            )
     table = _engines_table(run)
-    if "lmcache" in run and _pp(run, "P") > 1:
-        raise ValueError(
-            "the run file has an lmcache entry and a pipeline above one stage: "
-            "ATOM's lmcache_mp does not run under PP"
-        )
     if "lmcache" in run:
-        pd = "router_s" in run
         add_lmcache(
             table,
             _lmcache_engine(run),
@@ -805,6 +821,13 @@ def channel_table(run: dict):
             _dp(run, "P" if pd else None),
             envs.OFFLOAD_MP_LOOKUP_THREAD,
         )
+    if store.ENTRY in run:
+        # Every engine LP of the prefill side, or the run's one engine.
+        names = [lp.name for lp in table.registry.ids()]
+        engines = [n for n in names if re.fullmatch(r"engine(-P\d*)?", n)]
+        store.check_entry(run[store.ENTRY])
+        rpc_s = store.store_rpc_s(run[store.ENTRY])
+        add_mooncake_store(table, engines, rpc_s, _dp(run, "P" if pd else None))
     return table
 
 
@@ -1139,9 +1162,15 @@ def _launch_lmcache(config, run: dict, side: str | None) -> None:
             f"number of this deployment's {block}-token KV blocks "
             "(kv_cache_block_size), which ATOM's lmcache_mp workers refuse"
         )
+    _start_lp(LMCACHE_MAIN, str(block))
+
+
+def _start_lp(main: str, *args: str) -> None:
+    """Start a shared server's LP in a process of its own: `main` run with
+    `args`, importing this tree's ATOM."""
     paths = [str(Path(atom.__file__).parents[1]), os.environ.get("PYTHONPATH")]
     subprocess.Popen(
-        [sys.executable, "-c", LMCACHE_MAIN, str(block)],
+        [sys.executable, "-c", main, *args],
         env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, paths))},
     )
 
@@ -1190,6 +1219,125 @@ def lmcache(block_tokens: int) -> None:
         raise
     finally:
         _hand_in(run, LMCACHE.name, rt.refusals + ended)
+        sock.close(linger=0)
+
+
+def _launch_mooncake_store(config, run: dict, side: str | None) -> None:
+    """Check a deployment that offloads KV to a shared Mooncake Store against
+    the run file's entry, and on the first prefill deployment, or the run's
+    one, start LP `mooncake_store` in a process of its own, given its KV block
+    tokens. Refuse a deployment and a run file that disagree on whether the
+    Store runs, a decode side or a pipeline that offloads to it, pools that
+    address several masters, and a deployment whose Store settings or worker
+    widths differ from those the entry was fitted at."""
+    from atom.compass.kv import mooncake_store_server as store
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+    from atom.kv_transfer.offload.mooncake_store.config import (
+        parse_mooncake_store_config,
+    )
+    from atom.kv_transfer.offload.mooncake_store.pool import _SLOT_ALIGN, _round_up
+    from atom.utils import envs
+
+    leaves = KVConnectorFactory.leaf_connectors(config) or ()
+    sub = next((c for name, c in leaves if name == store.ENTRY), None)
+    offloads = sub is not None
+    if offloads != (store.ENTRY in run) and (offloads or side != "D"):
+        raise ValueError(
+            f"this deployment {'offloads' if offloads else 'offloads no'} KV to a "
+            f"Mooncake Store and the run file {'has no' if offloads else 'has a'} "
+            f"{store.ENTRY} entry; LP mooncake_store runs exactly when the "
+            "prefill or only deployments offload to one"
+        )
+    if not offloads:
+        return
+    if side == "D":
+        raise ValueError(
+            "this decode side offloads KV to a Mooncake Store; LP mooncake_store "
+            "serves the prefill side"
+        )
+    if config.pipeline_parallel_size > 1:
+        raise ValueError(
+            f"this deployment runs {config.pipeline_parallel_size} pipeline stages "
+            "and offloads KV to a Mooncake Store; LP mooncake_store serves no "
+            "pipelined prefill"
+        )
+    entry = run[store.ENTRY]
+    store.check_entry(entry)
+    cfg = parse_mooncake_store_config(sub.kv_transfer_config)
+    if len(masters := cfg.store_masters()) > 1:
+        raise ValueError(
+            f"mooncake_store.pools addresses {len(masters)} masters "
+            f"({', '.join(m.master for m in masters)}); LP mooncake_store plays one"
+        )
+    stride = _round_up(entry["chunk_bytes"], _SLOT_ALIGN)
+    here = {
+        "protocol": cfg.protocol,
+        "chunk_tokens": cfg.chunk_tokens,
+        "world": 1 if config.enable_dp_attention else config.tensor_parallel_size,
+        "save_slots": cfg.save_pool_bytes // stride,
+        "load_slots": cfg.load_pool_bytes // stride,
+        "save_workers": envs.OFFLOAD_COPY_WORKERS,
+        "load_workers": envs.OFFLOAD_LOAD_WORKERS,
+    }
+    if differ := [
+        f"{k} {v} (the entry's {entry[k]})" for k, v in here.items() if v != entry[k]
+    ]:
+        raise ValueError(
+            f"this deployment's {', '.join(differ)}: the {store.ENTRY} entry's "
+            "laws were fitted at its fields"
+        )
+    if (_pd_kv(config) or {}).get(INSTANCE_KEY, 0) == 0:
+        _start_lp(MOONCAKE_STORE_MAIN, str(config.kv_cache_block_size))
+
+
+#: LP `mooncake_store`'s process, given the deployment's KV block tokens.
+MOONCAKE_STORE_MAIN = (
+    "import sys; from atom.compass import run; run.mooncake_store(int(sys.argv[1]))"
+)
+
+
+def mooncake_store(block_tokens: int) -> None:
+    """LP `mooncake_store`: a shared Mooncake Store's master on the run's clock
+    until its ``+inf`` grant, then its hand-in, which carries its counts
+    (`mooncake_store_server.COUNTS`) as ``store``. It serves at a port on the
+    clock endpoint's host and names that endpoint in the out_dir's
+    `ENDPOINT_FILE`. At its first stamped request, once every member of the
+    engines it serves has planned its pool, it checks their plans against the
+    entry (`check_plans`), each chunk `block_tokens` KV blocks of tokens."""
+    import zmq
+
+    from atom.compass.kv import mooncake_store_server as store
+
+    run = spec()
+    entry = run[store.ENTRY]
+    rt = _runtime(MOONCAKE_STORE, run)
+    served = {c.source.name for c in rt.table.channels_into(MOONCAKE_STORE)}
+    members = [n for n in _hand_ins(run) if n.partition(".")[0] in served]
+
+    def check_plans() -> None:
+        store.check_plans(entry, _published_plans(run, members), block_tokens)
+
+    sock = zmq.Context.instance().socket(zmq.ROUTER)
+    host = run["clock_endpoint"].rpartition(":")[0]
+    port = sock.bind_to_random_port(host)
+    _write_whole(Path(run["out_dir"]) / store.ENDPOINT_FILE, f"{host}:{port}")
+    lp = store.MooncakeStoreLP(
+        rt,
+        sock,
+        store.Master(entry),
+        lookup_s=entry["lookup_s"],
+        check_plans=check_plans,
+    )
+    name = MOONCAKE_STORE.name
+    rt.client_run_ended = lambda k: _hand_in(run, name, rt.refusals, k, store=lp.counts)
+    ended = []
+    try:
+        lp.serve()
+    except BaseException as e:
+        ended = [f"ended:{name} raised {e!r}"]
+        raise
+    finally:
+        _hand_in(run, name, rt.refusals + ended, store=lp.counts)
         sock.close(linger=0)
 
 
@@ -1562,6 +1710,7 @@ def frontend(config):
         )
         _early_end.start()
     _launch_lmcache(config, run, side)
+    _launch_mooncake_store(config, run, side)
     # A co-hosting frontend reaches the authority in-process, with no socket.
     rt = _runtime(lp, run, cls=_StoppingClock, here=authority is not None)
     rt.client_run_ended = lambda k: _frontend_hand_in(run, rt, k)
@@ -2018,9 +2167,11 @@ def runner(model_runner, tree) -> None:
     if NOW_ENV in os.environ:
         now = Path(os.environ[NOW_ENV])
         model_runner.compass_raised_file = _raised_file(now, model_runner.rank)
-        # What it planned prices a prefill-decode transfer and sizes LP lmcache.
-        planned = _pd_side(config) is not None or _offloads(
-            config.kv_transfer_config, "lmcache_mp"
+        # What it planned prices a prefill-decode transfer and sizes LP lmcache,
+        # and LP mooncake_store checks it.
+        kv = config.kv_transfer_config
+        planned = _pd_side(config) is not None or any(
+            _offloads(kv, c) for c in ("lmcache_mp", "mooncake_store")
         )
         if planned and model_runner.rank == 0:
             model_runner.compass_block_file = _block_file(now)

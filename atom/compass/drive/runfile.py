@@ -33,7 +33,9 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   and ``backend``'s digest is over every law's in any order, their provenance
   ``entries``; so is the ``ingress`` term.
 - ``--lmcache-offload FILE``, the ``lmcache_offload`` entry
-  `step_linear_fit`'s offload form writes, at that key.
+  `step_linear_fit`'s offload form writes, at that key, and
+  ``--mooncake-store FILE``, a shared Mooncake Store's ``mooncake_store``
+  entry, at that key.
 - ``--device``, ``--ptl``, ``--stack`` and ``--network``, the platform
   flags, whose spec `spec` composes, as ``machine``; ``--store``'s root as
   ``store``; ``--on-refusal``;
@@ -89,9 +91,9 @@ def add_arguments(parser) -> None:
     parser.add_argument(
         "--host-laws", metavar="KEY", action="append", help="a token or law file"
     )
-    parser.add_argument(
-        "--lmcache-offload", metavar="FILE", help="the lmcache_offload entry"
-    )
+    for entry in ("lmcache_offload", "mooncake_store"):
+        flag = "--" + entry.replace("_", "-")
+        parser.add_argument(flag, metavar="FILE", help=f"the {entry} entry")
     parser.add_argument("--device", required=True, help="the datasheet, SKU or path")
     parser.add_argument("--ptl", required=True, choices=("enabled", "disabled"))
     parser.add_argument("--stack", help="the readings' stack and torch, of several")
@@ -211,8 +213,9 @@ def build(args, atom_args, across: bool = False) -> dict:
             out[run.INGRESS] = picked[run.INGRESS]
     if args.padding:
         out["padding"] = args.padding
-    if entry := getattr(args, "lmcache_offload", None):
-        out["lmcache_offload"] = json.loads(Path(entry).read_text())
+    for key in ("lmcache_offload", "mooncake_store"):
+        if entry := getattr(args, key, None):
+            out[key] = json.loads(Path(entry).read_text())
     return out
 
 
