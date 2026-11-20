@@ -223,6 +223,7 @@ def test_decode_sends_the_write_request_to_the_prefill_deployment_that_served_it
             num_cached_tokens=0,
         )
     )
+    d.device_done(None)  # the admission step's forward returns, its device done
     channel, seq_no, arrival = rt_d.send_log[-1]
     assert channel == "engine-D0->engine-P1:kv_write_req"
     rt_p1.conn.grants.append((1.0, {channel: [(seq_no, arrival)]}))

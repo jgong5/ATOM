@@ -1803,7 +1803,10 @@ class NonAllocatingRunner(
         priced by the installed cost backend, then its DP group target, on TP
         rank 0; the engine reads no other rank's reply, and it reports 0 s.
         Its `out_s` and `group_out` are `_group_step_seconds`'s `_out_s` and
-        `_group_out`, which `clock.charge` advances after the return.
+        `_group_out`, which `clock.charge` advances after the return, and its
+        `device_end` that one's `_device_end`, when the device work the step
+        launched ends, which a P/D decode's write request waits for
+        (`atom.compass.kv.connector.forward_returned`).
         A runner with no backend refuses the step rather than report one that
         took no time. ATOM's `dummy_execution` answers with this reply too, so
         an idle DP rank's dummy batch is priced and joins the group's targets.
@@ -1883,6 +1886,7 @@ class NonAllocatingRunner(
         )
         out.out_s = getattr(self, "_out_s", None)
         out.group_out = getattr(self, "_group_out", None)
+        out.device_end = vars(self).get("_device_end")
         out.pp_send = self._pp_send(batch, seconds)
         if out.pp_send is not None:
             out.predicted_s -= out.pp_send[1]
@@ -2000,7 +2004,9 @@ def _group_step_seconds(
     for a real forward's cross-rank collectives, and every rank leaves at its
     own charge. With no
     `compass_host`, a rank with output, not the DP dummy, leaves at the group's
-    max, any other at its own seconds. `_group_targets` holds all,
+    max, any other at its own seconds. `_device_end` is the end of the device
+    work the forward launched, `HostDeviceRecurrence.ends`' last, the group's
+    latest under DP, or None with no `HostDeviceRecurrence`. `_group_targets` holds all,
     by rank, or None with one rank. `_out_s` is the host's ``out_s`` for this
     step, the seconds from its return to the engine's next input pull, or
     None; `_group_out` holds each rank's target plus its ``out_s``, for the
@@ -2148,6 +2154,10 @@ def _group_step_seconds(
         charge_s = charge(batch, device_s, draft_s, refuse=False)
     if refused:
         vars(runner).setdefault("_refused_commands", []).append(refused)
+    # The end of the device work this forward launched, the group's latest
+    # under DP; None with no recurrence, whose forward returns at its end.
+    device_end = host.ends[-1] if isinstance(host, HostDeviceRecurrence) else None
+    vars(runner)["_device_end"] = device_end
     group_s, targets, pulls = charge_s, None, None
     out_s = getattr(host, "out_s", None)
     if group is not None:
@@ -2267,6 +2277,7 @@ class RapidServeRpcs:
         out = super().forward(batch)
         ids = self._token_stream.token_ids
         sampled = SampledIds(ids[int(r) % len(ids)] for r in batch.req_ids)
-        for name in ("predicted_s", "out_s", "group_targets", "group_out"):
+        names = ("predicted_s", "out_s", "group_targets", "group_out", "device_end")
+        for name in names:
             setattr(sampled, name, getattr(out, name, None))
         return sampled
