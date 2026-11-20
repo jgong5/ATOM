@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """`step_linear.moe_column`'s `moe_experts` for a data-parallel group whose idle ranks forward empty batches: those
-dummies add no token to the group's tokens (#3682), so subtracting `dummies - 1` from them must not go below zero."""
+dummies add no token to the group's tokens (#3682), so subtracting `dummies - 1` from them must not go below zero.
+"""
 
 import itertools
 
@@ -15,7 +16,7 @@ def test_three_idle_ranks_beside_one_token_do_not_price_negative_experts():
 
 
 def test_no_group_shape_prices_a_negative_column():
-    for tokens, dummies in itertools.product(range(0, 9), range(0, 6)):
+    for tokens, dummies in itertools.product(range(9), range(6)):
         assert moe_column("moe_experts", tokens, ROUTING, dummies) >= 0
 
 
