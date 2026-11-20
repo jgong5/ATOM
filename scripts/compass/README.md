@@ -122,20 +122,22 @@ COMPASS_COVERAGE_WHEEL=<wheel> COMPASS_GATE_SHARDS=16 $T/scripts/compass/gate_ma
 ```
 
 The map records, per test file, the functions whose bodies it ran in pytest's process
-or in any Python process started under it with the tree on its path. A process killed
+or in any Python process started under it with the tree on its path, and the tree's `.py`
+files those processes opened and directories they listed, other than to import. A process killed
 by a signal other than SIGTERM records nothing. Its run's verdict is not the tree's:
 under coverage a test that waits a set time on a process, or counts what one prints as
 it exits, can fail, and its file holds what ran up to there. A round stages and runs with it:
 `COMPASS_GATE_SELECT=<map> scripts/compass/snapshot.sh <dir>`, then the gate with the same
 variable. The gate prints `select: <n> of <m>, map <sha>` and deselects the rest. A test
-file runs when it ran a function whose body the diff since the map's commit changes, or
-a method of a class that gains a definition; when the diff changes it, or a file under
-`tests/` it imports; or when the map does not hold it. It prints `select: whole gate --
-<why>` and runs everything when the map's commit is not an ancestor of HEAD, the
-snapshot was staged without the map, or the diff changes module-level code other than an
-added import or a new name's definition, changes a definition outside its body, or
-touches a `conftest.py`, `gate_select.py`, or a non-Python file outside
-`atom/compass/design/`. Every process still collects all of `tests/`, so a selection of
+file runs when it ran a function whose body the diff since the map's commit changes; when
+it read a file the diff changes, or listed the directory of one the diff adds; when the
+diff changes it, or a file under `tests/` it imports; or when the map does not hold it. It
+prints `select: whole gate -- <why>` and runs everything when the map's commit is not an
+ancestor of HEAD, the map records no source reads, the snapshot was staged without the
+map, or the diff changes module-level code other than an added import or a new name's
+definition, changes a definition outside its body, adds a method to a class, or touches
+`compass_harness/` (the gate runs an installed copy), a `conftest.py`, `gate_select.py`,
+or a non-Python file outside `atom/compass/design/`. Every process still collects all of `tests/`, so a selection of
 none passes on that collection. A test that reads state an earlier file left, a session
 fixture's or a cache's, is held only by the file that first ran the code.
 

@@ -27,7 +27,7 @@ SITE=$ROOT/sitecustomize.py
 W=$(mktemp -d "$(dirname -- "$OUT")/gate_map.XXXXXX") || exit 96
 trap 'rm -rf "$W" "$SITE"' EXIT
 python -m pip install -q --no-deps --no-index --target "$W/lib" "$COMPASS_COVERAGE_WHEEL" >&2 || exit 96
-cp "$ROOT/scripts/compass/gate_select.py" "$W/lib/" && mkdir "$W/cov" "$W/ctx" || exit 96
+cp "$ROOT/scripts/compass/gate_select.py" "$W/lib/" && mkdir "$W/cov" "$W/ctx" "$W/reads" || exit 96
 printf '[run]\ncore = ctrace\nparallel = true\ndata_file = %s/cov/c\nsource = %s\n' "$W" "$ROOT" >"$W/rc"
 printf 'context = ${COMPASS_MAP_CONTEXT}\npatch = _exit, fork\nsigterm = true\n' >>"$W/rc"
 python -c 'import sys; w, root = sys.argv[1:]

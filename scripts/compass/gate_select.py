@@ -9,14 +9,16 @@
   gate_select.py build WORK ROOT SHA OUT   the map of gate_map.sh's run
 
 A test file is kept when it ran a function whose body the diff since the map's
-commit changes, or a method of a class that gains a definition; when the diff
-changes it or a file under tests/ it imports; or when the map does not hold it.
-Any other change runs the whole gate.
+commit changes; when it read a changed file's source, or listed a directory an
+added file is in; when the diff changes it or a file under tests/ it imports; or
+when the map does not hold it. Any other change runs the whole gate.
 
 Under gate_map.sh this module also starts coverage in every Python process
 (startup) and is the gate's pytest plugin (-p gate_select): a test file's
 collection and its tests run under that file's coverage context, and a process
-another one starts takes the context of its nearest ancestor that has one.
+another one starts takes the context of its nearest ancestor that has one. An
+audit hook records, under that context, each .py file of the tree a process
+opens and each directory of it a process lists, other than the import system's.
 """
 
 import ast
@@ -31,10 +33,12 @@ import sys
 
 DESIGN = "atom/compass/design/"
 GATE = "scripts/compass/gate_select.py"
+HARNESS = "compass_harness/"
 EMPTY = {"code": [], "names": {}, "bodies": {}}
 SKIP_DIRS = {"__pycache__", "target", "build", "dist", "node_modules", "venv"}
 DIFF = ["-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", "-z"]
-_work = _root = _ctx = None
+_work = _root = _ctx = _fd = None
+_seen = set()
 
 
 def _h(parts):
@@ -111,8 +115,8 @@ def structure(src):
     return s, sorted(spans)
 
 
-def _compare(p, old, new, funcs, grown):
-    """Why `old` to `new` needs the whole gate, else None, adding to `funcs` and `grown`."""
+def _compare(p, old, new, funcs):
+    """Why `old` to `new` needs the whole gate, else None, adding to `funcs`."""
     was = collections.Counter(h for h, _ in old["code"])
     now = collections.Counter(h for h, _ in new["code"])
     if was - now:
@@ -131,7 +135,8 @@ def _compare(p, old, new, funcs, grown):
         if q in bound:
             return f"{p} rebinds {q}"
         if q.rpartition(".")[0] in old["names"]:
-            grown.add(f"{p}::{q.rpartition('.')[0]}.")
+            # Nothing in the map says which files build the class's instances.
+            return f"{p} adds {q} to a class"
     funcs.update(f"{p}::{q}" for q, h in old["bodies"].items() if new["bodies"][q] != h)
     return None
 
@@ -208,10 +213,14 @@ def _keep(m, root):
     why, changed = _changed(root, m["sha"])
     if why:
         return why, None
-    funcs, grown, own = set(), set(), set()
+    if "reads" not in m:
+        return f"map {m['sha'][:9]} records no source reads; build it again", None
+    funcs, own, read = set(), set(), set()
     for p in changed:
         if p == GATE or os.path.basename(p) == "conftest.py":
             return f"{p} is a conftest.py or the gate's own", None
+        if p.startswith(HARNESS):
+            return f"{p}: the gate runs an installed copy of {HARNESS}", None
         if not p.endswith(".py"):
             if p.startswith(DESIGN):
                 continue
@@ -224,7 +233,11 @@ def _keep(m, root):
         old = m["tree"].get(p, EMPTY)
         if new is None or old is None:
             return f"{p} does not parse", None
-        why = _compare(p, old, new, funcs, grown)
+        why = _compare(p, old, new, funcs)
+        added = p not in m["tree"]
+        for t, rs in m["reads"].items():
+            if p in rs or added and any(p.startswith(r) for r in rs if r[-3:] != ".py"):
+                read.add(t)
         mine = {p} if _is_test(p) else set()
         own |= mine
         if why and p.startswith("tests/"):
@@ -234,9 +247,10 @@ def _keep(m, root):
             own |= users
         if why:
             return why, None
-    grown = tuple(grown)
-    hit = {i for i, f in enumerate(m["funcs"]) if f in funcs or f.startswith(grown)}
-    return None, own | {t for t, ids in m["ran"].items() if hit.intersection(ids)}
+    hit = {i for i, f in enumerate(m["funcs"]) if f in funcs}
+    return None, own | read | {
+        t for t, ids in m["ran"].items() if hit.intersection(ids)
+    }
 
 
 def select(path, root, *ignored):
@@ -292,15 +306,48 @@ def build(work, root, sha, out):
                 if k >= 0 and n <= spans[p][k][1]:
                     got.add(ids.setdefault(f"{p}::{spans[p][k][2]}", len(ids)))
     ran = {t: sorted(v) for t, v in sorted(ran.items())}
+    reads = collections.defaultdict(set)
+    for name in os.listdir(os.path.join(work, "reads")):
+        with open(os.path.join(work, "reads", name), encoding="utf-8") as f:
+            for line in f:
+                ctx, _, r = line.rstrip("\n").partition("\t")
+                reads[ctx].add(r)
+    reads = {t: sorted(v) for t, v in sorted(reads.items())}
     with open(out, "w", encoding="utf-8") as f:
-        json.dump({"sha": sha, "funcs": list(ids), "ran": ran, "tree": tree}, f)
+        m = {"sha": sha, "funcs": list(ids), "ran": ran, "tree": tree, "reads": reads}
+        json.dump(m, f)
     print(f"map:    {out}: {len(ran)} test files, {len(ids)} functions")
     print(f"        {bad} coverage data files unreadable")
 
 
+def _audit(event, args):
+    """Record a source read: a .py file of the tree opened, or a directory of it
+    listed. The import system's reads, and coverage's, are their own."""
+    global _fd
+    if event not in ("open", "os.listdir", "os.scandir") or not _ctx or not args:
+        return
+    up = sys._getframe().f_back
+    if isinstance(args[0], int) or not up or up.f_code.co_filename[:7] == "<frozen":
+        return
+    r = os.path.relpath(os.path.abspath(os.fsdecode(args[0] or ".")), _root)
+    if r[:2] == ".." or event == "open" and r[-3:] != ".py":
+        return
+    while up:
+        if f"{os.sep}coverage{os.sep}" in up.f_code.co_filename:
+            return
+        up = up.f_back
+    r = r if event == "open" else "" if r == "." else r + "/"
+    if (_ctx, r) not in _seen:
+        _seen.add((_ctx, r))
+        if _fd is None:
+            flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+            _fd = os.open(f"{_work}/reads/{os.getpid()}", flags, 0o644)
+        os.write(_fd, f"{_ctx}\t{r}\n".encode())
+
+
 def startup(work, root):
     """Start coverage here, under the context of the nearest ancestor that has one."""
-    global _work, _root
+    global _work, _root, _ctx
     _work, _root, ctx, pid = work, root, "", os.getppid()
     while pid > 1:
         try:
@@ -315,7 +362,8 @@ def startup(work, root):
         except (OSError, IndexError, ValueError):
             break
     os.environ["COVERAGE_PROCESS_START"] = f"{work}/rc"
-    os.environ["COMPASS_MAP_CONTEXT"] = ctx
+    os.environ["COMPASS_MAP_CONTEXT"] = _ctx = ctx
+    sys.addaudithook(_audit)
     import coverage
 
     coverage.process_startup()

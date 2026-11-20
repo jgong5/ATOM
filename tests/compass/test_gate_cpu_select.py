@@ -5,9 +5,10 @@ function the diff since the map's commit changes, or the whole gate and why.
 Each case makes the throwaway tree of ``test_gate_cpu_verdict_through_pipe.py``
 a git repository holding `atom/m.py` and a test file per function there, each
 recording that it ran; `test_g.py` runs its function in a subprocess with only
-PYTHONPATH set. The map of the first commit is written from the tree's own
-`gate_select.py` and the files' known coverage, or by `gate_map.sh` when
-COMPASS_COVERAGE_WHEEL names a coverage.py wheel. A second commit makes the
+PYTHONPATH set, and `test_src.py`, where a case adds it, reads the source of
+`atom/`. The map of the first commit is written from the tree's own
+`gate_select.py` and the files' known coverage and source reads, or by
+`gate_map.sh` when COMPASS_COVERAGE_WHEEL names a coverage.py wheel. A second commit makes the
 change; `snapshot.sh` stages it and `gate_cpu.sh` runs on the extraction, or in
 the checkout. Nothing needs a driver.
 """
@@ -57,6 +58,14 @@ RAN = {
     "tests/test_ok.py": [],
 }
 ALL = ["C", "f", "g", "ok"]
+READER = """import pathlib
+
+
+def test_src():
+    pathlib.Path({ran!r}, "src").touch()
+    for p in sorted(pathlib.Path(__file__).parents[1].joinpath("atom").iterdir()):
+        assert p.suffix != ".py" or "monotonic" not in p.read_text(), p
+"""
 WHEEL = os.environ.get("COMPASS_COVERAGE_WHEEL")
 
 
@@ -96,8 +105,9 @@ def repo(tmp_path):
     return root, sha
 
 
-def _map(root, sha):
-    """The map gate_map.sh writes of `root` at `sha`, its coverage given as RAN."""
+def _map(root, sha, reads=None, older=False):
+    """The map gate_map.sh writes of `root` at `sha`, its coverage given as RAN
+    and its source reads as `reads`; `older`, as one recording no reads wrote it."""
     spec = importlib.util.spec_from_file_location(
         "gs", root / "scripts/compass/gate_select.py"
     )
@@ -110,9 +120,11 @@ def _map(root, sha):
     ]
     funcs = sorted({f for fs in RAN.values() for f in fs})
     ran = {t: [funcs.index(f) for f in fs] for t, fs in RAN.items()}
+    ran |= {t: [] for t in reads or {}}
     tree = {p: gs.structure((root / p).read_bytes())[0] for p in paths}
     out = root.parent / "map.json"
-    out.write_text(json.dumps({"sha": sha, "funcs": funcs, "ran": ran, "tree": tree}))
+    m = {"sha": sha, "funcs": funcs, "ran": ran, "tree": tree}
+    out.write_text(json.dumps(m if older else m | {"reads": reads or {}}))
     return out
 
 
@@ -149,12 +161,20 @@ def test_a_diff_inside_one_function_runs_exactly_the_files_that_ran_it(repo, whe
     ), out.stdout
 
 
-def test_a_class_gaining_a_method_runs_the_files_that_ran_its_methods(repo):
-    root, sha = repo
-    mapfile = _map(root, sha)
-    _commit(root, {"atom/m.py": MOD + "\n    def i(self):\n        return 4\n"})
+@pytest.mark.parametrize("path", ["atom/m.py", "atom/n.py"])
+def test_a_file_that_read_the_changed_file_or_listed_its_directory_runs(repo, path):
+    # A change no function body shows, in a file a test reads, or added where it lists.
+    root, _ = repo
+    sha = _commit(
+        root, {"tests/test_src.py": READER.format(ran=str(root.parent / "ran"))}
+    )
+    reads = {"tests/test_src.py": ["atom/", "atom/__init__.py", "atom/m.py"]}
+    mapfile = _map(root, sha, reads)
+    text = (root / path).read_text() if (root / path).exists() else ""
+    _commit(root, {path: "# monotonic\n" + text})
     lines, ran, out = _gate(root, mapfile)
-    assert lines == [f"select: 1 of 4, map {sha[:9]}"] and ran == ["C"], out.stdout
+    assert lines == [f"select: 1 of 5, map {sha[:9]}"] and ran == ["src"], out.stdout
+    assert out.stdout.splitlines()[-1].startswith("GATE_CPU_RC=1 "), out.stdout
 
 
 def test_a_changed_test_file_runs_and_a_design_doc_runs_nothing_more(repo):
@@ -201,6 +221,16 @@ FALLBACKS = {
         "gate_select.py is a conftest.py or the gate's own",
     ),
     "non-Python": ("README.md", lambda t: "x\n", "README.md is not Python"),
+    "class gains a method": (
+        "atom/m.py",
+        lambda t: t + "\n    def __post_init__(self):\n        raise AssertionError\n",
+        "atom/m.py adds C.__post_init__ to a class",
+    ),
+    "compass_harness": (
+        "compass_harness/compass_harness/timesource.py",
+        lambda t: "def sim_ns():\n    return 0\n",
+        "the gate runs an installed copy of compass_harness/",
+    ),
 }
 
 
@@ -239,6 +269,15 @@ def test_a_map_not_behind_head_or_not_stamped_runs_the_whole_gate(repo, staged):
     assert len(lines) == 1 and why in lines[0] and ran == ALL, out.stdout
 
 
+def test_a_map_without_source_reads_runs_the_whole_gate(repo):
+    root, sha = repo
+    mapfile = _map(root, sha, older=True)
+    _commit(root, {"atom/m.py": MOD.replace("return 2", "return 2 + 0")})
+    lines, ran, out = _gate(root, mapfile)
+    why = f"map {sha[:9]} records no source reads"
+    assert len(lines) == 1 and why in lines[0] and ran == ALL, out.stdout
+
+
 def test_unset_the_run_is_unchanged(repo):
     root, _ = repo
     _commit(root, {"atom/m.py": MOD.replace("return 2", "return 2 + 0")})
@@ -254,7 +293,10 @@ def test_unset_the_run_is_unchanged(repo):
     reason="gate_map.sh installs the coverage.py wheel COMPASS_COVERAGE_WHEEL names",
 )
 def test_the_map_holds_what_each_file_ran_its_subprocesses_included(repo):
-    root, sha = repo
+    root, _ = repo
+    sha = _commit(
+        root, {"tests/test_src.py": READER.format(ran=str(root.parent / "ran"))}
+    )
     tars = root.parent / "tars"
     tars.mkdir()
     assert _run(root, f"scripts/compass/snapshot.sh {tars}").returncode == 0
@@ -278,8 +320,17 @@ def test_the_map_holds_what_each_file_ran_its_subprocesses_included(repo):
     assert {t: ran.get(t) for t in RAN} == {t: set(fs) for t, fs in RAN.items()}, m[
         "ran"
     ]
+    # What a test reads of the tree, never what the import system does.
+    src = {"atom/", "atom/__init__.py", "atom/m.py"}
+    assert src <= set(m["reads"].get("tests/test_src.py", ())), m["reads"]
+    assert [t for t, rs in m["reads"].items() if "atom/m.py" in rs] == [
+        "tests/test_src.py"
+    ]
     for p in (root.parent / "ran").iterdir():
         p.unlink()
     _commit(root, {"atom/m.py": MOD.replace("return 2", "return 2 + 0")})
     lines, ran, out = _gate(root, mapfile)
-    assert lines == [f"select: 1 of 4, map {sha[:9]}"] and ran == ["g"], out.stdout
+    assert lines == [f"select: 2 of 5, map {sha[:9]}"] and ran == [
+        "g",
+        "src",
+    ], out.stdout
