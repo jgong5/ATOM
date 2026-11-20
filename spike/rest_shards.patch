@@ -1,0 +1,48 @@
+diff --git a/scripts/compass/gate_cpu.sh b/scripts/compass/gate_cpu.sh
+index bddf186fd..7e842cfa0 100755
+--- a/scripts/compass/gate_cpu.sh
++++ b/scripts/compass/gate_cpu.sh
+@@ -344,8 +344,29 @@ for ((s = 0; s < SHARDS; s++)); do
+ done
+ DROP=()
+ [ "$SHARDS" -eq 0 ] || DROP=(--deselect=tests/compass/)
++# The rest of tests/ as COMPASS_GATE_REST_SHARDS processes, rest shard r taking
++# every RS-th test file from r; the first stays in the foreground.
++RS=${COMPASS_GATE_REST_SHARDS:-1}
++RFILES=()
++[ "$RS" -le 1 ] || mapfile -t RFILES < <(find tests \( -path tests/compass -o -path tests/plugin \) -prune -o \
++    \( -name 'test_*.py' -o -name '*_test.py' \) -print | sort | grep -vxF -f <(printf '%s\n' "${IGN[@]#--ignore=}"))
++rest_others() {
++    ROTHERS=()
++    local k
++    for ((k = 0; k < ${#RFILES[@]}; k++)); do
++        [ $((k % RS)) -eq "$1" ] || ROTHERS+=(--deselect="${RFILES[k]}")
++    done
++}
++RPIDS=()
++for ((r = 1; r < RS; r++)); do
++    rest_others $r
++    own ".rest$r"
++    python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${DROP[@]}" "${ROTHERS[@]}" >"$LOGS/r$r" 2>&1 &
++    RPIDS+=($!)
++done
++rest_others 0
+ own ""
+-python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${DROP[@]}"
++python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${DROP[@]}" "${ROTHERS[@]}"
+ CODES=($?)
+ for ((s = 0; s < SHARDS; s++)); do
+     wait "${PIDS[s]}"
+@@ -353,6 +374,12 @@ for ((s = 0; s < SHARDS; s++)); do
+     printf '\n== tests/compass, shard %s of %s: rc=%s\n' $((s + 1)) "$SHARDS" "${CODES[s + 1]}"
+     cat "$LOGS/$s"
+ done
++for ((r = 1; r < RS; r++)); do
++    wait "${RPIDS[r - 1]}"
++    CODES+=($?)
++    printf '\n== rest of tests/, shard %s of %s: rc=%s\n' $((r + 1)) "$RS" "${CODES[-1]}"
++    cat "$LOGS/r$r"
++done
+ RC=0
+ RAN=
+ for c in "${CODES[@]}"; do
