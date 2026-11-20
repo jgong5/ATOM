@@ -29,6 +29,11 @@ from test_memory_readings import DOCUMENT
 
 from atom.compass import run as compass_run
 from atom.compass.backends.step_stub import Coefficients
+from atom.kv_transfer.offload.mooncake_store.config import parse_mooncake_store_config
+from atom.model_engine.arg_utils import (
+    compose_kv_offload_config,
+    kv_offload_connector_config,
+)
 
 TREE = Path(__file__).resolve().parents[2]
 SCRIPT = TREE / "scripts/compass/deploy.sh"
@@ -61,6 +66,7 @@ import http.server, json, os, signal, sys, threading
 argv = sys.argv[1:]
 out = argv[argv.index("--out") + 1]
 json.dump(argv, open(out + ".argv.json", "w"))
+json.dump(dict(os.environ), open(out + ".env.json", "w"))
 if os.environ.get("PLANTED_FAIL") == os.path.basename(out):
     sys.exit(3)
 os.makedirs(out)
@@ -318,6 +324,102 @@ def test_two_prefill_instances_join_by_index_behind_a_router_lp_choosing_among_t
         {"name": "prefill1", "side": "P", "index": 1},
         {"name": "decode", "side": "D", "index": 0},
     ]
+
+
+#: A prefill side's Mooncake Store as `pd_server_atom.sh`'s launcher names it to
+#: each worker: rdma, one pool a NIC, each its master and metadata server.
+STORE = (
+    '{"mooncake_store.local_hostname":"10.0.0.1","mooncake_store.protocol":"rdma",'
+    '"mooncake_store.pools":{'
+    '"ionic_0":{"master":"10.0.0.1:50051","metadata":"http://10.0.0.1:8080/metadata"},'
+    '"ionic_1":{"master":"10.0.0.1:50151","metadata":"http://10.0.0.1:8180/metadata"}}}'
+)
+PREFILL_ENV = {
+    "ATOM_KV_OFFLOAD": "mooncake_store",
+    "ATOM_KV_OFFLOAD_EXTRA_CONFIG": STORE,
+}
+DECODE_ENV = {"ATOM_HOST_IP": "10.0.0.2"}
+
+
+@pytest.mark.parametrize("cmd", ["run", "record"])
+def test_each_side_s_variables_reach_its_instances_alone_here_and_through_on(
+    tmp_path, planted, cmd
+):
+    """2P1D, the second prefill instance started through a prefix that, as
+    `ssh <node>` does, runs its words in a shell of its own: each prefill
+    instance runs under PREFILL_ENV's Store, byte for byte, the decode under
+    DECODE_ENV's variables, and neither side's command names the other's."""
+    env, flags = planted
+    prefix = tmp_path / "bin" / "on"
+    prefix.write_text('#!/bin/sh\nshift\necho "$*" >>"$PLANTED_ON"\nexec sh -c "$*"\n')
+    prefix.chmod(0o755)
+    for name in (*PREFILL_ENV, *DECODE_ENV):  # none from the caller
+        env.pop(name, None)
+    env |= {
+        "PLANTED_ON": str(tmp_path / "on.log"),
+        "PLANTED_BUILD": f"{_tree_commit()} clean",
+        "PREFILL_ENV": " ".join(f"{k}={v}" for k, v in PREFILL_ENV.items()),
+        "DECODE_ENV": " ".join(f"{k}={v}" for k, v in DECODE_ENV.items()),
+    }
+    if cmd == "run":  # an instance on another node prices the KV on the network
+        flags += [*router_hop(tmp_path), *platforms.network(DOCUMENT, tmp_path)]
+    else:
+        flags = ["--gpu", "0,1"]
+    words = argv(tmp_path, flags, router=ROUTER_LP_ARGS)
+    words[3] = cmd
+    at = words.index("--decode")
+    model = ["--model", str(tmp_path)]
+    words[at:at] = ["--prefill", "--on", f"{prefix} node-b", "--", *model, *PREFILL]
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
+    )
+    try:
+        _until(d / "server.json", script)
+    finally:
+        script.send_signal(signal.SIGTERM)
+        script.communicate(timeout=60)
+
+    assert (tmp_path / "on.log").read_text().splitlines()[0] == f"bash {d}/prefill1.sh"
+    for name in ("prefill0", "prefill1", "decode"):
+        own, other = PREFILL_ENV, DECODE_ENV
+        if name == "decode":
+            own, other = other, own
+        seen = json.loads((d / f"{name}.env.json").read_text())
+        assert {k: seen.get(k) for k in own} == own, name
+        assert not other.keys() & seen.keys(), name
+        assert not any(k in (d / f"{name}.sh").read_text() for k in other), name
+        if own is PREFILL_ENV:
+            # ATOM folds it in beside the P/D connector, a Store it can address.
+            kv = json.loads(json.loads((d / f"{name}.argv.json").read_text())[-1])
+            offload = kv_offload_connector_config(
+                seen["ATOM_KV_OFFLOAD"], seen["ATOM_KV_OFFLOAD_EXTRA_CONFIG"]
+            )
+            folded = json.loads(compose_kv_offload_config(json.dumps(kv), offload))
+            assert folded["connectors"] == [kv, offload]
+            pools = parse_mooncake_store_config(offload).pools
+            assert sorted(pools) == ["ionic_0", "ionic_1"]
+
+
+def test_a_side_s_variable_that_is_no_name_value_word_exits_2(tmp_path, planted):
+    env, flags = planted
+    env["PREFILL_ENV"] = (
+        'ATOM_KV_OFFLOAD_EXTRA_CONFIG={"mooncake_store.protocol": "tcp"}'
+    )
+
+    done = subprocess.run(
+        argv(tmp_path, flags),
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert done.returncode == 2, done.stderr
+    assert 'take NAME=VALUE words, not "tcp"}' in done.stderr
+    assert not (tmp_path / "d" / "run_file.json").exists()
 
 
 @pytest.mark.parametrize(
