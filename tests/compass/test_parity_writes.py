@@ -27,6 +27,7 @@ import msgpack
 import pytest
 
 from atom.compass.parity import ENV, StepRecording
+from atom.compass.parity.writes import REQUEST_STAMPS
 
 PRODUCER = {"pp_rank": 0, "dp_rank": 2, "tp_rank": 0}
 CONSUMER = {"pp_rank": 0, "dp_rank": 6, "tp_rank": 0}
@@ -342,6 +343,119 @@ def test_each_write_is_stamped_on_the_calls_that_serve_it(
         assert done["t_write_done_ns"] >= write["t_notify_ns"][1]
 
 
+def _receiving(mc, sent):
+    """A consumer rank whose `start_load_kv` builds its write requests, its
+    write-request thread driven by hand and its sends kept in `sent`."""
+    c = _consumer(mc, [])
+    c.__dict__.update(
+        tp_size=1,
+        pp_size=1,
+        dcp_size=1,
+        dcp_rank=0,
+        dcp_interleave_size=1,
+        local_ip="10.0.0.9",
+        rpc_port=7002,
+        ib_device="ionic_2",
+        _notification_port=5555,
+        _num_local_layers=0,
+        _block_region_roles=[None, None],
+        _block_regions=list(zip([0x90000, 0xA0000], BLOCK_BYTES)),
+        _unit_layout=None,
+        _has_slot_regions=False,
+        _swa_block_regions=[],
+        kv_caches_base_addr=[0x90000, 0xA0000],
+        _mla_landing=None,
+        _cuda_device=0,
+        _write_queue=[],
+        _write_cv=threading.Condition(),
+        _write_closed=False,
+        _write_thread=object(),  # no thread: `_post_queued_write_requests` by hand
+        _write_request_error=None,
+        _verified_producers={"tcp://10.0.0.1:6301"},
+        _staging_slots=mc.SlotPool(),
+    )
+    c._send_on_socket = lambda addr, parts, repeat=1: sent.append((addr, parts))
+    return c
+
+
+def _receive(transfer_id, blocks, chunked=False):
+    """A receive's metadata: P at TP 1, or under a chunked transfer TP 2, which a
+    TP 1 consumer refuses before it posts anything."""
+    from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+
+    return ConnectorMetadata._build_req_meta(
+        req_id=f"d-{transfer_id}",
+        local_block_ids=blocks,
+        kv_transfer_params={
+            "remote_block_ids": BLOCKS,
+            "remote_host": "10.0.0.1",
+            "remote_handshake_port": 6301,
+            "tp_size": 2 if chunked else 1,
+            "transfer_id": transfer_id,
+            "chunked_transfer": chunked,
+        },
+    )
+
+
+def test_a_write_request_is_stamped_from_its_load_to_its_send(
+    mc, tmp_path, monkeypatch
+):
+    """D's stamps say when each write request was asked for, queued and sent,
+    on the line of the write-done that answered it, or on its own line."""
+    sent, synced = [], []
+    consumer = _receiving(mc, sent)
+    monkeypatch.setenv(ENV, str(tmp_path / "decode"))
+    decode = _runner(consumer, monkeypatch)
+    monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: synced.append(1))
+    receives = {
+        "d-a": _receive("a", [5, 6, 7]),
+        # Refused before it is queued: it must not take the next one's stamps.
+        "d-r": _receive("r", [8, 9, 10], chunked=True),
+        "d-b": _receive("b", [11, 12, 13]),
+    }
+    meta = SimpleNamespace(request_id_to_transfer_id={}, reqs_to_recv=receives)
+    before = time.monotonic_ns()
+    consumer.start_load_kv(meta)
+    assert not sent and len(consumer._write_queue) == 2
+    assert consumer.failed_recving == {"d-r"}
+    assert consumer._post_queued_write_requests()
+    after = time.monotonic_ns()
+    assert synced == [1] and len(sent) == 2
+    nonces = {}
+    for addr, (kind, payload) in sent:
+        request = msgpack.loads(payload)
+        assert (addr, kind) == ("tcp://10.0.0.1:6301", mc.MSG_WRITE_REQUEST)
+        nonces[request["request_id"]] = request["write_nonce"]
+    assert nonces.keys() == {"d-a", "d-b"}
+    # Only d-a is answered, twice, as the producer resends.
+    done = {
+        "request_id": "d-a",
+        "pp_rank": 0,
+        "tp_rank": 0,
+        "write_nonce": nonces["d-a"],
+        "success": True,
+    }
+    frame = [b"p", mc.MSG_WRITE_DONE, msgpack.dumps(done)]
+    _listen(mc, monkeypatch, consumer._notification_listener, [frame, frame])
+    decode.exit()
+    assert consumer.done_recving == {"d-a"}
+
+    lines = _lines(tmp_path / "decode" / "dp6.tp0.writes.jsonl")
+    assert lines.keys() == {"d-a", "d-b"}
+    a, b = lines["d-a"], lines["d-b"]
+    assert set(a) == CONSUMER_FIELDS | set(REQUEST_STAMPS)
+    assert set(b) == {"request_id", "write_nonce", *REQUEST_STAMPS}
+    assert (a["write_nonce"], b["write_nonce"]) == (nonces["d-a"], nonces["d-b"])
+    assert a["t_load_ns"] == b["t_load_ns"]  # one metadata asked for both
+    for line in (a, b):
+        (send,) = line["t_send_ns"]
+        stamps = [before, line["t_load_ns"], line["t_post_ns"], *send, after]
+        assert stamps == sorted(stamps)
+    assert a["t_post_ns"] < b["t_post_ns"]
+    assert a["t_send_ns"][0][1] <= b["t_send_ns"][0][0]
+    assert a["t_write_done_ns"] >= a["t_send_ns"][0][1]
+
+
 def test_an_unrecorded_run_wraps_nothing(mc, monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
     log, requests = [], _requests()[:2]
@@ -355,8 +469,12 @@ def test_an_unrecorded_run_wraps_nothing(mc, monkeypatch):
         "_rdma_write",
         "_notify_transfer_result",
         "_record_write_done",
+        "start_load_kv",
+        "_enqueue_write_requests",
     }
     assert not wrapped & (vars(producer).keys() | vars(consumer).keys())
+    # The producer double's own `_send_on_socket` is an instance attribute.
+    assert "_send_on_socket" not in vars(consumer)
     _serve(mc, monkeypatch, producer, requests)
     assert producer.done_sending == {"a", "b"}
     assert sorted(call[0] for call in log) == ["ionic_2"] * 3 + ["ionic_6"] * 3
