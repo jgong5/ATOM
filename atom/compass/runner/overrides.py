@@ -1972,7 +1972,10 @@ def _group_step_seconds(
     unless it is priced under the `eager DP dummy` treatment, whose 0 s the
     group's max already covers. A forward `compass_host` refuses takes the
     same path, charged with each segment it named at 0; a step both refuse
-    has one reason.
+    has one reason. A DP dummy forward is charged at 0 each segment its host
+    laws hold no law for, and not refused: no fit samples a dummy's host
+    time, and a dummy's kind is decode, which a P/D producer's host laws,
+    fitted on its prefills and middle chunks, do not hold (#3689).
 
     On the rank that keeps the parity record, each step also appends its cost
     line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`;
@@ -2081,7 +2084,9 @@ def _group_step_seconds(
 
     try:
         total = fold_seconds((device_s, draft_s))
-        charge_s = total if host is None else charge(batch, device_s, draft_s)
+        # No fit samples a dummy's host time (`projection.is_dummy`).
+        refuse = not (batch.is_dummy_run or not batch.total_seqs_num)
+        charge_s = total if host is None else charge(batch, device_s, draft_s, refuse)
     except CostRefused as refusal:
         if getattr(runner, "compass_abort", False):
             raise
