@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 """A designed-load calibration's decode design plan and prefill point plan,
-each planned from a served real record: its engine files, its step record as
-`parity.read` gives it, its request bodies and the calibration traces its
-client run was given."""
+each planned from a served real record: its engine files, its step record,
+its request bodies and the calibration traces its client run was given."""
 
 import json
 import math

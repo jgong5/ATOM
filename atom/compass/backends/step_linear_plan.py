@@ -41,6 +41,7 @@ below (`_hit_replay`) at that block: each plan counts so the tokens its fills
 compute, beside the rows it sends.
 """
 
+import argparse
 import json
 import math
 import random
@@ -51,7 +52,9 @@ from pathlib import Path
 
 import numpy as np
 
+from atom.compass.backends.json_file import read_jsonl
 from atom.compass.backends.step_linear import EAGER
+from atom.compass.backends.step_linear_fit import _stamps
 
 #: aiperf's arguments that start every trajectory at its first turn.
 FIRST_TURN = "--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"
@@ -72,6 +75,9 @@ CHAR_BYTES, ID_BYTES = 4, 12
 #: The model types whose prefix hit, under encoder bounded replay, rebuilds its
 #: window state from the KV block below where it resumes.
 REPLAYING = ("deepseek_v41", "deepseek_v41_text")
+#: The HTTP intake stamps a real server writes beside its steps
+#: (`atom.compass.run.INTAKE_RECORD`).
+INTAKE = "intake.stamps"
 #: A decode design's level groups: each kind's first row's level, then the
 #: rest's, 0 the bottom level and 2 the top.
 LEVEL_GROUPS = (("bottom", 0, 0), ("middle", 1, 1), ("top", 2, 2), ("one_long", 2, 0))
@@ -195,7 +201,9 @@ def design(real, seed: int) -> dict:
         "block": block,
         "hit_replay": replay,
         "max_tokens": max_tokens,
-        "tokenize_cache_mb": math.ceil(per_token * sum(t for *_, t in sent) / 2**20),
+        "tokenize_cache_mb": math.ceil(
+            per_token * sum(t for *_, t in sorted(sent)) / 2**20
+        ),
         "levels": [_levels(served[k][0]) for k in range(ranks)],
         "sessions": sessions,
         "groups": groups,
@@ -227,8 +235,6 @@ def trace_design(real, seed: int) -> dict:
     after that history, and a row with no history opens with a marker of its
     own, so no row hits past its history. `rows` and `fill_tokens` count the
     rows sent and the tokens the fills compute."""
-    from atom.compass.drive.sweep_plan import budget
-
     real = Path(real)
     stated, served, _, _ = _served(real)
     if len(stated) > 1 or any((real / "steps").glob("pp*")):
@@ -239,7 +245,7 @@ def trace_design(real, seed: int) -> dict:
     engine = stated[0]
     block, b, bound = (
         engine["kv_cache_block_size"],
-        budget(engine),
+        engine["max_num_batched_tokens"],
         engine["max_num_seqs"],
     )
     replay = _hit_replay(real, block)
@@ -275,7 +281,7 @@ def trace_design(real, seed: int) -> dict:
     for less, level, n, q in sorted(
         (-_scale(pool, sessions[:n]), level, n, q)
         for level in range(3)
-        for n, q in warm
+        for n, q in sorted(warm)
     ):
         heights = [whole(int(-less * s["cuts"][level])) for s in sessions[:n]]
         for i, h in enumerate(heights):
@@ -306,43 +312,48 @@ def trace_design(real, seed: int) -> dict:
 def _hit_replay(real: Path, block: int) -> int:
     """The tokens a prefix hit recomputes below where it resumes on the server
     of the real record at `real`: `block`, its KV block, where the model's type
-    is one of `REPLAYING` and ATOM's arguments leave its encoder bounded replay
-    on (`BlockManager.replay_start`); else none."""
-    from atom.compass.drive.runfile import _engine_args
-
+    is one of `REPLAYING` and the ATOM arguments after -- in its run.json leave
+    its encoder bounded replay on (`BlockManager.replay_start`); else none."""
     argv = json.loads((real / "run.json").read_text())["argv"]
-    atom = _engine_args(argv[argv.index("--") + 1 :])
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--model")
+    parser.add_argument(
+        "--encoder-swa-bounded-replay",
+        "--enable-encoder-swa-bounded-replay",
+        dest="replay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    atom = parser.parse_known_args(argv[argv.index("--") + 1 :])[0]
     model = json.loads((Path(atom.model) / "config.json").read_text())
-    replays = model.get("model_type") in REPLAYING
-    return block if replays and atom.enable_encoder_swa_bounded_replay else 0
+    return block if model.get("model_type") in REPLAYING and atom.replay else 0
 
 
 def _served(real: Path) -> tuple[dict, dict, float, int]:
     """The real record at `real`: each DP rank's engine file; per rank, its
     decode rows' contexts and its prefill rows' cached histories, each sorted;
     the tokens a decode step adds to a request's context, on average; and the
-    prompt tokens of every request it names, summed."""
-    from atom.compass.drive.sweep_plan import engines
-    from atom.compass.parity import read
-
-    served, contexts, prompts = {}, defaultdict(list), 0
-    for rank, steps in read(real / "steps").items():
+    prompt tokens of every request it names at its final chunk, summed."""
+    stated, served, contexts, prompts = {}, {}, defaultdict(list), 0
+    for path in sorted((real / "steps").glob("dp*[0-9].jsonl")):
+        rank = int(path.stem[2:])
+        stated[rank] = json.loads(path.with_suffix(".engine.json").read_text())
         decode, history = [], []
-        for step in steps:
-            named = step.get("request_ids", {})
-            for (key, _, context), (q, kv, decoding) in zip(
+        for step in read_jsonl(path):
+            named = [request for request, *_ in step["named"]]
+            for (request, _, context), (q, kv, decoding) in zip(
                 step["batch"], step["rows"]
             ):
-                prompts += context if key in named else 0
+                prompts += context if request in named else 0
                 if decoding:
                     decode.append(kv)
-                    contexts[rank, key].append(kv)
+                    contexts[rank, request].append(kv)
                 elif kv > q:
                     history.append(kv - q)
         served[rank] = sorted(decode), sorted(history)
     added = [b - a for kv in contexts.values() for a, b in pairwise(kv)]
     advance = float(np.mean(added)) if added else 1.0
-    return engines(real / "steps"), served, advance, prompts
+    return stated, served, advance, prompts
 
 
 def _traces(real: Path) -> dict[str, int]:
@@ -359,10 +370,7 @@ def _traces(real: Path) -> dict[str, int]:
 
 def _body_bytes(real: Path) -> int:
     """The bytes of every request body the real record's server read."""
-    from atom.compass.backends.step_linear_fit import _stamps
-    from atom.compass.run import INTAKE_RECORD
-
-    return sum(e[3] for e in _stamps(real / "steps" / INTAKE_RECORD) if e[2] == "body")
+    return sum(e[3] for e in _stamps(real / "steps" / INTAKE) if e[2] == "body")
 
 
 def _sessions(
