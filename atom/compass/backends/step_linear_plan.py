@@ -113,24 +113,25 @@ def design(real, seed: int) -> dict:
     the second sent on the first's fill), each at the rung's rows on every rank,
     `bound` at the eager rung, and the first four kinds' gap batch after each at
     the fewest rows that replay the rung; then under DP the middle level's group
-    with the full rank, rotating from group to group, beside the other ranks at
-    half its rows, at one row, with the next rank empty and every other rank
-    empty. A group is ``{"rung", "kind", "gap", "fill", "rows"}``, `rows` per
-    rank in the order sent, each ``[session, prompt tokens]``, row i of a group
-    session i but in the half-long pair. Each group's prompts are sent first,
-    one output token each, when `fill`, then again as its rows at once, each
-    asking `max_tokens`, `DECODE_STEPS` at the real record's tokens a decode
-    step. `tokenize_cache_mb` holds every prompt sent, at `CHAR_BYTES` a
-    character, taken as the real record's request body bytes a prompt token,
-    and `ID_BYTES` an id; `rows` and `fill_tokens` count, per rank, the rows
-    sent and the tokens the fills compute."""
+    with the full rank, moving from group to group and rung to rung, beside
+    the other ranks at half its rows, at one row, with the next rank empty and
+    every other rank empty. A group is ``{"rung", "kind", "gap", "fill",
+    "rows"}``, `rows` per rank in the order sent, each ``[session, prompt
+    tokens]``, row i of a group session i but in the half-long pair. Each
+    group's prompts are sent first, one output token each, when `fill`, then
+    again as its rows at once, each asking `max_tokens`, `DECODE_STEPS` at the
+    real record's tokens a decode step. `tokenize_cache_mb` holds every
+    prompt sent, at `CHAR_BYTES` a character, taken as the real record's
+    request body bytes a prompt token, and `ID_BYTES` an id; `rows` and
+    `fill_tokens` count, per rank, the rows sent and the tokens the fills
+    compute."""
     real = Path(real)
     stated, served, advance, prompts = _served(real)
     first = stated[0]
     block, ranks = first["kv_cache_block_size"], len(stated)
     drafts = (first.get("speculative") or (None, 0))[1]
     bound = min(first["max_num_seqs"], first["max_num_batched_tokens"] // (1 + drafts))
-    rungs = scheduled_rungs([r for r in first["ladder"] if r <= bound], bound)
+    rungs = scheduled_rungs(first["ladder"], bound)
     width = {r: bound if r == EAGER else r for r in rungs}
     max_tokens = round(DECODE_STEPS * advance)
     limit = first["max_model_len"] - max_tokens - drafts
@@ -143,8 +144,8 @@ def design(real, seed: int) -> dict:
         for k in range(ranks)
     ]
     pools = [stated[k]["num_kvcache_blocks"] * block for k in range(ranks)]
-    groups, prev, full = [], 0, 0
-    for rung in rungs:
+    groups, prev = [], 0
+    for index, rung in enumerate(rungs):
         r = width[rung]
         scale = [_scale(pools[k], sessions[k][:r]) for k in range(ranks)]
         # Each group's kind, whether a gap batch, whether filled, and its rows
@@ -161,10 +162,11 @@ def design(real, seed: int) -> dict:
             alternating = [x for pair in zip_longest(tops, bottoms) for x in pair if x]
             made.append(("half_alternating", False, True, [alternating] * ranks))
             made.append(("half_halves", False, False, [tops + bottoms] * ranks))
-        # The other ranks' rows beside the full rank's.
+        # The other ranks' rows beside the full rank's, the full rank moving
+        # from group to group and from rung to rung.
         others = {"dp_half": r // 2, "dp_one": 1, "dp_one_empty": r, "dp_empty": 0}
-        for kind, n in others.items() if ranks > 1 else ():
-            at, full = full % ranks, full + 1
+        for j, (kind, n) in enumerate(others.items() if ranks > 1 else ()):
+            at = (index + j) % ranks
             counts = [n] * ranks
             counts[at] = r
             if kind == "dp_one_empty":
@@ -195,7 +197,8 @@ def design(real, seed: int) -> dict:
                 if g["fill"]:
                     fill_tokens[k] += _computed(cached[k][i], tokens, block, replay)
                     cached[k][i] = max(cached[k][i], tokens)
-    per_token = CHAR_BYTES * _body_bytes(real) / prompts + ID_BYTES
+    body = sum(e[3] for e in _stamps(real / "steps" / INTAKE) if e[2] == "body")
+    per_token = CHAR_BYTES * body / prompts + ID_BYTES
     return {
         "seed": seed,
         "block": block,
@@ -368,11 +371,6 @@ def _traces(real: Path) -> dict[str, int]:
     return {t["id"]: max(r["in"] for r in t["requests"] if "in" in r) for t in traces}
 
 
-def _body_bytes(real: Path) -> int:
-    """The bytes of every request body the real record's server read."""
-    return sum(e[3] for e in _stamps(real / "steps" / INTAKE) if e[2] == "body")
-
-
 def _sessions(
     rng: random.Random, rows: list, traces: dict, count: int, cut, rank: int
 ) -> list[dict]:
@@ -418,7 +416,7 @@ def _computed(cached: int, tokens: int, block: int, replay: int) -> int:
     """The tokens a prompt of `tokens` computes on a session that has cached
     `cached` of its tokens: from the last whole `block` the two share short of
     the prompt's last block, `replay` before it at a hit."""
-    hit = max(0, (min(cached, tokens) - 1) // block * block)
+    hit = min(cached // block, (tokens - 1) // block) * block
     return tokens - (max(0, hit - replay) if hit else 0)
 
 

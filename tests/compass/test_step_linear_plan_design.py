@@ -19,10 +19,6 @@ def _engine(**fields):
     return {
         "ladder": [1, 2, 4, 8],
         "kv_cache_block_size": BLOCK,
-        "data_parallel_size": 1,
-        "enable_dp_attention": False,
-        "enable_tbo": False,
-        "enable_prefix_caching": True,
         "max_num_seqs": 16,
         "max_num_batched_tokens": 64,
         "max_model_len": 1 << 20,
@@ -81,7 +77,7 @@ def _record(
                     )
         text = "".join(json.dumps({"step": s, **x}) + "\n" for s, x in enumerate(lines))
         (steps / f"dp{rank}.jsonl").write_text(text)
-        stated = engine or _engine(data_parallel_size=len(contexts))
+        stated = engine or _engine()
         (steps / f"dp{rank}.engine.json").write_text(json.dumps(stated))
     (steps / "intake.stamps").write_text("\n".join(stamps) + "\n")
     given = path / "client" / "traces"
@@ -189,12 +185,12 @@ def test_under_dp_every_rank_runs_the_rung_and_the_middle_runs_beside_uneven_pee
     tmp_path,
 ):
     ladder = [1, 2, 4, 8, 16, 24, 32, 40, 48, 64]
+    # A pool of 1.6M tokens a rank, which every rank's rung-64 top cuts pass.
     engine = _engine(
         ladder=ladder,
         max_num_seqs=64,
-        data_parallel_size=4,
-        enable_dp_attention=True,
         max_num_batched_tokens=4096,
+        num_kvcache_blocks=100_000,
     )
     contexts = [_spread(1000 * (k + 1), 50_000) for k in range(4)]
     plan = design(_record(tmp_path, contexts, engine=engine), 2)
@@ -206,8 +202,18 @@ def test_under_dp_every_rank_runs_the_rung_and_the_middle_runs_beside_uneven_pee
     for g in plan["groups"]:
         if not g["kind"].startswith("dp_"):
             assert len({len(rows) for rows in g["rows"]}) == 1
-    at_8 = [[len(rows) for rows in g["rows"]] for g in dp if g["rung"] == 8]
-    assert at_8 == [[8, 4, 4, 4], [1, 8, 1, 1], [8, 8, 8, 0], [0, 0, 0, 8]]
+    # Each kind's full rank moves from rung to rung, as from group to group.
+    at = {
+        r: [[len(rows) for rows in g["rows"]] for g in dp if g["rung"] == r]
+        for r in ladder
+    }
+    assert at[8] == [[4, 4, 4, 8], [8, 1, 1, 1], [8, 8, 0, 8], [0, 0, 8, 0]]
+    assert at[16] == [[16, 8, 8, 8], [1, 16, 1, 1], [16, 16, 16, 0], [0, 0, 0, 16]]
+    # Each rank's rung-64 top cuts fill 0.8 of its own pool, scaled by its own
+    # factor, each row short of its share by under a token.
+    tops = [g for g in plan["groups"] if g["kind"] == "top" and not g["gap"]]
+    for rows in tops[-1]["rows"]:
+        assert 0.8 * 1_600_000 - 64 < sum(t for _, t in rows) <= 0.8 * 1_600_000
     # Each rank's sessions are its own rows' draws.
     assert [len(s) for s in plan["sessions"]] == [64] * 4
     assert min(s["cuts"][0] for s in plan["sessions"][0]) < 4000
@@ -261,14 +267,17 @@ def test_the_same_record_and_seed_print_the_same_bytes(tmp_path, capsys):
         main(["design", str(record)])
 
 
+@pytest.mark.parametrize("model, replay", [("qwen3", 0), ("deepseek_v41", BLOCK)])
 def test_trace_points_run_cold_then_each_list_bottom_first_within_the_budget(
-    tmp_path,
+    tmp_path, model, replay
 ):
     # A budget of 64 tokens and five sequences: up to four rows beside a parked
     # decode; buckets at 16 and 64.
     engine = _engine(max_num_seqs=5, prefill_buckets=[16, 64])
     histories = [_spread(16, 4000)]
-    plan = trace_design(_record(tmp_path, [[100] * 4], histories, engine), 1)
+    record = _record(tmp_path, [[100] * 4], histories, engine, model=model)
+    plan = trace_design(record, 1)
+    assert plan["hit_replay"] == replay
     levels = list(np.percentile(sorted(histories[0]), (10, 50, 90)))
     assert plan["levels"] == levels
     points = plan["points"]
@@ -279,6 +288,7 @@ def test_trace_points_run_cold_then_each_list_bottom_first_within_the_budget(
     assert (1, 17) in shapes and (1, 65) not in shapes
     assert {n for n, _ in shapes} == {1, 2, 4}
     assert all(n * q <= 64 for n, q in shapes)
+    assert all(p["record"] == [[q, q]] * n for p, (n, q) in zip(cold, shapes))
     warm = points[len(cold) :]
     # No scaling on this pool: one list, bottom level first, n and q ascending.
     order = [(p["level"], len(p["rows"]), p["rows"][0][2]) for p in warm]
@@ -289,18 +299,27 @@ def test_trace_points_run_cold_then_each_list_bottom_first_within_the_budget(
         heights = [plan["sessions"][i]["cuts"][p["level"]] for i in range(n)]
         assert [r[1] for r in p["rows"]] == heights
         assert all(h % BLOCK == 0 and h > 0 for h in heights)
-        # The step records its rows' first chunks: a row past the budget
-        # computes the budget first.
-        assert p["record"] == [[min(q, 64), h + min(q, 64)] for h in heights]
-    assert {(1, 64), (1, 65)} <= {(len(p["rows"]), p["rows"][0][2]) for p in warm}
+        # A row computes its q tokens, and the block below its history where
+        # a hit replays one, as its step records its first chunk: a row past
+        # the budget computes the budget first.
+        first = min(q + replay, 64)
+        assert p["record"] == [[first, h - replay + first] for h in heights]
+        assert n * (q + replay) <= 64 or (n, q + replay) == (1, 65)
+    shapes = {(len(p["rows"]), p["rows"][0][2]) for p in warm}
+    assert {(1, 64 - replay), (1, 65 - replay)} <= shapes
     # Each session fills to its top history once, from the level below, and
-    # each later fill computes its history's next token alone.
+    # each later fill computes its history's next token alone, with the block
+    # below where a hit replays one.
     fills = sum(len(p["rows"]) for p in warm)
-    tops = sum(s["cuts"][2] + 1 for s in plan["sessions"])
-    assert plan["fill_tokens"] == tops + fills - len(plan["sessions"])
+    used = {r[0] for p in warm for r in p["rows"]}
+    tops = sum(plan["sessions"][i]["cuts"][2] + 1 for i in used)
+    assert plan["fill_tokens"] == tops + (fills - len(used)) * (1 + replay)
 
 
-def test_a_trace_design_refuses_a_dp_record(tmp_path):
-    record = _record(tmp_path, [[100], [100]], histories=[[64], [64]])
+@pytest.mark.parametrize("ranks, stage", [(2, False), (1, True)])
+def test_a_trace_design_refuses_a_dp_or_pipeline_record(tmp_path, ranks, stage):
+    record = _record(tmp_path, [[100]] * ranks, histories=[[64]] * ranks)
+    if stage:
+        (record / "steps" / "pp1.dp0.jsonl").write_text("")
     with pytest.raises(ValueError, match="DP 1 and PP 1"):
         trace_design(record, 1)
