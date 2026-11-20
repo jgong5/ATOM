@@ -432,6 +432,11 @@ class LPRuntime:
         if not self.in_run or self.now == math.inf:
             self.queued.clear()
             return
+        # The stamp rule for another thread's send, option (a) of #3767's
+        # ruling: it is stamped here, at the releasing grant's clock (the
+        # ADD's arrival when the engine idles, the forward's end inside one),
+        # never at the arrival of the message its handler took; D6.2's text,
+        # which says the arrival, waits on #3804.
         self.draining = True
         try:
             while self.queued:
