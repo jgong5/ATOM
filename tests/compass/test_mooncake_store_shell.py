@@ -19,6 +19,7 @@ import copy
 import json
 import logging
 import math
+import signal
 import subprocess
 import threading
 from pathlib import Path
@@ -405,6 +406,20 @@ def test_a_saved_prefix_is_put_on_its_lane_and_a_later_query_loads_it(
             "evicted": 0,
         },
     }
+
+
+def test_the_lp_outlives_its_server_group_s_sigterm_and_hands_in_at_the_finish(
+    tmp_path, monkeypatch, factory
+):
+    """`compass run` SIGTERMs its server's process group, LP mooncake_store
+    among it, as the frontend's stop finishes the run: the LP keeps serving
+    to its +inf grant and hands in."""
+    engine = Engine(tmp_path, monkeypatch)
+    client = engine.shell._inner._lookup_client
+    assert client.submit(_seq(1), "1")
+    engine.proc.send_signal(signal.SIGTERM)
+    _answered(engine, client, "1")
+    assert engine.finish()["store"]["lookups"] == 1
 
 
 def test_the_query_asks_the_keys_atom_s_store_lookup_asks(
