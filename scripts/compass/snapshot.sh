@@ -76,14 +76,16 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/ATOM"
 printf '%s\n' "$SHA" >"$STAGE/ATOM/.compass-commit"
-git -C "$ROOT" diff --name-only "$BASE" HEAD >"$STAGE/ATOM/.compass-changed"
+# Both sides of a rename, unquoted, in both stamps as in gate_cpu.sh: else a
+# renamed trigger file or a non-ASCII path under a trigger matches nothing.
+git -C "$ROOT" -c core.quotePath=false diff --no-renames --name-only "$BASE" HEAD >"$STAGE/ATOM/.compass-changed"
 : >"$STAGE/ATOM/.compass-gpu-carry"
 if [ -n "${COMPASS_GPU_GATE_DONE:-}" ]; then
     G=$(git -C "$ROOT" rev-parse --verify --quiet "$COMPASS_GPU_GATE_DONE^{commit}") && [ "$G" = "$COMPASS_GPU_GATE_DONE" ] || {
         printf 'REFUSED: COMPASS_GPU_GATE_DONE=%s is not the full sha of a commit here.\n' "$COMPASS_GPU_GATE_DONE" >&2
         exit 93
     }
-    [ "$G" = "$SHA" ] || { printf '%s\n%s\n' "$G" "$SHA"; git -C "$ROOT" diff --name-only "$G" HEAD; } >"$STAGE/ATOM/.compass-gpu-carry"
+    [ "$G" = "$SHA" ] || { printf '%s\n%s\n' "$G" "$SHA"; git -C "$ROOT" -c core.quotePath=false diff --no-renames --name-only "$G" HEAD; } >"$STAGE/ATOM/.compass-gpu-carry"
 fi
 
 git -C "$ROOT" archive --format=tar --prefix=ATOM/ HEAD >"$TAR"

@@ -12,6 +12,7 @@ each store key or law file a flag
 names (`runfile.resolve`); a step linear law and host laws held against this
 run's engine config, widths, platform and host key
 (`run.pick_fitted`, `run.refuse_unfitted_law`, `run.refuse_unfitted_host`),
+and to the prefill token-graph buckets it records (`run.refuse_other_buckets`),
 and the step linear law's decode vectors against the rungs this configuration
 schedules (`uncovered_rungs`); the host laws' tokenizer term against the
 backend of the tokenizer ATOM's server loads (`run.tokenizer_term`); a step
@@ -47,10 +48,12 @@ device, when it prices the steps the backend refuses. No `compass run`
 backend is the step roofline itself.
 """
 
+import functools
 import json
 import os
 import re
 import shlex
+import tempfile
 from pathlib import Path
 
 from atom.compass import run as compass_run
@@ -197,10 +200,14 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
         if held and len(held) == len(tokens):
             run[name] = held if len(held) > 1 else held[0]
     law, host = NAMES[STEP_LINEAR], NAMES["host"]
+    buckets = {STEP_LINEAR, "host"} & run.keys() and recorded_buckets(config, arch)
     if STEP_LINEAR in run and met(
         law, made_by[STEP_LINEAR], compass_run.pick_fitted, run, STEP_LINEAR, config
     ):
-        met(law, made_by[STEP_LINEAR], compass_run.refuse_unfitted_law, run, config)
+        made = made_by[STEP_LINEAR]
+        if met(law, made, compass_run.refuse_unfitted_law, run, config):
+            given = config, buckets, {STEP_LINEAR: run[STEP_LINEAR]}
+            met(law, made, compass_run.refuse_other_buckets, *given)
         if rungs := uncovered_rungs(run[STEP_LINEAR], config):
             whose = (
                 " in the law or its draft law" if "draft" in run[STEP_LINEAR] else ""
@@ -216,6 +223,8 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     ):
         given = run["host"], config, machine_platform(machine)
         met(host, made_by["host"], compass_run.refuse_unfitted_host, *given)
+        given = config, buckets, {"host": run["host"]}
+        met(host, made_by["host"], compass_run.refuse_other_buckets, *given)
         tok = load_tokenizer(engine.model, engine.trust_remote_code)
         met(host, made_by["host"], compass_run.tokenizer_term, run, tok, config)
     grid, made = NAMES[STEP_GRID], MADE_BY[STEP_GRID]
@@ -284,6 +293,41 @@ def _reads_page_bound(config) -> bool:
     if getattr(config, "index_cache_dtype", None) != "fp4":
         return False
     return attn_family(get_hf_text_config(config.hf_config)) is Family.CSA2
+
+
+def recorded_buckets(config, arch: str) -> tuple[int, ...]:
+    """The prefill token-graph buckets a run of `config` on a device of `arch`
+    records at capture (`state_prefill_buckets`): `ATOM_TOKEN_GRAPH_SIZES` up to
+    `ModelRunner.warmup_max_tokens` where ATOM's attention builder for its model
+    records token graphs; none if eager or under RapidServe, whose prefill is eager."""
+    from atom.utils import envs, get_hf_text_config
+    from atom.utils.selector import attn_family
+
+    if config.enforce_eager or getattr(config, "enable_rapidserve", False):
+        return ()
+    dp = 1 if config.enable_dp_attention else config.parallel_config.data_parallel_size
+    limit = config.max_num_batched_tokens // dp // config.prefill_context_parallel_size
+    sizes = sorted({n for n in envs.ATOM_TOKEN_GRAPH_SIZES if 0 < n <= limit})
+    family = attn_family(get_hf_text_config(config.hf_config))
+    return tuple(sizes) if sizes and _token_graphs(family, arch) else ()
+
+
+@functools.cache
+def _token_graphs(family, arch: str) -> bool:
+    """Whether ATOM's attention builder for `family` records token graphs, in a
+    process declaring a device of `arch`: its module imports aiter, which needs one."""
+    from atom.compass.bench.ops import _child
+
+    return _child(_builder_records, family, arch)
+
+
+def _builder_records(family, arch: str) -> bool:
+    from atom.compass.capture import driverless
+    from atom.utils.selector import get_attn_backend
+
+    with tempfile.TemporaryDirectory(prefix="compass-check-") as tmpdir:
+        driverless.install(tmpdir, arch)
+        return get_attn_backend(family).get_builder_cls().supports_token_graph
 
 
 def _state(refused) -> str:

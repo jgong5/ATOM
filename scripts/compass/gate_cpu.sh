@@ -135,7 +135,9 @@ if [ -n "${COMPASS_CHANGED_FILES:-}" ]; then
 elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 &&
      REF=$(compass_resolve_ref "$ROOT" "$INTEGRATION") &&
      BASE=$(git -C "$ROOT" merge-base HEAD "$REF" 2>/dev/null); then
-    CHANGED=$(git -C "$ROOT" diff --name-only "$BASE")
+    # Both sides of a rename, unquoted, here and in the carry below: else a
+    # renamed trigger file or a non-ASCII path under a trigger matches nothing.
+    CHANGED=$(git -C "$ROOT" -c core.quotePath=false diff --no-renames --name-only "$BASE")
     SRC="diff vs $REF (${BASE:0:9})"
     # Announce the fallback the way snapshot.sh does. Without this the resolved
     # name appears only inside the `gpu:` source string -- reported, not
@@ -399,7 +401,7 @@ if [ -n "$GPU_NEEDED" ]; then
     if [ "$DONE" = "$HEAD_SHA" ]; then :
     elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
         { [ "$(git -C "$ROOT" rev-parse --verify --quiet "$DONE^{commit}")" = "$DONE" ] &&
-            CARRY=$(git -C "$ROOT" diff --name-only "$G"); } || WHY="$DONE is not the full sha of a commit here"
+            CARRY=$(git -C "$ROOT" -c core.quotePath=false diff --no-renames --name-only "$G"); } || WHY="$DONE is not the full sha of a commit here"
     elif [ -s "$ROOT/.compass-gpu-carry" ]; then
         { read -r G; read -r TO; CARRY=$(cat); } <"$ROOT/.compass-gpu-carry"
         [ "$G $TO" = "$DONE $HEAD_SHA" ] || WHY="the .compass-gpu-carry stamp carries $G to $TO"

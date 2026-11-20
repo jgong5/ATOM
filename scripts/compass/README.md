@@ -13,7 +13,9 @@ on, because until 2026-09-20 it was not — see "Which tree a script acts on" be
 New to Compass? [QUICKSTART.md](QUICKSTART.md) takes a model from an empty store
 to a simulation graded against real runs, and `smoke_cell.sh` runs that path in
 about an hour. [ADVICE.md](ADVICE.md) takes a user from a space file of
-configurations through `compass advice` to the one it recommends. `calibrate.sh OUT RECORD...` takes its calibration in one command,
+configurations through `compass advice` to the one it recommends.
+[USER_QUICKSTART.md](USER_QUICKSTART.md) predicts one configuration from a committed
+law file, on a host with no GPU. `calibrate.sh OUT RECORD...` takes its calibration in one command,
 from the warm record to the fits, and resumes a stopped run; its variables are in
 its header.
 
@@ -576,7 +578,7 @@ the run ends 98 unless `COMPASS_GPU_GATE_DONE` discharges it:
 | unset | **98** — run `gate_gpu.sh`, then re-run with that tree's HEAD |
 | set, but this tree has no commit (no `.git`, no `.compass-commit`) | **98** — an attestation names a tree; accepting an uncheckable one makes the rule bypassable in exactly the snapshot where the gate normally runs. Rebuild with `snapshot.sh`. |
 | set to another value G, and the diff from G to this tree touches a trigger, or a snapshot has no `.compass-gpu-carry` stamp from G to this HEAD, or G is not a full commit sha | **98** — the GPU gate passed on a different tree and does not carry here |
-| set to another full sha G, and the diff from G touches no trigger | discharged, `gpu: satisfied by <G> carried to <HEAD>`; the diff is `git diff --name-only G` in a checkout, or in a snapshot the stamp `snapshot.sh` writes when staged with the same `COMPASS_GPU_GATE_DONE` |
+| set to another full sha G, and the diff from G touches no trigger | discharged, `gpu: satisfied by <G> carried to <HEAD>`; the diff is `git -c core.quotePath=false diff --no-renames --name-only G` in a checkout, or in a snapshot the stamp `snapshot.sh` writes when staged with the same `COMPASS_GPU_GATE_DONE` |
 | equal to this tree's HEAD | discharged |
 
 The trigger match is *reported* before pytest and *enforced* after it, so one run

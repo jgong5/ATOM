@@ -10,8 +10,8 @@ person and an agent follow the same steps; an agent also keeps the rules in
 
 [QUICKSTART.md](QUICKSTART.md) is the developer's path for one configuration:
 records, fits, real runs and grading. This page uses its container, variables and
-platform readings, and never grades. A prediction on a host with no GPU at all is
-[#2893](https://github.com/jgong5/ATOM/issues/2893)'s page.
+platform readings, and never grades. [USER_QUICKSTART.md](USER_QUICKSTART.md)
+predicts one configuration on a host with no GPU at all.
 
 ## Limits
 
