@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 """`cost.idle_group_dummy` prices a producer's idle-group dummy at the seconds COMPASS_IDLE_DP_GROUP_S states, 0 where unset
-(unchanged): at 0 s its group stepped without the clock moving and a 1P1D simulation never advanced."""
-
-import pytest
+(unchanged): at 0 s its group stepped without the clock moving and a 1P1D simulation never advanced.
+"""
 
 from atom.compass.backends import cost
 from atom.compass.backends.cost import IDLE_DP_GROUP_S, idle_group_dummy

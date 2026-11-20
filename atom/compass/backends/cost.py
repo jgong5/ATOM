@@ -31,8 +31,8 @@ adds a `+`.
 
 from __future__ import annotations
 
-import os
 import math
+import os
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
