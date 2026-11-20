@@ -1920,6 +1920,17 @@ def replayed_stall(runner: Any, view: Any, host: Any) -> float:
     return seconds
 
 
+def _producer_dummy(runner: Any, view: Any) -> bool:
+    """Whether `view` is a P/D producer's DP dummy forward, which runs no
+    drafter: a producer never speculates, its dummies included
+    (`ModelRunner`), and its drafter only writes its requests' context KV
+    (`Drafter.context_kv_only`), of which a dummy has none."""
+    from atom.kv_transfer.disaggregation import kv_config_has_producer
+
+    kv = getattr(runner.config, "kv_transfer_config", None)
+    return bool(view.dp_dummy) and kv_config_has_producer(kv)
+
+
 def _group_step_seconds(
     runner: Any,
     batch: Any,
@@ -1970,12 +1981,14 @@ def _group_step_seconds(
     a speculative config, a step whose price holds no `draft_terms` is
     refused the same way, since the drafter runs after every target forward,
     unless it is priced under the `eager DP dummy` treatment, whose 0 s the
-    group's max already covers. A forward `compass_host` refuses takes the
-    same path, charged with each segment it named at 0; a step both refuse
-    has one reason. A DP dummy forward is charged at 0 each segment its host
-    laws hold no law for, and not refused: no fit samples a dummy's host
-    time, and a dummy's kind is decode, which a P/D producer's host laws,
-    fitted on its prefills and middle chunks, do not hold (#3689).
+    group's max already covers, or it is a P/D producer's DP dummy, which
+    runs no drafter (`_producer_dummy`). A forward `compass_host` refuses
+    takes the same path, charged with each segment it named at 0; a step
+    both refuse has one reason. A DP dummy forward is charged at 0 each
+    segment its host laws hold no law for, and not refused: no fit samples
+    a dummy's host time, and a dummy's kind is decode, which a P/D
+    producer's host laws, fitted on its prefills and middle chunks, do not
+    hold (#3689).
 
     On the rank that keeps the parity record, each step also appends its cost
     line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`;
@@ -2048,7 +2061,8 @@ def _group_step_seconds(
         # with output_prefill_kv, step_linear's module text) is priced among the target's terms, as `draft.` terms,
         # and states no draft_terms: that is a priced draft, not a missing one.
         in_kv = any(t.name.startswith("draft.") for t in cost.terms)
-        if spec and not cost.draft_terms and not in_kv and not dummy:
+        drafted = cost.draft_terms or in_kv or _producer_dummy(runner, view)
+        if spec and not drafted and not dummy:
             name = type(backend).__name__
             raise CostRefused(batch, [Refusal(name, "prices no draft")])
     except CostRefused as refusal:
