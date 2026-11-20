@@ -75,6 +75,8 @@ from compass_harness.strategy import ClockPhaseRunner
 from compass_harness.timesource import ClockTimer
 from compass_harness.traffic_lp import (
     HTTP,
+    INTAKE_JITTER_BYTES,
+    INTAKE_JITTER_SIGMA,
     PREFILL_URL_ENV,
     STREAM,
     SendAfterCancel,
@@ -1228,17 +1230,18 @@ def test_returns_whose_finals_share_a_grant_pass_in_stream_order(tmp_path):
     assert _run(main()) == [0, 1]
 
 
-def _stamped(tmp_path, instants, seed=None) -> list[tuple]:
+def _stamped(tmp_path, instants, seed=None, **lp) -> list[tuple]:
     """aiperf sends the turns ``instants[k]`` lists, each (conversation, turn),
     at ``k`` s in the order listed, numbering each one's credit as it sends it.
     Each stamp as a worker reads it, its turn in place of its key: (arrival,
-    seq, conversation, turn), by seq."""
+    seq, conversation, turn), then ``"jitter", <bytes>`` if it has one, by seq.
+    `lp`: more arguments for the traffic LP."""
 
     async def main():
         prefix = str(tmp_path / f"lp-{uuid.uuid4().hex[:8]}")
         # A stream event released at 100 s that no worker reports holds the
         # traffic LP there, its requests open, while the stamps are read.
-        traffic = TrafficLP(ScriptedRuntime([(100.0, {0})]), prefix, seed=seed)
+        traffic = TrafficLP(ScriptedRuntime([(100.0, {0})]), prefix, seed=seed, **lp)
         sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
         sub.connect(addresses(prefix)[0])
         sub.subscribe(b"")
@@ -1254,7 +1257,9 @@ def _stamped(tmp_path, instants, seed=None) -> list[tuple]:
         stamps = [await sub.recv_pyobj() for _ in turns]
         traffic.done.cancel()
         sub.close(linger=0)
-        return sorted((arrival, seq, *turns[key]) for key, arrival, seq in stamps)
+        return sorted(
+            (arrival, seq, *turns[key], *more) for key, arrival, seq, *more in stamps
+        )
 
     return _run(main())
 
@@ -1295,6 +1300,70 @@ def test_a_seed_draws_one_instant_s_order_the_same_whatever_order_aiperf_sends_i
     assert one[0] == one[1]
     assert len({tuple(s[2:] for s in run) for run in (plain, one[0], two)}) == 3
     assert [s[:2] for s in plain] == [s[:2] for s in one[0]] == [s[:2] for s in two]
+
+
+def _jitters(stamps) -> dict[tuple, float]:
+    """Each turn's intake jitter in `_stamped`'s stamps, by (conversation, turn)."""
+    assert all(s[4] == "jitter" and len(s) == 6 for s in stamps)
+    return {(s[2], s[3]): s[5] for s in stamps}
+
+
+def test_a_seed_gives_each_turn_one_intake_jitter_whatever_order_aiperf_sends_in(
+    tmp_path,
+):
+    """Seed 1 gives each of the burst's turns an intake jitter its stamp
+    carries, drawn by its conversation and turn alone: the stamps are the same,
+    jitters and all, whichever order aiperf sends the turns in, and at
+    whichever instant."""
+    runs = [
+        _stamped(tmp_path, [sends], "1")
+        for sends in (BURST, BURST[::-1], BURST[2:] + BURST[:2])
+    ]
+    assert runs[1] == runs[0] and runs[2] == runs[0]
+    later = _jitters(_stamped(tmp_path, [[("x", 0)], BURST], "1"))
+    assert {k: later[k] for k in BURST} == _jitters(runs[0])
+    print(f"\n  seed 1 jitters (bytes): {_jitters(runs[0])}")
+    assert all(0 < j < math.inf for j in _jitters(runs[0]).values())
+
+
+def test_each_seed_draws_its_own_jitters_and_no_seed_draws_none(tmp_path):
+    """Seeds 1 and 2 give each turn a jitter of their own, so the frontend
+    orders the burst two ways; with no seed, or a median of 0, no stamp carries
+    one, and the frontend takes the exact intake order."""
+    one, two = (_jitters(_stamped(tmp_path, [BURST], seed)) for seed in ("1", "2"))
+    assert all(one[k] != two[k] for k in BURST)
+    assert sorted(BURST, key=one.get) != sorted(BURST, key=two.get)
+    for stamps in (
+        _stamped(tmp_path, [BURST]),
+        _stamped(tmp_path, [BURST], "1", jitter_median=0.0),
+    ):
+        assert [len(s) for s in stamps] == [4] * len(BURST)
+    with pytest.raises(ValueError, match="no count of bytes"):
+        TrafficLP(None, str(tmp_path / "lp-x"), seed="1", jitter_median=-1.0)
+
+
+def test_the_intake_jitter_is_log_normal_about_the_median_it_names():
+    """Over many turns a seed's jitters have the median asked for, 48 kB by
+    default, and the real burst's spread of send offsets in their logs; each
+    draw is the same every time, and apart from the seq order's draw."""
+    lp = SimpleNamespace(seed="7", jitter_median=INTAKE_JITTER_BYTES)
+    ranks = [(0, "profiling", f"t{i}", i % 5, "") for i in range(4000)]
+    draws = [TrafficLP.jitter(lp, rank) for rank in ranks]
+    assert draws == [TrafficLP.jitter(lp, rank) for rank in ranks]
+    logs = [math.log(d) for d in draws]
+    median = sorted(draws)[len(draws) // 2]
+    sigma = (sum((x - sum(logs) / len(logs)) ** 2 for x in logs) / len(logs)) ** 0.5
+    print(f"\n  median {median:.0f} B, log sigma {sigma:.3f}")
+    assert median == pytest.approx(INTAKE_JITTER_BYTES, rel=0.06)
+    assert sigma == pytest.approx(INTAKE_JITTER_SIGMA, rel=0.04)
+    halved = SimpleNamespace(seed="7", jitter_median=INTAKE_JITTER_BYTES / 2)
+    assert [TrafficLP.jitter(halved, r) for r in ranks[:5]] == pytest.approx(
+        [d / 2 for d in draws[:5]]
+    )
+    assert (
+        TrafficLP.jitter(SimpleNamespace(seed=None, jitter_median=1.0), ranks[0])
+        is None
+    )
 
 
 def test_turns_sent_at_a_later_instant_take_later_seqs_seeded_or_not(tmp_path):

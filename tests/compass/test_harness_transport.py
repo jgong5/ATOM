@@ -68,7 +68,12 @@ from compass_harness.transport import (
     credit_key,
 )
 
-from atom.compass.carriers import cancel_body, stamp_events, tracestate_stamp
+from atom.compass.carriers import (
+    cancel_body,
+    stamp_events,
+    tracestate_jitter,
+    tracestate_stamp,
+)
 from atom.compass.clock import LpId, single_engine_table
 from compass_harness import fingerprint
 
@@ -276,6 +281,27 @@ def test_the_stamp_may_reach_the_worker_before_or_after_its_credit(
     for record, num in zip(_run(run()), (0, 1)):
         assert record.error is None
         assert record.start_perf_ns == _ns(SENDS[num][0])
+
+
+def test_a_seeded_stamp_s_intake_jitter_rides_in_the_request_s_tracestate(
+    tmp_path, monkeypatch
+):
+    """A stamp that ends ``"jitter", <bytes>`` (a seeded traffic LP's) puts the
+    jitter in the request's compass entry; one without names none."""
+
+    async def run():
+        async with Harness(tmp_path, monkeypatch) as h:
+            await h.pub.send_pyobj((_key(0), *SENDS[0], "jitter", 48123.5))
+            await h.stamp(1)
+            return h, [await h.send(num) for num in (0, 1)]
+
+    h, records = _run(run())
+    assert [r.error for r in records] == [None, None]
+    assert [r.start_perf_ns for r in records] == [_ns(SENDS[n][0]) for n in (0, 1)]
+    assert tracestate_stamp(h.tracestate[0]) == SENDS[0]
+    assert tracestate_jitter(h.tracestate[0]) == 48123.5
+    assert tracestate_stamp(h.tracestate[1]) == SENDS[1]
+    assert ";j:" not in h.tracestate[1]
 
 
 def test_an_unstamped_event_fails_its_request_by_name(tmp_path, monkeypatch):

@@ -35,6 +35,18 @@ under the same inputs. With ``SEND_ORDER_SEED_ENV`` set, they follow a digest
 of the seed and the rank instead: each seed is one draw of that order, the
 same in every run, so the router's placements can be sampled on purpose.
 
+The frontend hands one instant's requests on in the order their bodies are
+in, smallest first (`atom.utils.compass_loop.HttpChannel`), so seqs only break
+its ties. A seed therefore also gives each request an intake jitter (`jitter`),
+which its stamp carries to the frontend: its body is ordered as if it were that
+many bytes longer. It stands for the real client's wall spread of one
+instant's sends, which the real frontend's concurrent reads mix with the
+bodies' sizes. Each is a draw per seed and rank, its phase, conversation and
+turn, log-normal with median ``INTAKE_JITTER_ENV`` bytes (by default
+`INTAKE_JITTER_BYTES`) and the spread `INTAKE_JITTER_SIGMA` of the real burst's
+send offsets. With no seed, or a median of 0, no request carries one and the
+frontend takes the exact intake order.
+
 When aiperf cancels the requests in flight at its grace deadline, the traffic
 LP closes them at that time (`cancel`): each one's cancel is a stamped request
 of its own, which its worker sends and the frontend answers by hanging the
@@ -55,6 +67,7 @@ import logging
 import math
 import os
 import pickle
+from statistics import NormalDist
 
 import zmq
 import zmq.asyncio
@@ -77,8 +90,22 @@ PREFILL_URL_ENV = "COMPASS_HARNESS_PREFILL_URL"
 #: The seed of the order the requests sent at one instant are stamped in; unset
 #: or empty, they follow their ranks.
 SEND_ORDER_SEED_ENV = "COMPASS_HARNESS_SEND_ORDER_SEED"
+#: The median, in body bytes, of a seeded run's intake jitter (`TrafficLP.jitter`);
+#: unset or empty, `INTAKE_JITTER_BYTES`; 0, none.
+INTAKE_JITTER_ENV = "COMPASS_HARNESS_INTAKE_JITTER_BYTES"
+#: Cell A c=256's 300 s burst (#3742), whose bodies run 3.8 bytes a token: the
+#: median at which a simulated burst's order matches the real one's. Within the
+#: burst, Spearman of route order against input size reads +0.943 real (each
+#: rank's prefill entry +0.935); a Monte Carlo over the burst's sizes gives
+#: +0.942 +- 0.019 at this median, and ten seeded runs +0.941 +- 0.020 (each
+#: rank's entry +0.940 +- 0.021).
+INTAKE_JITTER_BYTES = 48_000.0
+#: The log-normal sigma of the intake jitter: the real burst's send offsets
+#: from its first send, p10 / p50 / p90 2.8 / 12.2 / 67 ms, ln(67 / 12.2) / 1.2816.
+INTAKE_JITTER_SIGMA = 1.33
 #: Loop turns the hold waits for aiperf to block before it says so in the log.
 SPIN_DIAG = 100_000
+_NORMAL = NormalDist()
 
 logger = logging.getLogger(__name__)
 
@@ -100,11 +127,18 @@ class TrafficLP:
         stream: str = STREAM,
         cancel_url: str | None = None,
         seed: str | None = None,
+        jitter_median: float = INTAKE_JITTER_BYTES,
     ) -> None:
         # cancel_url: where each cancel goes, if not to its request's URL.
         # seed: the send order's (`SEND_ORDER_SEED_ENV`), or None.
+        # jitter_median: of a seeded request's intake jitter, in bytes.
         self.rt, self.http, self.stream = rt, http, stream
         self.cancel_url, self.seed = cancel_url, seed
+        if not (math.isfinite(jitter_median) and jitter_median >= 0):
+            raise ValueError(
+                f"intake jitter median {jitter_median!r} is no count of bytes >= 0"
+            )
+        self.jitter_median = jitter_median
         stamps, reports = addresses(prefix)
         ctx = zmq.asyncio.Context.instance()
         self._pub = ctx.socket(zmq.XPUB)
@@ -162,6 +196,7 @@ class TrafficLP:
             stream.name,
             os.environ.get(PREFILL_URL_ENV) if http.name == PREFILL_HTTP else None,
             os.environ.get(SEND_ORDER_SEED_ENV) or None,
+            float(os.environ.get(INTAKE_JITTER_ENV) or INTAKE_JITTER_BYTES),
         )
 
     # ---- the clock ClockPacedLoopScheduler paces on ----
@@ -219,12 +254,16 @@ class TrafficLP:
         Called once aiperf has caught up with the clock, before the clock call
         or a cancel, so aiperf has sent every one: they take their seqs in
         their ranks' order, or with a seed in the order of a digest of it and
-        each rank, never in the order aiperf sent them in.
+        each rank, never in the order aiperf sent them in. A stamp is
+        ``(key, arrival, seq)``, then ``"jitter", <bytes>`` with a seed
+        (`jitter`).
         """
-        for _, key in sorted(self._unstamped, key=lambda sent: self._place(sent[0])):
+        for rank, key in sorted(self._unstamped, key=lambda sent: self._place(sent[0])):
             arrival, seq = self.rt.stamp_send(self.http)
             self.open[key] = None
-            self._pub.send_pyobj((key, arrival, seq))
+            jitter = self.jitter(rank)
+            more = () if jitter is None else ("jitter", jitter)
+            self._pub.send_pyobj((key, arrival, seq, *more))
         self._unstamped.clear()
 
     def _place(self, rank: tuple):
@@ -234,6 +273,17 @@ class TrafficLP:
         if self.seed is None:
             return rank
         return hashlib.sha256(repr((self.seed, rank)).encode()).digest(), rank
+
+    def jitter(self, rank: tuple) -> float | None:
+        """The intake jitter, in bytes, of a send ranked `rank`: None with no
+        seed or a median of 0; else log-normal, its median `jitter_median` and its
+        sigma `INTAKE_JITTER_SIGMA`, drawn from a digest of the seed and the
+        rank, which no hash seed or platform moves, apart from `_place`'s."""
+        if self.seed is None or self.jitter_median == 0:
+            return None
+        digest = hashlib.sha256(repr((self.seed, "intake", rank)).encode()).digest()
+        u = (int.from_bytes(digest[:8], "big") + 0.5) / 2**64
+        return self.jitter_median * math.exp(INTAKE_JITTER_SIGMA * _NORMAL.inv_cdf(u))
 
     async def cancel(self) -> None:
         """aiperf cancels what is in flight: close every open request.

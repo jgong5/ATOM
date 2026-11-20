@@ -85,6 +85,7 @@ from atom.compass.carriers import (
     cancel_seq,
     relay_stamp,
     stamp_events,
+    tracestate_jitter,
     with_relay_stamp,
 )
 from atom.utils import clock
@@ -822,6 +823,15 @@ class HttpChannel:
     it. A cancel takes its turn after every request waiting with it, among
     them any it names.
 
+    A request whose ``tracestate`` entry names an intake jitter, ``j:<bytes>``
+    (`atom.compass.carriers`), is ordered as if its body were that many bytes
+    longer: ``fixed_s + (body bytes + jitter) x per_byte_s``. The traffic LP
+    draws one per conversation and turn from its send-order seed
+    (`compass_harness.traffic_lp`), so a seed samples the order a real burst's
+    wall spread of sends gives, and the same seed gives the same order. The
+    jitter orders requests only: their intake charge is their own bodies'.
+    With none, as with no seed, they take the exact intake order.
+
     A stamped request whose body is a cancel
     (`atom.compass.carriers.cancel_seq`) goes to no app: it is answered 204,
     and the request it names, if the app is still serving it, reads
@@ -901,10 +911,11 @@ class HttpChannel:
             )
             arrival, seq = got
             rt.check_arrival(ch, arrival, seq)
+            jitter = 0.0 if relay_in is not None else _intake_jitter(scope)
             wake, ready = loop.create_future(), loop.create_future()
             # Its body leaves the socket as it comes, not at its turn.
             reading = asyncio.ensure_future(_body_messages(receive))
-            reading.add_done_callback(partial(self._ready, ready, arrival))
+            reading.add_done_callback(partial(self._ready, ready, arrival, jitter))
             loop.held[ch, seq] = (arrival, wake, ready)
             try:
                 await wake
@@ -955,11 +966,14 @@ class HttpChannel:
             if hangup is not None:
                 del self.hangups[seq]
 
-    def _ready(self, ready: asyncio.Future, arrival: float, reading) -> None:
+    def _ready(
+        self, ready: asyncio.Future, arrival: float, jitter: float, reading
+    ) -> None:
         """Resolve `ready` with when the request's body, read at once with the
-        others', is in: its arrival plus its own intake, ``fixed_s + body bytes
-        x per_byte_s``, which depends on nothing the wall decides; a cancel's
-        after every request it can name. A body never read is in at once."""
+        others', is in: its arrival plus its own intake, ``fixed_s + (body
+        bytes + jitter) x per_byte_s``, which depends on nothing the wall
+        decides; a cancel's after every request it can name. A body never read
+        is in at once."""
         if ready.done():
             return
         if reading.cancelled() or reading.exception() is not None:
@@ -969,7 +983,19 @@ class HttpChannel:
         else:
             fixed, per_byte, _ = self.intake or (0.0, 0.0, 0.0)
             nbytes = sum(len(m.get("body", b"")) for m in reading.result())
-            ready.set_result(arrival + fixed + per_byte * nbytes)
+            ready.set_result(arrival + fixed + per_byte * (nbytes + jitter))
+
+
+def _intake_jitter(scope) -> float:
+    """The intake jitter, in bytes, a request's ``tracestate`` header lines
+    carry (`atom.compass.carriers.tracestate_jitter`); 0.0 with none."""
+    return tracestate_jitter(
+        ",".join(
+            v.decode("latin-1")
+            for k, v in scope.get("headers", ())
+            if k.lower() == b"tracestate"
+        )
+    )
 
 
 async def _refuse_unstamped(rt, method: str, path: str, send) -> None:

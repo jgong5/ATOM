@@ -13,7 +13,12 @@ import re
 import pytest
 from starlette.responses import StreamingResponse
 
-from atom.compass.carriers import sse_stamp, tracestate_stamp, tracestate_with
+from atom.compass.carriers import (
+    sse_stamp,
+    tracestate_jitter,
+    tracestate_stamp,
+    tracestate_with,
+)
 from atom.compass.clock import LpId, prefill_decode_table, single_engine_table
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.serving_chat import stream_chat_response
@@ -138,6 +143,34 @@ class TestTracestate:
     def test_writing_a_second_entry_is_refused(self):
         with pytest.raises(ValueError, match="already has a compass entry"):
             tracestate_with("rojo=1,compass=a:1.0;s:1", 2.0, 2)
+
+    @pytest.mark.parametrize("jitter", [0.0, 1.0, 48000.0, 0.1 + 0.2, 3.5e-07, 2e20])
+    def test_an_intake_jitter_round_trips_beside_the_stamp(self, jitter):
+        header = tracestate_with(VENDORS, 1.5, 3, jitter)
+        assert header.startswith(f"compass=a:1.5;s:3;j:{jitter!r},rojo=")
+        assert tracestate_stamp(header) == (1.5, 3)
+        assert tracestate_jitter(header) == jitter
+
+    @pytest.mark.parametrize("header", [None, "", VENDORS, "compass=a:1.5;s:3"])
+    def test_no_intake_jitter_reads_as_zero(self, header):
+        assert tracestate_jitter(header) == 0.0
+
+    def test_a_stamp_with_no_jitter_names_none(self):
+        assert tracestate_with(None, 1.5, 3) == "compass=a:1.5;s:3"
+        assert tracestate_with(None, 1.5, 3, None) == "compass=a:1.5;s:3"
+
+    @pytest.mark.parametrize(
+        "value", ["a:1.0;s:1;j:", "a:1.0;s:1;j:x", "a:1.0;s:1;j:-1.0", "a:1.0;s:1;x:2"]
+    )
+    def test_a_malformed_jitter_is_refused_by_name(self, value):
+        for read in (tracestate_stamp, tracestate_jitter):
+            with pytest.raises(ValueError, match="^malformed compass tracestate entry"):
+                read(f"{VENDORS},compass={value}")
+
+    @pytest.mark.parametrize("jitter", [-1.0, float("nan"), float("inf")])
+    def test_writing_a_jitter_that_is_no_count_of_bytes_is_refused(self, jitter):
+        with pytest.raises(ValueError, match="no finite count of bytes"):
+            tracestate_with(None, 1.5, 3, jitter)
 
 
 class TestSseComment:

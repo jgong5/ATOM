@@ -1092,10 +1092,11 @@ def _intake_run_file(monkeypatch, tmp_path, intake) -> None:
     monkeypatch.setenv(compass_run.ENV, str(path))
 
 
-def _burst(run, monkeypatch, n, app, sizes=None, receives=None):
+def _burst(run, monkeypatch, n, app, sizes=None, receives=None, jitters=None):
     """`n` stamped requests at one arrival, through the served app, each with a
-    body of ``sizes[seq]`` bytes, or read from ``receives(seq)``; returns the
-    arrival once the loop has finished."""
+    body of ``sizes[seq]`` bytes, or read from ``receives(seq)``, and the
+    intake jitter ``jitters[seq]`` in its stamp, if given; returns the arrival
+    once the loop has finished."""
     stamps = queue.Queue()
     traffic = _traffic(run, stamps, before_ner=lambda: None, n=n)
     arrival = stamps.get(timeout=10)[0]
@@ -1109,7 +1110,8 @@ def _burst(run, monkeypatch, n, app, sizes=None, receives=None):
             body = b"x" * (sizes[seq] if sizes else 0)
             return {"type": "http.request", "body": body}
 
-        tracestate = carriers.tracestate_with(None, arrival, seq).encode()
+        jitter = None if jitters is None else jitters[seq]
+        tracestate = carriers.tracestate_with(None, arrival, seq, jitter).encode()
         scope = {"type": "http", "headers": [(b"tracestate", tracestate)]}
         return served(scope, receives(seq) if receives else receive, None)
 
@@ -1173,6 +1175,53 @@ def test_a_same_instant_burst_reaches_the_app_smallest_body_first_whatever_ends_
         t += fixed + per_byte * sizes[seq]
         at.append(t)
     print(f"\n  app entered {entered}")
+    assert [seq for seq, _ in entered] == order
+    assert [t for _, t in entered] == pytest.approx(at)
+
+
+#: One burst's intake jitters, in bytes, as two seeds of the traffic LP might
+#: draw them, per seq; None: no seed.
+JITTERS = {
+    "no seed": None,
+    "seed a": {0: 0.0, 1: 2500.0, 2: 0.0, 3: 100.0},
+    "seed b": {0: 10.0, 1: 0.0, 2: 1800.0, 3: 0.0},
+}
+
+
+@pytest.mark.parametrize(
+    "draw, order",
+    [("no seed", [1, 3, 2, 0]), ("seed a", [3, 2, 0, 1]), ("seed b", [1, 3, 0, 2])],
+)
+def test_an_intake_jitter_orders_a_burst_as_if_each_body_were_that_much_longer(
+    run, monkeypatch, tmp_path, draw, order
+):
+    # Bodies of 3000, 1000, 2000 and 1500 bytes, the largest read first on the
+    # wall. With no seed they take the exact intake order, smallest first; a
+    # seed's jitters order them by body + jitter: seed a 3000, 3500, 2000,
+    # 1600 bytes; seed b 3010, 1000, 3800, 1500. Each draw gives one order and
+    # one set of times, every run; each request is charged its own body.
+    fixed, per_byte = 2e-3, 1e-6
+    _intake_run_file(monkeypatch, tmp_path, (fixed, per_byte))
+    sizes, entered = [3000, 1000, 2000, 1500], []
+
+    async def app(scope, receive, send):
+        seq = api_server._tracestate_stamp(scope)[1]
+        entered.append((seq, asyncio.get_running_loop().time()))
+
+    def receives(seq):
+        async def receive():
+            for _ in range(seq):  # a later seq's body takes more socket reads
+                await asyncio.sleep(0)
+            return {"type": "http.request", "body": b"x" * sizes[seq]}
+
+        return receive
+
+    arrival = _burst(run, monkeypatch, 4, app, receives=receives, jitters=JITTERS[draw])
+    at, t = [], arrival
+    for seq in order:
+        t += fixed + per_byte * sizes[seq]
+        at.append(t)
+    print(f"\n  {draw}: app entered {entered}")
     assert [seq for seq, _ in entered] == order
     assert [t for _, t in entered] == pytest.approx(at)
 
