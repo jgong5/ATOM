@@ -27,9 +27,9 @@ stand-in, `StandInClient`, whose ``exists`` answers as the master's reply did.
   loop whose bound is a daemon deadline; ATOM's ``_renew`` runs over the reply.
   In a DP group the members park before their forwards (`run.engine`).
 - An offer from the engine's input thread (`offer_lookups`) cannot send: only
-  the clock owner sends in a run. It is queued, and the owner stamps it at its
-  next clock call or poll, at its clock then. This is the one seam #3767
-  changes (`StoreShell._send_lookup`).
+  the clock owner stamps a send in a run. It is handed to the owner, through
+  #3767's `LPRuntime.offer` where the runtime has it, and made there; this is
+  the one seam #3767 changes (`StoreShell._send_lookup`).
 
 Each writer rank (``world`` of them, ATOM's replica world) keeps an ATOM
 `MooncakeStoreOffloadConnector` with no device: a stand-in slot pool
@@ -55,6 +55,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import functools
 import itertools
 import logging
 import math
@@ -390,11 +391,15 @@ class StoreShell:
         self._ids = itertools.count()
         # Per lookup id, its last reply's lease deadline and present keys.
         self._leases: collections.OrderedDict = collections.OrderedDict()
-        self._offered: list = []  # (message arrival, payload), queued by a handler
+        # #3767's owner-stamped send, when the runtime has it; else the
+        # offers the shell queues itself for the owner's next clock call.
+        self._offer = getattr(rt, "offer", None)
+        self._offered: list = []
         self._lock = threading.Lock()
         self.counts = dict.fromkeys(COUNTS, 0)
         self.offered_late_s = 0.0  # the latest offer's lateness, at most
-        self._install_flush()
+        if self._offer is None:
+            self._install_flush()
 
     def __getattr__(self, name: str):
         inner = self.__dict__.get("_inner")
@@ -448,44 +453,57 @@ class StoreShell:
     def _send_lookup(self, payload) -> None:
         """Send a query or renewal on this engine's lookup channel.
 
-        The #3767 seam. The step loop, the clock owner, sends at once. An
-        offer from the engine's input thread (`EngineCore._offer_tier_lookups`)
-        may not send in a run (`clock.RelayQueue`: only the clock owner puts in
-        the run), so it is queued with its message's arrival, the owner's clock
-        while it waits for the handler, and the owner stamps it at its next
-        clock call or poll (`_flush`): at the clock the grant that released
-        the message left it, the arrival when the engine was idle, the
-        forward's end when the grant was a forward's. Once #3767's variant
-        lands, the handler hands it to the clock's owner-stamped send instead,
-        stamped at the arrival before the next release, and `_flush`, its
-        hooks and ``offers_late`` go."""
+        The #3767 seam, the one place a Store call is sent off the step loop.
+        The step loop, the clock owner, sends at once. An offer from the
+        engine's input thread (`EngineCore._offer_tier_lookups`) may not stamp
+        a send in a run, so it is handed to the clock owner as a callable
+        (`_offered_send`), with the arrival of the message the handler was
+        given, the owner's clock while it waits for the handler:
+
+        - with #3767's `LPRuntime.offer`, the owner makes it once the handler
+          is back at its wait point, stamped at that arrival, before it
+          releases the next message; (b) or (e) then lets an arrival inside a
+          forward's TAR be stamped there too;
+        - on a runtime without it, as on this branch until #3767's base is
+          merged, the shell queues it and the owner makes it at its next clock
+          call (`_install_flush`), at the clock the releasing grant left it: the
+          arrival when the engine was idle, the forward's end inside one,
+          counted in ``offers_late``.
+        """
         rt = self._rt
         if threading.current_thread() is rt.owner:
-            self._flush()
             self._send(self._look, payload)
             return
+        send = functools.partial(self._offered_send, rt.now, payload)
         with self._lock:
-            self._offered.append((rt.now, payload))
             self.counts["offers"] += 1
+            if self._offer is None:
+                self._offered.append(send)
+                return
+        self._offer(send)
+
+    def _offered_send(self, arrival: float, payload) -> None:
+        """Make an offered send on the owner, at its clock now; count it late
+        when that is past the arrival of the message that offered it."""
+        late = self._rt.now - arrival
+        if late > 0:
+            self.counts["offers_late"] += 1
+            self.offered_late_s = max(self.offered_late_s, late)
+        self._send(self._look, payload)
 
     def _flush(self) -> None:
-        """Send the offers handlers queued, stamped at the owner's clock now."""
-        rt = self._rt
-        if not self._offered or threading.current_thread() is not rt.owner:
+        """On the owner, make the offers the shell queued itself."""
+        if not self._offered or threading.current_thread() is not self._rt.owner:
             return
         with self._lock:
             offered, self._offered = self._offered, []
-        for arrival, payload in offered:
-            late = rt.now - arrival
-            if late > 0:
-                self.counts["offers_late"] += 1
-                self.offered_late_s = max(self.offered_late_s, late)
-            self._send(self._look, payload)
+        for send in offered:
+            send()
 
     def _install_flush(self) -> None:
-        """Have the owner flush the queued offers before each clock call it
-        makes or answers itself, so none is stamped past the grant that
-        released its message."""
+        """On a runtime with no `offer`, have the owner make the queued offers
+        before each clock call it makes or answers itself, as `offer` makes
+        those of a thread no release handed a message."""
         rt = self._rt
         for name in ("_ca_send", "_own_step"):
             call = getattr(rt, name)
