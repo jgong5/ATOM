@@ -19,6 +19,7 @@ import signal
 import subprocess
 import time
 from collections import Counter, defaultdict
+from types import SimpleNamespace
 
 import pytest
 import zmq
@@ -684,3 +685,77 @@ def test_the_launched_lp_answers_an_engine_on_the_run_s_clock(tmp_path, monkeypa
             "evicted": 0,
         },
     }
+
+
+# --- a Store emptied between client runs ----------------------------------------
+
+
+def test_an_entry_may_empty_the_store_between_client_runs_and_size_each():
+    entry = _entry(clear_between_client_runs=True, capacity_by_client_run=[200, 50])
+    store.check_entry(entry)
+    assert [store.client_run_capacity(entry, k) for k in range(4)] == [200, 50, 50, 50]
+    assert store.client_run_capacity(_entry(), 3) == 200
+
+
+@pytest.mark.parametrize(
+    "changed, refusal",
+    [
+        ({"clear_between_client_runs": 1}, "clear_between_client_runs is 1"),
+        (
+            {"clear_between_client_runs": True, "capacity_by_client_run": []},
+            "not a list of positive ints",
+        ),
+        (
+            {"clear_between_client_runs": True, "capacity_by_client_run": [100]},
+            "starts at 100, and capacity_bytes, client run 0's, is 200",
+        ),
+        ({"capacity_by_client_run": [200, 50]}, "needs clear_between_client_runs"),
+    ],
+    ids=["not-bool", "empty", "first-differs", "never-emptied"],
+)
+def test_a_client_run_field_the_lp_cannot_read_is_refused_by_name(changed, refusal):
+    with pytest.raises(MooncakeStoreRefusal, match=refusal):
+        store.check_entry(_entry(**changed))
+
+
+def test_a_cleared_store_holds_nothing_at_its_new_size_and_drops_pending_puts():
+    """Published objects, a put still to publish and the eviction deadlines
+    all go; a query after it finds nothing, and the new size bounds puts."""
+    lp, rt = _loop(_entry(capacity_bytes=6))
+    keys, groups = _keys(0)
+    _serve(lp, rt, [(1.0, XFER, ("put", keys, groups, 1.0, 1.5))], until=2.0)
+    assert lp.master.exists(keys, 2.0) == dict.fromkeys(keys, "engine-P1")
+    late, late_groups = _keys(1)
+    _serve(lp, rt, [(2.0, XFER, ("put", late, late_groups, 2.0, 9.0))], until=2.5)
+    assert lp.events and lp.master.used == 4
+
+    lp.clear(2)
+
+    assert (lp.master.capacity, lp.master.used, lp.master.filed) == (2, 0, 0)
+    assert not lp.master.objects and not lp.master.groups and not lp.events
+    assert lp.master.next_tick(3.0) == math.inf
+    got = _serve(lp, rt, [(3.0, LOOK, ("query", "after", keys + late))], until=10.0)
+    assert [p[3] for _, _, p in got] == [{}]  # nor did the pending put publish
+    lp.master.put(*_keys(2), "engine-P0", 10.0)  # two one-byte objects fit
+    with pytest.raises(MooncakeStoreRefusal, match="of the Store's 2 B in use"):
+        lp.master.put(*_keys(3), "engine-P0", 10.0)
+
+
+@pytest.mark.parametrize("clear", [False, True])
+def test_the_lp_hands_in_each_client_run_then_empties_the_store_where_told(
+    tmp_path, monkeypatch, clear
+):
+    entry = _entry(capacity_by_client_run=[200, 50, 25]) if clear else _entry()
+    if clear:
+        entry["clear_between_client_runs"] = True
+    run = {store.ENTRY: entry}
+    handed, cleared = [], []
+    monkeypatch.setattr(
+        compass_run, "_hand_in", lambda run, lp, reasons, k, **s: handed.append(k)
+    )
+    lp = SimpleNamespace(counts={}, clear=cleared.append)
+    ended = compass_run._store_client_run_ended(run, SimpleNamespace(refusals=[]), lp)
+    for k in range(3):
+        ended(k)
+    assert handed == [0, 1, 2]
+    assert cleared == ([50, 25, 25] if clear else [])
