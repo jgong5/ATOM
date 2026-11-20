@@ -1430,6 +1430,87 @@ def test_a_cancel_closes_one_instant_s_requests_in_their_seqs_order(tmp_path):
     ]
 
 
+def test_every_cancel_of_a_burst_reaches_a_worker_that_lags_behind_it(tmp_path):
+    """10,000 requests are open at the grace deadline, their send stamps read
+    as each instant's are published. The worker reads nothing while the cancel
+    burst is published, then reports each cancel it gets written: every one
+    reaches it and `cancel` returns. Two c=512 runs on a loaded node hung
+    there (#3819): PUB's high-water mark dropped the last 114 of 769 cancels
+    to every worker, whose cancels were never written, so `cancel`, the hold
+    and the clock waited forever."""
+    n, per_instant = 10_000, 400
+
+    async def main():
+        prefix = str(tmp_path / "lp")
+        traffic = TrafficLP(ScriptedRuntime([]), prefix)
+        stamps, reports = addresses(prefix)
+        # A blocking socket: while the worker reads, the loop, and with it the
+        # owner's clock calls, waits.
+        sub = zmq.Context.instance().socket(zmq.SUB)
+        sub.setsockopt(zmq.RCVTIMEO, 2000)
+        sub.connect(stamps)
+        sub.subscribe(b"")
+        await traffic.subscribed(1)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.setsockopt(zmq.SNDHWM, 0)  # the reports wait for the loop, unread
+        push.connect(reports)
+        try:
+            for first in range(0, n, per_instant):
+                for num in range(first, first + per_instant):
+                    traffic.send(_key(num))
+                t = 1.0 + first // per_instant
+                while traffic.now() < t:
+                    await traffic.wait(t)
+                for _ in range(per_instant):
+                    sub.recv_pyobj()
+            cancelling = asyncio.ensure_future(traffic.cancel())
+            while not traffic.cancelled:  # the burst is out once they are closed
+                await asyncio.wait({cancelling}, timeout=0.05)
+            got = []
+            with contextlib.suppress(zmq.Again):
+                while len(got) < n:
+                    key, *_, kind = sub.recv_pyobj()
+                    got.append((key, kind))
+                    push.send_pyobj((key,))
+            # Not one lost, or `cancel` waits for its report forever.
+            assert got == [(_key(num), "cancel") for num in range(n)]
+            await asyncio.wait_for(cancelling, 10)
+        finally:
+            traffic.done.cancel()  # the hold waits for their returns
+            push.close(linger=0)
+            sub.close(linger=0)
+
+    _run(main())
+
+
+def test_a_cancel_not_written_is_named_while_it_waits(tmp_path, monkeypatch, caplog):
+    """A cancel its worker never reports written keeps `cancel` waiting, and
+    the log names it every ``DIAG_S`` wall seconds."""
+    monkeypatch.setattr(traffic_lp, "DIAG_S", 0.05)
+
+    async def main():
+        traffic = TrafficLP(ScriptedRuntime([]), str(tmp_path / "lp"))
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(str(tmp_path / "lp"))[1])
+        traffic.send(_key(0))
+        traffic.send(_key(1))
+        while traffic.now() < 2.0:
+            await traffic.wait(2.0)
+        cancelling = asyncio.ensure_future(traffic.cancel())
+        push.send_pyobj((_key(0),))
+        try:
+            await asyncio.wait({cancelling}, timeout=0.5)
+            return cancelling.done()
+        finally:
+            cancelling.cancel()
+            traffic.done.cancel()
+            push.close(linger=0)
+
+    assert not _run(main())
+    named = [r.getMessage() for r in caplog.records if "cancels of" in r.getMessage()]
+    assert named and f"cancels of [{_key(1)}] not reported written" in named[-1]
+
+
 def test_a_cancel_waits_for_a_released_final_s_return_before_it_stamps(tmp_path):
     """Credits 0 and 1 are open; the grant at the grace deadline, 2.0, releases
     credit 0's final, whose return reaches the hold 50 ms after aiperf cancels.

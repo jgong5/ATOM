@@ -54,7 +54,18 @@ cancelled request up at the cancel's arrival. Behind a PD router the router LP
 answers it and hands it on to the frontend that holds the request. A PD router
 that is no LP answers a cancel 400, as a chat request it cannot read, so behind
 one, where the HTTP channel leads to frontend-P, each cancel goes to
-frontend-P's own URL, from ``PREFILL_URL_ENV``.
+frontend-P's own URL, from ``PREFILL_URL_ENV``. A cancel its worker has not
+reported written after ``DIAG_S`` wall seconds is named in the log.
+
+Every stamp, a send's or a cancel's, goes to every worker, and none may be
+lost: a worker that never gets its request's stamp never sends it, and one that
+never gets its cancel never writes it, so `cancel` and the clock wait forever.
+So the stamp socket has no high-water mark. A PUB socket drops a subscriber's
+messages once its pipe holds the mark's worth, by the count the I/O thread last
+reported read, which it does only every half mark; at the default 1000, two
+c=512 runs on a loaded node lost the last 114 of 769 cancels to every worker
+(the burst's 655th took each pipe to 9,000 messages written, the last report
+8,000 read).
 
 A request that errors mid-stream never reports the events after its last read.
 When released events stay unreported for ``DIAG_S`` wall seconds while an
@@ -143,6 +154,9 @@ class TrafficLP:
         ctx = zmq.asyncio.Context.instance()
         self._pub = ctx.socket(zmq.XPUB)
         self._pub.setsockopt(zmq.XPUB_VERBOSE, 1)
+        # No high-water mark: past one, a stamp a worker lags behind is dropped
+        # (see the module docstring). Set before the bind, which makes the pipes.
+        self._pub.setsockopt(zmq.SNDHWM, 0)
         self._pub.bind(stamps)
         self._pull = ctx.socket(zmq.PULL)
         self._pull.bind(reports)
@@ -291,7 +305,8 @@ class TrafficLP:
         Once aiperf has caught up with the clock, stamps one cancel per open
         request, in their seqs' order, publishes it for the worker that sent
         the request, with `cancel_url` when set, and returns once every one is
-        written. The hold passes each closed request's return before the next
+        written, naming those that are not every ``DIAG_S`` wall seconds until
+        then. The hold passes each closed request's return before the next
         clock call; its stream events still to come are dropped.
         """
         fut = asyncio.get_running_loop().create_future()
@@ -309,7 +324,16 @@ class TrafficLP:
             self._pub.send_pyobj((key, arrival, seq, "cancel", *to))
         while not self._written.issuperset(keys):
             self._changed.clear()
-            await self._changed.wait()
+            try:
+                await asyncio.wait_for(self._changed.wait(), DIAG_S)
+            except TimeoutError:
+                logger.warning(
+                    "traffic at %s: cancels of %s not reported written by their "
+                    "workers after %s wall seconds; still waiting",
+                    self.rt.now,
+                    [key for key in keys if key not in self._written],
+                    DIAG_S,
+                )
 
     def hold(self, callback):
         """aiperf's return callback, behind the hold."""
