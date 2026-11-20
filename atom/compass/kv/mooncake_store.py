@@ -446,6 +446,19 @@ class StoreShell:
         sid = str(seq.id)
         self._replies[sid] = (present, lease)
         self._counts["lookups" if kind == "query" else "renewals"] += 1
+        keys = self._keys(seq, *span)
+        logger.info(
+            "compass: mooncake_store %s of %s from %r: %d of its %d keys present, "
+            "%d put by another engine, lease to %r; first key %s",
+            kind,
+            sid,
+            start,
+            sum(k in present for k in keys),
+            len(keys),
+            sum(present.get(k, self._me) != self._me for k in keys),
+            lease,
+            keys[0],
+        )
         if future.cancelled():
             return
         try:

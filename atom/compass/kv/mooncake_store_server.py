@@ -64,6 +64,7 @@ from __future__ import annotations
 import argparse
 import heapq
 import itertools
+import logging
 import math
 import pickle
 import re
@@ -73,6 +74,7 @@ from typing import NamedTuple
 
 from atom.compass.kv.lmcache_server import StationLP
 
+logger = logging.getLogger(__name__)
 #: The run-file key of the entry.
 ENTRY = "mooncake_store"
 #: The entry's laws, each ``[fixed, per key]`` (lookup) or ``[fixed, per chunk]``
@@ -491,7 +493,18 @@ class MooncakeStoreLP(StationLP):
             at, _, action = heapq.heappop(self.events)
             action(at)
         if self.master.next_tick(now) <= now:
-            self.counts["evicted"] += self.master.evict(now).objects
+            done = self.master.evict(now)
+            self.counts["evicted"] += done.objects
+            logger.info(
+                "compass: LP mooncake_store's eviction round at %r: target %.3f, "
+                "goal %d, evicted %d objects of groups %s, skipped %s",
+                now,
+                done.target,
+                done.goal,
+                done.objects,
+                done.evicted,
+                done.skipped,
+            )
 
     def _deadlines(self) -> tuple[float, float]:
         t, now = super()._deadlines()[0], self.rt.now
