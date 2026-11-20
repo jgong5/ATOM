@@ -1082,8 +1082,11 @@ def _lmcache_plan(run: dict, blocks: int) -> tuple[int, int]:
 
 
 def _launch_lmcache(config, run: dict, side: str | None) -> None:
-    """Start LP `lmcache`, the stand-in lmcache server, in a process of its own
-    when this deployment offloads KV to one, given its KV block tokens; refuse
+    """Start LP `lmcache`, the stand-in lmcache server, in a process and a
+    session of its own when this deployment offloads KV to one, given its KV
+    block tokens: a stop of the server that started it, `compass run`'s
+    SIGTERM to that server's process group, does not reach it, so it leaves at
+    its ``+inf`` grant, after its hand-in, which the summary waits for. Refuse
     a deployment and a run file that disagree on whether one runs, a decode
     side that would start it, an entry stating ``writers`` or ``state_bytes``,
     which nothing reads, or a server chunk that is not a whole number of the
@@ -1125,6 +1128,7 @@ def _launch_lmcache(config, run: dict, side: str | None) -> None:
     subprocess.Popen(
         [sys.executable, "-c", LMCACHE_MAIN, str(block)],
         env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, paths))},
+        start_new_session=True,
     )
 
 
