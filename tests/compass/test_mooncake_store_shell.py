@@ -221,6 +221,30 @@ def test_an_offer_from_the_input_thread_is_sent_by_the_clock_owner(shell):
     assert "2" in s._lookups.pending and rt.refusals == []
 
 
+def test_a_renewal_past_its_bound_returns_0_and_holds_the_next_until_its_reply(
+    shell,
+):
+    """A renewal whose reply is not in by `RENEW_TIMEOUT_S` returns 0 at the
+    bound, a daemon deadline; while it is out another renewal sends nothing,
+    and its late reply, taken at a poll, frees the next."""
+    s, rt, lp = shell.shell, shell.rt, shell.lp
+    seq, lookups = _seq(4, 41), shell.shell._lookups
+    shell.conn.next = (1.0, {})  # the authority grants the bound
+    assert lookups.renew(seq, CHUNK, 5 * CHUNK) == 0
+    assert shell.conn.sent[-1][:4] == ("NER", math.inf, [(ASK, 0, HOP)], 1.0)
+    assert rt.now == 1.0 and lookups._renewing
+    identity, _, (kind, rid, asked) = _received(lp)
+    assert kind == "renew" and len(asked) == 5
+    assert lookups.renew(seq, CHUNK, 5 * CHUNK) == 0 and not lp.poll(100)
+
+    reply = (rid, HOP, 1.25 + TTL, {})
+    lp.send_multipart([identity, pickle.dumps((BACK, 1.25, 0)), pickle.dumps(reply)])
+    shell.conn.next = (1.25, {BACK: [(0, 1.25)]})
+    rt.next_event(math.inf)
+    lookups.pump()
+    assert not lookups._renewing and s._replies["4"] == ({}, 1.25 + TTL)
+
+
 def test_a_save_puts_as_it_is_queued_and_a_load_gets_all_or_nothing(shell):
     s, rt, lp = shell.shell, shell.rt, shell.lp
     hashes = store_keys.chunk_hash_chain(list(range(32)), CHUNK)  # four chunks
