@@ -41,7 +41,7 @@ from types import SimpleNamespace
 
 from atom.compass.backends.step_grid_plan import DEFERS_OUTPUT
 from atom.compass.backends.step_stub import Coefficients
-from atom.compass.clock import TAR
+from atom.compass.clock import ARRIVAL, TAR
 from atom.compass.detect.determinism import CONFIGURATION_PREFIX, compare_step_tables
 from atom.compass.parity import read
 from atom.compass.parity.recurrence import _waited
@@ -179,13 +179,16 @@ def _run_properties(table: str, summary: dict) -> list[str]:
 
 def _rows(table: str):
     """A step table's run file, its TAR rows by LP, its release ends by channel
-    and seq."""
+    and seq. A TAR granted an offering arrival first is one row, from where it
+    was asked."""
     lines = table.splitlines()
     run = json.loads(lines[0].removeprefix(CONFIGURATION_PREFIX))
-    tars, arrived = defaultdict(list), defaultdict(dict)
+    tars, arrived, asked = defaultdict(list), defaultdict(dict), {}
     for lp, t0, t1, event, ch, seq, _ in map(str.split, lines[1:]):
-        if event == TAR:
-            tars[lp].append((float(t0), float(t1)))
+        if event == ARRIVAL:
+            asked.setdefault(lp, float(t0))
+        elif event == TAR:
+            tars[lp].append((asked.pop(lp, float(t0)), float(t1)))
         elif event == "release":
             arrived[ch][int(seq)] = float(t1)
     return run, tars, arrived

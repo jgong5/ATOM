@@ -56,6 +56,10 @@ send side stamps each frame with `stamp_send`, directly or through the
 A handler, or a thread a handler wakes, that would send instead `offer`s the
 send: the owner makes it once the handler is back at its wait point, stamped at
 the arrival of the message the handler was given, before it releases the next.
+A grant releasing a message on a channel the table marks offering may fall
+short of the TAR rounds asked, at that message's arrival: the owner then asks
+the rounds left again, and a parked member parks again. An own step counts the
+sends offered while it walks as made before it (#3767).
 """
 
 import contextlib
@@ -200,6 +204,7 @@ class LPRuntime:
         # the reports that paid them all.
         self.paid = {"rounds": 0, "ahead": 0, "reports": 0}
         self.parking = False  # a DP member between its state sync and its park
+        self.woken = False  # the last grant released a message on an offering channel
         # The frontend's event loop, once built: a frame a thread takes is a job on it.
         self.loop = None
         # Clock calls refused, as run-summary reasons ``clock:<call> ...``: a
@@ -286,10 +291,18 @@ class LPRuntime:
         self.settle()
         if T < self.now:
             raise ValueError(f"{self.me} cannot advance to {T}, it is at {self.now}")
-        if T < self.ceiling:  # a member's stays -inf
-            self._own_step("TAR", T, T)
-        else:
-            self._grant(*self._ca_call("TAR", T, rounds=later))
+        self._rounds([T, *later])
+
+    def _rounds(self, rounds: list) -> None:
+        """TAR through `rounds`, answering one below the ceiling itself. A grant
+        short of the last released a message on an offering channel at its
+        arrival: the rounds left are asked again."""
+        while rounds:
+            if rounds[0] < self.ceiling:  # a member's stays -inf
+                self._own_step("TAR", rounds[0], rounds[0])
+            else:
+                self._grant(*self._ca_call("TAR", rounds[0], rounds=rounds[1:]))
+            rounds = [t for t in rounds if t > self.now]
 
     def advance_group(self, targets, mine: float) -> None:
         """A DP group step: each distinct target is a round every member asks,
@@ -318,7 +331,7 @@ class LPRuntime:
             self._own_step("TAR", t, t)
         rest = owed[len(ahead) :]
         if rest:
-            self._grant(*self._ca_call("TAR", rest[0], rounds=rest[1:]))
+            self._rounds(rest)
         else:
             self._ca_send("REPORT", self.now, math.inf)
         self.calls = calls
@@ -361,14 +374,18 @@ class LPRuntime:
         """A DP member's last clock call before it dispatches a forward: wait,
         standing in its peers' rounds with no target, until every member has
         parked; then walk the messages released to it meanwhile, each at its
-        arrival, and leave at the group's clock, the latest member's."""
+        arrival, and leave at the group's clock, the latest member's. A message
+        on an offering channel is walked at its grant, and the member parks
+        again."""
         self._require_open("park")
         if self.owed:
             self._refuse(f"park while owing group rounds {self.owed}")
-        self.parking = False
-        self._ca_send("PARK", math.inf, math.inf)
-        self.asked = True
-        self.take_grant()
+        self.woken = True
+        while self.woken and self.now < math.inf:
+            self.parking = False
+            self._ca_send("PARK", math.inf, math.inf)
+            self.asked = True
+            self.take_grant()
 
     def take_grant(self) -> float:
         """Wait for the grant of the request `ask_next_event` sent; returns it."""
@@ -431,11 +448,10 @@ class LPRuntime:
 
     def _own_step(self, kind: str, t: float, G: float) -> None:
         """Answer a call below the ceiling, as the authority would: walk the
-        messages sent ahead up to `G`, and keep the step for the next call."""
+        messages sent ahead up to `G`, and keep the step for the next call. A
+        send offered in the walk, at an arrival up to `G`, counts before it."""
         with self.lock:
             self._make_offers()
-            sent = len(self.send_log)
-        self.steps.append((kind, t, G, sent))
         self.calls += 1
         cut = next((k for k, m in enumerate(self.ahead) if m[0] > G), len(self.ahead))
         reached, self.ahead = self.ahead[:cut], self.ahead[cut:]
@@ -443,12 +459,17 @@ class LPRuntime:
         for a, ch, seq in reached:
             walk.setdefault(ch, []).append((seq, a))
         self._step_through(G, walk)
+        with self.lock:
+            sent = len(self.send_log)
+        self.steps.append((kind, t, G, sent))
 
     def _grant(self, G: float, released: dict) -> None:
         """Take a grant: walk what it releases up to `G` and every message sent
         ahead before it, and keep its ceiling and the messages it sends ahead."""
         ceiling = getattr(released, "ceiling", None)
         below = -math.inf if ceiling is None else ceiling
+        offering = self.table.offering
+        self.woken = any(msgs and offering(ch) for ch, msgs in released.items())
         if self.member is None:
             self.ceiling = below
         else:  # a member answers none of its own calls, only its owed rounds

@@ -232,7 +232,9 @@ first stamped request LP ``lmcache`` sizes a chunk and a rank's state image
 from what each member of the engine it serves planned (`_lmcache_plan`), as a
 prefill-decode connector prices its transfer. The copy engine
 prices on the machine's ``interconnect.host_link``. Its channels' lookahead is
-``lmcache_ipc_s``, the run's ``ipc_s`` when absent (`add_lmcache`). `engine(config)`
+``lmcache_ipc_s``, the run's ``ipc_s`` when absent (`add_lmcache`); with
+``OFFLOAD_MP_LOOKUP_THREAD`` set, in the authority's process as in each
+engine's, the channels whose handlers offer a lookup are offering. `engine(config)`
 has the connector factory build ``lmcache_mp`` as Compass's
 (`atom.compass.kv.lmcache_mp`), whose scheduler half sends each transfer to LP
 ``lmcache`` from the step loop.
@@ -308,7 +310,7 @@ from atom.compass.clock.channels import add_lmcache
 from atom.compass.clock_transport import connect, connect_here, serve
 from atom.compass.detect.determinism import StepTable
 from atom.compass.runner import COMPASS_RAPIDSERVE_QUALNAME, COMPASS_RUNNER_QUALNAME
-from atom.utils import clock
+from atom.utils import clock, envs
 
 ENV = "ATOM_COMPASS_RUN"
 CLOCK_ENV = "ATOM_COMPASS_CLOCK_ENDPOINT"
@@ -786,6 +788,7 @@ def channel_table(run: dict):
             _lmcache_engine(run),
             run.get("lmcache_ipc_s", hop(run, "ipc_s")),
             _dp(run, "P" if pd else None),
+            envs.OFFLOAD_MP_LOOKUP_THREAD,
         )
     return table
 
