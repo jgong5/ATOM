@@ -199,8 +199,9 @@ compass_gpu_skips "$ARCH" || finish 1 "$SKIP_WHY"
 
 # What of tests/compass runs. batch, the default, runs the driver-run files
 # gpu_gate_driver_run.txt lists: every other compass file runs in the CPU gate,
-# and tests/compass/conftest.py fails a driver-run skip in a file the list does
-# not name. all runs every compass file, the superset, for the daily run.
+# and tests/compass/driver_run_skips.py fails a driver-run skip in a file the
+# list does not name. all runs every compass file, the superset, for the daily
+# run.
 SCOPE=${COMPASS_GPU_GATE_SCOPE:-batch}
 LIST=$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_driver_run.txt
 case "$SCOPE" in

@@ -6,6 +6,10 @@
 files that list names. A driver-run skip in a file it does not name would run in
 no gate: the CPU gate skips it and the GPU gate never collects it. So the CPU
 gate, which runs every compass file without the inputs, holds the list complete.
+
+`tests/conftest.py` loads these hooks. They are not a `tests/compass/conftest.py`
+because compass tests import `tests/conftest.py`'s helpers as `conftest`, a name
+a second conftest would take over.
 """
 
 import re
@@ -34,12 +38,16 @@ LISTED = _listed()
 
 
 def _unlisted(report, path):
-    """Turns a driver-run skip in a file LIST does not name into a failure."""
+    """Turns a driver-run skip in a compass file LIST does not name into a failure."""
     if not report.skipped or hasattr(report, "wasxfail"):
         return
     reason = report.longrepr[2] if isinstance(report.longrepr, tuple) else ""
     rel = Path(path).resolve().relative_to(ROOT).as_posix()
-    if DRIVER_RUN.search(reason) and rel not in LISTED:
+    if (
+        rel.startswith("tests/compass/")
+        and DRIVER_RUN.search(reason)
+        and rel not in LISTED
+    ):
         report.outcome = "failed"
         report.longrepr = (
             f"{rel} skipped for want of a driver-run input, but {LIST} does not "

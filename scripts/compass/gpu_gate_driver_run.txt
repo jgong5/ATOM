@@ -2,8 +2,9 @@
 # The driver-run compass files: each skips in the CPU gate for want of an input
 # gate_gpu.sh sets (a model directory, the cc-traces file, a harness Python,
 # atomesh). gate_gpu.sh runs these, of tests/compass, by default;
-# COMPASS_GPU_GATE_SCOPE=all runs every compass file. tests/compass/conftest.py
-# fails such a skip in a file this list does not name.
+# COMPASS_GPU_GATE_SCOPE=all runs every compass file.
+# tests/compass/driver_run_skips.py fails such a skip in a file this list does
+# not name.
 tests/compass/test_cctraces_sim_smoke.py
 tests/compass/test_client_runs_slice.py
 tests/compass/test_dp_slice.py

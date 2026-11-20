@@ -30,6 +30,8 @@ from test_gate_gpu_verdict_through_pipe import (
     _torch,
 )
 
+from tests.compass import driver_run_skips
+
 REPO = Path(__file__).resolve().parents[2]
 
 pytestmark = pytest.mark.skipif(BASH is None, reason="needs bash")
@@ -334,11 +336,22 @@ def test_every_file_the_repositorys_list_names_is_a_compass_test_file():
     assert [f for f in listed if not (REPO / f).is_file()] == []
 
 
-# tests/compass/conftest.py, run over a throwaway tree of its own.
+def test_the_suites_conftest_loads_the_driver_run_hooks(request):
+    hook = request.config.pluginmanager.hook
+    for name in ("pytest_runtest_makereport", "pytest_make_collect_report"):
+        impls = getattr(hook, name).get_hookimpls()
+        assert getattr(driver_run_skips, name) in [i.function for i in impls]
+
+
+# The hooks, loaded as tests/conftest.py loads them, over a throwaway tree.
 def _pytest(tmp_path, listed, text):
     root = tmp_path / "ATOM"
     (root / "tests/compass").mkdir(parents=True)
-    shutil.copy(REPO / "tests/compass/conftest.py", root / "tests/compass")
+    shutil.copy(REPO / "tests/compass/driver_run_skips.py", root / "tests/compass")
+    (root / "tests/conftest.py").write_text(
+        "from tests.compass.driver_run_skips import (  # noqa: F401\n"
+        "    pytest_make_collect_report,\n    pytest_runtest_makereport,\n)\n"
+    )
     (root / "tests/compass/test_a.py").write_text(text)
     (root / "scripts/compass").mkdir(parents=True)
     (root / LIST).write_text("tests/compass/test_a.py\n" if listed else "")

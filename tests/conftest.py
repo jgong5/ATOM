@@ -33,6 +33,13 @@ if ATOM_ROOT not in sys.path:
 # session takes that first open here.
 from atom.compass.drive.gpu import kfd_pid
 
+# A compass test that skips for want of a driver-run input fails unless
+# scripts/compass/gpu_gate_driver_run.txt lists its file.
+from tests.compass.driver_run_skips import (  # noqa: F401
+    pytest_make_collect_report,
+    pytest_runtest_makereport,
+)
+
 kfd_pid()
 
 from atom.config import Config

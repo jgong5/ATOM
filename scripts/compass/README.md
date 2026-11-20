@@ -47,7 +47,7 @@ its header.
 | `gpu_gate_baselines/<target>/gpu_gate_baseline.env` | — | The GPU gate's baseline for one GPU target (`gfx942`, `gfx950`, `gfx1250`), as the `BASE_*` lines `gate_gpu.sh` reads when torch names that target for the first card: the commit measured, its pass and fail counts, how many tests `gpu_gate_skip.txt` left out of the run (`BASE_LEFT_OUT`), and the torch, HIP and AITER versions it ran under. A target with no pair is refused with 93, naming it. Written by `regen_gpu_gate_baseline.sh`; a change is a reviewed edit. |
 | `gpu_gate_baselines/<target>/gpu_gate_known_failures.txt` | — | The known-failing GPU node-ids at the `BASE_COMMIT` of the `gpu_gate_baseline.env` beside it, verbatim, written by `regen_gpu_gate_baseline.sh`. Its line count and `BASE_FAILED` are two statements of one fact; `gate_gpu.sh` refuses to run if they disagree. |
 | `gpu_gate_skip.txt` | — | Hand-written `<target> <test file>` lines, read when torch names that GPU target for the first card: files whose result there the target's pair cannot record, the kinds listed in its header. `gate_gpu.sh` leaves each out, a suite file's collected tests coming off the expected passes and a `tests/compass` file only leaving its run; `regen_gpu_gate_baseline.sh` leaves a suite file out the same way and records the count as `BASE_LEFT_OUT`, which goes back on. A `<target> driver-run` line says that target's nodes hold no driver-run inputs (below). Each line goes when the issue or Ruling above it closes. |
-| `gpu_gate_driver_run.txt` | — | Hand-written: the `tests/compass` files that skip in the CPU gate for want of a driver-run input (below), which `gate_gpu.sh` runs of `tests/compass` by default. `tests/compass/conftest.py` fails such a skip in a file it does not list, so the CPU gate holds the list complete. |
+| `gpu_gate_driver_run.txt` | — | Hand-written: the `tests/compass` files that skip in the CPU gate for want of a driver-run input (below), which `gate_gpu.sh` runs of `tests/compass` by default. `tests/compass/driver_run_skips.py`, which `tests/conftest.py` loads, fails such a skip in a file it does not list, so the CPU gate holds the list complete. |
 | `gate_map.sh` | CPU container | `COMPASS_COVERAGE_WHEEL=<coverage.py wheel> scripts/compass/gate_map.sh OUT`: the CPU gate under coverage.py, and to OUT the map `COMPASS_GATE_SELECT` reads, keyed by the tree's commit (below). |
 | `gate_select.py` | either | What a map selects for a tree: `gate_cpu.sh` asks it which test files to deselect, `snapshot.sh` writes the `.compass-select` stamp with it, and `gate_map.sh` starts coverage and builds the map with it. |
 | `_lib.sh` | — | Tree resolution, `PYTHONPATH`, the `import atom` assertion, commit stamp, the changed files, exclusion list and compass_harness install `gate_cpu.sh` and `gate_targeted.sh` share, and the pytest summary parse `gate_gpu.sh` and `regen_gpu_gate_baseline.sh` count with. |
@@ -698,7 +698,7 @@ Of `tests/compass/`, the default run takes only the files
 `gpu_gate_driver_run.txt` lists, the cc-traces smoke among them, run apart as
 below: every other compass file runs in the CPU gate. A compass test that skips
 there on a reason naming one of the inputs below, or `atomesh` on PATH, fails
-unless that list names its file (`tests/compass/conftest.py`), so a driver-run
+unless that list names its file (`tests/compass/driver_run_skips.py`), so a driver-run
 file is never left to no gate. `COMPASS_GPU_GATE_SCOPE=all` runs every compass
 file instead, for the daily run.
 
