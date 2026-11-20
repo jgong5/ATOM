@@ -23,13 +23,15 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
 - ``--host-laws KEY``, a `host_laws` entry's params, as ``host``, and its
   ``hops``, each at the run-file key of its name, ``router_s`` only in a
   prefill-decode run's; without it the run charges no host time and each hop
-  its floor (`run.HOP_FLOOR_S`).
+  its floor (`run.HOP_FLOOR_S`). The entry's ``ingress`` term, the encoding
+  ingress in front of the deployment (`atom.compass.ingress`), goes to the run
+  file's ``ingress``, a prefill-decode run's from its prefill side's entry.
 - ``--step-linear`` and ``--host-laws`` repeat, one entry per engine config:
   the key then holds a list, each process installing its own config's entry,
   and where their hops differ, the hops are those of the entry fitted under the
   config ATOM's arguments resolve, as `drive.run.check` resolves one,
   and ``backend``'s digest is over every law's in any order, their provenance
-  ``entries``.
+  ``entries``; so is the ``ingress`` term.
 - ``--lmcache-offload FILE``, the ``lmcache_offload`` entry
   `step_linear_fit`'s offload form writes, at that key.
 - ``--device``, ``--ptl``, ``--stack`` and ``--network``, the platform
@@ -202,9 +204,11 @@ def build(args, atom_args, across: bool = False) -> dict:
             resolve(store, "host", k, machine, atom_args)[0] for k in args.host_laws
         ]
         out["host"] = hosts if len(hosts) > 1 else hosts[0]
+        picked = _picked(hosts, atom_args, machine.value("device.arch"))
         # A run file's router_s makes it prefill-decode: `prefill_decode` writes it.
-        hops = _hops(hosts, atom_args, machine.value("device.arch"))
-        out |= {k: v for k, v in hops.items() if k != "router_s"}
+        out |= {k: v for k, v in picked.get("hops", {}).items() if k != "router_s"}
+        if run.INGRESS in picked:
+            out[run.INGRESS] = picked[run.INGRESS]
     if args.padding:
         out["padding"] = args.padding
     if entry := getattr(args, "lmcache_offload", None):
@@ -303,18 +307,23 @@ def _model_digest(model: str) -> str:
 
 
 def _hops(hosts: list, atom_args, arch: str) -> dict:
-    """The ``hops`` of the entry of `hosts` fitted under the config ATOM's
-    arguments `atom_args` resolve on a device of `arch`, picked as the runner
-    picks its own (`run.pick_fitted`); the hops every entry states alike as
-    they are, with no config resolved."""
+    """The ``hops`` of the entry of `hosts` `_picked` picks."""
+    return _picked(hosts, atom_args, arch).get("hops", {})
+
+
+def _picked(hosts: list, atom_args, arch: str) -> dict:
+    """The entry of `hosts` fitted under the config ATOM's arguments
+    `atom_args` resolve on a device of `arch`, picked as the runner picks its
+    own (`run.pick_fitted`); the first where every entry states its ``hops``
+    and ``ingress`` alike, with no config resolved."""
     host = hosts[0]
-    if any(h.get("hops") != host.get("hops") for h in hosts):
+    if any(h.get(k) != host.get(k) for h in hosts for k in ("hops", run.INGRESS)):
         from atom.compass.drive.run import _config
 
         picked = {"host": hosts}
         run.pick_fitted(picked, "host", _config(atom_args, arch))
         host = picked["host"]
-    return host.get("hops", {})
+    return host
 
 
 def _dp_width(atom_args) -> int:

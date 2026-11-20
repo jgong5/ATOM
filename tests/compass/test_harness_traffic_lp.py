@@ -95,6 +95,7 @@ from atom.compass.clock import (
     prefill_decode_table,
     single_engine_table,
 )
+from atom.compass.ingress import Ingress
 from atom.compass.run import ENV as RUN_ENV
 from atom.utils.clock import LPRuntime, Straggler
 from compass_harness import ADDRESS_ENV, fingerprint, traffic_lp
@@ -479,9 +480,9 @@ class ScriptedRuntime:
         self.stream, self.released = stream, {stream: set()}
         self.calls = []
 
-    def stamp_send(self, ch):
+    def stamp_send(self, ch, at=None):
         self.seq += 1
-        return self.now + ADMIT, self.seq - 1
+        return self.now + ADMIT if at is None else at, self.seq - 1
 
     def check_arrival(self, ch, arrival, seq) -> None:
         pass
@@ -1568,6 +1569,152 @@ def test_a_cancel_waits_for_a_released_final_s_return_before_it_stamps(tmp_path)
     cancels, passed = _run(main())
     assert cancels == [_key(1)]
     assert passed == [0, 1]
+
+
+#: An encoding ingress of two threads, its terms dyadic so its sums are exact.
+INGRESS = {
+    "fixed_s": 0.5,
+    "per_byte_s": 2.0**-10,
+    "workers": 2,
+    "router_per_byte_s": 2.0**-13,
+}
+
+
+async def _behind_an_ingress(tmp_path, sizes, script, then=None):
+    """aiperf sends credits 0, 1, ... at 0 s, one a trace, behind `INGRESS`;
+    no stamp is published before every size is reported, which a worker does
+    for credit k once 0.1 s has passed, with `sizes[k]` bytes, None for an
+    errored return in its place. `then(traffic, sub, push)` runs after the
+    stamps are read. The stamps, by seq, and what `then` returns."""
+    prefix = str(tmp_path / f"lp-{uuid.uuid4().hex[:8]}")
+    rt = ScriptedRuntime(script)
+    traffic = TrafficLP(rt, prefix, ingress=Ingress(INGRESS, ADMIT))
+    stamps, reports = addresses(prefix)
+    sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+    sub.connect(stamps)
+    sub.subscribe(b"")
+    await traffic.subscribed(1)
+    push = zmq.Context.instance().socket(zmq.PUSH)
+    push.connect(reports)
+
+    async def on_return(worker_id, ret):
+        pass
+
+    held = traffic.hold(on_return)
+    for num in range(len(sizes)):
+        traffic.send(_key(num), send_rank(_credit(num)))
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(sub.recv_pyobj(), 0.1)
+        for num, size in enumerate(sizes):
+            if size is None:
+                await held("w", SimpleNamespace(credit=_credit(num), error="refused"))
+            else:
+                push.send_pyobj((_key(num), size))
+        published = sorted([await sub.recv_pyobj() for _ in sizes], key=lambda s: s[2])
+        more = then and await then(traffic, sub, push)
+    finally:
+        traffic.done.cancel()
+        push.close(linger=0)
+        sub.close(linger=0)
+    return published, more
+
+
+def test_behind_an_ingress_requests_reach_the_router_past_its_threads(tmp_path):
+    """Credits 0, 1 and 2 at 0 s with 1, 2 and 0.5 KiB bodies: none is
+    stamped before its worker reports its size; each reaches the ingress at the
+    channel's lookahead, where its record starts, and the receiver once a
+    thread has held it 0.5 s plus 1 s a KiB and the router has parsed it, 1/8 s
+    a KiB. The third waits for the first thread to come free."""
+    published, _ = _run(_behind_an_ingress(tmp_path, [1024, 2048, 512], [(100.0, {0})]))
+    first = ADMIT + 0.5 + 1.0  # the first thread comes free
+    expected = [first + 0.125, ADMIT + 0.5 + 2.0 + 0.25, first + 0.5 + 0.5 + 0.0625]
+    assert published == [
+        (_key(num), at, num, "start", ADMIT) for num, at in enumerate(expected)
+    ]
+
+
+def test_behind_an_ingress_a_request_that_failed_unsent_takes_no_thread(tmp_path):
+    """Credit 0's request failed before its worker sent it, so no size comes:
+    its return lets the hold stamp it at the lookahead, and credit 1 takes the
+    first thread."""
+    published, _ = _run(_behind_an_ingress(tmp_path, [None, 1024], [(100.0, {0})]))
+    assert published == [
+        (_key(0), ADMIT, 0, "start", ADMIT),
+        (_key(1), ADMIT + 0.5 + 1.0 + 0.125, 1, "start", ADMIT),
+    ]
+
+
+def test_behind_an_ingress_a_cancel_arrives_no_earlier_than_its_request(tmp_path):
+    """aiperf cancels credits 0 and 1 at its grace deadline, 2.0: credit 1,
+    with 4 KiB, reaches the router about 5.0 s, so its cancel does too, one seq
+    later; credit 0 was there by then, and its cancel takes the lookahead. The
+    grant at 2.0 releases an event of credit 0's, which holds the traffic LP at
+    2.0 until it is reported, once aiperf is cancelling."""
+
+    async def then(traffic, sub, push):
+        while traffic.now() < 2.0:
+            await asyncio.sleep(0.001)
+        cancelling = asyncio.ensure_future(traffic.cancel())
+        await asyncio.sleep(0)  # the cancel waits for the hold
+        push.send_pyobj((_key(0), 0, 2.0, False))
+        cancels = [await sub.recv_pyobj() for _ in range(2)]
+        for key, *_ in cancels:
+            push.send_pyobj((key,))
+        await cancelling
+        return cancels
+
+    published, cancels = _run(
+        _behind_an_ingress(tmp_path, [64, 4096], [(2.0, {0})], then)
+    )
+    last = ADMIT + 0.5 + 4.0 + 0.5
+    assert [at for _, at, *_ in published] == [ADMIT + 0.5 + 0.0625 + 2.0**-7, last]
+    assert cancels == [
+        (_key(0), 2.0 + ADMIT, 2, "cancel"),
+        (_key(1), last, 3, "cancel"),
+    ]
+
+
+def test_a_run_file_with_an_ingress_gives_the_traffic_lp_its_queue(
+    tmp_path, monkeypatch
+):
+    """Behind the router LP the ingress sits in front of it, its lookahead the
+    channel's into the router; the arrival the runtime logs is past the hop.
+    A run file with none builds none, and its send is the lookahead's."""
+    pd = {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10, "router_in_s": 2.0**-14}
+    table = prefill_decode_table(**RUN, **pd)
+    http = "traffic->router:http"
+    sent = {}
+    for name, more in (("plain", {}), ("ingress", {"ingress": INGRESS})):
+        endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
+        server = clock_transport.serve(ClockAuthority(table), endpoint)
+        run_file = tmp_path / f"{name}.json"
+        run = {"clock_endpoint": endpoint, "bound_s": 1e6, **RUN, **pd, **more}
+        run_file.write_text(json.dumps(run))
+        monkeypatch.setenv(RUN_ENV, str(run_file))
+        monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / f"lp-{name}"))
+
+        async def main():
+            traffic = TrafficLP.from_env()
+            try:
+                traffic.send(_key(0))
+                traffic._take((_key(0), 1024))  # its worker's report
+                traffic._stamp_sends()  # as the hold does once aiperf has caught up
+                return traffic.ingress, traffic.rt.send_log
+            finally:
+                for task in (*traffic._tasks, traffic.done):
+                    task.cancel()
+                traffic._pub.close(linger=0)
+                traffic._pull.close(linger=0)
+
+        try:
+            sent[name] = _run(main())
+        finally:
+            server.close()
+    assert sent["plain"] == (None, [(http, 0, table.lookahead(http))])
+    ingress, log = sent["ingress"]
+    assert ingress.lookahead_s == table.lookahead(http)
+    assert log == [(http, 0, table.lookahead(http) + 0.5 + 1.0 + 0.125)]
 
 
 class StragglerRuntime(ScriptedRuntime):

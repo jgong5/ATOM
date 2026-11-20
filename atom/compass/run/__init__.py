@@ -251,6 +251,11 @@ lookups and copies from the entry. Each such engine's hand-in holds
 GPU and CPU hit rates: prefix-cache hits and tier loads over the prompt tokens
 the prefix cache counted.
 
+An optional ``ingress`` states an encoding ingress in front of the run's
+first server, or its router (`atom.compass.ingress`), which a ``host`` entry
+may state as a term of its own: the traffic LP prices its hop on the HTTP
+channel, so no server LP reads it and the channel table is the same.
+
 The API server's ``--compass-clock-endpoint`` sets `CLOCK_ENV`: the authority
 is not co-hosted but served by `authority`, its own process started before the
 engines (``python -m atom.compass.run``), and every LP connects to that
@@ -311,6 +316,9 @@ from atom.compass.clock import (
 from atom.compass.clock.channels import add_lmcache
 from atom.compass.clock_transport import connect, connect_here, serve
 from atom.compass.detect.determinism import StepTable
+from atom.compass.ingress import KEY as INGRESS
+from atom.compass.ingress import check as check_ingress
+from atom.compass.ingress import stated as stated_ingress
 from atom.compass.runner import COMPASS_RAPIDSERVE_QUALNAME, COMPASS_RUNNER_QUALNAME
 from atom.utils import clock, envs
 
@@ -630,6 +638,7 @@ def spec() -> dict | None:
         )
     for host in entries(run, "host"):
         _check_host(path, host)
+    stated_ingress(run)
     run["clock_endpoint"] = os.environ.get(CLOCK_ENV, run.get("clock_endpoint"))
     return run
 
@@ -641,7 +650,8 @@ def _check_host(path, host: dict) -> None:
 
     laws, columns = host.get("laws", {}), host.get("columns", {})
     if (
-        set(host) - {"laws", "skip", "key", "admit", "hops", "columns", *HOST_TERMS}
+        set(host)
+        - {"laws", "skip", "key", "admit", "hops", "columns", *HOST_TERMS, INGRESS}
         or set(host.get("skip", ())) - set(SEGMENTS)
         or {*laws, *columns} - set(HOST_LAW_KINDS)
         or {s for v in (*laws.values(), *columns.values()) for s in v} - set(SEGMENTS)
@@ -653,9 +663,12 @@ def _check_host(path, host: dict) -> None:
             f"laws, mapping {HOST_LAW_KINDS} to segments to three coefficients, "
             "columns, mapping them to segments to launch features' coefficients, "
             "admit, three coefficients on a forward's admissions or null, "
-            "key, the host key the laws were fitted under, hops, and the terms "
-            f"{' and '.join(HOST_TERMS)}"
+            "key, the host key the laws were fitted under, hops, the terms "
+            f"{' and '.join(HOST_TERMS)}, and {INGRESS}, the encoding ingress in "
+            "front of the deployment (atom.compass.ingress)"
         )
+    if INGRESS in host:
+        check_ingress(host[INGRESS], f"{path}: host's {INGRESS}")
     hops = host.get("hops", {})
     if not (_seconds(hops, set(), set(HOPS)) and all(v > 0 for v in hops.values())):
         raise ValueError(

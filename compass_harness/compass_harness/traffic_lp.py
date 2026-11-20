@@ -47,6 +47,17 @@ turn, log-normal with median ``INTAKE_JITTER_ENV`` bytes (by default
 send offsets. With no seed, or a median of 0, no request carries one and the
 frontend takes the exact intake order.
 
+A run file that states an encoding ingress (``ingress``, `atom.compass.ingress`)
+puts it in front of the HTTP channel's receiver, and the traffic LP prices its
+hop: each worker reports its request's body size before the request is sent,
+the hold stamps no request before its size is in, and `Ingress.admit` gives
+each, in seq order, its arrival at the receiver past the ingress's queue,
+encode and the router's parse. Its stamp then ends ``"start", <time>``, its
+arrival at the ingress, where its record starts, so a client run's TTFT and
+latency hold the hop. A cancel arrives no earlier than its request: in the real
+ingress a request whose client has left is still encoded and sent on. With no
+``ingress`` nothing of this runs and no worker reports a size.
+
 When aiperf cancels the requests in flight at its grace deadline, the traffic
 LP closes them at that time (`cancel`): each one's cancel is a stamped request
 of its own, which its worker sends and the frontend answers by hanging the
@@ -84,6 +95,7 @@ import zmq
 import zmq.asyncio
 
 from atom.compass import clock_transport
+from atom.compass import ingress as compass_ingress
 from atom.compass import run as compass_run
 from atom.compass.clock import LpId
 from atom.utils.clock import DIAG_S, LPRuntime
@@ -139,12 +151,19 @@ class TrafficLP:
         cancel_url: str | None = None,
         seed: str | None = None,
         jitter_median: float = INTAKE_JITTER_BYTES,
+        ingress: compass_ingress.Ingress | None = None,
     ) -> None:
         # cancel_url: where each cancel goes, if not to its request's URL.
         # seed: the send order's (`SEND_ORDER_SEED_ENV`), or None.
         # jitter_median: of a seeded request's intake jitter, in bytes.
+        # ingress: the encoding ingress in front of the HTTP channel, or None.
         self.rt, self.http, self.stream = rt, http, stream
         self.cancel_url, self.seed = cancel_url, seed
+        self.ingress = ingress
+        # Behind an ingress: each sent request's body bytes, None for none, as
+        # its worker reported it; and each open one's arrival past the ingress.
+        self._bodies: dict[tuple, int | None] = {}
+        self._arrivals: dict[tuple, float] = {}
         if not (math.isfinite(jitter_median) and jitter_median >= 0):
             raise ValueError(
                 f"intake jitter median {jitter_median!r} is no count of bytes >= 0"
@@ -203,6 +222,7 @@ class TrafficLP:
         # LP, behind a PD router) and back from the one that streams
         # (frontend-D, or the router LP).
         (http,), (stream,) = table.channels_from(TRAFFIC), table.channels_into(TRAFFIC)
+        entry = compass_ingress.stated(run)
         return cls(
             LPRuntime(TRAFFIC, table, conn),
             os.environ[ADDRESS_ENV],
@@ -211,6 +231,11 @@ class TrafficLP:
             os.environ.get(PREFILL_URL_ENV) if http.name == PREFILL_HTTP else None,
             os.environ.get(SEND_ORDER_SEED_ENV) or None,
             float(os.environ.get(INTAKE_JITTER_ENV) or INTAKE_JITTER_BYTES),
+            (
+                None
+                if entry is None
+                else compass_ingress.Ingress(entry, table.lookahead(http.name))
+            ),
         )
 
     # ---- the clock ClockPacedLoopScheduler paces on ----
@@ -270,15 +295,31 @@ class TrafficLP:
         their ranks' order, or with a seed in the order of a digest of it and
         each rank, never in the order aiperf sent them in. A stamp is
         ``(key, arrival, seq)``, then ``"jitter", <bytes>`` with a seed
-        (`jitter`).
+        (`jitter`), then, behind an ingress, ``"start", <time>``, its arrival
+        at the ingress, which takes them in that order (`Ingress.admit`), each
+        with the body size its worker reported.
         """
         for rank, key in sorted(self._unstamped, key=lambda sent: self._place(sent[0])):
-            arrival, seq = self.rt.stamp_send(self.http)
+            if self.ingress is None:
+                arrival, seq = self.rt.stamp_send(self.http)
+            else:
+                start, at = self.ingress.admit(self.rt.now, self._bodies.pop(key))
+                arrival, seq = self.rt.stamp_send(self.http, at)
+                self._arrivals[key] = arrival
             self.open[key] = None
             jitter = self.jitter(rank)
             more = () if jitter is None else ("jitter", jitter)
+            if self.ingress is not None:
+                more += ("start", start)
             self._pub.send_pyobj((key, arrival, seq, *more))
         self._unstamped.clear()
+
+    def _unsized(self) -> list[tuple]:
+        """Behind an ingress, the requests sent at this instant whose body
+        size no worker has reported yet."""
+        if self.ingress is None:
+            return []
+        return [key for _, key in self._unstamped if key not in self._bodies]
 
     def _place(self, rank: tuple):
         """Where a send ranked `rank` goes among those at its instant: by its
@@ -307,12 +348,16 @@ class TrafficLP:
         the request, with `cancel_url` when set, and returns once every one is
         written, naming those that are not every ``DIAG_S`` wall seconds until
         then. The hold passes each closed request's return before the next
-        clock call; its stream events still to come are dropped.
+        clock call; its stream events still to come are dropped. Behind an
+        ingress a cancel arrives no earlier than its request does.
         """
         fut = asyncio.get_running_loop().create_future()
         self._caught_up.append(fut)
         self._changed.set()
         await fut
+        while self._unsized():  # one sent since the hold, as below
+            self._changed.clear()
+            await self._changed.wait()
         self._stamp_sends()  # none left by the hold; one sent since is closed too
         keys = list(self.open)
         self.open.clear()
@@ -320,7 +365,12 @@ class TrafficLP:
         self.closed.update(dict.fromkeys(keys))
         to = (self.cancel_url,) if self.cancel_url else ()
         for key in keys:
-            arrival, seq = self.rt.stamp_send(self.http)
+            if self.ingress is None:
+                arrival, seq = self.rt.stamp_send(self.http)
+            else:
+                at = self.rt.now + self.ingress.lookahead_s
+                at = max(at, self._arrivals.pop(key))
+                arrival, seq = self.rt.stamp_send(self.http, at)
             self._pub.send_pyobj((key, arrival, seq, "cancel", *to))
         while not self._written.issuperset(keys):
             self._changed.clear()
@@ -346,6 +396,9 @@ class TrafficLP:
                 # return; with none, the key stays open and the finish names it.
                 self._returns.put_nowait(lambda: callback(worker_id, message))
                 self._held[key] = None
+                if self.ingress is not None and key not in self._arrivals:
+                    # It failed before its worker sent it, so no size comes.
+                    self._bodies.setdefault(key, None)
             else:
                 self._held[key] = lambda: callback(worker_id, message)
             self._changed.set()
@@ -383,6 +436,10 @@ class TrafficLP:
         self._changed.set()
         if len(report) == 1:  # a worker wrote this request's cancel
             self._written.add(report[0])
+            return
+        if len(report) == 2:  # behind an ingress, a request's body bytes
+            key, nbytes = report
+            self._bodies[key] = nbytes
             return
         key, seq, arrival, final = report
         # A cancelled request's seq may be dropped already, before its report.
@@ -456,6 +513,7 @@ class TrafficLP:
                         unreturned.append(key)
                         break
                     self.open.pop(key, None)
+                    self._arrivals.pop(key, None)
                     if (ret := self._held.pop(key)) is not None:
                         self._returns.put_nowait(ret)
                 self.rt.released[self.stream].discard(seq)
@@ -465,7 +523,9 @@ class TrafficLP:
                     if (ret := self._held.pop(key)) is not None:
                         self._returns.put_nowait(ret)
                 self.closed.clear()
-            if unreported or unreturned or self._passing:
+            # Behind an ingress no request is stamped before its body size is in.
+            unsized = self._unsized()
+            if unreported or unreturned or self._passing or unsized:
                 self._changed.clear()
                 self._alive = None
                 try:
@@ -479,14 +539,24 @@ class TrafficLP:
                             f"seqs {unreported} were not reported after {DIAG_S} wall "
                             "seconds"
                         ) from None
-                    logger.warning(
-                        "traffic at %s: released stream seqs %s not reported, returns "
-                        "of %s not received after %s wall seconds; still waiting",
-                        self.rt.now,
-                        unreported,
-                        unreturned,
-                        DIAG_S,
-                    )
+                    if unsized:
+                        logger.warning(
+                            "traffic at %s: no worker reported the body size of %s "
+                            "after %s wall seconds; still waiting",
+                            self.rt.now,
+                            unsized,
+                            DIAG_S,
+                        )
+                    if unreported or unreturned or self._passing:
+                        logger.warning(
+                            "traffic at %s: released stream seqs %s not reported, "
+                            "returns of %s not received after %s wall seconds; "
+                            "still waiting",
+                            self.rt.now,
+                            unreported,
+                            unreturned,
+                            DIAG_S,
+                        )
                 continue
             ready, self._alive, ended = _look(self._alive)
             if not ready and not ended:
