@@ -5420,6 +5420,78 @@
    "mechanism_why": "the put of a relayed send on engine->lmcache:lookup#dpN: the clock owner stamps it here, as it stamps the engine's output queue"
   },
   {
+   "id": "atom/compass/kv/mooncake_store.py::StoreShell._send::self._socks[ch].send_multipart( [pickle.dumps((ch, *stamp)), pickle.dumps(payload)] )::p2p#0",
+   "file": "atom/compass/kv/mooncake_store.py",
+   "symbol": "StoreShell._send",
+   "call": "self._socks[ch].send_multipart",
+   "expr": "self._socks[ch].send_multipart( [pickle.dumps((ch, *stamp)), pickle.dumps(payload)] )",
+   "shape": "p2p",
+   "peer": "process",
+   "why": "the Store's shell sends a query, a renewal or a put to LP mooncake_store from the step loop",
+   "mechanism": "K4",
+   "mechanism_why": "the engine end of lookup#dpN and transfer#dpN: the step loop stamps each as it sends it; another thread's send goes through clock.send_on_owner"
+  },
+  {
+   "id": "atom/compass/kv/mooncake_store.py::StoreShell._take::sock.poll()::poll#0",
+   "file": "atom/compass/kv/mooncake_store.py",
+   "symbol": "StoreShell._take",
+   "call": "sock.poll",
+   "expr": "sock.poll()",
+   "shape": "poll",
+   "peer": "process",
+   "why": "before taking Store replies the step loop waits until every one the authority released has physically arrived; LP mooncake_store sent each before the clock call that logged it",
+   "mechanism": "K5",
+   "mechanism_why": "the settle of an inline receive, as on a wrapped socket: it waits only for frames already released, so never past the LP's clock"
+  },
+  {
+   "id": "atom/compass/kv/mooncake_store.py::StoreShell._take::sock.recv_multipart(zmq.NOBLOCK)::socket_recv#0",
+   "file": "atom/compass/kv/mooncake_store.py",
+   "symbol": "StoreShell._take",
+   "call": "sock.recv_multipart",
+   "expr": "sock.recv_multipart(zmq.NOBLOCK)",
+   "shape": "socket_recv",
+   "peer": "process",
+   "why": "the Store's shell reads every reply already at its DP rank's lookup DEALER without blocking, and holds each until released",
+   "mechanism": "K5",
+   "mechanism_why": "the engine end of mooncake_store->engine:lookup#dpN, received inline by the step loop at a poll of a query or in a renewal's wait"
+  },
+  {
+   "id": "atom/compass/kv/mooncake_store.py::_Renewal.result::super().result(timeout=0)::event_wait#0",
+   "file": "atom/compass/kv/mooncake_store.py",
+   "symbol": "_Renewal.result",
+   "call": "super().result",
+   "expr": "super().result(timeout=0)",
+   "shape": "event_wait",
+   "peer": "none",
+   "why": "a renewal's future read once the step loop's own take completed it, or outside the run, where no renewal is sent",
+   "mechanism": "K9",
+   "mechanism_why": "cannot park: timeout=0, and in the run the loop above it returns only once the future is done or raises at its bound"
+  },
+  {
+   "id": "atom/compass/run/__init__.py::mooncake_store_endpoint::time.sleep(0.05)::sleep#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "mooncake_store_endpoint",
+   "call": "time.sleep",
+   "expr": "time.sleep(0.05)",
+   "shape": "sleep",
+   "peer": "process",
+   "why": "the Store's shell, built with the engine's scheduler, waits in twentieths of a wall second up to a bound for LP mooncake_store to name its endpoint",
+   "mechanism": "K9",
+   "mechanism_why": "the engine waits at startup, while it is built and before its step loop's first clock request, so outside the simulated window"
+  },
+  {
+   "id": "atom/compass/kv/mooncake_store.py::_polled.Polled.poll::super().poll(sid)::poll#0",
+   "file": "atom/compass/kv/mooncake_store.py",
+   "symbol": "_polled.Polled.poll",
+   "call": "super().poll",
+   "expr": "super().poll(sid)",
+   "shape": "poll",
+   "peer": "none",
+   "why": "AsyncStoreLookup.poll after the shell has taken the replies released so far: whether a query's future is done",
+   "mechanism": "K9",
+   "mechanism_why": "cannot park: it reads a future's state under a lock no thread holds across a wait"
+  },
+  {
    "id": "atom/kv_transfer/offload/mp/lookup.py::_MPLookupClient.lookup::clock.sleep(self._poll_interval, time.sleep)::sleep#0",
    "file": "atom/kv_transfer/offload/mp/lookup.py",
    "symbol": "_MPLookupClient.lookup",
@@ -5911,7 +5983,7 @@
    "lp": "engine",
    "why": "the Store's scheduler half starts one daemon worker thread per executor: the arrival-time query worker, the renewal worker, and a lookup worker per Store pool when several pools are asked at once",
    "mechanism": "K9",
-   "mechanism_why": "starting a thread cannot park; it would run in the engine LP, but only for the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "on a simulated run the shell builds AsyncStoreLookup with its executor stand-in (atom.compass.kv.mooncake_store._Executor), so no DaemonExecutor thread starts"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/async_lookup.py::DaemonExecutor._run::self._queue.get()::queue_get#0",
@@ -5923,7 +5995,7 @@
    "peer": "thread",
    "why": "a Store executor's worker thread waits for its next task, a query, a renewal or one pool's exists call, which the scheduler thread queues",
    "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "no DaemonExecutor runs on a simulated run: the shell's executor stand-in sends each task to LP mooncake_store instead"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/async_lookup.py::_BackendSlot.take::self._cond.wait()::event_wait#0",
@@ -5935,7 +6007,7 @@
    "peer": "thread",
    "why": "a query or renewal worker waits its turn for the one call at a time into the synchronous Store client; a renewal goes ahead of every waiting query",
    "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "only _query and _renew take the slot, and a simulated run calls neither: the shell runs _StoreLookup's lookup or renew on the step loop as it takes the reply, and LP mooncake_store serializes a channel's calls"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/async_lookup.py::AsyncStoreLookup.submit::self.executor.submit(self._query, seq, sid)::executor_handoff#0",
@@ -5944,10 +6016,10 @@
    "call": "self.executor.submit",
    "expr": "self.executor.submit(self._query, seq, sid)",
    "shape": "executor_handoff",
-   "peer": "thread",
+   "peer": "process",
    "why": "queues a request's Store query on the query worker, at arrival, on prefetch or at admission, and returns",
-   "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism": "K4",
+   "mechanism_why": "the shell's executor stand-in (atom.compass.kv.mooncake_store) sends the call on engine->mooncake_store:lookup#dpN as it is submitted, stamped by the step loop, the clock owner"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/async_lookup.py::AsyncStoreLookup.submit_if::self.submit(seq, sid)::executor_handoff#0",
@@ -5956,10 +6028,10 @@
    "call": "self.submit",
    "expr": "self.submit(seq, sid)",
    "shape": "executor_handoff",
-   "peer": "thread",
+   "peer": "process",
    "why": "the engine's input thread queues an arriving request's Store query if the request is still waiting, under the lock terminal cleanup takes",
-   "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism": "K4",
+   "mechanism_why": "an arrival's offer, which EngineCore._offer_tier_lookups hands the clock owner from the input thread (clock.send_on_owner, #3767): the owner sends the query at the releasing grant's clock"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/async_lookup.py::AsyncStoreLookup.pump::f.result()::event_wait#0",
@@ -5968,10 +6040,10 @@
    "call": "f.result",
    "expr": "f.result()",
    "shape": "event_wait",
-   "peer": "thread",
+   "peer": "process",
    "why": "keeps a discarded query's hit, read only once its future is done, so it never parks",
-   "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism": "K5",
+   "mechanism_why": "the future is done only once the step loop has taken the call's released reply from LP mooncake_store at a poll; the result is read without waiting"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/async_lookup.py::AsyncStoreLookup.lookup::self.submit(seq, sid)::executor_handoff#0",
@@ -5980,10 +6052,10 @@
    "call": "self.submit",
    "expr": "self.submit(seq, sid)",
    "shape": "executor_handoff",
-   "peer": "thread",
+   "peer": "process",
    "why": "a lookup with no query in flight queues one on the query worker and returns no answer yet",
-   "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism": "K4",
+   "mechanism_why": "the shell's executor stand-in (atom.compass.kv.mooncake_store) sends the call on engine->mooncake_store:lookup#dpN as it is submitted, stamped by the step loop, the clock owner"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/async_lookup.py::AsyncStoreLookup.lookup::f.result()::event_wait#0",
@@ -5992,10 +6064,10 @@
    "call": "f.result",
    "expr": "f.result()",
    "shape": "event_wait",
-   "peer": "thread",
+   "peer": "process",
    "why": "reads an answered query's hit, only once its future is done, so it never parks",
-   "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism": "K5",
+   "mechanism_why": "the future is done only once the step loop has taken the call's released reply from LP mooncake_store at a poll; the result is read without waiting"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/async_lookup.py::AsyncStoreLookup.renew::self.renew_executor.submit(self._renew, seq, start, end)::executor_handoff#0",
@@ -6004,10 +6076,10 @@
    "call": "self.renew_executor.submit",
    "expr": "self.renew_executor.submit(self._renew, seq, start, end)",
    "shape": "executor_handoff",
-   "peer": "thread",
+   "peer": "process",
    "why": "right before a load whose hit is more than 1 s old is dispatched, queues the renewal of its chunks' read leases on the renewal worker",
-   "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism": "K4",
+   "mechanism_why": "the shell's executor stand-in (atom.compass.kv.mooncake_store) sends the call on engine->mooncake_store:lookup#dpN as it is submitted, stamped by the step loop, the clock owner, ahead of the channel's queued queries at LP mooncake_store"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/async_lookup.py::AsyncStoreLookup.renew::future.result(timeout=RENEW_TIMEOUT_S)::event_wait#0",
@@ -6016,10 +6088,10 @@
    "call": "future.result",
    "expr": "future.result(timeout=RENEW_TIMEOUT_S)",
    "shape": "event_wait",
-   "peer": "thread",
+   "peer": "process",
    "why": "the scheduler thread waits up to RENEW_TIMEOUT_S, 1 s, for that renewal's Store call, then dispatches the load with or without it",
-   "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism": "K3",
+   "mechanism_why": "an idle point on the LP clock until the renewal's reply is taken, next_event(+inf, now + RENEW_TIMEOUT_S), its bound a daemon deadline; in a DP group the member asks alone while its peers park before their forwards (run/__init__.py::_park_before_dispatch)"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/pool.py::TransferSlotPool.acquire::self._cond.wait()::event_wait#0",
@@ -6031,7 +6103,7 @@
    "peer": "thread",
    "why": "a Store worker's thread waits for free slots in its registered transfer pool; a release or a quarantine wakes it",
    "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "the shell gives each rank a stand-in pool that hands slots out at once; a copy's time is its lane's"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/scheduler.py::_StoreLookup._exists_on::pool.executor.submit(pool.client.exists, asked)::executor_handoff#0",
@@ -6043,7 +6115,7 @@
    "peer": "thread",
    "why": "a lookup that asks several Store pools hands each pool's exists call to that pool's lookup worker, so the masters answer it concurrently",
    "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "several pools are refused, LP mooncake_store plays one master, so no pool has an executor of its own"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/scheduler.py::_StoreLookup._exists_on::futures[index].result()::event_wait#0",
@@ -6055,7 +6127,7 @@
    "peer": "thread",
    "why": "the query worker waits for each pool's lookup worker to bring back its master's answer to the exists call",
    "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "several pools are refused, LP mooncake_store plays one master, so no pool has an executor of its own"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/taint.py::TaintMarker.place::threading.Thread( target=self._retry, name=\"mooncake-store-taint\", daemon=True )::thread_start#0",
@@ -6068,7 +6140,7 @@
    "lp": "engine",
    "why": "a Store worker whose taint marker the Store did not take starts a daemon thread that retries placing it",
    "mechanism": "K9",
-   "mechanism_why": "starting a thread cannot park; it would run in the engine LP, but only for the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "no simulated put fails, so no worker places the taint marker"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/taint.py::TaintMarker._retry::self._stop.wait(delay)::event_wait#0",
@@ -6080,7 +6152,7 @@
    "peer": "thread",
    "why": "the taint retry thread's backoff between two attempts, 1 s doubling to 30 s, cut short when the worker closes",
    "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "no simulated put fails, so no worker places the taint marker"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/worker.py::MooncakeStoreOffloadConnector._probe_store::pool.acquire(\"save\", 1)::lock_acquire#0",
@@ -6092,7 +6164,7 @@
    "peer": "thread",
    "why": "the Store worker's startup probe takes a save slot and a load slot from its transfer pool to send one chunk through the Store and back",
    "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "the worker half is compass's null connector: the Store worker's code runs only inside StoreShell, at a copy's lane end, over stand-ins; the startup probe runs only at register_kv_caches, which none reaches"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/worker.py::MooncakeStoreOffloadConnector._probe_store::pool.acquire(\"load\", 1)::lock_acquire#0",
@@ -6104,7 +6176,7 @@
    "peer": "thread",
    "why": "the Store worker's startup probe takes a save slot and a load slot from its transfer pool to send one chunk through the Store and back",
    "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "the worker half is compass's null connector: the Store worker's code runs only inside StoreShell, at a copy's lane end, over stand-ins; the startup probe runs only at register_kv_caches, which none reaches"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/worker.py::MooncakeStoreOffloadConnector._do_save_req::pool.acquire(\"save\", len(window))::lock_acquire#0",
@@ -6116,7 +6188,7 @@
    "peer": "thread",
    "why": "a save thread takes the slots for one window of chunks from the transfer pool, waiting while other saves hold them",
    "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "the worker half is compass's null connector: the Store worker's code runs only inside StoreShell, at a copy's lane end, over stand-ins, whose pool never waits; the copy's time is its lane's"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/worker.py::MooncakeStoreOffloadConnector._do_load_req::pool.acquire(\"load\", len(window))::lock_acquire#0",
@@ -6128,7 +6200,7 @@
    "peer": "thread",
    "why": "a load thread takes the slots for one window of chunks from the transfer pool, waiting while other loads hold them",
    "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "the worker half is compass's null connector: the Store worker's code runs only inside StoreShell, at a copy's lane end, over stand-ins, whose pool never waits; the copy's time is its lane's"
   },
   {
    "id": "atom/kv_transfer/offload/mooncake_store/worker.py::_synchronize::torch.cuda.synchronize(device)::device_sync#0",
@@ -6140,7 +6212,7 @@
    "peer": "none",
    "why": "the Store worker waits for the device around its startup probe's copies, and after a failed copy before it releases the copy's slots",
    "mechanism": "K9",
-   "mechanism_why": "inside the Mooncake Store offload backend: the simulated runner refuses kv_connector 'mooncake_store' by name at allocate_kv_cache, before the engine builds its scheduler or a worker builds its connector, so no simulated run reaches it"
+   "mechanism_why": "the worker half is compass's null connector: the Store worker's code runs only inside StoreShell, at a copy's lane end, over stand-ins; its stand-in pool's device is the CPU"
   },
   {
    "id": "atom/utils/region_graph.py::_Recorder.join::join()::join#0",

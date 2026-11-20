@@ -16,10 +16,9 @@ LMCache's lookup client factory raises, where ATOM's scheduler half would run
 with no lookup client and look nothing up. It keeps one ATOM worker
 connector of that layout per TP rank, with no device, whose LMCache engine is
 the rank's `Engine` over the rank's `Tier`. Each load and save that
-`build_connector_meta` hands a rank waits on the rank's load or save queue, as
-wide as the worker's `load_workers` or `save_workers`, and the worker runs it
-at its priced end: the entry's ``load_s`` or ``store_s``, ``[fixed, per
-chunk]`` seconds, over the chunks it copies, and nothing for a copy of none.
+`build_connector_meta` hands a rank waits on the rank's `Lanes`, which
+`atom.compass.kv.mooncake_store` shares, and the worker runs it at its priced
+end.
 `process_completions` reports what the ranks' `get_finished`, aggregated over
 the TP group, gave at the previous call, since the engine's aggregation
 answers one poll behind.
@@ -306,6 +305,62 @@ class Engine:
         return got
 
 
+class Lanes:
+    """Each TP rank's load and save lanes on the step loop's LP clock, as wide
+    as its worker's `load_workers` and `save_workers`. A copy waits for its
+    rank's first free lane of its kind and ends at its priced end, the
+    entry's ``load_s`` or ``store_s``, ``[fixed, per chunk]`` seconds over the
+    chunks it copies and nothing for a copy of none; `run_due` runs each copy
+    whose end the clock has reached, in end order. Rank 0's copies are counted
+    and logged under `name`, the entry's connector."""
+
+    def __init__(self, name: str, widths, terms: dict, now) -> None:
+        self.name, self.now = name, now
+        self.terms = {"load": terms["load_s"], "save": terms["store_s"]}
+        self.free = [{"load": [0.0] * ld, "save": [0.0] * sv} for ld, sv in widths]
+        self.due: list = []  # (end, order, run)
+        self._order = itertools.count()
+        self.copied = {
+            kind: collections.Counter(copies=0, chunks=0, seconds=0.0, waited=0.0)
+            for kind in ("load", "save")
+        }
+
+    def queue(self, k: int, kind: str, chunks: int, req_id, run) -> tuple:
+        """Queue rank `k`'s copy of `chunks` chunks; `run` runs at its end.
+        Returns its lane's start and end."""
+        now, lanes = self.now(), self.free[k][kind]
+        fixed, per_chunk = self.terms[kind]
+        start = max(now, heapq.heappop(lanes))
+        end = start + (fixed + per_chunk * chunks if chunks else 0.0)
+        heapq.heappush(lanes, end)
+        heapq.heappush(self.due, (end, next(self._order), run))
+        if k == 0:
+            self.copied[kind].update(copies=1, chunks=chunks)
+            self.copied[kind]["seconds"] += end - start
+            self.copied[kind]["waited"] += start - now
+            logger.info(
+                "compass: %s %s of %s, %d chunks: queued at %r, from %r to %r",
+                self.name,
+                kind,
+                req_id,
+                chunks,
+                now,
+                start,
+                end,
+            )
+        return start, end
+
+    def run_due(self) -> None:
+        """Run each copy whose end the clock has reached, in end order."""
+        now = self.now()
+        while self.due and self.due[0][0] <= now:
+            heapq.heappop(self.due)[2]()
+
+    def copies(self) -> dict:
+        """Rank 0's copies: their count, chunks, priced and waited seconds."""
+        return {kind: dict(c) for kind, c in self.copied.items()}
+
+
 class Lookup:
     """LMCache's lookup client over the tiers of `ranks`."""
 
@@ -318,7 +373,7 @@ class Lookup:
         if not keys:
             return 0
         rt = shell._rt
-        shell._run_due()
+        shell._lanes.run_due()
         hits = [
             shell._tiers[r].lookup(keys, str(lookup_id), rt.now) for r in self.ranks
         ]
@@ -424,16 +479,12 @@ class OffloadShell:
             rank._engine = Engine(tier, self.chunk, self._rt.read_clock, safe)
             rank.chunk_size, rank._rank = self.chunk, k
             self._ranks.append(rank)
-        self._lanes = [
-            {"load": [0.0] * r.load_workers, "save": [0.0] * r.save_workers}
-            for r in self._ranks
-        ]
-        self._due: list = []  # (end, order, rank, kind, request)
-        self._order = itertools.count()
-        self._copied = {
-            kind: collections.Counter(copies=0, chunks=0, seconds=0.0, waited=0.0)
-            for kind in ("load", "save")
-        }
+        self._lanes = Lanes(
+            ENTRY,
+            [(r.load_workers, r.save_workers) for r in self._ranks],
+            self._terms,
+            self._rt.read_clock,
+        )
         self._tp = KVOutputAggregator(world_size=world)
         self._held = None  # what the ranks reported at the previous call
 
@@ -455,44 +506,19 @@ class OffloadShell:
         return max(0, whole - req.save_spec.skip_leading_tokens // self.chunk)
 
     def _queue(self, k: int, kind: str, req) -> None:
-        now, lanes = self._rt.read_clock(), self._lanes[k][kind]
+        rank = self._ranks[k]
+        run = rank._do_load_req if kind == "load" else rank._do_save_req
         chunks = self._chunks(kind, req)
-        fixed, per_chunk = self._terms["load_s" if kind == "load" else "store_s"]
-        start = max(now, heapq.heappop(lanes))
-        end = start + (fixed + per_chunk * chunks if chunks else 0.0)
-        heapq.heappush(lanes, end)
-        heapq.heappush(self._due, (end, next(self._order), k, kind, req))
-        if k == 0:
-            self._copied[kind].update(copies=1, chunks=chunks)
-            self._copied[kind]["seconds"] += end - start
-            self._copied[kind]["waited"] += start - now
-            logger.info(
-                "compass: lmcache_offload %s of %s, %d chunks: queued at %r, from "
-                "%r to %r",
-                kind,
-                req.req_id,
-                chunks,
-                now,
-                start,
-                end,
-            )
-
-    def _run_due(self) -> None:
-        """Run each copy whose priced end the clock has reached, as its rank's
-        worker runs it, in end order."""
-        now = self._rt.read_clock()
-        while self._due and self._due[0][0] <= now:
-            _, _, k, kind, req = heapq.heappop(self._due)
-            rank = self._ranks[k]
-            run = rank._do_load_req if kind == "load" else rank._do_save_req
-            rank._guard(kind, run, req)
+        self._lanes.queue(
+            k, kind, chunks, req.req_id, lambda: rank._guard(kind, run, req)
+        )
 
     def build_connector_meta(self):
         """ATOM's metadata, each rank's share of it queued as its worker takes
         it: a lookup of the step that is no load unpinned, each load and save
         on its queue."""
         meta = self._inner.build_connector_meta()
-        self._run_due()
+        self._lanes.run_due()
         for k, rank in enumerate(self._ranks):
             loads = [r for r in meta.requests if r.load_spec is not None]
             loading = {str(r.req_id) for r in loads if rank._do_load}
@@ -509,7 +535,7 @@ class OffloadShell:
     def process_completions(self, output):
         """Run the copies due; report what the ranks gave at the previous
         call, then let ATOM's scheduler half read it."""
-        self._run_due()
+        self._lanes.run_due()
         held = self._tp.aggregate([rank.get_finished() for rank in self._ranks])
         held, self._held = self._held, held
         for field in dataclasses.fields(held) if held is not None else ():
@@ -520,7 +546,7 @@ class OffloadShell:
 
     def has_pending_work(self) -> bool:
         held = self._held is not None and not self._held.is_empty()
-        return bool(self._due) or held or self._inner.has_pending_work()
+        return bool(self._lanes.due) or held or self._inner.has_pending_work()
 
     def offload_statistics(self) -> dict:
         """ATOM's counters, rank 0's priced copies, and the tiers' counts
@@ -530,6 +556,6 @@ class OffloadShell:
             tiers.update(tier.counts)  # `+` would drop the zeros
         return {
             "connector": self._inner.get_statistics(),
-            "copies": {kind: dict(c) for kind, c in self._copied.items()},
+            "copies": self._lanes.copies(),
             "tier": dict(tiers) | {"held_chunks": len(self._tiers[0].chunks)},
         }

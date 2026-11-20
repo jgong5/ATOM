@@ -244,7 +244,11 @@ file with one needs such a deployment. Each such frontend checks its
 deployment against the entry, and the first prefill deployment's, or the one
 deployment's, starts LP ``mooncake_store`` (`mooncake_store`) in a process of
 its own. Its channels to each DP rank of each engine it serves take half the
-entry's fixed lookup term (`add_mooncake_store`).
+entry's fixed lookup term (`add_mooncake_store`). `engine(config)` has the
+connector factory build ``mooncake_store`` as Compass's
+(`atom.compass.kv.mooncake_store`), whose scheduler half sends its lookups,
+renewals and puts to LP ``mooncake_store`` from the step loop and prices each
+rank's copies, and arms a DP member's park, as for ``lmcache_mp``.
 
 A deployment that offloads KV through ATOM's in-process ``lmcache_offload``
 needs an ``lmcache_offload`` entry, which `atom.compass.kv.lmcache_offload`
@@ -1319,6 +1323,24 @@ def mooncake_store(block_tokens: int) -> None:
         sock.close(linger=0)
 
 
+def mooncake_store_endpoint(run: dict) -> str:
+    """The endpoint LP mooncake_store names in the out_dir (`mooncake_store`),
+    once it has; refused after `PLANNED_BLOCK_WAIT_S` wall seconds. An engine's
+    Store shell, built with its scheduler, reads it before the run."""
+    from atom.compass.kv.mooncake_store_server import ENDPOINT_FILE
+
+    path = Path(run["out_dir"]) / ENDPOINT_FILE
+    deadline = time.monotonic() + PLANNED_BLOCK_WAIT_S
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"LP mooncake_store named no endpoint in {path} in "
+                f"{PLANNED_BLOCK_WAIT_S} wall seconds"
+            )
+        time.sleep(0.05)
+    return path.read_text()
+
+
 def configuration(run: dict) -> dict:
     """The run file without its per-run keys."""
     return {k: v for k, v in run.items() if k not in PER_RUN}
@@ -1846,6 +1868,11 @@ def engine(config):
 
         substitute()
     _offload_tier(config, run)
+    if _offloads(config.kv_transfer_config, "mooncake_store"):
+        from atom.compass.kv import mooncake_store
+
+        # The frontend checked the deployment against the run file's entry.
+        mooncake_store.substitute()
     utils.LP_OF_RANK = dict.fromkeys(range(pc.data_parallel_size), lp)
     _member = f"dp{pc.data_parallel_rank}" if pc.data_parallel_size > 1 else None
     name = lp.name if _member is None else f"{lp.name}.{_member}"
@@ -1854,7 +1881,10 @@ def engine(config):
         # Under the clock's wrap, so a call settles before it waits on its peers.
         shm_collectives.install()
     clock.settle_before_collectives()
-    if _member is not None and _offloads(config.kv_transfer_config, "lmcache_mp"):
+    kv = config.kv_transfer_config
+    if _member is not None and any(
+        _offloads(kv, c) for c in ("lmcache_mp", "mooncake_store")
+    ):
         _park_before_dispatch()
     rt = _runtime(lp, run, _member, _PublishedClock)
     rt.sampler = metrics.Sampler(
@@ -1945,9 +1975,10 @@ def _park_before_dispatch() -> None:
     """A DP member parks as its last clock call before it dispatches a forward,
     real or the DP dummy, and asks no TAR from its DP state sync to that park.
 
-    A member waiting on the lmcache MP server asks for time alone while its
-    peers, their forwards dispatched, wait on it in the predicted forward's
-    gather and make no clock call; a park stands in for each of them."""
+    A member waiting on the lmcache MP server, or on a Mooncake Store
+    renewal, asks for time alone while its peers, their forwards dispatched,
+    wait on it in the predicted forward's gather and make no clock call; a
+    park stands in for each of them."""
     from atom.model_engine.async_proc import AsyncIOProcManager
     from atom.model_engine.engine_core import DPEngineCoreProc
 
@@ -3242,8 +3273,9 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     scheduler keeps lookup counters hands in ``lookups``: its tier lookups,
     the prefetches among them, and the deferred prefetches it stopped
     waiting for. A speculative engine hands in ``speculative``, `_acceptance`.
-    An engine whose ``lmcache_offload`` is simulated hands in ``offload``:
-    `OffloadShell.offload_statistics`, and under ``cache`` its prefix cache's
+    An engine whose ``lmcache_offload`` or ``mooncake_store`` is simulated
+    hands in ``offload``: `OffloadShell.offload_statistics` or
+    `StoreShell.offload_statistics`, and under ``cache`` its prefix cache's
     counters (`EngineStats.cache_statistics`)."""
     said = _workers_say(engine_core)
     rt = clock.installed()
