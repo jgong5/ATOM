@@ -34,6 +34,7 @@ import sys
 DESIGN = "atom/compass/design/"
 GATE = "scripts/compass/gate_select.py"
 HARNESS = "compass_harness/"
+IMPORT = ("<frozen importlib", "<frozen zipimport")
 EMPTY = {"code": [], "names": {}, "bodies": {}}
 SKIP_DIRS = {"__pycache__", "target", "build", "dist", "node_modules", "venv"}
 DIFF = ["-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", "-z"]
@@ -237,7 +238,7 @@ def _keep(m, root):
         added = p not in m["tree"]
         for t, rs in m["reads"].items():
             if p in rs or added and any(p.startswith(r) for r in rs if r[-3:] != ".py"):
-                read.add(t)
+                read |= {t} if _is_test(t) else _importers(root, t)
         mine = {p} if _is_test(p) else set()
         own |= mine
         if why and p.startswith("tests/"):
@@ -322,27 +323,33 @@ def build(work, root, sha, out):
 
 def _audit(event, args):
     """Record a source read: a .py file of the tree opened, or a directory of it
-    listed. The import system's reads, and coverage's, are their own."""
+    listed, under the test file and any helper under tests/ whose import made it.
+    The import system's reads, and coverage's, are their own."""
     global _fd
     if event not in ("open", "os.listdir", "os.scandir") or not _ctx or not args:
         return
-    up = sys._getframe().f_back
-    if isinstance(args[0], int) or not up or up.f_code.co_filename[:7] == "<frozen":
+    up = sys._getframe().f_back  # `os` is frozen too: skip only the import system
+    if isinstance(args[0], int) or not up or up.f_code.co_filename.startswith(IMPORT):
         return
     r = os.path.relpath(os.path.abspath(os.fsdecode(args[0] or ".")), _root)
     if r[:2] == ".." or event == "open" and r[-3:] != ".py":
         return
+    who = {_ctx}
     while up:
-        if f"{os.sep}coverage{os.sep}" in up.f_code.co_filename:
+        code, up = up.f_code, up.f_back
+        if f"{os.sep}coverage{os.sep}" in code.co_filename:
             return
-        up = up.f_back
+        if code.co_name == "<module>" and code.co_filename.endswith(".py"):
+            h = os.path.relpath(code.co_filename, _root)
+            who |= {h} if h[:6] == "tests/" else set()
     r = r if event == "open" else "" if r == "." else r + "/"
-    if (_ctx, r) not in _seen:
-        _seen.add((_ctx, r))
-        if _fd is None:
-            flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
-            _fd = os.open(f"{_work}/reads/{os.getpid()}", flags, 0o644)
-        os.write(_fd, f"{_ctx}\t{r}\n".encode())
+    for ctx in who:
+        if (ctx, r) not in _seen:
+            _seen.add((ctx, r))
+            if _fd is None:
+                flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                _fd = os.open(f"{_work}/reads/{os.getpid()}", flags, 0o644)
+            os.write(_fd, f"{ctx}\t{r}\n".encode())
 
 
 def startup(work, root):

@@ -58,13 +58,28 @@ RAN = {
     "tests/test_ok.py": [],
 }
 ALL = ["C", "f", "g", "ok"]
-READER = """import pathlib
+READER = """import os, pathlib
 
 
 def test_src():
     pathlib.Path({ran!r}, "src").touch()
-    for p in sorted(pathlib.Path(__file__).parents[1].joinpath("atom").iterdir()):
-        assert p.suffix != ".py" or "monotonic" not in p.read_text(), p
+    for d, _, names in os.walk(pathlib.Path(__file__).parents[1] / "atom"):
+        for p in (pathlib.Path(d, n) for n in names if n.endswith(".py")):
+            assert "monotonic" not in p.read_text(), p
+"""
+# A helper under tests/ that lists atom/ as it is imported, once per process,
+# and two test files importing it.
+ROOTS = """import os, pathlib
+
+ROOTS = sorted(os.listdir(pathlib.Path(__file__).parents[1] / "atom"))
+"""
+USER = """import pathlib
+from roots import ROOTS
+
+
+def test_{name}():
+    pathlib.Path({ran!r}, "{name}").touch()
+    assert "n.py" not in ROOTS
 """
 WHEEL = os.environ.get("COMPASS_COVERAGE_WHEEL")
 
@@ -288,15 +303,8 @@ def test_unset_the_run_is_unchanged(repo):
     )
 
 
-@pytest.mark.skipif(
-    not WHEEL,
-    reason="gate_map.sh installs the coverage.py wheel COMPASS_COVERAGE_WHEEL names",
-)
-def test_the_map_holds_what_each_file_ran_its_subprocesses_included(repo):
-    root, _ = repo
-    sha = _commit(
-        root, {"tests/test_src.py": READER.format(ran=str(root.parent / "ran"))}
-    )
+def _built(root, sha):
+    """The map this tree's gate_map.sh writes of a snapshot of `root` at `sha`."""
     tars = root.parent / "tars"
     tars.mkdir()
     assert _run(root, f"scripts/compass/snapshot.sh {tars}").returncode == 0
@@ -311,26 +319,59 @@ def test_the_map_holds_what_each_file_ran_its_subprocesses_included(repo):
         f"COMPASS_COVERAGE_WHEEL={WHEEL} scripts/compass/gate_map.sh {mapfile}",
     )
     assert out.returncode == 0, out.stdout + out.stderr
-    m = json.loads(mapfile.read_text())
+    assert not (into / "ATOM" / "sitecustomize.py").exists()
+    for p in (root.parent / "ran").iterdir():
+        p.unlink()
+    return mapfile, json.loads(mapfile.read_text())
+
+
+NEEDS_WHEEL = pytest.mark.skipif(
+    not WHEEL,
+    reason="gate_map.sh installs the coverage.py wheel COMPASS_COVERAGE_WHEEL names",
+)
+
+
+@NEEDS_WHEEL
+def test_the_map_holds_what_each_file_ran_its_subprocesses_included(repo):
+    root, _ = repo
+    sha = _commit(
+        root, {"tests/test_src.py": READER.format(ran=str(root.parent / "ran"))}
+    )
+    mapfile, m = _built(root, sha)
     ran = {
         t: {m["funcs"][i] for i in ids if m["funcs"][i].startswith("atom/")}
         for t, ids in m["ran"].items()
     }
-    assert m["sha"] == sha and not (into / "ATOM" / "sitecustomize.py").exists()
+    assert m["sha"] == sha
     assert {t: ran.get(t) for t in RAN} == {t: set(fs) for t, fs in RAN.items()}, m[
         "ran"
     ]
-    # What a test reads of the tree, never what the import system does.
+    # What a test reads of the tree, os.walk's listing included, never what the
+    # import system does.
     src = {"atom/", "atom/__init__.py", "atom/m.py"}
     assert src <= set(m["reads"].get("tests/test_src.py", ())), m["reads"]
     assert [t for t, rs in m["reads"].items() if "atom/m.py" in rs] == [
         "tests/test_src.py"
     ]
-    for p in (root.parent / "ran").iterdir():
-        p.unlink()
     _commit(root, {"atom/m.py": MOD.replace("return 2", "return 2 + 0")})
     lines, ran, out = _gate(root, mapfile)
     assert lines == [f"select: 2 of 5, map {sha[:9]}"] and ran == [
         "g",
         "src",
     ], out.stdout
+
+
+@NEEDS_WHEEL
+def test_an_added_file_runs_what_listed_its_directory_a_helper_s_importers_too(repo):
+    root, _ = repo
+    ran = str(root.parent / "ran")
+    files = {"tests/test_src.py": READER.format(ran=ran), "tests/roots.py": ROOTS}
+    files |= {f"tests/test_{n}.py": USER.format(name=n, ran=ran) for n in ("ra", "rb")}
+    sha = _commit(root, files)
+    mapfile, m = _built(root, sha)
+    assert "atom/" in m["reads"].get("tests/roots.py", ()), m["reads"]
+    _commit(root, {"atom/n.py": "# monotonic\n"})
+    lines, ran, out = _gate(root, mapfile)
+    assert lines == [f"select: 3 of 7, map {sha[:9]}"], out.stdout
+    assert ran == ["ra", "rb", "src"], out.stdout + out.stderr
+    assert out.stdout.splitlines()[-1].startswith("GATE_CPU_RC=1 "), out.stdout

@@ -123,7 +123,8 @@ COMPASS_COVERAGE_WHEEL=<wheel> COMPASS_GATE_SHARDS=16 $T/scripts/compass/gate_ma
 
 The map records, per test file, the functions whose bodies it ran in pytest's process
 or in any Python process started under it with the tree on its path, and the tree's `.py`
-files those processes opened and directories they listed, other than to import. A process killed
+files those processes opened and directories they listed, other than to import; what a
+helper under `tests/` reads as it is imported counts for each test file importing it. A process killed
 by a signal other than SIGTERM records nothing. Its run's verdict is not the tree's:
 under coverage a test that waits a set time on a process, or counts what one prints as
 it exits, can fail, and its file holds what ran up to there. A round stages and runs with it:
