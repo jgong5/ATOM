@@ -388,7 +388,12 @@ EOF
 ) || fail "the router LP's worker order: $order"
     router_env+=(ATOM_COMPASS_ROUTER_ORDER="${order%%$'\n'*}" ATOM_COMPASS_ROUTER_WORKERS="${order#*$'\n'}")
 fi
-env "${router_env[@]}" "${ROUTER[@]}" >"$OUT/router.log" 2>&1 &
+# Atomesh holds a descriptor for each client connection and each upstream one,
+# and raises no limit of its own: at a soft limit of 1024 a c=1228 router ran
+# out, answered 502 for the prefill instances it could not reach, and a request
+# the router LP was released never reached it, so the run hung (#3720). It starts
+# at the hard limit, as a `compass run` server raises its own (#3819).
+(ulimit -n "$(ulimit -Hn)" 2>/dev/null || true; exec env "${router_env[@]}" "${ROUTER[@]}") >"$OUT/router.log" 2>&1 &
 R=$!
 compass_wait_up router $R "http://127.0.0.1:$ROUTER_PORT/v1/models"
 # A stop from here on, one server.json's reader sends included, also stops the

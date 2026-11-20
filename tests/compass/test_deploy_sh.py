@@ -93,7 +93,9 @@ if argv == ["--version-verbose"]:
     print(f"atomesh 0.1.0\\n  Git Commit: {commit}\\n  Git Status: {status}")
     sys.exit()
 lp = {k: v for k, v in os.environ.items() if k.startswith("ATOM_COMPASS_")}
-json.dump({"argv": argv, "pid": os.getpid(), "env": lp}, open(os.environ["PLANTED_ROUTER"], "w"))
+import resource
+nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+json.dump({"argv": argv, "pid": os.getpid(), "env": lp, "nofile": nofile}, open(os.environ["PLANTED_ROUTER"], "w"))
 def stop(*_):
     summary = os.path.exists(os.environ["PLANTED_SUMMARY"])
     open(os.environ["PLANTED_ROUTER"] + ".stop", "w").write(json.dumps(summary))
@@ -235,6 +237,9 @@ def test_a_deployment_joins_both_instances_to_its_authority_behind_the_router(
         urls[side] = json.loads((d / side / "server.json").read_text())["url"]
     router = json.loads((tmp_path / "router.json").read_text())
     port = router["argv"][router["argv"].index("--port") + 1]
+    # It starts at the hard open-file limit: a c=1228 router at 1024 ran out (#3720).
+    soft, hard = router["nofile"]
+    assert soft == hard
     assert router["argv"][-len(ROUTER_ARGS) - 5 :] == [
         "--pd-disaggregation", "--prefill", urls["prefill"], "--decode", urls["decode"],
         *ROUTER_ARGS,
