@@ -1714,6 +1714,8 @@ def engine(config):
         lp = LpId(f"{lp.name}-pp{pc.pipeline_parallel_rank}")
     if side is not None:
         _bind_transfer(config, run)
+    if side == "D":
+        _watch_forwards()
     if "lmcache" in run:
         from atom.compass.kv.lmcache_mp import substitute
 
@@ -1814,6 +1816,11 @@ def _offload_tier(config, run: dict) -> None:
     lmcache_offload.substitute()
 
 
+#: The engine's worker calls that run a forward, real or the DP dummy, and
+#: reply with its price.
+FORWARD_CALLS = ("forward", "dummy_execution")
+
+
 def _park_before_dispatch() -> None:
     """A DP member parks as its last clock call before it dispatches a forward,
     real or the DP dummy, and asks no TAR from its DP state sync to that park.
@@ -1829,7 +1836,7 @@ def _park_before_dispatch() -> None:
     @functools.wraps(call)
     def parking(self, func_name, *args, **kwargs):
         rt = clock.installed()
-        if func_name in ("forward", "dummy_execution") and rt and rt.in_run:
+        if func_name in FORWARD_CALLS and rt and rt.in_run:
             cpu, at = time.thread_time(), rt.now
             rt.park()
             parks = rt.__dict__.setdefault("parks", [])
@@ -1846,6 +1853,29 @@ def _park_before_dispatch() -> None:
 
     AsyncIOProcManager.call_func = parking
     DPEngineCoreProc._sync_dp_state = synced
+
+
+def _watch_forwards() -> None:
+    """Have the engine's `call_func` tell the simulated KV connector's
+    consumer of each forward, the DP group's dummy too, whose priced reply
+    it returns (`atom.compass.kv.connector.forward_returned`), once in a
+    process."""
+    from atom.compass.kv import connector
+    from atom.model_engine.async_proc import AsyncIOProcManager
+
+    call = AsyncIOProcManager.call_func
+    if getattr(call, "compass_watched", False):
+        return
+
+    @functools.wraps(call)
+    def watched(self, func_name, *args, **kwargs):
+        out = call(self, func_name, *args, **kwargs)
+        if func_name in FORWARD_CALLS and getattr(out, "predicted_s", None) is not None:
+            connector.forward_returned(out)
+        return out
+
+    watched.compass_watched = True
+    AsyncIOProcManager.call_func = watched
 
 
 @contextlib.contextmanager

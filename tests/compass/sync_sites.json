@@ -90,16 +90,16 @@
    "mechanism_why": "arithmetic inside the cost backend, which cannot park"
   },
   {
-   "id": "atom/compass/kv/connector.py::SimulatedKVConnectorScheduler._send::self._socks[key].send(pickle.dumps((params[\"transfer_id\"], blocks, a, key[1])))::p2p#0",
+   "id": "atom/compass/kv/connector.py::SimulatedKVConnectorScheduler._send::self._socks[key].send(message, at=a)::p2p#0",
    "file": "atom/compass/kv/connector.py",
    "symbol": "SimulatedKVConnectorScheduler._send",
    "call": "self._socks[key].send",
-   "expr": "self._socks[key].send(pickle.dumps((params[\"transfer_id\"], blocks, a, key[1])))",
+   "expr": "self._socks[key].send(message, at=a)",
    "shape": "p2p",
    "peer": "deployment",
-   "why": "the decode engine's KV write request to the prefill engine of another deployment, sent on the decode step loop right after the request's blocks are allocated, or its notice that none will come, sent when the request finishes before one",
+   "why": "the decode engine's KV write request to the prefill engine of another deployment, sent on the decode step loop once the forward after the request's blocks were allocated has returned, arriving when that forward's device work is done, or its notice that none will come, sent when the request finishes before one",
    "mechanism": "K4",
-   "mechanism_why": "the decode end of the kv_write_req channel: the wrapped socket stamps the send with the LP's time, and the step loop that makes it is the clock owner"
+   "mechanism_why": "the decode end of the kv_write_req channel: the wrapped socket stamps the send with the arrival it is given, never before the LP's time plus the lookahead, and the step loop that makes it is the clock owner"
   },
   {
    "id": "atom/compass/kv/connector.py::SimulatedKVConnectorScheduler._write_requests::sock.poll(0)::poll#0",

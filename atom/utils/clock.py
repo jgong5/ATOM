@@ -633,19 +633,22 @@ class WrappedSocket:
         self.relay: RelayQueue | None = None
         self.buf: list[tuple] = []  # (ch, arrival, seq, payload frame) read, not taken
 
-    def send(self, data, **kw) -> None:
-        self.send_multipart([data], **kw)
+    def send(self, data, *, at: float | None = None, **kw) -> None:
+        self.send_multipart([data], at=at, **kw)
 
-    def send_multipart(self, frames: list, **kw) -> None:
+    def send_multipart(self, frames: list, *, at: float | None = None, **kw) -> None:
+        """Send `frames` stamped as arriving at `at`, by default after the
+        channel's lookahead (`LPRuntime.stamp_send`); a relay's stamp is the
+        one its queue took."""
         if not self.rt.in_run:
             stamp = (None, None)
         elif self.relay is not None:
             stamp = self.relay.take_stamp()
         else:
-            stamp = self.rt.stamp_send(self.ch)
+            stamp = self.rt.stamp_send(self.ch, at)
         hdr = pickle.dumps((self.ch, *stamp))  # arrival None: outside the run
-        at = 1 if self.raw.type == zmq.ROUTER else 0
-        self.raw.send_multipart([*frames[:at], hdr, *frames[at:]], **kw)
+        k = 1 if self.raw.type == zmq.ROUTER else 0
+        self.raw.send_multipart([*frames[:k], hdr, *frames[k:]], **kw)
 
     def recv_multipart(self, *args, **kw) -> list:
         """A frame sent outside the run, ATOM's connect handshake: the frames, header removed."""
