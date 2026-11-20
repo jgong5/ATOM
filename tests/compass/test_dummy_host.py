@@ -41,7 +41,9 @@ class Planted(LaunchFeatures):
     features = ("eager",)
 
     def predict(self, view, graphs):
-        peak = max(sum(r.query_tokens for r in view.requests), view.group_max_tokens or 0)
+        peak = max(
+            sum(r.query_tokens for r in view.requests), view.group_max_tokens or 0
+        )
         return {"eager": float(peak > max(graphs["token"]["prefill"]))}
 
 
@@ -124,9 +126,7 @@ def _samples(rng, dummies, observed=None):
         provenance = {"source": "record", "run": "a", "requests": [i], "config": key}
         sample = Sample(i, 0, view, 0.01, None, host, False, provenance)
         out.append(
-            dataclasses.replace(
-                sample, launch={"eager": 0.0}, dummy_host=tuple(rows)
-            )
+            dataclasses.replace(sample, launch={"eager": 0.0}, dummy_host=tuple(rows))
         )
     return out
 

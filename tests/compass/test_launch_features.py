@@ -154,7 +154,8 @@ def test_one_run_holds_out_spans_of_its_steps_and_adopts_the_column():
     host, report = fit_host(_samples(runs=("a",)))
     adopted = report["prefill.W_launch"]["launch_columns"]
     assert adopted["adopted"] == ["eager"]
-    assert adopted["held_out"][0]["none"] > 0.1 > 0.01 > adopted["held_out"][1]["eager"]
+    none, eager = adopted["held_out"][0]["none"], adopted["held_out"][1]["eager"]
+    assert none > 0.1 and eager < 0.01
     column = host["columns"]["prefill"]["W_launch"]
     assert column == pytest.approx({"eager": EAGER_S}, rel=0.05)
 
