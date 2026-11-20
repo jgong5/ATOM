@@ -445,7 +445,7 @@ class StoreShell:
             return future
         with self._lock:
             rid = next(self._ids)
-            self._calls[rid] = (kind, fn, args, future)
+            self._calls[rid] = (kind, fn, args, future, keys)
             self.counts["lookups" if kind == "query" else "renewals"] += 1
         self._send_lookup((kind, rid, keys))
         return future
@@ -579,9 +579,20 @@ class StoreShell:
         the reply's lease for the request's load."""
         rid, start, deadline, present = reply
         with self._lock:
-            kind, fn, args, future = self._calls.pop(rid)
+            kind, fn, args, future, keys = self._calls.pop(rid)
         seq = args[0]
         sid = args[1] if kind == "query" else str(seq.id)
+        logger.info(
+            "compass: mooncake_store %s of %s at %r: chunk 0 %s, %d of %d keys "
+            "present, %d another instance's",
+            kind,
+            sid,
+            self._rt.now,
+            keys[0].rpartition("/")[2][:12],
+            len(present),
+            len(keys),
+            sum(p != self._me for p in present.values()),
+        )
         self._leases[sid] = (deadline, present)
         self._leases.move_to_end(sid)
         lookup = self._lookup
