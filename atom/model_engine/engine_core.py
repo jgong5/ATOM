@@ -961,17 +961,25 @@ class EngineCore:
 
         Runs on this IO thread, so a lookup is sent while the engine thread is
         still inside a forward instead of when it next schedules. Only a
-        connector with a lookup thread defines `offer_lookups`.
+        connector with a lookup thread defines `offer_lookups`. On a simulated
+        run the clock owner makes the offer (`clock.send_on_owner`): at the
+        ADD's arrival when the engine idles, else at the forward's end.
         """
         connector = getattr(getattr(self, "scheduler", None), "kv_connector", None)
         offer = getattr(connector, "offer_lookups", None)
         if not callable(offer):
             return
-        try:
-            offer(reqs)
-        except Exception:
-            # The scheduler's own prefetch still sends these lookups.
-            logger.warning(f"{self.label}: offering tier lookups failed", exc_info=True)
+
+        def offer_or_warn() -> None:
+            try:
+                offer(reqs)
+            except Exception:
+                # The scheduler's own prefetch still sends these lookups.
+                logger.warning(
+                    f"{self.label}: offering tier lookups failed", exc_info=True
+                )
+
+        clock.send_on_owner(offer_or_warn)
 
     def process_input_sockets(self, input_address: str, control_address: str):
         """Input IO thread, serving both the request and control sockets.

@@ -18,6 +18,8 @@ import logging
 import threading
 from typing import Any
 
+from atom.utils import clock
+
 logger = logging.getLogger("atom")
 
 # Poll period while lookups are in flight. LMCache futures have no callbacks,
@@ -59,7 +61,9 @@ class _LockedAdapter:
 
 
 class _LookupDriver:
-    """Runs `_MPLookupClient._drive` on its own thread."""
+    """Runs `_MPLookupClient._drive` on its own thread; on a simulated run, at
+    the clock owner's drains, since a lookup this thread sent would carry no
+    time (`clock.poll_on_owner`)."""
 
     def __init__(self, client: Any, window: int) -> None:
         if window <= 0:
@@ -75,7 +79,18 @@ class _LookupDriver:
         return self._window
 
     def start(self) -> None:
-        self._thread.start()
+        if not clock.poll_on_owner(self._owner_pass):
+            self._thread.start()
+
+    def _owner_pass(self) -> None:
+        """A pass on the clock owner; none while the owner holds the client's
+        lock, which this thread's pass would wait for: a later drain makes it."""
+        if self._stop.is_set() or self._client._lock._is_owned():
+            return
+        try:
+            self._client._drive(self._window)
+        except Exception:
+            logger.warning("LMCache MP lookup driver pass failed", exc_info=True)
 
     def notify(self) -> None:
         """New work was offered; run a pass now."""

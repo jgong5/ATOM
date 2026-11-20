@@ -52,8 +52,19 @@ every stamped frame it reads, holds a frame back until `is_released`, and
 brackets handing one to ATOM with `handed_over` and `back_at_wait_point`. The
 send side stamps each frame with `stamp_send`, directly or through the
 `RelayQueue` that stands in for the engine's output queue.
+
+Another thread sends nothing in the run. A send it wants made, such as an
+input thread's tier-lookup offer, is queued (`send_on_owner`), and the owner
+makes it at its next drain: once a grant has walked what it releases, at the
+grant's clock, or before its next clock call. A handler runs inside the walk,
+so its send goes at the ADD's arrival when the engine idles and at the
+forward's end when a forward's grant releases the ADD: stamped at the ADD's
+arrival, the authority would refuse it as backdated. A polling thread that
+sends, such as `lmcache_mp`'s lookup driver, makes its passes at each drain
+instead (`poll_on_owner`).
 """
 
+import collections
 import contextlib
 import json
 import logging
@@ -107,6 +118,27 @@ def sleep(seconds: float, real) -> None:
         real(seconds)
     else:
         runtime.next_event(runtime.now + seconds)
+
+
+def send_on_owner(fn) -> None:
+    """Call `fn`, which sends, now; in a run on another thread than the clock
+    owner, queue it for the owner's next drain (`LPRuntime._drain`)."""
+    runtime = _installed
+    elsewhere = runtime is not None and threading.current_thread() is not runtime.owner
+    if elsewhere and runtime.in_run:
+        runtime.queued.append(fn)
+    else:
+        fn()
+
+
+def poll_on_owner(fn) -> bool:
+    """On a simulated run, have the clock owner call `fn` at each drain, as a
+    polling thread that sends would make its passes; True. On a real run
+    False: the caller polls on a thread of its own."""
+    runtime = _installed
+    if runtime is not None:
+        runtime.polls.append(fn)
+    return runtime is not None
 
 
 #: The station job this thread is serving, as ``job.cur = (station, k)``; the
@@ -207,6 +239,11 @@ class LPRuntime:
         # Whether the owner holds work a bounded poll must not idle past: then
         # the poll's bound is an essential deadline, else a daemon one.
         self.holds_work = lambda: False
+        # Sends other threads queued for the owner (`send_on_owner`), and the
+        # passes it makes at each drain (`poll_on_owner`).
+        self.queued: collections.deque = collections.deque()
+        self.polls: list = []
+        self.draining = False
 
     def start_run(self) -> None:
         self.in_run = True
@@ -386,9 +423,28 @@ class LPRuntime:
         self._ca_send(kind, t, t_daemon, rounds=rounds)
         return self.conn.recv()
 
+    def _drain(self) -> None:
+        """Make the sends other threads queued, then each polling pass, at the
+        clock now. Only the owner in the run does; past the ``+inf`` grant, what
+        is queued is dropped. A send that itself calls the clock drains nothing."""
+        if self.draining or threading.current_thread() is not self.owner:
+            return
+        if not self.in_run or self.now == math.inf:
+            self.queued.clear()
+            return
+        self.draining = True
+        try:
+            while self.queued:
+                self.queued.popleft()()
+            for poll in self.polls:
+                poll()
+        finally:
+            self.draining = False
+
     def _ca_send(
         self, kind: str, t: float, t_daemon: float, ahead: bool = False, rounds=()
     ) -> None:
+        self._drain()
         with self.lock:
             log, self.send_log = self.send_log, []
         steps, self.steps = self.steps, []
@@ -401,6 +457,7 @@ class LPRuntime:
     def _own_step(self, kind: str, t: float, G: float) -> None:
         """Answer a call below the ceiling, as the authority would: walk the
         messages sent ahead up to `G`, and keep the step for the next call."""
+        self._drain()
         with self.lock:
             sent = len(self.send_log)
         self.steps.append((kind, t, G, sent))
@@ -472,6 +529,7 @@ class LPRuntime:
             late = [(a, ch, s) for (ch, s), a in self.unreleased.items() if a < G]
             if late:
                 self._straggler(*min(late))
+        self._drain()
 
     def _straggler(self, arrival: float, ch: str, seq: int) -> None:
         raise Straggler(
