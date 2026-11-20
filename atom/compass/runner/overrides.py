@@ -1888,18 +1888,20 @@ def _time_target(runner: Any, batch: Any) -> None:
     metrics.poll()
 
 
-#: A file of a real record's stalled forwards a simulated run replays
-#: (`replayed_stall`), as `python -m atom.compass.validate.stalls RUN OUT` writes it.
+#: A file of a real record's stalled forwards and whole-group pauses a simulated
+#: run replays (`replayed_stall`), as `python -m atom.compass.validate.stalls RUN OUT` writes it.
 REPLAY_STALLS = "COMPASS_REPLAY_STALLS"
 
 
 def replayed_stall(runner: Any, view: Any, host: Any) -> float:
-    """The seconds of `REPLAY_STALLS`' stalls this rank's prefill step `view`
-    replays: every one of this DP rank's stalls whose time, from the run's
-    first forward, the engine clock (`host.now`) has reached and no earlier
-    step replayed. A what-if that attributes a simulated run's error to the
-    real run's stalls, not a price: 0 s unset, with no clock, or on a step
-    that prefills nothing."""
+    """The seconds of `REPLAY_STALLS`' stalls this rank's step `view` replays:
+    every one of this DP rank's stalls whose time, from the run's first
+    forward, the engine clock (`host.now`) has reached and no earlier step
+    replayed. A launch stall waits for a step that prefills, as it stalled a
+    prefill's launch; a whole-group pause (``any_step``) takes this rank's next
+    step of any kind, a dummy run's too, as it stopped the device whatever
+    it ran. A what-if that attributes a simulated run's error to the real
+    run's stalls, not a price: 0 s unset, with no clock, or with none due."""
     path = os.environ.get(REPLAY_STALLS)
     now = getattr(host, "now", None)
     if not path or now is None or view is None:
@@ -1909,14 +1911,24 @@ def replayed_stall(runner: Any, view: Any, host: Any) -> float:
         with open(path) as f:
             stalls = json.load(f)["stalls"]
         rank = view.dp_rank or 0
-        mine = sorted((s["t_s"], s["seconds"]) for s in stalls if s["rank"] == rank)
-        state = vars(runner)["_replay_stalls"] = (now(), collections.deque(mine))
-    first, pending = state
-    if all(r.decode for r in view.requests):
-        return 0.0
+        mine = [s for s in stalls if s["rank"] == rank]
+        launch, pauses = (
+            collections.deque(
+                sorted(
+                    (s["t_s"], s["seconds"])
+                    for s in mine
+                    if bool(s.get("any_step")) == any_step
+                )
+            )
+            for any_step in (False, True)
+        )
+        state = vars(runner)["_replay_stalls"] = (now(), launch, pauses)
+    first, launch, pauses = state
     seconds, at = 0.0, now() - first
-    while pending and pending[0][0] <= at:
-        seconds += pending.popleft()[1]
+    due = [pauses] + [launch] * (not all(r.decode for r in view.requests))
+    for pending in due:
+        while pending and pending[0][0] <= at:
+            seconds += pending.popleft()[1]
     return seconds
 
 
