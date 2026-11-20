@@ -1359,7 +1359,10 @@ def mooncake_store(block_tokens: int) -> None:
     clock endpoint's host and names that endpoint in the out_dir's
     `ENDPOINT_FILE`. At its first stamped request, once every member of the
     engines it serves has planned its pool, it checks their plans against the
-    entry (`check_plans`), each chunk `block_tokens` KV blocks of tokens."""
+    entry (`check_plans`), each chunk `block_tokens` KV blocks of tokens. At
+    the end of each client run, after its hand-in, an entry stating
+    ``clear_between_client_runs`` has it empty the Store and mount it at the
+    next client run's size (`MooncakeStoreLP.clear`)."""
     import zmq
 
     from atom.compass.kv import mooncake_store_server as store
@@ -1386,7 +1389,7 @@ def mooncake_store(block_tokens: int) -> None:
         check_plans=check_plans,
     )
     name = MOONCAKE_STORE.name
-    rt.client_run_ended = lambda k: _hand_in(run, name, rt.refusals, k, store=lp.counts)
+    rt.client_run_ended = _store_client_run_ended(run, rt, lp)
     ended = []
     try:
         lp.serve()
@@ -1396,6 +1399,22 @@ def mooncake_store(block_tokens: int) -> None:
     finally:
         _hand_in(run, name, rt.refusals + ended, store=lp.counts)
         sock.close(linger=0)
+
+
+def _store_client_run_ended(run: dict, rt, lp):
+    """LP `mooncake_store`'s `client_run_ended`: at the end of client run ``k``
+    its hand-in, then, where the entry states ``clear_between_client_runs``, an
+    empty Store mounted at client run ``k + 1``'s size (`MooncakeStoreLP.clear`)."""
+    from atom.compass.kv import mooncake_store_server as store
+
+    entry = run[store.ENTRY]
+
+    def ended(k: int) -> None:
+        _hand_in(run, MOONCAKE_STORE.name, rt.refusals, k, store=lp.counts)
+        if entry.get("clear_between_client_runs"):
+            lp.clear(store.client_run_capacity(entry, k + 1))
+
+    return ended
 
 
 def configuration(run: dict) -> dict:

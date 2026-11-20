@@ -47,6 +47,10 @@ socket carries; each payload is pickled:
 The LP hands in its lookups, the keys they found present, those another
 engine LP published, its renewals and the objects it evicted (`COUNTS`).
 
+With ``clear_between_client_runs`` the Store is emptied at the end of each
+client run, and mounted again at ``capacity_by_client_run``'s next size
+(`MooncakeStoreLP.clear`), as a record's launcher empties it between segments.
+
 What it does not model: contention at the owners, a get's own master call,
 failures, soft pins, tenants, the owners' allocator and its fragmentation, and
 the eviction thread's phase. The master flags it reads are
@@ -78,6 +82,13 @@ ENTRY = "mooncake_store"
 #: The entry's laws, each ``[fixed, per key]`` (lookup) or ``[fixed, per chunk]``
 #: seconds; the fixed lookup term is both hops.
 TERMS = ("lookup_s", "store_s", "load_s")
+#: Optional fields: the Store a run with several client runs starts each one
+#: with, as a record's launcher empties it (``store_check --clear``) and
+#: mounts it again at each segment's size. ``clear_between_client_runs``: the
+#: Store is emptied at the end of each client run (`MooncakeStoreLP.clear`);
+#: ``capacity_by_client_run``: the owners' bytes for client run ``k``, the
+#: last repeating, its first ``capacity_bytes``'s.
+CLIENT_RUN_FIELDS = ("clear_between_client_runs", "capacity_by_client_run")
 #: The entry's fields the deployment must match.
 MATCHED = (
     "protocol",
@@ -169,7 +180,7 @@ def check_entry(entry) -> argparse.Namespace:
         raise MooncakeStoreRefusal(
             f"the run file's {ENTRY} entry lacks {', '.join(missing)}"
         )
-    if extra := sorted(entry.keys() - need - {"fit"}):
+    if extra := sorted(entry.keys() - need - {"fit", *CLIENT_RUN_FIELDS}):
         raise MooncakeStoreRefusal(
             f"the run file's {ENTRY} entry has unknown {', '.join(extra)}"
         )
@@ -196,10 +207,44 @@ def check_entry(entry) -> argparse.Namespace:
             raise MooncakeStoreRefusal(
                 f"{ENTRY}.{name} is {entry[name]!r}, not a positive int"
             )
+    clear = entry.get("clear_between_client_runs", False)
+    if type(clear) is not bool:
+        raise MooncakeStoreRefusal(
+            f"{ENTRY}.clear_between_client_runs is {clear!r}, not a bool"
+        )
+    sizes = entry.get("capacity_by_client_run")
+    if sizes is not None:
+        if not (
+            isinstance(sizes, list)
+            and sizes
+            and all(type(b) is int and b > 0 for b in sizes)
+        ):
+            raise MooncakeStoreRefusal(
+                f"{ENTRY}.capacity_by_client_run is {sizes!r}, not a list of "
+                "positive ints"
+            )
+        if sizes[0] != entry["capacity_bytes"]:
+            raise MooncakeStoreRefusal(
+                f"{ENTRY}.capacity_by_client_run starts at {sizes[0]}, and "
+                f"capacity_bytes, client run 0's, is {entry['capacity_bytes']}"
+            )
+        if not clear:
+            raise MooncakeStoreRefusal(
+                f"{ENTRY}.capacity_by_client_run sizes a Store that is never "
+                "emptied: a mounted Store changes size only when it is mounted "
+                "again, so it needs clear_between_client_runs"
+            )
     argv = entry["master"]
     if not (isinstance(argv, list) and all(isinstance(a, str) for a in argv)):
         raise MooncakeStoreRefusal(f"{ENTRY}.master is {argv!r}, not argv")
     return parse_master_flags(argv)
+
+
+def client_run_capacity(entry: dict, k: int) -> int:
+    """The owners' bytes client run `k` starts with: ``capacity_by_client_run``'s
+    ``k``-th, its last past its end, else ``capacity_bytes``."""
+    sizes = entry.get("capacity_by_client_run") or [entry["capacity_bytes"]]
+    return sizes[min(k, len(sizes) - 1)]
 
 
 def check_plans(entry: dict, plans: dict, block_tokens: int) -> None:
@@ -277,7 +322,13 @@ class Master:
             flags.eviction_ratio,
         )
         self.threads = flags.rpc_thread_num
-        self.capacity, self.chunk_bytes = entry["capacity_bytes"], entry["chunk_bytes"]
+        self.chunk_bytes = entry["chunk_bytes"]
+        self.reset(entry["capacity_bytes"])
+
+    def reset(self, capacity: int) -> None:
+        """An empty Store of `capacity` bytes: every object, group, lease and
+        eviction deadline gone, as a cleared and remounted Store has none."""
+        self.capacity = capacity
         self.objects: dict[str, _Object] = {}
         self.groups: dict[str, _Group] = {}
         self.used = 0
@@ -445,6 +496,15 @@ class MooncakeStoreLP(StationLP):
                 calls.append(call)
         else:
             raise MooncakeStoreRefusal(f"LP mooncake_store takes no {kind!r} on {ch}")
+
+    def clear(self, capacity: int) -> None:
+        """Empty the Store and mount it again at `capacity` bytes, at the end
+        of a client run (``clear_between_client_runs``), as a record's
+        launcher runs ``store_check --clear`` between segments: every object
+        and the put starts and publications still pending go. The calls
+        queued on the master stay, answered from the empty Store."""
+        self.events = []
+        self.master.reset(capacity)
 
     def _at_time(self, t: float, action) -> None:
         heapq.heappush(self.events, (t, next(self._order), action))
