@@ -32,14 +32,17 @@ reference (`REF_STEPS` or more steps, else the median after any forward of its
 prefill-or-decode kind); a step whose span exceeds it by more than `GROUP_MIN_S`
 holds a pause of that excess.
 
-A pause is device-side, on all ranks, where every rank's device window
-(`d_busy_ns`) at that step or the one before exceeds its own kind's median by
-half the pause or more, or else every rank spent half the pause or more inside
-its forward: released together, the rank that held them is not in host stamps.
-Otherwise one rank stood between its forwards while the others waited inside
-theirs, and the pause is that rank's, the one that stood out longest. A rank
-with no output to wait for also waits for its group between its forwards, so
-without device windows a device-side pause can read as that rank's.
+A rank that arrived at the paused step late by half the pause or more, between
+its previous forward's exit and this one's entry, held the group: the others
+wait for it at their forward's first collective. The pause is that rank's, the
+latest, unless every rank's device window (`d_busy_ns`) at that step or the one
+before exceeds its kind's median by half the pause or more: the device stopped
+on every rank, and a host that waited on it arrived late too. With no late
+rank it is device-side, on all ranks: every rank waited where its step left
+it, released together, so the rank that held them is not in host stamps. A
+rank between its forwards after the paused one, as one with no output to wait
+for is, waits for its group, not the other way round (#3778's second shape:
+in g08's records every such pause is in every rank's device window).
 
 The report gives the stalls' and the pauses' count and seconds over the whole
 record and over the client's graded window, from its first profiling request's
@@ -87,8 +90,11 @@ WAITS = {
     "draft_recv": "t_draft_recv_ns",
     "launch": "t_launch_ns",
 }
-#: Where a rank that waited out a pause between its forwards waited.
+#: Where a rank that waited out a pause between its forwards, after the paused
+#: one, waited: for its group.
 BETWEEN = "between steps"
+#: Where a rank that arrived late at the paused forward was: it held the group.
+LATE = "late"
 
 
 def _kind(line: dict) -> tuple[bool, bool]:
@@ -181,6 +187,11 @@ def _medians(values: dict) -> dict:
     }
 
 
+def _overlap(a: int, b: int, lo: int, hi: int) -> float:
+    """Seconds [a, b] and [lo, hi], nanoseconds, share."""
+    return max(0, min(b, hi) - max(a, lo)) * 1e-9
+
+
 def group_pauses(
     steps: Path, min_s: float = GROUP_MIN_S
 ) -> tuple[list[dict], float, list[int]]:
@@ -188,7 +199,7 @@ def group_pauses(
     each its ``step``, ``t_s`` (its span's start on the record's clock,
     seconds), ``seconds`` (its excess), ``span_s``, ``rank`` (None for a
     device-side pause, on all ranks), ``waits`` (where each rank waited:
-    a `WAITS` name or `BETWEEN`) and ``device_s`` (the least device excess
+    a `WAITS` name, `LATE` or `BETWEEN`) and ``device_s`` (the least device excess
     over the ranks, None without device windows); the record's first entry,
     in seconds; and its ranks."""
     record = {}
@@ -232,25 +243,31 @@ def group_pauses(
         if excess <= min_s:
             continue
         end = start + span
-        waits, inside, outside, device = {}, {}, {}, {}
+        waits, late, device = {}, {}, {}
         for r, now, before in zip(ranks, group[s], group[s - 1]):
-            held = max(0, min(now.exit, end) - max(now.enter, start)) * 1e-9
-            inside[r], outside[r] = held, span * 1e-9 - held
-            waits[r] = now.wait[0] if held >= excess / 2 else BETWEEN
+            inside = _overlap(now.enter, now.exit, start, end)
+            late[r] = _overlap(before.exit, now.enter, start, end)
+            waits[r] = (
+                now.wait[0]
+                if inside >= excess / 2
+                else LATE if late[r] >= excess / 2 else BETWEEN
+            )
             if windows:
-                device[r] = max(
-                    now.busy - busy[keys[s]], before.busy - busy[keys[s - 1]]
-                ) * 1e-9
+                device[r] = (
+                    max(now.busy - busy[keys[s]], before.busy - busy[keys[s - 1]])
+                    * 1e-9
+                )
         held_device = windows and min(device.values()) >= excess / 2
-        all_inside = min(inside.values()) >= excess / 2
-        late = None if held_device or all_inside else max(outside, key=outside.get)
+        latest = max(late, key=late.get)
+        if held_device or late[latest] < excess / 2:
+            latest = None
         out.append(
             {
                 "step": s,
                 "t_s": start * 1e-9,
                 "seconds": excess,
                 "span_s": span * 1e-9,
-                "rank": late,
+                "rank": latest,
                 "waits": waits,
                 "device_s": min(device.values()) if windows else None,
             }
@@ -407,7 +424,7 @@ def _pause(p: dict, first: float) -> str:
     who = (
         "device-side, all ranks"
         if p["rank"] is None
-        else f"rank {p['rank']} between its forwards"
+        else f"rank {p['rank']}'s, late to its forward"
     )
     waits = ", ".join(f"{r} {w}" for r, w in p["waits"].items())
     line = (
@@ -416,9 +433,8 @@ def _pause(p: dict, first: float) -> str:
     )
     if (k := p.get("kfd")) is not None:
         top = ", ".join(f"{pid} {ms / 1e3:.1f} s" for pid, ms in k["evicted_ms"][:6])
-        line += (
-            f"; KFD evicted over it: {len(k['evicted_ms'])} processes"
-            + (f" ({top})" if top else "")
+        line += f"; KFD evicted over it: {len(k['evicted_ms'])} processes" + (
+            f" ({top})" if top else ""
         )
     return line
 

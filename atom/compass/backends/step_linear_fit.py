@@ -113,7 +113,9 @@ from the median are dropped and the rest refitted, until the kept set settles.
 The dropped steps that lead a record's steps of one vector, each slower than
 the law, are its warm steps (shape compiles and first touches), and so is a
 dropped step anywhere that ran more than `WARM_FACTOR` times its price, such as
-the first short chunk on a deep history: counted with their seconds apart from
+the first short chunk on a deep history, or more than `PAUSE_S` seconds past
+it, a whole-group pause (`validate.stalls`) on a step of any price: counted
+with their seconds apart from
 the dropped ones, never charged, and listed per run under `warm_steps`, in the
 order the law's `runs` names the runs. A feature with no variance gets coefficient
 zero and is named. Each vector reports its samples,
@@ -251,6 +253,7 @@ from atom.compass.backends.step_linear import (
     serial_passes,
     token_padding,
 )
+from atom.compass.validate.stalls import GROUP_MIN_S
 
 FORMS = ("base", "history", "shared", "cached_seqs")
 CONTEXT_PARALLEL = ("prefill_context_parallel_size", "decode_context_parallel_size")
@@ -266,6 +269,11 @@ MAD_PASSES = 20
 FIT_PASSES = 10_000
 #: A step that ran this many times its price is a one-off first touch, not scatter.
 WARM_FACTOR = 5.0
+#: A step that ran this many seconds past its price held a whole-group pause, the
+#: least `validate.stalls` names (#3778): every rank's device stopped, which no
+#: law prices, so it is warm too, on a prefill of a second or more as well,
+#: whose pause is less than `WARM_FACTOR` times its price.
+PAUSE_S = GROUP_MIN_S
 TOKEN_BANDS = (512, 2048, 8192)
 #: Steps at its rung a record needs before a `rowmod` choice holds it out.
 ROWMOD_CELL_STEPS = 100
@@ -1846,7 +1854,10 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             names = [*vector["coefficients"], *["rowmod"] * bool(rowmod_k)]
         members = solved["rows"]
         slow = ~solved["keep"] & (solved["residual"] < 0)
-        once = solved["residual"] < 1 - WARM_FACTOR
+        # A residual r = (price - label) / price, so price = label / (1 - r).
+        label = np.array([r[3] for r in members], dtype=np.float64)
+        past = label - label / np.maximum(1 - solved["residual"], 1e-12)
+        once = (solved["residual"] < 1 - WARM_FACTOR) | (past > PAUSE_S)
         warm = np.zeros(len(members), dtype=bool)
         for rec in range(len(runs)):
             leading = True

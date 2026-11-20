@@ -30,7 +30,7 @@ from atom.compass.backends import (
 from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.cost import group as method_group
 from atom.compass.backends.step_linear import dummy_view
-from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band
+from atom.compass.backends.step_linear_fit import PAUSE_S, WARM_FACTOR, _band
 from atom.compass.backends.step_roofline import StepFallbackBackend
 
 WITHIN = 0.10
@@ -179,7 +179,11 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
     parts: dict[str, list] = {}
     by_rank: dict[str, dict] = {}
     for key, band, step, seconds, price, target, draft, cost, top in priced:
-        if step in leading or seconds > WARM_FACTOR * price:
+        if (
+            step in leading
+            or seconds > WARM_FACTOR * price
+            or seconds - price > PAUSE_S
+        ):
             warm.append(
                 {
                     "step": step,

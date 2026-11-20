@@ -34,7 +34,8 @@ the graded header names the kind's steps a law priced at a decode rung its fit
 filled (`step_linear_fit.fill_rungs`), with their real seconds, their share of
 the kind's and the rungs. A step that ran more
 than `step_linear_fit.WARM_FACTOR` times its price is warm, a one-off first touch the
-law does not model: it is named with its seconds and enters no figure. So are,
+law does not model, and so is one more than `step_linear_fit.PAUSE_S` past it, a
+whole-group pause (`validate.stalls`): it is named with its seconds and enters no figure. So are,
 under a law or an op graph, the steps that lead a vector's priced steps, each
 slower than its price by more than `step_linear_fit.MAD_K` scaled MADs of the
 errors the law's vector was fitted on, as the fit names them; of that vector's

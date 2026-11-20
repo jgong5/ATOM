@@ -28,6 +28,7 @@ from atom.compass.backends import (
 from atom.compass.backends.step_labels import BUILDS, label
 from atom.compass.backends.step_linear import EAGER_DUMMY, EXTRAPOLATED
 from atom.compass.backends.step_linear_fit import (
+    WARM_FACTOR,
     _fit_form,
     _solve,
     fill_rungs,
@@ -247,6 +248,24 @@ def test_warm_steps_are_not_fitted(tmp_path):
     assert (law["prefill"]["fit"]["warm"], law["prefill"]["fit"]["dropped"]) == (2, 1)
     assert law["decode"]["2"]["fit"]["warm"] == 1
     assert law["prefill"]["coefficients"] == pytest.approx(PREFILL, rel=1e-6)
+
+
+def test_a_step_a_whole_group_pause_held_is_warm_however_long_its_price(tmp_path):
+    # validate.stalls' pauses (#3778) add seconds to a step, not a factor: on
+    # a prefill priced at a second or more, a 4 s pause is under WARM_FACTOR
+    # times its price, and is warm all the same, as on a decode.
+    steps = _steps(2)
+    prefill = next(i for i in range(130, 240, 2) if steps[i][2] >= 1.0)
+    decode = 101
+    pause = {i: (steps[i][2] + 4.0) / steps[i][2] for i in (prefill, decode)}
+    assert pause[prefill] < WARM_FACTOR
+    (tmp_path / "steps").mkdir()
+    law = _fit([_record(tmp_path / "steps" / "dp0.jsonl", steps, pause)])
+
+    assert sorted(law["warm_steps"][0]) == sorted(pause)
+    assert law["prefill"]["coefficients"] == pytest.approx(PREFILL, rel=1e-6)
+    named = [w["step"] for w in cost_accuracy(tmp_path / "steps", law)["warm"]]
+    assert sorted(named) == sorted(pause)
 
 
 def test_three_forms_are_scored_on_a_record_held_out_of_their_fit(tmp_path):
