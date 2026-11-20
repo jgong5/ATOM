@@ -95,7 +95,7 @@ def engine_id(lp: str) -> str:
 
 #: The consumers built in this process, each told of every forward its
 #: engine's workers return (`forward_returned`).
-_CONSUMERS: "weakref.WeakSet[SimulatedKVConnectorScheduler]" = weakref.WeakSet()
+_CONSUMERS: weakref.WeakSet[SimulatedKVConnectorScheduler] = weakref.WeakSet()
 
 
 def forward_returned(reply) -> None:
