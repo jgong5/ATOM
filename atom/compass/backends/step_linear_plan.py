@@ -143,18 +143,12 @@ def design(real, seed: int) -> dict:
         scale = [_scale(pools[k], sessions[k][:r]) for k in range(ranks)]
         # Each group's kind, whether a gap batch, whether filled, and its rows
         # on each rank, each a (session, level).
-        made = []
         batches = [(r, False)] + ([(prev + 1, True)] if r > prev + 1 else [])
-        for kind, head, rest in LEVEL_GROUPS:
-            for n, gap in batches:
-                made.append(
-                    (
-                        kind,
-                        gap,
-                        True,
-                        [list(enumerate([head] + [rest] * (n - 1)))] * ranks,
-                    )
-                )
+        made = [
+            (kind, gap, True, [list(enumerate([head] + [rest] * (n - 1)))] * ranks)
+            for kind, head, rest in LEVEL_GROUPS
+            for n, gap in batches
+        ]
         if r >= 4:
             tops = [(i, 2) for i in range(r // 2)]
             bottoms = [(i, 0) for i in range(r // 2, r)]

@@ -166,19 +166,24 @@ def test_levels_are_the_decode_rows_percentiles_and_each_draw_sits_within_ten(
 
 
 def test_a_wide_rung_scales_its_three_levels_together_to_the_pool_cap(tmp_path):
-    # A pool of 64 blocks, so a rung's top cuts hold at most 819 tokens: every
-    # draw 400 or 401 tokens, the top ones 401, scaled from four rows.
+    # A pool of 64 blocks, so a rung's top cuts hold at most 819 tokens.
     engine = _engine(num_kvcache_blocks=64, max_num_seqs=8)
-    plan = design(_record(tmp_path, [[400] * 50], engine=engine), 1)
+    plan = design(_record(tmp_path, [_spread(100, 400)], engine=engine), 1)
+    cuts = plan["sessions"][0]
     full = [g for g in plan["groups"] if not g["gap"]]
     top = {g["rung"]: g["rows"][0] for g in full if g["kind"] == "top"}
     bottom = {g["rung"]: g["rows"][0] for g in full if g["kind"] == "bottom"}
-    assert [t for _, t in top[2]] == [401, 401]
-    assert [t for _, t in bottom[2]] == [400, 400]
-    for rows in top.values():
-        assert sum(t for _, t in rows) <= 0.8 * 64 * BLOCK
-    # 819.2 / 3208 of 401 and of 400 tokens.
-    assert [t for _, t in top[8]] == [102] * 8 == [t for _, t in bottom[8]]
+    # Two rows fit unscaled; from four, the rung's top cuts together fill the
+    # cap, each row short of its share by under a token, and every level
+    # scales by the same factor.
+    assert [t for _, t in top[2]] == [s["cuts"][2] for s in cuts[:2]]
+    for rung in 4, 8:
+        sent = [t for _, t in top[rung]]
+        assert 819.2 - rung < sum(sent) <= 819.2
+        scale = 819.2 / sum(s["cuts"][2] for s in cuts[:rung])
+        assert [t for _, t in bottom[rung]] == [
+            int(scale * s["cuts"][0]) for s in cuts[:rung]
+        ]
 
 
 def test_under_dp_every_rank_runs_the_rung_and_the_middle_runs_beside_uneven_peers(
