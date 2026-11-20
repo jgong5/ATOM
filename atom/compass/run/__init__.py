@@ -1162,6 +1162,10 @@ def lmcache(block_tokens: int) -> None:
         return TransferModel(*link, server.chunk_bytes)
 
     sock = zmq.Context.instance().socket(zmq.ROUTER)
+    # No high-water mark: past one, ROUTER drops a reply to an engine that lags
+    # behind, whose future then never resolves, as PUB dropped the traffic LP's
+    # cancels (compass_harness/traffic_lp.py). Set before the bind.
+    sock.setsockopt(zmq.SNDHWM, 0)
     sock.bind(server.url)
     ended = []
     try:
