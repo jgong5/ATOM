@@ -27,12 +27,24 @@ A consumer rank writes a line per write-done it receives
 the producer's ``pp_rank`` and ``tp_rank``, ``write_nonce``, ``success`` and
 ``t_write_done_ns``, when it arrived. A write's line joins its write-done's on
 ``request_id``, ``write_nonce`` and the producer's ranks.
+
+The write-done's line also says when its write request left: ``t_load_ns``,
+when `start_load_kv` took the step's metadata that asked for it, the engine
+having admitted the request; ``t_post_ns``, when it was queued for the
+write-request thread (`_enqueue_write_requests`); and ``t_send_ns``, ``[enter,
+exit]`` of each `_send_on_socket` call that sent it, one per producer stage,
+after that thread's device synchronize. A write request that no write-done
+answered by the record's end has a line of its own with those stamps,
+``request_id`` and ``write_nonce``.
 """
 
 import functools
 import json
 import os
 import threading
+
+#: A consumer's stamps of a write request, on its write-done's line.
+REQUEST_STAMPS = ("t_load_ns", "t_post_ns", "t_send_ns")
 
 
 class WriteRecord:
@@ -60,6 +72,18 @@ class WriteRecord:
             c._record_write_done = functools.partial(
                 self.record_write_done, c._record_write_done
             )
+            c.start_load_kv = functools.partial(self.start_load_kv, c.start_load_kv)
+            c._enqueue_write_requests = functools.partial(
+                self.enqueue_write_requests, c._enqueue_write_requests
+            )
+            c._send_on_socket = functools.partial(
+                self.send_on_socket, c._send_on_socket
+            )
+        # The worker's `start_load_kv` in progress: its receives, in the order
+        # it walks them, how many it has queued, and its entry.
+        self.loading = threading.local()
+        self.posted: dict = {}  # id(parts) -> (parts, request stamps), until sent
+        self.requested: dict = {}  # request id -> its write request's stamps
 
     def serve_write(self, call, request_data):
         keys = ("request_id", "transfer_id", "write_nonce")
@@ -111,20 +135,76 @@ class WriteRecord:
         key = (req_id, pp_rank, tp_rank, write_nonce)
         if key not in self.heard:  # the producer resends each write-done
             self.heard.add(key)
-            self.lines.append(
-                {
-                    "request_id": req_id,
-                    "pp_rank": pp_rank,
-                    "tp_rank": tp_rank,
-                    "write_nonce": write_nonce,
-                    "success": kwargs.get("success", True),
-                    "t_write_done_ns": received,
-                }
-            )
+            line = {
+                "request_id": req_id,
+                "pp_rank": pp_rank,
+                "tp_rank": tp_rank,
+                "write_nonce": write_nonce,
+                "success": kwargs.get("success", True),
+                "t_write_done_ns": received,
+            }
+            asked = self.requested.get(req_id)
+            # None: a landing request, whose nonce the receiver keeps.
+            if asked is not None and asked["write_nonce"] in (None, write_nonce):
+                asked["answered"] = True
+                line.update((k, asked[k]) for k in REQUEST_STAMPS)
+            self.lines.append(line)
         return call(req_id, pp_rank, tp_rank, write_nonce, **kwargs)
 
+    def start_load_kv(self, call, metadata):
+        receives = getattr(metadata, "reqs_to_recv", None)
+        if not receives:
+            return call(metadata)
+        loading = self.loading
+        loading.ids, loading.next, loading.t = list(receives), 0, self.clock()
+        try:
+            return call(metadata)
+        finally:
+            loading.ids = None
+
+    def enqueue_write_requests(self, call, write_requests):
+        loading = self.loading
+        ids = getattr(loading, "ids", None)
+        if ids is not None:
+            # `start_load_kv` queues each receive it takes, in its order, once
+            # it is pending; one it refuses is never pending.
+            pending = self.connector._pending_recv
+            while loading.next < len(ids) and ids[loading.next] not in pending:
+                loading.next += 1
+            if loading.next < len(ids):
+                req_id = ids[loading.next]
+                loading.next += 1
+                stamps = {
+                    "request_id": req_id,
+                    "write_nonce": self.connector._pending_recv_nonce.get(req_id),
+                    "t_load_ns": loading.t,
+                    "t_post_ns": self.clock(),
+                    "t_send_ns": [],
+                    "answered": False,
+                }
+                self.requested[req_id] = stamps
+                for _, parts in write_requests:
+                    self.posted[id(parts)] = (parts, stamps)
+        return call(write_requests)
+
+    def send_on_socket(self, call, addr, parts, *args, **kwargs):
+        posted = self.posted.pop(id(parts), None)
+        enter = self.clock()
+        reply = call(addr, parts, *args, **kwargs)
+        if posted is not None:
+            posted[1]["t_send_ns"].append([enter, self.clock()])
+        return reply
+
     def write(self) -> None:
-        """Append the lines kept so far to the file, flushed."""
+        """Append the lines kept so far to the file, flushed, and a line for
+        each write request no write-done has answered."""
+        for req_id, asked in list(self.requested.items()):
+            if not asked["answered"]:
+                self.lines.append(
+                    {"request_id": req_id, "write_nonce": asked["write_nonce"]}
+                    | {k: asked[k] for k in REQUEST_STAMPS}
+                )
+            del self.requested[req_id]
         lines, self.lines = self.lines, []
         self.file.write("".join(json.dumps(line) + "\n" for line in lines))
         self.file.flush()
