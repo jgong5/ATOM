@@ -91,7 +91,6 @@ UNSCANNED_ROOTS: tuple[tuple[str, str], ...] = (
             "atom_lmcache_staging.py",
             "dense/",
             "hybrid/",
-            "mooncake_store/",
         )
     ),
     (
