@@ -94,11 +94,14 @@ if [ "${#RUN[@]}" -gt 0 ]; then
     trap 'rm -rf "${HARNESS:-}" "$LOG"' EXIT
     python -m pytest tests/ "${IGN[@]}" -q --no-header -p no:cacheprovider "${DESEL[@]}" "$@" -rfs 2>&1 | tee "$LOG"
     RC=${PIPESTATUS[0]}
+    printf '\npytest: rc=%s\n' "$RC"
+    # A skip line names the file that raised it, so a helper's skip names the
+    # helper and a module-level skip in a deselected file names that file:
+    # this can name a file the change did not select, and never misses one.
     while IFS= read -r f; do
         NEED+=("$f: a test skipped for want of gate_gpu.sh's driver-run inputs")
     done < <(grep -E "$COMPASS_DRIVER_RUN_SKIP" "$LOG" | sed -E 's/^SKIPPED \[[0-9]+\] ([^:]+):.*/\1/' | sort -u)
 fi
-printf '\npytest: rc=%s\n' "$RC"
 [ "$RC" -eq 0 ] || finish "$RC" "pytest failed; the FAILED lines above name the tests"
 
 if [ "${#NEED[@]}" -gt 0 ]; then
