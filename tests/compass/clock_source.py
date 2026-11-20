@@ -188,11 +188,6 @@ CORE_ROOTS = tuple(
 _REPLACED_RUNNER = "the real model runner, which a simulated run replaces"
 _REPLACED_TRANSFER = "a transfer backend the simulator replaces with a priced one"
 _LOG_ONLY = "times real work for a log line; nothing in the simulated record reads it"
-_SAVE_LEASE = (
-    "a save lease's age, which only the base reclaim_stale_leases reads; the "
-    "lmcache_mp scheduler overrides it to release nothing, and every other "
-    "offload backend is refused"
-)
 _TRACE = (
     "a request's OpenTelemetry span times, exported only when tracing is "
     "configured; no simulated result reads them"
@@ -279,10 +274,6 @@ _KEPT_REAL = (
      "K9", _LOG_ONLY, 2),
     ("atom/kv_transfer/offload/chunked_scheduler.py", "build_connector_meta",
      "time.perf_counter", "K9", _LOG_ONLY, 2),
-    ("atom/kv_transfer/offload/chunked_scheduler.py", "activate_block_leases", "time.monotonic",
-     "K9", _SAVE_LEASE, 1),
-    ("atom/kv_transfer/offload/chunked_scheduler.py", "reclaim_stale_leases", "time.monotonic",
-     "K9", _SAVE_LEASE, 1),
     ("atom/kv_transfer/offload/dense/connector.py", "_do_load_req", "time.perf_counter",
      "K9", _REPLACED_TRANSFER, 4),
     ("atom/kv_transfer/offload/dense/connector.py", "_do_save_req", "time.perf_counter",
@@ -338,12 +329,10 @@ _KEPT_REAL = (
                 ("seconds", "monotonic", 1), ("seconds", "time", 1))),
             ("offload/mooncake_store/scheduler.py", (
                 ("_build_save_request", "monotonic", 1), ("_connect", "monotonic", 1),
-                ("_count_lookup", "monotonic", 1), ("_ensure_lookup_pin", "monotonic", 1),
-                ("_exists_on", "monotonic", 1), ("_fresh_tier_lookup", "monotonic", 1),
+                ("_count_lookup", "monotonic", 1), ("_exists_on", "monotonic", 1),
                 ("__init__", "monotonic", 1), ("lookup", "perf_counter", 2),
-                ("_may_emit_save", "monotonic", 1), ("_pause", "monotonic", 1),
-                ("_pools_to_ask", "monotonic", 1),
-                ("_retry_or_retire_failed_save", "monotonic", 1), ("_warn", "monotonic", 1))),
+                ("_pause", "monotonic", 1), ("_pools_to_ask", "monotonic", 1),
+                ("_warn", "monotonic", 1))),
             ("offload/mooncake_store/worker.py", (
                 ("_do_load_req", "perf_counter", 6), ("_do_save_req", "monotonic", 1),
                 ("_do_save_req", "perf_counter", 8), ("_maybe_log_store_stats", "monotonic", 1),
