@@ -303,9 +303,10 @@ import compass_harness, aiperf; print(aiperf.__file__, compass_harness.__file__)
     printf 'harness: %s\n' "$WHY"
 }
 
-# A SKIPPED line naming one of gate_gpu.sh's driver-run inputs: a driver-run
-# test that did not run for want of it.
-COMPASS_DRIVER_RUN_SKIP='^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK)_MODEL|ATOM_COMPASS_CCTRACES|COMPASS_AIPERF_PYTHON|atomesh)'
+# A SKIPPED line naming one of gate_gpu.sh's driver-run inputs, or the router it
+# puts on PATH: a driver-run test that did not run for want of it. The
+# alternation is tests/compass/driver_run_skips.py's DRIVER_RUN.
+COMPASS_DRIVER_RUN_SKIP='^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK|CCTRACES)|COMPASS_(HARNESS|AIPERF)_PYTHON|ATOMESH|needs atomesh|atomesh on PATH)'
 
 # PYTHONPATH is set to the tree and nothing else. Inherited entries are not
 # merged: an inherited entry ahead of ours is exactly how a take2 script silently
