@@ -68,6 +68,16 @@ and the squared error `F`; a fit at the limit keeps the vector it reached, the
 lowest `F` its passes found. A held-out
 step is priced and banded as its costliest rank.
 
+A calibration ladder's samples (`Sample.ladder`, the rungs its client run
+calibrates) join the decode vectors of those rungs only (`ladder_cut`): a
+ladder runs a decode instance under a load no deployment serves, so at a
+rung the other client runs fill, its steps would set the rung's price at the
+ladder's. On #3720's cell B the long-context ladder (`ldl` and `ldl2`: 252
+subagents on 18 shared prefixes, admitted at once and decoded down with no
+arrival) ran D's rung-16 steps 5-6% under the same deployment's c=64 point at
+the same summed context and MoE tokens; pooled with it, rung 16's vector
+priced the c=128 record's steps 7% low, and its TPOT 6.5% low.
+
 Records with a host key (`dp0.key.json`, from the real runner) also give the
 host laws as a run file's `host` entry: `key`, and `laws[kind][segment]`,
 seconds on `(1, tokens, seqs)`, fitted on the samples' host labels. They take
@@ -524,6 +534,25 @@ def _admit_rows(samples, host) -> list[tuple]:
         and (base := _host_price(host, host_kind(s.view), "E", _host_x(s), s.launch))
         is not None
     ]
+
+
+def ladder_cut(samples) -> tuple[list, dict]:
+    """`samples` less each decode of a calibration ladder's client run at a rung
+    it does not calibrate (`Sample.ladder`), and the report of what was left
+    out: per run, rung (`EAGER` for an eager step) to the samples left out."""
+    kept, cut = [], {}
+    for s in samples:
+        rung = s.view.capture_rung
+        if (
+            s.ladder is not None
+            and host_kind(s.view) == "decode"
+            and rung not in s.ladder
+        ):
+            at = cut.setdefault(s.provenance["run"], {})
+            at[_rung_key(rung)] = at.get(_rung_key(rung), 0) + 1
+            continue
+        kept.append(s)
+    return kept, cut
 
 
 def records_atom(samples) -> str | None:

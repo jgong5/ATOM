@@ -45,6 +45,13 @@ warns on stderr naming them (`step_linear_fit.filled_warning`). The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
 
+`--ladder-run RECORD EXPORT RUNGS` names one more client run RECORD's server
+served, a calibration ladder that calibrates the decode rungs RUNGS (comma
+separated): it is served and graded as a `--client-run` is, and its decode
+steps at any other rung give no sample (`step_linear_fit.ladder_cut`); the
+report counts them, per run and rung, under `ladder`. Only `step-linear`
+reads it.
+
 `step-grid` plans again over `--grid`'s inputs, record directories and
 `shape_population` tokens, and over its ragged targets, with the nodes and
 margin `--grid-definition` states, as `measure steps` plans, and reads each
@@ -125,6 +132,7 @@ def _model_routing(
 
 def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     form = args.form or "history"
+    samples, ladder = step_linear_fit.ladder_cut(samples)
     options = {"form": form, "dp": step_linear_fit.join_width(config["engine_config"])}
     options["moe_routing"] = args.moe_routing or (
         args.model and _model_routing(args.model, config["model"])
@@ -145,6 +153,11 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     if warning := step_linear_fit.filled_warning(law):
         print(warning, file=sys.stderr)
     report["provenance"] = publish.runs(samples)
+    if args.ladder_run:
+        report["ladder"] = {
+            "runs": [[r, e, list(rungs)] for r, e, rungs in args.ladder_run],
+            "left_out": ladder,
+        }
     law["platform"] = keyed_platform(Kind.STEP_LINEAR_LAW, config["platform"])
     law["engine_config"] = config["engine_config"]
     if atom := step_linear_fit.records_atom(samples):
@@ -208,6 +221,21 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
     return {**grid_key, "grid": grid["grid"]}, bundle, report
 
 
+def _rungs(word: str) -> tuple[int, ...]:
+    """The decode rungs `--ladder-run`'s RUNGS names, comma separated, each a
+    positive whole number, once."""
+    try:
+        rungs = [int(w) for w in word.split(",")]
+    except ValueError:
+        rungs = []
+    if not rungs or min(rungs) < 1 or len(set(rungs)) != len(rungs):
+        raise ValueError(
+            f"--ladder-run RUNGS {word!r}: name the decode rungs it calibrates, "
+            "comma separated, e.g. 24,32,48,64"
+        )
+    return tuple(sorted(rungs))
+
+
 #: Each backend's name, to the kind it publishes, its label sources and its fit.
 BACKENDS = {
     "step-linear": (Kind.STEP_LINEAR_LAW, ("record",), _step_linear),
@@ -219,6 +247,7 @@ OWN = {
     "cold_peer_rows": "step-linear",
     "moe_routing": "step-linear",
     "model": "step-linear",
+    "ladder_run": "step-linear",
     "grid": "step-grid",
     "grid_definition": "step-grid",
     "sessions": "step-grid",
@@ -265,6 +294,15 @@ def main(argv: list[str]) -> None:
         help="the prefill vector adds cold_peer_rows: its peers' MoE rows on a "
         "step outside a stretch of prefill steps (data-parallel records only)",
     )
+    parser.add_argument(
+        "--ladder-run",
+        nargs=3,
+        action="append",
+        metavar=("RECORD", "EXPORT", "RUNGS"),
+        help="a client run RECORD's server served as a calibration ladder, by its "
+        "export, and the decode rungs it calibrates (comma separated); its decode "
+        "steps at any other rung give no sample",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--ops",
@@ -286,6 +324,10 @@ def main(argv: list[str]) -> None:
             raise ValueError(
                 f"--{flag.replace('_', '-')} is read by {owner}, not {args.backend}"
             )
+    if args.ladder_run:
+        args.ladder_run = [
+            (record, export, _rungs(rungs)) for record, export, rungs in args.ladder_run
+        ]
     if args.backend == "step-grid" and not (args.grid and args.grid_definition):
         raise ValueError(
             "step-grid plans over --grid INPUT... with the nodes and margin "

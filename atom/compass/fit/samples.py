@@ -36,6 +36,12 @@ the same record. A sample's `dummy_host`, its rank's dummy forwards at a step
 its group prefills, is cut to the same steps. Its host laws' tokenizer, intake
 and hop terms still read the record's whole stamp files.
 
+A record's client run named as a calibration ladder (`load`'s `ladders`,
+`compass fit steps --ladder-run`) is served and graded as any other; each
+sample of a step within its span (`client_spans`) holds as its `ladder` the
+decode rungs the ladder calibrates, which the step linear fit reads
+(`step_linear_fit.ladder_cut`). Every other sample's `ladder` is None.
+
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
 does (`rows`, `rung`, `produces_output`, and `group_needs_eager` where the
@@ -109,20 +115,32 @@ UNRECORDED = "unrecorded"
 
 
 def load(
-    records: Mapping, measurements: Sequence = (), store=None, floored=None, engine=None
+    records: Mapping,
+    measurements: Sequence = (),
+    store=None,
+    floored=None,
+    engine=None,
+    ladders: Mapping | None = None,
 ) -> tuple[list[Sample], dict]:
     """The samples of `records`, {record directory: the client runs its server
     served}, labelled under `floored`, and of the `measurements` keys in the
     store at `store`, in run digest, DP rank and step order; and the
     configuration they state, the records' under the engine file `engine`, and
-    each engine config at the longest ladder among them (`pooled`)."""
+    each engine config at the longest ladder among them (`pooled`). `ladders`
+    maps a record directory to {index of a client run in its list: the decode
+    rungs that client run, a calibration ladder, calibrates}."""
     samples, configs, held = [], {}, {}
     if engine is not None:
         owns = {d: Path(d) / "steps" / "dp0.engine.json" for d in records}
         held = pooled({d: keyed_of(json.loads(o.read_text())) for d, o in owns.items()})
     for directory, client_runs in records.items():
         got, configs[str(directory)] = _record(
-            Path(directory), client_runs, floored, engine, held.get(directory)
+            Path(directory),
+            client_runs,
+            floored,
+            engine,
+            held.get(directory),
+            (ladders or {}).get(directory),
         )
         samples += got
     for key in measurements:
@@ -144,7 +162,7 @@ def load(
 
 
 def _record(
-    directory: Path, client_runs, floored=None, stated=None, held=None
+    directory: Path, client_runs, floored=None, stated=None, held=None, ladder=None
 ) -> tuple[list[Sample], dict]:
     run = json.loads((directory / "run.json").read_text())
     if run["format_version"] != FORMAT_VERSION:
@@ -173,6 +191,13 @@ def _record(
             f"{steps} holds {ARRIVALS}, so its steps are not numbered as its lines"
         )
     record = served(steps, client_runs)
+    spans = client_spans(record)
+    # Each step within a calibration ladder's span, to the rungs it calibrates.
+    laddered = {
+        n: tuple(sorted(rungs))
+        for k, rungs in (ladder or {}).items()
+        for n in range(spans[k][0], spans[k][1] + 1)
+    }
     graded = graded_to = None
     seconds = os.environ.get(GRADED_SECONDS_ENV)
     if seconds and os.environ.get(GRADED_ONLY_ENV) != "1":
@@ -222,7 +247,12 @@ def _record(
                 graphs = {k: v for k, v in key["engine"].items() if k == GRAPHS}
                 traced["config"] = {**key, "engine": engine | graphs}
             samples.append(
-                dataclasses.replace(s, provenance=traced, dummy_host=dummies)
+                dataclasses.replace(
+                    s,
+                    provenance=traced,
+                    dummy_host=dummies,
+                    ladder=laddered.get(s.step),
+                )
             )
     host = run["host_key"]
     return samples, {
@@ -271,19 +301,26 @@ def _steps(record: dict) -> list[dict]:
     return [s for steps in record.values() for s in steps]
 
 
-def graded_steps(record: dict) -> frozenset[int]:
-    """The steps of `record`, as `parity.served` splits it, within some client
-    run's graded span: from the first step in which some DP rank holds one of
-    its sent requests to the last, whatever those in between hold."""
+def client_spans(record: dict) -> dict[int, tuple[int, int]]:
+    """Each client run's graded span in `record`, as `parity.served` splits it,
+    by its index: the first and last step in which some DP rank holds one of
+    its sent requests."""
     spans: dict[int, tuple[int, int]] = {}
     for s in _steps(record):
         if (k := s["client_run"]) is not None:
             first, last = spans.get(k, (s["step"], s["step"]))
             spans[k] = (min(first, s["step"]), max(last, s["step"]))
+    return spans
+
+
+def graded_steps(record: dict) -> frozenset[int]:
+    """The steps of `record`, as `parity.served` splits it, within some client
+    run's graded span (`client_spans`), whatever those in between hold."""
+    spans = client_spans(record).values()
     return frozenset(
         s["step"]
         for s in _steps(record)
-        if any(first <= s["step"] <= last for first, last in spans.values())
+        if any(first <= s["step"] <= last for first, last in spans)
     )
 
 

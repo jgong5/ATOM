@@ -28,7 +28,13 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.step_labels import digest, label
 from atom.compass.fit.publish import platform
-from atom.compass.fit.samples import GRADED_ONLY_ENV, MEMBER, graded_steps, load
+from atom.compass.fit.samples import (
+    GRADED_ONLY_ENV,
+    MEMBER,
+    client_spans,
+    graded_steps,
+    load,
+)
 from atom.compass.parity import ARRIVALS
 from atom.compass.parity.served import served
 from atom.compass.run.step_grid import keyed_of
@@ -420,3 +426,34 @@ def test_the_graded_steps_are_each_client_run_s_span_whatever_its_steps_hold():
         1: [line(n, None) for n in range(6)] + [line(6, 1, "b"), line(7, None)],
     }
     assert graded_steps(record) == {1, 2, 3, 6}
+
+
+def test_a_ladder_client_run_s_samples_state_the_rungs_it_calibrates(
+    tmp_path, monkeypatch
+):
+    # Three groups served one after another; the second client run, sending the
+    # last group, is a calibration ladder of rungs 2 and 4.
+    a = record(tmp_path, monkeypatch, groups=((0, 1), (2, 3), (4, 5)))
+    runs = [client_run([0, 1]), client_run([4, 5])]
+    every, config = load({a: runs})
+    first, last = client_spans(served(a / "steps", runs))[1]
+
+    laddered, laddered_config = load({a: runs}, ladders={a: {1: (4, 2)}})
+    assert laddered_config == config
+    assert [dataclasses.replace(s, ladder=None) for s in laddered] == every
+    within = {s.step for s in every if first <= s.step <= last}
+    assert within and within < {s.step for s in every}
+    assert {s.step for s in laddered if s.ladder == (2, 4)} == within
+    assert all(s.ladder is None for s in laddered if s.step not in within)
+    assert all(s.ladder is None for s in every)
+
+
+def test_each_client_run_s_span_runs_from_its_first_step_to_its_last():
+    def line(step, client_run):
+        return {"step": step, "client_run": client_run, "batch": []}
+
+    record = {
+        0: [line(0, None), line(1, 0), line(2, None), line(3, 0), line(4, 1)],
+        1: [line(0, None), line(1, None), line(2, None), line(3, None), line(4, 1)],
+    }
+    assert client_spans(record) == {0: (1, 3), 1: (4, 4)}

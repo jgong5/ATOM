@@ -523,3 +523,67 @@ def test_a_record_whose_server_built_an_aiter_module_refuses_naming_it(tmp_path)
     with pytest.raises(SystemExit, match=re.escape(named)):
         fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
     assert not (tmp_path / "store").exists()
+
+
+def _rung_lines(directory, rungs) -> int:
+    """The decode lines of `directory`'s record at a rung of `rungs`."""
+    lines = (directory / "steps/dp0.jsonl").read_text().splitlines()
+    return sum(
+        1
+        for line in map(json.loads, lines)
+        if line["rows"] and all(r[2] for r in line["rows"]) and line["rung"] in rungs
+    )
+
+
+def test_a_ladder_run_s_decodes_join_only_the_rungs_it_calibrates(tmp_path):
+    a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
+    ladder = ("--ladder-run", b, b / "client.json", "4")
+    fit(tmp_path / "x", "fit steps", *LINEAR, a, b, *clients(a), *ladder)
+    fit(tmp_path / "y", "fit steps", *LINEAR, a, b, *clients(a, b))
+    fit(tmp_path / "z", "fit steps", *LINEAR, a, *clients(a))
+
+    laddered, report = (
+        member(tmp_path / "x/store", law_key(), m) for m in ("params", "report")
+    )
+    both = member(tmp_path / "y/store", law_key(), "params")
+    alone = member(tmp_path / "z/store", law_key(), "params")
+    StepLinearLaw(laddered)
+    # Rung 4 takes both records' decodes; rung 2 and the eager decodes a's alone.
+    assert _rung_lines(b, (2, None)) and _rung_lines(b, (4,))
+    assert (
+        laddered["decode"]["4"]["coefficients"] == both["decode"]["4"]["coefficients"]
+    )
+    for rung in ("2", step_linear_fit.EAGER):
+        coefficients = laddered["decode"][rung]["coefficients"]
+        assert coefficients == alone["decode"][rung]["coefficients"]
+        assert coefficients != both["decode"][rung]["coefficients"]
+    run = digest(b / "steps/dp0.jsonl")
+    assert report["ladder"] == {
+        "runs": [[str(b), str(b / "client.json"), [4]]],
+        "left_out": {
+            run: {
+                "2": _rung_lines(b, (2,)),
+                step_linear_fit.EAGER: _rung_lines(b, (None,)),
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "backend, rungs, named",
+    [
+        ("step-grid", "4", "--ladder-run is read by step-linear, not step-grid"),
+        ("step-linear", "4,x", "--ladder-run RUNGS '4,x': name the decode rungs"),
+        ("step-linear", "4,4", "--ladder-run RUNGS '4,4': name the decode rungs"),
+        ("step-linear", "0", "--ladder-run RUNGS '0': name the decode rungs"),
+    ],
+)
+def test_a_ladder_run_refuses_off_step_linear_and_naming_no_rungs(
+    tmp_path, backend, rungs, named
+):
+    a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
+    ladder = ("--ladder-run", b, b / "client.json", rungs)
+
+    with pytest.raises(SystemExit, match=re.escape(named)):
+        fit(tmp_path, "fit steps", "--backend", backend, a, b, *clients(a), *ladder)
+    assert not (tmp_path / "store").exists()

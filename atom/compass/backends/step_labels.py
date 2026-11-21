@@ -246,6 +246,9 @@ class Sample:
     prefills, ``(step, view, host, launch)``: its view, its host segments in
     seconds and its line's launch features (`_dummy_hosts`); the same tuple on
     each of the rank's samples, empty on a trace run.
+    `ladder` holds the decode rungs a calibration ladder's client run calibrates,
+    on a step within that client run's graded span (`fit.samples.load`); None on
+    any other step, and wherever a record is labelled without its client runs.
     """
 
     step: int
@@ -266,6 +269,7 @@ class Sample:
     floor: dict = field(default_factory=dict)
     passes_s: tuple | None = None
     dummy_host: tuple = ()
+    ladder: tuple | None = None
 
 
 class Floor:
