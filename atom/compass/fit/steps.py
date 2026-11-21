@@ -48,9 +48,9 @@ coefficients are stated, not fitted, so `step-stub` refuses.
 `--ladder-run RECORD EXPORT RUNGS` names one more client run RECORD's server
 served, a calibration ladder that calibrates the decode rungs RUNGS (comma
 separated): it is served and graded as a `--client-run` is, and its decode
-steps at any other rung give no sample (`step_linear_fit.ladder_cut`); the
-report counts them, per run and rung, under `ladder`. Only `step-linear`
-reads it.
+steps at any other rung give no sample, nor do its prefill steps
+(`step_linear_fit.ladder_cut`); the report counts them, per run and rung or
+step kind, under `ladder`. Only `step-linear` reads it.
 
 `step-grid` plans again over `--grid`'s inputs, record directories and
 `shape_population` tokens, and over its ragged targets, with the nodes and

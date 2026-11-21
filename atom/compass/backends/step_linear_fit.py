@@ -76,7 +76,13 @@ ladder's. On #3720's cell B the long-context ladder (`ldl` and `ldl2`: 252
 subagents on 18 shared prefixes, admitted at once and decoded down with no
 arrival) ran D's rung-16 steps 5-6% under the same deployment's c=64 point at
 the same summed context and MoE tokens; pooled with it, rung 16's vector
-priced the c=128 record's steps 7% low, and its TPOT 6.5% low.
+priced the c=128 record's steps 7% low, and its TPOT 6.5% low. A ladder's
+prefills, final and middle chunks, join no vector: a ladder admits its
+requests at once on a few shared prefixes, a prefill load no deployment
+serves. Cell B's `ldl` / `ldl2` prefills (162 steps of 8192+ tokens, 113 s)
+ran 11-14% under the law fitted on its live points; pooled into the one
+prefill vector they priced r256's c=256 prefill steps 4.1% low (1.2% without
+them), and its simulated TTFT p50 3 points lower.
 
 Records with a host key (`dp0.key.json`, from the real runner) also give the
 host laws as a run file's `host` entry: `key`, and `laws[kind][segment]`,
@@ -537,19 +543,18 @@ def _admit_rows(samples, host) -> list[tuple]:
 
 
 def ladder_cut(samples) -> tuple[list, dict]:
-    """`samples` less each decode of a calibration ladder's client run at a rung
-    it does not calibrate (`Sample.ladder`), and the report of what was left
-    out: per run, rung (`EAGER` for an eager step) to the samples left out."""
+    """`samples` less each of a calibration ladder's client run (`Sample.ladder`)
+    but its decodes at the rungs it calibrates: its decodes at any other rung
+    and its prefills, middle chunks too; and the report of what was left out:
+    per run, rung (`EAGER` for an eager step) or `host_kind` of a step that
+    is no decode, to the samples left out."""
     kept, cut = [], {}
     for s in samples:
-        rung = s.view.capture_rung
-        if (
-            s.ladder is not None
-            and host_kind(s.view) == "decode"
-            and rung not in s.ladder
-        ):
+        rung, kind = s.view.capture_rung, host_kind(s.view)
+        if s.ladder is not None and (kind != "decode" or rung not in s.ladder):
             at = cut.setdefault(s.provenance["run"], {})
-            at[_rung_key(rung)] = at.get(_rung_key(rung), 0) + 1
+            key = _rung_key(rung) if kind == "decode" else kind
+            at[key] = at.get(key, 0) + 1
             continue
         kept.append(s)
     return kept, cut

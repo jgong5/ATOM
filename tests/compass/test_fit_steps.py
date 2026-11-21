@@ -535,7 +535,22 @@ def _rung_lines(directory, rungs) -> int:
     )
 
 
-def test_a_ladder_run_s_decodes_join_only_the_rungs_it_calibrates(tmp_path):
+def _prefill_lines(directory, output: bool) -> int:
+    """The prefill lines of `directory`'s record that produce output (a final
+    chunk) when `output`, else its middle chunks."""
+    lines = (directory / "steps/dp0.jsonl").read_text().splitlines()
+    return sum(
+        1
+        for line in map(json.loads, lines)
+        if line["rows"]
+        and not all(r[2] for r in line["rows"])
+        and line["produces_output"] == output
+    )
+
+
+def test_a_ladder_run_s_decodes_join_only_the_rungs_it_calibrates_and_its_prefills_none(
+    tmp_path,
+):
     a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
     ladder = ("--ladder-run", b, b / "client.json", "4")
     fit(tmp_path / "x", "fit steps", *LINEAR, a, b, *clients(a), *ladder)
@@ -557,6 +572,11 @@ def test_a_ladder_run_s_decodes_join_only_the_rungs_it_calibrates(tmp_path):
         coefficients = laddered["decode"][rung]["coefficients"]
         assert coefficients == alone["decode"][rung]["coefficients"]
         assert coefficients != both["decode"][rung]["coefficients"]
+    # The ladder's prefills, final and middle chunks, join no vector: a's alone.
+    assert _prefill_lines(b, True) and _prefill_lines(b, False)
+    prefill = laddered["prefill"]["coefficients"]
+    assert prefill == alone["prefill"]["coefficients"]
+    assert prefill != both["prefill"]["coefficients"]
     run = digest(b / "steps/dp0.jsonl")
     assert report["ladder"] == {
         "runs": [[str(b), str(b / "client.json"), [4]]],
@@ -564,6 +584,8 @@ def test_a_ladder_run_s_decodes_join_only_the_rungs_it_calibrates(tmp_path):
             run: {
                 "2": _rung_lines(b, (2,)),
                 step_linear_fit.EAGER: _rung_lines(b, (None,)),
+                "prefill": _prefill_lines(b, True),
+                "middle": _prefill_lines(b, False),
             }
         },
     }
