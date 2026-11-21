@@ -33,7 +33,14 @@ HEADS = {
 
 
 def _gate(
-    tmp_path, shards, failing=(), excluded=(), args="", rest=(), rest_shards=None, table=None
+    tmp_path,
+    shards,
+    failing=(),
+    excluded=(),
+    args="",
+    rest=(),
+    rest_shards=None,
+    table=None,
 ):
     root = _tree(tmp_path / "ATOM", stamped=True)
     ran = root / "ran"
@@ -126,9 +133,7 @@ REST = ["test_r1", "test_r2", "sub/test_r3"]
 
 
 @pytest.mark.parametrize("rest_shards", [None, 1, 2, 4])
-def test_every_rest_file_runs_once_apart_from_every_compass_file(
-    tmp_path, rest_shards
-):
+def test_every_rest_file_runs_once_apart_from_every_compass_file(tmp_path, rest_shards):
     out, pids = _gate(tmp_path, 2, rest=REST, rest_shards=rest_shards)
     assert out.returncode == 98, out.stdout + out.stderr
     assert "pytest: rc=0" in out.stdout, out.stdout
