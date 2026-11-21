@@ -178,7 +178,7 @@ suite checks.
    straggler detector and the cost-backend interface are all testable without a device.
    Those tests are the 74 in the decomposition above.
 4. **The CPU gate refuses rather than reporting "not required" (principle 6).** Green at the
-   CPU gate is not green for the task when the diff lands in what the CPU gate cannot see. That
+   CPU gate is not green for the batch when the diff lands in what the CPU gate cannot see. That
    blind spot is a file, not a sentence: `scripts/compass/gpu_gate_triggers.txt`, **30 paths**,
    generated rather than hand-written — the counts in its own header included. The rule:
    an `atom` module named by an excluded test is a blind spot unless a CPU-gate test that

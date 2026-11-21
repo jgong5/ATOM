@@ -361,7 +361,7 @@ both carried, "32 files reach the driver, 28 of them at collection time via `roc
 joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* suite,
 `tests/plugin/` included (25 + 3), and was attached to a non-plugin set of 32.
 
-- **Per task — the CPU gate, re-measured by P0.1 and superseding the counts above.**
+- **The CPU gate, re-measured by P0.1 and superseding the counts above.**
   `tests/` minus `tests/plugin/` (30 files) minus the 29 driver-dependent files in
   `scripts/compass/cpu_gate_exclude.txt`, driven by `scripts/compass/gate_cpu.sh`:
   **130 of the 189 test files at `105ca4197`, 4030 passed, 0 failed, 149 skipped, 3 xfailed,
@@ -389,7 +389,7 @@ joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* sui
   128-file gate whose 149 skips were 68 distinct reasons: 66 skipped tests name a device, 83
   do not. Both carry to `105ca4197`: its `tests/` and code differ from `b963c9411`'s only by
   the two `tests/compass/` files above, which collect tests and skip none.
-- **Per wave — the GPU superset, re-measured by P0.1.** `tests/ --ignore=tests/plugin` in the
+- **The GPU superset, re-measured by P0.1.** `tests/ --ignore=tests/plugin` in the
   GPU container, driven by `scripts/compass/gate_gpu.sh`, judged as a **delta**, never as
   "green". The baseline is **4779 passed / 5 failed**, 0 errors, 105 skipped, 3 xfailed,
   72.6 s, measured 2026-09-20 at `fe9ea043c` on node 18 in `xiaobizh_n18` with
@@ -490,10 +490,11 @@ are read as text, not resolved as a graph, so a transitive import, an `importlib
 re-export is invisible. A path *absent* from `gpu_gate_triggers.txt` is not a claim that the
 CPU gate covers it, and a path *present* is not proof that it does not. Of the two mistakes
 this gate prefers the first, because running the GPU gate when in doubt is never the wrong
-one. Judging that a change sits outside the blind spot remains the task's own call.
+one. Judging that a change sits outside the blind spot remains its reviewer's call.
 
-**A task touching EPLB, CUDA-graph capture bounds, block tables, the paged index builders or
-the prefix-cache kernels runs the GPU superset as part of its own gate, not at wave end.**
+**A change touching EPLB, CUDA-graph capture bounds, block tables, the paged index builders or
+the prefix-cache kernels lands in a batch of its own, and its lander runs `gate_gpu.sh` on the
+batch commit.**
 That is where the files running nothing here concentrate — 29 excluded plus 22 exercising
 nothing, 51 in all; the silent 22 include `test_pool_index.py`,
 `test_prefill_indices_paged.py`, `test_decode_indices_paged.py`, `test_postprocess_width.py`
