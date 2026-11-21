@@ -271,7 +271,7 @@ def test_the_surface_is_every_dispatched_name_a_model_runner_answers():
     `ModelRunner` are exactly this intersection -- no list, no judgement.
     """
     assert set(RPC_SURFACE) == set(SITES) & BASE
-    assert len(RPC_SURFACE) == 17
+    assert len(RPC_SURFACE) == 18
 
 
 def test_both_filters_in_the_derivation_drop_nothing():
@@ -990,6 +990,7 @@ def test_the_names_no_caller_waits_for_and_what_replying_costs():
         "poll_forward_metrics",
         "process_kvconnector_output",
         "release_multimodal_requests",
+        "release_structured_requests",
     }
     bodies = {
         n.name: n
@@ -1000,6 +1001,7 @@ def test_the_names_no_caller_waits_for_and_what_replying_costs():
         "poll_forward_metrics",
         "process_kvconnector_output",
         "release_multimodal_requests",
+        "release_structured_requests",
     ):
         returns = [n for n in ast.walk(bodies[name]) if isinstance(n, ast.Return)]
         assert not [n for n in returns if n.value], name
@@ -1066,11 +1068,16 @@ def test_what_a_hole_at_exit_loses_is_what_exit_does():
         for n in ast.walk(_classes(ATOM_RUNNER)["ModelRunner"])
         if isinstance(n, ast.FunctionDef) and n.name == "exit"
     )
-    # Statements of the body itself: a call inside a lambda, a branch or a
-    # nested def is one `exit` may never make.
+    # Statements of the body itself, and of a `finally` it holds, which runs
+    # whatever the `try` did: a call inside a lambda, a branch or a nested def
+    # is one `exit` may never make.
+    statements = [
+        *body.body,
+        *(n for t in body.body if isinstance(t, ast.Try) for n in t.finalbody),
+    ]
     calls = {
         ast.unparse(n.value.func)
-        for n in body.body
+        for n in statements
         if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
     }
     assert {"destroy_dist_env", "torch.cuda.empty_cache"} <= calls

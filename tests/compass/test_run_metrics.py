@@ -267,9 +267,10 @@ def _engine(files, started, side, loop):
     worker, another = (values.MultiProcessValue(lambda p=p: p) for p in (WORKER, OTHER))
     with _process(worker):
         gpu = GPUForwardMetrics(_Event)
+    # The request-context gauges are opt-in upstream (--enable-request-context-metrics).
     with _process(another):
-        other = SchedulerMetrics(7)
-    scheduler = SchedulerMetrics(0)
+        other = SchedulerMetrics(7, request_context_enabled=True)
+    scheduler = SchedulerMetrics(0, request_context_enabled=True)
     unclassified = Gauge("atom:unclassified", "No class.", registry=None)
     RequestMetrics(None), StreamMetrics(None)
     rt = started("engine", side)

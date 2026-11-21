@@ -171,6 +171,7 @@ RPC_SURFACE: dict[str, bool] = {
     # Reached only after a fit, so never: ATOM's own.
     "take_dynamic_chunking_fit": True,  # EngineCore reads the reply
     "release_multimodal_requests": False,  # EngineCore does not wait
+    "release_structured_requests": False,  # EngineCore does not wait
     # Refused by `RefusedControlCommands`: ATOM's own starts a real profiler.
     "start_profiler": True,  # EngineUtilityHandler forwards the reply unread
     "stop_profiler": True,  # EngineUtilityHandler forwards the reply unread
@@ -1809,11 +1810,11 @@ class NonAllocatingRunner(
             # control, and `self.config` is what this reads. The ids are vetted
             # against the tokenizer the frontend serves with, loaded the same
             # way.
-            from atom.model_engine.llm_engine import _load_tokenizer
+            from atom.model_engine.llm_engine import load_tokenizer
 
             model = _config_field(self, "model")
             fillers = filler_token_ids(
-                _load_tokenizer(model, _config_field(self, "trust_remote_code")),
+                load_tokenizer(model, _config_field(self, "trust_remote_code")),
                 _config_field(self, "eos_token_id"),
                 _config_field(self, "stop_token_ids"),
             )

@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import re
+import struct
 import subprocess
 import sys
 
@@ -86,7 +87,9 @@ def _decode_moes(tmp_path_factory, atom_args=(), env=None):
     config = json.loads(CONFIG.read_text())
     config["num_hidden_layers"], config["first_k_dense_replace"] = 4, 1
     (root / "model" / "config.json").write_text(json.dumps(config))
-    (root / "model" / "model-00001-of-00001.safetensors").write_bytes(b"not a shard")
+    # A shard that holds no tensor: ATOM reads its header, and loads nothing.
+    shard = root / "model" / "model-00001-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", 2) + b"{}")
     command = ["trace", "ops", "--model", str(root / "model"), "--tp", "8"]
     command += ["--width", "4", "--arch", "gfx950", "--store", str(root / "store")]
     command += ["--", "--kv_cache_dtype", "fp8", "--enable-dp-attention", *atom_args]

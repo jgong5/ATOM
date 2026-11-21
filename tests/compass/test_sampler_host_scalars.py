@@ -116,6 +116,7 @@ def test_prepare_sample_hands_over_a_shared_k_and_p_as_host_scalars():
         "temperatures": CpuGpuBuffer(4, dtype=torch.float, **kw),
         "top_ks": CpuGpuBuffer(4, dtype=torch.int32, **kw),
         "top_ps": CpuGpuBuffer(4, dtype=torch.float, **kw),
+        "required_channel_states": CpuGpuBuffer(4, dtype=torch.int32, **kw),
     }
     # The rows each step uploads, by buffer: None is a buffer left on the host.
     published = []
@@ -141,6 +142,7 @@ def test_prepare_sample_hands_over_a_shared_k_and_p_as_host_scalars():
             temperatures=np.ones(len(top_ks), dtype=np.float32),
             top_ks=np.asarray(top_ks, dtype=np.int32),
             top_ps=np.asarray(top_ps, dtype=np.float32),
+            required_channel=None,
         )
 
     _, top_ks, top_ps, _, _ = runner.prepare_sample(batch([20], [0.95]))
@@ -150,7 +152,8 @@ def test_prepare_sample_hands_over_a_shared_k_and_p_as_host_scalars():
     _, top_ks, top_ps, _, _ = runner.prepare_sample(batch([20, 40], [0.95, 0.95]))
     assert top_ks.tolist() == [20, 40]
     assert type(top_ps) is float
+    none = {"required_channel_states": None}  # no request names a channel
     assert published == [
-        {"temperatures": 1, "top_ks": None, "top_ps": None},
-        {"temperatures": 2, "top_ks": 2, "top_ps": None},
+        {"temperatures": 1, "top_ks": None, "top_ps": None, **none},
+        {"temperatures": 2, "top_ks": 2, "top_ps": None, **none},
     ]

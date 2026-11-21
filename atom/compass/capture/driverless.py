@@ -489,6 +489,13 @@ def group(tp: int, dp: int) -> dict:
     }
 
 
+def uncached_bytes(nbytes, device):
+    """A mono runner's uncached scratch, of the size it asks for, on the
+    declared device: a plain tensor, since a capture reads no value through
+    it and every rank of a capture is this one."""
+    return torch.empty(nbytes, dtype=torch.uint8, device=device)
+
+
 class PeerBuffer(peer_memory.PeerBuffer):
     """A mono runner's peer buffer of the sizes it asks for, on the declared
     device: no IPC heap and no handle exchange, since every rank of a capture
