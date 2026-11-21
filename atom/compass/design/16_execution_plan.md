@@ -332,8 +332,8 @@ question, not an engineering one.
 P0.2's result, and the reason the agents' original test gate cannot be run as written.
 That gate, `08` D43.1 and ATOM's own `CLAUDE.md` all assert the same thing — that the
 187-file suite under `tests/` runs GPU-free and green — and P0.2 measured both halves
-false. What is GPU-free is the **CPU gate**, run per task; the rest is the GPU gate, a superset, run per
-wave as a delta. Re-derived on 2026-09-20 after review: the first derivation iterated
+false. What is GPU-free is the **CPU gate**, run per landing batch; the rest is the GPU gate, a superset,
+run on a batch that touches a trigger and daily by hand, as a delta. Re-derived on 2026-09-20 after review: the first derivation iterated
 *whole-suite collection* to a fixed point, which measures a property of the collection
 order, not of the files.
 

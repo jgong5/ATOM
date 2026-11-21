@@ -65,7 +65,8 @@ own `gh` login. Ownership is the assignee:
   git command that writes files (worktree add, fetch into a branch, merge,
   checkout) and check nothing is left.
 - **The CPU gates run in a CPU environment with no GPU driver**:
-  `gate_targeted.sh`, the task gate, at each round's head, and
+  `gate_targeted.sh`, the task gate, at each round's head (by default;
+  with `ATOM_COMPASS_SLICE_MODEL` set it runs in the GPU container), and
   `gate_cpu.sh`, the batch gate, on the batch commit before landing
   (`land.md`, Land a batch), each on a `scripts/compass/snapshot.sh`
   tarball of its tree (`scripts/compass/README.md`). A red `gate_cpu.sh` is

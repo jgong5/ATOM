@@ -208,7 +208,7 @@ suite checks.
    which of the two mistakes to prefer — running the GPU gate when in doubt is never the wrong one — and the asymmetry
    above is that preference written down. Cite it that way wherever it is cited.
 
-`16` states the same rule as the per-task gate, under its measured test and lint
+`16` states the same rule as the CPU gate, under its measured test and lint
 baselines; the two must be amended together.
 
 **Baseline caveat.** Take each gate's *current* pass/fail state as the baseline before the
