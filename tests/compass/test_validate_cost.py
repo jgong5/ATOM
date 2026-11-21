@@ -265,6 +265,28 @@ def test_a_leading_slow_step_is_judged_by_the_law_s_scatter_not_the_record_s(
     assert [w["step"] for w in cost_accuracy(record, law)["warm"]] == [0]
 
 
+def test_a_record_the_law_prices_low_throughout_leads_no_warm_step(tmp_path):
+    # Every decode step ran 8% over its price, the law fitted on a 1% scatter:
+    # against the fit's centre each one leads slow, against this record's own
+    # median none does. Only a stretch slower than the rest still leads warm.
+    steps = _steps()
+    law = json.loads(json.dumps(LAW))
+    for vector in law["decode"].values():
+        vector["fit"] = {"centre": 0.0, "mad": 0.01}
+    decodes = [i for i, (rows, _) in enumerate(steps) if rows[0][2]]
+    record = _record(tmp_path / "steps", steps, dict.fromkeys(decodes, 1.08))
+    report = cost_accuracy(record, law)
+
+    assert report["warm"] == []
+    graded = report["graded"]["decode"]
+    assert graded["steps"] == len(decodes)
+    assert graded["on_totals"] == pytest.approx(1 / 1.08 - 1, rel=1e-6)
+
+    lead = dict.fromkeys(decodes, 1.08) | {decodes[0]: 1.3}
+    record = _record(tmp_path / "lead", steps, lead)
+    assert [w["step"] for w in cost_accuracy(record, law)["warm"]] == decodes[:1]
+
+
 def _grid(wrapped):
     """`_steps()`'s step grid, bare or the first backend of a fallback."""
     from test_validate_step_grid import _bundle  # it imports this module

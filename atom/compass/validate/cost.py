@@ -39,7 +39,11 @@ whole-group pause (`validate.stalls`): it is named with its seconds and enters n
 under a law or an op graph, the steps that lead a vector's priced steps, each
 slower than its price by more than `step_linear_fit.MAD_K` scaled MADs of the
 errors the law's vector was fitted on, as the fit names them; of that vector's
-errors here if the law records no `fit.mad` or the backend is an op graph. A step
+errors here if the law records no `fit.mad` or the backend is an op graph. Slower
+about the fit's centre; on a record the law was not fitted on, about the median
+of that vector's errors here where that median is itself that far from it: a
+record the law prices off throughout would lead slow throughout, which is no
+warm-up. A step
 grid, bare or below a fallback, has no such rule: its bundle's points are measured
 after the bench warm-up and its fit names no warm step, so only a step above that
 factor is warm. A step the backend declines is counted

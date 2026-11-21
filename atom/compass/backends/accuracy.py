@@ -52,10 +52,19 @@ def _is_grid(backend) -> bool:
     return isinstance(first, StepGridBackend)
 
 
-def _leading_slow(priced: list[tuple], law: dict | None) -> set[int]:
+def _leading_slow(
+    priced: list[tuple], law: dict | None, fitted: bool = True
+) -> set[int]:
     """Steps leading their vector's (vector, band, step, seconds, price) rows, each
     slow by the scatter `law` fitted the vector on, or by the scatter here where
-    `law` records none or is None, as for an op graph."""
+    `law` records none or is None, as for an op graph; slow about the centre the
+    law fitted. On rows of a run the law was not `fitted` on, slow about their
+    own median instead where that median is itself slow or fast from the
+    fitted centre by that bound, as a warm step runs slow against the rest of
+    its own record: about the fitted centre a record the law prices off
+    throughout leads slow throughout, and grades none of its steps (#3720's
+    r256: store_bL's rung 32, fitted MAD 0.8%, priced every step 7.5% low, and
+    each one was named warm)."""
     out = set()
     for key in sorted({p[0] for p in priced}):
         mine = [p for p in priced if p[0] == key]
@@ -67,12 +76,12 @@ def _leading_slow(priced: list[tuple], law: dict | None) -> set[int]:
         vector = {}
         if law is not None:
             vector = law["prefill"] if key == "prefill" else law["decode"][key]
-        if "mad" in vector.get("fit", {}):
-            centre, mad = vector["fit"]["centre"], vector["fit"]["mad"]
-        slow = (error < 0) & (
-            np.abs(error - centre)
-            > max(step_linear_fit.MAD_K * mad, step_linear_fit.MAD_FLOOR)
-        )
+        fit = vector.get("fit", {})
+        mad = fit.get("mad", mad)
+        bound = max(step_linear_fit.MAD_K * mad, step_linear_fit.MAD_FLOOR)
+        if "mad" in fit and (fitted or abs(centre - fit["centre"]) <= bound):
+            centre = fit["centre"]
+        slow = (error < 0) & (np.abs(error - centre) > bound)
         for p, s in zip(mine, slow):
             if not s:
                 break
@@ -175,7 +184,10 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
             draft = (min(labels), costs[real].draft_seconds, _group(mine))
         target = _group(costs[top].terms)
         priced.append((key, band, step, seconds, price, target, draft, costs[top], top))
-    leading = set() if grid else _leading_slow(priced, law)
+    # A run the law was fitted on leads warm where the fit named it warm.
+    names = {s.provenance["run"] for rank in run for s in rank}
+    fitted = law is not None and bool(names & set(law.get("runs", ())))
+    leading = set() if grid else _leading_slow(priced, law, fitted)
     parts: dict[str, list] = {}
     by_rank: dict[str, dict] = {}
     for key, band, step, seconds, price, target, draft, cost, top in priced:
