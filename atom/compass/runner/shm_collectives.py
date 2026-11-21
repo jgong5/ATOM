@@ -157,8 +157,15 @@ def _fits(t) -> bool:
 
 def install() -> None:
     """Route `torch.distributed.all_reduce` and `all_gather` on an attached
-    group to its segment, around whatever the two are now."""
-    reduce, gather = dist.all_reduce, dist.all_gather
+    group to its segment, around whatever the two are now, once: a collective
+    already routed is left as it is. The route goes beneath the clock's wrap
+    (`clock.settle_before_collectives`), which the engine puts back on top
+    after this, so a call settles before it waits on its peers."""
+
+    def beneath_the_clock(fn):
+        return fn.__wrapped__ if getattr(fn, "settles", None) is True else fn
+
+    reduce, gather = map(beneath_the_clock, (dist.all_reduce, dist.all_gather))
     SUM, MAX, MIN = dist.ReduceOp.SUM, dist.ReduceOp.MAX, dist.ReduceOp.MIN
 
     def all_reduce(*args, **kwargs):
@@ -186,7 +193,10 @@ def install() -> None:
         for out, row in zip(outs, segment.exchange(tensor.detach().numpy())):
             np.copyto(out.detach().numpy(), row.reshape(out.shape), casting="unsafe")
 
-    dist.all_reduce, dist.all_gather = all_reduce, all_gather
+    for fn, routed in ((reduce, all_reduce), (gather, all_gather)):
+        if getattr(fn, "routes", None) is not True:
+            routed.routes = True
+            setattr(dist, routed.__name__, routed)
 
 
 @contextlib.contextmanager
