@@ -3,7 +3,6 @@ repo: jgong5/ATOM
 integration_branch: feature/atomcompass_new
 gate_task: scripts/compass/gate_cpu.sh
 gate_targeted: scripts/compass/gate_targeted.sh
-gate_post_land: scripts/compass/gate_gpu.sh
 design_entry: atom/compass/design/README.md
 never_touch: ROCm/ATOM
 new_tests_dir: tests/compass
@@ -53,24 +52,27 @@ own `gh` login. Ownership is the assignee:
 
 ## Environment requirements
 
-- Git, `gh`, `python3`, `gate_post_land` and the `agent-team` scripts run where
+- Git, `gh`, `python3`, the gates and the `agent-team` scripts run where
   the local file says, with the project's toolchain; a stray host Python
   that happens to work tells you nothing.
 - A `gh` login with write access to `repo`, recent enough that `gh pr view`
   accepts `closingIssuesReferences` (`pr_state.py` asks for it on every PR;
   2.45.0 rejects it), and the `gh stack` extension.
-- Every owner runs agent-team 0.14.0 or later: an older `overlay.py` rejects
-  `gate_post_land`, and an older `pr_state.py` ignores `agent-team/*` holds.
+- Every owner runs agent-team 0.19.1 or later: 0.17.1's `overlay.py` rejects
+  `gate_targeted`.
 - Files a git command writes are owned by the user who edits them; if git
   runs as another user (root in a container), chown the worktree after every
   git command that writes files (worktree add, fetch into a branch, merge,
   checkout) and check nothing is left.
-- **`gate_task` runs in a CPU environment with no GPU driver**, on a
-  `scripts/compass/snapshot.sh` tarball of the head
-  (`scripts/compass/README.md`), and is judged against the same run on the
-  base. Not where a driver is present: kernel tests in the CPU gate run on
-  the device there and fail at the base too. New tests in `new_tests_dir`
-  are CPU-only: they pass there with no driver.
+- **The CPU gates run in a CPU environment with no GPU driver**:
+  `gate_targeted.sh`, the task gate, at each round's head, and
+  `gate_cpu.sh`, the batch gate, on the batch commit before landing
+  (`land.md`, Land a batch), each on a `scripts/compass/snapshot.sh`
+  tarball of its tree (`scripts/compass/README.md`). A red `gate_cpu.sh` is
+  judged against the same run on the base. Not where a driver is present:
+  kernel tests in the CPU gate run on the device there and fail at the base
+  too. New tests in `new_tests_dir` are CPU-only: they pass there with no
+  driver.
 - **Python resolution.** Run `python3` and `pytest` from the tree's root, or
   with `PYTHONPATH` set to it, and run `import_check` before trusting a
   result: an environment with another ATOM checkout resolves `atom` there
@@ -147,13 +149,24 @@ own `gh` login. Ownership is the assignee:
 - **Re-basing a stack.** A PR in a `gh stack` refuses a base PATCH with 422.
   Run `gh stack unstack`, PATCH each base, then `gh stack link --base
   <integration_branch>` the whole chain again.
-- **Gating a stacked PR.** Set `COMPASS_INTEGRATION_REF` to the parent PR's
-  head, so `.compass-changed` lists only this PR's diff. Otherwise a
-  GPU-trigger path changed lower in the stack makes `gate_cpu.sh` exit 98
-  for every PR above it; only the PR that changes that path needs
-  `gate_gpu.sh`.
-- **Timing noise.** `scripts/compass/README.md` ("A red CPU gate that may
-  not be your diff") covers one timing class in
+- **Gating a stacked PR.** Run `gate_targeted.sh` with
+  `COMPASS_INTEGRATION_REF` set to the parent PR's head, so
+  `.compass-changed` lists only this PR's diff. Otherwise it also runs the
+  test files the PRs below changed.
+- **The GPU gate.** `gate_post_land` is unset: no task and no `run` runs
+  `gate_gpu.sh` as a routine. About daily, the owner or an orchestrator runs
+  `COMPASS_GPU_GATE_SCOPE=all scripts/compass/gate_gpu.sh` by hand on the
+  integration tip; each failure outside the known-failures list is a
+  finding issue. A batch whose diff touches a path in
+  `scripts/compass/gpu_gate_triggers.txt`, where `gate_cpu.sh` exits 98,
+  holds one PR, or one stack of building blocks and their wiring PR
+  (Production reachability). Its lander runs `gate_gpu.sh` on the batch
+  commit, then `gate_cpu.sh` there with `COMPASS_GPU_GATE_DONE` set to that
+  commit's full sha.
+- **Timing noise.** A red `gate_cpu.sh` on a batch, or a red
+  `gate_targeted.sh` on a task that edits the file, can be timing:
+  `scripts/compass/README.md` ("A red CPU gate that may not be your diff")
+  covers one timing class in
   `tests/entrypoints/test_stream_marker_properties.py`;
   `TestNoSizeAtWhichACallStopsBeingOne::test_a_long_call_costs_what_it_is_and_not_its_square`
   in the same file also times wall clock and is read the same way.
@@ -163,6 +176,7 @@ own `gh` login. Ownership is the assignee:
   (`scripts/compass/machines/*.json`, fitted law JSONs). The Dev record lists
   the excluded rows. Hand-written code, docstrings, fixtures and tables still
   count.
-- **Bound every gate.** Run gates under `timeout`. `gate_cpu.sh` prints
-  `GATE_CPU_RC=` on every exit, pass or fail; a run that shows a pytest
+- **Bound every gate.** Run gates under `timeout`. `gate_targeted.sh`,
+  `gate_cpu.sh` and `gate_gpu.sh` print `GATE_TARGETED_RC=`, `GATE_CPU_RC=`
+  and `GATE_GPU_RC=` on every exit, pass or fail; a run that shows a pytest
   summary and no such line hung.
