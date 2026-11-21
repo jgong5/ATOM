@@ -109,7 +109,9 @@ all-gather's `x` its `sizes` entry's, and MORI's dispatch and combine at a G
 its DP group gathers, its share of G as the capture splits it, refused by
 name where no G gives the rows the leaf states a rank receives.
 A collective leaf is one family over its message bytes, decode and prefill
-alike (`exchange`), which the plan ladders, densifies and covers.
+alike (`exchange`), which the plan ladders, densifies and covers; MORI's
+dispatch and combine at a shape stating G are a family of their own, over EP
+times their largest rank's rows (`exchange_at`), which it does not densify.
 aiter's comm-fused MoE (`COMM_FUSED`) runs on a process group, as a collective
 does: it is called on the runtime ATOM builds for the model's first MoE layer
 that takes it, as its loader builds it before the runner's KV pool is sized,
@@ -2781,8 +2783,7 @@ def _mori_rows(op) -> dict:
     from atom.compass.capture.peers import split
 
     args, combines = op["args"], op["op"].endswith(".combine")
-    rows, ep = args["indices"]["shape"][0], args["num_ep_ranks"]
-    most = args["input"]["shape"][0] if combines else op["out"][0][0]
+    rows, ep, most = _mori_counts(op)
     group = get_dp_group()
     dp, rank = group.world_size, group.rank_in_group
     if most == rows * ep or dp == 1:
@@ -2799,6 +2800,15 @@ def _mori_rows(op) -> dict:
         if isinstance(t, dict) and "shape" in t and not (combines and slot == "input")
     }
     return {**op, "args": args | sent}
+
+
+def _mori_counts(op) -> tuple[int, int, int]:
+    """MORI's dispatch or combine `op`'s rows from this rank, its ids', its EP
+    width and the rows a rank receives at most, a dispatch's output's or a
+    combine's input's."""
+    args, combines = op["args"], op["op"].endswith(".combine")
+    most = args["input"]["shape"][0] if combines else op["out"][0][0]
+    return args["indices"]["shape"][0], args["num_ep_ranks"], most
 
 
 def _written(op, path) -> str | None:
@@ -4188,7 +4198,8 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     rows' cached tokens too (`_bracket_cached`); and `fit ops`' price list of
     `records` prices it at the step, as `compass run --coverage` asks it, a
     drafter's leaf under DP at each batch and G a run asks it at
-    (`_drafter_at`). A
+    (`_drafter_at`), a target's MORI leaf at a step stating G at the most
+    tokens a rank of its group ran (`group_max_tokens`). A
     decode leaf is read at the rows it ran, its shape's T: of a drafter's own
     decode shape past its step's, a leaf its width's graphs hold at that
     width, as `--plan` measures it. A prefill leaf is asked at the B it ran,
@@ -4248,11 +4259,18 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                     # whether its shape states one
                     at = moved
                     fam, tokens = _family(at, None, name, signature(op), dependent)
-                bound = (*at[:4], mean, top)
+                # a target at a G: its group's most tokens, after its real rows
+                stated = not part and at.gathered is not None
+                peak = line.get("group_max_tokens") if stated else None
+                tail = () if peak is None else (None, peak)
+                if peak is not None and name.startswith(MORI):  # at its largest rank
+                    sig = signature(op)
+                    fam, tokens = _family(at, None, name, sig, dependent, peak)
+                bound = (*at[:4], mean, top, *tail)
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
                     bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
-                    bound += (None if part else _real(line),)  # a target's real rows
+                    bound += (None if part else _real(line), *tail[1:])
                 elif asked:  # a prefill's drafter's leaf at each bound a run asks
                     each = [(*b, mean, top) for b, _ in asked]
                     bound = each if each[1:] else each[0]
@@ -4490,11 +4508,31 @@ def exchange(op: dict) -> list | None:
     return [json.dumps(["exchange", fam], sort_keys=True), nbytes]
 
 
+def exchange_at(op: dict, ex: list, gathered, largest=None) -> list:
+    """`op`'s `exchange`, `ex`, at a shape whose MoE gathers `gathered` rows,
+    G, or states none (None). MORI's dispatch or combine at a G is a family
+    of its own (``exchange G``): its ranks send unlike rows, and it takes
+    about what its largest sender sends, not G. Its bytes are those of EP
+    times that sender's rows: `largest` where the caller states them, a
+    run's step its DP group's most tokens, but never under this rank's; else
+    the most `peers.split` gives a rank of G, as the capture splits it. `ex`
+    for any other leaf or shape."""
+    if gathered is None or not op["op"].startswith(MORI):
+        return ex
+    from atom.compass.capture.peers import split
+
+    rows, ep, most = _mori_counts(op)
+    if largest is None:  # the peers split the rest evenly
+        largest = max(split(gathered, rows, gathered * ep // most))
+    fam, nbytes = json.loads(ex[0])[1], ex[1] // most * ep * max(largest, rows)
+    return [json.dumps(["exchange G", fam], sort_keys=True), nbytes]
+
+
 def _exchanged(fam: str) -> bool:
-    return json.loads(fam)[0] == "exchange"
+    return json.loads(fam)[0].startswith("exchange")
 
 
-def _family(shape, context, op: str, sig: str, dependent: dict):
+def _family(shape, context, op: str, sig: str, dependent: dict, largest=None):
     """The family a leaf's point belongs to, and where on its axis: a decode
     leaf at its width, and its rows' mean when they are ragged, over context;
     a prefill leaf over its tokens, at its rows unless its kind's prefill
@@ -4502,9 +4540,12 @@ def _family(shape, context, op: str, sig: str, dependent: dict):
     when its kind depends on context, as its prefill points read it, else its
     decode points, else by default, a shape that states G apart from one that
     does not, as `fit ops` keeps them; a collective over its message bytes
-    (`exchange`). A prefill leaf reads as `fit.ops.prefill_leaf` reads it."""
+    (`exchange`), MORI's at a G apart, at its group's `largest` rank where
+    stated (`exchange_at`). A prefill leaf reads as `fit.ops.prefill_leaf`
+    reads it."""
     if op.startswith(COLLECTIVES):
-        return tuple(exchange(json.loads(sig)))
+        leaf = json.loads(sig)
+        return tuple(exchange_at(leaf, exchange(leaf), shape.gathered, largest))
     if shape.phase == "decode":
         context, mean = _split(context)
         return json.dumps([str(shape), sig] + ([mean] if mean else [])), context
@@ -4629,8 +4670,9 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
     switch that moves with cached tokens, as one at a fixed sum of the two
     does, is halved over cached tokens at each token count alone, where `fit
     ops` reads it after the token count. A prefill family whose shapes state G
-    is not halved over its tokens: `trace ops` traces such a shape only at a
-    record's step. Any other is `_bent` on its line as `fit ops` reads it, taking
+    is not halved over its tokens, nor a collective's family whose shapes
+    state G (`exchange_at`): `trace ops` traces such a shape only at a record's
+    step. Any other is `_bent` on its line as `fit ops` reads it, taking
     in a gap beside a bend each count of a step (`step_tokens`) at its rows, or
     at any for a family stating none."""
     from atom.compass.capture.forward import decode, prefill
@@ -4672,6 +4714,8 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
 
     want = defaultdict(set)
     for fam, points in [*families.items(), *across.items()]:
+        if isinstance(fam, str) and json.loads(fam)[0] == "exchange G":
+            continue
         points = sorted(points, key=lambda p: p[0])
         decoding = points[0][2]["shape"].startswith("decode")
         # a ragged decode line is halved where it bends, not where its kind steps
