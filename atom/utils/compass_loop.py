@@ -83,6 +83,7 @@ from functools import partial
 
 from atom.compass.carriers import (
     cancel_seq,
+    relay_service,
     relay_stamp,
     stamp_events,
     tracestate_jitter,
@@ -842,18 +843,26 @@ class HttpChannel:
     a cancel's too, from its body's ``kv_transfer_params`` instead. An LP that
     sends on one stamps a send on it for each JSON response whose
     ``kv_transfer_params`` is an object, and writes the stamp there; with a
-    ``relay`` term in its host entry (`atom.compass.run.relay`), the send
-    arrives that term's time, less ``router_s``, past the channel's lookahead,
-    where that is positive, for the bytes of decode's request, which the
-    router builds from the client's request and the prompt's token ids on the
-    response: the two bodies' bytes.
+    ``relay`` term in its host entry (`atom.compass.run.relay`), it also writes
+    there the relay's service time (`carriers.RELAY_SERVICE`): that term's
+    time, less ``router_s``, where that is positive, for the bytes of
+    decode's request, which the router builds from the client's request and
+    the prompt's token ids on the response: the two bodies' bytes. The send
+    arrives at the channel's lookahead, and the receiving LP charges the
+    service on its loop at the request's turn, before its intake: the relays
+    and intakes of requests in flight together take the loop one at a time,
+    so a relay waits behind those ahead of it as on r256 (#3720), where
+    prefill's response to decode's app call took p50 12 ms alone and 100 ms
+    with 8 others in flight, while a lone one takes the term's time as
+    before. A relayed request without the field is charged no relay.
 
     During the run, each event of a ``text/event-stream`` response body leaves
     with a comment line carrying its stamp on the LP's stream channel
     (`atom.compass.carriers.stamp_events`). Each body message is one frame the
     app's stream yielded, so it must end in a blank line.
 
-    Taking in a stamped request other than a cancel costs the event loop
+    Taking in a stamped request other than a cancel costs the event loop its
+    relay's service time, if it came on a relay that states one, then
     ``fixed_s + body bytes x per_byte_s`` (`atom.compass.run.http_intake`),
     charged on the loop at its turn, once the loop is idle at that instant,
     every tokenizer station job placed and all else due by then run
@@ -919,10 +928,13 @@ class HttpChannel:
             arrival, seq = got
             rt.check_arrival(ch, arrival, seq)
             jitter = 0.0 if relay_in is not None else _intake_jitter(scope)
+            service = relay_service(body) if relay_in is not None else 0.0
             wake, ready = loop.create_future(), loop.create_future()
             # Its body leaves the socket as it comes, not at its turn.
             reading = asyncio.ensure_future(_body_messages(receive))
-            reading.add_done_callback(partial(self._ready, ready, arrival, jitter))
+            reading.add_done_callback(
+                partial(self._ready, ready, arrival, jitter, service)
+            )
             loop.held[ch, seq] = (arrival, wake, ready)
             try:
                 await wake
@@ -932,6 +944,9 @@ class HttpChannel:
                     body = await reading
                     cancelled = cancel_seq(body[0].get("body", b""))
                     nbytes = taken[0] = sum(len(m.get("body", b"")) for m in body)
+                    if service and cancelled is None:
+                        # The relay serves it on this loop, behind those ahead.
+                        charge(service)
                     if self.intake is not None and cancelled is None:
                         fixed, per_byte, idle = self.intake
                         if arrival >= self.intake_end:
@@ -974,13 +989,18 @@ class HttpChannel:
                 del self.hangups[seq]
 
     def _ready(
-        self, ready: asyncio.Future, arrival: float, jitter: float, reading
+        self,
+        ready: asyncio.Future,
+        arrival: float,
+        jitter: float,
+        service: float,
+        reading,
     ) -> None:
         """Resolve `ready` with when the request's body, read at once with the
-        others', is in: its arrival plus its own intake, ``fixed_s + (body
-        bytes + jitter) x per_byte_s``, which depends on nothing the wall
-        decides; a cancel's after every request it can name. A body never read
-        is in at once."""
+        others', is in: its arrival plus its relay's `service` and its own
+        intake, ``fixed_s + (body bytes + jitter) x per_byte_s``, which depends
+        on nothing the wall decides; a cancel's after every request it can
+        name. A body never read is in at once."""
         if ready.done():
             return
         if reading.cancelled() or reading.exception() is not None:
@@ -990,7 +1010,7 @@ class HttpChannel:
         else:
             fixed, per_byte, _ = self.intake or (0.0, 0.0, 0.0)
             nbytes = sum(len(m.get("body", b"")) for m in reading.result())
-            ready.set_result(arrival + fixed + per_byte * (nbytes + jitter))
+            ready.set_result(arrival + service + fixed + per_byte * (nbytes + jitter))
 
 
 def _intake_jitter(scope) -> float:
@@ -1089,12 +1109,14 @@ def _stamping_events(send, rt):
 
 def _stamping(send, rt, ch: str, relay=None, taken=(0,)):
     """`send`, holding a JSON response back until its body is whole, to stamp it
-    for `ch`; with `relay`, `atom.compass.run.relay`'s ``(fixed_s, per_byte_s,
-    router_s)``, arriving ``fixed_s + bytes x per_byte_s - router_s`` past the
-    channel's lookahead where that is positive. ``bytes`` are those of the
-    request the router builds for decode from the client's request, whose
-    body's bytes `taken` holds, and this response's prompt token ids: the
-    two bodies' bytes."""
+    for `ch`, arriving at the channel's lookahead; with `relay`,
+    `atom.compass.run.relay`'s ``(fixed_s, per_byte_s, router_s)``, carrying
+    ``fixed_s + bytes x per_byte_s - router_s`` where that is positive as the
+    relay's service time (`carriers.RELAY_SERVICE`), which the receiving
+    `HttpChannel` charges on its loop. ``bytes`` are those of the request the
+    router builds for decode from the client's request, whose body's bytes
+    `taken` holds, and this response's prompt token ids: the two bodies'
+    bytes."""
     start, chunks = None, []
 
     async def stamping(message):
@@ -1110,12 +1132,12 @@ def _stamping(send, rt, ch: str, relay=None, taken=(0,)):
         chunks.append(message.get("body", b""))
         if message.get("more_body", False):
             return
-        raw, at = b"".join(chunks), None
+        raw, service = b"".join(chunks), None
         if relay is not None:
             fixed_s, per_byte_s, router_s = relay
             extra = fixed_s + (taken[0] + len(raw)) * per_byte_s - router_s
-            at = rt.now + rt.table.lookahead(ch) + extra if extra > 0 else None
-        body = with_relay_stamp(raw, lambda: rt.stamp_send(ch, at))
+            service = extra if extra > 0 else None
+        body = with_relay_stamp(raw, lambda: rt.stamp_send(ch), service)
         headers = [(k, v) for k, v in start["headers"] if k != b"content-length"]
         headers.append((b"content-length", str(len(body)).encode()))
         await send({**start, "headers": headers})

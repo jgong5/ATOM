@@ -7,7 +7,9 @@ request in is p50 24 ms: the response carrying the prompt's token ids through
 the router (~1.5 ms + 8-12 ns per byte of decode's request) and decode's API
 server taking that body in (`http_intake`, ~1.2 ms + 12 ns/B). The term is
 fitted by `step_linear_fit.fit_relay`; here it is read off the run file and
-delays the relay channel's stamp.
+written on the relayed response as its service time, which decode's API
+server loop charges (`tests/compass/test_compass_event_loop.py`), while the
+relay send arrives at the channel's lookahead.
 """
 
 import asyncio
@@ -17,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from atom.compass import run as compass_run
+from atom.compass.carriers import RELAY_SERVICE, relay_service
 from atom.utils.compass_loop import _stamping
 
 TERM = {"fixed_s": 1.5e-3, "per_byte_s": 1e-6, "bytes": [100, 10**7]}
@@ -61,9 +64,9 @@ def test_a_prefill_decode_run_reads_its_prefill_entry_s_relay_with_router_s(
 
 
 def stamped(body: bytes, relay, request=0):
-    """The arrival `_stamping` stamps a JSON response `body` sent on the relay
-    with, for a request of `request` bytes, the LP at 2 s and the channel's
-    lookahead 1 ms."""
+    """The arrival `_stamping` asks for a JSON response `body` sent on the
+    relay, None for the channel's lookahead, and the body it sends, for a
+    request of `request` bytes, the LP at 2 s and the lookahead 1 ms."""
     asked, sent = [], []
     lookahead = 1e-3
 
@@ -88,19 +91,24 @@ def stamped(body: bytes, relay, request=0):
 
     asyncio.run(go())
     assert b'"compass"' in sent[-1]["body"]
-    return asked[0]
+    return asked[0], sent[-1]["body"]
 
 
-def test_a_relayed_response_arrives_its_relay_time_past_router_s():
+def test_a_relayed_response_carries_its_relay_time_past_router_s_as_its_service():
     """Decode's request carries the client's request and the response's token
-    ids: the relay takes the time of both bodies' bytes."""
+    ids: the relay takes the time of both bodies' bytes. It is written on the
+    response for decode's loop to charge; the send itself arrives at the
+    channel's lookahead, so relays in flight together queue on that loop."""
     ids = list(range(100_000, 101_000))
     body = json.dumps({"kv_transfer_params": {"x": 1}, "prompt_token_ids": ids})
     body = body.encode()
     took = 1.5e-3 + (4000 + len(body)) * 1e-6
-    assert stamped(body, (1.5e-3, 1e-6, 2e-3), 4000) == pytest.approx(
-        2.0 + 1e-3 + took - 2e-3
-    )
-    # Shorter than router_s, or no term: the channel's lookahead alone.
-    assert stamped(body, (1e-4, 1e-9, 2e-3)) is None
-    assert stamped(body, None) is None
+    at, sent = stamped(body, (1.5e-3, 1e-6, 2e-3), 4000)
+    assert at is None
+    assert relay_service(sent) == pytest.approx(took - 2e-3)
+    assert json.loads(sent)["kv_transfer_params"]["x"] == 1
+    # Shorter than router_s, or no term: no service, and the body as before.
+    for relay in ((1e-4, 1e-9, 2e-3), None):
+        at, sent = stamped(body, relay)
+        assert at is None and relay_service(sent) == 0.0
+        assert RELAY_SERVICE.encode() not in sent

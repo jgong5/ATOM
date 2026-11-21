@@ -141,8 +141,9 @@ token counts outside which a decode is refused and charged 0 s; ``http_intake``,
 ``[lo, hi]`` body bytes it was fitted over, outside which an intake is refused
 and charged 0 s; a prefill-decode run's prefill entry's ``relay``,
 ``fixed_s`` and ``per_byte_s``, with ``bytes`` optional, the time a response
-takes from prefill's server to decode's app call through the router, which
-delays a relayed response past ``router_s`` (`relay`), and which a
+takes from prefill's server to decode's app call through the router, whose
+part past ``router_s`` decode's API server loop serves each relayed response,
+queued with the others in flight there (`relay`), and which a
 prefill-decode run with no entry stating it names under
 ``uncharged_host_terms``; a term an entry lacks, or every term with no entry, is
 charged 0 s and the run summary names it, a kind of tokenizer call as
@@ -3206,10 +3207,11 @@ def relay() -> tuple[float, float, float] | None:
     term of its ``host`` entry, the one `tokenizer` resolved among several,
     and the lookahead of the relay's path through the router, which the
     channels price already; None on a real run or with no term.
-    `atom.utils.compass_loop.HttpChannel` delays a relayed response of `n`
-    bytes past its channel's lookahead by ``fixed_s + n x per_byte_s -
-    router_s``, where that is positive. A run that is not prefill-decode
-    relays nothing: None."""
+    `atom.utils.compass_loop.HttpChannel` writes ``fixed_s + n x per_byte_s -
+    router_s``, where that is positive, on a relayed response of `n` bytes as
+    its relay's service time, and decode's `HttpChannel` charges it on its
+    loop at the request's turn, queued with the relays and intakes in flight
+    there. A run that is not prefill-decode relays nothing: None."""
     run = spec()
     if run is None or "router_s" not in run:
         return None

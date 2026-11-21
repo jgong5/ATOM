@@ -12,7 +12,11 @@ start with a colon. Both pass a router that forwards headers and the stream
 unchanged. A prefill response the router relays to decode carries its stamp as
 the ``compass`` field of its ``kv_transfer_params``, ``a:<arrival>;s:<seq>``,
 which the router copies onto the decode request. The arrival is written as
-``repr(float)``, so it parses back exactly.
+``repr(float)``, so it parses back exactly. Beside it, ``compass_relay_s``
+holds the seconds the relay serves the response on decode's API server loop
+(`RELAY_SERVICE`, `atom.utils.compass_loop.HttpChannel`), where prefill's host
+entry prices a relay; the router restamps only ``compass`` and copies the rest
+of the object, so the seconds reach decode as prefill wrote them.
 
 A client's cancel of a request is itself a stamped request to the same URL,
 whose body names the cancelled request's seq: ``{"compass_cancel": <seq>}``.
@@ -31,6 +35,9 @@ from typing import Any
 import msgspec
 
 _NUM = r"(inf|\d[\d.e+-]*)"
+#: The ``kv_transfer_params`` field of a relayed response holding the seconds
+#: its relay serves it on decode's API server loop.
+RELAY_SERVICE = "compass_relay_s"
 _ENTRY = re.compile(rf"a:{_NUM};s:(\d+)")
 _TRACE_ENTRY = re.compile(rf"a:{_NUM};s:(\d+)(?:;j:{_NUM})?")
 _COMMENT = re.compile(rf": compass a={_NUM} s=(\d+)")
@@ -136,6 +143,7 @@ def sse_stamp(line: str) -> tuple[float, int] | None:
 
 class _Params(msgspec.Struct):
     compass: Any = None
+    compass_relay_s: Any = None
 
 
 class _Relayed(msgspec.Struct):
@@ -161,10 +169,32 @@ def relay_stamp(body: bytes) -> tuple[float, int] | None:
     return None if value is None else _parse(_ENTRY, value, "kv_transfer_params entry")
 
 
-def with_relay_stamp(body: bytes, stamp) -> bytes:
-    """`body` with ``stamp()``'s ``(arrival, seq)`` in its ``kv_transfer_params``;
-    `body` itself, and `stamp` not called, when it has no such object. Every
-    other value keeps its JSON text."""
+def relay_service(body: bytes) -> float:
+    """The seconds a JSON request body's ``kv_transfer_params`` says its relay
+    serves it on the receiving loop (`RELAY_SERVICE`); 0.0 without one."""
+    try:
+        params = _STAMP.decode(body).kv_transfer_params
+    except msgspec.DecodeError:
+        return 0.0
+    value = None if params is None else params.compass_relay_s
+    if value is None:
+        return 0.0
+    # A JSON number, not a bool or a string of one.
+    seconds = value if type(value) in (int, float) else math.nan
+    if not (math.isfinite(seconds) and seconds >= 0):
+        raise ValueError(
+            f"malformed {RELAY_SERVICE} {value!r}; expected finite seconds >= 0"
+        )
+    return float(seconds)
+
+
+def with_relay_stamp(body: bytes, stamp, service_s: float | None = None) -> bytes:
+    """`body` with ``stamp()``'s ``(arrival, seq)`` in its ``kv_transfer_params``,
+    and with `service_s` there under `RELAY_SERVICE` when given; `body`
+    itself, and `stamp` not called, when it has no such object. Every other
+    value keeps its JSON text."""
+    if service_s is not None and not (math.isfinite(service_s) and service_s >= 0):
+        raise ValueError(f"relay service {service_s!r} is no finite seconds >= 0")
     try:
         doc = _MEMBERS.decode(body)
         params = _MEMBERS.decode(doc["kv_transfer_params"])
@@ -172,6 +202,8 @@ def with_relay_stamp(body: bytes, stamp) -> bytes:
         return body
     arrival, seq = stamp()
     params["compass"] = f"a:{arrival!r};s:{seq}"
+    if service_s is not None:
+        params[RELAY_SERVICE] = float(service_s)
     doc["kv_transfer_params"] = msgspec.Raw(_ENCODE.encode(params))
     return _ENCODE.encode(doc)
 

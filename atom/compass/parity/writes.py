@@ -31,11 +31,18 @@ the producer's ``pp_rank`` and ``tp_rank``, ``write_nonce``, ``success`` and
 The write-done's line also says when its write request left: ``t_load_ns``,
 when `start_load_kv` took the step's metadata that asked for it, the engine
 having admitted the request; ``t_post_ns``, when it was queued for the
-write-request thread (`_enqueue_write_requests`); and ``t_send_ns``, ``[enter,
-exit]`` of each `_send_on_socket` call that sent it, one per producer stage,
-after that thread's device synchronize. A write request that no write-done
-answered by the record's end has a line of its own with those stamps,
-``request_id`` and ``write_nonce``.
+write-request thread (`_enqueue_write_requests`); ``t_sync_ns``, when that
+thread took it off the queue, with the requests queued beside it, and began
+the device synchronize it posts them after (`_post_queued_write_requests`:
+the return of its wait on the queue's condition, the one wait that condition
+serves); and ``t_send_ns``, ``[enter, exit]`` of each `_send_on_socket` call
+that sent it, one per producer stage, after that synchronize. Between
+``t_sync_ns`` and the first send's enter the device ran every forward already
+launched, so which forwards a write request waited for is read off these
+stamps and the step record (#3720: on r256 a request's send came a forward
+later than on r128b). A write request that no write-done answered by the
+record's end has a line of its own with those stamps, ``request_id`` and
+``write_nonce``; ``t_sync_ns`` is None on one the thread never took.
 """
 
 import functools
@@ -44,7 +51,31 @@ import os
 import threading
 
 #: A consumer's stamps of a write request, on its write-done's line.
-REQUEST_STAMPS = ("t_load_ns", "t_post_ns", "t_send_ns")
+REQUEST_STAMPS = ("t_load_ns", "t_post_ns", "t_sync_ns", "t_send_ns")
+
+
+class _TakeStamped:
+    """A consumer's write-request condition, `cv`, stamping on `record` when
+    each `wait_for` returns on the thread that called it: the write-request
+    thread taking the queue, right before its device synchronize. Everything
+    else is the condition's own."""
+
+    def __init__(self, cv, record) -> None:
+        self._cv, self._record = cv, record
+
+    def __enter__(self):
+        return self._cv.__enter__()
+
+    def __exit__(self, *exc):
+        return self._cv.__exit__(*exc)
+
+    def wait_for(self, predicate, timeout=None):
+        got = self._cv.wait_for(predicate, timeout)
+        self._record.taken.t = self._record.clock()
+        return got
+
+    def __getattr__(self, name):
+        return getattr(self._cv, name)
 
 
 class WriteRecord:
@@ -61,6 +92,8 @@ class WriteRecord:
         self.lines: list[dict] = []
         self.serving = threading.local()  # the line of the write a send worker serves
         self.heard: set[tuple] = set()  # the write-dones already stamped
+        # When this thread last took the write-request queue (`_TakeStamped`).
+        self.taken = threading.local()
         c = connector
         if c.is_producer:
             c._serve_write = functools.partial(self.serve_write, c._serve_write)
@@ -79,6 +112,10 @@ class WriteRecord:
             c._send_on_socket = functools.partial(
                 self.send_on_socket, c._send_on_socket
             )
+            # Built in the connector's constructor, before any write request
+            # starts the thread that waits on it.
+            if getattr(c, "_write_cv", None) is not None:
+                c._write_cv = _TakeStamped(c._write_cv, self)
         # The worker's `start_load_kv` in progress: its receives, in the order
         # it walks them, how many it has queued, and its entry.
         self.loading = threading.local()
@@ -179,6 +216,7 @@ class WriteRecord:
                     "write_nonce": self.connector._pending_recv_nonce.get(req_id),
                     "t_load_ns": loading.t,
                     "t_post_ns": self.clock(),
+                    "t_sync_ns": None,
                     "t_send_ns": [],
                     "answered": False,
                 }
@@ -192,7 +230,10 @@ class WriteRecord:
         enter = self.clock()
         reply = call(addr, parts, *args, **kwargs)
         if posted is not None:
-            posted[1]["t_send_ns"].append([enter, self.clock()])
+            stamps = posted[1]
+            stamps["t_send_ns"].append([enter, self.clock()])
+            if stamps["t_sync_ns"] is None:
+                stamps["t_sync_ns"] = getattr(self.taken, "t", None)
         return reply
 
     def write(self) -> None:

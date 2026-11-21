@@ -400,13 +400,17 @@ def _receive(transfer_id, blocks, chunked=False):
 def test_a_write_request_is_stamped_from_its_load_to_its_send(
     mc, tmp_path, monkeypatch
 ):
-    """D's stamps say when each write request was asked for, queued and sent,
-    on the line of the write-done that answered it, or on its own line."""
+    """D's stamps say when each write request was asked for, queued, taken by
+    the write-request thread for its device synchronize, and sent, on the
+    line of the write-done that answered it, or on its own line."""
     sent, synced = [], []
     consumer = _receiving(mc, sent)
     monkeypatch.setenv(ENV, str(tmp_path / "decode"))
     decode = _runner(consumer, monkeypatch)
-    monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: synced.append(1))
+    # The synchronize runs once the thread has taken the queue.
+    monkeypatch.setattr(
+        mc.torch.cuda, "synchronize", lambda *a: synced.append(time.monotonic_ns())
+    )
     receives = {
         "d-a": _receive("a", [5, 6, 7]),
         # Refused before it is queued: it must not take the next one's stamps.
@@ -420,7 +424,7 @@ def test_a_write_request_is_stamped_from_its_load_to_its_send(
     assert consumer.failed_recving == {"d-r"}
     assert consumer._post_queued_write_requests()
     after = time.monotonic_ns()
-    assert synced == [1] and len(sent) == 2
+    assert len(synced) == 1 and len(sent) == 2
     nonces = {}
     for addr, (kind, payload) in sent:
         request = msgpack.loads(payload)
@@ -447,9 +451,12 @@ def test_a_write_request_is_stamped_from_its_load_to_its_send(
     assert set(b) == {"request_id", "write_nonce", *REQUEST_STAMPS}
     assert (a["write_nonce"], b["write_nonce"]) == (nonces["d-a"], nonces["d-b"])
     assert a["t_load_ns"] == b["t_load_ns"]  # one metadata asked for both
+    # One take of the queue, then one synchronize, covered both.
+    assert a["t_sync_ns"] == b["t_sync_ns"] <= synced[0]
     for line in (a, b):
         (send,) = line["t_send_ns"]
-        stamps = [before, line["t_load_ns"], line["t_post_ns"], *send, after]
+        posted = [line["t_load_ns"], line["t_post_ns"], line["t_sync_ns"]]
+        stamps = [before, *posted, *send, after]
         assert stamps == sorted(stamps)
     assert a["t_post_ns"] < b["t_post_ns"]
     assert a["t_send_ns"][0][1] <= b["t_send_ns"][0][0]

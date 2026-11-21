@@ -1016,6 +1016,106 @@ def test_a_cancel_on_the_relay_hangs_its_request_up_at_its_arrival_never_the_soc
     ]
 
 
+def _relayed_to_decode(sends, bodies):
+    """frontend-D behind a router LP: the router stamps a relay send at each
+    LP time in `sends`; frontend-D's `HttpChannel` serves a request per send,
+    relay seq `k` with body ``bodies(k, arrival)``, to an app that records
+    the seq it reads and the loop time it is entered at. Returns those
+    records in entry order and the relay channel's lookahead."""
+    table = prefill_decode_table(
+        admission_s=0.54e-3,
+        ipc_s=0.001,
+        stream_s=0.002,
+        router_s=2.0**-12,
+        kv_write_req_s=2.0**-10,
+        router_in_s=2.0**-14,
+    )
+    relay, router, me = "router->frontend-D:relay", LpId("router"), LpId("frontend-D")
+    endpoint = f"inproc:test-compass-loop-{uuid.uuid4().hex}"
+    server = clock_transport.serve(ClockAuthority(table), endpoint)
+    for lp in table.registry.ids():
+        if lp not in (router, me):
+            clock_transport.connect(lp, endpoint).send((NER, INF, [], INF))
+    rt = LPRuntime(me, table, clock_transport.connect(me, endpoint))
+    rt.start_run()
+    clock.install(rt)
+
+    def hop():
+        rt = LPRuntime(router, table, clock_transport.connect(router, endpoint))
+        rt.start_run()
+        for at in sends:
+            rt.advance_to(at)
+            rt.stamp_send(relay)
+        rt.next_event(INF)
+        rt.close()
+
+    thread = threading.Thread(target=hop, name="router", daemon=True)
+    thread.start()
+    lookahead = table.lookahead(relay)
+    loop = CompassEventLoop()
+    guard = threading.Timer(20, loop.call_soon_threadsafe, (loop.stop,))
+    entered = []
+
+    async def app(scope, receive, send):
+        body = (await receive())["body"]
+        entered.append((carriers.relay_stamp(body)[1], loop.time()))
+
+    def wire(body: bytes):
+        parts = [{"type": "http.request", "body": body, "more_body": False}]
+
+        async def receive():
+            return parts.pop(0) if parts else {"type": "http.disconnect"}
+
+        return receive
+
+    async def go():
+        channel = HttpChannel(app, _stamp)
+        scope = {"type": "http", "headers": []}
+        await asyncio.gather(
+            *(
+                channel(scope, wire(bodies(k, at + lookahead)), None)
+                for k, at in enumerate(sends)
+            )
+        )
+
+    guard.start()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        guard.cancel()
+        thread.join(10)
+        clock.install(None)
+        server.close()
+    loop.close()
+    return entered, lookahead
+
+
+def test_relays_in_flight_together_take_decode_s_loop_one_service_at_a_time():
+    """Prefill writes each relayed response's relay service time beside its
+    stamp; frontend-D charges it on its loop at the request's turn. Relays 0-2
+    arrive at one instant, serving 4, 2 and no ms: they take the loop
+    smallest service first, each after those ahead of it, so relay 0 enters
+    6 ms past its arrival, as relays queued on r256's decode frontend (#3720).
+    Relay 3 arrives alone a second later and enters its own 3 ms past its
+    arrival, as the term's lone time delayed it before."""
+    service = {0: 4e-3, 1: 2e-3, 3: 3e-3}
+
+    def bodies(k, arrival):
+        params = {"compass": f"a:{arrival!r};s:{k}"}
+        if k in service:
+            params[carriers.RELAY_SERVICE] = service[k]
+        return json.dumps({"kv_transfer_params": params}).encode()
+
+    entered, lookahead = _relayed_to_decode([0.0, 0.0, 0.0, 1.0], bodies)
+    t0, t1 = lookahead, 1.0 + lookahead
+    print(f"\n  entered {entered}")
+    assert [k for k, _ in entered] == [2, 1, 0, 3]
+    assert [t for _, t in entered] == pytest.approx(
+        [t0, t0 + 2e-3, t0 + 2e-3 + 4e-3, t1 + 3e-3]
+    )
+
+
 def test_a_released_request_whose_accept_ran_out_of_descriptors_is_still_read(
     run, monkeypatch
 ):
