@@ -181,19 +181,28 @@ fi
 # exit code and a failing suite reports success.
 #
 # tests/compass holds most of the suite's time, in model traces that each take
-# one core, so it runs as COMPASS_GATE_SHARDS pytest processes beside the rest
-# of tests/, shard s taking every COMPASS_GATE_SHARDS-th file from s; 0 runs
-# tests/ as one process. Every process collects all of tests/ and deselects
-# what it does not run, because test files collect only after earlier files
-# have imported engine modules under an aiter stub; alone, they reach rocminfo.
-# A shard's output is printed after the rest's. A process left with no test to
-# run (exit 5) fails the gate only when none ran. A caller's --junitxml or
-# --basetemp path is the first process's; shard k writes <path>.shard<k>, since
-# a shared one is overwritten or cleared by every process.
-SHARDS=${COMPASS_GATE_SHARDS:-4}
+# one core, so it runs as COMPASS_GATE_SHARDS pytest processes and the rest of
+# tests/ as COMPASS_GATE_REST_SHARDS more, no process running files of both;
+# COMPASS_GATE_SHARDS=0 runs tests/ as one process. pack deals each set to its
+# processes, never more of them than the set has files. Every process collects
+# all of tests/ and deselects what it does not run, because test files collect
+# only after earlier files have imported engine modules under an aiter stub;
+# alone, they reach rocminfo. The first rest process prints as it runs, the
+# others' output follows. A process left with no test to run (exit 5) fails
+# the gate only when none ran. A caller's --junitxml or --basetemp path is the
+# first rest process's; compass shard k writes <path>.shard<k> and rest process
+# k <path>.rest<k>, since a shared one is overwritten or cleared by every
+# process.
+SHARDS=${COMPASS_GATE_SHARDS:-16}
+RS=${COMPASS_GATE_REST_SHARDS:-4}
 [[ $SHARDS =~ ^[0-9]+$ ]] || finish 95 "COMPASS_GATE_SHARDS=$SHARDS is not a count; pytest was not run"
+[[ $RS =~ ^[1-9][0-9]*$ ]] || finish 95 "COMPASS_GATE_REST_SHARDS=$RS is not a count of 1 or more; pytest was not run"
+DURATIONS=$ROOT/scripts/compass/cpu_gate_durations.txt
+[ -r "$DURATIONS" ] || finish 94 "cannot read $DURATIONS; nothing was run"
 CF=()
 [ -d tests/compass ] && mapfile -t CF < <(find tests/compass \( -name 'test_*.py' -o -name '*_test.py' \) | sort)
+mapfile -t RF < <(find tests \( -path tests/compass -o -path tests/plugin \) -prune -o \
+    \( -name 'test_*.py' -o -name '*_test.py' \) -print | sort | grep -vxF -f <(printf '%s\n' "${IGN[@]#--ignore=}"))
 # COMPASS_GATE_SELECT names a map gate_map.sh wrote. gate_select.py prints how
 # many test files the diff since the map's commit reaches and then each file
 # every process deselects, or why the whole gate runs. Every process still
@@ -208,9 +217,12 @@ if [ -n "${COMPASS_GATE_SELECT:-}" ]; then
     mapfile -t UNSEL < <(tail -n +2 <<<"$SEL")
     [ "${#UNSEL[@]}" -eq 0 ] || [ "${#CF[@]}" -eq 0 ] ||
         mapfile -t CF < <(printf '%s\n' "${CF[@]}" | grep -vxF -f <(printf '%s\n' "${UNSEL[@]}"))
-    [ "$SHARDS" -le "${#CF[@]}" ] || SHARDS=${#CF[@]}
+    [ "${#UNSEL[@]}" -eq 0 ] || [ "${#RF[@]}" -eq 0 ] ||
+        mapfile -t RF < <(printf '%s\n' "${RF[@]}" | grep -vxF -f <(printf '%s\n' "${UNSEL[@]}"))
 fi
-[ "${#CF[@]}" -gt 0 ] || SHARDS=0
+[ "$SHARDS" -le "${#CF[@]}" ] || SHARDS=${#CF[@]}
+[ "$SHARDS" -gt 0 ] || RS=1
+[ "$RS" -le "${#RF[@]}" ] || RS=$((${#RF[@]} > 0 ? ${#RF[@]} : 1))
 LOGS=$(mktemp -d) || finish 96 "mktemp failed; nothing was run"
 trap 'rm -rf "${HARNESS:-}" "$LOGS"' EXIT
 # More than one of these processes runs cargo in atom/mesh, and on NFS cargo
@@ -245,25 +257,60 @@ for e in tests/*; do
     [ -d "$e" ] && e=$e/
     [ "$e" = tests/compass/ ] || REST+=(--deselect="$e")
 done
+# pack N FILE...: prints "<process> <file>" for each FILE, dealt to processes
+# 0..N-1 longest first, each to the process with the fewest seconds so far by
+# cpu_gate_durations.txt, then the fewest files. An unlisted file counts 0.
+pack() {
+    local n=$1
+    shift
+    printf '%s\n' "$@" |
+        awk -v table="$DURATIONS" 'BEGIN { while ((getline l < table) > 0) if (split(l, a, " ") == 2 && a[1] !~ /^#/) t[a[2]] = a[1] }
+            { print ($0 in t ? t[$0] : 0), $0 }' |
+        sort -k1,1gr -k2,2 |
+        awk -v n="$n" '{ m = 0; for (i = 1; i < n; i++) if (s[i] < s[m] || (s[i] == s[m] && c[i] < c[m])) m = i
+            s[m] += $1; c[m]++; print m, $2 }'
+}
+# others P LINE...: sets OTHERS to a --deselect for each file pack dealt to a
+# process other than P.
+others() {
+    local p=$1 a
+    shift
+    OTHERS=()
+    for a; do [ "${a%% *}" = "$p" ] || OTHERS+=(--deselect="${a#* }"); done
+}
+CPACK=()
+RPACK=()
+[ "$SHARDS" -eq 0 ] || mapfile -t CPACK < <(pack "$SHARDS" "${CF[@]}")
+[ "$RS" -eq 1 ] || mapfile -t RPACK < <(pack "$RS" "${RF[@]}")
 PIDS=()
 for ((s = 0; s < SHARDS; s++)); do
-    OTHERS=()
-    for ((k = 0; k < ${#CF[@]}; k++)); do
-        [ $((k % SHARDS)) -eq "$s" ] || OTHERS+=(--deselect="${CF[k]}")
-    done
+    others "$s" "${CPACK[@]}"
     own ".shard$((s + 1))"
     python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${REST[@]}" "${OTHERS[@]}" >"$LOGS/$s" 2>&1 &
     PIDS+=($!)
 done
 DROP=()
 [ "$SHARDS" -eq 0 ] || DROP=(--deselect=tests/compass/)
+for ((r = 1; r < RS; r++)); do
+    others "$r" "${RPACK[@]}"
+    own ".rest$((r + 1))"
+    python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${DROP[@]}" "${OTHERS[@]}" >"$LOGS/r$r" 2>&1 &
+    PIDS+=($!)
+done
+others 0 "${RPACK[@]}"
 own ""
-python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${DROP[@]}"
+python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${DROP[@]}" "${OTHERS[@]}"
 CODES=($?)
+for ((r = 1; r < RS; r++)); do
+    wait "${PIDS[SHARDS + r - 1]}"
+    CODES+=($?)
+    printf '\n== the rest of tests/, process %s of %s: rc=%s\n' $((r + 1)) "$RS" "${CODES[-1]}"
+    cat "$LOGS/r$r"
+done
 for ((s = 0; s < SHARDS; s++)); do
     wait "${PIDS[s]}"
     CODES+=($?)
-    printf '\n== tests/compass, shard %s of %s: rc=%s\n' $((s + 1)) "$SHARDS" "${CODES[s + 1]}"
+    printf '\n== tests/compass, shard %s of %s: rc=%s\n' $((s + 1)) "$SHARDS" "${CODES[-1]}"
     cat "$LOGS/$s"
 done
 RC=0
