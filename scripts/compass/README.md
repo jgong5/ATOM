@@ -1078,7 +1078,13 @@ returns the command's exit status. Neither gap matters to `deploy.sh`: the
 decode's command reads nothing from stdin, and its stop is a second command
 through the same prefix, `kill -TERM <pid>` in the container, whose process ids
 `OUT/decode.pid` holds. A file the decode writes, such as its `server.json`,
-reaches 005 through `/shared_nfs` seconds late, so set `PREFIX_S=300`.
+reaches 005 through `/shared_nfs` seconds late, so set `PREFIX_S=300`. The
+one use of the prefix the gaps defeat is the pairing of 013's clock with 005's
+(`OUT/clock_pairs.jsonl`, `atom/compass/drive/clock_pair.py`), hundreds of
+lines each way over its stdin and stdout, as `ssh` and `srun` carry them: each
+pair fails, `clock_pair: 10.245.149.94: ...` on `deploy.sh`'s stderr, after
+`PREFIX_S` at most, and the split joins the decode's events to 005's clock by
+the bounds its requests set (`atom/compass/report/split.py`).
 
 | | 005 (prefill) | 013 (decode) |
 |---|---|---|

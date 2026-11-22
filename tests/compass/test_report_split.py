@@ -27,6 +27,7 @@ from test_runner_step_semantics import _drive
 
 from atom.compass import parity
 from atom.compass.carriers import EPOCH_NS
+from atom.compass.drive import clock_pair
 from atom.compass.parity.client_run import NAME
 from atom.compass.report import split
 from atom.compass.runner import overrides
@@ -286,14 +287,28 @@ def test_a_one_node_deployment_whose_kv_crossed_the_network_keeps_one_clock(
     }
 
 
-def _two_nodes(run, remote=("prefill1", "decode1")) -> None:
+def _ahead(t: float) -> float:
+    """How far the second node's clock runs ahead of the client's at `t` on
+    the client's."""
+    return NODE_S
+
+
+def _here(t: float) -> float:
+    """The client's node's clock, which runs ahead of none."""
+    return 0.0
+
+
+def _two_nodes(run, remote=("prefill1", "decode1"), ahead=_ahead) -> None:
     """A real 2P2D run across two nodes: the instances `remote` names on
-    10.0.0.2, whose clock runs `NODE_S` ahead of the client's node's, as g27's
-    ran ahead of g08's (#3720), and the others on the client's node. Request A
-    goes from prefill0 to decode0, B from prefill1 to decode0, C from prefill0
-    to decode1 and D from prefill1 to decode1, each event of each a round time
-    on the client's clock; C's first token reaches the client as the forward
-    handing it over returns."""
+    10.0.0.2, or each on the address it maps them to, whose clock runs
+    `ahead` of the client's node's, `NODE_S` unless given, as g27's ran ahead
+    of g08's (#3720), and the others on the client's node. Request A goes from
+    prefill0 to decode0, B from prefill1 to decode0, C from prefill0 to decode1
+    and D from prefill1 to decode1, each event of each a round time on the
+    client's clock; C's first token reaches the client as the forward handing
+    it over returns."""
+    if not isinstance(remote, dict):
+        remote = dict.fromkeys(remote, "10.0.0.2")
     run.mkdir()
     instances = [
         {"name": "prefill0", "side": "P", "index": 0, "handshake_port": 17100},
@@ -325,9 +340,16 @@ def _two_nodes(run, remote=("prefill1", "decode1")) -> None:
         ],
     }
     for name, held in forwards.items():
-        ahead, host = (NODE_S, "10.0.0.2") if name in remote else (0.0, "127.0.0.1")
+        there, host = (ahead, remote[name]) if name in remote else (_here, "127.0.0.1")
         lines = [
-            _line(i, enter + ahead, out + ahead, batch, named, is_dummy_run=not batch)
+            _line(
+                i,
+                enter + there(enter),
+                out + there(out),
+                batch,
+                named,
+                is_dummy_run=not batch,
+            )
             for i, (enter, out, batch, named) in enumerate(held)
         ]
         _record(run / name, lines, False)
@@ -357,6 +379,36 @@ def _two_nodes(run, remote=("prefill1", "decode1")) -> None:
     )
 
 
+#: Each request of `_two_nodes` split as it ran, its `SEGMENTS`.
+AS_RUN = {
+    "a": (0.2, 0.7, 0.4, 0.7, 1.62),
+    "b": (0.2, 0.9, 0.4, 0.3, 1.62),
+    "c": (0.4, 0.2, 0.3, 0.4, 1.02),
+    "d": (0.2, 0.1, 0.2, 0.6, 0.67),
+}
+SEGMENTS = ("queue_s", "prefill_s", "kv_transfer_s", "decode_s", "forward_ttft_s")
+
+
+def _drifting(t: float) -> float:
+    """A second node's clock ahead of the client's as g27's moved against
+    g08's, a timesyncd slew one way then the other (#3720), though a thousand
+    times as fast: `NODE_S` at 0 s, 10 ms more each second to 2 s, then 5 ms
+    less each second."""
+    return NODE_S + (0.01 * t if t <= 2.0 else 0.02 - 0.005 * (t - 2.0))
+
+
+def _pairs(run, offsets, node="10.0.0.2", error_ns=20_000) -> None:
+    """OUT's clock pairs, as `deploy.sh` record writes them, of `node`: each
+    of `offsets` the client's clock and how far that node's runs ahead of it
+    then, in seconds; each stating `error_ns`."""
+    rows = [
+        {"node": node, "mono_ns": round(t * 1e9), "offset_ns": round(o * 1e9)}
+        | {"error_ns": error_ns}
+        for t, o in offsets
+    ]
+    (run / clock_pair.FILE).write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
 def test_a_two_node_deployment_joins_each_instance_by_its_nodes_offset(tmp_path):
     """prefill1 and decode1 ran on the second node: B's and D's sends bound
     its offset from below, B's decode entry and C's and D's first tokens from
@@ -375,16 +427,9 @@ def test_a_two_node_deployment_joins_each_instance_by_its_nodes_offset(tmp_path)
     assert joined["offset_s"] == pytest.approx(-NODE_S)
     assert joined["bounds_s"] == pytest.approx([-NODE_S - 0.2, -NODE_S])
     assert [r["response_id"] for r in out["requests"]] == ["a", "b", "c", "d"]
-    expected = {
-        "a": (0.2, 0.7, 0.4, 0.7, 1.62),
-        "b": (0.2, 0.9, 0.4, 0.3, 1.62),
-        "c": (0.4, 0.2, 0.3, 0.4, 1.02),
-        "d": (0.2, 0.1, 0.2, 0.6, 0.67),
-    }
-    segments = ("queue_s", "prefill_s", "kv_transfer_s", "decode_s", "forward_ttft_s")
     for r in out["requests"]:
-        assert [r[k] for k in segments] == pytest.approx(expected[r["response_id"]])
-        assert sum(r[k] for k in segments[:4]) == pytest.approx(r["e2el_s"], abs=1e-9)
+        assert [r[k] for k in SEGMENTS] == pytest.approx(AS_RUN[r["response_id"]])
+        assert sum(r[k] for k in SEGMENTS[:4]) == pytest.approx(r["e2el_s"], abs=1e-9)
     assert out["unsplit"] == {}
 
 
@@ -445,6 +490,116 @@ def test_a_one_node_deployment_s_split_is_the_same_whatever_its_instances_serve_
     assert split.write(run) == out
     assert (run / split.FILE).read_bytes() == written
     assert "node_offsets_s" not in out and "decode_offset_s" not in out
+
+
+def test_a_node_whose_clock_is_measured_joins_each_event_by_the_offset_at_it(
+    tmp_path,
+):
+    """The second node's clock drifts between the three pairs OUT holds of it,
+    10 ms a second then back 5: each of its events moves by the offset at its
+    own time, so each request splits as it ran, as no one offset, the bounds',
+    can split it; the bounds stay beside the pairs as they were."""
+    run = tmp_path / "run"
+    _two_nodes(run, ahead=_drifting)
+    bounded = split.split(run)
+    _pairs(run, [(t, _drifting(t)) for t in (0.0, 2.0, 4.0)])
+
+    out = split.write(run)
+
+    assert out["node_offsets_s"] == {
+        "10.0.0.2": {
+            "source": "measured",
+            "samples": 3,
+            "measured_s": pytest.approx([-NODE_S - 0.02, -NODE_S]),
+            "error_s": pytest.approx(2e-5),
+            "bounds_s": bounded["node_offsets_s"]["10.0.0.2"]["bounds_s"],
+            "order_violations": 0,
+        }
+    }
+    assert [r["response_id"] for r in out["requests"]] == ["a", "b", "c", "d"]
+    for r in out["requests"]:
+        expected = AS_RUN[r["response_id"]]
+        assert [r[k] for k in SEGMENTS] == pytest.approx(expected, abs=2e-9)
+    # The bounds' one offset, C's first token's way out taken as none, moves
+    # B's prefill side 4.4 ms early and D's 1.6 ms late.
+    queues = {r["response_id"]: r["queue_s"] for r in bounded["requests"]}
+    assert queues["b"] - AS_RUN["b"][0] == pytest.approx(-0.0044, abs=1e-8)
+    assert queues["d"] - AS_RUN["d"][0] == pytest.approx(0.0016, abs=1e-8)
+
+
+def test_without_pairs_of_its_nodes_the_split_is_the_bounds_byte_for_byte(
+    tmp_path,
+):
+    """OUT holding no clock pair, or pairs of no node its instances ran on,
+    leaves the split the bounds give, byte for byte, naming no source."""
+    run = tmp_path / "run"
+    _two_nodes(run)
+    out = split.write(run)
+    written = (run / split.FILE).read_bytes()
+    _pairs(run, [(0.0, 0.5), (4.0, 0.5)], node="10.0.0.9")
+
+    assert split.write(run) == out
+    assert (run / split.FILE).read_bytes() == written
+    joined = out["node_offsets_s"]["10.0.0.2"]
+    assert list(joined) == ["offset_s", "bounds_s"]
+    assert joined["offset_s"] == pytest.approx(-NODE_S)
+
+
+@pytest.mark.parametrize("error_ns", [20_000, 2_000])
+def test_a_request_the_measured_offset_puts_out_of_order_counts_within_its_error(
+    tmp_path, error_ns
+):
+    """The pairs read the second node's clock 5 us behind where it ran, so C's
+    first token, which reached the client as its hand-over returned there,
+    lands 5 us before it: within the pairs' stated error, 20 us, C is split as
+    joined and counted; past it, 2 us, the split is refused."""
+    run = tmp_path / "run"
+    _two_nodes(run)
+    _pairs(run, [(0.0, NODE_S - 5e-6), (4.0, NODE_S - 5e-6)], error_ns=error_ns)
+
+    out = split.write(run)
+
+    if error_ns < 5_000:
+        assert out == {
+            "refused": "request c's first token is 0.000005000 s before its "
+            "hand-over, so its events are not on one clock"
+        }
+        return
+    assert out["node_offsets_s"]["10.0.0.2"]["order_violations"] == 1
+    # Each event on the second node lands 5 us late.
+    late = {"b": (5e-6, 0, -5e-6, 0, 0), "c": (0, 0, 5e-6, -5e-6, 5e-6)}
+    late["d"] = (5e-6, 0, 0, -5e-6, 5e-6)
+    for r in out["requests"]:
+        shift = late.get(r["response_id"], (0,) * 5)
+        expected = [v + d for v, d in zip(AS_RUN[r["response_id"]], shift)]
+        assert [r[k] for k in SEGMENTS] == pytest.approx(expected, abs=2e-9)
+
+
+def test_beside_a_measured_node_a_node_the_pairs_miss_keeps_its_bounds(tmp_path):
+    """prefill1 ran on 10.0.0.2, whose clock OUT holds pairs of, and decode1
+    on 10.0.0.3, whose it does not: that one takes its upper bound, C's first
+    token's way out taken as none, and says so; D, from one to the other, is
+    checked across both."""
+    run = tmp_path / "run"
+    _two_nodes(run, remote={"prefill1": "10.0.0.2", "decode1": "10.0.0.3"})
+    _pairs(run, [(0.0, NODE_S), (4.0, NODE_S)])
+
+    out = split.write(run)
+
+    joined = out["node_offsets_s"]
+    assert list(joined) == ["10.0.0.2", "10.0.0.3"]
+    assert joined["10.0.0.2"]["source"] == "measured"
+    assert joined["10.0.0.2"]["bounds_s"] == pytest.approx(
+        [-NODE_S - 0.2, -NODE_S + 0.4]
+    )
+    assert joined["10.0.0.3"] == {
+        "source": "bounds",
+        "offset_s": pytest.approx(-NODE_S),
+        "bounds_s": pytest.approx([-NODE_S - 0.3, -NODE_S]),
+    }
+    for r in out["requests"]:
+        expected = AS_RUN[r["response_id"]]
+        assert [r[k] for k in SEGMENTS] == pytest.approx(expected, abs=2e-9)
 
 
 def test_a_request_no_later_forward_hands_over_is_unsplit(tmp_path):

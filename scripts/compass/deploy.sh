@@ -60,7 +60,9 @@
 #   WAIT_S         seconds each instance and the router have to answer, and
 #                  the deployment to leave once stopped (default 600)
 #   PREFIX_S       seconds --on's prefix has to start the decode's command,
-#                  and to send it a stop (default 60)
+#                  to send it a stop, and to pair its node's clock (default 60)
+#   CLOCK_PAIR_S   seconds between two pairs of a node's clock (below; default
+#                  60)
 #   PREFILL_ENV DECODE_ENV
 #                  NAME=VALUE words, split on whitespace, set in that side's
 #                  instances only, as pd_sim.sh takes them: each instance's
@@ -108,7 +110,16 @@
 # command, OUT/<name>.sh, which first writes its process id to OUT/<name>.pid;
 # one given --on as `PREFIX bash OUT/<name>.sh`, stopped as `PREFIX kill -TERM
 # <pid>`, a second command under the first, so srun inside an allocation takes
-# --overlap. --on on any instance makes the KV link inter_node. run.json's
+# --overlap. --on on any instance makes the KV link inter_node. Each node
+# other than this one that an --on prefix starts an instance on, named by the
+# address that instance's server.json URL gives (none for a loopback or
+# unspecified one, which the split takes as this node), has its CLOCK_MONOTONIC
+# paired with this one's over that prefix (atom/compass/drive/clock_pair.py):
+# as the router answers and every CLOCK_PAIR_S while the deployment serves and
+# stops, apart from it, and once it has stopped, each pair a line of
+# OUT/clock_pairs.jsonl, by which the split joins that node's instances to the
+# client's clock. A pair that fails, the prefix closing or not answering in
+# PREFIX_S, writes no line, why on stderr, and fails nothing. run.json's
 # `instances` names each instance, its side and index and, real, its Mooncake
 # handshake port, by which the split tells a decode's transfers apart by the
 # prefill instance they came from (atom/compass/report/split.py). A shell may
@@ -379,6 +390,17 @@ for i in "${!sides[@]}"; do
 done
 urls=()
 for i in "${!sides[@]}"; do urls+=("$(url "$i")"); done
+# Real, each --on instance's URL and prefix, whose node's clock is paired with
+# this one's; the pairing leaves out an instance on this node.
+clocked=() watch=
+if [[ $cmd == record ]]; then
+    for i in "${!sides[@]}"; do
+        declare -n on=on_$i
+        ((${#on[@]} == 0)) || clocked+=("${urls[i]}" "${#on[@]}" "${on[@]}")
+        unset -n on
+    done
+fi
+pair=(python3 -m atom.compass.drive.clock_pair "$OUT/clock_pairs.jsonl" --timeout "$PREFIX_S")
 # The router's requests to each instance, and the wait on the router, go
 # direct, never through a proxy the environment names.
 hosts=127.0.0.1
@@ -426,6 +448,12 @@ compass_wait_up router $R "http://127.0.0.1:$ROUTER_PORT/v1/models"
 prefills=("${pids[@]:0:NP}")
 stopped=0
 trap 'stopped=1; kill -TERM "${prefills[@]}" 2>/dev/null || true' TERM INT
+# Each other node's clock paired as the deployment starts and every
+# CLOCK_PAIR_S after, apart, so a prefix slow to pair delays no start.
+if ((${#clocked[@]})); then
+    (cd / && exec "${pair[@]}" --every "${CLOCK_PAIR_S:-60}" -- "${clocked[@]}") &
+    watch=$!
+fi
 # server.json names a child of this script that lives as long as it does, so a
 # client's stop, sent to its parent, reaches the script whatever else has left.
 # It holds none of the script's output, which its caller may read to the end.
@@ -461,6 +489,11 @@ for pid in "${pids[@]}" $authority $R; do
     done
     wait $pid || ((pid == R)) || rc=1
 done
+if [[ -n $watch ]]; then
+    kill -TERM "$watch" 2>/dev/null || true
+    wait "$watch" || true
+    (cd / && "${pair[@]}" -- "${clocked[@]}") || true
+fi
 trap - EXIT
 # Each instance: its directory's name, side and index, and, real, its
 # Mooncake handshake port, which a prefill's transfers carry to the decode.

@@ -77,7 +77,8 @@ class Health(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
 host = argv[argv.index("--host") + 1] if "--host" in argv else "127.0.0.1"
-server = http.server.HTTPServer((host, 0), Health)
+# One serving at another node's address serves here at PLANTED_BIND.
+server = http.server.HTTPServer((os.environ.get("PLANTED_BIND", host), 0), Health)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 
 def stop(*_):
@@ -399,6 +400,67 @@ def test_each_side_s_variables_reach_its_instances_alone_here_and_through_on(
             assert folded["connectors"] == [kv, offload]
             pools = parse_mooncake_store_config(offload).pools
             assert sorted(pools) == ["ionic_0", "ionic_1"]
+
+
+@pytest.mark.parametrize("node", ["10.0.0.2", None])
+def test_a_record_pairs_the_clock_of_each_other_node_it_starts_an_instance_on(
+    tmp_path, planted, node
+):
+    """2P1D recorded, the second prefill instance started through a prefix
+    that, as `ssh <node>` does, runs its words in a shell of its own, and
+    serving at `node`'s address: the deployment pairs that node's clock with
+    this one's over the prefix as it starts, every CLOCK_PAIR_S and once it
+    has stopped, each pair a line of OUT/clock_pairs.jsonl, which the router,
+    asking prefill0 alone, never reaches. Serving at its node's loopback,
+    None, it has no node the split tells apart from this one, so no pair."""
+    env, _ = planted
+    prefix = tmp_path / "bin" / "on"
+    prefix.write_text('#!/bin/sh\nshift\necho "$*" >>"$PLANTED_ON"\nexec sh -c "$*"\n')
+    prefix.chmod(0o755)
+    env |= {"PLANTED_ON": str(tmp_path / "on.log"), "PLANTED_BIND": "127.0.0.1"}
+    env |= {"CLOCK_PAIR_S": "1"}
+    words = argv(tmp_path, ["--gpu", "0,1"])
+    words[3] = "record"
+    at = words.index("--decode")
+    own = ["--on", f"{prefix} node-b", *(["--host", node] if node else [])]
+    words[at:at] = ["--prefill", *own, "--", "--model", str(tmp_path), *PREFILL]
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        words,
+        env=env,
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _until(d / "server.json", script)
+        ready = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        time.sleep(3)
+    finally:
+        stopping = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        script.send_signal(signal.SIGTERM)
+        _, err = script.communicate(timeout=60)
+
+    # No pair failed; and the run was written once all had stopped.
+    assert "clock_pair" not in err, err
+    assert (d / "run.json").exists()
+    ran = (tmp_path / "on.log").read_text().splitlines()
+    assert ran[0] == f"bash {d}/prefill1.sh"
+    serve = f"python3 -I -u {TREE}/atom/compass/drive/clock_pair.py serve"
+    paired = d / "clock_pairs.jsonl"
+    if node is None:
+        assert not paired.exists() and serve not in ran
+        return
+    rows = [json.loads(line) for line in paired.read_text().splitlines()]
+    # As it started, once a second after while it served, and once stopped.
+    assert len(rows) >= 3 and ran.count(serve) == len(rows)
+    assert {r["node"] for r in rows} == {node}
+    times = [r["mono_ns"] for r in rows]
+    assert times == sorted(times) and times[0] < ready + 2e9
+    assert times[-1] > stopping
+    # That node is this one, so each offset is none within the error it states.
+    assert all(abs(r["offset_ns"]) <= r["error_ns"] for r in rows)
 
 
 def test_a_side_s_variable_that_is_no_name_value_word_exits_2(tmp_path, planted):

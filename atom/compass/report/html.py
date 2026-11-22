@@ -313,10 +313,22 @@ def _split(run: Path) -> str:
             f" {low:.4f} s to {high:.4f} s"
         )
     for node, joined in made.get("node_offsets_s", {}).items():
-        if joined:
-            low, high = (
-                "none" if b is None else f"{b:.4f} s" for b in joined["bounds_s"]
+        if not joined:
+            continue
+        low, high = (
+            "none" if b is None else f"{b:.4f} s"
+            for b in joined["bounds_s"] or (None, None)
+        )
+        if joined.get("source") == "measured":
+            least, most = joined["measured_s"]
+            clock += (
+                f", {node}'s instances joined to it by {joined['samples']} measured"
+                f" offsets, {least:.4f} s to {most:.4f} s, each within"
+                f" {joined['error_s'] * 1e3:.3f} ms, which put"
+                f" {joined['order_violations']} requests out of order, its bounds"
+                f" {low} to {high}"
             )
+        else:
             clock += (
                 f", {node}'s instances joined to it at {joined['offset_s']:.4f} s,"
                 f" its bounds {low} to {high}"
