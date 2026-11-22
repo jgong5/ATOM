@@ -159,11 +159,10 @@ own `gh` login. Ownership is the assignee:
   `COMPASS_GPU_GATE_SCOPE=all scripts/compass/gate_gpu.sh` by hand on the
   integration tip; each failure outside the known-failures list is a
   finding issue. A batch whose diff touches a path in
-  `scripts/compass/gpu_gate_triggers.txt`, where `gate_cpu.sh` exits 98,
-  or touches EPLB, CUDA-graph capture bounds or block tables, which no
-  trigger path covers and `gate_cpu.sh` does not detect, holds one PR,
-  or one stack of building blocks and their wiring PR (Production
-  reachability). Its lander runs `gate_gpu.sh` on the batch
+  `scripts/compass/gpu_gate_triggers.txt`, where `gate_cpu.sh` exits 98
+  (it lists EPLB, CUDA-graph capture bounds and block tables by name),
+  holds one PR, or one stack of building blocks and their wiring PR
+  (Production reachability). Its lander runs `gate_gpu.sh` on the batch
   commit, then `gate_cpu.sh` there with `COMPASS_GPU_GATE_DONE` set to that
   commit's full sha.
   - **The blind-spot call.** A reviewer whose PR changes code that only

@@ -492,10 +492,9 @@ CPU gate covers it, and a path *present* is not proof that it does not. Of the t
 this gate prefers the first, because running the GPU gate when in doubt is never the wrong
 one. Judging that a change sits outside the blind spot remains its reviewer's call.
 
-**A change touching a path in `scripts/compass/gpu_gate_triggers.txt`, EPLB, CUDA-graph
-capture bounds or block tables lands in a batch of its own, and its lander runs `gate_gpu.sh`
-on the batch commit.** The overlay (`.claude/agent-team.md`, "The GPU gate") states the same
-rule.
+**A change touching a path in `scripts/compass/gpu_gate_triggers.txt` lands in a batch of its
+own, and its lander runs `gate_gpu.sh` on the batch commit.** The overlay
+(`.claude/agent-team.md`, "The GPU gate") states the same rule.
 EPLB, CUDA-graph capture bounds, block tables, the paged index builders and the prefix-cache
 kernels are where the files running nothing here concentrate — 29 excluded plus 22 exercising
 nothing, 51 in all; the silent 22 include `test_pool_index.py`,
@@ -505,8 +504,10 @@ and `test_prefill_prefix_vs_native.py`, the paged-index and prefix-cache areas `
 are CPU-green, measured above, and booking a GPU for them spends the resource the booking
 queue below exists to ration.
 The paged index builders and the prefix-cache kernels sit under `atom/model_ops/v4_kernels/`,
-a trigger-list entry. EPLB, the capture bounds and the block tables are named because no
-trigger-list path covers them: the CPU gate runs their tests, but without a device.
+a trigger-list entry. EPLB, the capture bounds and the block tables are on the trigger list by
+name (`NAMED` in `regen_gpu_gate_triggers.sh`), because the derivation cannot see them: the
+CPU gate runs their tests, but without a device, and either no excluded test imports their
+files or a CPU-gate import credits them.
 
 **Three files are covered by neither gate**, measured in `xiaobizh_n18` at `83daf636d`:
 `test_prefix_cache_accuracy.py` (`no tests ran`), `test_kv_connector_scheduler.py` and

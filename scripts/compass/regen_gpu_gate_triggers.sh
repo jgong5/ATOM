@@ -74,6 +74,9 @@
 # So the output is neither a floor nor a ceiling. Of the two mistakes, this file
 # prefers firing: running the GPU gate when in doubt is never the wrong one.
 # Decision 3 is that preference, written down.
+#
+# NAMED below lists EPLB, block tables and CUDA-graph capture bounds by name: the
+# CPU gate runs their tests without a device, which the rule above cannot see.
 set -uo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -84,6 +87,22 @@ compass_env "$ROOT"
 EXCLUDE=$ROOT/scripts/compass/cpu_gate_exclude.txt
 OUT=$ROOT/scripts/compass/gpu_gate_triggers.txt
 [ -e "$EXCLUDE" ] || { printf 'REFUSED: %s missing\n' "$EXCLUDE" >&2; exit 94; }
+
+# Printed after the derived paths. gate_cpu.sh reads every non-# line as a path.
+NAMED=$(cat <<'EOF'
+# EPLB: no excluded test imports it, so it is never a candidate.
+atom/model_ops/eplb.py
+# Block tables: no excluded test imports these, so they are never candidates.
+atom/model_engine/block_manager.py
+atom/model_engine/block_table_codec.py
+atom/model_engine/block_pool.py
+atom/utils/block_tables.py
+# CUDA-graph capture bounds: a CPU-gate test imports these at module level,
+# which credits them as covered.
+atom/config.py
+atom/model_engine/model_runner.py
+EOF
+)
 
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
@@ -203,7 +222,9 @@ N_UNRES=$(sort -u "$D/unres" | grep -c .)
     exit 98
 }
 
-comm -23 "$D/cand" "$D/covered" >"$D/final0"
+grep -v '^#' <<<"$NAMED" | sort >"$D/named"
+N_NAMED=$(grep -c . "$D/named")
+comm -23 "$D/cand" "$D/covered" | comm -23 - "$D/named" >"$D/final0" # none listed twice
 
 # Drop anything already covered by a subtree entry above it.
 : >"$D/final"
@@ -284,6 +305,10 @@ TMP=$OUT.tmp
 # Of the two mistakes, this list prefers firing: running the GPU gate when in
 # doubt is never the wrong one.
 #
+# The paths after the derived ones are listed by name: the CPU gate runs their
+# tests without a device, which the rule above cannot see. A comment above each
+# names its area and why.
+#
 # A trailing / matches the whole subtree.
 HDR
     printf '#\n# Measured at %s over this tree:\n' "$SHA"
@@ -299,8 +324,9 @@ HDR
     printf '#              prints the run, and is the only source for its outcome counts.\n'
     printf '#   candidates   %4s paths named by an excluded test, any indentation\n' "$N_CAND"
     printf '#   covered      %4s paths named at module level by a live CPU-gate file\n' "$N_COV"
-    printf '#   triggers     %4s paths below\n' "$N"
+    printf '#   triggers     %4s derived paths below, then %s listed by name\n' "$N" "$N_NAMED"
     cat "$D/final"
+    printf '%s\n' "$NAMED"
 } >"$TMP"
 mv -f "$TMP" "$OUT"
 
