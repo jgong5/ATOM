@@ -54,6 +54,9 @@ PIDS = "COMPASS_TEST_PROBE_PIDS"
 OUTLIVED = f"the child reading ATOM's attention builder outlived {BOUND} s"
 #: Why a child in which ATOM's builder fails to load gives none.
 ATOM_FAILS = "ATOM's attention builder: ModuleNotFoundError: No module named 'aiter'"
+#: The candidate's dimensions: an argument that varies with the concurrency, so
+#: each of its points is an instance of its own, judged apart.
+SCALED = {"config": {"a": {"per_concurrency": {"--max-num-seqs": 8}}}}
 
 
 def outliving(family, arch):
@@ -69,7 +72,7 @@ def outliving(family, arch):
 def bounded(monkeypatch, tmp_path):
     """The bound `BOUND`, the stand-ins' pids in `tmp_path`, and no builder's
     answer cached before or after."""
-    monkeypatch.setattr(lacking, "PROBE_SECONDS", BOUND)
+    monkeypatch.setattr(lacking, "PROBE_SECONDS", BOUND, raising=False)
     monkeypatch.setenv(PIDS, str(tmp_path / "pids"))
     lacking._token_graphs.cache_clear()
     yield
@@ -131,12 +134,13 @@ def test_a_compass_defect_reading_the_builder_fails_check_with_its_traceback(
 def test_the_reuse_check_refuses_by_name_a_law_whose_buckets_outlive_the_bound_once(
     tmp_path, monkeypatch, v41  # noqa: F811
 ):
-    """Each of the candidate's two points refuses, its child read once."""
+    """Each of the candidate's two points, judged apart, refuses; the builder's
+    child is read once."""
     monkeypatch.setattr(lacking, "_builder_records", outliving)
     law_file(tmp_path, held(v41, RECORDED))
     started = time.monotonic()
 
-    found = verdicts(advise(tmp_path), "law")
+    found = verdicts(advise(tmp_path, dimensions=SCALED), "law")
 
     assert time.monotonic() - started < SLEEP
     assert [(v["verdict"], v["requirement"]) for v in found] == [("refused", None)] * 2
