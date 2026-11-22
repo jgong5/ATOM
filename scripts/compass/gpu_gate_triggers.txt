@@ -44,19 +44,19 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at 066a0e4f7ab5561c4063786f8a5b63dc86f429cd over this tree:
+# Measured at 2028c9234fc12ff56ce3d5d22bd3abd99000c105 over this tree:
 #   tests/       1055 files  = 80 in tests/plugin/ + 61 excluded + 914 CPU gate
 #   CPU gate      851 files collect >=1 test, 63 collect none
 #   imports      1357 indented `import atom.*` lines in non-plugin test files
-#   collected  19677 tests by --collect-only. A run of the same set reports
-#              the same 19677 outcomes. Its "skipped" total is LARGER than any
+#   collected  19684 tests by --collect-only. A run of the same set reports
+#              the same 19684 outcomes. Its "skipped" total is LARGER than any
 #              skip count here, because a module-level skip in one of the 63
 #              files that collect nothing is counted as skipped without ever
 #              becoming a collected test. This file states the set; gate_cpu.sh
 #              prints the run, and is the only source for its outcome counts.
 #   candidates    157 paths named by an excluded test, any indentation
 #   covered       446 paths named at module level by a live CPU-gate file
-#   triggers       90 derived paths below, then 7 listed by name
+#   triggers       90 derived paths below, then 4 listed by name
 atom/distributed/pcp_utils.py
 atom/model_loader/loader.py
 atom/model_ops/attention_gdn.py
@@ -147,14 +147,8 @@ atom/spec_decode/eagle_proposer.py
 atom/structured_output/schema.py
 atom/utils/custom_register.py
 atom/utils/decorators.py
-# EPLB: no excluded test imports it, so it is never a candidate.
-atom/model_ops/eplb.py
 # Block tables: no excluded test imports these, so they are never candidates.
 atom/model_engine/block_manager.py
 atom/model_engine/block_table_codec.py
 atom/model_engine/block_pool.py
 atom/utils/block_tables.py
-# CUDA-graph capture bounds: a CPU-gate test imports these at module level,
-# which credits them as covered.
-atom/config.py
-atom/model_engine/model_runner.py
