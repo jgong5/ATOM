@@ -123,6 +123,7 @@ def test_the_step_that_moves_the_total_is_held_out_and_the_spread_reported(tmp_p
         "unsplit": 0,
         "untraced": 0,
         "traced": 0,
+        "paced": 0,
     }
     assert report["unvalidated"] == {} and report["refused"] == {}
     prefill = report["validated"]["prefill"]
@@ -160,6 +161,7 @@ def test_unvalidated_and_refused_steps_are_reported_apart(tmp_path):
         "unsplit": 0,
         "untraced": 0,
         "traced": 0,
+        "paced": 0,
     }
     (unvalidated,) = report["unvalidated"].values()
     assert unvalidated["steps"] == 1
@@ -384,6 +386,7 @@ def test_a_group_step_prices_as_its_slowest_rank_against_the_group_s_time(tmp_pa
         "unsplit": 0,
         "untraced": 0,
         "traced": 0,
+        "paced": 0,
         "ranks": 0,
     }
     assert report["warm"] == [] and report["refused"] == {}
@@ -516,6 +519,7 @@ def test_a_peer_s_dummy_forward_is_priced_0_s_and_its_step_graded(tmp_path):
         "unsplit": 0,
         "untraced": 0,
         "traced": 0,
+        "paced": 0,
         "ranks": 0,
     }
     assert report["unvalidated"] == {} and report["refused"] == {}

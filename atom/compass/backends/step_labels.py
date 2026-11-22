@@ -78,7 +78,19 @@ that produces output), the draft label the rest of `d_busy_ns`, and the
 propose label `d_propose_ns`. Such a label holds whatever idle the host paced
 inside the window, so it reads the step's device span, not its busy time; its
 sample's provenance says so (`prefill_label`), and a step with busy time keeps
-the trace run's labels.
+the trace run's labels. One whose labelled device work, placed on the host
+clock by the lead (below), ends within `PACED_S` of its host launch's end ran
+at its launch's pace: the device waited for each kernel the host launched, so
+its span is the launch's, which the host laws' `W_launch` prices, not device
+work. It is cut as `paced` (`_paced`) and keeps its host labels. On #3720's
+cell B (DeepSeek-V4.1 1P1D, P at DP2 EP2, eager) an output prefill's launch
+takes 55-56 ms up to 8k tokens, and 96% of those of 1024 or fewer tokens end
+their device span 0.5-1.5 ms after it, its spike (b3_B3 and r256: 1,987 of
+the output prefills within 2 ms, about 40 per 0.5 ms bin past it); the same
+tokens after a middle chunk, whose device the host keeps busy, run 24-27 ms.
+Fitted on the paced spans, the prefill vector's intercept held the launch
+(42 ms) and priced such a tail at 50 ms, and with the launch priced again by
+the host's recurrence a lone prefill of 1-2k tokens 13-18% over the real one.
 
 Given `floored`, a trace run's drafter labels, the draft's and its passes',
 lose what the profiler added to each drafter kernel shorter than the profiler's
@@ -160,8 +172,9 @@ from atom.compass.backends.shape import BatchView, PrefillDuty, RequestShape
 #: returns for the lead.
 ANCHORS = 32
 #: Why a device label is cut: a launch-exposed decode, mixed rows, no MTP target
-#: end, a prefill with no traced busy time, a trace run's decode.
-CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced")
+#: end, a prefill with no traced busy time, a trace run's decode, a windowed
+#: prefill its launch paced.
+CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced", "paced")
 #: The directory beside a trace run's `steps` its traces are in (`parity.busy`).
 TRACE = "trace"
 HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
@@ -174,6 +187,9 @@ BUILDS = "aiter_jit_builds"
 #: The variable that, set to ``record``, labels an untraced prefill step from its
 #: own device window (module docstring); unset, such a step is cut `untraced`.
 PREFILL_LABEL_ENV = "COMPASS_PREFILL_LABEL"
+#: How near its host launch's end a windowed prefill's device work ends, either
+#: side, to have run at the launch's pace (`_paced`), in seconds.
+PACED_S = 2e-3
 
 
 def _prefill_label() -> str:
@@ -484,6 +500,23 @@ def host_paced_drafts(lines) -> set[int]:
     }
 
 
+def _paced(lines) -> set[int]:
+    """The prefill steps of `lines` whose labelled device work, the target's
+    and on a step that produces output its draft-KV pass, ends within
+    `PACED_S` of their host launch's end, either side, placed on the host
+    clock by the lead `_timed` gives: their device ran at the launch's pace."""
+    paced = set()
+    for s, start, lead, _ in _timed(lines):
+        if s["is_dummy_run"] or "d_target_ns" not in s or "t_launch_ns" not in s:
+            continue
+        if not any(not decode for _, _, decode in s["rows"]):
+            continue
+        work = s["d_target_ns"] + s.get("d_draft_kv_ns", 0) * s["produces_output"]
+        if abs(start + work + lead - s["t_launch_ns"][1]) <= PACED_S * 1e9:
+            paced.add(s["step"])
+    return paced
+
+
 def _host_cut(lines) -> tuple[set[int], set[int]]:
     """The steps whose device start precedes their host launch end, and the
     MTP decodes whose device reached the propose pass before the host's draft
@@ -710,6 +743,7 @@ def _label(
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     window_prefill = _prefill_label() == "record" and not traced
+    paced = _paced(lines) if window_prefill and mtp else set()
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
     tbo = (config or {}).get("engine", {}).get("enable_tbo")
@@ -785,6 +819,8 @@ def _label(
             cut = "traced"
         elif view.prefill and "b_target_ns" not in s and not windowed:
             cut = "untraced"
+        elif windowed and s["step"] in paced:
+            cut = "paced"
         elif mtp and "d_target_ns" not in s:
             cut = "unsplit"
         gap = 0 if view.prefill else s.get("d_gap_ns", 0)
