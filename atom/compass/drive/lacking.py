@@ -44,12 +44,14 @@ Printed apart, outside the exit status: the gaps `--coverage`'s check counts;
 an op graph's absent price list, which prices every leaf by its analytical
 law, unless `--coverage` asks for its check, which then refuses; and the
 modules the step roofline leaves unclassified on the model built on the meta
-device, when it prices the steps the backend refuses. No `compass run`
-backend is the step roofline itself.
+device, when it prices the steps the backend refuses; and why the prefill
+token-graph buckets cannot be worked out, so no law is held to them. No
+`compass run` backend is the step roofline itself.
 """
 
 import functools
 import json
+import multiprocessing
 import os
 import re
 import shlex
@@ -118,6 +120,9 @@ SIDE_LAW = (
 FITS = {STEP_LINEAR: "steps --backend step-linear", "host": "host"}
 #: Each side by the letter `runfile.pd_side` gives it.
 SIDES = {"P": "prefill", "D": "decode"}
+#: How long the child reading ATOM's attention builder may take, in seconds, far
+#: past the few it takes on a CPU host; past it, the child is ended.
+PROBE_SECONDS = 300
 
 
 def report(args, atom_args, real=None, env=None) -> int:
@@ -200,7 +205,11 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
         if held and len(held) == len(tokens):
             run[name] = held if len(held) > 1 else held[0]
     law, host = NAMES[STEP_LINEAR], NAMES["host"]
-    buckets = {STEP_LINEAR, "host"} & run.keys() and recorded_buckets(config, arch)
+    try:
+        buckets = {STEP_LINEAR, "host"} & run.keys() and recorded_buckets(config, arch)
+    except ValueError as unworked:
+        buckets = ()
+        apart.append(f"{unworked}, so no law is held to them")
     if STEP_LINEAR in run and met(
         law, made_by[STEP_LINEAR], compass_run.pick_fitted, run, STEP_LINEAR, config
     ):
@@ -299,7 +308,8 @@ def recorded_buckets(config, arch: str) -> tuple[int, ...]:
     """The prefill token-graph buckets a run of `config` on a device of `arch`
     records at capture (`state_prefill_buckets`): `ATOM_TOKEN_GRAPH_SIZES` up to
     `ModelRunner.warmup_max_tokens` where ATOM's attention builder for its model
-    records token graphs; none if eager or under RapidServe, whose prefill is eager."""
+    records token graphs; none if eager or under RapidServe, whose prefill is eager.
+    Where the builder cannot be read (`_token_graphs`), a value error says why."""
     from atom.utils import envs, get_hf_text_config
     from atom.utils.selector import attn_family
 
@@ -309,30 +319,41 @@ def recorded_buckets(config, arch: str) -> tuple[int, ...]:
     limit = config.max_num_batched_tokens // dp // config.prefill_context_parallel_size
     sizes = sorted({n for n in envs.ATOM_TOKEN_GRAPH_SIZES if 0 < n <= limit})
     family = attn_family(get_hf_text_config(config.hf_config))
-    return tuple(sizes) if sizes and _token_graphs(family, arch) else ()
+    records = bool(sizes) and _token_graphs(family, arch)
+    if isinstance(records, str):
+        raise ValueError(records)  # noqa: TRY004 - why, not a wrong type
+    return tuple(sizes) if records else ()
 
 
 @functools.cache
-def _token_graphs(family, arch: str) -> bool:
+def _token_graphs(family, arch: str) -> bool | str:
     """Whether ATOM's attention builder for `family` records token graphs, in a
     process declaring a device of `arch`: its module imports aiter, which needs one.
-    Compass's own defect there raises as a runtime error (`check._resolving`), and
-    anything else it raises, or the child dying, as a value error naming it."""
-    from concurrent.futures.process import BrokenProcessPool
+    Compass's own defect there raises as a runtime error (`check._resolving`).
+    Anything else it raises, the child dying, or the child outliving
+    `PROBE_SECONDS`, which ends it, gives why the buckets cannot be worked out,
+    cached as an answer is, so a child that hangs is waited for once."""
+    from concurrent.futures.process import BrokenProcessPool, ProcessPoolExecutor
 
     from atom.compass.advice.check import _resolving
-    from atom.compass.bench.ops import _child
 
-    of = "attention builder"
-    try:
-        records, raised, said = _child(_resolving, _builder_records, family, arch, of)
-    except BrokenProcessPool as died:
-        raised, said = "refused", f"the child reading ATOM's {of} died: {died}"
+    of, spawn = "attention builder", multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(1, mp_context=spawn) as child:
+        try:
+            read = child.submit(_resolving, _builder_records, family, arch, of)
+            records, raised, said = read.result(PROBE_SECONDS)
+        except BrokenProcessPool as died:
+            raised, said = "refused", f"the child reading ATOM's {of} died: {died}"
+        except TimeoutError:
+            for process in list(child._processes.values()):  # 3.14: kill_workers
+                process.kill()
+            raised = "refused"
+            said = f"the child reading ATOM's {of} outlived {PROBE_SECONDS} s"
     if raised == "defect":
         raise RuntimeError(f"Compass's own code raised reading ATOM's {of}:\n{said}")
     if raised:
         why = "the prefill token-graph buckets this run records cannot be worked out"
-        raise ValueError(f"{why}: {said}")
+        return f"{why}: {said}"
     return records
 
 
