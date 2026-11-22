@@ -455,10 +455,17 @@ fi
 R=$!
 compass_wait_up router $R "http://127.0.0.1:$ROUTER_PORT/v1/models"
 # A stop from here on, one server.json's reader sends included, also stops the
-# prefill instances, so the wait below ends even when the stop comes before it.
-prefills=("${pids[@]:0:NP}")
+# prefill instances, so the wait below ends even when the stop comes before it:
+# each here by a SIGTERM, each elsewhere through its prefix, as the stop below
+# reaches every instance. A signal to the prefix itself would end it apart
+# from its command, with a status of its own, ssh's 255 or a shell's 143, on
+# which a normal stop failed; ended by its command, it ends with its status.
+stop_prefills() {
+    local i
+    for ((i = 0; i < NP; i++)); do stop_instance "$i"; done
+}
 stopped=0
-trap 'stopped=1; kill -TERM "${prefills[@]}" 2>/dev/null || true' TERM INT
+trap 'stopped=1; stop_prefills' TERM INT
 # Each other node's clock paired as the deployment starts and every
 # CLOCK_PAIR_S after, apart, so a prefix slow to pair delays no start.
 if ((${#clocked[@]})); then
@@ -490,7 +497,9 @@ rc=$((!stopped))
 # Each instance stops its server, whose frontend ends a simulated run through
 # the authority; the authority leaves once it has written the summary.
 # The router stops last: a router LP's run needs it until then.
-for i in "${!sides[@]}"; do stop_instance "$i"; done
+# A prefill instance the stop's trap reached is not stopped again: a second
+# SIGTERM after `compass record` has stopped its server would end it there.
+for i in "${!sides[@]}"; do ((stopped && i < NP)) || stop_instance "$i"; done
 deadline=$((SECONDS + WAIT_S))
 for pid in "${pids[@]}" $authority $R; do
     ((pid != R)) || kill -TERM $R 2>/dev/null || true

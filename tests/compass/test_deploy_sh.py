@@ -62,7 +62,7 @@ time.sleep(2)
 open(out + "/summary.json", "w").write("{}")
 """
 INSTANCE = """\
-import http.server, json, os, signal, sys, threading
+import http.server, json, os, signal, sys, threading, time
 argv = sys.argv[1:]
 out = argv[argv.index("--out") + 1]
 json.dump(argv, open(out + ".argv.json", "w"))
@@ -76,6 +76,15 @@ class Health(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
+def leave(name, path):
+    # Once `path` exists, `name` leaves with an error, as one that fails on its own.
+    if name == os.path.basename(out):
+        while not os.path.exists(path):
+            time.sleep(0.1)
+        os._exit(3)
+
+if "PLANTED_DIE" in os.environ:
+    threading.Thread(target=leave, args=os.environ["PLANTED_DIE"].split(), daemon=True).start()
 host = argv[argv.index("--host") + 1] if "--host" in argv else "127.0.0.1"
 # One serving at another node's address serves here at PLANTED_BIND.
 server = http.server.HTTPServer((os.environ.get("PLANTED_BIND", host), 0), Health)
@@ -443,6 +452,7 @@ def test_a_record_pairs_the_clock_of_each_other_node_it_starts_an_instance_on(
         _, err = script.communicate(timeout=60)
 
     # No pair failed; and the run was written once all had stopped.
+    assert script.returncode == 0, err
     assert "clock_pair" not in err, err
     assert (d / "run.json").exists()
     ran = (tmp_path / "on.log").read_text().splitlines()
@@ -514,6 +524,7 @@ def test_a_node_whose_prefix_carries_no_stdin_is_paired_through_its_override(
         script.send_signal(signal.SIGTERM)
         _, err = script.communicate(timeout=60)
 
+    assert script.returncode == 0, err
     assert (d / "run.json").exists()
     serve = f"python3 -I -u {TREE}/atom/compass/drive/clock_pair.py serve"
     relayed = (tmp_path / "on.log").read_text().splitlines()
@@ -536,6 +547,65 @@ def test_a_node_whose_prefix_carries_no_stdin_is_paired_through_its_override(
     assert set(ssh) == {serve} and len(ssh) - len(rows) in (0, 1)
     assert serve not in relayed
     assert all(abs(r["offset_ns"]) <= r["error_ns"] for r in rows)
+
+
+#: A prefix as `ssh <node>`: it runs its words in a shell of its own and ends
+#: with their status, or, signalled itself, with 255, as ssh does at SIGTERM.
+SSH = (
+    '#!/bin/sh\ntrap "exit 255" TERM\nshift\necho "$*" >>"$PLANTED_ON"\n'
+    'sh -c "$*" &\nwait $!\n'
+)
+
+
+@pytest.mark.parametrize("leaves", [False, True])
+def test_a_record_s_stop_reaches_an_instance_elsewhere_through_its_prefix(
+    tmp_path, planted, leaves
+):
+    """prefill1 started through a prefix that, as `ssh <node>` does, ends
+    with its command's status, or with 255 when signalled itself: the stop
+    reaches prefill1 through the prefix, never the prefix, so its status is
+    prefill1's, and the record exits 0. prefill1 leaving with an error before
+    any stop fails it."""
+    env, _ = planted
+    (tmp_path / "bin" / "ssh").write_text(SSH)
+    (tmp_path / "bin" / "ssh").chmod(0o755)
+    env |= {"PLANTED_ON": str(tmp_path / "on.log")}
+    env |= {"PLANTED_DIE": f"prefill1 {tmp_path / 'leave'}"}
+    words = argv(tmp_path, ["--gpu", "0,1"])
+    words[3] = "record"
+    at = words.index("--decode")
+    own = ["--on", f"{tmp_path / 'bin' / 'ssh'} node-b"]
+    words[at:at] = ["--prefill", *own, "--", "--model", str(tmp_path), *PREFILL]
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        words,
+        env=env,
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _until(d / "server.json", script)
+        time.sleep(1)
+        if leaves:
+            (tmp_path / "leave").touch()
+            script.wait(timeout=60)
+    finally:
+        script.send_signal(signal.SIGTERM)
+        _, err = script.communicate(timeout=60)
+
+    assert (d / "run.json").exists()
+    pid = int((d / "prefill1.pid").read_text())
+    ran = (tmp_path / "on.log").read_text().splitlines()
+    assert ran[0] == f"bash {d}/prefill1.sh"
+    if leaves:
+        assert script.returncode == 1
+        assert "deploy: a process of the deployment left before a stop" in err
+        return
+    assert script.returncode == 0, err
+    assert ran[1:] == [f"kill -TERM {pid}"]
+    assert (d / "prefill1" / "run.json").exists()
 
 
 def test_a_side_s_variable_that_is_no_name_value_word_exits_2(tmp_path, planted):
