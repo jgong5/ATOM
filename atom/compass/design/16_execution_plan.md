@@ -504,10 +504,11 @@ and `test_prefill_prefix_vs_native.py`, the paged-index and prefix-cache areas `
 are CPU-green, measured above, and booking a GPU for them spends the resource the booking
 queue below exists to ration.
 The paged index builders and the prefix-cache kernels sit under `atom/model_ops/v4_kernels/`,
-a trigger-list entry. EPLB, the capture bounds and the block tables are on the trigger list by
-name (`NAMED` in `regen_gpu_gate_triggers.sh`), because the derivation cannot see them: the
-CPU gate runs their tests, but without a device, and either no excluded test imports their
-files or a CPU-gate import credits them.
+a trigger-list entry. The block tables are on the trigger list by name (`NAMED` in
+`regen_gpu_gate_triggers.sh`), because the derivation cannot see them: the CPU gate runs their
+tests, but without a device, and no excluded test imports their files. EPLB and the capture
+bounds are not on it: neither gate runs their device code, so a GPU gate would test nothing of
+a change there.
 
 **Three files are covered by neither gate**, measured in `xiaobizh_n18` at `83daf636d`:
 `test_prefix_cache_accuracy.py` (`no tests ran`), `test_kv_connector_scheduler.py` and

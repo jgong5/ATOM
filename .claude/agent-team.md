@@ -160,8 +160,8 @@ own `gh` login. Ownership is the assignee:
   integration tip; each failure outside the known-failures list is a
   finding issue. A batch whose diff touches a path in
   `scripts/compass/gpu_gate_triggers.txt`, where `gate_cpu.sh` exits 98
-  (it lists EPLB, CUDA-graph capture bounds and block tables by name),
-  holds one PR, or one stack of building blocks and their wiring PR
+  (it lists block tables by name; neither gate runs the device code of
+  EPLB or the CUDA-graph capture bounds), holds one PR, or one stack of building blocks and their wiring PR
   (Production reachability). Its lander runs `gate_gpu.sh` on the batch
   commit, then `gate_cpu.sh` there with `COMPASS_GPU_GATE_DONE` set to that
   commit's full sha.

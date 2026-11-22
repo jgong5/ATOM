@@ -75,8 +75,10 @@
 # prefers firing: running the GPU gate when in doubt is never the wrong one.
 # Decision 3 is that preference, written down.
 #
-# NAMED below lists EPLB, block tables and CUDA-graph capture bounds by name: the
-# CPU gate runs their tests without a device, which the rule above cannot see.
+# NAMED below lists the block tables by name: the CPU gate runs their tests
+# without a device, which the rule above cannot see. EPLB and the CUDA-graph
+# capture bounds are not listed: no test gate_gpu.sh runs reaches their device
+# code, so the GPU gate would test nothing of a change there.
 set -uo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -90,17 +92,11 @@ OUT=$ROOT/scripts/compass/gpu_gate_triggers.txt
 
 # Printed after the derived paths. gate_cpu.sh reads every non-# line as a path.
 NAMED=$(cat <<'EOF'
-# EPLB: no excluded test imports it, so it is never a candidate.
-atom/model_ops/eplb.py
 # Block tables: no excluded test imports these, so they are never candidates.
 atom/model_engine/block_manager.py
 atom/model_engine/block_table_codec.py
 atom/model_engine/block_pool.py
 atom/utils/block_tables.py
-# CUDA-graph capture bounds: a CPU-gate test imports these at module level,
-# which credits them as covered.
-atom/config.py
-atom/model_engine/model_runner.py
 EOF
 )
 
