@@ -74,6 +74,17 @@
 # So the output is neither a floor nor a ceiling. Of the two mistakes, this file
 # prefers firing: running the GPU gate when in doubt is never the wrong one.
 # Decision 3 is that preference, written down.
+#
+# Three areas are listed BY NAME after the derived paths, from NAMED below,
+# because the derivation cannot reach them. The CPU gate runs their tests, but
+# without a device, so their device paths run nowhere on the CPU side:
+#   - EPLB, and block tables (block_manager.py, block_table_codec.py,
+#     block_pool.py, utils/block_tables.py): no excluded test imports these
+#     files, so they are never candidates;
+#   - CUDA-graph capture bounds (config.py, model_runner.py): candidates, but a
+#     module-level import in a live CPU-gate file credits them as covered.
+# The import credit itself stays as decision 3 states it; only these files are
+# exempt from it.
 set -uo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -84,6 +95,26 @@ compass_env "$ROOT"
 EXCLUDE=$ROOT/scripts/compass/cpu_gate_exclude.txt
 OUT=$ROOT/scripts/compass/gpu_gate_triggers.txt
 [ -e "$EXCLUDE" ] || { printf 'REFUSED: %s missing\n' "$EXCLUDE" >&2; exit 94; }
+
+# Written verbatim to the end of the output. Comments stay on lines of their
+# own: gate_cpu.sh reads every other line as a path.
+NAMED=$(cat <<'EOF'
+# EPLB. No excluded test imports it, so the derivation never makes it a
+# candidate; its CPU-gate tests run without a device.
+atom/model_ops/eplb.py
+# Block tables. No excluded test imports these, so the derivation never makes
+# them candidates; their CPU-gate tests run without a device.
+atom/model_engine/block_manager.py
+atom/model_engine/block_table_codec.py
+atom/model_engine/block_pool.py
+atom/utils/block_tables.py
+# CUDA-graph capture bounds: the capture sizes and their capture. Excluded tests
+# import these, but a module-level import in a CPU-gate test credits them as
+# covered, and that test runs without a device.
+atom/config.py
+atom/model_engine/model_runner.py
+EOF
+)
 
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
@@ -203,7 +234,14 @@ N_UNRES=$(sort -u "$D/unres" | grep -c .)
     exit 98
 }
 
-comm -23 "$D/cand" "$D/covered" >"$D/final0"
+# The named paths, checked to exist, are kept out of the derived ones so none
+# is listed twice.
+grep -v '^#' <<<"$NAMED" | sort >"$D/named"
+while read -r p; do
+    [ -f "$p" ] || { printf 'REFUSED: named trigger %s is not a file in this tree; %s left untouched.\n' "$p" "$OUT" >&2; exit 94; }
+done <"$D/named"
+N_NAMED=$(grep -c . "$D/named")
+comm -23 "$D/cand" "$D/covered" | comm -23 - "$D/named" >"$D/final0"
 
 # Drop anything already covered by a subtree entry above it.
 : >"$D/final"
@@ -284,6 +322,12 @@ TMP=$OUT.tmp
 # Of the two mistakes, this list prefers firing: running the GPU gate when in
 # doubt is never the wrong one.
 #
+# After the derived paths, three areas are listed by name: EPLB, block tables
+# and CUDA-graph capture bounds. The CPU gate runs their tests without a
+# device, and the rule above cannot see that: no excluded test imports the
+# first two, and a CPU-gate import credits the third. A comment above each
+# names its area and why.
+#
 # A trailing / matches the whole subtree.
 HDR
     printf '#\n# Measured at %s over this tree:\n' "$SHA"
@@ -299,8 +343,10 @@ HDR
     printf '#              prints the run, and is the only source for its outcome counts.\n'
     printf '#   candidates   %4s paths named by an excluded test, any indentation\n' "$N_CAND"
     printf '#   covered      %4s paths named at module level by a live CPU-gate file\n' "$N_COV"
-    printf '#   triggers     %4s paths below\n' "$N"
+    printf '#   triggers     %4s derived paths below, then %s listed by name\n' "$N" "$N_NAMED"
     cat "$D/final"
+    printf '#\n# Listed by name, not derived (NAMED in regen_gpu_gate_triggers.sh):\n'
+    printf '%s\n' "$NAMED"
 } >"$TMP"
 mv -f "$TMP" "$OUT"
 
@@ -322,5 +368,5 @@ N_COLLECTED2=$(printf '%s' "$COLLECT2" | grep -oE '[0-9]+ tests? collected' | gr
     exit 97
 }
 sed -i "s/@@N@@/$(printf '%5s' "$N_COLLECTED2")/; s/@@M@@/$N_COLLECTED2/; s/@@IND@@/$N_IND/" "$OUT"
-printf 'wrote %s: %s trigger paths (%s cpu-gate files, %s live, %s excluded) at %s\nCPU gate now collects %s tests, was %s before this rewrite\n' \
-    "$OUT" "$N" "$N_CPU" "$N_LIVE" "$N_EX" "$SHA" "$N_COLLECTED2" "$N_COLLECTED"
+printf 'wrote %s: %s derived + %s named trigger paths (%s cpu-gate files, %s live, %s excluded) at %s\nCPU gate now collects %s tests, was %s before this rewrite\n' \
+    "$OUT" "$N" "$N_NAMED" "$N_CPU" "$N_LIVE" "$N_EX" "$SHA" "$N_COLLECTED2" "$N_COLLECTED"
