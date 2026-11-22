@@ -269,19 +269,31 @@ def test_a_selected_files_cargo_skip_refuses_with_96(tree, env):
     )
 
 
-# A selected test that reaches a fixture in a file the change did not select
-# skips on that file's line, inside the fixture: the skip still counts.
-def test_a_cargo_skip_in_another_files_fixture_refuses_with_96(tree):
-    (tree / "tests" / "test_mesh.py").write_text(
-        "import pytest\n\n\n@pytest.fixture\ndef atomesh():\n"
-        '    pytest.skip("cargo cannot resolve atomesh\'s dependencies here")\n\n\n'
-        "def test_router(atomesh):\n    pass\n"
-    )
+MESH = (
+    "import pytest\n\n\n{}def build():\n"
+    '    pytest.skip("cargo cannot resolve atomesh\'s dependencies here")\n\n\n'
+)
+
+
+# A selected test can reach the skip through a file the change did not select.
+# A fixture's skip names the test that asked for it; a helper's names the line
+# that raised it, inside the helper. Either way it counts.
+@pytest.mark.parametrize(
+    "fixture, named",
+    [("@pytest.fixture\n", "tests/test_pd.py"), ("", "tests/test_mesh.py")],
+)
+def test_a_cargo_skip_through_another_file_refuses_with_96(tree, fixture, named):
+    (tree / "tests" / "test_mesh.py").write_text(MESH.format(fixture))
     (tree / "tests" / "test_pd.py").write_text(
-        "from test_mesh import atomesh\n\n\ndef test_pd(atomesh):\n    pass\n"
+        "from test_mesh import build\n\n\n"
+        + (
+            "def test_pd(build):\n    pass\n"
+            if fixture
+            else "def test_pd():\n    build()\n"
+        )
     )
     out = _run(tree, COMPASS_CHANGED_FILES=_changed(tree, "tests/test_pd.py"))
     assert out.returncode == 96, out.stdout + out.stderr
     assert out.stdout.splitlines()[-1].startswith(
-        "GATE_TARGETED_RC=96 NOT PASSED -- tests/test_mesh.py skipped, cargo"
+        f"GATE_TARGETED_RC=96 NOT PASSED -- {named} skipped, cargo"
     )

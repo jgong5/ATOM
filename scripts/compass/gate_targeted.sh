@@ -144,8 +144,8 @@ if [ "${#RUN[@]}" -gt 0 ]; then
     # line names the file and line that raised it. One outside any function in
     # a test file the change did not select is that file's module-level skip,
     # taken because it was collected only to be deselected, and is dropped. One
-    # inside a function is a helper or fixture a selected test reached, and is
-    # kept wherever it lives.
+    # inside a function is a helper a selected test called, and is kept
+    # wherever it lives; a fixture's skip names the test that asked for it.
     skipped() {
         grep -E "$1" "$LOG" | python -c '
 import ast, re, sys
