@@ -33,7 +33,8 @@ So `--precise` prints chains that are call paths, branch conditions aside,
 and misses calls on receivers of unknown type; the default prints every
 candidate, a method name shared across reached classes over-reaching. A
 "none" in the default misses only where dispatch hides the name (getattr, a
-registry, a string).
+registry, a string such as `call_func("capture_cudagraph")`) or a process
+runs the code (an engine a CLI starts in a subprocess).
 
 A test runs on a device when its function, its decorators, its classes'
 decorators or its module body name CUDA (a "cuda" string, `.cuda(`,
@@ -564,18 +565,22 @@ def main():
             host = {x[1] for x in h["host"]} - {x[1] for x in dev}
             first = f"`{dev[0][1]}`" if dev else "none"
             print(f"| `{q}` | {first} | {len(dev)} | {len(host)} |")
-    print(
-        "\n## chains: every device file per function, else the shortest host-only one"
-    )
+    # Per device file: what it reaches, and its chain into each area by the
+    # shortest one, which is where a reader checks the reach.
+    by_file = defaultdict(dict)
     for key in wanted:
-        dev = sorted(hits[key]["device"])
-        host = sorted(hits[key]["host"])
-        print(f"\n{key}")
-        if not dev and not host:
-            print("  no test reaches it")
-        for n, path, why, chain in dev or host[:1]:
-            print(f"  {path} [{why or 'host-only'}]")
-            print("    " + " -> ".join(chain))
+        for n, path, why, chain in hits[key]["device"]:
+            by_file[path][key] = (n, why, chain)
+    print("\n## device files: each one's targets, and its shortest chain per area")
+    for path in sorted(by_file):
+        found = by_file[path]
+        print(f"\n{path} [{min(found.values())[1]}]")
+        for area, items in TARGETS.items():
+            keys = [f"{m}:{q}" for m, q in items if f"{m}:{q}" in found]
+            if keys:
+                print(f"  {area}: " + ", ".join(k.split(":")[1] for k in keys))
+                chain = min(found[k] for k in keys)[2]
+                print("    " + " -> ".join(chain))
 
 
 if __name__ == "__main__":
