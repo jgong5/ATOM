@@ -88,8 +88,7 @@ EXCLUDE=$ROOT/scripts/compass/cpu_gate_exclude.txt
 OUT=$ROOT/scripts/compass/gpu_gate_triggers.txt
 [ -e "$EXCLUDE" ] || { printf 'REFUSED: %s missing\n' "$EXCLUDE" >&2; exit 94; }
 
-# Written verbatim after the derived paths. Comments stay on lines of their own:
-# gate_cpu.sh reads every other line as a path.
+# Printed after the derived paths. gate_cpu.sh reads every non-# line as a path.
 NAMED=$(cat <<'EOF'
 # EPLB: no excluded test imports it, so it is never a candidate.
 atom/model_ops/eplb.py
