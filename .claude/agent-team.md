@@ -164,6 +164,11 @@ own `gh` login. Ownership is the assignee:
   (Production reachability). Its lander runs `gate_gpu.sh` on the batch
   commit, then `gate_cpu.sh` there with `COMPASS_GPU_GATE_DONE` set to that
   commit's full sha.
+  - **The blind-spot call.** A reviewer whose PR changes code that only
+    test files outside the CPU gate exercise, and touches no trigger path,
+    states in the review record whether its batch needs `gate_gpu.sh`. When
+    it does, the lander runs `gate_gpu.sh` on the batch commit before
+    `gate_cpu.sh`.
 - **Timing noise.** A red `gate_cpu.sh` on a batch, or a red
   `gate_targeted.sh` on a task that edits the file, can be timing:
   `scripts/compass/README.md` ("A red CPU gate that may not be your diff")
