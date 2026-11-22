@@ -379,10 +379,10 @@ class Graph:
         """(def, called) pairs `d` names directly: bare names, module attributes."""
         if d.key not in self._static:
             mod, out = d.module, []
-            for name in d.names:
+            for name in sorted(d.names):
                 called = name in d.called
                 out += [(t, called) for t in self.resolve_name(mod, name)]
-            for alias, attr in d.attr_on:
+            for alias, attr in sorted(d.attr_on):
                 called = f"{alias}.{attr}" in d.called
                 out += [(t, called) for t in self.resolve_ref(mod, alias, attr)]
             self._static[d.key] = out
@@ -480,19 +480,19 @@ def reach(graph, roots, wanted, generic):
                 reach_class(t, d.key, called)
             else:
                 push(t, d.key)
-        for attr in d.attrs if generic else ():
+        for attr in sorted(d.attrs) if generic else ():
             if attr not in attrs and not attr.startswith("__"):
                 attrs[attr] = d.key
                 for _, t in reached[attr]:
                     push(t, d.key)
         if d.owner is not None:
-            for attr in d.super_attrs:
+            for attr in sorted(d.super_attrs):
                 for base in graph.ancestors(d.owner)[1:]:
                     t = base.module.defs.get(f"{base.qualname}.{attr}")
                     if t is not None:
                         push(t, d.key)
                         break
-            for attr in d.self_attrs:
+            for attr in sorted(d.self_attrs):
                 key = (d.owner.key, attr)
                 if key not in self_attrs:
                     self_attrs[key] = d.key
@@ -500,16 +500,16 @@ def reach(graph, roots, wanted, generic):
                     for keys, t in reached[attr]:
                         if d.owner.key in keys:
                             push(t, d.key)
-            for field, attr in d.field_attrs:
+            for field, attr in sorted(d.field_attrs):
                 for a in graph.ancestors(d.owner):
-                    for ref in a.field_types.get(field, ()):
+                    for ref in sorted(a.field_types.get(field, ()), key=str):
                         for cls in graph.classes_of(a.module, ref):
                             push(graph.methods_of(cls).get(attr), d.key)
-        for alias, attr in d.attr_on:
+        for alias, attr in sorted(d.attr_on):
             types = d.var_types.get(alias, set()) | d.module.body.var_types.get(
                 alias, set()
             )
-            for ref in types:
+            for ref in sorted(types, key=str):
                 for cls in graph.classes_of(d.module, ref):
                     push(graph.methods_of(cls).get(attr), d.key)
     return found
