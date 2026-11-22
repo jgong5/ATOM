@@ -42,9 +42,9 @@ from test_run_lacking import checked, lacked, served
 
 from atom.compass.drive import lacking
 
-#: The bound in place of `lacking.PROBE_SECONDS`: past a child's start, as
-#: the stand-ins write their pid before it ends.
-BOUND = 30
+#: The bound in place of `lacking.PROBE_SECONDS`: well past the time a child
+#: takes to start and import this module, so `outliving` writes its pid first.
+BOUND = 40
 #: How long `outliving` sleeps: past the bound, and finite, so a check with no
 #: bound ends.
 SLEEP = 4 * BOUND
