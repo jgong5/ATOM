@@ -357,7 +357,16 @@ class HostDeviceRecurrence:
     segment, and each column, `DUMMY_KIND` states, else `decode`'s, the kind
     `forward_shape` gives an empty batch that produces output; one that
     produces none, whose labels `DUMMY_KIND` holds no `W_post` of, stays a
-    middle chunk.
+    middle chunk. On the last stage of a runner that does not defer its output,
+    as a prefill-decode producer, such a dummy reads no token, so its exit
+    waits for no output, its own or its group's: it leaves at its launch and
+    `W_post`, and marks no output end. On #3720's
+    cell B (P at DP2) a dummy beside its peer's middle chunk left 2.6 ms after
+    it entered while its device ran the peer's 162 ms; charged as an output
+    forward, it held the group's next step, the prompt's tail, until the
+    middle chunk's device end, where the real tail's 55 ms launch runs beside
+    it (b3_B3 c=32: a 6272-token chunk and its 181-token tail took 233 ms
+    against 190).
     """
 
     def __init__(
@@ -460,7 +469,9 @@ class HostDeviceRecurrence:
         self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)
-        output = batch.produces_output()
+        # Where output is not deferred a dummy reads no token: its exit waits
+        # for no output (`_exit`).
+        output = batch.produces_output() and not (dummy and self.last)
         launch_end = max(prepared, meta - self.segments[PP_RECV_SEGMENT]) + launch
         release = getattr(batch, "compass_pp_release", -math.inf)
         queued_end = self.ends[-1] + getattr(batch, "compass_queued_s", 0.0)

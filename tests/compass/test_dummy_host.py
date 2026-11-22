@@ -223,3 +223,21 @@ def test_a_run_file_s_host_laws_may_state_the_dummy_kind(tmp_path):
     )
     with pytest.raises(ValueError, match="host is"):
         compass_run._check_host(tmp_path, {"laws": {"dummies": segment}})
+
+
+def test_a_dummy_reads_no_token_so_leaves_at_its_launch_not_its_group_s_end():
+    """A producer that does not defer its output waits for its own target; a
+    dummy beside a peer's middle chunk, whose device runs until the group's
+    end (the DP charge's `all_reduce`), reads no token and leaves at its
+    launch and `W_post`, so the group's next step enters beside that device
+    work, as a real dummy leaves (#3720 b3_B3: 2.6 ms beside a 162 ms chunk)."""
+    laws = {"decode": DECODE}
+    host = sum(DECODE[s][0] for s in ("E", "W_pre", "W_launch", "W_post"))
+    late = 0.172  # the group's device end: the peer's middle chunk's
+    dummy = HostDeviceRecurrence(laws, (), lambda: 0.0, defer=False)
+    dummy.device_end(_dummy_batch(True, 0.0), 0.0, 0.0)
+    assert dummy.release(late, late) == pytest.approx(host)
+    assert dummy.ends[-1] == late
+    own = HostDeviceRecurrence(laws, (), lambda: 0.0, defer=False)
+    own.device_end(_dummy_batch(False, 0.0), 0.0, 0.0)
+    assert own.release(late, late) == pytest.approx(late + DECODE["W_post"][0])
