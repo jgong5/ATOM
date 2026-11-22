@@ -268,9 +268,9 @@ fi
 # first card alone, as the baseline was measured: an upstream test that needs
 # two cards skips there. The surplus over the baseline is what the compass
 # files this scope runs pass on this tree; an absent tests/compass contributes none.
-# The tests that cargo-build atomesh skip unless cargo resolves its crates; the
-# gate has no network, so they come from the container's cache, under the
-# image's lockfile, as in gate_cpu.sh.
+# The tests that cargo-build atomesh skip unless cargo resolves its crates, and
+# the gate refuses that skip; it has no network, so the crates come from the
+# container's cache, under the image's lockfile, as in gate_cpu.sh.
 export CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:-true}
 [ ! -r "$ROOT/atom/mesh/Cargo.toml" ] || compass_cargo_lock "$ROOT/atom/mesh"
 ARGS=("$@")
@@ -316,6 +316,11 @@ if [ -f "$SMOKE" ]; then
     PYTHONPATH=$ROOT/compass_harness:$PYTHONPATH ATOM_COMPASS_SLICE_MODEL=$ATOM_COMPASS_CCTRACES_MODEL \
         compass_tests "$SMOKE" "$SMOKE"
 fi
+CARGO=$(grep -E "$COMPASS_CARGO_SKIP" "$COUT")
+[ -z "$CARGO" ] || {
+    rm -f "$COUT"
+    finish 96 "a test that cargo-builds atomesh skipped, cargo cannot resolve its crates here: ${CARGO%%$'\n'*}; see scripts/compass/README.md"
+}
 DEVICE=$(HIP_VISIBLE_DEVICES=${GPUS%%,*} python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null)
 printf 'device: %s\n' "${DEVICE:-UNKNOWN}"
 LEFT_OUT=$((SKIP_N - ${BASE_LEFT_OUT:-0}))

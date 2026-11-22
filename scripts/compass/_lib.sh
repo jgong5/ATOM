@@ -186,13 +186,17 @@ compass_ref_drift() {
 # touches and CHANGED_SRC to where that list came from, from the first source
 # that answers: the file COMPASS_CHANGED_FILES names, the diff since HEAD's
 # merge-base with INTEGRATION, or snapshot.sh's .compass-changed stamp. When
-# none answers, CHANGED_UNKNOWN says why instead. Returns 94 when
+# none answers, CHANGED_UNKNOWN says why instead. Returns 94 with WHY set when
 # COMPASS_CHANGED_FILES names a file it cannot read.
 compass_changed() {
     local root=$1 integration=$2 ref base
     CHANGED= CHANGED_SRC= CHANGED_UNKNOWN=
     if [ -n "${COMPASS_CHANGED_FILES:-}" ]; then
-        [ -r "$COMPASS_CHANGED_FILES" ] || return 94
+        [ -r "$COMPASS_CHANGED_FILES" ] || {
+            printf 'FATAL: COMPASS_CHANGED_FILES=%s unreadable\n' "$COMPASS_CHANGED_FILES" >&2
+            WHY="COMPASS_CHANGED_FILES unreadable"
+            return 94
+        }
         CHANGED=$(cat "$COMPASS_CHANGED_FILES")
         CHANGED_SRC="COMPASS_CHANGED_FILES"
     elif git -C "$root" rev-parse --git-dir >/dev/null 2>&1 &&
@@ -308,6 +312,11 @@ import compass_harness, aiperf; print(aiperf.__file__, compass_harness.__file__)
 # alternation is tests/compass/driver_run_skips.py's DRIVER_RUN.
 COMPASS_DRIVER_RUN_SKIP='^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK|CCTRACES)|COMPASS_(HARNESS|AIPERF)_PYTHON|ATOMESH|needs atomesh|atomesh on PATH)'
 
+# A SKIPPED line from a test that cargo-builds atomesh, taken where `cargo
+# metadata` cannot resolve atomesh's crates: no driver-run input would run it,
+# so a gate that runs such a test refuses with 96, as gate_cpu.sh's probe does.
+COMPASS_CARGO_SKIP="^SKIPPED .*cargo cannot resolve atomesh's dependencies"
+
 # PYTHONPATH is set to the tree and nothing else. Inherited entries are not
 # merged: an inherited entry ahead of ours is exactly how a take2 script silently
 # ran another branch's engine, and an entry behind ours can still satisfy an
@@ -394,6 +403,13 @@ compass_gpu_arch() {
     HIP_VISIBLE_DEVICES=$1 python -c 'import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])' 2>/dev/null
 }
 
+# compass_gpu_skip_lines TARGET: what gpu_gate_skip.txt names for GPU target
+# TARGET, one per line: a test file it leaves out there, or `driver-run`.
+compass_gpu_skip_lines() {
+    grep -vE '^[[:space:]]*(#|$)' "$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_skip.txt" |
+        awk -v t="$1" '$1 == t { print $2 }'
+}
+
 # compass_gpu_skips TARGET: sets SKIP_ARGS to an --ignore for each file
 # gpu_gate_skip.txt leaves out on GPU target TARGET, the first card's, and
 # SKIP_N to the tests those files collect, run from the tree being measured. A
@@ -401,26 +417,25 @@ compass_gpu_arch() {
 # counts what tests/compass passes on the tree. The line `TARGET driver-run`
 # sets NO_DRIVER_RUN. A file it cannot count fails, SKIP_WHY naming it.
 compass_gpu_skips() {
-    local gpu file n
+    local file n
     SKIP_ARGS=() SKIP_N=0 COMPASS_LEFT=() NO_DRIVER_RUN=
-    while read -r gpu file; do
-        [ "$gpu" = "$1" ] || continue
+    while read -r file; do
         if [ "$file" = driver-run ]; then
-            printf 'driver-run inputs: none on %s\n' "$gpu"
+            printf 'driver-run inputs: none on %s\n' "$1"
             NO_DRIVER_RUN=1
             continue
         fi
         [ -e "$file" ] || continue
         if [[ $file == tests/compass/* ]]; then
-            printf 'left out on %s: %s\n' "$gpu" "$file"
+            printf 'left out on %s: %s\n' "$1" "$file"
             COMPASS_LEFT+=("$file")
             continue
         fi
         n=$(python -m pytest "$file" --collect-only -q -p no:cacheprovider 2>&1 | sed -nE 's/^([0-9]+) tests? collected.*/\1/p')
-        [ -n "$n" ] || { SKIP_WHY="cannot count the tests of $file, which gpu_gate_skip.txt leaves out on $gpu"; return 1; }
-        printf 'left out on %s: %s (%s tests)\n' "$gpu" "$file" "$n"
+        [ -n "$n" ] || { SKIP_WHY="cannot count the tests of $file, which gpu_gate_skip.txt leaves out on $1"; return 1; }
+        printf 'left out on %s: %s (%s tests)\n' "$1" "$file" "$n"
         SKIP_ARGS+=("--ignore=$file") SKIP_N=$((SKIP_N + n))
-    done < <(grep -vE '^[[:space:]]*(#|$)' "$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_skip.txt")
+    done < <(compass_gpu_skip_lines "$1")
 }
 
 # compass_cargo_lock MESH: copies into atomesh's directory MESH, unless it has
