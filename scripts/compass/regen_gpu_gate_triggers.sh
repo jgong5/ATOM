@@ -75,9 +75,8 @@
 # prefers firing: running the GPU gate when in doubt is never the wrong one.
 # Decision 3 is that preference, written down.
 #
-# NAMED below adds three areas by name after the derived paths: EPLB, block
-# tables and CUDA-graph capture bounds. The CPU gate runs their tests without a
-# device, and the rule above cannot see that; a comment there says why per file.
+# NAMED below lists EPLB, block tables and CUDA-graph capture bounds by name: the
+# CPU gate runs their tests without a device, which the rule above cannot see.
 set -uo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -350,5 +349,5 @@ N_COLLECTED2=$(printf '%s' "$COLLECT2" | grep -oE '[0-9]+ tests? collected' | gr
     exit 97
 }
 sed -i "s/@@N@@/$(printf '%5s' "$N_COLLECTED2")/; s/@@M@@/$N_COLLECTED2/; s/@@IND@@/$N_IND/" "$OUT"
-printf 'wrote %s: %s derived + %s named trigger paths (%s cpu-gate files, %s live, %s excluded) at %s\nCPU gate now collects %s tests, was %s before this rewrite\n' \
-    "$OUT" "$N" "$N_NAMED" "$N_CPU" "$N_LIVE" "$N_EX" "$SHA" "$N_COLLECTED2" "$N_COLLECTED"
+printf 'wrote %s: %s trigger paths (%s cpu-gate files, %s live, %s excluded) at %s\nCPU gate now collects %s tests, was %s before this rewrite\n' \
+    "$OUT" "$N" "$N_CPU" "$N_LIVE" "$N_EX" "$SHA" "$N_COLLECTED2" "$N_COLLECTED"
