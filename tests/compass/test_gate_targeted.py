@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from test_gate_gpu_verdict_through_pipe import _torch
 
 REPO = Path(__file__).resolve().parents[2]
 BASH = shutil.which("bash")
@@ -181,3 +182,106 @@ def test_another_checkouts_copy_is_refused(tree, tmp_path):
     )
     assert out.returncode == 99, out.stdout + out.stderr
     assert out.stdout.splitlines()[-1].startswith("GATE_TARGETED_RC=99 NOT PASSED")
+
+
+def test_the_gpu_container_follows_gpu_gate_skip_for_the_first_cards_target(tree):
+    (tree / "torch").mkdir()
+    (tree / "torch" / "__init__.py").write_text(_torch("gfx942"))
+    (tree / "scripts" / "compass" / "gpu_gate_skip.txt").write_text(
+        "gfx950 tests/test_kernel.py\ngfx942 tests/test_ok.py\ngfx942 driver-run\n"
+    )
+    lst = _changed(tree, "tests/test_ok.py", "tests/test_kernel.py")
+    env = {"ATOM_COMPASS_SLICE_MODEL": "/m"}
+    out = _run(tree, COMPASS_CHANGED_FILES=lst, **env)
+    assert out.returncode == 98, out.stdout + out.stderr
+    assert "tests/test_ok.py: gpu_gate_skip.txt leaves it out on gfx942" in out.stderr
+    assert out.stdout.splitlines()[-1].endswith(
+        "not run here: tests/test_ok.py; see 'not run here' above"
+    )
+    # Its nodes hold no driver-run inputs, so a driver-run skip is accepted.
+    out = _run(tree, COMPASS_CHANGED_FILES=_changed(tree, "tests/test_slice.py"), **env)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "driver-run: skips accepted on gfx942" in out.stdout
+
+
+SMOKE = "tests/compass/test_cctraces_sim_smoke.py"
+
+
+def test_the_gpu_container_runs_the_smoke_alone_with_its_own_model(tree):
+    (tree / "tests" / "compass").mkdir()
+    (tree / SMOKE).write_text(
+        "import os\n\n\ndef test_smoke():\n"
+        "    assert os.environ['ATOM_COMPASS_SLICE_MODEL'] == '/cc'\n"
+    )
+    (tree / "tests" / "test_ok.py").write_text(
+        "import os\n\n\ndef test_ok():\n"
+        "    assert os.environ['ATOM_COMPASS_SLICE_MODEL'] == '/m'\n"
+    )
+    out = _run(
+        tree,
+        COMPASS_CHANGED_FILES=_changed(tree, SMOKE, "tests/test_ok.py"),
+        ATOM_COMPASS_SLICE_MODEL="/m",
+        ATOM_COMPASS_CCTRACES_MODEL="/cc",
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.count("1 passed") == 2, out.stdout
+
+
+def test_a_selected_file_holding_no_test_passes_saying_so(tree):
+    (tree / "tests" / "test_empty.py").write_text("")
+    out = _run(tree, COMPASS_CHANGED_FILES=_changed(tree, "tests/test_empty.py"))
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "no test collected from tests/test_empty.py" in out.stdout
+
+
+# A module-level skip runs at collection, so a file the change did not select
+# still prints its skip line.
+@pytest.mark.parametrize(
+    "selected, env",
+    [
+        ("tests/test_empty.py", {}),
+        ("tests/test_ok.py", {"ATOM_COMPASS_SLICE_MODEL": "/m"}),
+    ],
+)
+def test_only_a_selected_files_driver_run_skip_counts(tree, selected, env):
+    (tree / "tests" / "test_empty.py").write_text("")
+    (tree / "tests" / "test_module_skip.py").write_text(
+        "import pytest\n\npytest.skip('needs ATOM_COMPASS_SLICE_MODEL', "
+        "allow_module_level=True)\n"
+    )
+    out = _run(tree, COMPASS_CHANGED_FILES=_changed(tree, selected), **env)
+    assert "SKIPPED [1] tests/test_module_skip.py" in out.stdout, out.stdout
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.splitlines()[-1] == "GATE_TARGETED_RC=0 PASSED"
+
+
+@pytest.mark.parametrize("env", [{}, {"ATOM_COMPASS_SLICE_MODEL": "/m"}])
+def test_a_selected_files_cargo_skip_refuses_with_96(tree, env):
+    (tree / "tests" / "test_mesh.py").write_text(
+        "import pytest\n\n\ndef test_router():\n"
+        '    pytest.skip("cargo cannot resolve atomesh\'s dependencies here")\n'
+    )
+    lst = _changed(tree, "tests/test_mesh.py", "tests/test_ok.py")
+    out = _run(tree, COMPASS_CHANGED_FILES=lst, **env)
+    assert out.returncode == 96, out.stdout + out.stderr
+    assert out.stdout.splitlines()[-1].startswith(
+        "GATE_TARGETED_RC=96 NOT PASSED -- tests/test_mesh.py skipped, cargo"
+    )
+
+
+# A selected test that reaches a fixture in a file the change did not select
+# skips on that file's line, inside the fixture: the skip still counts.
+def test_a_cargo_skip_in_another_files_fixture_refuses_with_96(tree):
+    (tree / "tests" / "test_mesh.py").write_text(
+        "import pytest\n\n\n@pytest.fixture\ndef atomesh():\n"
+        '    pytest.skip("cargo cannot resolve atomesh\'s dependencies here")\n\n\n'
+        "def test_router(atomesh):\n    pass\n"
+    )
+    (tree / "tests" / "test_pd.py").write_text(
+        "from test_mesh import atomesh\n\n\ndef test_pd(atomesh):\n    pass\n"
+    )
+    out = _run(tree, COMPASS_CHANGED_FILES=_changed(tree, "tests/test_pd.py"))
+    assert out.returncode == 96, out.stdout + out.stderr
+    assert out.stdout.splitlines()[-1].startswith(
+        "GATE_TARGETED_RC=96 NOT PASSED -- tests/test_mesh.py skipped, cargo"
+    )

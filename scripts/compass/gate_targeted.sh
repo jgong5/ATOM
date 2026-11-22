@@ -5,13 +5,28 @@
 # run as gate_cpu.sh runs them. gate_cpu.sh, the whole CPU suite, is the batch
 # gate.
 #
-# The change is read from gate_cpu.sh's sources (_lib.sh, compass_changed). In
-# the CPU container a selected file runs unless it is under tests/plugin/, in
+# What it keys on:
+#   the change         gate_cpu.sh's sources (_lib.sh, compass_changed):
+#                      COMPASS_CHANGED_FILES, the diff since
+#                      COMPASS_INTEGRATION_REF's merge-base, or .compass-changed
+#   the container      ATOM_COMPASS_SLICE_MODEL, set: the GPU container; unset:
+#                      the CPU container. Only the mode reads it; the caller
+#                      sets every other driver-run input gate_gpu.sh names,
+#                      since not every driver-run test reads this one
+#   the GPU target     torch's, of the first card in HIP_VISIBLE_DEVICES (GPU)
+#   the smoke's model  ATOM_COMPASS_CCTRACES_MODEL (GPU)
+#   the harness wheel  COMPASS_AGENTX_HARNESS, as in gate_cpu.sh
+#
+# In the CPU container a selected file runs unless it is under tests/plugin/, in
 # cpu_gate_exclude.txt, or has a test that skipped for want of gate_gpu.sh's
-# driver-run inputs; any of those makes the run exit 98, naming the file. With
-# ATOM_COMPASS_SLICE_MODEL set, the input every driver-run test reads, this is
-# the GPU container: every selected file outside tests/plugin/ runs, and a
-# driver-run skip fails the run, as in gate_gpu.sh.
+# driver-run inputs; any of those makes the run exit 98, naming the file. In the
+# GPU container every selected file runs but those under tests/plugin/ and those
+# gpu_gate_skip.txt leaves out on the target (98 again), the cc-traces smoke
+# apart, with its own model as its slice model, as in gate_gpu.sh; a driver-run
+# skip fails the run with 92, unless gpu_gate_skip.txt says the target's nodes
+# hold no driver-run inputs. A selected file that collects no test passes. A
+# selected file that skipped because cargo cannot resolve atomesh's crates
+# refuses the run with 96, as gate_cpu.sh refuses an atom/mesh diff.
 #
 # A change on a GPU-trigger path is the batch gate's to send to gate_gpu.sh,
 # not this one's.
@@ -40,6 +55,7 @@ for arg in "$@"; do
         ;;
     esac
 done
+ARGS=("$@")
 
 ROOT=$(compass_tree_root) || finish $? "the tree to measure could not be resolved; nothing was run"
 cd "$ROOT" || finish 90 "cannot cd into the tree; nothing was run"
@@ -47,8 +63,7 @@ compass_env "$ROOT"
 compass_require_tree "$ROOT" || finish $? "atom does not import from this tree; nothing was run"
 compass_describe "$ROOT"
 
-compass_changed "$ROOT" "${COMPASS_INTEGRATION_REF:-feature/atomcompass_new}" ||
-    { printf 'FATAL: COMPASS_CHANGED_FILES=%s unreadable\n' "$COMPASS_CHANGED_FILES" >&2; finish 94 "COMPASS_CHANGED_FILES unreadable; nothing was run"; }
+compass_changed "$ROOT" "${COMPASS_INTEGRATION_REF:-feature/atomcompass_new}" || finish $? "$WHY; nothing was run"
 [ -z "$CHANGED_UNKNOWN" ] || finish 98 "unknown which files this change touches: $CHANGED_UNKNOWN; nothing was run"
 
 # The test files pytest collects (test_*.py, *_test.py) that the change adds or
@@ -60,10 +75,20 @@ done <<<"$CHANGED"
 [ "${#SEL[@]}" -gt 0 ] || { printf 'select: none (%s)\n' "$CHANGED_SRC"; finish 0; }
 
 GPU=${ATOM_COMPASS_SLICE_MODEL:+1}
+NO_DRIVER_RUN=
 if [ -n "$GPU" ]; then
     IGN=(--ignore=tests/plugin)
+    # gpu_gate_skip.txt, read for the first card's target as gate_gpu.sh reads it.
+    CARD=${HIP_VISIBLE_DEVICES:-0}
+    ARCH=$(compass_gpu_arch "${CARD%%,*}")
+    [ -n "$ARCH" ] || printf 'gpu:    torch reads no GPU target for card %s, so gpu_gate_skip.txt leaves nothing out\n' "${CARD%%,*}"
+    while IFS= read -r f; do
+        [ "$f" = driver-run ] && NO_DRIVER_RUN=1 || IGN+=(--ignore="$f")
+    done < <([ -z "$ARCH" ] || compass_gpu_skip_lines "$ARCH")
+    LEFT="gpu_gate_skip.txt leaves it out on $ARCH"
 else
     compass_cpu_ignores "$ROOT" || finish $? "$WHY; nothing was run"
+    LEFT="cpu_gate_exclude.txt leaves it out, it needs a driver"
 fi
 # NEED holds `<file>: <why>` for each selected file this container does not run.
 RUN=() NEED=()
@@ -71,7 +96,7 @@ for f in "${SEL[@]}"; do
     why=
     for i in "${IGN[@]#--ignore=}"; do
         [[ $f == "$i" || $f == "$i"/* ]] || continue
-        why="cpu_gate_exclude.txt leaves it out, it needs a driver"
+        why=$LEFT
         [ "$i" != tests/plugin ] || why="tests/plugin needs sglang and vllm, in no image"
     done
     [ -z "$why" ] && RUN+=("$f") || NEED+=("$f: $why")
@@ -84,25 +109,69 @@ if [ "${#RUN[@]}" -gt 0 ]; then
     compass_harness "$ROOT" || finish $? "$WHY; nothing was run"
     export CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:-true}
     [ ! -r "$ROOT/atom/mesh/Cargo.toml" ] || compass_cargo_lock "$ROOT/atom/mesh"
-    # One process that collects all of tests/, as gate_cpu.sh's do, and
-    # deselects every test file it does not select: run alone, a file can
-    # reach rocminfo at collection that it does not reach in the batch.
-    DESEL=()
-    mapfile -t DESEL < <(find tests \( -name 'test_*.py' -o -name '*_test.py' \) | sort |
-        grep -vxF -f <(printf '%s\n' "${RUN[@]}") | sed 's/^/--deselect=/')
     LOG=$(mktemp) || finish 96 "mktemp failed; nothing was run"
     trap 'rm -rf "${HARNESS:-}" "$LOG"' EXIT
-    python -m pytest tests/ "${IGN[@]}" -q --no-header -p no:cacheprovider "${DESEL[@]}" "$@" -rfs 2>&1 | tee "$LOG"
-    RC=${PIPESTATUS[0]}
-    printf '\npytest: rc=%s\n' "$RC"
-    # A skip line names the file that raised it, so a helper's skip names the
-    # helper and a module-level skip in a deselected file names that file:
-    # this can name a file the change did not select, and never misses one.
-    while IFS= read -r f; do
-        NEED+=("$f: a test skipped for want of gate_gpu.sh's driver-run inputs")
-    done < <(grep -E "$COMPASS_DRIVER_RUN_SKIP" "$LOG" | sed -E 's/^SKIPPED \[[0-9]+\] ([^:]+):.*/\1/' | sort -u)
+    mapfile -t ALL < <(find tests \( -name 'test_*.py' -o -name '*_test.py' \) | sort)
+    # run_tests FILE...: one process that collects all of tests/, as
+    # gate_cpu.sh's do, and deselects every test file but FILE...: run alone, a
+    # file can reach rocminfo at collection that it does not reach in the batch.
+    # RC keeps the first failing status; 5, no test collected, is not one.
+    run_tests() {
+        local rc desel
+        mapfile -t desel < <(printf '%s\n' "${ALL[@]}" | grep -vxF -f <(printf '%s\n' "$@"))
+        python -m pytest tests/ "${IGN[@]}" -q --no-header -p no:cacheprovider \
+            "${desel[@]/#/--deselect=}" "${ARGS[@]}" -rfs 2>&1 | tee -a "$LOG"
+        rc=${PIPESTATUS[0]}
+        printf '\npytest: rc=%s\n' "$rc"
+        if [ "$rc" -eq 5 ]; then
+            printf 'pytest: no test collected from %s\n' "$*"
+        elif [ "$RC" -eq 0 ]; then
+            RC=$rc
+        fi
+    }
+    # The cc-traces smoke replays turns longer than the slice model's context,
+    # so in the GPU container it runs alone, as gate_gpu.sh runs it.
+    SMOKE=tests/compass/test_cctraces_sim_smoke.py
+    MAIN=() ALONE=
+    for f in "${RUN[@]}"; do
+        [ -n "$GPU" ] && [ "$f" = "$SMOKE" ] && ALONE=1 || MAIN+=("$f")
+    done
+    [ "${#MAIN[@]}" -eq 0 ] || run_tests "${MAIN[@]}"
+    [ -z "$ALONE" ] ||
+        PYTHONPATH=$ROOT/compass_harness:$PYTHONPATH ATOM_COMPASS_SLICE_MODEL=${ATOM_COMPASS_CCTRACES_MODEL:-} \
+            run_tests "$SMOKE"
+    # skipped PATTERN: the files the SKIPPED lines matching PATTERN name. A skip
+    # line names the file and line that raised it. One outside any function in
+    # a test file the change did not select is that file's module-level skip,
+    # taken because it was collected only to be deselected, and is dropped. One
+    # inside a function is a helper or fixture a selected test reached, and is
+    # kept wherever it lives.
+    skipped() {
+        grep -E "$1" "$LOG" | python -c '
+import ast, re, sys
+run = set(sys.argv[1:])
+for line in sys.stdin:
+    path, n = re.match(r"SKIPPED (?:\[\d+\] )?([^:]*):?(\d+)?", line).groups()
+    test = re.fullmatch(r"tests/(.*/)?(test_[^/]*|[^/]*_test)\.py", path)
+    if path in run or not test or not n or any(
+        isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and d.lineno <= int(n) <= d.end_lineno
+        for d in ast.walk(ast.parse(open(path).read()))
+    ):
+        print(path)
+' "${RUN[@]}" | sort -u
+    }
+    [ "$RC" -eq 0 ] || finish "$RC" "pytest failed; the FAILED lines above name the tests"
+    CARGO=$(skipped "$COMPASS_CARGO_SKIP")
+    [ -z "$CARGO" ] || finish 96 "$(tr '\n' ' ' <<<"$CARGO")skipped, cargo cannot resolve atomesh's crates here; see scripts/compass/README.md"
+    if [ -n "$NO_DRIVER_RUN" ]; then
+        printf 'driver-run: skips accepted on %s, whose nodes hold no inputs\n' "$ARCH"
+    else
+        while IFS= read -r f; do
+            NEED+=("$f: a test skipped for want of gate_gpu.sh's driver-run inputs")
+        done < <(skipped "$COMPASS_DRIVER_RUN_SKIP")
+    fi
 fi
-[ "$RC" -eq 0 ] || finish "$RC" "pytest failed; the FAILED lines above name the tests"
 
 if [ "${#NEED[@]}" -gt 0 ]; then
     printf 'not run here:\n' >&2

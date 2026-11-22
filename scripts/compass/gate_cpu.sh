@@ -103,8 +103,7 @@ printf 'gate:   %s files excluded + tests/plugin\n' "$NEX"
 # and the run below exits 98 rather than passing -- reporting "GPU not
 # required" there would be a guess that reads as a clear.
 GPU_NEEDED=
-compass_changed "$ROOT" "$INTEGRATION" ||
-    { printf 'FATAL: COMPASS_CHANGED_FILES=%s unreadable\n' "$COMPASS_CHANGED_FILES" >&2; finish 94 "COMPASS_CHANGED_FILES unreadable; nothing was run"; }
+compass_changed "$ROOT" "$INTEGRATION" || finish $? "$WHY; nothing was run"
 SRC=$CHANGED_SRC
 GPU_SRC_UNKNOWN=$CHANGED_UNKNOWN
 

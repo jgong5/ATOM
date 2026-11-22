@@ -235,6 +235,17 @@ def test_a_driver_run_skip_fails_by_name(tmp_path, which, reason, where):
     assert reason in verdict
 
 
+def test_a_cargo_skip_refuses_with_96_before_the_suite(tmp_path):
+    reason = "cargo cannot resolve atomesh's dependencies here"
+    skip = f"import pytest\n\n\n@pytest.mark.skip(reason={reason!r})\ndef test_"
+    root = _tree(tmp_path, DRIVER.replace("def test_", skip))
+    out, verdict = _run(tmp_path, root)
+    assert out.returncode == 96, out.stdout[-3000:]
+    assert verdict.startswith("GATE_GPU_RC=96 NOT PASSED -- a test that cargo-builds")
+    assert "tests/compass/test_d.py" in verdict
+    assert "main" not in (root / "runs.txt").read_text()
+
+
 # A tests/compass run that collected nothing (pytest rc 5) completed and passes
 # none; one interrupted by a collection error (rc 2) did not complete. rc 1, tests
 # failed, is the pipe test's `compass-failure` case.
