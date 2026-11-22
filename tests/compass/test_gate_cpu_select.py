@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import textwrap
 
 import pytest
 from test_gate_cpu_verdict_through_pipe import _run, _tree
@@ -36,14 +37,17 @@ class C:
     def h(self):
         return 3
 """
-TEST = """import pathlib, subprocess, sys
-from atom.m import {name}
+# Indented: `regen_gpu_gate_triggers.sh` reads a column-0 `from atom.` line as
+# this file's import, and `atom.m` exists only in the throwaway tree.
+TEST = textwrap.dedent("""\
+    import pathlib, subprocess, sys
+    from atom.m import {name}
 
 
-def test_{name}():
-    pathlib.Path({ran!r}, "{name}").touch()
-    {call}
-"""
+    def test_{name}():
+        pathlib.Path({ran!r}, "{name}").touch()
+        {call}
+    """)
 G = "subprocess.run([sys.executable, '-c', 'from atom.m import g; g()'], check=True, env={'PYTHONPATH': str(pathlib.Path(__file__).parents[2])})"
 CALLS = {"f": "f()", "g": G, "C": "C().h()"}
 FILES = {
