@@ -130,7 +130,9 @@ requests, ``fixed_s`` from the bursts or else ``idle_s``, and ``bytes`` over eve
 request's body. On a prefill-decode deployment's two sides' stamps it fits the
 prefill host entry's ``relay`` term (`fit_relay`): what carrying a prefill's
 response through the router to decode's app call costs per request and per
-byte.
+byte. On a streaming server's stamps it fits the ``http_stream`` term
+(`fit_stream`): its API loop's CPU per SSE event its streamed responses send,
+from the loop thread's CPU clock over windows of the record.
 
 Each equation is divided by its price, from its label until no price moves
 (`_fit_form`), and the coefficients are bound to be
@@ -325,6 +327,14 @@ RELAY_FEATURES = ("fixed", "bytes")
 #: Output rows one output thread takes in within this of the row before are
 #: one burst's, the rows of the requests one prefill step finished.
 RELAY_BURST_S = 0.05
+#: What a streaming server's API loop spends in a window: the window's seconds,
+#: and per SSE event, per request taken in and per body byte read there.
+STREAM_FEATURES = ("seconds", "events", "requests", "bytes")
+#: The windows `fit_stream` reads the loop's CPU over, and the share of each
+#: the loop thread's stamps must span for it to be read.
+STREAM_WINDOW_S, STREAM_SPAN = 10.0, 0.8
+#: The intake stamps the loop thread makes (`atom.compass.run._stamp_intake`).
+LOOP_KINDS = frozenset(("app", "body", "send", "recv", "wait", "head"))
 #: What a lone tokenizer call costs: per call, per token, and for a segment
 #: tokenizer call per character its stored-prefix search compared.
 TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
@@ -1077,6 +1087,76 @@ def fit_relay(pairs) -> tuple[dict, dict]:
     (fixed, per_byte), report = _host_law(x, np.array(took), RELAY_FEATURES)
     term = {"fixed_s": fixed, "per_byte_s": per_byte, "bytes": [min(sizes), max(sizes)]}
     return term, report
+
+
+def streams(path) -> bool:
+    """Whether the server whose intake stamps `path` holds sent an SSE
+    response head (``head``): it streamed its responses."""
+    with open(path) as lines:
+        return any(line.split(maxsplit=3)[2:3] == ["head"] for line in lines)
+
+
+def _loop_windows(path) -> list[tuple]:
+    """The intake stamps at `path` (`atom.compass.run.INTAKE_RECORD`) as one row
+    per `STREAM_WINDOW_S` window: ``(seconds, events, requests, bytes, CPU
+    seconds)``. CPU seconds are the API loop thread's, the one stamping app
+    calls, read off its stamps' thread CPU clock between its first and last
+    stamp in the window and scaled to the window, which they must span
+    `STREAM_SPAN` of; events are the output rows its output threads took in
+    (``out``), one SSE event each on a streamed response; requests and bytes
+    are the bodies read and their sizes. None for a server that sent no SSE
+    response head (``head``): its outputs stream nothing."""
+    if not streams(path):
+        return []
+    rows = [line.split() for line in Path(path).read_text().splitlines()]
+    loop = next((r[1] for r in rows if len(r) >= 7 and r[2] == "app"), None)
+    width = STREAM_WINDOW_S * 1e9
+    counts: dict = {}
+    clock = []
+    for r in rows:
+        if len(r) < 7:
+            continue
+        end, kind = int(r[0]), r[2]
+        at = counts.setdefault(int(end // width), [0, 0, 0])
+        if kind == "out":
+            at[0] += 1
+        elif kind == "body":
+            at[1] += 1
+            at[2] += int(r[4])
+        if kind in LOOP_KINDS and r[1] == loop:
+            clock.append((end, int(r[5])))
+    clock.sort()
+    ends = np.array([e for e, _ in clock], dtype=np.float64)
+    cpu = np.array([c for _, c in clock], dtype=np.float64)
+    out = []
+    for w, (events, requests, nbytes) in sorted(counts.items()):
+        i = int(np.searchsorted(ends, w * width))
+        j = int(np.searchsorted(ends, (w + 1) * width)) - 1
+        if j <= i or ends[j] - ends[i] < STREAM_SPAN * width:
+            continue
+        busy = (cpu[j] - cpu[i]) / (ends[j] - ends[i]) * STREAM_WINDOW_S
+        out.append((STREAM_WINDOW_S, events, requests, nbytes, busy))
+    return out
+
+
+def fit_stream(paths) -> tuple[dict, dict]:
+    """The ``http_stream`` term over the intake stamps each record in `paths`
+    holds, and its report: ``per_event_s``, the API loop's CPU seconds per SSE
+    event its streamed responses send, by the host-law solver on the loop's
+    CPU over every window of the streaming records (`_loop_windows`) on
+    `STREAM_FEATURES`. The window's seconds and its requests and bytes stand
+    for the loop's idle polling and its intakes, which ``http_intake`` prices,
+    and stay in the report. Raises where no record streamed."""
+    rows = [w for path in paths for w in _loop_windows(path)]
+    if not rows:
+        raise ValueError("no record streamed an SSE response, so none times its events")
+    x = np.array([w[:4] for w in rows], dtype=np.float64)
+    y = np.array([w[4] for w in rows], dtype=np.float64)
+    coef, report = _host_law(x, y, STREAM_FEATURES)
+    report["coefficients"] = dict(zip(STREAM_FEATURES, coef))
+    report["windows"] = len(rows)
+    report["loop_busy"] = float(y.sum() / x[:, 0].sum())
+    return {"per_event_s": coef[1]}, report
 
 
 #: The host entry's ``hops`` `fit_hops` fits (`atom.compass.run.HOPS`).

@@ -859,7 +859,12 @@ class HttpChannel:
     During the run, each event of a ``text/event-stream`` response body leaves
     with a comment line carrying its stamp on the LP's stream channel
     (`atom.compass.carriers.stamp_events`). Each body message is one frame the
-    app's stream yielded, so it must end in a blank line.
+    app's stream yielded, so it must end in a blank line. With an
+    ``http_stream`` term in its host entry (`atom.compass.run.http_stream`),
+    the loop is charged ``per_event_s`` for each event but a ``[DONE]`` before
+    it stamps them: a real decode server's loop spends ~50 us of CPU an
+    event, a fifth of its wall time at c=256 (r256, #3720), and the relays
+    and intakes it takes in wait behind that work.
 
     Taking in a stamped request other than a cancel costs the event loop its
     relay's service time, if it came on a relay that states one, then
@@ -880,11 +885,11 @@ class HttpChannel:
     """
 
     def __init__(self, app, stamp) -> None:
-        from atom.compass.run import http_intake, http_intake_hull, relay
+        from atom.compass.run import http_intake, http_intake_hull, http_stream, relay
 
         self.app, self.stamp = app, stamp
         self.intake, self.hull = http_intake(), http_intake_hull()
-        self.relay = relay()
+        self.relay, self.per_event = relay(), http_stream()
         self.intake_end = -math.inf  # the LP time the last intake ended
         # http seq -> its hang-up, for each stamped request the app is serving
         self.hangups: dict[int, asyncio.Event] = {}
@@ -896,7 +901,7 @@ class HttpChannel:
         if rt is not None and scope["type"] == "http":
             relay_in = _relay(rt.table.channels_into(rt.me))
             relay_out = _relay(rt.table.channels_from(rt.me))
-            send = _stamping_events(send, rt)
+            send = _stamping_events(send, rt, self.per_event)
         if relay_out is not None:
             send = _stamping(send, rt, relay_out, self.relay, taken)
         if relay_in is not None:
@@ -1076,8 +1081,10 @@ async def _read_body(receive):
     return body, replay
 
 
-def _stamping_events(send, rt):
-    """`send`, stamping each event of an SSE response body sent during the run.
+def _stamping_events(send, rt, per_event=None):
+    """`send`, stamping each event of an SSE response body sent during the run,
+    with `per_event`, `atom.compass.run.http_stream`'s seconds, first charged
+    on the loop for each event of the frame but a ``[DONE]``.
 
     The body message that ends in the ``[DONE]`` event ends the response too,
     and what the app sends after it is dropped. The traffic LP holds its clock
@@ -1098,7 +1105,13 @@ def _stamping_events(send, rt):
             content_type = dict(message.get("headers", [])).get(b"content-type", b"")
             events = content_type.startswith(b"text/event-stream")
         elif events and rt.in_run:
-            text = stamp_events(message.get("body", b"").decode(), rt)
+            text = message.get("body", b"").decode()
+            if per_event:
+                sent = text.split("\n\n")[:-1]
+                n = sum(1 for e in sent if not e.endswith("data: [DONE]"))
+                if n:
+                    charge(per_event * n)
+            text = stamp_events(text, rt)
             message = {**message, "body": text.encode()}
             if text.endswith("\ndata: [DONE]\n\n"):
                 ended, message["more_body"] = True, False

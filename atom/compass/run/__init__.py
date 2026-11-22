@@ -46,7 +46,8 @@ member, the frontend's included, connects to.
   each HTTP request's intake, beside the step record instead.
 - `http_intake()` is what `atom.utils.compass_loop.HttpChannel` charges the
   frontend's event loop for each request it takes in, from the ``host``
-  entry's ``http_intake`` term.
+  entry's ``http_intake`` term; `http_stream()`, for each SSE event a
+  streamed response sends, from its ``http_stream`` term.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
   finish, each handing in its LP's refusals; the frontend's, when it co-hosts
   the authority, then writes the step table and the run summary. A SIGINT or
@@ -412,6 +413,9 @@ HOST_TERMS = ("http_intake", "tokenizer")
 #: A prefill-decode run's prefill host entry's term pricing the relay of its
 #: response through the router to decode (`relay`).
 RELAY_TERM = "relay"
+#: A streaming server's host entry's term pricing its API loop's work per SSE
+#: event it sends (`http_stream`).
+STREAM_TERM = "http_stream"
 #: The kinds of call a ``tokenizer`` term prices, each 0 s where it is absent.
 TOKENIZER_KINDS = ("encode", "encode_batch", "decode", "segment")
 #: A ``host`` entry's ``hops``, each optional and the run-file key of its name:
@@ -690,6 +694,7 @@ def _check_host(path, host: dict) -> None:
             *HOST_TERMS,
             INGRESS,
             RELAY_TERM,
+            STREAM_TERM,
         }
         or set(host.get("skip", ())) - set(SEGMENTS)
         or {*laws, *columns} - set(HOST_LAW_KINDS)
@@ -703,8 +708,8 @@ def _check_host(path, host: dict) -> None:
             "columns, mapping them to segments to launch features' coefficients, "
             "admit, three coefficients on a forward's admissions or null, "
             "key, the host key the laws were fitted under, hops, the terms "
-            f"{' and '.join(HOST_TERMS)}, {RELAY_TERM}, and {INGRESS}, the encoding "
-            "ingress in front of the deployment (atom.compass.ingress)"
+            f"{' and '.join(HOST_TERMS)}, {RELAY_TERM}, {STREAM_TERM}, and {INGRESS}, "
+            "the encoding ingress in front of the deployment (atom.compass.ingress)"
         )
     if INGRESS in host:
         check_ingress(host[INGRESS], f"{path}: host's {INGRESS}")
@@ -762,6 +767,12 @@ def _check_host(path, host: dict) -> None:
             f"{path}: host's relay is {term!r}; it takes fixed_s and per_byte_s, "
             "each a non-negative number, and bytes optional, the bytes of the "
             "requests it was fitted over, [lo, hi]"
+        )
+    term = host.get(STREAM_TERM)
+    if term is not None and not _seconds(term, {"per_event_s"}):
+        raise ValueError(
+            f"{path}: host's {STREAM_TERM} is {term!r}; it takes per_event_s, a "
+            "non-negative number"
         )
 
 
@@ -3218,6 +3229,18 @@ def relay() -> tuple[float, float, float] | None:
     if (term := _host_term(RELAY_TERM)) is None:
         return None
     return term["fixed_s"], term["per_byte_s"], hop(run, "router_s")
+
+
+def http_stream() -> float | None:
+    """``per_event_s``: the frontend loop's time to send one SSE event of a
+    streamed response, from the ``http_stream`` term of this server's ``host``
+    entry, the one `tokenizer` resolved among several; None on a real run or
+    with no term. `atom.utils.compass_loop.HttpChannel` charges it on the loop
+    before it stamps each event, queued with the requests it takes in, as a
+    decode server's loop at c=256 (#3720, r256) spends ~50 us an event, a
+    fifth of its wall time."""
+    term = _host_term(STREAM_TERM)
+    return None if term is None else term["per_event_s"]
 
 
 def http_intake_hull() -> tuple[float, float] | None:
