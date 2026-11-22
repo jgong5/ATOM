@@ -312,6 +312,15 @@ def _split(run: Path) -> str:
             f", the decode side's joined to it at {high:.4f} s, its bounds"
             f" {low:.4f} s to {high:.4f} s"
         )
+    for node, joined in made.get("node_offsets_s", {}).items():
+        if joined:
+            low, high = (
+                "none" if b is None else f"{b:.4f} s" for b in joined["bounds_s"]
+            )
+            clock += (
+                f", {node}'s instances joined to it at {joined['offset_s']:.4f} s,"
+                f" its bounds {low} to {high}"
+            )
     counted = _counted(made)
     text = (
         f"{len(requests)} requests split, on {clock}; {len(unsplit)} not. Below,"

@@ -7,7 +7,8 @@ as a run ends.
 A simulated instance's record and cost lines are the simulated runner's own,
 driven through ATOM's scheduler on a clock each forward's charge moves, as the
 engine's moves; a real deployment's are written by hand, its decode side on a
-clock `DECODE_S` ahead of its client's and its prefill side's.
+clock `DECODE_S` ahead of its client's and its prefill side's, or, across two
+nodes, the second node's instances on a clock `NODE_S` ahead of the first's.
 """
 
 import gzip
@@ -32,6 +33,8 @@ from atom.compass.runner import overrides
 from atom.compass.runner.overrides import HostDeviceRecurrence
 
 DECODE_S = 1000.0
+#: How far a second node's clock runs ahead of the client's node's.
+NODE_S = 1.056
 
 
 def _export(run, requests, simulated=False) -> None:
@@ -281,6 +284,167 @@ def test_a_one_node_deployment_whose_kv_crossed_the_network_keeps_one_clock(
         "refused": "request a's first token is 999.980000000 s before its "
         "hand-over, so its events are not on one clock"
     }
+
+
+def _two_nodes(run, remote=("prefill1", "decode1")) -> None:
+    """A real 2P2D run across two nodes: the instances `remote` names on
+    10.0.0.2, whose clock runs `NODE_S` ahead of the client's node's, as g27's
+    ran ahead of g08's (#3720), and the others on the client's node. Request A
+    goes from prefill0 to decode0, B from prefill1 to decode0, C from prefill0
+    to decode1 and D from prefill1 to decode1, each event of each a round time
+    on the client's clock; C's first token reaches the client as the forward
+    handing it over returns."""
+    run.mkdir()
+    instances = [
+        {"name": "prefill0", "side": "P", "index": 0, "handshake_port": 17100},
+        {"name": "prefill1", "side": "P", "index": 1, "handshake_port": 17200},
+        {"name": "decode0", "side": "D", "index": 0},
+        {"name": "decode1", "side": "D", "index": 1},
+    ]
+    meta = {"kv_link": "inter_node", "across_nodes": True, "instances": instances}
+    (run / "run.json").write_text(json.dumps(meta))
+    # Each instance's forwards: entry, return, rows and the requests it names.
+    forwards = {
+        "prefill0": [
+            (1.2, 1.9, [(1, 136, 200)], [(1, "ka", "pa")]),
+            (1.9, 2.1, [(2, 80, 80)], [(2, "kc", "pc")]),
+        ],
+        "prefill1": [
+            (1.3, 2.2, [(1, 50, 50)], [(1, "kb", "pb")]),
+            (2.2, 2.3, [(2, 30, 30)], [(2, "kd", "pd")]),
+        ],
+        "decode0": [
+            (2.3, 2.32, [(5, 1, 201)], [(5, 5, "a")]),
+            (2.6, 2.62, [(5, 1, 202), (6, 1, 51)], [(6, 6, "b")]),
+            (2.7, 2.72, [], []),
+        ],
+        "decode1": [
+            (2.4, 2.42, [(7, 1, 81)], [(7, 7, "c")]),
+            (2.5, 2.52, [(7, 1, 82), (8, 1, 31)], [(8, 8, "d")]),
+            (2.65, 2.67, [], []),
+        ],
+    }
+    for name, held in forwards.items():
+        ahead, host = (NODE_S, "10.0.0.2") if name in remote else (0.0, "127.0.0.1")
+        lines = [
+            _line(i, enter + ahead, out + ahead, batch, named, is_dummy_run=not batch)
+            for i, (enter, out, batch, named) in enumerate(held)
+        ]
+        _record(run / name, lines, False)
+        ready = {"url": f"http://{host}:8000", "pid": 1}
+        (run / name / "server.json").write_text(json.dumps(ready))
+    for name, sent in (("decode0", "ab"), ("decode1", "cd")):
+        transfers = [
+            {
+                "response_id": n,
+                "remote_dp_rank": 0,
+                "transfer_id": 1 if name == "decode0" else 2,
+                "remote_handshake_port": port,
+            }
+            for n, port in zip(sent, (17100, 17200))
+        ]
+        (run / name / "steps" / parity.TRANSFERS).write_text(
+            "".join(json.dumps(t) + "\n" for t in transfers)
+        )
+    _export(
+        run,
+        [
+            ("xa", "a", 1.0, 1.64, 2.0),
+            ("xb", "b", 1.1, 1.65, 1.8),
+            ("xc", "c", 1.5, 1.02, 1.3),
+            ("xd", "d", 2.0, 0.69, 1.1),
+        ],
+    )
+
+
+def test_a_two_node_deployment_joins_each_instance_by_its_nodes_offset(tmp_path):
+    """prefill1 and decode1 ran on the second node: B's and D's sends bound
+    its offset from below, B's decode entry and C's and D's first tokens from
+    above, and its upper bound, C's first token's way out, is the offset
+    itself, so each request splits as it ran, wherever its sides ran."""
+    run = tmp_path / "run"
+    _two_nodes(run)
+
+    out = split.write(run)
+
+    assert out["clock"] == "monotonic" and "decode_offset_s" not in out
+    # At least B's and D's send less their prefill entry, -NODE_S - 0.2; at
+    # most C's first token less its hand-over's return, -NODE_S.
+    ((node, joined),) = out["node_offsets_s"].items()
+    assert node == "10.0.0.2"
+    assert joined["offset_s"] == pytest.approx(-NODE_S)
+    assert joined["bounds_s"] == pytest.approx([-NODE_S - 0.2, -NODE_S])
+    assert [r["response_id"] for r in out["requests"]] == ["a", "b", "c", "d"]
+    expected = {
+        "a": (0.2, 0.7, 0.4, 0.7, 1.62),
+        "b": (0.2, 0.9, 0.4, 0.3, 1.62),
+        "c": (0.4, 0.2, 0.3, 0.4, 1.02),
+        "d": (0.2, 0.1, 0.2, 0.6, 0.67),
+    }
+    segments = ("queue_s", "prefill_s", "kv_transfer_s", "decode_s", "forward_ttft_s")
+    for r in out["requests"]:
+        assert [r[k] for k in segments] == pytest.approx(expected[r["response_id"]])
+        assert sum(r[k] for k in segments[:4]) == pytest.approx(r["e2el_s"], abs=1e-9)
+    assert out["unsplit"] == {}
+
+
+def test_a_two_node_deployment_whose_instances_name_no_node_is_refused(tmp_path):
+    """Without its instances' server.json, every prefill instance is read on
+    the client's clock, as the split read them before it read nodes: prefill1's
+    return of B lands `NODE_S` late, after decode0 took B in."""
+    run = tmp_path / "run"
+    _two_nodes(run)
+    for name in ("prefill0", "prefill1", "decode0", "decode1"):
+        (run / name / "server.json").unlink()
+
+    out = split.write(run)
+
+    # decode0's offset is A's first token less its hand-over, 0.02 s.
+    assert out == {
+        "refused": "request b's decode entry is 0.636000000 s before its prefill "
+        "return, so its events are not on one clock"
+    }
+
+
+def test_a_node_of_prefill_instances_alone_takes_its_lower_bound(tmp_path):
+    """prefill1 alone ran on the second node: B's and D's way in, each one's
+    send to its prefill entry, bounds its offset from below, and the faster of
+    the two is taken as none."""
+    run = tmp_path / "run"
+    _two_nodes(run, remote=("prefill1",))
+
+    out = split.write(run)
+
+    # At most B's decode entry less its prefill return there, -NODE_S + 0.4,
+    # and D's, -NODE_S + 0.2.
+    joined = out["node_offsets_s"]["10.0.0.2"]
+    assert joined["offset_s"] == pytest.approx(-NODE_S - 0.2)
+    assert joined["bounds_s"] == pytest.approx([-NODE_S - 0.2, -NODE_S + 0.2])
+    b, d = (r for r in out["requests"] if r["response_id"] in ("b", "d"))
+    assert (b["queue_s"], b["kv_transfer_s"]) == pytest.approx((0.0, 0.6))
+    assert (d["queue_s"], d["kv_transfer_s"]) == pytest.approx((0.0, 0.4))
+
+
+def test_a_one_node_deployment_s_split_is_the_same_whatever_its_instances_serve_at(
+    tmp_path,
+):
+    """`across_nodes` false: one clock, read the same whatever node an
+    instance's server.json names, byte for byte."""
+    run = tmp_path / "run"
+    _two_prefills(run)
+    out = split.write(run)
+    written = (run / split.FILE).read_bytes()
+    for name, host in (
+        ("prefill0", "127.0.0.1"),
+        ("prefill1", "10.0.0.2"),
+        ("decode", "10.0.0.3"),
+    ):
+        ready = {"url": f"http://{host}:8000", "pid": 1}
+        (run / name / "server.json").write_text(json.dumps(ready))
+
+    assert split.write(run) == out
+    assert (run / split.FILE).read_bytes() == written
+    assert "node_offsets_s" not in out and "decode_offset_s" not in out
 
 
 def test_a_request_no_later_forward_hands_over_is_unsplit(tmp_path):

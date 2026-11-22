@@ -29,13 +29,30 @@ to OUT/`FILE`, one JSON document, and no other file changes:
 - ``unsplit``: each other request aiperf recorded, by its ``request_id``, and why.
 - ``clock``: ``virtual`` for a simulated run; ``monotonic`` for a real one, the
   host clock its client shares with the server it reaches at 127.0.0.1. A real
-  deployment's decode side on another node (`run.json`'s ``across_nodes``, or,
-  where an older one states none, its ``kv_link`` ``inter_node``) is joined to
-  it; one whose KV crossed the network from this node (`deploy.sh
-  --kv-over-network`) shares the clock: ``decode_offset_s`` bounds what its times
-  take to land on this clock, at least each request's prefill return less its
-  decode entry and at most its first token less its hand-over's return; they
-  take the upper bound.
+  deployment across nodes (`run.json`'s ``across_nodes``, or, where an older
+  one states none, its ``kv_link`` ``inter_node``) has a monotonic clock a
+  node, each counting from its own boot; one whose KV crossed the network from
+  this node (`deploy.sh --kv-over-network`) shares this one. Across nodes, each
+  instance ran on the node its ``server.json`` URL names (`compass record
+  --host`), this one for a loopback or unspecified address, and each other
+  node's instances, prefill and decode alike, are joined to this clock by that
+  node's one offset. No record measures it; the events of each request that
+  cross between this node and that one bound it. ``node_offsets_s`` gives each
+  other node's, by its address, as ``offset_s``, the one taken, and
+  ``bounds_s``: at least each request's send less its prefill entry there and
+  its prefill return here less its decode entry there; at most its first token
+  less its hand-over's return there and its decode entry here less its prefill
+  return there; null where no request sets one. A node holding a decode
+  instance takes its upper bound, as though its fastest first token reached the
+  client the moment its forward handed it over; a node of prefill instances
+  alone its lower, as though its fastest request entered a forward the moment
+  it was sent. A node no request reached is null. A request's hop between two
+  other nodes bounds neither; its order is checked as every request's is. Where
+  an instance's directory holds no ``server.json``, every prefill instance is
+  taken to run here and each decode instance on a node of its own, as before
+  nodes were read: ``decode_offset_s`` bounds what the decode side's times take
+  to land on this clock, as ``bounds_s`` does a node's, and they take the upper
+  bound.
 
 A real forward's entry and return are its step line's ``t_enter_ns`` and
 ``t_exit_ns``; a simulated one's are its cost line's ``t_s`` and that plus
@@ -44,8 +61,8 @@ A deployment's sides join through the decode side's `TRANSFERS`. Above one
 instance of a side (`deploy.sh`'s ``prefill<k>/`` and ``decode<k>/``), each
 transfer names the prefill instance it came from (`parity.INSTANCE_FIELDS`): a
 simulated one by its engine id, a real one by the Mooncake handshake port
-`run.json`'s ``instances`` gives it; a real decode instance on another node
-takes its own ``decode_offset_s``, listed by instance as
+`run.json`'s ``instances`` gives it; where the instances name no node, each
+real decode instance takes its own ``decode_offset_s``, listed by instance as
 ``decode_offsets_s``, the first field then spanning them all. In place of
 the split, ``refused`` says why there is none: a file it reads is missing or
 holds no step times, a side is a pipeline's, whose first tokens leave a stage
@@ -57,10 +74,12 @@ before.
 
 import collections
 import gzip
+import ipaddress
 import itertools
 import json
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from atom.benchmarks.results.records import from_aiperf
 from atom.compass.backends.json_file import read_json, read_jsonl
@@ -71,6 +90,8 @@ from atom.compass.parity.client_run import RAW, response_id
 FILE = "request_split.json"
 RECORDS = "artifacts/profile_export.jsonl"
 STEPS = "steps"
+#: Where an instance names the URL it served at (`drive.serve.READY_FILE`).
+READY = "server.json"
 #: The clocks' resolution, a nanosecond stamp, in seconds.
 RESOLUTION_S = 1e-9
 
@@ -228,6 +249,70 @@ def _record(side: Path, simulated: bool, every: bool) -> tuple[dict, dict, dict]
     return first, named, lmcache
 
 
+def _node(path: Path) -> str | None:
+    """The node the instance at `path` ran on: the host its `READY` URL names,
+    None for the client's, a loopback or unspecified address."""
+    host = urlsplit(read_json(path / READY)["url"]).hostname
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:  # a name
+        return None if host == "localhost" else host
+    return None if address.is_loopback or address.is_unspecified else host
+
+
+def _join(
+    events: dict, own: dict, decoded_by: dict, prefills: list, decodes: list
+) -> dict:
+    """Move each request's `events` on a node other than its client's onto the
+    client's clock by that node's offset, as the module says; the fields that
+    say how. Each request's prefill instance is the first of its key in `own`,
+    its decode instance its `decoded_by`."""
+    paths = [path for path, _ in prefills] + decodes
+    located = all((path / READY).exists() for path in paths)
+    if located:
+        nodes = [_node(path) for path in paths]
+    else:  # every prefill instance here, each decode instance a node of its own
+        nodes = [None] * len(prefills) + [("decode", j) for j in range(len(decodes))]
+    prefill_on, decode_on = nodes[: len(prefills)], nodes[len(prefills) :]
+    # Each request's events by the node they ran on, None for the client's.
+    where = {}
+    lows, highs = collections.defaultdict(list), collections.defaultdict(list)
+    for name, e in events.items():
+        p = prefill_on[own[name][0]]
+        d = decode_on[decoded_by[name]] if decodes else p
+        where[name] = {"prefill entry": p, "prefill return": p}
+        where[name] |= {"decode entry": d, "hand-over": d}
+        for (a, x), (b, y) in itertools.pairwise(e.items()):
+            here, there = where[name].get(a), where[name].get(b)
+            if here is None and there is not None:
+                lows[there].append(x - y)
+            elif there is None and here is not None:
+                highs[here].append(y - x)
+    bounds, taken = {}, {}
+    for node in dict.fromkeys(n for n in nodes if n is not None):
+        if node not in lows and node not in highs:
+            bounds[node] = None
+            continue
+        low, high = max(lows[node], default=None), min(highs[node], default=None)
+        bounds[node] = [low, high]
+        upper = high is not None and (node in decode_on or low is None)
+        taken[node] = high if upper else low
+    for name, e in events.items():
+        for event, node in where[name].items():
+            if node is not None and event in e:
+                e[event] += taken[node]
+    if not located:
+        offsets = [bounds[node] for node in decode_on]
+        held = [o for o in offsets if o]
+        out = {"decode_offset_s": [min(o[0] for o in held), max(o[1] for o in held)]}
+        return out | ({"decode_offsets_s": offsets} if len(decodes) > 1 else {})
+    joined = {node: None for node in bounds}
+    joined |= {
+        node: {"offset_s": taken[node], "bounds_s": bounds[node]} for node in taken
+    }
+    return {"node_offsets_s": joined}
+
+
 def split(run) -> dict:
     """`run`'s split, as the module says."""
     run = Path(run)
@@ -277,22 +362,7 @@ def split(run) -> dict:
         raise ValueError("no request aiperf finished is named by its step records")
     clock = {"clock": "virtual" if simulated else "monotonic"}
     if not simulated and meta.get("across_nodes", meta.get("kv_link") == "inter_node"):
-        offsets = []
-        for j in range(len(decodes)):
-            mine = [e for name, e in events.items() if decoded_by[name] == j]
-            if not mine:
-                offsets.append(None)
-                continue
-            low = max(e["prefill return"] - e["decode entry"] for e in mine)
-            high = min(e["first token"] - e["hand-over"] for e in mine)
-            for e in mine:
-                e["decode entry"] += high
-                e["hand-over"] += high
-            offsets.append([low, high])
-        held = [o for o in offsets if o]
-        clock["decode_offset_s"] = [min(o[0] for o in held), max(o[1] for o in held)]
-        if len(decodes) > 1:
-            clock["decode_offsets_s"] = offsets
+        clock |= _join(events, own, decoded_by, prefills, decodes)
     requests = []
     for name, e in events.items():
         for (a, x), (b, y) in itertools.pairwise(e.items()):
