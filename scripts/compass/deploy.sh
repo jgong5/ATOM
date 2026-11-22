@@ -63,6 +63,16 @@
 #                  to send it a stop, and to pair its node's clock (default 60)
 #   CLOCK_PAIR_S   seconds between two pairs of a node's clock (below; default
 #                  60)
+#   CLOCK_PAIR_PREFIX_<node>
+#                  a command prefix, split on whitespace, that pairs <node>'s
+#                  clock in place of the --on prefix of its instances, such as
+#                  `ssh -o BatchMode=yes <host>` where that one carries no
+#                  stdin, as a relay may not; it reaches the node as --on's
+#                  does, this tree at its path. <node> is the address its
+#                  instances' server.json URLs name, each character other
+#                  than a letter, a digit or _ an _: 10.19.0.127's is
+#                  CLOCK_PAIR_PREFIX_10_19_0_127, fd00::7's
+#                  CLOCK_PAIR_PREFIX_fd00__7
 #   PREFILL_ENV DECODE_ENV
 #                  NAME=VALUE words, split on whitespace, set in that side's
 #                  instances only, as pd_sim.sh takes them: each instance's
@@ -114,7 +124,8 @@
 # other than this one that an --on prefix starts an instance on, named by the
 # address that instance's server.json URL gives (none for a loopback or
 # unspecified one, which the split takes as this node), has its CLOCK_MONOTONIC
-# paired with this one's over that prefix (atom/compass/drive/clock_pair.py):
+# paired with this one's over that prefix, or CLOCK_PAIR_PREFIX_<node>'s
+# (atom/compass/drive/clock_pair.py):
 # as the router answers and every CLOCK_PAIR_S while the deployment serves and
 # stops, apart from it, and once it has stopped, each pair a line of
 # OUT/clock_pairs.jsonl, by which the split joins that node's instances to the

@@ -114,12 +114,18 @@ def test_a_pair_over_a_prefix_runs_this_file_there_and_states_its_error(on):
     assert ran == [f"python3 -I -u {os.path.abspath(clock_pair.__file__)} serve"]
 
 
-def _main(tmp_path, *words):
-    """The command's run on `words` after its file, and the pairs it wrote."""
+def _main(tmp_path, *words, env=None):
+    """The command's run on `words` after its file, under `env` or this
+    process's environment, and the pairs it wrote."""
     out = tmp_path / clock_pair.FILE
     command = [sys.executable, "-m", "atom.compass.drive.clock_pair", str(out)]
     done = subprocess.run(
-        [*command, *words], capture_output=True, text=True, timeout=120, check=False
+        [*command, *words],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        env=env,
     )
     rows = out.read_text().splitlines() if out.exists() else []
     return done, [json.loads(r) for r in rows]
@@ -144,6 +150,37 @@ def test_each_other_node_is_paired_once_by_the_first_prefix_naming_it(tmp_path, 
     assert [r["node"] for r in rows] == ["10.0.0.2", "node-c"]
     assert all(abs(r["offset_ns"]) <= r["error_ns"] for r in rows)
     assert len(on.with_name("on.log").read_text().splitlines()) == 2
+
+
+def test_a_node_s_override_is_named_by_its_address_in_letters_digits_and_underscores():
+    assert clock_pair.override("10.19.0.127") == "CLOCK_PAIR_PREFIX_10_19_0_127"
+    assert clock_pair.override("fd00::7") == "CLOCK_PAIR_PREFIX_fd00__7"
+    assert clock_pair.override("pit2-p03-g27") == "CLOCK_PAIR_PREFIX_pit2_p03_g27"
+
+
+def test_a_node_whose_override_is_set_is_paired_through_it_in_place_of_its_prefix(
+    tmp_path, on
+):
+    """10.0.0.2's instance came up through `false`, which reaches nothing,
+    and its override names the prefix, which pairs it; 10.0.0.3's override is
+    blank, so its instance's own prefix pairs it."""
+    other = tmp_path / "other"
+    other.write_text(ON)
+    other.chmod(0o755)
+    env = os.environ | {
+        clock_pair.override("10.0.0.2"): f"{on}  node-b ",
+        clock_pair.override("10.0.0.3"): "  ",
+    }
+    words = ["--", "http://10.0.0.2:8000", "1", "false"]
+    words += ["http://10.0.0.3:8000", "2", str(other), "node-c"]
+
+    done, rows = _main(tmp_path, *words, env=env)
+
+    assert done.returncode == 0, done.stderr
+    assert [r["node"] for r in rows] == ["10.0.0.2", "10.0.0.3"]
+    serve = f"python3 -I -u {os.path.abspath(clock_pair.__file__)} serve"
+    for prefix in (on, other):
+        assert prefix.with_name(f"{prefix.name}.log").read_text() == serve + "\n"
 
 
 def test_a_node_its_prefix_cannot_reach_writes_no_pair_and_fails_naming_it(

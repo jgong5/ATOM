@@ -8,10 +8,14 @@ command prefix that started it on its node (`deploy.sh --on`), such as `ssh
 <host>`; its node is the host the URL names (`node`), and one on this node, a
 loopback or unspecified address, is none to pair. Each other node, once
 however many instances it holds, is paired as an NTP client pairs with its
-server, though over the prefix's own channel, so no port opens: the prefix
-runs this file there (`serve`, by its path, which that node sees as this one
-does), and each of `ROUNDS` exchanges, after `WARM` that are not kept, reads
-this node's clock, asks that one for its own, and reads this one's again.
+server, though over a prefix's own channel, so no port opens: the first
+instance's prefix that reaches it, or, where the environment sets one, the
+prefix `override` names for it, its words split on whitespace, such as `ssh
+-o BatchMode=yes <host>` in place of a relay that carries no stdin. The
+prefix runs this file there (`serve`, by its path, which that node sees as
+this one does), and each of `ROUNDS` exchanges, after `WARM` that are not
+kept, reads this node's clock, asks that one for its own, and reads this
+one's again.
 That node's clock less the middle of the two is its offset, off by at most
 half the round trip, as the exchange's two ways may differ. The offset is the
 median over the tenth of the exchanges, at least 5, that came back fastest,
@@ -41,6 +45,7 @@ import bisect
 import ipaddress
 import json
 import os
+import re
 import select
 import shlex
 import signal
@@ -57,6 +62,14 @@ ROUNDS, WARM = 400, 20
 #: The fastest share of the exchanges the offset is taken from, and their least number.
 FASTEST, AT_LEAST = 10, 5
 CLOCK = time.CLOCK_MONOTONIC
+
+
+def override(node: str) -> str:
+    """The variable naming the prefix `node` is paired through in place of its
+    instances': ``CLOCK_PAIR_PREFIX_`` and the address, each character other
+    than a letter, a digit or ``_`` an ``_``, so 10.19.0.127's is
+    ``CLOCK_PAIR_PREFIX_10_19_0_127`` and fd00::7's ``CLOCK_PAIR_PREFIX_fd00__7``."""
+    return "CLOCK_PAIR_PREFIX_" + re.sub(r"[^A-Za-z0-9_]", "_", node)
 
 
 def node(url: str) -> str | None:
@@ -186,7 +199,8 @@ def read(path) -> dict:
 
 
 def _nodes(words: list) -> dict:
-    """Each other node `words`, URL N WORD..., name, by the first prefix that
+    """Each other node `words`, URL N WORD..., name, by the prefix it is
+    paired through: its `override`'s, set and not blank, else the first that
     reaches it."""
     reached = {}
     while words:
@@ -194,7 +208,9 @@ def _nodes(words: list) -> dict:
         prefix, words = words[2 : 2 + n], words[2 + n :]
         name = node(url)
         if name is not None and prefix:
-            reached.setdefault(name, prefix)
+            reached.setdefault(
+                name, os.environ.get(override(name), "").split() or prefix
+            )
     return reached
 
 

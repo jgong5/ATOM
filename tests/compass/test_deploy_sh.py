@@ -454,12 +454,87 @@ def test_a_record_pairs_the_clock_of_each_other_node_it_starts_an_instance_on(
         return
     rows = [json.loads(line) for line in paired.read_text().splitlines()]
     # As it started, once a second after while it served, and once stopped.
-    assert len(rows) >= 3 and ran.count(serve) == len(rows)
+    # A pair the stop cut short ran through the prefix and wrote no line.
+    assert len(rows) >= 3 and ran.count(serve) - len(rows) in (0, 1)
     assert {r["node"] for r in rows} == {node}
     times = [r["mono_ns"] for r in rows]
     assert times == sorted(times) and times[0] < ready + 2e9
     assert times[-1] > stopping
     # That node is this one, so each offset is none within the error it states.
+    assert all(abs(r["offset_ns"]) <= r["error_ns"] for r in rows)
+
+
+#: A prefix as a relay that carries no stdin, c2_r2's relay_client.py: it runs
+#: its words in a shell of its own, as `ssh <node>` does, its stdin closed,
+#: and lives as long as they do.
+RELAY = (
+    '#!/bin/sh\nshift\necho "$*" >>"$PLANTED_ON"\nsh -c "$*" </dev/null &\nwait $!\n'
+)
+
+
+@pytest.mark.parametrize("override", [True, False])
+def test_a_node_whose_prefix_carries_no_stdin_is_paired_through_its_override(
+    tmp_path, planted, override
+):
+    """prefill1 on 10.0.0.2, started through a relay that carries no stdin:
+    with CLOCK_PAIR_PREFIX_10_0_0_2 naming a prefix that carries it, as `ssh`
+    does, that node is paired through that prefix alone; without, each pair
+    fails, so none is written, and nothing else does."""
+    env, _ = planted
+    bindir = tmp_path / "bin"
+    (bindir / "relay").write_text(RELAY)
+    (bindir / "ssh").write_text(
+        '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\n'
+        'echo "$*" >>"$PLANTED_SSH"\nexec sh -c "$*"\n'
+    )
+    for tool in ("relay", "ssh"):
+        (bindir / tool).chmod(0o755)
+    env |= {"PLANTED_ON": str(tmp_path / "on.log"), "PLANTED_BIND": "127.0.0.1"}
+    env |= {"PLANTED_SSH": str(tmp_path / "ssh.log"), "CLOCK_PAIR_S": "1"}
+    if override:
+        env["CLOCK_PAIR_PREFIX_10_0_0_2"] = f"{bindir / 'ssh'} -o BatchMode=yes node-b"
+    words = argv(tmp_path, ["--gpu", "0,1"])
+    words[3] = "record"
+    at = words.index("--decode")
+    own = ["--on", f"{bindir / 'relay'} node-b", "--host", "10.0.0.2"]
+    words[at:at] = ["--prefill", *own, "--", "--model", str(tmp_path), *PREFILL]
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        words,
+        env=env,
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _until(d / "server.json", script)
+        time.sleep(2)
+    finally:
+        script.send_signal(signal.SIGTERM)
+        _, err = script.communicate(timeout=60)
+
+    assert (d / "run.json").exists()
+    serve = f"python3 -I -u {TREE}/atom/compass/drive/clock_pair.py serve"
+    relayed = (tmp_path / "on.log").read_text().splitlines()
+    assert relayed[0] == f"bash {d}/prefill1.sh"
+    paired = d / "clock_pairs.jsonl"
+    if not override:
+        assert not paired.exists() and not (tmp_path / "ssh.log").exists()
+        closed = (
+            f"clock_pair: 10.0.0.2: `{bindir / 'relay'} node-b` closed with no answer"
+        )
+        # As it started and once it stopped at the least; one the stop cut
+        # short ran through the relay and said nothing.
+        assert err.count(closed) >= 2, err
+        assert relayed.count(serve) - err.count(closed) in (0, 1)
+        return
+    assert "clock_pair" not in err, err
+    rows = [json.loads(line) for line in paired.read_text().splitlines()]
+    assert len(rows) >= 2 and {r["node"] for r in rows} == {"10.0.0.2"}
+    ssh = (tmp_path / "ssh.log").read_text().splitlines()
+    assert set(ssh) == {serve} and len(ssh) - len(rows) in (0, 1)
+    assert serve not in relayed
     assert all(abs(r["offset_ns"]) <= r["error_ns"] for r in rows)
 
 

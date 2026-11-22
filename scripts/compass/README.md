@@ -1084,7 +1084,14 @@ one use of the prefix the gaps defeat is the pairing of 013's clock with 005's
 lines each way over its stdin and stdout, as `ssh` and `srun` carry them: each
 pair fails, `clock_pair: 10.245.149.94: ...` on `deploy.sh`'s stderr, after
 `PREFIX_S` at most, and the split joins the decode's events to 005's clock by
-the bounds its requests set (`atom/compass/report/split.py`).
+the bounds its requests set (`atom/compass/report/split.py`). A prefix that
+carries both, set as `CLOCK_PAIR_PREFIX_<node>` in `deploy.sh`'s environment,
+pairs that node in place of `--on`'s: `<node>` is the address the decode's
+`server.json` URL names, each character other than a letter, a digit or `_`
+an `_`, so `CLOCK_PAIR_PREFIX_10_245_149_94='ssh -o BatchMode=yes <013>'`
+here. It runs `python3 -I -u <this tree>/atom/compass/drive/clock_pair.py
+serve` there, so it must reach a host or container that sees this tree at its
+path; a container reads its host's CLOCK_MONOTONIC, so either serves.
 
 | | 005 (prefill) | 013 (decode) |
 |---|---|---|
