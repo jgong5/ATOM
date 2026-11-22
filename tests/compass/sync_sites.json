@@ -4281,6 +4281,43 @@
    "mechanism_why": "in `compass record`, which is no LP: it serves a real server on the GPUs it names and refuses a run file and a clock, so no simulated clock reads this"
   },
   {
+   "id": "atom/compass/drive/lacking.py::_token_graphs::ProcessPoolExecutor(1, mp_context=spawn)::thread_start#0",
+   "file": "atom/compass/drive/lacking.py",
+   "symbol": "_token_graphs",
+   "call": "ProcessPoolExecutor",
+   "expr": "ProcessPoolExecutor(1, mp_context=spawn)",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "none",
+   "why": "compass run --check and compass advice read whether ATOM's attention builder records token graphs in one spawned process declaring the machine's device, as its module imports aiter",
+   "mechanism": "K9",
+   "mechanism_why": "starting a process cannot park; the checking command is no LP"
+  },
+  {
+   "id": "atom/compass/drive/lacking.py::_token_graphs::child.submit(_resolving, _builder_records, family, arch, of)::executor_handoff#0",
+   "file": "atom/compass/drive/lacking.py",
+   "symbol": "_token_graphs",
+   "call": "child.submit",
+   "expr": "child.submit(_resolving, _builder_records, family, arch, of)",
+   "shape": "executor_handoff",
+   "peer": "process",
+   "why": "the check hands that process the builder's attention family and the device arch",
+   "mechanism": "K9",
+   "mechanism_why": "compass run --check and compass advice's reuse check read the builder before any server starts, and no simulated run reads it"
+  },
+  {
+   "id": "atom/compass/drive/lacking.py::_token_graphs::read.result(PROBE_SECONDS)::event_wait#0",
+   "file": "atom/compass/drive/lacking.py",
+   "symbol": "_token_graphs",
+   "call": "read.result",
+   "expr": "read.result(PROBE_SECONDS)",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "the check waits up to PROBE_SECONDS for that process's answer, and past them ends the process and works out no buckets",
+   "mechanism": "K9",
+   "mechanism_why": "compass run --check and compass advice's reuse check read the builder before any server starts, and no simulated run reads it"
+  },
+  {
    "id": "atom/compass/drive/pp_probe.py::_polled::event.query()::event_poll#0",
    "file": "atom/compass/drive/pp_probe.py",
    "symbol": "_polled",
