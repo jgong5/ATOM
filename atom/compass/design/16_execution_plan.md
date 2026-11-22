@@ -492,9 +492,13 @@ CPU gate covers it, and a path *present* is not proof that it does not. Of the t
 this gate prefers the first, because running the GPU gate when in doubt is never the wrong
 one. Judging that a change sits outside the blind spot remains its reviewer's call.
 
-**A change touching EPLB, CUDA-graph capture bounds, block tables, the paged index builders or
-the prefix-cache kernels lands in a batch of its own, and its lander runs `gate_gpu.sh` on the
-batch commit.**
+**A change touching a path in `scripts/compass/gpu_gate_triggers.txt`, EPLB, CUDA-graph
+capture bounds or block tables lands in a batch of its own, and its lander runs `gate_gpu.sh`
+on the batch commit.** The overlay (`.claude/agent-team.md`, "The GPU gate") states the same
+rule. The paged index builders and the prefix-cache kernels sit under
+`atom/model_ops/v4_kernels/`, a trigger-list entry; EPLB, the capture bounds and the block
+tables are named because no trigger-list path covers them: the CPU gate runs their tests, but
+without a device.
 That is where the files running nothing here concentrate — 29 excluded plus 22 exercising
 nothing, 51 in all; the silent 22 include `test_pool_index.py`,
 `test_prefill_indices_paged.py`, `test_decode_indices_paged.py`, `test_postprocess_width.py`
