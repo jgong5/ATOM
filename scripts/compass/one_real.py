@@ -26,11 +26,17 @@ SIM, its requests paired with REAL's by conversation and turn (`paired`): a
 percentile of each run is a rank statistic over its own request set, and E2E's
 middle is sparse (#3720 c=8: 3.5% of requests within 5% of the median), so its
 p50 moves with the requests either run finished and with each request's place
-in the schedule, which the paired E2E does not.
+in the schedule, which the paired E2E does not. Then, per SIM, its throughput
+per GPU over the requests both runs finished, and the seconds aiperf's agentic
+replay skipped in each run under its global system-idle cap (`window`): a
+short window's throughput is the tokens of the requests the client sent in it,
+and a run whose system went idle where the other's did not jumps its whole
+replay ahead.
 """
 
 import json
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -41,6 +47,7 @@ from atom.compass.validate.curves import (
     RECORDS,
     _metric,
     _positive,
+    gpus,
     metrics,
     percentile,
     profiled,
@@ -104,6 +111,8 @@ def main(argv: list[str]) -> int:
     print(tails(real, sims, rows))
     for sim in sims:
         print(paired(real, sim))
+    for sim in sims:
+        print(window(real, sim))
     print(json.dumps(rows))
     return 0
 
@@ -191,6 +200,77 @@ def tails(real: Path, sims: list[Path], rows: dict) -> str:
     return (
         f"real tails' own 95% interval over {len(keys)} {BLOCK_S} s send blocks: "
         + "; ".join(out)
+    )
+
+
+#: aiperf's log in a client export, and the line its agentic replay writes at
+#: each phase's end of what its global system-idle cap skipped.
+AIPERF_LOG = "artifacts/logs/aiperf.log"
+IDLE_CAP = re.compile(
+    r"Global system-idle cap summary: limit=\S+, jumps=(\d+), skipped=([0-9.]+)s"
+)
+
+
+def idle_cap(run: Path) -> tuple[int, float] | None:
+    """The jumps aiperf's agentic replay made in `run` under its global
+    system-idle cap and the seconds they skipped, from the last summary its log
+    holds (the profiling phase's, which ends after the warmup's); None where
+    the log states none."""
+    try:
+        found = IDLE_CAP.findall((run / AIPERF_LOG).read_text(errors="replace"))
+    except OSError:
+        return None
+    return (int(found[-1][0]), float(found[-1][1])) if found else None
+
+
+def _served(run: Path) -> dict:
+    """Each profiled request of `run` by (conversation, turn): its send, its
+    end at the client and its input plus output tokens."""
+    out = {}
+    for r in profiled(read_jsonl(run / RECORDS)):
+        m = r.get("metadata", {})
+        start, end = m.get("request_start_ns"), m.get("request_end_ns")
+        if None in (start, end) or "conversation_id" not in m or "turn_index" not in m:
+            continue
+        tokens = sum(
+            n
+            for k in ("input_sequence_length", "output_sequence_length")
+            if (n := _metric(r, k, int)) is not None
+        )
+        out[m["conversation_id"], m["turn_index"]] = (int(start), int(end), tokens)
+    return out
+
+
+def window(real: Path, sim: Path) -> str:
+    """`sim`'s throughput per GPU against `real`'s over the requests both ran
+    (each run's tokens of them over its span from the first one's send to the
+    last one's end), beside what aiperf's global system-idle cap skipped in
+    each run (`idle_cap`). The table's throughput is a window's: the tokens of
+    the requests the client sent in it. Under agentic replay the client shifts
+    every pending send earlier once the system has been idle for the cap, so a
+    run that goes idle where the other has a request in flight sends its whole
+    replay ahead (#3720 c=8: each simulated run jumped 3 times, 57 s, the real
+    one 2 times, 27 s, as a lane ran 2 s ahead of the real one's; the 30 s more
+    of the trace sent 4 more requests holding 1.9M input tokens: throughput
+    +7.8%, and -0.2% over the 198 requests both ran)."""
+    a, b = _served(real), _served(sim)
+    both = set(a) & set(b)
+    caps = ", ".join(
+        f"{name} {'-' if c is None else f'{c[1]:.1f} s in {c[0]} jumps'}"
+        for name, c in (("real", idle_cap(real)), (sim.name, idle_cap(sim)))
+    )
+    if not both:
+        return f"{sim.name}: no request paired with the real run's; idle cap skipped {caps}"
+
+    def per_gpu(run: Path, served: dict) -> float | None:
+        span = (max(served[k][1] for k in both) - min(served[k][0] for k in both)) / 1e9
+        return sum(served[k][2] for k in both) / span / gpus(run) if span > 0 else None
+
+    return (
+        f"{sim.name}: throughput per GPU over the {len(both)} requests both ran "
+        f"{error(per_gpu(real, a), per_gpu(sim, b))} ({len(a) - len(both)} ran in "
+        f"the real run only, {len(b) - len(both)} in {sim.name} only); the "
+        f"client's global idle cap skipped {caps}"
     )
 
 
