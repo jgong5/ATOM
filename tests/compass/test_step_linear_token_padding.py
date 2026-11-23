@@ -362,6 +362,8 @@ def test_the_projection_states_the_groups_largest_rank(dp):
     )
     mode = SimpleNamespace(
         use_cudagraph=False,
+        is_prefill=True,
+        tbo_collective_active=False,
         running_tokens_are_unified=dp == 1,
         running_bs=1,
         running_tokens=100,

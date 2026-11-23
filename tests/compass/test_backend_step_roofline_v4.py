@@ -321,6 +321,8 @@ def test_the_batch_view_states_the_real_tokens_among_the_gathered_rows():
     )
     mode = SimpleNamespace(
         sync=sync,
+        is_prefill=False,
+        tbo_collective_active=False,
         running_tokens_are_unified=True,
         running_tokens=4,
         use_cudagraph=True,
@@ -341,7 +343,12 @@ def test_a_rank_s_view_names_its_own_slot_of_the_split():
         any_rank_needs_eager=False,
     )
     mode = SimpleNamespace(
-        sync=sync, running_tokens_are_unified=False, use_cudagraph=False, running_bs=1
+        sync=sync,
+        is_prefill=True,
+        tbo_collective_active=True,
+        running_tokens_are_unified=False,
+        use_cudagraph=False,
+        running_bs=1,
     )
     view = projection.batch_view(prefill(7), mode, r)
 

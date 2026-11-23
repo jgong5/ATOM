@@ -120,6 +120,8 @@ def view(batch, counts, split=None, unified=False, rung=None):
     )
     mode = SimpleNamespace(
         sync=sync,
+        is_prefill=batch.has_prefill,
+        tbo_collective_active=split is not None,
         running_tokens_are_unified=unified,
         running_tokens=rung,
         running_bs=rung or 1,

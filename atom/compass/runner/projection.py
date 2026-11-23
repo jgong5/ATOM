@@ -117,12 +117,12 @@ def forward_mode(batch: Any, runner: Any) -> ForwardMode:
     `tbo_on`, `tbo_decode` and `local_tbo` are what `ModelRunner.prepare_model`
     passes: the config's `enable_tbo` and `enable_tbo_decode`, and the runner's
     own `_local_tbo_eligibility`, which rides the collective, so the group
-    agrees the two-batch-overlap split a real run agrees. The other arguments that do not reach the rung are passed at
-    their inert values: `decide` settles a query length as well, and that is
-    what `is_block_drafter` feeds. The width and the replay decision come from
-    `capture_sizes`, `enforce_eager`, the attention builder's
-    `step_needs_eager`, `tbo_decode_graphs`, the batch and the collective
-    alone; the group's running tokens land in the runner's own
+    agrees the two-batch-overlap split a real run agrees. The other arguments
+    that do not reach the rung are passed at their inert values: `decide`
+    settles a query length as well, and that is what `is_block_drafter` feeds.
+    The width and the replay decision come from `capture_sizes`,
+    `enforce_eager`, the attention builder's `step_needs_eager`,
+    `tbo_decode_graphs`, the batch and the collective alone; the group's running tokens land in the runner's own
     `running_tokens_per_dp_rank`, as the real forward's do.
     """
     dp_size = _data_parallel_size(runner)
