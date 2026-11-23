@@ -262,7 +262,9 @@ collects `tests/`, or the run stops at collection (pytest rc=2):
 
 ```
 docker exec <user>_gpu python3 -m pip install llguidance==1.9.1 'google-re2>=1.1'
-docker exec <user>_gpu mv /app/aiter-test/tests/conftest.py /app/aiter-test/tests/conftest.py.aside
+docker exec <user>_gpu bash -c 'cd /app/aiter-test &&
+  git update-index --skip-worktree tests/conftest.py && mv tests/conftest.py /root/ &&
+  echo aiter/jit/flydsl_cache/ >> .git/info/exclude'
 ```
 
 The first installs ATOM's `structured-output` extra, which the image lacks, so
@@ -271,7 +273,11 @@ The first installs ATOM's `structured-output` extra, which the image lacks, so
 a namespace package, and once collecting
 `tests/attentions/deepseek_v41/test_a8w4_attention.py` has put `/app/aiter-test`
 on `sys.path` through aiter, aiter's own `tests/conftest.py` answers that
-import. The CPU gate leaves these files out instead (`cpu_gate_exclude.txt`).
+import. Moved that way and with FlyDSL's cache, which a GPU run writes inside
+aiter's tree, excluded, aiter's tree stays clean: the gates read aiter by `git
+describe --dirty`, and `compass measure memory`, which the driver-run tests run,
+refuses a source root with uncommitted files. The CPU gate leaves these files
+out instead (`cpu_gate_exclude.txt`).
 This image's `/opt/venv` holds no `aiperf`, so a gate there sets
 `COMPASS_AIPERF_PYTHON=/opt/agentx-venv/bin/python`, the image's own
 agentx-harness.
