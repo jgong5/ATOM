@@ -654,8 +654,50 @@ def test_a_split_step_s_note_names_the_stated_fields_of_every_price():
 # --- the published 27B -----------------------------------------------------------
 
 
-def test_the_27b_s_captured_decode_step_prices_leaf_by_leaf(tmp_path_factory):
-    graph, _ = capture(1, WIDTH_2, tmp_path_factory)["decode B=2"]
+#: DeepSeek-V4-Pro's DPA-TP8 steps whose KV pools differ, in the order a run
+#: meets them: a decode's the fewest blocks a capture allocates
+#: (`forward.KV_BLOCKS`), a prefill of one-token rows a block a row.
+POOLS = (("decode", 2, 2), ("prefill", 100, 100), ("prefill", 80, 80))
+
+
+def _alone(root, phase, tokens, seqs):
+    """V4-Pro's DPA-TP8 step at a shape alone in a `trace ops` of its own into
+    `root`, a prefill as one forward: `root` and the finished process."""
+    from test_capture_v4_pro import DPA_TP8, trace
+
+    at = f"--width {seqs}" if phase == "decode" else f"--prefill {tokens} {seqs}"
+    return root, trace(root, f"{at} --whole{DPA_TP8}")
+
+
+@pytest.fixture(scope="module")
+def ahead(tmp_path_factory):
+    """The module's longest traces, each a process of its own, all started at
+    the first test that reads one: the 27B's captures by their shapes
+    (`capture`) and each step of `POOLS` alone (`_alone`), each a future of
+    what it returns. The module ends once every one has."""
+    # The session's base directory is made at its first use, and threads that
+    # each first use it make one apiece: make it here, before they start.
+    tmp_path_factory.getbasetemp()
+    with ThreadPoolExecutor(2 + len(POOLS)) as each:
+        started = {
+            shapes: each.submit(capture, 1, shapes, tmp_path_factory)
+            for shapes in (WIDTH_2, PREFILLS)
+        }
+        for at in POOLS:
+            started[at] = each.submit(_alone, tmp_path_factory.mktemp("alone"), *at)
+        yield started
+
+
+def captured(ahead, shapes):
+    """`capture(1, shapes)`, once both of the 27B's captures have published:
+    a test reads every TP1 store whole."""
+    for done in (ahead[WIDTH_2], ahead[PREFILLS]):
+        done.result()
+    return ahead[shapes].result()
+
+
+def test_the_27b_s_captured_decode_step_prices_leaf_by_leaf(ahead):
+    graph, _ = captured(ahead, WIDTH_2)["decode B=2"]
     cost = backend(graph["region"]).price(DECODE)
     flat: dict = {}
     for op in _ops(graph["region"]):
@@ -677,8 +719,8 @@ def _engine(graph) -> dict:
     }
 
 
-def test_the_run_s_lookup_reads_the_eager_graph_at_a_shape(tmp_path_factory):
-    graph, _ = capture(1, WIDTH_2, tmp_path_factory)["decode B=2"]
+def test_the_run_s_lookup_reads_the_eager_graph_at_a_shape(ahead, tmp_path_factory):
+    graph, _ = captured(ahead, WIDTH_2)["decode B=2"]
     base = tmp_path_factory.getbasetemp()
     hf = SimpleNamespace(architectures=json.loads(CONFIG.read_text())["architectures"])
     found = []
@@ -698,8 +740,10 @@ def test_the_run_s_lookup_reads_the_eager_graph_at_a_shape(tmp_path_factory):
     assert (graph["region"], None) in found
 
 
-def test_a_27b_middle_chunk_prices_from_its_graph_with_no_lm_head(tmp_path_factory):
-    (graph, _), *_ = capture(1, PREFILLS, tmp_path_factory).values()
+def test_a_27b_middle_chunk_prices_from_its_graph_with_no_lm_head(
+    ahead, tmp_path_factory
+):
+    (graph, _), *_ = captured(ahead, PREFILLS).values()
     hf = SimpleNamespace(architectures=json.loads(CONFIG.read_text())["architectures"])
     lookups = [
         _op_graphs(
@@ -1370,9 +1414,9 @@ def in_thread(monkeypatch):
 
 
 def test_a_shape_no_graph_holds_is_traced_in_the_run_as_trace_ops_traces_it(
-    tmp_path_factory, tmp_path
+    ahead, tmp_path_factory, tmp_path
 ):
-    (graph, _), *_ = capture(1, PREFILLS, tmp_path_factory).values()
+    (graph, _), *_ = captured(ahead, PREFILLS).values()
     stores = tmp_path_factory.getbasetemp().glob("tp1*/store")
     model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
     config, lazy = _reader(graph, model), _counts()
@@ -1394,11 +1438,11 @@ def test_a_shape_no_graph_holds_is_traced_in_the_run_as_trace_ops_traces_it(
     assert lazy["lazy_traces"] == 1 and lazy["lazy_trace_wall_seconds"] > 0
 
 
-def _lazily(tmp_path_factory, root, *atom_args, **engine):
+def _lazily(ahead, tmp_path_factory, root, *atom_args, **engine):
     """The run's lookup of the 27B under `engine`'s config fields into the
     store at `root`, tracing a missing shape from the server's `atom_args`, and
     its counts."""
-    (graph, _), *_ = capture(1, PREFILLS, tmp_path_factory).values()
+    (graph, _), *_ = captured(ahead, PREFILLS).values()
     model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
     config, lazy = _reader(graph, model), _counts()
     vars(config).update(engine)
@@ -1407,30 +1451,28 @@ def _lazily(tmp_path_factory, root, *atom_args, **engine):
 
 
 def test_a_prefill_two_batch_overlap_would_split_is_traced_lazily_as_one_forward(
-    tmp_path_factory, tmp_path, monkeypatch
+    ahead, tmp_path_factory, tmp_path, monkeypatch
 ):
     # ATOM splits a prefill under --enable-tbo from this many tokens on.
     monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "256")
-    lookup, lazy = _lazily(tmp_path_factory, tmp_path, "--enable-tbo", enable_tbo=True)
+    lookup, lazy = _lazily(
+        ahead, tmp_path_factory, tmp_path, "--enable-tbo", enable_tbo=True
+    )
 
     assert isinstance(lookup("prefill", 512, 2), dict)
     assert lazy["lazy_traces"] == 1
 
 
 def test_a_lazy_trace_reads_atom_s_arguments_in_either_spelling_as_its_server_does(
-    tmp_path_factory, tmp_path
+    ahead, tmp_path_factory, tmp_path
 ):
     args = "--kv-cache-dtype", "fp8"
-    lookup, lazy = _lazily(tmp_path_factory, tmp_path, *args, kv_cache_dtype="fp8")
+    lookup, lazy = _lazily(
+        ahead, tmp_path_factory, tmp_path, *args, kv_cache_dtype="fp8"
+    )
 
     assert isinstance(lookup("decode", 2, 2), dict)
     assert lazy["lazy_traces"] == 1
-
-
-#: DeepSeek-V4-Pro's DPA-TP8 steps whose KV pools differ, in the order a run
-#: meets them: a decode's the fewest blocks a capture allocates
-#: (`forward.KV_BLOCKS`), a prefill of one-token rows a block a row.
-POOLS = (("decode", 2, 2), ("prefill", 100, 100), ("prefill", 80, 80))
 
 
 def _run_config(structure: str, model) -> SimpleNamespace:
@@ -1470,19 +1512,17 @@ def _tracers() -> tuple[int, int]:
 
 
 def test_a_run_s_lazy_traces_share_one_process_and_trace_as_a_process_each(
-    tmp_path_factory, tmp_path, monkeypatch
+    ahead, tmp_path, monkeypatch
 ):
-    from test_capture_v4_pro import DPA_TP8, trace
+    from test_capture_v4_pro import DPA_TP8
 
     from atom.compass.artifacts import ArtifactStore, Kind, Topology
     from atom.compass.capture.forward import Shape
 
     # Each shape alone in a `trace ops` of its own, a prefill as one forward.
     alone, rank = {}, Topology().ranks()[0]
-    for phase, tokens, seqs in POOLS:
-        root = tmp_path_factory.mktemp("alone")
-        at = f"--width {seqs}" if phase == "decode" else f"--prefill {tokens} {seqs}"
-        done = trace(root, f"{at} --whole{DPA_TP8}")
+    for at in POOLS:
+        root, done = ahead[at].result()
         published = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
         assert published, done.stderr[-4000:]
         store = ArtifactStore(str(root / "store"))
@@ -1535,10 +1575,10 @@ def _held(atom_args) -> list[tuple[int, int, int]]:
 
 
 def test_a_warm_tracer_holds_one_trace_s_worth_whatever_it_traced_before(
-    tmp_path_factory, tmp_path, monkeypatch
+    ahead, tmp_path_factory, tmp_path, monkeypatch
 ):
     spawned = _spawned(monkeypatch)
-    lookup, _ = _lazily(tmp_path_factory, tmp_path)
+    lookup, _ = _lazily(ahead, tmp_path_factory, tmp_path)
     assert isinstance(lookup("decode", 2, 2), dict)
     model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
 

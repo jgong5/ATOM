@@ -19,6 +19,7 @@ import re
 import struct
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from test_capture_ir import MAIN, _decoder, _ops
@@ -81,6 +82,7 @@ SCRATCH = (
 )
 
 _CAPTURES: dict = {}
+_TRACED: dict = {}
 
 
 def trace(root, argv, arch, prelude=""):
@@ -106,13 +108,40 @@ def trace(root, argv, arch, prelude=""):
     )
 
 
+def traced(tmp_path_factory, *keys):
+    """`trace` over each of `keys`, its arguments, arch and prelude, that has
+    not run yet, all at once, since each takes its process's whole seconds:
+    each key's finished process and the root it ran under."""
+    todo = [key for key in keys if key not in _TRACED]
+    roots = [tmp_path_factory.mktemp("v41") for _ in todo]
+    with ThreadPoolExecutor(max(len(todo), 1)) as pool:
+        done = pool.map(lambda key, root: trace(root, *key), todo, roots)
+        _TRACED.update(zip(todo, zip(done, roots)))
+    return [_TRACED[key] for key in keys]
+
+
+#: Each `trace` this file's cases read: its arguments, arch and prelude.
+TRACES = [
+    (SHAPES + ARGS, "gfx1250", ""),
+    (SHAPES + ARGS + EP4, "gfx1250", ""),
+    ("--width 16" + ARGS + EP4, "gfx950", ""),
+    *((MONO, "gfx950", p) for p in ("", BIND_FAILURE, BUILD_FAILURE, KERNELS)),
+    *((MONOS, "gfx950", p) for p in (BIND_REFUSAL, SCRATCH)),
+]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _trace_all(tmp_path_factory):
+    """`TRACES`, at once, before this file's first case."""
+    traced(tmp_path_factory, *TRACES)
+
+
 def capture(tmp_path_factory, argv, arch="gfx1250", prelude=""):
     """`trace` over `argv` at `arch` after `prelude`: each shape's published
     graph and declarations, by shape, a prefill's final chunk."""
     if (argv, arch, prelude) in _CAPTURES:
         return _CAPTURES[argv, arch, prelude]
-    root = tmp_path_factory.mktemp("v41")
-    done = trace(root, argv, arch, prelude)
+    [(done, root)] = traced(tmp_path_factory, (argv, arch, prelude))
     tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
     assert (
         done.returncode == 0 and tokens
@@ -238,8 +267,10 @@ def test_each_decode_layer_s_index_top_k_states_its_layer_s_ratio(
         assert bool(stated) == (index in TEXT["index_source_layer_ids"]), index
 
 
-def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(tmp_path):
-    done = trace(tmp_path, MONO, "gfx950")
+def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(
+    tmp_path_factory,
+):
+    [(done, _)] = traced(tmp_path_factory, (MONO, "gfx950", ""))
 
     log = done.stdout + done.stderr
     # The width's kernels compiled for the declared arch, as the deployment's.
@@ -276,8 +307,10 @@ def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(tmp_p
     ],
     ids=["bind", "build", "kernels"],
 )
-def test_a_mono_failure_the_capture_makes_stops_it_by_name(prelude, refusal, tmp_path):
-    done = trace(tmp_path, MONO, "gfx950", prelude)
+def test_a_mono_failure_the_capture_makes_stops_it_by_name(
+    prelude, refusal, tmp_path_factory
+):
+    [(done, _)] = traced(tmp_path_factory, (MONO, "gfx950", prelude))
 
     assert done.returncode and "published" not in done.stdout
     assert done.stderr.strip().splitlines()[-1] == f"compass trace ops: {refusal}"
