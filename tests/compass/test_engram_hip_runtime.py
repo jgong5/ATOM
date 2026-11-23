@@ -108,7 +108,7 @@ def test_with_a_second_runtime_mapped_the_shard_is_registered_in_place(
         """
         ctypes.CDLL("libamdhip64.so")
         loaded = hip_files()
-        host_memory._register = lambda sources, leases: "registered in place"
+        host_memory._register = lambda sources, leases, **kw: "registered in place"
         out = host_memory.pin_rows([torch.zeros(4096, dtype=torch.uint8)])
         print(json.dumps([loaded, out]))
         """,

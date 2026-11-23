@@ -778,6 +778,7 @@ def test_a_reader_asks_a_recorded_eager_dp_drafter_what_a_simulated_run_asks(
     monkeypatch.setattr(projection, "batch_view", lambda *_: view)
     batch = SimpleNamespace(
         is_dummy_run=False,
+        total_seqs_num=3,
         req_ids=[0, 1, 2],
         num_scheduled_tokens=[3, 3, 3],
         context_lens=[90, 90, 90],

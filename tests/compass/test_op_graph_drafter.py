@@ -302,6 +302,8 @@ def dp_view(width, rung, dp, counts=None):
             ub_tokens_across_dp=None,
             any_rank_needs_eager=False,
         ),
+        is_prefill=False,
+        tbo_collective_active=False,
         running_tokens_are_unified=True,
         running_tokens=2 * rung,
         running_bs=rung,
@@ -476,6 +478,8 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
             ub_tokens_across_dp=None,
             any_rank_needs_eager=False,
         ),
+        is_prefill=True,
+        tbo_collective_active=False,
         running_tokens_are_unified=False,
         running_tokens=64,
         running_bs=1,
@@ -567,8 +571,9 @@ def test_a_decode_padded_to_its_rung_prices_its_drafter_at_its_rows(
     assert set(graphs) == {(False, "decode B=4"), (True, "decode B=4")} | {
         (True, "decode T=3 B=4")
     }
-    # Its first pass runs the rows' 6 tokens; the rung's traces 8.
-    for shape, tokens in (("decode T=3 B=4", 6), ("decode B=4", 8)):
+    # Its first pass runs the target's stream at the rung's 8 tokens, as
+    # ATOM's propose does since upstream b7b5ec3f2; so does the rung's.
+    for shape, tokens in (("decode T=3 B=4", 8), ("decode B=4", 8)):
         ops = _ops(graphs[True, shape]["region"])
         assert {op["args"]["q"]["shape"][0] for op in ops if op["op"] == ATTENTION} == {
             tokens

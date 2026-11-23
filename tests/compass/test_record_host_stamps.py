@@ -265,6 +265,9 @@ def test_a_recorded_server_stamps_each_output_row_taken_in_and_each_stream_head(
     send_s = 0.001  # each send of a response message takes this long
     manager = CoreManager.__new__(CoreManager)
     manager._seq_load, manager._seq_id_to_callback = {}, {}
+    # The router state a first token releases: none, the plain load policy.
+    manager._prefix_router = manager._backlog = manager._dp_policy = None
+    manager._dp_session_affinity_enabled = False
 
     async def streamed(request):
         await request.body()
