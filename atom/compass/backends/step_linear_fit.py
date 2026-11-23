@@ -337,6 +337,10 @@ ROWMOD_CELL_STEPS = 100
 ROWMOD_GAIN = 0.1
 #: Seeded shuffles of each step's rows whose mean MAD the `rowmod` column must not beat.
 ROWMOD_SHUFFLES = 8
+#: The MoE-token bands, quantiles of a decode rung's real MoE tokens, a record
+#: held out of the rung is graded on, a p50 each, when the rung picks its MoE
+#: column (`_moe_column`).
+MOE_BANDS = 4
 #: The free features up to which `_hull` is qhull's exact hull; past them it
 #: is the intersection of each pair's 2-D hull, whose facets the pairs' edges
 #: bound (#3720: real_pw_c128's prefill points, 8 features, hulled exactly to
@@ -1984,11 +1988,11 @@ def _folds(design, y, cell, names, path=None) -> dict:
     return out
 
 
-def _max_affine_folds(steps, vector: dict, routing, cell=None) -> dict:
-    """Per cell beside which another holds steps, (its steps, the p50 error
-    on them, each priced as the max over its ranks, of `_fit_vector` of
-    `vector` on the other cells' steps). `cell` is each step's cell, its
-    record when None."""
+def _max_affine_errors(steps, vector: dict, routing, cell=None) -> dict:
+    """Per cell beside which another holds steps, (the positions of its steps
+    in `steps`, the error on each, priced as the max over its ranks, of
+    `_fit_vector` of `vector` on the other cells' steps). `cell` is each
+    step's cell, its record when None."""
     if cell is None:
         cell = np.array([s[0][0] for s in steps])
     out = {}
@@ -1997,15 +2001,52 @@ def _max_affine_folds(steps, vector: dict, routing, cell=None) -> dict:
         if other.any():
             fold = [s for s, o in zip(steps, other) if o]
             coef = _fit_vector(fold, vector, routing)["coef"]
-            error = [
-                max(np.dot(coef, _counts(vector, routing, r[2], *r[5:])) for r in s)
-                / s[0][3]
-                - 1.0
-                for s, o in zip(steps, other)
-                if not o
-            ]
-            out[c] = (len(error), float(np.median(error)))
+            at = np.flatnonzero(~other)
+            error = np.array(
+                [
+                    max(
+                        np.dot(coef, _counts(vector, routing, r[2], *r[5:]))
+                        for r in steps[i]
+                    )
+                    / steps[i][0][3]
+                    - 1.0
+                    for i in at
+                ]
+            )
+            out[c] = (at, error)
     return out
+
+
+def _p50s(errors: dict, band=None) -> dict:
+    """Per held-out cell of `errors`, `_max_affine_errors`', (its steps, the
+    p50 error on them); given `band`, a value per step, the same per cell and
+    value, keyed by both, as `_folds` takes a path."""
+    out = {}
+    for c, (at, error) in errors.items():
+        if band is None:
+            out[c] = (len(error), float(np.median(error)))
+            continue
+        held = band[at]
+        for b in sorted(set(held.tolist())):
+            mine = error[held == b]
+            out[c, b] = (len(mine), float(np.median(mine)))
+    return out
+
+
+def _max_affine_folds(steps, vector: dict, routing, cell=None) -> dict:
+    """Per cell beside which another holds steps, (its steps, the p50 error
+    on them, each priced as the max over its ranks, of `_fit_vector` of
+    `vector` on the other cells' steps). `cell` is each step's cell, its
+    record when None."""
+    return _p50s(_max_affine_errors(steps, vector, routing, cell))
+
+
+def _token_bands(steps) -> tuple[np.ndarray, list[float]]:
+    """Each of `steps`' MoE-token band, the `MOE_BANDS` quantile of the steps'
+    real MoE tokens it lies in, counted from 0, and the quantiles' edges."""
+    tokens = np.array([s[0][6] for s in steps], dtype=np.float64)
+    edges = np.quantile(tokens, np.arange(1, MOE_BANDS) / MOE_BANDS)
+    return np.searchsorted(edges, tokens, side="right"), edges.tolist()
 
 
 def _held_out_error(folds: dict) -> float | None:
@@ -2026,7 +2067,19 @@ def _moe_column(steps, routing, base=DECODE, select: str = "held_out") -> tuple:
     column and each of `MOE_COLUMNS` over the steps' real MoE tokens,
     `moe_experts` under `routing` and with each step's group dummies as one
     token (`moe_column`). Each form is fitted with each record held out of the
-    rung's steps (`_max_affine_folds`), its held-out error `_held_out_error`'s.
+    rung's steps (`_max_affine_errors`), its held-out error `_held_out_error`'s
+    over each held-out record's p50 error per MoE-token band (`_token_bands`:
+    `MOE_BANDS` quantiles of the rung's real MoE tokens), as a host law's
+    columns are chosen per launch path (`_launch_columns`). One p50 over all
+    of a record's steps is its commonest token count's, which a column its
+    fullest steps need barely moves (#3720 rung 16 of cell B's D, 384 experts
+    top-6: `moe_experts`, which nearly every expert reached past ~200 group
+    tokens holds flat, held out nearest by record, 0.25% against
+    `moe_tokens`' 0.35%, yet priced the rung's fullest steps 2-5% low out of
+    sample, the load the requests making TPOT p90 decode at, where
+    `moe_tokens`' error stays level across the rows). Each record's own p50
+    stays under `folds`, the p50s graded under `bands`, keyed "record:band",
+    and the bands' edges under `token_bands`.
     A rung of one record holds out each group composition instead, the steps
     with as many dummy forwards beside them (`BatchView.group_dummies`): what a
     run at another concurrency changes at a rung is how many of its ranks are
@@ -2063,20 +2116,24 @@ def _moe_column(steps, routing, base=DECODE, select: str = "held_out") -> tuple:
     cell, by = np.array([s[0][0] for s in steps]), "record"
     if len(set(cell.tolist())) == 1:
         cell, by = np.array([s[0][7] for s in steps]), "group_dummies"
-    held, error = {}, {}
+    band, edges = _token_bands(steps)
+    held, banded, error = {}, {}, {}
     for form, vector in forms.items():
-        held[form] = _max_affine_folds(steps, vector, routing, cell)
-        error[form] = _held_out_error(held[form])
+        errors = _max_affine_errors(steps, vector, routing, cell)
+        held[form], banded[form] = _p50s(errors), _p50s(errors, band)
+        error[form] = _held_out_error(banded[form])
     picked = min(error, key=error.get) if held["none"] else None
     adopted = None if picked in (None, "none") else picked
     figures = {
         "picked": picked,
         "adopted": adopted,
         "held_out_by": by,
+        "token_bands": edges,
         "held_out": {
             form: {
                 "error": error[form],
                 "folds": {str(c): list(f) for c, f in held[form].items()},
+                "bands": {f"{c}:{b}": list(f) for (c, b), f in banded[form].items()},
             }
             for form in forms
         },
