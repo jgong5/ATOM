@@ -16,6 +16,7 @@ import json
 import sys
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -120,6 +121,13 @@ def _producer(mc, log, meet, matched):
         _completion_lock=threading.Lock(),
         _writes_in_flight={},
         _aborted_transfers={},
+        # Chunked transfer state, which the listener dispatches from each pass.
+        _chunked_prefills={},
+        _chunked_local_ids={},
+        _retired_chunked_transfers=OrderedDict(),
+        _pending_chunked_requests=[],
+        _chunked_admissions={},
+        _admission_results=set(),
         done_sending=set(),
         _send_executor=ThreadPoolExecutor(2),
         _side_channel_port=0,
@@ -179,6 +187,7 @@ def _consumer(mc, requests):
         _pending_recv={r["request_id"] for r in requests},
         _pending_recv_blocks={},
         _pending_recv_slots={},
+        _pending_handoffs={},  # chunked transfers' handoffs: none here
         _held_failures={},
         _blocks_pending_fence=[],
         _completion_lock=threading.Lock(),
@@ -230,6 +239,7 @@ def _listen(mc, monkeypatch, listener, frames):
 
     sock = SimpleNamespace(
         recv_multipart=recv_multipart,
+        poll=lambda timeout=None: True,  # a frame is always waiting
         getsockopt=lambda _option: b"tcp://127.0.0.1:5555",
     )
     monkeypatch.setattr(mc, "zmq_socket_ctx", lambda *_a, **_k: nullcontext(sock))

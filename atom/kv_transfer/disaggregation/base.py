@@ -75,6 +75,9 @@ class KVConnectorBase(ABC):
         """
         ...
 
+    def publish_prefill_chunks(self, batch: Any) -> None:
+        """Publish completed prefill chunks; no-op without chunked P/D transfer."""
+
     def get_finished_recv_blocks(self) -> list[int]:
         """Return block IDs from recently completed receives for GPU memory fence.
 
@@ -113,6 +116,18 @@ class KVConnectorSchedulerBase(ABC):
         """Update internal state after the scheduler allocates blocks."""
         ...
 
+    def process_pd_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
+        """Preserve completions unless the backend consumes chunked P/D metadata."""
+        return output
+
+    def admission_ready(self, seq: Any) -> bool:
+        """Whether the scheduler may allocate this request and start prefill."""
+        return True
+
+    def abort_send(self, seq: Any) -> None:
+        """Retire an unsent abort; streaming senders must wait for reader drain."""
+        self.send_finished(seq.id)
+
     @abstractmethod
     def request_finished(self, seq: Any) -> None:
         """Populate KV transfer output metadata when a request completes."""
@@ -132,8 +147,8 @@ class KVConnectorSchedulerBase(ABC):
         """Retire a P/D send claim; explicit no-op for backends without sends."""
         ...
 
-    def abort_send(self, req_id: Any) -> None:
-        """The request was aborted while its send claim was held.
+    def abort_parked_send(self, req_id: Any) -> None:
+        """The request was aborted after it finished, while its send claim was held.
 
         A backend that sees every transfer of the source blocks reports the
         send in ``finished_sending`` once none can run, at once when none has

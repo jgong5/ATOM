@@ -60,6 +60,20 @@ reported beside its grade (D50, `19` D117).
 [#3423](https://github.com/jgong5/ATOM/issues/3423):** the DSv41-DPEP stage grades its DP
 points by D45.1 too, without the CPU hit rate, a set of their own (D50).
 
+**Revised 2026-11-18 by the owner's
+[ruling on #3590](https://github.com/jgong5/ATOM/issues/3590#issuecomment-6910498913):** a
+passed GPU gate carries to a tree whose diff from the gated tree touches no GPU-gate trigger
+(D43.1, rule 4).
+
+**Revised 2026-11-20 by [#3828](https://github.com/jgong5/ATOM/issues/3828):** the GPU gate
+runs, of `tests/compass`, only the driver-run files by default, and every compass file on
+request (D43.1, the two gates).
+
+**Revised 2026-11-21 by [#3830](https://github.com/jgong5/ATOM/issues/3830):** the CPU gate
+runs per landing batch, a task runs only the test files it adds or edits, and the GPU gate
+runs on a batch that touches a trigger and, as the superset, by hand about daily (D43.1, the
+two gates).
+
 **Scope.** What counts as evidence: which results are reported, how each is measured, what
 tolerance applies and where that tolerance comes from, and what invalidates a run.
 Acceptance is paired simulated and real execution of cc-traces proper, so every rule here
@@ -101,8 +115,8 @@ that subset is genuinely green.
 
 | Gate | What runs | Measured result |
 |---|---|---|
-| **CPU gate** — per task, and green is the bar | Every test file outside `tests/plugin/` and `scripts/compass/cpu_gate_exclude.txt`. Driven by `scripts/compass/gate_cpu.sh`; no driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` were both in the gate at `236abfd9a`, and each reached `rocminfo` when run *alone* (`no tests collected, 1 error`, rc=2, each, measured in `xiaobizh_n18_cpu`); inside the gate they module-skipped on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | Green, `GATE_CPU_RC=0`, read at `bdd244c57` in `xiaobizh_n18_cpu`. The counts are not restated here, because they move with every test the gate gains or loses: `gate_cpu.sh` prints them under the `commit:` line of the tree it ran, and `scripts/compass/README.md` says what the gate runs. |
-| **GPU gate**, a superset — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`, less any file `scripts/compass/gpu_gate_skip.txt` names for the GPU target it runs on: a file whose result on that target its pair cannot record. A suite file's collected tests come off the expectation; a `tests/compass` file only leaves its run. A target whose nodes hold no driver-run inputs has one line saying so, and there the gate sets none, needs one card and accepts a driver-run skip. | The commit, its counts and the toolchain it ran under are in `scripts/compass/gpu_gate_baselines/<GPU target>/gpu_gate_baseline.env`, one pair per GPU target, and every failing node-id is on file verbatim in the same directory's `gpu_gate_known_failures.txt` and compared by name, so "N failed" is checked against "the *same* N failed". `scripts/compass/regen_gpu_gate_baseline.sh` rewrites both from two runs that pass the same count and fail the same node-ids, so a new image or GPU is re-baselined by one command. |
+| **CPU gate** — per landing batch, and green is the bar | Every test file outside `tests/plugin/` and `scripts/compass/cpu_gate_exclude.txt`. Driven by `scripts/compass/gate_cpu.sh` on the batch commit before every landing; per task, `scripts/compass/gate_targeted.sh` runs only the test files the change adds or edits, collected as this gate collects them. No driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` were both in the gate at `236abfd9a`, and each reached `rocminfo` when run *alone* (`no tests collected, 1 error`, rc=2, each, measured in `xiaobizh_n18_cpu`); inside the gate they module-skipped on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | Green, `GATE_CPU_RC=0`, read at `bdd244c57` in `xiaobizh_n18_cpu`. The counts are not restated here, because they move with every test the gate gains or loses: `gate_cpu.sh` prints them under the `commit:` line of the tree it ran, and `scripts/compass/README.md` says what the gate runs. |
+| **GPU gate** — per landing batch that touches a trigger, and daily by hand, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`. Of `tests/compass`, by default only the driver-run files `scripts/compass/gpu_gate_driver_run.txt` lists, the ones that skip in the CPU gate for want of a driver-run input: every other compass file already runs there, and a driver-run skip in a file the list does not name fails the CPU gate, which holds the list complete. A batch whose diff touches a trigger (rule 4) holds that change alone (`.claude/agent-team.md`, The GPU gate), and its lander runs this default on the batch commit before the CPU gate accepts it. With `COMPASS_GPU_GATE_SCOPE=all` it runs every compass file, the superset of the CPU gate: the owner or an orchestrator runs that by hand on the integration tip about daily, and each failure outside the known-failures list is a finding issue. No gate runs after each landing. Less any file `scripts/compass/gpu_gate_skip.txt` names for the GPU target it runs on: a file whose result on that target its pair cannot record. A suite file's collected tests come off the expectation; a `tests/compass` file only leaves its run. A target whose nodes hold no driver-run inputs has one line saying so, and there the gate sets none, needs one card and accepts a driver-run skip. | The commit, its counts and the toolchain it ran under are in `scripts/compass/gpu_gate_baselines/<GPU target>/gpu_gate_baseline.env`, one pair per GPU target, and every failing node-id is on file verbatim in the same directory's `gpu_gate_known_failures.txt` and compared by name, so "N failed" is checked against "the *same* N failed". `scripts/compass/regen_gpu_gate_baseline.sh` rewrites both from two runs that pass the same count and fail the same node-ids, so a new image or GPU is re-baselined by one command. |
 
 `test_dp_metadata.py`, `test_dp_sync_layout.py`
 and `test_forward_mode.py` were once excluded and were re-measured CPU-green (`16`); prose
@@ -164,7 +178,7 @@ suite checks.
    straggler detector and the cost-backend interface are all testable without a device.
    Those tests are the 74 in the decomposition above.
 4. **The CPU gate refuses rather than reporting "not required" (principle 6).** Green at the
-   CPU gate is not green for the task when the diff lands in what the CPU gate cannot see. That
+   CPU gate is not green for the batch when the diff lands in what the CPU gate cannot see. That
    blind spot is a file, not a sentence: `scripts/compass/gpu_gate_triggers.txt`, **30 paths**,
    generated rather than hand-written — the counts in its own header included. The rule:
    an `atom` module named by an excluded test is a blind spot unless a CPU-gate test that
@@ -174,10 +188,14 @@ suite checks.
    imports that provably execute. `regen_gpu_gate_triggers.sh` reproduces it, and a trailing
    `/` matches a subtree.
    `gate_cpu.sh` exits **98** when a changed path matches a trigger and
-   `COMPASS_GPU_GATE_DONE=<sha>` is absent or names a different tree — and also when it
-   cannot determine the diff at all (no git, no `COMPASS_CHANGED_FILES`) or cannot name the
-   tree the attestation would apply to. An unanswerable question is refused, not answered
-   "no". The previous form of this rule was a prose list of areas — "EPLB, DP metadata,
+   `COMPASS_GPU_GATE_DONE=<sha>` is absent or names a different tree whose diff from this
+   one touches a trigger — and also when it cannot determine the diff at all (no git, no
+   `COMPASS_CHANGED_FILES`) or cannot name the tree the attestation would apply to. A GPU
+   gate passed on tree G carries to a later tree whose diff from G touches no trigger:
+   landing G first already allows that tree, so the blind spot does not grow. G is a full
+   sha; a snapshot carries the diff in the `.compass-gpu-carry` stamp `snapshot.sh` writes,
+   and with no stamp from G to its own HEAD it is refused. An unanswerable question is refused, not answered "no".
+   The previous form of this rule was a prose list of areas — "EPLB, DP metadata,
    cudagraph bounds, block tables" — which both missed modules and named two the CPU gate
    does cover.
 
@@ -190,7 +208,7 @@ suite checks.
    which of the two mistakes to prefer — running the GPU gate when in doubt is never the wrong one — and the asymmetry
    above is that preference written down. Cite it that way wherever it is cited.
 
-`16` states the same rule as the per-task gate, under its measured test and lint
+`16` states the same rule as the CPU gate, under its measured test and lint
 baselines; the two must be amended together.
 
 **Baseline caveat.** Take each gate's *current* pass/fail state as the baseline before the

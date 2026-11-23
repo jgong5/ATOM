@@ -883,7 +883,7 @@ def test_a_run_refuses_host_laws_fitted_under_another_key(tmp_path, monkeypatch)
 
     laws = {"decode": {"E": [1e-4, 0.0, 0.0]}}
     spec = machine_platform(MachineSpec.from_mapping(DOCUMENT))
-    cases = (("same", {}), ("other", {"host_cpu": "another cpu"}), ("none", None))
+    cases = (("same", {}), ("other", {"model": "sha256:" + "f" * 64}), ("none", None))
     for name, other in cases:
         (tmp_path / name).mkdir()
         r = deployment(tmp_path / name)

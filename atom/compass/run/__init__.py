@@ -82,7 +82,9 @@ priced by `StepStubBackend`), ``step_linear`` (a `StepLinearLaw` mapping,
 priced by `StepLinearBackend`; its ``platform``, the platform fields of its key,
 and its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, a run whose ladder is a prefix of the law's read at the law's, and a
-law missing either refuses; a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
+law missing either refuses; a runner that records prefill token-graph buckets
+refuses a law whose engine config, or else prefill vector, states none or others
+(`refuse_other_buckets`); a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
 holds at its shape and output, traced under this process's torch, each file it
@@ -127,7 +129,8 @@ that admits a request, and absent from an entry whose ``E`` laws hold them;
 ``skip``, segments zeroed for a what-if run, which the graders refuse;
 ``columns``, per kind and segment, coefficients on launch features
 (`backends.launch_features`), predicted under the graph sets ``key``'s engine
-states, which the run takes as its own, since it records no graphs;
+states, which the run takes as its own, since it records no graphs; a key stating
+other prefill token-graph buckets than its runner's refuses (`refuse_other_buckets`);
 ``tokenizer``, the served tokenizer's ``backend`` (``fast`` or ``slow``), the
 ``fingerprint`` of the ``tokenizer.json`` it was fitted on, and, each
 optional, ``encode``, one-item calls, ``encode_batch``, a backend
@@ -227,8 +230,9 @@ file with one needs such a deployment. `frontend(config)` then starts LP
 process of its own, given the deployment's KV block tokens, of which the
 server's chunk must be a whole number. The entry holds ``server``, the
 ``lmcache server`` flags; the request loop's laws, ``lookup_s`` (``[fixed, per
-prompt chunk]``) and ``request_s``; optional ``copy_width``, 1 when absent;
-and optional ``writers``, the writer ranks per DP rank, 1 when absent. At its
+prompt chunk]``) and ``request_s``; and optional ``copy_width``, 1 when absent.
+It states no ``writers`` or ``state_bytes``, which the launch refuses: every
+writer rank of a DP rank shares that rank's one transfer channel, and at its
 first stamped request LP ``lmcache`` sizes a chunk and a rank's state image
 from what each member of the engine it serves planned (`_lmcache_plan`), as a
 prefill-decode connector prices its transfer. The copy engine
@@ -535,6 +539,40 @@ def refuse_unfitted_law(run: dict, config) -> None:
         )
 
 
+def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
+    """Refuse the run file's step linear law on a runner that records the
+    prefill token-graph buckets `buckets`, ascending, where the law states none
+    or others: in its engine config, which `refuse_unfitted_law` held to
+    `config`'s, or else in its prefill vector, those its records' runner
+    recorded. An engine config states them only off ATOM's default, which can
+    move between a fit and a run, so one stating none says nothing of them. Host
+    laws refuse where their key's graph sets state others; `run` replaces `spec()`."""
+    if not buckets or (run := spec() if run is None else run) is None:
+        return
+    from atom.compass.backends import launch_features
+    from atom.compass.run.step_grid import BUCKETS
+
+    pick_fitted(run, "host", config)
+    host = run.get("host") or {}
+    graphs = host.get("laws") and launch_features.stated(host.get("key"))[1]
+    if graphs and (theirs := graphs["token"]["prefill"]) != list(buckets):
+        raise ValueError(
+            f"the host laws' key states the prefill token-graph buckets {theirs}, "
+            f"and this run's runner records {list(buckets)}"
+        )
+    if STEP_LINEAR not in run:
+        return
+    pick_fitted(run, STEP_LINEAR, config)
+    law = run[STEP_LINEAR]
+    stated = sorted((law.get("prefill") or {}).get("buckets") or ())
+    if BUCKETS not in law["engine_config"]["env"] and stated != list(buckets):
+        raise ValueError(
+            f"the step linear law states no {BUCKETS} in its engine config and "
+            f"{stated or 'none'} as its prefill vector's buckets, and this run's "
+            f"runner records the prefill token-graph buckets {list(buckets)}"
+        )
+
+
 def refuse_context_parallel(name: str, config) -> None:
     """Refuse a context-parallel `config` for the run file's `name`, a law or a
     bundle: neither's engine config states a context-parallel width."""
@@ -553,9 +591,9 @@ def refuse_context_parallel(name: str, config) -> None:
 
 def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     """Refuse the run file's host laws `host` when fitted under another host
-    key than this run's, on `platform` (`machine_platform`), the graph sets
-    their key states taken as this run's, which records none, and its engine
-    config read at their ladder where this run's is a prefix of it."""
+    key than this run's, on `platform` (`machine_platform`), the host CPU and
+    graph sets their key states taken as this run's, which records none, and
+    its engine config read at their ladder where this run's is a prefix of it."""
     from atom.compass.artifacts import Kind, keyed_platform
     from atom.compass.backends.launch_features import GRAPHS, stated
     from atom.compass.backends.step_grid_plan import at_ladder
@@ -566,6 +604,9 @@ def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     }
     theirs = host.get("key") or {}
     launch = stated(theirs)
+    if ours and "host_cpu" in theirs:
+        # The host they timed is the host the run predicts, from any CPU.
+        ours["host_cpu"] = theirs["host_cpu"]
     if ours:
         ours["engine"] = at_ladder(ours["engine"], theirs.get("engine"))
     if ours and launch[1] is not None:
@@ -787,7 +828,6 @@ def channel_table(run: dict):
             _lmcache_engine(run),
             run.get("lmcache_ipc_s", hop(run, "ipc_s")),
             _dp(run, "P" if pd else None),
-            run["lmcache"].get("writers", 1),
         )
     return table
 
@@ -858,7 +898,7 @@ def _members(table, dp: int | tuple[int, int]) -> dict | None:
     """Each engine LP's members at its DP width above one: rank ``dp<r>`` owns
     the channels whose ``#`` tag names it at that LP's end, ``#dp<r>`` or, on a
     channel between two engine LPs, ``#dp<sender rank>.dp<receiver rank>``. A
-    tag's other parts, as the ``tp<k>`` of ``#dp<r>.tp<k>``, name no member.
+    tag's parts other than ``dp<r>`` name no member.
     `dp` is every engine LP's width, or ``(prefill, decode)`` by side."""
 
     def rank(c, lp):
@@ -1086,12 +1126,12 @@ def _lmcache_plan(run: dict, blocks: int) -> tuple[int, int]:
 def _launch_lmcache(config, run: dict, side: str | None) -> None:
     """Start LP `lmcache`, the stand-in lmcache server, in a process of its own
     when this deployment offloads KV to one, given its KV block tokens; refuse
-    a deployment and a run file that disagree on whether one runs or on its
-    writer ranks, a decode side that would start it, or a server chunk that is
-    not a whole number of the deployment's KV blocks."""
+    a deployment and a run file that disagree on whether one runs, a decode
+    side that would start it, an entry stating ``writers`` or ``state_bytes``,
+    which nothing reads, or a server chunk that is not a whole number of the
+    deployment's KV blocks."""
     from atom.compass.kv.lmcache_server import parse_server_flags
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-    from atom.kv_transfer.offload.mp.deployment import _tp_replication_factor
 
     leaves = KVConnectorFactory.leaf_connectors(config) or ()
     lm = next((c for name, c in leaves if name == "lmcache_mp"), None)
@@ -1107,14 +1147,12 @@ def _launch_lmcache(config, run: dict, side: str | None) -> None:
         return
     if side == "D":
         raise ValueError("LP lmcache serves the prefill side; this is the decode side")
-    # Under DP-attention each DP rank runs at TP 1.
-    tp = 1 if config.enable_dp_attention else config.tensor_parallel_size
-    writers = tp // min(tp, _tp_replication_factor(lm))
-    if run["lmcache"].get("writers", 1) != writers:
+    if retired := sorted({"writers", "state_bytes"} & run["lmcache"].keys()):
         raise ValueError(
-            f"the run file's lmcache writers is {run['lmcache'].get('writers', 1)}; "
-            f"this deployment stores from {writers} rank(s) per DP rank, its TP "
-            "width per DP rank (1 under DP-attention) over its TP replication factor"
+            f"the run file's lmcache entry states {' and '.join(retired)}, which "
+            "nothing reads: every writer rank of a DP rank sends on that rank's "
+            "one transfer channel, and LP lmcache sizes a rank's state image from "
+            "its engine's plan"
         )
     _lmcache_stations(run)  # refused here, before the run starts
     chunk = parse_server_flags(run["lmcache"]["server"]).chunk_size
@@ -1949,7 +1987,8 @@ def runner(model_runner, tree) -> None:
         )
     from atom.compass.run import memory
 
-    measured = memory.load(run["store"], config, machine, model_runner.rank)
+    carried = run.get(memory.CARRIED, ())
+    measured = memory.load(run["store"], config, machine, model_runner.rank, carried)
     # `ModelRunner.warmup_model` sizes its batch from the scheduler bounds and
     # the DP and PCP widths, all in the readings' key, so the tokens the
     # reading warmed up with are the ones this deployment's warmup runs.
@@ -2080,13 +2119,15 @@ def op_graph(
     """The `OpGraphBackend` the run file `run` names for `config` on
     `machine` at EP width `ep`, with its price list when it names one; with
     `lazy`, a shape no graph holds is traced from the run file's `ATOM_ARGS`
-    when it holds them (`_op_graphs`), counted in `lazy`; with `env`, its
-    graphs are read under that performance environment (`forward.structure`)."""
+    when it holds them (`_op_graphs`), counted in `lazy`, which also sums each
+    `price` call's wall seconds, its lookups among them, as
+    ``price_wall_seconds``; with `env`, its graphs are read under that
+    performance environment (`forward.structure`)."""
     from atom.compass.backends.op_graph import OpGraphBackend
 
     drafter = getattr(config, "speculative_config", None)
     lazily = (run[ATOM_ARGS], lazy) if lazy is not None and ATOM_ARGS in run else ()
-    return OpGraphBackend(
+    backend = OpGraphBackend(
         machine,
         _op_graphs(
             run["store"], config, machine.value("device.arch"), *lazily, env=env
@@ -2102,6 +2143,20 @@ def op_graph(
         drafts=drafter.num_speculative_tokens if drafter else 0,
         block=bool(drafter) and drafter.use_dspark(),
     )
+    if lazy is None:
+        return backend
+    price = backend.price
+
+    def timed(view):
+        began = time.monotonic()
+        try:
+            return price(view)
+        finally:
+            spent = time.monotonic() - began
+            lazy["price_wall_seconds"] = lazy.get("price_wall_seconds", 0) + spent
+
+    backend.price = timed
+    return backend
 
 
 def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None):
@@ -3388,7 +3443,8 @@ def _write_client_run(run: dict, a: _RecordingAuthority, k: int, hand_ins=None):
         hand_ins = _read_hand_ins(run, here, True)
     since = _read_hand_ins(run, out / CLIENT_DIR.format(k - 1), False) if k else {}
     record = a.ended[k]
-    summary = _summary(run, a, record, a.wall(k), hand_ins, since)
+    since_wall = a.wall(k - 1) if k else 0.0
+    summary = _summary(run, a, record, a.wall(k), hand_ins, since, since_wall)
     summary["client_run"] = {"index": k, "start": record.start, "end": record.end}
     hits = {
         n: _in_force_from(h["hit_counters"], record.start)
@@ -3401,9 +3457,12 @@ def _write_client_run(run: dict, a: _RecordingAuthority, k: int, hand_ins=None):
     _write_whole(here / SUMMARY_FILE, json.dumps(summary, sort_keys=True, indent=1))
 
 
-def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> dict:
+def _summary(
+    run: dict, a, record, wall: float, hand_ins: dict, since: dict, since_wall=0.0
+) -> dict:
     """The summary of `record`, the authority or one client run, over the steps
-    the hand-ins count beyond those in `since`."""
+    the hand-ins count beyond those in `since`; `since_wall` is the part of
+    `wall` the client runs `since` counts served."""
     from atom.compass.backends.cost import GROUPS
 
     reasons = Counter(r for h in hand_ins.values() for r in h["refusals"])
@@ -3441,6 +3500,17 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     for key in ("held_lookups", "lookup_wall_seconds"):
         if value := total(key):
             summary["cost"][key] = value
+    # Each DP group's wall waited on lookups, on the rest of pricing, and on
+    # neither, by the engine of its first rank, over `record`'s own wall.
+    waited = {}
+    for n, h in hand_ins.items():
+        if w := h.get("priced", {}).get("group_waited_seconds"):
+            gone = since.get(n, {}).get("priced", {}).get("group_waited_seconds")
+            lookups, pricing = (a - b for a, b in zip(w, gone or (0, 0)))
+            rest = wall - since_wall - lookups - pricing
+            waited[n] = {"lookups": lookups, "pricing": pricing, "rest": rest}
+    if waited:
+        summary["cost"]["group_waited_seconds"] = waited
     schedule = summary["schedule"]
     schedule["predicted_seconds"] = seconds
     # How the seconds were obtained: reported, never gated.
