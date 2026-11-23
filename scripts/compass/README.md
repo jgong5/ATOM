@@ -272,6 +272,9 @@ a namespace package, and once collecting
 `tests/attentions/deepseek_v41/test_a8w4_attention.py` has put `/app/aiter-test`
 on `sys.path` through aiter, aiter's own `tests/conftest.py` answers that
 import. The CPU gate leaves these files out instead (`cpu_gate_exclude.txt`).
+This image's `/opt/venv` holds no `aiperf`, so a gate there sets
+`COMPASS_AIPERF_PYTHON=/opt/agentx-venv/bin/python`, the image's own
+agentx-harness.
 
 ## The compass_harness tests need an agentx-harness wheel
 
