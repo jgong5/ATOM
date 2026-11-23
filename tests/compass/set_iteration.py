@@ -276,6 +276,31 @@ _KEPT = (
      "real ports from the OS; nothing simulated reads which role got which", 1),
     ("atom/utils/__init__.py", "getLogger", "names torch.compile tests for membership", 1),
     ("atom/utils/cuda_piecewise_backend.py", "__init__", "a dict keyed by size, " + _STARTUP, 1),
+    ("atom/entrypoints/openai/reasoning.py", "__init__", _INTO_A_SET, 1),
+    ("atom/kv_transfer/disaggregation/pd_admission.py", "commit",
+     "block ids into a dict of counts; " + _INTS, 1),
+    ("atom/kv_transfer/offload/mooncake_store/async_lookup.py", "pump",
+     _REPLACED_TRANSFER, 1),
+    ("atom/model_engine/early_load.py", "prune", _INTO_A_SET, 1),
+    ("atom/model_engine/state_offload.py", "take_touches",
+     "the state-cache offload tier, which a simulated run refuses", 1),
+    ("atom/model_ops/fused_moe/sp_mega_moe.py", "_plan", _ONE, 1),
+    *(
+        (f"atom/models/{path}", scope, _REPLACED_RUNNER, n)
+        for path, scope, n in (
+            ("deepseek_v41/mono/hi_draft.py", "_ctx_table", 1),
+            ("deepseek_v41/mono/hi_draft.py", "_draft_table", 1),
+            ("deepseek_v41/mono/hi_runner.py", "_bind_cache", 1),
+            ("deepseek_v41/mono/hi_runner.py", "check", 1),
+            ("deepseek_v41/mono/hi/blocks/gfx950/linear.py", "_unit_candidates", 1),
+            ("deepseek_v41/mono/hi/device/gfx950/mailbox.py", "poll", 2),
+            ("deepseek_v41/mono/hi/plan/check.py", "check_memory", 1),
+            ("deepseek_v41/mono/hi/plan/trace.py", "_target", 2),
+            ("deepseek_v41/mono/hi/plan/trace.py", "_tagged", 1),
+            ("deepseek_v41/mono/round/post_verify.py", "committed", 1),
+            ("qwen38/mono/kernels/device/mailbox.py", "poll", 2),
+        )
+    ),
 )
 # fmt: on
 CORE_SET_ALLOW_LIST: dict[tuple[str, str], tuple[str, int]] = {
