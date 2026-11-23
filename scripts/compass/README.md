@@ -1397,15 +1397,18 @@ pin processes that run at once to cores with `taskset`.
 ### The TP8 cell under the op-level backend
 
 The TP8 cell is the DPA-TP8 cell less `--enable-dp-attention`: each side runs `-tp 8
---kv_cache_dtype fp8 --block-size 16 --no-enable_prefix_caching --max-num-seqs 512` under
-`AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1`, the prefill side also `--enable-tbo` under
-`GPU_MAX_HW_QUEUES=5 ATOM_NUMA_BIND=1`. The prefill side runs at `--gpu-memory-utilization 0.65`
-and the decode side at 0.70: at 0.70 a prefill rank ran out of device memory on a
-219,399-token prompt, and at 0.72 a decode rank did
-([Ruling](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6789775071),
+--trust-remote-code --kv_cache_dtype fp8 --block-size 16 --no-enable_prefix_caching
+--max-num-seqs 512` under `AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1`, the prefill side
+also `--enable-tbo` under `GPU_MAX_HW_QUEUES=5 ATOM_NUMA_BIND=1`, and the decode side also
+`--cudagraph-capture-sizes` of 1, 2, 4 and every multiple of 4 from 8 to 256, the ladder its
+host law keys. The prefill side runs at `--gpu-memory-utilization 0.65` and the decode side
+at 0.70: prefill ranks ran out of device memory at 0.72, and at 0.70 on a 219,399-token
+prompt, and every decode rank did at #975's 0.75
+([evidence](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6788714068),
+[Ruling](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6789775071),
 [Ruling](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6841461259)). A real run is
-`deploy.sh record` as above. A simulated run takes the DPA-TP8 cell's graphs, points, price
-list, run and grading, with these differences:
+`deploy.sh record` as above. A simulated run follows the DPA-TP8 cell's Graphs, Points, Price
+list, Runs and Grading steps, with these differences:
 
 - **One group of eight ranks.** No graph holds `G=`. A prefill step that `--enable-tbo`
   splits runs as two micro-batches on one DP rank, and `trace ops --population`,
@@ -1423,9 +1426,9 @@ list, run and grading, with these differences:
 - **Host laws only.** `P` and `D` are the tree's
   `laws/deepseek-v4-pro-tp8-mi355x-crs005-prefill-host.json.xz` and `-decode-host.json.xz`,
   host terms with no step linear law: the op-level backend prices every device step. The
-  decode side's `http_intake` is the crs005 DPA8 law's, fitted on bodies of up to 827,747
-  bytes, so a run of traces 0 to 255 refuses each larger intake and `validate` grades no
-  such run ([#3919](https://github.com/jgong5/ATOM/issues/3919)).
+  decode side's `http_intake` is the crs005 DPA8 law's, whose fitted body range stops below
+  the largest bodies traces 0 to 255 send, so a run of them refuses each larger intake and
+  `validate` grades no such run ([#3919](https://github.com/jgong5/ATOM/issues/3919)).
 
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
