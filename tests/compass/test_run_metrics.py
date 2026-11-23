@@ -518,7 +518,7 @@ def test_a_frontend_writes_what_it_held_at_each_refresh(
         ("atom:dp_requests_routed", (("rank", "0"),)),
     ):
         key = family, family + "_total", labels
-        assert [at[key] for at in written.values()] == [0, 1, 1], family
+        assert [at[key] for at in written.values()] == [0, 1, 1, 1], family
     _whole_before_hand_in(renames, tmp_path, lp)
     assert rt.refusals == []
 

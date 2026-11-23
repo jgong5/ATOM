@@ -203,7 +203,7 @@ TP2_ONLY_OPS = (
 ROW_PARALLEL = "atom/model_ops/layernorm.py:1014 in _forward_fused_allreduce"
 VOCAB_EMBEDDING = "atom/model_ops/embed_head.py:179 in forward"
 VOCAB_LM_HEAD = "atom/model_ops/embed_head.py:276 in forward"
-SAMPLER = "atom/model_engine/model_runner.py:3684 in postprocess"
+SAMPLER = "atom/model_engine/model_runner.py:3700 in postprocess"
 
 # Where a free symbol stops being free, each as the value it takes and the
 # innermost ATOM frames it takes it through. Three, and in an order: a symbol
@@ -532,7 +532,7 @@ EXPECTED_HOST_RESOLUTIONS = {
     "atom/model_engine/model_runner.py:569 in prepare_input_ids": 3,
     "atom/model_engine/model_runner.py:677 in _stage_input_ids": 1,
     "atom/model_engine/model_runner.py:680 in _stage_input_ids": 1,
-    "atom/model_engine/model_runner.py:2849 in prepare_sample": 1,
+    "atom/model_engine/model_runner.py:2865 in prepare_sample": 1,
     "atom/model_ops/sampler.py:48 in _apply_greedy_tokens": 1,
     "atom/utils/forward_context.py:370 in decide": 1,
     H2D_COUNT_CHECK: WIDTH_COUNTED_COPIES,

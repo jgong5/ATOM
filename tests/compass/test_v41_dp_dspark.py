@@ -437,7 +437,14 @@ def test_fit_steps_takes_the_drafter_s_routing_from_the_served_model(fitted, tmp
         "model": digest,
         "platform": machine_platform(MachineSpec.from_mapping(document)),
     }
-    args = SimpleNamespace(form="base", seed=0, moe_routing=None, model=str(tmp_path))
+    args = SimpleNamespace(
+        form="base",
+        seed=0,
+        moe_routing=None,
+        model=str(tmp_path),
+        cold_peer_rows=False,
+        ladder_run=None,
+    )
     law = steps._step_linear(samples, config, args)[1]
     assert law["moe_routing"] == {"experts": 384, "top_k": 6}
     assert law["draft"]["moe_routing"] == {"experts": 128, "top_k": 3}

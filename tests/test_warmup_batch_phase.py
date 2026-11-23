@@ -12,6 +12,8 @@ from atom.model_engine import model_runner as runner_module
 
 @pytest.mark.parametrize("max_model_len,warmup_tokens", [(4096, 16384), (8192, 4096)])
 def test_warmup_batch_is_a_prefill(monkeypatch, max_model_len, warmup_tokens):
+    # The native A8 prewarm reads a model these runners hold none of.
+    monkeypatch.setenv("ATOM_PREWARM_NATIVE_A8", "0")
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.config = SimpleNamespace(
         max_model_len=max_model_len,
@@ -43,6 +45,7 @@ def test_warmup_batch_is_a_prefill(monkeypatch, max_model_len, warmup_tokens):
 def test_every_stage_warms_up_on_the_rows_the_last_stage_does(monkeypatch):
     """A block drafter warms up on >= 2 sequences. Read off the drafter, a
     stage without one sent 1 x 5000 rows to a last stage expecting 2 x 4096."""
+    monkeypatch.setenv("ATOM_PREWARM_NATIVE_A8", "0")
     monkeypatch.setattr(runner_module.torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(
         runner_module.torch.cuda, "reset_peak_memory_stats", lambda: None

@@ -163,6 +163,11 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
         "provenance; it prices recorded steps offline and never runs inside a "
         "simulated run"
     ),
+    "atom/compass/drive/clock_pair.py": (
+        "another node's CLOCK_MONOTONIC paired with this one's for a real "
+        "record's split, which deploy.sh pairs beside a real deployment alone; "
+        "a simulated run's instances share the run's clock and pair nothing"
+    ),
 }
 
 #: Packages under `atom/` a simulated run never executes, or that keep their
@@ -289,7 +294,7 @@ _KEPT_REAL = (
     ("atom/model_engine/model_runner.py", "stop_profiler", "time.monotonic",
      "K9", _REPLACED_RUNNER, 2),
     ("atom/model_engine/model_runner.py", "warmup_model", "time.time",
-     "K9", _REPLACED_RUNNER, 2),
+     "K9", _REPLACED_RUNNER, 3),
     ("atom/model_engine/model_runner.py", "capture_cudagraph", "time.time",
      "K9", _REPLACED_RUNNER, 2),
     ("atom/model_engine/model_runner.py", "_disagg_collect_rank_files", "time.monotonic",

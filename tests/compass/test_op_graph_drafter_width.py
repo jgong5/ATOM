@@ -64,6 +64,7 @@ def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True, dr
             any_rank_has_prefill=bool(prefill) or any(p for *_, p in peers),
             prefill_across_dp=(bool(prefill), *(p for *_, p in peers)),
             any_rank_needs_eager=False,
+            max_final_requests_across_dp=0,
             max_seqlen_q_across_dp=None,
             tbo_collective_active=False,
             scheduled_tokens_per_dp_rank=torch.tensor(counts),

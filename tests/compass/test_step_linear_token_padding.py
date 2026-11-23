@@ -359,6 +359,7 @@ def test_the_projection_states_the_groups_largest_rank(dp):
         ub_tokens_across_dp=None,
         max_bs_across_dp=1,
         any_rank_needs_eager=False,
+        max_final_requests_across_dp=0,
     )
     mode = SimpleNamespace(
         use_cudagraph=False,
