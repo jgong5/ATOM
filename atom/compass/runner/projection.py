@@ -54,6 +54,24 @@ def is_dummy(batch: Any) -> bool:
     return bool(batch.is_dummy_run) or not batch.total_seqs_num
 
 
+def _tbo_tokens(batch: Any, mode: ForwardMode) -> tuple | None:
+    """The two-batch-overlap split the group runs, per micro-batch each rank's
+    tokens: a prefill's as its exchange agreed it; a decode the group splits,
+    which casts no vote (`ForwardMode.decide` splits its `running_bs`), as
+    ATOM cuts it (`cut_decode_ubatches`), each micro-batch the same running
+    tokens on every rank."""
+    if mode.sync is None:
+        return None
+    if mode.is_prefill or not mode.tbo_collective_active:
+        return mode.sync.ub_tokens_across_dp
+    from atom.utils.tbo.ubatch_splitting import cut_decode_ubatches
+
+    lengths = np.asarray(batch.num_scheduled_tokens[: mode.scheduled_bs])
+    ranks = len(mode.sync.scheduled_tokens_per_dp_rank)
+    cut = cut_decode_ubatches(mode.running_bs, mode.running_tokens, lengths)
+    return tuple((ub.running_tokens,) * ranks for ub in cut)
+
+
 def _dummy_row(batch: Any, mode: ForwardMode) -> RequestShape:
     """The row an empty dummy is priced and recorded as, as the one fabricated
     request the dummy ran before: a decode of the step's spec width
@@ -96,10 +114,10 @@ def forward_mode(batch: Any, runner: Any) -> ForwardMode:
     on the DP group, so every rank calls it once per step, as the real forward
     does; the group's rung and token counts come back from it.
 
-    `tbo_on` and `local_tbo` are what `ModelRunner.prepare_model` passes: the
-    config's `enable_tbo` and the runner's own `_local_tbo_eligibility`, which
-    ride the collective, so the group agrees the two-batch-overlap split a real
-    run agrees. The other arguments that do not reach the rung are passed at
+    `tbo_on`, `tbo_decode` and `local_tbo` are what `ModelRunner.prepare_model`
+    passes: the config's `enable_tbo` and `enable_tbo_decode`, and the runner's
+    own `_local_tbo_eligibility`, which rides the collective, so the group
+    agrees the two-batch-overlap split a real run agrees. The other arguments that do not reach the rung are passed at
     their inert values: `decide` settles a query length as well, and that is
     what `is_block_drafter` feeds. The width and the replay decision come from
     `capture_sizes`, `enforce_eager`, the attention builder's
@@ -132,6 +150,7 @@ def forward_mode(batch: Any, runner: Any) -> ForwardMode:
         ),
         max_seqlen_q=batch.num_spec_step + 1,
         running_tokens_per_dp_rank=runner.running_tokens_per_dp_rank,
+        tbo_decode=bool(runner.config.enable_tbo_decode),
         tbo_decode_graphs=runner.tbo_decode_graphs,
     )
 
@@ -255,7 +274,7 @@ def batch_view(
         draft_bs=draft_bs,
         target_bs=target_bs,
         produces_output=batch.produces_output(),
-        tbo_tokens=None if mode.sync is None else mode.sync.ub_tokens_across_dp,
+        tbo_tokens=_tbo_tokens(batch, mode),
         image_tokens=image_tokens(batch, runner),
         moe_tokens=moe_tokens,
         dp_rank=dp_rank,
