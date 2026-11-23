@@ -23,9 +23,10 @@ that samples a block drafter's draft-KV pass, `d_draft_kv_ns`, which runs
 before `forward_done_event`. On an MTP record only the target's price is
 compared, that pass's included; the drafter's is reported apart.
 With `--ratios-from`, the prices are DEV's datasheet peaks at the ratios of
-the readings S holds for DEVICE, a device name a datasheet states, as `compass
-fit device --assume-from` takes them (`fit.device.assumed_entry`): run on a
-device's own records, the report is the error of projecting it from the other.
+the readings S holds for DEVICE, a device name a datasheet states, else its
+committed copy, as `compass fit device --assume-from` takes them
+(`fit.device.assumed_entry`): run on a device's own records, the report is
+the error of projecting it from the other.
 
 A data-parallel step (one with `moe_rows`) is read off every rank's line at
 that step: its `moe_tokens` is the group's scheduled tokens, a dummy rank's
@@ -530,8 +531,10 @@ def main(argv: list[str]) -> None:
 
     store = ArtifactStore(args.store)
     if args.ratios_from:
-        key, entry, _ = assumed_entry(store, args.ratios_from, args.ptl, args.stack)
-        machine = composed(datasheet(args.device), key, entry)
+        key, entry, _, where = assumed_entry(
+            store, args.ratios_from, args.ptl, args.stack
+        )
+        machine = composed(datasheet(args.device), key, entry, source=where)
     else:
         machine = compose(args.device, store, args.ptl, args.stack)
     config, ep, priced = backends(

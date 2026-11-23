@@ -5,7 +5,7 @@ import importlib.util
 import itertools
 import logging
 from collections import Counter
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import Any
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
@@ -17,14 +17,18 @@ from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_
 from atom.model_engine.segment_tokenizer import SegmentTokenizer
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
-from atom.sampling_params import SamplingParams
+from atom.sampling_params import RequiredChannel, SamplingParams
+from atom.structured_output.validation import (
+    WorkerGrammarPreflight,
+    validate_execution_options,
+)
 from atom.utils import clock, envs
 from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
 
-def _load_tokenizer(model: str, trust_remote_code: bool = False):
+def load_tokenizer(model: str, trust_remote_code: bool = False):
     tokenizer = AutoTokenizer.from_pretrained(
         model, use_fast=True, trust_remote_code=trust_remote_code
     )
@@ -46,7 +50,7 @@ class LLMEngine:
         data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
         self.config = config
-        self.tokenizer = tokenizer or _load_tokenizer(
+        self.tokenizer = tokenizer or load_tokenizer(
             config.model, config.trust_remote_code
         )
         config.bos_token_id = self.tokenizer.bos_token_id
@@ -159,6 +163,19 @@ class LLMEngine:
                     "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
                     "prefill uses request-boundary balanced grouping."
                 )
+            # TBO stripes positions per request group, the draft prefill split
+            # the batch as one sequence: their shards disagree. Keyed on config,
+            # so runs that would never reach TBO are refused too.
+            if config.enable_tbo and config.speculative_config is not None:
+                raise ValueError(
+                    "prefill_context_parallel_size > 1 (-pcp) with speculative "
+                    "decoding is not supported under TBO: TBO's PCP prefill "
+                    "splits per request group, which the draft model's global "
+                    "round-robin query split does not match. Drop --enable-tbo, "
+                    "or run without a draft model. Note -tp > 1 already "
+                    "disables TBO under PCP (see above), so this only affects "
+                    "-tp 1 (e.g. -tp 1 -pcp 8)."
+                )
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
@@ -167,6 +184,11 @@ class LLMEngine:
                 self.core_mgr = DisaggCoreManager(config)
             else:
                 self.core_mgr = CoreManager(config)
+        self._structured_preflight = WorkerGrammarPreflight(
+            self, self.tokenizer, config
+        )
+        self.io_processor.structured_admission = self.prepare_structured_request
+        self.core_mgr.structured_request_prepare = self.bind_structured_requests
         self._step_lock = None
         self._pending_results = {}
         import json
@@ -186,9 +208,43 @@ class LLMEngine:
 
     def close(self):
         """Shut down engine and release all GPU resources."""
+        if getattr(self, "_structured_preflight", None) is not None:
+            self._structured_preflight.close()
         clock.finish()
         if hasattr(self, "core_mgr"):
             self.core_mgr.close()
+
+    def prepare_structured_request(self, params, kv_transfer=None, multimodal=False):
+        if params.json_schema is None:
+            return
+        validate_execution_options(
+            self.config,
+            params,
+            kv_transfer=kv_transfer,
+            multimodal=multimodal,
+            relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+        )
+        preflight = self._structured_preflight
+        key = (
+            params.json_schema,
+            params.structured_tool_format,
+            params.structured_reasoning_end,
+        )
+        preflight.submit(*key).result()
+
+    def bind_structured_requests(self, seqs):
+        # Called by CoreManager only after frontend context validation, at the
+        # actual submission boundary. No worker matcher belongs to preprocessing.
+        groups = {}
+        for seq in seqs:
+            key = (
+                seq.json_schema,
+                seq.structured_tool_format,
+                seq.structured_reasoning_end,
+            )
+            groups.setdefault(key, []).append(seq.id)
+        for key, request_ids in groups.items():
+            self._structured_preflight.prepare_requests(key, tuple(request_ids))
 
     def add_request(
         self,
@@ -304,7 +360,10 @@ class LLMEngine:
         # fresh batch gets deterministic DP assignment and no leaked counts.
         self.core_mgr.reset_dp_router()
 
-        self.add_request(prompts, sampling_params, request_ids=request_ids)
+        # Backpressure admission is offline-only. The flag covers this add,
+        # not the collect loop; refills of the pool do not consult it.
+        with self.core_mgr.offline_backpressure_batch():
+            self.add_request(prompts, sampling_params, request_ids=request_ids)
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -324,11 +383,12 @@ class LLMEngine:
     ) -> list[dict]:
         """Generate completions for multimodal inputs (token IDs + vision data)."""
         self.core_mgr.reset_dp_router()
-        self.add_request(
-            token_ids_list,
-            sampling_params,
-            multimodal_data_list=multimodal_data_list,
-        )
+        with self.core_mgr.offline_backpressure_batch():
+            self.add_request(
+                token_ids_list,
+                sampling_params,
+                multimodal_data_list=multimodal_data_list,
+            )
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -694,7 +754,13 @@ class InputOutputProcessor:
         self.config = config
         self.tokenizer = tokenizer
         self.block_size = block_size
+        self.structured_admission = None
         self.requests = {}
+        # The one channel `tool_choice="required"` holds this engine's requests
+        # to (`_engine_channel`): as the server's format named it, and as built
+        # from that once with every id this engine stops on held back.
+        self._format_channel: RequiredChannel | None = None
+        self._required_channel: RequiredChannel | None = None
         self.segment_tokenizer = SegmentTokenizer.maybe_create(
             tokenizer, envs.ATOM_TOKENIZE_CACHE_MB << 20
         )
@@ -786,6 +852,31 @@ class InputOutputProcessor:
         )
         return seqs[0]
 
+    def _engine_channel(self, channel: RequiredChannel) -> RequiredChannel:
+        """The channel a required request is held to on this engine.
+
+        Hold its opening against every single id this engine ends a sequence
+        on (`Scheduler.postprocess` stops on EOS and on `stop_token_ids`), not
+        just the ones the tool-call format named. The third way a sequence
+        ends, the request's own `stop` strings, is left to end it: the client
+        asked for that stop, and a multi-token match is not one logits row's
+        mask.
+
+        Built once, from the first required request, and shared by every
+        later one. A request naming a different channel is refused here, at
+        admission, where it fails alone; the engine loop batches every
+        request together and holds one channel.
+        """
+        if self._required_channel is None:
+            held = channel.ending_on(self.config.end_token_ids)
+            self._format_channel, self._required_channel = channel, held
+        elif channel != self._format_channel and channel != self._required_channel:
+            raise ValueError(
+                'this engine already holds tool_choice="required" requests to '
+                "another channel; a server resolves one tool-call format"
+            )
+        return self._required_channel
+
     def preprocess_fanout(
         self,
         prompt_or_tokens: str | list[int],
@@ -815,6 +906,12 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
+        if sampling_params.json_schema is not None:
+            if self.structured_admission is None:
+                raise ValueError("Structured output requires engine admission")
+            self.structured_admission(
+                sampling_params, kv_transfer_params, multimodal_data is not None
+            )
         request_validator = getattr(self.config.hf_config, "validate_request", None)
         if request_validator is not None:
             request_validator(
@@ -864,6 +961,12 @@ class InputOutputProcessor:
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
 
+        if sampling_params.required_channel is not None:
+            sampling_params = replace(
+                sampling_params,
+                required_channel=self._engine_channel(sampling_params.required_channel),
+            )
+
         if stream_callbacks is not None and len(stream_callbacks) != n:
             raise ValueError(
                 f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
@@ -895,11 +998,13 @@ class InputOutputProcessor:
                 dp_parent_session_id=dp_parent_session_id,
             )
             seq.arrive_time = time.time()
+            seqs.append(seq)
+
+        for seq in seqs:
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
                 self._internal_to_external[seq.id] = seq.external_request_id
-            seqs.append(seq)
 
         # Runs in an executor or submit thread, not the event loop. Siblings
         # share a prompt and seed, so one chain serves them all.

@@ -4,6 +4,8 @@ directory, changing none of its results.
 
 - `split` -- each request's latency split into queue, prefill, KV transfer and
   decode, and its LMCache loads and stores.
+- `ops` -- an op-level run's time per step phase by op family, from its
+  prices.
 - `html` -- the run's report, one static page: the run, its headline metrics,
-  a simulated run's trust and the split.
+  a simulated run's trust, the split and the op-family split.
 """

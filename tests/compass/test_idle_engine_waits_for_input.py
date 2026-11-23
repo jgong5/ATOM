@@ -77,6 +77,10 @@ class Scheduler:
     KV work stays pending until `kv_done` is set."""
 
     prefill_delayer = None
+    # The busy loop notes each pass on the engine stats.
+    engine_stats = SimpleNamespace(
+        note_busy=lambda now: None, note_idle=lambda now: None, bump_step=lambda: None
+    )
 
     def __init__(self):
         self.got, self.passes = queue.Queue(), 0

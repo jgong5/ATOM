@@ -16,9 +16,10 @@ gate (`t_gate_ns`), the launch (`t_launch_ns`) and the wait for the previous
 output's token copy (`t_recv_ns`, only on a forward that reaches it; off a
 pipeline, a runner that does not defer its output reads its own tokens under
 `t_read_ns` instead), and with
-a drafter its MTP status (`t_mtp_ns`) and draft copy (`t_draft_recv_ns`). Its device
-window is `d_busy_ns`, from an event recorded at the launch's entry to one
-recorded at the forward's exit (`d_target_ns` to one recorded just after
+a drafter its MTP status (`t_mtp_ns`) and draft copy (`t_draft_recv_ns`; reading its own, `t_draft_read_ns`). Its device
+window is `d_busy_ns`, from an event recorded at the launch's entry, the clock
+read under `t_launch_event_ns` once the event exists and just before its record,
+to one recorded at the forward's exit (`d_target_ns` to one recorded just after
 `postprocess` records `forward_done_event`, less the drafter's `compute_draft_kv`
 pass before it, or on a forward that samples nothing, to the start of its first
 drafter pass, that one or `propose_draft_token_ids`); `d_draft_kv_ns` and
@@ -43,7 +44,7 @@ finished by its last forward. A real line also
 carries `launch`, where its model's launch provider declares features
 (`backends.launch_features`), and `blocked_ns`, where the worker loaded the
 blocking-call tool (`blocked`): the nanoseconds its thread spent in each HIP
-call that blocked, from the launch's entry to the token copy wait's, or to
+call that blocked, from the launch's entry to its token read's, or to
 the launch's exit on a forward with no such wait. A simulated runner's line is
 written as its step is recorded, and flushed to the file the record keeps open
 from its start, so a killed simulated worker keeps every line. Under `kv` a line carries the lmcache offload loads
@@ -120,10 +121,12 @@ TIMESTAMPS = (
     "t_exit_ns",
     "t_gate_ns",
     "t_launch_ns",
+    "t_launch_event_ns",
     "t_recv_ns",
     "t_read_ns",
     "t_mtp_ns",
     "t_draft_recv_ns",
+    "t_draft_read_ns",
     "t_pp_recv_ns",
     "t_flush_ns",
     "d_busy_ns",
@@ -143,8 +146,8 @@ TIMESTAMPS = (
 MARK = "compass::"
 TARGET_DONE = MARK + "target_done"
 #: The stamps the blocking-call tool's sums are read at: a line's `blocked_ns`
-#: runs from the launch's entry to the token copy wait's, as `W_launch` does.
-BLOCKED_AT = ("t_launch_ns", "t_recv_ns")
+#: runs from the launch's entry to its token read's, as `W_launch` does.
+BLOCKED_AT = ("t_launch_ns", "t_recv_ns", "t_read_ns")
 
 
 class StepRecord:
@@ -441,7 +444,8 @@ def recorded_graphs(config) -> dict:
 def carry_response_ids() -> None:
     """Set a one-sequence request's `external_request_id` to its response id,
     the `request_id` of the API server function calling `add_request`, read
-    off its frame. A sequence with an id keeps it; a fan-out's get none.
+    off its frame, or off its caller's when `_submit_engine_requests` makes
+    the call. A sequence with an id keeps it; a fan-out's get none.
 
     A sequence whose `kv_transfer_params` carry a `transfer_id`, a decode
     instance's request, also gets a line ``{response_id, remote_dp_rank,
@@ -455,8 +459,10 @@ def carry_response_ids() -> None:
 
         def add_request(self, seqs, add=cls.add_request):
             if len(seqs) == 1 and seqs[0].external_request_id is None:
-                caller = sys._getframe(1).f_locals
-                seqs[0].external_request_id = caller.get("request_id")
+                caller = sys._getframe(1)
+                if caller.f_code.co_name == "_submit_engine_requests":
+                    caller = caller.f_back
+                seqs[0].external_request_id = caller.f_locals.get("request_id")
             params = (seqs[0].kv_transfer_params or {}) if len(seqs) == 1 else {}
             if params.get("transfer_id") is not None:
                 line = {
@@ -502,8 +508,9 @@ class StepRecording:
     ATOM's `ModelRunner.__init__` warms up with a forward over a fabricated
     batch, which the simulated runner declines, so recording starts once
     construction returns. The class it is composed into supplies
-    `step_clock_ns`, the clock its lines are timed by, and `device_event`,
-    which records a timing event on the current stream and returns it.
+    `step_clock_ns`, the clock its lines are timed by, and
+    `device_event(event=None)`, which records `event`, or a new timing event,
+    on the current stream and returns it.
 
     A recorded forward is also stamped inside: around `_gate_staging_reuse`,
     `run_model` and the instance's `tokenID_processor.recv_async_output`, with
@@ -537,12 +544,17 @@ class StepRecording:
         pp = getattr(getattr(self, "config", None), "pipeline_parallel_size", 1) > 1
         if not getattr(processor, "is_deferred_out", True):
             # The forward reads its own tokens off the device: the wait is the
-            # call. Off a pipeline the gate releases that wait itself, so it
-            # stays in `W_post` and its stamp only ties the clocks.
+            # call. Off a pipeline the gate releases that wait at the forward's
+            # own target end, and the labels end `W_launch` and start `W_post` there.
             sampled = processor.prepare_sampled_ids
             processor.prepare_sampled_ids = functools.partial(
                 self._stamped, "t_recv_ns" if pp else "t_read_ns", sampled
             )
+            if hasattr(self, "drafter"):  # and its own draft ids, once its draft ends
+                drafts = processor.prepare_draft_ids
+                processor.prepare_draft_ids = functools.partial(
+                    self._stamped, "t_draft_read_ns", drafts
+                )
         if pp:
             from aiter.dist.parallel_state import get_pp_group
 
@@ -660,7 +672,12 @@ class StepRecording:
         if getattr(self, "_parity_record", None) is not None:
             from atom.utils.forward_context import get_forward_context
 
-            self._stamps["launch_event"] = self.device_event()
+            # The event is recorded once to create it, then again just after
+            # the read: neither a stall nor the event's creation comes between
+            # the read and the record that places the launch.
+            event = self.device_event()
+            self._stamps["t_launch_event_ns"] = self.step_clock_ns()
+            self._stamps["launch_event"] = self.device_event(event)
             context = get_forward_context().context
             self._stamps["forward_mode"] = getattr(context, "forward_mode", None)
         return self._stamped("t_launch_ns", super().run_model, *args)
@@ -673,7 +690,7 @@ class StepRecording:
         sums = {key: stamps.pop((key, "blocked"), None) for key in BLOCKED_AT}
         if sums["t_launch_ns"]:
             before, end = sums["t_launch_ns"]
-            end = sums["t_recv_ns"][0] if sums["t_recv_ns"] else end
+            end = (sums["t_recv_ns"] or sums["t_read_ns"] or (end,))[0]
             stamps["blocked_ns"] = self._blocked.between(before, end)
         launch = stamps.pop("launch_event", None)
         names = {"d_target_ns": "target_event", "d_recv_ns": "recv_event"}

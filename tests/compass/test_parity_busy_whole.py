@@ -149,7 +149,7 @@ def test_a_trace_run_s_server_keeps_every_profiler_row(planted):  # noqa: F811
         [sys.executable, "-c", DRIVE, str(planted / "server.py"), str(out), *ARGS],
         env=env,
     )
-    _ready(out, driver, 600, 0.05)
+    _ready(out, driver)
     driver.send_signal(signal.SIGTERM)
     assert driver.wait(timeout=60) == 0
 

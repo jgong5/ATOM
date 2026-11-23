@@ -226,7 +226,7 @@ class TestASubstitutedReadTakesTheLpClock:
     def test_the_scheduler_metrics_stamps(self, lp_clock):
         """Receipt, the KV wait's start and end, the first forward and its label."""
         registry = CollectorRegistry()
-        metrics = SchedulerMetrics(registry=registry)
+        metrics = SchedulerMetrics(registry=registry, request_context_enabled=True)
         seq = SimpleNamespace(id=1, kv_transfer_params={"do_remote_prefill": True})
         SchedulerMetrics.enqueue(seq)
         metrics.start_kv_wait(seq)

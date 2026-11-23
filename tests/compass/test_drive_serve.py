@@ -15,9 +15,10 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from pathlib import Path
 
+import psutil
 import pytest
 from test_drive_gpu import FREE, GPU45, LISTING, _kfd, _plant
 from test_launcher_held_ports import HELD, _squat
@@ -114,14 +115,29 @@ def _seen(planted: Path) -> dict:
     return json.loads((planted / "argv.json").read_text())
 
 
-def _ready(out: Path, driver, polls: int, poll_s: float) -> dict:
-    """The ready file, once the driver in `driver` has written it."""
-    for _ in range(polls):
-        if (out / serve.READY_FILE).exists():
-            return json.loads((out / serve.READY_FILE).read_text())
+#: How long `_ready` waits for a driver's ready file: well past the longest a
+#: start has taken on a loaded host, where each process that imports torch, the
+#: driver and a planted server that reads ATOM's envs among them, can wait
+#: seconds on a run queue.
+READY_S = 300
+
+
+def _ready(out: Path, driver) -> dict:
+    """The ready file, once the driver in `driver` has written it. Fail if the
+    driver exits first, or after `READY_S`, once it and every process under it
+    are killed."""
+    deadline = time.monotonic() + READY_S
+    while not (out / serve.READY_FILE).exists():
         assert driver.poll() is None, (out / serve.LOG_FILE).read_text()[-4000:]
-        time.sleep(poll_s)
-    pytest.fail(f"no {serve.READY_FILE} after {polls * poll_s} s")
+        if time.monotonic() > deadline:
+            top = psutil.Process(driver.pid)
+            for proc in [top, *top.children(recursive=True)]:
+                with suppress(psutil.NoSuchProcess):
+                    proc.kill()
+            driver.wait()
+            pytest.fail(f"no {serve.READY_FILE} after {READY_S} s")
+        time.sleep(0.05)
+    return json.loads((out / serve.READY_FILE).read_text())
 
 
 def test_a_server_runs_atom_arguments_verbatim_on_its_gpus_between_the_checks(
@@ -416,7 +432,7 @@ def test_the_ready_file_follows_the_first_answer_and_a_stop_leaves_nothing(
         ],
         env=env,
     )
-    server = _ready(out, driver, 600, 0.05)["pid"]
+    server = _ready(out, driver)["pid"]
     assert (planted / "answered").exists()
     child = int((planted / "child").read_text())
     assert _running(server) and _running(child)
@@ -609,7 +625,7 @@ def test_a_worker_blocked_past_atom_s_default_wait_at_the_stop_keeps_its_record(
         [sys.executable, "-c", DRIVE, str(planted / "recorded.py"), str(out), *ARGS],
         env=env,
     )
-    _ready(out, driver, 600, 0.05)
+    _ready(out, driver)
     driver.send_signal(signal.SIGTERM)
     assert driver.wait(timeout=serve.STOP_GRACE_S) == 0
     lines = (out / serve.STEPS / "dp0.jsonl").read_text().splitlines()

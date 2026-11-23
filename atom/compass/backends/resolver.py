@@ -49,6 +49,10 @@ from typing import Any
 from atom.compass.backends.cost import CostTerm
 from atom.compass.backends.provenance import Refusal
 
+#: The answers of its first source a resolver keeps resolved; past it, it
+#: forgets them.
+KEPT = 1 << 14
+
 
 class CostSource(abc.ABC):
     """One source: something that can price a request, or say why it cannot."""
@@ -109,6 +113,9 @@ class Resolver:
                 )
             seen.add(source.name)
         self._sources = sources
+        # By answer object, which each entry holds so its id names it alone:
+        # the resolution of an answer the first source gave.
+        self._resolved: dict[int, tuple[CostTerm, Resolution]] = {}
 
     @property
     def sources(self) -> tuple[CostSource, ...]:
@@ -153,11 +160,20 @@ class Resolver:
                 raise TypeError(
                     f"source {source.name!r} returned {answer!r}, not a cost term"
                 )
+            # An answer the first source gave before resolves as it did.
+            kept = None if declined else self._resolved.get(id(answer))
+            if kept is not None and kept[0] is answer:
+                return kept[1]
             stamped = CostTerm(
                 answer.name,
                 answer.seconds,
                 answer.provenance.resolved(source.name, declined),
                 by_bound=answer.by_bound,
             )
-            return Resolution(stamped, source.name, tuple(declined))
+            resolution = Resolution(stamped, source.name, tuple(declined))
+            if not declined:
+                if len(self._resolved) >= KEPT:
+                    self._resolved.clear()
+                self._resolved[id(answer)] = (answer, resolution)
+            return resolution
         raise CostRefused(request, declined)

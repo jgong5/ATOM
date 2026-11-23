@@ -110,7 +110,10 @@ CASES = {
     "compass-failure": (
         1,
         "first tests/compass/test_c.py::test_c; 2 more",
-        {"tests/compass/test_c.py": "def test_c():\n    assert False\n"},
+        {
+            "tests/compass/test_c.py": "def test_c():\n    assert False\n",
+            "scripts/compass/gpu_gate_driver_run.txt": "tests/compass/test_c.py\n",
+        },
         "",
     ),
     "no-pair": (
