@@ -5,22 +5,24 @@ DeepSeek-V4.1-Flash with DSpark5 at DP 2: each rank's step is its target,
 then on a decode its draft-KV pass and its block draft, on an output prefill
 its draft-KV pass and its propose pass. The group's step is the max over its
 ranks, and an idle rank runs a dummy forward that drafts but writes no draft
-context. Each rank's record is written from known per-rank laws, every line of
-a step labelled with the group's step, each pass the max over the ranks that
-ran it, as a real DP group's ranks each measure it; rank 1 runs the dummy
-forwards. The fitted law is read by `StepLinearLaw` and priced by
+context. Each rank's record is written from known per-rank laws: a pass that
+waits on its group labelled with the group's, the max over the ranks that ran
+it, as a real DP group's ranks each measure it, and a decode's draft-KV pass,
+which writes the rank's own draft context, with the rank's own; rank 1 runs
+the dummy forwards. The fitted law is read by `StepLinearLaw` and priced by
 `StepLinearBackend.price`.
 """
 
 import dataclasses
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from test_backend_step_linear_fit import _record, traced
+from test_backend_step_linear_fit import _engine_file, _record, traced
 
 from atom.compass.artifacts import machine_platform
 from atom.compass.backends import (
@@ -28,8 +30,15 @@ from atom.compass.backends import (
     RequestShape,
     StepLinearBackend,
     StepLinearLaw,
+    json_file,
+    step_linear_fit,
 )
-from atom.compass.backends.step_linear_fit import fit, label_records, mark_held_out
+from atom.compass.backends.step_linear_fit import (
+    fit,
+    label_records,
+    main,
+    mark_held_out,
+)
 from atom.compass.backends.work import activated_experts
 from atom.compass.fit import steps
 from atom.compass.spec import MachineSpec
@@ -96,8 +105,9 @@ def _seqs(view: BatchView, law: dict) -> float:
 
 
 def _groups(seed, n, others):
-    """`n` steps over `DP` ranks, each its ranks' views and its labels, every
-    pass's the max over the ranks that ran it. Every third step prefills on
+    """`n` steps over `DP` ranks, each its ranks' views and its labels: the
+    target's and the draft's the max over the ranks, `kv` each rank's own
+    draft-KV pass, None on a dummy forward. Every third step prefills on
     both ranks, each request finishing its prompt; the others decode at rung 4,
     rank `i % DP` the slowest with up to 4 rows of 6 queries, the other
     `others`' rows but no more, but every fifth, where rank 1 runs a dummy
@@ -162,10 +172,9 @@ def _groups(seed, n, others):
                 | ({} if v.dp_dummy else {"kv": _seqs(v, DRAFT_KV)})
                 for v in views
             ]
-        labels = {
-            k: max(p[k] for p in parts if k in p) for k in ("target", "kv", "draft")
-        }
+        labels = {k: max(p[k] for p in parts) for k in ("target", "draft")}
         assert all(parts[slow][k] == label for k, label in labels.items()), i
+        labels["kv"] = [p.get("kv") for p in parts]
         out.append(
             ([dataclasses.replace(v, dp_rank=r) for r, v in enumerate(views)], labels)
         )
@@ -173,21 +182,24 @@ def _groups(seed, n, others):
 
 
 def _records(path, groups):
-    """Rank `r`'s record of `groups`, its labels stretched by `1 + 0.01 r`: on
-    each step its target to `forward_done_event` less the draft-KV pass, that
-    pass, which a dummy forward does not run, and the rest of its device time
-    its draft; on a prefill the draft is its propose pass too."""
+    """Rank `r`'s record of `groups`: on each step its target to
+    `forward_done_event` less the draft-KV pass, that pass, which a dummy
+    forward does not run, and the rest of its device time its draft; on a
+    prefill the draft is its propose pass too. Each label its group's is
+    stretched by `1 + 0.01 r`, as a rank measures a pass its group waits on.
+    A decode's draft-KV pass is the rank's own; an output prefill's is the
+    group's, as the draft law's prefill vector is fitted over the group."""
     path.mkdir()
     paths = []
     for r in range(DP):
-        parts = [
-            {
-                k: round(s * (1 + 0.01 * r) * 1e9)
-                for k, s in labels.items()
-                if k != "kv" or not views[r].dp_dummy
-            }
-            for views, labels in groups
-        ]
+        parts = []
+        for views, labels in groups:
+            part = {k: labels[k] * (1 + 0.01 * r) for k in ("target", "draft")}
+            if views[r].prefill:
+                part["kv"] = max(labels["kv"]) * (1 + 0.01 * r)
+            elif labels["kv"][r] is not None:
+                part["kv"] = labels["kv"][r]
+            parts.append({k: round(s * 1e9) for k, s in part.items()})
         steps = [
             (
                 [(x.query_tokens, x.context_tokens, x.decode) for x in v[r].requests],
@@ -244,12 +256,12 @@ def _priced(law, views):
     return [backend.price(v) for v in views]
 
 
-def test_each_draft_vector_is_fitted_as_a_dp_vector_on_each_rank_s_rows(fitted):
+def test_each_draft_vector_is_fitted_on_the_labels_its_pass_is_measured_by(fitted):
     """The draft law's decode rung adopts the experts its block draft reaches,
-    over the drafter's own routing, as the target's does over its, and
-    `propose` and `draft_kv` recover each rank's law from labels each the
-    group's: the max over its ranks."""
-    law, _, _, _ = fitted
+    over the drafter's own routing, as the target's does over its; `propose`
+    recovers each rank's law from labels each the group's, the max over its
+    ranks, and `draft_kv` from each rank's own label, as at width 1."""
+    law, _, samples, _ = fitted
     draft = law["draft"]
     assert draft["moe_routing"] == {"experts": 128, "top_k": 3}
     for vector, expected in (
@@ -260,21 +272,33 @@ def test_each_draft_vector_is_fitted_as_a_dp_vector_on_each_rank_s_rows(fitted):
         assert vector["coefficients"] == pytest.approx(expected, rel=1e-5, abs=1e-12)
     for name, expected in (("propose", PROPOSE), ("draft_kv", DRAFT_KV)):
         assert draft[name]["coefficients"] == pytest.approx(expected, rel=1e-5)
-        assert draft[name]["fit"]["ranks"] == 0
-        assert draft[name]["fit"]["passes"]["stop"] == "settled"
+    assert draft["propose"]["fit"]["ranks"] == 0
+    assert draft["propose"]["fit"]["passes"]["stop"] == "settled"
     # Every per-rank row: each rank's label is the group's, so the slower
     # rank's coefficients do not fit the faster rank's rows.
-    assert draft["draft_kv"]["fit"]["all_rows"]["mad"] > 1e-3
+    assert draft["propose"]["fit"]["all_rows"]["mad"] > 1e-3
+    # Every decode rank that ran the pass is a sample of its own, fitted to
+    # within the labels' rounding to the nanosecond.
+    ran = [s for s in samples if s.draft_kv_s is not None and not s.view.prefill]
+    assert {s.rank for s in ran} == set(range(DP))
+    assert draft["draft_kv"]["fit"]["samples"] == len(ran)
+    assert draft["draft_kv"]["fit"]["mad"] < 1e-4
 
 
 def test_every_draft_pass_of_a_dp_step_is_priced_at_its_own_rank_s_rows(fitted):
-    """Each step's ranks priced apart: the max over them is the group's target
-    with its draft-KV pass, and its draft, on every step of a held-out run."""
+    """Each step's ranks priced apart, on every step of a held-out run: each
+    rank's draft-KV pass is its own, and the max over the ranks is the group's
+    target without it, and its draft."""
     law, _, _, _ = fitted
     for views, labels in _groups(2, 120, FULL):
         costs = _priced(law, views)
-        target = labels["target"] + labels["kv"]
-        assert max(c.target_seconds for c in costs) == pytest.approx(target, rel=1e-5)
+        kv = [
+            sum(t.seconds for t in c.terms if t.name.startswith("draft."))
+            for c in costs
+        ]
+        assert kv == pytest.approx([s or 0.0 for s in labels["kv"]], rel=1e-5)
+        target = max(c.target_seconds - s for c, s in zip(costs, kv))
+        assert target == pytest.approx(labels["target"], rel=1e-5)
         assert max(c.draft_seconds for c in costs) == pytest.approx(
             labels["draft"], rel=1e-5
         )
@@ -328,6 +352,61 @@ def test_the_draft_law_s_vectors_are_held_out_by_run(fitted):
     graded = cost_accuracy(root / "held", law)["validated"]
     for kind in ("prefill", "decode", "draft"):
         assert graded[kind]["on_totals"] == pytest.approx(0.0, abs=1e-5), kind
+
+
+def test_a_propose_step_a_rank_neither_labels_nor_idles_is_left_out(fitted):
+    """A step one rank proposes on, where its peer gives no propose label and
+    ran no dummy forward, has no group label the vector can price as the max
+    over its ranks: it is left out and counted, and the rest fit as before."""
+    _, _, samples, _ = fitted
+    peer = next(s for s in samples if s.rank == 1 and s.propose_s is not None)
+    planted = [
+        dataclasses.replace(s, propose_s=None) if s is peer else s for s in samples
+    ]
+    propose = fit(planted, OPTIONS)[0]["draft"]["propose"]
+    assert propose["fit"]["ranks"] == 1
+    assert propose["coefficients"] == pytest.approx(PROPOSE, rel=1e-5)
+
+
+def test_the_figures_command_folds_the_draft_law_over_the_drafter_s_routing(
+    fitted, tmp_path, monkeypatch
+):
+    """`figures` on the law restates the figures the fit wrote: each fold's
+    draft decode rung adopts the drafter's MoE column, over the routing the
+    law's draft states."""
+    law, _, _, root = fitted
+    records = []
+    for name in ("full", "half", "sparse"):
+        (tmp_path / name).mkdir()
+        for r in range(DP):
+            record = tmp_path / name / f"dp{r}.jsonl"
+            shutil.copyfile(root / name / record.name, record)
+            _engine_file(
+                record, {"data_parallel_size": DP, "enable_dp_attention": True}
+            )
+            records.append(record)
+    file = tmp_path / "law.json"
+    json_file.write_json(law, file)
+    written = json.loads(file.read_text())
+    file.write_text(json.dumps({**written, "figures": {}}))
+    folds = []
+
+    def kept(*args, **kwargs):
+        for fold in fold_laws(*args, **kwargs):
+            folds.append(fold[2])
+            yield fold
+
+    fold_laws = step_linear_fit._fold_laws
+    monkeypatch.setattr(step_linear_fit, "_fold_laws", kept)
+    main(["figures", *map(str, records), "--law", str(file)])
+
+    assert len(folds) == 3
+    for fold in folds:
+        rung = fold["draft"]["decode"]["4"]
+        assert rung["fit"]["moe_column"]["adopted"] == "moe_experts"
+    assert json.loads(file.read_text()) == written
+    for run in written["figures"].values():
+        assert run["draft"]["on_totals"] == pytest.approx(0.0, abs=1e-5)
 
 
 def test_fit_steps_takes_the_drafter_s_routing_from_the_served_model(fitted, tmp_path):

@@ -129,13 +129,15 @@ that label, the draft-KV pass a middle chunk runs too, and left out when
 nothing remains; the propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`,
 whatever lag the device ran at.
 A decode's draft-KV label fits the draft law's `draft_kv` vector alike. At
-`data_parallel_size` above 1 each of the two is fitted as the law's vectors are:
-a step is its ranks' labelled rows, labelled with the smallest, and priced as
-their max (`_pass_steps`); a step some rank neither labels nor ran as a dummy
-forward is left out, counted under the vector's `fit.ranks`. There
-`mark_held_out` gives the draft law's vectors `held_out` as it gives the law's,
-on the steps each is fitted on, `propose` and `draft_kv` priced as the max over
-each step's ranks (`_mark_dp_passes`). An
+`data_parallel_size` above 1 `propose`, whose drafter forward waits on its
+group, is fitted as the law's vectors are: a step is its ranks' labelled rows,
+labelled with the smallest, and priced as their max (`_pass_steps`); a step
+some rank neither labels nor ran as a dummy forward is left out, counted under
+the vector's `fit.ranks`. `draft_kv` is fitted there on each rank's own label,
+as at width 1: each rank writes its own draft context and waits on no peer
+(`GROUPED`). There `mark_held_out` gives the draft law's vectors `held_out` as
+it gives the law's, on the steps each is fitted on, `propose` priced as the max
+over each step's ranks and `draft_kv` at each rank's own (`_mark_dp_passes`). An
 output prefill's fits the draft law's prefill vector in place of its draft
 label, which, all after `forward_done_event`, fits the `propose` vector, and
 sets the draft law's `output_prefill_kv`. The target's vectors fit the device
@@ -1751,7 +1753,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         law["draft"]["propose"] = _propose(_rest(serial))
     elif drafts:
         for name, mine in _pass_samples(samples).items():
-            vector = mine and _propose(mine, PASSES[name], dp, samples)
+            width = dp if name in GROUPED else 1
+            vector = mine and _propose(mine, PASSES[name], width, samples)
             if vector:
                 law["draft"][name] = vector
             elif mine:
@@ -1830,6 +1833,9 @@ def _draft_kv(s) -> float:
 
 #: The draft law's vectors on `PROPOSE`, each with the label it is fitted on.
 PASSES = {"propose": "propose_s", "draft_kv": "draft_kv_s"}
+#: Those of `PASSES` whose pass waits on the rank's data-parallel peers, fitted
+#: over the group's steps (`_pass_steps`); the others on each rank's own label.
+GROUPED = ("propose",)
 
 
 def _pass_samples(samples) -> dict:
@@ -2131,23 +2137,31 @@ def _mark_passes(law: dict, report: dict, samples) -> None:
 
 def _mark_dp_passes(law: dict, report: dict, samples, dp: int) -> None:
     """`mark_held_out` for a data-parallel draft law's `PASSES` vectors: each
-    run's steps (`_pass_steps`) priced as the max over their ranks by the
-    vector fitted on the other runs, banded by vector."""
+    run's steps priced by the vector fitted on the other runs, banded by
+    vector; a `GROUPED` vector's step is its ranks' (`_pass_steps`), priced as
+    the max over them, another's each rank's sample at its own label."""
     from scipy.spatial import QhullError
 
     for name, mine in _pass_samples(samples).items():
         runs = list(dict.fromkeys(s.provenance["run"] for s in mine))
         if name not in law or len(runs) < 2:
             continue
-        rows = []
+        label, width, rows = PASSES[name], dp if name in GROUPED else 1, []
         for run in runs:
             others = [s for s in mine if s.provenance["run"] != run]
-            fold = _propose(others, PASSES[name], dp, samples)
+            fold = _propose(others, label, width, samples)
             if fold is None:
                 continue
             c = list(fold["coefficients"].values())
             held = [s for s in mine if s.provenance["run"] == run]
-            for step in _pass_steps(held, PASSES[name], dp, samples)[0]:
+            if width > 1:
+                steps = _pass_steps(held, label, dp, samples)[0]
+            else:
+                steps = [
+                    [(run, None, (1, len(s.view.requests)), getattr(s, label))]
+                    for s in held
+                ]
+            for step in steps:
                 price = {j: (float(np.dot(c, r[2])), r[2]) for j, r in enumerate(step)}
                 top = priced_rank(price)
                 error = price[top][0] / step[top][3] - 1.0
