@@ -107,6 +107,9 @@ def _producer(mc, log, meet, matched):
         _per_block_bytes_list=BLOCK_BYTES,
         _block_region_roles=[None, None],
         _block_region_consumer_indices=None,
+        _block_head_major_runs=(None, None),
+        _block_unit_specs=None,  # no backend here names its units
+        _unit_plans={},
         _num_local_layers=0,
         _start_layer=0,
         _MAX_RDMA_ENTRIES_PER_BATCH=2,
