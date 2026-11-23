@@ -2173,7 +2173,10 @@ class Stub:
                 got = rebuild_object(value["object"], build(path, value["state"], None))
                 cache = getattr(snap.attn_metadata, "cache", None)
                 geometry = getattr(cache, "geometry", None)
-                if value["object"] == RING and hasattr(geometry, "window_bytes"):
+                # A V4.1 pool places its BF16 window rings after its pages; an
+                # FP8 window's ring is on planes of its own, whatever the pages.
+                placed = hasattr(geometry, "window") and not geometry.window_fp8
+                if value["object"] == RING and placed:
                     at = _captured(geometry, op.get("rings", ()))
                     return _ring(geometry, cache.num_pages, got, at)
                 return got
@@ -3034,12 +3037,12 @@ def _widest(shape, stride) -> int:
 def _layers(geometry, captured) -> dict:
     """By page count, the layer of DeepSeek-V4.1's pool `geometry` whose window
     ring a pool of that many pages starts where `captured` (`RING`) does, and
-    its build (`V41PoolGeometry.window`, or `window_bytes` in bytes)."""
+    its build (`V41PoolGeometry.window`)."""
     found = {}
-    for build in (geometry.window, geometry.window_bytes)[: 1 + geometry.window_fp8]:
+    for build in (geometry.window,):
         first = build(0, 0)
         if dataclasses.replace(first, ring_start=captured.ring_start) != captured:
-            continue  # counted in the other unit
+            continue  # not this pool's ring
         # a layer's ring starts this far past the last's, on any pool
         step = build(min(1, geometry.layers - 1), 0).ring_start - first.ring_start
         for layer in range(geometry.layers):
