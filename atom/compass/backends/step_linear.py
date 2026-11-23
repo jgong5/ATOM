@@ -29,6 +29,18 @@ column priced the stretches (the warmup's first turns, c=256's prefill queue)
 about 5% high and the isolated prefills of c=8 to c=128 2-4% low (#3747). A
 vector with the column states its `duty_tau`, which must be `DUTY_TAU`, and a
 step stating no `prefill_duty` is refused.
+After `seqs` and `out` it may add `peer_small` and `peer_large` (`peer_share`):
+on a data-parallel rank's own prefill forward, output or middle chunk, whose
+peers run real rows (its group's MoE gather, `BatchView.moe_rows`, carrying
+more rows than its own tokens), 1 in the first where those peer rows are under
+`PEER_SMALL` of its own and 1 in the second where they are not, else 0; 0 on
+one rank and on a dummy forward. Each rank's forward waits on its peers' at
+every layer's MoE collective, and a peer's small real prefill costs the group
+device time a max over its ranks' prices does not hold: on cell B's P (#3720,
+DeepSeek-V4.1 DP2 EP2, store_bF5) steps whose largest rank ran 8k-24k tokens
+beside a peer under a quarter of them ran 21-28 ms over the law on every
+record, beside a larger peer 6-10 ms and beside a dummy 1-3 ms, both ranks'
+device windows alike and their host launches long done.
 Last, a prefill vector may add `padding`, the rows its token graph runs past
 the step's tokens (`token_padding`): ATOM replays a prefill's first layers at
 the smallest of the vector's `buckets`, the prefill token-graph buckets the
@@ -198,12 +210,18 @@ PREFILL_EXTRA = (
     "cold_peer_rows",
     "seqs",
     "out",
+    "peer_small",
+    "peer_large",
     "padding",
     "eager_dummy",
     "eager_dummy_tail",
 )
 #: The prefill vector's columns over a DP dummy forward run eagerly (`eager_dummy`).
 EAGER_DUMMY = ("eager_dummy", "eager_dummy_tail")
+#: The prefill vector's columns over its data-parallel peers' share of its rows
+#: (`peer_share`): below `PEER_SMALL` of them, and at or above it.
+PEER_SHARE = ("peer_small", "peer_large")
+PEER_SMALL = 0.25
 DECODE = ("step", "context", "graph_padding")
 #: The MoE columns a decode vector may add, over its step's real MoE tokens.
 MOE_COLUMNS = ("moe_tokens", "moe_experts")
@@ -311,10 +329,14 @@ def token_padding(view: BatchView, buckets: tuple[int, ...]) -> int | None:
 
 def hull_axes(features) -> tuple[int, ...]:
     """The positions in `features` of a vector's hull coordinates: all but the
-    intercept, first, and the `EAGER_DUMMY` indicators, which a hull in their
-    extra dimensions would only split into its 0 and 1 faces, at a cost
-    qhull's facet count grows by."""
-    return tuple(i for i, f in enumerate(features) if i and f not in EAGER_DUMMY)
+    intercept, first, and the `EAGER_DUMMY` and `PEER_SHARE` indicators, which
+    a hull in their extra dimensions would only split into its 0 and 1 faces,
+    at a cost qhull's facet count grows by."""
+    return tuple(
+        i
+        for i, f in enumerate(features)
+        if i and f not in EAGER_DUMMY and f not in PEER_SHARE
+    )
 
 
 def dummy_view(view: BatchView) -> BatchView:
@@ -352,6 +374,22 @@ def eager_dummy(view: BatchView, buckets: tuple[int, ...]) -> tuple[int, int] | 
         if padding:
             return 0, 0
     return 1, int(view.group_tail)
+
+
+def peer_share(view: BatchView) -> tuple[int, int]:
+    """`PEER_SHARE`'s counts for `view`: on a data-parallel rank's own prefill
+    forward whose peers run real rows, `moe_rows` less its own tokens, (1, 0)
+    where those rows are under `PEER_SMALL` of its own and (0, 1) where they
+    are not; else (0, 0), on one rank, which has no `moe_rows`, and on a dummy
+    forward too."""
+    if view.moe_rows is None or view.dp_dummy:
+        return 0, 0
+    own = sum_tokens(view.requests)
+    peers = view.moe_rows - own
+    if own <= 0 or peers <= 0:
+        return 0, 0
+    small = peers < PEER_SMALL * own
+    return int(small), int(not small)
 
 
 def cold_peer_rows(view: BatchView) -> float | None:
@@ -541,6 +579,9 @@ class StepLinearBackend(CostBackend):
                     f"which its {what}prefill terms depend on",
                 )
             counts += tuple(by_output[f] for f in mine)
+            if share := [f for f in PEER_SHARE if f in vector.features]:
+                got = dict(zip(PEER_SHARE, peer_share(batch_view)))
+                counts += tuple(got[f] for f in share)
             if vector.buckets:
                 padding = token_padding(batch_view, vector.buckets)
                 if padding is None:

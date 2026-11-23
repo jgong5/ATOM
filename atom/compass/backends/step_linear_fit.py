@@ -268,6 +268,7 @@ from atom.compass.backends.step_linear import (
     EAGER,
     HISTORY,
     MOE_COLUMNS,
+    PEER_SHARE,
     PREFILL,
     PROPOSE,
     EAGER_DUMMY,
@@ -278,6 +279,7 @@ from atom.compass.backends.step_linear import (
     hull_axes,
     moe_column,
     moe_tokens,
+    peer_share,
     rowmod,
     serial_passes,
     token_padding,
@@ -363,10 +365,11 @@ def _prefill_counts(
     buckets,
     eager,
     cold: bool = False,
+    share: bool = False,
 ) -> tuple:
     """The prefill vector's features of `view`'s step, `where` naming it in a
     refusal, as `_features` states them; under `eager` its `EAGER_DUMMY`,
-    under `cold` its `cold_peer_rows`."""
+    under `cold` its `cold_peer_rows`, under `share` its `PEER_SHARE`."""
     r = view.prefill
     counts = (1, sum_tokens(r), sum_query_square(r), sum_query_cached(r))
     if form == "history":
@@ -392,6 +395,8 @@ def _prefill_counts(
     if out:
         output = bool(view.produces_output)
         counts += (len(r) if output else 0, int(output))
+    if share:
+        counts += peer_share(view)
     if buckets:
         if (padding := token_padding(view, buckets)) is None:
             raise ValueError(
@@ -424,6 +429,35 @@ def _cold(options) -> bool:
     return True
 
 
+def _share(options) -> bool:
+    """Whether the prefill vector adds `PEER_SHARE`: as `options`'
+    `peer_share` states, False by default. Its columns mark a rank whose
+    data-parallel peers run real rows, so `dp` 1 refuses them."""
+    if not (options or {}).get("peer_share"):
+        return False
+    if _options(options)[1] == 1:
+        raise ValueError(
+            "peer_small and peer_large mark a prefill beside a data-parallel "
+            "peer's real rows, and these records run one rank"
+        )
+    return True
+
+
+def _keep_peer_tail(options) -> bool:
+    """Whether the prefill vector's solve keeps the slower steps a
+    `PEER_SHARE` column marks (`_fit_form`'s `protect`): as `options`'
+    `keep_peer_tail` states, False by default; without `peer_share` there
+    is no such column, which refuses it."""
+    if not (options or {}).get("keep_peer_tail"):
+        return False
+    if not _share(options):
+        raise ValueError(
+            "keep_peer_tail keeps the steps a peer_small or peer_large column "
+            "marks, and the fit adds neither without peer_share"
+        )
+    return True
+
+
 def _eager_dummies(samples, options) -> bool:
     """Whether the prefill vector adds `EAGER_DUMMY`: as `options` states, else
     above `dp` 1 when some prefill step of `samples` had a dummy peer and ran
@@ -451,6 +485,7 @@ def _features(
     buckets: tuple[int, ...] = (),
     eager: bool = False,
     cold: bool = False,
+    share: bool = False,
 ) -> tuple[list[tuple], dict]:
     """One rank's fittable samples as (vector, features, seconds, step, context,
     tokens, dummies, dummy), and how many were cut, per reason.
@@ -458,7 +493,7 @@ def _features(
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
     order, plus `history` or `cached_seqs` in its form, above `dp` 1 `moe_rows` on prefill and
     under `serial` `serial_moe_rows`, under `cold` `cold_peer_rows`, and under `draft` or on a step with a draft
-    label `seqs` and `out` on prefill, with `buckets` its `padding`, and under
+    label `seqs` and `out` on prefill, under `share` its `PEER_SHARE`, with `buckets` its `padding`, and under
     `eager` its `EAGER_DUMMY`, as `StepLinearBackend` counts them;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill;
     `tokens` a decode step's real MoE tokens under `routing`, the model's
@@ -479,10 +514,10 @@ def _features(
                 key = "prefill"
                 where = f"{s.provenance['run']} step {s.step}"
                 shape = (form, dp, serial, draft or s.draft_s is not None, buckets)
-                counts = _prefill_counts(view, where, *shape, eager, cold)
+                counts = _prefill_counts(view, where, *shape, eager, cold, share)
                 if dp > 1 and not draft:
                     dummy = _prefill_counts(
-                        dummy_view(view), where, *shape, eager, cold
+                        dummy_view(view), where, *shape, eager, cold, share
                     )
             else:
                 key = _rung_key(view.capture_rung)
@@ -1561,6 +1596,7 @@ def _fit_form(
     offset=0.0,
     kept: str = "step",
     drops: bool = True,
+    protect: np.ndarray | None = None,
 ) -> dict:
     """One form fitted by max-affine regression: step `i`'s label `y[i]` is the
     max over its ranks' rows `x[i, r]`, those `real[i, r]` holds, of their
@@ -1585,7 +1621,11 @@ def _fit_form(
     label, over its price. Steps whose residual is more than
     `MAD_K` scaled MADs from the median are then dropped and the passes rerun
     from there, until the kept set settles, for `MAD_PASSES` rounds, or until
-    the passes reach the limit; with `drops` false none is dropped. A kept step
+    the passes reach the limit; with `drops` false none is dropped. A step
+    `protect` marks is not dropped for running slower than its price, the
+    median's side of the scatter, unless it ran `WARM_FACTOR` times its price
+    or more: a class whose cost a one-sided tail carries is then priced at its
+    mean, not its median. A kept step
     priced at no time, which no equation can be divided by, ends the
     reweighting, and a MAD round drops it.
 
@@ -1699,6 +1739,9 @@ def _fit_form(
         centre = np.median(residual)
         mad = 1.4826 * np.median(np.abs(residual - centre))
         moved = np.abs(residual - centre) <= max(MAD_K * mad, MAD_FLOOR)
+        if protect is not None:
+            # A residual is (price - label) / price: a slower step's is lower.
+            moved |= protect & (residual < centre) & (residual > 1.0 - WARM_FACTOR)
         if (
             not drops
             or stop == "limit"
@@ -2015,6 +2058,7 @@ def _groups(
     buckets: tuple[int, ...] = (),
     eager: bool = False,
     cold: bool = False,
+    share: bool = False,
 ) -> tuple[list[dict[int, tuple]], dict, list[float]]:
     """One run's steps, each {rank: its `_features` row} labelled with the
     smallest rank label; what was cut; and each step's rank label spread. A
@@ -2022,15 +2066,17 @@ def _groups(
     dummy (`_features`' `dummy`), labelled the same, since the backend prices
     it as a rank of the group and the step waits for it; one that ran a decode
     step or, under `draft`, any step so holds none. With `steps`, only the
-    steps numbered in it; `serial`, `routing`, `buckets`, `eager` and `cold`
-    as `_features` reads them;
+    steps numbered in it; `serial`, `routing`, `buckets`, `eager`, `cold` and
+    `share` as `_features` reads them;
     `dummies`, each rank's steps run as dummy forwards, read from its samples
     when None: a rank that gave no sample needs them given."""
     if dummies is None:
         dummies = [rank[0].dummies for rank in run]
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
     got = [
-        _features(rank, form, len(run), draft, serial, routing, buckets, eager, cold)
+        _features(
+            rank, form, len(run), draft, serial, routing, buckets, eager, cold, share
+        )
         for rank in run
     ]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
@@ -2054,9 +2100,12 @@ def _groups(
     return groups, cut, spread
 
 
-def _fit_steps(steps: list[list[tuple]], names: list[str], design) -> dict:
+def _fit_steps(
+    steps: list[list[tuple]], names: list[str], design, protect=None
+) -> dict:
     """`_fit_form` of `steps`, each its ranks' `fit` rows, on `design(row)`, the
-    form's features of a row; with `rows`, each step's row at the rank picked.
+    form's features of a row, with `protect`, a step's mark, as `_fit_form`
+    takes it; with `rows`, each step's row at the rank picked.
     A rank that ran the step as a dummy forward holds its dummy's row, or none
     (`_groups`)."""
     width = max(map(len, steps))
@@ -2065,7 +2114,9 @@ def _fit_steps(steps: list[list[tuple]], names: list[str], design) -> dict:
     for i, step in enumerate(steps):
         for r, row in enumerate(step):
             x[i, r], real[i, r] = design(row), True
-    solved = _fit_form(x, real, np.array([s[0][3] for s in steps]), names)
+    marks = None if protect is None else np.array([protect(s) for s in steps])
+    y = np.array([s[0][3] for s in steps])
+    solved = _fit_form(x, real, y, names, protect=marks)
     solved["rows"] = [s[p] for s, p in zip(steps, solved["pick"])]
     return solved
 
@@ -2116,7 +2167,11 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     buckets, under which the prefill vector adds `padding`, and `cold`, under
     which above `dp` 1 it adds `cold_peer_rows` (`_cold`); `seed` fixes the
     `rowmod` shuffles; `draft`, or a sample with a draft label, adds `seqs` and
-    `out` to the prefill vector.
+    `out` to the prefill vector. `peer_share`, false by default, adds
+    `PEER_SHARE` to it above `dp` 1 (`_share`), and `keep_peer_tail`, false by
+    default and only with `peer_share`, keeps in its solve the slower steps a
+    `PEER_SHARE` column marks on some rank (`_fit_form`'s `protect`); its
+    `fit` then counts under `peer_tail` those kept past the MAD band.
     """
     from scipy.spatial import QhullError
 
@@ -2126,6 +2181,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     buckets = _buckets(options)
     eager = not draft and _eager_dummies(samples, options)
     cold = not draft and _cold(options)
+    share = not draft and _share(options)
+    keep_tail = not draft and _keep_peer_tail(options)
     samples = [
         (
             s
@@ -2146,6 +2203,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             buckets=buckets,
             eager=eager,
             cold=cold,
+            share=share,
         )
         groups += [[(i, *r) for r in g.values()] for g in got]
         spread += s
@@ -2155,6 +2213,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     prefill += ["cached_seqs"] * (form == "cached_seqs") + ["moe_rows"] * (dp > 1)
     prefill += ["serial_moe_rows"] * serial + ["cold_peer_rows"] * cold
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
+    prefill += list(PEER_SHARE) * share
     prefill += ["padding"] * bool(buckets) + list(EAGER_DUMMY) * eager
     law = {
         "provenance": f"step_linear_fit {form} on {len(runs) * dp} real records "
@@ -2199,6 +2258,14 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         if key is None:
             solved = _fit_steps(
                 steps, names, lambda r: (*r[2][1:], *(r[1] == k for k in rungs))
+            )
+        elif key == "prefill" and keep_tail:
+            marks = [names.index(f) for f in PEER_SHARE]
+            solved = _fit_steps(
+                steps,
+                names,
+                lambda r: r[2],
+                lambda step, marks=marks: any(r[2][j] for r in step for j in marks),
             )
         else:
             solved = _fit_steps(steps, names, lambda r: r[2])
@@ -2285,6 +2352,10 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     vector["buckets"] = list(buckets)
                 if cold:
                     vector["duty_tau"] = DUTY_TAU
+                if keep_tail:
+                    band = max(MAD_K * solved["mad"], MAD_FLOOR)
+                    past = np.abs(solved["residual"] - solved["centre"]) > band
+                    vector["fit"]["peer_tail"] = int((solved["keep"] & past).sum())
                 law["prefill"] = vector
             else:
                 law["decode"][k] = vector
@@ -2504,6 +2575,7 @@ def _fold_laws(samples, options, seed, draft: bool = False):
         "serial": _serial(samples, options),
         "eager_dummies": _eager_dummies(samples, options),
         "cold": _cold(options),
+        "peer_share": _share(options),
     }
     for run, ranks in _runs(samples, _options(options)[1]).items():
         others = [s for s in samples if s.provenance["run"] != run]
@@ -2522,6 +2594,7 @@ def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None
         "serial": _serial(samples, options),
         "eager_dummies": _eager_dummies(samples, options),
         "cold": _cold(options),
+        "peer_share": _share(options),
     }
     if warm is None:
         warm = fit(samples, options, seed, draft)[0]["warm_steps"]
@@ -2537,6 +2610,7 @@ def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None
             buckets=_buckets(options),
             eager=not draft and options["eager_dummies"],
             cold=not draft and options["cold"],
+            share=not draft and options["peer_share"],
         )[0]:
             key, _, seconds, step, *_ = next(iter(group.values()))
             if step in warm[i]:
