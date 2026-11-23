@@ -22,7 +22,7 @@ from test_bench_ops import KEY, TREE, _graph, _leaf, _t
 from test_bench_ops import _Runner as OpsRunner
 from test_bench_replay_state import MTP1, gdn_config
 from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
-from test_gdn_prefill_metadata_host import GDNStateMixin  # importable with no device
+from test_prefill_host_reads import gdn_attn  # importable with no device
 
 from atom.compass import ir
 from atom.compass.bench import ops, replay
@@ -31,6 +31,8 @@ from atom.config import KVCacheTensor
 from atom.utils import forward_context as fctx
 
 pytestmark = pytest.mark.usefixtures("unpriced")
+
+GDNStateMixin = gdn_attn.GDNStateMixin
 
 BF16 = "torch.bfloat16"
 #: The layer's state slots: three placements of two rows of two each.

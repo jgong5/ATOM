@@ -297,16 +297,15 @@ def add_lmcache(
     engine: str,
     lmcache_ipc_s: float,
     dp: int = 1,
-    writers: int = 1,
 ) -> None:
     """LP ``lmcache``, the lmcache MP server, and its channels to and from `engine`.
 
     Per DP rank, ``lookup#dp<r>`` carries the scheduler adapter's requests and
-    their replies, which lmcache's client polling thread takes; per writer rank
-    ``k``, ``transfer#dp<r>.tp<k>`` carries a STORE or RETRIEVE from the step
-    loop and its reply back to it. The server's loop takes every request
-    itself. Each is one ZMQ hop of `lmcache_ipc_s`, which must be positive:
-    engine to server and back is a cycle.
+    their replies, which lmcache's client polling thread takes, and
+    ``transfer#dp<r>`` every writer rank's STORE or RETRIEVE from the step loop,
+    in rank order, and its reply back to it. The server's loop takes every
+    request itself. Each is one ZMQ hop of `lmcache_ipc_s`, which must be
+    positive: engine to server and back is a cycle.
     """
     if not lmcache_ipc_s > 0.0:
         raise ValueError(
@@ -315,9 +314,7 @@ def add_lmcache(
         )
     eng, lm = LpId(engine), table.registry.register(LpId("lmcache"))
     kinds = [(f"lookup#dp{r}", "thread") for r in range(dp)]
-    kinds += [
-        (f"transfer#dp{r}.tp{k}", "inline") for r in range(dp) for k in range(writers)
-    ]
+    kinds += [(f"transfer#dp{r}", "inline") for r in range(dp)]
     for kind, back in kinds:
         table.declare(f"{engine}->lmcache:{kind}", eng, lm, lmcache_ipc_s, "inline")
         table.declare(f"lmcache->{engine}:{kind}", lm, eng, lmcache_ipc_s, back)

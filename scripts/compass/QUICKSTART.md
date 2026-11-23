@@ -11,6 +11,10 @@ not a sustainable configuration
 `smoke_cell.sh` runs the same path at one concurrency in about an hour, so start
 there (below), then run the full cell.
 
+To search several configurations for the one to deploy, from a space file to a
+recommendation, follow [ADVICE.md](ADVICE.md); it runs in this page's
+Environment, with its Variables.
+
 ## Concepts
 
 Compass replaces only ATOM's forward pass. The scheduler, the KV block manager,
@@ -311,6 +315,21 @@ Each prints its token last, `published step_linear_law(...) as <token>` and
 there refuses every step it prices. `fit host` takes no trace run: a trace run's
 host segments ran under the profiler.
 
+**Steps 1, 2 and 4 in one command.** `calibrate.sh` takes a warm record, the
+readings, the records and both fits, publishing into `STORE`, and resumes a
+stopped run without taking a finished step again; its variables are in its
+header. In the background, so it outlives the shell:
+
+```bash
+setsid nohup env STORE=$R/store GPU=$G AIPERF_PYTHON=$REAL_PY $T/scripts/compass/calibrate.sh \
+  $R/calibration 1 4 16 'trace 16' 'trace 4' > $R/calibration.log 2>&1 < /dev/null &
+```
+
+`$R/calibration/status` holds each step's start, its end with its wall seconds, or its
+failure with its reason. Its end prints the tokens to take as `LAW` and `HOST`,
+each step's wall seconds and the node-hours. Run it again to resume one that
+failed.
+
 **5. Simulated runs** (CPU, 2 to 4 min per concurrency).
 
 ```bash
@@ -374,11 +393,12 @@ Reference results: the graded tables of
 ## The smoke cell
 
 `smoke_cell.sh MODEL OUT` runs steps 0 to 6 at c=1 on one GPU, step 1 first:
-step 0's record, one calibration record of traces 353 to 360, two real runs and
-one simulated run of traces 0 to 7, each client run 600 s. It fits before the
-real runs, so a failed fit costs no more GPU time. Its variables are in its
-header. It may run on a busy node (GPUs are shared), and its real runs count
-toward the two at once.
+step 0's record, one calibration record of traces 353 to 360 with the
+blocking-call tool and a trace run of it, two real runs and one simulated run of
+traces 0 to 7, each client run 600 s. It fits before the real runs, so a failed
+fit, or a law that leaves a vector unfitted, costs no more GPU time. Its
+variables are in its header. It may run on a busy node (GPUs are shared), and
+its real runs count toward the two at once.
 
 ```bash
 GPU=$G DEVICE=mi308x PTL=enabled READINGS=$R/store HARNESS_PYTHON=$SIM_PY AIPERF_PYTHON=$REAL_PY \
@@ -391,7 +411,8 @@ names the step that failed, and exits 1 unless the cell is graded. At abc5f542f
 on node 18, in a container that held step 0's build, it took 61 min: 2 min for
 step 1, 14 min for calibration, 14 to 15 min per server of traces 0 to 7, step
 0's included, each with one warmup request of 113 s, and 2 min for the simulated
-run; the cell was graded.
+run; the cell was graded. That run took no trace run, which adds a server's
+start, its warmup, `TRACE_S` and a stop that writes and reduces its traces.
 
 A law has a decode vector only for the batch sizes its calibration took. At
 `client.sh`'s seed, traces 0 to 7 start mid-session and batch up to 4 requests a
@@ -402,9 +423,9 @@ concurrency does not help: aiperf sends each lane's next request at its
 trace-time offset from the lane's start and caps an idle gap only while no lane
 is busy, so at c=4 one lane carried the 600 s. Its cost rows all read
 `unvalidated` too: `fit steps` marks the
-region it validates by holding out each calibration record in turn, so it needs
-two or more, and the smoke cell has one. The smoke cell checks the path, not the
-law's accuracy.
+region it validates by holding out each record in turn, so a vector needs two
+or more records that label it, and the smoke cell has one calibration record and
+one trace run. The smoke cell checks the path, not the law's accuracy.
 
 ## Traps
 
