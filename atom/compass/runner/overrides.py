@@ -171,7 +171,7 @@ RPC_SURFACE: dict[str, bool] = {
     # Reached only after a fit, so never: ATOM's own.
     "take_dynamic_chunking_fit": True,  # EngineCore reads the reply
     "release_multimodal_requests": False,  # EngineCore does not wait
-    "release_structured_requests": False,  # EngineCore does not wait
+    "release_constraints": False,  # EngineCore does not wait
     # Refused by `RefusedControlCommands`: ATOM's own starts a real profiler.
     "start_profiler": True,  # EngineUtilityHandler forwards the reply unread
     "stop_profiler": True,  # EngineUtilityHandler forwards the reply unread
