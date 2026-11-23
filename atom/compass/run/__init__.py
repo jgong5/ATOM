@@ -1665,10 +1665,24 @@ def _price_images(price: float | None) -> None:
     """Make `MediaLoader.load_image` charge `price` seconds to the station job
     loading the image. Refuse an image named by an http(s) URL, which the real
     server fetches on wall time, and any image when the run file states no
-    price."""
+    price. The server fetches a chat's URLs itself before its media loader
+    sees them (`images.load_chat_images`), so its download refuses too."""
+    from atom.entrypoints.openai import images
     from atom.multimodal.media import MediaLoader
     from atom.utils.compass_loop import Refused, charge
 
+    download = images._download
+
+    @functools.wraps(download)
+    def refusing(url):
+        rt = clock.installed()
+        if rt is None:  # no LP clock in this process: a load outside any run
+            return download(url)
+        why = "an image named by a remote URL"
+        rt.refusals.append(f"media:{why}")
+        raise Refused(("media", why))
+
+    images._download = refusing
     load = MediaLoader.load_image
 
     @functools.wraps(load)
