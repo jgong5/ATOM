@@ -109,9 +109,10 @@ def test_a_later_step_prices_only_what_it_moved_again(monkeypatch):
         run.price(_step(*s))
 
     # the GEMM at the graph's first two steps, the second planning it;
-    # attention at each step but the last, a view priced before
-    assert asked == {GEMM: 2, ATTENTION: len(STEPS) - 1}
-    # the experts there too, and at each later step that moves the tokens
+    # attention at each step but the last, a view priced before; the experts
+    # and the GEMM beside them there too, and at each later step that moves
+    # the tokens
+    assert asked == {GEMM: 2 + 4, MOE: 4, ATTENTION: len(STEPS) - 1}
     assert works[MOE] == 4
 
 

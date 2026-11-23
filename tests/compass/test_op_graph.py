@@ -3,7 +3,8 @@
 
 Each leaf is one roofline over its work; a `Seq` adds, a `Repeat` re-emits its
 body's prices, a `max` `Par` takes its longest branch, and a
-`resource_bound` `Par` costs one roofline over the branches' summed work. A step runs at its rung's
+`resource_bound` `Par` its longest branch too, or one roofline over the
+branches' summed work where that is longer. A step runs at its rung's
 graph, or its width's under ``padding: none``, a prefill at its tokens and
 rows; attention reads its context in the run's KV format. What cannot be
 priced is refused by name, each reason once. The Qwen3.8-27B TP1 capture prices leaf by leaf, and `run.runner` installs the
@@ -998,7 +999,7 @@ def test_a_prefill_whose_rows_cached_tokens_differ_is_not_validated(rows, valida
     assert term.provenance.validated is validated
 
 
-def test_a_resource_bound_par_prices_its_leaves_work_not_their_listed_prices():
+def test_a_resource_bound_par_whose_roofline_passes_its_listed_branches_is_it():
     big = g(2, 4096, 4096)
     params = listed(
         *[pt(g(b, 4096, 4096), f"decode B={b}", 1e3, c) for b in (2, 4) for c in (1, 9)]
@@ -1009,6 +1010,32 @@ def test_a_resource_bound_par_prices_its_leaves_work_not_their_listed_prices():
     summed = gemm(2, 4096, 4096) + gemm(2, 4096, 4096)
 
     assert by_name(cost) == {"par.resource_bound": price(summed, SPEC)}
+
+
+def test_a_resource_bound_par_whose_listed_branch_passes_its_roofline_is_it():
+    # each GEMM listed at a millisecond, far past the three's roofline
+    params = listed(
+        *[pt(g(b, 4096, 4096), f"decode B={b}", 1e6, c) for b in (2, 4) for c in (1, 9)]
+    )
+    two = {"seq": [g(2, 4096, 4096), g(2, 4096, 4096)]}
+    pooled = {"par": [two, g(2, 4096, 4096)], "join": "resource_bound"}
+    cost = backend(pooled, price_list=params).price(DECODE)
+
+    assert price(gemm(2, 4096, 4096), SPEC) * 3 < 1e-3
+    assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(2e-3)}
+    assert cost.terms[0].provenance.method is Method.MEASURED
+
+
+def test_a_resource_bound_par_whose_branch_of_rooflines_passes_its_roofline_is_it():
+    # three GEMMs at the kernel floor beside one: the four's roofline is a floor
+    three = {"seq": [g(2, 64, 64) for _ in range(3)]}
+    pooled = {"par": [three, g(2, 64, 64)], "join": "resource_bound"}
+    floor = price(gemm(2, 64, 64), SPEC)
+
+    assert price(sum([gemm(2, 64, 64)] * 4, Work()), SPEC) == floor
+    assert by_name(backend(pooled).price(DECODE)) == {
+        f"op.{GEMM}": fold_seconds([floor] * 3)
+    }
 
 
 def test_each_micro_batch_of_a_split_step_prices_at_its_own_shape():
