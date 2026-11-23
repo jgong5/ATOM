@@ -583,7 +583,8 @@ completes inside an intake hands its result on when the intake ends, whatever wa
 its real thread took. A request that arrives once the last intake has ended is charged
 `http_intake.idle_s` in place of `fixed_s` (revised 2026-10-20,
 [#1775](https://github.com/jgong5/ATOM/issues/1775)). In a burst, `fixed_s` is the loop's
-whole time per request: between two template starts the loop also parses the next request
+whole time per request: between two template starts, or two pool job submits on a server
+that renders no template ([#3229](https://github.com/jgong5/ATOM/issues/3229)), the loop also parses the next request
 and finishes earlier ones after their encode (the result, `add_request`, the response
 start). A lone request waits for none of that, only for its own path: from the ASGI app call
 to its tokenizer pool job, and from the job's end to its engine send, as
