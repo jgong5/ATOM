@@ -258,7 +258,10 @@ def _engine(rank):
     core.scheduler = Scheduler(MockConfig())
     core.scheduler.kv_connector = _mooncake()
     core.kv_transfer_enabled = True
+    core._kv_progress_event = threading.Event()
     core.runner_mgr = _Workers(rank)
+    core.input_queue = queue.Queue()
+    core.utility_queue = queue.Queue()
     core.output_queue = queue.Queue()
     core.stream_output_queue = queue.Queue()
     return core
@@ -272,7 +275,8 @@ def _step(core):
 
 def _parked(core):
     """A request the router sends on, prefilled and finished by one engine
-    step, and its rank's last."""
+    step, and its rank's last. A finished prefill's source reaches its rank
+    in the metadata of the step after it, here an idle one."""
     seq = Sequence(
         [1, 2, 3, 4],
         4,
@@ -280,6 +284,7 @@ def _parked(core):
         kv_transfer_params={"do_remote_decode": True},
     )
     core.scheduler.add(seq)
+    _step(core)
     _step(core)
     assert seq.id in core.scheduler.deferred_free_blocks
     assert seq.id in core.runner_mgr.rank._completed_prefills
