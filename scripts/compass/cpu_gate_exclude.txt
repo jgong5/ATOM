@@ -117,6 +117,9 @@ tests/test_benchmark_catalog.py
 # 4 tests fail without a driver on nightly 202611151511: `No gfx arch found in rocminfo
 # output.`; pure upstream b7b5ec3f2 fails the same 4, 384375db0
 tests/test_deepseek_v41_mono_hi_gate.py
+# 4 tests error at setup without a driver on nightly 202611151511: `torch.finfo()
+# requires a floating point input type`, aiter's fp8 dtype unresolved; pure upstream b7b5ec3f2 errors the same 4
+tests/test_deepseek_v41_mono_hi_rope.py
 # fails without a driver on nightly 20261026: Triton's arch probe finds `0 active
 # drivers` and aiter's fallback raises `No module named 'jax'`; pure upstream e893780f4 + f6a0c132 fails the same, ca8a54916
 tests/test_deepseek_v4_wo_a_dequant.py
