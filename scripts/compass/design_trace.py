@@ -45,13 +45,32 @@ from pathlib import Path
 BLOCK, MODEL, ACCEPT, K, RANKS = 64, "claude-opus-4-8", 3.51, 1024, 4
 RUNGS = (64, 48, 40, 32, 24, 16, 8, 4, 2, 1)  # args agg's capture sizes, widest first
 #: Decode group step seconds per rung, ms: the dry run's (store_c128's law), 2026-11-19.
-STEP_MS = {64: 48, 48: 40, 40: 36, 32: 31, 24: 28, 16: 24, 8: 19, 4: 14.3, 2: 13.9, 1: 12}
+STEP_MS = {
+    64: 48,
+    48: 40,
+    40: 36,
+    32: 31,
+    24: 28,
+    16: 24,
+    8: 19,
+    4: 14.3,
+    2: 13.9,
+    1: 12,
+}
 MIX = ((0.4, 8 * K, 64 * K), (0.4, 64 * K, 256 * K), (0.2, 256 * K, 600 * K))
 CAP = 880 * K  # a prompt, under the model's 1M context with the longest output
-S1_FIRST, S1_DELTA, S1_OUT = (2, 16, 64, 200, 400, 700), (128, K, 4 * K, 16 * K), (32, 512)
+S1_FIRST, S1_DELTA, S1_OUT = (
+    (2, 16, 64, 200, 400, 700),
+    (128, K, 4 * K, 16 * K),
+    (32, 512),
+)
 PROBE_FIRST, PROBE_OUT = (16, 96, 256, 512), (16, 128)
 PROBE_DELTA = (128, 512, 2 * K, 8 * K, 32 * K)
-S3_DELTA, S3_OUT, S3_GAP = (256, K, 4 * K, 2 * K, 512), (64, 256, 1024, 128), (0.5, 1.5, 3.0, 1.0)
+S3_DELTA, S3_OUT, S3_GAP = (
+    (256, K, 4 * K, 2 * K, 512),
+    (64, 256, 1024, 128),
+    (0.5, 1.5, 3.0, 1.0),
+)
 
 
 def blocks(n: int) -> int:
@@ -62,12 +81,23 @@ def trace(name: str, turns) -> dict:
     """A trace of `turns`, (t, prompt, out) each; prompt i's blocks are 0..n-1,
     so each turn's hash_ids extend the one before."""
     reqs = [
-        {"t": round(t, 3), "type": "s", "model": MODEL, "in": n, "out": out,
-         "hash_ids": list(range(n // BLOCK))}
+        {
+            "t": round(t, 3),
+            "type": "s",
+            "model": MODEL,
+            "in": n,
+            "out": out,
+            "hash_ids": list(range(n // BLOCK)),
+        }
         for t, n, out in turns
     ]
-    return {"id": name, "models": [MODEL], "block_size": BLOCK,
-            "hash_id_scope": "local", "requests": reqs}
+    return {
+        "id": name,
+        "models": [MODEL],
+        "block_size": BLOCK,
+        "hash_id_scope": "local",
+        "requests": reqs,
+    }
 
 
 def session(first: int, follow, out0: int) -> list:
@@ -89,9 +119,10 @@ def prompts(groups: int) -> list[int]:
     counts[1] += groups - sum(counts)
     values = sorted(
         BLOCK * round(lo * (hi / lo) ** ((i + 0.5) / c) / BLOCK)
-        for c, (_, lo, hi) in zip(counts, MIX) for i in range(c)
+        for c, (_, lo, hi) in zip(counts, MIX)
+        for i in range(c)
     )
-    vdc = lambda i: int(f"{i:016b}"[::-1], 2)  # noqa: E731
+    vdc = lambda i: int(f"{i:016b}"[::-1], 2)
     order = sorted(range(groups), key=vdc)
     return [values[order.index(i)] for i in range(groups)]
 
@@ -118,7 +149,11 @@ def s2(rows, dwell, step_ms, tail, spread, period, waves):
         for m, f in enumerate(spread):
             stop = last[m] if g == rows - 1 else end
             size = min(CAP, BLOCK * round(n * f / BLOCK))
-            lanes.append(trace(f"rc-s2a-g{g:02d}-m{m}", [(0.0, size, 1 + math.ceil(ACCEPT * stop))]))
+            lanes.append(
+                trace(
+                    f"rc-s2a-g{g:02d}-m{m}", [(0.0, size, 1 + math.ceil(ACCEPT * stop))]
+                )
+            )
     ramp = sum(dwell for r in steps) + (RANKS - 1) * tail
     waves = waves or int(ramp / period)
     for g in range(8):
@@ -138,9 +173,17 @@ def s2(rows, dwell, step_ms, tail, spread, period, waves):
                 est = 0.1 + delta / 50000 + math.ceil(out / ACCEPT) * 0.03
                 prev = w
             first = PROBE_FIRST[g % 4] * K
-            lanes.append(trace(f"rc-s2b-g{g}-m{m}", session(first, follow, PROBE_OUT[0])))
-    plan = {"decode_steps": steps, "group_end_steps": ends, "last_group_end_steps": last,
-            "waves": waves, "period": period, "est_ramp_s": ramp}
+            lanes.append(
+                trace(f"rc-s2b-g{g}-m{m}", session(first, follow, PROBE_OUT[0]))
+            )
+    plan = {
+        "decode_steps": steps,
+        "group_end_steps": ends,
+        "last_group_end_steps": last,
+        "waves": waves,
+        "period": period,
+        "est_ramp_s": ramp,
+    }
     return lanes, plan
 
 
@@ -148,11 +191,21 @@ def s3(lanes: int, turns: int) -> list:
     """S3's sessions: lane i's first prompt the (i + 1/2)/lanes quantile of
     log-uniform 8k..256k, its turns' delta, out and gap cycling apart."""
     return [
-        trace(f"rc-s3-{i:02d}", session(
-            BLOCK * round(8 * K * 32 ** ((i + 0.5) / lanes) / BLOCK),
-            [(S3_GAP[(i + j) % 4], S3_DELTA[(i + j) % 5], S3_OUT[(i + 2 * j) % 4])
-             for j in range(1, turns)],
-            S3_OUT[i % 4]))
+        trace(
+            f"rc-s3-{i:02d}",
+            session(
+                BLOCK * round(8 * K * 32 ** ((i + 0.5) / lanes) / BLOCK),
+                [
+                    (
+                        S3_GAP[(i + j) % 4],
+                        S3_DELTA[(i + j) % 5],
+                        S3_OUT[(i + 2 * j) % 4],
+                    )
+                    for j in range(1, turns)
+                ],
+                S3_OUT[i % 4],
+            ),
+        )
         for i in range(lanes)
     ]
 
@@ -162,21 +215,37 @@ def main(argv=None) -> None:
     p.add_argument("out", type=Path)
     p.add_argument("--rows", type=int, default=56, help="S2a lanes a DP rank (groups)")
     p.add_argument("--dwell", type=float, default=40.0, help="seconds a decode rung")
-    p.add_argument("--tail", type=float, default=10.0, help="seconds at 3, 2, 1 busy ranks")
-    p.add_argument("--spread", default="0.55,0.8,1.2,1.45", help="a group's member sizes")
-    p.add_argument("--step-ms", type=json.loads, default=None, help="{rung: ms} over STEP_MS")
-    p.add_argument("--period", type=float, default=7.5, help="seconds between probe waves")
+    p.add_argument(
+        "--tail", type=float, default=10.0, help="seconds at 3, 2, 1 busy ranks"
+    )
+    p.add_argument(
+        "--spread", default="0.55,0.8,1.2,1.45", help="a group's member sizes"
+    )
+    p.add_argument(
+        "--step-ms", type=json.loads, default=None, help="{rung: ms} over STEP_MS"
+    )
+    p.add_argument(
+        "--period", type=float, default=7.5, help="seconds between probe waves"
+    )
     p.add_argument("--waves", type=int, default=0, help="probe waves (0: the ramp's)")
     p.add_argument("--s3", type=int, default=32, help="S3 lanes (0: no S3)")
     p.add_argument("--s3-turns", type=int, default=40, help="turns an S3 session")
     a = p.parse_args(argv)
     step_ms = STEP_MS | {int(k): float(v) for k, v in (a.step_ms or {}).items()}
     s1 = [
-        trace(f"rc-s1-{i}", session(f * K, [(1.0, S1_DELTA[(j - 1) % 4], S1_OUT[j % 2])
-                                            for j in range(1, 8)], S1_OUT[0]))
+        trace(
+            f"rc-s1-{i}",
+            session(
+                f * K,
+                [(1.0, S1_DELTA[(j - 1) % 4], S1_OUT[j % 2]) for j in range(1, 8)],
+                S1_OUT[0],
+            ),
+        )
         for i, f in enumerate(S1_FIRST)
     ]
-    s0 = [trace(f"rc-s0-{i}", [(0.0, BLOCK * blocks(100_000), 64)]) for i in range(RANKS)]
+    s0 = [
+        trace(f"rc-s0-{i}", [(0.0, BLOCK * blocks(100_000), 64)]) for i in range(RANKS)
+    ]
     spread = sorted(map(float, a.spread.split(",")))
     if len(spread) != RANKS:
         p.error(f"--spread names {len(spread)} sizes, one a member of {RANKS}")
@@ -186,12 +255,17 @@ def main(argv=None) -> None:
     if a.s3:
         segments["s3"] = (s3(a.s3, a.s3_turns), a.s3)
     for name, (traces, _) in segments.items():
-        (a.out / f"{name}.jsonl").write_text("".join(json.dumps(t) + "\n" for t in traces))
+        (a.out / f"{name}.jsonl").write_text(
+            "".join(json.dumps(t) + "\n" for t in traces)
+        )
     plan |= {"step_ms": step_ms, "args": {k: str(v) for k, v in vars(a).items()}}
     plan["segments"] = {
-        name: {"traces": len(t), "concurrency": c,
-               "requests": sum(len(x["requests"]) for x in t),
-               "prompt_tokens": sum(r["in"] for x in t for r in x["requests"])}
+        name: {
+            "traces": len(t),
+            "concurrency": c,
+            "requests": sum(len(x["requests"]) for x in t),
+            "prompt_tokens": sum(r["in"] for x in t for r in x["requests"]),
+        }
         for name, (t, c) in segments.items()
     }
     (a.out / "plan.json").write_text(json.dumps(plan, indent=1))

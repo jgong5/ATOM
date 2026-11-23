@@ -269,11 +269,11 @@ from atom.compass.backends.step_labels import CUTS, HOST_SEGMENTS, host_kind
 from atom.compass.backends.step_linear import (
     DECODE,
     EAGER,
+    EAGER_DUMMY,
     HISTORY,
     MOE_COLUMNS,
     PREFILL,
     PROPOSE,
-    EAGER_DUMMY,
     cached_seqs,
     cold_peer_rows,
     dummy_view,
@@ -2049,7 +2049,10 @@ def _groups(
     for step in sorted(set().union(*ranks)):
         group = {i: rank[step] for i, rank in enumerate(ranks) if step in rank}
         idle = [i for i, d in enumerate(dummies) if step in d]
-        if len(group) + len(idle) < len(ranks) or len({r[0] for r in group.values()}) > 1:
+        if (
+            len(group) + len(idle) < len(ranks)
+            or len({r[0] for r in group.values()}) > 1
+        ):
             cut["ranks"] += 1
             continue
         labels = [r[2] for r in group.values()]
@@ -2697,9 +2700,7 @@ def fill_rungs(law: dict, ladder) -> dict:
             rule = f"rung {rung} filled, no record reached it: {how}"
             vector = {
                 "coefficients": coefficients,
-                "hull": {
-                    "facets": [[x, *[0.0] * (free - 1), c] for x, c in NO_POINT]
-                },
+                "hull": {"facets": [[x, *[0.0] * (free - 1), c] for x, c in NO_POINT]},
                 "declared": rule,
                 "filled": {"from": list(pair), "weight": w},
             }
@@ -2708,9 +2709,7 @@ def fill_rungs(law: dict, ladder) -> dict:
             decode[str(rung)] = vector
             filled[("draft " if of is not law else "") + str(rung)] = rule
     if filled:
-        law["filled"] = {
-            k: v for k, v in sorted(filled.items(), key=lambda kv: kv[0])
-        }
+        law["filled"] = {k: v for k, v in sorted(filled.items(), key=lambda kv: kv[0])}
         law[FILLED_RUNGS] = filled_rungs(law)
     return filled
 

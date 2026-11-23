@@ -28,7 +28,12 @@ from pathlib import Path
 
 import numpy as np
 
-from atom.compass.backends import CostRefused, StepLinearBackend, StepLinearLaw, step_labels
+from atom.compass.backends import (
+    CostRefused,
+    StepLinearBackend,
+    StepLinearLaw,
+    step_labels,
+)
 from atom.compass.backends.hull import Hull
 from atom.compass.backends.shape import BatchView, RequestShape, sum_context
 from atom.compass.backends.step_linear import dummy_view
@@ -40,10 +45,14 @@ def steps(run: str):
     prefill dummies at their dummy view."""
     path, _, span = run.partition(":")
     lo, hi = map(int, span.split("-")) if span else (0, 1 << 62)
-    files = sorted(Path(path, "steps").glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
+    files = sorted(
+        Path(path, "steps").glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:])
+    )
     ranks = [[json.loads(x) for x in f.read_text().splitlines()] for f in files]
     dummies, peaks = step_labels.group_dummies(ranks), step_labels.group_peaks(ranks)
-    tails, at = step_labels.group_tails(ranks), [{s["step"]: s for s in r} for r in ranks]
+    tails, at = step_labels.group_tails(ranks), [
+        {s["step"]: s for s in r} for r in ranks
+    ]
     for n in sorted(set().union(*at)):
         group = {r: x[n] for r, x in enumerate(at) if n in x}
         real = {r: s for r, s in group.items() if not s["is_dummy_run"]}
@@ -53,11 +62,16 @@ def steps(run: str):
         for r, s in real.items():
             views[r] = BatchView(
                 tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
-                capture_rung=s["rung"], moe_rows=s.get("moe_rows"),
-                moe_tokens=s.get("moe_tokens") or step_labels.group_tokens(list(group.values())),
-                produces_output=s["produces_output"], draft_bs=s.get("draft_bs"),
-                dp_rank=s["dp_rank"], group_dummies=dummies.get(n, 0),
-                group_max_tokens=peaks.get(n), group_tail=n in tails,
+                capture_rung=s["rung"],
+                moe_rows=s.get("moe_rows"),
+                moe_tokens=s.get("moe_tokens")
+                or step_labels.group_tokens(list(group.values())),
+                produces_output=s["produces_output"],
+                draft_bs=s.get("draft_bs"),
+                dp_rank=s["dp_rank"],
+                group_dummies=dummies.get(n, 0),
+                group_max_tokens=peaks.get(n),
+                group_tail=n in tails,
                 group_needs_eager=s.get("group_needs_eager", False),
             )
         peer = next(iter(views.values()))
@@ -120,16 +134,24 @@ def main(argv=None) -> None:
             vector, x = points.step(views)
             key = vector if x is None else vector.name
             inside = x is not None and (
-                key in hulls and hulls[key].contains(x) if a.population else vector.hull.contains(x)
+                key in hulls and hulls[key].contains(x)
+                if a.population
+                else vector.hull.contains(x)
             )
             rows[key] += (1, inside, seconds, seconds * inside)
         for name, kind in (("prefill all", "prefill"), ("decode all", "decode rung")):
-            rows[name] = sum((v for k, v in list(rows.items()) if k.startswith(kind)), np.zeros(4))
+            rows[name] = sum(
+                (v for k, v in list(rows.items()) if k.startswith(kind)), np.zeros(4)
+            )
         print(f"\n{record}\n  vector | steps | held | seconds | held")
-        last = lambda k: int(k.split()[-1]) if k[-1].isdigit() else 999  # noqa: E731
-        for k in sorted(rows, key=lambda k: (k.split()[0] != "prefill", "all" in k, last(k))):
+        last = lambda k: int(k.split()[-1]) if k[-1].isdigit() else 999
+        for k in sorted(
+            rows, key=lambda k: (k.split()[0] != "prefill", "all" in k, last(k))
+        ):
             n, h, sec, hs = rows[k]
-            print(f"  {k} | {n:.0f} | {h / max(n, 1):.1%} | {sec:.1f} | {hs / max(sec, 1e-12):.1%}")
+            print(
+                f"  {k} | {n:.0f} | {h / max(n, 1):.1%} | {sec:.1f} | {hs / max(sec, 1e-12):.1%}"
+            )
 
 
 if __name__ == "__main__":

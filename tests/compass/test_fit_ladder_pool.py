@@ -104,7 +104,9 @@ def test_records_at_a_prefix_fit_one_law_and_host_entry_keyed_at_the_longest(
         assert got["filled_rungs"]["decode"] == [1, 3, 5, 6, 7, 8]
     # Each law-writing command names the rungs it filled on stderr (#3796).
     warning = step_linear_fit.filled_warning(law)
-    assert warning.startswith("WARNING: no record reached decode rungs 1, 3, 5, 6, 7, 8")
+    assert warning.startswith(
+        "WARNING: no record reached decode rungs 1, 3, 5, 6, 7, 8"
+    )
     assert capsys.readouterr().err.splitlines().count(warning) == 2
     assert len(law["runs"]) == 2
 

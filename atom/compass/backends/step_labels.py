@@ -161,8 +161,8 @@ import hashlib
 import itertools
 import json
 import os
-import sys
 import statistics
+import sys
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -382,7 +382,10 @@ def group_tails(ranks: Iterable[list[dict]]) -> frozenset[int]:
     lines, finishes a prompt's prefill: its line names a request (`named`
     holds a request whose prompt was digested whole at its final chunk)."""
     return frozenset(
-        s["step"] for lines in ranks for s in lines if s.get("named") and not s["is_dummy_run"]
+        s["step"]
+        for lines in ranks
+        for s in lines
+        if s.get("named") and not s["is_dummy_run"]
     )
 
 

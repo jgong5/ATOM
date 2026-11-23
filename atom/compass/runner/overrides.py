@@ -1207,7 +1207,9 @@ def _transferred_slot(runner: Any) -> tuple[int, bool]:
     from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
 
     builder = runner.attn_metadata_builder
-    if isinstance(builder, (DeepseekV4AttentionMetadataBuilder, DeepseekV41MetadataBuilder)):
+    if isinstance(
+        builder, (DeepseekV4AttentionMetadataBuilder, DeepseekV41MetadataBuilder)
+    ):
         return runner.pool_plan.entry_bytes[STATE_SLOT_CLASS], False
     if isinstance(builder, _KimiMLAGDNCommon):
         cursor = torch.int32.itemsize if builder.replayssm else 0

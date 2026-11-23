@@ -147,9 +147,7 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
     if law is not None:
         backend = StepLinearBackend(StepLinearLaw(law))
     grid = _is_grid(backend)
-    groups = {
-        g: {} for g in ("graded", PRICED, "validated", "unvalidated", "declared")
-    }
+    groups = {g: {} for g in ("graded", PRICED, "validated", "unvalidated", "declared")}
     declined: dict[str, dict] = {}
     fell: dict[str, dict] = {}
     warm, priced, extrapolated = [], [], 0

@@ -409,7 +409,9 @@ def test_a_captured_rung_no_record_reached_is_filled_declared_and_outside_its_hu
         assert three[f] == pytest.approx((two[f] + four[f]) / 2)
     assert eight == four and one == two
     assert law["decode"]["8"]["filled"] == {"from": [4, 4], "weight": 0.0}
-    assert law["filled_rungs"] == filled_rungs(law) == {"decode": [1, 3, 8], "draft": []}
+    assert (
+        law["filled_rungs"] == filled_rungs(law) == {"decode": [1, 3, 8], "draft": []}
+    )
     terms = StepLinearBackend(StepLinearLaw(law)).price(_view([(1, 900, True)], 3))
     assert {t.provenance.method for t in terms.terms} == {Method.DECLARED}
     assert {t.provenance.source for t in terms.terms} == {EXTRAPOLATED}
@@ -457,7 +459,9 @@ def test_the_filled_rungs_a_target_record_ran_at_are_named_with_their_share():
     assert filled_share(law, {}) == {"steps": 0, "share": 0.0, "rungs": []}
     assert filled_share({"decode": {}}, {"64": 5})["share"] == 0.0
     warning = filled_warning(law)
-    assert warning.startswith("WARNING: no record reached decode rungs 40, 64; draft rungs 64:")
+    assert warning.startswith(
+        "WARNING: no record reached decode rungs 40, 64; draft rungs 64:"
+    )
     assert filled_warning({"decode": {}}) is None
 
 

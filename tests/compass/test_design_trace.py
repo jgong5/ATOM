@@ -69,7 +69,9 @@ def test_s0_and_s1_are_the_recipe_s(made):
     assert [t["requests"][0]["in"] // 1024 for t in s1] == [2, 16, 64, 200, 400, 700]
     for t in s1:
         assert len(t["requests"]) == 8
-        assert {round(b["t"] - a["t"], 3) for a, b in zip(t["requests"], t["requests"][1:])} == {1.0}
+        assert {
+            round(b["t"] - a["t"], 3) for a, b in zip(t["requests"], t["requests"][1:])
+        } == {1.0}
         assert {r["out"] for r in t["requests"]} == {32, 512}
     assert plan["segments"]["s1"] == {
         "traces": 6,
@@ -92,7 +94,9 @@ def test_the_ladder_holds_every_rung_and_ends_a_group_a_row(made):
     for g, base in zip(groups, dt.prompts(rows)):
         sizes = [m["requests"][0]["in"] for m in g]
         assert sizes == sorted(sizes) and sizes[0] < sizes[-1] and max(sizes) <= dt.CAP
-        assert sizes == [min(dt.CAP, 64 * round(base * f / 64)) for f in (0.55, 0.8, 1.2, 1.45)]
+        assert sizes == [
+            min(dt.CAP, 64 * round(base * f / 64)) for f in (0.55, 0.8, 1.2, 1.45)
+        ]
     firsts = [o[0] for o in outs]
     assert firsts == sorted(firsts) and len(set(firsts)) == rows
     assert outs[-1] == sorted(set(outs[-1])) and outs[-1][0] == firsts[-1]
@@ -109,7 +113,10 @@ def test_the_prompt_mix_spans_its_bands(made):
     first = dt.prompts(56)
     k = 1024
     assert 8 * k <= min(first) and max(first) <= 600 * k
-    bands = [sum(lo <= x < hi for x in first) for lo, hi in ((0, 64 * k), (64 * k, 256 * k), (256 * k, 10**9))]
+    bands = [
+        sum(lo <= x < hi for x in first)
+        for lo, hi in ((0, 64 * k), (64 * k, 256 * k), (256 * k, 10**9))
+    ]
     assert bands == [22, 23, 11]
     # Any eight consecutive groups in the end order reach every band.
     for i in range(len(first) - 8):
@@ -129,22 +136,33 @@ def test_probe_lanes_join_every_even_wave_and_one_group_s_odd_ones(made):
         assert all(n >= (waves + 1) // 2 for n in turns)
         assert turns == sorted(turns, reverse=True)
     assert {p["requests"][0]["in"] // 1024 for p in probes} == {16, 96, 256, 512}
-    gaps = [b["t"] - a["t"] for p in probes for a, b in zip(p["requests"], p["requests"][1:])]
+    gaps = [
+        b["t"] - a["t"]
+        for p in probes
+        for a, b in zip(p["requests"], p["requests"][1:])
+    ]
     assert min(gaps) >= 0.5 and max(gaps) <= 2 * plan["period"]
 
 
-def test_the_plan_counts_what_is_written_and_a_second_run_writes_the_same(made, tmp_path):
+def test_the_plan_counts_what_is_written_and_a_second_run_writes_the_same(
+    made, tmp_path
+):
     _, segments, plan = made
     for name, s in segments.items():
         p = plan["segments"][name]
-        assert (p["traces"], p["requests"]) == (len(s), sum(len(t["requests"]) for t in s))
+        assert (p["traces"], p["requests"]) == (
+            len(s),
+            sum(len(t["requests"]) for t in s),
+        )
     assert plan["segments"]["s2"]["concurrency"] == len(segments["s2"])
     _, again, _ = _made(tmp_path)
     assert again == segments
 
 
 def test_step_times_and_rows_reshape_the_ladder(tmp_path):
-    _, segments, plan = _made(tmp_path, "--rows", "52", "--step-ms", '{"64": 80}', "--waves", "4")
+    _, segments, plan = _made(
+        tmp_path, "--rows", "52", "--step-ms", '{"64": 80}', "--waves", "4"
+    )
     assert sum("s2a" in t["id"] for t in segments["s2"]) == 4 * 52
     assert plan["decode_steps"]["64"] == 500 and plan["waves"] == 4
 
@@ -157,7 +175,11 @@ def test_s3_holds_eight_sessions_a_rank_of_growing_context(made):
     first = [t["requests"][0]["in"] for t in s3]
     assert first == sorted(first) and first[0] // 1024 == 8 and first[-1] // 1024 < 256
     assert {len(t["requests"]) for t in s3} == {40}
-    gaps = {round(b["t"] - a["t"], 3) for t in s3 for a, b in zip(t["requests"], t["requests"][1:])}
+    gaps = {
+        round(b["t"] - a["t"], 3)
+        for t in s3
+        for a, b in zip(t["requests"], t["requests"][1:])
+    }
     assert gaps == {0.5, 1.0, 1.5, 3.0}
 
 

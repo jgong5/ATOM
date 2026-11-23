@@ -18,11 +18,25 @@ def _law(path: Path) -> Path:
         "provenance": "test",
         "prefill": {
             "coefficients": VECTOR,
-            "hull": {"equal": {"query_cached": 0}, "facets": [
-                [-1, 0, 64], [1, 0, -4096], [0, -1, 4096], [0, 1, -(4096**2)]]},
+            "hull": {
+                "equal": {"query_cached": 0},
+                "facets": [
+                    [-1, 0, 64],
+                    [1, 0, -4096],
+                    [0, -1, 4096],
+                    [0, 1, -(4096**2)],
+                ],
+            },
         },
-        "decode": {"1": {"coefficients": decode, "hull": {
-            "equal": {"graph_padding": 0}, "facets": [[-1, 100], [1, -1000]]}}},
+        "decode": {
+            "1": {
+                "coefficients": decode,
+                "hull": {
+                    "equal": {"graph_padding": 0},
+                    "facets": [[-1, 100], [1, -1000]],
+                },
+            }
+        },
         "draft": {"provenance": "dropped", "decode": {}},
     }
     path.write_text(json.dumps({"params": law}))
@@ -31,21 +45,43 @@ def _law(path: Path) -> Path:
 
 def _record(path: Path, contexts, rung=1) -> Path:
     lines = [
-        {"step": i, "dp_rank": 0, "is_dummy_run": False, "produces_output": True,
-         "rows": [[1, c, True]], "rung": rung, "d_busy_ns": 10_000_000}
+        {
+            "step": i,
+            "dp_rank": 0,
+            "is_dummy_run": False,
+            "produces_output": True,
+            "rows": [[1, c, True]],
+            "rung": rung,
+            "d_busy_ns": 10_000_000,
+        }
         for i, c in enumerate(contexts)
     ]
-    lines.append({"step": len(lines), "dp_rank": 0, "is_dummy_run": False,
-                  "produces_output": True, "rows": [[2048, 2048, False]], "rung": None,
-                  "d_busy_ns": 30_000_000})
+    lines.append(
+        {
+            "step": len(lines),
+            "dp_rank": 0,
+            "is_dummy_run": False,
+            "produces_output": True,
+            "rows": [[2048, 2048, False]],
+            "rung": None,
+            "d_busy_ns": 30_000_000,
+        }
+    )
     (path / "steps").mkdir(parents=True)
-    (path / "steps" / "dp0.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    (path / "steps" / "dp0.jsonl").write_text(
+        "".join(json.dumps(x) + "\n" for x in lines)
+    )
     return path
 
 
 def _rows(*args) -> dict:
-    out = subprocess.run([sys.executable, str(SCRIPT), *map(str, args)], capture_output=True,
-                         text=True, env={"PYTHONPATH": str(ROOT)}, check=True).stdout
+    out = subprocess.run(
+        [sys.executable, str(SCRIPT), *map(str, args)],
+        capture_output=True,
+        text=True,
+        env={"PYTHONPATH": str(ROOT)},
+        check=True,
+    ).stdout
     return {
         line.split(" | ")[0].strip(): line.split(" | ")[1:]
         for line in out.splitlines()

@@ -805,13 +805,17 @@ def test_the_priced_total_prints_on_the_line_after_the_graded_one(tmp_path):
     every, graded = report["priced"], report["graded"]
     assert totals == [
         f"  on totals              {graded['prefill']['on_totals']:+.2%}",
-        f"  priced, all on totals  {every['prefill']['on_totals']:+.2%}  (10 steps,"
-        f" real {every['prefill']['real_s']:.2f} s, priced"
-        f" {every['prefill']['priced_s']:.2f} s)",
+        (
+            f"  priced, all on totals  {every['prefill']['on_totals']:+.2%}  (10 steps,"
+            f" real {every['prefill']['real_s']:.2f} s, priced"
+            f" {every['prefill']['priced_s']:.2f} s)"
+        ),
         f"  on totals              {graded['decode']['on_totals']:+.2%}",
-        f"  priced, all on totals  {every['decode']['on_totals']:+.2%}  (14 steps,"
-        f" real {every['decode']['real_s']:.2f} s, priced"
-        f" {every['decode']['priced_s']:.2f} s)",
+        (
+            f"  priced, all on totals  {every['decode']['on_totals']:+.2%}  (14 steps,"
+            f" real {every['decode']['real_s']:.2f} s, priced"
+            f" {every['decode']['priced_s']:.2f} s)"
+        ),
     ]
     filled = report["filled"]["decode"]
     header = next(x for x in lines if x.startswith("decode  10 steps"))
