@@ -790,18 +790,24 @@ def _decline_custom_all_gather():
 
 
 def _select_direct_h2d():
-    """Select ATOM's direct host-to-device copies, and say so.
+    """Keep ATOM's direct host-to-device copies, and say so.
 
-    The packed transport, ATOM's default, stages every published buffer through
-    one host block it reads with `.numpy()`, which a fake tensor refuses, and
-    scatters it with a raw kernel addressed by device pointers, which a fake
-    tensor does not have. Its single copy is a byte count summed on the host,
-    so even past both it would carry the hint, never the step's symbol. Direct
-    copies each buffer with its own `copy_`. The transport decides how staged
-    metadata reaches the device and nothing about the model's operators.
+    The packed transport, ATOM's default wherever a device can serve it, stages
+    every published buffer through one host block it reads with `.numpy()`,
+    which a fake tensor refuses, and scatters it with a raw kernel addressed by
+    device pointers, which a fake tensor does not have. Its single copy is a
+    byte count summed on the host, so even past both it would carry the hint,
+    never the step's symbol. Direct copies each buffer with its own `copy_`, the
+    transport a group falls back to when packing declines it. The transport
+    decides how staged metadata reaches the device and nothing about the
+    model's operators.
     """
-    os.environ["ATOM_H2D_BACKEND"] = "direct"
-    return "ATOM_H2D_BACKEND=direct"
+    from atom.utils import packed_h2d
+
+    packed_h2d.PackedCopy.create = classmethod(
+        lambda cls, members, device: (None, "a capture packs no bytes")
+    )
+    return "packed_h2d.PackedCopy.create declines every group"
 
 
 def _sync_on_the_host():
@@ -828,13 +834,15 @@ def _sync_on_the_host():
     def own_row(scheduled_tokens, scheduled_bs, is_prefill, needs_eager, **kwargs):
         hint = int(scheduled_tokens.node.hint)
         q = kwargs.get("max_seqlen_q")
+        row = np.array([hint], dtype=np.int32)
+        # The caller's running tokens, which ATOM's exchange fills from the rows.
+        np.copyto(kwargs["running_tokens_per_dp_rank"], row)
         return ubatching.DPSyncResult(
-            scheduled_tokens_per_dp_rank=np.array([hint], dtype=np.int32),
+            scheduled_tokens_per_dp_rank=row,
             max_bs_across_dp=scheduled_bs,
             prefill_across_dp=(bool(is_prefill),),
             any_rank_needs_eager=bool(needs_eager),
             tbo_collective_active=False,
-            ub_max_tokens_across_dp=None,
             ub_tokens_across_dp=None,
             max_seqlen_q_across_dp=q,
             max_final_requests_across_dp=kwargs.get("final_requests", 0),
