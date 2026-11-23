@@ -41,16 +41,20 @@ the target's, `d_target_ns` with no gap, and the draft label is the rest of
 `d_busy_ns`. A decode's draft-KV pass, `d_draft_kv_ns`, runs before
 `forward_done_event`: its device label holds it, as its draft-KV label too,
 and its draft label does not. A device event runs no earlier than the host
-records it, so a launch record less its device start bounds the host clock's
-lead from below, and an MTP status wait's return less the `forward_done_event`
-it waits for bounds it from above. The clocks drift apart over a record, and
-the tightest of the last `ANCHORS` status-wait bounds (of the first, before as
+records it, so the host clock read just before a launch's entry event is
+recorded (`t_launch_event_ns`) less the event's device start bounds the host
+clock's lead from below, and an MTP status wait's return less the
+`forward_done_event` it waits for bounds it from above. A record without that
+read takes the launch's entry stamp, read after the event, so a host stall
+between the two lifts its bound. The clocks drift apart over a record, and the
+tightest of the last `ANCHORS` status-wait bounds (of the first, before as
 many) follows them: a step's lead is the largest launch bound moved by how far
 that tightest bound moved since, leaving out any above it at its own launch,
-whose host stalled before stamping it; with no status wait, the largest launch
+which only a stalled entry stamp or drift faster than the anchors follow
+reaches; with no status wait, the largest launch
 bound over the record. A decode's draft label, its `propose`
 pass, is cut where the device reached the pass, placed by that lead, before
-the host's draft copy wait (`t_draft_recv_ns`) began: the host queues the pass
+the host's draft copy wait (`t_draft_recv_ns`, or reading its own, `t_draft_read_ns`) began: the host queues the pass
 just before that wait, so the window may hold the device's wait for it.
 Under an EAGLE3 drafter a decode's line also times each draft forward of that
 pass (`DRAFT_PASSES`), which stand and are cut with its draft label.
@@ -87,7 +91,7 @@ rows is cut. A step of an MTP record without `d_target_ns` is cut as
 
 A step's host labels are its segments: `E` from the previous forward's exit,
 cut as idle after an idle engine (`busy_gaps`); `W_pre` to the launch, less
-the staging gate's wait; `W_launch` from the launch to the token copy wait,
+the staging gate's wait; `W_launch` from the launch to the token read,
 the sampler's launch included, or to the launch's end on a forward with no
 such wait, less the time its line's `blocked_ns` states the launch thread
 spent in HIP's blocking calls, there waiting on the device; a line without
@@ -348,7 +352,9 @@ def _timed(lines) -> list[tuple[dict, int, int, int | None]]:
         if b is not None:
             recent.append(b)
         tight.append(min(recent) if len(recent) == ANCHORS else first)
-    lows = [s["t_launch_ns"][0] - start for s, start, _ in timed]
+    lows = [
+        s.get("t_launch_event_ns", s["t_launch_ns"][0]) - start for s, start, _ in timed
+    ]
     margins = [t - low for t, low in zip(tight, lows) if low <= t or not waits]
     if not margins:
         raise ValueError("every launch bound exceeds the MTP status waits' bound")
@@ -379,10 +385,10 @@ def host_paced_drafts(lines) -> set[int]:
     return {
         s["step"]
         for s, start, lead, _ in _timed(lines)
-        if "t_draft_recv_ns" in s
+        if ("t_draft_recv_ns" in s or "t_draft_read_ns" in s)
         and "d_target_ns" in s
         and start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0) + lead
-        < s["t_draft_recv_ns"][0]
+        < s.get("t_draft_recv_ns", s.get("t_draft_read_ns"))[0]
     }
 
 
@@ -618,7 +624,7 @@ def _label(
             propose = s.get("b_propose_ns") if view.produces_output else None
         enter, (l0, l1) = s["t_enter_ns"], s["t_launch_ns"]
         g0, g1 = s.get("t_gate_ns", (l0, l0))
-        r0, r1 = s.get("t_recv_ns", (l1, l1))
+        r0, r1 = s.get("t_recv_ns", s.get("t_read_ns", (l1, l1)))
         m0, m1 = s.get("t_mtp_ns", (l0, l0))
         blocked = s.get("blocked_ns")
         host = {"W_pre": g0 - enter + m0 - g1}
@@ -628,7 +634,7 @@ def _label(
         if "t_pp_recv_ns" in s:
             host["W_recv"] = s["t_pp_recv_ns"][0] - l0
         if host_kind(view) != "middle":
-            d0, d1 = s.get("t_draft_recv_ns", (0, 0))
+            d0, d1 = s.get("t_draft_recv_ns", s.get("t_draft_read_ns", (0, 0)))
             host["W_post"] = s["t_exit_ns"] - r1 - (d1 - d0)
         if "t_pull_ns" in s:
             host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]

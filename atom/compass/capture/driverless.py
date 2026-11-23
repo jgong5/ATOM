@@ -30,6 +30,13 @@ DEVICES = {
     # Its capability is card 0's of the MI455 A0 node.
     "gfx1250": (256, (12, 5), 432 << 30),
 }
+#: The card's product name, by arch, as rocm-smi's series and the datasheet
+#: in `compass/devices` name it: aiter reads the model it keys its comm-fused
+#: MoE's winners on off the name. An arch without one is named by its arch.
+NAMES = {
+    "gfx942": "AMD Instinct MI308X",
+    "gfx950": "AMD Instinct MI355X",
+}
 #: The rest of a declared device, by arch, where a source states it: warp size,
 #: threads per CU, L2 bytes, registers per CU and shared memory per block.
 PROPERTIES = {
@@ -93,7 +100,7 @@ def _props(arch, read=None):
     return types.SimpleNamespace(
         multi_processor_count=cus,
         gcnArchName=arch,
-        name=arch,
+        name=NAMES.get(arch, arch),
         major=major,
         minor=minor,
         total_memory=memory,
@@ -183,12 +190,9 @@ def _stream(stream):
         current[0] = previous
 
 
-def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
-    """Declare the device of `arch`, or the card `read` (`card`); say what."""
-    if read is None and arch not in DEVICES:
-        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
-    props = _props(arch, read)
-    cuda = {
+def _cuda(props) -> dict:
+    """`torch.cuda`'s answers as the one device `props` declares."""
+    return {
         # True: on False ATOM takes paths no deployment runs. The fake mode is
         # told otherwise by `driverless_mode`.
         "is_available": lambda: True,
@@ -224,6 +228,14 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
         "MemPool": lambda *a, **k: None,
         "use_mem_pool": lambda *a, **k: contextlib.nullcontext(),
     }
+
+
+def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
+    """Declare the device of `arch`, or the card `read` (`card`); say what."""
+    if read is None and arch not in DEVICES:
+        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
+    props = _props(arch, read)
+    cuda = _cuda(props)
     for name, value in cuda.items():
         setattr(torch.cuda, name, value)
     # ATOM's H2D publication reads the current stream's id off `torch._C`, and
@@ -234,6 +246,8 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
     # No checkpoint is read, so a parameter's fill is arbitrary either way, and
     # the in-place RNG fills ask the device for a generator.
     torch.Tensor.uniform_ = torch.Tensor.normal_ = lambda self, *a, **k: self
+    # The allocator's note that another stream uses a block: none is allocated.
+    torch.Tensor.record_stream = lambda self, stream: None
 
     from torch._subclasses import fake_tensor
 
@@ -261,6 +275,17 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
     return {"cuda": sorted(cuda), "arch": arch, "flags": flags} | (
         {"card": read} if read else {}
     )
+
+
+def answer_as(arch: str) -> None:
+    """`install`'s `torch.cuda` answers for a device of `arch`, and `torch._C`'s
+    device query, for the life of this process. `is_available` keeps this
+    host's answer, and nothing else `install` declares is declared."""
+    cuda = _cuda(_props(arch))
+    del cuda["is_available"]
+    for name, value in cuda.items():
+        setattr(torch.cuda, name, value)
+    torch._C._cuda_getDevice = lambda: 0
 
 
 #: The operators outside torch that the fake mode's dispatch cache takes: each
@@ -462,6 +487,13 @@ def group(tp: int, dp: int) -> dict:
         "functional": ["all_gather_into_tensor", "broadcast", "all_to_all_single"],
         "communicator_checked_only": ["fused_allreduce_rmsnorm_quant_per_group"],
     }
+
+
+def uncached_bytes(nbytes, device):
+    """A mono runner's uncached scratch, of the size it asks for, on the
+    declared device: a plain tensor, since a capture reads no value through
+    it and every rank of a capture is this one."""
+    return torch.empty(nbytes, dtype=torch.uint8, device=device)
 
 
 class PeerBuffer(peer_memory.PeerBuffer):

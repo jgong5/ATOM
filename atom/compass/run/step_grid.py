@@ -29,10 +29,10 @@ is `keyed`, as JSON: the ladder the runner replays (none under
 ``enforce_eager``), the KV block size and dtype, the quantization with its
 layer names as the model's runner remaps them (`quantization`), the TP and
 DP widths, DP attention, expert parallelism, TBO, the MoE backend, the
-all-to-all backend, EPLB and DeepSeek-V4.1 decoder SWA bounded replay when
-off ATOM's default, the index cache's dtype where ATOM resolved it apart from
-the KV cache's, whether mori imports where it does not, MiniMax-M3's
-indexer-only context parallelism when on, the model config's
+all-to-all backend, EPLB, DeepSeek-V4.1 decoder SWA bounded replay and the
+compilation level when off ATOM's default, the index cache's dtype where ATOM
+resolved it apart from the KV cache's, whether mori imports where it does not,
+MiniMax-M3's indexer-only context parallelism when on, the model config's
 ``--hf-overrides`` when it states any, the performance environment, each
 variable of `READ_OFF_DEFAULT` in it when ATOM reads it off its default too,
 and, under speculation, its method and draft width, and the digest of the
@@ -42,10 +42,12 @@ what differs:
 - a run at data-parallel width above one, since every bundle is measured at one;
 - a keyed condition, the grid's graph mode, a timing scope other than the
   whole ``ModelRunner.forward``, or a value other than ``measure steps``'
-  bench window (`step_grid_fit.VALUE`), none included;
-- the gates, or any reading, through `ArtifactStore.load`;
-- a rung of the ladder between the grid's lowest and highest measured rungs
-  that was not measured;
+  bench window (`step_grid_fit.VALUE`), none included; a ladder that is a
+  non-empty prefix of the bundle's is read as the bundle's (`at_ladder`);
+- the gates, or any reading, through `ArtifactStore.load`, the engine config
+  read at the bundle's ladder too;
+- a rung of this run's ladder between the grid's lowest and highest measured
+  rungs that was not measured;
 - a configured bound above the one the grid was planned for.
 
 Under expert parallelism the bench routed every MoE layer by a uniform draw
@@ -85,7 +87,12 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.step_grid import StepGrid, StepGridBackend
 from atom.compass.backends.step_grid_fit import VALUE
-from atom.compass.backends.step_grid_plan import BOUNDS, SCOPE, keyed_of  # noqa: F401
+from atom.compass.backends.step_grid_plan import (  # noqa: F401
+    BOUNDS,
+    SCOPE,
+    at_ladder,
+    keyed_of,
+)
 from atom.compass.backends.step_grid_residual import Residual
 from atom.compass.backends.step_linear import UNIFORM_ROUTING
 from atom.compass.runner.overrides import schedulable_ladder
@@ -104,6 +111,9 @@ OFF_DEFAULT = (
 )
 #: The index cache takes the KV cache's dtype unless ATOM resolves it apart.
 DERIVED = {"index_cache_dtype": "kv_cache_dtype"}
+#: `compilation_config.level`, keyed only off the default of ATOM's ``--level``
+#: (`EngineArgs.level`): from 1, Inductor fuses the torch ops between custom ops.
+LEVEL = "level"
 #: ATOM's prefill token buckets, an environment variable `keyed` the same way.
 BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
 #: ATOM's environment variables keyed only where ATOM reads them off their
@@ -135,13 +145,14 @@ DRAFT = "draft_model"
 
 def keyed(config, ladder: bool = True) -> dict:
     """The conditions a bundle is measured under, as the resolved config holds them,
-    `OFF_DEFAULT` only where it is off its default, `MORI` only where mori does
+    `OFF_DEFAULT` and `LEVEL` only off their default, `MORI` only where mori does
     not import, MiniMax-M3's indexer-only context parallelism only when on, the
     model config's overrides only when it states some, and the performance
     environment of this process less the client's and the device selection
     (`keyed_env`), and under speculation its method and draft width, and
     `DRAFT` (`_draft`); the ladder only with `ladder`."""
     from atom.config import Config
+    from atom.model_engine.arg_utils import EngineArgs
 
     spec = getattr(config, "speculative_config", None)
     drafts = {"speculative": [spec.method, spec.num_speculative_tokens]} if spec else {}
@@ -156,6 +167,9 @@ def keyed(config, ladder: bool = True) -> dict:
             default = getattr(config, DERIVED[name])
         if (value := getattr(config, name, None)) not in (None, default):
             drafts[name] = value
+    compilation = getattr(config, "compilation_config", None)
+    if getattr(compilation, LEVEL, None) not in (None, EngineArgs.level):
+        drafts[LEVEL] = compilation.level
     if getattr(getattr(config, "dcp_config", None), "indexer_dcp_only", False):
         drafts["indexer_dcp_only"] = True
     # ATOM applies them to the model config after it reads config.json.
@@ -273,16 +287,16 @@ def differ(there: dict, here: dict, where: str) -> list[str]:
     return named
 
 
-def conditions(config, machine) -> Conditions:
+def conditions(config, machine, engine: dict | None = None) -> Conditions:
     """This run's readings: `readings` of this process's ATOM source, the
-    served config.json and `keyed`."""
+    served config.json and `keyed`, or `engine` in its place."""
     from atom.compass.run import _file_digest, atom_source
 
     return readings(
         machine_platform(machine),
         atom_src=atom_source(),
         model=_file_digest(config.model, "config.json"),
-        engine_config=json.dumps(keyed(config), sort_keys=True),
+        engine_config=json.dumps(engine or keyed(config), sort_keys=True),
     )
 
 
@@ -322,11 +336,12 @@ def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
         raise ValueError(
             f"{key} does not load: {type(error).__name__}: {error}"
         ) from error
+    at = at_ladder(ours, recorded)
     pairs = {
         "graph mode": (grid.graph_mode, "eager" if config.enforce_eager else "replay"),
         "timing scope": (grid.scope, SCOPE),
         "value": (member["grid"].get("value"), VALUE),
-        **{name: (recorded.get(name), value) for name, value in ours.items()},
+        **{name: (recorded.get(name), value) for name, value in at.items()},
     }
     differ = [
         f"{name} {theirs!r} in the bundle and {here!r} here"
@@ -337,7 +352,7 @@ def load(spec: Mapping, config, machine) -> tuple[StepGridBackend, dict]:
         raise ValueError(
             f"{key} was measured under other conditions: " + "; ".join(differ)
         )
-    store.load(key, conditions=conditions(config, machine), gates=GateState.of())
+    store.load(key, conditions=conditions(config, machine, at), gates=GateState.of())
     if grid.graph_mode == "replay":
         measured = sorted(rung for rung, cells in grid.decode.items() if cells.points)
         unmeasured = [

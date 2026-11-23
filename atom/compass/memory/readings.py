@@ -76,6 +76,9 @@ ENTRY_FIELDS = (
 #: What a member published outside `compass measure memory` may also state:
 #: why its readings are assumed and where they were copied from.
 ASSUMED = "assumed"
+#: What a member also states where its start's attention builder bounds its
+#: PAGEs by what is allocated (DeepSeek-V4.1's): those bytes less after load.
+PAGE_BOUND = "persistent_at_page_bound_bytes"
 
 
 class MemoryRefusal(Exception):
@@ -166,12 +169,12 @@ class MemoryReadings:
     def from_member(cls, member: object, source: str) -> MemoryReadings:
         """The readings of a member, or a refusal naming what it holds instead."""
         fields = set(member) if isinstance(member, Mapping) else set()
-        if fields - {ASSUMED} != set(ENTRY_FIELDS):
+        if fields - {ASSUMED, PAGE_BOUND} != set(ENTRY_FIELDS):
             raise MemoryRefusal(
                 f"{source} holds {sorted(fields)}, not one rank's readings",
                 f"a member states exactly {', '.join(ENTRY_FIELDS)}, and "
-                f"{ASSUMED} where they are; take the entry again with compass "
-                "measure memory",
+                f"{ASSUMED} or {PAGE_BOUND} where they are; take the entry again "
+                "with compass measure memory",
             )
         assumed = member.get(ASSUMED)
         if ASSUMED in fields and not (isinstance(assumed, str) and assumed.strip()):
@@ -179,7 +182,7 @@ class MemoryReadings:
                 f"{source} holds {ASSUMED} {assumed!r}, which names no assumption",
                 "state where its readings were copied from and why",
             )
-        for name in ENTRY_FIELDS:
+        for name in (*ENTRY_FIELDS, *sorted(fields & {PAGE_BOUND})):
             value = member[name]
             whole = isinstance(value, int) and not isinstance(value, bool)
             if name == "record":
@@ -233,7 +236,8 @@ class MemoryReadings:
 
 @dataclass(frozen=True, slots=True)
 class DeviceReadings:
-    """The five readings, each as its terms, for one width of one spec."""
+    """The five readings, each as its terms, for one width of one spec, and
+    the member's `PAGE_BOUND` where it states one."""
 
     total: Reading
     peak_torch: Reading
@@ -242,6 +246,7 @@ class DeviceReadings:
     free: Reading
     tp_width: int | str
     spec_digest: str
+    page_bound: Term | None = None
 
     def as_dict(self) -> dict[str, Reading]:
         """The five by the name `get_num_blocks` knows each of them by."""
@@ -365,4 +370,9 @@ def device_readings(
         free=free,
         tp_width=tp_width,
         spec_digest=spec.digest(),
+        page_bound=(
+            memory.term("persistent at the PAGE bound", PAGE_BOUND)
+            if PAGE_BOUND in memory.values
+            else None
+        ),
     )

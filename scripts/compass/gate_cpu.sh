@@ -91,108 +91,43 @@ compass_env "$ROOT"
 compass_require_tree "$ROOT" || finish $? "atom does not import from this tree; nothing was run"
 compass_describe "$ROOT"
 
-EXCLUDE=$ROOT/scripts/compass/cpu_gate_exclude.txt
+compass_cpu_ignores "$ROOT" || finish $? "$WHY; nothing was run"
 TRIGGERS=$ROOT/scripts/compass/gpu_gate_triggers.txt
-[ -r "$EXCLUDE" ] || { printf 'FATAL: cannot read %s\n' "$EXCLUDE" >&2; finish 94 "exclusion list unreadable; nothing was run"; }
 [ -r "$TRIGGERS" ] || { printf 'FATAL: cannot read %s\n' "$TRIGGERS" >&2; finish 94 "trigger list unreadable; nothing was run"; }
-
-# Parse defensively: strip a trailing CR so a list that has been through a
-# Windows editor does not turn into --ignore=tests/foo.py^M, which pytest
-# accepts and silently matches nothing; drop inline comments; and check the
-# file exists, because a renamed test would otherwise be excluded forever by a
-# stale line nobody can see failing.
-NEX=0
-IGN=(--ignore=tests/plugin)
-while IFS= read -r line || [ -n "$line" ]; do
-    line=${line%$'\r'}
-    line=${line%%#*}
-    line=${line#"${line%%[![:space:]]*}"}
-    line=${line%"${line##*[![:space:]]}"}
-    [ -n "$line" ] || continue
-    [ -e "$ROOT/$line" ] || {
-        printf 'FATAL: %s lists %s, which does not exist.\n' "$EXCLUDE" "$line" >&2
-        printf '       Re-run regen_cpu_gate_exclude.sh.\n' >&2
-        finish 94 "exclusion list names a missing file; nothing was run"
-    }
-    IGN+=(--ignore="$line")
-    NEX=$((NEX + 1))
-done <"$EXCLUDE"
 printf 'gate:   %s files excluded + tests/plugin\n' "$NEX"
 
 # --- does this change need the GPU gate? -------------------------------------
 # Answered here, enforced after pytest, so a run yields both answers rather than
 # trading one for the other. That includes the case where the question cannot be
-# answered at all: it is recorded, not exited on, so the suite still reports.
+# answered at all: it is recorded, not exited on, so the suite still reports,
+# and the run below exits 98 rather than passing -- reporting "GPU not
+# required" there would be a guess that reads as a clear.
 GPU_NEEDED=
-CHANGED=
-SRC=
-GPU_SRC_UNKNOWN=
-if [ -n "${COMPASS_CHANGED_FILES:-}" ]; then
-    [ -r "$COMPASS_CHANGED_FILES" ] ||
-        { printf 'FATAL: COMPASS_CHANGED_FILES=%s unreadable\n' "$COMPASS_CHANGED_FILES" >&2; finish 94 "COMPASS_CHANGED_FILES unreadable; nothing was run"; }
-    CHANGED=$(cat "$COMPASS_CHANGED_FILES")
-    SRC="COMPASS_CHANGED_FILES"
-elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 &&
-     REF=$(compass_resolve_ref "$ROOT" "$INTEGRATION") &&
-     BASE=$(git -C "$ROOT" merge-base HEAD "$REF" 2>/dev/null); then
-    CHANGED=$(git -C "$ROOT" diff --name-only "$BASE")
-    SRC="diff vs $REF (${BASE:0:9})"
-    # Announce the fallback the way snapshot.sh does. Without this the resolved
-    # name appears only inside the `gpu:` source string -- reported, not
-    # announced, so a caller who set nothing sees a prefix it never asked for.
-    [ "$REF" = "$INTEGRATION" ] ||
-        printf 'ref:    %s is not a ref here; resolved it as %s\n' "$INTEGRATION" "$REF"
-    compass_ref_drift "$ROOT" "$REF"
-elif [ -r "$ROOT/.compass-changed" ]; then
-    # A snapshot built by snapshot.sh, which is how this gate normally runs.
-    # The stamp was written from the same rev-parse that selected the archived
-    # tree, so it describes this tree and not whichever one the archiver
-    # happened to be sitting in.
-    #
-    # The drift line above does not reach here, and this is the path the gate
-    # normally runs on. .compass-changed records the file list and
-    # .compass-commit the sha; neither records the *base*, so a stamp built on
-    # a stale local branch cannot be told from one built on the remote, and the
-    # announcement lives only in the staging log while this is the log that
-    # gets pasted. Closing it means recording the base in a stamp, which
-    # changes the stamp format and is not #102.
-    CHANGED=$(cat "$ROOT/.compass-changed")
-    SRC=".compass-changed stamp"
-else
-    # No supplied list, no usable diff, no stamp: the question cannot be
-    # answered. It is recorded as unanswered, with which of the three ways in
-    # failed, and the run below exits 98 rather than passing -- reporting "GPU
-    # not required" here would be a guess that reads as a clear. Only a tree with
-    # no .git is a staging omission; a git checkout reaches here because the
-    # integration ref does not resolve, or shares no commit with HEAD.
-    if ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-        GPU_SRC_UNKNOWN="this tree was never stamped (no .git, no .compass-changed); a staging omission, see snapshot.sh"
-    elif REF=$(compass_resolve_ref "$ROOT" "$INTEGRATION"); then
-        GPU_SRC_UNKNOWN="a git checkout with no .compass-changed, and $REF shares no commit with HEAD"
-    else
-        GPU_SRC_UNKNOWN="a git checkout with no .compass-changed, and $INTEGRATION resolves to no commit here"
-    fi
-fi
+compass_changed "$ROOT" "$INTEGRATION" || finish $? "$WHY; nothing was run"
+SRC=$CHANGED_SRC
+GPU_SRC_UNKNOWN=$CHANGED_UNKNOWN
 
-if [ -z "$GPU_SRC_UNKNOWN" ]; then
+# Print `<path> -> <trigger>` for each path in $1 a trigger matches.
+trigger_hits() {
     while IFS= read -r pat; do
         pat=${pat%$'\r'}
         case "$pat" in ''|'#'*) continue ;; esac
         while IFS= read -r f; do
             [ -n "$f" ] || continue
             case "$pat" in
-            */) case "$f" in "$pat"*) GPU_NEEDED="$GPU_NEEDED$f -> $pat"$'\n' ;; esac ;;
-            *)  [ "$f" = "$pat" ] && GPU_NEEDED="$GPU_NEEDED$f -> $pat"$'\n' ;;
+            */) case "$f" in "$pat"*) printf '%s -> %s\n' "$f" "$pat" ;; esac ;;
+            *)  [ "$f" != "$pat" ] || printf '%s -> %s\n' "$f" "$pat" ;;
             esac
-        done <<<"$CHANGED"
+        done <<<"$1"
     done <"$TRIGGERS"
-fi
+}
+[ -n "$GPU_SRC_UNKNOWN" ] || GPU_NEEDED=$(trigger_hits "$CHANGED")
 
 if [ -n "$GPU_SRC_UNKNOWN" ]; then
     printf 'gpu:    UNKNOWN -- %s\n' "$GPU_SRC_UNKNOWN"
 elif [ -n "$GPU_NEEDED" ]; then
     printf 'gpu:    REQUIRED (%s)\n' "$SRC"
-    printf '%s' "$GPU_NEEDED" | sed 's/^/          /'
+    printf '%s\n' "$GPU_NEEDED" | sed 's/^/          /'
 else
     printf 'gpu:    not required (%s)\n' "$SRC"
 fi
@@ -203,27 +138,8 @@ printf '\n'
 # cannot name.
 HEAD_SHA=$(compass_head_sha "$ROOT") || HEAD_SHA=UNKNOWN
 
-# The compass_harness tests skip by name when compass-harness, or the aiperf it
-# adapts, does not import, and the CPU container has neither. So this gate
-# installs the tree's own compass_harness into a run-local directory every run,
-# beside the aiperf wheel COMPASS_AGENTX_HARNESS names, and refuses to run when
-# the tests' own skip condition still holds.
-if [ -r "$ROOT/compass_harness/pyproject.toml" ]; then
-    HARNESS=$(mktemp -d) || finish 96 "mktemp failed; nothing was run"
-    trap 'rm -rf "$HARNESS"' EXIT
-    # A copy, because setuptools writes build/ and *.egg-info into the source.
-    cp -r "$ROOT/compass_harness" "$HARNESS/src" || finish 96 "cannot copy compass_harness; nothing was run"
-    python -m pip install -q --no-deps --no-build-isolation --no-index --target "$HARNESS/site" \
-        "$HARNESS/src" ${COMPASS_AGENTX_HARNESS:+"$COMPASS_AGENTX_HARNESS"} >&2 ||
-        finish 96 "pip could not install compass_harness${COMPASS_AGENTX_HARNESS:+ and $COMPASS_AGENTX_HARNESS}; nothing was run"
-    export PYTHONPATH=$PYTHONPATH:$HARNESS/site
-    WHY=$(cd / && python -c 'from importlib import metadata; metadata.version("compass-harness")
-import compass_harness, aiperf; print(aiperf.__file__, compass_harness.__file__)' 2>&1) || {
-        WHY=${WHY##*$'\n'}
-        finish 96 "the compass_harness tests would skip ($WHY); set COMPASS_AGENTX_HARNESS to an agentx-harness 56a0cf70 wheel, see scripts/compass/README.md; nothing was run"
-    }
-    printf 'harness: %s\n' "$WHY"
-fi
+# The compass_harness tests run, or the gate refuses (_lib.sh, compass_harness).
+compass_harness "$ROOT" || finish $? "$WHY; nothing was run"
 
 # atomesh's unit tests and every Compass cargo target (tests/compass_*.rs) run
 # here, offline, since the gate has no network: from the container's crate
@@ -241,8 +157,7 @@ if [ -r "$MESH/Cargo.toml" ]; then
             finish 96 "flock not found, so cargo in atom/mesh cannot run one process at a time; nothing was run"
     fi
     export CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:-true}
-    LOCK=${COMPASS_CARGO_LOCK:-/app/ATOM/atom/mesh/Cargo.lock}
-    [ -e "$MESH/Cargo.lock" ] || [ ! -r "$LOCK" ] || cp "$LOCK" "$MESH/Cargo.lock"
+    compass_cargo_lock "$MESH"
     if WHY=$(cd "$MESH" && cargo metadata --format-version 1 2>&1 >/dev/null); then
         TARGETS=(--lib)
         for f in "$MESH"/tests/compass_*.rs; do
@@ -265,20 +180,48 @@ fi
 # exit code and a failing suite reports success.
 #
 # tests/compass holds most of the suite's time, in model traces that each take
-# one core, so it runs as COMPASS_GATE_SHARDS pytest processes beside the rest
-# of tests/, shard s taking every COMPASS_GATE_SHARDS-th file from s; 0 runs
-# tests/ as one process. Every process collects all of tests/ and deselects
-# what it does not run, because test files collect only after earlier files
-# have imported engine modules under an aiter stub; alone, they reach rocminfo.
-# A shard's output is printed after the rest's. A process left with no test to
-# run (exit 5) fails the gate only when none ran. A caller's --junitxml or
-# --basetemp path is the first process's; shard k writes <path>.shard<k>, since
-# a shared one is overwritten or cleared by every process.
-SHARDS=${COMPASS_GATE_SHARDS:-4}
+# one core, so it runs as COMPASS_GATE_SHARDS pytest processes and the rest of
+# tests/ as COMPASS_GATE_REST_SHARDS more, no process running files of both;
+# COMPASS_GATE_SHARDS=0 runs tests/ as one process. pack deals each set to its
+# processes, never more of them than the set has files. Every process collects
+# all of tests/ and deselects what it does not run, because test files collect
+# only after earlier files have imported engine modules under an aiter stub;
+# alone, they reach rocminfo. The first rest process prints as it runs, the
+# others' output follows. A process left with no test to run (exit 5) fails
+# the gate only when none ran. A caller's --junitxml or --basetemp path is the
+# first rest process's; compass shard k writes <path>.shard<k> and rest process
+# k <path>.rest<k>, since a shared one is overwritten or cleared by every
+# process.
+SHARDS=${COMPASS_GATE_SHARDS:-16}
+RS=${COMPASS_GATE_REST_SHARDS:-4}
 [[ $SHARDS =~ ^[0-9]+$ ]] || finish 95 "COMPASS_GATE_SHARDS=$SHARDS is not a count; pytest was not run"
+[[ $RS =~ ^[1-9][0-9]*$ ]] || finish 95 "COMPASS_GATE_REST_SHARDS=$RS is not a count of 1 or more; pytest was not run"
+DURATIONS=$ROOT/scripts/compass/cpu_gate_durations.txt
+[ -r "$DURATIONS" ] || finish 94 "cannot read $DURATIONS; nothing was run"
 CF=()
 [ -d tests/compass ] && mapfile -t CF < <(find tests/compass \( -name 'test_*.py' -o -name '*_test.py' \) | sort)
-[ "${#CF[@]}" -gt 0 ] || SHARDS=0
+mapfile -t RF < <(find tests \( -path tests/compass -o -path tests/plugin \) -prune -o \
+    \( -name 'test_*.py' -o -name '*_test.py' \) -print | sort | grep -vxF -f <(printf '%s\n' "${IGN[@]#--ignore=}"))
+# COMPASS_GATE_SELECT names a map gate_map.sh wrote. gate_select.py prints how
+# many test files the diff since the map's commit reaches and then each file
+# every process deselects, or why the whole gate runs. Every process still
+# collects all of tests/, and a selection of none passes on that collection.
+UNSEL=()
+SEL_NONE=
+if [ -n "${COMPASS_GATE_SELECT:-}" ]; then
+    SEL=$(python "$ROOT/scripts/compass/gate_select.py" select "$COMPASS_GATE_SELECT" "$ROOT" "${IGN[@]#--ignore=}") ||
+        finish 94 "gate_select.py could not read COMPASS_GATE_SELECT=$COMPASS_GATE_SELECT; nothing was run"
+    printf '%s\n' "${SEL%%$'\n'*}"
+    [[ $SEL != "select: 0 of "* ]] || SEL_NONE=1
+    mapfile -t UNSEL < <(tail -n +2 <<<"$SEL")
+    [ "${#UNSEL[@]}" -eq 0 ] || [ "${#CF[@]}" -eq 0 ] ||
+        mapfile -t CF < <(printf '%s\n' "${CF[@]}" | grep -vxF -f <(printf '%s\n' "${UNSEL[@]}"))
+    [ "${#UNSEL[@]}" -eq 0 ] || [ "${#RF[@]}" -eq 0 ] ||
+        mapfile -t RF < <(printf '%s\n' "${RF[@]}" | grep -vxF -f <(printf '%s\n' "${UNSEL[@]}"))
+fi
+[ "$SHARDS" -le "${#CF[@]}" ] || SHARDS=${#CF[@]}
+[ "$SHARDS" -gt 0 ] || RS=1
+[ "$RS" -le "${#RF[@]}" ] || RS=$((${#RF[@]} > 0 ? ${#RF[@]} : 1))
 LOGS=$(mktemp -d) || finish 96 "mktemp failed; nothing was run"
 trap 'rm -rf "${HARNESS:-}" "$LOGS"' EXIT
 # More than one of these processes runs cargo in atom/mesh, and on NFS cargo
@@ -295,7 +238,7 @@ if [ -n "$CARGO_BIN" ]; then
         chmod +x "$LOGS/bin/cargo" || finish 96 "cannot write the cargo wrapper; pytest was not run"
     export PATH=$LOGS/bin:$PATH
 fi
-PYTEST=(tests/ "${IGN[@]}" -q --no-header -p no:cacheprovider)
+PYTEST=(tests/ "${IGN[@]}" -q --no-header -p no:cacheprovider "${UNSEL[@]/#/--deselect=}")
 ARGS=("$@")
 own() {
     local a prev=
@@ -313,25 +256,60 @@ for e in tests/*; do
     [ -d "$e" ] && e=$e/
     [ "$e" = tests/compass/ ] || REST+=(--deselect="$e")
 done
+# pack N FILE...: prints "<process> <file>" for each FILE, dealt to processes
+# 0..N-1 longest first, each to the process with the fewest seconds so far by
+# cpu_gate_durations.txt, then the fewest files. An unlisted file counts 0.
+pack() {
+    local n=$1
+    shift
+    printf '%s\n' "$@" |
+        awk -v table="$DURATIONS" 'BEGIN { while ((getline l < table) > 0) if (split(l, a, " ") == 2 && a[1] !~ /^#/) t[a[2]] = a[1] }
+            { print ($0 in t ? t[$0] : 0), $0 }' |
+        sort -k1,1gr -k2,2 |
+        awk -v n="$n" '{ m = 0; for (i = 1; i < n; i++) if (s[i] < s[m] || (s[i] == s[m] && c[i] < c[m])) m = i
+            s[m] += $1; c[m]++; print m, $2 }'
+}
+# others P LINE...: sets OTHERS to a --deselect for each file pack dealt to a
+# process other than P.
+others() {
+    local p=$1 a
+    shift
+    OTHERS=()
+    for a; do [ "${a%% *}" = "$p" ] || OTHERS+=(--deselect="${a#* }"); done
+}
+CPACK=()
+RPACK=()
+[ "$SHARDS" -eq 0 ] || mapfile -t CPACK < <(pack "$SHARDS" "${CF[@]}")
+[ "$RS" -eq 1 ] || mapfile -t RPACK < <(pack "$RS" "${RF[@]}")
 PIDS=()
 for ((s = 0; s < SHARDS; s++)); do
-    OTHERS=()
-    for ((k = 0; k < ${#CF[@]}; k++)); do
-        [ $((k % SHARDS)) -eq "$s" ] || OTHERS+=(--deselect="${CF[k]}")
-    done
+    others "$s" "${CPACK[@]}"
     own ".shard$((s + 1))"
     python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${REST[@]}" "${OTHERS[@]}" >"$LOGS/$s" 2>&1 &
     PIDS+=($!)
 done
 DROP=()
 [ "$SHARDS" -eq 0 ] || DROP=(--deselect=tests/compass/)
+for ((r = 1; r < RS; r++)); do
+    others "$r" "${RPACK[@]}"
+    own ".rest$((r + 1))"
+    python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${DROP[@]}" "${OTHERS[@]}" >"$LOGS/r$r" 2>&1 &
+    PIDS+=($!)
+done
+others 0 "${RPACK[@]}"
 own ""
-python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${DROP[@]}"
+python -m pytest "${PYTEST[@]}" "${OWN[@]}" "${DROP[@]}" "${OTHERS[@]}"
 CODES=($?)
+for ((r = 1; r < RS; r++)); do
+    wait "${PIDS[SHARDS + r - 1]}"
+    CODES+=($?)
+    printf '\n== the rest of tests/, process %s of %s: rc=%s\n' $((r + 1)) "$RS" "${CODES[-1]}"
+    cat "$LOGS/r$r"
+done
 for ((s = 0; s < SHARDS; s++)); do
     wait "${PIDS[s]}"
     CODES+=($?)
-    printf '\n== tests/compass, shard %s of %s: rc=%s\n' $((s + 1)) "$SHARDS" "${CODES[s + 1]}"
+    printf '\n== tests/compass, shard %s of %s: rc=%s\n' $((s + 1)) "$SHARDS" "${CODES[-1]}"
     cat "$LOGS/$s"
 done
 RC=0
@@ -339,7 +317,7 @@ RAN=
 for c in "${CODES[@]}"; do
     case $c in 0) RAN=1 ;; 5) ;; *) [ "$RC" -ne 0 ] || RC=$c ;; esac
 done
-[ "$RC" -ne 0 ] || [ -n "$RAN" ] || RC=5
+[ "$RC" -ne 0 ] || [ -n "$RAN$SEL_NONE" ] || RC=5
 printf '\npytest: rc=%s\n' "$RC"
 
 if [ "$RC" -ne 0 ]; then
@@ -374,7 +352,7 @@ if [ -n "$GPU_SRC_UNKNOWN" ]; then
 fi
 
 # A green pytest run is not a passed gate when the diff lands in the blind spot:
-# the GPU gate has to have run on this same tree, and to have said so.
+# the GPU gate has to have run on this same tree, or carry to it, and said so.
 if [ -n "$GPU_NEEDED" ]; then
     DONE=${COMPASS_GPU_GATE_DONE:-}
     if [ -z "$DONE" ]; then
@@ -392,11 +370,27 @@ if [ -n "$GPU_NEEDED" ]; then
         printf '  any tree. Rebuild the snapshot with scripts/compass/snapshot.sh.\n' >&2
         finish 98 "COMPASS_GPU_GATE_DONE cannot be checked; this tree has no commit"
     fi
-    if [ "$DONE" != "$HEAD_SHA" ]; then
+    # A GPU gate passed on full sha G carries here when the diff from G, git's or
+    # snapshot.sh's .compass-gpu-carry stamp (G, HEAD, the diff), hits no trigger.
+    G=$DONE CARRY= WHY= HITS=
+    if [ "$DONE" = "$HEAD_SHA" ]; then :
+    elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+        { [ "$(git -C "$ROOT" rev-parse --verify --quiet "$DONE^{commit}")" = "$DONE" ] &&
+            CARRY=$(git -C "$ROOT" -c core.quotePath=false diff --no-renames --name-only "$G"); } || WHY="$DONE is not the full sha of a commit here"
+    elif [ -s "$ROOT/.compass-gpu-carry" ]; then
+        { read -r G; read -r TO; CARRY=$(cat); } <"$ROOT/.compass-gpu-carry"
+        [ "$G $TO" = "$DONE $HEAD_SHA" ] || WHY="the .compass-gpu-carry stamp carries $G to $TO"
+    else
+        WHY="the snapshot has no .compass-gpu-carry stamp; stage it with COMPASS_GPU_GATE_DONE set"
+    fi
+    [ -n "$WHY" ] || HITS=$(trigger_hits "$CARRY")
+    [ -z "$HITS" ] || WHY="the diff from ${G:0:9} touches a trigger: $(printf '%s' "$HITS" | tr '\n' ' ')"
+    if [ -n "$WHY" ]; then
         printf 'COMPASS_GPU_GATE_DONE=%s but this tree is %s.\n' "$DONE" "$HEAD_SHA" >&2
         printf '  The GPU gate passed on a different tree. Re-run it here.\n' >&2
-        finish 98 "COMPASS_GPU_GATE_DONE names a different tree; run gate_gpu.sh here"
+        finish 98 "COMPASS_GPU_GATE_DONE names a different tree and does not carry here: $WHY; run gate_gpu.sh here"
     fi
-    printf 'gpu:    satisfied by COMPASS_GPU_GATE_DONE=%s\n' "${DONE:0:9}"
+    [ "$G" = "$HEAD_SHA" ] && printf 'gpu:    satisfied by COMPASS_GPU_GATE_DONE=%s\n' "${DONE:0:9}" ||
+        printf 'gpu:    satisfied by %s carried to %s\n' "${G:0:9}" "${HEAD_SHA:0:9}"
 fi
 finish 0

@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import re
+import struct
 import subprocess
 import sys
 import types
@@ -60,13 +61,13 @@ _CAPTURES: dict = {}
 
 def trace(root, argv):
     """`trace ops --tp 8 --arch gfx950` over `argv`, run in a process of its own
-    on a model directory holding V4-Pro's config.json and a shard of junk:
-    nothing may open the checkpoint."""
+    on a model directory holding V4-Pro's config.json and a shard that holds
+    no tensor: ATOM reads its header, and nothing may load a tensor."""
     assert hashlib.sha256(CONFIG.read_bytes()).hexdigest() == CONFIG_SHA256
     (root / "model").mkdir()
     (root / "model" / "config.json").write_bytes(CONFIG.read_bytes())
-    junk = root / "model" / "model-00001-of-00001.safetensors"
-    junk.write_bytes(b"not a safetensors shard")
+    shard = root / "model" / "model-00001-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", 2) + b"{}")
     command = ["trace", "ops", "--model", str(root / "model"), "--tp", "8"]
     command += ["--arch", "gfx950", "--store", str(root / "store"), *argv.split()]
     return subprocess.run(

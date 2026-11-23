@@ -200,7 +200,7 @@ TP2_ONLY_OPS = (
 ROW_PARALLEL = "atom/model_ops/layernorm.py:944 in _forward_fused_allreduce"
 VOCAB_EMBEDDING = "atom/model_ops/embed_head.py:178 in forward"
 VOCAB_LM_HEAD = "atom/model_ops/embed_head.py:269 in forward"
-SAMPLER = "atom/model_engine/model_runner.py:3389 in postprocess"
+SAMPLER = "atom/model_engine/model_runner.py:3479 in postprocess"
 
 # Where a free symbol stops being free, each as the value it takes and the
 # innermost ATOM frames it takes it through. Three, and in an order: a symbol
@@ -233,9 +233,9 @@ SITE_THREE = (
 # so these say which constructor answered and how often -- the half of the
 # second site's pin that no specialisation site covers, because a repair inside
 # `__init__` changes what it allocates rather than where a symbol is solved.
-# Measured: 23 buffers, each one host allocation and one numpy view.
+# Measured: 22 buffers, each one host allocation and one numpy view.
 BUFFER_INIT = "atom/utils/__init__.py:714"
-BUFFER_COUNT = 23
+BUFFER_COUNT = 22
 
 # The `torch.cuda` names `_declare_cuda` stubs, which are exactly the names a
 # capture reads. Measured by counting every read of a stubbed name over a whole
@@ -505,12 +505,12 @@ EXPECTED_HOST_RESOLUTIONS = {
     "atom/model_ops/attentions/backends.py:671 in _build_mrope_decode_positions": 1,
     "atom/model_ops/attentions/backends.py:714 in prepare_cu_seqlens_q": 1,
     "atom/model_ops/attentions/backends.py:715 in prepare_cu_seqlens_q": 3,
-    "atom/model_engine/model_runner.py:522 in prepare_input_ids": 3,
-    "atom/model_engine/model_runner.py:608 in _stage_input_ids": 1,
-    "atom/model_engine/model_runner.py:611 in _stage_input_ids": 1,
-    "atom/model_engine/model_runner.py:2698 in prepare_sample": 1,
+    "atom/model_engine/model_runner.py:498 in prepare_input_ids": 3,
+    "atom/model_engine/model_runner.py:585 in _stage_input_ids": 1,
+    "atom/model_engine/model_runner.py:588 in _stage_input_ids": 1,
+    "atom/model_engine/model_runner.py:2700 in prepare_sample": 1,
     "atom/model_ops/sampler.py:48 in _apply_greedy_tokens": 1,
-    "atom/utils/forward_context.py:318 in decide": 1,
+    "atom/utils/forward_context.py:322 in decide": 1,
     "atom/utils/h2d.py:51 in _count": WIDTH_COUNTED_COPIES,
 }
 
@@ -666,9 +666,11 @@ def _declare_cuda():
         "is_current_stream_capturing": lambda: False,
     }
     # ATOM's H2D publication compares the current stream by identity, and by
-    # id through torch's own accessor, which it reads off `torch._C`.
+    # id through torch's own accessor, which it reads off `torch._C`; aiter's
+    # top-k reads the current device there.
     current = _Stream()
     torch._C._cuda_getCurrentStream = lambda *a: (current.stream_id, 0, 1)
+    torch._C._cuda_getDevice = lambda: 0
     for group in (for_import, for_runner):
         for name, value in group.items():
             setattr(torch.cuda, name, value)

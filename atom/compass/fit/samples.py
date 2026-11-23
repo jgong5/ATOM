@@ -28,7 +28,8 @@ replay unprofiled.
 Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
 config.json's digest; `device`, each GPU's `<name> <arch>`, as a spec states
-it; `engine_config`, `keyed`'s fields, the parallel layout among them;
+it; `engine_config`, `keyed`'s fields, the parallel layout among them, over the
+level `step_linear_fit.recorded_level` reads, as is each sample's host key's;
 `prefill_buckets`, those `step_linear_fit.stated_buckets` reads, null where it
 states none; `source_root`, its host key's ``atom`` as `source_root` writes
 it; `sampling`, the request parameters, null for a record serving no client
@@ -39,7 +40,12 @@ names none. A measurement reads the same fields but the host key, stack and
 prefill buckets from its key, whose `engine_config` and `sampling` are JSON
 objects as text. A field that differs between inputs refuses, naming each
 value and the inputs holding it; so do a profiled record and a record whose
-requests carry two sets of request parameters.
+requests carry two sets of request parameters. Ladders that are non-empty
+prefixes of the longest among the inputs read as it (`step_grid_plan.pooled`).
+
+A stated engine file (`--engine`) stands in for each record's own as
+`step_linear_fit --engine` takes it, in `engine_config`, the host key's
+``engine`` (its graph sets kept) and a record's prefill buckets stating none.
 """
 
 import dataclasses
@@ -48,10 +54,16 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, Topology
+from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.shape import BatchView, RequestShape
-from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS
+from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, pooled
 from atom.compass.backends.step_labels import Sample, digest, label_run
-from atom.compass.backends.step_linear_fit import stated_buckets
+from atom.compass.backends.step_linear_fit import (
+    recorded_buckets,
+    recorded_level,
+    refuse_contradicting,
+    stated_buckets,
+)
 from atom.compass.drive import aiter_jit
 from atom.compass.drive.identity import PTL_CHANGES
 from atom.compass.parity import ARRIVALS
@@ -71,19 +83,27 @@ UNRECORDED = "unrecorded"
 
 
 def load(
-    records: Mapping, measurements: Sequence = (), store=None, floored=None
+    records: Mapping, measurements: Sequence = (), store=None, floored=None, engine=None
 ) -> tuple[list[Sample], dict]:
     """The samples of `records`, {record directory: the client runs its server
     served}, labelled under `floored`, and of the `measurements` keys in the
     store at `store`, in run digest, DP rank and step order; and the
-    configuration they state."""
-    samples, configs = [], {}
+    configuration they state, the records' under the engine file `engine`, and
+    each engine config at the longest ladder among them (`pooled`)."""
+    samples, configs, held = [], {}, {}
+    if engine is not None:
+        owns = {d: Path(d) / "steps" / "dp0.engine.json" for d in records}
+        held = pooled({d: keyed_of(json.loads(o.read_text())) for d, o in owns.items()})
     for directory, client_runs in records.items():
-        got, configs[str(directory)] = _record(Path(directory), client_runs, floored)
+        got, configs[str(directory)] = _record(
+            Path(directory), client_runs, floored, engine, held.get(directory)
+        )
         samples += got
     for key in measurements:
         got, configs[str(key)] = _measurement(ArtifactStore(store), key)
         samples.append(got)
+    for i, at in pooled({i: c["engine_config"] for i, c in configs.items()}).items():
+        configs[i]["engine_config"] = at
     fields = sorted({f for c in configs.values() for f in c})
     differ = [
         line
@@ -97,7 +117,9 @@ def load(
     return samples, one
 
 
-def _record(directory: Path, client_runs, floored=None) -> tuple[list[Sample], dict]:
+def _record(
+    directory: Path, client_runs, floored=None, stated=None, held=None
+) -> tuple[list[Sample], dict]:
     run = json.loads((directory / "run.json").read_text())
     if run["format_version"] != FORMAT_VERSION:
         raise ValueError(
@@ -132,24 +154,46 @@ def _record(directory: Path, client_runs, floored=None) -> tuple[list[Sample], d
             f"parameters: {' and '.join(sampling)}"
         )
     traces = {(s["dp_rank"], s["step"]): s["traces"] for s in _steps(record)}
+    own, buckets = steps / "dp0.engine.json", stated_buckets(steps / "dp0.jsonl")
+    level = recorded_level(steps / "dp0.jsonl")
+    engine = level | keyed_of(json.loads(own.read_text()))
+    if stated is not None:
+        engine, buckets = _stated(own, level | held, buckets, stated)
     files = sorted(steps.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
     name, samples = ", ".join(map(digest, files)), []
     for got, _ in label_run(files, name, _split, floored):
         for s in got:
             at = traces[s.rank, s.step]
             traced = {**s.provenance, "traces": at, "profiled": run["profiled"]}
+            if stated is not None and (key := traced["config"]) is not None:
+                graphs = {k: v for k, v in key["engine"].items() if k == GRAPHS}
+                traced["config"] = {**key, "engine": engine | graphs}
+            elif level and (key := traced["config"]) is not None:
+                traced["config"] = {**key, "engine": level | key["engine"]}
             samples.append(dataclasses.replace(s, provenance=traced))
-    engine = json.loads((steps / "dp0.engine.json").read_text())
     host = run["host_key"]
     return samples, {
         **fields,
-        "engine_config": keyed_of(engine),
-        PREFILL_BUCKETS: stated_buckets(steps / "dp0.jsonl"),
+        "engine_config": engine,
+        PREFILL_BUCKETS: buckets,
         "stack": run["stack"],
         "ptl": run.get("ptl", UNRECORDED),
         "sampling": json.loads(sampling[0]) if sampling else None,
         "host_key": {k: v for k, v in host.items() if k not in ("model", "engine")},
     }
+
+
+def _stated(own: Path, held: dict, buckets, stated) -> tuple[dict, list | None]:
+    """The `keyed` fields of the engine file `stated` and the prefill buckets a
+    record with engine file `own`, `held` its keyed fields at the records'
+    longest ladder, states, else the file's. A field the file omits or states
+    otherwise, or other buckets, refuse."""
+    raw = json.loads(Path(stated).read_text())
+    engine = keyed_of(raw)
+    refuse_contradicting(own, held, stated, engine)
+    held_buckets = {} if buckets is None else {str(own.parent): buckets}
+    stating = recorded_buckets({str(stated): raw.get(PREFILL_BUCKETS)} | held_buckets)
+    return engine, None if stating is None else list(stating)
 
 
 def run_fields(run: dict, record="run.json") -> dict:

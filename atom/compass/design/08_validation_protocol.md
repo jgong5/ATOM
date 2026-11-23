@@ -60,6 +60,20 @@ reported beside its grade (D50, `19` D117).
 [#3423](https://github.com/jgong5/ATOM/issues/3423):** the DSv41-DPEP stage grades its DP
 points by D45.1 too, without the CPU hit rate, a set of their own (D50).
 
+**Revised 2026-11-18 by the owner's
+[ruling on #3590](https://github.com/jgong5/ATOM/issues/3590#issuecomment-6910498913):** a
+passed GPU gate carries to a tree whose diff from the gated tree touches no GPU-gate trigger
+(D43.1, rule 4).
+
+**Revised 2026-11-20 by [#3828](https://github.com/jgong5/ATOM/issues/3828):** the GPU gate
+runs, of `tests/compass`, only the driver-run files by default, and every compass file on
+request (D43.1, the two gates).
+
+**Revised 2026-11-21 by [#3830](https://github.com/jgong5/ATOM/issues/3830):** the CPU gate
+runs per landing batch, a task runs only the test files it adds or edits, and the GPU gate
+runs on a batch that touches a trigger and, as the superset, by hand about daily (D43.1, the
+two gates).
+
 **Scope.** What counts as evidence: which results are reported, how each is measured, what
 tolerance applies and where that tolerance comes from, and what invalidates a run.
 Acceptance is paired simulated and real execution of cc-traces proper, so every rule here
@@ -101,8 +115,8 @@ that subset is genuinely green.
 
 | Gate | What runs | Measured result |
 |---|---|---|
-| **CPU gate** — per task, and green is the bar | Every test file outside `tests/plugin/` and `scripts/compass/cpu_gate_exclude.txt`. Driven by `scripts/compass/gate_cpu.sh`; no driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` were both in the gate at `236abfd9a`, and each reached `rocminfo` when run *alone* (`no tests collected, 1 error`, rc=2, each, measured in `xiaobizh_n18_cpu`); inside the gate they module-skipped on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | Green, `GATE_CPU_RC=0`, read at `bdd244c57` in `xiaobizh_n18_cpu`. The counts are not restated here, because they move with every test the gate gains or loses: `gate_cpu.sh` prints them under the `commit:` line of the tree it ran, and `scripts/compass/README.md` says what the gate runs. |
-| **GPU gate**, a superset — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`, less any file `scripts/compass/gpu_gate_skip.txt` names for the GPU target it runs on: a file whose result on that target its pair cannot record. A suite file's collected tests come off the expectation; a `tests/compass` file only leaves its run. A target whose nodes hold no driver-run inputs has one line saying so, and there the gate sets none, needs one card and accepts a driver-run skip. | The commit, its counts and the toolchain it ran under are in `scripts/compass/gpu_gate_baselines/<GPU target>/gpu_gate_baseline.env`, one pair per GPU target, and every failing node-id is on file verbatim in the same directory's `gpu_gate_known_failures.txt` and compared by name, so "N failed" is checked against "the *same* N failed". `scripts/compass/regen_gpu_gate_baseline.sh` rewrites both from two runs that pass the same count and fail the same node-ids, so a new image or GPU is re-baselined by one command. |
+| **CPU gate** — per landing batch, and green is the bar | Every test file outside `tests/plugin/` and `scripts/compass/cpu_gate_exclude.txt`. Driven by `scripts/compass/gate_cpu.sh` on the batch commit before every landing; per task, `scripts/compass/gate_targeted.sh` runs only the test files the change adds or edits, collected as this gate collects them. No driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` were both in the gate at `236abfd9a`, and each reached `rocminfo` when run *alone* (`no tests collected, 1 error`, rc=2, each, measured in `xiaobizh_n18_cpu`); inside the gate they module-skipped on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | Green, `GATE_CPU_RC=0`, read at `bdd244c57` in `xiaobizh_n18_cpu`. The counts are not restated here, because they move with every test the gate gains or loses: `gate_cpu.sh` prints them under the `commit:` line of the tree it ran, and `scripts/compass/README.md` says what the gate runs. |
+| **GPU gate** — per landing batch that touches a trigger, and daily by hand, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`. Of `tests/compass`, by default only the driver-run files `scripts/compass/gpu_gate_driver_run.txt` lists, the ones that skip in the CPU gate for want of a driver-run input: every other compass file already runs there, and a driver-run skip in a file the list does not name fails the CPU gate, which holds the list complete. A batch whose diff touches a trigger (rule 4) holds that change alone (`.claude/agent-team.md`, The GPU gate), and its lander runs this default on the batch commit before the CPU gate accepts it. With `COMPASS_GPU_GATE_SCOPE=all` it runs every compass file, the superset of the CPU gate: the owner or an orchestrator runs that by hand on the integration tip about daily, and each failure outside the known-failures list is a finding issue. No gate runs after each landing. Less any file `scripts/compass/gpu_gate_skip.txt` names for the GPU target it runs on: a file whose result on that target its pair cannot record. A suite file's collected tests come off the expectation; a `tests/compass` file only leaves its run. A target whose nodes hold no driver-run inputs has one line saying so, and there the gate sets none, needs one card and accepts a driver-run skip. | The commit, its counts and the toolchain it ran under are in `scripts/compass/gpu_gate_baselines/<GPU target>/gpu_gate_baseline.env`, one pair per GPU target, and every failing node-id is on file verbatim in the same directory's `gpu_gate_known_failures.txt` and compared by name, so "N failed" is checked against "the *same* N failed". `scripts/compass/regen_gpu_gate_baseline.sh` rewrites both from two runs that pass the same count and fail the same node-ids, so a new image or GPU is re-baselined by one command. |
 
 `test_dp_metadata.py`, `test_dp_sync_layout.py`
 and `test_forward_mode.py` were once excluded and were re-measured CPU-green (`16`); prose
@@ -164,7 +178,7 @@ suite checks.
    straggler detector and the cost-backend interface are all testable without a device.
    Those tests are the 74 in the decomposition above.
 4. **The CPU gate refuses rather than reporting "not required" (principle 6).** Green at the
-   CPU gate is not green for the task when the diff lands in what the CPU gate cannot see. That
+   CPU gate is not green for the batch when the diff lands in what the CPU gate cannot see. That
    blind spot is a file, not a sentence: `scripts/compass/gpu_gate_triggers.txt`, **30 paths**,
    generated rather than hand-written — the counts in its own header included. The rule:
    an `atom` module named by an excluded test is a blind spot unless a CPU-gate test that
@@ -174,10 +188,14 @@ suite checks.
    imports that provably execute. `regen_gpu_gate_triggers.sh` reproduces it, and a trailing
    `/` matches a subtree.
    `gate_cpu.sh` exits **98** when a changed path matches a trigger and
-   `COMPASS_GPU_GATE_DONE=<sha>` is absent or names a different tree — and also when it
-   cannot determine the diff at all (no git, no `COMPASS_CHANGED_FILES`) or cannot name the
-   tree the attestation would apply to. An unanswerable question is refused, not answered
-   "no". The previous form of this rule was a prose list of areas — "EPLB, DP metadata,
+   `COMPASS_GPU_GATE_DONE=<sha>` is absent or names a different tree whose diff from this
+   one touches a trigger — and also when it cannot determine the diff at all (no git, no
+   `COMPASS_CHANGED_FILES`) or cannot name the tree the attestation would apply to. A GPU
+   gate passed on tree G carries to a later tree whose diff from G touches no trigger:
+   landing G first already allows that tree, so the blind spot does not grow. G is a full
+   sha; a snapshot carries the diff in the `.compass-gpu-carry` stamp `snapshot.sh` writes,
+   and with no stamp from G to its own HEAD it is refused. An unanswerable question is refused, not answered "no".
+   The previous form of this rule was a prose list of areas — "EPLB, DP metadata,
    cudagraph bounds, block tables" — which both missed modules and named two the CPU gate
    does cover.
 
@@ -190,7 +208,7 @@ suite checks.
    which of the two mistakes to prefer — running the GPU gate when in doubt is never the wrong one — and the asymmetry
    above is that preference written down. Cite it that way wherever it is cited.
 
-`16` states the same rule as the per-task gate, under its measured test and lint
+`16` states the same rule as the CPU gate, under its measured test and lint
 baselines; the two must be amended together.
 
 **Baseline caveat.** Take each gate's *current* pass/fail state as the baseline before the
@@ -732,6 +750,16 @@ never a combination of them:
    never admits a ρ under 0.9. Client count alone orders much of a matrix spanning one to
    hundreds of clients, so ρ is the weaker check of the two.
 
+Every configuration one ranking orders is simulated at one tree, which the ranking's
+registration names: two trees are two simulators, and between `ef8d20ed5` and `2aa7f8477`
+#3399 cut a padded DP decode's MoE term from 7.53 to 3.94 ms, DPA's price alone. A run
+simulated at another tree is simulated again at that one before it is ranked
+([ruling on #3179](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6887067640)).
+A configuration simulated at a tree that differs from the named one only in how `deploy.sh`
+builds a run file counts as simulated at the named one when every other configuration's run
+file builds at the differing tree to its registered hash, so one simulator prices them all
+([ruling on #3179](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6965210050)).
+
 Stage 2 runs one configuration, so it has no ranking to grade; it is graded by D44's
 results alone. Stage 4 has no ranking gate either, by the owner's ruling on #2138: each
 MI455 cell is graded by D44's results and by the speed floor of `README.md`, faster than
@@ -926,7 +954,7 @@ claims there are not.
 | D48 | Memory per term, never as a sum. The gate is whether the top-1 configuration choice survives, not the byte error. | 2026-09-18 |
 | D49 | Seven hygiene refusals, each with a prior incident behind it. An op-level leaf is not extrapolated: with no same-kernel bracket it falls to its analytical law. An out-of-hull step is graded and also reported apart. | 2026-09-18; op-level leaf 2026-10-18 (#1489); out-of-hull graded 2026-10-23 (#2011) |
 | D50.1 | A step is refused only when some term is still unanswered after method fallback, its reasons listed per term; a fall-through and an answer of any method are not refusals, and the priced seconds are reported by method (analytical, declared, measured, estimated, unvalidated) with their steps and share of predicted seconds. Each unanswered term costs 0 s, and a step the cost backend refuses charges no device time, its answered terms included; the run continues, `--on-refusal abort` stops at the first, and the summary is written either way. Any refusal, of any source, makes the run a coverage report: no refused-seconds fraction, no threshold, and no answered step invalidates a run, whatever its method or share. No validated share refuses or makes a coverage report. | 2026-09-19; revised 2026-10-11 (#765, and again to drop the analytical cap); 2026-10-14 (#952); 2026-10-23 (#2011); 2026-10-26 (#2294) |
-| D50 | Everything registered and hashed before evaluation; the case set never shrinks, though the owner dropped stage 2's 64 and 256, whose aiperf warmup cannot finish within a capture's window (#1590). One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The cells are stage 2's Qwen3.8-27B TP1 on MI308X and M2's four nightly P/D configurations of DeepSeek-V4-Pro on MI355X at their concurrencies, then the DPA two at EP8; stage 4's two DeepSeek-V4.1-Flash TP4 DSpark5 cells on MI455, with and without EP4, graded with no ranking gate; the M3-Agentic stage's MiniMax-M3 arms on gpu-40, graded point by point by D45.1, and the DSv41-DPEP stage's DeepSeek-V4.1-Flash DP points there, graded the same way; after v1, the adoption showcase's recommended MiniMax-M3 configuration and its runner-up on crsuse2-m2m-v3-005 and -013, graded by D44 with their order compared, each point's D45.1 verdict reported beside its grade. M2's ranking gate: the same best configuration as hardware at each concurrency, and rank correlation across all cells, per end-to-end metric, each inside its real-vs-real spread, with Spearman's ρ also at least 0.9. DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01, 2026-10-09, 2026-10-10, 2026-10-20, 2026-10-25 and 2026-10-27 (#2138), 2026-11-12 (#3257), 2026-11-13 ([#3355](https://github.com/jgong5/ATOM/issues/3355)), 2026-11-14 (#3423) |
+| D50 | Everything registered and hashed before evaluation; the case set never shrinks, though the owner dropped stage 2's 64 and 256, whose aiperf warmup cannot finish within a capture's window (#1590). One simulated run plus a reproducibility assertion; N≥3 spaced real runs. The cells are stage 2's Qwen3.8-27B TP1 on MI308X and M2's four nightly P/D configurations of DeepSeek-V4-Pro on MI355X at their concurrencies, then the DPA two at EP8; stage 4's two DeepSeek-V4.1-Flash TP4 DSpark5 cells on MI455, with and without EP4, graded with no ranking gate; the M3-Agentic stage's MiniMax-M3 arms on gpu-40, graded point by point by D45.1, and the DSv41-DPEP stage's DeepSeek-V4.1-Flash DP points there, graded the same way; after v1, the adoption showcase's recommended MiniMax-M3 configuration and its runner-up on crsuse2-m2m-v3-005 and -013, graded by D44 with their order compared, each point's D45.1 verdict reported beside its grade. M2's ranking gate: the same best configuration as hardware at each concurrency, and rank correlation across all cells, per end-to-end metric, each inside its real-vs-real spread, with Spearman's ρ also at least 0.9, every configuration it orders simulated at one tree, named in its registration, or at a tree differing from it only in how `deploy.sh` builds a run file, where every other configuration's run file builds to its registered hash. DP mechanism tests run on a CPU fake-model DP2. | 2026-09-18; revised 2026-10-01, 2026-10-09, 2026-10-10, 2026-10-20, 2026-10-25 and 2026-10-27 (#2138), 2026-11-12 (#3257), 2026-11-13 ([#3355](https://github.com/jgong5/ATOM/issues/3355)), 2026-11-14 (#3423), 2026-11-15 ([#3179](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6887067640)), 2026-11-18 ([#3179](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6965210050)) |
 | D50.2 | The MI455 projection is sound, not graded: on every measured step, at both granularities, the analytical price at attainable peaks probed on the device, composed by the IR's own joins, is at most the measured time, with measured over analytical per op kind and phase reported beside it; every MI455 input is sourced or marked assumed: the A0 samples' peaks probed on their node since stage 4, the frozen projection's the datasheet times MI355X's probed ratios, and the B0 machines' too until a B0 node is probed; the method's error, the same A0 records bounded at the frozen spec and at A0's probed spec, and before them MI308X to MI355X on Qwen3.8-27B, and the configuration ranking are reported, not gated. Replaces the bound first stated at the spec's peaks with derates at 1, and the method that carried implementation efficiencies onto the target. | 2026-10-09; revised 2026-10-17 (#1392), 2026-10-25 and 2026-10-27 (#2138), 2026-10-28 (#2141) |
 | D50.3 | The op-level empirical backend is graded by this protocol as the step-level backends are, on the same real runs: Qwen3.8-27B TP1 on MI308X on #974's runs, then M2's cells with the ranking gate. Faster than real is gated; 5× is reported. Reported, not gated: the analytical fallback's share of priced seconds, the per-step composed-over-measured gap per phase and op kind, the step-level backend's table beside it, and warm-over-cold. | 2026-10-18 (#1489) |
 | D51 | Measure a saturated cell early. Account cold costs once; report the simulator's own per-step CPU cost alongside the ratio. | 2026-09-18 |

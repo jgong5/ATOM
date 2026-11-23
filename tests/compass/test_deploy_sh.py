@@ -12,6 +12,7 @@ Every other `python3` is the real one, so the run file is
 `runfile.prefill_decode`'s. Nothing needs a driver.
 """
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -23,6 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import platforms
+import psutil
 import pytest
 from test_launcher_held_ports import HELD, SQUAT
 from test_memory_readings import DOCUMENT
@@ -175,17 +177,30 @@ def argv(tmp_path, flags, prefill=PREFILL, router=ROUTER_ARGS):
     ]  # fmt: skip
 
 
+#: How long `_until` waits for deploy.sh's file: a few times the longest a
+#: deployment has taken to write it on a loaded host, its run-file build
+#: resolving each side's config in a process of its own.
+UNTIL_S = 300
+
+
 def _until(path: Path, script) -> None:
+    """Return once deploy.sh `script` has written `path`. Fail if it exits
+    first, or after UNTIL_S, once it and every process under it are killed."""
     router = path.with_name("router.log")
-    for _ in range(600):
-        if path.exists():
-            return
+    deadline = time.monotonic() + UNTIL_S
+    while not path.exists():
         assert script.poll() is None, (
             script.communicate(),
             router.read_text() if router.exists() else "no router.log",
         )
+        if time.monotonic() > deadline:
+            top = psutil.Process(script.pid)
+            for proc in [top, *top.children(recursive=True)]:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    proc.kill()
+            script.wait()
+            pytest.fail(f"no {path} after {UNTIL_S} s")
         time.sleep(0.1)
-    pytest.fail(f"no {path}")
 
 
 def _parent(pid: int) -> int:

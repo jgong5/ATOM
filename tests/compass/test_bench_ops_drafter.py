@@ -566,3 +566,50 @@ def test_each_leaf_of_a_drafter_s_graphs_reaches_its_launch(rehearsed):
     assert {r["shape"] for r in rehearsed} == {"decode B=4", "prefill T=124 B=1"}
     assert OWN_KERNELS <= {r["op"] for r in rehearsed}
     assert [r for r in rehearsed if r["verdict"] != "reaches launch"] == []
+
+
+def test_the_draft_block_takes_what_its_drafter_builds_from_its_anchors(rehearsed):
+    """Each leaf of the drafter's that takes its block's anchors, or the
+    positions and indices ATOM builds from them, takes that build's, at both
+    shapes."""
+    v41, stage = "atom.model_ops.deepseek_v41", "atom.spec_decode.dspark_proposer"
+    built = {
+        (f"{stage}:DSparkProposer._stage_anchors", "rows"): "rows",
+        (f"{v41}.dspark:draft_step_indices", "positions"): "anchors",
+        (f"{v41}.rope_window:_launch_rope_window", "positions"): "positions",
+        ("atom.model_ops.sparse_attn_v4:_sparse_attn_triton", "topk_idxs"): "indices",
+        ("aiter._inverse_rope_group_quant_kernel.default", "positions"): "positions",
+    }
+    taken = {
+        (r["shape"], r["op"], slot, r["bound"].get(slot))
+        for r in rehearsed
+        for op, slot in built
+        if op == r["op"]
+    }
+    assert taken == {
+        (shape, op, slot, f"draft_step.{item}")
+        for shape in ("decode B=4", "prefill T=124 B=1")
+        for (op, slot), item in built.items()
+    }
+
+
+def test_the_draft_kv_tail_and_the_cursor_commit_take_what_atom_passes_them(
+    rehearsed,
+):
+    """The draft-KV tail of a replayed prefill takes the step's positions at
+    its tail's rows, and a decode's cursor commit its block's anchor rows and
+    its step's segment starts, each request its own staged rows."""
+    tail = "atom.model_ops.deepseek_v41.dspark:fused_draft_kv_tail"
+    commit = "atom.model_ops.attentions.deepseek_v41.speculative:_launch_commit_cursors"
+    taken = {
+        (r["shape"], r["op"], slot, r["bound"].get(slot))
+        for r in rehearsed
+        for op, slot in ((tail, "positions"), (commit, "anchors"), (commit, "starts"))
+        if r["op"] == op
+    }
+    assert taken == {
+        ("prefill T=124 B=1", tail, "positions", "plan.tail_rows.positions"),
+        ("decode B=4", tail, "positions", "step.positions"),
+        ("decode B=4", commit, "anchors", "draft_step.rows"),
+        ("decode B=4", commit, "starts", "step.cu_seqlens_q"),
+    }

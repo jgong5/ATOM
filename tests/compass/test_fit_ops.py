@@ -241,6 +241,14 @@ def test_fit_ops_holds_out_no_point_between_neighbours_one_apart(
     assert held == ([[2, 512]] if declined else [])
 
 
+def _combine(rows, width=7168):
+    """A MORI combine of `rows` rows of `width` bf16 in, as the capture states
+    it: MORI's whole buffer of 16384 rows out at every width."""
+    x = {"shape": [rows, width], "stride": [width, 1], "dtype": BF16}
+    args = {"input": x | {"role": "activation"}, "weights": None}
+    return {"op": f"{MORI}.combine", "args": args, "out": [[16384, width]]}
+
+
 BEND = "bytes = 8192 reads +10.0%"
 MOE = "atom.model_ops.moe:"
 
@@ -273,10 +281,12 @@ def test_fit_ops_holds_out_no_collective_point_between_neighbours_one_row_apart(
     # row, so a row's bytes are not known; all_gatherv's, reduce_scatterv's and
     # MORI's ranks' rows can differ, so a step can hold between two points' rows;
     # the padded pair pads every rank to the same rows, so a row keeps its bytes
+    # a combine's bytes are its leaf's input's, as many rows of 1024 bytes
     fam = json.dumps(["exchange", {"op": op}])
     points = [
         {"shape": shape.format(b), "context": 1024, "op": op}
-        | {"leaf": "{}", "exchange": [fam, n * 1024], "cold_ns": ns, "kernels": ["k"]}
+        | {"leaf": bench.signature(_combine(n, 512) | {"op": op}), "cold_ns": ns}
+        | {"exchange": [fam, n * 1024], "kernels": ["k"]}
         for b, n, ns in zip(rows, nbytes, (1e4, 1e4, 12e3))
     ]
     d, _ = measured("m", points)
@@ -515,6 +525,36 @@ def test_a_price_list_prices_a_collective_between_two_measured_sizes(rows, at, p
         assert got.reason == priced
     else:
         assert got.seconds == pytest.approx(priced)
+
+
+#: #3437's first EP8 run on 005: each combine's cold ns by its B, eight ranks'
+#: B rows in, stored at MORI's whole buffer at every B
+STORED_COMBINE_NS = {1: 22179.2, 8: 22208.9, 32: 28080.9}
+
+
+def test_a_combine_point_stored_at_mori_s_whole_buffer_is_priced_at_its_own_rows():
+    whole = 16384 * 7168 * 2  # MORI's buffer, the bytes stored at every B
+    points = [
+        {"shape": f"decode B={b}", "context": 8192, "op": f"{MORI}.combine"}
+        | {"leaf": bench.signature(_combine(8 * b)), "cold_ns": ns, "kernels": ["k"]}
+        | {"exchange": [bench.exchange(_combine(8 * b))[0], whole]}
+        for b, ns in STORED_COMBINE_NS.items()
+    ]
+    params = ops.fit(points)
+    ops.held_out(params)
+
+    got = [
+        ops.PriceList(params).price(
+            (_combine(8 * b), ("decode", None, b, None, 8192, 8192), 0)
+        )
+        for b in STORED_COMBINE_NS
+    ]
+
+    (f,) = params["families"].values()
+    assert [c for c, *_ in f["points"]] == [[8 * b * 7168 * 2] for b in (1, 8, 32)]
+    assert [g.seconds for g in got] == pytest.approx(
+        [ns * 1e-9 for ns in STORED_COMBINE_NS.values()]
+    )
 
 
 V4_DECODE = "aiter.mla:mla_decode_fwd_v4_nm"

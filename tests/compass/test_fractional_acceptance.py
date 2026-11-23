@@ -66,7 +66,7 @@ class _Runner(NonAllocatingRunner):
 def serve(monkeypatch, spec, dp_rank=0):
     """ATOM's scheduler after serving `REQUESTS` requests to their end, each
     step the runner's reply, and the number of steps that took."""
-    monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *_: None)
+    monkeypatch.setattr(llm_engine, "load_tokenizer", lambda *_: None)
     monkeypatch.setattr(overrides, "filler_token_ids", lambda *_: [7])
     config = MockConfig(
         speculative_config=spec,

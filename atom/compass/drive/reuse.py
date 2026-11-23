@@ -16,28 +16,39 @@ outside ATOM's Python passes.
 `law` gives the step linear law and host laws a resolved config runs under one
 verdict, `reuse`, `calibrate` or `refused`, from each law file under `LAWS` and
 each step linear law in a store whose key states the config's model, engine
-config and platform, at any ATOM digest and form; of several, reuse comes
+config and platform, at any ATOM digest and form, the engine config at any
+ladder the config's is a prefix of; of several, reuse comes
 first, then refused, then calibrate. The requirement a verdict names:
 
 1. the same key: none there, a store law, or host laws beside it, at another
    ATOM digest than the head's, or a law file whose host key states another
-   (calibrate); host laws fitted on another host CPU (refused);
+   (calibrate); host laws fitted on another host CPU serve, predicting the
+   host they timed;
 2. not invalidated: a store law the store refuses to load under the head's
    readings (calibrate);
 3. coverage: a decode rung the config schedules with no vector
    (`lacking.uncovered_rungs`), each listed (calibrate);
 4. accuracy: no cost-accuracy figures, on the law or on one of its sources
+   whose vectors price a step, which a source of host laws alone does not
    (calibrate); a figure on totals, holding out the costliest step or per step
    at the median past `GATE`, on some held-out run and kind, refused when the
    law's records ran at the head's ATOM digest (`records_atom`), since a
    calibration refits the same miss, else calibrate.
 
-A verdict on a store's own step linear law at the head's ATOM digest names
-that ``store``, whatever the verdict. A refusal the runner makes of the config
-under the law, as of context parallelism, propagates. `readings` gives the config's memory readings in a
-store `reuse`, or `measure` where none is at their key or the one there was
-measured at another ATOM digest (requirement 1). `stores` orders the stores a
-candidate is looked up in.
+A verdict on a law found names, as ``run``, the ``--step-linear`` and
+``--host-laws`` values a run of it takes, and one on a store's own step linear
+law at the head's ATOM digest names that ``store``, whatever the verdict. A
+refusal the runner makes of the config under the law, as of context
+parallelism or of the prefill token-graph buckets it records, propagates.
+`readings` gives the config's memory readings in a
+store, or where it holds none and the config's law verdict is ``reuse`` the
+assumed ones carried by the law files it names as ``run``, as a run of it
+reads them, `reuse`, or `measure` where none is at their key or the one there
+was measured at another ATOM digest (requirement 1), or where it lacks the PAGE
+bound a start of the config reads, which `compass run --check` finds stale
+(`lacking.stale_page_bound`, requirement 2), ``held`` saying whether readings
+are at their key, since the store refuses a second publish there. `stores`
+orders the stores a candidate is looked up in.
 """
 
 import json
@@ -57,15 +68,17 @@ from atom.compass.artifacts import (
     machine_platform,
 )
 from atom.compass.artifacts.store import ENTRY_FILE
+from atom.compass.backends.json_file import XZ, read_json
 from atom.compass.backends.launch_features import GRAPHS
-from atom.compass.drive import runfile
-from atom.compass.drive.lacking import AXIS, uncovered_rungs
+from atom.compass.backends.step_grid_plan import at_ladder
+from atom.compass.drive import lacking, runfile
+from atom.compass.drive.lacking import AXIS, stale_page_bound, uncovered_rungs
 from atom.compass.run import STEP_LINEAR, memory
 from atom.compass.run.step_grid import differ, keyed
 
 #: The tree `atom` resolves under, whose repository the head is read from.
 TREE = Path(atom.__file__).resolve().parents[1]
-#: The checked-in law files.
+#: The checked-in law files, stored xz-compressed; a plain JSON one reads too.
 LAWS = TREE / "scripts" / "compass" / "laws"
 #: The integration branch, whose tip at its remote-tracking ref is the head.
 INTEGRATION = "feature/atomcompass_new"
@@ -152,12 +165,13 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
     engine, platform = keyed(config), machine_platform(machine)
     stated = keyed_platform(Kind.STEP_LINEAR_LAW, platform)
     found = []
-    for path in sorted(LAWS.glob("*.json")):
-        held = json.loads(path.read_text())
+    for path in sorted([*LAWS.glob("*.json"), *LAWS.glob(f"*.json{XZ}")]):
+        held = read_json(path)
         host = held.get("host")
         at = host and (held.get("platform"), host["key"].get("model"))
         if at == (stated, model) and _same(held.get("engine_config"), engine):
             found.append(_law_file(str(path), held, config, machine, atom))
+            found[-1]["run"] = [str(path)] * 2
     for key in _keyed(store, Kind.STEP_LINEAR_LAW, engine, model=model, **stated):
         where = f"{key.kind} {key.token()} in {store.root}"
         if (ran := key.values["source_root"]) != compass_run.source_root(atom):
@@ -182,6 +196,7 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
         hosts.sort(key=lambda k: k.values["host_cpu"] != compass_run.host_cpu())
         host = runfile._member(store.read(hosts[0]), "params")
         found.append(_judged(where, step[0], host, config, machine, atom) | read)
+        found[-1]["run"] = [key.token(), hosts[0].token()]
     if not found:
         why = (
             f"no step linear law at its key, model {model}, this engine config and "
@@ -191,38 +206,46 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
     return min(found, key=lambda v: PREFERRED.index(v["verdict"]))
 
 
-def readings(store: ArtifactStore, config, machine) -> dict:
-    """The verdict on `config`'s memory readings in `store` on `machine`."""
+def readings(store: ArtifactStore, config, machine, law: dict) -> dict:
+    """The verdict on `config`'s memory readings in `store` on `machine`, else,
+    when `config`'s verdict `law` is ``reuse``, in the law files it names to run
+    with, as `compass run` reads them: a calibration runs with the store law it
+    publishes, which carries none."""
+    carried = runfile.carried(law["run"]) if law["verdict"] == "reuse" else ()
     try:
-        memory.load(str(store.root), config, machine, 0)
+        read = memory.load(str(store.root), config, machine, 0, carried)
     except ArtifactRefusal as refused:
         stale = refused.rule is Rule.INVALIDATED
         if refused.rule is not Rule.RESOLUTION and not (
             stale and AXIS.findall(str(refused)) == [str(Axis.ATOM_SRC)]
         ):
             raise
-        return _verdict("measure", 1, str(refused))
-    return _verdict("reuse", None, f"at their key in {store.root}")
+        return _verdict("measure", 1, str(refused), held=stale)
+    held = (store.directory_for(memory.key_of(config, machine)) / ENTRY_FILE).is_file()
+    if why := stale_page_bound(read, config):
+        return _verdict("measure", 2, why, held=held)
+    where = f"at their key in {store.root}" if held else f"in {read.source}"
+    return _verdict("reuse", None, where)
 
 
 def _law_file(where: str, held: dict, config, machine, atom: str) -> dict:
     if (ran := held["host"]["key"].get("atom")) != atom:
         why = f"{where} states ATOM digest {ran}, and the head's is {atom}"
         return _verdict("calibrate", 1, why, law=where)
-    step = {k: v for k, v in held.items() if k not in runfile.HOST_MEMBERS}
+    step = {k: v for k, v in held.items() if k not in runfile.NOT_STEP_LAW}
     return _judged(where, step, held["host"], config, machine, atom)
 
 
 def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> dict:
     """The verdict on the step linear law `law` and host laws `host` found at
-    `where`, both at the head's key: their CPU, then requirements 3 and 4."""
-    if (cpu := host["key"].get("host_cpu")) != (here := compass_run.host_cpu()):
-        why = f"{where}'s host laws were fitted on {cpu}, and this host is {here}"
-        return _verdict("refused", 1, why, law=where)
+    `where`, both at the head's key, on any host CPU, the one they timed being
+    the one predicted: requirements 3 and 4."""
     compass_run.refuse_unfitted_law(
         {STEP_LINEAR: law, "machine": machine.echo()}, config
     )
     compass_run.refuse_unfitted_host(host, config, machine_platform(machine))
+    buckets = lacking.recorded_buckets(config, machine.value("device.arch"))
+    compass_run.refuse_other_buckets(config, buckets, {STEP_LINEAR: law, "host": host})
     if rungs := [str(r) for r in uncovered_rungs(law, config)]:
         why = (
             f"{where} has no decode vector for rung{'s' * (len(rungs) > 1)} "
@@ -230,7 +253,7 @@ def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> di
         )
         return _verdict("calibrate", 3, why, law=where, rungs=rungs)
     past = []
-    for name, held in (law.get("sources") or {"": law}).items():
+    for name, held in _folded(law).items():
         of = f" of source {name}" if name else ""
         if not held.get("figures"):
             why = f"{where} states no cost-accuracy figures{of}"
@@ -252,6 +275,20 @@ def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> di
     return _verdict("calibrate", 4, f"{worst}, on records re-keyed {ran}", law=where)
 
 
+def _folded(law: dict) -> dict:
+    """What of `law` states cost-accuracy figures, by source name: each of its
+    `sources` with a vector that prices a step, the prefill one or a decode one
+    (`step_linear_fit._vector_of`), as ``step_linear_fit figures`` folds no
+    other, such as one of host laws alone; else the law itself, named ``""``."""
+    sources = (law.get("sources") or {}).items()
+    priced = {
+        name: source
+        for name, source in sources
+        if any(v == "prefill" or v.startswith("decode ") for v in source["vectors"])
+    }
+    return priced or {"": law}
+
+
 def _keyed(store: ArtifactStore, kind: Kind, engine: dict, **fields) -> list[Key]:
     """The keys of `store`'s `kind` entries that state each of `fields` as
     given, and `engine` as their engine config, less its graph sets."""
@@ -266,8 +303,9 @@ def _keyed(store: ArtifactStore, kind: Kind, engine: dict, **fields) -> list[Key
 
 
 def _same(there, here: dict) -> bool:
-    """Whether `there` is the engine config `here`, as the runner compares one."""
-    return isinstance(there, dict) and not differ(there, here, "")
+    """Whether `there` is the engine config `here`, as the runner compares one:
+    `here` at `there`'s ladder where its own is a prefix of it (`at_ladder`)."""
+    return isinstance(there, dict) and not differ(there, at_ladder(here, there), "")
 
 
 def _verdict(verdict: str, requirement: int | None, reason: str, **more) -> dict:
