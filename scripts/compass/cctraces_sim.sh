@@ -214,6 +214,9 @@ if [[ $MODE == 1p1d ]]; then
     # An agentic cell, as the real one is launched: under DP attention its
     # router is the --dp-aware router LP, which draws from the cell's seed, and
     # its dp_sticky keys off X-Session-ID, which the real cell's aiperf sends.
+    # Where the arm sets the Dynamo session header, aiperf sends no
+    # X-Session-ID, and dp_sticky, which reads no other header, routes each
+    # request by load.
     export BENCHMARK_KIND=aiperf_agentic SEED=${SEED:-20260707}
     [[ -z $DYNAMO && " $SERVER_ARGS ${PREFILL_ARGS:-} ${DECODE_ARGS:-} " == *" --enable-dp-attention "* ]] && export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
     PREFILL_PORT=$PORT bash "$ROOT/scripts/compass/pd_sim.sh" "$OUT/run.json" >"$OUT/pd_sim.log" 2>&1 &
