@@ -609,15 +609,15 @@ class StepRecording:
             return self._stamped("t_flush_ns", super().flush_pp_send)
         return super().flush_pp_send()
 
-    def _stamped(self, key, call, *args):
-        """`call(*args)`, stamped under `key` when this forward is recorded,
-        with the blocking-call tool's sums around it at `BLOCKED_AT`."""
+    def _stamped(self, key, call, *args, **kwargs):
+        """`call(*args, **kwargs)`, stamped under `key` when this forward is
+        recorded, with the blocking-call tool's sums around it at `BLOCKED_AT`."""
         if getattr(self, "_parity_record", None) is None:
-            return call(*args)
+            return call(*args, **kwargs)
         tool = self._blocked if key in BLOCKED_AT else None
         enter = self.step_clock_ns()
         before = None if tool is None else tool()
-        reply = call(*args)
+        reply = call(*args, **kwargs)
         self._stamps[key] = (enter, self.step_clock_ns())
         if tool is not None:
             self._stamps[(key, "blocked")] = (before, tool())
@@ -631,13 +631,15 @@ class StepRecording:
             self._stamps["recv_event"] = self.device_event()
         return reply
 
-    def _target_done(self, call, *args):
-        """`call(*args)` after a device event where `postprocess` has just
-        recorded `forward_done_event`: the target's end, sampling included."""
+    def _target_done(self, call, *args, **kwargs):
+        """`call(*args, **kwargs)` after a device event where `postprocess` has
+        just recorded `forward_done_event`: the target's end, sampling
+        included. Keywords pass through: since the upstream merge
+        `prepare_sampled_ids` takes `channel_states=`."""
         if getattr(self, "_parity_record", None) is not None:
             self._stamps["target_event"] = self.device_event()
         with _traced(TARGET_DONE):
-            return call(*args)
+            return call(*args, **kwargs)
 
     def _draft_pass(self, key, call, *args, **kwargs):
         """`call`, a drafter pass, between two device events kept under `key`,

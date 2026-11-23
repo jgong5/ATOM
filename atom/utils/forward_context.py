@@ -17,7 +17,9 @@ from atom.config import Config, KVCacheTensor, ParallelConfig
 # A module, not its names: `region_graph` reads this one back at call time.
 from atom.utils import region_graph
 from atom.utils.tbo.ubatch_splitting import UBatchSlice, decode_bucket_splits
-from atom.utils.tbo.ubatching import sync_dp_metadata
+# Called through the module, so a caller that replaces
+# `ubatching.sync_dp_metadata` (Compass's driverless capture) reaches the call.
+from atom.utils.tbo import ubatching
 
 if TYPE_CHECKING:
     from atom.distributed.pcp_utils import PcpBalGroup
@@ -248,7 +250,7 @@ class ForwardMode:
         meets_min, can_split, ub0, ub1 = local_tbo
         # Every rank's row of the step, a group of one's included (its own
         # row, with nothing exchanged).
-        sync = sync_dp_metadata(
+        sync = ubatching.sync_dp_metadata(
             dp_group=dp_group,
             dp_size=dp_size,
             scheduled_tokens=scheduled_tokens,
