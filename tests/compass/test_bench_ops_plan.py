@@ -1379,7 +1379,7 @@ def test_coverage_traces_a_dpa_tp8_graph_and_reads_it_at_tp1_dp8(tmp_path, monke
     tokenizer = SimpleNamespace(bos_token_id=1, eos_token_id=2)
     monkeypatch.setattr("atom.config.Config", _Config)
     monkeypatch.setattr(
-        "atom.model_engine.llm_engine._load_tokenizer", lambda *a: tokenizer
+        "atom.model_engine.llm_engine.load_tokenizer", lambda *a: tokenizer
     )
     store, traced = ArtifactStore(str(tmp_path / "store")), set()
 

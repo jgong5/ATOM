@@ -2,18 +2,21 @@
 """DeepSeek-V4.1's sparse attention over its FP8 pool under `compass measure
 ops`: its operator states its layer's geometry under capture and takes the
 lists and row pointers its index build writes for its pass, as the BF16
-pool's does.
+pool's does, and a prefill's own rows as one buffer, as ATOM passes them.
 """
 
 import dataclasses
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import pytest
 import torch
 from test_bench_ops import _graph, _leaf, _Runner, _t
 from test_capture_ir import _decoder
 from test_capture_v41_flash import LAYERS, capture, geometry
 
 from atom.compass.bench import ops
+from atom.compass.capture.forward import decode
 from atom.utils import forward_context as fctx
 
 #: The FP8 pool's sparse attention.
@@ -91,3 +94,51 @@ def test_the_fp8_pool_s_attention_takes_its_pass_s_lists_and_reads_the_rows_they
     assert bound[sig, "kv_indices_prefix"][1].tolist() == [100, 101, 102, 103]
     assert bound[sig, "kv_indices_extend"][1].tolist() == [300, 301, 302, 303]
     assert stub._plan(op, instances, {}, 99, 1, None, sig)[3][0] == 12 * 16
+
+
+@pytest.mark.parametrize("stride", [528, 544])
+def test_a_prefill_s_values_and_scales_filling_their_rows_are_one_buffer_a_copy(
+    monkeypatch, stride
+):
+    # The attention's extend source, 4 rows of 512 E4M3 values and 16 E8M0
+    # scales at one row stride, beside a query of 4 * 8 floats; 2 copies pass
+    # twice a 2000-byte cache. At 528 they fill each row, as ATOM's
+    # `rope_quant_window` passes them: a copy builds one buffer, its scales
+    # 512 bytes past its values, and a call counts its rows once. At 544 they
+    # do not, and stay two activations.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    e4m3, e8m0 = torch.float8_e4m3fn, torch.float8_e8m0fnu
+    kv = _t([4, 512], "activation", [stride, 1], str(e4m3))
+    scale = _t([4, 16], "activation", [stride, 1], str(e8m0))
+    q = _t([4, 8], "activation")
+    leaf = _leaf(FP8, ("q", q), ("kv", kv), ("kv_scale", scale))
+    found = ops.leaves(_graph(leaf)["region"])
+    placed = SimpleNamespace(block_size=16, batch=lambda view, b, s: (b, s))
+    graphs = []
+
+    def replay(fn, calls, flush=None):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        [record] = ops.Stub(_Runner(), 2000).point(placed, decode(2), 20, found)
+
+    copies = [(kw["kv"], kw["kv_scale"]) for kw, _ in graphs[0][:2]]
+    assert copies[0][0].data_ptr() != copies[1][0].data_ptr()
+    joined = stride == 528
+    for values, scales in copies:
+        assert (values.dtype, scales.dtype) == (e4m3, e8m0)
+        assert values.stride() == scales.stride() == (stride, 1)
+        stores = values.untyped_storage(), scales.untyped_storage()
+        held = {(s.data_ptr(), s.nbytes()) for s in stores}
+        if joined:  # one buffer, its values from its start, its scales 512 on
+            assert held == {(values.data_ptr(), 4 * 528)}
+            assert scales.data_ptr() - values.data_ptr() == 512
+        else:
+            assert len(held) == 2
+    extend = 4 * 528 if joined else 2 * 3 * stride + 512 + 16
+    assert record["footprint_bytes"] == 2 * (4 * 8 * 4 + extend)

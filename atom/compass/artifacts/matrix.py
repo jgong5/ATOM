@@ -120,14 +120,16 @@ INDEPENDENT = Cell(False)
 #: The invalidation matrix, row by row and column by column.
 MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
     Row.OP_GRAPH: {
-        Axis.SOFTWARE_STACK: INDEPENDENT,
+        Axis.SOFTWARE_STACK: Cell(False, "aiter's Python and data: in its files"),
         Axis.TORCH: DEPENDS,
-        Axis.ATOM_SRC: DEPENDS,
+        Axis.ATOM_SRC: Cell(True, "the files its trace ran and read"),
         Axis.MODEL: DEPENDS,
         Axis.DEVICE: INDEPENDENT,
         Axis.PTL: INDEPENDENT,
         Axis.HOST_CPU: INDEPENDENT,
-        Axis.ENGINE_CONFIG: Cell(True, "level, cudagraph mode"),
+        Axis.ENGINE_CONFIG: Cell(
+            True, "a step law's less its ladder and level, and the cudagraph mode"
+        ),
     },
     Row.PRICE_LIST: {
         Axis.SOFTWARE_STACK: DEPENDS,

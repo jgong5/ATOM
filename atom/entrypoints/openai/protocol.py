@@ -206,11 +206,18 @@ class ChatMessage(BaseModel):
                 parts.append(part.get("text", ""))
         return "\n".join(parts)
 
-    def to_template_dict(self, *, preserve_content: bool = False) -> dict[str, Any]:
+    def to_template_dict(
+        self,
+        *,
+        preserve_content: bool = False,
+        preserve_tool_call_arguments: bool = False,
+    ) -> dict[str, Any]:
         """Convert to dict for chat template, preserving tool-related fields.
 
         Returns a dict with role, content, and any extra fields (tool_calls,
         tool_call_id, name, reasoning_content, tools) that the chat template needs.
+        ``preserve_tool_call_arguments`` keeps ``function.arguments`` strings
+        as sent, for templates that render them verbatim (Kimi-K3).
         """
         d: dict[str, Any] = {
             "role": self.role,
@@ -224,7 +231,7 @@ class ChatMessage(BaseModel):
             if key in extras:
                 d[key] = (
                     _normalize_tool_call_arguments(extras[key])
-                    if key == "tool_calls"
+                    if key == "tool_calls" and not preserve_tool_call_arguments
                     else extras[key]
                 )
         return d
@@ -246,6 +253,7 @@ class ChatCompletionRequest(BaseModel):
     stop: list[str] | None = None
     ignore_eos: bool | None = False
     stream: bool | None = False
+    stream_options: dict[str, Any] | None = None
     seed: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     # Tool calling
@@ -395,6 +403,12 @@ class ModelCard(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "atom"
+    name: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    input_modalities: list[str] | None = None
+    output_modalities: list[str] | None = None
+    effort: dict[str, Any] | None = None
 
 
 class ModelList(BaseModel):

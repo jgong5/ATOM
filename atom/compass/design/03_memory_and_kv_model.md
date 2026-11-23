@@ -16,10 +16,18 @@ activations are that entry's reading too, and no geometry form stands in for one
 coefficient is not derivable from geometry within 25%
 ([#705](https://github.com/jgong5/ATOM/issues/705)), so the reading is its source (D16).
 
+**Revised 2026-11-10 by [#2899](https://github.com/jgong5/ATOM/issues/2899):** a run whose
+store holds no `memory_readings` entry reads the assumed readings of the law file it prices
+by, and refuses with neither (D15; `07` D41).
+
 **Revised 2026-11-12 by the owner's ruling on
 [#3257](https://github.com/jgong5/ATOM/issues/3257):** ATOM's `lmcache_offload` connector
 runs simulated, a CPU tier per rank beside ATOM's real scheduler half and HBM prefix cache
 (D13.1).
+
+**Revised 2026-11-19 by the owner's rulings on
+[#3762](https://github.com/jgong5/ATOM/issues/3762):** D13.1's lanes and per-chunk laws
+also price a shared Mooncake Store's copies, at any DP width (`01` D6.2).
 
 **Depends on:** `02_model_runner_and_cost_backend.md` (the runner that must answer
 `get_num_blocks` and `allocate_kv_cache`).
@@ -216,6 +224,11 @@ are simulated.**
   beside its step law. Each rank runs its saves and its loads on queues as wide as
   `OFFLOAD_COPY_WORKERS` and `OFFLOAD_LOAD_WORKERS`, and a copy completes at its priced
   end.
+- **A shared Mooncake Store** (`mooncake_store`, `01` D6.2, on `dsv41/dev`) prices its
+  saves and loads on these lanes and per-chunk laws, its `store_s` and `load_s` fitted on
+  the Store worker's own lines. Each DP rank's engine process holds its own lanes, so they
+  serve at any DP width; the tier is LP `mooncake_store`, not an index per rank, and the
+  lookup is a request to it, not this tier's synchronous one.
 
 ### Consequences
 
@@ -442,7 +455,8 @@ none read from a runtime:
 
 The runtime and library memory constants above are not in it (revised 2026-10-14):
 `compass measure memory` takes them on the target per configuration, and a run reads that
-`memory_readings` entry and refuses without it (`07` D38, Phase 2); the spec keeps the
+`memory_readings` entry, or a law file's assumed readings (`07` D41), and refuses with
+neither (`07` D38, Phase 2); the spec keeps the
 capacity alone (revised 2026-10-16, [#1226](https://github.com/jgong5/ATOM/issues/1226)).
 For a card nobody has run, developer tooling outside the CLI states the entry, each
 member stating `assumed` and where its readings were copied from; every term built on it
@@ -579,7 +593,7 @@ for the model — which is the per-term rule above, not the aggregate.
 ### Open issues
 
 - Activations are not blocked on topic `04`: until an op graph exists they come from the
-  entry, and a configuration with no entry refuses. **Cross-check against
+  entry or a law file's readings, and a configuration with neither refuses. **Cross-check against
   `04`, for when the walk lands:** the liveness walk is `04` D22, which resolves observationally
   under fake tensors and treats an opaque leaf's internal scratch as a *stated per-leaf
   constant* rather than a walked one. So this term is not simply "blocked on a graph" —
@@ -603,7 +617,7 @@ for the model — which is the per-term rule above, not the aggregate.
 | # | Decision | Date |
 |---|---|---|
 | D13 | Do not simulate the KV pool. Stub `allocate_kv_cache`; ATOM's real `BlockManager`, `BlockPool`, prefix index and `plan_pools` run unmodified. | 2026-09-18 |
-| D13.1 | `lmcache_offload`, ruled by the owner: a capacity-bounded CPU tier per rank keyed by 256-token chunks, evicting by ATOM's SLRU policy with its protected share; lookup over every rank takes the minimum hit, synchronous and priced; store and load priced per chunk from measured device-to-host and host-to-device rates; ATOM's scheduler half and HBM's SLRU prefix cache run as real code. | 2026-11-12 (#3257) |
+| D13.1 | `lmcache_offload`, ruled by the owner: a capacity-bounded CPU tier per rank keyed by 256-token chunks, evicting by ATOM's SLRU policy with its protected share; lookup over every rank takes the minimum hit, synchronous and priced; store and load priced per chunk from measured device-to-host and host-to-device rates; ATOM's scheduler half and HBM's SLRU prefix cache run as real code. Extended: the lanes and per-chunk laws also price a shared Mooncake Store's copies, at any DP width (`01` D6.2). | 2026-11-12 (#3257); extended 2026-11-19 (#3762) |
 | D14 | Substitute the five device readings, reuse ATOM's budget arithmetic and `plan_pools`. Compass models a dedicated device; that is a stated scope boundary. | 2026-09-18 |
-| D15 | The device specification is an input artifact authored outside Compass, carrying capacity, compute, bandwidth, interconnect and derate factors. It is echoed into every run artifact. The runtime memory constants, activations included, are `measure memory`'s `memory_readings` entries, per configuration, which a run refuses without; an assumed entry's terms are declared and `run.json` lists its assumption. | 2026-09-18; revised 2026-10-14 (#851); 2026-10-16 (#1226) |
+| D15 | The device specification is an input artifact authored outside Compass, carrying capacity, compute, bandwidth, interconnect and derate factors. It is echoed into every run artifact. The runtime memory constants, activations included, are `measure memory`'s `memory_readings` entries, per configuration, or a law file's (`07` D41), which a run refuses without; an assumed entry's terms are declared and `run.json` lists its assumption. | 2026-09-18; revised 2026-10-14 (#851); 2026-10-16 (#1226); a law file's readings 2026-11-10 ([#2899](https://github.com/jgong5/ATOM/issues/2899)) |
 | D16 | Validate every non-KV memory term individually, never as a sum. Keep ATOM's graph-pool estimator and the measured one as two separate functions. Revised: one source per term. Weights come from a meta build in the simulated runner at the deployment's group widths. Activations come from a coefficient keyed by architecture, `config.json` sha256 and tensor-parallel width, with the scratch inside it and a geometry form as fallback, until the liveness walk lands. The graph pool reserves for the deployment's own capture mode, and the per-term check is wired. Activations from the `memory_readings` entry, with no geometry form. | 2026-09-18; revised 2026-10-10 and 2026-10-16 (#965) |

@@ -80,7 +80,9 @@ class Planted:
     def step_clock_ns(self):
         return self.host
 
-    def device_event(self):
+    def device_event(self, event=None):
+        if event is not None:  # recorded again: nothing queued since
+            return event
         self._queue(0)
         return _Event(self, self.free)
 

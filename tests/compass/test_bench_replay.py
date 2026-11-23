@@ -16,7 +16,7 @@ from test_parity_record import BLOCK, PROMPT, _config, _drive, _prompt, _Runner
 from atom.compass.bench import replay
 from atom.compass.parity import ENV, read
 from atom.compass.runner.step_output import DeferredTokenStream, filler_token_ids
-from atom.model_engine.llm_engine import _load_tokenizer
+from atom.model_engine.llm_engine import load_tokenizer
 
 pytestmark = pytest.mark.usefixtures("unpriced")
 
@@ -151,7 +151,7 @@ def test_rows_sharing_blocks_hold_the_same_leading_blocks_then_their_own(rule):
 def test_tokens_are_the_fillers_the_simulated_runner_reports(
     rule, model_dir  # noqa: F811
 ):
-    tokenizer = _load_tokenizer(str(model_dir))
+    tokenizer = load_tokenizer(str(model_dir))
     config = _config()
     fillers = filler_token_ids(tokenizer, config.eos_token_id, config.stop_token_ids)
     queries = [7, 2, 1]

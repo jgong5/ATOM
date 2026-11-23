@@ -201,7 +201,7 @@ def main(argv=None) -> None:
     parser.add_argument("record", help="a real run's step record directory")
     parser.add_argument("law", help="a law file, as step_linear_fit writes it")
     args = parser.parse_args(argv)
-    print(_text(cost_accuracy(args.record, json.loads(Path(args.law).read_text()))))
+    print(_text(cost_accuracy(args.record, read_json(args.law))))
 
 
 if __name__ == "__main__":
