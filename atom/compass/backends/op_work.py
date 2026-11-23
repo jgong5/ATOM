@@ -887,6 +887,10 @@ EXTRACTORS = {
         op, outs=["torch.float32"]
     ),
     "atom.model_ops.decode_input_ids:fill_deferred_decode_ids": _in_place(),
+    # The shared experts' columns of a gathered batch's ids, from its template.
+    "atom.model_ops.fused_moe.gathered_shared_ids:copy_shared_expert_ids_": _only(
+        "topk_ids", "shared_template"
+    ),
     "atom.utils.block_convert:kv_indices_generate_triton": _kv_indices,
 }
 #: DeepSeek-V4.1's kinds, gfx1250's and gfx950's. What a lifted leaf writes
