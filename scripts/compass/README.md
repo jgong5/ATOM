@@ -1086,7 +1086,12 @@ holds `AITER_LOG_LEVEL`, `OMP_NUM_THREADS` and `ATOM_TOKEN_GRAPH_SIZES` at ed5fa
 default buckets; a run priced by it sets them and passes the acceptance length too. The
 records are concurrency 1, 4, 16, 64 and 256, then 8, 12 and 56 from each trajectory's
 first turn: at c=256 all but a few hundred decode steps run at rung 64. No record built a
-JIT kernel.
+JIT kernel. From 350 s to 824 s of the c=56 record its MTP status waits returned late, p50 168
+to 391 us after the fastest return within 16 waits, while no other host segment moved; the host
+laws keep those labels, which lift both `L_mtp` laws by about 0.25% of a c=256 decode forward,
+and that record's near-zero labels come from its clock lead, set too high by launch bounds in
+that span, the class of [#3133](https://github.com/jgong5/ATOM/issues/3133)
+([#3721](https://github.com/jgong5/ATOM/issues/3721)).
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-ep4-dspark5-mi355x-gpu40.json.xz` is cell A's law
 on mi355-gpu-40, keyed by the platform its `platform` states (aiter `09d256420`,
