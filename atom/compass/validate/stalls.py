@@ -70,6 +70,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from atom.compass.backends.json_file import read_jsonl
+from atom.compass.backends.step_linear_fit import PAUSE_S
 from atom.compass.parity.client_run import RAW
 from atom.compass.report.split import _client
 
@@ -77,8 +78,9 @@ from atom.compass.report.split import _client
 MIN_S = 0.2
 #: The graded window's bins, in seconds.
 BIN_S = 300.0
-#: The least seconds a whole-group pause holds past its step's reference.
-GROUP_MIN_S = 3.0
+#: The least seconds a whole-group pause holds past its step's reference, the
+#: excess a step law's fit takes for one (`step_linear_fit.PAUSE_S`).
+GROUP_MIN_S = PAUSE_S
 #: The fewest steps whose median span a kind of forward takes as its reference.
 REF_STEPS = 20
 #: A forward's stamped waits, any of which may hold a pause, by the name a
@@ -232,7 +234,7 @@ def group_pauses(
         _medians(
             {
                 k: [min(f.busy for f in group[s]) for s in common if keys[s] == k]
-                for k in set(keys.values())
+                for k in dict.fromkeys(keys.values())
             }
         )
         if windows

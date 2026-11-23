@@ -1941,7 +1941,7 @@ class NonAllocatingRunner(
         )
         out.out_s = getattr(self, "_out_s", None)
         out.group_out = getattr(self, "_group_out", None)
-        out.device_end = vars(self).get("_device_end")
+        out.device_end = getattr(self, "_device_end", None)
         out.pp_send = self._pp_send(batch, seconds)
         if out.pp_send is not None:
             out.predicted_s -= out.pp_send[1]

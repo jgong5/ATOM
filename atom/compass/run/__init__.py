@@ -2955,10 +2955,10 @@ def _record_routes(record: Path) -> None:
 
         def routed(seq, explicit_rank):
             load = {"reqs": list(self._rank_reqs), "tokens": list(self._rank_tokens)}
-            rank = select(self, seq, explicit_rank)
-            line = {"key": keys[seq.id], "rank": rank} | load
+            route = select(self, seq, explicit_rank)
+            line = {"key": keys[seq.id], "rank": route.rank} | load
             lines[0].write(json.dumps(line) + "\n")
-            return rank
+            return route
 
         self._select_dp_rank_for_seq_locked = routed
         try:

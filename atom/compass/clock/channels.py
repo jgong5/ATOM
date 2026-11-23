@@ -56,7 +56,8 @@ class ChannelTable:
         # Each LP's channels out and in, by name; a declare empties both.
         self._from: dict[LpId, tuple[Channel, ...]] = {}
         self._into: dict[LpId, tuple[Channel, ...]] = {}
-        self._offering: set[str] = set()
+        # The offering channels' names, an ordered set.
+        self._offering: dict[str, None] = {}
 
     def declare(
         self,
@@ -123,7 +124,7 @@ class ChannelTable:
         """Mark each channel named as offering: its handler may offer a send."""
         for name in names:
             self.channel(name)
-        self._offering.update(names)
+        self._offering.update(dict.fromkeys(names))
 
     def offering(self, name: str) -> bool:
         """Whether the handler of a message on `name` may offer a send."""

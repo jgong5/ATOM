@@ -285,7 +285,6 @@ from atom.compass.backends.step_linear import (
     serial_passes,
     token_padding,
 )
-from atom.compass.validate.stalls import GROUP_MIN_S
 
 FORMS = ("base", "history", "shared", "cached_seqs")
 CONTEXT_PARALLEL = ("prefill_context_parallel_size", "decode_context_parallel_size")
@@ -305,7 +304,7 @@ WARM_FACTOR = 5.0
 #: least `validate.stalls` names (#3778): every rank's device stopped, which no
 #: law prices, so it is warm too, on a prefill of a second or more as well,
 #: whose pause is less than `WARM_FACTOR` times its price.
-PAUSE_S = GROUP_MIN_S
+PAUSE_S = 3.0
 TOKEN_BANDS = (512, 2048, 8192)
 #: Steps at its rung a record needs before a `rowmod` choice holds it out.
 ROWMOD_CELL_STEPS = 100

@@ -755,11 +755,11 @@ class ClockAuthority:
         under a grant `short` of the round's target, the rest stay in that
         round, their replies held for its grant. Otherwise each member's next
         queued round joins the next one."""
-        woken = {
+        woken = dict.fromkeys(
             self._owner[i][c]
             for c, r in released.items()
             if r and c in self._offering[i]
-        }
+        )
         for m in woken:
             self._queued[i].pop(m, None)
         if short is None:
