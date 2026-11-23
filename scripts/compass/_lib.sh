@@ -479,6 +479,13 @@ if not os.fork():
     select.select([os.pidfd_open(int(sys.argv[1]))], [], [])' $$ "${1:-1}"
 }
 
+# compass_dynamo_header: X-Dynamo-Session-ID, which aiperf then sends, where
+# AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID is true as aiperf reads it.
+compass_dynamo_header() {
+    local v=${AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID-}
+    [[ ${v,,} =~ ^(1|t|true|y|yes|on)$ ]] && echo X-Dynamo-Session-ID || :
+}
+
 # The router's bound on each request to a worker, its whole response
 # included, which `--request-timeout-secs` sets (default 1800 s) and the
 # clock cannot reach. A simulated stream lasts as much wall time as the run
@@ -488,11 +495,39 @@ COMPASS_SIM_REQUEST_TIMEOUT_S=31536000
 # Every wall-clock bound a simulated router gets, each at that year: the one
 # above, and the prepare pool's wait for a thread and its preparation of a
 # request (`--prepare-queue-timeout-ms`, `--prepare-timeout-ms`; atomesh's
-# defaults are 250 ms and 5 s), which run on the wall clock too, so a request a
-# router LP holds for its release would otherwise run them out.
+# defaults are 250 ms and 5 s). Those two start once the router LP releases a
+# request, so its hold runs neither out (atom/mesh/tests/compass_pd_router_test.rs),
+# but a loaded host stretches a preparation's wall time, which the run's clock
+# does not see.
 COMPASS_SIM_ROUTER_BOUNDS=(--request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S"
     --prepare-queue-timeout-ms "${COMPASS_SIM_REQUEST_TIMEOUT_S}000"
     --prepare-timeout-ms "${COMPASS_SIM_REQUEST_TIMEOUT_S}000")
+
+# compass_sim_router_refusal LP WORD...: why a simulated router refuses its
+# `atomesh launch` arguments WORD..., or nothing. LP is 1 where the router runs
+# as LP `router`, whose retry resends a request under its first seq.
+compass_sim_router_refusal() {
+    local lp=$1 word why
+    shift
+    for word; do
+        case ${word%%=*} in
+        --prefill | --decode)
+            echo "the router's arguments carry ${word%%=*}, a worker more for a simulated router to choose"
+            return ;;
+        --max-concurrent-requests | --rate-limit-tokens-per-second)
+            echo "the router's arguments carry ${word%%=*}, a limiter a simulated router leaves out"
+            return ;;
+        --request-timeout-secs | --prepare-queue-timeout-ms | --prepare-timeout-ms)
+            echo "the router's arguments carry ${word%%=*}, a wall-clock bound the script sets for a simulated router"
+            return ;;
+        esac
+    done
+    if ((lp)) && [[ " $* " != *" --disable-retries "* ]]; then
+        why="carry --dp-aware"
+        [[ " $* " == *" --dp-aware "* ]] || why="choose among a side's instances as LP router"
+        echo "the router's arguments $why but not --disable-retries: a router LP's retry resends a request under its first seq, which the frontend refuses as arrived twice"
+    fi
+}
 
 # compass_on_arch RUN_FILE: the words ahead of `-m MODULE` that start a simulated
 # server under on_arch on RUN_FILE's machine's arch, as `compass run` starts its

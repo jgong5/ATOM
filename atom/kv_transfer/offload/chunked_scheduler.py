@@ -464,6 +464,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if not self._lookup_in_flight(seq):
             return False
         first = self._lookup_defer_since.get(str(seq.id))
+        # The clock `lookup_pending` stamped `first` with.
         now = clock.now(time.monotonic)
         return first is None or now - first <= envs.OFFLOAD_LOOKUP_DEFER_S
 
@@ -1195,7 +1196,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         added = set(block_ids) - leased
         leased.update(added)
         if added:
-            self._save_lease_at.setdefault(lease_key, time.monotonic())
+            self._save_lease_at.setdefault(lease_key, clock.now(time.monotonic))
             self.total_leased_source_blocks += len(added)
 
     def take_source_safe_releases(self) -> list[frozenset]:
@@ -1208,7 +1209,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Force-release leases whose save never reported, past ``timeout_s``."""
         if timeout_s <= 0 or not self._save_lease_at:
             return []
-        now = time.monotonic()
+        now = clock.now(time.monotonic)
         stale_keys = [
             lease_key
             for lease_key, at in self._save_lease_at.items()

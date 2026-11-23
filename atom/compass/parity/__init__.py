@@ -112,6 +112,15 @@ ARRIVALS = "arrivals.json"
 #: The file in a decode instance's record directory joining each request's
 #: response id to the prefill request its KV came from (`carry_response_ids`).
 TRANSFERS = "transfers.jsonl"
+#: A transfer's fields naming the prefill instance it came from: a simulated
+#: one's engine id (`kv.connector.engine_id`), a real one's host and Mooncake
+#: handshake port.
+INSTANCE_FIELDS = ("remote_engine_id", "remote_host", "remote_handshake_port")
+#: The file in a record directory with a line ``{key, rank, reqs, tokens}`` per
+#: request the frontend routed across DP ranks, in routing order: its whole
+#: prompt's digest, its rank, and each rank's in-flight requests and queued
+#: prefill tokens the router weighed (`atom.compass.run._record_routes`).
+ROUTES = "routes.jsonl"
 RUNNER = "atom.compass.parity.runner.RecordingModelRunner"
 #: The recording runner of a real RapidServe run.
 RAPID = "atom.compass.parity.runner.RecordingRapidServeModelRunner"
@@ -188,15 +197,19 @@ class StepRecord:
         """Keep each lmcache offload load and save `meta` hands the worker:
         ``[request id, "load", HBM-cached tokens, offload-cached tokens]`` or
         ``[request id, "save", tokens already saved, tokens computed]``."""
+        from atom.kv_transfer.offload.mp.token_shipping import ShippedTokens
+
         for req in getattr(meta, "requests", ()):
             if (ls := req.load_spec) is not None:
                 span = (ls.hbm_cached_tokens, ls.lmcache_cached_tokens)
                 self.kv.append((req.req_id, "load", *span))
                 self.loaded[req.req_id] = span
             if (ss := req.save_spec) is not None:
-                self.kv.append(
-                    (req.req_id, "save", ss.skip_leading_tokens, len(req.token_ids))
-                )
+                # A real worker is handed the scheduler's shipment, which names
+                # the prefix's end, before it rebuilds the prefix.
+                tokens = req.token_ids
+                end = tokens.end if isinstance(tokens, ShippedTokens) else len(tokens)
+                self.kv.append((req.req_id, "save", ss.skip_leading_tokens, end))
 
     def add(self, batch, runner, forward=None):
         """Append `batch`'s line; with `forward`, run it inside the line's timestamps.
@@ -397,7 +410,11 @@ def _record(runner):
         record = None
         if directory and runner.rank == 0:
             directory = record_dir(directory, runner.config)
-            from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, UNKEYED
+            from atom.compass.backends.step_grid_plan import (
+                DEFERS_OUTPUT,
+                PREFILL_BUCKETS,
+                UNKEYED,
+            )
             from atom.compass.backends.step_linear_fit import CONTEXT_PARALLEL
             from atom.compass.run.step_grid import keyed
             from atom.utils.region_graph import TokenGraph
@@ -415,6 +432,8 @@ def _record(runner):
                 if (width := getattr(runner.config, name, 1)) > 1:
                     engine[name] = width
             engine[PREFILL_BUCKETS] = list(TokenGraph.captured_sizes("prefill"))
+            processor = getattr(runner, "tokenID_processor", None)
+            engine[DEFERS_OUTPUT] = getattr(processor, "is_deferred_out", True)
             record.path.with_suffix(".engine.json").write_text(json.dumps(engine))
             key = getattr(runner, "host_key", None)
             if key is not None:
@@ -441,6 +460,26 @@ def recorded_graphs(config) -> dict:
     return {"architecture": architecture(config), "token": token, "request": request}
 
 
+#: How many frames above `add_request` `_caller_request_id` looks for the API
+#: server function's `request_id`: since the upstream merge its handlers reach
+#: `add_request` through `_submit_engine_requests`, one frame further up.
+CALLER_DEPTH = 4
+
+
+def _caller_request_id():
+    """The `request_id` local of the nearest of `CALLER_DEPTH` frames above
+    the patched `add_request` that has one, or None (a thread's own stack,
+    such as `asyncio.to_thread`'s, holds none)."""
+    frame = sys._getframe(2)
+    for _ in range(CALLER_DEPTH):
+        if frame is None:
+            return None
+        if "request_id" in frame.f_locals:
+            return frame.f_locals["request_id"]
+        frame = frame.f_back
+    return None
+
+
 def carry_response_ids() -> None:
     """Set a one-sequence request's `external_request_id` to its response id,
     the `request_id` of the API server function calling `add_request`, read
@@ -449,7 +488,8 @@ def carry_response_ids() -> None:
 
     A sequence whose `kv_transfer_params` carry a `transfer_id`, a decode
     instance's request, also gets a line ``{response_id, remote_dp_rank,
-    transfer_id}`` in `TRANSFERS` of the record directory, which this replaces."""
+    transfer_id}``, with each of `INSTANCE_FIELDS` the parameters hold, in
+    `TRANSFERS` of the record directory, which this replaces."""
     from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 
     path = pathlib.Path(os.environ[ENV]) / TRANSFERS
@@ -459,10 +499,7 @@ def carry_response_ids() -> None:
 
         def add_request(self, seqs, add=cls.add_request):
             if len(seqs) == 1 and seqs[0].external_request_id is None:
-                caller = sys._getframe(1)
-                if caller.f_code.co_name == "_submit_engine_requests":
-                    caller = caller.f_back
-                seqs[0].external_request_id = caller.f_locals.get("request_id")
+                seqs[0].external_request_id = _caller_request_id()
             params = (seqs[0].kv_transfer_params or {}) if len(seqs) == 1 else {}
             if params.get("transfer_id") is not None:
                 line = {
@@ -470,6 +507,11 @@ def carry_response_ids() -> None:
                     "remote_dp_rank": params.get("remote_dp_rank", 0),
                     "transfer_id": params["transfer_id"],
                 }
+                # Which prefill instance sent it, where a deployment runs
+                # several: their transfer ids, each its own sequence ids, meet.
+                for field in INSTANCE_FIELDS:
+                    if params.get(field) is not None:
+                        line[field] = params[field]
                 with path.open("a") as f:
                     f.write(json.dumps(line) + "\n")
             return add(self, seqs)
@@ -826,6 +868,35 @@ def _request_ranks(name: str, record: dict[int, list[dict]]) -> dict[str, int]:
     return ranks
 
 
+def compare_routes(real, simulated) -> dict | None:
+    """Two record directories' `ROUTES`, None unless both hold it: requests
+    per DP rank in each; of the requests both routed, keyed as `read` keys
+    twins, how many took the same rank; and the first of those, in the real
+    run's order, that did not, with each run's line for it."""
+    runs = {}
+    for name, directory in (("real", real), ("simulated", simulated)):
+        if not (path := pathlib.Path(directory) / ROUTES).exists():
+            return None
+        runs[name], seen = read_jsonl(path), collections.Counter()
+        for line in runs[name]:
+            n = seen[line["key"]]
+            seen[line["key"]] += 1
+            line["key"] += f".{n}" if n else ""
+    other = {line["key"]: line for line in runs["simulated"]}
+    both = [(a, other[a["key"]]) for a in runs["real"] if a["key"] in other]
+    unlike = [{"real": a, "simulated": b} for a, b in both if a["rank"] != b["rank"]]
+    width = max((len(x["reqs"]) for lines in runs.values() for x in lines), default=0)
+    return {
+        "requests_per_rank": {
+            name: [sum(line["rank"] == r for line in lines) for r in range(width)]
+            for name, lines in runs.items()
+        },
+        "routed_by_both": len(both),
+        "routed_alike": len(both) - len(unlike),
+        "first_unlike": unlike[0] if unlike else None,
+    }
+
+
 def compare(real, simulated, stage: int = 0) -> dict:
     """Two record directories: per DP rank of pipeline `stage`, the first step
     whose decision differs.
@@ -835,7 +906,8 @@ def compare(real, simulated, stage: int = 0) -> dict:
     steps is refused: two runs that scheduled nothing agree, and that means
     nothing. Steps are compared and reported without timestamps, request
     or response ids or a real line's `launch`. Under `steps`, each rank's count of step pairs compared
-    and of identical ones.
+    and of identical ones. Where both hold `ROUTES`, `routes` holds
+    `compare_routes`'s answer.
     """
     records = {"real": read(real, stage), "simulated": read(simulated, stage)}
     for name, record in records.items():
@@ -864,10 +936,13 @@ def compare(real, simulated, stage: int = 0) -> dict:
             "compared": len(pairs),
             "identical": sum(a == b for a, b in pairs),
         }
-    return {
+    out = {
         "first_divergence": first,
         "steps": counts,
         "request_dp_rank": {
             name: _request_ranks(name, record) for name, record in records.items()
         },
     }
+    if (routed := compare_routes(real, simulated)) is not None:
+        out["routes"] = routed
+    return out

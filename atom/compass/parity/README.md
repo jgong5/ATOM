@@ -21,7 +21,8 @@ its charge was made of (`_group_step_seconds` in
 A 1P1D decode instance also writes `transfers.jsonl` (`transfers` in
 `__init__.py` says what it joins). On a real Mooncake P/D side, every worker writes
 `dp<r>.tp<t>.writes.jsonl` too, a line per KV write it served or write-done it
-received (`writes.py` says what each line holds).
+received, a write-done's line saying when its write request was sent, and a
+line per write request none answered (`writes.py` says what each line holds).
 
 A real run's lines also state the time each launch blocked in HIP, `blocked_ns`,
 which `W_launch` leaves out (`atom/compass/backends/step_labels.py`), when the

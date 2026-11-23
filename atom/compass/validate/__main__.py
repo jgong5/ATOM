@@ -88,6 +88,7 @@ COLUMNS = ("result", "metric", "value", "verdict")
 #: Cost rows' verdict per report group: the graded ones carry the gate.
 GATED = {
     "graded": "-",
+    "priced": "not gated",  # graded and declared together (#3796)
     "validated": "not gated",
     "unvalidated": "not gated",
     "declared": "not gated",

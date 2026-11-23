@@ -346,7 +346,7 @@ def test_the_compass_runner_builds_the_worker_half_that_moves_nothing(monkeypatc
     assert runner_.allocate_kv_cache(100) is True
     assert [type(w) for w in built] == [SimulatedKVConnector]
     runner_.config = _config({"kv_connector": "mooncake"})
-    with pytest.raises(RunnerRefusal, match="'lmcache_mp' and 'lmcache_offload'"):
+    with pytest.raises(RunnerRefusal, match="'lmcache_offload' and 'mooncake_store'"):
         runner_.allocate_kv_cache(100)
 
 

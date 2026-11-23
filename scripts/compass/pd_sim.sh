@@ -40,6 +40,12 @@
 #   BENCHMARK_KIND ROUTER_POLICY ATOM_PD_RANK_MAPPING_POLICY
 #                       as `start_router` in .github/scripts/atomesh/pd_server_atom.sh
 #                       reads them (defaults random, random, none)
+#   ROUTER_ARGS         `atomesh launch` arguments, word-split, in place of those
+#                       three's: a recipe's own, as deploy.sh takes them, the
+#                       router's wall-clock detectors switched off by the caller;
+#                       refused, exit 2, as deploy.sh refuses them
+#                       (compass_sim_router_refusal); --dp-aware among them
+#                       makes the router LP `router`
 #   SEED                the run's seed, which the router LP's policies draw
 #                       from (default 20260707, aiperf's in cctraces_sim.sh)
 #
@@ -138,6 +144,15 @@ if [[ $policy == cache_aware ]]; then
     mapping_args=(--atom-pd-rank-mapping-policy "$mapping")
 fi
 router+=("${mapping_args[@]}" "${dp_aware[@]}")
+router+=(--backend atom --disable-health-check --disable-circuit-breaker
+    --disable-retries --log-level info)
+if [[ -n ${ROUTER_ARGS:-} ]]; then
+    read -ra router <<<"$ROUTER_ARGS"
+    dp_aware=()
+    [[ " ${router[*]} " != *" --dp-aware "* ]] || dp_aware=(--dp-aware)
+    why=$(compass_sim_router_refusal $((${#dp_aware[@]} || PREFILLS > 1 || DECODES > 1)) "${router[@]}")
+    [[ -z $why ]] || { echo "pd_sim: $why" >&2; exit 2; }
+fi
 # Each server's role, port, kv_role, DP port, index and count, and, above one
 # server of a side, its URL's frontend LP for the router.
 specs=() workers=()
@@ -202,12 +217,11 @@ for i in "${!specs[@]}"; do
     compass_wait_up "$role" "${servers[$i]}" "http://127.0.0.1:$port/health"
 done
 
-env "${router_env[@]}" "$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --pd-disaggregation \
-    "${urls[@]}" \
-    "${router[@]}" --backend atom --disable-health-check --disable-circuit-breaker \
-    --disable-retries "${COMPASS_SIM_ROUTER_BOUNDS[@]}" \
-    --prometheus-port "$PROMETHEUS_PORT" --log-level info \
-    >"$OUT/router.log" 2>&1 &
+launch=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --pd-disaggregation
+    "${urls[@]}" "${router[@]}" "${COMPASS_SIM_ROUTER_BOUNDS[@]}"
+    --prometheus-port "$PROMETHEUS_PORT")
+echo "pd_sim: router ${launch[*]}"
+env "${router_env[@]}" "${launch[@]}" >"$OUT/router.log" 2>&1 &
 compass_wait_up router $! "http://127.0.0.1:$ROUTER_PORT/v1/models"
 echo "pd_sim: ready"
 

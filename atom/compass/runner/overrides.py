@@ -283,6 +283,11 @@ OUT_SEGMENT = "E_out"
 #: Every segment a law may price.
 SEGMENTS = (*HOST_SEGMENTS, MTP_SEGMENT, MTP_COPY, PP_RECV_SEGMENT, OUT_SEGMENT)
 FORWARD_KINDS = ("decode", "prefill", "middle")
+#: The host-law kind of a DP rank's dummy forward at a step its group prefills
+#: (`step_linear_fit._fit_dummy`), which a batch's `compass_dummy` marks.
+DUMMY_KIND = "dummy"
+#: The kinds a host entry's laws and columns may name.
+HOST_LAW_KINDS = (*FORWARD_KINDS, DUMMY_KIND)
 #: `admit` for a host entry fitted before admissions were priced apart, whose
 #: `E` laws hold them: they cost nothing on top.
 ADMISSION_IN_E = (0.0, 0.0, 0.0)
@@ -348,6 +353,21 @@ class HostDeviceRecurrence:
     pipeline stage refuses any column.
     With `own_draft`, true unless it defers, an output forward that waits for its own
     target leaves no earlier than its device end, as one that reads its own draft ids does.
+    A batch whose `compass_dummy` is true, a DP rank's dummy forward at a step
+    its group prefills, is priced as `DUMMY_KIND` where the laws state it: each
+    segment, and each column, `DUMMY_KIND` states, else `decode`'s, the kind
+    `forward_shape` gives an empty batch that produces output; one that
+    produces none, whose labels `DUMMY_KIND` holds no `W_post` of, stays a
+    middle chunk. On the last stage of a runner that does not defer its output,
+    as a prefill-decode producer, such a dummy reads no token, so its exit
+    waits for no output, its own or its group's: it leaves at its launch and
+    `W_post`, and marks no output end. On #3720's
+    cell B (P at DP2) a dummy beside its peer's middle chunk left 2.6 ms after
+    it entered while its device ran the peer's 162 ms; charged as an output
+    forward, it held the group's next step, the prompt's tail, until the
+    middle chunk's device end, where the real tail's 55 ms launch runs beside
+    it (b3_B3 c=32: a 6272-token chunk and its 181-token tail took 233 ms
+    against 190).
     """
 
     def __init__(
@@ -415,7 +435,10 @@ class HostDeviceRecurrence:
         first runs `PP_RECV_SEGMENT`. Once any kind's law has `OUT_SEGMENT`
         every kind runs it, as `out_s`, else None."""
         kind, x = forward_shape(batch)
-        law = self.laws.get(kind, {})
+        dummy = getattr(batch, "compass_dummy", False) and kind == "decode"
+        if dummy and DUMMY_KIND in self.laws:
+            kind = DUMMY_KIND
+        law = self._law(kind)
         ran = HOST_SEGMENTS[: 3 if kind == "middle" else 4]
         mtp = self.mtp and kind != "middle"
         ran += (MTP_SEGMENT,) if mtp else ()
@@ -425,7 +448,7 @@ class HostDeviceRecurrence:
         ran += (OUT_SEGMENT,) if out else ()
         missing = [f"{kind}.{s}" for s in ran if s not in {*law, *self.skip}]
         features = getattr(batch, "compass_launch", None) or {}
-        columns = self.columns.get(kind, {})
+        columns = self._columns(kind)
         missing += [
             f"{kind}.{s}.{f}"
             for s in ran
@@ -447,7 +470,9 @@ class HostDeviceRecurrence:
         self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)
-        output = batch.produces_output()
+        # Where output is not deferred a dummy reads no token: its exit waits
+        # for no output (`_exit`).
+        output = batch.produces_output() and not (dummy and self.last)
         launch_end = max(prepared, meta - self.segments[PP_RECV_SEGMENT]) + launch
         release = getattr(batch, "compass_pp_release", -math.inf)
         queued_end = self.ends[-1] + getattr(batch, "compass_queued_s", 0.0)
@@ -457,6 +482,18 @@ class HostDeviceRecurrence:
             return max(self.target_end, launch_end)
         queued = launch_end if self.sync else self._exit(self.target_end)
         return max(self.target_end, queued) + draft_s
+
+    def _law(self, kind: str) -> dict:
+        """`kind`'s laws by segment, `DUMMY_KIND`'s over `decode`'s."""
+        if kind == DUMMY_KIND:
+            return {**self.laws.get("decode", {}), **self.laws.get(kind, {})}
+        return self.laws.get(kind, {})
+
+    def _columns(self, kind: str) -> dict:
+        """`kind`'s columns by segment, as `_law` takes its laws."""
+        if kind == DUMMY_KIND:
+            return {**self.columns.get("decode", {}), **self.columns.get(kind, {})}
+        return self.columns.get(kind, {})
 
     def predicted(self, view: Any) -> dict:
         """A step's launch features by `launch`'s provider, from its
@@ -479,7 +516,7 @@ class HostDeviceRecurrence:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
         `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, and each column a segment
         adopts prices `features`' value of its feature, 0 where absent."""
-        law, columns = self.laws.get(kind, {}), self.columns.get(kind, {})
+        law, columns = self._law(kind), self._columns(kind)
         features = features or {}
         seg = {
             s: (
@@ -1155,16 +1192,22 @@ def _transferred_slot(runner: Any) -> tuple[int, bool]:
     planned slot entry, with the blocks; one unit of each of Kimi's KDA state
     regions (`state_slot_regions`), after them, its GDN state entry without the
     kpool tail plus ReplaySSM's int32 cursor; none for any other builder. A
-    Qwen GDN hybrid plans a slot its regions do not carry."""
+    Qwen GDN hybrid plans a slot its regions do not carry. DeepSeek-V4.1's
+    builder is not V4's, but publishes the request's whole STATE slot as one
+    slot-indexed region beside its PAGE units (`get_kv_transfer_tensors`'s
+    ``slot_regions``), so it moves the planned slot entry as V4's does."""
     from atom.model_engine.kv_block import STATE_SLOT_CLASS
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
     )
     from atom.model_ops.attentions.gdn_attn import GDNStateMixin
     from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
 
     builder = runner.attn_metadata_builder
-    if isinstance(builder, DeepseekV4AttentionMetadataBuilder):
+    if isinstance(builder, (DeepseekV4AttentionMetadataBuilder, DeepseekV41MetadataBuilder)):
         return runner.pool_plan.entry_bytes[STATE_SLOT_CLASS], False
     if isinstance(builder, _KimiMLAGDNCommon):
         cursor = torch.int32.itemsize if builder.replayssm else 0
@@ -1647,11 +1690,14 @@ class NonAllocatingRunner(
 
         An empty registry still goes through ATOM's `set_kv_cache_data`: it is
         the one call that builds the worker-side KV connector, which the engine
-        polls for transfer completions. An `lmcache_mp` or `lmcache_offload`
-        one, alone or in a `multi`, is built as `compass`'s worker half, which
-        moves nothing.
+        polls for transfer completions. An `lmcache_mp`, `lmcache_offload` or
+        `mooncake_store` one, alone or in a `multi`, is built as `compass`'s
+        worker half, which moves nothing. They substitute here, after
+        `get_num_blocks` has read the real worker class's HBM reserve
+        (`KVConnectorFactory.kv_budget_reserve_bytes`); the Store's simulated
+        worker keeps that reserve too.
         """
-        from atom.compass.kv import lmcache_mp, lmcache_offload
+        from atom.compass.kv import lmcache_mp, lmcache_offload, mooncake_store
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
         from atom.utils.forward_context import set_kv_cache_data
 
@@ -1660,13 +1706,18 @@ class NonAllocatingRunner(
             names = [
                 n for n, _ in KVConnectorFactory.leaf_connectors(self.config) or ()
             ]
-        simulated = {"lmcache_mp": lmcache_mp, "lmcache_offload": lmcache_offload}
+        simulated = {
+            "lmcache_mp": lmcache_mp,
+            "lmcache_offload": lmcache_offload,
+            "mooncake_store": mooncake_store,
+        }
         for name in names:
             if name != "compass" and name not in simulated:
                 raise RunnerRefusal(
                     f"kv_connector {name!r} is a real transfer backend; this "
-                    "runner simulates only 'compass', 'lmcache_mp' and "
-                    "'lmcache_offload', and an unset kv_connector means 'moriio'."
+                    "runner simulates only 'compass', 'lmcache_mp', "
+                    "'lmcache_offload' and 'mooncake_store', and an unset "
+                    "kv_connector means 'moriio'."
                 )
         for name in sorted(simulated.keys() & set(names)):
             simulated[name].substitute()
@@ -1797,7 +1848,10 @@ class NonAllocatingRunner(
         priced by the installed cost backend, then its DP group target, on TP
         rank 0; the engine reads no other rank's reply, and it reports 0 s.
         Its `out_s` and `group_out` are `_group_step_seconds`'s `_out_s` and
-        `_group_out`, which `clock.charge` advances after the return.
+        `_group_out`, which `clock.charge` advances after the return, and its
+        `device_end` that one's `_device_end`, when the device work the step
+        launched ends, which a P/D decode's write request waits for
+        (`atom.compass.kv.connector.forward_returned`).
         A runner with no backend refuses the step rather than report one that
         took no time. ATOM's `dummy_execution` answers with this reply too, so
         an idle DP rank's dummy batch is priced and joins the group's targets.
@@ -1877,6 +1931,7 @@ class NonAllocatingRunner(
         )
         out.out_s = getattr(self, "_out_s", None)
         out.group_out = getattr(self, "_group_out", None)
+        out.device_end = vars(self).get("_device_end")
         out.pp_send = self._pp_send(batch, seconds)
         if out.pp_send is not None:
             out.predicted_s -= out.pp_send[1]
@@ -1896,7 +1951,8 @@ def _start_cost_table(runner: Any, record: Any) -> None:
 def _time_target(runner: Any, batch: Any) -> None:
     """Time the step `_group_step_seconds` just priced through the
     `GPUForwardMetrics` ATOM's `ModelRunner` builds on `runner` with the
-    device timer on: `measure` around the step's `StepCost.target_seconds` on
+    device timer on: `measure` around the step's `_target_s` (its
+    `StepCost.target_seconds`, under DP with its lockstep wait) on
     `PredictedEvent`s, then `poll`, so its observations, a prefill request's
     sum over its chunks included, are in the worker's file before `forward`
     replies. `measure` skips a DP dummy run and an empty batch, as on a real
@@ -1915,6 +1971,50 @@ def _time_target(runner: Any, batch: Any) -> None:
     metrics.poll()
 
 
+#: A file of a real record's stalled forwards and whole-group pauses a simulated
+#: run replays (`replayed_stall`), as `python -m atom.compass.validate.stalls RUN OUT` writes it.
+REPLAY_STALLS = "COMPASS_REPLAY_STALLS"
+
+
+def replayed_stall(runner: Any, view: Any, host: Any) -> float:
+    """The seconds of `REPLAY_STALLS`' stalls this rank's step `view` replays:
+    every one of this DP rank's stalls whose time, from the run's first
+    forward, the engine clock (`host.now`) has reached and no earlier step
+    replayed. A launch stall waits for a step that prefills, as it stalled a
+    prefill's launch; a whole-group pause (``any_step``) takes this rank's next
+    step of any kind, a dummy run's too, as it stopped the device whatever
+    it ran. A what-if that attributes a simulated run's error to the real
+    run's stalls, not a price: 0 s unset, with no clock, or with none due."""
+    path = os.environ.get(REPLAY_STALLS)
+    now = getattr(host, "now", None)
+    if not path or now is None or view is None:
+        return 0.0
+    state = vars(runner).get("_replay_stalls")
+    if state is None:
+        with open(path) as f:
+            stalls = json.load(f)["stalls"]
+        rank = view.dp_rank or 0
+        mine = [s for s in stalls if s["rank"] == rank]
+        launch, pauses = (
+            collections.deque(
+                sorted(
+                    (s["t_s"], s["seconds"])
+                    for s in mine
+                    if bool(s.get("any_step")) == any_step
+                )
+            )
+            for any_step in (False, True)
+        )
+        state = vars(runner)["_replay_stalls"] = (now(), launch, pauses)
+    first, launch, pauses = state
+    seconds, at = 0.0, now() - first
+    due = [pauses] + [launch] * (not all(r.decode for r in view.requests))
+    for pending in due:
+        while pending and pending[0][0] <= at:
+            seconds += pending.popleft()[1]
+    return seconds
+
+
 def _group_step_seconds(
     runner: Any,
     batch: Any,
@@ -1930,7 +2030,12 @@ def _group_step_seconds(
     it; without one it is settled here, which runs the DP collective; `view`,
     the `BatchView` the record built from it, is priced in place of a new one.
     Under DP the group then sums its dummy forwards (`projection.dummy_ranks`),
-    which the view states as its `group_dummies`.
+    which the view states as its `group_dummies`. With a `compass_host` the
+    view also states its `prefill_duty`: the runner's `shape.PrefillDuty`
+    (`_prefill_duty`) at the engine's clock on the forward's entry, over its
+    earlier forwards, each from that entry to its return, `group_s` later, and
+    a prefill forward when its group prefills at its step (on one rank, when
+    it prefills); with none it states no duty, which a law pricing it refuses.
 
     In a run, `compass_host` composes the price, the target's device seconds
     and then the draft's (`StepCost.target_seconds`, `draft_seconds`), with
@@ -1944,12 +2049,17 @@ def _group_step_seconds(
     for a real forward's cross-rank collectives, and every rank leaves at its
     own charge. With no
     `compass_host`, a rank with output, not the DP dummy, leaves at the group's
-    max, any other at its own seconds. `_group_targets` holds all,
+    max, any other at its own seconds. `_device_end` is the end of the device
+    work the forward launched, `HostDeviceRecurrence.ends`' last, the group's
+    latest under DP, or None with no `HostDeviceRecurrence`. `_group_targets` holds all,
     by rank, or None with one rank. `_out_s` is the host's ``out_s`` for this
     step, the seconds from its return to the engine's next input pull, or
     None; `_group_out` holds each rank's target plus its ``out_s``, for the
     ranks with one, or None. `_target_s` is the step's `target_seconds`, or
-    None for a refused step.
+    None for a refused step; under DP with a `HostDeviceRecurrence`, plus the
+    rank's lockstep wait, from its own target end to the group's latest, which
+    the same `all_reduce(MAX)` gives: a real rank's device events span that
+    wait at its forward's collectives (`GPUForwardMetrics.steps`).
 
     A pipeline stage runs only its own layers, so it is refused unless its
     backend states the `stage_share` it prices; any other backend prices the
@@ -1975,10 +2085,13 @@ def _group_step_seconds(
     `MTP_SEGMENT` and `PP_RECV_SEGMENT`, the part of `W_launch` before a
     later stage's receive, in seconds, each 0.0 where the law has none, and `skipped`,
     those its `skip` charged as 0; `device_s` and `draft_s`, the backend's
-    target and draft price; `charge_s`, those composed with host time (their
-    sum with no host);
+    target and draft price, the target's with any `replayed_stall`, which
+    ``replayed_stall_s`` then states; `charge_s`, those composed with host
+    time (their sum with no host);
     `group_s`, its DP group target; `terms`, each one's `name`, `seconds`
-    and its provenance's `method`, `validated` and `source`; and `refused`,
+    and its provenance's `method`, `validated` and `source`, the target's
+    then the draft's; `target_terms`, how many of them are the target's;
+    and `refused`,
     the ``cost:`` reason or None. Above them, `forward` starts the file with
     `{"version": COST_TABLE_VERSION}` as the record starts, replacing an
     earlier run's file, and keeps it open in `_cost_table` for the run.
@@ -2001,14 +2114,20 @@ def _group_step_seconds(
             f"layers, but {type(backend).__name__} prices a whole step; charging "
             "each stage the whole model would count it once per stage"
         )
-    from atom.compass.backends.cost import EAGER_DP_DUMMY, ProvenanceMix, fold_seconds
+    from atom.compass.backends.cost import (
+        EAGER_DP_DUMMY,
+        IDLE_DP_GROUP,
+        ProvenanceMix,
+        fold_seconds,
+    )
     from atom.compass.backends.resolver import CostRefused, Refusal
+    from atom.compass.backends.shape import PrefillDuty
 
     if mode is None:
         mode = forward_mode(batch, runner)
     mix = vars(runner).setdefault("_priced", ProvenanceMix())
     spec = getattr(runner.config, "speculative_config", None)
-    terms, refused = (), None
+    terms, target_terms, refused = (), 0, None
     host = getattr(runner, "compass_host", None)
     if isinstance(host, HostDeviceRecurrence) and host.admit != ADMISSION_IN_E:
         # A block-table entry holds a block's tokens on each DCP rank.
@@ -2018,15 +2137,26 @@ def _group_step_seconds(
         seen = vars(runner).setdefault("_admitted", set())
         batch.compass_admitted = admitted(batch, seen, entry)
     dummies = dummy_ranks(batch, mode)
+    clock = getattr(host, "now", None)
+    entered = None if clock is None else clock()
+    duty = vars(runner).setdefault("_prefill_duty", PrefillDuty())
     try:
         if view is None:
             view = batch_view(batch, mode, runner, dummies)
         elif view.dp_rank is not None:
             view = dataclasses.replace(view, group_dummies=dummies)
+        if entered is not None:
+            view = dataclasses.replace(view, prefill_duty=duty.at(entered))
         if isinstance(host, HostDeviceRecurrence):
             batch.compass_launch = host.predicted(view)
+            batch.compass_dummy = bool(view.dp_dummy and view.prefill)
         cost = backend.price(view)
-        if spec and not cost.draft_terms and EAGER_DP_DUMMY not in cost.treatments:
+        dummy = {EAGER_DP_DUMMY, IDLE_DP_GROUP} & set(cost.treatments)
+        # A draft whose work on this step is only its draft-KV pass (a producer's output prefill under a draft law
+        # with output_prefill_kv, step_linear's module text) is priced among the target's terms, as `draft.` terms,
+        # and states no draft_terms: that is a priced draft, not a missing one.
+        in_kv = any(t.name.startswith("draft.") for t in cost.terms)
+        if spec and not cost.draft_terms and not in_kv and not dummy:
             name = type(backend).__name__
             raise CostRefused(batch, [Refusal(name, "prices no draft")])
     except CostRefused as refusal:
@@ -2039,7 +2169,9 @@ def _group_step_seconds(
     else:
         mix.record(cost)
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
-        terms = (*cost.terms, *cost.draft_terms)
+        terms, target_terms = (*cost.terms, *cost.draft_terms), len(cost.terms)
+    stall_s = 0.0 if refused else replayed_stall(runner, view, host)
+    device_s += stall_s
     # `decide` returns the collective's rows for a group of one too.
     many = mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1
     group = dp_group() if many else None
@@ -2050,9 +2182,13 @@ def _group_step_seconds(
             end = host.device_end(batch, device_s, draft_s, refuse)
             # The output end: the device end, or with MTP or a draft the target end.
             mark = host.target_end if host.mtp or draft_s else end
-            t = torch.tensor([end, mark], dtype=torch.float64)
+            own = host.target_end
+            t = torch.tensor([end, mark, own], dtype=torch.float64)
             torch.distributed.all_reduce(t, torch.distributed.ReduceOp.MAX, group)
-            return host.release(*t.tolist())
+            end, mark, last = t.tolist()
+            # A real rank's target waits at its collectives for the group's last.
+            vars(runner)["_lockstep_s"] = last - own
+            return host.release(end, mark)
 
     try:
         total = fold_seconds((device_s, draft_s))
@@ -2065,6 +2201,10 @@ def _group_step_seconds(
         charge_s = charge(batch, device_s, draft_s, refuse=False)
     if refused:
         vars(runner).setdefault("_refused_commands", []).append(refused)
+    # The end of the device work this forward launched, the group's latest
+    # under DP; None with no recurrence, whose forward returns at its end.
+    device_end = host.ends[-1] if isinstance(host, HostDeviceRecurrence) else None
+    vars(runner)["_device_end"] = device_end
     group_s, targets, pulls = charge_s, None, None
     out_s = getattr(host, "out_s", None)
     if group is not None:
@@ -2082,9 +2222,17 @@ def _group_step_seconds(
         ends = zip(targets, (o for *_, o in rows))
         pulls = tuple(t + o for t, o in ends if not math.isnan(o)) or None
         group_s = targets[group.rank()]
+    if entered is not None:
+        prefilled = (
+            not mode.running_tokens_are_unified
+            if many
+            else bool(batch.total_seqs_num_prefill)
+        )
+        duty.add(entered, entered + group_s, prefilled)
     vars(runner)["_group_targets"] = targets
     vars(runner)["_out_s"], vars(runner)["_group_out"] = out_s, pulls
-    vars(runner)["_target_s"] = None if refused else device_s
+    lockstep_s = vars(runner).pop("_lockstep_s", 0.0)
+    vars(runner)["_target_s"] = None if refused else device_s + lockstep_s
     record = getattr(runner, "_parity_record", None)
     if record is None:
         return group_s
@@ -2100,6 +2248,7 @@ def _group_step_seconds(
         **segments,
         "device_s": device_s,
         "draft_s": draft_s,
+        **({"replayed_stall_s": stall_s} if stall_s else {}),
         "charge_s": charge_s,
         "group_s": group_s,
         "terms": [
@@ -2112,6 +2261,7 @@ def _group_step_seconds(
             }
             for t in terms
         ],
+        "target_terms": target_terms,
         "refused": refused,
     }
     runner._cost_table.write(json.dumps(line) + "\n")
@@ -2175,6 +2325,7 @@ class RapidServeRpcs:
         out = super().forward(batch)
         ids = self._token_stream.token_ids
         sampled = SampledIds(ids[int(r) % len(ids)] for r in batch.req_ids)
-        for name in ("predicted_s", "out_s", "group_targets", "group_out"):
+        names = ("predicted_s", "out_s", "group_targets", "group_out", "device_end")
+        for name in names:
             setattr(sampled, name, getattr(out, name, None))
         return sampled

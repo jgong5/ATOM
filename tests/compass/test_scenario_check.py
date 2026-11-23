@@ -214,11 +214,36 @@ PREFILL_THEN_DECODES = [(PREFILL, True), (DECODE, True), (DECODE, True)]
     ids=["mixed", "decode", "middle"],
 )
 def test_each_dp_rank_returns_at_its_own_exit(rank0, rank1, tars):
-    record = {
+    assert expected_timeline(_record(rank0, rank1), P, D, tars) == tars
+
+
+def _record(*ranks) -> dict:
+    return {
         r: [
             {"rows": rows, "produces_output": out, "is_dummy_run": False}
             for rows, out in steps
         ]
-        for r, steps in enumerate((rank0, rank1))
+        for r, steps in enumerate(ranks)
     }
-    assert expected_timeline(record, P, D, tars) == tars
+
+
+def test_an_engine_that_reads_its_ids_at_once_returns_at_each_output_s_device_end():
+    # A P/D producer with recurrent state defers nothing
+    # (`scheduler.defers_output`): each output forward reads its own ids, so
+    # returns at its own device end, the group's: P, then a decode each.
+    record = _record(PREFILL_THEN_DECODES, PREFILL_THEN_DECODES)
+    tars = [(0.0, P), (P, P + D), (P + D, P + 2 * D)]
+    assert expected_timeline(record, P, D, tars, defer=False) == tars
+    assert expected_timeline(record, P, D, tars) != tars
+
+
+def test_an_engine_file_states_whether_its_engine_deferred(tmp_path):
+    from atom.compass.backends.step_grid_plan import DEFERS_OUTPUT, keyed_of
+    from atom.compass.detect.scenario import _defers_output
+
+    (tmp_path / "dp0.engine.json").write_text(json.dumps({"ladder": []}))
+    assert _defers_output(tmp_path)  # written before engines stated it
+    engine = {"ladder": [], DEFERS_OUTPUT: False}
+    (tmp_path / "dp1.engine.json").write_text(json.dumps(engine))
+    assert not _defers_output(tmp_path)
+    assert keyed_of(engine) == {"ladder": []}  # no law's engine config moves
