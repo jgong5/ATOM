@@ -21,9 +21,11 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.offload import register_backends
-from atom.kv_transfer.offload.config import DEFAULT_MIN_LOAD_TOKENS, connector_extras
 from atom.kv_transfer.offload.tier import OffloadTierProfile
-from atom.utils import envs
+
+# `offload.config` and `atom.utils` import torch; they are imported where they
+# are read, so importing the factory loads no device runtime (Compass prices
+# transfers through it where none exists).
 
 logger = logging.getLogger("atom")
 
@@ -233,6 +235,9 @@ class KVConnectorFactory:
         the process keeps its own. A ``multi`` runs at most one offload tier, so
         this reads that leaf, not the P/D transport beside it.
         """
+        from atom.kv_transfer.offload.config import DEFAULT_MIN_LOAD_TOKENS
+        from atom.utils import envs
+
         override = envs.OFFLOAD_MIN_LOAD_TOKENS
         if override is not None:
             return override
@@ -258,6 +263,7 @@ class KVConnectorFactory:
             )
             if cls.is_offload_backend(name) and role in ("offload", "kv_both"):
                 if name == "mooncake_store":
+                    from atom.kv_transfer.offload.config import connector_extras
                     from atom.kv_transfer.offload.mooncake_store.config import (
                         parse_mooncake_store_config,
                     )
