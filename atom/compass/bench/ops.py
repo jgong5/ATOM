@@ -2416,7 +2416,7 @@ class Stub:
             return _clone(meta[1]) if fresh and role != "kv" else meta[1]
         raise ValueError(f"a {role} tensor argument {_text(spec)} is not built")
 
-    def _weight(self, spec, c, count, path=None):
+    def _weight(self, spec, c, count, path):
         """Weight `c mod count` of `spec`, random: the `count` of a leaf are
         built once, as slices of one tensor each starting on a `WEIGHT_ALIGN`
         boundary, each marked preshuffled when ATOM marked the captured one, so
