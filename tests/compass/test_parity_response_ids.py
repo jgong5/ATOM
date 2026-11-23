@@ -121,9 +121,7 @@ def test_a_recording_server_s_sequences_carry_their_response_ids(
     ids.append("cmpl-stream")
     # Upstream's streaming setup reads `sampling_params.logprobs`.
     asyncio.run(
-        api_server.setup_streaming_request(
-            _prompt(1), SamplingParams(), ids[-1]
-        )
+        api_server.setup_streaming_request(_prompt(1), SamplingParams(), ids[-1])
     )
 
     async def multimodal():

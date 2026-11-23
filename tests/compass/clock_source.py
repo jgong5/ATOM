@@ -275,12 +275,12 @@ _KEPT_REAL = (
     ("atom/entrypoints/openai/frontend_workers.py", "wait_for_workers", "time.monotonic",
      "K9", _STARTUP, 2),
     ("atom/entrypoints/openai/frontend_workers.py", "longest_silence", "time.monotonic",
-     "K9", "the age of a front-end worker's last GC report, read by its health "
-     "metric only; no simulated result reads it", 1),
+     "K9", ("the age of a front-end worker's last GC report, read by its health "
+     "metric only; no simulated result reads it"), 1),
     *(
         ("atom/entrypoints/openai/images.py", scope, "time.monotonic", "K8",
-         "the deadline of fetching a prompt's image over the network, real I/O "
-         "that must time out in real seconds", 1)
+         ("the deadline of fetching a prompt's image over the network, real I/O "
+          "that must time out in real seconds"), 1)
         for scope in ("_download", "__init__", "remaining")
     ),
     ("atom/kv_transfer/offload/mp/transfer_thread.py", "fence", "time.monotonic", "K9",
