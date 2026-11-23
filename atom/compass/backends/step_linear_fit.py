@@ -673,9 +673,9 @@ def _intakes(path) -> tuple[list, list, list]:
     thread spent from the app call to the send's end, less what it spent from
     its pool job's submit to its resume (``wait``), the job's and other
     requests' work. A request's mark is its template's start or, on a server
-    that renders none, its body read's end. A burst is a run of requests each
-    of whose app call came before the mark of the one ahead of it, the loop
-    taking them in one after another."""
+    that renders none, its pool job's submit: either follows its body's parse.
+    A burst is a run of requests each of whose app call came before the mark of
+    the one ahead of it, the loop taking them in one after another."""
     ev = _stamps(path)
     at = [e[0] for e in ev]
     cpu = {e[0]: e[4] for e in ev if e[2] == "app"}
@@ -694,16 +694,16 @@ def _intakes(path) -> tuple[list, list, list]:
             continue
         body, *_, send = between
         lone.append((body[3], (send[5] - cpu[call] - waits) * 1e-9))
-    # The loop renders each request's template as soon as its body is read.
-    bodies = sorted((e for e in ev if e[2] == "body"), key=lambda e: e[1])
-    sizes = [e[3] for e in bodies]
-    marks = [(e[0], e[4]) for e in ev if e[2] == "tmpl"]
-    marks = marks or [(e[1], e[5]) for e in bodies]
+    # The loop parses each request's body as soon as it is read, then renders
+    # its template, if the server renders one, and submits its pool job.
+    mark = "tmpl" if any(e[2] == "tmpl" for e in ev) else "wait"
+    marks = [e for e in ev if e[2] == mark]
+    sizes = [e[3] for e in sorted(ev, key=lambda e: e[1]) if e[2] == "body"]
     # A mark that finds a later request arrived and not yet marked.
     queued = [np.searchsorted(calls, m[0]) > k + 1 for k, m in enumerate(marks)]
     bursts, run = [], []
     for k, m in enumerate(marks):
-        run.append((sizes[k], *m))
+        run.append((sizes[k], m[0], m[4]))
         if not queued[k]:
             if len(run) > 1:
                 bursts.append(run)
