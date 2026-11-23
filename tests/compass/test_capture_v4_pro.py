@@ -59,10 +59,11 @@ CORE = {"decode": DECODE, "prefill": "aiter.pa_sparse_prefill_fp8_opus.default"}
 _CAPTURES: dict = {}
 
 
-def trace(root, argv):
+def trace(root, argv, env=None):
     """`trace ops --tp 8 --arch gfx950` over `argv`, run in a process of its own
     on a model directory holding V4-Pro's config.json and a shard that holds
-    no tensor: ATOM reads its header, and nothing may load a tensor."""
+    no tensor: ATOM reads its header, and nothing may load a tensor. `env`
+    adds to the process's environment."""
     assert hashlib.sha256(CONFIG.read_bytes()).hexdigest() == CONFIG_SHA256
     (root / "model").mkdir()
     (root / "model" / "config.json").write_bytes(CONFIG.read_bytes())
@@ -82,17 +83,18 @@ def trace(root, argv):
         check=False,
         timeout=1800,
         cwd=TREE,
-        env={**os.environ, "PYTHONPATH": str(TREE)},
+        env={**os.environ, **(env or {}), "PYTHONPATH": str(TREE)},
     )
 
 
-def capture(tmp_path_factory, argv):
-    """`trace` over `argv`: each shape's published graph and declarations, by
-    shape."""
-    if argv in _CAPTURES:
-        return _CAPTURES[argv]
+def capture(tmp_path_factory, argv, env=None):
+    """`trace` over `argv` under `env`: each shape's published graph and
+    declarations, by shape."""
+    key = argv, *sorted((env or {}).items())
+    if key in _CAPTURES:
+        return _CAPTURES[key]
     root = tmp_path_factory.mktemp("v4pro")
-    done = trace(root, argv)
+    done = trace(root, argv, env)
     tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
     assert tokens, f"rc {done.returncode}\n{done.stderr[-4000:]}"
     store = ArtifactStore(str(root / "store"))
@@ -105,7 +107,7 @@ def capture(tmp_path_factory, argv):
             for stem in ("graph", "declared")
         )
         graphs[graph["shape"]] = graph, declared
-    _CAPTURES[argv] = graphs
+    _CAPTURES[key] = graphs
     return graphs
 
 
