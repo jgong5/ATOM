@@ -492,13 +492,24 @@ def test_a_simulated_router_bounds_a_request_by_a_year_of_wall_time(tmp_path, pl
     out, _ = script.communicate(timeout=60)
 
     assert script.returncode == 0, out
-    assert router.count("--request-timeout-secs") == 1
-    bound = int(router[router.index("--request-timeout-secs") + 1])
-    assert bound >= 365 * 24 * 3600
+    year = 365 * 24 * 3600
+    for flag, unit in (
+        ("--request-timeout-secs", 1),
+        ("--prepare-queue-timeout-ms", 1000),
+        ("--prepare-timeout-ms", 1000),
+    ):
+        assert router.count(flag) == 1
+        assert int(router[router.index(flag) + 1]) >= year * unit
 
 
 @pytest.mark.parametrize(
-    "words", [["--request-timeout-secs", "60"], ["--request-timeout-secs=60"]]
+    "words",
+    [
+        ["--request-timeout-secs", "60"],
+        ["--request-timeout-secs=60"],
+        ["--prepare-queue-timeout-ms", "5000"],
+        ["--prepare-timeout-ms=15000"],
+    ],
 )
 def test_a_simulated_router_refuses_the_caller_s_request_timeout(
     tmp_path, planted, words
@@ -516,7 +527,8 @@ def test_a_simulated_router_refuses_the_caller_s_request_timeout(
     )
 
     assert done.returncode == 2, done.stderr
-    assert "the router's arguments carry --request-timeout-secs," in done.stderr
+    flag = words[0].split("=")[0]
+    assert f"the router's arguments carry {flag}," in done.stderr
     assert not (tmp_path / "d").exists()
 
 

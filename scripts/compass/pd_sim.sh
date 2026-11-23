@@ -205,7 +205,7 @@ done
 env "${router_env[@]}" "$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --pd-disaggregation \
     "${urls[@]}" \
     "${router[@]}" --backend atom --disable-health-check --disable-circuit-breaker \
-    --disable-retries --request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S" \
+    --disable-retries "${COMPASS_SIM_ROUTER_BOUNDS[@]}" \
     --prometheus-port "$PROMETHEUS_PORT" --log-level info \
     >"$OUT/router.log" 2>&1 &
 compass_wait_up router $! "http://127.0.0.1:$ROUTER_PORT/v1/models"

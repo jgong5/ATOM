@@ -28,8 +28,9 @@
 #                  its own from. run refuses --prefill and --decode, a worker more to
 #                  choose, and --max-concurrent-requests and
 #                  --rate-limit-tokens-per-second, a limiter on the wall
-#                  clock; it sets --request-timeout-secs (`_lib.sh`) and
-#                  refuses the caller's; the caller switches the router's
+#                  clock; it sets --request-timeout-secs and the prepare
+#                  pool's two deadlines (`_lib.sh`) and refuses the
+#                  caller's; the caller switches the router's
 #                  wall-clock detectors off, as pd_sim.sh does:
 #                  --disable-health-check
 #                  --disable-circuit-breaker --disable-retries. run refuses
@@ -117,7 +118,7 @@ ATOMESH=${ATOMESH:-atomesh} ROUTER_LP=
     case ${word%%=*} in
     --prefill | --decode) bad "the router's arguments carry ${word%%=*}, a worker more for a simulated router to choose" ;;
     --max-concurrent-requests | --rate-limit-tokens-per-second) bad "the router's arguments carry ${word%%=*}, a limiter a simulated router leaves out" ;;
-    --request-timeout-secs) bad "the router's arguments carry ${word%%=*}, a wall-clock bound the script sets for a simulated router" ;;
+    --request-timeout-secs | --prepare-queue-timeout-ms | --prepare-timeout-ms) bad "the router's arguments carry ${word%%=*}, a wall-clock bound the script sets for a simulated router" ;;
     esac
 done
 [[ -z $ROUTER_LP || " ${router[*]} " == *" --disable-retries "* ]] || bad "the router's arguments carry --dp-aware but not --disable-retries: a router LP's retry resends a request under its first seq, which the frontend refuses as arrived twice"
@@ -288,7 +289,7 @@ for u in "$prefill_url" "$decode_url"; do u=${u#*://} && hosts+=,${u%:*}; done
 export NO_PROXY=$hosts${NO_PROXY:+,$NO_PROXY} no_proxy=$hosts${no_proxy:+,$no_proxy}
 
 ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-port "$PROMETHEUS_PORT")
-[[ -z $RUN_FILE ]] || ROUTER+=(--request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S")
+[[ -z $RUN_FILE ]] || ROUTER+=("${COMPASS_SIM_ROUTER_BOUNDS[@]}")
 ROUTER+=(--pd-disaggregation --prefill "$prefill_url" --decode "$decode_url" "${router[@]}")
 router_env=()
 [[ -z $ROUTER_LP ]] || router_env=(ATOM_COMPASS_CLOCK_ENDPOINT="$CLOCK" ATOM_COMPASS_SEED="${SEED:-20260707}" ATOM_COMPASS_ROUTER_LOOKAHEADS="$LOOKAHEADS")

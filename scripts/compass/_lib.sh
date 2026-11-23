@@ -485,6 +485,14 @@ if not os.fork():
 # takes to reach its end, past 1800 s at c=256, so a simulated launch sets
 # the bound to a year.
 COMPASS_SIM_REQUEST_TIMEOUT_S=31536000
+# Every wall-clock bound a simulated router gets, each at that year: the one
+# above, and the prepare pool's wait for a thread and its preparation of a
+# request (`--prepare-queue-timeout-ms`, `--prepare-timeout-ms`; atomesh's
+# defaults are 250 ms and 5 s), which run on the wall clock too, so a request a
+# router LP holds for its release would otherwise run them out.
+COMPASS_SIM_ROUTER_BOUNDS=(--request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S"
+    --prepare-queue-timeout-ms "${COMPASS_SIM_REQUEST_TIMEOUT_S}000"
+    --prepare-timeout-ms "${COMPASS_SIM_REQUEST_TIMEOUT_S}000")
 
 # compass_on_arch RUN_FILE: the words ahead of `-m MODULE` that start a simulated
 # server under on_arch on RUN_FILE's machine's arch, as `compass run` starts its
