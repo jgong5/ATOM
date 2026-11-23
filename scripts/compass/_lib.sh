@@ -403,10 +403,15 @@ compass_gpu_arch() {
     HIP_VISIBLE_DEVICES=$1 python -c 'import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])' 2>/dev/null
 }
 
+# This file's directory, resolved as it is sourced: a caller may cd elsewhere
+# before a function reads a list beside it, as regen_gpu_gate_baseline.sh cd's
+# into the base it measures, where a relative path names nothing.
+COMPASS_LIB_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 # compass_gpu_skip_lines TARGET: what gpu_gate_skip.txt names for GPU target
 # TARGET, one per line: a test file it leaves out there, or `driver-run`.
 compass_gpu_skip_lines() {
-    grep -vE '^[[:space:]]*(#|$)' "$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_skip.txt" |
+    grep -vE '^[[:space:]]*(#|$)' "$COMPASS_LIB_DIR/gpu_gate_skip.txt" |
         awk -v t="$1" '$1 == t { print $2 }'
 }
 
