@@ -1344,12 +1344,35 @@ class PipelineFrames:
 
     def _pp_output(self, n: int) -> dict:
         """Each key a non-last stage's output can carry to ATOM's PP send, a
-        meta tensor for `n` tokens, or None where this stage does not carry it."""
+        meta tensor for `n` tokens, or None where this stage does not carry it.
+
+        A drafter's target aux hidden states (`pp_comm.PP_AUX_KEY`) are as
+        many hidden-size columns as ATOM's relay sends on (`PPAuxRelay`).
+        Kimi-K3's AttnRes block window (`block_residual`), which its stages'
+        intermediate tensors name, is not sized, so such a stage refuses."""
+        from atom.distributed.pp_comm import PP_AUX_KEY
+
         self._setup_pp_shared_indexer()
         meta, on = partial(torch.empty, device="meta"), self._pp_send_needs_sparse
-        x = meta(n, self.hf_text_config.hidden_size, dtype=self.config.torch_dtype)
+        dtype = self.config.torch_dtype
+        x = meta(n, self.hf_text_config.hidden_size, dtype=dtype)
         sparse = meta(n * self._pp_index_topk, dtype=torch.int32) if on else None
-        return {"hidden_states": x, "residual": x, "sparse_kv_indices": sparse}
+        model = getattr(self, "model", None)
+        carried = getattr(model, "make_empty_intermediate_tensors", None)
+        if carried is not None and "block_residual" in carried(1, dtype, "meta").tensors:
+            raise RunnerRefusal(
+                "this model's pipeline stages send an AttnRes block window "
+                "(block_residual), whose size this runner does not model"
+            )
+        relay = getattr(self, "pp_aux_relay", None)
+        columns = len(relay.outgoing_ids) * relay.spec.hidden_size if relay else 0
+        return {
+            "hidden_states": x,
+            "residual": x,
+            "block_residual": None,
+            "sparse_kv_indices": sparse,
+            PP_AUX_KEY: meta(n, columns, dtype=dtype) if columns else None,
+        }
 
     def pp_recv_posted(self, called: float, kind: str, x: tuple) -> tuple:
         """Where this stage posts its ``pp_data`` receive, its forward's prepare
