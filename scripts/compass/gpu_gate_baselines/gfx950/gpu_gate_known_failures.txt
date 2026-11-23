@@ -150,6 +150,7 @@ tests/test_qwen4_exp_mtp.py::test_qsa_row_sharded_selection_matches_whole_batch[
 tests/test_qwen4_exp_mtp.py::test_qsa_row_sharded_selection_matches_whole_batch[1025-rows-8-triton-shard]
 tests/test_qwen4_exp_mtp.py::test_qsa_row_sharded_selection_matches_whole_batch[1025-rows-8-triton-half-shard]
 tests/test_qwen4_exp_mtp.py::test_qsa_row_sharded_selection_matches_whole_batch[1025-rows-8-triton-200-rows]
+tests/test_qwen4_exp_sequence_parallel.py::test_select_tokens_row_sharded_matches_replicated[2-triton]
 tests/test_qwen4_exp_sequence_parallel.py::test_select_tokens_row_sharded_matches_replicated[4-triton]
 tests/test_qwen4_exp_sequence_parallel.py::test_select_tokens_row_sharded_matches_replicated[8-triton]
 tests/test_sampler_greedy_rows.py::test_gpu_sampling_greedy_rows_and_no_mask_readback[mixed-aiter]
