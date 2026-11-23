@@ -256,6 +256,23 @@ skip below a GPU count start workers and fail
 available` (`tests/test_vllm_kda_state_offload.py`). Measured on mi355-gpu-40,
 where `torch.cuda.device_count()` reads 8 without the mount and 0 with it.
 
+The GPU container for `gate_gpu.sh` and `regen_gpu_gate_baseline.sh` runs on the
+same image, with `/dev/kfd` and `/dev/dri`, and needs two repairs before either
+collects `tests/`, or the run stops at collection (pytest rc=2):
+
+```
+docker exec <user>_gpu python3 -m pip install llguidance==1.9.1 'google-re2>=1.1'
+docker exec <user>_gpu mv /app/aiter-test/tests/conftest.py /app/aiter-test/tests/conftest.py.aside
+```
+
+The first installs ATOM's `structured-output` extra, which the image lacks, so
+`tests/test_structured_output.py` and its siblings import. The second is for
+`tests/test_pp.py`'s `from tests.conftest import MockConfig`: ATOM's `tests/` is
+a namespace package, and once collecting
+`tests/attentions/deepseek_v41/test_a8w4_attention.py` has put `/app/aiter-test`
+on `sys.path` through aiter, aiter's own `tests/conftest.py` answers that
+import. The CPU gate leaves these files out instead (`cpu_gate_exclude.txt`).
+
 ## The compass_harness tests need an agentx-harness wheel
 
 `tests/compass/test_harness_*.py` skip when `compass-harness` or `aiperf` does not
