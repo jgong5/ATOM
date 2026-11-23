@@ -63,8 +63,10 @@ PLANE_BOUND = {
 }
 #: V4.1's RoPE, over a query's heads or a ratio's index keys, one head.
 ROPE = "aiter.rope_cached_positions_fwd_impl.default"
-#: V4.1's top-k on gfx1250, on a scorer's logits or the candidate pick's maxima.
-TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
+#: V4.1's decode top-k on gfx1250, on a scorer's logits or the candidate pick's
+#: maxima: aiter's routed operator, which V4.1's scorer calls since upstream
+#: b7b5ec3f2, each row bounded by `seqLens`.
+TOPK = "aiter_routed.top_k_per_row_decode.default"
 #: V4.1's read of its state cursors back to the host, `.cpu()`, a copy into
 #: pageable memory, which no CUDA graph captures: `measure ops` refuses it.
 HOST_COPY = "aten.to.dtype_layout"
@@ -343,14 +345,13 @@ def test_each_top_k_alone_takes_its_ratio_s_visible_rows(undrafted_cell):
     point = ["--width", "16", "--context", "8192", "--only", TOPK, "--llc-mib", "512"]
     _run(HARNESS, root / "topk.json", *point, "--store", root / "store", "--", *atom)
     got = json.loads((root / "topk.json").read_text())
-    bounds = "row_starts", "row_ends"
     staged = {
-        r["leaf"]: [r["identity"].get(s) for s in bounds]
+        r["leaf"]: r["identity"].get("seqLens")
         for r in got
-        if json.loads(r["leaf"])["args"]["row_ends"]["role"] == "metadata"
+        if json.loads(r["leaf"])["args"]["seqLens"]["role"] == "metadata"
     }
-    assert staged == {leaf: [truth[leaf][s][0] for s in bounds] for leaf in staged}
-    assert len({n for n, _ in staged.values()}) == len(staged) == 2
+    assert staged == {leaf: truth[leaf]["seqLens"][0] for leaf in staged}
+    assert len(set(staged.values())) == len(staged) == 2
     assert {r["verdict"] for r in got} == {"reaches launch"}
 
 
@@ -377,7 +378,7 @@ def test_a_top_k_or_key_rope_stating_no_ratio_refuses_where_its_point_cannot_tel
         _run(HARNESS, root / "untold.json", *point, "--store", store, "--", *atom)
         for r in json.loads((root / "untold.json").read_text()):
             args = json.loads(r["leaf"])["args"]
-            if r["op"] == ROPE or args.get("row_ends", {}).get("role") == "metadata":
+            if r["op"] == ROPE or args.get("seqLens", {}).get("role") == "metadata":
                 told = r["why"].rpartition("cannot tell which ratio's ")[-1]
                 why[only[0], args.get("stride0")] = told
     again = ": trace its shape again"

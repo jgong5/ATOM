@@ -149,6 +149,9 @@ V41_TOPKS = (
     "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode",
     "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
     "aiter._top_k_per_row_decode.default",
+    # aiter's routed operator, which picks its kernel itself: what V4.1's
+    # scorer calls since upstream b7b5ec3f2
+    "aiter_routed.top_k_per_row_decode.default",
 )
 #: DeepSeek-V4.1's RoPE, which its index keys take at their ratio's compress
 #: plan's positions: with no drafter both ratios' plans hold as many rows.
@@ -1537,7 +1540,9 @@ def _build_runner(config, fake_mode):
         patch.object(
             packed_h2d.PackedCopy,
             "create",
-            classmethod(lambda cls, members, device: (None, "a capture packs no bytes")),
+            classmethod(
+                lambda cls, members, device: (None, "a capture packs no bytes")
+            ),
         ),
         torch.inference_mode(),
     ):
