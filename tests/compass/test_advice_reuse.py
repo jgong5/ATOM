@@ -11,6 +11,7 @@ pair. The head is the tree's own digest, except where a test builds a
 repository for the tree.
 """
 
+import functools
 import json
 import os
 import pickle
@@ -91,9 +92,28 @@ def searched(tmp_path, monkeypatch, at_head):
     return r
 
 
-#: Each config `check._resolved` resolved in this module, pickled, by its
-#: arguments, arch and this process's environment.
-RESOLVED = {}
+#: Each config `check._resolved` resolved in this module, by its arguments,
+#: arch and this process's environment, and each law file `reuse.law` read, by
+#: path; pickled.
+RESOLVED, READ = {}, {}
+DIGEST = compass_run.atom_digest
+
+
+@functools.cache
+def tree_digest() -> str:
+    """This tree's ATOM digest, taken at the first call."""
+    return DIGEST()
+
+
+@pytest.fixture(autouse=True)
+def digested_once(monkeypatch):
+    """`atom_digest` of this tree taken once for the module, as no case edits
+    the tree; of any other root, at each call."""
+    monkeypatch.setattr(
+        compass_run,
+        "atom_digest",
+        lambda root=None: tree_digest() if root is None else DIGEST(root),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -109,8 +129,14 @@ def v4_pro(tmp_path_factory):
 @pytest.fixture
 def resolved_once(monkeypatch):
     """Each instance's config resolved in the check's child once per module at
-    its arguments, arch and environment, as alike ones resolve alike."""
-    resolve = check._resolved
+    its arguments, arch and environment, as alike ones resolve alike; and each
+    shipped law file read once, as no case edits one."""
+    resolve, read = check._resolved, reuse.read_json
+
+    def read_once(path):
+        if path not in READ:
+            READ[path] = pickle.dumps(read(path))
+        return pickle.loads(READ[path])
 
     def once(args, arch):
         env = sorted(
@@ -122,6 +148,7 @@ def resolved_once(monkeypatch):
         return pickle.loads(RESOLVED[at])
 
     monkeypatch.setattr(check, "_resolved", once)
+    monkeypatch.setattr(reuse, "read_json", read_once)
 
 
 def resolved_here(monkeypatch, resolve):
