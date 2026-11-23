@@ -82,6 +82,7 @@ SCRATCH = (
 )
 
 _CAPTURES: dict = {}
+_TRACED: dict = {}
 
 
 def trace(root, argv, arch, prelude=""):
@@ -107,7 +108,19 @@ def trace(root, argv, arch, prelude=""):
     )
 
 
-#: Each `trace` this file reads: its arguments, arch and prelude.
+def traced(tmp_path_factory, *keys):
+    """`trace` over each of `keys`, its arguments, arch and prelude, that has
+    not run yet, all at once, since each takes its process's whole seconds:
+    each key's finished process and the root it ran under."""
+    todo = [key for key in keys if key not in _TRACED]
+    roots = [tmp_path_factory.mktemp("v41") for _ in todo]
+    with ThreadPoolExecutor(max(len(todo), 1)) as pool:
+        done = pool.map(lambda key, root: trace(root, *key), todo, roots)
+        _TRACED.update(zip(todo, zip(done, roots)))
+    return [_TRACED[key] for key in keys]
+
+
+#: Each `trace` this file's cases read: its arguments, arch and prelude.
 TRACES = [
     (SHAPES + ARGS, "gfx1250", ""),
     (SHAPES + ARGS + EP4, "gfx1250", ""),
@@ -117,24 +130,18 @@ TRACES = [
 ]
 
 
-@pytest.fixture(scope="module")
-def traced(tmp_path_factory):
-    """Each of `TRACES` run at once, each in a process of its own under a root
-    of its own, since each takes its process's whole seconds: the finished
-    process and its root, by its arguments, arch and prelude."""
-    roots = [tmp_path_factory.mktemp("v41") for _ in TRACES]
-    with ThreadPoolExecutor(len(TRACES)) as pool:
-        done = pool.map(lambda t, root: (trace(root, *t), root), TRACES, roots)
-        return dict(zip(TRACES, done))
+@pytest.fixture(scope="module", autouse=True)
+def _trace_all(tmp_path_factory):
+    """`TRACES`, at once, before this file's first case."""
+    traced(tmp_path_factory, *TRACES)
 
 
-def capture(traced, argv, arch="gfx1250", prelude=""):
-    """`trace` over `argv` at `arch` after `prelude`, from `traced`: each
-    shape's published graph and declarations, by shape, a prefill's final
-    chunk."""
+def capture(tmp_path_factory, argv, arch="gfx1250", prelude=""):
+    """`trace` over `argv` at `arch` after `prelude`: each shape's published
+    graph and declarations, by shape, a prefill's final chunk."""
     if (argv, arch, prelude) in _CAPTURES:
         return _CAPTURES[argv, arch, prelude]
-    done, root = traced[argv, arch, prelude]
+    [(done, root)] = traced(tmp_path_factory, (argv, arch, prelude))
     tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
     assert (
         done.returncode == 0 and tokens
@@ -174,9 +181,11 @@ def scored(layer):
 
 @pytest.mark.parametrize("ep", [False, True], ids=["ep_off", "ep4"])
 def test_each_decode_layer_attends_through_its_own_leaves_stating_its_geometry(
-    ep, traced
+    ep, tmp_path_factory
 ):
-    graph, _ = capture(traced, SHAPES + ARGS + (EP4 if ep else ""))["decode B=16"]
+    graph, _ = capture(tmp_path_factory, SHAPES + ARGS + (EP4 if ep else ""))[
+        "decode B=16"
+    ]
 
     widths = f"tp={TP}" + (f" ep={TP}" if ep else "")
     assert graph["structure"].endswith(f" {widths} decode eager")
@@ -197,9 +206,11 @@ def test_each_decode_layer_attends_through_its_own_leaves_stating_its_geometry(
 
 @pytest.mark.parametrize("ep", [False, True], ids=["ep_off", "ep4"])
 def test_a_prefill_attends_every_layer_and_its_tail_through_their_own_leaves(
-    ep, traced
+    ep, tmp_path_factory
 ):
-    graph, _ = capture(traced, SHAPES + ARGS + (EP4 if ep else ""))["prefill T=512 B=1"]
+    graph, _ = capture(tmp_path_factory, SHAPES + ARGS + (EP4 if ep else ""))[
+        "prefill T=512 B=1"
+    ]
 
     ops = _ops(graph["region"])
     attention = [op for op in ops if op["op"] == V41_ATTENTION]
@@ -214,11 +225,11 @@ def test_a_prefill_attends_every_layer_and_its_tail_through_their_own_leaves(
     assert gathers and all(len(op["args"]["tensors"]) > 1 for op in gathers)
 
 
-def test_under_ep4_a_rank_holds_a_quarter_of_the_experts_whole(traced):
+def test_under_ep4_a_rank_holds_a_quarter_of_the_experts_whole(tmp_path_factory):
     experts = TEXT["n_routed_experts"]
     held = {}
     for ep in ("", EP4):
-        graph, _ = capture(traced, SHAPES + ARGS + ep)["decode B=16"]
+        graph, _ = capture(tmp_path_factory, SHAPES + ARGS + ep)["decode B=16"]
         moes = [op for op in _ops(graph["region"]) if op["op"] == MOE]
         assert len(moes) == LAYERS
         held[ep] = {op["args"]["w1"]["shape"][0] for op in moes}
@@ -227,9 +238,11 @@ def test_under_ep4_a_rank_holds_a_quarter_of_the_experts_whole(traced):
 
 
 def test_gfx950_s_fp8_scorer_lifts_its_compiled_kernel_launch_to_its_function(
-    traced,
+    tmp_path_factory,
 ):
-    graph, _ = capture(traced, "--width 16" + ARGS + EP4, "gfx950")["decode B=16"]
+    graph, _ = capture(tmp_path_factory, "--width 16" + ARGS + EP4, "gfx950")[
+        "decode B=16"
+    ]
 
     scorers = [op for op in _ops(graph["region"]) if op["op"] == COMPILED]
     assert len(scorers) == len(TEXT["index_source_layer_ids"])
@@ -241,10 +254,12 @@ def test_gfx950_s_fp8_scorer_lifts_its_compiled_kernel_launch_to_its_function(
 
 
 @pytest.mark.parametrize("arch", ["gfx1250", "gfx950"])
-def test_each_decode_layer_s_index_top_k_states_its_layer_s_ratio(arch, traced):
+def test_each_decode_layer_s_index_top_k_states_its_layer_s_ratio(
+    arch, tmp_path_factory
+):
     # gfx950's decode under EP4, which V4.1's mono decode does not serve
     argv = SHAPES + ARGS if arch == "gfx1250" else "--width 16" + ARGS + EP4
-    graph, _ = capture(traced, argv, arch)["decode B=16"]
+    graph, _ = capture(tmp_path_factory, argv, arch)["decode B=16"]
 
     for index, layer in enumerate(_decoder(graph)):
         stated = [op.get("stated") for op in layer if op["op"] == TOPKS[arch]]
@@ -252,8 +267,10 @@ def test_each_decode_layer_s_index_top_k_states_its_layer_s_ratio(arch, traced):
         assert bool(stated) == (index in TEXT["index_source_layer_ids"]), index
 
 
-def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(traced):
-    done, _ = traced[MONO, "gfx950", ""]
+def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(
+    tmp_path_factory,
+):
+    [(done, _)] = traced(tmp_path_factory, (MONO, "gfx950", ""))
 
     log = done.stdout + done.stderr
     # The width's kernels compiled for the declared arch, as the deployment's.
@@ -290,8 +307,10 @@ def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(trace
     ],
     ids=["bind", "build", "kernels"],
 )
-def test_a_mono_failure_the_capture_makes_stops_it_by_name(prelude, refusal, traced):
-    done, _ = traced[MONO, "gfx950", prelude]
+def test_a_mono_failure_the_capture_makes_stops_it_by_name(
+    prelude, refusal, tmp_path_factory
+):
+    [(done, _)] = traced(tmp_path_factory, (MONO, "gfx950", prelude))
 
     assert done.returncode and "published" not in done.stdout
     assert done.stderr.strip().splitlines()[-1] == f"compass trace ops: {refusal}"
@@ -309,9 +328,9 @@ def test_a_mono_failure_the_capture_makes_stops_it_by_name(prelude, refusal, tra
     ids=["bind_check", "scratch"],
 )
 def test_a_mono_refusal_the_deployment_makes_too_is_declared_by_the_graphs_it_turns_away(
-    prelude, declined, traced
+    prelude, declined, tmp_path_factory
 ):
-    graphs = capture(traced, MONOS, "gfx950", prelude)
+    graphs = capture(tmp_path_factory, MONOS, "gfx950", prelude)
 
     assert len(graphs) == 3
     for shape, (graph, declared) in graphs.items():
