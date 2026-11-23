@@ -3,8 +3,7 @@
 
 Each leaf is one roofline over its work; a `Seq` adds, a `Repeat` re-emits its
 body's prices, a `max` `Par` takes its longest branch, and a
-`resource_bound` `Par` its longest branch too, or one roofline over the
-branches' summed work where that is longer. A step runs at its rung's
+`resource_bound` `Par` costs one roofline over the branches' summed work. A step runs at its rung's
 graph, or its width's under ``padding: none``, a prefill at its tokens and
 rows; attention reads its context in the run's KV format. What cannot be
 priced is refused by name, each reason once. The Qwen3.8-27B TP1 capture prices leaf by leaf, and `run.runner` installs the
@@ -13,7 +12,8 @@ list, a leaf takes its price first, measured on a point or estimated between
 two of one kernel, at the step's counts and its rows' context, a decode's
 longest row and a prefill's mean cached tokens; anything
 the list declines, a line the fit declined among them, is its roofline,
-carrying why.
+carrying why. Under a list, a `resource_bound` `Par` takes its longest branch
+where that is longer than its roofline.
 """
 
 import copy
