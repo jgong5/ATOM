@@ -1026,16 +1026,21 @@ def test_a_resource_bound_par_whose_listed_branch_passes_its_roofline_is_it():
     assert cost.terms[0].provenance.method is Method.MEASURED
 
 
-def test_a_resource_bound_par_whose_branch_of_rooflines_passes_its_roofline_is_it():
-    # three GEMMs at the kernel floor beside one: the four's roofline is a floor
+def test_a_resource_bound_par_whose_declined_branch_passes_its_roofline_is_it():
+    # three GEMMs at the kernel floor beside one, under a list of another
+    # GEMM: the four's roofline is a floor, and with no list the join alone
+    other = listed(
+        *[pt(g(b, 8, 8), f"decode B={b}", 1e3, c) for b in (2, 4) for c in (1, 9)]
+    )
     three = {"seq": [g(2, 64, 64) for _ in range(3)]}
     pooled = {"par": [three, g(2, 64, 64)], "join": "resource_bound"}
     floor = price(gemm(2, 64, 64), SPEC)
 
     assert price(sum([gemm(2, 64, 64)] * 4, Work()), SPEC) == floor
-    assert by_name(backend(pooled).price(DECODE)) == {
+    assert by_name(backend(pooled, price_list=other).price(DECODE)) == {
         f"op.{GEMM}": fold_seconds([floor] * 3)
     }
+    assert by_name(backend(pooled).price(DECODE)) == {"par.resource_bound": floor}
 
 
 def test_each_micro_batch_of_a_split_step_prices_at_its_own_shape():

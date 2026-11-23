@@ -153,8 +153,7 @@ prices the real rows instead.
   is priced as fusion. Aten ops share one generic extractor that reuses
   `torch.utils.flop_counter`. An op kind with no extractor is refused by name.
 - Leaves compose by the IR's own joins: `Seq` sums, `Par` joins, TBO overlaps, a DP group
-  takes the max. The `resource_bound` join is its longest branch, or one roofline over the
-  branches' summed work where that is longer (`04` D19).
+  takes the max. The `resource_bound` join sums the branches' work and takes one roofline.
 
 ### Step level
 

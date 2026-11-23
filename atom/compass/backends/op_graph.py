@@ -48,8 +48,9 @@ whose prices they are. A step at the view of one of the last `VIEWED` steps,
 reading the same graphs, prices as it did, as a DP rank's dummy forwards do.
 Regions compose by the IR's joins: a `Seq` adds its items in order, a `Repeat`
 re-emits its body's prices once per instance, a `max` `Par` emits its longest
-branch's prices, and a `resource_bound` `Par` the same, or where one roofline
-over its branches' summed work is longer, that roofline. The price
+branch's prices, and a `resource_bound` `Par` one roofline over its branches'
+summed work, or with a price list its longest branch's prices where they are
+longer. The price
 is one rank's device busy time: the runner takes a DP group's max and
 composes host time.
 
@@ -907,7 +908,7 @@ class OpGraphBackend(CostBackend):
             unit = self._unit(name, summed, refused)
             if unit is None:
                 return []
-            if unit[0] >= max(each):
+            if not bound or unit[0] >= max(each):
                 return [(name, *unit[:2], summed, comm, ((), ()), unit[2])]
         # The longest branch's prices stay under their own terms; the first
         # carries every branch's work for an enclosing resource_bound.
