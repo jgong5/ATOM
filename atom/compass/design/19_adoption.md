@@ -437,11 +437,6 @@ the run's provenance.
    `source_root`, host laws' `atom`, readings' `atom_src`) is then held against the
    tree's. A law with no entry at its key is *calibrate*; readings with none, or measured
    at another digest, *measure*, since they re-key with a law only under #3122's design.
-   A law the runner refuses for the prefill token-graph buckets it records is
-   *calibrate* where its records ran at another digest or state none (`records_atom`,
-   as requirement 4 reads it), since a calibration of the configuration records the
-   run's buckets, and *refused* where they ran at the head
-   ([ruling](https://github.com/jgong5/ATOM/issues/3792#issuecomment-7081019326)).
 2. **Not invalidated**: no ATOM change since the calibration moves step costs, and only
    then is a law re-keyed onto the new tree (README principle 10, #2594); a change that
    moves what a start under the law's engine config holds takes its readings again
