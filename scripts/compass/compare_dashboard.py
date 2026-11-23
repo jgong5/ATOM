@@ -1,10 +1,24 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Real against simulated Prometheus series of one cell, one HTML page per cell,
-switchable by concurrency.
+"""Real against simulated Prometheus series, one HTML page over many cells,
+switchable by model, deployment (PD disaggregated or aggregated), parallel
+configuration and concurrency.
 
-    python3 scripts/compass/compare_dashboard.py MANIFEST --out DASH.html
-        [--one-real-tree TREE] [--window 1800]
+    python3 scripts/compass/compare_dashboard.py [MANIFEST] [--scan ROOT ...]
+        --out DASH.html [--one-real-tree TREE] [--window 1800]
+
+``--scan ROOT`` finds every cell under the directory layout (`scan`), so a new
+result shows by being put in its place, with no manifest to edit::
+
+    ROOT/<model>/<pd|aggregated>/<parallel>/c<C>/
+        real/                   the real run's client export
+        prom/report-data.json   its CI collector report (collect_metrics.py)
+        sims/<label>/           each simulated run, prometheus.json inside
+        one_real.txt            optional: one_real.py's output
+        cell.json               optional, at any level: manifest cell fields
+
+A directory that is not yet a complete cell is listed on the page, not shown.
+A MANIFEST and any number of --scan roots merge.
 
 Each concurrency's real run is CI's collector report (``report-data.json`` by
 ``.github/scripts/atomesh/observability/collect_metrics.py``), each simulated
@@ -12,7 +26,15 @@ run Compass's re-render of the same report from its simulated series
 (``prometheus.json`` by ``atom.compass.report.prometheus``). The page embeds
 their data (Chart.js comes from cdnjs) and holds:
 
-- a matrix, concurrency x metric, of each simulated run's error against the
+- an overview of every (model, deployment, parallel configuration) against
+  concurrency:
+  one metric's error, (sim - real) / real, for one simulated run label, as a
+  heatmap, with that metric's real and simulated values against concurrency
+  for the selected configuration and each configuration's error against
+  concurrency. The metric is any of the matrix's columns below, either kind;
+  Overall TTFT is one metric across deployments (``api_ttft`` aggregated,
+  ``mesh_ttft`` PD);
+- for the selected configuration, a matrix, concurrency x metric, of each simulated run's error against the
   real run, (sim - real) / real, colored by |error| <= 5%, 5-15%, > 15%. It
   reads either the panels' series (each panel's mean of its one-minute values
   over the minutes both runs have one, histogram panels at the selected
@@ -28,6 +50,16 @@ request (the earliest send of a profiling record with no error in
 simulated time plus ``atom.compass.carriers.EPOCH_NS``) and kept from 0 to the
 window, then interpolated onto one grid of the reports' step.
 
+A cell's ``model``, ``deployment`` and ``parallel`` (a string, or a mapping
+of sizes in order: ``{"tp": 8, "ep": 8}`` shows as ``TP8 EP8``) default to the
+manifest's own, and with none the page has one configuration, as a one-model
+manifest did before. The deployment, ``pd`` (or ``disaggregated``) or
+``aggregated`` (or ``standalone``), is read from the reports' panels when not
+given: a prefill or decode side is PD's. A cell whose runs' reports disagree,
+or disagree with the manifest, is refused, and so are two cells that share
+model, deployment, parallel and ``c``. The page shows a cell the panels its
+own reports hold.
+
 MANIFEST is JSON (YAML when PyYAML is installed). Relative paths resolve
 against a cell's ``dir``, which resolves against ``base`` (default: the
 manifest's directory). A cell with ``dir`` alone takes the standard layout:
@@ -35,7 +67,7 @@ real ``real1`` with ``real1-prom/report-data.json``, each simulated run
 ``<sim>/prometheus.json``, and ``one_real.txt`` when present::
 
     {"title": "Cell A: real vs simulated", "base": "/data/dsv41-mi355",
-     "window_s": 1800,
+     "window_s": 1800, "model": "DeepSeek-V4.1-Flash", "parallel": "TP8",
      "cells": [
        {"c": 256, "dir": "a_pw_c256", "sims": ["step_linear", "rep1", "rep2"],
         "one_real": ["one_real_reps.txt"], "note": "in-sample law"},
@@ -45,7 +77,9 @@ real ``real1`` with ``real1-prom/report-data.json``, each simulated run
         "sims": [{"label": "fm_in", "run": "step_linear_fm_in",
                   "report": "step_linear_fm_in/prometheus.json",
                   "key": "step_linear_fm_in"}],
-        "one_real": ["one_real_step_linear_fm_in.txt"]}]}
+        "one_real": ["one_real_step_linear_fm_in.txt"]},
+       {"c": 128, "dir": "b_c128", "model": "Kimi-K3",
+        "parallel": {"dp": 8, "ep": 8}, "sims": ["step_linear"]}]}
 
 A run's ``run`` is the directory ``client.sh`` exported into; ``t0`` (unix
 seconds for the real run, simulated seconds for a simulated one) stands in for
@@ -84,8 +118,24 @@ MATRIX_SUBS = {
 }
 #: The sub-series a panel of each kind shows first.
 DEFAULT_SUB = {"queues": "running", "blocks": "used", "cache": "reuse"}
+#: A cell's deployment kinds, by the name a manifest gives, and their labels.
+DEPLOYMENTS = {"pd": "PD disaggregated", "aggregated": "Aggregated"}
+DEPLOYMENT_NAMES = {
+    "pd": "pd",
+    "disaggregated": "pd",
+    "aggregated": "aggregated",
+    "standalone": "aggregated",
+}
+#: Panels that are one metric under either deployment: the overview pairs them.
+ALIASES = {"api_ttft": "overall_ttft", "mesh_ttft": "overall_ttft"}
+#: A panel role's prefix in a matrix header, where a deployment has two sides.
+ROLE_PREFIX = {"prefill": "P ", "decode": "D "}
 #: Short matrix headers by panel id suffix; others use the panel's title.
 SHORT = {
+    "api_ttft": "Overall TTFT",
+    "mesh_ttft": "Overall TTFT",
+    "prefill_ttft": "Prefill TTFT",
+    "decode_ttft": "Decode TTFT",
     "ttft": "TTFT",
     "itl": "ITL",
     "queue_time": "Queue time",
@@ -117,6 +167,103 @@ THRESHOLDS = (0.05, 0.15)
 CHART_JS = "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"
 
 
+#: The scan layout's names, under ROOT/<model>/<deployment>/<parallel>/c<C>/.
+SCAN_REAL, SCAN_REPORT, SCAN_SIMS = "real", "prom/report-data.json", "sims"
+SCAN_ONE_REAL, SCAN_CELL = "one_real.txt", "cell.json"
+SCAN_C = re.compile(r"^c(\d+)$")
+
+
+def scan(root: Path) -> tuple[list[dict], list[str]]:
+    """The cells under `root` in the scan layout, as manifest cells, and why
+    each directory that looks like a cell but is not complete was left out.
+
+    ROOT/<model>/<deployment>/<parallel>/c<C>/ holds ``real/`` (the real run's
+    client export), ``prom/report-data.json`` (its CI collector report),
+    ``sims/<label>/`` (each simulated run, its ``prometheus.json`` inside) and
+    optionally ``one_real.txt``. A ``cell.json`` in ROOT or at any of the four
+    levels is merged into each cell below it, the deeper over the shallower: it takes
+    any manifest cell field (``model`` or ``parallel`` to show another name,
+    ``note``, ``real``, ``sims``). The deployment directory is ``pd`` or
+    ``aggregated`` (or ``disaggregated`` / ``standalone``)."""
+    root = root.expanduser().resolve()
+    if not root.is_dir():
+        raise SystemExit(f"--scan {root}: not a directory")
+    cells, skipped = [], []
+
+    def subdirs(d: Path) -> list[Path]:
+        return sorted(x for x in d.iterdir() if x.is_dir() and x.name[0] not in "._")
+
+    def extra(d: Path) -> dict:
+        f = d / SCAN_CELL
+        if not f.is_file():
+            return {}
+        value = json.loads(f.read_text())
+        if not isinstance(value, dict):
+            raise SystemExit(f"{f}: not a JSON object")
+        return value
+
+    for model in subdirs(root):
+        for dep in subdirs(model):
+            if dep.name.lower() not in DEPLOYMENT_NAMES:
+                skipped.append(
+                    f"{dep}: not a deployment directory"
+                    f" ({', '.join(DEPLOYMENT_NAMES)})"
+                )
+                continue
+            for par in subdirs(dep):
+                for cdir in subdirs(par):
+                    if not (m := SCAN_C.match(cdir.name)):
+                        skipped.append(f"{cdir}: not a c<concurrency> directory")
+                        continue
+                    if not (cdir / SCAN_REPORT).is_file():
+                        skipped.append(f"{cdir}: no {SCAN_REPORT} (real run)")
+                        continue
+                    sims, missing = [], []
+                    for sim in (
+                        subdirs(cdir / SCAN_SIMS) if (cdir / SCAN_SIMS).is_dir() else []
+                    ):
+                        if (sim / "prometheus.json").is_file():
+                            sims.append(
+                                {"label": sim.name, "run": f"{SCAN_SIMS}/{sim.name}"}
+                            )
+                        else:
+                            why = sim / "prometheus.txt"
+                            missing.append(
+                                f"{sim}: no prometheus.json"
+                                + (
+                                    f" ({why.read_text().strip()})"
+                                    if why.is_file()
+                                    else ""
+                                )
+                            )
+                    skipped += missing
+                    cell = {
+                        "model": model.name,
+                        "deployment": dep.name,
+                        "parallel": par.name,
+                        "c": int(m[1]),
+                        "dir": str(cdir),
+                        "real": {
+                            "label": "real",
+                            "run": SCAN_REAL,
+                            "report": SCAN_REPORT,
+                        },
+                        "sims": sims,
+                        "one_real": (
+                            [SCAN_ONE_REAL] if (cdir / SCAN_ONE_REAL).is_file() else []
+                        ),
+                    }
+                    for d in (root, model, dep, par, cdir):
+                        cell.update(extra(d))
+                    if not cell["sims"]:
+                        skipped.append(
+                            f"{cdir}: no simulated run with a prometheus.json"
+                        )
+                        continue
+                    cells.append(cell)
+    return cells, skipped
+
+
 def load_manifest(path: Path) -> dict:
     text = path.read_text()
     if path.suffix in (".yaml", ".yml"):
@@ -133,8 +280,20 @@ def _path(root: Path, value) -> Path | None:
     return p if p.is_absolute() else root / p
 
 
+def parallel_label(value) -> str:
+    """A cell's parallel configuration as the page shows it: a string as is, a
+    mapping as its sizes in order, ``{"tp": 8, "ep": 8}`` as ``TP8 EP8``."""
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return " ".join(f"{k.upper()}{v}" for k, v in value.items())
+    return str(value)
+
+
 def normalize(manifest: dict, manifest_path: Path) -> list[dict]:
-    """The manifest's cells, each run's paths resolved, sorted by concurrency."""
+    """The manifest's cells, each run's paths resolved. A cell's ``model``,
+    ``deployment`` and ``parallel`` default to the manifest's; `build` checks
+    the deployment against the reports and sorts the cells."""
     base = _path(manifest_path.parent.resolve(), manifest.get("base", "."))
     cells = []
     for cell in manifest["cells"]:
@@ -170,6 +329,13 @@ def normalize(manifest: dict, manifest_path: Path) -> list[dict]:
         cells.append(
             {
                 "c": cell["c"],
+                "model": str(cell.get("model", manifest.get("model", ""))),
+                "parallel": parallel_label(
+                    cell.get("parallel", manifest.get("parallel"))
+                ),
+                "deployment": deployment_name(
+                    cell.get("deployment", manifest.get("deployment"))
+                ),
                 "note": cell.get("note", ""),
                 "one_real_note": cell.get("one_real_note", ""),
                 "real": real,
@@ -177,7 +343,38 @@ def normalize(manifest: dict, manifest_path: Path) -> list[dict]:
                 "one_real": [_path(root, f) for f in one_real],
             }
         )
-    return sorted(cells, key=lambda c: c["c"])
+    return cells
+
+
+def deployment_name(value) -> str | None:
+    if value is None:
+        return None
+    if str(value).lower() not in DEPLOYMENT_NAMES:
+        raise SystemExit(
+            f"deployment {value!r}: not one of {', '.join(DEPLOYMENT_NAMES)}"
+        )
+    return DEPLOYMENT_NAMES[str(value).lower()]
+
+
+def deployment_of(report: dict) -> str | None:
+    """A report's deployment by its panels' roles: a prefill or decode side is
+    a PD deployment's, a standalone one an aggregated deployment's."""
+    roles = {p.get("role") for p in report["panels"].values()}
+    if roles & {"prefill", "decode"}:
+        return "pd"
+    return "aggregated" if "standalone" in roles else None
+
+
+def cell_key(cell: dict) -> tuple:
+    return (cell["model"], cell["deployment"] or "", cell["parallel"], cell["c"])
+
+
+def where(cell: dict) -> str:
+    """A cell's name in messages: its model, deployment and parallel
+    configuration, those given, and its concurrency."""
+    deployment = DEPLOYMENTS.get(cell.get("deployment") or "", "")
+    parts = (cell["model"], deployment, cell["parallel"], f"c={cell['c']}")
+    return " ".join(filter(None, parts))
 
 
 def first_graded(run: Path, simulated: bool) -> tuple[float, int]:
@@ -424,10 +621,26 @@ def build(cells: list[dict], window: float, args) -> dict:
             dict(s, sim=True) for s in cell["sims"]
         ]
         reports = [read_report(r["report"]) for r in runs]
+        found = {
+            r["label"]: d
+            for r, rep in zip(runs, reports)
+            if (d := deployment_of(rep)) is not None
+        }
+        if len(set(found.values())) > 1:
+            raise SystemExit(
+                f"{where(cell)}: its runs are of different deployments: {found}"
+            )
+        detected = next(iter(found.values()), None)
+        if cell["deployment"] and detected and cell["deployment"] != detected:
+            raise SystemExit(
+                f"{where(cell)}: the manifest says {cell['deployment']}, the"
+                f" reports' panels are a {detected} deployment's"
+            )
+        cell["deployment"] = cell["deployment"] or detected
         step = max(float(r["meta"]["step"]) for r in reports)
         if 60 % step:
             raise SystemExit(
-                f"c={cell['c']}: report step {step} s does not divide 60 s"
+                f"{where(cell)}: report step {step} s does not divide 60 s"
             )
         n = int(window // step) + 1
         per_minute = int(60 // step)
@@ -442,6 +655,7 @@ def build(cells: list[dict], window: float, args) -> dict:
                         "detail": p.get("detail", ""),
                         "unit": p.get("unit", "ms"),
                         "kind": p.get("kind"),
+                        "role": p.get("role"),
                         "subs": [],
                     }
                 info = panels[pid]
@@ -500,7 +714,8 @@ def build(cells: list[dict], window: float, args) -> dict:
         files = [f for f in cell["one_real"] if f.is_file()]
         missing = [str(f) for f in cell["one_real"] if not f.is_file()]
         if not files and args.one_real_tree and all(r["run"] for r in runs):
-            target = args.out.parent / f"one_real_c{cell['c']}.txt"
+            name = re.sub(r"[^\w.-]+", "_", where(cell).replace("c=", "c"))
+            target = args.out.parent / f"one_real_{name}.txt"
             files, missing = [run_one_real(args.one_real_tree, cell, target)], []
         one_real = merge_one_real([parse_one_real(f) for f in files])
         warnings = []
@@ -532,6 +747,10 @@ def build(cells: list[dict], window: float, args) -> dict:
         out_cells.append(
             {
                 "c": cell["c"],
+                "model": cell["model"],
+                "deployment": cell["deployment"] or "",
+                "parallel": cell["parallel"],
+                "panels": sorted({pid for rep in reports for pid in rep["panels"]}),
                 "note": cell["note"],
                 "one_real_note": cell["one_real_note"],
                 "step": step,
@@ -541,6 +760,12 @@ def build(cells: list[dict], window: float, args) -> dict:
                 "warnings": warnings,
             }
         )
+    keys = [cell_key(c) for c in out_cells]
+    if dup := {k for k in keys if keys.count(k) > 1}:
+        raise SystemExit(
+            f"two cells share model, deployment, parallel and c: {sorted(dup)}"
+        )
+    out_cells.sort(key=cell_key)
     panel_list = []
     for pid in order:
         p = panels[pid]
@@ -551,9 +776,16 @@ def build(cells: list[dict], window: float, args) -> dict:
         panel_list.append(p)
     matrix_cols = []
     for p in panel_list:
+        prefix = ROLE_PREFIX.get(p["role"], "")
+        alias = ALIASES.get(p["id"])
         if not p["kind"]:
+            label = short(p)
+            # A latency each deployment has once needs no side.
+            if not label.startswith(("Prefill", "Decode", "Overall", "ITL")):
+                label = prefix + label
             matrix_cols.append(
-                {"pid": p["id"], "sub": None, "label": short(p), "unit": p["unit"]}
+                {"pid": p["id"], "sub": None, "label": label, "unit": p["unit"]}
+                | ({"alias": alias} if alias else {})
             )
             continue
         for sub in MATRIX_SUBS.get(p["kind"], ()):
@@ -562,15 +794,21 @@ def build(cells: list[dict], window: float, args) -> dict:
                     p["kind"], short(p)
                 )
                 matrix_cols.append(
-                    {"pid": p["id"], "sub": sub, "label": label, "unit": p["unit"]}
+                    {
+                        "pid": p["id"],
+                        "sub": sub,
+                        "label": prefix + label,
+                        "unit": p["unit"],
+                    }
                 )
     return {
         "meta": {
             "title": args.title,
             "generated": f"{dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%M} UTC",
-            "manifest": str(args.manifest),
+            "manifest": " · ".join(args.sources),
             "window": window,
             "thresholds": THRESHOLDS,
+            "deployments": DEPLOYMENTS,
         },
         "panels": panel_list,
         "matrix_cols": matrix_cols,
@@ -595,8 +833,8 @@ def summary(data: dict) -> str:
                 a, b, _ = run["pairs"].get(pid, {}).get("p50", (None, None, 0))
                 if a and b is not None:
                     parts.append(f"{name} p50 {b / a - 1:+.1%}")
-            lines.append(f"c={cell['c']:<4} {run['label']:<20} " + ", ".join(parts))
-        lines += [f"c={cell['c']:<4} warning: {w}" for w in cell["warnings"]]
+            lines.append(f"{where(cell)}  {run['label']:<20} " + ", ".join(parts))
+        lines += [f"{where(cell)}  warning: {w}" for w in cell["warnings"]]
     return "\n".join(lines)
 
 
@@ -621,7 +859,16 @@ def main(argv=None) -> int:
         description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("manifest", type=Path)
+    parser.add_argument("manifest", type=Path, nargs="?")
+    parser.add_argument(
+        "--scan",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="ROOT",
+        help="add every cell under ROOT/<model>/<pd|aggregated>/<parallel>/c<C>/"
+        " (repeatable; see `scan`)",
+    )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
         "--window",
@@ -635,12 +882,29 @@ def main(argv=None) -> int:
         help="an ATOM tree whose scripts/compass/one_real.py runs for a cell with no one_real file",
     )
     args = parser.parse_args(argv)
-    manifest = load_manifest(args.manifest)
+    if not args.manifest and not args.scan:
+        parser.error("give a MANIFEST, a --scan ROOT, or both")
+    if args.manifest:
+        manifest, where_from = load_manifest(args.manifest), args.manifest
+    else:
+        manifest, where_from = {"cells": []}, Path.cwd() / "scan"
+    skipped = []
+    for root in args.scan:
+        cells, why = scan(root)
+        manifest["cells"] = [*manifest.get("cells", []), *cells]
+        skipped += why
+    for line in skipped:
+        print(f"skipped: {line}", file=sys.stderr)
+    if not manifest["cells"]:
+        parser.error("no cell to show")
     window = args.window or float(manifest.get("window_s", 1800))
     if window % 60:
         parser.error("the window must be whole minutes")
     args.title = args.title or manifest.get("title", "Real vs simulated Prometheus")
-    data = build(normalize(manifest, args.manifest), window, args)
+    args.sources = [str(args.manifest)] if args.manifest else []
+    args.sources += [f"--scan {r}" for r in args.scan]
+    data = build(normalize(manifest, where_from), window, args)
+    data["meta"]["skipped"] = skipped
     render(data, args.out)
     print(summary(data))
     print(f"{args.out.resolve()} ({args.out.stat().st_size / 1e6:.1f} MB)")
@@ -749,6 +1013,18 @@ dl.defs dt { font-weight: 650; }
 dl.defs dd { margin: 0; color: var(--ink2); }
 @media (max-width: 640px) { dl.defs { grid-template-columns: 1fr; } dl.defs dd { margin-bottom: 6px; } .controls { position: static; } }
 .nochart { color: var(--crit); font-size: 12.5px; }
+.ovgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 14px; margin-top: 10px; }
+.ovgrid h3 { margin-bottom: 4px; }
+#heat th, #heat td { text-align: center; }
+#heat th:nth-child(-n+3), #heat td.lbl { text-align: left; }
+#heat td.err { cursor: pointer; min-width: 70px; }
+#heat td.err small { display: block; font-size: 10.5px; color: var(--ink2); }
+#heat td.cur { outline: 2px solid var(--ink); outline-offset: -2px; font-weight: 650; }
+#heat tr.cur td.lbl { font-weight: 650; }
+.ctl[hidden] { display: none; }
+.dep { display: inline-block; font-size: 11px; font-weight: 650; letter-spacing: .02em; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); white-space: nowrap; }
+.dep.pd { color: var(--s7); background: color-mix(in srgb, var(--s7) 14%, transparent); }
+.dep.aggregated { color: var(--s3); background: color-mix(in srgb, var(--s3) 14%, transparent); }
 </style>
 <script src="__CHART_JS__"></script>
 </head>
@@ -759,21 +1035,40 @@ dl.defs dd { margin: 0; color: var(--ink2); }
 </header>
 <div class="controls">
   <div class="wrap" style="display:flex;flex-wrap:wrap;gap:10px 22px;align-items:center;padding:0 16px;margin:0 auto;width:100%">
+    <div class="ctl" id="modelCtl"><span>Model</span><div class="seg" id="modelSel"></div></div>
+    <div class="ctl" id="depCtl"><span>Deployment</span><div class="seg" id="depSel"></div></div>
+    <div class="ctl" id="parCtl"><span>Parallel</span><div class="seg" id="parSel"></div></div>
     <div class="ctl"><span>Concurrency</span><div class="seg" id="cSel"></div></div>
     <div class="ctl"><span>Statistic</span><div class="seg" id="statSel"></div></div>
     <div class="ctl"><span>Y axis</span><div class="seg" id="ySel"></div></div>
   </div>
 </div>
 <main class="wrap">
+  <section class="card" id="overview">
+    <div class="card-head">
+      <h2>Every configuration, (sim &minus; real) / real</h2>
+      <div class="ctl"><select id="ovMetric" aria-label="Metric of the overview"></select><div class="seg" id="ovSim"></div></div>
+    </div>
+    <div class="caption small" id="ovCaption"></div>
+    <div class="key">
+      <span><i class="good"></i>|error| &le; 5%</span><span><i class="warn"></i>5&ndash;15%</span><span><i class="crit"></i>&gt; 15%</span><span><i class="na"></i>&mdash; no value</span>
+      <span>Click a cell to open that model, deployment, parallel configuration and concurrency.</span>
+    </div>
+    <div class="tablewrap"><table id="heat"></table></div>
+    <div class="ovgrid">
+      <div><h3 id="ovValTitle"></h3><div class="caption small">Solid real, dashed simulated, one point per concurrency.</div><div class="chart"><canvas id="ovVal" role="img" aria-label="The selected configuration's metric against concurrency, real and simulated"></canvas></div></div>
+      <div><h3 id="ovErrTitle"></h3><div class="caption small">One line per model, deployment and parallel configuration; the grey lines are &plusmn;5% and &plusmn;15%.</div><div class="chart"><canvas id="ovErr" role="img" aria-label="Error against concurrency, one line per configuration"></canvas></div></div>
+    </div>
+  </section>
   <section class="card" id="matrixCard">
     <div class="card-head">
-      <h2>Error by concurrency and metric, (sim &minus; real) / real</h2>
+      <h2 id="mTitle">Error by concurrency and metric, (sim &minus; real) / real</h2>
       <div class="seg" id="modeSel"></div>
     </div>
     <div class="caption small" id="mCaption"></div>
     <div class="key">
       <span><i class="good"></i>|error| &le; 5%</span><span><i class="warn"></i>5&ndash;15%</span><span><i class="crit"></i>&gt; 15%</span><span><i class="na"></i>&mdash; no value</span>
-      <span>Click a row to open its concurrency.</span>
+      <span>Rows: the selected model, deployment and parallel configuration. Click a row to open its concurrency.</span>
     </div>
     <div class="tablewrap"><table id="matrix"></table></div>
   </section>
@@ -801,6 +1096,11 @@ dl.defs dd { margin: 0; color: var(--ink2); }
       <dt>Simulated GPU panels</dt><dd>A simulated run's GPU panels are the predicted target device time on TP rank 0; a real run whose collector took no samples of them shows none.</dd>
     </dl>
   </section>
+  <section class="card" id="skippedCard" hidden>
+    <h3>Not shown</h3>
+    <div class="caption small">Directories the scan found that are not a complete cell (a run still going, a report not written yet).</div>
+    <ul class="warnings small" id="skipped"></ul>
+  </section>
   <p class="small muted" id="footer" style="margin:18px 0 30px"></p>
 </main>
 <script id="data" type="application/json">__DATA__</script>
@@ -813,19 +1113,49 @@ const STAT_LABEL = { p50: "P50", p90: "P90", p95: "P95", p99: "P99", mean: "Mean
 const DASH = [[], [6, 4], [2, 3], [10, 3, 2, 3], [4, 2], [8, 2, 2, 2], [1, 3], [12, 4]];
 const $ = (id) => document.getElementById(id);
 const YMODES = { fit: "Fit", full: "Full", log: "Log" };
-const st = { ci: 0, stat: "p50", mode: "panel", y: "fit", subs: {}, tbl: null };
-let charts = [];
+const st = { ci: 0, stat: "p50", mode: "panel", y: "fit", subs: {}, tbl: null, sim: null, ov: null };
+let charts = [], ovCharts = [];
+// A group: one model, deployment and parallel configuration, its cells by concurrency.
+const GROUPS = [];
+D.cells.forEach((c, i) => {
+  const key = [c.model, c.deployment, c.parallel].join("\u0001");
+  let g = GROUPS.find((x) => x.key === key);
+  if (!g) GROUPS.push((g = { key: key, model: c.model, deployment: c.deployment, parallel: c.parallel, cells: [] }));
+  g.cells.push(i);
+});
+const MODELS = [...new Set(D.cells.map((c) => c.model))];
+const DEP = D.meta.deployments;
+const depName = (d) => DEP[d] || "";
+const depChip = (d) => (d ? '<span class="dep ' + esc(d) + '">' + esc(depName(d)) + "</span>" : "—");
+const CS = [...new Set(D.cells.map((c) => c.c))].sort((a, b) => a - b);
+const SIMS = [...new Set(D.cells.flatMap((c) => c.runs.slice(1).map((r) => r.label)))];
+const groupOf = (ci) => GROUPS.find((g) => g.cells.includes(ci));
+const groupName = (g) => [g.model, depName(g.deployment), g.parallel].filter(Boolean).join(" · ") || "all cells";
+const cellName = (cell) => [cell.model, depName(cell.deployment), cell.parallel, "c = " + cell.c].filter(Boolean).join(" · ");
+// A panel the cell's runs have: a PD deployment's and an aggregated one's differ.
+const hasPanel = (cell, pid) => cell.panels.includes(pid);
 
 function readHash() {
   const h = new URLSearchParams(location.hash.slice(1));
-  const i = D.cells.findIndex((x) => String(x.c) === h.get("c"));
-  st.ci = i >= 0 ? i : D.cells.length - 1;
+  const i = D.cells.findIndex((x) => String(x.c) === h.get("c") && (!h.has("model") || x.model === h.get("model")) &&
+    (!h.has("dep") || x.deployment === h.get("dep")) && (!h.has("par") || x.parallel === h.get("par")));
+  st.ci = i >= 0 ? i : GROUPS[0].cells[GROUPS[0].cells.length - 1];
   if (STATS.includes(h.get("stat"))) st.stat = h.get("stat");
   if (["panel", "request"].includes(h.get("m"))) st.mode = h.get("m");
   if (h.get("y") in YMODES) st.y = h.get("y");
+  st.sim = SIMS.includes(h.get("sim")) ? h.get("sim") : SIMS[0];
+  st.ov = h.get("ov");
 }
 function writeHash() {
-  history.replaceState(null, "", "#c=" + D.cells[st.ci].c + "&stat=" + st.stat + "&m=" + st.mode + "&y=" + st.y);
+  const cell = D.cells[st.ci];
+  const q = new URLSearchParams({ model: cell.model, dep: cell.deployment, par: cell.parallel, c: cell.c, stat: st.stat, m: st.mode, y: st.y, sim: st.sim || "", ov: st.ov || "" });
+  history.replaceState(null, "", "#" + q.toString());
+}
+// The cell of group `g` nearest concurrency `c`.
+function nearest(g, c) {
+  let best = g.cells[0];
+  for (const i of g.cells) if (Math.abs(Math.log(D.cells[i].c / c)) < Math.abs(Math.log(D.cells[best].c / c))) best = i;
+  return best;
 }
 // Fit: a panel whose peak is over 3x its 98th percentile point is cut at 1.25x that point.
 function fitMax(datasets) {
@@ -903,7 +1233,25 @@ function lineSample(i, sim) {
 }
 
 function drawControls() {
-  seg($("cSel"), D.cells.map((c, i) => [i, "c = " + c.c]), st.ci, (i) => { st.ci = i; drawAll(); });
+  const cell = D.cells[st.ci], g = groupOf(st.ci);
+  $("modelCtl").hidden = MODELS.length < 2 && !MODELS[0];
+  $("depCtl").hidden = GROUPS.every((x) => !x.deployment);
+  $("parCtl").hidden = GROUPS.every((x) => !x.parallel);
+  // Keep what the new choice allows of the current deployment, parallel
+  // configuration and concurrency.
+  const pick = (pool) => {
+    const ng = pool.find((x) => x.deployment === cell.deployment && x.parallel === cell.parallel) ||
+      pool.find((x) => x.deployment === cell.deployment) || pool[0];
+    st.ci = nearest(ng, cell.c); drawAll();
+  };
+  seg($("modelSel"), MODELS.map((m) => [m, m || "—"]), cell.model, (m) => pick(GROUPS.filter((x) => x.model === m)));
+  const deps = [...new Set(GROUPS.filter((x) => x.model === cell.model).map((x) => x.deployment))];
+  seg($("depSel"), deps.map((d) => [d, depName(d) || "—"]), cell.deployment,
+    (d) => pick(GROUPS.filter((x) => x.model === cell.model && x.deployment === d)));
+  seg($("parSel"), GROUPS.filter((x) => x.model === cell.model && x.deployment === cell.deployment).map((x) => [x.key, x.parallel || "—"]), g.key, (k) => {
+    st.ci = nearest(GROUPS.find((x) => x.key === k), cell.c); drawAll();
+  });
+  seg($("cSel"), g.cells.map((i) => [i, "c = " + D.cells[i].c]), st.ci, (i) => { st.ci = i; drawAll(); });
   seg($("statSel"), STATS.map((s) => [s, STAT_LABEL[s]]), st.stat, (s) => { st.stat = s; drawAll(); });
   seg($("ySel"), Object.entries(YMODES), st.y, (y) => { st.y = y; writeHash(); drawControls(); drawPanels(); });
   seg($("modeSel"), [["panel", "Panel series (window mean)"], ["request", "Per request (one_real.py)"]], st.mode, (m) => { st.mode = m; drawAll(); });
@@ -912,15 +1260,18 @@ function drawControls() {
 function drawMatrix() {
   const t = $("matrix");
   const panelMode = st.mode === "panel";
-  const cols = panelMode ? D.matrix_cols : D.request_cols;
+  const groupCells = groupOf(st.ci).cells.map((i) => D.cells[i]);
+  const cols = panelMode ? D.matrix_cols.filter((col) => groupCells.some((c) => hasPanel(c, col.pid))) : D.request_cols;
   $("mCaption").textContent = panelMode
     ? "Each cell: the mean of a panel's one-minute values over 0–" + D.meta.window + " s, over the minutes both runs have a value in (* when fewer than all), histogram panels at " +
       STAT_LABEL[st.stat] + " (switch above). Running, waiting and KV are sampled state and ignore the statistic. Hover a cell for both values."
     : "Each cell: one_real.py's per-request metric over each run's graded requests (the issues' figures). The statistic switch does not apply.";
+  $("mTitle").textContent = "Error by concurrency and metric, (sim − real) / real · " + groupName(groupOf(st.ci));
   let h = "<thead><tr><th>c</th><th>simulated run</th>";
   for (const col of cols) h += "<th>" + esc(col.label) + (panelMode && !col.sub ? ' <span class="tag">' + STAT_LABEL[st.stat] + "</span>" : "") + "</th>";
   h += "</tr></thead><tbody>";
-  D.cells.forEach((cell, ci) => {
+  groupOf(st.ci).cells.forEach((ci) => {
+    const cell = D.cells[ci];
     const sims = cell.runs.slice(1);
     sims.forEach((run, si) => {
       h += '<tr class="clickable' + (ci === st.ci ? " sel" : "") + '" data-ci="' + ci + '">';
@@ -960,7 +1311,7 @@ function drawMatrix() {
 
 function drawCellHead() {
   const cell = D.cells[st.ci];
-  let h = '<div class="card-head"><h2>c = ' + cell.c + "</h2></div>";
+  let h = '<div class="card-head"><h2>' + esc(cellName(cell)) + "</h2>" + depChip(cell.deployment) + "</div>";
   if (cell.note) h += '<div class="small">' + esc(cell.note) + "</div>";
   h += '<div class="runs">';
   cell.runs.forEach((r, i) => {
@@ -1026,6 +1377,7 @@ function drawPanels() {
   $("noChart").hidden = hasChart;
   const muted = css("--muted"), grid = css("--grid"), axis = css("--axis");
   for (const p of D.panels) {
+    if (!hasPanel(cell, p.id)) continue;
     const sub = subOf(p);
     const card = document.createElement("div");
     card.className = "card panel";
@@ -1114,6 +1466,7 @@ function drawPanels() {
 function tableOptions() {
   const out = [];
   for (const p of D.panels) {
+    if (!hasPanel(D.cells[st.ci], p.id)) continue;
     if (p.kind) for (const s of p.subs) out.push([p.id + "|" + s, p.title + " · " + s]);
     else out.push([p.id + "|*", p.title + " · " + STAT_LABEL[st.stat]]);
   }
@@ -1154,24 +1507,134 @@ function drawTable() {
   if (!real) $("tblCaption").textContent += " The real report has no samples for this panel.";
 }
 
+// The overview's metrics: one_real.py's per-request ones, when any cell has
+// them, then the panel matrix's columns at the selected statistic.
+function ovMetrics() {
+  const out = [];
+  if (D.cells.some((c) => c.one_real))
+    for (const col of D.request_cols) out.push({ id: "r:" + col.key, label: col.label + " · per request", mode: "request", key: col.key });
+  // One metric for a panel each deployment names differently (Overall TTFT).
+  for (const col of D.matrix_cols) {
+    const id = "p:" + (col.alias || col.pid) + "|" + (col.sub || "");
+    const had = out.find((x) => x.id === id);
+    if (had) { had.pids.push(col.pid); continue; }
+    out.push({ id: id, label: col.label + (col.sub ? "" : " " + STAT_LABEL[st.stat]) + " · panel mean",
+      mode: "panel", pids: [col.pid], sub: col.sub, unit: col.unit });
+  }
+  return out;
+}
+// The real and simulated values of metric `m` in `cell` for the selected
+// simulated run, and the error; null when the cell has no such run.
+function ovPoint(cell, m) {
+  const run = cell.runs.slice(1).find((r) => r.label === st.sim);
+  if (!run) return null;
+  if (m.mode === "panel") {
+    const pid = m.pids.find((x) => hasPanel(cell, x));
+    const pr = pid ? pairOf(run, pid, m.sub || st.stat) : null;
+    return pr ? { real: pr[0], sim: pr[1], e: errOf(pr[0], pr[1]), fmt: (v) => fmtVal(v, m.unit) } : null;
+  }
+  const o = cell.one_real;
+  if (!o) return null;
+  if (m.key === "E2E paired") {
+    const p = o.paired[run.key];
+    return p ? { real: null, sim: null, e: p.median, fmt: () => "—" } : null;
+  }
+  const a = o.real[m.key], s = (o.sims[run.key] || {})[m.key];
+  return { real: a, sim: s, e: errOf(a, s), fmt: (v) => fmtReq(m.key, v) };
+}
+function drawOverview() {
+  ovCharts.forEach((c) => c.destroy());
+  ovCharts = [];
+  const metrics = ovMetrics();
+  if (!metrics.some((m) => m.id === st.ov)) st.ov = (metrics.find((m) => m.key === "TTFT p50") || metrics[0]).id;
+  const m = metrics.find((x) => x.id === st.ov);
+  $("ovMetric").innerHTML = metrics.map((x) => '<option value="' + esc(x.id) + '"' + (x.id === st.ov ? " selected" : "") + ">" + esc(x.label) + "</option>").join("");
+  if (SIMS.length > 1) seg($("ovSim"), SIMS.map((x) => [x, x]), st.sim, (x) => { st.sim = x; drawAll(); });
+  $("ovCaption").textContent = "Each cell: " + m.label + " of the simulated run " + st.sim + " against the real run of that model, parallel configuration and concurrency" +
+    (m.mode === "panel" ? " (the panel matrix's value: a mean of one-minute values over the minutes both runs have)." : " (one_real.py over each run's graded requests).") +
+    " Below the error: real → simulated.";
+  const cur = groupOf(st.ci);
+  let h = "<thead><tr><th>model</th><th>deployment</th><th>parallel</th>" + CS.map((c) => "<th>c = " + c + "</th>").join("") + "</tr></thead><tbody>";
+  for (const g of GROUPS) {
+    h += "<tr" + (g === cur ? ' class="cur"' : "") + '><td class="lbl">' + esc(g.model || "—") + '</td><td class="lbl">' + depChip(g.deployment) +
+      '</td><td class="lbl">' + esc(g.parallel || "—") + "</td>";
+    for (const c of CS) {
+      const ci = g.cells.find((i) => D.cells[i].c === c);
+      if (ci == null) { h += '<td class="na">·</td>'; continue; }
+      const pt = ovPoint(D.cells[ci], m);
+      const e = pt ? pt.e : null;
+      const vals = pt && pt.real != null ? "<small>" + pt.fmt(pt.real) + " → " + pt.fmt(pt.sim) + "</small>" : "";
+      h += '<td class="err ' + band(e) + (ci === st.ci ? " cur" : "") + '" data-ci="' + ci + '" title="' + esc(cellName(D.cells[ci])) + '">' + fmtErr(e) + vals + "</td>";
+    }
+    h += "</tr>";
+  }
+  $("heat").innerHTML = h + "</tbody>";
+  $("heat").querySelectorAll("td[data-ci]").forEach((td) => td.addEventListener("click", () => { st.ci = +td.dataset.ci; drawAll(); }));
+  $("ovValTitle").textContent = m.label + " against concurrency · " + groupName(cur);
+  $("ovErrTitle").textContent = "Error against concurrency · " + st.sim + " · every configuration";
+  if (typeof Chart === "undefined") return;
+  const muted = css("--muted"), grid = css("--grid"), axis = css("--axis");
+  const xScale = { type: "category", labels: CS.map(String), ticks: { color: muted, font: { size: 11 } }, grid: { color: grid }, border: { color: axis },
+    title: { display: true, text: "concurrency", color: muted, font: { size: 11 } } };
+  const base = (yTick, tip) => ({ animation: false, responsive: true, maintainAspectRatio: false, interaction: { mode: "index", intersect: false },
+    plugins: { legend: { display: true, labels: { color: muted, boxWidth: 18, font: { size: 11 }, filter: (it, d) => !d.datasets[it.datasetIndex].guide } },
+      tooltip: { filter: (it) => !it.dataset.guide, callbacks: { title: (items) => (items.length ? "c = " + items[0].label : ""), label: tip } } },
+    scales: { x: xScale, y: { ticks: { color: muted, font: { size: 11 }, maxTicksLimit: 6, callback: yTick }, grid: { color: grid }, border: { color: axis } } } });
+  // Values: the selected configuration, the real run and each simulated run.
+  const at = (ci, f) => (ci == null ? null : f(D.cells[ci]));
+  const byC = (f) => CS.map((c) => at(cur.cells.find((i) => D.cells[i].c === c), f));
+  const sets = [{ label: "real", data: byC((cell) => { const p = ovPoint(cell, m); return p ? p.real : null; }),
+    borderColor: runColor(0), backgroundColor: runColor(0), borderWidth: 2, pointRadius: 3, spanGaps: true }];
+  const keep = st.sim;
+  SIMS.forEach((label, i) => {
+    st.sim = label;
+    const data = byC((cell) => { const p = ovPoint(cell, m); return p ? p.sim : null; });
+    if (data.some((v) => v != null))
+      sets.push({ label: label, data: data, borderColor: runColor(i + 1), backgroundColor: runColor(i + 1), borderDash: DASH[(i + 1) % DASH.length],
+        borderWidth: 1.8, pointRadius: 3, pointStyle: "rectRot", spanGaps: true });
+  });
+  st.sim = keep;
+  const fmtM = (v) => (m.mode === "panel" ? fmtVal(v, m.unit) : fmtReq(m.key, v));
+  ovCharts.push(new Chart($("ovVal"), { type: "line", data: { datasets: sets },
+    options: base((v) => (m.mode === "panel" ? fmtAxis(v, m.unit) : String(+(+v).toPrecision(3))), (it) => " " + it.dataset.label + ": " + fmtM(it.parsed.y)) }));
+  // Errors: every configuration, the selected one drawn heavier.
+  const errSets = GROUPS.map((g, gi) => ({
+    label: groupName(g),
+    data: CS.map((c) => { const ci = g.cells.find((i) => D.cells[i].c === c); const p = ci == null ? null : ovPoint(D.cells[ci], m); return p && p.e != null ? 100 * p.e : null; }),
+    borderColor: runColor(gi), backgroundColor: runColor(gi), borderDash: DASH[gi % DASH.length], borderWidth: g === cur ? 3 : 1.5,
+    pointRadius: g === cur ? 4 : 2.5, spanGaps: true,
+  }));
+  for (const t of D.meta.thresholds) for (const sgn of [1, -1])
+    errSets.push({ guide: true, label: "", data: CS.map(() => sgn * 100 * t), borderColor: axis, borderWidth: 1, borderDash: [3, 3], pointRadius: 0, pointHitRadius: 0 });
+  ovCharts.push(new Chart($("ovErr"), { type: "line", data: { datasets: errSets },
+    options: base((v) => (v > 0 ? "+" : "") + v + "%", (it) => " " + it.dataset.label + ": " + fmtErr(it.parsed.y / 100)) }));
+}
+
 function drawAll() {
-  writeHash();
   drawControls();
+  drawOverview();
   drawMatrix();
   drawCellHead();
   drawPerRequest();
   drawPanels();
   drawTable();
+  writeHash();
 }
 
 $("title").textContent = D.meta.title;
 document.title = D.meta.title;
 $("subtitle").textContent = "Generated " + D.meta.generated + " · window 0–" + D.meta.window +
-  " s from each run's first graded request · solid = real, dashed = simulated · concurrencies: " + D.cells.map((c) => c.c).join(", ");
+  " s from each run's first graded request · solid = real, dashed = simulated · " + GROUPS.length + " configuration(s) over " +
+  MODELS.length + " model(s) · concurrencies: " + CS.join(", ");
+$("ovMetric").addEventListener("change", (e) => { st.ov = e.target.value; writeHash(); drawOverview(); });
 document.querySelectorAll(".win").forEach((e) => (e.textContent = D.meta.window));
-$("footer").textContent = "Manifest: " + D.meta.manifest + " · scripts/compass/compare_dashboard.py";
+$("footer").textContent = "Sources: " + D.meta.manifest + " · scripts/compass/compare_dashboard.py";
+if ((D.meta.skipped || []).length) {
+  $("skippedCard").hidden = false;
+  $("skipped").innerHTML = D.meta.skipped.map((w) => "<li>" + esc(w) + "</li>").join("");
+}
 $("tblSel").addEventListener("change", (e) => { st.tbl = e.target.value; drawTable(); });
-window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { drawPanels(); drawCellHead(); drawMatrix(); });
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { drawOverview(); drawPanels(); drawCellHead(); drawMatrix(); });
 readHash();
 drawAll();
 })();
