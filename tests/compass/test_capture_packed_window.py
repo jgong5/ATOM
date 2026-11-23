@@ -129,7 +129,7 @@ def test_compass_off_the_fp8_window_write_launches_with_its_steps_fields(
         RequestSpan(2, 7, 6, 3, 1),
     )
     step = _host_step(spans, is_prefill=True, running_bs=4, running_tokens=12)
-    values, scales = _rows(geometry, step.width, "cpu")
+    values, scales = _rows(geometry, step.running_tokens, "cpu")
     pool = torch.empty(4096, dtype=torch.uint8)
     window = geometry.window_bytes(LAYER, PAGES)
     until = torch.tensor([0, 131, 8, 0], dtype=torch.int32) if cached else None
@@ -183,7 +183,7 @@ def _write(geometry, step, pool):
         write_packed_window,
     )
 
-    values, scales = _rows(geometry, step.width, "cuda")
+    values, scales = _rows(geometry, step.running_tokens, "cuda")
     window = geometry.window_bytes(LAYER, PAGES)
     write_packed_window(values, scales, pool, step, window, geometry.head_dim)
 

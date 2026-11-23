@@ -1362,7 +1362,7 @@ class Stub:
         for rows, (step, _) in passes.items():
             if hasattr(step, "request_floors"):
                 split = np.maximum(step.request_positions, step.request_cached_until)
-                self.reach[rows or step.width] = split - step.request_floors
+                self.reach[rows or step.running_tokens] = split - step.request_floors
         # DeepSeek-V4's persistent HCA decode workspace, one per device: a slot
         # of `HCA_DECODE` named as one of its fields is a view of that field
         hca = sys.modules.get("atom.model_ops.v4_kernels.hca_persist")

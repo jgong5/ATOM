@@ -2906,7 +2906,7 @@ def test_a_v41_attention_reads_its_pass_s_indptrs_whatever_was_timed_before_it(
 
         def indptrs(self, step):
             for p, _ in (step.indptr_buffers or self.indptr_buffers).values():
-                p[0], p[1 : step.width + 1] = 0, (step.batch_ids >= 0).cumsum(0) * 2
+                p[0], p[1 : step.running_tokens + 1] = 0, (step.batch_ids >= 0).cumsum(0) * 2
 
     taken, held = {}, {"cache": Cache()}
 

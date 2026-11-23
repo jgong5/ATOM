@@ -48,6 +48,7 @@ def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True, dr
         total_seqs_num_prefill=prefill,
         total_tokens_num=sum(queries),
         total_tokens_num_prefill=sum(q for q, _, d in rows if not d),
+        has_prefill=prefill > 0,
         num_scheduled_tokens=queries,
         context_lens=[c for _, c, _ in rows],
         req_ids=list(range(len(rows))),
