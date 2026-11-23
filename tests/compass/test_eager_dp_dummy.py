@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""A DP dummy forward that replays no graph, beside a peer with work, is priced
+"""A DP dummy forward that replays no graph, beside a decoding peer (ATOM runs
+an idle rank's dummy in its group's phase), is priced
 0 s under the `eager DP dummy` treatment by a step linear law with no `eager`
 vector and by a replay step grid, where each refused it before. A real eager
 decode step and a dummy forward on one rank are still refused, an eager bundle
@@ -11,7 +12,7 @@ one is still refused.
 import pytest
 from test_backend_step_grid import ON_NODE, eager, replay
 from test_backend_step_linear import law
-from test_dp_step_max import dp2, prefill, runner  # noqa: F401  the dp2 fixture
+from test_dp_step_max import decode, dp2, prefill, runner  # noqa: F401  the dp2 fixture
 from test_run_treatments import dp_summary
 from test_speculative_step import _speculative
 
@@ -69,19 +70,19 @@ def test_the_run_summary_counts_each_eager_dummy_step(
     monkeypatch, tmp_path, dp2  # noqa: F811
 ):
     ranks = [runner(no_eager(2), dp_size=2, dp_rank=r) for r in range(2)]
-    # Two steps per rank: rank 1 has no work, so it runs ATOM's DP dummy.
+    # Two steps per rank: rank 1 has no work, so it runs ATOM's DP dummy, a
+    # decode beside rank 0's eager decode, as the group's phase is.
     dp2(
-        lambda: [ranks[0].forward(prefill(40)) for _ in range(2)],
+        lambda: [ranks[0].forward(decode(40)) for _ in range(2)],
         lambda: [ranks[1].dummy_execution() for _ in range(2)],
     )
 
     out = dp_summary(monkeypatch, tmp_path, ranks)
 
-    assert out["schedule"]["treatments"] == {
-        EAGER_DP_DUMMY: 2,
-        "uniform routing": 2,
-    }
-    assert [r.refused_commands() for r in ranks] == [(), ()]
+    # Rank 0's eager decode has no vector, and is refused; its dummy peer is not.
+    assert out["schedule"]["treatments"] == {EAGER_DP_DUMMY: 2}
+    eager = "cost:step-linear: no decode vector for rung eager"
+    assert [r.refused_commands() for r in ranks] == [(eager, eager), ()]
 
 
 def test_an_eager_bundle_prices_the_dummy_from_its_grid():
@@ -105,12 +106,12 @@ def test_under_a_speculative_config_the_dummy_is_0_s_and_a_draftless_step_refuse
     monkeypatch, tmp_path, dp2  # noqa: F811
 ):
     ranks = [_speculative(runner(no_eager(2), dp_size=2, dp_rank=r)) for r in range(2)]
-    dp2(lambda: ranks[0].forward(prefill(40)), lambda: ranks[1].dummy_execution())
+    dp2(lambda: ranks[0].forward(decode(40)), lambda: ranks[1].dummy_execution())
 
     out = dp_summary(monkeypatch, tmp_path, ranks)
 
     assert out["schedule"]["treatments"] == {EAGER_DP_DUMMY: 1}
     assert [r.refused_commands() for r in ranks] == [
-        ("cost:StepLinearBackend: prices no draft",),
+        ("cost:step-linear: no decode vector for rung eager",),
         (),
     ]
