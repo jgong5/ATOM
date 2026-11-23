@@ -73,15 +73,24 @@ def _rows(b: int, total: int, ratio: float, spread: float, contexts, rng, top):
 
 
 def compose(
-    seed: dict, contexts: list, rng, blocks: int, block_size: int, max_len, ladder=()
+    seed: dict,
+    contexts: list,
+    rng,
+    blocks: int,
+    block_size: int,
+    max_len,
+    ladder=(),
+    block_drafter=False,
 ):
     """The ragged views of the decode view `seed` (`rows`, `rung`,
-    `produces_output`), over the sorted decode-row contexts `contexts`."""
+    `produces_output`), over the sorted decode-row contexts `contexts`, each
+    row holding the positions its draft round writes past it, a block
+    drafter's (DSpark's) one more than a serial one's."""
     from atom.model_engine.block_manager import draft_kv_lookahead
 
     rows, rung = seed["rows"], seed["rung"]
     b, total = len(rows), sum(context for _, context, _ in rows)
-    lookahead = draft_kv_lookahead(rows[0][0] - 1)
+    lookahead = draft_kv_lookahead(rows[0][0] - 1, block_drafter=block_drafter)
     out = []
     if b < 2:
         return out

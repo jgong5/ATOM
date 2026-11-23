@@ -187,7 +187,7 @@ def test_measuring_one_record_twice_publishes_each_view_once_and_then_nothing(ru
         assert member["seconds"] == 1e-6 * sum(q for q, *_ in member["rows"])
         assert member["repeats"] and member["statistic"] == "median"
         assert member["protocol"] == window.PROTOCOL
-        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 3}
+        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 4}
         assert member["origin"] == "replay"
         assert member["sources"] == [
             measure.file_digest(run.record / "steps/dp0.jsonl")
@@ -714,7 +714,9 @@ def test_ragged_composes_across_the_rungs_of_the_ladder_the_record_states(
     ladder = json.loads((run.record / "steps/dp0.engine.json").read_text())["ladder"]
     given, compose = [], measure.ragged.compose
     monkeypatch.setattr(
-        measure.ragged, "compose", lambda *a: given.append(a[-1]) or compose(*a)
+        measure.ragged,
+        "compose",
+        lambda *a, **k: given.append(a[-1]) or compose(*a, **k),
     )
 
     run(rec, "--sample", "2", "--seed", "3", "--ragged", *run.named(rec))
