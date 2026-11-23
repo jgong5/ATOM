@@ -11,7 +11,7 @@
 #
 # THE RULE: an atom module named by an excluded test is a blind spot unless a
 # CPU-gate test that actually runs names it too. Imports are read at any
-# indentation on the excluded side -- 1949 of this tree's `import atom.*`
+# indentation on the excluded side -- 1971 of this tree's `import atom.*`
 # lines are indented -- but coverage is credited only for a module-level import
 # in a CPU-gate file that collects at least one test, because those are the only
 # imports that provably execute. At 236abfd9a the MODULE-LEVEL half carried both
@@ -44,18 +44,18 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at 185a7fda0683bcc61452726ea9e4d5adec52a9fd over this tree:
-#   tests/       1202 files  = 88 in tests/plugin/ + 86 excluded + 1028 CPU gate
-#   CPU gate      951 files collect >=1 test, 77 collect none
-#   imports      1949 indented `import atom.*` lines in non-plugin test files
-#   collected  22393 tests by --collect-only. A run of the same set reports
-#              the same 22393 outcomes. Its "skipped" total is LARGER than any
+# Measured at dfc23fba0d93f109bbd9ec851e7d9d61f038e184 over this tree:
+#   tests/       1234 files  = 88 in tests/plugin/ + 87 excluded + 1059 CPU gate
+#   CPU gate      982 files collect >=1 test, 77 collect none
+#   imports      1971 indented `import atom.*` lines in non-plugin test files
+#   collected  22839 tests by --collect-only. A run of the same set reports
+#              the same 22839 outcomes. Its "skipped" total is LARGER than any
 #              skip count here, because a module-level skip in one of the 77
 #              files that collect nothing is counted as skipped without ever
 #              becoming a collected test. This file states the set; gate_cpu.sh
 #              prints the run, and is the only source for its outcome counts.
 #   candidates    234 paths named by an excluded test, any indentation
-#   covered       498 paths named at module level by a live CPU-gate file
+#   covered       509 paths named at module level by a live CPU-gate file
 #   triggers      120 derived paths below, then 4 listed by name
 atom/distributed/pcp_utils.py
 atom/distributed/pp_comm.py
