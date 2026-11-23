@@ -59,7 +59,9 @@ a table, the placement's, a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
 experts' ids ATOM fuses into them, at a point that states its real MoE
 rows (``R=``) each row past them routed to no expert as ATOM routes a pad
-row, one rank's batch holding its real rows alone (`_route`), the
+row, one rank's batch holding its real rows alone (`_route`), the count
+of rows MORI's dispatch hands aiter's fused MoE, every row the leaf holds
+(`RECEIVED`), the
 `NM_OUTPUT` slot at
 one KV split, a view at the start of twice its span, and aiter's top-k
 scratch (`TOPK_WORKSPACE`), one byte in the graph, built as aiter builds it
@@ -321,7 +323,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 43
+PROTOCOL = 44
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -366,6 +368,12 @@ WEIGHT_ALIGN = 512
 #: (`get_topk_valid_mask`). Drawn as another integer weight is, all zero, it
 #: leaves no route to compute; a leaf takes the layer's own (`Stub._mask`).
 EXPERT_MASK = "expert_mask"
+#: The integer activation, by operator and slot, in which MORI's dispatch hands
+#: aiter's fused MoE how many of its rows it received: aiter sorts those rows
+#: alone. Drawn as another integer activation is, zero, it leaves no row to
+#: compute; a copy takes every row its expert ids hold (`routed_rows`), a pad
+#: row among them routed to no expert (`Stub._route`).
+RECEIVED = {("aiter.fused_moe_.default", "num_local_tokens")}
 #: The release waits since a point last recorded them: seconds, and how many
 #: ended at `CLEAR_S`.
 _waited: Counter = Counter()
@@ -2180,6 +2188,11 @@ class Stub:
                 return out.copy_(self.built["rows"][at].view(out.shape))
             if isinstance(value, dict) and self._routed(value, sig, path, drafted):
                 return self._route(value, c, drafted)
+            received = (op["op"], path) in RECEIVED and isinstance(value, dict)
+            if received and value.get("role") == "activation":
+                if (rows := routed_rows(op)) is None:
+                    raise ValueError(f"{op['op']} holds no expert ids to count")
+                return _random(value, self.runner.device).fill_(rows)
             if isinstance(value, dict) and value.get("role") == "weight":
                 # each cache-sized copy takes a weight of its own, as it does
                 # activations; a gathered table's copies share one

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """`compass measure ops` on an MoE leaf: the router's top-k expert ids it reads
 are drawn independently and uniformly per copy, and their loads recorded; under
-expert parallelism it takes its layer's expert mask."""
+expert parallelism it takes its layer's expert mask, and under MORI every row it
+holds as received."""
 
 import sys
 from types import SimpleNamespace
@@ -345,3 +346,13 @@ def test_an_expert_mask_no_moe_layer_holds_refuses_by_name():
 
         with pytest.raises(ValueError, match=r"holds an expert mask of \[33\]"):
             stub._copy(_masked(33), "sig", [{}], 0)
+
+
+def test_mori_s_received_row_count_is_every_row_the_leaf_holds():
+    # Under MORI, aiter's fused MoE sorts only the rows the dispatch counts as
+    # received: a count of zero leaves it no row to compute.
+    moe = {"op": MOE["op"], "args": MOE["args"] | {"num_local_tokens": _spec([1])}}
+
+    _, copies = _timed(_stub((16, 2)), moe, 3)
+
+    assert [c["num_local_tokens"].tolist() for c in copies] == [[4]] * 3
