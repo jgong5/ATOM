@@ -347,6 +347,7 @@ def test_a_record_states_the_prefill_buckets_its_runner_recorded(tmp_path, monke
 @pytest.mark.parametrize("dp", [1, 2])
 def test_the_projection_states_the_groups_largest_rank(dp):
     batch = SimpleNamespace(
+        total_seqs_num=1,
         total_seqs_num_prefill=1,
         num_scheduled_tokens=np.array([100]),
         context_lens=np.array([100]),

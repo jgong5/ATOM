@@ -119,22 +119,9 @@ def test_prepare_sample_hands_over_a_shared_k_and_p_as_host_scalars():
         "required_channel_states": CpuGpuBuffer(4, dtype=torch.int32, **kw),
     }
     # The rows each step uploads, by buffer: None is a buffer left on the host.
+    # ATOM publishes them with the step's token inputs, from the counts set here.
     published = []
-
-    def publish(counts):
-        published.append(dict(counts))
-        for name, rows in counts.items():
-            if rows is not None:
-                runner.forward_vars[name].copy_to_gpu(rows)
-
-    runner.h2d_groups = {
-        "sampling": SimpleNamespace(
-            counts={},
-            indices={name: name for name in runner.forward_vars},
-            publish=publish,
-            check_writable=lambda: None,
-        )
-    }
+    group = SimpleNamespace(set_counts=lambda counts: published.append(dict(counts)))
 
     def batch(top_ks, top_ps):
         return SimpleNamespace(
@@ -145,14 +132,15 @@ def test_prepare_sample_hands_over_a_shared_k_and_p_as_host_scalars():
             required_channel=None,
         )
 
-    _, top_ks, top_ps, _, _ = runner.prepare_sample(batch([20], [0.95]))
+    _, top_ks, top_ps, _, _ = runner.prepare_sample(batch([20], [0.95]), group)
     assert (type(top_ks), top_ks) == (int, 20)
     assert (type(top_ps), top_ps) == (float, float(np.float32(0.95)))
 
-    _, top_ks, top_ps, _, _ = runner.prepare_sample(batch([20, 40], [0.95, 0.95]))
+    _, top_ks, top_ps, _, _ = runner.prepare_sample(batch([20, 40], [0.95, 0.95]), group)
     assert top_ks.tolist() == [20, 40]
     assert type(top_ps) is float
-    none = {"required_channel_states": None}  # no request names a channel
+    # No request names a channel or asks for logprobs.
+    none = {"required_channel_states": None, "logprob_request_indices": None}
     assert published == [
         {"temperatures": 1, "top_ks": None, "top_ps": None, **none},
         {"temperatures": 2, "top_ks": 2, "top_ps": None, **none},

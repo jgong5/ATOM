@@ -447,6 +447,7 @@ def _dp2_record(directory, monkeypatch):
             batch = SimpleNamespace(
                 view=view,
                 is_dummy_run=False,
+                total_seqs_num=len(rows),
                 req_ids=list(range(len(rows))),
                 num_scheduled_tokens=np.array([r.query_tokens for r in rows]),
                 context_lens=np.array([r.context_tokens for r in rows]),
