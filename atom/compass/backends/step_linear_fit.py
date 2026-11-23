@@ -926,7 +926,7 @@ def _tokenizing(calls) -> dict:
 
 def _intakes(path, calls=None) -> tuple[list, list, list]:
     """The HTTP intake stamps `path` holds as each lone request's ``(body
-    bytes, CPU seconds)``, each burst's ``(body bytes, template start CPU
+    bytes, CPU seconds)``, each burst's ``(body bytes, mark ns, mark CPU
     ns)`` per request, and every request's body bytes.
 
     A request is its app call and the body, template, pool job and engine send
@@ -942,10 +942,11 @@ def _intakes(path, calls=None) -> tuple[list, list, list]:
     during which its thread made no tokenizer call other than a decode by the
     tokenizer record at `calls` (none where there is none), is priced by no
     tokenizer law: its wall time, which the loop awaits, joins the request's
-    seconds. A burst is a run of requests each of whose app call
-    came before the template of the one ahead of it began, the loop taking them
-    in one after another, its templates rendered on the loop's thread, the only
-    one whose CPU clock their gaps read."""
+    seconds. A request's mark is its template's start or, on a server that
+    renders none, its pool job's submit: either follows its body's parse. A
+    burst is a run of requests each of whose app call came before the mark of
+    the one ahead of it, the loop taking them in one after another, its marks
+    on the loop's thread, the only one whose CPU clock their gaps read."""
     ev = _stamps(path)
     tokenized = _tokenizing(calls)
     # Arrays, searched once per request: np.searchsorted converts a list on
@@ -981,16 +982,18 @@ def _intakes(path, calls=None) -> tuple[list, list, list]:
         if not rendered and not np.any((prep[0] <= starts) & (starts <= prep[1])):
             seconds += prep[1] - prep[0]
         lone.append((body[3], seconds * 1e-9))
-    # The loop renders each request's template as soon as its body is read;
-    # since the API server hands it to a thread, no gap of theirs is the loop's.
+    # The loop parses each request's body as soon as it is read, then renders
+    # its template, if the server renders one, and submits its pool job; since
+    # the API server hands a template to a thread, no gap of theirs is the loop's.
     loops = {e[6] for e in ev if e[2] == "app"}
-    tmpl = [e for e in ev if e[2] == "tmpl" and e[6] in loops]
+    mark = "tmpl" if any(e[2] == "tmpl" for e in ev) else "wait"
+    marks = [e for e in ev if e[2] == mark and e[6] in loops]
     sizes = [e[3] for e in sorted(ev, key=lambda e: e[1]) if e[2] == "body"]
-    # A template whose start finds a later request arrived and not yet rendered.
-    queued = [np.searchsorted(called, t[0]) > k + 1 for k, t in enumerate(tmpl)]
+    # A mark that finds a later request arrived and not yet marked.
+    queued = [np.searchsorted(called, m[0]) > k + 1 for k, m in enumerate(marks)]
     bursts, run = [], []
-    for k, t in enumerate(tmpl):
-        run.append((sizes[k], t[0], t[4]))
+    for k, m in enumerate(marks):
+        run.append((sizes[k], m[0], m[4]))
         if not queued[k]:
             if len(run) > 1:
                 bursts.append(run)
@@ -1004,8 +1007,8 @@ def fit_intake(paths, calls=None) -> tuple[dict, dict]:
     same order (none where `calls` is None), and its report: ``idle_s`` and ``per_byte_s`` by the
     host-law solver on the lone requests' CPU seconds over their body bytes;
     ``bytes`` spans every request's body; ``fixed_s`` the mean, over every
-    burst's later requests, of the loop's CPU time from the template start
-    before each to its own, less ``per_byte_s`` times its body, the report's
+    burst's later requests, of the loop's CPU time from the mark before each
+    to its own, less ``per_byte_s`` times its body, the report's
     ``burst`` giving the bursts, their requests and those values' p10 and p90;
     or ``idle_s`` where that mean is negative or there is no burst, the
     report's ``fixed_s_is_idle_s`` saying which. Raises on too few lone
@@ -1023,7 +1026,7 @@ def fit_intake(paths, calls=None) -> tuple[dict, dict]:
     if not bursts:
         report["fixed_s_is_idle_s"] = f"no burst among {len(lone)} lone requests"
         return {"fixed_s": idle, **term}, report
-    # Each burst's (body bytes, template start ns, its CPU ns) per request.
+    # Each burst's (body bytes, mark ns, its CPU ns) per request.
     runs = [np.array(b, dtype=np.float64).T for b in bursts]
     gaps = np.concatenate([np.diff(cpu) * 1e-9 for _, _, cpu in runs])
     sizes = np.concatenate([body[1:] for body, _, _ in runs])

@@ -489,6 +489,57 @@ def test_requests_lone_after_two_that_overlap_fit_with_their_pool_rendered_templ
     assert lone == pytest.approx(expect) and not bursts and len(sizes) == 10
 
 
+def test_a_server_that_renders_no_template_fits_its_intake_on_its_pool_jobs(
+    tmp_path,
+):
+    # A prefill-decode deployment's decode side renders no chat template: each
+    # request reads its body, submits its pool job and is sent. The same requests
+    # stamped so fit the same term, each request of a burst marked by its pool
+    # job's submit, stamped where its template began. Each pool job encodes, as
+    # its record's tokenizer record says, so no job's wall joins its intake.
+    rendered, bare = tmp_path / "rendered", tmp_path / "bare"
+    for d in (rendered, bare):
+        (d / "steps").mkdir(parents=True)
+        stamped(d, burst=(40_000, 60_000, 50_000, 45_000))
+    stamps = bare / "steps" / compass_run.INTAKE_RECORD
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    kept = [row for row in rows if row[2] != "tmpl"]
+    for k, row in enumerate(rows):
+        later = [r[2] for r in rows[k + 1 :] if r[2] in ("app", "wait")]
+        if row[2] == "tmpl" and later[:1] != ["wait"]:
+            # `stamped` gives only the lone requests a pool job's wait.
+            kept.append([row[3], row[1], "wait", row[3], "0", row[6], row[6]])
+    stamps.write_text("".join(" ".join(row) + "\n" for row in kept))
+    record = bare / "steps" / compass_run.TOKENIZER_RECORD
+    jobs = [
+        {"call": "encode", "tokens": 1, "items": 1, "thread": int(row[1])}
+        | {"t_start_ns": int(row[3]), "t_end_ns": int(row[0])}
+        for row in kept
+        if row[2] == "prep"
+    ]
+    record.write_text(record.read_text() + "".join(json.dumps(j) + "\n" for j in jobs))
+
+    got = [
+        fit_intake(
+            [d / "steps" / compass_run.INTAKE_RECORD],
+            [d / "steps" / compass_run.TOKENIZER_RECORD],
+        )
+        for d in (rendered, bare)
+    ]
+    assert got[1] == got[0]
+    term, report = got[1]
+    assert term == pytest.approx(
+        {
+            "fixed_s": FIXED,
+            "per_byte_s": PER_BYTE,
+            "idle_s": IDLE,
+            "bytes": [9000, 400_000],
+        },
+        rel=1e-6,
+    )
+    assert report["samples"] == 8 and report["burst"]["requests"] == 4
+
+
 @pytest.mark.parametrize(
     "lone, burst, encodes, unfitted",
     [
