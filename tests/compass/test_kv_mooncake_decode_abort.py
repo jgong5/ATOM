@@ -55,7 +55,10 @@ def _listen(rank, monkeypatch, messages) -> None:
             raise _Ended
         return messages.pop(0)
 
-    sock = SimpleNamespace(recv_multipart=recv_multipart)
+    # `poll`: a message is always waiting.
+    sock = SimpleNamespace(
+        recv_multipart=recv_multipart, poll=lambda timeout=None: True
+    )
     monkeypatch.setitem(
         MC, "zmq_socket_ctx", lambda *_a, **_k: contextlib.nullcontext(sock)
     )

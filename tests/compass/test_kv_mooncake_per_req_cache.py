@@ -35,6 +35,7 @@ def test_per_request_cache_forces_the_full_transfer(
     scheduler.is_producer = False
     scheduler.block_size, scheduler.dcp_size, scheduler.hash_block_size = own, 1, own
     scheduler._reqs_need_recv = {}
+    scheduler._chunked_waiting, scheduler._chunked_ready = {}, set()
     scheduler.transfer_id_to_request_id = {}
     scheduler.request_id_to_transfer_id = {}
     seq = SimpleNamespace(
@@ -116,6 +117,8 @@ def test_an_unsharded_producer_into_dcp2_is_priced_on_mooncakes_slices(monkeypat
     ref.is_producer = False
     ref.block_size, ref.dcp_size, ref.hash_block_size = own, dcp, own * dcp
     ref._reqs_need_recv, ref._reqs_need_save = {}, {}
+    ref._chunked_waiting, ref._chunked_ready = {}, set()
+    ref._pending_chunked_admissions = {}
     ref.transfer_id_to_request_id, ref.request_id_to_transfer_id = {}, {}
     ref.update_state_after_alloc(seq())
     sent = []

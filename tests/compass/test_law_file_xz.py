@@ -29,7 +29,7 @@ LAWS = Path(__file__).resolve().parents[2] / "scripts/compass/laws"
 
 
 def test_every_checked_in_law_is_stored_xz_compressed():
-    names = sorted(p.name for p in LAWS.iterdir())
+    names = sorted(p.name for p in LAWS.iterdir() if p.is_file())
     assert names and [n for n in names if not n.endswith(".json.xz")] == []
 
 

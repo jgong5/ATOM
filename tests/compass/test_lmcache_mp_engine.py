@@ -113,7 +113,7 @@ class Engine:
     ) -> None:
         monkeypatch.setattr(clock, "_installed", None)
         monkeypatch.setattr(dist_utils, "LP_OF_RANK", None)
-        self.run = run = _run(tmp_path, writers=tp, **entry)
+        self.run = run = _run(tmp_path, **entry)
         if pd:
             run |= {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10}
             run["kv_link"] = "inter_node"
@@ -356,17 +356,21 @@ def test_a_native_state_rank_saves_on_its_channel_and_loads_with_its_restore(
     assert f"saved {[str(SaveOperationId('r0', 0))]}" in reports[0]
 
 
-@pytest.mark.parametrize("width", [1, 2])
-def test_two_writer_ranks_report_a_save_once_both_copies_end(
-    tmp_path, monkeypatch, factory, width
+@pytest.mark.parametrize("tp, width", [(2, 1), (2, 2), (8, 1)])
+def test_writer_ranks_store_on_one_channel_and_report_a_save_once_every_copy_ends(
+    tmp_path, monkeypatch, factory, tp, width
 ):
-    engine = Engine(tmp_path, monkeypatch, tp=2, copy_width=width)
+    engine = Engine(tmp_path, monkeypatch, tp=tp, copy_width=width)
     rt = engine.rt
     copy = LATENCY_S + CHUNKS * engine.chunk_bytes / BANDWIDTH
+    # Every TP rank writes its own shard, on its DP rank's one transfer channel.
+    adapters = [(r._adapter.kind, r._adapter.worker_id) for r in engine.lm._ranks]
+    assert adapters == [("transfer#dp0", k) for k in range(tp)]
 
     engine.build(_save("r0"))
-    # One copy server takes the second rank's store after the first's.
-    last = IPC + copy * (3 - width) + IPC
+    assert list(engine.lm._socks) == ["lmcache->engine:transfer#dp0"]
+    # The copy servers take the ranks' stores `width` at a time.
+    last = IPC + copy * math.ceil(tp / width) + IPC
     while rt.now < last + 3 * STEP:
         engine.step()
     assert engine.finish() == {"refusals": []}

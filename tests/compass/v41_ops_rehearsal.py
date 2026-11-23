@@ -33,11 +33,13 @@ kernel's (a candidate list's), the plane's width; no tensor
 equals another, so each placement clones its metadata; DeepSeek-V4.1's state
 cursors read back zeros and its check of them has no values to judge, as in
 a capture; a host tensor allocated pinned, which a fake one cannot say it is,
-reads as pinned. OUT gets one record a leaf: its point, its verdict (`LAUNCH` with
-the kernels it launched, `REFUSED` with the reason, or `UNTOLD`, which a fake
-tensor's missing values stopped), the buffers its KV and metadata arguments
-bound, each one's identity (`identity`), and that of each its later
-occurrences take apart (`later`, `ops.QUERIED`).
+reads as pinned. Each point's batch is placed once, not once for each round
+of cold copies its leaves cycle on a card: each leaf's call is its first
+copy, on the first placement. OUT gets one record a leaf: its point, its
+verdict (`LAUNCH` with the kernels it launched, `REFUSED` with the reason,
+or `UNTOLD`, which a fake tensor's missing values stopped), the buffers its
+KV and metadata arguments bound, each one's identity (`identity`), and that
+of each its later occurrences take apart (`later`, `ops.QUERIED`).
 """
 
 import contextlib
@@ -344,7 +346,8 @@ def main(out, argv) -> None:
     import torch._inductor.decomposition  # noqa: F401  as a capture imports it
 
     function, draw, bincount = ops._function, ops.uniform_ids, torch.bincount
-    deep, prepare, time_ = ops._deep, ops.Stub._prepare, ops.Stub._time
+    deep, prepare, plan = ops._deep, ops.Stub._prepare, ops.Stub._plan
+    time_ = ops.Stub._time
     journal = ops._journal
     # by the id of each metadata view's clone, the live view it cloned; by
     # leaf and slot, the identity and staged values of what placement 0 bound;
@@ -358,10 +361,12 @@ def main(out, argv) -> None:
             sources[id(out)] = out, x
         return out
 
+    def placed_once(stub, *args, **kwargs):
+        n, size, _, shared = plan(stub, *args, **kwargs)
+        return n, size, 1, shared
+
     def preparing(stub, batch):
         prepare(stub, batch)
-        if len(stub.placed) > 1:
-            return
         bound.clear()
         pool, hosts = named(stub.runner), staged(stub.runner)
         for (sig, path), (_, view) in stub.placed[0][1].items():
@@ -467,6 +472,7 @@ def main(out, argv) -> None:
             (ops, "_reached", reached),
             (torch, "empty_strided", pinning),
             (ops.Stub, "_prepare", preparing),
+            (ops.Stub, "_plan", placed_once),
             (ops.Stub, "_time", timing),
             (ops, "uniform_ids", host_draw),
             (ops.Stub, "_top_k", lambda *a: None),

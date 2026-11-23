@@ -15,9 +15,11 @@ import json
 import os
 import pathlib
 import re
+import struct
 import subprocess
 import sys
 import types
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import pytest
 from test_capture_ir import MAIN, _decoder, _ops
@@ -58,15 +60,16 @@ CORE = {"decode": DECODE, "prefill": "aiter.pa_sparse_prefill_fp8_opus.default"}
 _CAPTURES: dict = {}
 
 
-def trace(root, argv):
+def trace(root, argv, env=None):
     """`trace ops --tp 8 --arch gfx950` over `argv`, run in a process of its own
-    on a model directory holding V4-Pro's config.json and a shard of junk:
-    nothing may open the checkpoint."""
+    on a model directory holding V4-Pro's config.json and a shard that holds
+    no tensor: ATOM reads its header, and nothing may load a tensor. `env`
+    adds to the process's environment."""
     assert hashlib.sha256(CONFIG.read_bytes()).hexdigest() == CONFIG_SHA256
     (root / "model").mkdir()
     (root / "model" / "config.json").write_bytes(CONFIG.read_bytes())
-    junk = root / "model" / "model-00001-of-00001.safetensors"
-    junk.write_bytes(b"not a safetensors shard")
+    shard = root / "model" / "model-00001-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", 2) + b"{}")
     command = ["trace", "ops", "--model", str(root / "model"), "--tp", "8"]
     command += ["--arch", "gfx950", "--store", str(root / "store"), *argv.split()]
     return subprocess.run(
@@ -81,17 +84,18 @@ def trace(root, argv):
         check=False,
         timeout=1800,
         cwd=TREE,
-        env={**os.environ, "PYTHONPATH": str(TREE)},
+        env={**os.environ, **(env or {}), "PYTHONPATH": str(TREE)},
     )
 
 
-def capture(tmp_path_factory, argv):
-    """`trace` over `argv`: each shape's published graph and declarations, by
-    shape."""
-    if argv in _CAPTURES:
-        return _CAPTURES[argv]
+def capture(tmp_path_factory, argv, env=None):
+    """`trace` over `argv` under `env`: each shape's published graph and
+    declarations, by shape."""
+    key = argv, *sorted((env or {}).items())
+    if key in _CAPTURES:
+        return _CAPTURES[key]
     root = tmp_path_factory.mktemp("v4pro")
-    done = trace(root, argv)
+    done = trace(root, argv, env)
     tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
     assert tokens, f"rc {done.returncode}\n{done.stderr[-4000:]}"
     store = ArtifactStore(str(root / "store"))
@@ -104,8 +108,33 @@ def capture(tmp_path_factory, argv):
             for stem in ("graph", "declared")
         )
         graphs[graph["shape"]] = graph, declared
-    _CAPTURES[argv] = graphs
+    _CAPTURES[key] = graphs
     return graphs
+
+
+#: The bf16 KV cache under DP attention, at decode width 2.
+BF16 = "--width 2 -- --kv_cache_dtype bf16 --enable-dp-attention"
+#: A P/D prefill side's decode and prefill.
+PRODUCED = "--width 2 --prefill 512 2" + DPA_TP8 + PRODUCER
+#: TP8 without DP attention.
+TP8 = "--width 2 --prefill 512 1 -- --kv_cache_dtype fp8"
+#: A prefill that ATOM splits into two micro-batches under --enable-tbo.
+TBO = "--prefill 512 1 --prefill 8192 1" + DPA_TP8 + EP8 + " --enable-tbo"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def traces(tmp_path_factory):
+    """Every trace this file's cases read, each its own process, all started at
+    once, so each case's `capture` finds its graphs held: by argv, the future of
+    each. A capture that fails is not held, and the case that reads it traces it
+    again and fails on its own output."""
+    tmp_path_factory.getbasetemp()  # created once, before the threads mktemp
+    argvs = (SHAPES + DPA_TP8, SHAPES + DPA_TP8 + EP8, BF16, PRODUCED, TP8)
+    with ThreadPoolExecutor(len(argvs) + 1) as pool:
+        futures = {TBO: pool.submit(trace, tmp_path_factory.mktemp("tbo"), TBO)}
+        futures |= {a: pool.submit(capture, tmp_path_factory, a) for a in argvs}
+        wait(futures.values())
+        yield futures
 
 
 def _pars(region):
@@ -303,9 +332,7 @@ def test_the_bf16_cache_s_qk_norm_states_its_ratio_beside_the_rows_it_writes(
     tmp_path_factory,
 ):
     config = json.loads(CONFIG.read_text())
-    graphs = capture(
-        tmp_path_factory, "--width 2 -- --kv_cache_dtype bf16 --enable-dp-attention"
-    )
+    graphs = capture(tmp_path_factory, BF16)
 
     layers = _decoder(graphs["decode B=2"][0])
     for layer, ratio in zip(layers, config["compress_ratios"], strict=False):
@@ -321,7 +348,7 @@ def test_a_mooncake_producer_traces_its_steps_with_its_indexer_cache_in_fp8(
     # A Mooncake connector would register the fake KV pool, which has no
     # address. P/D pins the indexer cache to fp8, where gfx950 takes fp4.
     config = json.loads(CONFIG.read_text())
-    graphs = capture(tmp_path_factory, "--width 2 --prefill 512 2" + DPA_TP8 + PRODUCER)
+    graphs = capture(tmp_path_factory, PRODUCED)
 
     assert graphs.keys() == {"decode B=2", "prefill T=512 B=2"}
     indexed = [int(ratio == 4) for ratio in config["compress_ratios"][:LAYERS]]
@@ -336,7 +363,7 @@ def test_the_prefill_attention_states_the_ratio_of_the_lists_it_is_passed(
     # Each layer's prefill attention reads the prefix index list and indptr of
     # its layer's compress class, which `measure ops` binds by that ratio.
     config = json.loads(CONFIG.read_text())
-    graphs = capture(tmp_path_factory, "--width 2 --prefill 512 2" + DPA_TP8 + PRODUCER)
+    graphs = capture(tmp_path_factory, PRODUCED)
 
     layers = _decoder(graphs["prefill T=512 B=2"][0])
     assert len(layers) == LAYERS
@@ -348,9 +375,7 @@ def test_the_prefill_attention_states_the_ratio_of_the_lists_it_is_passed(
 def test_tp8_without_dp_attention_reduces_in_each_layer_and_declares_nothing(
     tmp_path_factory,
 ):
-    graphs = capture(
-        tmp_path_factory, "--width 2 --prefill 512 1 -- --kv_cache_dtype fp8"
-    )
+    graphs = capture(tmp_path_factory, TP8)
 
     for shape in ("decode B=2", "prefill T=512 B=1"):
         graph, _ = graphs[shape]
@@ -364,11 +389,9 @@ def test_tp8_without_dp_attention_reduces_in_each_layer_and_declares_nothing(
             assert not [op for op in layer if op["kind"] == "declared"]
 
 
-def test_a_step_split_into_two_micro_batches_is_refused_by_name(tmp_path):
+def test_a_step_split_into_two_micro_batches_is_refused_by_name(traces):
     # ATOM splits a prefill under --enable-tbo from 8192 tokens on, its default.
-    done = trace(
-        tmp_path, "--prefill 512 1 --prefill 8192 1" + DPA_TP8 + EP8 + " --enable-tbo"
-    )
+    done = traces[TBO].result()
 
     captured = re.findall(r"^captured (.*) in ", done.stdout, re.MULTILINE)
     # A prefill shape is captured twice: as a middle chunk, then a final one.

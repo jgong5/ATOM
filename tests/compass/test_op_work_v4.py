@@ -13,13 +13,21 @@ under `ATOM_USE_TRITON_MOE_A4W4`.
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from math import comb
 
 import pytest
-import test_capture_v4_pro
 from test_capture_ir import _ops
-from test_capture_v4_pro import DPA_TP8, EP8, FP8_QUERY, PRODUCER, SHAPES, capture
+from test_capture_v4_pro import (
+    DPA_TP8,
+    EP8,
+    FP8_QUERY,
+    PRODUCER,
+    SHAPES,
+    capture,
+    trace,
+)
 from test_op_work import BF16, I32, ONE, _view, leaf, rows, t
 from test_work import machine
 
@@ -339,9 +347,45 @@ def test_the_attention_is_refused_by_name():
         work(op, ONE, 1, "fp8")
 
 
+def triton_env(a4w4):
+    """The environment that runs V4-Pro's experts on the Triton kernels, at
+    fp4 activations when `a4w4` is "1"."""
+    return {"ATOM_USE_TRITON_MOE": "1", "ATOM_USE_TRITON_MOE_A4W4": a4w4}
+
+
+TRITON_SHAPES = "--width 1 --prefill 512 1"
+#: Each capture the cases read, by name: its trace's arguments and the
+#: environment the trace runs under.
+CAPTURES = {
+    "ep_off": (SHAPES + DPA_TP8, None),
+    "ep8": (SHAPES + DPA_TP8 + EP8, None),
+    "producer": ("--width 2 --prefill 512 2" + DPA_TP8 + PRODUCER, None),
+    "triton ep_off": (TRITON_SHAPES + DPA_TP8, triton_env("0")),
+    "triton ep8": (TRITON_SHAPES + DPA_TP8 + EP8, triton_env("0")),
+    "triton ep8_a4w4": (TRITON_SHAPES + DPA_TP8 + EP8, triton_env("1")),
+}
+#: DeepSeek-V4-Pro at TP8 under MTP2, a 64-token prefill.
+MTP2 = "--prefill 64 1 -- --kv_cache_dtype fp8 --method mtp --num-speculative-tokens 2"
+
+
+@pytest.fixture(scope="module")
+def captures(tmp_path_factory):
+    """Every capture of `CAPTURES` and the MTP2 trace, all started at once,
+    each its own process: by name, the future of its graphs, and under
+    "mtp2" the future of the MTP2 trace's root and finished process."""
+    mtp2 = tmp_path_factory.mktemp("mtp2")
+    with ThreadPoolExecutor(len(CAPTURES) + 1) as pool:
+        futures = {
+            name: pool.submit(capture, tmp_path_factory, argv, env)
+            for name, (argv, env) in CAPTURES.items()
+        }
+        futures["mtp2"] = pool.submit(lambda: (mtp2, trace(mtp2, MTP2)))
+        yield futures
+
+
 @pytest.mark.parametrize("ep", ["", EP8], ids=["ep_off", "ep8"])
-def test_every_v4_pro_leaf_prices(ep, tmp_path_factory):
-    graphs = capture(tmp_path_factory, SHAPES + DPA_TP8 + ep)
+def test_every_v4_pro_leaf_prices(ep, captures):
+    graphs = captures["ep8" if ep else "ep_off"].result()
     kinds = set()
     for shape, (graph, _) in graphs.items():
         view = _view(shape)
@@ -369,8 +413,8 @@ def test_every_v4_pro_leaf_prices(ep, tmp_path_factory):
         assert backend.price(view).seconds > 0
 
 
-def test_v4_pro_s_moe_leaves_take_the_run_s_ep_width(tmp_path_factory):
-    graph, _ = capture(tmp_path_factory, SHAPES + DPA_TP8 + EP8)["prefill T=512 B=1"]
+def test_v4_pro_s_moe_leaves_take_the_run_s_ep_width(captures):
+    graph, _ = captures["ep8"].result()["prefill T=512 B=1"]
     view = _view("prefill T=512 B=1")
     found = {op["op"]: op for op, _ in leaves(graph["region"]).values()}
     kinds = ("aiter.fused_moe_.default", MORI + "dispatch", MORI + "combine")
@@ -388,9 +432,9 @@ def test_v4_pro_s_moe_leaves_take_the_run_s_ep_width(tmp_path_factory):
         assert work(op, view, 1, "fp8", 1).comm == ()
 
 
-def test_every_leaf_of_a_v4_pro_p_d_side_prices_its_fp8_index_query(tmp_path_factory):
+def test_every_leaf_of_a_v4_pro_p_d_side_prices_its_fp8_index_query(captures):
     # P/D pins the indexer cache to fp8, whose query quant is a kind of its own.
-    graphs = capture(tmp_path_factory, "--width 2 --prefill 512 2" + DPA_TP8 + PRODUCER)
+    graphs = captures["producer"].result()
     kinds = set()
     for shape, (graph, _) in graphs.items():
         view = _view(shape)
@@ -407,18 +451,18 @@ def test_every_leaf_of_a_v4_pro_p_d_side_prices_its_fp8_index_query(tmp_path_fac
 
 
 @pytest.mark.parametrize(
-    "ep, a4w4, fmt",
-    [("", "0", "bf16"), (EP8, "0", "fp8"), (EP8, "1", "fp4")],
+    "ep, name, fmt",
+    [
+        ("", "triton ep_off", "bf16"),
+        (EP8, "triton ep8", "fp8"),
+        (EP8, "triton ep8_a4w4", "fp4"),
+    ],
     ids=["ep_off", "ep8", "ep8_a4w4"],
 )
 def test_v4_pro_s_triton_experts_price_at_the_format_their_kernels_run(
-    ep, a4w4, fmt, tmp_path_factory, monkeypatch
+    ep, name, fmt, captures
 ):
-    monkeypatch.setenv("ATOM_USE_TRITON_MOE", "1")
-    monkeypatch.setenv("ATOM_USE_TRITON_MOE_A4W4", a4w4)
-    # `capture` keys its cache by the arguments alone, not the environment.
-    monkeypatch.setattr(test_capture_v4_pro, "_CAPTURES", {})
-    graphs = capture(tmp_path_factory, "--width 1 --prefill 512 1" + DPA_TP8 + ep)
+    graphs = captures[name].result()
     width = 8 if ep else 1
 
     formats = set()
@@ -442,13 +486,12 @@ def test_v4_pro_s_triton_experts_price_at_the_format_their_kernels_run(
     assert seconds[0].seconds < seconds[1].seconds if ep else seconds[0].seconds > 0
 
 
-def test_a_v4_pro_mtp2_drafter_prices_its_pick_and_its_later_passes(tmp_path):
-    # DeepSeek-V4-Pro at TP8 under MTP2: the drafter of a 64-token prefill
-    # picks each pass's token from the vocabulary shards, and attends its
-    # later passes through the decode kernel alone.
-    argv = "--prefill 64 1 -- --kv_cache_dtype fp8 --method mtp"
-    done = test_capture_v4_pro.trace(tmp_path, argv + " --num-speculative-tokens 2")
-    store = ArtifactStore(str(tmp_path / "store"))
+def test_a_v4_pro_mtp2_drafter_prices_its_pick_and_its_later_passes(captures):
+    # The drafter of `MTP2`'s prefill picks each pass's token from the
+    # vocabulary shards, and attends its later passes through the decode
+    # kernel alone.
+    root, done = captures["mtp2"].result()
+    store = ArtifactStore(str(root / "store"))
     rank = next(iter(Topology().ranks()))
     graphs = {}
     for token in re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE):

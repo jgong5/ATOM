@@ -332,8 +332,8 @@ question, not an engineering one.
 P0.2's result, and the reason the agents' original test gate cannot be run as written.
 That gate, `08` D43.1 and ATOM's own `CLAUDE.md` all assert the same thing — that the
 187-file suite under `tests/` runs GPU-free and green — and P0.2 measured both halves
-false. What is GPU-free is the **CPU gate**, run per task; the rest is the GPU gate, a superset, run per
-wave as a delta. Re-derived on 2026-09-20 after review: the first derivation iterated
+false. What is GPU-free is the **CPU gate**, run per landing batch; the rest is the GPU gate, a superset,
+run on a batch that touches a trigger and daily by hand, as a delta. Re-derived on 2026-09-20 after review: the first derivation iterated
 *whole-suite collection* to a fixed point, which measures a property of the collection
 order, not of the files.
 
@@ -361,7 +361,7 @@ both carried, "32 files reach the driver, 28 of them at collection time via `roc
 joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* suite,
 `tests/plugin/` included (25 + 3), and was attached to a non-plugin set of 32.
 
-- **Per task — the CPU gate, re-measured by P0.1 and superseding the counts above.**
+- **The CPU gate, re-measured by P0.1 and superseding the counts above.**
   `tests/` minus `tests/plugin/` (30 files) minus the 29 driver-dependent files in
   `scripts/compass/cpu_gate_exclude.txt`, driven by `scripts/compass/gate_cpu.sh`:
   **130 of the 189 test files at `105ca4197`, 4030 passed, 0 failed, 149 skipped, 3 xfailed,
@@ -389,7 +389,7 @@ joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* sui
   128-file gate whose 149 skips were 68 distinct reasons: 66 skipped tests name a device, 83
   do not. Both carry to `105ca4197`: its `tests/` and code differ from `b963c9411`'s only by
   the two `tests/compass/` files above, which collect tests and skip none.
-- **Per wave — the GPU superset, re-measured by P0.1.** `tests/ --ignore=tests/plugin` in the
+- **The GPU superset, re-measured by P0.1.** `tests/ --ignore=tests/plugin` in the
   GPU container, driven by `scripts/compass/gate_gpu.sh`, judged as a **delta**, never as
   "green". The baseline is **4779 passed / 5 failed**, 0 errors, 105 skipped, 3 xfailed,
   72.6 s, measured 2026-09-20 at `fe9ea043c` on node 18 in `xiaobizh_n18` with
@@ -446,9 +446,11 @@ covered). The rule it applies: an `atom` module named by an excluded test is a b
 **unless a CPU-gate test that actually runs names it too**. A module both gates import is
 covered when the CPU gate runs, so triggering on it would make the gate cry wolf. A trailing
 `/` matches a subtree. `gate_cpu.sh` matches the diff against that file and **exits 98 unless
-`COMPASS_GPU_GATE_DONE` names this tree's own HEAD**; where it can compute neither a diff nor
-a supplied file list — a `git archive` snapshot with no `.git` — it refuses rather than
-reporting "not required", per principle 6.
+`COMPASS_GPU_GATE_DONE` names this tree's own HEAD, or a tree whose diff from this one touches
+no trigger**, read from git or from a snapshot's `.compass-gpu-carry` stamp (the
+[ruling on #3590](https://github.com/jgong5/ATOM/issues/3590#issuecomment-6910498913)); where
+it can compute neither a diff nor a supplied file list — a `git archive` snapshot with no
+`.git` — it refuses rather than reporting "not required", per principle 6.
 
 The rule has three parts. One was forced by a counter-example measured in this tree, one is
 what kept the headline example at `236abfd9a`, and one changed no path there:
@@ -488,17 +490,25 @@ are read as text, not resolved as a graph, so a transitive import, an `importlib
 re-export is invisible. A path *absent* from `gpu_gate_triggers.txt` is not a claim that the
 CPU gate covers it, and a path *present* is not proof that it does not. Of the two mistakes
 this gate prefers the first, because running the GPU gate when in doubt is never the wrong
-one. Judging that a change sits outside the blind spot remains the task's own call.
+one. Judging that a change sits outside the blind spot remains its reviewer's call.
 
-**A task touching EPLB, CUDA-graph capture bounds, block tables, the paged index builders or
-the prefix-cache kernels runs the GPU superset as part of its own gate, not at wave end.**
-That is where the files running nothing here concentrate — 29 excluded plus 22 exercising
+**A change touching a path in `scripts/compass/gpu_gate_triggers.txt` lands in a batch of its
+own, and its lander runs `gate_gpu.sh` on the batch commit.** The overlay
+(`.claude/agent-team.md`, "The GPU gate") states the same rule.
+EPLB, CUDA-graph capture bounds, block tables, the paged index builders and the prefix-cache
+kernels are where the files running nothing here concentrate — 29 excluded plus 22 exercising
 nothing, 51 in all; the silent 22 include `test_pool_index.py`,
 `test_prefill_indices_paged.py`, `test_decode_indices_paged.py`, `test_postprocess_width.py`
 and `test_prefill_prefix_vs_native.py`, the paged-index and prefix-cache areas `03` D13 and
 `01` D6 lean on. `test_dp_metadata` and `test_dp_sync_layout` are **not** among them: they
 are CPU-green, measured above, and booking a GPU for them spends the resource the booking
 queue below exists to ration.
+The paged index builders and the prefix-cache kernels sit under `atom/model_ops/v4_kernels/`,
+a trigger-list entry. The block tables are on the trigger list by name (`NAMED` in
+`regen_gpu_gate_triggers.sh`), because the derivation cannot see them: the CPU gate runs their
+tests, but without a device, and no excluded test imports their files. EPLB and the capture
+bounds are not on it: neither gate runs their device code, so a GPU gate would test nothing of
+a change there.
 
 **Three files are covered by neither gate**, measured in `xiaobizh_n18` at `83daf636d`:
 `test_prefix_cache_accuracy.py` (`no tests ran`), `test_kv_connector_scheduler.py` and

@@ -141,7 +141,9 @@ def _recorded(warmup, drafter=None):
         def step_clock_ns():
             return next(clock)
 
-        def device_event(self):
+        def device_event(self, event=None):
+            if event is not None:  # recorded again: nothing queued since
+                return event
             # Launch after the previous exit, exit after the launch.
             last = device.times[-1] if device.times else 0
             step = {"launch": GAP, "target": TARGET, "sample": SAMPLE}

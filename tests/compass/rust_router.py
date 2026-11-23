@@ -151,7 +151,7 @@ _KEPT = (
     ("routers/grpc/engine/worker_client_cache.rs", "RandomState", LATENCY, _LOOKUP, 1),
     ("routers/grpc/pipeline.rs", "Instant::now", LATENCY, _TIMING, 2),
     ("routers/http_pd_router.rs", "Instant::now", LATENCY, _TIMING, 1),
-    ("routers/http_pd_router.rs", "RandomState", LATENCY, "startup bootstrap tables; " + _LOOKUP, 5),
+    ("routers/http_pd_router.rs", "RandomState", LATENCY, "startup bootstrap tables; " + _LOOKUP, 6),
     ("routers/http_pd_router.rs", "tokio::time", BOUND, (
         "aborts a prefill after 5 wall seconds and drops its load guard, on the "
         "vLLM backend only; pd_sim.sh passes --backend atom"), 1),

@@ -602,9 +602,10 @@ has run, and #3355 defers changing either.
   coverage. A term no one op kind holds shows whole with the reason, since a split by
   kind would estimate it: a TBO step's one `op.tbo` term, the finish time of its two
   micro-batches on a compute and a comm stream, and a `resource_bound` `Par`'s
-  `par.resource_bound`, one roofline over its branches' summed work. A `Par` hides the
-  kinds it holds, on DeepSeek-V4-Pro's decode the MoE layer,
-  so that family reads empty there until the split files a `Par` under one
+  `par.resource_bound`, one roofline over its branches' summed work, which a run with a
+  price list charges only where it is at least as long as the longest branch. That term
+  hides the kinds it holds, so their families read short where it is charged until the
+  split files a `Par` under one
   ([#3706](https://github.com/jgong5/ATOM/issues/3706)). A step-level run says it has no
   op split.
 

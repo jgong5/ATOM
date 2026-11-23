@@ -29,6 +29,7 @@ from atom.compass.backends.step_roofline import UNCLASSIFIED, Module
 from atom.compass.bench import ops
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import runfile, serve
+from atom.compass.fit import device
 from atom.compass.kv.lmcache_offload import OffloadShell
 from atom.compass.validate import bound
 from atom.model_engine import llm_engine
@@ -68,7 +69,7 @@ def served(monkeypatch, config):
     tokenizer.json; no server starts."""
     monkeypatch.setattr(drive_run, "_config", lambda atom_args, arch=None: config)
     tok = SimpleNamespace(is_fast=True, name_or_path=None)
-    monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *args: tok)
+    monkeypatch.setattr(llm_engine, "load_tokenizer", lambda *args: tok)
     monkeypatch.setattr(serve, "serve", unstarted)
 
 
@@ -152,7 +153,7 @@ def test_check_meets_the_server_s_refusal_of_a_tokenizer_from_another_backend(
     )
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run_file.json"))
     with pytest.raises(ValueError) as refused:
-        compass_run.tokenizer(llm_engine._load_tokenizer(str(tmp_path)), r.config)
+        compass_run.tokenizer(llm_engine.load_tokenizer(str(tmp_path)), r.config)
     monkeypatch.delenv(compass_run.ENV)
 
     assert checked(tmp_path, *flags) == 1
@@ -187,12 +188,25 @@ def test_a_run_that_lacks_nothing_exits_0_and_needs_no_out(
 
 def test_missing_platform_readings_are_listed_alone(tmp_path, monkeypatch, capsys):
     served(monkeypatch, deployment(tmp_path).config)
+    monkeypatch.setattr(device, "COPIES", tmp_path / "no copies")
 
     platform = ["--device", "mi355x", "--ptl", "disabled"]
     code = checked(tmp_path, "--step-stub", stub(tmp_path), platform=platform)
 
     assert code == 1
     assert lacked(capsys.readouterr().out) == ["platform: missing"]
+
+
+def test_a_platform_the_store_lacks_resolves_from_its_committed_copy(
+    tmp_path, monkeypatch, capsys
+):
+    served(monkeypatch, deployment(tmp_path).config)
+
+    platform = ["--device", "mi355x", "--ptl", "disabled"]
+    code = checked(tmp_path, "--step-stub", stub(tmp_path), platform=platform)
+
+    assert code == 1
+    assert lacked(capsys.readouterr().out) == ["memory readings: missing"]
 
 
 @pytest.mark.parametrize(

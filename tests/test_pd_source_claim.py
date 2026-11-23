@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from types import SimpleNamespace
 
 import pytest
@@ -59,6 +59,9 @@ def _build(cls, is_producer, **extra):
     sched = cls.__new__(cls)
     sched.is_producer = is_producer
     sched._awaiting_send = set()
+    sched._pending_chunked_admissions = {}
+    sched._chunked_waiting = {}
+    sched._chunked_ready = set()
     for name in ("_reqs_need_save", "_reqs_need_recv", "request_id_to_transfer_id"):
         setattr(sched, name, {})
     sched.transfer_id_to_request_id = {}
@@ -197,6 +200,15 @@ def _producer_rank():
         _transfer_refcount_lock=threading.Lock(),
         _writes_in_flight={},
         _aborted_transfers={},
+        # Chunked transfer state, which every producer step dispatches from.
+        _chunked_prefills={},
+        _chunked_local_ids={},
+        _retired_chunked_transfers=OrderedDict(),
+        _pending_chunked_requests=[],
+        _chunked_admissions={},
+        _received_handoffs={},
+        _pending_handoffs={},
+        _admission_results=set(),
         _pending_recv_stall_watch={},
         _pending_recv_acks={},
         _held_failures={},
@@ -352,7 +364,7 @@ def test_a_backend_that_cannot_see_every_transfer_keeps_an_aborted_claim(build):
     seq.leave_reason = "length"
     sched.request_finished(seq)
 
-    sched.abort_send(seq.id)
+    sched.abort_parked_send(seq.id)
 
     assert sched.should_defer_free(seq) is True
     assert not sched.build_connector_meta().reqs_not_processed
@@ -368,7 +380,7 @@ def test_multi_hands_an_abort_to_its_producer_sub_as_work():
     seq.leave_reason = "length"
     producer.request_finished(seq)
 
-    multi.abort_send(seq.id)
+    multi.abort_parked_send(seq.id)
     meta = multi.build_connector_meta()
 
     assert meta.metas[0].reqs_not_processed == {seq.id}

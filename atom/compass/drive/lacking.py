@@ -12,6 +12,7 @@ each store key or law file a flag
 names (`runfile.resolve`); a step linear law and host laws held against this
 run's engine config, widths, platform and host key
 (`run.pick_fitted`, `run.refuse_unfitted_law`, `run.refuse_unfitted_host`),
+and to the prefill token-graph buckets it records (`run.refuse_other_buckets`),
 and the step linear law's decode vectors against the rungs this configuration
 schedules (`uncovered_rungs`); the host laws' tokenizer term against the
 backend of the tokenizer ATOM's server loads (`run.tokenizer_term`); a step
@@ -43,14 +44,18 @@ Printed apart, outside the exit status: the gaps `--coverage`'s check counts;
 an op graph's absent price list, which prices every leaf by its analytical
 law, unless `--coverage` asks for its check, which then refuses; and the
 modules the step roofline leaves unclassified on the model built on the meta
-device, when it prices the steps the backend refuses. No `compass run`
-backend is the step roofline itself.
+device, when it prices the steps the backend refuses; and why the prefill
+token-graph buckets cannot be worked out, so no law is held to them. No
+`compass run` backend is the step roofline itself.
 """
 
+import functools
 import json
+import multiprocessing
 import os
 import re
 import shlex
+import tempfile
 from pathlib import Path
 
 from atom.compass import run as compass_run
@@ -115,6 +120,9 @@ SIDE_LAW = (
 FITS = {STEP_LINEAR: "steps --backend step-linear", "host": "host"}
 #: Each side by the letter `runfile.pd_side` gives it.
 SIDES = {"P": "prefill", "D": "decode"}
+#: How long the child reading ATOM's attention builder may take, in seconds, far
+#: past the few it takes on a CPU host; past it, the child is ended.
+PROBE_SECONDS = 300
 
 
 def report(args, atom_args, real=None, env=None) -> int:
@@ -137,7 +145,7 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     and runs under `env`, the variables the check set, where given."""
     from atom.compass.drive import run as drive_run
     from atom.compass.run import memory, step_grid
-    from atom.model_engine.llm_engine import _load_tokenizer
+    from atom.model_engine.llm_engine import load_tokenizer
 
     lacks, apart = [], []
 
@@ -197,10 +205,18 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
         if held and len(held) == len(tokens):
             run[name] = held if len(held) > 1 else held[0]
     law, host = NAMES[STEP_LINEAR], NAMES["host"]
+    try:
+        buckets = {STEP_LINEAR, "host"} & run.keys() and recorded_buckets(config, arch)
+    except ValueError as unworked:
+        buckets = ()
+        apart.append(f"{unworked}, so no law is held to them")
     if STEP_LINEAR in run and met(
         law, made_by[STEP_LINEAR], compass_run.pick_fitted, run, STEP_LINEAR, config
     ):
-        met(law, made_by[STEP_LINEAR], compass_run.refuse_unfitted_law, run, config)
+        made = made_by[STEP_LINEAR]
+        if met(law, made, compass_run.refuse_unfitted_law, run, config):
+            given = config, buckets, {STEP_LINEAR: run[STEP_LINEAR]}
+            met(law, made, compass_run.refuse_other_buckets, *given)
         if rungs := uncovered_rungs(run[STEP_LINEAR], config):
             whose = (
                 " in the law or its draft law" if "draft" in run[STEP_LINEAR] else ""
@@ -216,7 +232,9 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     ):
         given = run["host"], config, machine_platform(machine)
         met(host, made_by["host"], compass_run.refuse_unfitted_host, *given)
-        tok = _load_tokenizer(engine.model, engine.trust_remote_code)
+        given = config, buckets, {"host": run["host"]}
+        met(host, made_by["host"], compass_run.refuse_other_buckets, *given)
+        tok = load_tokenizer(engine.model, engine.trust_remote_code)
         met(host, made_by["host"], compass_run.tokenizer_term, run, tok, config)
     grid, made = NAMES[STEP_GRID], MADE_BY[STEP_GRID]
     checked = STEP_GRID in run and (
@@ -224,7 +242,9 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
         and met(grid, made, step_grid.load, run[STEP_GRID], config, machine)
     )
     made = measure_memory(args.store, real or atom_args, env)
-    read = met("memory readings", made, memory.load, run["store"], config, machine, 0)
+    carried = runfile.carried(runfile.priced_by(args))
+    given = run["store"], config, machine, 0, carried
+    read = met("memory readings", made, memory.load, *given)
     if read and (why := stale_page_bound(read, config)):
         lacks.append(("memory readings", "stale", why, made))
 
@@ -282,6 +302,68 @@ def _reads_page_bound(config) -> bool:
     if getattr(config, "index_cache_dtype", None) != "fp4":
         return False
     return attn_family(get_hf_text_config(config.hf_config)) is Family.CSA2
+
+
+def recorded_buckets(config, arch: str) -> tuple[int, ...]:
+    """The prefill token-graph buckets a run of `config` on a device of `arch`
+    records at capture (`state_prefill_buckets`): `ATOM_TOKEN_GRAPH_SIZES` up to
+    `ModelRunner.warmup_max_tokens` where ATOM's attention builder for its model
+    records token graphs; none if eager or under RapidServe, whose prefill is eager.
+    Where the builder cannot be read (`_token_graphs`), a value error says why."""
+    from atom.utils import envs, get_hf_text_config
+    from atom.utils.selector import attn_family
+
+    if config.enforce_eager or getattr(config, "enable_rapidserve", False):
+        return ()
+    dp = 1 if config.enable_dp_attention else config.parallel_config.data_parallel_size
+    limit = config.max_num_batched_tokens // dp // config.prefill_context_parallel_size
+    sizes = sorted({n for n in envs.ATOM_TOKEN_GRAPH_SIZES if 0 < n <= limit})
+    family = attn_family(get_hf_text_config(config.hf_config))
+    records = bool(sizes) and _token_graphs(family, arch)
+    if isinstance(records, str):
+        raise ValueError(records)  # noqa: TRY004 - why, not a wrong type
+    return tuple(sizes) if records else ()
+
+
+@functools.cache
+def _token_graphs(family, arch: str) -> bool | str:
+    """Whether ATOM's attention builder for `family` records token graphs, in a
+    process declaring a device of `arch`: its module imports aiter, which needs one.
+    Compass's own defect there raises as a runtime error (`check._resolving`).
+    Anything else it raises, the child dying, or the child outliving
+    `PROBE_SECONDS`, which ends it, gives why the buckets cannot be worked out,
+    cached as an answer is, so a child that hangs is waited for once."""
+    from concurrent.futures.process import BrokenProcessPool, ProcessPoolExecutor
+
+    from atom.compass.advice.check import _resolving
+
+    of, spawn = "attention builder", multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(1, mp_context=spawn) as child:
+        try:
+            read = child.submit(_resolving, _builder_records, family, arch, of)
+            records, raised, said = read.result(PROBE_SECONDS)
+        except BrokenProcessPool as died:
+            raised, said = "refused", f"the child reading ATOM's {of} died: {died}"
+        except TimeoutError:
+            for process in list(child._processes.values()):  # 3.14: kill_workers
+                process.kill()
+            raised = "refused"
+            said = f"the child reading ATOM's {of} outlived {PROBE_SECONDS} s"
+    if raised == "defect":
+        raise RuntimeError(f"Compass's own code raised reading ATOM's {of}:\n{said}")
+    if raised:
+        why = "the prefill token-graph buckets this run records cannot be worked out"
+        return f"{why}: {said}"
+    return records
+
+
+def _builder_records(family, arch: str) -> bool:
+    from atom.compass.capture import driverless
+    from atom.utils.selector import get_attn_backend
+
+    with tempfile.TemporaryDirectory(prefix="compass-check-") as tmpdir:
+        driverless.install(tmpdir, arch)
+        return get_attn_backend(family).get_builder_cls().supports_token_graph
 
 
 def _state(refused) -> str:

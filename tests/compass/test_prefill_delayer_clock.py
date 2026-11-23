@@ -58,6 +58,7 @@ def delayer(monkeypatch):
         enable_rapidserve=False,
         max_num_batched_tokens=BUDGET,
         parallel_config=SimpleNamespace(data_parallel_size=2),
+        prefill_admit_policy="interval",  # ATOM's default
     )
     EngineCore._init_prefill_delayer(engine, config, _Rank0())
     return built[0]

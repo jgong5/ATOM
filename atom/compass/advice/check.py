@@ -520,7 +520,7 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                 verdicts = config, config
             else:
                 law = _or_refused(reuse.law, store, config, machine, args, atom)
-                readings = _or_refused(reuse.readings, store, config, machine)
+                readings = _or_refused(reuse.readings, store, config, machine, law)
                 if law["verdict"] == "calibrate" and side in drive_run.ROLES:
                     fits = lacking.FITS.values()
                     law["made_by"] = [
@@ -638,7 +638,7 @@ def _resolved(args, arch: str):
     return config
 
 
-def _resolving(declared, args, arch: str) -> tuple:
+def _resolving(declared, args, arch: str, of: str = "config") -> tuple:
     """In the child: `declared(args, arch)`, else what it raised as text, which
     always unpickles: ``refused`` with its exception line, ATOM's, or with its
     message, a refusal Compass raises; ``defect`` with its traceback, anything
@@ -649,7 +649,7 @@ def _resolving(declared, args, arch: str) -> tuple:
         *_, inner = traceback.extract_tb(error.__traceback__)
         if not Path(inner.filename).resolve().is_relative_to(OWN):
             said = traceback.format_exception_only(error)[-1].strip()
-            return None, "refused", f"ATOM's config: {said}"
+            return None, "refused", f"ATOM's {of}: {said}"
         if isinstance(error, REFUSALS):
             return None, "refused", str(error)
         return None, "defect", "".join(traceback.format_exception(error))
