@@ -49,7 +49,8 @@ reading the same graphs, prices as it did, as a DP rank's dummy forwards do.
 Regions compose by the IR's joins: a `Seq` adds its items in order, a `Repeat`
 re-emits its body's prices once per instance, a `max` `Par` emits its longest
 branch's prices, and a `resource_bound` `Par` one roofline over its branches'
-summed work. The price
+summed work, or with a price list its longest branch's prices where they are
+longer. The price
 is one rank's device busy time: the runner takes a DP group's max and
 composes host time.
 
@@ -65,15 +66,15 @@ stream. Both micro-batches' segments go on the two streams in ATOM's order
 (`step_roofline.overlap`); the finish time is the one term ``op.tbo``.
 
 With a `price_list`, a source named `LISTED` (`fit.ops.PriceList` in a run),
-each leaf outside a `resource_bound` `Par` resolves through a `Resolver`: the
+each leaf resolves through a `Resolver`: the
 price list, asked ``(leaf, bound, work)`` with `bound` the step's or
 micro-batch's (`_bound`) at the rows the leaf ran (`_ran_at`), or the list of
 each it may have run at where it leads with a padded prefill's T that is also
 a count of its width (`_ran_at_each`), then its roofline. `work` gives the
 leaf's work when called, which the roofline alone does: a leaf known to launch
 a kernel whose work reads the step has it worked out only where the list
-declines it. A `resource_bound` `Par` prices its branches' summed work, so its
-leaves take no price of their own.
+declines it. A leaf inside a `resource_bound` `Par` also carries its work,
+which the `Par`'s roofline sums.
 
 Terms. One per op kind, ``op.<kind>``, and ``par.resource_bound``, each
 the fold of its prices in run order. A term is `declared`, its note naming
@@ -870,49 +871,54 @@ class OpGraphBackend(CostBackend):
         price = (name, overlap([zip(*runs)]), notes, Work(), False, (origins, why), {})
         return " and ".join(at), [price]
 
-    def _priced(self, region: dict, view: BatchView, refused: list, bound) -> list:
+    def _priced(
+        self, region: dict, view: BatchView, refused: list, bound, pooled=False
+    ) -> list:
         """`region`'s prices in run order, each ``(term, seconds, stated, work,
         comm, (origins, declined))``, `work` what it adds to an enclosing
         resource_bound, `comm` that it rides the comm stream under two-batch
         overlap, None when it joins an MoE exchange to work on another stream,
         `origins` the price list's provenances and `declined` its reasons for a
         roofline; what refuses goes to `refused`. With a `bound`, a leaf
-        resolves through the price list first."""
+        resolves through the price list first, and with `pooled`, inside a
+        resource_bound, carries its work beside the list's price."""
         if "op" in region:
-            got = self._leaf(region, view, refused, bound)
+            got = self._leaf(region, view, refused, bound, pooled)
             return [_ridden(region, got)] if got else []
         if "repeat" in region:
-            body = self._priced(region["repeat"], view, refused, bound)
+            body = self._priced(region["repeat"], view, refused, bound, pooled)
             return body * region["count"]
         if "seq" in region:
             priced = []
             for item in region["seq"]:
                 if "op" not in item:
-                    priced += self._priced(item, view, refused, bound)
-                elif got := self._leaf(item, view, refused, bound):
+                    priced += self._priced(item, view, refused, bound, pooled)
+                elif got := self._leaf(item, view, refused, bound, pooled):
                     priced.append(_ridden(item, got))
             return priced
-        pooled = region["join"] == "resource_bound"
+        pooled = bool(bound) and (pooled or region["join"] == "resource_bound")
         branches = [
-            self._priced(b, view, refused, None if pooled else bound)
-            for b in region["par"]
+            self._priced(b, view, refused, bound, pooled) for b in region["par"]
         ]
         summed = sum((p[3] for b in branches for p in b), Work())
         comm = None if any(p[4] is not False for b in branches for p in b) else False
-        if region["join"] == "max":
-            each = [fold_seconds(p[1] for p in b) for b in branches]
-            longest = branches[each.index(max(each))]
-            # The longest branch's prices stay under their own terms; the
-            # first carries every branch's work for an enclosing resource_bound.
-            return [
-                (*p[:3], summed if i == 0 else Work(), comm, *p[5:])
-                for i, p in enumerate(longest)
-            ]
-        name = f"par.{region['join']}"
-        unit = self._unit(name, summed, refused)
-        return [(name, *unit[:2], summed, comm, ((), ()), unit[2])] if unit else []
+        each = [fold_seconds(p[1] for p in b) for b in branches]
+        if region["join"] == "resource_bound":
+            name = "par.resource_bound"
+            unit = self._unit(name, summed, refused)
+            if unit is None:
+                return []
+            if not bound or unit[0] >= max(each):
+                return [(name, *unit[:2], summed, comm, ((), ()), unit[2])]
+        # The longest branch's prices stay under their own terms; the first
+        # carries every branch's work for an enclosing resource_bound.
+        longest = branches[each.index(max(each))]
+        return [
+            (*p[:3], summed if i == 0 else Work(), comm, *p[5:])
+            for i, p in enumerate(longest)
+        ]
 
-    def _leaf(self, leaf: dict, view: BatchView, refused: list, bound):
+    def _leaf(self, leaf: dict, view: BatchView, refused: list, bound, pooled=False):
         """`_price_leaf`, once a step for each value of every path its op
         kind's work has read of a leaf, and with a price list of the leaf's
         operator, arguments, outputs and stated fields; and once for good at a
@@ -921,7 +927,7 @@ class OpGraphBackend(CostBackend):
         places in `bound` laid flat (`_flat`) of the items it read and the
         names of the attributes of `view` its work read, or `VIEW` where it
         refused or read its pass's view. A leaf `_pass_views` holds reads its
-        pass's view."""
+        pass's view. A `pooled` leaf is kept apart, since it carries its work."""
         kept = self._kept.get(id(leaf))
         if kept is None:
             if len(self._kept) >= KEPT:
@@ -929,18 +935,19 @@ class OpGraphBackend(CostBackend):
             kept = self._kept[id(leaf)] = [leaf, None, None, None]
         elif kept[3] and kept[3][0] is None:  # it launches no kernel at any step
             return None
-        if kept[2] and kept[2][0] == bound:
+        at = (bound, pooled)
+        if kept[2] and kept[2][0] == at:
             self._read |= kept[2][2]
             return kept[2][1]
         own = view
         if self._passes:
             view = self._passes.get(id(leaf), view)
         # A step's refusals are named once, so a repeat need not add its own.
-        key = (id(view), bound, self._text(kept, bound))
+        key = (id(view), at, self._text(kept, bound))
         step = self._step.get(key)
         if step is None:
             n, watched, reads = len(refused), _Watched(view), set()
-            got = self._price_leaf(kept, watched, refused, bound, reads)
+            got = self._price_leaf(kept, watched, refused, bound, reads, pooled)
             free = not (watched.read or refused[n:])
             if refused[n:] or watched.read and view is not own:
                 reads = {VIEW}
@@ -948,10 +955,10 @@ class OpGraphBackend(CostBackend):
             step = self._step[key] = (view, got, reads, free)
             # Kept too by every path the work has read by now, its own among
             # them, which a path read anew changes.
-            self._step[id(view), bound, self._text(kept, bound)] = step
+            self._step[id(view), at, self._text(kept, bound)] = step
         _, got, reads, free = step
         if free:
-            kept[2] = (bound, got, reads)
+            kept[2] = (at, got, reads)
         self._read |= reads
         return got
 
@@ -987,23 +994,29 @@ class OpGraphBackend(CostBackend):
             kept[3] = False
         return w
 
-    def _price_leaf(self, kept: list, view, refused: list, bound, reads: set):
+    def _price_leaf(
+        self, kept: list, view, refused: list, bound, reads: set, pooled=False
+    ):
         """The leaf `kept` holds as ``(term, seconds, stated, work, (origins,
         declined))``, as `_priced` lists it; None when it launches no kernel or
         refuses. With a `bound`, a leaf known to launch a kernel leaves its
         work to the roofline, which reads it only where the price list
         declines, and `reads` gains what the price list read of the bound
-        (`_Read`)."""
+        (`_Read`); a `pooled` one works it out once and carries it, refusing
+        where it cannot."""
         leaf = kept[0]
-        if not bound or kept[3] is None:
+        if pooled or not bound or kept[3] is None:
             w = self._work(kept, view)
             if w is None:
                 return None
-            if bound:  # whether it launches a kernel, which `kept` holds now,
-                view.read.clear()  # is all a price list's answer reads of the view
+            if isinstance(w, tuple) and (pooled or not bound):
+                refused.extend(w)
+                return None
+            if bound and not pooled:  # whether it launches a kernel, which `kept`
+                view.read.clear()  # holds now, is all the list's answer reads of it
         if bound:
             each = _reading(bound, _ran_at_each(leaf, bound), reads)
-            later = functools.partial(self._work, kept, view)
+            later = (lambda: w) if pooled else functools.partial(self._work, kept, view)
             try:
                 got = self.resolver.resolve(
                     (leaf, each if each[1:] else each[0], later)
@@ -1015,10 +1028,8 @@ class OpGraphBackend(CostBackend):
             notes = term.provenance.note.split("; ") if term.provenance.note else []
             name = f"{term.name}.price_list" if listed else term.name
             how = ((term.provenance,) if listed else (), got.declined)
-            return name, term.seconds, notes, Work(), how, term.by_bound
-        if isinstance(w, tuple):
-            refused.extend(w)
-            return None
+            carried = w if pooled else Work()
+            return name, term.seconds, notes, carried, how, term.by_bound
         unit = self._unit(leaf["op"], w, refused)
         return unit and (f"op.{leaf['op']}", *unit[:2], w, ((), ()), unit[2])
 

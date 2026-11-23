@@ -13,6 +13,7 @@ frozen out of the collector's reach, unless `ATOM_GC_FREEZE` is off.
 import gc
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -94,42 +95,54 @@ def test_a_dp_prefill_s_graph_holds_g_and_each_step_s_g_puts_it_byte_for_byte(
     root, ahead = tmp_path_factory.mktemp("traced"), tmp_path_factory.mktemp("ahead")
     deployed = f"{DPA_TP8}{EP8 * ep}"
     population = f"--population {_record(root / 'record')}{deployed}"
-    traced = _published(root, trace(root, population))
-    # Traced ahead: (T, B) at its default G, then with G a symbol.
-    held = _published(ahead, trace(ahead, f"--prefill {T} 1 --symbolic{deployed}"))
-    chunks = (False, True)
-    assert held.keys() == {(s, o) for s in (shape(DP * T), HELD) for o in chunks}
-    config = _run_config(held[HELD, True]["structure"], root / "model")
-    args = ["--model", config.model, "-tp", "8", *deployed.split()[1:]]
-    spawned, lazy = _spawned(monkeypatch), _counts()
-    store = tmp_path_factory.mktemp("store")
-    lookups = (
-        _op_graphs(str(store), config, "gfx950", args, lazy),
-        _op_graphs(str(ahead / "store"), config, "gfx950"),
-    )
+    # The record's steps trace in a process of their own beside the rest,
+    # which reads none of them until every lookup below has run.
+    with ThreadPoolExecutor(1) as beside:
+        tracing = beside.submit(trace, root, population)
+        # Traced ahead: (T, B) at its default G, then with G a symbol.
+        argv = f"--prefill {T} 1 --symbolic{deployed}"
+        held = _published(ahead, trace(ahead, argv))
+        chunks = (False, True)
+        assert held.keys() == {(s, o) for s in (shape(DP * T), HELD) for o in chunks}
+        config = _run_config(held[HELD, True]["structure"], ahead / "model")
+        args = ["--model", config.model, "-tp", "8", *deployed.split()[1:]]
+        spawned, lazy = _spawned(monkeypatch), _counts()
+        store = tmp_path_factory.mktemp("store")
+        lookups = (
+            _op_graphs(str(store), config, "gfx950", args, lazy),
+            _op_graphs(str(ahead / "store"), config, "gfx950"),
+        )
 
-    for g in GATHERED:
-        for output in (False, True):
-            want = json.dumps(traced[shape(g), output]["region"])
-            assert [json.dumps(at("prefill", T, 1, output, g)) for at in lookups] == [
-                want
-            ] * 2, g
-    # One lazy trace, both ends of G's range, answered all six.
-    assert (len(spawned), lazy["lazy_traces"]) == (1, 1)
-    assert "lazy_per_g" not in lazy
+        put = {
+            (g, output): [json.dumps(at("prefill", T, 1, output, g)) for at in lookups]
+            for g in GATHERED
+            for output in (False, True)
+        }
+        # One lazy trace, both ends of G's range, answered all six.
+        assert (len(spawned), lazy["lazy_traces"]) == (1, 1)
+        assert "lazy_per_g" not in lazy
 
-    # A prefill whose LM head pads holds G too, keyed by its width: one more.
-    lookup = lookups[0]
-    for g in GATHERED:
-        want = json.dumps(traced[shape(g, WIDE), True]["region"])
-        assert json.dumps(lookup("prefill", T, 1, True, g, False, WIDE)) == want, g
-    assert lazy["lazy_traces"] == 2 and "lazy_per_g" not in lazy
+        # A prefill whose LM head pads holds G too, keyed by its width: one more.
+        lookup = lookups[0]
+        wide = {
+            g: json.dumps(lookup("prefill", T, 1, True, g, False, WIDE))
+            for g in GATHERED
+        }
+        assert lazy["lazy_traces"] == 2 and "lazy_per_g" not in lazy
 
-    # Past the range's top, where MORI's trim guards G too, the step is traced.
-    exchange = f"{MORI}.dispatch" if ep else "atom.model_ops.moe:all_gatherv"
-    past = lookup("prefill", T, 1, True, TOP + 1)
-    assert lazy["lazy_traces"] == 3
-    assert {op["out"][0][0] for op in _ops(past) if op["op"] == exchange} == {TOP + 1}
+        # Past the range's top, where MORI's trim guards G too, the step is traced.
+        exchange = f"{MORI}.dispatch" if ep else "atom.model_ops.moe:all_gatherv"
+        past = lookup("prefill", T, 1, True, TOP + 1)
+        assert lazy["lazy_traces"] == 3
+        assert {op["out"][0][0] for op in _ops(past) if op["op"] == exchange} == {
+            TOP + 1
+        }
+
+        traced = _published(root, tracing.result())
+    for (g, output), got in put.items():
+        assert got == [json.dumps(traced[shape(g), output]["region"])] * 2, g
+    for g, got in wide.items():
+        assert got == json.dumps(traced[shape(g, WIDE), True]["region"]), g
 
 
 def _ops(region):

@@ -1408,6 +1408,82 @@ pin processes that run at once to cores with `taskset`.
   that side's `left out` row, and that side's prefill has no cost row until a gated
   record grades it ([#3028](https://github.com/jgong5/ATOM/issues/3028)).
 
+### The TP8 cell under the op-level backend
+
+The TP8 cell is the DPA-TP8 cell less `--enable-dp-attention`: each side runs `-tp 8
+--trust-remote-code --kv_cache_dtype fp8 --block-size 16 --no-enable_prefix_caching
+--max-num-seqs 512` under `AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1`, the prefill side
+also `--enable-tbo` under `GPU_MAX_HW_QUEUES=5 ATOM_NUMA_BIND=1`, and the decode side also
+`--cudagraph-capture-sizes` of 1, 2, 4 and every multiple of 4 from 8 to 256, the ladder its
+host law keys. The prefill side runs at `--gpu-memory-utilization 0.65` and the decode side
+at 0.70: prefill ranks ran out of device memory at 0.72, and at 0.70 on a 219,399-token
+prompt, and every decode rank did at #975's 0.75
+([evidence](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6788714068),
+[Ruling](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6789775071),
+[Ruling](https://github.com/jgong5/ATOM/issues/3179#issuecomment-6841461259)). A real run is
+`deploy.sh record` as above. A simulated run follows the DPA-TP8 cell's Graphs, Points, Price
+list, Runs and Grading steps, with these differences:
+
+- **One group of eight ranks.** No graph holds `G=`. A prefill step that `--enable-tbo`
+  splits runs as two micro-batches on one DP rank, and `trace ops --population`,
+  `measure ops --coverage` and the analytical bound read the split as the DPA cell's.
+  The plan's later rounds do not reach most of the prefill points past its measured range,
+  so check each real record with `compass run --op-graph --coverage` against the fitted price
+  list and measure only the points that alone leave steps out ([Ruling on #3567](https://github.com/jgong5/ATOM/issues/3567#issuecomment-6951471078)):
+  `trace ops --prefill T B --whole`, then `measure ops --prefill T B --context C`. Such a run
+  names a whole step's graph, whose leaves key the same points its micro-batches' do. A step
+  whose `aiter.tbo_all_reduce` the price list declines is refused
+  ([#3672](https://github.com/jgong5/ATOM/issues/3672)).
+- **The decode side's points at 0.6.** At 0.70 the decode side's `measure ops` runs out of
+  device memory on its MoE points ([#3632](https://github.com/jgong5/ATOM/issues/3632)).
+  No graph or point key holds the utilization, so the decode side's simulated run stays at 0.70.
+- **Host laws only.** `P` and `D` are the tree's
+  `laws/deepseek-v4-pro-tp8-mi355x-crs005-prefill-host.json.xz` and `-decode-host.json.xz`,
+  host terms with no step linear law: the op-level backend prices every device step. The
+  decode side's `http_intake` is the crs005 DPA8 law's, whose fitted body range stops below
+  the largest bodies traces 0 to 255 send, so a run of them refuses each larger intake and
+  `validate` grades no such run ([#3919](https://github.com/jgong5/ATOM/issues/3919)).
+
+### The EP8 cell under the op-level backend
+
+The EP8 cell runs simulated under the op-level backend as the DPA-TP8 cell above does,
+each side under the EP8 cell's arguments and environment, with these differences.
+
+- **Points.** A point's key holds the parallel layout only for a leaf on a process group
+  (`point_key` in `atom/compass/bench/ops.py`), so the DPA-TP8 cell's points serve EP8 at
+  the leaves both cells run. A store measured before that key changed is republished at
+  today's keys by `python3 scripts/compass/migrate_keys.py --machines tests/compass/machines
+  --store OLD NEW`. Over `NEW`, `measure ops --plan` measures only what EP8 adds: on one
+  GPU the routed MoE over one rank's experts, and on all eight the collectives, MORI's
+  dispatch and combine among them.
+- **MORI on the prefill side.** A prefill step's shape under DP-attention states its
+  group's rows, `G=`, and a MORI exchange there takes about what its largest rank sends,
+  not `G`. `measure ops` sends each rank its own share of `G` through MORI's dispatch and
+  combine, and `fit ops` prices MORI at a shape stating `G` as a family of its own, over
+  EP times the rows the step's largest rank scheduled, which the plan does not densify
+  ([#3729](https://github.com/jgong5/ATOM/issues/3729)). Bound the eight-GPU prefill run
+  with `timeout`: `fit ops` reads every round a run published and declines the gaps
+  beside a point off its neighbours' line. `measure ops --coverage`, as in step 11 of the
+  stage-2 cell below, names the steps the price list leaves out; its `--out` is a
+  directory holding every run's `plan.jsonl` lines of the side and one run's `run.json`.
+- **Runs.** As the DPA-TP8 cell's, with the EP8 cell's host laws,
+  `laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json.xz` and `-decode.json.xz`.
+- **Trees.** Every run the cell adds, EP8's at every concurrency and EP off's at c=64 and
+  256, runs at the run tree: `c92c36110` with the commits that closed #3688, #3729 and
+  #3657, the last pricing a step again only at the leaves whose reads moved. The replay
+  tree is the run tree without #3657's commit
+  ([Ruling](https://github.com/jgong5/ATOM/issues/3409#issuecomment-6999401243)). A side's
+  `steps/dp<r>.cost.jsonl` holds the terms each line of its `steps/dp<r>.jsonl` was priced
+  at; a replay prices those lines again with the run's price list and graphs through the
+  replay tree's `OpGraphBackend` and compares each term's name, seconds, method, validated
+  flag and source. A line that differs voids the run, and its cell runs at the replay
+  tree.
+- **Ranking.** EP8 is ordered against the DPA-TP8 cell only as both are simulated at one
+  tree (the ranking gate of `atom/compass/design/08_validation_protocol.md`), the run tree.
+  The DPA-TP8 cell's runs at c=1, 4 and 16, simulated at `c92c36110`, count as run there
+  when every line of both sides replays through the run tree alike; a line that differs
+  is escalated, and the ranking waits for its ruling.
+
 ## The analytical bound — `python -m atom.compass.validate.bound`
 
 `PYTHONPATH=$T python -m atom.compass.validate.bound ... RECORD...` exits 1 when a real

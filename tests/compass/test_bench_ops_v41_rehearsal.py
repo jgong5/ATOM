@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
@@ -82,6 +83,8 @@ GATHER = "aten.index.Tensor", "self"
 
 
 def _run(script, *argv, cwd=TREE):
+    """`script` run over `argv` in a process of its own: what it wrote to its
+    first argument, as JSON."""
     done = subprocess.run(
         [sys.executable, str(script), *map(str, argv)],
         capture_output=True,
@@ -91,30 +94,77 @@ def _run(script, *argv, cwd=TREE):
         env={**os.environ, "PYTHONPATH": str(TREE)},
     )
     assert done.returncode == 0, done.stderr[-4000:]
+    return json.loads(pathlib.Path(argv[0]).read_text())
+
+
+def _unstated(root) -> pathlib.Path:
+    """A copy of `root`'s store as traced before V4.1's top-k and key RoPE
+    stated their ratio: each graph's members stating none."""
+    store = root / "unstated"
+    shutil.copytree(root / "store", store, copy_function=shutil.copyfile)
+    for entry in store.glob("op_graph/*/entry.json"):
+        doc = json.loads(entry.read_text())
+        for name in doc["members"]:
+            data = (entry.parent / name).read_bytes()
+            data = re.sub(rb', "stated": \{"compress_ratio": \d+\}', b"", data)
+            (entry.parent / name).write_bytes(data)
+            doc["members"][name] = f"sha256:{hashlib.sha256(data).hexdigest()}"
+        entry.write_text(json.dumps(doc))
+    return store
+
+
+@pytest.fixture(scope="module")
+def rehearsals(model_dir, tmp_path_factory):  # noqa: F811
+    """Each cell's graphs traced into a store, and those of cell B's decode
+    B=16 with no drafter (`None`), the three at once; then, all at once, by
+    the cell and a name: what its own capture passes each leaf (`truth`,
+    `v41_capture_truth.py`) and the rehearsal's record at each point a case
+    reads, each in a process of its own."""
+    undrafted = CELL.replace(DRAFTER, "")
+    cells = {
+        ep: (f"{SHAPES} {WINDOW}{CELL}{ep}", CELL + ep, SHAPES) for ep in ("", EP4)
+    }
+    cells[None] = f"--width 16{undrafted}", undrafted, "--width 16"
+    roots = {cell: tmp_path_factory.mktemp("v41_rehearsal") for cell in cells}
+    where = "--arch", "gfx1250", "--gpu", "0"
+    with ThreadPoolExecutor(len(cells)) as pool:
+        list(pool.map(lambda c: _trace(roots[c], cells[c][0], where, READ), cells))
+    jobs = {}
+    for cell, (_, args, shapes) in cells.items():
+        root, args = roots[cell], args.split()[1:]
+        model, store = root / "model", root / "store"
+        for name in ("tokenizer.json", "tokenizer_config.json"):
+            shutil.copy(model_dir / name, model / name)
+        jobs[cell, "truth"] = (TRUTH, root / "truth.json", model, 4, *shapes.split())
+        jobs[cell, "truth"] += ("--", *args)
+        points = {"cached": (store, [*SHAPES.split(), "--context", "8192"])}
+        points["fresh"] = store, [*SHAPES.split()[2:], *WINDOW.split()]
+        if cell is None:  # each a decode of 8192 tokens a row
+            unstated, decode = _unstated(root), ["--width", "16", "--context", "8192"]
+            points = {
+                "rope": (store, [*decode, "--only", ROPE]),
+                "topk": (store, [*decode, "--only", TOPK]),
+                "unstated_rope": (unstated, [*decode, "--only", ROPE]),
+                "unstated": (unstated, decode),
+                "unstated_topk": (unstated, [*decode, "--only", TOPK]),
+                "unstated_kinds": (unstated, [*decode, "--kinds"]),
+            }
+        atom = ["--model", model, "-tp", "4", "--enforce-eager", "--level", "0", *args]
+        for name, (at, point) in points.items():
+            jobs[cell, name] = (HARNESS, root / f"{name}.json", *point, "--llc-mib")
+            jobs[cell, name] += ("512", "--store", at, "--", *atom)
+    with ThreadPoolExecutor(len(jobs)) as pool:
+        return dict(zip(jobs, pool.map(lambda job: _run(*job), jobs.values())))
 
 
 @pytest.fixture(scope="module", params=["", EP4], ids=["cell_b", "cell_a"])
-def rehearsed(request, model_dir, tmp_path_factory):  # noqa: F811
-    """A cell's graphs traced into a store; what its own capture passes each
-    leaf (`v41_capture_truth.py`); and the rehearsal's record of each leaf at
-    a decode of 8192 tokens a row and a prefill past as many cached, and of
-    each prefill leaf, and `WINDOW`'s, on no cached tokens."""
-    root, ep = tmp_path_factory.mktemp("v41_rehearsal"), request.param
-    traced = f"{SHAPES} {WINDOW}{CELL}{ep}"
-    _trace(root, traced, ("--arch", "gfx1250", "--gpu", "0"), READ)
-    model, cell = root / "model", (CELL + ep).split()[1:]
-    for name in ("tokenizer.json", "tokenizer_config.json"):
-        shutil.copy(model_dir / name, model / name)
-    _run(TRUTH, root / "truth.json", model, 4, *SHAPES.split(), "--", *cell)
-    atom = ["--model", model, "-tp", "4", "--enforce-eager", "--level", "0", *cell]
-    store = ["--llc-mib", "512", "--store", root / "store"]
-    points = {"cached": [*SHAPES.split(), "--context", "8192"]}
-    points["fresh"] = [*SHAPES.split()[2:], *WINDOW.split()]
-    got = {}
-    for name, shapes in points.items():
-        _run(HARNESS, root / f"{name}.json", *shapes, *store, "--", *atom)
-        got[name] = json.loads((root / f"{name}.json").read_text())
-    return got, json.loads((root / "truth.json").read_text())
+def rehearsed(request, rehearsals):
+    """The rehearsal's record of each leaf of a cell at a decode of 8192
+    tokens a row and a prefill past as many cached, and of each prefill leaf,
+    and `WINDOW`'s, on no cached tokens; and what its own capture passes each
+    leaf."""
+    got = {name: rehearsals[request.param, name] for name in ("cached", "fresh")}
+    return got, rehearsals[request.param, "truth"]
 
 
 def test_every_leaf_reaches_its_launch_but_a_host_copy(rehearsed):
@@ -271,27 +321,11 @@ def test_the_queries_pointer_gather_takes_its_last_layer_s_prefix_table():
 
 
 @pytest.fixture(scope="module")
-def undrafted_cell(model_dir, tmp_path_factory):  # noqa: F811
-    """Cell B's decode B=16 with no drafter, traced, and what its capture passes
-    each leaf, under one root; and ATOM's arguments for that cell."""
-    root, cell = tmp_path_factory.mktemp("v41_undrafted"), CELL.replace(DRAFTER, "")
-    _trace(root, f"--width 16{cell}", ("--arch", "gfx1250", "--gpu", "0"), READ)
-    model, cell = root / "model", cell.split()[1:]
-    for name in ("tokenizer.json", "tokenizer_config.json"):
-        shutil.copy(model_dir / name, model / name)
-    _run(TRUTH, root / "truth.json", model, 4, "--width", "16", "--", *cell)
-    atom = ["--model", model, "-tp", "4", "--enforce-eager", "--level", "0", *cell]
-    return root, atom
-
-
-@pytest.fixture(scope="module")
-def undrafted(undrafted_cell):
-    """The rehearsal's record of `undrafted_cell`'s RoPE leaves alone, no
-    compress leaf beside them, at 8192 tokens a row; and its capture's truth."""
-    root, atom = undrafted_cell
-    point = ["--width", "16", "--context", "8192", "--only", ROPE, "--llc-mib", "512"]
-    _run(HARNESS, root / "got.json", *point, "--store", root / "store", "--", *atom)
-    return [json.loads((root / f).read_text()) for f in ("got.json", "truth.json")]
+def undrafted(rehearsals):
+    """The rehearsal's record of cell B's RoPE leaves alone at a decode B=16
+    with no drafter, no compress leaf beside them, at 8192 tokens a row; and
+    its capture's truth."""
+    return rehearsals[None, "rope"], rehearsals[None, "truth"]
 
 
 def test_each_rope_alone_takes_its_positions_at_a_decode_with_no_drafter(undrafted):
@@ -308,43 +342,26 @@ def test_each_rope_alone_takes_its_positions_at_a_decode_with_no_drafter(undraft
 
 
 def test_a_key_rope_stating_no_ratio_refuses_where_both_ratios_plans_hold_its_rows(
-    undrafted_cell,
+    rehearsals,
 ):
     """In a graph traced before V4.1's key RoPE stated its ratio, at a decode
     with no drafter, both ratios' keys' RoPEs are one leaf, and both ratios'
     compress plans hold its rows: alone or beside them, it refuses by name, to
     be traced again, and the query's RoPE takes what ATOM's capture passes it."""
-    root, atom = undrafted_cell
-    store, truth = root / "unstated", json.loads((root / "truth.json").read_text())
-    shutil.copytree(root / "store", store, copy_function=shutil.copyfile)
-    for entry in store.glob("op_graph/*/entry.json"):  # each RoPE stating nothing
-        doc = json.loads(entry.read_text())
-        for name in doc["members"]:
-            data = (entry.parent / name).read_bytes()
-            data = re.sub(rb', "stated": \{"compress_ratio": \d+\}', b"", data)
-            (entry.parent / name).write_bytes(data)
-            doc["members"][name] = f"sha256:{hashlib.sha256(data).hexdigest()}"
-        entry.write_text(json.dumps(doc))
-    for only in (["--only", ROPE], []):
-        point = ["--width", "16", "--context", "8192", *only, "--llc-mib", "512"]
-        _run(HARNESS, root / "unstated.json", *point, "--store", store, "--", *atom)
-        got = json.loads((root / "unstated.json").read_text())
-        ropes = [r for r in got if r["op"] == ROPE]
+    truth = rehearsals[None, "truth"]
+    for name in ("unstated_rope", "unstated"):  # alone, and beside them
+        ropes = [r for r in rehearsals[None, name] if r["op"] == ROPE]
         heads = [json.loads(r["leaf"])["args"]["input"]["shape"][-2] for r in ropes]
         (_, key), (_, query) = sorted(zip(heads, ropes), key=lambda h: h[0])
         assert key["why"].endswith("holds its 16 rows: trace its shape again")
         assert [query["identity"].get("positions")] == truth[query["leaf"]]["positions"]
 
 
-def test_each_top_k_alone_takes_its_ratio_s_visible_rows(undrafted_cell):
+def test_each_top_k_alone_takes_its_ratio_s_visible_rows(rehearsals):
     """The row bounds ATOM stages for a top-k are its ratio's visible rows,
     which the capture states: each such top-k, with no scorer beside it, takes
     those ATOM's capture passes it, each ratio's apart."""
-    root, atom = undrafted_cell
-    truth = json.loads((root / "truth.json").read_text())
-    point = ["--width", "16", "--context", "8192", "--only", TOPK, "--llc-mib", "512"]
-    _run(HARNESS, root / "topk.json", *point, "--store", root / "store", "--", *atom)
-    got = json.loads((root / "topk.json").read_text())
+    got, truth = rehearsals[None, "topk"], rehearsals[None, "truth"]
     staged = {
         r["leaf"]: r["identity"].get("seqLens")
         for r in got
@@ -356,31 +373,19 @@ def test_each_top_k_alone_takes_its_ratio_s_visible_rows(undrafted_cell):
 
 
 def test_a_top_k_or_key_rope_stating_no_ratio_refuses_where_its_point_cannot_tell(
-    undrafted_cell,
+    rehearsals,
 ):
     """In a graph traced before V4.1's top-k and key RoPE stated their ratio, a
     top-k whose row bounds ATOM stages, with no scorer beside it, and the key
     RoPE beside one ratio's compressor alone, both ratios' plans holding its
     rows, refuse by name, to be traced again; a top-k beside its scorer binds."""
-    root, atom = undrafted_cell
-    store, why = root / "untold", {}
-    shutil.copytree(root / "store", store, copy_function=shutil.copyfile)
-    for entry in store.glob("op_graph/*/entry.json"):  # each stating no ratio alone
-        doc = json.loads(entry.read_text())
-        for name in doc["members"]:
-            data = (entry.parent / name).read_bytes()
-            data = re.sub(rb', "stated": \{"compress_ratio": \d+\}', b"", data)
-            (entry.parent / name).write_bytes(data)
-            doc["members"][name] = f"sha256:{hashlib.sha256(data).hexdigest()}"
-        entry.write_text(json.dumps(doc))
-    for only in (["--only", TOPK], ["--kinds"]):
-        point = ["--width", "16", "--context", "8192", *only, "--llc-mib", "512"]
-        _run(HARNESS, root / "untold.json", *point, "--store", store, "--", *atom)
-        for r in json.loads((root / "untold.json").read_text()):
+    why = {}
+    for only, name in (("--only", "unstated_topk"), ("--kinds", "unstated_kinds")):
+        for r in rehearsals[None, name]:
             args = json.loads(r["leaf"])["args"]
             if r["op"] == ROPE or args.get("seqLens", {}).get("role") == "metadata":
                 told = r["why"].rpartition("cannot tell which ratio's ")[-1]
-                why[only[0], args.get("stride0")] = told
+                why[only, args.get("stride0")] = told
     again = ": trace its shape again"
     assert why == {
         ("--only", 131072): f"scorer writes its 131072-wide logits{again}",

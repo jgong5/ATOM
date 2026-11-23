@@ -2448,13 +2448,15 @@ def op_graph(
     """The `OpGraphBackend` the run file `run` names for `config` on
     `machine` at EP width `ep`, with its price list when it names one; with
     `lazy`, a shape no graph holds is traced from the run file's `ATOM_ARGS`
-    when it holds them (`_op_graphs`), counted in `lazy`; with `env`, its
-    graphs are read under that performance environment (`forward.structure`)."""
+    when it holds them (`_op_graphs`), counted in `lazy`, which also sums each
+    `price` call's wall seconds, its lookups among them, as
+    ``price_wall_seconds``; with `env`, its graphs are read under that
+    performance environment (`forward.structure`)."""
     from atom.compass.backends.op_graph import OpGraphBackend
 
     drafter = getattr(config, "speculative_config", None)
     lazily = (run[ATOM_ARGS], lazy) if lazy is not None and ATOM_ARGS in run else ()
-    return OpGraphBackend(
+    backend = OpGraphBackend(
         machine,
         _op_graphs(
             run["store"], config, machine.value("device.arch"), *lazily, env=env
@@ -2470,6 +2472,20 @@ def op_graph(
         drafts=drafter.num_speculative_tokens if drafter else 0,
         block=bool(drafter) and drafter.use_dspark(),
     )
+    if lazy is None:
+        return backend
+    price = backend.price
+
+    def timed(view):
+        began = time.monotonic()
+        try:
+            return price(view)
+        finally:
+            spent = time.monotonic() - began
+            lazy["price_wall_seconds"] = lazy.get("price_wall_seconds", 0) + spent
+
+    backend.price = timed
+    return backend
 
 
 def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None):
@@ -3835,7 +3851,8 @@ def _write_client_run(run: dict, a: _RecordingAuthority, k: int, hand_ins=None):
         hand_ins = _read_hand_ins(run, here, True)
     since = _read_hand_ins(run, out / CLIENT_DIR.format(k - 1), False) if k else {}
     record = a.ended[k]
-    summary = _summary(run, a, record, a.wall(k), hand_ins, since)
+    since_wall = a.wall(k - 1) if k else 0.0
+    summary = _summary(run, a, record, a.wall(k), hand_ins, since, since_wall)
     summary["client_run"] = {"index": k, "start": record.start, "end": record.end}
     hits = {
         n: _in_force_from(h["hit_counters"], record.start)
@@ -3848,9 +3865,12 @@ def _write_client_run(run: dict, a: _RecordingAuthority, k: int, hand_ins=None):
     _write_whole(here / SUMMARY_FILE, json.dumps(summary, sort_keys=True, indent=1))
 
 
-def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> dict:
+def _summary(
+    run: dict, a, record, wall: float, hand_ins: dict, since: dict, since_wall=0.0
+) -> dict:
     """The summary of `record`, the authority or one client run, over the steps
-    the hand-ins count beyond those in `since`."""
+    the hand-ins count beyond those in `since`; `since_wall` is the part of
+    `wall` the client runs `since` counts served."""
     from atom.compass.backends.cost import GROUPS
 
     reasons = Counter(r for h in hand_ins.values() for r in h["refusals"])
@@ -3888,6 +3908,17 @@ def _summary(run: dict, a, record, wall: float, hand_ins: dict, since: dict) -> 
     for key in ("held_lookups", "lookup_wall_seconds"):
         if value := total(key):
             summary["cost"][key] = value
+    # Each DP group's wall waited on lookups, on the rest of pricing, and on
+    # neither, by the engine of its first rank, over `record`'s own wall.
+    waited = {}
+    for n, h in hand_ins.items():
+        if w := h.get("priced", {}).get("group_waited_seconds"):
+            gone = since.get(n, {}).get("priced", {}).get("group_waited_seconds")
+            lookups, pricing = (a - b for a, b in zip(w, gone or (0, 0)))
+            rest = wall - since_wall - lookups - pricing
+            waited[n] = {"lookups": lookups, "pricing": pricing, "rest": rest}
+    if waited:
+        summary["cost"]["group_waited_seconds"] = waited
     schedule = summary["schedule"]
     schedule["predicted_seconds"] = seconds
     # How the seconds were obtained: reported, never gated.
