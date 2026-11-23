@@ -12,6 +12,8 @@ repository for the tree.
 """
 
 import json
+import os
+import pickle
 import shutil
 import subprocess
 
@@ -39,6 +41,7 @@ from test_run_step_grid import DOCUMENT, PLATFORM, deployment, host_laws_key, re
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import cli
 from atom.compass import run as compass_run
+from atom.compass.advice import check
 from atom.compass.advice.check import REUSE, STATES
 from atom.compass.artifacts import (
     ArtifactStore,
@@ -76,13 +79,49 @@ def at_head(monkeypatch):
 @pytest.fixture
 def searched(tmp_path, monkeypatch, at_head):
     """The deployment at `COVERED`, served for every instance, at the head
-    whose digest is the tree's, with no law file."""
+    whose digest is the tree's, with no law file; each start the check makes
+    answers, so a point it would start is searchable (`test_advice_check`
+    starts one)."""
     r = deployment(tmp_path, **COVERED)
     served(monkeypatch, r.config)
+    monkeypatch.setattr(check, "_start", lambda *args: None)
     resolved_here(monkeypatch, lambda atom_args: r.config)
     monkeypatch.setattr(reuse, "LAWS", tmp_path / "laws")
     (tmp_path / "laws").mkdir()
     return r
+
+
+#: Each config `check._resolved` resolved in this module, pickled, by its
+#: arguments, arch and this process's environment.
+RESOLVED = {}
+
+
+@pytest.fixture(scope="module")
+def v4_pro(tmp_path_factory):
+    """DeepSeek-V4-Pro's model directory, one for the module, so each 1P1D
+    case serves its sides at the same arguments."""
+    model = tmp_path_factory.mktemp("models") / "DeepSeek-V4-Pro"
+    model.mkdir()
+    shutil.copy(V4_PRO, model / "config.json")
+    return model
+
+
+@pytest.fixture
+def resolved_once(monkeypatch):
+    """Each instance's config resolved in the check's child once per module at
+    its arguments, arch and environment, as alike ones resolve alike."""
+    resolve = check._resolved
+
+    def once(args, arch):
+        env = sorted(
+            (k, v) for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"
+        )
+        at = (tuple(args), arch, tuple(env))
+        if at not in RESOLVED:
+            RESOLVED[at] = pickle.dumps(resolve(args, arch))
+        return pickle.loads(RESOLVED[at])
+
+    monkeypatch.setattr(check, "_resolved", once)
 
 
 def resolved_here(monkeypatch, resolve):
@@ -463,10 +502,8 @@ def test_readings_with_no_entry_or_measured_at_another_digest_are_measured(
     ids=["fp4-v41-without", "fp4-v41-with", "fp8-v41"],
 )
 def test_an_fp4_v41_entry_without_the_page_bound_reading_is_measured_as_check_finds_it(
-    tmp_path, searched, monkeypatch, index, reading, judged, state
+    tmp_path, searched, index, reading, judged, state
 ):
-    # Each start answers: a point the check would start is searchable.
-    monkeypatch.setattr("atom.compass.advice.check._start", lambda *args: None)
     vars(searched.config).update(index_cache_dtype=index, hf_config=V41)
     member = READINGS[1] | ({} if reading is None else {PAGE_BOUND: reading})
     publish_readings(tmp_path / "store", searched.config, readings=member)
@@ -595,12 +632,11 @@ def test_a_store_no_law_is_read_from_is_passed_over_for_the_shared_store(
     assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
 
 
-def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, at_head):
+def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(
+    tmp_path, monkeypatch, at_head, v4_pro, resolved_once
+):
     for name in PERFORMANCE_KEYS:
         monkeypatch.delenv(name, raising=False)
-    model = tmp_path / "DeepSeek-V4-Pro"
-    model.mkdir()
-    shutil.copy(V4_PRO, model / "config.json")
     cpu = read_json(PAIR["prefill"])["host"]["key"]["host_cpu"]
     monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
     common = {"basis": "a recipe", "deployment": "1p1d", "env": SHARED_ENV}
@@ -609,7 +645,7 @@ def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, a
     common["prefill"] = {"args": {"--enable-tbo": True}, "env": SIDES["prefill"][1]}
     common["decode"] = {"args": {"--cudagraph-capture-sizes": DECODE_SIZES}}
 
-    judged = advise(tmp_path, MACHINE, model=str(model), common=common)
+    judged = advise(tmp_path, MACHINE, model=str(v4_pro), common=common)
 
     for side, rungs in UNCOVERED.items():
         found = verdicts(judged, "law", side)
@@ -634,15 +670,12 @@ def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, a
     ids=["exported empty", "empty in the space", "set in the space"],
 )
 def test_a_1p1d_side_runs_under_the_aiter_log_level_deploy_sh_starts_it_with(
-    tmp_path, monkeypatch, at_head, exported, given, level
+    tmp_path, monkeypatch, at_head, v4_pro, resolved_once, exported, given, level
 ):
     for name in PERFORMANCE_KEYS:
         monkeypatch.delenv(name, raising=False)
     if exported is not None:
         monkeypatch.setenv("AITER_LOG_LEVEL", exported)
-    model = tmp_path / "DeepSeek-V4-Pro"
-    model.mkdir()
-    shutil.copy(V4_PRO, model / "config.json")
     cpu = read_json(PAIR["prefill"])["host"]["key"]["host_cpu"]
     monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
     common = {"basis": "a recipe", "deployment": "1p1d", "env": SHARED_ENV | given}
@@ -651,7 +684,7 @@ def test_a_1p1d_side_runs_under_the_aiter_log_level_deploy_sh_starts_it_with(
     common["prefill"] = {"args": {"--enable-tbo": True}, "env": SIDES["prefill"][1]}
     common["decode"] = {"args": {"--cudagraph-capture-sizes": DECODE_SIZES}}
 
-    judged = advise(tmp_path, MACHINE, model=str(model), common=common)
+    judged = advise(tmp_path, MACHINE, model=str(v4_pro), common=common)
 
     # The pair's laws are keyed WARNING: each side finds its own there, else
     # none at its key.
