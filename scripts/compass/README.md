@@ -1454,18 +1454,16 @@ each side under the EP8 cell's arguments and environment, with these differences
   directory holding every run's `plan.jsonl` lines of the side and one run's `run.json`.
 - **Runs.** As the DPA-TP8 cell's, with the EP8 cell's host laws,
   `laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-prefill.json.xz` and `-decode.json.xz`.
-- **Trees.** Every run the cell adds, EP8's and EP off's at c=64 and 256, runs at the run
-  tree: `c92c36110` with the commits that closed #3688, #3729 and #3657, the last pricing
-  a step again only at the leaves whose reads moved. The replay tree is the run tree
-  without #3657's commit
+- **Trees.** Every run the cell adds, EP8's at every concurrency and EP off's at c=64 and
+  256, runs at the run tree: `c92c36110` with the commits that closed #3688, #3729 and
+  #3657, the last pricing a step again only at the leaves whose reads moved. The replay
+  tree is the run tree without #3657's commit
   ([Ruling](https://github.com/jgong5/ATOM/issues/3409#issuecomment-6999401243)). A side's
   `steps/dp<r>.cost.jsonl` holds the terms each line of its `steps/dp<r>.jsonl` was priced
   at; a replay prices those lines again with the run's price list and graphs through the
   replay tree's `OpGraphBackend` and compares each term's name, seconds, method, validated
   flag and source. A line that differs voids the run, and its cell runs at the replay
-  tree. Take #3729's commit onto the run tree as it landed, over #3657's: git merges
-  #3657 cleanly onto the replay tree's port of #3729, into a `PriceList.price` that reads
-  names #3657 removed.
+  tree.
 - **Ranking.** EP8 is ordered against the DPA-TP8 cell only as both are simulated at one
   tree (the ranking gate of `atom/compass/design/08_validation_protocol.md`), the run tree.
   The DPA-TP8 cell's runs at c=1, 4 and 16, simulated at `c92c36110`, count as run there
