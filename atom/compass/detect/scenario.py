@@ -91,7 +91,9 @@ def expected_timeline(
     forward returns at the group's device end, as one that synchronizes its
     stream before it returns does. Without `defer`, an engine whose token
     processor reads each step's ids at once (`scheduler.defers_output`), an
-    output forward returns at its own device end, the group's, as it reads them.
+    output forward returns at its own device end, the group's, as it reads them,
+    and a dummy forward, which reads none, returns at its entry and marks no
+    output end, as the runner's `HostDeviceRecurrence` charges it.
 
     With `draft_s`, a speculative engine's: each forward's device work runs
     `draft_s` of draft after its target, and an output forward enters no
@@ -124,10 +126,10 @@ def expected_timeline(
                 host = max(host, output)
             targets[r] = max(last, host) + busy
             ends[r] = targets[r] + draft_s
-            if step["produces_output"] and not defer:
+            if _waits_for_output(step, defer) and not defer:
                 reads = True
             else:
-                back = max(host, output) if step["produces_output"] else host
+                back = max(host, output) if _waits_for_output(step, defer) else host
                 returns.add(back - now)
         end = max(ends.values())
         mark = max(targets.values()) if draft_s else end
@@ -137,7 +139,11 @@ def expected_timeline(
             returns = {end - now}
         for r in ranks:
             _, last, output = device[r]
-            device[r] = (last, end, mark if record[r][k]["produces_output"] else output)
+            device[r] = (
+                last,
+                end,
+                mark if _waits_for_output(record[r][k], defer) else output,
+            )
         start = now
         for t in sorted(returns):
             want.append((start, now + t))
@@ -437,6 +443,13 @@ def _outputs(sent, taken) -> list[str]:
         return []
     took = f"took {done} [DONE] and usage counts {tokens}"
     return [f"the traffic sent requests for {sorted(sent)} tokens and {took}"]
+
+
+def _waits_for_output(step: dict, defer: bool) -> bool:
+    """Whether the recorded `step` waits for output: one that produces it,
+    unless it is a dummy forward of an engine that does not defer its output,
+    which reads no token."""
+    return step["produces_output"] and (defer or not step.get("is_dummy_run"))
 
 
 def _defers_output(directory) -> bool:
