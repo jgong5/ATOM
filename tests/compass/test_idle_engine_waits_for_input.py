@@ -112,6 +112,9 @@ class Scheduler:
     def shutdown_kv_events(self):
         pass
 
+    def close_kv_connector(self):
+        pass
+
 
 def _engine(kv: bool = False, cls=EngineCore) -> EngineCore:
     engine = cls.__new__(cls)
@@ -120,9 +123,13 @@ def _engine(kv: bool = False, cls=EngineCore) -> EngineCore:
     engine.output_queue = queue.Queue()
     engine._has_pending_utility = engine._is_rl_weights_offloaded = False
     engine._weight_sync_fenced, engine._next_idle_kv_drain = False, 0.0
+    engine._generation_paused, engine._ingested_seqs = False, 0
+    engine._kv_progress_event = threading.Event()
     engine.kv_transfer_enabled = kv
     engine.runner_mgr = SimpleNamespace(
-        call_func_with_aggregation=lambda name: SimpleNamespace(name=name)
+        call_func_with_aggregation=lambda name: SimpleNamespace(
+            name=name, is_empty=lambda: True
+        )
     )
     engine.utility_handler = EngineUtilityHandler(
         engine.runner_mgr, engine.output_queue, scheduler=engine.scheduler

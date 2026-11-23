@@ -349,6 +349,7 @@ def test_the_engine_input_thread_takes_a_request_sent_by_the_frontend(
     clock.name_endpoints(0, *addrs, "")
     engine = EngineCore.__new__(EngineCore)
     engine.label, engine.input_queue = "engine", queue.Queue()
+    engine._kv_progress_event = threading.Event()
     thread = threading.Thread(
         target=engine.process_input_sockets, args=addrs, daemon=True
     )
