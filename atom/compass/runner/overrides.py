@@ -511,7 +511,8 @@ class HostDeviceRecurrence:
         at `end` and its target's at `target_end`: `W_post` after its launch
         and the wait that follows it, an output forward's for the previous
         output forward's target on a single stage that defers or its own on the last or one that does not, or
-        under `sync` for `end`; with `own_draft`, one waiting for its own target leaves no earlier than `end`."""
+        under `sync` for `end`; with `own_draft`, one waiting for its own target leaves no earlier than `end`.
+        """
         _, launch_end, output, post = self._held
         released = launch_end
         if self.sync:
@@ -1075,8 +1076,8 @@ def publish_planned_transfer(runner: Any) -> None:
     `run.runner` gives TP rank 0 of a prefill-decode deployment and of one that
     offloads to an lmcache server: its connector prices a transfer at them, and
     LP lmcache sizes a chunk and an image. A prefill-decode deployment is
-    refused for a pipeline stage of Kimi's hybrid, whose KDA state regions
-    ATOM's builder refuses to publish there
+    refused for a pipeline stage of Kimi's hybrid with a sparse MLA indexer,
+    whose regions ATOM's builder refuses to publish there
     (`_refuse_kda_regions_across_stages`), and for an MLA builder whose sparse
     indexer scores in FP4, whose regions no P/D backend parses
     (`_refuse_fp4_indexer_regions`)."""
@@ -1109,19 +1110,21 @@ def _saved_image_bytes(runner: Any) -> int:
 
 
 def _refuse_kda_regions_across_stages(runner: Any) -> None:
-    """Refuse a transfer from a pipeline stage of Kimi's hybrid with the reason
-    ATOM's builder gives as it refuses to publish the KDA state regions there:
-    this runner allocates no cache, so the builder is never asked. DeepSeek-V4's
+    """Refuse a transfer from a pipeline stage of Kimi's hybrid with a sparse
+    MLA indexer with the reason ATOM's builder gives as it refuses to publish
+    the regions there: this runner allocates no cache, so the builder is never
+    asked. A stage of one without an indexer places its MLA rows and KDA slots
+    by layer (`_pp_consumer_region_indices`) and is not refused. DeepSeek-V4's
     builder refuses a stage too, which ATOM's pool plan has refused already."""
     from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
 
     pp = runner.config.pipeline_parallel_size
-    if pp > 1 and isinstance(runner.attn_metadata_builder, _KimiMLAGDNCommon):
+    builder = runner.attn_metadata_builder
+    if pp > 1 and isinstance(builder, _KimiMLAGDNCommon) and runner.has_mla_indexer:
         raise RunnerRefusal(
             "ATOM's `_KimiMLAGDNCommon._with_kda_disagg_regions` refuses a "
-            f"prefill-decode transfer at pipeline_parallel_size {pp}: the KDA "
-            "state regions are keyed by KDA layer index, which "
-            "`_consumer_region_map` cannot align across stages"
+            f"prefill-decode transfer at pipeline_parallel_size {pp}: a sparse "
+            "MLA indexer's regions have no placement across stages"
         )
 
 
@@ -1359,7 +1362,10 @@ class PipelineFrames:
         sparse = meta(n * self._pp_index_topk, dtype=torch.int32) if on else None
         model = getattr(self, "model", None)
         carried = getattr(model, "make_empty_intermediate_tensors", None)
-        if carried is not None and "block_residual" in carried(1, dtype, "meta").tensors:
+        if (
+            carried is not None
+            and "block_residual" in carried(1, dtype, "meta").tensors
+        ):
             raise RunnerRefusal(
                 "this model's pipeline stages send an AttnRes block window "
                 "(block_residual), whose size this runner does not model"
