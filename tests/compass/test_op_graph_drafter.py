@@ -285,6 +285,7 @@ def dp_view(width, rung, dp, counts=None):
     `rung`, every rank of `dp` alike or at its tokens in `counts`, as
     `batch_view` builds it from the step's mode."""
     batch = SimpleNamespace(
+        total_seqs_num=width,
         total_seqs_num_prefill=0,
         num_scheduled_tokens=[2] * width,
         context_lens=[90] * width,
@@ -458,6 +459,7 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
     assert attended[0] == attended[1]
 
     batch = SimpleNamespace(
+        total_seqs_num=1,
         total_seqs_num_prefill=1,
         num_scheduled_tokens=[64],
         context_lens=[64],
@@ -541,6 +543,7 @@ def verify_view(width, rung):
     """One rank's view of a decode of `width` rows, each verifying one draft,
     replaying `rung`, as `batch_view` builds it from the step's mode."""
     batch = SimpleNamespace(
+        total_seqs_num=width,
         total_seqs_num_prefill=0,
         num_scheduled_tokens=[2] * width,
         context_lens=[90] * width,
