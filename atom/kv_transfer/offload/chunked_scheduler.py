@@ -464,7 +464,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if not self._lookup_in_flight(seq):
             return False
         first = self._lookup_defer_since.get(str(seq.id))
-        return first is None or time.monotonic() - first <= envs.OFFLOAD_LOOKUP_DEFER_S
+        now = clock.now(time.monotonic)
+        return first is None or now - first <= envs.OFFLOAD_LOOKUP_DEFER_S
 
     def lookup_pending(self, seq) -> bool:
         """True while admission should pass over `seq`: its lookup is in flight.

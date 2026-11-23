@@ -187,11 +187,12 @@ class TestASubstitutedReadTakesTheLpClock:
 
     def test_the_responses_endpoint_created_at(self, lp_clock, monkeypatch):
         async def nonstream(generator, raw_request, request_id):
-            return {"text": "hi"}
+            return {"text": "hi", "num_tokens_input": 1, "num_tokens_output": 1}
 
         for name, value in {
             "engine": SimpleNamespace(
-                config=SimpleNamespace(generation_config=None, max_model_len=4096)
+                config=SimpleNamespace(generation_config=None, max_model_len=4096),
+                io_processor=SimpleNamespace(encode_prompt=lambda prompt: [1]),
             ),
             "tokenizer": SimpleNamespace(encode=lambda text: [1]),
             "apply_chat_template": lambda *args, **kwargs: "prompt",

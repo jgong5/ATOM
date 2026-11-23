@@ -204,6 +204,11 @@ _WORKER_RPC = (
     "tensor-parallel group; the simulated runner answers within real "
     "milliseconds, so the bound never fires"
 )
+_STARTUP = "waits for the deployment to come up, before the simulated window"
+_STATE_TIER = (
+    "the state-cache offload tier's verdict and touch ages; a simulated run "
+    "refuses an lmcache_offload layout that keeps a state tier"
+)
 _CONTROL_DEADLINE = (
     "the reply deadline of an out-of-band control command, which produces no "
     "simulated event; it stays real on purpose, because the LP clock moves only "
@@ -251,6 +256,35 @@ _KEPT_REAL = (
      "K9", _LOG_ONLY, 2),
     ("atom/model_engine/engine_utility.py", "_remaining_timeout", "time.time",
      "K8", _CONTROL_DEADLINE, 1),
+    ("atom/model_engine/engine_utility.py", "_prepare_engine", "time.monotonic",
+     "K8", _CONTROL_DEADLINE, 1),
+    ("atom/model_engine/engine_utility.py", "_handle_pause_generation", "time.monotonic",
+     "K8", _CONTROL_DEADLINE, 1),
+    ("atom/model_engine/engine_core.py", "prepare_kv_change", "time.monotonic",
+     "K8", _CONTROL_DEADLINE, 2),
+    *(
+        ("atom/model_engine/early_load.py", scope, "time.monotonic", "K9", _LOG_ONLY, 1)
+        for scope in ("__init__", "note_submitted", "note_prefill", "maybe_log")
+    ),
+    *(
+        ("atom/model_engine/state_offload.py", scope, "time.monotonic", "K9", _STATE_TIER, 1)
+        for scope in ("_mark_verified", "take_touches", "hold_admission")
+    ),
+    ("atom/model_engine/tp_multinode.py", "release_remote_readers", "time.monotonic",
+     "K9", _STARTUP, 2),
+    ("atom/entrypoints/openai/frontend_workers.py", "wait_for_workers", "time.monotonic",
+     "K9", _STARTUP, 2),
+    ("atom/entrypoints/openai/frontend_workers.py", "longest_silence", "time.monotonic",
+     "K9", "the age of a front-end worker's last GC report, read by its health "
+     "metric only; no simulated result reads it", 1),
+    *(
+        ("atom/entrypoints/openai/images.py", scope, "time.monotonic", "K8",
+         "the deadline of fetching a prompt's image over the network, real I/O "
+         "that must time out in real seconds", 1)
+        for scope in ("_download", "__init__", "remaining")
+    ),
+    ("atom/kv_transfer/offload/mp/transfer_thread.py", "fence", "time.monotonic", "K9",
+     "the vLLM plugin's fence on reused blocks; ATOM's engine never calls it", 2),
     ("atom/model_engine/model_runner.py", "_build_and_load_model", "time.perf_counter",
      "K9", _REPLACED_RUNNER, 2),
     ("atom/model_engine/model_runner.py", "_on_trace_ready", "time.time",
@@ -340,6 +374,8 @@ _KEPT_REAL = (
                 ("_report_held_failures", "monotonic", 1), ("_request_write", "time", 1),
                 ("_service_write_requests", "monotonic", 1),
                 ("_service_write_requests", "time", 1), ("start_load_kv", "monotonic", 1))),
+            ("offload/mooncake_store/async_lookup.py", (
+                ("_warn_lookup_failure", "monotonic", 1), ("_query", "monotonic", 1))),
             ("offload/mooncake_store/client.py", (
                 ("__init__", "monotonic", 1), ("__init__", "time", 1),
                 ("seconds", "monotonic", 1), ("seconds", "time", 1))),
@@ -371,7 +407,23 @@ _KEPT_REAL = (
     ("atom/model_loader/weight_iterator.py", "_run", "time.perf_counter", "K9", _LOAD, 2),
     ("atom/model_loader/weight_utils.py", "download_weights_from_hf", "time.perf_counter",
      "K9", _LOAD, 2),
-    ("atom/spec_decode/drafter.py", "warmup_draft_graphs", "time.time", "K9", _LOAD, 2),
+    ("atom/spec_decode/drafter.py", "_warmup_draft_graphs", "time.time", "K9", _LOAD, 2),
+    ("atom/model_ops/engram/host_memory.py", "_flock_logging_wait", "time.monotonic",
+     "K9", _LOAD, 2),
+    ("atom/model_ops/engram/host_memory.py", "_flock_logging_wait", "time.time",
+     "K9", _LOAD, 2),
+    ("atom/models/deepseek_v41/mono/hi_contract.py", "main", "time.time", "K9",
+     "a check of the mono runner's programs run by hand, outside any run", 2),
+    ("atom/models/deepseek_v41/mono/hi_runner.py", "__init__", "time.time",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/models/deepseek_v41/mono/hi_runner.py", "_check_host_shard", "time.time",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/models/deepseek_v41/mono/gfx1250/debug.py", "mark", "time.perf_counter",
+     "K9", _REPLACED_RUNNER, 1),
+    ("atom/models/deepseek_v41/mono/gfx1250/inputs.py", "_hm", "time.perf_counter",
+     "K9", _REPLACED_RUNNER, 1),
+    ("atom/models/deepseek_v41/mono/gfx1250/runner.py", "__init__", "time.perf_counter",
+     "K9", _REPLACED_RUNNER, 2),
     ("atom/model_ops/eplb.py", "_execute_runtime_rebalance", "time.perf_counter",
      "K9", "moves expert weights inside the real forward, which a simulated run replaces", 4),
     ("atom/observability/tracing.py", "now", "time.perf_counter_ns", "K9", _TRACE, 1),
