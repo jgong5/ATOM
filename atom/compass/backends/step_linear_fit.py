@@ -2639,7 +2639,7 @@ def fill_rungs(law: dict, ladder) -> dict:
     """Give each rung of `ladder`, the captured decode widths, that `law` (and
     its draft law) holds no decode vector for a declared one, and return the
     rungs filled, each to its rule. No record reaching a rung leaves it with no
-    vector, and a run's step at it would be refused (D58); a filled vector
+    vector, and a run's step at it would be refused for want of one; a filled vector
     prices it instead, `declared` and never validated, and outside its hull.
 
     The rule: between two fitted rungs, coefficient by coefficient, a

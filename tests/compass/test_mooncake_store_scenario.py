@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Two prefill instances at DP2 share one LP `mooncake_store` under
-`share_cache`, one loading the other's saved prefix (#3806, D6.2's scenario).
+`share_cache`, one loading the other's saved prefix, and an eviction round
+drops a prompt past its lease (#3806).
 
 DeepSeek-V4.1-Flash runs as two prefill instances of ROCm/ATOM's 6P16D C1228
 share-cache recipe's form (`-tp 2 --enable-dp-attention`, `--dp-load-balance

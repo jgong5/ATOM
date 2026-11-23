@@ -534,7 +534,7 @@ EXPECTED_HOST_RESOLUTIONS = {
     "atom/model_engine/model_runner.py:680 in _stage_input_ids": 1,
     "atom/model_engine/model_runner.py:2865 in prepare_sample": 1,
     "atom/model_ops/sampler.py:48 in _apply_greedy_tokens": 1,
-    "atom/utils/forward_context.py:370 in decide": 1,
+    "atom/utils/forward_context.py:371 in decide": 1,
     H2D_COUNT_CHECK: WIDTH_COUNTED_COPIES,
 }
 
