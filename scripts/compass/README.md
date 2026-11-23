@@ -215,38 +215,37 @@ do not claim green.
 ## The CPU gate container
 
 `gate_cpu.sh` and the two list regenerators run in a container on
-`rocm/atom-dev:vllm-v0.31.0-nightly_20261103`, the image of upstream `58ba50180`,
-with no GPU device and the worktree root's parent mounted at its own path:
+`rocm/atom-dev:nightly_202611151511`, built from upstream `273c78de5` with aiter
+`95d211284`, with no GPU device and the worktree root's parent mounted at its
+own path:
 
 ```
 docker run -d --init --name <user>_gate --network host -v <parent>:<parent> \
-  rocm/atom-dev:vllm-v0.31.0-nightly_20261103 sleep infinity
+  rocm/atom-dev:nightly_202611151511 sleep infinity
 docker exec <user>_gate bash -c 'cd /app/ATOM/atom/mesh && cargo fetch --locked'
+docker exec <user>_gate bash -c 'tar -C <tree> --exclude=atom/mesh/target -cf - atom/mesh |
+  tar -x -C /tmp && cd /tmp/atom/mesh && cp /app/ATOM/atom/mesh/Cargo.lock . &&
+  cargo fetch && cp Cargo.lock /app/ATOM/atom/mesh/Cargo.lock'
 docker exec <user>_gate git config --global --add safe.directory '*'
-docker exec <user>_gate bash -c 'cd /opt/venv/lib/python3.12/site-packages/mooncake &&
-  mv engine.cpython-312-x86_64-linux-gnu.so engine.cpython-312-x86_64-linux-gnu.so.not-in-record'
 docker exec <user>_gate python3 -m pip install --no-deps -r <tree>/scripts/compass/cpu_gate_aiperf_deps.txt
 ```
 
 "atomesh's cargo tests run offline" below says why `cargo fetch` runs once. The
-`safe.directory` line lets git, run as the container's root, read a tree another
-user owns; without it `regen_gpu_gate_triggers.sh` records the tree's commit as
-`UNKNOWN`. Run the gate with `COMPASS_AGENTX_HARNESS` naming the wheel the next
-section builds.
+image built atomesh from `273c78de5`'s manifest, and its lockfile lacks what the
+tree's `atom/mesh/Cargo.toml` asks for since (`llm-tokenizer` 1.4.2, `protox`,
+`zmq`), so the gate's cargo probe fails offline and a diff touching `atom/mesh`
+exits 96. The third line resolves the tree's manifest starting from the image's
+lockfile, which adds only what it lacks, and puts the result where the gates
+read their lockfile. The `safe.directory` line lets git, run as the container's
+root, read a tree another user owns; without it `regen_gpu_gate_triggers.sh`
+records the tree's commit as `UNKNOWN`. Run the gate with
+`COMPASS_AGENTX_HARNESS` naming the wheel the next section builds.
 
-The last two lines repair the image. Its `mooncake/engine.cpython-312-x86_64-linux-gnu.so`
-is in no installed package's `RECORD`; Python loads it before the wheel's own
-`mooncake/engine.so`, and it needs an `asio` symbol the `libasio.so` beside it
-does not export, so `import mooncake.engine` fails on
-`undefined symbol: ...reactive_socket_service_base15start_accept_op...`.
-`lmcache.integration.atom` imports it, so `tests/compass/test_lmcache_server.py`
-fails at collection, and neither a Mooncake nor an `lmcache_mp` server starts in
-that image until the file is moved aside. Nightly 20261108's fails the same way;
-nightly 20261111's imports.
-The image also no longer installs `aiperf` in `/opt/venv` (agentx-harness has
-its own `/opt/agentx-venv`, at a version `compass_harness` does not pin), so the
+The image installs no `aiperf` in `/opt/venv` (agentx-harness has its own
+`/opt/agentx-venv`, at a version `compass_harness` does not pin), so the
 wheel's dependencies come from `cpu_gate_aiperf_deps.txt`, installed without
-theirs so that no package the image ships changes version.
+theirs so that no package the image ships changes version. Its mooncake
+extension imports; nightly 20261103's did not until moved aside.
 
 On a host with GPUs, also mount an empty directory over `/sys/class/kfd`
 (`-v <empty dir>:/sys/class/kfd:ro`). Without `/dev/kfd` the container has no
