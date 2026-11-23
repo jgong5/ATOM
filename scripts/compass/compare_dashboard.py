@@ -1143,7 +1143,8 @@ function readHash() {
   if (STATS.includes(h.get("stat"))) st.stat = h.get("stat");
   if (["panel", "request"].includes(h.get("m"))) st.mode = h.get("m");
   if (h.get("y") in YMODES) st.y = h.get("y");
-  st.sim = SIMS.includes(h.get("sim")) ? h.get("sim") : SIMS[0];
+  // "" is each cell's first simulated run: experiments name their runs apart.
+  st.sim = SIMS.includes(h.get("sim")) ? h.get("sim") : "";
   st.ov = h.get("ov");
 }
 function writeHash() {
@@ -1526,7 +1527,7 @@ function ovMetrics() {
 // The real and simulated values of metric `m` in `cell` for the selected
 // simulated run, and the error; null when the cell has no such run.
 function ovPoint(cell, m) {
-  const run = cell.runs.slice(1).find((r) => r.label === st.sim);
+  const run = st.sim ? cell.runs.slice(1).find((r) => r.label === st.sim) : cell.runs[1];
   if (!run) return null;
   if (m.mode === "panel") {
     const pid = m.pids.find((x) => hasPanel(cell, x));
@@ -1549,8 +1550,9 @@ function drawOverview() {
   if (!metrics.some((m) => m.id === st.ov)) st.ov = (metrics.find((m) => m.key === "TTFT p50") || metrics[0]).id;
   const m = metrics.find((x) => x.id === st.ov);
   $("ovMetric").innerHTML = metrics.map((x) => '<option value="' + esc(x.id) + '"' + (x.id === st.ov ? " selected" : "") + ">" + esc(x.label) + "</option>").join("");
-  if (SIMS.length > 1) seg($("ovSim"), SIMS.map((x) => [x, x]), st.sim, (x) => { st.sim = x; drawAll(); });
-  $("ovCaption").textContent = "Each cell: " + m.label + " of the simulated run " + st.sim + " against the real run of that model, parallel configuration and concurrency" +
+  if (SIMS.length > 1) seg($("ovSim"), [["", "first of each"]].concat(SIMS.map((x) => [x, x])), st.sim, (x) => { st.sim = x; drawAll(); });
+  const simName = st.sim || "each cell's first simulated run";
+  $("ovCaption").textContent = "Each cell: " + m.label + " of " + (st.sim ? "the simulated run " + st.sim : simName) + " against the real run of that model, parallel configuration and concurrency" +
     (m.mode === "panel" ? " (the panel matrix's value: a mean of one-minute values over the minutes both runs have)." : " (one_real.py over each run's graded requests).") +
     " Below the error: real → simulated.";
   const cur = groupOf(st.ci);
@@ -1571,7 +1573,7 @@ function drawOverview() {
   $("heat").innerHTML = h + "</tbody>";
   $("heat").querySelectorAll("td[data-ci]").forEach((td) => td.addEventListener("click", () => { st.ci = +td.dataset.ci; drawAll(); }));
   $("ovValTitle").textContent = m.label + " against concurrency · " + groupName(cur);
-  $("ovErrTitle").textContent = "Error against concurrency · " + st.sim + " · every configuration";
+  $("ovErrTitle").textContent = "Error against concurrency · " + simName + " · every configuration";
   if (typeof Chart === "undefined") return;
   const muted = css("--muted"), grid = css("--grid"), axis = css("--axis");
   const xScale = { type: "category", labels: CS.map(String), ticks: { color: muted, font: { size: 11 } }, grid: { color: grid }, border: { color: axis },
