@@ -734,7 +734,7 @@ def test_ragged_under_grid_also_plans_the_cells_of_the_views_it_composes(
     monkeypatch.setattr(
         measure.ragged,
         "compose",
-        lambda seed, *_: [{**seed, "rows": [[1, 1000, True], *seed["rows"][1:]]}],
+        lambda seed, *_, **__: [{**seed, "rows": [[1, 1000, True], *seed["rows"][1:]]}],
     )
     rec = str(run.record)
     definition = run.tmp / "definition.json"

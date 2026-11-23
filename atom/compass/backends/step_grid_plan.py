@@ -199,9 +199,7 @@ def _lookahead(drafts: int, *, block_drafter: bool = False) -> int:
     writes under a drafter of draft width `drafts`, a block drafter's (DSpark's)
     one more than a serial one's, which ATOM's scheduler allocates with the row
     (`block_manager.draft_kv_lookahead`)."""
-    from atom.model_engine.block_manager import draft_kv_lookahead
-
-    return draft_kv_lookahead(drafts, block_drafter=block_drafter)
+    return drafts if block_drafter else max(0, drafts - 1)
 
 
 def _extra(target: dict) -> int:
