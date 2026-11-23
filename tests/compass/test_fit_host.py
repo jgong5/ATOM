@@ -373,6 +373,45 @@ def test_the_intake_hull_spans_bodies_past_the_lone_requests_both_ways(tmp_path)
     assert term["bytes"] == [9000, 600_000] and report["samples"] == 8
 
 
+def test_a_server_that_renders_no_template_fits_its_intake_on_its_body_reads(
+    tmp_path,
+):
+    # A prefill-decode deployment's decode side renders no chat template: each
+    # request reads its body, runs its pool job and is sent. The same requests
+    # stamped so, each body read ending where its template began, fit the same
+    # term, its bursts found by their body reads.
+    rendered, bare = tmp_path / "rendered", tmp_path / "bare"
+    for d in (rendered, bare):
+        (d / "steps").mkdir(parents=True)
+        stamped(d, burst=(40_000, 60_000, 50_000, 45_000))
+    stamps, rows = bare / "steps" / compass_run.INTAKE_RECORD, []
+    for row in map(str.split, stamps.read_text().splitlines()):
+        if row[2] != "tmpl":
+            rows.append(row)
+            continue
+        # The body read stamped just before the template ends where it began.
+        body = rows[-1]
+        assert body[2] == "body"
+        body[0], body[5] = row[3], row[6]
+    stamps.write_text("".join(" ".join(row) + "\n" for row in rows))
+
+    got = [
+        fit_intake([d / "steps" / compass_run.INTAKE_RECORD]) for d in (rendered, bare)
+    ]
+    assert got[1] == got[0]
+    term, report = got[1]
+    assert term == pytest.approx(
+        {
+            "fixed_s": FIXED,
+            "per_byte_s": PER_BYTE,
+            "idle_s": IDLE,
+            "bytes": [9000, 400_000],
+        },
+        rel=1e-6,
+    )
+    assert report["samples"] == 8 and report["burst"]["requests"] == 4
+
+
 @pytest.mark.parametrize(
     "lone, burst, encodes, unfitted",
     [
