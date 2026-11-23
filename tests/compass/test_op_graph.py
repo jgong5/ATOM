@@ -674,6 +674,9 @@ def ahead(tmp_path_factory):
     the first test that reads one: the 27B's captures by their shapes
     (`capture`) and each step of `POOLS` alone (`_alone`), each a future of
     what it returns. The module ends once every one has."""
+    # The session's base directory is made at its first use, and threads that
+    # each first use it make one apiece: make it here, before they start.
+    tmp_path_factory.getbasetemp()
     with ThreadPoolExecutor(2 + len(POOLS)) as each:
         started = {
             shapes: each.submit(capture, 1, shapes, tmp_path_factory)
