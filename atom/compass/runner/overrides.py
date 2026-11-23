@@ -2039,7 +2039,10 @@ def _group_step_seconds(
     group_s, targets, pulls = charge_s, None, None
     out_s = getattr(host, "out_s", None)
     if group is not None:
-        waits = host is None and batch.produces_output() and not batch.is_dummy_run
+        # A dummy, flagged or (since ROCm/ATOM main b7b5ec3f2) empty, waits on
+        # no output of its own (`projection.is_dummy`).
+        dummy = batch.is_dummy_run or not batch.total_seqs_num
+        waits = host is None and batch.produces_output() and not dummy
         out = math.nan if out_s is None else out_s
         mine = torch.tensor([charge_s, waits, out], dtype=torch.float64)
         rows = [torch.empty_like(mine) for _ in range(group.size())]

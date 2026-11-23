@@ -224,7 +224,7 @@ class StepRecord:
         without one the mode the view was built from and the view, so a caller
         pricing the step need not run the collective or build the view again.
         """
-        from atom.compass.runner.projection import batch_view, forward_mode
+        from atom.compass.runner.projection import batch_view, forward_mode, is_dummy
 
         # The view is settled after `forward`, from the fields it was handed;
         # with no forward to rewrite them, the batch is its own.
@@ -234,7 +234,7 @@ class StepRecord:
             before.num_scheduled_tokens = np.copy(batch.num_scheduled_tokens)
             before.context_lens = np.copy(batch.context_lens)
         rows, named = [], []
-        if not batch.is_dummy_run:
+        if not is_dummy(batch):
             ends = np.cumsum(batch.num_scheduled_tokens)
             for i, req_id in enumerate(batch.req_ids):
                 num = int(batch.num_scheduled_tokens[i])
@@ -290,7 +290,7 @@ class StepRecord:
         line = {
             "step": self.step,
             "dp_rank": self.dp_rank,
-            "is_dummy_run": bool(batch.is_dummy_run),
+            "is_dummy_run": is_dummy(batch),
             "produces_output": bool(batch.produces_output()),
             "batch": tuple(rows),
             "named": tuple(named),
