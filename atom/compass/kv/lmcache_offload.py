@@ -61,11 +61,15 @@ import heapq
 import itertools
 import logging
 import math
+from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 
 #: The run-file key of the connector's entry.
 ENTRY = "lmcache_offload"
+#: The producer fence a save is handed (`wait_save_fence`): one whose writes
+#: have run, as a forward's have by the save's priced end.
+_RAN = SimpleNamespace(synchronize=lambda: None)
 #: The entry's priced terms, each ``[fixed, per chunk]`` seconds.
 TERMS = ("lookup_s", "store_s", "load_s")
 #: A tier's counts, each reported from zero.
@@ -420,7 +424,9 @@ class OffloadShell:
             self._inner = LMCacheOffloadConnectorScheduler(config)
         finally:
             LookupClientFactory.create_lookup_client = factory
-        if not isinstance(self._inner._impl._lookup_client, Lookup):
+        built = self._inner._impl._lookup_client
+        # ATOM binds a client of LMCache's behind its adapter (`as_lookup_client`).
+        if not isinstance(getattr(built, "client", built), Lookup):
             why = f"raised {raised[0]!r}" if raised else "did not build it"
             raise RuntimeError(  # noqa: TRY004 - a refusal, not a type error
                 "lmcache_offload's scheduler half has no simulated lookup client "
@@ -494,8 +500,10 @@ class OffloadShell:
         while self._due and self._due[0][0] <= now:
             _, _, k, kind, req = heapq.heappop(self._due)
             rank = self._ranks[k]
-            run = rank._do_load_req if kind == "load" else rank._do_save_req
-            rank._guard(kind, run, req)
+            if kind == "load":
+                rank._guard(kind, rank._do_load_req, req)
+            else:  # at its priced end the forward that wrote its KV has run
+                rank._guard(kind, rank._do_save_req, req, producer_event=_RAN)
 
     def build_connector_meta(self):
         """ATOM's metadata, each rank's share of it queued as its worker takes
