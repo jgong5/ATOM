@@ -210,17 +210,20 @@ def test_a_final_chunk_under_the_last_forwards_rows_is_planned_where_atom_runs_i
     assert covered([tail], {0: [line]}) == ([tail], [])
 
 
+@pytest.mark.parametrize("budget", [1024, 1000])
 @pytest.mark.parametrize("dcp", [1, 2])
 def test_a_prefix_row_is_planned_where_atom_starts_it_at_the_hit_the_sweep_sends(
-    tmp_path, dcp
+    tmp_path, dcp, budget
 ):
-    # DeepSeek-V4.1's 128-token blocks, so at DCP 1 a prefix's hits are the
-    # chunk cuts and its designs the chunk rows unmoved; then its 128-row
-    # minimum and its encoder SWA bounded replay, a `replay` state transfer.
+    # DeepSeek-V4.1's 128-token blocks, so at DCP 1 on a budget of whole
+    # blocks a prefix's hits are the chunk cuts and its designs the chunk rows
+    # unmoved; a budget off the blocks moves ATOM's hits below its contexts.
+    # Then its 128-row minimum and its encoder SWA bounded replay, a `replay`
+    # state transfer.
     engine = _engine(
         data_parallel_size=1,
         kv_cache_block_size=128,
-        max_num_batched_tokens=1024,
+        max_num_batched_tokens=budget,
         **({"decode_context_parallel_size": dcp} if dcp > 1 else {}),
     )
     designed = plan(_write(tmp_path, engine), _workload(3000))
@@ -245,18 +248,20 @@ def test_a_prefix_row_is_planned_where_atom_starts_it_at_the_hit_the_sweep_sends
     # block a design's context holds, and within the budget.
     prefix = [p.rows[0] for p in points if p.cached == ("prefix",)]
     assert all(ran(c - hit(v41, (q, c)), hit(v41, (q, c))) == (q, c) for q, c in prefix)
-    hits = {hit(v41, r) for r in prefix}
-    assert hits == {128 * dcp, 256, 512, 1024, 1920 // hbs * hbs, 2048}
-    assert len(prefix) > 100 and max(q for q, _ in prefix) <= 1024
+    # The contexts: from a hash block doubling, the budget doubling, and a
+    # budget below the longest prompt.
+    contexts = (128 * dcp, 256, 512, budget, 2 * budget, 3000 - budget)
+    assert {hit(v41, r) for r in prefix} == {c // hbs * hbs for c in contexts}
+    assert len(prefix) > 100 and max(q for q, _ in prefix) <= budget
     assert hit(engine, (5, 640)) == 635
-    if dcp == 1:
+    if dcp == 1 and budget == 1024:
         # Each design as ATOM runs it, once, where no chunk point runs it:
         # query 128 at hit 512 as [256, 640], query 1 as the final chunk's
         # own row, [129, 513].
         chunks = {p.rows for p in points if p.cached == ("chunk",)}
         designs = [p.rows[0] for p in designed if p.cached == ("chunk",)]
         want = dict.fromkeys(ran(q, c - q) for q, c in designs)
-        assert prefix == [r for r in want if (r,) not in chunks and r[0] <= 1024]
+        assert prefix == [r for r in want if (r,) not in chunks and r[0] <= budget]
         assert (256, 640) in prefix and ((129, 513),) in chunks
     # A line of the row ATOM runs covers a moved point.
     moved = next(p for p in points if p.cached == ("prefix",))
