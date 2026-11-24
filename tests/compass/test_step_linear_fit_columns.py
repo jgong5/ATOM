@@ -314,6 +314,42 @@ def test_row_padding_is_fitted_when_asked_and_off_by_default(tmp_path):
     assert json.dumps(_fit(paths, **unset)) == json.dumps(off)
 
 
+def _vif(x: np.ndarray) -> np.ndarray:
+    """Each column's variance inflation factor over the others and an intercept."""
+    out = []
+    for j in range(x.shape[1]):
+        others = np.column_stack([np.ones(len(x)), np.delete(x, j, axis=1)])
+        fitted = others @ np.linalg.lstsq(others, x[:, j], rcond=None)[0]
+        residual = ((x[:, j] - fitted) ** 2).sum()
+        out.append(((x[:, j] - x[:, j].mean()) ** 2).sum() / residual)
+    return np.array(out)
+
+
+def test_the_fit_reports_an_opt_in_column_s_variance_inflation(tmp_path):
+    """Over the row each step was fitted on, its slowest rank's: the column's
+    variance over its residual's on the other columns and an intercept. A
+    vector carrying no such column states none."""
+    truth = {k: DECODE[k] for k in ("step", "context", "graph_padding", "row_padding")}
+    groups = _decode_groups(0, 200, truth)
+    paths = _decode_records(tmp_path / "run", groups)
+    vector = _fit(paths, row_padding=True)["decode"][str(RUNG)]
+    assert vector["fit"]["samples"] == len(groups)
+    slowest = [views[i % DP] for i, (views, _) in enumerate(groups)]
+    x = np.array(
+        [
+            (
+                sum(r.context_tokens for r in v.decode),
+                v.graph_padding,
+                row_padding(v.decode),
+            )
+            for v in slowest
+        ],
+        dtype=np.float64,
+    )
+    assert vector["fit"]["vif"] == pytest.approx({"row_padding": _vif(x)[2]}, rel=1e-9)
+    assert "vif" not in _fit(paths)["decode"][str(RUNG)]["fit"]
+
+
 def test_insample_adopts_a_moe_column_where_held_out_records_cannot_choose(tmp_path):
     """One run whose ranks are all busy: one group composition, no record or
     composition to hold out, so the held-out rule adopts none; in-sample
@@ -449,6 +485,7 @@ def test_the_gather_columns_are_fitted_and_the_vector_states_width_and_spread(tm
     vector = law["prefill"]
     assert vector["coefficients"] == pytest.approx(PREFILL, rel=1e-5)
     assert vector["ranks"] == DP and vector["min_spread"] == 0.2
+    assert set(vector["fit"]["vif"]) == {"gather_rows", "moe_imbalance"}
     backend = StepLinearBackend(StepLinearLaw(law), DP)
     for ranks, moe, peak, seconds in groups[:30]:
         views = [
@@ -539,6 +576,7 @@ def test_a_draft_law_takes_peer_tokens_from_its_own_switch_alone(tmp_path):
     options = {"form": "base", "dp": DP, "row_padding": True}
     draft = fit(samples, {**options, "draft_peer_tokens": (RUNG,)}, draft=True)[0]
     assert draft["decode"][str(RUNG)]["coefficients"] == pytest.approx(truth, rel=1e-5)
+    assert set(draft["decode"][str(RUNG)]["fit"]["vif"]) == {"peer_tokens"}
     target = fit(samples, {**options, "peer_tokens": (RUNG,)}, draft=True)[0]
     assert list(target["decode"][str(RUNG)]["coefficients"]) == list(truth)[:3]
     every = fit(samples, {**options, "draft_peer_tokens": "all"}, draft=True)[0]

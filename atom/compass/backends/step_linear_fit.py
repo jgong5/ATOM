@@ -233,7 +233,9 @@ adopted `moe_experts` column its median step holds at `SATURATED` of the
 experts (`_peer_rung`, `PEER_TOKENS_ENV`); `draft_peer_tokens` adds it to the
 draft law's decode rungs above `dp` 1, every one as ``all``
 (`DRAFT_PEER_TOKENS_ENV`): a draft's MoE runs on its group's rows too. The draft
-law takes none of the others.
+law takes none of the others. A vector carrying one of these columns states,
+under `fit.vif`, each one's variance inflation factor over the rows it was
+fitted on (`_vif`), how far the other columns already hold it.
 
 Outside `shared`, a decode rung may adopt a `rowmod(k)` column (`StepLinearLaw`),
 read from its rows in scheduled order, by the rule `_rowmod` states; the
@@ -414,6 +416,8 @@ DRAFT_PEER_TOKENS_ENV = "COMPASS_FIT_DRAFT_PEER_TOKENS"
 #: `moe_experts` count is saturated: past it the column barely moves with the
 #: group's tokens.
 SATURATED = 0.9
+#: The opt-in columns whose variance inflation factor a vector states (`_vif`).
+OPT_IN = ("row_padding", "peer_tokens", *GATHER_COLUMNS)
 
 
 def _rung_key(rung: int | None) -> str:
@@ -642,6 +646,25 @@ def _peer_rung(steps, rung: int, vector: dict, routing, peers) -> bool:
         return False
     reached = [moe_column("moe_experts", s[0][6], routing, s[0][7]) for s in steps]
     return float(np.median(reached)) >= SATURATED * routing[0]
+
+
+def _vif(points, features, columns) -> dict:
+    """Each of `columns`' variance inflation factor over `points`, the rows a
+    vector of `features`, the intercept first, was fitted on: the column's
+    variance over its residual's on the other columns and an intercept,
+    `1 / (1 - R^2)`, infinite where they hold it exactly. A column that does
+    not vary has none."""
+    x = np.asarray(points, dtype=np.float64)[:, 1:]
+    out = {}
+    for f in columns:
+        j = features.index(f) - 1
+        others = np.column_stack([np.ones(len(x)), np.delete(x, j, axis=1)])
+        fitted = others @ np.linalg.lstsq(others, x[:, j], rcond=None)[0]
+        spread = float(((x[:, j] - x[:, j].mean()) ** 2).sum())
+        residual = float(((x[:, j] - fitted) ** 2).sum())
+        if spread > 0:
+            out[f] = spread / residual if residual > 0 else math.inf
+    return out
 
 
 def _eager_dummies(samples, options) -> bool:
@@ -2660,6 +2683,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                 vector["fit"]["passes"] = solved["passes"]
             if figures:
                 vector["fit"]["moe_column"] = figures
+            if carried := [f for f in OPT_IN if f in features]:
+                vector["fit"]["vif"] = _vif(points, list(features), carried)
             if rowmod_k:
                 vector["rowmod"] = rowmod_k
                 vector["fit"]["rowmod"] = evidence
