@@ -57,14 +57,15 @@ beside a peer under a quarter of them ran 21-28 ms over the law on every
 record, beside a larger peer 6-10 ms and beside a dummy 1-3 ms, both ranks'
 device windows alike and their host launches long done.
 Then, for a model with KDA layers (`kda_layers`: Kimi-K3), it may add `KDA`, the
-recurrent state work its step does beside the tokens, read off the step's
-`BatchView.kda` counts: `kda_seqs`, the rows holding a KDA state (each read
-and written once); `kda_saves`, the midstep checkpoints the forward writes;
-`kda_forks`, the rows that read their state from another slot (a prefix-cache
-hit resuming at a checkpoint); `kda_moves`, the state slot moves and paged
-checkpoint copies run before the forward; and `kda_pad_blocks`, the padding of
-the prefill rows' last chunks in chunks, `Sum ceil(N_Q / c) - N_Q / c` at the
-recurrence's chunk `c` (`KDA_CHUNK`). The chunk kernel's work is
+recurrent state work its step does beside the tokens (`kda_columns`), four of
+them the step's `BatchView.kda` counts: `kda_seqs`, the rows holding a KDA
+state (each read and written once); `kda_saves`, the midstep checkpoints the
+forward writes; `kda_forks`, the rows that read their state from another slot
+(a prefix-cache hit resuming at a checkpoint slot; Kimi-K3.1's PAGE-backed
+checkpoints restore instead, a move); `kda_moves`, the state slot moves and
+paged checkpoint copies run before the forward; and, off the rows,
+`kda_pad_blocks`, the padding of the prefill rows' last chunks in chunks,
+`Sum ceil(N_Q / c) - N_Q / c` at the recurrence's chunk `c` (`KDA_CHUNK`). The chunk kernel's work is
 `Sum ceil(N_Q / c)` chunks, which `tokens` holds but for that padding: a column
 of the chunks themselves is `tokens / c` but for it: on synthetic Kimi records
 (`tests/compass/test_step_linear_kda.py`) its VIF against the other columns was
@@ -244,7 +245,8 @@ from atom.compass.backends.work import activated_experts
 
 PREFILL = ("step", "tokens", "query_square", "query_cached")
 HISTORY = PREFILL + ("history",)
-#: A KDA model's prefill columns, in `BatchView.kda`'s order (`kda_counts`).
+#: A KDA model's prefill columns: `BatchView.kda`'s counts in its order, then the
+#: prefill rows' chunk padding (`kda_columns`).
 KDA = ("kda_seqs", "kda_saves", "kda_forks", "kda_moves", "kda_pad_blocks")
 #: The chunk, in tokens, Kimi-K3's KDA prefill recurrence runs its rows in: aiter's
 #: FlashKDA path (`kimi_delta_attn.flash_kda.FLASH_KDA_CHUNK`), which its
@@ -375,12 +377,17 @@ def kda_layers(hf_config) -> int:
 
 
 def kda_columns(view: BatchView) -> tuple | None:
-    """`KDA`'s columns of `view`'s step, its `kda` counts with the padded tokens
-    in chunks of `KDA_CHUNK`; None for a view stating none."""
+    """`KDA`'s columns of `view`'s step: its `kda` counts, then the padding of
+    its prefill rows' last chunks of `KDA_CHUNK` tokens, in chunks, the
+    chunked recurrence running each row from its own first token; no padding
+    on a step whose rows hold no state (a data-parallel dummy's). None for a
+    view stating no counts."""
     if view.kda is None:
         return None
-    *counts, padded = view.kda
-    return (*counts, padded / KDA_CHUNK)
+    padded = (
+        sum(-r.query_tokens % KDA_CHUNK for r in view.prefill) if view.kda[0] else 0
+    )
+    return (*view.kda, padded / KDA_CHUNK)
 
 
 def moe_tokens(view: BatchView) -> int | None:
@@ -517,7 +524,7 @@ def dummy_view(view: BatchView) -> BatchView:
         draft_bs=None,
         target_bs=None,
         image_tokens=0,
-        kda=None if view.kda is None else (0,) * len(KDA),
+        kda=None if view.kda is None else (0,) * len(view.kda),
     )
 
 
