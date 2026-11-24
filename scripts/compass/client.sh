@@ -22,7 +22,8 @@
 #                    request longer than the server's context aborts aiperf's
 #                    run, so a shorter context takes the 256k-capped copy), seed
 #                    42, a trajectory start between 0.25 and 0.75 of each
-#                    trace, 10 warmup requests per lane with 1800 s grace, a
+#                    trace, 10 warmup requests per lane (--warmup-per-lane N)
+#                    with 1800 s grace, a
 #                    per-trace idle cap of 300 s, a system idle cap of 10 s,
 #                    the chat template applied, and against a real server
 #                    aiperf's scrape of its /metrics, which InferenceX takes
@@ -83,7 +84,7 @@
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
-USAGE="usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop] | OUT --agentx --concurrency C [--duration S] [--stop] | OUT --sweep --traces A-B --stop"
+USAGE="usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop] | OUT --agentx --concurrency C [--duration S] [--warmup-per-lane N] [--stop] | OUT --sweep --traces A-B --stop"
 bad() { echo "client: $1; $USAGE" >&2; exit 2; }
 fail() { echo "client: $1" >&2; exit 1; }
 ROOT=$(compass_tree_root) || exit $?
@@ -102,10 +103,12 @@ while (($#)); do
     --stop) stop=1 ;;
     --sweep) sweep=1 ;;
     --agentx) agentx=1 ;;
+    --warmup-per-lane) [[ ${2-} =~ ^(0|[1-9][0-9]*)$ ]] || bad "--warmup-per-lane takes a whole number"; warmup=$2; shift ;;
     *) bad "unknown argument $1" ;;
     esac
     shift
 done
+[[ -z ${warmup-} ]] || ((agentx)) || bad "--warmup-per-lane is the agentx scenario's warmup, and takes --agentx"
 if ((agentx)); then
     ((!sweep)) && [[ -z ${first-} ]] || bad "--agentx takes every trace, and neither --traces nor --sweep"
     [[ -n ${c-} ]] || bad "--concurrency is required"
@@ -126,7 +129,7 @@ if ((agentx)); then
     ((last >= 0)) || fail "traces: $TRACES holds no trace"
     first=0 duration=${duration:-3600} random_seed=42
     agentx_args=(--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75
-        --warmup-requests-per-lane 10 --agentic-warmup-grace-period 1800
+        --warmup-requests-per-lane "${warmup:-10}" --agentic-warmup-grace-period 1800
         --trace-idle-gap-cap-seconds 300 --system-idle-gap-cap-seconds 10 --apply-chat-template)
 fi
 duration=${duration:-1800}

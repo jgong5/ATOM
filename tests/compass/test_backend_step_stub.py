@@ -182,6 +182,8 @@ class TestPerRequestSums:
             "group_dummies",
             "group_max_tokens",
             "group_needs_eager",
+            "group_tail",
+            "prefill_duty",
         ]
         assert [f.name for f in fields(RequestShape)] == [
             "query_tokens",

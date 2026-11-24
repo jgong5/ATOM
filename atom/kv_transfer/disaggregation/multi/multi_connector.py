@@ -925,6 +925,10 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
     def admission_ready(self, seq: Any) -> bool:
         return all(connector.admission_ready(seq) for connector in self._connectors)
 
+    def abort_send(self, seq: Any) -> None:
+        for connector in self._connectors:
+            connector.abort_send(seq)
+
     def process_pd_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         for connector in self._connectors:
             output = connector.process_pd_completions(output)
@@ -982,12 +986,10 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if hasattr(c, "send_finished"):
                 c.send_finished(req_id)
 
-    def abort_send(self, seq: Any) -> None:
-        # Fanned out like `send_finished`, with the `Sequence` or the bare id
-        # the scheduler passed (`KVConnectorBase.abort_send`): only the sub
-        # holding the claim acts.
-        for fn in self._sub_methods("abort_send"):
-            fn(seq)
+    def abort_parked_send(self, req_id: Any) -> None:
+        # Fanned out like `send_finished`: only the sub holding the claim acts.
+        for fn in self._sub_methods("abort_parked_send"):
+            fn(req_id)
 
     def load_failed(self, req_id: Any) -> None:
         for c in self._connectors:

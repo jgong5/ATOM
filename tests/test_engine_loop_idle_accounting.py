@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from atom.model_engine.engine_stats import EngineStats
+from atom.utils import clock
 
 ENGINE_CORE = Path(__file__).resolve().parents[1] / "atom/model_engine/engine_core.py"
 
@@ -46,6 +47,8 @@ def _extract(class_name: str, method: str):
         "logger": SimpleNamespace(info=lambda *a, **k: None, exception=lambda *a: None),
         "tracing": SimpleNamespace(shutdown=lambda: None),
         "time": SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _: None),
+        # Compass's clock hook: with no LP runtime installed it reads `time`.
+        "clock": clock,
         "HELD_POLL_S": 0.0,
     }
     exec(  # noqa: S102 - execute only AST nodes from this repository's source.
@@ -144,6 +147,11 @@ class _Engine:
 
     def has_pending_kv_work(self):
         return False
+
+    def _wait_for_input(self, next_metrics_push):
+        # The real one parks on the input queue; the next pass is the
+        # schedule's.
+        return None
 
     def _advance_idle_kv_transfer(self):
         raise AssertionError("no KV work was scripted")

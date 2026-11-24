@@ -32,7 +32,7 @@ FP4_DENSE = {
     "model_type": "llama",
     "hidden_size": 256,
     "intermediate_size": 512,
-    "num_attention_heads": 4,
+    "num_attention_heads": 8,
     "num_key_value_heads": 2,
     "head_dim": 64,
     "num_hidden_layers": 2,
@@ -63,12 +63,13 @@ def test_each_fp4_linear_is_walked_at_its_unpacked_input_width(tp):
     gemms = {(m.name.split(".")[-1], m.dims, m.fmt) for m in modules if m.layer == 0}
 
     assert not [m for m in modules if m.kind == "unclassified"]
-    # q, k and v of 4 + 2 + 2 heads of 64, and gate and up, from the hidden
-    # 256; o from the 4 heads of 64 and down from the intermediate 512, each
-    # split over the group.
+    # q, k and v of 8 + 2 + 2 heads of 64, and gate and up, from the hidden
+    # 256; o from the 8 heads of 64 and down from the intermediate 512, each
+    # split over the group. Each split keeps K a multiple of 256, which ATOM's
+    # preshuffled MXFP4 GEMM requires.
     assert {g for g in gemms if g[2] == "fp4"} == {
-        ("qkv_proj", (512 // tp, 256), "fp4"),
-        ("o_proj", (256, 256 // tp), "fp4"),
+        ("qkv_proj", (768 // tp, 256), "fp4"),
+        ("o_proj", (256, 512 // tp), "fp4"),
         ("gate_up_proj", (1024 // tp, 256), "fp4"),
         ("down_proj", (256, 512 // tp), "fp4"),
     }

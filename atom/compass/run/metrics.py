@@ -15,7 +15,9 @@ Only `FAMILIES` is written, each family by the LP that observes it, each
 series once per sample but those of `ONCE`, with the labels CI's scrape gives
 the side's series (`Sampler`). The LP writes
 its samples when it hands in for the last time, before its hand-in, as
-OpenMetrics 1.0 under gzip, the file whole or not at all (`Sampler.write`).
+OpenMetrics 1.0 under gzip, the file whole or not at all (`Sampler.write`),
+having sampled once more with its timer's read at its last finite clock,
+which replaces a point at that instant (`Sampler.final`).
 """
 
 import functools
@@ -103,17 +105,32 @@ class Sampler:
         # By family: its header, and by series its samples' names and labels
         # and its points, each a time then the samples' values in that order.
         self.families: dict[str, tuple[tuple, dict]] = {}
+        # The read its LP's metrics timer last sampled with.
+        self.read = None
 
     def sample(self, collect) -> None:
         """Take the families `collect()` returns at the LP's clock, while its
-        run is on and its runtime is the one installed. Refused, as a reason
-        of the LP's hand-in, when collecting moved the clock or called it."""
+        run is on and its runtime is the one installed, and keep `collect` as
+        the timer's read. Refused, as a reason of the LP's hand-in, when
+        collecting moved the clock or called it."""
         rt = self.rt
         if not rt.in_run or clock.installed() is not rt:
             return
-        t, calls = rt.now, rt.calls
+        self.read = collect
+        self._take(collect, rt.now)
+
+    def final(self, t: float) -> None:
+        """Sample once more with the timer's read, at the LP's last finite
+        clock `t`: a series' point at `t` is replaced, not followed by a
+        second. Nothing before the timer has sampled."""
+        if self.read is not None:
+            self._take(self.read, t, replace=True)
+
+    def _take(self, collect, t: float, replace: bool = False) -> None:
+        rt = self.rt
+        now, calls = rt.now, rt.calls
         metrics = list(collect())
-        if (rt.now, rt.calls) != (t, calls):
+        if (rt.now, rt.calls) != (now, calls):
             why = f"sampling its Prometheus series moved or called its clock at {t}"
             rt.refusals.append(f"clock:{why}")
             raise RuntimeError(f"{rt.me}: {why}")
@@ -128,7 +145,9 @@ class Sampler:
                     series[key] = labels, array("d")
                 elif m.name in ONCE:
                     continue
-                points = series[key][1]
+                labels, points = series[key]
+                if replace and points and points[-len(labels) - 1] == t:
+                    del points[-len(labels) - 1 :]
                 points.append(t)
                 points.extend(s.value for s in samples)
 

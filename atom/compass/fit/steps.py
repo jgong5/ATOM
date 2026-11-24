@@ -19,7 +19,8 @@ counts, per kernel the floor could not place and per label field, the steps
 the fit labels whose label keeps that kernel's recorded length.
 
 `step-linear` takes real runs only and fits `step_linear_fit.FORMS`' `--form`,
-`history` by default, joining each step's ranks at the engine config's
+`history` by default, with `--cold-peer-rows` its prefill vector's
+`cold_peer_rows` (`step_linear_fit._cold`), joining each step's ranks at the engine config's
 `data_parallel_size`, so a record with a
 rank that gave no sample refuses; it pads prefill to the records'
 `prefill_buckets`, naming under `unfitted` records stating none, and holds
@@ -39,9 +40,17 @@ and `engine_config`, as that command's does, and the key holds them, and
 `records_atom` as that command's states it. Each rung of the capture ladder
 no record reached gets a declared vector, filled from the fitted rungs beside
 it (`step_linear_fit.fill_rungs`), and the law and the report name each under
-`filled`. The report's
+`filled`; the law also lists them by law under `filled_rungs`, and the command
+warns on stderr naming them (`step_linear_fit.filled_warning`). The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
+
+`--ladder-run RECORD EXPORT RUNGS` names one more client run RECORD's server
+served, a calibration ladder that calibrates the decode rungs RUNGS (comma
+separated): it is served and graded as a `--client-run` is, and its decode
+steps at any other rung give no sample, nor do its prefill steps
+(`step_linear_fit.ladder_cut`); the report counts them, per run and rung or
+step kind, under `ladder`. Only `step-linear` reads it.
 
 `step-grid` plans again over `--grid`'s inputs, record directories and
 `shape_population` tokens, and over its ragged targets, with the nodes and
@@ -68,6 +77,7 @@ targets', naming the targets'. `--sessions A:B` keeps the `--grid` lines
 import copy
 import dataclasses
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -122,6 +132,7 @@ def _model_routing(
 
 def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     form = args.form or "history"
+    samples, ladder = step_linear_fit.ladder_cut(samples)
     options = {"form": form, "dp": step_linear_fit.join_width(config["engine_config"])}
     options["moe_routing"] = args.moe_routing or (
         args.model and _model_routing(args.model, config["model"])
@@ -130,6 +141,7 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
         drafter = _model_routing(args.model, config["model"], DRAFT_ROUTING)
         options["draft_moe_routing"] = drafter
     options["buckets"] = config.get("prefill_buckets")
+    options["cold"] = bool(args.cold_peer_rows)
     law, report = step_linear_fit.fit(samples, options, args.seed)
     if options["buckets"] is None:
         law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
@@ -138,7 +150,14 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     report["filled"] = step_linear_fit.fill_rungs(
         law, config["engine_config"].get("ladder")
     )
+    if warning := step_linear_fit.filled_warning(law):
+        print(warning, file=sys.stderr)
     report["provenance"] = publish.runs(samples)
+    if args.ladder_run:
+        report["ladder"] = {
+            "runs": [[r, e, list(rungs)] for r, e, rungs in args.ladder_run],
+            "left_out": ladder,
+        }
     law["platform"] = keyed_platform(Kind.STEP_LINEAR_LAW, config["platform"])
     law["engine_config"] = config["engine_config"]
     if atom := step_linear_fit.records_atom(samples):
@@ -202,6 +221,21 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
     return {**grid_key, "grid": grid["grid"]}, bundle, report
 
 
+def _rungs(word: str) -> tuple[int, ...]:
+    """The decode rungs `--ladder-run`'s RUNGS names, comma separated, each a
+    positive whole number, once."""
+    try:
+        rungs = [int(w) for w in word.split(",")]
+    except ValueError:
+        rungs = []
+    if not rungs or min(rungs) < 1 or len(set(rungs)) != len(rungs):
+        raise ValueError(
+            f"--ladder-run RUNGS {word!r}: name the decode rungs it calibrates, "
+            "comma separated, e.g. 24,32,48,64"
+        )
+    return tuple(sorted(rungs))
+
+
 #: Each backend's name, to the kind it publishes, its label sources and its fit.
 BACKENDS = {
     "step-linear": (Kind.STEP_LINEAR_LAW, ("record",), _step_linear),
@@ -210,8 +244,10 @@ BACKENDS = {
 #: The flags only one backend reads, each to that backend.
 OWN = {
     "form": "step-linear",
+    "cold_peer_rows": "step-linear",
     "moe_routing": "step-linear",
     "model": "step-linear",
+    "ladder_run": "step-linear",
     "grid": "step-grid",
     "grid_definition": "step-grid",
     "sessions": "step-grid",
@@ -251,6 +287,22 @@ def main(argv: list[str]) -> None:
         metavar="A:B",
         help="the --grid lines measure steps --sessions A:B keeps",
     )
+    parser.add_argument(
+        "--cold-peer-rows",
+        action="store_const",
+        const=True,
+        help="the prefill vector adds cold_peer_rows: its peers' MoE rows on a "
+        "step outside a stretch of prefill steps (data-parallel records only)",
+    )
+    parser.add_argument(
+        "--ladder-run",
+        nargs=3,
+        action="append",
+        metavar=("RECORD", "EXPORT", "RUNGS"),
+        help="a client run RECORD's server served as a calibration ladder, by its "
+        "export, and the decode rungs it calibrates (comma separated); its decode "
+        "steps at any other rung give no sample",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--ops",
@@ -272,6 +324,10 @@ def main(argv: list[str]) -> None:
             raise ValueError(
                 f"--{flag.replace('_', '-')} is read by {owner}, not {args.backend}"
             )
+    if args.ladder_run:
+        args.ladder_run = [
+            (record, export, _rungs(rungs)) for record, export, rungs in args.ladder_run
+        ]
     if args.backend == "step-grid" and not (args.grid and args.grid_definition):
         raise ValueError(
             "step-grid plans over --grid INPUT... with the nodes and margin "

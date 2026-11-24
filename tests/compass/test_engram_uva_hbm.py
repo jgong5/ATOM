@@ -247,9 +247,9 @@ def test_the_option_puts_this_ranks_heads_of_every_table_on_its_device(
     tp_group(monkeypatch, world_size=2, rank=1)
     votes = []
     monkeypatch.setattr(
-        engram.host.dist,
-        "all_reduce",
-        lambda t, op=None, group=None: votes.append(int(t)),
+        engram.host,
+        "group_agree",
+        lambda ok, group: votes.append(int(ok)) or ok,
     )
     rt = tiny_runtime(engram)
     mapping = rt.prefetcher._hash_mapping
@@ -280,9 +280,9 @@ def test_a_rank_whose_hbm_copy_fails_turns_the_group_around(engram, monkeypatch)
     tp_group(monkeypatch, world_size=2, rank=0)
     votes = []
     monkeypatch.setattr(
-        engram.host.dist,
-        "all_reduce",
-        lambda t, op=None, group=None: votes.append(int(t)),
+        engram.host,
+        "group_agree",
+        lambda ok, group: votes.append(int(ok)) or ok,
     )
     taken = []
     real = engram.host_memory.to_device
@@ -323,7 +323,7 @@ def test_without_the_option_the_shard_is_page_locked_as_before(engram, monkeypat
         lambda sources, device: pytest.fail("copied to the device without the option"),
     )
     tp_group(monkeypatch, world_size=2, rank=0)
-    monkeypatch.setattr(engram.host.dist, "all_reduce", lambda *a, **k: None)
+    monkeypatch.setattr(engram.host, "group_agree", lambda ok, group: ok)
     rt = tiny_runtime(engram)
     heads = rt.prefetcher._hash_mapping.config.num_hash_heads
     assert rt._enable_uva(rt.prefetcher, heads) is True

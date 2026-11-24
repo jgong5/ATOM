@@ -51,6 +51,7 @@ def settled(refused: bool) -> ForwardMode:
         total_seqs_num=1,
         total_tokens_num=300,
         total_tokens_num_prefill=300,
+        has_prefill=True,
         final_prefill_requests=lambda: 1,
     )
     return ForwardMode.decide(

@@ -31,6 +31,7 @@ from atom.compass.backends.step_linear_fit import (
     _intakes,
     fit_host,
     fit_intake,
+    fit_relay,
     fit_tokenizer,
     label_records,
 )
@@ -101,6 +102,47 @@ def test_a_stated_hop_is_written_into_the_entry_s_hops_and_named_in_its_report(
     assert host["hops"] == {"router_s": 0.0015, "kv_write_req_s": 1e-4}
     report = member(tmp_path / "store", host_laws_key(key), "report")
     assert report["stated_hops"] == host["hops"]
+
+
+def test_a_stated_ingress_is_written_as_the_entry_s_term_and_named_in_its_report(
+    tmp_path,
+):
+    """`--ingress FILE`: the encoding ingress in front of the deployment, as
+    `compass fit ingress` wrote it from the ingress's stamps, which no record
+    holds; an entry stated with one goes to a run file as its ingress."""
+    r = deployment(tmp_path)
+    publish(tmp_path, r)
+    key = compass_run.host_key(r.config)
+    a = record(tmp_path / "a", 19, key=key, trace="trace-a")
+    term = {"fixed_s": 0.0, "per_byte_s": 4.4e-7, "workers": 64}
+    term |= {"router_per_byte_s": 1.2e-8, "bytes": [875, 3620123]}
+    (tmp_path / "ingress.json").write_text(json.dumps({"ingress": term}))
+    fit(
+        tmp_path,
+        "fit host",
+        a,
+        *clients(a),
+        "--ingress",
+        str(tmp_path / "ingress.json"),
+    )
+
+    host = member(tmp_path / "store", host_laws_key(key), "params")
+    assert host["ingress"] == term
+    report = member(tmp_path / "store", host_laws_key(key), "report")
+    assert report["stated_ingress"] == {
+        "file": str(tmp_path / "ingress.json"),
+        "ingress": term,
+    }
+    (tmp_path / "bad.json").write_text(json.dumps({"ingress": {**term, "workers": 0}}))
+    with pytest.raises(SystemExit, match="bad.json: its ingress is"):
+        fit(
+            tmp_path,
+            "fit host",
+            a,
+            *clients(a),
+            "--ingress",
+            str(tmp_path / "bad.json"),
+        )
 
 
 @pytest.mark.parametrize(
@@ -447,6 +489,57 @@ def test_requests_lone_after_two_that_overlap_fit_with_their_pool_rendered_templ
     assert lone == pytest.approx(expect) and not bursts and len(sizes) == 10
 
 
+def test_a_server_that_renders_no_template_fits_its_intake_on_its_pool_jobs(
+    tmp_path,
+):
+    # A prefill-decode deployment's decode side renders no chat template: each
+    # request reads its body, submits its pool job and is sent. The same requests
+    # stamped so fit the same term, each request of a burst marked by its pool
+    # job's submit, stamped where its template began. Each pool job encodes, as
+    # its record's tokenizer record says, so no job's wall joins its intake.
+    rendered, bare = tmp_path / "rendered", tmp_path / "bare"
+    for d in (rendered, bare):
+        (d / "steps").mkdir(parents=True)
+        stamped(d, burst=(40_000, 60_000, 50_000, 45_000))
+    stamps = bare / "steps" / compass_run.INTAKE_RECORD
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    kept = [row for row in rows if row[2] != "tmpl"]
+    for k, row in enumerate(rows):
+        later = [r[2] for r in rows[k + 1 :] if r[2] in ("app", "wait")]
+        if row[2] == "tmpl" and later[:1] != ["wait"]:
+            # `stamped` gives only the lone requests a pool job's wait.
+            kept.append([row[3], row[1], "wait", row[3], "0", row[6], row[6]])
+    stamps.write_text("".join(" ".join(row) + "\n" for row in kept))
+    record = bare / "steps" / compass_run.TOKENIZER_RECORD
+    jobs = [
+        {"call": "encode", "tokens": 1, "items": 1, "thread": int(row[1])}
+        | {"t_start_ns": int(row[3]), "t_end_ns": int(row[0])}
+        for row in kept
+        if row[2] == "prep"
+    ]
+    record.write_text(record.read_text() + "".join(json.dumps(j) + "\n" for j in jobs))
+
+    got = [
+        fit_intake(
+            [d / "steps" / compass_run.INTAKE_RECORD],
+            [d / "steps" / compass_run.TOKENIZER_RECORD],
+        )
+        for d in (rendered, bare)
+    ]
+    assert got[1] == got[0]
+    term, report = got[1]
+    assert term == pytest.approx(
+        {
+            "fixed_s": FIXED,
+            "per_byte_s": PER_BYTE,
+            "idle_s": IDLE,
+            "bytes": [9000, 400_000],
+        },
+        rel=1e-6,
+    )
+    assert report["samples"] == 8 and report["burst"]["requests"] == 4
+
+
 @pytest.mark.parametrize(
     "lone, burst, encodes, unfitted",
     [
@@ -656,3 +749,81 @@ def test_the_segment_term_takes_what_its_stored_prefix_search_compared(tmp_path)
     term, why = segment(zero)
     assert set(term) == {"fixed_s", "tokens_per_s"}
     assert why == "the records give no time per compared character"
+
+
+def test_a_request_given_its_token_ids_takes_its_pool_job_in_with_its_intake(tmp_path):
+    # A prefill-decode decode side's requests: no template, and a pool job
+    # that builds the sequence and calls no tokenizer, which no tokenizer law
+    # prices, so its wall joins the loop's CPU time. One whose job encodes
+    # (a text prompt) leaves its job to the tokenizer laws.
+    t, cpu, lines, expect, calls = 10**12, 0, [], [], [TOKENIZER]
+    for k, size in enumerate(np.linspace(30_000, 900_000, 6).astype(int).tolist()):
+        t += 10**9
+        loop, job = round((IDLE + PER_BYTE * size) * 1e9), 100_000 + 3 * size
+        p, e = t + 10_000, t + 20_000 + job
+        lines += [
+            _stamp("app", t, t, cpu=(cpu, cpu)),
+            _stamp("body", t + 1000, t + 2000, size, (cpu + 1000, cpu + 2000)),
+            _stamp("wait", p - 1000, p + job + 1000, 0, (cpu + 5000,) * 2),
+            _stamp("prep", p, p + job, thread=POOL[k % 2]),
+            _stamp("send", e, e + 10_000, 0, (cpu, cpu + loop)),
+        ]
+        encodes = k == 5
+        if encodes:
+            calls.append(
+                {"call": "encode", "tokens": 9, "items": 1, "thread": POOL[k % 2]}
+                | {"t_start_ns": p + 10, "t_end_ns": p + 20}
+            )
+        expect.append((size, (loop + (0 if encodes else job)) * 1e-9))
+        cpu += loop + 10**6
+    path = tmp_path / compass_run.INTAKE_RECORD
+    path.write_text("\n".join(lines) + "\n")
+    record = tmp_path / compass_run.TOKENIZER_RECORD
+    record.write_text("".join(json.dumps(c) + "\n" for c in calls))
+    lone, bursts, sizes = _intakes(path, record)
+    assert lone == pytest.approx(expect) and not bursts and len(sizes) == 6
+    # With no tokenizer record, no job is known to have called one.
+    assert _intakes(path)[0][-1] == pytest.approx(
+        (sizes[-1], expect[-1][1] + 3e-9 * sizes[-1] + 1e-4)
+    )
+
+
+def _relayed(directory, sizes, fixed, per_byte, rows=3, others=()):
+    """A prefill-decode deployment's two sides' intake stamps: each request's
+    `rows` output rows on prefill, one per 100 us, then decode's app call for
+    it `fixed + per_byte x bytes` after the last row's return, and its body;
+    `others`, app calls on decode with no output on prefill before them."""
+    pre, dec = [], [_stamp("app", t, t) for t in others]
+    t = 10**12
+    for k, size in enumerate(sizes):
+        t += 10**9
+        for r in range(rows):
+            pre.append(_stamp("out", t + r * 100_000, t + r * 100_000 + 1000, thread=7))
+        back = t + (rows - 1) * 100_000 + 1000
+        app = back + round((fixed + per_byte * size) * 1e9)
+        dec += [_stamp("app", app, app), _stamp("body", app + 100, app + 500, size)]
+        dec += [_stamp("send", app + 900, app + 1000)]
+    for side, lines in (("prefill", pre), ("decode", dec)):
+        (directory / side / "steps").mkdir(parents=True)
+        path = directory / side / "steps" / compass_run.INTAKE_RECORD
+        path.write_text("".join(line + "\n" for line in lines))
+    return [tuple(directory / s / "steps" / compass_run.INTAKE_RECORD for s in SIDES)]
+
+
+SIDES = ("prefill", "decode")
+
+
+def test_the_relay_term_is_fitted_from_prefill_s_last_output_row_to_decode_s_app_call(
+    tmp_path,
+):
+    sizes = np.linspace(20_000, 3_000_000, 12).astype(int).tolist()
+    pairs = _relayed(tmp_path, sizes, 1.5e-3, 11e-9, others=(10**11,))
+    term, report = fit_relay(pairs)
+    assert term["fixed_s"] == pytest.approx(1.5e-3, rel=1e-3)
+    assert term["per_byte_s"] == pytest.approx(11e-9, rel=1e-3)
+    assert term["bytes"] == [sizes[0], sizes[-1]] and report["samples"] == 12
+
+
+def test_a_relay_with_no_request_alone_on_it_is_left_unfitted(tmp_path):
+    with pytest.raises(ValueError, match="0 forwards for 2 coefficients"):
+        fit_relay(_relayed(tmp_path, [], 1.5e-3, 11e-9))

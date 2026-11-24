@@ -182,6 +182,141 @@ compass_ref_drift() {
     printf '        the base is the local branch; COMPASS_INTEGRATION_REF=%s uses the remote\n' "$up"
 }
 
+# compass_changed ROOT INTEGRATION: sets CHANGED to the paths this tree's change
+# touches and CHANGED_SRC to where that list came from, from the first source
+# that answers: the file COMPASS_CHANGED_FILES names, the diff since HEAD's
+# merge-base with INTEGRATION, or snapshot.sh's .compass-changed stamp. When
+# none answers, CHANGED_UNKNOWN says why instead. Returns 94 with WHY set when
+# COMPASS_CHANGED_FILES names a file it cannot read.
+compass_changed() {
+    local root=$1 integration=$2 ref base
+    CHANGED= CHANGED_SRC= CHANGED_UNKNOWN=
+    if [ -n "${COMPASS_CHANGED_FILES:-}" ]; then
+        [ -r "$COMPASS_CHANGED_FILES" ] || {
+            printf 'FATAL: COMPASS_CHANGED_FILES=%s unreadable\n' "$COMPASS_CHANGED_FILES" >&2
+            WHY="COMPASS_CHANGED_FILES unreadable"
+            return 94
+        }
+        CHANGED=$(cat "$COMPASS_CHANGED_FILES")
+        CHANGED_SRC="COMPASS_CHANGED_FILES"
+    elif git -C "$root" rev-parse --git-dir >/dev/null 2>&1 &&
+         ref=$(compass_resolve_ref "$root" "$integration") &&
+         base=$(git -C "$root" merge-base HEAD "$ref" 2>/dev/null); then
+        # Both sides of a rename, unquoted, here and in gate_cpu.sh's carry:
+        # else a renamed trigger file or a non-ASCII path under a trigger
+        # matches nothing.
+        CHANGED=$(git -C "$root" -c core.quotePath=false diff --no-renames --name-only "$base")
+        CHANGED_SRC="diff vs $ref (${base:0:9})"
+        # Announce the fallback the way snapshot.sh does. Without this the
+        # resolved name appears only inside the source string -- reported, not
+        # announced, so a caller who set nothing sees a prefix it never asked for.
+        [ "$ref" = "$integration" ] ||
+            printf 'ref:    %s is not a ref here; resolved it as %s\n' "$integration" "$ref"
+        compass_ref_drift "$root" "$ref"
+    elif [ -r "$root/.compass-changed" ]; then
+        # A snapshot built by snapshot.sh, which is how the gates normally run.
+        # The stamp was written from the same rev-parse that selected the
+        # archived tree, so it describes this tree and not whichever one the
+        # archiver happened to be sitting in.
+        #
+        # The drift line above does not reach here, and this is the path the
+        # gates normally run on. .compass-changed records the file list and
+        # .compass-commit the sha; neither records the *base*, so a stamp built
+        # on a stale local branch cannot be told from one built on the remote,
+        # and the announcement lives only in the staging log while this is the
+        # log that gets pasted. Closing it means recording the base in a stamp,
+        # which changes the stamp format and is not #102.
+        CHANGED=$(cat "$root/.compass-changed")
+        CHANGED_SRC=".compass-changed stamp"
+    elif ! git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+        # No supplied list, no usable diff, no stamp: the question cannot be
+        # answered, and the reason names which of the three ways in failed.
+        # Only a tree with no .git is a staging omission; a git checkout
+        # reaches here because the integration ref does not resolve, or shares
+        # no commit with HEAD.
+        CHANGED_UNKNOWN="this tree was never stamped (no .git, no .compass-changed); a staging omission, see snapshot.sh"
+    elif ref=$(compass_resolve_ref "$root" "$integration"); then
+        CHANGED_UNKNOWN="a git checkout with no .compass-changed, and $ref shares no commit with HEAD"
+    else
+        CHANGED_UNKNOWN="a git checkout with no .compass-changed, and $integration resolves to no commit here"
+    fi
+}
+
+# compass_cpu_ignores ROOT: sets IGN to the --ignore arguments for what the CPU
+# gate leaves out, tests/plugin and each file cpu_gate_exclude.txt lists, and
+# NEX to how many files the list names. Returns 94 with WHY set when the list
+# is unreadable or names a missing file.
+#
+# Parsed defensively: a trailing CR is stripped so a list that has been through
+# a Windows editor does not turn into --ignore=tests/foo.py^M, which pytest
+# accepts and silently matches nothing; inline comments are dropped; and each
+# file is checked to exist, because a renamed test would otherwise be excluded
+# forever by a stale line nobody can see failing.
+compass_cpu_ignores() {
+    local exclude=$1/scripts/compass/cpu_gate_exclude.txt line
+    NEX=0
+    IGN=(--ignore=tests/plugin)
+    [ -r "$exclude" ] || {
+        printf 'FATAL: cannot read %s\n' "$exclude" >&2
+        WHY="exclusion list unreadable"
+        return 94
+    }
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        line=${line%%#*}
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        [ -n "$line" ] || continue
+        [ -e "$1/$line" ] || {
+            printf 'FATAL: %s lists %s, which does not exist.\n' "$exclude" "$line" >&2
+            printf '       Re-run regen_cpu_gate_exclude.sh.\n' >&2
+            WHY="exclusion list names a missing file"
+            return 94
+        }
+        IGN+=(--ignore="$line")
+        NEX=$((NEX + 1))
+    done <"$exclude"
+}
+
+# compass_harness ROOT: when ROOT has a compass_harness, installs it, with the
+# aiperf wheel COMPASS_AGENTX_HARNESS names, into the run-local directory
+# HARNESS, removed at exit, and appends that to PYTHONPATH. Returns 96 with WHY
+# set when the install fails or the compass_harness tests would still skip.
+#
+# Those tests skip by name when compass-harness, or the aiperf it adapts, does
+# not import, and the CPU container has neither. So the gates install the
+# tree's own compass_harness every run, and refuse to run while the tests' own
+# skip condition still holds.
+compass_harness() {
+    [ -r "$1/compass_harness/pyproject.toml" ] || return 0
+    HARNESS=$(mktemp -d) || { WHY="mktemp failed"; return 96; }
+    trap 'rm -rf "$HARNESS"' EXIT
+    # A copy, because setuptools writes build/ and *.egg-info into the source.
+    cp -r "$1/compass_harness" "$HARNESS/src" || { WHY="cannot copy compass_harness"; return 96; }
+    python -m pip install -q --no-deps --no-build-isolation --no-index --target "$HARNESS/site" \
+        "$HARNESS/src" ${COMPASS_AGENTX_HARNESS:+"$COMPASS_AGENTX_HARNESS"} >&2 || {
+        WHY="pip could not install compass_harness${COMPASS_AGENTX_HARNESS:+ and $COMPASS_AGENTX_HARNESS}"
+        return 96
+    }
+    export PYTHONPATH=$PYTHONPATH:$HARNESS/site
+    WHY=$(cd / && python -c 'from importlib import metadata; metadata.version("compass-harness")
+import compass_harness, aiperf; print(aiperf.__file__, compass_harness.__file__)' 2>&1) || {
+        WHY="the compass_harness tests would skip (${WHY##*$'\n'}); set COMPASS_AGENTX_HARNESS to an agentx-harness 56a0cf70 wheel, see scripts/compass/README.md"
+        return 96
+    }
+    printf 'harness: %s\n' "$WHY"
+}
+
+# A SKIPPED line naming one of gate_gpu.sh's driver-run inputs, or the router it
+# puts on PATH: a driver-run test that did not run for want of it. The
+# alternation is tests/compass/driver_run_skips.py's DRIVER_RUN.
+COMPASS_DRIVER_RUN_SKIP='^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK|CCTRACES)|COMPASS_(HARNESS|AIPERF)_PYTHON|ATOMESH|needs atomesh|atomesh on PATH)'
+
+# A SKIPPED line from a test that cargo-builds atomesh, taken where `cargo
+# metadata` cannot resolve atomesh's crates: no driver-run input would run it,
+# so a gate that runs such a test refuses with 96, as gate_cpu.sh's probe does.
+COMPASS_CARGO_SKIP="^SKIPPED .*cargo cannot resolve atomesh's dependencies"
+
 # PYTHONPATH is set to the tree and nothing else. Inherited entries are not
 # merged: an inherited entry ahead of ours is exactly how a take2 script silently
 # ran another branch's engine, and an entry behind ours can still satisfy an
@@ -268,6 +403,18 @@ compass_gpu_arch() {
     HIP_VISIBLE_DEVICES=$1 python -c 'import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])' 2>/dev/null
 }
 
+# This file's directory, resolved as it is sourced: a caller may cd elsewhere
+# before a function reads a list beside it, as regen_gpu_gate_baseline.sh cd's
+# into the base it measures, where a relative path names nothing.
+COMPASS_LIB_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+# compass_gpu_skip_lines TARGET: what gpu_gate_skip.txt names for GPU target
+# TARGET, one per line: a test file it leaves out there, or `driver-run`.
+compass_gpu_skip_lines() {
+    grep -vE '^[[:space:]]*(#|$)' "$COMPASS_LIB_DIR/gpu_gate_skip.txt" |
+        awk -v t="$1" '$1 == t { print $2 }'
+}
+
 # compass_gpu_skips TARGET: sets SKIP_ARGS to an --ignore for each file
 # gpu_gate_skip.txt leaves out on GPU target TARGET, the first card's, and
 # SKIP_N to the tests those files collect, run from the tree being measured. A
@@ -275,26 +422,35 @@ compass_gpu_arch() {
 # counts what tests/compass passes on the tree. The line `TARGET driver-run`
 # sets NO_DRIVER_RUN. A file it cannot count fails, SKIP_WHY naming it.
 compass_gpu_skips() {
-    local gpu file n
+    local file n
     SKIP_ARGS=() SKIP_N=0 COMPASS_LEFT=() NO_DRIVER_RUN=
-    while read -r gpu file; do
-        [ "$gpu" = "$1" ] || continue
+    while read -r file; do
         if [ "$file" = driver-run ]; then
-            printf 'driver-run inputs: none on %s\n' "$gpu"
+            printf 'driver-run inputs: none on %s\n' "$1"
             NO_DRIVER_RUN=1
             continue
         fi
         [ -e "$file" ] || continue
         if [[ $file == tests/compass/* ]]; then
-            printf 'left out on %s: %s\n' "$gpu" "$file"
+            printf 'left out on %s: %s\n' "$1" "$file"
             COMPASS_LEFT+=("$file")
             continue
         fi
         n=$(python -m pytest "$file" --collect-only -q -p no:cacheprovider 2>&1 | sed -nE 's/^([0-9]+) tests? collected.*/\1/p')
-        [ -n "$n" ] || { SKIP_WHY="cannot count the tests of $file, which gpu_gate_skip.txt leaves out on $gpu"; return 1; }
-        printf 'left out on %s: %s (%s tests)\n' "$gpu" "$file" "$n"
+        [ -n "$n" ] || { SKIP_WHY="cannot count the tests of $file, which gpu_gate_skip.txt leaves out on $1"; return 1; }
+        printf 'left out on %s: %s (%s tests)\n' "$1" "$file" "$n"
         SKIP_ARGS+=("--ignore=$file") SKIP_N=$((SKIP_N + n))
-    done < <(grep -vE '^[[:space:]]*(#|$)' "$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_skip.txt")
+    done < <(compass_gpu_skip_lines "$1")
+}
+
+# compass_cargo_lock MESH: copies into atomesh's directory MESH, unless it has
+# one, the lockfile the image built atomesh with (COMPASS_CARGO_LOCK, default
+# /app/ATOM/atom/mesh/Cargo.lock). The tree ignores Cargo.lock, and offline
+# cargo resolves atomesh's crates only under the lockfile the container's crate
+# cache was fetched for. Both gates call it before their cargo runs.
+compass_cargo_lock() {
+    local lock=${COMPASS_CARGO_LOCK:-/app/ATOM/atom/mesh/Cargo.lock}
+    [ -e "$1/Cargo.lock" ] || [ ! -r "$lock" ] || cp "$lock" "$1/Cargo.lock"
 }
 
 # compass_held_port [N]: the first of N ports in a row (default 1), each one
@@ -341,6 +497,42 @@ compass_dynamo_header() {
 # takes to reach its end, past 1800 s at c=256, so a simulated launch sets
 # the bound to a year.
 COMPASS_SIM_REQUEST_TIMEOUT_S=31536000
+# Every wall-clock bound a simulated router gets, each at that year: the one
+# above, and the prepare pool's wait for a thread and its preparation of a
+# request (`--prepare-queue-timeout-ms`, `--prepare-timeout-ms`; atomesh's
+# defaults are 250 ms and 5 s). Those two start once the router LP releases a
+# request, so its hold runs neither out (atom/mesh/tests/compass_pd_router_test.rs),
+# but a loaded host stretches a preparation's wall time, which the run's clock
+# does not see.
+COMPASS_SIM_ROUTER_BOUNDS=(--request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S"
+    --prepare-queue-timeout-ms "${COMPASS_SIM_REQUEST_TIMEOUT_S}000"
+    --prepare-timeout-ms "${COMPASS_SIM_REQUEST_TIMEOUT_S}000")
+
+# compass_sim_router_refusal LP WORD...: why a simulated router refuses its
+# `atomesh launch` arguments WORD..., or nothing. LP is 1 where the router runs
+# as LP `router`, whose retry resends a request under its first seq.
+compass_sim_router_refusal() {
+    local lp=$1 word why
+    shift
+    for word; do
+        case ${word%%=*} in
+        --prefill | --decode)
+            echo "the router's arguments carry ${word%%=*}, a worker more for a simulated router to choose"
+            return ;;
+        --max-concurrent-requests | --rate-limit-tokens-per-second)
+            echo "the router's arguments carry ${word%%=*}, a limiter a simulated router leaves out"
+            return ;;
+        --request-timeout-secs | --prepare-queue-timeout-ms | --prepare-timeout-ms)
+            echo "the router's arguments carry ${word%%=*}, a wall-clock bound the script sets for a simulated router"
+            return ;;
+        esac
+    done
+    if ((lp)) && [[ " $* " != *" --disable-retries "* ]]; then
+        why="carry --dp-aware"
+        [[ " $* " == *" --dp-aware "* ]] || why="choose among a side's instances as LP router"
+        echo "the router's arguments $why but not --disable-retries: a router LP's retry resends a request under its first seq, which the frontend refuses as arrived twice"
+    fi
+}
 
 # compass_on_arch RUN_FILE: the words ahead of `-m MODULE` that start a simulated
 # server under on_arch on RUN_FILE's machine's arch, as `compass run` starts its

@@ -17,13 +17,12 @@ import os
 import re
 import signal
 import subprocess
-import sys
 import time
 from contextlib import suppress
 from pathlib import Path
 
 import pytest
-from test_calibrate import CLIENT, _calibrate, _tree
+from test_calibrate import CLIENT, _calibrate, _path, _tree
 
 #: A status line, less its UTC stamp, its seconds read as N.
 STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ ")
@@ -169,7 +168,7 @@ def _started(tmp_path, out: str, gate: Path, request) -> int:
     script = tmp_path / "ATOM" / "scripts" / "compass" / "calibrate.sh"
     env = {
         **os.environ,
-        "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+        "PATH": _path(tmp_path),
         "LOG": str(tmp_path / "log"),
         "GPU": "7",
         "MODEL": str(tmp_path / "m"),

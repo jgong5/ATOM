@@ -745,10 +745,9 @@ def weight_is_stored_preshuffled(
     checkpoint bytes. Native 32x32 weights are shuffled on gfx950 for AITER's
     preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by default),
     always on gfx1250, whose only group32 GEMM is AITER's preshuffled FlyDSL
-    one (it reads the 32x32 scales as stored), and always under
-    ``needs_preshuffled_weight`` (V4.1's grouped ``wo_a``). Native 1x32
-    weights are shuffled only when the existing ``needs_preshuffled_weight``
-    override is set, as the M3.1 shape-gated opt-in path does.
+    one. Native 1x32 weights are shuffled only when the existing
+    ``needs_preshuffled_weight`` override is set, as the M3.1 shape-gated
+    opt-in path does.
 
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller

@@ -144,9 +144,19 @@ END_TO_END = {
 
 def sides(run) -> list[Path]:
     """Where `run`'s servers wrote their records: the prefill/ and decode/ of a
-    deployment `deploy.sh` wrote, else `run` itself."""
+    deployment `deploy.sh` wrote, or, above one instance of a side, that side's
+    prefill<k>/ or decode<k>/, in index order, else `run` itself."""
     run = Path(run)
-    return [run / s for s in SIDES] if (run / SIDES[0]).is_dir() else [run]
+    found = []
+    for side in SIDES:
+        if (run / side).is_dir():
+            found.append(run / side)
+            continue
+        indexed = (p for p in run.glob(f"{side}*") if p.name[len(side) :].isdigit())
+        found += sorted(
+            (p for p in indexed if p.is_dir()), key=lambda p: int(p.name[len(side) :])
+        )
+    return found or [run]
 
 
 def _steps(cell) -> list[dict]:

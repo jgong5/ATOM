@@ -32,6 +32,7 @@ VERBS = [
     "fit steps",
     "fit ops",
     "fit host",
+    "fit ingress",
     "run",
 ]
 

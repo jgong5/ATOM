@@ -21,8 +21,11 @@ ladder the config's is a prefix of; of several, reuse comes
 first, then refused, then calibrate. The requirement a verdict names:
 
 1. the same key: none there, a store law, or host laws beside it, at another
-   ATOM digest than the head's, or a law file whose host key states another
-   (calibrate); host laws fitted on another host CPU (refused);
+   ATOM digest than the head's, or a law file whose host key states another,
+   or a law the runner refuses for the prefill token-graph buckets it records
+   whose records ran at another ATOM digest (`records_atom`) or state none,
+   since a calibration of the config records them (calibrate); host laws
+   fitted on another host CPU serve, predicting the host they timed;
 2. not invalidated: a store law the store refuses to load under the head's
    readings (calibrate);
 3. coverage: a decode rung the config schedules with no vector
@@ -38,9 +41,13 @@ A verdict on a law found names, as ``run``, the ``--step-linear`` and
 ``--host-laws`` values a run of it takes, and one on a store's own step linear
 law at the head's ATOM digest names that ``store``, whatever the verdict. A
 refusal the runner makes of the config under the law, as of context
-parallelism, propagates. `readings` gives the config's memory readings in a
-store `reuse`, or `measure` where none is at their key or the one there was
-measured at another ATOM digest (requirement 1), or where it lacks the PAGE
+parallelism, propagates; so does one of the prefill token-graph buckets it
+records, on a law whose records ran at the head's ATOM digest.
+`readings` gives the config's memory readings in a
+store, or where it holds none and the config's law verdict is ``reuse`` the
+assumed ones carried by the law files it names as ``run``, as a run of it
+reads them, `reuse`, or `measure` where none is at their key or the one there
+was measured at another ATOM digest (requirement 1), or where it lacks the PAGE
 bound a start of the config reads, which `compass run --check` finds stale
 (`lacking.stale_page_bound`, requirement 2), ``held`` saying whether readings
 are at their key, since the store refuses a second publish there. `stores`
@@ -67,7 +74,7 @@ from atom.compass.artifacts.store import ENTRY_FILE
 from atom.compass.backends.json_file import XZ, read_json
 from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.step_grid_plan import at_ladder
-from atom.compass.drive import runfile
+from atom.compass.drive import lacking, runfile
 from atom.compass.drive.lacking import AXIS, stale_page_bound, uncovered_rungs
 from atom.compass.run import STEP_LINEAR, memory
 from atom.compass.run.step_grid import differ, keyed
@@ -202,10 +209,14 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
     return min(found, key=lambda v: PREFERRED.index(v["verdict"]))
 
 
-def readings(store: ArtifactStore, config, machine) -> dict:
-    """The verdict on `config`'s memory readings in `store` on `machine`."""
+def readings(store: ArtifactStore, config, machine, law: dict) -> dict:
+    """The verdict on `config`'s memory readings in `store` on `machine`, else,
+    when `config`'s verdict `law` is ``reuse``, in the law files it names to run
+    with, as `compass run` reads them: a calibration runs with the store law it
+    publishes, which carries none."""
+    carried = runfile.carried(law["run"]) if law["verdict"] == "reuse" else ()
     try:
-        read = memory.load(str(store.root), config, machine, 0)
+        read = memory.load(str(store.root), config, machine, 0, carried)
     except ArtifactRefusal as refused:
         stale = refused.rule is Rule.INVALIDATED
         if refused.rule is not Rule.RESOLUTION and not (
@@ -213,29 +224,41 @@ def readings(store: ArtifactStore, config, machine) -> dict:
         ):
             raise
         return _verdict("measure", 1, str(refused), held=stale)
+    held = (store.directory_for(memory.key_of(config, machine)) / ENTRY_FILE).is_file()
     if why := stale_page_bound(read, config):
-        return _verdict("measure", 2, why, held=True)
-    return _verdict("reuse", None, f"at their key in {store.root}")
+        return _verdict("measure", 2, why, held=held)
+    where = f"at their key in {store.root}" if held else f"in {read.source}"
+    return _verdict("reuse", None, where)
 
 
 def _law_file(where: str, held: dict, config, machine, atom: str) -> dict:
     if (ran := held["host"]["key"].get("atom")) != atom:
         why = f"{where} states ATOM digest {ran}, and the head's is {atom}"
         return _verdict("calibrate", 1, why, law=where)
-    step = {k: v for k, v in held.items() if k not in runfile.HOST_MEMBERS}
+    step = {k: v for k, v in held.items() if k not in runfile.NOT_STEP_LAW}
     return _judged(where, step, held["host"], config, machine, atom)
 
 
 def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> dict:
     """The verdict on the step linear law `law` and host laws `host` found at
-    `where`, both at the head's key: their CPU, then requirements 3 and 4."""
-    if (cpu := host["key"].get("host_cpu")) != (here := compass_run.host_cpu()):
-        why = f"{where}'s host laws were fitted on {cpu}, and this host is {here}"
-        return _verdict("refused", 1, why, law=where)
+    `where`, both at the head's key, on any host CPU, the one they timed being
+    the one predicted: requirement 1's prefill token-graph buckets, then
+    requirements 3 and 4."""
     compass_run.refuse_unfitted_law(
         {STEP_LINEAR: law, "machine": machine.echo()}, config
     )
     compass_run.refuse_unfitted_host(host, config, machine_platform(machine))
+    buckets = lacking.recorded_buckets(config, machine.value("device.arch"))
+    try:
+        compass_run.refuse_other_buckets(
+            config, buckets, {STEP_LINEAR: law, "host": host}
+        )
+    except ValueError as refused:
+        if (ran := law.get("records_atom")) == atom:
+            raise
+        ran = f"from ATOM digest {ran}" if ran else "stating no ATOM digest"
+        why = f"{where}: {refused}, on records re-keyed {ran}"
+        return _verdict("calibrate", 1, why, law=where)
     if rungs := [str(r) for r in uncovered_rungs(law, config)]:
         why = (
             f"{where} has no decode vector for rung{'s' * (len(rungs) > 1)} "

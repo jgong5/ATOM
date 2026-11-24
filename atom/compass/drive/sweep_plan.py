@@ -44,8 +44,7 @@ decodes within `max_num_seqs`, contexts and their output tokens within
 or the workload's (no prompt longer than its longest). Whether two-batch
 overlap splits a step is ATOM's prefill rule over the step's ranks
 (`atom.compass.validate.bound._split`), under this process's
-``ATOM_TBO_PREFILL_MIN_TOKENS`` and ``ATOM_TBO_PREFILL_TOKEN_SPLIT``, which
-must be the server's. A step-record line covers an unsplit A point when it
+``ATOM_TBO_PREFILL_MIN_TOKENS``, which must be the server's. A step-record line covers an unsplit A point when it
 is any rank's unsplit step of the point's token count, and any other point
 when its prefill rows are the point's, in batch order, and its split is the
 point's.

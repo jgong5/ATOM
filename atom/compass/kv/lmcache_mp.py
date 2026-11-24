@@ -26,6 +26,11 @@ each reply once a grant releases it and sets its future. A wait on that future
 on the step loop is an idle point until the reply or the wait's bound. Frames
 outside the run go unstamped.
 
+With ``OFFLOAD_MP_LOOKUP_THREAD``, the shell replaces the lookup driver's thread
+with `_OwnedDriver`, whose passes the clock owner makes (`LPRuntime.offer`):
+one when the input thread offers an arrival's lookup, at that arrival, and one
+when lmcache's polling thread takes a reply, at the reply's arrival (#3767).
+
 A server URL lmcache reaches over gRPC is refused by its scheme. Importing this
 module loads no third-party package; using it loads lmcache, zmq and torch.
 """
@@ -38,6 +43,7 @@ import logging
 import math
 import pickle
 import threading
+from functools import partial
 from types import SimpleNamespace
 
 from atom.compass.kv.connector import SimulatedKVConnectorScheduler
@@ -92,10 +98,18 @@ class MultiShell(MultiConnectorScheduler):
 def _units_as_named(config) -> SimpleNamespace:
     """A native-state rank's checkpoint layout: the units it is given, as
     named, and an image group exactly when ATOM's worker registers one."""
-    from atom.kv_transfer.offload.mp.native_state_layout import stores_state_images
+    from atom.kv_transfer.offload.mp.native_state_layout import (
+        NativeStateMPLayout,
+        stores_state_images,
+    )
 
     replay = int(getattr(config, "state_replay_tokens", 0) or 0)
-    return SimpleNamespace(validate_unit_ids=tuple, images=stores_state_images(replay))
+    return SimpleNamespace(
+        validate_unit_ids=tuple,
+        images=stores_state_images(replay),
+        # ATOM's own block ids per group, which read nothing of the layout.
+        transfer_block_ids=partial(NativeStateMPLayout.transfer_block_ids, None),
+    )
 
 
 def _restored(pending) -> bool:
@@ -152,6 +166,12 @@ class LMCacheMPShell:
         self._inner.bind_block_manager(block_manager)
         if self._ranks:
             return
+        client = getattr(self._inner._impl, "_lookup_client", None)
+        driver = getattr(client, "_driver", None)
+        if driver is not None:
+            driver.stop()
+            client._driver = _OwnedDriver(self._rt, client, driver.window)
+            client._adapter.compass_replied.append(client._driver.notify)
         impl, config = self._inner._impl, self._config
         native = isinstance(impl, NativeStateLMCacheMPConnectorScheduler)
         tp, group = config.tensor_parallel_size, _tp_replication_factor(config)
@@ -287,6 +307,35 @@ class LMCacheMPShell:
             )
 
 
+class _OwnedDriver:
+    """`mp/lookup_driver.py::_LookupDriver` with no thread of its own: each pass
+    is offered to the clock owner, which makes it at the arrival whose handler
+    woke it, or at its own next clock call. The real driver also wakes every
+    `_DRIVER_IDLE_S` to release stale answers; this one does so only at a pass."""
+
+    def __init__(self, rt, client, window: int) -> None:
+        self.rt, self.client, self.window = rt, client, window
+        self.queued = False
+
+    def start(self) -> None:
+        pass
+
+    def stop(self, timeout: float = 5.0) -> None:
+        pass
+
+    def notify(self) -> None:
+        if not self.queued:
+            self.queued = True
+            self.rt.offer(self._pass)
+
+    def _pass(self) -> None:
+        self.queued = False
+        try:
+            self.client._drive(self.window)
+        except Exception:
+            logger.warning("LMCache MP lookup driver pass failed", exc_info=True)
+
+
 class _Rank:
     """One TP rank's lmcache worker adapter: each STORE and RETRIEVE it is given
     goes to LP ``lmcache`` on its DP rank's channel, under its writer's worker
@@ -385,6 +434,7 @@ def clocked_adapter(cls, config, **kwargs):
             return self.query()
 
     adapter = cls(context=Context(), **kwargs)
+    adapter.compass_replied = []  # called as a stamped reply is taken
     client = adapter._client._message_queue_client
     sock, receive, submit = client.socket, client.process_inbound, client.submit_request
     client.input_queue = clock.RelayQueue(rt, sock)
@@ -405,6 +455,8 @@ def clocked_adapter(cls, config, **kwargs):
             rt.handed_over(back, seq)
             try:
                 receive()
+                for replied in adapter.compass_replied:
+                    replied()
             finally:
                 rt.back_at_wait_point()
 

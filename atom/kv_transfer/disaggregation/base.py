@@ -183,6 +183,10 @@ class KVConnectorSchedulerBase(ABC):
         """
         return not self.is_offload
 
+    def abort_send(self, seq: Any) -> None:
+        """Retire an unsent abort; streaming senders must wait for reader drain."""
+        self.send_finished(seq.id)
+
     @abstractmethod
     def request_finished(self, seq: Any) -> None:
         """Populate KV transfer output metadata when a request completes."""
@@ -202,22 +206,14 @@ class KVConnectorSchedulerBase(ABC):
         """Retire a P/D send claim; explicit no-op for backends without sends."""
         ...
 
-    def abort_send(self, seq: Any) -> None:
-        """A request was aborted; retire or keep its send claim.
+    def abort_parked_send(self, req_id: Any) -> None:
+        """The request was aborted after it finished, while its send claim was held.
 
-        Called with the `Sequence` when a request finishes aborted
-        (`Scheduler._connector_abort_send`): it produced no handoff, so the
-        claim is retired, as for an unsent abort; streaming senders must wait
-        for reader drain. Called with a bare request id when an abort reaches
-        a request already finished and parked for its send
-        (`Scheduler.abort_request`): a backend that sees every transfer of the
-        source blocks reports the send in ``finished_sending`` once none can
-        run, at once when none has started, and refuses a later one. This
-        default keeps that claim: a backend that cannot see a transfer must
-        not free blocks one may read.
+        A backend that sees every transfer of the source blocks reports the
+        send in ``finished_sending`` once none can run, at once when none has
+        started, and refuses a later one. This default keeps the claim: a
+        backend that cannot see a transfer must not free blocks one may read.
         """
-        if hasattr(seq, "id"):
-            self.send_finished(seq.id)
 
     @abstractmethod
     def source_blocks_released(self, seq: Any) -> None:

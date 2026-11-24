@@ -33,7 +33,13 @@ BASE = dict(re.findall(r"^(BASE_\w+)=(\S+)$", BASELINE.read_text(), re.MULTILINE
 KNOWN = [
     f"tests/test_suite.py::test_known[{i}]" for i in range(int(BASE["BASE_FAILED"]))
 ]
-EXPECT = int(BASE["BASE_PASSED"]) - int(BASE["BASE_COMPASS_TESTS"])
+# The tests the pair's skip lines left out run in a tree that holds none of
+# their files, so the gate expects them to pass too.
+EXPECT = (
+    int(BASE["BASE_PASSED"])
+    - int(BASE["BASE_COMPASS_TESTS"])
+    + int(BASE.get("BASE_LEFT_OUT", 0))
+)
 
 pytestmark = pytest.mark.skipif(BASH is None, reason="needs bash")
 
@@ -110,7 +116,10 @@ CASES = {
     "compass-failure": (
         1,
         "first tests/compass/test_c.py::test_c; 2 more",
-        {"tests/compass/test_c.py": "def test_c():\n    assert False\n"},
+        {
+            "tests/compass/test_c.py": "def test_c():\n    assert False\n",
+            "scripts/compass/gpu_gate_driver_run.txt": "tests/compass/test_c.py\n",
+        },
         "",
     ),
     "no-pair": (

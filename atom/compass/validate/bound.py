@@ -23,9 +23,10 @@ that samples a block drafter's draft-KV pass, `d_draft_kv_ns`, which runs
 before `forward_done_event`. On an MTP record only the target's price is
 compared, that pass's included; the drafter's is reported apart.
 With `--ratios-from`, the prices are DEV's datasheet peaks at the ratios of
-the readings S holds for DEVICE, a device name a datasheet states, as `compass
-fit device --assume-from` takes them (`fit.device.assumed_entry`): run on a
-device's own records, the report is the error of projecting it from the other.
+the readings S holds for DEVICE, a device name a datasheet states, else its
+committed copy, as `compass fit device --assume-from` takes them
+(`fit.device.assumed_entry`): run on a device's own records, the report is
+the error of projecting it from the other.
 
 A data-parallel step (one with `moe_rows`) is read off every rank's line at
 that step: its `moe_tokens` is the group's scheduled tokens, a dummy rank's
@@ -150,24 +151,19 @@ def steps(record, tbo=False, mtp=False):
 
 def _split(lines):
     """The two-batch-overlap split ATOM agrees over a DP group's step `lines`,
-    per micro-batch each rank's tokens, or None: each rank's prefill answer
-    (`local_tbo_precompute`), then `sync_dp_metadata`'s OR of the min-token
-    bar, AND of can-split and uniform prefill. A decoding rank, a dummy run
-    among them, cannot split."""
-    from atom.utils import envs
+    per micro-batch each rank's tokens, or None: each rank's vote on its
+    prefill tokens, cut at their midpoint (`prefill_tbo_vote`), then
+    `sync_dp_metadata`'s OR of the min-token bar, AND of can-split and uniform
+    prefill. A decoding rank, a dummy run among them, casts no prefill vote,
+    so the step does not split."""
     from atom.utils.tbo import ubatching
 
-    rule = (
-        ubatching._precompute_prefill_token_split
-        if envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
-        else ubatching._precompute_prefill_req_split
-    )
-    local, bar = [], envs.ATOM_TBO_PREFILL_MIN_TOKENS
+    local = []
     for s in lines:
         prefill = [q for q, _, d in s["rows"] if not d]
         if not prefill:
             return None
-        local.append(rule(np.array(prefill), len(prefill), bar))
+        local.append(ubatching.prefill_tbo_vote(sum(prefill)))
     meets, can, first, second = zip(*local)
     return (first, second) if any(meets) and all(can) else None
 
@@ -530,8 +526,10 @@ def main(argv: list[str]) -> None:
 
     store = ArtifactStore(args.store)
     if args.ratios_from:
-        key, entry, _ = assumed_entry(store, args.ratios_from, args.ptl, args.stack)
-        machine = composed(datasheet(args.device), key, entry)
+        key, entry, _, where = assumed_entry(
+            store, args.ratios_from, args.ptl, args.stack
+        )
+        machine = composed(datasheet(args.device), key, entry, source=where)
     else:
         machine = compose(args.device, store, args.ptl, args.stack)
     config, ep, priced = backends(

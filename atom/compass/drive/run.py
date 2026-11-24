@@ -85,6 +85,7 @@ from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactStore, Kind
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.step_grid_plan import BOUNDS, coverage
+from atom.compass.backends.step_labels import group_peaks
 from atom.compass.drive import lacking, runfile, serve
 from atom.compass.run import (
     OP_GRAPH,
@@ -335,7 +336,9 @@ def op_coverage(backend, steps) -> dict:
     on a line the fit declined among them, goes to the roofline and leaves its
     step out. A step the backend refuses is left out under ``step refused``.
     A line's `tbo_tokens`, the two-batch-overlap split its data-parallel
-    group agreed, makes the step its rank's (`dp_rank`) two micro-batches.
+    group agreed, makes the step its rank's (`dp_rank`) two micro-batches;
+    its `group_max_tokens`, the most tokens a rank of the group ran, is the
+    step's, as a run's projection states it.
     Its `target_bs`, `draft_bs`, `draft_moe_rows` and `draft_rows` read its
     target and its drafter at the widths and rows they ran at, as a simulated
     run reads them."""
@@ -353,6 +356,7 @@ def op_coverage(backend, steps) -> dict:
             produces_output=line["produces_output"],
             tbo_tokens=split and tuple(map(tuple, split)),
             dp_rank=split and line.get("dp_rank"),
+            group_max_tokens=line.get("group_max_tokens"),
         )
         try:
             cost = backend.price(view)
@@ -387,7 +391,9 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
     engine states other `SHAPING` fields than `here` refuses, naming each.
     Whatever a line states, its `tbo_tokens` is, under two-batch overlap
     (`tbo`, ATOM's `enable_tbo`), the split `bound._split` agrees over every
-    rank's line at that step, one rank's included, else None."""
+    rank's line at that step, one rank's included, else None; and its
+    `group_max_tokens`, in a DP group, the most tokens a rank's line runs at
+    that step (`step_labels.group_peaks`), else None."""
     path = Path(name)
     if (path / serve.RUN_JSON).is_file():
         records = {
@@ -421,8 +427,13 @@ def _steps(name: str, store, here: dict, tbo: bool) -> list:
     # `trace ops --population` reads it.
     every = set.intersection(*map(set, at.values())) if tbo and at else ()
     splits = {n: _split([r[n] for r in at.values()]) for n in every}
+    ran = ([s for s in r.values() if "rows" in s] for r in at.values())
+    peaks = group_peaks(ran) if len(at) > 1 else {}
     return [
-        (f"{name} dp{rank} step {n}", line | {"tbo_tokens": splits.get(n)})
+        (
+            f"{name} dp{rank} step {n}",
+            line | {"tbo_tokens": splits.get(n), "group_max_tokens": peaks.get(n)},
+        )
         for rank, steps in at.items()
         for n, line in steps.items()
         if not line["is_dummy_run"]

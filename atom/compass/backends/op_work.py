@@ -840,6 +840,9 @@ EXTRACTORS = {
     "atom.model_ops.fla_ops.replayssm:replayssm_commit": _only(
         "slot_idx", "num_accepted"
     ),
+    # GDN's causal-conv1d program map: two int32 words for each of its
+    # ceil(tokens / 8) + rows programs, which the floor bounds.
+    "atom.model_ops.mamba_ops.causal_conv1d:compute_causal_conv1d_metadata": _launch,
     "atom.model_ops.rejection_sampler:rejection_sample": _in_place(),
     **{kind: _experts(fmt) for kind, fmt in EXPERTS.items()},
     TRITON_MOE + "quant_moe:downcast_to_mxfp": _downcast,
@@ -884,6 +887,10 @@ EXTRACTORS = {
         op, outs=["torch.float32"]
     ),
     "atom.model_ops.decode_input_ids:fill_deferred_decode_ids": _in_place(),
+    # The shared experts' columns of a gathered batch's ids, from its template.
+    "atom.model_ops.fused_moe.gathered_shared_ids:copy_shared_expert_ids_": _only(
+        "topk_ids", "shared_template"
+    ),
     "atom.utils.block_convert:kv_indices_generate_triton": _kv_indices,
 }
 #: DeepSeek-V4.1's kinds, gfx1250's and gfx950's. What a lifted leaf writes

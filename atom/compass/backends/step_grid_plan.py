@@ -17,8 +17,9 @@ states, since a real start sets it from its free memory; inputs whose ranks
 state two engines otherwise are refused. A decode row computes the engine's
 decode width N_Q: one token, or under the drafter its engine states
 (`speculative`, [method, K]) the K + 1 of a verify step, whose draft round
-also writes KV at K - 1 positions past the row, the lookahead ATOM's
-scheduler allocates with it (`block_manager.draft_kv_lookahead`); a step
+also writes KV at K - 1 positions past the row (K under DSpark, a block
+drafter), the lookahead ATOM's scheduler allocates with it
+(`block_manager.draft_kv_lookahead`); a step
 whose decode row computes another count is refused. The grid definition is a
 mapping:
 
@@ -81,14 +82,21 @@ UNKEYED = (*BOUNDS, "num_kvcache_blocks", "enable_prefix_caching")
 #: The engine file's prefill token-graph buckets its runner recorded, where it
 #: recorded some, also beside `keyed`'s.
 PREFILL_BUCKETS = "prefill_buckets"
+#: Whether the engine's token processor defers each step's sampled ids a step
+#: (`scheduler.defers_output`), also beside `keyed`'s: `check_run` reads it.
+DEFERS_OUTPUT = "deferred_output"
 #: The grid definition's own fields.
 DEFINITION = ("prefill", "decode", "margin")
 
 
 def keyed_of(engine: dict) -> dict:
     """`run.step_grid.keyed`'s fields of an engine file's mapping `engine`, which
-    adds `UNKEYED` and `PREFILL_BUCKETS` to them."""
-    return {k: v for k, v in engine.items() if k not in (*UNKEYED, PREFILL_BUCKETS)}
+    adds `UNKEYED`, `PREFILL_BUCKETS` and `DEFERS_OUTPUT` to them."""
+    return {
+        k: v
+        for k, v in engine.items()
+        if k not in (*UNKEYED, PREFILL_BUCKETS, DEFERS_OUTPUT)
+    }
 
 
 def at_ladder(here: dict, there) -> dict:
@@ -170,13 +178,14 @@ def _target(definition: dict, engines: dict) -> dict:
                 f"{k} {definition[k]!r} and the engine {engine[k]!r}" for k in differ
             )
         )
-    drafts = (engine.get("speculative") or (None, 0))[1]
+    method, drafts = engine.get("speculative") or (None, 0)
     if type(drafts) is not int or drafts < 0:
         raise ValueError(
             f"{first} states the drafter {engine['speculative']!r}, whose draft "
             "width is not a count"
         )
-    drafter = {"draft_width": drafts, "lookahead": _lookahead(drafts)}
+    lookahead = _lookahead(drafts, block_drafter=method == "dspark")
+    drafter = {"draft_width": drafts, "lookahead": lookahead}
     return {key: engine[key] for key in TARGET} | drafter
 
 
@@ -192,11 +201,12 @@ def _span(nodes, low, high, margin: int) -> list:
     return nodes[max(0, first - margin) : last + margin + 1]
 
 
-def _lookahead(drafts: int) -> int:
+def _lookahead(drafts: int, *, block_drafter: bool = False) -> int:
     """The KV positions past a row's context that one forward's draft round
-    writes under a drafter of draft width `drafts`, which ATOM's scheduler
-    allocates with the row (`block_manager.draft_kv_lookahead`)."""
-    return max(0, drafts - 1)
+    writes under a drafter of draft width `drafts`, a block drafter's (DSpark's)
+    one more than a serial one's, which ATOM's scheduler allocates with the row
+    (`block_manager.draft_kv_lookahead`)."""
+    return drafts if block_drafter else max(0, drafts - 1)
 
 
 def _extra(target: dict) -> int:

@@ -15,15 +15,18 @@ refuses them, and the clock endpoint flag, among ATOM's arguments; an op graph
 run's file also holds ATOM's arguments, from which its engines trace a shape
 the store lacks (`run.ATOM_ARGS`). A simulated server whose run file names
 a machine starts under `on_arch`, which imports aiter as on that machine's
-device first, so the server resolves its config, an FP8 quantization's dtype
-among it, as there, whatever device this host has. Each start
+device first, in the server and in every process it spawns, so the server
+resolves its config, an FP8 quantization's dtype among it, and its engines and
+workers start as there, whatever device this host has, a host with none
+included. Each start
 takes a free `ATOM_DP_MASTER_PORT`: the port keys ATOM's compiled-graph cache,
 and the first start that loads that cache autotunes every graph's kernels
 again, whose configs stay loaded and read in `non_torch`. No later start loads
 the directory, so the server's stop removes it (`drop_compiled`).
 
 The server runs this driver's tree in its own process group, so its engine
-processes stop with it, and writes ``<out>/server.log`` and its step record in
+processes stop with it, with the open-file soft limit raised as ATOM's own
+server raises it (`atom.utils.set_ulimit`), and writes ``<out>/server.log`` and its step record in
 ``<out>/steps``. Once its ``/health`` first answers, ``<out>/server.json``
 names its URL and process id, its host's wall clock and monotonic nanoseconds
 read together then (`step_labels.CLOCK`), for a simulated server its clock
@@ -59,6 +62,7 @@ from atom.compass.drive import jit_cache
 from atom.compass.drive.gpu import KFD, hip_visible, quiet
 from atom.compass.drive.identity import _device, _stack, clock_ns, identity
 from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _machine, _write_whole
+from atom.utils import set_ulimit
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 SERVER = (sys.executable, "-m", "atom.entrypoints.openai.api_server")
@@ -226,6 +230,13 @@ def serve(
         kfd = _kfd() if gpus else None
         if library:
             jit_cache.restore(library)
+        # The server inherits this process's open-file limit. A simulated run's
+        # client opens a second connection for each request it cancels while
+        # the request's own is open, about twice its concurrency at the grace
+        # deadline: past the usual soft 1024 at c=512, where an accept that
+        # failed for want of a descriptor left the cancel it was to take in
+        # unread.
+        set_ulimit()
         with (out / LOG_FILE).open("w") as log:
             # The log's creation, on the clock a cache file's mtime reads.
             since = os.fstat(log.fileno()).st_mtime_ns

@@ -34,6 +34,7 @@ def _group(monkeypatch):
 
     group = GroupCoordinator.__new__(GroupCoordinator)
     group.world_size, group.rank_in_group, group.device_group = TP, RANK, None
+    group.device_communicator = None  # aiter's gather reads it; none here
     ran = []
 
     def all_gather_into_tensor(output, input, group=None, async_op=False):

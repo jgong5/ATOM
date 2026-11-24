@@ -31,15 +31,11 @@ def _geometry(kv_dtype):
     )
 
 
-def _coinciding():
-    """V4.1's FP8 pool of 6 layers and no drafter, 4 layers' rings a page:
-    layer L's ring on P pages starts where layer L + 4's does on P - 1."""
-    return V41PoolGeometry(6, ((0, 1),), 16, 16, 128, 32, kv_dtype="fp8")
-
-
-def _taken(windows, cache):
+def _taken(windows, cache, kept=None):
     """Copy 0's `window` of a window write given each of `windows` as the
-    capture states it, on a point whose forward context holds `cache`."""
+    capture states it, on a point whose forward context holds `cache`: of each
+    leaf of their graph, or of those at `kept` alone, the graph's leaves left
+    to measure."""
     leaves = [
         _leaf(WRITE, ("window", Reduced(RING, tuple(dataclasses.asdict(w).items()))))
         for w in windows
@@ -53,7 +49,8 @@ def _taken(windows, cache):
         return out
 
     runner.prepare_model, stub = prepare_model, ops.Stub(runner, 10_000)
-    stub.leaves = ops.leaves(_graph(*leaves, layers=1)["region"])
+    found = list(ops.leaves(_graph(*leaves, layers=1)["region"]).items())
+    stub.leaves = dict(found[i] for i in kept or range(len(found)))
     stub._prepare((0, 0))
     return [
         stub._copy(op, sig, instances, 0)[0]["window"]
@@ -61,14 +58,10 @@ def _taken(windows, cache):
     ]
 
 
-@pytest.mark.parametrize(
-    "kv_dtype, form",
-    [("fp8", "window_bytes"), ("fp8", "window"), ("bf16", "window")],
-)
-def test_a_v41_window_ring_is_its_layer_s_of_the_point_s_pool(kv_dtype, form):
+def test_a_v41_window_ring_is_its_layer_s_of_the_point_s_pool():
     # each layer's ring as a 2-page pool placed it, taken on a 7-page pool
-    geometry = _geometry(kv_dtype)
-    ring = getattr(geometry, form)
+    geometry = _geometry("bf16")
+    ring = geometry.window
     cache = SimpleNamespace(geometry=geometry, num_pages=POINT)
 
     got = _taken([ring(layer, CAPTURED) for layer in range(3)], cache)
@@ -76,43 +69,41 @@ def test_a_v41_window_ring_is_its_layer_s_of_the_point_s_pool(kv_dtype, form):
     assert got == [ring(layer, POINT) for layer in range(3)]
 
 
-@pytest.mark.parametrize("form", ["window_bytes", "window"])
-def test_rings_that_coincide_take_the_one_pool_that_holds_all_the_point_s(form):
-    # layer 0's ring on 2 pages starts where layer 4's does on 1, and layer 5's
-    # on 2 where layer 1's does on 3: only 2 pages hold each of the six
-    geometry = _coinciding()
-    ring = getattr(geometry, form)
-    cache = SimpleNamespace(geometry=geometry, num_pages=POINT)
-    assert ring(0, CAPTURED) == ring(4, CAPTURED - 1)
-
-    got = _taken([ring(layer, CAPTURED) for layer in range(6)], cache)
-
-    assert got == [ring(layer, POINT) for layer in range(6)]
-
-
-def _off(geometry):
-    ring = geometry.window_bytes(1, CAPTURED)
-    return dataclasses.replace(ring, ring_start=ring.ring_start + 1)
-
-
-@pytest.mark.parametrize(
-    "geometry, ring, why",
-    [
-        (_geometry("fp8"), _off, "no layers'"),
-        # alone, layer 0's ring on 2 pages is layer 4's on 1
-        (_coinciding(), lambda g: g.window_bytes(0, CAPTURED), "2 layers'"),
-    ],
-    ids=["no-layer", "two-layers"],
-)
-def test_a_ring_not_one_layer_s_refuses_its_leaf(geometry, ring, why):
+@pytest.mark.parametrize("kept", [[0], [0, 1], [1, 2]], ids=["0", "0-1", "1-2"])
+def test_a_point_holding_some_of_a_graph_s_rings_takes_the_graph_s_pool(kept):
+    # the graph's other leaves measured already: those kept take their layers'
+    # rings on the point's pool
+    geometry = _geometry("bf16")
+    ring = geometry.window
     cache = SimpleNamespace(geometry=geometry, num_pages=POINT)
 
-    with pytest.raises(ValueError, match=f"{why} window rings start where"):
-        _taken([ring(geometry)], cache)
+    got = _taken([ring(layer, CAPTURED) for layer in range(3)], cache, kept)
+
+    assert got == [ring(layer, POINT) for layer in kept]
+
+
+def test_a_ring_no_layer_s_refuses_its_leaf():
+    geometry = _geometry("bf16")
+    ring = geometry.window(1, CAPTURED)
+    off = dataclasses.replace(ring, ring_start=ring.ring_start + 1)
+    cache = SimpleNamespace(geometry=geometry, num_pages=POINT)
+
+    with pytest.raises(ValueError, match="no layers' window rings start where"):
+        _taken([off], cache)
+
+
+def test_an_fp8_window_s_ring_on_its_own_planes_is_taken_as_captured():
+    # its ring starts at its planes' first row, whatever the pool's pages and
+    # whichever its layer
+    geometry = _geometry("fp8")
+    captured = [geometry.window(2, CAPTURED)]
+    cache = SimpleNamespace(geometry=geometry, num_pages=POINT)
+
+    assert _taken(captured, cache) == captured
 
 
 def test_a_ring_beside_no_v41_cache_is_taken_as_captured():
     # DeepSeek-V4's rings start inside a state slot, wherever its pool ends
-    captured = _geometry("fp8").window_bytes(2, CAPTURED)
+    captured = _geometry("fp8").window(2, CAPTURED)
 
     assert _taken([captured], None) == [captured]

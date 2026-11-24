@@ -2,7 +2,7 @@
 """`compass fit host`: the host laws, fitted on real runs' records and published.
 
     compass fit host RECORD... --client-run RECORD EXPORT... --store ROOT
-        [--stated-hop NAME=SECONDS...] --out DIR
+        [--stated-hop NAME=SECONDS...] [--ingress FILE] --out DIR
 
 `host_laws` fits the samples' host labels by `step_linear_fit.fit_host`, under
 the host key the real runner writes beside each record, and its report names
@@ -13,7 +13,13 @@ intake stamps the recorded server wrote beside its steps
 (`step_linear_fit.fit_intake`); and from those stamps, the engine's queue
 handoffs and step lines, and the aiperf raw records beside each client run's
 export (`client_run.RAW`, gzipped or not), its ``hops``
-(`step_linear_fit.fit_hops`). A record whose server did not exit refuses: its
+(`step_linear_fit.fit_hops`). A prefill side's record beside its deployment's
+decode side's, both stamped on one host's clock, also gives the ``relay``
+term (`step_linear_fit.fit_relay`): a prefill response's time through the
+router to decode's app call, which a run delays past ``router_s``. Records of
+a server that streamed its responses give the ``http_stream`` term
+(`step_linear_fit.fit_stream`): its API loop's CPU per SSE event; a server
+that streamed none has no such term to fit. A record whose server did not exit refuses: its
 server's lines are where ``steps/<name>.local`` names (`atom.compass.run.LOCAL`),
 not in its steps. A term the records cannot give, or a kind of
 tokenizer call as ``tokenizer.<kind>`` or a hop as ``hops.<hop>``, is left out
@@ -28,6 +34,13 @@ per-request forward, which a `deploy.sh run` with a `--dp-aware` router needs
 above the IPC hop it borrows for ``router_in_s``, and ``kv_write_req_s``,
 Mooncake's write request (`STATED_HOPS`). The report's ``stated_hops`` names
 each, so the entry says which hops were stated rather than fitted.
+
+`--ingress FILE` states the encoding ingress in front of the deployment as the
+entry's ``ingress`` term (`atom.compass.ingress`): FILE's ``ingress``, as
+`compass fit ingress` writes it from the ingress's stamps, which no record
+here holds. The report's ``stated_ingress`` names FILE and the term. Fit such
+an entry on records taken behind that ingress: their server took each prompt's
+token ids, so it rendered and tokenized nothing, and read larger bodies.
 """
 
 import gzip
@@ -40,9 +53,14 @@ from atom.compass.backends.step_linear_fit import (
     fit_hops,
     fit_host,
     fit_intake,
+    fit_relay,
+    fit_stream,
     fit_tokenizer,
+    streams,
 )
 from atom.compass.fit import publish
+from atom.compass.ingress import KEY as INGRESS
+from atom.compass.ingress import check as check_ingress
 from atom.compass.parity.client_run import RAW
 from atom.compass.run import INTAKE_RECORD, LOCAL, TOKENIZER_RECORD
 from atom.compass.validate.runs import SIDES
@@ -81,10 +99,22 @@ def host_laws(samples, records=(), client_runs=()) -> tuple[dict, dict]:
     clients = [
         _client(r, [e for d, e in client_runs if Path(d) == Path(r)]) for r in stamped
     ]
+    # A prefill side whose deployment's decode side stamped its intake too.
+    relayed = [
+        (d, sibling)
+        for r, d in zip(stamped, steps)
+        if Path(r).name == SIDES[0]
+        and (sibling := Path(r).parent / SIDES[1] / "steps" / INTAKE_RECORD).is_file()
+    ]
+    # A server that streamed its responses: a non-streaming one, as a
+    # prefill-decode prefill side, sends no event to price.
+    streamed = any(streams(d) for d in steps)
     for term, fit in (
         ("tokenizer", lambda: fit_tokenizer(calls, steps)),
-        ("http_intake", lambda: fit_intake(steps)),
+        ("http_intake", lambda: fit_intake(steps, calls)),
         ("hops", lambda: fit_hops(steps, clients)),
+        *([("http_stream", lambda: fit_stream(steps))] if streamed else []),
+        *([("relay", lambda: fit_relay(relayed))] if relayed else []),
     ):
         try:
             if not steps:
@@ -160,6 +190,15 @@ def stated_hops(words: list[str], fitted: dict) -> dict:
     return out
 
 
+def stated_ingress(path: str) -> dict:
+    """The ``ingress`` term `--ingress path` states: the file's ``ingress``,
+    refused unless it is one (`atom.compass.ingress.check`)."""
+    got = json.loads(Path(path).read_text())
+    if not isinstance(got, dict) or INGRESS not in got:
+        raise ValueError(f"--ingress {path}: holds no {INGRESS} term")
+    return check_ingress(got[INGRESS], f"--ingress {path}: its {INGRESS}")
+
+
 def main(argv: list[str]) -> None:
     parser = publish.parser(PROG, __doc__.split("\n\n")[0])
     parser.add_argument(
@@ -170,12 +209,23 @@ def main(argv: list[str]) -> None:
         help=f"a hop no record times, one of {', '.join(STATED_HOPS)}, written "
         "into the entry's hops and named under the report's stated_hops",
     )
+    parser.add_argument(
+        "--ingress",
+        metavar="FILE",
+        help="the encoding ingress in front of the deployment, compass fit "
+        "ingress's FILE, written as the entry's ingress term and named under the "
+        "report's stated_ingress",
+    )
     args = parser.parse_args(argv)
+    ingress = stated_ingress(args.ingress) if args.ingress else None
     samples, config = publish.inputs(args, ("record",))
     host, report = host_laws(samples, args.inputs, args.client_run)
     if stated := stated_hops(args.stated_hop, host.get("hops", {})):
         host["hops"] = {**host.get("hops", {}), **stated}
         report["stated_hops"] = stated
+    if ingress is not None:
+        host[INGRESS] = ingress
+        report["stated_ingress"] = {"file": args.ingress, INGRESS: ingress}
     k = host["key"]
     k |= keyed_platform(Kind.HOST_LAWS, config["platform"])
     key = Key.of(

@@ -666,9 +666,7 @@ class PrefillDelayer:
                 self._reduce_buf[self._gate_at + offset] = value
         if self.admit_policy == "adaptive":
             if not self._cost_gate:
-                now_a = (
-                    time.perf_counter() if self._clock is None else self._clock()
-                )
+                now_a = time.perf_counter() if self._clock is None else self._clock()
                 if self._last_call_s is not None:
                     step_s = now_a - self._last_call_s
                 self._last_call_s = now_a

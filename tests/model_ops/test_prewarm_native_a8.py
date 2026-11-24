@@ -38,8 +38,9 @@ def _model(*specs):
 @pytest.fixture
 def calls(monkeypatch):
     made = []
-    zeros = lambda shape, **k: SimpleNamespace(shape=shape)  # noqa: E731
+    zeros = lambda shape, **k: SimpleNamespace(shape=shape)
     monkeypatch.setattr(torch, "zeros", zeros)
+
     def gemm(x, w, s, **k):
         made.append((w.shape, x.shape[0], k["weight_preshuffled"]))
 
@@ -49,12 +50,8 @@ def calls(monkeypatch):
 
 def test_each_shape_once_at_each_tuned_m_up_to_the_budget(monkeypatch, calls):
     tuned = {(512, 5120): (1, 16, 64, 2048, 4096, 32768)}
-    monkeypatch.setattr(
-        blockscale, "_tuned_ms", lambda n, k, s: tuned.get((n, k), ())
-    )
-    model = _model(
-        (512, 5120, 32, True), (512, 5120, 32, True), (5120, 2048, 32, True)
-    )
+    monkeypatch.setattr(blockscale, "_tuned_ms", lambda n, k, s: tuned.get((n, k), ()))
+    model = _model((512, 5120, 32, True), (512, 5120, 32, True), (5120, 2048, 32, True))
     assert blockscale.prewarm_native_a8(model, 3000) == len(calls)
     tuned_shape = [m for s, m, _ in calls if s == (512, 5120)]
     assert tuned_shape == [1, 16, 64, 2048, 4096]  # once, and the row 3000 pads to

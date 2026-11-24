@@ -10,8 +10,8 @@ person and an agent follow the same steps; an agent also keeps the rules in
 
 [QUICKSTART.md](QUICKSTART.md) is the developer's path for one configuration:
 records, fits, real runs and grading. This page uses its container, variables and
-platform readings, and never grades. A prediction on a host with no GPU at all is
-[#2893](https://github.com/jgong5/ATOM/issues/2893)'s page.
+platform readings, and never grades. [USER_QUICKSTART.md](USER_QUICKSTART.md)
+predicts one configuration on a host with no GPU at all.
 
 ## Limits
 
@@ -117,6 +117,9 @@ real-run command. Copy its server command into blocks by these rules.
   takes into its `prefill` or `decode` block.
 - **A variant that adds to another**, as the single-node recipe's LMCache variant
   adds variables to the DP attention one, is written whole in its own value.
+- **An LMCache server's command** (`lmcache server ...`) goes into the block's
+  `lmcache_server`, each flag written as an argument is, but `--host` and
+  `--port`: `compass advice` gives each point its own server address.
 - **Every other argument and variable** of the server command is kept as the
   recipe gives it; only the next two sections take any out or change one.
 
@@ -139,15 +142,18 @@ when every candidate's recipe sets it:
 | `AITER_LOG_LEVEL`, on a 1P1D side | unset: deploy.sh sets WARNING itself |
 | `PYTHONUNBUFFERED` | unset: it orders log lines, not the engine's work |
 | `--block-size`, on a DeepSeek-V4 checkpoint | unset: ATOM sets 256 on any DeepSeek-V4 checkpoint, so the recipe's value has no effect |
+| `ATOM_KV_OFFLOAD_EXTRA_CONFIG`, when it names only the LMCache server's host and port | unset: compass advice sets it to each point's own lmcache server, whose host and port it assigns |
+| the router's `--policy` | unset, not the recipe's: compass advice starts the router with its own flags, the same for every candidate, and with one worker a side no policy chooses |
 
-Some things a recipe sets are no instance's and take no departure: the
-router's command (`deploy.sh` starts it), the client's with its `AIPERF_*`
-variables (`client.sh` runs it from `workload`), an LMCache server's (a simulated
-run serves Compass's own in its place), a variable ATOM does not read that the
-recipe sets only to build another value, as `NODE_IP` builds `ATOM_HOST_IP` and
-`--kv-transfer-config`, and the Mooncake variables the README's 1P1D deployment
-gives a real side. Keep each variable the recipe gives the server for LMCache,
-such as `ATOM_KV_OFFLOAD` and its `ATOM_KV_OFFLOAD_EXTRA_CONFIG`, as it gives it.
+Some things a recipe sets are no instance's and take no departure: the rest of
+the router's command (`deploy.sh` starts it, with `compass advice`'s flags), the
+client's with its `AIPERF_*` variables (`client.sh` runs it from `workload`), a
+variable ATOM does not read that the recipe sets only to build another value, as
+`NODE_IP` builds `ATOM_HOST_IP` and `--kv-transfer-config`, and the Mooncake
+variables the README's 1P1D deployment gives a real side. Keep each other
+variable the recipe gives the server for LMCache, such as `ATOM_KV_OFFLOAD`, as
+it gives it, and any key of `ATOM_KV_OFFLOAD_EXTRA_CONFIG` but
+`lmcache.mp.host` and `lmcache.mp.port`.
 
 ### What the user decides
 

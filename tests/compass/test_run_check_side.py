@@ -6,10 +6,12 @@ them.
 DeepSeek-V4-Pro's DPA8 sides resolve the fp8 index cache under the
 `--kv-transfer-config` the script adds, and fp4 without one at gfx950. The
 shipped crs005 DPA8 pair is keyed to fp8, so each side's check finds its own
-law and host laws there and lacks only the decode rungs its capture ladder
-schedules that its own law has no vector for, and its readings, which the
-command it prints measures; the same arguments checked as a lone server
-resolve fp4, and both laws refuse them, naming it.
+law and host laws there and lacks, the decode side, the decode rungs its
+capture ladder schedules that its own law has no vector for, and the prefill
+side, a producer, none (`lacking.uncovered_rungs`); with the pair less the
+readings it carries, its readings too, which the command it prints measures.
+The same arguments checked as a lone server resolve fp4, and both laws refuse
+them, naming it.
 
 Each check resolves its config where the machine's gfx950 is declared, a
 process of its own (`run._config`). The host laws' CPU is the laws', and ATOM's
@@ -35,6 +37,7 @@ from atom.compass import run as compass_run
 from atom.compass.backends.json_file import read_json
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import runfile
+from atom.compass.run import memory
 from atom.model_engine import llm_engine
 
 LAWS = Path(__file__).resolve().parents[2] / "scripts/compass/laws"
@@ -66,13 +69,13 @@ SIDES = {
 #: Both sides' environment less AITER_LOG_LEVEL, which deploy.sh sets.
 SHARED_ENV = {"AITER_BF16_FP8_MOE_BOUND": "0", "ATOM_MOE_GU_ITLV": "1"}
 ROLES = {"prefill": "kv_producer", "decode": "kv_consumer"}
-#: The decode rungs each side's capture ladder schedules that its law in the
-#: pair has no vector for.
-UNCOVERED = {
-    "prefill": "8, 16, 48, 64, 128, 256, 512",
-    "decode": ", ".join(map(str, range(32, 257, 4))) + ", eager",
-}
+#: The decode rungs the decode side's capture ladder schedules that its law in
+#: the pair has no vector for.
+UNCOVERED = ", ".join(map(str, range(32, 257, 4))) + ", eager"
 COVERAGE = "step linear law: stale (coverage)"
+#: What each side's check lacks besides its readings: the prefill side, a
+#: producer, schedules no decode rung, so its law's coverage is complete.
+COVERED = {"prefill": [], "decode": [COVERAGE]}
 
 
 @pytest.fixture(autouse=True)
@@ -90,12 +93,23 @@ def platform(tmp_path) -> list[str]:
     return [*platforms.flags(store, MACHINE, tmp_path), "--store", str(store)]
 
 
-def pair(tmp_path) -> list[str]:
-    """`deploy.sh run`'s flags for the crs005 pair."""
+def pair(tmp_path, readings=True) -> list[str]:
+    """`deploy.sh run`'s flags for the crs005 pair, or without `readings` for
+    the pair less the memory readings it carries."""
+    files = PAIR if readings else {s: _bare(tmp_path, p) for s, p in PAIR.items()}
     laws = [
-        [flag, str(PAIR[s])] for flag in ("--step-linear", "--host-laws") for s in PAIR
+        [flag, str(files[s])] for flag in ("--step-linear", "--host-laws") for s in PAIR
     ]
     return [word for law in laws for word in law] + platform(tmp_path)
+
+
+def _bare(tmp_path, path: Path) -> Path:
+    """The law file at `path` less its memory readings, written into `tmp_path`."""
+    held = read_json(path)
+    held.pop(memory.LAW_MEMBER)
+    bare = tmp_path / path.name.removesuffix(".xz")
+    bare.write_text(json.dumps(held))
+    return bare
 
 
 def side_args(tmp_path, monkeypatch, side) -> list[str]:
@@ -131,11 +145,13 @@ def test_each_side_holds_the_fp8_index_cache_its_crs005_laws_state(
 ):
     atom_args = side_args(tmp_path, monkeypatch, side)
 
-    assert checked(pair(tmp_path), side, atom_args) == 1
+    assert checked(pair(tmp_path, readings=False), side, atom_args) == 1
 
     out = capsys.readouterr().out
-    assert lacked(out) == [COVERAGE, "memory readings: missing"]
-    assert f"no decode vector for rungs {UNCOVERED[side]}, which" in out
+    assert lacked(out) == [*COVERED[side], "memory readings: missing"]
+    assert (f"no decode vector for rungs {UNCOVERED}, which" in out) == (
+        side == "decode"
+    )
     assert '"index_cache_dtype": "fp8"' in out
     assert '"AITER_LOG_LEVEL": "WARNING"' in out
     kv = json.dumps({"kv_role": ROLES[side], "kv_connector": "mooncake"})
@@ -169,7 +185,7 @@ def test_readings_the_printed_command_measures_complete_the_side_s_check(
     tmp_path, monkeypatch, capsys, side
 ):
     atom_args = side_args(tmp_path, monkeypatch, side)
-    flags = pair(tmp_path)
+    flags = pair(tmp_path, readings=False)
     assert checked(flags, side, atom_args) == 1
     words = shlex.split(capsys.readouterr().out.rsplit("made by: ", 1)[1])
     env, measured = words[: words.index("compass")], words[words.index("--") + 1 :]
@@ -181,9 +197,9 @@ def test_readings_the_printed_command_measures_complete_the_side_s_check(
     publish_readings(tmp_path / "store", config, MACHINE)
     monkeypatch.delenv("AITER_LOG_LEVEL", raising=False)
 
-    assert checked(flags, side, atom_args) == 1
+    assert checked(flags, side, atom_args) == (1 if COVERED[side] else 0)
 
-    assert lacked(capsys.readouterr().out) == [COVERAGE]
+    assert lacked(capsys.readouterr().out) == COVERED[side]
 
 
 @pytest.mark.parametrize(
@@ -236,13 +252,13 @@ def test_an_empty_aiter_log_level_is_unset_to_a_side_as_to_deploy_sh(
     tmp_path, monkeypatch, capsys, side
 ):
     atom_args = side_args(tmp_path, monkeypatch, side)
-    flags = pair(tmp_path)
+    flags = pair(tmp_path, readings=False)
     monkeypatch.setenv("AITER_LOG_LEVEL", "")
 
     assert checked(flags, side, atom_args) == 1
 
     out = capsys.readouterr().out
-    assert lacked(out) == [COVERAGE, "memory readings: missing"]
+    assert lacked(out) == [*COVERED[side], "memory readings: missing"]
     assert '"AITER_LOG_LEVEL": "WARNING"' in out
     made = out.rsplit("made by: ", 1)[1]
     assert made.startswith("AITER_LOG_LEVEL=WARNING compass measure memory ")
@@ -252,8 +268,8 @@ def test_an_empty_aiter_log_level_is_unset_to_a_side_as_to_deploy_sh(
     config = drive_run._config(words[words.index("--") + 1 :], "gfx950")
     publish_readings(tmp_path / "store", config, MACHINE)
     monkeypatch.setenv("AITER_LOG_LEVEL", "")
-    assert checked(flags, side, atom_args) == 1
-    assert lacked(capsys.readouterr().out) == [COVERAGE]
+    assert checked(flags, side, atom_args) == (1 if COVERED[side] else 0)
+    assert lacked(capsys.readouterr().out) == COVERED[side]
 
 
 @pytest.mark.parametrize("side", ["prefill", "decode"])

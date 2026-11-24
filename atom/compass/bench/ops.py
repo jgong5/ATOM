@@ -59,13 +59,17 @@ a table, the placement's, a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
 experts' ids ATOM fuses into them, at a point that states its real MoE
 rows (``R=``) each row past them routed to no expert as ATOM routes a pad
-row, one rank's batch holding its real rows alone (`_route`), the
+row, one rank's batch holding its real rows alone (`_route`), the count
+of rows MORI's dispatch hands aiter's fused MoE, every row the leaf holds
+(`RECEIVED`), the
 `NM_OUTPUT` slot at
 one KV split, a view at the start of twice its span, and aiter's top-k
 scratch (`TOPK_WORKSPACE`), one byte in the graph, built as aiter builds it
 on the device for the call's rows, row stride, k and path
 (`_topk_workspace`); a weight is random at its
-shape, dtype and stride, one tensor per occurrence of the leaf in the step;
+shape, dtype and stride, one tensor per occurrence of the leaf in the step,
+but an expert mask its MoE layers' own, ones on the rank's experts
+(`EXPERT_MASK`);
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
@@ -103,11 +107,15 @@ A leaf whose operator cannot run, or that copies to the host or with host
 memory ATOM keeps pageable (`_pageable`), refuses by name.
 On one GPU at a DP-attention layout, the runner is one DP rank's own, TP 1 and DP 1, the
 graphs read and the lines written keep the layout, and a collective leaf
-refuses: it is measured across the layout's ranks, where a DP all-gather's
-`x` holds each rank's own `sizes` entry's rows, the capture's being rank 0's
-(`_own_rows`).
+refuses: it is measured across the layout's ranks, each on its own rows
+where the capture's, rank 0's, are not every rank's (`_own_rows`): a DP
+all-gather's `x` its `sizes` entry's, and MORI's dispatch and combine at a G
+its DP group gathers, its share of G as the capture splits it, refused by
+name where no G gives the rows the leaf states a rank receives.
 A collective leaf is one family over its message bytes, decode and prefill
-alike (`exchange`), which the plan ladders, densifies and covers.
+alike (`exchange`), which the plan ladders, densifies and covers; MORI's
+dispatch and combine at a shape stating G are a family of their own, over EP
+times their largest rank's rows (`exchange_at`), which it does not densify.
 aiter's comm-fused MoE (`COMM_FUSED`) runs on a process group, as a collective
 does: it is called on the runtime ATOM builds for the model's first MoE layer
 that takes it, as its loader builds it before the runner's KV pool is sized,
@@ -120,7 +128,8 @@ called at MORI's entry point on the handle ATOM builds for the model's MoE,
 with the leaf's arguments, and, since neither runs twice in a row, timed
 through graphs that keep MORI's order (`_Mori`): a combine alone on one
 dispatch's rows, their count restored before each call, less that restore;
-a dispatch as rounds of it and a combine, less that combine alone. The point
+a dispatch as rounds of it and a combine of the rows its output holds, less
+that combine alone. The point
 records each graph's median (`parts_ns`), and its kernels are the leaf's own.
 
 Cold, by copies. A call's bytes are its tensor arguments' spans, a KV
@@ -314,7 +323,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 42
+PROTOCOL = 44
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -353,6 +362,18 @@ CLEAR_S, CLEAR_SLACK = 3.0, 256 << 20
 #: aiter's Mega-MHC launcher aborts the process on an `hc_scale` that is not
 #: 16-byte aligned, as three in four three-float slices packed back to back are.
 WEIGHT_ALIGN = 512
+#: The weight slot in which ATOM passes aiter's MoE operators their layer's
+#: expert mask under expert parallelism: ones on the rank's own experts, which
+#: aiter's sorting reads to drop each route to another rank's
+#: (`get_topk_valid_mask`). Drawn as another integer weight is, all zero, it
+#: leaves no route to compute; a leaf takes the layer's own (`Stub._mask`).
+EXPERT_MASK = "expert_mask"
+#: The integer activation, by operator and slot, in which MORI's dispatch hands
+#: aiter's fused MoE how many of its rows it received: aiter sorts those rows
+#: alone. Drawn as another integer activation is, zero, it leaves no row to
+#: compute; a copy takes every row its expert ids hold (`routed_rows`), a pad
+#: row among them routed to no expert (`Stub._route`).
+RECEIVED = {("aiter.fused_moe_.default", "num_local_tokens")}
 #: The release waits since a point last recorded them: seconds, and how many
 #: ended at `CLEAR_S`.
 _waited: Counter = Counter()
@@ -504,6 +525,9 @@ _TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
 # aiter's other decode top-ks: FlyDSL's multi-CTA one (gfx950's) and HIP's
 _MULTI = "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode"
 _PICK = "aiter._top_k_per_row_decode.default"
+# aiter's decode top-k as its routed operator, which picks its kernel itself:
+# what DeepSeek-V4.1's scorer calls since upstream b7b5ec3f2
+_ROUTED = "aiter_routed.top_k_per_row_decode.default"
 _INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
 _SCAN = f"{_INDPTRS}:_launch_indptr_scan"
 _INDICES = f"{_INDPTRS}:_launch_indices"
@@ -533,6 +557,7 @@ V41_NAMES = {
     (_MULTI, "row_starts", "packed"): _OFFSETS,
     (_MULTI, "seq_lens"): "step.visible.{ratio}",
     (_PICK, "seqLens"): "step.visible.{ratio}",
+    (_ROUTED, "seqLens"): "step.visible.{ratio}",
     (_FUSED, "plan_gpu"): _PLAN,
     ("atom.model_ops.deepseek_v41.index_write:write_index_rows", "plan"): _PLAN,
     (_INDICES, "pptr"): f"{_CACHE}.0",
@@ -610,6 +635,7 @@ PAGE_WIDE = {
     _TOPK: ("row_ends", "logits", "stride0"),
     _MULTI: ("seq_lens", "logits", "stride0"),
     _PICK: ("seqLens", "logits", "stride0"),
+    _ROUTED: ("seqLens", "logits", "stride0"),
     _MAXIMA: ("visible", "logits", "maxima", "blocks"),
     f"{_V41}.unit_table:unit_table": ("block_tables", "block_tables"),
 }
@@ -659,6 +685,7 @@ _WRITTEN = {
     (_MULTI, "row_starts"): "context",
     (_MULTI, "seq_lens"): "context",
     (_PICK, "seqLens"): "context",
+    (_ROUTED, "seqLens"): "context",
     (_MAXIMA, "packed.0"): "offsets",
     (_MAXIMA, "packed.1"): "block_offsets",
     **{
@@ -1018,8 +1045,10 @@ def _kv_unsized(value):
 def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
     """Each leaf of a graph's JSON region by `signature`: one of its ops, its
     times in the step under ``occurrences``, and its instances in run order,
-    each the key or path every reference slot binds."""
-    env, found = env or {}, {} if found is None else found
+    each the key or path every reference slot binds; one that takes a
+    DeepSeek-V4.1 window ring (`RING`) with, under ``rings``, every ring the
+    leaves of `found` take, which the capture's one pool placed (`_captured`)."""
+    top, env, found = env is None, env or {}, {} if found is None else found
     if "op" in region:
         bound = {}
         for slot, value in _values(region["args"]):
@@ -1037,7 +1066,20 @@ def leaves(region: dict, env=None, found=None) -> dict[str, tuple[dict, list]]:
     else:
         for item in region.get("seq", region.get("par", ())):
             leaves(item, env, found)
+    if top:  # before any caller cuts `found` to the leaves it measures
+        rings = frozenset(r for op, _ in found.values() for r in _rings(op))
+        for op, _ in found.values():
+            op |= {"rings": rings} if _rings(op) else {}
     return found
+
+
+def _rings(op) -> list[tuple]:
+    """The states of the DeepSeek-V4.1 window rings (`RING`) `op` takes."""
+    return [
+        tuple(map(tuple, v["state"]))
+        for v in op["args"].values()
+        if isinstance(v, dict) and v.get("object") == RING
+    ]
 
 
 def measure(config, todo, llc: int, rank: int = 0) -> list[dict]:
@@ -1218,6 +1260,14 @@ class Stub:
         drafter = getattr(runner, "drafter", None)
         self.moe = _moe(runner.model)
         self.draft_moe = _moe(drafter.model) if drafter else []
+        # the expert masks the model's and its drafter's MoE layers hold under
+        # expert parallelism, which ATOM built for this rank (`_mask`)
+        self.masks = [
+            m.expert_mask
+            for model in [runner.model, *([drafter.model] if drafter else [])]
+            for m in model.modules()
+            if torch.is_tensor(getattr(m, EXPERT_MASK, None))
+        ]
         # ATOM's top-k weights and ids buffers when its MoE layers fuse shared
         # experts into top-k (`init_aiter_topK_meta_data`), live metadata a
         # leaf may read: past top-k, the shared experts' ids, under EP one
@@ -1313,8 +1363,6 @@ class Stub:
         for owner in (fc.attn_metadata, fc.context):
             live |= {k: v for k, v in vars(owner).items() if torch.is_tensor(v)}
         device, md = self.runner.device, fc.attn_metadata
-        if not self.placed:  # one capture's pool placed the point's window rings
-            self.captured = _captured(getattr(md, "cache", None), self.leaves)
         live = {
             k: v
             for k, v in live.items()
@@ -1344,7 +1392,7 @@ class Stub:
         for rows, (step, _) in passes.items():
             if hasattr(step, "request_floors"):
                 split = np.maximum(step.request_positions, step.request_cached_until)
-                self.reach[rows or step.width] = split - step.request_floors
+                self.reach[rows or step.running_tokens] = split - step.request_floors
         # DeepSeek-V4's persistent HCA decode workspace, one per device: a slot
         # of `HCA_DECODE` named as one of its fields is a view of that field
         hca = sys.modules.get("atom.model_ops.v4_kernels.hca_persist")
@@ -1433,7 +1481,8 @@ class Stub:
                                 "cannot tell which ratio's compress plan holds its "
                                 f"{spec['shape'][-1]} rows: trace its shape again"
                             )
-                        top_k = op["op"] in (_TOPK, _MULTI, _PICK) and not index
+                        top_k = op["op"] in (_TOPK, _MULTI, _PICK, _ROUTED)
+                        top_k = top_k and not index
                         bound = V41_NAMES.get(key) == "step.visible.{ratio}"
                         if top_k and ratio is None and untold and bound:
                             raise ValueError(  # a row bound ATOM stages, its ratio's
@@ -1660,8 +1709,9 @@ class Stub:
             dp = self.alone or self.runner.config.parallel_config.data_parallel_size
             moe = shape.gathered or dp * shape.tokens * (drafts + 1)
             self.real = shape.real, dp, moe
-            if dp == 1:  # one rank's batch holds its real rows, padded to the rung
-                batch = shape._replace(tokens=shape.real // (drafts + 1))
+            if dp == 1:  # one rank's batch holds its real rows, padded to the
+                # rung: as few rows as hold them, each verifying its drafts
+                batch = shape._replace(tokens=-(-shape.real // (drafts + 1)))
         rows = point_rows(batch, context, pool, rule.block_size, bool(uncut), drafts)
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
@@ -1993,7 +2043,8 @@ class Stub:
         occurrence where later ones take a `QUERIED` buffer, with no read;
         with its kernels, profiled again on every rank when any rank's named
         none of a call its cold graph timed. Every rank's graph holds the most K
-        any rank's call gives, and a leaf any rank refuses, every rank does; K
+        any rank's call gives, every rank times the warm graph where any rank
+        has several copies, and a leaf any rank refuses, every rank does; K
         past a leaf's occurrences, where later ones take a `QUERIED` buffer, a
         multiple of them. Refused, naming the share of `COLD` times the cache
         its copies read, where `n` stops under both `m` and K. A MORI leaf is
@@ -2076,9 +2127,12 @@ class Stub:
             n = len(calls)
             cycle = [calls[i % n] for i in range(k)]
             cold, parts = _timed(fn, cycle, self.flush)
-            # warm: call i on its cold call's occurrence's first copy (`QUERIED`)
+            # warm: call i on its cold call's occurrence's first copy (`QUERIED`),
+            # on every rank where any has several copies: a collective's ranks,
+            # each on its own rows (`_own_rows`), can build different counts
             warm = [calls[i % n % o] for i in range(k)]
-            warm = _timed(fn, warm)[0] if n > 1 and k == CALLS else None
+            several = agreed(int(n > 1), cpu_group(), most=True)
+            warm = _timed(fn, warm)[0] if several and k == CALLS else None
             # two profiles that named nothing of a call its graph timed missed it
             if agreed(int(not kernels and any(cold)), cpu_group(), most=True):
                 forward_context._forward_context = calls[0][1]
@@ -2142,17 +2196,26 @@ class Stub:
                 return out.copy_(self.built["rows"][at].view(out.shape))
             if isinstance(value, dict) and self._routed(value, sig, path, drafted):
                 return self._route(value, c, drafted)
+            received = (op["op"], path) in RECEIVED and isinstance(value, dict)
+            if received and value.get("role") == "activation":
+                if (rows := routed_rows(op)) is None:
+                    raise ValueError(f"{op['op']} holds no expert ids to count")
+                return _random(value, self.runner.device).fill_(rows)
             if isinstance(value, dict) and value.get("role") == "weight":
                 # each cache-sized copy takes a weight of its own, as it does
                 # activations; a gathered table's copies share one
                 count = max(op["occurrences"], self.cold_copies.get(sig, 1))
-                return self._weight(value, c, 1 if path == table else count)
+                return self._weight(value, c, 1 if path == table else count, path)
             if isinstance(value, dict) and "object" in value:
                 got = rebuild_object(value["object"], build(path, value["state"], None))
                 cache = getattr(snap.attn_metadata, "cache", None)
                 geometry = getattr(cache, "geometry", None)
-                if value["object"] == RING and hasattr(geometry, "window_bytes"):
-                    return _ring(geometry, cache.num_pages, got, self.captured)
+                # A V4.1 pool places its BF16 window rings after its pages; an
+                # FP8 window's ring is on planes of its own, whatever the pages.
+                placed = hasattr(geometry, "window") and not geometry.window_fp8
+                if value["object"] == RING and placed:
+                    at = _captured(geometry, op.get("rings", ()))
+                    return _ring(geometry, cache.num_pages, got, at)
                 return got
             if (
                 isinstance(value, dict)
@@ -2359,7 +2422,7 @@ class Stub:
             if isinstance(value, dict) and value.get("device") == "cpu":
                 return old  # the copy's own, built on the host
             if isinstance(value, dict) and value.get("role") == "weight":
-                return self._weight(value, c, op["occurrences"])
+                return self._weight(value, c, op["occurrences"], path)
             if isinstance(value, dict) and self._routed(value, sig, path, drafted):
                 return self._route(value, c, drafted)
             return old
@@ -2377,11 +2440,14 @@ class Stub:
             return _clone(meta[1]) if fresh and role != "kv" else meta[1]
         raise ValueError(f"a {role} tensor argument {_text(spec)} is not built")
 
-    def _weight(self, spec, c, count):
+    def _weight(self, spec, c, count, path):
         """Weight `c mod count` of `spec`, random: the `count` of a leaf are
         built once, as slices of one tensor each starting on a `WEIGHT_ALIGN`
         boundary, each marked preshuffled when ATOM marked the captured one, so
-        the operator picks the kernel it picked."""
+        the operator picks the kernel it picked. At the `EXPERT_MASK` slot
+        `path`, the MoE layer's own mask (`_mask`)."""
+        if path == EXPERT_MASK:
+            return self._mask(spec)
         if (_spec_of(spec), 0) not in self.built:
             n = _span(spec["shape"], spec["stride"])
             dtype, device = _dtype(spec["dtype"]), self.runner.device
@@ -2396,6 +2462,18 @@ class Stub:
                     view.is_shuffled = True
                 self.built[_spec_of(spec), i] = view
         return self.built[_spec_of(spec), c % count]
+
+    def _mask(self, spec):
+        """The expert mask of `spec`'s shape and dtype that the model's or its
+        drafter's MoE layers hold, as ATOM built it for this rank: ones on the
+        experts the rank owns; refused by name where no MoE layer holds one."""
+        want = tuple(spec["shape"]), _dtype(spec["dtype"])
+        for mask in self.masks:
+            if (tuple(mask.shape), mask.dtype) == want:
+                return mask.to(self.runner.device)
+        raise ValueError(
+            f"no MoE layer of the model holds an expert mask of {_text(spec)}"
+        )
 
 
 def _alive(device) -> None:
@@ -2726,9 +2804,12 @@ def _summed(op, rows) -> dict:
 
 
 def _own_rows(op) -> dict:
-    """`op`, when it is the DP all-gather (`GATHERV`), with each tensor of its
-    `x` holding this DP rank's `sizes` entry's rows: the capture records rank
-    0's call, and aiter fails a rank whose rows are not its entry."""
+    """`op` with this rank's rows where the capture's, rank 0's, are not every
+    rank's: the DP all-gather (`GATHERV`), each tensor of its `x` holding this
+    DP rank's `sizes` entry's rows, as aiter fails a rank whose rows are not
+    its entry, and MORI's dispatch and combine (`_mori_rows`)."""
+    if op["op"].startswith(MORI):
+        return _mori_rows(op)
     if op["op"] != GATHERV:
         return op
     from aiter.dist.parallel_state import get_dp_group
@@ -2741,6 +2822,48 @@ def _own_rows(op) -> dict:
     x = op["args"]["x"]
     x = [own(t) for t in x] if isinstance(x, list) else own(x)
     return {**op, "args": op["args"] | {"x": x}}
+
+
+def _mori_rows(op) -> dict:
+    """MORI's dispatch or combine `op` on this rank's rows. The capture states
+    rank 0's rows, its ids', and the rows a rank receives at most, a
+    dispatch's output or a combine's input: the DP group's G rows, sent from
+    each of a DP rank's EP ranks (`peers.install_mori`). Where those are rank
+    0's rows from every EP rank, every rank sends rank 0's; else this rank
+    sends its share of G as the capture split it (`peers.split`), in each
+    tensor but a combine's input. Marked refused where no G gives what the
+    leaf states; unchanged on a DP group of one, whose rank is rank 0."""
+    from aiter.dist.parallel_state import get_dp_group
+
+    from atom.compass.capture.peers import split
+
+    args, combines = op["args"], op["op"].endswith(".combine")
+    rows, ep, most = _mori_counts(op)
+    group = get_dp_group()
+    dp, rank = group.world_size, group.rank_in_group
+    if most == rows * ep or dp == 1:
+        return op
+    g, left = divmod(most * dp, ep)
+    if left or g < rows:
+        why = f"MORI's {op['op'].rsplit('.', 1)[1]} states {most} rows a rank"
+        why += f" receives from {ep} EP ranks, {rows} of them this rank's"
+        return op | {"refuses": f"{why}: no split of a DP group of {dp} gives that"}
+    own = split(g, rows, dp)[rank]
+    sent = {
+        slot: {**t, "shape": [own, *t["shape"][1:]]}
+        for slot, t in args.items()
+        if isinstance(t, dict) and "shape" in t and not (combines and slot == "input")
+    }
+    return {**op, "args": args | sent}
+
+
+def _mori_counts(op) -> tuple[int, int, int]:
+    """MORI's dispatch or combine `op`'s rows from this rank, its ids', its EP
+    width and the rows a rank receives at most, a dispatch's output's or a
+    combine's input's."""
+    args, combines = op["args"], op["op"].endswith(".combine")
+    most = args["input"]["shape"][0] if combines else op["out"][0][0]
+    return args["indices"]["shape"][0], args["num_ep_ranks"], most
 
 
 def _written(op, path) -> str | None:
@@ -2966,12 +3089,12 @@ def _widest(shape, stride) -> int:
 def _layers(geometry, captured) -> dict:
     """By page count, the layer of DeepSeek-V4.1's pool `geometry` whose window
     ring a pool of that many pages starts where `captured` (`RING`) does, and
-    its build (`V41PoolGeometry.window`, or `window_bytes` in bytes)."""
+    its build (`V41PoolGeometry.window`)."""
     found = {}
-    for build in (geometry.window, geometry.window_bytes)[: 1 + geometry.window_fp8]:
+    for build in (geometry.window,):
         first = build(0, 0)
         if dataclasses.replace(first, ring_start=captured.ring_start) != captured:
-            continue  # counted in the other unit
+            continue  # not this pool's ring
         # a layer's ring starts this far past the last's, on any pool
         step = build(min(1, geometry.layers - 1), 0).ring_start - first.ring_start
         for layer in range(geometry.layers):
@@ -2985,21 +3108,15 @@ def _layers(geometry, captured) -> dict:
     return found
 
 
-def _captured(cache, leaves) -> int | None:
+@functools.cache
+def _captured(geometry, rings) -> int | None:
     """The pages of the capture's pool that placed the DeepSeek-V4.1 window
-    rings (`RING`) `leaves` take, as the one count on which each is a layer's
-    (`_layers`): one capture's pool placed them all; None where not one is."""
+    rings (`RING`) `rings`, a graph's (`leaves`), as the one count on which
+    each is a layer's (`_layers`): one capture's pool placed them all; None
+    where not one is."""
     from atom.compass.capture.forward import rebuild_object
 
-    geometry = getattr(cache, "geometry", None)
-    if not hasattr(geometry, "window_bytes"):
-        return None
-    fits = [
-        _layers(geometry, rebuild_object(RING, v["state"]))
-        for op, _ in leaves.values()
-        for v in op["args"].values()
-        if isinstance(v, dict) and v.get("object") == RING
-    ]
+    fits = [_layers(geometry, rebuild_object(RING, r)) for r in rings]
     common = [p for p in fits[0] if all(p in f for f in fits)] if fits else []
     return common[0] if len(common) == 1 else None
 
@@ -3196,7 +3313,8 @@ class _Mori:
     `after`):
 
     * a dispatch's call is a round: it, then a combine of its rows from a
-      buffer as ATOM's experts write one, of `dtype`;
+      buffer as ATOM's experts write one, of `dtype`, as many rows as the
+      dispatch's output, every rank's;
     * a combine's call first fills the count of one dispatch back in
       (`_restore`): the first call's, made at once, and again after a round.
       A combine's own dispatch sends zeros at the handle's format, as many
@@ -3215,6 +3333,7 @@ class _Mori:
         if not self.combines:
             self.parts = [("round", 1, self), ("combine", -1, self.alone)]
             self.parts.append(("fill", 1, self.fill))
+            self.most = op["out"][0][0]  # the rows a rank receives at most
 
     def __call__(self, **kwargs):
         self.before(**kwargs)
@@ -3279,9 +3398,10 @@ class _Mori:
         """A combine onto `indices` of the experts' output for every rank's
         rows, the most a rank receives, at the dispatch's launch counts."""
         c, device = self.handle.config, indices.device
-        rows = len(indices) * c.world_size
-        if self.out is None or len(self.out) < rows:
-            self.out = torch.zeros(rows, c.hidden_dim, dtype=self.dtype, device=device)
+        if self.out is None:
+            self.out = torch.zeros(
+                self.most, c.hidden_dim, dtype=self.dtype, device=device
+            )
         launch = {k: kwargs[k] for k in ("block_num", "warp_per_block") if k in kwargs}
         self.handle.combine(self.out, None, indices, **launch)
 
@@ -4133,7 +4253,8 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     rows' cached tokens too (`_bracket_cached`); and `fit ops`' price list of
     `records` prices it at the step, as `compass run --coverage` asks it, a
     drafter's leaf under DP at each batch and G a run asks it at
-    (`_drafter_at`). A
+    (`_drafter_at`), a target's MORI leaf at a step stating G at the most
+    tokens a rank of its group ran (`group_max_tokens`). A
     decode leaf is read at the rows it ran, its shape's T: of a drafter's own
     decode shape past its step's, a leaf its width's graphs hold at that
     width, as `--plan` measures it. A prefill leaf is asked at the B it ran,
@@ -4193,11 +4314,18 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                     # whether its shape states one
                     at = moved
                     fam, tokens = _family(at, None, name, signature(op), dependent)
-                bound = (*at[:4], mean, top)
+                # a target at a G: its group's most tokens, after its real rows
+                stated = not part and at.gathered is not None
+                peak = line.get("group_max_tokens") if stated else None
+                tail = () if peak is None else (None, peak)
+                if peak is not None and name.startswith(MORI):  # at its largest rank
+                    sig = signature(op)
+                    fam, tokens = _family(at, None, name, sig, dependent, peak)
+                bound = (*at[:4], mean, top, *tail)
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
                     bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
-                    bound += (None if part else _real(line),)  # a target's real rows
+                    bound += (None if part else _real(line), *tail[1:])
                 elif asked:  # a prefill's drafter's leaf at each bound a run asks
                     each = [(*b, mean, top) for b, _ in asked]
                     bound = each if each[1:] else each[0]
@@ -4435,11 +4563,31 @@ def exchange(op: dict) -> list | None:
     return [json.dumps(["exchange", fam], sort_keys=True), nbytes]
 
 
+def exchange_at(op: dict, ex: list, gathered, largest=None) -> list:
+    """`op`'s `exchange`, `ex`, at a shape whose MoE gathers `gathered` rows,
+    G, or states none (None). MORI's dispatch or combine at a G is a family
+    of its own (``exchange G``): its ranks send unlike rows, and it takes
+    about what its largest sender sends, not G. Its bytes are those of EP
+    times that sender's rows: `largest` where the caller states them, a
+    run's step its DP group's most tokens, but never under this rank's; else
+    the most `peers.split` gives a rank of G, as the capture splits it. `ex`
+    for any other leaf or shape."""
+    if gathered is None or not op["op"].startswith(MORI):
+        return ex
+    from atom.compass.capture.peers import split
+
+    rows, ep, most = _mori_counts(op)
+    if largest is None:  # the peers split the rest evenly
+        largest = max(split(gathered, rows, gathered * ep // most))
+    fam, nbytes = json.loads(ex[0])[1], ex[1] // most * ep * max(largest, rows)
+    return [json.dumps(["exchange G", fam], sort_keys=True), nbytes]
+
+
 def _exchanged(fam: str) -> bool:
-    return json.loads(fam)[0] == "exchange"
+    return json.loads(fam)[0].startswith("exchange")
 
 
-def _family(shape, context, op: str, sig: str, dependent: dict):
+def _family(shape, context, op: str, sig: str, dependent: dict, largest=None):
     """The family a leaf's point belongs to, and where on its axis: a decode
     leaf at its width, and its rows' mean when they are ragged, over context;
     a prefill leaf over its tokens, at its rows unless its kind's prefill
@@ -4447,9 +4595,12 @@ def _family(shape, context, op: str, sig: str, dependent: dict):
     when its kind depends on context, as its prefill points read it, else its
     decode points, else by default, a shape that states G apart from one that
     does not, as `fit ops` keeps them; a collective over its message bytes
-    (`exchange`). A prefill leaf reads as `fit.ops.prefill_leaf` reads it."""
+    (`exchange`), MORI's at a G apart, at its group's `largest` rank where
+    stated (`exchange_at`). A prefill leaf reads as `fit.ops.prefill_leaf`
+    reads it."""
     if op.startswith(COLLECTIVES):
-        return tuple(exchange(json.loads(sig)))
+        leaf = json.loads(sig)
+        return tuple(exchange_at(leaf, exchange(leaf), shape.gathered, largest))
     if shape.phase == "decode":
         context, mean = _split(context)
         return json.dumps([str(shape), sig] + ([mean] if mean else [])), context
@@ -4574,8 +4725,9 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
     switch that moves with cached tokens, as one at a fixed sum of the two
     does, is halved over cached tokens at each token count alone, where `fit
     ops` reads it after the token count. A prefill family whose shapes state G
-    is not halved over its tokens: `trace ops` traces such a shape only at a
-    record's step. Any other is `_bent` on its line as `fit ops` reads it, taking
+    is not halved over its tokens, nor a collective's family whose shapes
+    state G (`exchange_at`): `trace ops` traces such a shape only at a record's
+    step. Any other is `_bent` on its line as `fit ops` reads it, taking
     in a gap beside a bend each count of a step (`step_tokens`) at its rows, or
     at any for a family stating none."""
     from atom.compass.capture.forward import decode, prefill
@@ -4617,6 +4769,8 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
 
     want = defaultdict(set)
     for fam, points in [*families.items(), *across.items()]:
+        if isinstance(fam, str) and json.loads(fam)[0] == "exchange G":
+            continue
         points = sorted(points, key=lambda p: p[0])
         decoding = points[0][2]["shape"].startswith("decode")
         # a ragged decode line is halved where it bends, not where its kind steps
@@ -4882,5 +5036,16 @@ def _child(fn, *args):
     """`fn(*args)` in a spawned process of its own: the device is free again
     at its end, and a capture's process-wide patches end with it."""
     spawn = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(1, mp_context=spawn) as child:
-        return child.submit(fn, *args).result()
+    # A script read on stdin (`python3 -`, as deploy.sh builds its run file) names itself `<stdin>`, a file spawn
+    # cannot re-import in the child (BrokenProcessPool); `fn` is imported by name, so the child needs no main module.
+    main = sys.modules["__main__"]
+    path = getattr(main, "__file__", None)
+    hidden = path is not None and not os.path.exists(path)
+    if hidden:
+        del main.__file__
+    try:
+        with ProcessPoolExecutor(1, mp_context=spawn) as child:
+            return child.submit(fn, *args).result()
+    finally:
+        if hidden:
+            main.__file__ = path

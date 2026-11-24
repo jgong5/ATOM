@@ -18,6 +18,17 @@ and then `moe_rows`, the rows the data-parallel group's MoE gather carries
 After `moe_rows` it may add `serial_moe_rows`: `moe_rows` on a step the group did
 not split for two-batch overlap (`BatchView.tbo_tokens` None), else 0, the MoE
 rows no second micro-batch overlaps.
+Then it may add `cold_peer_rows` (`cold_peer_rows`): the rows the group's MoE
+gather carries from the rank's peers, `moe_rows` less its own tokens, times one
+less its `BatchView.prefill_duty`, the share of the last seconds the rank spent
+in its group's prefill steps (`shape.PrefillDuty`, at `DUTY_TAU`). On cell A
+(DeepSeek-V4.1, DPA4-EP4) a prefill step that several ranks run right after
+decode steps costs more than the same step deep in a stretch of prefill steps,
+by about the peers' share of the gather: the prefill vector fitted without the
+column priced the stretches (the warmup's first turns, c=256's prefill queue)
+about 5% high and the isolated prefills of c=8 to c=128 2-4% low (#3747). A
+vector with the column states its `duty_tau`, which must be `DUTY_TAU`, and a
+step stating no `prefill_duty` is refused.
 Last, a prefill vector may add `padding`, the rows its token graph runs past
 the step's tokens (`token_padding`): ATOM replays a prefill's first layers at
 the smallest of the vector's `buckets`, the prefill token-graph buckets the
@@ -85,7 +96,8 @@ is refused: prefill when the law has no prefill vector, a decode rung with
 none, a step mixing prefill and decode rows, or one with image tokens. `compass
 fit steps` leaves no captured rung without one: a rung no record reached gets
 a declared vector filled from the fitted rungs beside it, under a hull holding
-no point (`step_linear_fit.fill_rungs`), named under the law's `filled`.
+no point (`step_linear_fit.fill_rungs`), named under the law's `filled` and, by
+law, its `filled_rungs`.
 
 A law fitted on an MTP record holds a draft law of its own form under `draft`.
 Its terms, named `draft.<kind>.<feature>`, are the step's `draft_terms`, priced from the
@@ -133,6 +145,7 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
     VECTOR = {"coefficients": {<feature>: seconds, ...},
               "hull": HULL,
               "rowmod": k,    # a decode vector with a `rowmod` coefficient only
+              "duty_tau": s,  # a prefill vector with a `cold_peer_rows` coefficient only
               "declared": "<where it was fitted>",  # optional
               "held_out": {"hull": HULL, "bands": {<band>: ERRORS, ...}}}  # optional
 
@@ -163,6 +176,7 @@ from atom.compass.backends.hull import Hull
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import (
+    DUTY_TAU,
     IMAGES,
     BatchView,
     RequestShape,
@@ -181,6 +195,7 @@ PREFILL_EXTRA = (
     "cached_seqs",
     "moe_rows",
     "serial_moe_rows",
+    "cold_peer_rows",
     "seqs",
     "out",
     "padding",
@@ -231,6 +246,15 @@ class _Vector:
         self.rowmod = int(spec["rowmod"]) if "rowmod" in features else None
         if self.rowmod is not None and self.rowmod < 1:
             raise ValueError(f"the {name} vector's rowmod modulus is {self.rowmod}")
+        self.duty_tau = None
+        if "cold_peer_rows" in features:
+            self.duty_tau = spec.get("duty_tau")
+            if self.duty_tau != DUTY_TAU:
+                raise ValueError(
+                    f"the {name} vector carries cold_peer_rows over a duty of time "
+                    f"constant {self.duty_tau!r}; a view states its duty at "
+                    f"{DUTY_TAU} s"
+                )
         self.buckets = None
         if "padding" in features:
             self.buckets = tuple(sorted(int(b) for b in spec.get("buckets") or ()))
@@ -259,7 +283,12 @@ def moe_column(
     top-k) of `moe_routing`, counts the dummies' rows as one token, since
     every dummy runs the same row."""
     if feature == "moe_experts":
-        return activated_experts(*routing, tokens - max(dummies - 1, 0))
+        reached = tokens - max(dummies - 1, 0)
+        # An idle rank's dummy is an empty batch that adds no token to `tokens` (#3682), so with three idle ranks
+        # beside a one-token decode the subtraction passes below zero and the column, then its term, went negative
+        # (CostTerm refuses it). The step reaches at least the experts of one token; where `reached` was already
+        # one or more, nothing changes.
+        return activated_experts(*routing, max(reached, 1 if tokens or dummies else 0))
     return float(tokens)
 
 
@@ -323,6 +352,19 @@ def eager_dummy(view: BatchView, buckets: tuple[int, ...]) -> tuple[int, int] | 
         if padding:
             return 0, 0
     return 1, int(view.group_tail)
+
+
+def cold_peer_rows(view: BatchView) -> float | None:
+    """`view`'s `cold_peer_rows`: the rows its data-parallel group's MoE gather
+    carries from its peers, `moe_rows` less its own tokens (a dummy forward's
+    one row), times one less its `prefill_duty`; 0 on one rank, which has no
+    `moe_rows`. None for a data-parallel view stating no `prefill_duty`."""
+    if view.moe_rows is None:
+        return 0.0
+    if view.prefill_duty is None:
+        return None
+    peers = max(view.moe_rows - sum_tokens(view.requests), 0)
+    return peers * (1.0 - min(max(view.prefill_duty, 0.0), 1.0))
 
 
 def cached_seqs(rows) -> int:
@@ -477,6 +519,15 @@ class StepLinearBackend(CostBackend):
                 counts += (batch_view.moe_rows,)
             if "serial_moe_rows" in vector.features:
                 counts += (0 if batch_view.tbo_tokens else batch_view.moe_rows,)
+            if "cold_peer_rows" in vector.features:
+                cold = cold_peer_rows(batch_view)
+                if cold is None:
+                    raise self._refuse(
+                        batch_view,
+                        "no prefill duty on this data-parallel step, which its "
+                        "peers' MoE rows are priced by",
+                    )
+                counts += (cold,)
             output = batch_view.produces_output
             by_output = {
                 "seqs": len(prefill) if output else 0,

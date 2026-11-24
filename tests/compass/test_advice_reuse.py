@@ -11,7 +11,10 @@ pair. The head is the tree's own digest, except where a test builds a
 repository for the tree.
 """
 
+import functools
 import json
+import os
+import pickle
 import shutil
 import subprocess
 
@@ -20,6 +23,8 @@ import pytest
 from test_artifact_invalidation import STANZA, moved
 from test_capture_v4_pro import CONFIG as V4_PRO
 from test_drive_runfile import LAWS as HOST_LAWS
+from test_law_file_readings import law_member
+from test_law_token_graph_buckets import RECORDED
 from test_memory_readings import READINGS, publish_readings
 from test_page_bound_reading import V41
 from test_run_check_side import (
@@ -31,12 +36,17 @@ from test_run_check_side import (
     UNCOVERED,
 )
 from test_run_lacking import served
+
+#: The requirement each side's law in the crs005 pair is calibrated for at its
+#: own key: the decode side's coverage, the prefill side's accuracy.
+COVERAGE_REQUIREMENT = {"prefill": 4, "decode": 3}
 from test_run_lacking_rungs import DPA8
 from test_run_step_grid import DOCUMENT, PLATFORM, deployment, host_laws_key, readings
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import cli
 from atom.compass import run as compass_run
+from atom.compass.advice import check
 from atom.compass.advice.check import REUSE, STATES
 from atom.compass.artifacts import (
     ArtifactStore,
@@ -74,19 +84,86 @@ def at_head(monkeypatch):
 @pytest.fixture
 def searched(tmp_path, monkeypatch, at_head):
     """The deployment at `COVERED`, served for every instance, at the head
-    whose digest is the tree's, with no law file."""
+    whose digest is the tree's, with no law file; each start the check makes
+    answers, so a point it would start is searchable (`test_advice_check`
+    starts one)."""
     r = deployment(tmp_path, **COVERED)
     served(monkeypatch, r.config)
+    monkeypatch.setattr(check, "_start", lambda *args: None)
     resolved_here(monkeypatch, lambda atom_args: r.config)
     monkeypatch.setattr(reuse, "LAWS", tmp_path / "laws")
     (tmp_path / "laws").mkdir()
     return r
 
 
+#: Each config `check._resolved` resolved in this module, by its arguments,
+#: arch and this process's environment, and each law file `reuse.law` read, by
+#: path; pickled.
+RESOLVED, READ = {}, {}
+DIGEST = compass_run.atom_digest
+
+
+@functools.cache
+def tree_digest() -> str:
+    """This tree's ATOM digest, taken at the first call."""
+    return DIGEST()
+
+
+@pytest.fixture(autouse=True)
+def digested_once(monkeypatch):
+    """`atom_digest` of this tree taken once for the module, as no case edits
+    the tree; of any other root, at each call."""
+    monkeypatch.setattr(
+        compass_run,
+        "atom_digest",
+        lambda root=None: tree_digest() if root is None else DIGEST(root),
+    )
+
+
+@pytest.fixture(scope="module")
+def v4_pro(tmp_path_factory):
+    """DeepSeek-V4-Pro's model directory, one for the module, so each 1P1D
+    case serves its sides at the same arguments."""
+    model = tmp_path_factory.mktemp("models") / "DeepSeek-V4-Pro"
+    model.mkdir()
+    shutil.copy(V4_PRO, model / "config.json")
+    return model
+
+
+@pytest.fixture
+def resolved_once(monkeypatch):
+    """Each instance's config resolved in the check's child once per module at
+    its arguments, arch and environment, as alike ones resolve alike; and each
+    shipped law file read once, as no case edits one."""
+    resolve, read = check._resolved, reuse.read_json
+
+    def read_once(path):
+        if path not in READ:
+            READ[path] = pickle.dumps(read(path))
+        return pickle.loads(READ[path])
+
+    def once(args, arch):
+        env = sorted(
+            (k, v) for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"
+        )
+        at = (tuple(args), arch, tuple(env))
+        if at not in RESOLVED:
+            RESOLVED[at] = pickle.dumps(resolve(args, arch))
+        return pickle.loads(RESOLVED[at])
+
+    monkeypatch.setattr(check, "_resolved", once)
+    monkeypatch.setattr(reuse, "read_json", read_once)
+
+
 def resolved_here(monkeypatch, resolve):
     """Each instance's config `resolve(atom_args)`, resolved in this process
-    rather than in the check's child."""
-    monkeypatch.setattr(ops, "_child", lambda fn, *args: fn(*args))
+    rather than in the check's child; any other child stays one."""
+    child = ops._child
+
+    def here(fn, *args):
+        return fn(*args) if args[:1] == (drive_run._declared,) else child(fn, *args)
+
+    monkeypatch.setattr(ops, "_child", here)
     monkeypatch.setattr(
         drive_run, "_declared", lambda atom_args, arch: resolve(atom_args)
     )
@@ -208,7 +285,6 @@ def test_a_law_and_readings_at_the_head_s_key_are_reused_at_every_point(
         ("a law file at another digest", "calibrate", "states ATOM digest 000000"),
         ("a store law at another digest", "calibrate", "never re-keyed"),
         ("no host laws beside a store law", "calibrate", "has no host laws beside"),
-        ("host laws of another CPU", "refused", "fitted on another CPU, and"),
     ],
 )
 def test_a_law_at_another_key_names_requirement_1(
@@ -223,17 +299,49 @@ def test_a_law_at_another_key_names_requirement_1(
         law_file(tmp_path, held)
     elif case == "a store law at another digest":
         stored(tmp_path, r, atom="0" * 64)
-    elif case == "no host laws beside a store law":
-        stored(tmp_path, r, host=False)
     else:
-        held = law(r)
-        held["host"]["key"]["host_cpu"] = "another CPU"
-        law_file(tmp_path, held)
+        stored(tmp_path, r, host=False)
 
     found = verdicts(advise(tmp_path), "law")
 
     assert [(v["verdict"], v["requirement"]) for v in found] == [(verdict, 1)] * 2
     assert named in found[0]["reason"]
+
+
+def test_a_law_file_s_host_laws_fitted_on_another_cpu_are_reused(tmp_path, searched):
+    held = law(searched)
+    held["host"]["key"]["host_cpu"] = "another CPU"
+    where = law_file(tmp_path, held)
+
+    found = verdicts(advise(tmp_path), "law")
+
+    assert [(v["verdict"], v["reason"]) for v in found] == [("reuse", where)] * 2
+
+
+@pytest.mark.parametrize("calibrated", [False, True], ids=["reused", "calibrated"])
+def test_a_law_file_s_readings_serve_only_where_its_law_is_reused(
+    tmp_path, searched, calibrated
+):
+    # A calibration runs with the store law it publishes, which carries none.
+    held = law(searched) | {memory.LAW_MEMBER: law_member(searched)}
+    if calibrated:
+        for source in held["sources"].values():
+            source["figures"] = {}
+    where = law_file(tmp_path, held)
+    shutil.rmtree(tmp_path / "store" / Kind.MEMORY_READINGS.value)
+
+    judged = advise(tmp_path)
+
+    laws = {(v["verdict"], v["requirement"]) for v in verdicts(judged, "law")}
+    found = verdicts(judged, "readings")
+    if not calibrated:
+        assert laws == {("reuse", None)}
+        reason = f"in {where}'s {memory.LAW_MEMBER}"
+        assert [(v["verdict"], v["reason"]) for v in found] == [("reuse", reason)] * 2
+        return
+    assert laws == {("calibrate", 4)}
+    assert [(v["verdict"], v["requirement"]) for v in found] == [("measure", 1)] * 2
+    assert "no entry for memory_readings" in found[0]["reason"]
 
 
 @pytest.mark.parametrize("invalidated", [True, False])
@@ -425,14 +533,14 @@ def test_readings_with_no_entry_or_measured_at_another_digest_are_measured(
     ids=["fp4-v41-without", "fp4-v41-with", "fp8-v41"],
 )
 def test_an_fp4_v41_entry_without_the_page_bound_reading_is_measured_as_check_finds_it(
-    tmp_path, searched, monkeypatch, index, reading, judged, state
+    tmp_path, searched, index, reading, judged, state
 ):
-    # Each start answers: a point the check would start is searchable.
-    monkeypatch.setattr("atom.compass.advice.check._start", lambda *args: None)
     vars(searched.config).update(index_cache_dtype=index, hf_config=V41)
     member = READINGS[1] | ({} if reading is None else {PAGE_BOUND: reading})
     publish_readings(tmp_path / "store", searched.config, readings=member)
-    law_file(tmp_path, law(searched))
+    held = law(searched)
+    held["prefill"]["buckets"] = RECORDED
+    law_file(tmp_path, held)
 
     found = verdicts(advise(tmp_path), "readings")
 
@@ -505,7 +613,7 @@ def test_a_calibration_store_holding_every_input_at_its_key_is_looked_up_whateve
     "case, looked_up, verdict, named, readings_verdict",
     [
         ("a reusable law", "b", ("reuse", None), "", "measure"),
-        ("host laws of another CPU", "b", ("refused", 1), "on another CPU", "reuse"),
+        ("host laws of another CPU", "b", ("reuse", None), "", "reuse"),
         ("past 5%", "b", ("refused", 4), "run at the head", "measure"),
         ("an older store holding every input", "a", ("reuse", None), "", "reuse"),
     ],
@@ -544,25 +652,22 @@ def test_with_no_store_holding_every_input_the_latest_a_law_is_read_from_is_look
 def test_a_store_no_law_is_read_from_is_passed_over_for_the_shared_store(
     tmp_path, searched
 ):
-    held = law(searched)
-    held["host"]["key"]["host_cpu"] = "another CPU"
-    law_file(tmp_path, held)
+    law_file(tmp_path, past(searched)[0])
     platforms.flags(tmp_path / "out/cal/x/store", DOCUMENT, tmp_path)
 
     judged = advise(tmp_path)
 
     assert judged["candidates"]["a"]["store"] == str(tmp_path / "store")
     found = verdicts(judged, "law")
-    assert [(v["verdict"], v["requirement"]) for v in found] == [("refused", 1)] * 2
+    assert [(v["verdict"], v["requirement"]) for v in found] == [("refused", 4)] * 2
     assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
 
 
-def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, at_head):
+def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(
+    tmp_path, monkeypatch, at_head, v4_pro, resolved_once
+):
     for name in PERFORMANCE_KEYS:
         monkeypatch.delenv(name, raising=False)
-    model = tmp_path / "DeepSeek-V4-Pro"
-    model.mkdir()
-    shutil.copy(V4_PRO, model / "config.json")
     cpu = read_json(PAIR["prefill"])["host"]["key"]["host_cpu"]
     monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
     common = {"basis": "a recipe", "deployment": "1p1d", "env": SHARED_ENV}
@@ -571,16 +676,18 @@ def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, a
     common["prefill"] = {"args": {"--enable-tbo": True}, "env": SIDES["prefill"][1]}
     common["decode"] = {"args": {"--cudagraph-capture-sizes": DECODE_SIZES}}
 
-    judged = advise(tmp_path, MACHINE, model=str(model), common=common)
+    judged = advise(tmp_path, MACHINE, model=str(v4_pro), common=common)
 
-    for side, rungs in UNCOVERED.items():
+    # The decode side lacks the rungs its ladder schedules (requirement 3); the
+    # prefill side, a producer, schedules none, so its law is held to accuracy
+    # (requirement 4), where a source of the pair's prefill law states none.
+    for side, requirement in COVERAGE_REQUIREMENT.items():
         found = verdicts(judged, "law", side)
         assert [(v["verdict"], v["requirement"]) for v in found] == [
-            ("calibrate", 3)
+            ("calibrate", requirement)
         ] * 2
-        assert f"{PAIR[side]} has no decode vector for rungs {rungs}, which" in (
-            found[0]["reason"]
-        )
+        uncovered = f"{PAIR[side]} has no decode vector for rungs {UNCOVERED}, which"
+        assert (uncovered in found[0]["reason"]) == (side == "decode")
         (reason,) = {v["reason"] for v in verdicts(judged, "readings", side)}
         assert '"index_cache_dtype": "fp8"' in reason
         assert '"AITER_LOG_LEVEL": "WARNING"' in reason
@@ -596,15 +703,12 @@ def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(tmp_path, monkeypatch, a
     ids=["exported empty", "empty in the space", "set in the space"],
 )
 def test_a_1p1d_side_runs_under_the_aiter_log_level_deploy_sh_starts_it_with(
-    tmp_path, monkeypatch, at_head, exported, given, level
+    tmp_path, monkeypatch, at_head, v4_pro, resolved_once, exported, given, level
 ):
     for name in PERFORMANCE_KEYS:
         monkeypatch.delenv(name, raising=False)
     if exported is not None:
         monkeypatch.setenv("AITER_LOG_LEVEL", exported)
-    model = tmp_path / "DeepSeek-V4-Pro"
-    model.mkdir()
-    shutil.copy(V4_PRO, model / "config.json")
     cpu = read_json(PAIR["prefill"])["host"]["key"]["host_cpu"]
     monkeypatch.setattr(compass_run, "host_cpu", lambda: cpu)
     common = {"basis": "a recipe", "deployment": "1p1d", "env": SHARED_ENV | given}
@@ -613,12 +717,12 @@ def test_a_1p1d_side_runs_under_the_aiter_log_level_deploy_sh_starts_it_with(
     common["prefill"] = {"args": {"--enable-tbo": True}, "env": SIDES["prefill"][1]}
     common["decode"] = {"args": {"--cudagraph-capture-sizes": DECODE_SIZES}}
 
-    judged = advise(tmp_path, MACHINE, model=str(model), common=common)
+    judged = advise(tmp_path, MACHINE, model=str(v4_pro), common=common)
 
     # The pair's laws are keyed WARNING: each side finds its own there, else
     # none at its key.
-    requirement = 3 if level == "WARNING" else 1
-    for side in UNCOVERED:
+    for side, own in COVERAGE_REQUIREMENT.items():
+        requirement = own if level == "WARNING" else 1
         found = verdicts(judged, "law", side)
         assert [(v["verdict"], v["requirement"]) for v in found] == [
             ("calibrate", requirement)

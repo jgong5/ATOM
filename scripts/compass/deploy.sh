@@ -13,8 +13,13 @@
 #                  --store, ... (atom/compass/drive/runfile.py); record: the
 #                  `compass record` flags both instances take, e.g. --gpu
 #   <own>          that instance's own `compass record` flags, e.g. --gpu, or
-#                  --host, an address the router reaches; and --on PREFIX
-#                  (below)
+#                  --host, an address the router reaches; --on PREFIX
+#                  (below); and --env NAME=VALUE, repeated, a variable that
+#                  instance's command alone runs under, such as a prefill's
+#                  ATOM_KV_OFFLOAD=mooncake_store and its
+#                  ATOM_KV_OFFLOAD_EXTRA_CONFIG, which ATOM folds into the
+#                  instance's --kv-transfer-config as the recipe's `multi`
+#                  connector (atom/model_engine/arg_utils.py)
 #   <ATOM args>    each instance's ATOM arguments; the script adds its
 #                  --kv-transfer-config, the simulated connector and the
 #                  write-request address, or, real, Mooncake and a handshake
@@ -39,8 +44,11 @@
 #                  its own from. run refuses --prefill and --decode, a worker more to
 #                  choose, and --max-concurrent-requests and
 #                  --rate-limit-tokens-per-second, a limiter on the wall
-#                  clock; it sets --request-timeout-secs (`_lib.sh`) and
-#                  refuses the caller's; the caller switches the router's
+#                  clock; it sets --request-timeout-secs,
+#                  --prepare-queue-timeout-ms and --prepare-timeout-ms
+#                  (`_lib.sh`: COMPASS_SIM_ROUTER_BOUNDS) and refuses the
+#                  caller's (compass_sim_router_refusal, which pd_sim.sh's
+#                  ROUTER_ARGS meets too); the caller switches the router's
 #                  wall-clock detectors off, as pd_sim.sh does:
 #                  --disable-health-check
 #                  --disable-circuit-breaker --disable-retries. run refuses
@@ -52,7 +60,27 @@
 #   WAIT_S         seconds each instance and the router have to answer, and
 #                  the deployment to leave once stopped (default 600)
 #   PREFIX_S       seconds --on's prefix has to start the decode's command,
-#                  and to send it a stop (default 60)
+#                  to show its environment, to send it a stop, and to pair
+#                  its node's clock (default 60)
+#   CLOCK_PAIR_S   seconds between two pairs of a node's clock (below; default
+#                  60)
+#   CLOCK_PAIR_PREFIX_<node>
+#                  a command prefix, split on whitespace, that pairs <node>'s
+#                  clock in place of the --on prefix of its instances, such as
+#                  `ssh -o BatchMode=yes <host>` where that one carries no
+#                  stdin, as a relay may not; it reaches the node as --on's
+#                  does, this tree at its path. <node> is the address its
+#                  instances' server.json URLs name, each character other
+#                  than a letter, a digit or _ an _: 10.19.0.127's is
+#                  CLOCK_PAIR_PREFIX_10_19_0_127, fd00::7's
+#                  CLOCK_PAIR_PREFIX_fd00__7
+#   PREFILL_ENV DECODE_ENV
+#                  NAME=VALUE words, split on whitespace, set in that side's
+#                  instances only, as pd_sim.sh takes them: each instance's
+#                  command (OUT/<name>.sh, below) sets them, so --on carries
+#                  them, e.g. `ATOM_KV_OFFLOAD=mooncake_store
+#                  ATOM_KV_OFFLOAD_EXTRA_CONFIG=<JSON>` for a prefill side on
+#                  the Mooncake Store; a word that is no NAME=VALUE exits 2
 #
 # OUT gets run_file.json, the deployment's one run file, built from the run
 # flags and both sides' ATOM arguments (`runfile.prefill_decode`), whose
@@ -93,13 +121,26 @@
 # command, OUT/<name>.sh, which first writes its process id to OUT/<name>.pid;
 # one given --on as `PREFIX bash OUT/<name>.sh`, stopped as `PREFIX kill -TERM
 # <pid>`, a second command under the first, so srun inside an allocation takes
-# --overlap. --on on any instance makes the KV link inter_node. run.json's
+# --overlap. --on on any instance makes the KV link inter_node. Each node
+# other than this one that an --on prefix starts an instance on, named by the
+# address that instance's server.json URL gives (none for a loopback or
+# unspecified one, which the split takes as this node), has its CLOCK_MONOTONIC
+# paired with this one's over that prefix, or CLOCK_PAIR_PREFIX_<node>'s
+# (atom/compass/drive/clock_pair.py):
+# as the router answers and every CLOCK_PAIR_S while the deployment serves and
+# stops, apart from it, and once it has stopped, each pair a line of
+# OUT/clock_pairs.jsonl, by which the split joins that node's instances to the
+# client's clock. A pair that fails, the prefix closing or not answering in
+# PREFIX_S, writes no line, why on stderr, and fails nothing. run.json's
 # `instances` names each instance, its side and index and, real, its Mooncake
 # handshake port, by which the split tells a decode's transfers apart by the
 # prefill instance they came from (atom/compass/report/split.py). A shell may
 # parse those words again, so OUT, this tree and the caller's directory must be
 # paths `printf %q` leaves as they are. That node sees them at their paths, and,
-# simulated, this node's 127.0.0.1.
+# simulated, this node's 127.0.0.1. Simulated, where the host entries' hops
+# differ, the decode's are picked under the environment the first decode
+# instance's prefix starts its command in, which `PREFIX env -0` shows, one more
+# command under it, as the prefill's are under this script's.
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -125,13 +166,17 @@ while (($#)); do
         if [[ $state != router ]]; then
             i=${#sides[@]}
             sides+=("$state")
-            declare -ga "atom_$i=()" "own_$i=()" "on_$i=()"
+            declare -ga "atom_$i=()" "own_$i=()" "on_$i=()" "env_$i=()"
         fi
     elif ((head)) && [[ $1 == -- ]]; then
         head=0
     elif [[ $state$head$1 == prefill1--on || $state$head$1 == decode1--on ]]; then
         [[ ${2-} == [!-]* ]] || bad "--on takes a command prefix, a command and its words"
         read -ra "on_$i" <<<"$2"
+        shift
+    elif [[ $state$head$1 == prefill1--env || $state$head$1 == decode1--env ]]; then
+        [[ ${2-} =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || bad "--env takes NAME=VALUE"
+        push "env_$i" "$2"
         shift
     else
         case $state$head in
@@ -158,22 +203,14 @@ for i in "${!sides[@]}"; do
     first=$([[ ${sides[i]} == prefill ]] && echo 0 || echo $NP)
     [[ $(quoted "atom_$i") == "$(quoted "atom_$first")" ]] || bad "${names[i]}'s ATOM arguments differ from ${names[first]}'s: every instance of a side takes the same"
 done
-declare -n prefill=atom_0 decode=atom_$NP
+declare -n prefill=atom_0 decode=atom_$NP decode_on=on_$NP
 ATOMESH=${ATOMESH:-atomesh} ROUTER_LP=
 # A simulated router chooses among a side's instances as LP `router`, as a
 # --dp-aware one chooses among DP ranks.
 [[ $cmd == record ]] || { [[ " ${router[*]} " != *" --dp-aware "* ]] && ((NP == 1 && ND == 1)); } || ROUTER_LP=$ATOMESH
-[[ $cmd == record ]] || for word in "${router[@]}"; do
-    case ${word%%=*} in
-    --prefill | --decode) bad "the router's arguments carry ${word%%=*}, a worker more for a simulated router to choose" ;;
-    --max-concurrent-requests | --rate-limit-tokens-per-second) bad "the router's arguments carry ${word%%=*}, a limiter a simulated router leaves out" ;;
-    --request-timeout-secs) bad "the router's arguments carry ${word%%=*}, a wall-clock bound the script sets for a simulated router" ;;
-    esac
-done
-if [[ -n $ROUTER_LP && " ${router[*]} " != *" --disable-retries "* ]]; then
-    why="carry --dp-aware"
-    [[ " ${router[*]} " == *" --dp-aware "* ]] || why="choose among a side's instances as LP router"
-    bad "the router's arguments $why but not --disable-retries: a router LP's retry resends a request under its first seq, which the frontend refuses as arrived twice"
+if [[ $cmd == run ]]; then
+    why=$(compass_sim_router_refusal "$([[ -n $ROUTER_LP ]] && echo 1 || echo 0)" "${router[@]}")
+    [[ -z $why ]] || bad "$why"
 fi
 for path in "$(realpath -m "$OUT")" "$ROOT" "$PWD"; do
     ((!any_on)) || [[ $(printf %q "$path") == "$path" ]] || bad "--on's prefix may parse $path again, which a shell would split or expand"
@@ -191,6 +228,11 @@ if [[ -n ${KV_EXTRA:-} ]]; then
     python3 -c 'import json, sys; assert isinstance(json.loads(sys.argv[1]), dict)' "$KV_EXTRA" 2>/dev/null ||
         bad "KV_EXTRA is no JSON object: $KV_EXTRA"
 fi
+read -ra prefill_env <<<"${PREFILL_ENV:-}"
+read -ra decode_env <<<"${DECODE_ENV:-}"
+for word in "${prefill_env[@]}" "${decode_env[@]}"; do
+    [[ $word =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || bad "PREFILL_ENV and DECODE_ENV take NAME=VALUE words, not $word"
+done
 
 compass_env "$ROOT"
 compass_require_tree "$ROOT" || exit $?
@@ -203,15 +245,19 @@ RUN_FILE= CLOCK=
 # listeners take one per rank from its handshake port. The decode's handshake
 # port, the prefill's plus its ranks as the nightly's 1P1D launch gives it, is
 # not held: its listeners bind ports the kernel hands out.
-ports=$(python3 - $$ "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "$NP" "$ND" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
+ports=$(python3 - $$ "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${decode_on[*]}" "$PREFIX_S" "$NP" "$ND" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
 import argparse, json, random, socket, subprocess, sys
 from pathlib import Path
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal
 from atom.compass.drive import runfile, serve
+from atom.compass.drive.run import side_env
 from atom.compass.spec import SpecRefusal
 
-script, run_file, kv_link, router_lp, np_, nd, n, *words = sys.argv[1:]
+# Python names a program read from stdin <stdin>, a file that a process this
+# one spawns to resolve a side's config would run as its main, and not find.
+globals().pop("__file__", None)
+script, run_file, kv_link, router_lp, on, prefix_s, np_, nd, n, *words = sys.argv[1:]
 np_, nd = int(np_), int(nd)
 flags, words = words[: int(n)], words[int(n) :]
 k = int(words[0])
@@ -245,11 +291,20 @@ if not run_file:
     ranks = engine.data_parallel_size * engine.tensor_parallel_size * engine.pipeline_parallel_size
     bases = [block(ranks) for _ in range(np_)]
     hand(router, prometheus, "-", "-", *bases, *(bases[0] + ranks + k for k in range(nd)))
+def decode_env():
+    """The environment --on's prefix starts the decode's command in, with what
+    compass_env sets over it there."""
+    shown = subprocess.run([*on.split(), "env", "-0"], stdin=subprocess.DEVNULL, capture_output=True, timeout=float(prefix_s))
+    if shown.returncode:
+        said = shown.stderr.decode(errors="replace").strip()
+        raise ValueError(f"--on's prefix exited {shown.returncode} showing the decode's environment: {said}")
+    env = dict(v.split("=", 1) for v in shown.stdout.decode(errors="surrogateescape").split("\0") if v)
+    return env | side_env(env)
 parser = argparse.ArgumentParser(prog="deploy.sh run")
 runfile.add_arguments(parser)
 args = parser.parse_args(flags)
 try:
-    run = runfile.prefill_decode(args, prefill, decode, kv_link)
+    run = runfile.prefill_decode(args, prefill, decode, kv_link, decode_env if on else None)
     for side, count in (("prefill_instances", np_), ("decode_instances", nd)):
         if count > 1:
             run[side] = count
@@ -259,7 +314,7 @@ try:
         run.setdefault("router_in_s", compass_run.hop(run, "ipc_s"))
         table = compass_run.channel_table(run)
         lookaheads = json.dumps({c.name: table.lookahead(c.name) for c in table.channels_from(compass_run.ROUTER)}, separators=(",", ":"))
-except (ValueError, OSError, ArtifactRefusal, SpecRefusal) as refused:
+except (ValueError, OSError, subprocess.TimeoutExpired, ArtifactRefusal, SpecRefusal) as refused:
     sys.exit(f"deploy: {refused}")
 clock = block(1)
 # One write-request port a (prefill instance, decode instance, prefill rank,
@@ -318,7 +373,9 @@ fi
 
 instance() { # I: write instance I's command, OUT/<name>.sh, and run it
     local i=$1 name=${names[$1]}
-    local -n atom=atom_$1 own=own_$1 prefix=on_$1
+    local -n atom=atom_$1 own=own_$1 prefix=on_$1 side_vars=${sides[$1]}_env own_vars=env_$1
+    # Its side's variables (PREFILL_ENV, DECODE_ENV), then its own (--env), which win.
+    local vars=("${side_vars[@]}" "${own_vars[@]}")
     local role=kv_consumer command=("$cmd" --join "$RUN_FILE") several=$ND
     [[ ${sides[i]} == decode ]] || role=kv_producer several=$NP
     local kv="{\"kv_role\":\"$role\",\"kv_connector\":\"compass\",\"compass_kv_write_req\":\"tcp://127.0.0.1:${KV_PORTS[i]}\""
@@ -334,6 +391,8 @@ print(json.dumps({**json.loads(sys.argv[2]), **json.loads(sys.argv[1])}))' "$kv"
     # Its process id, which exec keeps; then this tree, checked, and the caller's directory.
     printf 'echo $$ >%q\n. %q && compass_env %q && compass_require_tree %q && cd %q &&\n    exec' \
         "$OUT/$name.pid" "$ROOT/scripts/compass/_lib.sh" "$ROOT" "$ROOT" "$PWD" >"$OUT/$name.sh"
+    # Its variables, after compass_env so they win, quoted so a JSON value arrives whole.
+    ((${#vars[@]} == 0)) || printf ' %q' env "${vars[@]}" >>"$OUT/$name.sh"
     printf ' %q' python3 -c 'from atom.compass.cli import main; main()' "${command[@]}" >>"$OUT/$name.sh"
     "${prefix[@]}" bash "$OUT/$name.sh" >"$OUT/$name.log" 2>&1 &
     pids[i]=$!
@@ -359,6 +418,17 @@ for i in "${!sides[@]}"; do
 done
 urls=()
 for i in "${!sides[@]}"; do urls+=("$(url "$i")"); done
+# Real, each --on instance's URL and prefix, whose node's clock is paired with
+# this one's; the pairing leaves out an instance on this node.
+clocked=() watch=
+if [[ $cmd == record ]]; then
+    for i in "${!sides[@]}"; do
+        declare -n on=on_$i
+        ((${#on[@]} == 0)) || clocked+=("${urls[i]}" "${#on[@]}" "${on[@]}")
+        unset -n on
+    done
+fi
+pair=(python3 -m atom.compass.drive.clock_pair "$OUT/clock_pairs.jsonl" --timeout "$PREFIX_S")
 # The router's requests to each instance, and the wait on the router, go
 # direct, never through a proxy the environment names.
 hosts=127.0.0.1
@@ -366,7 +436,7 @@ for u in "${urls[@]}"; do u=${u#*://} && hosts+=,${u%:*}; done
 export NO_PROXY=$hosts${NO_PROXY:+,$NO_PROXY} no_proxy=$hosts${no_proxy:+,$no_proxy}
 
 ROUTER=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --prometheus-port "$PROMETHEUS_PORT")
-[[ -z $RUN_FILE ]] || ROUTER+=(--request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S")
+[[ -z $RUN_FILE ]] || ROUTER+=("${COMPASS_SIM_ROUTER_BOUNDS[@]}")
 ROUTER+=(--pd-disaggregation)
 for i in "${!sides[@]}"; do ROUTER+=("--${sides[i]}" "${urls[i]}"); done
 ROUTER+=("${router[@]}")
@@ -393,14 +463,32 @@ EOF
 ) || fail "the router LP's worker order: $order"
     router_env+=(ATOM_COMPASS_ROUTER_ORDER="${order%%$'\n'*}" ATOM_COMPASS_ROUTER_WORKERS="${order#*$'\n'}")
 fi
-env "${router_env[@]}" "${ROUTER[@]}" >"$OUT/router.log" 2>&1 &
+# Atomesh holds a descriptor for each client connection and each upstream one,
+# and raises no limit of its own: at a soft limit of 1024 a c=1228 router ran
+# out, answered 502 for the prefill instances it could not reach, and a request
+# the router LP was released never reached it, so the run hung (#3720). It starts
+# at the hard limit, as a `compass run` server raises its own (#3819).
+(ulimit -n "$(ulimit -Hn)" 2>/dev/null || true; exec env "${router_env[@]}" "${ROUTER[@]}") >"$OUT/router.log" 2>&1 &
 R=$!
 compass_wait_up router $R "http://127.0.0.1:$ROUTER_PORT/v1/models"
 # A stop from here on, one server.json's reader sends included, also stops the
-# prefill instances, so the wait below ends even when the stop comes before it.
-prefills=("${pids[@]:0:NP}")
+# prefill instances, so the wait below ends even when the stop comes before it:
+# each here by a SIGTERM, each elsewhere through its prefix, as the stop below
+# reaches every instance. A signal to the prefix itself would end it apart
+# from its command, with a status of its own, ssh's 255 or a shell's 143, on
+# which a normal stop failed; ended by its command, it ends with its status.
+stop_prefills() {
+    local i
+    for ((i = 0; i < NP; i++)); do stop_instance "$i"; done
+}
 stopped=0
-trap 'stopped=1; kill -TERM "${prefills[@]}" 2>/dev/null || true' TERM INT
+trap 'stopped=1; stop_prefills' TERM INT
+# Each other node's clock paired as the deployment starts and every
+# CLOCK_PAIR_S after, apart, so a prefix slow to pair delays no start.
+if ((${#clocked[@]})); then
+    (cd / && exec "${pair[@]}" --every "${CLOCK_PAIR_S:-60}" -- "${clocked[@]}") &
+    watch=$!
+fi
 # server.json names a child of this script that lives as long as it does, so a
 # client's stop, sent to its parent, reaches the script whatever else has left.
 # It holds none of the script's output, which its caller may read to the end.
@@ -426,7 +514,9 @@ rc=$((!stopped))
 # Each instance stops its server, whose frontend ends a simulated run through
 # the authority; the authority leaves once it has written the summary.
 # The router stops last: a router LP's run needs it until then.
-for i in "${!sides[@]}"; do stop_instance "$i"; done
+# A prefill instance the stop's trap reached is not stopped again: a second
+# SIGTERM after `compass record` has stopped its server would end it there.
+for i in "${!sides[@]}"; do ((stopped && i < NP)) || stop_instance "$i"; done
 deadline=$((SECONDS + WAIT_S))
 for pid in "${pids[@]}" $authority $R; do
     ((pid != R)) || kill -TERM $R 2>/dev/null || true
@@ -436,6 +526,11 @@ for pid in "${pids[@]}" $authority $R; do
     done
     wait $pid || ((pid == R)) || rc=1
 done
+if [[ -n $watch ]]; then
+    kill -TERM "$watch" 2>/dev/null || true
+    wait "$watch" || true
+    (cd / && "${pair[@]}" -- "${clocked[@]}") || true
+fi
 trap - EXIT
 # Each instance: its directory's name, side and index, and, real, its
 # Mooncake handshake port, which a prefill's transfers carry to the decode.

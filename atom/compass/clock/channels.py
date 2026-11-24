@@ -15,6 +15,11 @@ exist. What a grant needs is the distance ``D(j->i)``: the least summed
 lookahead over every channel path from *j* to *i*, infinite when there is none.
 Lookahead is static, so the distances are computed once, by Floyd-Warshall,
 and again only if a channel is declared afterwards.
+
+A channel into an LP may be marked *offering*: its handler, or a thread its
+handler wakes, offers a send that the clock owner makes at the message's
+arrival (`atom.utils.clock.LPRuntime.offer`), so the authority grants an LP
+waiting in TAR such a message's arrival first (`ClockAuthority`, #3767).
 """
 
 import math
@@ -51,6 +56,8 @@ class ChannelTable:
         # Each LP's channels out and in, by name; a declare empties both.
         self._from: dict[LpId, tuple[Channel, ...]] = {}
         self._into: dict[LpId, tuple[Channel, ...]] = {}
+        # The offering channels' names, an ordered set.
+        self._offering: dict[str, None] = {}
 
     def declare(
         self,
@@ -112,6 +119,16 @@ class ChannelTable:
                 c for _, c in sorted(self._channels.items()) if c.source == lp
             )
         return self._from[lp]
+
+    def mark_offering(self, *names: str) -> None:
+        """Mark each channel named as offering: its handler may offer a send."""
+        for name in names:
+            self.channel(name)
+        self._offering.update(dict.fromkeys(names))
+
+    def offering(self, name: str) -> bool:
+        """Whether the handler of a message on `name` may offer a send."""
+        return name in self._offering
 
     def lookahead(self, name: str) -> float:
         return self.channel(name).lookahead_s
@@ -297,6 +314,7 @@ def add_lmcache(
     engine: str,
     lmcache_ipc_s: float,
     dp: int = 1,
+    driven: bool = False,
 ) -> None:
     """LP ``lmcache``, the lmcache MP server, and its channels to and from `engine`.
 
@@ -306,6 +324,11 @@ def add_lmcache(
     in rank order, and its reply back to it. The server's loop takes every
     request itself. Each is one ZMQ hop of `lmcache_ipc_s`, which must be
     positive: engine to server and back is a cycle.
+
+    `driven`, when a lookup driver runs (``OFFLOAD_MP_LOOKUP_THREAD``): each
+    rank's ``request#dp<r>`` into `engine` and its lookup replies are offering,
+    as the input thread offers an arrival's lookup and a reply wakes the
+    driver's next pass.
     """
     if not lmcache_ipc_s > 0.0:
         raise ValueError(
@@ -318,6 +341,51 @@ def add_lmcache(
     for kind, back in kinds:
         table.declare(f"{engine}->lmcache:{kind}", eng, lm, lmcache_ipc_s, "inline")
         table.declare(f"lmcache->{engine}:{kind}", lm, eng, lmcache_ipc_s, back)
+    if driven:
+        ends = tuple(f":{k}#dp{r}" for r in range(dp) for k in ("request", "lookup"))
+        into = table.channels_into(eng)
+        table.mark_offering(*(c.name for c in into if c.name.endswith(ends)))
+
+
+def add_mooncake_store(
+    table: ChannelTable, engines: list[str], store_rpc_s: float, dp: int = 1
+) -> None:
+    """LP ``mooncake_store``, a shared Mooncake Store's master, and its channels
+    to and from each engine LP of `engines`.
+
+    Per engine and DP rank, ``lookup#dp<r>`` carries the step loop's queries
+    and renewals to the master and each reply back, and ``transfer#dp<r>``
+    every writer rank's put, in rank order, which gets no reply. Each end takes
+    its frames inline. Each is one hop of `store_rpc_s`, which must be
+    positive: a query and its reply are a cycle.
+
+    Each rank's ``request#dp<r>`` into each engine is offering: the engine's
+    input thread offers an arrival's Store lookup (`offer_lookups`, which
+    ATOM's Store scheduler always defines), and the shell hands it to
+    `LPRuntime.offer` (`StoreShell._send_lookup`). The marking follows from
+    the run file alone, so the authority's process and each engine's agree.
+    The Store's replies are taken by the step loop at its next poll, so they
+    offer nothing.
+    """
+    if not store_rpc_s > 0.0:
+        raise ValueError(
+            f"store_rpc_s is {store_rpc_s!r}; an engine queries the Mooncake Store "
+            "master and the master replies, a cycle that needs a positive lookahead"
+        )
+    store = table.registry.register(LpId("mooncake_store"))
+    for engine in engines:
+        eng = LpId(engine)
+        for r in range(dp):
+            for src, dst, kind in (
+                (eng, store, f"lookup#dp{r}"),
+                (store, eng, f"lookup#dp{r}"),
+                (eng, store, f"transfer#dp{r}"),
+            ):
+                name = f"{src.name}->{dst.name}:{kind}"
+                table.declare(name, src, dst, store_rpc_s, "inline")
+        ends = tuple(f":request#dp{r}" for r in range(dp))
+        into = table.channels_into(eng)
+        table.mark_offering(*(c.name for c in into if c.name.endswith(ends)))
 
 
 def prefill_decode_table(

@@ -3005,7 +3005,7 @@ class TestPostprocess:
             request_finished=lambda s: pending_send.add(str(s.id)),
             should_defer_free=lambda s: str(s.id) in pending_send,
             send_finished=lambda rid: pending_send.discard(str(rid)),
-            abort_send=aborted.append,
+            abort_parked_send=aborted.append,
             build_connector_meta=lambda: "metadata",
         )
 

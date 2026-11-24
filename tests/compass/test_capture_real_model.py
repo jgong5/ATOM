@@ -95,8 +95,9 @@ width, and is handed the hint for the same reason.
 
 The width is not free in one place: the H2D publication checks each count with
 `operator.index` and copies with the number that returns, so its copies are at
-the hint. The view it hands back carries the symbol, and the digest that shows
-the width free leaves the publication's own operators out by name.
+the hint. The device views the builders take after it carry the symbol, and
+the digest that shows the width free leaves the publication's own operators
+out by name.
 """
 
 from __future__ import annotations
@@ -162,6 +163,8 @@ COLLECTIVE_OPS = (
 
 # ATOM's H2D publication, which dispatches every staged copy of a step.
 H2D_PUBLICATION = "atom/utils/h2d.py:"
+# The decode builder, which slices each staged buffer's device view.
+STAGE_DECODE = "atom/model_ops/attentions/aiter_attention.py:"
 
 # Declared device readings -- node 18's MI308X. Nothing here reads a device.
 ARCH = "gfx942"
@@ -176,8 +179,8 @@ TOTAL_MEMORY_BYTES = 192 * (1 << 30)
 # ATOM's forward -- a fused kernel, one more view -- while the distinct set
 # moves when the kinds of work change, which is the thing worth holding.
 
-TP1_DISTINCT_OPS = 36
-TP2_DISTINCT_OPS = 42
+TP1_DISTINCT_OPS = 34
+TP2_DISTINCT_OPS = 40
 
 # What the width changes, by name. It swaps the embedding for its
 # vocab-parallel form, adds the collectives -- the row-parallel reduces fused
@@ -197,10 +200,10 @@ TP2_ONLY_OPS = (
 # The lines a TP2 decode step issues a collective from. Named, because a
 # collective's operator says what ran and only its call site says which of
 # ATOM's communication paths ran it.
-ROW_PARALLEL = "atom/model_ops/layernorm.py:944 in _forward_fused_allreduce"
-VOCAB_EMBEDDING = "atom/model_ops/embed_head.py:178 in forward"
-VOCAB_LM_HEAD = "atom/model_ops/embed_head.py:269 in forward"
-SAMPLER = "atom/model_engine/model_runner.py:3389 in postprocess"
+ROW_PARALLEL = "atom/model_ops/layernorm.py:1014 in _forward_fused_allreduce"
+VOCAB_EMBEDDING = "atom/model_ops/embed_head.py:179 in forward"
+VOCAB_LM_HEAD = "atom/model_ops/embed_head.py:276 in forward"
+SAMPLER = "atom/model_engine/model_runner.py:3700 in postprocess"
 
 # Where a free symbol stops being free, each as the value it takes and the
 # innermost ATOM frames it takes it through. Three, and in an order: a symbol
@@ -209,9 +212,12 @@ SAMPLER = "atom/model_engine/model_runner.py:3389 in postprocess"
 # the runner is built, sites one and three while the step is prepared; site
 # three is what site one hides, and it shows up in the pass that simulates
 # site one closed.
+#
+# Site one is the decode builder's padding of the staged positions out to the
+# bound, `_pad_tokens`, which `stage_decode` calls.
 SITE_ONE = (
     "2",
-    ("atom/model_ops/attentions/aiter_attention.py:1216 in prepare_decode",),
+    ("atom/model_ops/attentions/backends.py:1284 in _pad_tokens",),
 )
 # The H2D publication binds each staged buffer in `ModelRunner.__init__` and
 # checks that its host and device sides have one shape. With a symbol on every
@@ -219,14 +225,19 @@ SITE_ONE = (
 # no staged dimension is free by the time a step begins.
 SITE_TWO = (
     "16384",
-    ("atom/utils/h2d.py:133 in bind", "atom/utils/h2d.py:277 in __init__"),
+    ("atom/utils/h2d.py:133 in bind", "atom/utils/h2d.py:285 in __init__"),
 )
-# The publication's count check, `operator.index` of the bound, reached once
-# site one no longer takes `__index__` of it.
+# The MRoPE positions' host view, reached once site one no longer takes
+# `__index__` of the bound. It slices the staged buffer's flattened numpy array
+# by three times the bound; that array is a plain ndarray, which the simulated
+# repair does not wrap. The step stages every buffer before it publishes any,
+# so this comes before the publication's count check, `H2D_COUNT_CHECK`.
 SITE_THREE = (
     "2",
-    ("atom/utils/h2d.py:51 in _count",),
+    ("atom/model_ops/attentions/backends.py:1063 in _mrope_cpu_view",),
 )
+# The H2D publication's count check, `operator.index` of each staged count.
+H2D_COUNT_CHECK = "atom/utils/h2d.py:51 in _count"
 
 # `CpuGpuBuffer.__init__` as it is on this tree, and how many buffers one
 # runner builds through it. ATOM's own `__init__` executes under this capture,
@@ -453,7 +464,7 @@ COST_BEARING_FAMILIES = ("gemm", "attention", "normalisation")
 # is implied by the per-sequence bounds that both widths install. Asserted per
 # width rather than as a shared set, because the difference is a property of
 # the step and worth failing on if it changes. The set is the same at every
-# step width this file traces.
+# step width this file traces, but for `width_floor`.
 EXPECTED_GUARDS = {
     1: frozenset(
         {
@@ -469,12 +480,22 @@ EXPECTED_GUARDS = {
 }
 EXPECTED_GUARDS[2] = EXPECTED_GUARDS[1] - {"28*<axis> <= 8192"}
 
+
+# The one guard that names the width it was traced at: `build_cu_seqlens`
+# asserts `running_bs >= len(lengths)`, and the lengths are a host array as
+# long as the traced width. So the graph traced at width `w` holds from `w` up.
+# At width 2 torch's own floor on a size already implies it and nothing is
+# installed; at `SECOND_WIDTH` it is `<axis> >= 8`.
+def width_floor(width):
+    return {f"<axis> >= {width}"} if width > 2 else set()
+
+
 # How many of the step's staged buffers the H2D publication copies to the
-# device. Five from `prepare_decode`'s own list, and the rest from the
-# sampler's and the token processor's staging around it. All but one are
-# counted in the step's width, each checked by `_count`; the one left copies a
-# constant three rows.
-STAGED_COPIES = 11
+# device. Five from `stage_decode`'s own list, and the rest from the query
+# layout's, the sampler's and the token processor's staging around it. All but
+# one are counted in the step's width, each checked by `_count`; the one left
+# copies a constant three rows.
+STAGED_COPIES = 12
 WIDTH_COUNTED_COPIES = STAGED_COPIES - 1
 
 # Every conversion of the step's width to a number that one traced forward
@@ -493,25 +514,28 @@ WIDTH_COUNTED_COPIES = STAGED_COPIES - 1
 # one that only reaches a host value does not, which is why this is asserted
 # rather than left to the digest.
 EXPECTED_HOST_RESOLUTIONS = {
-    "atom/model_ops/attentions/aiter_attention.py:1216 in prepare_decode": 1,
-    "atom/model_ops/attentions/aiter_attention.py:1239 in prepare_decode": 1,
-    "atom/model_ops/attentions/aiter_attention.py:1240 in prepare_decode": 1,
-    "atom/model_ops/attentions/aiter_attention.py:1241 in prepare_decode": 2,
-    "atom/model_ops/attentions/aiter_attention.py:1249 in prepare_decode": 1,
-    "atom/model_ops/attentions/aiter_attention.py:1250 in prepare_decode": 2,
-    "atom/model_ops/attentions/backends.py:597 in prepare_block_tables": 1,
-    "atom/model_ops/attentions/backends.py:611 in _mrope_cpu_view": 1,
-    "atom/model_ops/attentions/backends.py:613 in _mrope_cpu_view": 1,
-    "atom/model_ops/attentions/backends.py:671 in _build_mrope_decode_positions": 1,
-    "atom/model_ops/attentions/backends.py:714 in prepare_cu_seqlens_q": 1,
-    "atom/model_ops/attentions/backends.py:715 in prepare_cu_seqlens_q": 3,
-    "atom/model_engine/model_runner.py:522 in prepare_input_ids": 3,
-    "atom/model_engine/model_runner.py:608 in _stage_input_ids": 1,
-    "atom/model_engine/model_runner.py:611 in _stage_input_ids": 1,
-    "atom/model_engine/model_runner.py:2698 in prepare_sample": 1,
+    "atom/model_ops/attentions/aiter_attention.py:1017 in stage_decode": 1,
+    "atom/model_ops/attentions/aiter_attention.py:1024 in stage_decode": 1,
+    "atom/model_ops/attentions/aiter_attention.py:1026 in stage_decode": 1,
+    "atom/model_ops/attentions/aiter_attention.py:1027 in stage_decode": 2,
+    "atom/model_ops/attentions/backends.py:163 in query_lengths": 1,
+    "atom/model_ops/attentions/backends.py:677 in prepare_block_tables": 1,
+    "atom/model_ops/attentions/backends.py:1061 in _mrope_cpu_view": 1,
+    "atom/model_ops/attentions/backends.py:1063 in _mrope_cpu_view": 1,
+    "atom/model_ops/attentions/backends.py:1116 in _build_mrope_decode_positions": 1,
+    "atom/model_ops/attentions/backends.py:1203 in decode_spans": 1,
+    "atom/model_ops/attentions/backends.py:1204 in decode_spans": 1,
+    "atom/model_ops/attentions/backends.py:1284 in _pad_tokens": 2,
+    "atom/model_ops/attentions/backends.py:1285 in _pad_tokens": 2,
+    "atom/model_ops/attentions/token_layout/batch_ids.py:53 in build_batch_ids": 1,
+    "atom/model_ops/attentions/token_layout/batch_ids.py:86 in build_cu_seqlens": 2,
+    "atom/model_engine/model_runner.py:569 in prepare_input_ids": 3,
+    "atom/model_engine/model_runner.py:677 in _stage_input_ids": 1,
+    "atom/model_engine/model_runner.py:680 in _stage_input_ids": 1,
+    "atom/model_engine/model_runner.py:2865 in prepare_sample": 1,
     "atom/model_ops/sampler.py:48 in _apply_greedy_tokens": 1,
-    "atom/utils/forward_context.py:318 in decide": 1,
-    "atom/utils/h2d.py:51 in _count": WIDTH_COUNTED_COPIES,
+    "atom/utils/forward_context.py:371 in decide": 1,
+    H2D_COUNT_CHECK: WIDTH_COUNTED_COPIES,
 }
 
 
@@ -666,9 +690,11 @@ def _declare_cuda():
         "is_current_stream_capturing": lambda: False,
     }
     # ATOM's H2D publication compares the current stream by identity, and by
-    # id through torch's own accessor, which it reads off `torch._C`.
+    # id through torch's own accessor, which it reads off `torch._C`; aiter's
+    # top-k reads the current device there.
     current = _Stream()
     torch._C._cuda_getCurrentStream = lambda *a: (current.stream_id, 0, 1)
+    torch._C._cuda_getDevice = lambda: 0
     for group in (for_import, for_runner):
         for name, value in group.items():
             setattr(torch.cuda, name, value)
@@ -788,18 +814,24 @@ def _decline_custom_all_gather():
 
 
 def _select_direct_h2d():
-    """Select ATOM's direct host-to-device copies, and say so.
+    """Keep ATOM's direct host-to-device copies, and say so.
 
-    The packed transport, ATOM's default, stages every published buffer through
-    one host block it reads with `.numpy()`, which a fake tensor refuses, and
-    scatters it with a raw kernel addressed by device pointers, which a fake
-    tensor does not have. Its single copy is a byte count summed on the host,
-    so even past both it would carry the hint, never the step's symbol. Direct
-    copies each buffer with its own `copy_`. The transport decides how staged
-    metadata reaches the device and nothing about the model's operators.
+    The packed transport, ATOM's default wherever a device can serve it, stages
+    every published buffer through one host block it reads with `.numpy()`,
+    which a fake tensor refuses, and scatters it with a raw kernel addressed by
+    device pointers, which a fake tensor does not have. Its single copy is a
+    byte count summed on the host, so even past both it would carry the hint,
+    never the step's symbol. Direct copies each buffer with its own `copy_`, the
+    transport a group falls back to when packing declines it. The transport
+    decides how staged metadata reaches the device and nothing about the
+    model's operators.
     """
-    os.environ["ATOM_H2D_BACKEND"] = "direct"
-    return "ATOM_H2D_BACKEND=direct"
+    from atom.utils import packed_h2d
+
+    packed_h2d.PackedCopy.create = classmethod(
+        lambda cls, members, device: (None, "a capture packs no bytes")
+    )
+    return "packed_h2d.PackedCopy.create declines every group"
 
 
 def _sync_on_the_host():
@@ -826,13 +858,15 @@ def _sync_on_the_host():
     def own_row(scheduled_tokens, scheduled_bs, is_prefill, needs_eager, **kwargs):
         hint = int(scheduled_tokens.node.hint)
         q = kwargs.get("max_seqlen_q")
+        row = np.array([hint], dtype=np.int32)
+        # The caller's running tokens, which ATOM's exchange fills from the rows.
+        np.copyto(kwargs["running_tokens_per_dp_rank"], row)
         return ubatching.DPSyncResult(
-            scheduled_tokens_per_dp_rank=np.array([hint], dtype=np.int32),
+            scheduled_tokens_per_dp_rank=row,
             max_bs_across_dp=scheduled_bs,
             prefill_across_dp=(bool(is_prefill),),
             any_rank_needs_eager=bool(needs_eager),
             tbo_collective_active=False,
-            ub_max_tokens_across_dp=None,
             ub_tokens_across_dp=None,
             max_seqlen_q_across_dp=q,
             max_final_requests_across_dp=kwargs.get("final_requests", 0),
@@ -2644,15 +2678,17 @@ def test_closing_site_one_moves_the_bound_to_a_third_site():
 
     With the numpy view reading the bound's hint instead of solving it -- the
     simulated site-one repair, applied from outside ATOM -- the bound survives
-    site one and is solved further on in the same step, by the H2D
-    publication's count check (`SITE_THREE`), reached when the block tables
-    are published. That is why the sites are an order rather than a set.
+    site one and is solved further on in the same step, by the MRoPE
+    positions' host view (`SITE_THREE`), which slices a flattened copy of a
+    staged buffer that the simulated repair does not wrap. That is why the
+    sites are an order rather than a set.
 
     The second site is untouched by the repair.
 
     It used to be ATOM's shape-contract assertion, `assert_shape_contract`,
-    later in the step; the publication now checks the count first. Nothing on
-    the path is `_rows`, which no longer converts a dimension.
+    later in the step, and then the H2D publication's count check; the step now
+    stages every buffer before it publishes any, so the MRoPE view comes first.
+    Nothing on the path is `_rows`, which no longer converts a dimension.
     """
     record = capture(1, symbolic=True, repair_site_one=True)
     assert record["site_one_repair_simulated"] is True
@@ -2860,22 +2896,27 @@ def test_the_symbol_reaches_the_work_that_decides_the_cost():
 def test_the_three_sites_are_where_they_were_and_carry_the_symbol_instead():
     """The three ordered sites, held by what happens at each of them in this pass.
 
-    **Site one**, the bound at the caller. `prepare_decode` still fills a
-    staged buffer's numpy view with the count, and a host fill still needs a
-    number, so the symbol is still converted there. It is converted to its hint
-    and logged as a host resolution, where it used to be converted to a guard
-    that made every shape downstream a constant. The line appears in
-    `host_resolutions` and in nothing else.
+    **Site one**, the bound at the caller. `_pad_tokens` still fills a staged
+    buffer's numpy view from the scheduled count to the bound, and a host fill
+    still needs a number, so the symbol is still converted there -- twice in
+    this pass, because a decode step's scheduled and running token counts are
+    the one symbol. It is converted to its hint and logged as a host
+    resolution, where it used to be converted to a guard that made every shape
+    downstream a constant. The line appears in `host_resolutions` and in
+    nothing else.
 
     **Site two**, the binding's shape check, is never reached with a symbol:
     this pass stages ATOM's own buffers, unsymbolised.
 
-    **Site three**, the H2D publication's count check, converts the width on
-    every copy, so it is a host resolution like site one -- but one whose
-    number the publication then copies with. The copies carry the hint, not
-    the symbol, and the view the publication hands back carries the symbol
-    again. That is the one place the width is not free, and `graph_digest`
-    leaves it out by name rather than by accident.
+    **Site three**, the MRoPE positions' host view, is a host resolution like
+    site one.
+
+    **The H2D publication's count check** converts the width on every copy,
+    so it is a host resolution too -- but one whose number the publication then
+    copies with. The copies carry the hint, not the symbol, and the device
+    views the builders take of what it copied carry the symbol again. That is
+    the one place the width is not free, and `graph_digest` leaves it out by
+    name rather than by accident.
 
     **And the whole log is held, not just those lines.** The point of replacing
     the recording with a log is that a conversion nobody expected fails rather
@@ -2905,8 +2946,9 @@ def test_the_three_sites_are_where_they_were_and_carry_the_symbol_instead():
     resolved_at = collections.Counter(
         event["frames"][-1] for event in record["host_resolutions"]
     )
-    assert resolved_at[SITE_ONE[1][0]] == 1
-    assert resolved_at[SITE_THREE[1][0]] == WIDTH_COUNTED_COPIES
+    assert resolved_at[SITE_ONE[1][0]] == 2
+    assert resolved_at[SITE_THREE[1][0]] == 1
+    assert resolved_at[H2D_COUNT_CHECK] == WIDTH_COUNTED_COPIES
     # ... and nowhere in the specialisations, which is the whole change.
     assert record["specialisations"] == []
 
@@ -2915,12 +2957,17 @@ def test_the_three_sites_are_where_they_were_and_carry_the_symbol_instead():
     copies = [op for op in published if op[0] == "aten.copy_.default"]
     assert len(copies) == STAGED_COPIES
     assert not any(_Recorder._carries_symbol(i, o) for _, i, o in copies)
-    # What the publication hands back is a slice with the symbol in it, and
-    # that is all it dispatches with one.
+    # The publication dispatches nothing with the symbol in it: it hands back
+    # no view, and each builder slices its own device view by the count.
+    assert not [
+        entry
+        for entry in record["symbolic_sites"]
+        if entry["call_site"].startswith(H2D_PUBLICATION)
+    ]
     assert {
         entry["op"]
         for entry in record["symbolic_sites"]
-        if entry["call_site"].startswith(H2D_PUBLICATION)
+        if entry["call_site"].startswith(STAGE_DECODE)
     } == {"aten.slice.Tensor"}
 
 
@@ -2969,7 +3016,8 @@ def test_the_symbol_is_free_across_the_step_width():
     copies are at the hint. They are asserted here rather than only left out,
     because a reader told the inventories are identical should be told which
     operators are not and why: the same operators in the same order, at two
-    sizes. The guards are the same at both widths.
+    sizes. The guards are the same at both widths but for the floor of the
+    width each was traced at, `width_floor`.
     """
     for tp in (1, 2):
         narrow = capture(tp, step_symbol=True)
@@ -3000,7 +3048,9 @@ def test_the_symbol_is_free_across_the_step_width():
         # step is eight wide is not the step.
         assert values & {DECODE_SEQS} == {DECODE_SEQS}, tp
         assert set(narrow["shape_env_guards"]) == EXPECTED_GUARDS[tp], tp
-        assert set(wide["shape_env_guards"]) == EXPECTED_GUARDS[tp], tp
+        assert set(wide["shape_env_guards"]) == (
+            EXPECTED_GUARDS[tp] | width_floor(SECOND_WIDTH)
+        ), tp
         # The one artifact that is width-dependent, stated rather than omitted.
         names = [op[0] for op in narrow["published_ops"]]
         assert names and [op[0] for op in wide["published_ops"]] == names, tp

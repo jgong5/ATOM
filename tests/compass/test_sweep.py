@@ -172,7 +172,6 @@ def test_one_rank_under_tbo_runs_each_count_past_the_minimum_split_and_says_so(
     monkeypatch.setattr(sweep_plan, "PARKED_TOKENS", 32)
     # `send` copies the server's TBO variables into this process.
     monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "128")
-    monkeypatch.delenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", raising=False)
     library = tmp_path / "library"
     planned, missing, _ = _round(tmp_path, monkeypatch, 1, library, paced, tbo=True)
     # A group of one has no peer to veto a split: A's counts from the minimum

@@ -15,12 +15,33 @@ rank file lost its lines, and refuses.
 A record whose run.json names `ptl_changes` refuses, naming them, and so does
 one whose `source` counts uncommitted files, or one whose `aiter_jit_builds`
 `step_labels.refusal` refuses; a step that overlaps a timed compile is cut.
-With `GRADED_ONLY_ENV` set to ``1``, a record's samples start at its graded
-window: the first step holding a request its client runs name as sent (their
-exports' ``requests``, the warmup's left out), every rank's earlier steps
-dropped after labelling, which still reads them. For a fit on the run it is
-compared against, where the warmup's transients (a page cache filling, the
-first touch of kernels) are not the graded window's.
+With `GRADED_ONLY_ENV` set to ``1``, a record's samples are its graded steps
+(`graded_steps`): those within some client run's graded span, from the first
+step in which a rank holds one of the requests it names as sent (its export's
+``requests``, the warmup's left out) to the last, every rank's other steps
+dropped after labelling, which still reads them. That drops the warmup before
+the first span and the tail after the last; and, on a record serving several
+client runs one after another, the steps between two spans, the drain of one
+client run and the warmup of the next, which a cut at the first graded step
+kept. A step inside a span stays whatever it holds: warmup and sent requests
+together, or only a request its export does not name (one the client cancelled
+when its run ended, in flight since). For a fit on the run it is compared
+against, where the warmup's transients (a page cache filling, the first touch
+of kernels, prefill on an empty KV cache) are not the graded window's: on
+#3720's E3 record, one server serving six client runs, the steps between the
+spans held 69% of the prefill device seconds that cut kept, and ran about 5%
+faster than graded steps of the same features. With `GRADED_SECONDS_ENV`
+also set to a number of seconds, they end that long after the first graded step
+entered (`graded_to`): a calibration timed on a shorter window, fitted from
+the same record. A sample's `dummy_host`, its rank's dummy forwards at a step
+its group prefills, is cut to the same steps. Its host laws' tokenizer, intake
+and hop terms still read the record's whole stamp files.
+
+A record's client run named as a calibration ladder (`load`'s `ladders`,
+`compass fit steps --ladder-run`) is served and graded as any other; each
+sample of a step within its span (`client_spans`) holds as its `ladder` the
+decode rungs the ladder calibrates, which the step linear fit reads
+(`step_linear_fit.ladder_cut`). Every other sample's `ladder` is None.
 
 A step measurement is a `step_measurement` entry `measure steps` published,
 read by key; its member `MEMBER` holds the batch view as a step-record line
@@ -35,7 +56,8 @@ replay unprofiled.
 Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
 config.json's digest; `device`, each GPU's `<name> <arch>`, as a spec states
-it; `engine_config`, `keyed`'s fields, the parallel layout among them;
+it; `engine_config`, `keyed`'s fields, the parallel layout among them, over the
+level `step_linear_fit.recorded_level` reads, as is each sample's host key's;
 `prefill_buckets`, those `step_linear_fit.stated_buckets` reads, null where it
 states none; `source_root`, its host key's ``atom`` as `source_root` writes
 it; `sampling`, the request parameters, null for a record serving no client
@@ -67,6 +89,7 @@ from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, pooled
 from atom.compass.backends.step_labels import Sample, digest, label_run
 from atom.compass.backends.step_linear_fit import (
     recorded_buckets,
+    recorded_level,
     refuse_contradicting,
     stated_buckets,
 )
@@ -83,6 +106,9 @@ FORMAT_VERSION = 2
 #: The variable that, set to ``1``, keeps a record's samples from its graded
 #: window on (module docstring); unset, every labelled step is a sample.
 GRADED_ONLY_ENV = "COMPASS_FIT_GRADED_ONLY"
+#: The variable that, with `GRADED_ONLY_ENV`, keeps only that many seconds of
+#: a record's graded window, from its first step's entry (module docstring).
+GRADED_SECONDS_ENV = "COMPASS_FIT_GRADED_SECONDS"
 #: A step measurement's one member: the bench replies for the whole TP group.
 MEMBER = ("measurement", Topology().ranks()[0], "json")
 #: What names a GPU's model in run.json's `device`.
@@ -92,20 +118,32 @@ UNRECORDED = "unrecorded"
 
 
 def load(
-    records: Mapping, measurements: Sequence = (), store=None, floored=None, engine=None
+    records: Mapping,
+    measurements: Sequence = (),
+    store=None,
+    floored=None,
+    engine=None,
+    ladders: Mapping | None = None,
 ) -> tuple[list[Sample], dict]:
     """The samples of `records`, {record directory: the client runs its server
     served}, labelled under `floored`, and of the `measurements` keys in the
     store at `store`, in run digest, DP rank and step order; and the
     configuration they state, the records' under the engine file `engine`, and
-    each engine config at the longest ladder among them (`pooled`)."""
+    each engine config at the longest ladder among them (`pooled`). `ladders`
+    maps a record directory to {index of a client run in its list: the decode
+    rungs that client run, a calibration ladder, calibrates}."""
     samples, configs, held = [], {}, {}
     if engine is not None:
         owns = {d: Path(d) / "steps" / "dp0.engine.json" for d in records}
         held = pooled({d: keyed_of(json.loads(o.read_text())) for d, o in owns.items()})
     for directory, client_runs in records.items():
         got, configs[str(directory)] = _record(
-            Path(directory), client_runs, floored, engine, held.get(directory)
+            Path(directory),
+            client_runs,
+            floored,
+            engine,
+            held.get(directory),
+            (ladders or {}).get(directory),
         )
         samples += got
     for key in measurements:
@@ -127,7 +165,7 @@ def load(
 
 
 def _record(
-    directory: Path, client_runs, floored=None, stated=None, held=None
+    directory: Path, client_runs, floored=None, stated=None, held=None, ladder=None
 ) -> tuple[list[Sample], dict]:
     run = json.loads((directory / "run.json").read_text())
     if run["format_version"] != FORMAT_VERSION:
@@ -156,15 +194,29 @@ def _record(
     record = served(steps, client_runs)
     if built := aiter_jit.refusal(run, record.values()):
         raise ValueError(f"{directory} is not fitted: {built}")
-    graded_from = None
+    spans = client_spans(record)
+    # Each step within a calibration ladder's span, to the rungs it calibrates.
+    laddered = {
+        n: tuple(sorted(rungs))
+        for k, rungs in (ladder or {}).items()
+        for n in range(spans[k][0], spans[k][1] + 1)
+    }
+    graded = graded_to = None
+    seconds = os.environ.get(GRADED_SECONDS_ENV)
+    if seconds and os.environ.get(GRADED_ONLY_ENV) != "1":
+        raise ValueError(
+            f"{GRADED_SECONDS_ENV} cuts the graded window, which {GRADED_ONLY_ENV}=1 "
+            "selects; set both"
+        )
     if os.environ.get(GRADED_ONLY_ENV) == "1":
-        held = [s["step"] for s in _steps(record) if s["client_run"] is not None]
-        if not held:
+        graded = graded_steps(record)
+        if not graded:
             raise ValueError(
                 f"{GRADED_ONLY_ENV}=1, and no step of {directory} holds a request "
                 "its client runs name as sent"
             )
-        graded_from = min(held)
+        if seconds:
+            graded_to = graded_to_step(record, min(graded), float(seconds))
     sampling = sorted({p for s in _steps(record) for p in s["sampling"]})
     if len(sampling) > 1:
         raise ValueError(
@@ -173,21 +225,41 @@ def _record(
         )
     traces = {(s["dp_rank"], s["step"]): s["traces"] for s in _steps(record)}
     own, buckets = steps / "dp0.engine.json", stated_buckets(steps / "dp0.jsonl")
-    engine = keyed_of(json.loads(own.read_text()))
+    level = recorded_level(steps / "dp0.jsonl")
+    engine = level | keyed_of(json.loads(own.read_text()))
     if stated is not None:
-        engine, buckets = _stated(own, held, buckets, stated)
+        engine, buckets = _stated(own, level | held, buckets, stated)
     files = sorted(steps.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
     name, samples = ", ".join(map(digest, files)), []
     for got, _ in label_run(files, name, _split, floored):
+        dummies = None
         for s in got:
-            if graded_from is not None and s.step < graded_from:
+            if graded is not None and s.step not in graded:
                 continue
+            if graded_to is not None and s.step >= graded_to:
+                continue
+            if dummies is None:  # the rank's dummy forwards, cut alike
+                dummies = tuple(
+                    d
+                    for d in s.dummy_host
+                    if (graded is None or d[0] in graded)
+                    and (graded_to is None or d[0] < graded_to)
+                )
             at = traces[s.rank, s.step]
             traced = {**s.provenance, "traces": at, "profiled": run["profiled"]}
             if stated is not None and (key := traced["config"]) is not None:
                 graphs = {k: v for k, v in key["engine"].items() if k == GRAPHS}
                 traced["config"] = {**key, "engine": engine | graphs}
-            samples.append(dataclasses.replace(s, provenance=traced))
+            elif level and (key := traced["config"]) is not None:
+                traced["config"] = {**key, "engine": level | key["engine"]}
+            samples.append(
+                dataclasses.replace(
+                    s,
+                    provenance=traced,
+                    dummy_host=dummies,
+                    ladder=laddered.get(s.step),
+                )
+            )
     host = run["host_key"]
     return samples, {
         **fields,
@@ -233,6 +305,48 @@ def run_fields(run: dict, record="run.json") -> dict:
 
 def _steps(record: dict) -> list[dict]:
     return [s for steps in record.values() for s in steps]
+
+
+def client_spans(record: dict) -> dict[int, tuple[int, int]]:
+    """Each client run's graded span in `record`, as `parity.served` splits it,
+    by its index: the first and last step in which some DP rank holds one of
+    its sent requests."""
+    spans: dict[int, tuple[int, int]] = {}
+    for s in _steps(record):
+        if (k := s["client_run"]) is not None:
+            first, last = spans.get(k, (s["step"], s["step"]))
+            spans[k] = (min(first, s["step"]), max(last, s["step"]))
+    return spans
+
+
+def graded_steps(record: dict) -> frozenset[int]:
+    """The steps of `record`, as `parity.served` splits it, within some client
+    run's graded span (`client_spans`), whatever those in between hold."""
+    spans = client_spans(record).values()
+    return frozenset(
+        s["step"]
+        for s in _steps(record)
+        if any(first <= s["step"] <= last for first, last in spans)
+    )
+
+
+def graded_to_step(record: dict, start: int, seconds: float) -> int | None:
+    """The first step that entered at least `seconds` after step `start` did,
+    each step's entry the earliest of its DP ranks' (they step together); None
+    when the record ends sooner. A step with no entry stamp is skipped."""
+    enter: dict[int, int] = {}
+    for s in _steps(record):
+        if "t_enter_ns" in s:
+            enter[s["step"]] = min(
+                enter.get(s["step"], s["t_enter_ns"]), s["t_enter_ns"]
+            )
+    if start not in enter:
+        raise ValueError(
+            f"step {start}, where the graded window starts, has no entry stamp"
+        )
+    cut = enter[start] + seconds * 1e9
+    later = [k for k, t in enter.items() if t >= cut]
+    return min(later) if later else None
 
 
 def _measurement(store: ArtifactStore, key) -> tuple[Sample, dict]:

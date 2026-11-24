@@ -190,12 +190,9 @@ def _stream(stream):
         current[0] = previous
 
 
-def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
-    """Declare the device of `arch`, or the card `read` (`card`); say what."""
-    if read is None and arch not in DEVICES:
-        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
-    props = _props(arch, read)
-    cuda = {
+def _cuda(props) -> dict:
+    """`torch.cuda`'s answers as the one device `props` declares."""
+    return {
         # True: on False ATOM takes paths no deployment runs. The fake mode is
         # told otherwise by `driverless_mode`.
         "is_available": lambda: True,
@@ -231,6 +228,14 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
         "MemPool": lambda *a, **k: None,
         "use_mem_pool": lambda *a, **k: contextlib.nullcontext(),
     }
+
+
+def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
+    """Declare the device of `arch`, or the card `read` (`card`); say what."""
+    if read is None and arch not in DEVICES:
+        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
+    props = _props(arch, read)
+    cuda = _cuda(props)
     for name, value in cuda.items():
         setattr(torch.cuda, name, value)
     # ATOM's H2D publication reads the current stream's id off `torch._C`, and
@@ -251,9 +256,6 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
     flags = {
         # The default custom vocab gather needs the device communicator.
         "ATOM_USE_CUSTOM_ALL_GATHER": "0",
-        # The packed H2D transport reads `.numpy()` and device pointers off one
-        # staging block; direct copies each buffer with its own `copy_`.
-        "ATOM_H2D_BACKEND": "direct",
         # aiter's CU count, which it would otherwise ask rocminfo for.
         "CU_NUM": str(props.multi_processor_count),
         # aiter's check that every rank sets it all-reduces over a group whose
@@ -270,6 +272,17 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
     return {"cuda": sorted(cuda), "arch": arch, "flags": flags} | (
         {"card": read} if read else {}
     )
+
+
+def answer_as(arch: str) -> None:
+    """`install`'s `torch.cuda` answers for a device of `arch`, and `torch._C`'s
+    device query, for the life of this process. `is_available` keeps this
+    host's answer, and nothing else `install` declares is declared."""
+    cuda = _cuda(_props(arch))
+    del cuda["is_available"]
+    for name, value in cuda.items():
+        setattr(torch.cuda, name, value)
+    torch._C._cuda_getDevice = lambda: 0
 
 
 #: The operators outside torch that the fake mode's dispatch cache takes: each
@@ -332,6 +345,9 @@ def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None, warp=None) ->
     cus = DEVICES[arch][0] if cus is None else cus
     revision = REVISIONS.get(arch, 0) if revision is None else revision
     warp = _props(arch).warp_size if warp is None else warp
+    import triton
+    from triton.backends.compiler import GPUTarget
+
     rocminfo = pathlib.Path(tmpdir) / "declared-bin" / "rocminfo"
     rocminfo.parent.mkdir(parents=True, exist_ok=True)
     rocminfo.write_text(
@@ -341,18 +357,6 @@ def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None, warp=None) ->
     rocminfo.chmod(0o755)
     os.environ["PATH"] = f"{rocminfo.parent}:{os.environ.get('PATH', '')}"
     os.environ["GPU_ARCHS"] = arch
-    declare_triton_target(arch, warp)
-
-
-def declare_triton_target(arch: str, warp=None) -> None:
-    """Answer Triton's target query in this process with `arch` and its `warp`
-    size (`_props`'s unless given): `_declare_arch`'s Triton half, for a
-    process that imported aiter before it could declare the rest, whose Triton
-    helpers ask for the target on first use."""
-    import triton
-    from triton.backends.compiler import GPUTarget
-
-    warp = _props(arch).warp_size if warp is None else warp
 
     class _DeclaredTarget:
         def get_current_target(self):
@@ -473,13 +477,27 @@ def group(tp: int, dp: int) -> dict:
     dist.all_gather_into_tensor, dist.broadcast = all_gather_into_tensor, broadcast
     dist.all_to_all_single = all_to_all_single
     dist.barrier = lambda *args, **kwargs: None  # no shape, nobody to wait for
+    # A rank-local verdict every rank of a CPU group takes alike (the agreed KV
+    # budget among them): every rank of a capture is this one, so the group's
+    # most is this rank's own value, with no all-reduce on a fake tensor.
+    from atom.distributed import group_agreement
+
+    group_agreement.group_max = lambda value, group: value
     return {
         "world_size": parallel_state.get_tp_group().world_size,
         "dp": parallel_state.get_dp_group().world_size,
         "declined": ["device_communicator", "message_queue_broadcaster", "barrier"],
         "functional": ["all_gather_into_tensor", "broadcast", "all_to_all_single"],
         "communicator_checked_only": ["fused_allreduce_rmsnorm_quant_per_group"],
+        "own_verdict": ["group_max"],
     }
+
+
+def uncached_bytes(nbytes, device):
+    """A mono runner's uncached scratch, of the size it asks for, on the
+    declared device: a plain tensor, since a capture reads no value through
+    it and every rank of a capture is this one."""
+    return torch.empty(nbytes, dtype=torch.uint8, device=device)
 
 
 class PeerBuffer(peer_memory.PeerBuffer):

@@ -9,15 +9,17 @@ at once, so a refusal that regresses fails the test rather than hanging it.
 import json
 import os
 import re
+import resource
 import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from pathlib import Path
 
+import psutil
 import pytest
 from test_drive_gpu import FREE, GPU45, LISTING, _kfd, _plant
 from test_launcher_held_ports import HELD, _squat
@@ -31,13 +33,14 @@ from atom.compass.run import ENV
 
 TREE = Path(__file__).resolve().parents[2]
 PLANTED = """\
-import http.server, json, os, subprocess, sys, time
+import http.server, json, os, resource, subprocess, sys, time
 d = os.environ["PLANTED_DIR"]
 when, _, rc = os.environ.get("PLANTED_EXIT", "never:0").partition(":")
 argv, keep = sys.argv[1:], ("HIP_VISIBLE_DEVICES", "PYTHONPATH", "ATOM_COMPASS_RUN")
 keep += ("ATOM_COMPASS_PARITY_RECORD",)
 with open(d + "/argv.json", "w") as f:
-    json.dump({"argv": argv, "env": {k: os.environ.get(k) for k in keep}}, f)
+    nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+    json.dump({"argv": argv, "env": {k: os.environ.get(k) for k in keep}, "nofile": nofile}, f)
 if os.environ.get("PLANTED_ENGINE", "1") == "1":
     record = os.environ["ATOM_COMPASS_PARITY_RECORD"]
     os.makedirs(record)
@@ -115,14 +118,29 @@ def _seen(planted: Path) -> dict:
     return json.loads((planted / "argv.json").read_text())
 
 
-def _ready(out: Path, driver, polls: int, poll_s: float) -> dict:
-    """The ready file, once the driver in `driver` has written it."""
-    for _ in range(polls):
-        if (out / serve.READY_FILE).exists():
-            return json.loads((out / serve.READY_FILE).read_text())
+#: How long `_ready` waits for a driver's ready file: well past the longest a
+#: start has taken on a loaded host, where each process that imports torch, the
+#: driver and a planted server that reads ATOM's envs among them, can wait
+#: seconds on a run queue.
+READY_S = 300
+
+
+def _ready(out: Path, driver) -> dict:
+    """The ready file, once the driver in `driver` has written it. Fail if the
+    driver exits first, or after `READY_S`, once it and every process under it
+    are killed."""
+    deadline = time.monotonic() + READY_S
+    while not (out / serve.READY_FILE).exists():
         assert driver.poll() is None, (out / serve.LOG_FILE).read_text()[-4000:]
-        time.sleep(poll_s)
-    pytest.fail(f"no {serve.READY_FILE} after {polls * poll_s} s")
+        if time.monotonic() > deadline:
+            top = psutil.Process(driver.pid)
+            for proc in [top, *top.children(recursive=True)]:
+                with suppress(psutil.NoSuchProcess):
+                    proc.kill()
+            driver.wait()
+            pytest.fail(f"no {serve.READY_FILE} after {READY_S} s")
+        time.sleep(0.05)
+    return json.loads((out / serve.READY_FILE).read_text())
 
 
 def _on_this_hosts_clocks(pair) -> bool:
@@ -311,6 +329,21 @@ def test_a_simulated_server_gets_its_run_file_and_clock_and_no_gpu_check(
     assert json.loads((out / serve.RUN_JSON).read_text())["args"][3] == "()"
 
 
+def test_the_server_starts_with_its_open_file_soft_limit_raised(planted, monkeypatch):
+    """A simulated client run opens a second connection for each request it
+    cancels while the request's own is open: at c=512, about 1,500 at the grace
+    deadline, past the usual soft 1024, where the server's accept failed."""
+    monkeypatch.setenv("PLANTED_EXIT", "late:0")
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(1024, hard), hard))
+    try:
+        serve.serve(ARGS, planted / "out", run={"bound_s": 1.0})
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    raised = 65535 if hard == resource.RLIM_INFINITY else min(65535, hard)
+    assert _seen(planted)["nofile"] == [raised, hard]
+
+
 def test_an_op_graph_run_file_holds_atom_s_arguments(planted, monkeypatch):
     monkeypatch.setenv("PLANTED_EXIT", "late:0")
     out = planted / "out"
@@ -426,7 +459,7 @@ def test_the_ready_file_follows_the_first_answer_and_a_stop_leaves_nothing(
         ],
         env=env,
     )
-    server = _ready(out, driver, 600, 0.05)["pid"]
+    server = _ready(out, driver)["pid"]
     assert (planted / "answered").exists()
     child = int((planted / "child").read_text())
     assert _running(server) and _running(child)
@@ -619,7 +652,7 @@ def test_a_worker_blocked_past_atom_s_default_wait_at_the_stop_keeps_its_record(
         [sys.executable, "-c", DRIVE, str(planted / "recorded.py"), str(out), *ARGS],
         env=env,
     )
-    _ready(out, driver, 600, 0.05)
+    _ready(out, driver)
     driver.send_signal(signal.SIGTERM)
     assert driver.wait(timeout=serve.STOP_GRACE_S) == 0
     lines = (out / serve.STEPS / "dp0.jsonl").read_text().splitlines()
