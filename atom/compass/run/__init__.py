@@ -135,7 +135,8 @@ that admits a request, and absent from an entry whose ``E`` laws hold them;
 states, which the run takes as its own, since it records no graphs; a key stating
 other prefill token-graph buckets than its runner's refuses (`refuse_other_buckets`);
 ``tokenizer``, the served tokenizer's ``backend`` (``fast`` or ``slow``), the
-``fingerprint`` of the ``tokenizer.json`` it was fitted on, and, each
+``fingerprint`` of the ``tokenizer.json`` it was fitted on (null for a slow
+tokenizer, which loads none, as Kimi-K3.1's tiktoken one: `_fingerprint`), and, each
 optional, ``encode``, one-item calls, ``encode_batch``, a backend
 ``encode_batch`` of several items, ``decode``, and ``segment``, the segment
 tokenizer call's own work over the ids its ``encode_batch`` calls return, each ``fixed_s`` and a
@@ -793,12 +794,16 @@ def _check_host(path, host: dict) -> None:
         <= tok.keys()
         <= {"backend", "fingerprint", *TOKENIZER_KINDS}
         and tok["backend"] in ("fast", "slow")
-        and isinstance(tok["fingerprint"], str)
+        and (
+            isinstance(tok["fingerprint"], str)
+            or (tok["fingerprint"] is None and tok["backend"] == "slow")
+        )
         and all(_rate(tok[k], k) for k in TOKENIZER_KINDS if k in tok)
     ):
         raise ValueError(
             f"{path}: host's tokenizer is {tok!r}; it takes backend, fast or slow, "
-            "fingerprint, the tokenizer.json it was fitted on, and, each "
+            "fingerprint, the tokenizer.json it was fitted on (null for a slow "
+            "tokenizer, which loads none), and, each "
             "optional, encode, encode_batch, decode and segment, each fixed_s and a "
             "positive tokens_per_s, a segment optionally a positive chars_per_s "
             "too, a decode fixed_s and tokens, [lo, hi], in their place"

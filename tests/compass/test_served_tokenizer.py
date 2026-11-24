@@ -153,6 +153,22 @@ def test_a_tokenizer_term_a_charge_would_misread_is_refused(
         compass_run.spec()
 
 
+@pytest.mark.parametrize("backend, ok", [("slow", True), ("fast", False)])
+def test_a_slow_tokenizer_term_states_no_fingerprint(
+    monkeypatch, tmp_path, backend, ok
+):
+    """A slow tokenizer loads no tokenizer.json (Kimi-K3.1's tiktoken one), so the
+    record names none and the host law fitted on it states a null fingerprint,
+    which a run takes; a fast tokenizer's term must name its tokenizer.json."""
+    term = TERM | {"backend": backend, "fingerprint": None}
+    _run_file(monkeypatch, tmp_path, {"host": {"tokenizer": term}})
+    if ok:
+        assert compass_run.spec()["host"]["tokenizer"]["fingerprint"] is None
+    else:
+        with pytest.raises(ValueError, match="host's tokenizer is"):
+            compass_run.spec()
+
+
 def test_each_kind_of_call_is_charged_its_own_term_a_flat_decode_inside_its_tokens(
     monkeypatch, tmp_path, rt
 ):
