@@ -84,7 +84,7 @@ priced by `StepLinearBackend`; its ``platform``, the platform fields of its key,
 and its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, a run whose ladder is a prefix of the law's read at the law's, and a
 law missing either refuses; a runner that records prefill token-graph buckets
-refuses a law whose engine config, or else prefill vector, states none or others
+refuses a law whose prefill vector, or else engine config, states none or others
 (`refuse_other_buckets`); a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
