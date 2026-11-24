@@ -85,17 +85,22 @@ PREFILL_BUCKETS = "prefill_buckets"
 #: Whether the engine's token processor defers each step's sampled ids a step
 #: (`scheduler.defers_output`), also beside `keyed`'s: `check_run` reads it.
 DEFERS_OUTPUT = "deferred_output"
+#: The fewest rows the engine's forward finishing a prompt runs
+#: (`Config.min_final_prefill_rows`), stated only above 0 and beside `keyed`'s:
+#: a JIT sweep's plan reads it (`atom/compass/drive/sweep_plan.py`).
+MIN_FINAL_ROWS = "min_final_prefill_rows"
 #: The grid definition's own fields.
 DEFINITION = ("prefill", "decode", "margin")
 
 
 def keyed_of(engine: dict) -> dict:
     """`run.step_grid.keyed`'s fields of an engine file's mapping `engine`, which
-    adds `UNKEYED`, `PREFILL_BUCKETS` and `DEFERS_OUTPUT` to them."""
+    adds `UNKEYED`, `PREFILL_BUCKETS`, `DEFERS_OUTPUT` and `MIN_FINAL_ROWS` to
+    them."""
     return {
         k: v
         for k, v in engine.items()
-        if k not in (*UNKEYED, PREFILL_BUCKETS, DEFERS_OUTPUT)
+        if k not in (*UNKEYED, PREFILL_BUCKETS, DEFERS_OUTPUT, MIN_FINAL_ROWS)
     }
 
 
