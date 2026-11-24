@@ -72,8 +72,8 @@ FORMS = {
     "pure_dp": Form("DP without DP-attention"),
     "cuda_graph": Form("CUDA graph mode", issue="#2669"),
     "hbm_prefix_hit": Form("a prefix hit in HBM", issue="#2669"),
-    "deepseek_v4": Form("DeepSeek-V4 sparse attention", issue="#2671"),
-    "mla": Form("MLA (DeepSeek-R1)", issue="#2671"),
+    "deepseek_v4": Form("DeepSeek-V4 sparse attention"),
+    "mla": Form("MLA (DeepSeek-R1)"),
     "router_cache_aware": Form(
         "the router LP's cache_aware, with and without timed eviction", issue="#2673"
     ),
