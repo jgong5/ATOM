@@ -34,7 +34,10 @@ roots: each point is planned once, on the rank its place in the walk names.
   budget doubling, then the last aligned context a whole budget fits behind
   in the longest prompt; with prefix caching on, a prefix another request
   computed, from one KV block up. A step's chunked rows take as many earlier
-  chunks each.
+  chunks each. A final chunk of fewer rows than the engine's
+  ``min_final_prefill_rows`` is planned as the row ATOM runs, which starts at
+  least that many rows before the prompt's end, on the hash-block grid
+  (`BlockManager.replay_start`).
 
 Every request asks for two output tokens, so its decode is reached too, with
 the workload's other sampling arguments copied unchanged; a parked decode asks
@@ -55,6 +58,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from atom.compass.backends.step_grid_plan import MIN_FINAL_ROWS
 from atom.compass.validate.bound import _split
 from atom.model_engine.dynamic_chunking import chunk_alignment
 from atom.utils import envs
@@ -71,8 +75,8 @@ PARKED_TOKENS = 128
 #: The fewest tokens of a micro-batch in 256 to 511, a launch size
 #: `csa_translate_pack` takes a block size of its own for.
 HALF = 256
-#: The engine fields `plan` reads; `speculative` and
-#: `prefill_context_parallel_size` too, where a rank states them.
+#: The engine fields `plan` reads; `speculative`, the context-parallel widths
+#: and `MIN_FINAL_ROWS` too, where a rank states them.
 ENGINE = (
     "max_num_seqs",
     "max_num_batched_tokens",
@@ -209,6 +213,14 @@ def _fits(engine: dict, rows, held: int) -> bool:
     )
 
 
+def _final(c: int, q: int, least: int, grid: int) -> tuple[int, int]:
+    """The row ATOM runs for a prompt's last `q` tokens on the `c` it computed
+    before them: from `c`, or, under `least` rows, from `least - q` rows
+    earlier, floored onto `grid`-token hash blocks (`BlockManager.replay_start`)."""
+    start = c if q >= least else max(0, (c - (least - q)) // grid * grid)
+    return c + q - start, c + q
+
+
 def _rows(t: int, cap: int) -> tuple:
     """Count `t` on no context in as few rows as hold it, none past `cap`."""
     n = -(-t // cap)
@@ -302,15 +314,17 @@ def plan(engine, workload: dict, a_only: bool = False) -> list[Point]:
     starts = {"chunk": align}
     if e["enable_prefix_caching"]:
         starts["prefix"] = e["kv_cache_block_size"]
-    families += [
-        [
-            (((q, c + q),), (kind,), 1, False)
+    least = e.get(MIN_FINAL_ROWS, 0)
+    grid = e["kv_cache_block_size"] * e.get("decode_context_parallel_size", 1)
+    for kind, start in starts.items():
+        rows = [
+            _final(c, q, least, grid) if kind == "chunk" else (q, c + q)
             for c in _contexts(start, b, cap)
             for q in _queries(b, align)
             if c + q <= cap
         ]
-        for kind, start in starts.items()
-    ]
+        # Two final chunks ATOM runs as one row are one point.
+        families.append([((r,), (kind,), 1, False) for r in dict.fromkeys(rows)])
     seen = set()
     for family in families:
         kept = [d for d in family if (d[3], d[0]) not in seen and _fits(e, d[0], d[2])]
