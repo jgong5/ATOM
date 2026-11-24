@@ -105,10 +105,15 @@ shard, and the Markov sampler on that shard, once a position.
 It reads a serial drafter's model too, the MTP layer `EagleProposer` runs once
 for each draft token: Qwen3.5's, DeepSeek-V3's and DeepSeek-V4's (`SERIAL`).
 Its modules carry its passes, the config's `num_speculative_tokens`
-(`Module.passes`). A drafter that holds no LM head of its own runs the
-target's, and its embedding, in each pass (V4's `share_with_target`), so
-those of the target's are its modules too. An Eagle3 drafter is not built,
-and a step under one prices no draft (#3962).
+(`Module.passes`). Each pass runs the first of its MTP layers, since
+`EagleProposer` passes no `spec_step_idx`. A drafter that holds no LM head of
+its own runs the target's, and its embedding, in each pass (V4's
+`share_with_target`), so those of the target's are its modules too. V4's MTP
+block norms its two inputs and its output itself, as a V4 block does not,
+its hidden-state norm and `h_proj` on each residual copy of a token;
+Qwen3.5's all-gathers its `fc`'s output over the TP group. An Eagle3 drafter
+is not built, and a step under one prices no draft (#3962), nor are the other
+serial drafters ATOM maps (#3984).
 
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
@@ -173,6 +178,9 @@ SERIAL = (
     "atom.models.deepseek_mtp.DeepSeekMTP",
     "atom.models.deepseek_v4_mtp.DeepseekV4MTP",
 )
+#: V4's MTP block and Qwen3.5's MTP layer, read apart (`walk`).
+V4_MTP_BLOCK = "atom.models.deepseek_v4_mtp.MTPBlock"
+QWEN35_MTP = "atom.models.qwen3_5_mtp.Qwen3_5MultiTokenPredictor"
 #: V4.1's rotary tables, read inside its attention and index kernels, its
 #: vision tower, the runtime's compiled stages, and DSpark's Markov tables,
 #: priced at the drafter's root.
@@ -185,6 +193,8 @@ V41_SILENT = (
 )
 #: What the routed experts' kernel reads once for each expert it runs.
 HELD = tuple(f"w{w}_{p}" for w in (13, 2) for p in ("weight", "weight_scale", "bias"))
+#: The containers a serial drafter's model holds its MTP layers in.
+LISTS = (torch.nn.ModuleList, torch.nn.ModuleDict)
 LAYER = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
@@ -212,7 +222,10 @@ def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
                 rows = replay[2]
             found.append(dataclasses.replace(p, replay=rows))
         if then is DESCEND:
-            for child, sub in module.named_children():
+            children = list(module.named_children())
+            if passes and parent is drafted.model and isinstance(module, LISTS):
+                children = children[:1]  # its MTP layers: the first runs
+            for child, sub in children:
                 inner = CONTEXT if _drafts_kv(sub, module) else draft
                 at = f"{name}.{child}" if name else child
                 visit(sub, at, module, inner, passes)
@@ -425,8 +438,17 @@ def _classify(module, name, parent):
             chunk = get_current_atom_config().attn_prefill_chunk_size
             return kv and Module(name, "mla_up", dims, fmt, act=act, kv=kv, chunk=chunk)
         dims = (weight.shape[0], _in_width(module))
-        return Module(name, "gemm", dims, fmt, ranks, act=act)
+        if _is(parent, V4_MTP_BLOCK) and module is parent.h_proj:
+            dims += (parent.hc_mult,)  # each residual copy of each token
+        if gathers := _is(parent, QWEN35_MTP) and module is parent.fc:
+            ranks = module.tp_size
+        return Module(name, "gemm", dims, fmt, ranks, act=act, gathers=gathers)
     if _is(module, *NORMS):
+        if _is(parent, V4_MTP_BLOCK) and any(
+            module is n for n in (parent.enorm, parent.hnorm, parent.norm)
+        ):
+            copies = parent.hc_mult if module is parent.hnorm else 1
+            return Module(name, "norm", (copies * weight.shape[0],))
         if parent is not None and _is(parent, V4 + "Block"):
             return NOTHING
         tp = module.tp_size if getattr(module, "fused_allreduce", False) else 1
