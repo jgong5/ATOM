@@ -173,8 +173,7 @@ def _row(
     out, with the commands that make what it lacks, a coverage report's from
     the calibrations of earlier rows in `calibrations` (`_calibrating`)."""
     name, configuration = point["name"], point["candidate"]
-    verdicts = judged["candidates"][configuration]
-    laws = verdicts["points"][name]["law"]
+    laws = judged["candidates"][configuration]["points"][name]["law"]
     row = {
         "point": name,
         "configuration": configuration,
@@ -205,9 +204,9 @@ def _row(
     except (OSError, ValueError) as unread:
         return row | {"refusal": f"no metrics in {run}: {unread}"}
     if row["refusal"]:
-        candidate, store = candidates[configuration], verdicts["store"]
+        candidate = candidates[configuration]
         row["made_by"] = _calibrating(
-            expansion, candidate, point, run, out, store, calibrations
+            expansion, judged, candidate, point, run, out, calibrations
         )
     return row | {"run": str(run)}
 
@@ -256,7 +255,7 @@ def _measured(run: Path) -> dict:
 
 
 def _calibrating(
-    expansion, candidate, point, run: Path, out: Path, store: str, calibrations: dict
+    expansion, judged, candidate, point, run: Path, out: Path, calibrations: dict
 ) -> list[str]:
     """The commands that calibrate `candidate`'s law anew, as the check names
     them for a missing one: on 1P1D each side's fits after a record of the
@@ -271,9 +270,9 @@ def _calibrating(
     store refuses a second law at a key: the point is then made by that one,
     named as the check names it (`check.BORROWED`), and by the command
     measuring its readings into the store it publishes into
-    (`check._readings_by`), unless `store`, the one the point was looked up
-    in, is that store; there, once that calibration has ended, why no command
-    serves instead."""
+    (`check._readings_by`), unless the check's verdicts `judged` looked the
+    candidate up in that store; there, once that calibration has ended, why no
+    command serves instead."""
     if candidate["deployment"] != "single":
         fits = lacking.FITS.values()
         return [
@@ -292,6 +291,7 @@ def _calibrating(
         started = check.started_store(lender)
         into = started or str(lender / "store")
         # The point's own calibration, or one whose store it was looked up in.
+        store = judged["candidates"][candidate["name"]]["store"]
         reads = lender == made or Path(into) == Path(store)
         if reads and _ended(lender / check.STATUS):
             why = (
