@@ -98,8 +98,9 @@ def _terms(run) -> set[str]:
 
 
 def test_each_form_meets_every_scenario_check(runs):
-    """At level 1, every check but the hand-computed timeline, which only a
-    constant stub's run has."""
+    """At level 1, the level-0 case's checks but one: the engine's
+    hand-computed timeline, `check_run`'s records, which it computes only for a
+    constant step stub, from that stub's prefill and decode costs."""
     form, level, done = runs
     run = done[0]
     print(
@@ -117,19 +118,23 @@ def test_each_form_meets_every_scenario_check(runs):
 
 
 def test_each_form_runs_as_its_flags_say(runs):
-    """Every DP rank serves a request; under TBO each rank's prefill is split;
-    under the roofline the routed experts are priced, and under TBO the
-    overlap of the two micro-batches."""
+    """Each DP rank keeps a record. At level 0 every rank serves a request,
+    and under TBO each rank runs a split step. At level 1 which rank serves
+    which request, and what each rank's step holds, follow when requests
+    finish against the steps, and so the step cost; there the roofline prices
+    the routed experts, and under TBO the overlap of a split step's two
+    micro-batches, without which no step of the run is priced as TBO's."""
     form, level, done = runs
     steps = done[0]["parity"]
     assert sorted(steps) == list(range(FORMS[form][2]))
-    assert all(any(s["batch"] for s in steps[rank]) for rank in steps)
-    if form == "tbo":
-        assert all(any(s.get("tbo_tokens") for s in steps[rank]) for rank in steps)
-    if level == 1:
-        terms = _terms(done[0])
-        assert ("roofline.moe" in terms) == (form != "pure_dp"), sorted(terms)
-        assert ("roofline.tbo" in terms) == (form == "tbo"), sorted(terms)
+    if level == 0:
+        assert all(any(s["batch"] for s in steps[rank]) for rank in steps)
+        if form == "tbo":
+            assert all(any(s.get("tbo_tokens") for s in steps[r]) for r in steps)
+        return
+    terms = _terms(done[0])
+    assert ("roofline.moe" in terms) == (form != "pure_dp"), sorted(terms)
+    assert ("roofline.tbo" in terms) == (form == "tbo"), sorted(terms)
 
 
 # --- without a driver ---------------------------------------------------------
