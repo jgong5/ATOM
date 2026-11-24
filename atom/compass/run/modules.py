@@ -23,8 +23,9 @@ module's own per-rank parameter shapes and attributes:
   module that holds it.
 - `Attention` (not MLA), `LinearAttention`: attention over the step's rows,
   at their own heads and dims; neither is gone into. An `Attention` with a
-  sliding window is unclassified, and so is one whose model plugs in an impl
-  other than ATOM's dense `PagedAttentionImpl` (MiniMax-M3's sparse layers).
+  sliding window is refused by name (below), and one whose model plugs in an
+  impl other than ATOM's dense `PagedAttentionImpl` (MiniMax-M3's sparse
+  layers) is unclassified.
 - `Attention` over MLA: its attention kernels, at the rank's heads, the
   heads the decode kernel pads them to, and the latent, rope, no-rope and
   value widths, the KV at the cache's format. Its up-projection linear
@@ -105,11 +106,13 @@ shard, and the Markov sampler on that shard, once a position.
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
 first of each class comes back as an `unclassified` module named by class
-and path, which the backend refuses. Kimi-K3's `KimiKDAAttention` is refused
-by name and not gone into: its KDA recurrence runs inside its forward, in no
-module the walk reads, so the first one comes back as such a module whose
-name also says what it runs and the issue that would price it. Each module
-carries the index of the decoder layer it sits in, read off its path.
+and path, which the backend refuses. Two are refused by name: Kimi-K3's
+`KimiKDAAttention`, not gone into, whose KDA recurrence runs inside its
+forward, in no module the walk reads, and an `Attention` with a sliding
+window, which no roofline class prices over its window. The first of each
+comes back as such a module whose name also says why and the issue that
+would price it. Each module carries the index of the decoder layer it sits
+in, read off its path.
 """
 
 import dataclasses
@@ -177,6 +180,8 @@ HELD = tuple(f"w{w}_{p}" for w in (13, 2) for p in ("weight", "weight_scale", "b
 #: Kimi-K3's KDA attention, and why the walk refuses it.
 KDA = "atom.models.kimi_k3.model.KimiKDAAttention"
 KDA_REFUSED = "Kimi-K3's KDA recurrence; no roofline class prices it before #3963"
+#: Why the walk refuses an `Attention` with a sliding window.
+WINDOW_REFUSED = "a sliding window; no roofline class prices it before #3965"
 LAYER = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
@@ -416,7 +421,7 @@ def _classify(module, name, parent):
         if f"{impl.__module__}.{impl.__qualname__}" != DENSE_MHA:
             return None
         if getattr(module.impl, "sliding_window", -1) > 0:
-            return None
+            return WINDOW_REFUSED
         dims = (module.num_heads, module.num_kv_heads, module.head_dim)
         return kv and Module(name, "attention", dims, kv) or None
     if _is(module, OPS + "base_attention.LinearAttention"):
