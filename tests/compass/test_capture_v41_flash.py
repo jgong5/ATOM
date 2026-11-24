@@ -42,8 +42,11 @@ TP = 4
 MOE = "aiter.fused_moe_.default"
 #: gfx950's FP8 scorer: aiter's function that launches its compiled kernel.
 COMPILED = "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits"
-#: V4.1's index top-k at a decode of 16 rows, as aiter launches it by arch:
-#: FlyDSL's one-block kernel, and on gfx950 its multi-CTA one.
+#: V4.1's index top-k at a decode of 16 rows: aiter's routed operator, which
+#: picks its kernel itself, where aiter registers it as one; else as aiter
+#: launches it by arch: FlyDSL's one-block kernel, and on gfx950 its multi-CTA
+#: one.
+ROUTED_TOPK = "aiter_routed.top_k_per_row_decode.default"
 TOPKS = {
     "gfx1250": "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
     "gfx950": "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode",
@@ -74,7 +77,9 @@ KERNELS = (
     "init = widths.WidthBuilds.__init__\n"
     "def kernels(built):\n"
     "    raise RuntimeError('an injected kernel-list failure')\n"
-    "widths.WidthBuilds.__init__ = lambda s, b, _, g, w: init(s, b, kernels, g, w)\n"
+    "def builds(s, b, _, g, w, **k):\n"
+    "    init(s, b, kernels, g, w, **k)\n"
+    "widths.WidthBuilds.__init__ = builds\n"
 )
 SCRATCH = (
     "from atom.mono.runtime import compile as built\n"
@@ -262,7 +267,8 @@ def test_each_decode_layer_s_index_top_k_states_its_layer_s_ratio(
     graph, _ = capture(tmp_path_factory, argv, arch)["decode B=16"]
 
     for index, layer in enumerate(_decoder(graph)):
-        stated = [op.get("stated") for op in layer if op["op"] == TOPKS[arch]]
+        topks = (TOPKS[arch], ROUTED_TOPK)
+        stated = [op.get("stated") for op in layer if op["op"] in topks]
         assert stated == [{"compress_ratio": RATIOS[index]}] * len(stated), index
         assert bool(stated) == (index in TEXT["index_source_layer_ids"]), index
 
@@ -276,10 +282,11 @@ def test_gfx950_s_mono_decode_binds_builds_its_width_and_meets_its_kernels(
     # The width's kernels compiled for the declared arch, as the deployment's.
     assert re.search(r"V4\.1 mono: \d+ width-16 kernels compiled at gfx950,", log), log
     # The step ran mono, not the original path: refused by name where it first
-    # calls a mono kernel whose contract a graph cannot hold.
+    # calls a launch of the mono step whose contract a graph cannot hold, its
+    # peer embedding's (only the mono runner binds one) or a mono kernel's.
     refusal = done.stderr.strip().splitlines()[-1]
     assert done.returncode and "published" not in done.stdout, refusal
-    mono = r"atom\.(mono|models\.deepseek_v41\.mono)\.[\w.]+:\w"
+    mono = r"atom\.(model_ops\.peer_embedding|(mono|models\.deepseek_v41\.mono)\.[\w.]+):\w"
     assert re.match(rf"compass trace ops: {mono}", refusal), refusal
 
 
