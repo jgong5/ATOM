@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""The step linear law's opt-in columns (#3720; LLM-Booster#739 sections 2.1,
-5 and 8): decode `row_padding` and `peer_tokens`, prefill `gather_rows` and
-`moe_imbalance`, and the in-sample rule a decode rung picks its MoE column by.
+"""The step linear law's opt-in columns (#3720): decode `row_padding` and
+`peer_tokens`, prefill `gather_rows` and `moe_imbalance`, and the in-sample
+rule a decode rung picks its MoE column by.
 
 Each column is counted by one `step_linear` function that `fit` and
 `StepLinearBackend` both call, so a law prices a simulated step as it was
