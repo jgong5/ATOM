@@ -29,9 +29,10 @@ is `keyed`, as JSON: the ladder the runner replays (none under
 ``enforce_eager``), the KV block size and dtype, the quantization with its
 layer names as the model's runner remaps them (`quantization`), the TP and
 DP widths, DP attention, expert parallelism, TBO, the MoE backend, the
-all-to-all backend, EPLB, DeepSeek-V4.1 decoder SWA bounded replay and the
-compilation level when off ATOM's default, the index cache's dtype where ATOM
-resolved it apart from the KV cache's, whether mori imports where it does not,
+all-to-all backend, EPLB, DeepSeek-V4.1 decoder SWA bounded replay, the
+Ulysses SP width and the compilation level when off ATOM's default, the index
+cache's dtype where ATOM resolved it apart from the KV cache's, whether mori
+imports where it does not,
 MiniMax-M3's indexer-only context parallelism when on, the model config's
 ``--hf-overrides`` when it states any, the performance environment, each
 variable of `READ_OFF_DEFAULT` in it when ATOM reads it off its default too,
@@ -110,6 +111,7 @@ OFF_DEFAULT = (
     "eplb_enable",
     "enable_decoder_swa_bounded_replay",
     "index_cache_dtype",
+    "sequence_parallel_size",
 )
 #: The index cache takes the KV cache's dtype unless ATOM resolves it apart.
 DERIVED = {"index_cache_dtype": "kv_cache_dtype"}
@@ -124,13 +126,15 @@ BUCKETS = "ATOM_TOKEN_GRAPH_SIZES"
 #: decide, with the all-to-all backend and whether mori imports (`MORI`), whether
 #: a MoE fuses its shared expert into aiter's top-k table (`model_ops/topK.py`):
 #: two under DP attention, and one for an MXFP8 shared expert beside MXFP4
-#: routed ones.
+#: routed ones; and DeepSeek-V4's and V4.1's FP4 index scorer on gfx950, from
+#: which ATOM resolves the index cache's layout (`Config.index_cache_layout`).
 READ_OFF_DEFAULT = (
     BUCKETS,
     "ATOM_REPLICATE_VOCAB_EMBED",
     "ATOM_FUSE_SHARED_EXPERT",
     "ATOM_DISABLE_MORI_EP",
     "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4",
+    "ATOM_V4_UNIFIED_MQA",
 )
 #: Whether mori, the all-to-all ATOM selects by default, imports: keyed only
 #: where it does not, so keys written where it imports do not move.
