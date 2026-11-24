@@ -83,6 +83,8 @@ pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash
 
 
 def _plant(tmp_path, monkeypatch, *listings, preflight_rc=0):
+    # The planted rocm-smi's GPUs, whatever ROCm mask the session runs under.
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
     bindir = tmp_path / "bin"
     bindir.mkdir()
     for i, text in enumerate(listings):
@@ -178,6 +180,102 @@ def test_a_gpu_s_hip_ordinal_is_its_kfd_node_s_rank(
     _plant(tmp_path, monkeypatch, FREE)
     (tmp_path / "bin" / "showhw").write_text(table)
     assert hip_visible(gpus) == hip
+
+
+#: `rocm-smi --showuniqueid` on `GPU45`'s node, as pit2-p03-g08 prints it.
+UNIQUE45 = """\
+
+
+============================ ROCm System Management Interface ============================
+======================================= Unique ID ========================================
+GPU[0]\t\t: Unique ID: 0xb9ebac5f14bf98f1
+GPU[1]\t\t: Unique ID: 0x7160f88cb991bd5a
+GPU[2]\t\t: Unique ID: 0xac7e36c9cf753afd
+GPU[3]\t\t: Unique ID: 0x7c2431bef0a19e9c
+GPU[4]\t\t: Unique ID: 0x57f5c23cb997acc7
+GPU[5]\t\t: Unique ID: 0x9f0c86e17f55a44d
+GPU[6]\t\t: Unique ID: 0xb1a42e0d0b35ae5c
+GPU[7]\t\t: Unique ID: 0xe34f75a476cede3d
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+"""
+
+
+def _uuids(*gpus):
+    """`ROCR_VISIBLE_DEVICES` naming `GPU45`'s `gpus` by unique id, in order,
+    as the GPU pool's lease does."""
+    ids = [r.split("0x")[1] for r in UNIQUE45.splitlines() if r.startswith("GPU[")]
+    return ",".join(f"GPU-{ids[g]}" for g in gpus)
+
+
+def _plant_unique(tmp_path, monkeypatch, mask):
+    """`_plant` on `GPU45`'s node, its rocm-smi printing `UNIQUE45` too, under
+    ROCm's mask `mask`, or none when it is None."""
+    _plant(tmp_path, monkeypatch, FREE)
+    bindir = tmp_path / "bin"
+    (bindir / "showhw").write_text(GPU45)
+    (bindir / "unique").write_text(UNIQUE45)
+    smi = bindir / "rocm-smi"
+    case = f'case "$*" in *--showuniqueid*) cat {bindir}/unique;;'
+    smi.write_text(smi.read_text().replace('case "$*" in', case, 1))
+    if mask is not None:
+        monkeypatch.setenv("ROCR_VISIBLE_DEVICES", mask)
+
+
+@pytest.mark.parametrize(
+    "mask, gpus, hip",
+    [
+        # A lease of GPUs 4-7, listed in KFD node order (6, 7, 8, 9).
+        (_uuids(7, 4, 6, 5), (4, 5, 6, 7), "1,3,2,0"),
+        # HIP numbers them in the mask's order, not their nodes'.
+        (_uuids(4, 5, 6, 7), (4, 5, 6, 7), "0,1,2,3"),
+        (_uuids(4, 5, 6, 7), (6, 4), "2,0"),
+        # Of GPUs 0-3, the four lowest nodes: as with no mask.
+        (_uuids(3, 0, 2, 1), (0, 1, 2, 3), "1,3,2,0"),
+        # ROCm's own ordinals 4-7: KFD nodes 6-9.
+        ("4,5,6,7", (4, 5, 6, 7), "1,3,2,0"),
+        (None, (4, 5, 6, 7), "5,7,6,4"),
+    ],
+)
+def test_under_rocm_s_mask_a_gpu_s_hip_ordinal_is_its_place_in_the_mask(
+    tmp_path, monkeypatch, mask, gpus, hip
+):
+    _plant_unique(tmp_path, monkeypatch, mask)
+    assert hip_visible(gpus) == hip
+
+
+@pytest.mark.parametrize(
+    "mask, gpus, shown",
+    [
+        (_uuids(7, 4, 6, 5), (4, 5, 6, 3), "[7, 4, 6, 5]"),
+        # Set but blank, ROCm's mask shows HIP no GPU.
+        ("", (3,), "[]"),
+        (" ", (3,), "[]"),
+    ],
+)
+def test_a_gpu_rocm_s_mask_hides_refuses(tmp_path, monkeypatch, mask, gpus, shown):
+    _plant_unique(tmp_path, monkeypatch, mask)
+    with pytest.raises(GpuRefusal) as refused:
+        hip_visible(gpus)
+    assert str(refused.value) == (
+        f"ROCR_VISIBLE_DEVICES shows HIP rocm-smi GPUs {shown} alone, and the run "
+        "names GPU [3]"
+    )
+
+
+@pytest.mark.parametrize("entry", ["GPU-0123456789abcdef", "8", "card4", ""])
+def test_a_mask_entry_naming_no_gpu_refuses(tmp_path, monkeypatch, entry):
+    _plant_unique(tmp_path, monkeypatch, f"{_uuids(7)},{entry}")
+    with pytest.raises(GpuRefusal, match=f"'{entry}' is neither"):
+        hip_visible((7,))
+
+
+@pytest.mark.parametrize("entry", [_uuids(7), "4"])
+def test_a_mask_naming_a_gpu_twice_refuses(tmp_path, monkeypatch, entry):
+    # ROCm's ordinal 4 is GPU 7, on the fifth-lowest KFD node.
+    _plant_unique(tmp_path, monkeypatch, f"{_uuids(7, 4)},{entry}")
+    with pytest.raises(GpuRefusal, match=f"'{entry}' names GPU 7 again$"):
+        hip_visible((7,))
 
 
 def test_a_gpu_rocm_smi_does_not_list_refuses(tmp_path, monkeypatch):
