@@ -493,8 +493,10 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
 - **A padded decode's drafter at its rows.** A decode of fewer rows than its rung replays
   the target at the rung, but `EagleProposer.propose` runs the drafter's first pass
   eagerly on the target's real tokens, the rows' `drafts + 1` each, and its later passes,
-  a row a sequence, at the rung (`running_bs`) when it declares a draft graph, at the
-  rows otherwise (MRoPE, one draft). The drafter's graph is keyed by both, `decode T=<rows>
+  a row a sequence, at the rung (`running_bs`), whether it declares a draft graph or runs
+  them eagerly (MRoPE), as ATOM has since `bf6575611`
+  ([#3995](https://github.com/jgong5/ATOM/issues/3995)); a drafter of one draft has no
+  later pass. The drafter's graph is keyed by both, `decode T=<rows>
   B=<rung>`: `--population` captures it from the rows' batch, its later passes at the
   rung, and publishes the drafter's half alone, as the target ran at the rung
   ([#1961](https://github.com/jgong5/ATOM/issues/1961)). Its default G is every rank's
@@ -504,9 +506,13 @@ and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
   batch itself off the ladder and under `enforce_eager`. So a sampling prefill, a decode
   beside a prefilling DP peer and an eager DP decode run their drafter's later passes
   past their rows too. The step's view states that batch as `draft_bs` (the record line
-  too) for a drafter that declares a draft graph. A decode's drafter is then keyed
-  `decode T=<rows> B=<draft_bs>`, a sampling prefill's `prefill T=<tokens> B=<rows>
-  W=<draft_bs>`; `--population` captures each and publishes the drafter's half alone
+  too) for every serial drafter of two or more drafts, a draft graph or none
+  ([#3995](https://github.com/jgong5/ATOM/issues/3995)); a record made before states it
+  only for a drafter that declares a draft graph, and for an eager DP one the rows its
+  later passes gathered as `draft_rows`, which the readers still take. A decode's
+  drafter is then keyed `decode T=<rows> B=<draft_bs>`, a sampling prefill's
+  `prefill T=<tokens> B=<rows> W=<draft_bs>`; `--population` captures each and
+  publishes the drafter's half alone
   ([#1982](https://github.com/jgong5/ATOM/issues/1982)).
 - **A target padded without a replay is read at its width.** Two targets run at
   `running_bs` with no graph: a decode every rank of whose DP group decodes, which
