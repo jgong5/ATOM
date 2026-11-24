@@ -200,10 +200,10 @@ TP2_ONLY_OPS = (
 # The lines a TP2 decode step issues a collective from. Named, because a
 # collective's operator says what ran and only its call site says which of
 # ATOM's communication paths ran it.
-ROW_PARALLEL = "atom/model_ops/layernorm.py:1014 in _forward_fused_allreduce"
-VOCAB_EMBEDDING = "atom/model_ops/embed_head.py:179 in forward"
-VOCAB_LM_HEAD = "atom/model_ops/embed_head.py:276 in forward"
-SAMPLER = "atom/model_engine/model_runner.py:3700 in postprocess"
+ROW_PARALLEL = "atom/model_ops/layernorm.py:1018 in _forward_fused_allreduce"
+VOCAB_EMBEDDING = "atom/model_ops/embed_head.py:180 in forward"
+VOCAB_LM_HEAD = "atom/model_ops/embed_head.py:373 in gather_logits"
+SAMPLER = "atom/model_engine/model_runner.py:3642 in postprocess"
 
 # Where a free symbol stops being free, each as the value it takes and the
 # innermost ATOM frames it takes it through. Three, and in an order: a symbol
@@ -217,7 +217,7 @@ SAMPLER = "atom/model_engine/model_runner.py:3700 in postprocess"
 # bound, `_pad_tokens`, which `stage_decode` calls.
 SITE_ONE = (
     "2",
-    ("atom/model_ops/attentions/backends.py:1284 in _pad_tokens",),
+    ("atom/model_ops/attentions/backends.py:1317 in _pad_tokens",),
 )
 # The H2D publication binds each staged buffer in `ModelRunner.__init__` and
 # checks that its host and device sides have one shape. With a symbol on every
@@ -234,7 +234,7 @@ SITE_TWO = (
 # so this comes before the publication's count check, `H2D_COUNT_CHECK`.
 SITE_THREE = (
     "2",
-    ("atom/model_ops/attentions/backends.py:1063 in _mrope_cpu_view",),
+    ("atom/model_ops/attentions/backends.py:1096 in _mrope_cpu_view",),
 )
 # The H2D publication's count check, `operator.index` of each staged count.
 H2D_COUNT_CHECK = "atom/utils/h2d.py:51 in _count"
@@ -245,7 +245,7 @@ H2D_COUNT_CHECK = "atom/utils/h2d.py:51 in _count"
 # second site's pin that no specialisation site covers, because a repair inside
 # `__init__` changes what it allocates rather than where a symbol is solved.
 # Measured: 23 buffers, each one host allocation and one numpy view.
-BUFFER_INIT = "atom/utils/__init__.py:714"
+BUFFER_INIT = "atom/utils/__init__.py:715"
 BUFFER_COUNT = 23
 
 # The `torch.cuda` names `_declare_cuda` stubs, which are exactly the names a
@@ -514,27 +514,27 @@ WIDTH_COUNTED_COPIES = STAGED_COPIES - 1
 # one that only reaches a host value does not, which is why this is asserted
 # rather than left to the digest.
 EXPECTED_HOST_RESOLUTIONS = {
-    "atom/model_ops/attentions/aiter_attention.py:1017 in stage_decode": 1,
-    "atom/model_ops/attentions/aiter_attention.py:1024 in stage_decode": 1,
-    "atom/model_ops/attentions/aiter_attention.py:1026 in stage_decode": 1,
-    "atom/model_ops/attentions/aiter_attention.py:1027 in stage_decode": 2,
-    "atom/model_ops/attentions/backends.py:163 in query_lengths": 1,
-    "atom/model_ops/attentions/backends.py:677 in prepare_block_tables": 1,
-    "atom/model_ops/attentions/backends.py:1061 in _mrope_cpu_view": 1,
-    "atom/model_ops/attentions/backends.py:1063 in _mrope_cpu_view": 1,
-    "atom/model_ops/attentions/backends.py:1116 in _build_mrope_decode_positions": 1,
-    "atom/model_ops/attentions/backends.py:1203 in decode_spans": 1,
-    "atom/model_ops/attentions/backends.py:1204 in decode_spans": 1,
-    "atom/model_ops/attentions/backends.py:1284 in _pad_tokens": 2,
-    "atom/model_ops/attentions/backends.py:1285 in _pad_tokens": 2,
+    "atom/model_ops/attentions/aiter_attention.py:1039 in stage_decode": 1,
+    "atom/model_ops/attentions/aiter_attention.py:1046 in stage_decode": 1,
+    "atom/model_ops/attentions/aiter_attention.py:1048 in stage_decode": 1,
+    "atom/model_ops/attentions/aiter_attention.py:1049 in stage_decode": 2,
+    "atom/model_ops/attentions/backends.py:167 in query_lengths": 1,
+    "atom/model_ops/attentions/backends.py:710 in prepare_block_tables": 1,
+    "atom/model_ops/attentions/backends.py:1094 in _mrope_cpu_view": 1,
+    "atom/model_ops/attentions/backends.py:1096 in _mrope_cpu_view": 1,
+    "atom/model_ops/attentions/backends.py:1149 in _build_mrope_decode_positions": 1,
+    "atom/model_ops/attentions/backends.py:1236 in decode_spans": 1,
+    "atom/model_ops/attentions/backends.py:1237 in decode_spans": 1,
+    "atom/model_ops/attentions/backends.py:1317 in _pad_tokens": 2,
+    "atom/model_ops/attentions/backends.py:1318 in _pad_tokens": 2,
     "atom/model_ops/attentions/token_layout/batch_ids.py:53 in build_batch_ids": 1,
     "atom/model_ops/attentions/token_layout/batch_ids.py:86 in build_cu_seqlens": 2,
-    "atom/model_engine/model_runner.py:569 in prepare_input_ids": 3,
-    "atom/model_engine/model_runner.py:677 in _stage_input_ids": 1,
-    "atom/model_engine/model_runner.py:680 in _stage_input_ids": 1,
-    "atom/model_engine/model_runner.py:2865 in prepare_sample": 1,
-    "atom/model_ops/sampler.py:48 in _apply_greedy_tokens": 1,
-    "atom/utils/forward_context.py:371 in decide": 1,
+    "atom/model_engine/model_runner.py:620 in prepare_input_ids": 3,
+    "atom/model_engine/model_runner.py:721 in _stage_input_ids": 1,
+    "atom/model_engine/model_runner.py:724 in _stage_input_ids": 1,
+    "atom/model_engine/model_runner.py:2800 in prepare_sample": 1,
+    "atom/model_ops/sampler.py:49 in _apply_greedy_tokens": 1,
+    "atom/utils/forward_context.py:372 in decide": 1,
     H2D_COUNT_CHECK: WIDTH_COUNTED_COPIES,
 }
 
