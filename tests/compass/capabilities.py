@@ -37,7 +37,7 @@ class Form:
     #: A refused form's refusal test, ``path::function``, without parameters.
     test: str = ""
     #: The open issue that adds a supported form's first case, or a refused
-    #: form's refusal test.
+    #: form's refusal test; the change that adds it drops this.
     issue: str = ""
 
 

@@ -199,16 +199,33 @@ def roofline_runs(request, tmp_path_factory):
 def test_every_request_meets_every_scenario_check_under_the_step_roofline(
     roofline_runs,
 ):
-    """Every check but the hand-computed timeline, which only a constant
-    stub's run has."""
+    """The level-0 case's checks but two. The hand-computed timelines of
+    engine-P and engine-D, `check_run`'s records, which it computes only for a
+    constant step stub, from that stub's prefill and decode costs. And that the
+    requests spread over both ranks of each side: the rank a request lands on
+    follows the in-flight load when it arrives, which turns on when earlier
+    requests finish, and so on the step cost."""
     run = roofline_runs[0]
+    rows = [r.split() for r in run["table"].splitlines()[1:]]
+    pairs = Counter(
+        r[4].rpartition("#")[2]
+        for r in rows
+        if r[3] == "release" and ":kv_write_req#" in r[4]
+    )
     print(f"\n{run['summary']['schedule']['seconds_by_method']}")
+    print("KV transfers per decode.prefill rank pair:", dict(sorted(pairs.items())))
     failed = check_run(
         [r["out"] for r in roofline_runs],
         MAX_TOKENS,
         [line for _, line in run["events"]],
     )
     assert not failed, "\n".join(failed)
+    assert sum(pairs.values()) == len(MAX_TOKENS)
+    assert run["handed_in"] == sorted(
+        compass_run.LP_FILE.format(n)
+        for n in ["frontend-P", "frontend-D"]
+        + [f"engine-{s}.dp{r}" for s in "PD" for r in range(DP)]
+    )
 
 
 # --- without a driver ---------------------------------------------------------

@@ -792,8 +792,10 @@ Each scenario case carries a mark, `capability(name, level)`, naming a form of
 `tests/compass/capabilities.py` (`08` D120): level 0 when its run file names the
 step stub, level 1 when it names the step roofline alone, on
 `tests/compass/machines/mi355x-gpu40.json` (`cost_overrides`). A level-1 case
-holds every scenario check but the hand-computed timeline, which only a constant
-stub's run has. The table is printed from pytest's collection:
+holds its level-0 twin's checks but those on step timing, which its docstring
+names: always the hand-computed timeline, which `check_run` computes only for a
+constant stub, and at DP above 1 which rank serves which request. The table is
+printed from pytest's collection:
 
 ```bash
 python3 scripts/compass/capability_table.py                    # every collected case counts
@@ -805,8 +807,10 @@ A row gives a form's highest level, its cases at level 0 and at level 1, or for 
 refused form its refusal test; a form with no case or no refusal test yet names
 the issue that adds it. The script exits 1 naming each finding: an unknown form
 or level, a mark on a refused form, a supported form with no level-0 case, a
-refusal test that does not collect. `tests/compass/test_capability_matrix.py`
-runs it in the CPU gate.
+refusal test that does not collect, and an entry still naming its issue once a
+case of it collects or it names its refusal test. The change that adds a form's
+first case or refusal test drops the issue from its entry.
+`tests/compass/test_capability_matrix.py` runs it in the CPU gate.
 
 ## Why the gates refuse a caller-supplied `-r`
 
