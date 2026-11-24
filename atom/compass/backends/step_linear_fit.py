@@ -222,7 +222,10 @@ without them writes the law it wrote before them), each column counted by the
 column of that name to every rung (`ROW_PADDING_ENV`); `gather_rows` and
 `moe_imbalance` add the prefill columns of those names above `dp` 1, the vector
 stating `ranks` and `moe_imbalance`'s `min_spread` (`GATHER_ROWS_ENV`,
-`MOE_IMBALANCE_ENV`, `MOE_MIN_SPREAD_ENV`); `moe_select` ``insample`` makes each
+`MOE_IMBALANCE_ENV`, `MOE_MIN_SPREAD_ENV`); `graph_tokens` and
+`graph_query_cached` add those prefill columns (`GRAPH_COLUMNS`) after
+`padding`, at any `dp`, to records stating their prefill buckets
+(`GRAPH_TOKENS_ENV`, `GRAPH_QUERY_CACHED_ENV`); `moe_select` ``insample`` makes each
 target decode rung adopt the MoE column its fit on all its steps prices nearest
 (`_moe_column`, `MOE_SELECT_ENV`); `peer_tokens` adds that decode column, after
 the MoE column, to the rungs it names or, as ``saturated``, to each rung whose
@@ -288,6 +291,7 @@ from atom.compass.backends.step_linear import (
     EAGER,
     EAGER_DUMMY,
     GATHER_COLUMNS,
+    GRAPH_COLUMNS,
     HISTORY,
     MOE_COLUMNS,
     PEER_SHARE,
@@ -298,6 +302,7 @@ from atom.compass.backends.step_linear import (
     dummy_view,
     eager_dummy,
     gather_rows,
+    graph_columns,
     hull_axes,
     moe_column,
     moe_imbalance,
@@ -387,6 +392,10 @@ DEFAULT_LEVEL = 3
 ROW_PADDING_ENV = "COMPASS_FIT_ROW_PADDING"
 GATHER_ROWS_ENV = "COMPASS_FIT_GATHER_ROWS"
 MOE_IMBALANCE_ENV = "COMPASS_FIT_MOE_IMBALANCE"
+#: Prefill `GRAPH_COLUMNS`: `tokens` and `query_cached` on a step replaying a
+#: prefill token graph.
+GRAPH_TOKENS_ENV = "COMPASS_FIT_GRAPH_TOKENS"
+GRAPH_QUERY_CACHED_ENV = "COMPASS_FIT_GRAPH_QUERY_CACHED"
 #: `moe_imbalance`'s `min_spread`, `MOE_MIN_SPREAD` when unset.
 MOE_MIN_SPREAD_ENV = "COMPASS_FIT_MOE_MIN_SPREAD"
 MOE_MIN_SPREAD = 0.2
@@ -426,7 +435,7 @@ def _prefill_counts(
     """The prefill vector's features of `view`'s step, `where` naming it in a
     refusal, as `_features` states them; under `eager` its `EAGER_DUMMY`,
     under `cold` its `cold_peer_rows`, under `share` its `PEER_SHARE`, and
-    those of `GATHER_COLUMNS` `cols` (`_columns`) holds."""
+    those of `GATHER_COLUMNS` and `GRAPH_COLUMNS` `cols` (`_columns`) holds."""
     r = view.prefill
     counts = (1, sum_tokens(r), sum_query_square(r), sum_query_cached(r))
     if form == "history":
@@ -474,6 +483,9 @@ def _prefill_counts(
                 "graph's bucket holds"
             )
         counts += (padding,)
+    if graph := [f for f in GRAPH_COLUMNS if cols and cols.get(f)]:
+        got = dict(zip(GRAPH_COLUMNS, graph_columns(view, buckets)))
+        counts += tuple(got[f] for f in graph)
     if eager:
         if (got := eager_dummy(view, buckets)) is None:
             raise ValueError(
@@ -530,20 +542,26 @@ def _keep_peer_tail(options) -> bool:
 
 def _columns(options, draft: bool = False) -> dict:
     """The opt-in columns `options` asks a law's vectors to add (`env_options`):
-    `row_padding` on decode, `gather_rows` and `moe_imbalance` (its
-    `min_spread`, or None) on prefill; none on a draft law. Each prefill one
-    prices a data-parallel group's gather, so `dp` 1 refuses it, and
-    `gather_rows`, which reads which steps replay a token graph, refuses
-    records stating no prefill buckets; the `shared` form refuses
-    `row_padding`, whose decode solve shares the base columns over rungs."""
+    `row_padding` on decode, `gather_rows`, `moe_imbalance` (its
+    `min_spread`, or None) and `GRAPH_COLUMNS` on prefill; none on a draft
+    law. Each gather column prices a data-parallel group's gather, so `dp` 1
+    refuses it, and `gather_rows` and `GRAPH_COLUMNS`, which read which steps
+    replay a token graph, refuse records stating no prefill buckets; the `shared` form refuses `row_padding`, whose decode solve
+    shares the base columns over rungs."""
     options = options or {}
     cols = {
         "row_padding": bool(options.get("row_padding")),
         "gather_rows": bool(options.get("gather_rows")),
         "moe_imbalance": options.get("moe_imbalance"),
+        **{f: bool(options.get(f)) for f in GRAPH_COLUMNS},
     }
     if draft:
-        return {"row_padding": False, "gather_rows": False, "moe_imbalance": None}
+        return {
+            "row_padding": False,
+            "gather_rows": False,
+            "moe_imbalance": None,
+            **dict.fromkeys(GRAPH_COLUMNS, False),
+        }
     form, dp = _options(options)
     gathered = [f for f in GATHER_COLUMNS if cols[f] not in (False, None)]
     if gathered and dp == 1:
@@ -551,11 +569,12 @@ def _columns(options, draft: bool = False) -> dict:
             f"{' and '.join(gathered)} price a data-parallel group's MoE gather, "
             "and these records run one rank"
         )
-    if cols["gather_rows"] and not _buckets(options):
-        raise ValueError(
-            "gather_rows reads which prefill steps replay a token graph from the "
-            "records' prefill buckets, and they state none"
-        )
+    for name in ("gather_rows", *GRAPH_COLUMNS):
+        if cols[name] and not _buckets(options):
+            raise ValueError(
+                f"{name} reads which prefill steps replay a token graph from the "
+                "records' prefill buckets, and they state none"
+            )
     if cols["row_padding"] and form == "shared":
         raise ValueError("the shared form fits no row_padding column")
     return cols
@@ -564,7 +583,8 @@ def _columns(options, draft: bool = False) -> dict:
 def env_options(environ=None) -> dict:
     """The `fit` options the opt-in column switches in `environ`, the process's
     environment by default, set: `ROW_PADDING_ENV`, `GATHER_ROWS_ENV` and
-    `MOE_IMBALANCE_ENV` at ``1`` (with `MOE_MIN_SPREAD_ENV`'s share), the
+    `MOE_IMBALANCE_ENV` at ``1`` (with `MOE_MIN_SPREAD_ENV`'s share),
+    `GRAPH_TOKENS_ENV` and `GRAPH_QUERY_CACHED_ENV` at ``1``, the
     `MOE_SELECT_ENV` rule and the `PEER_TOKENS_ENV` and `DRAFT_PEER_TOKENS_ENV`
     rungs; none set, none."""
     env = os.environ if environ is None else environ
@@ -572,6 +592,8 @@ def env_options(environ=None) -> dict:
     for key, name in (
         ("row_padding", ROW_PADDING_ENV),
         ("gather_rows", GATHER_ROWS_ENV),
+        ("graph_tokens", GRAPH_TOKENS_ENV),
+        ("graph_query_cached", GRAPH_QUERY_CACHED_ENV),
     ):
         if env.get(name) == "1":
             out[key] = True
@@ -2512,7 +2534,9 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     prefill += gathered
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
     prefill += list(PEER_SHARE) * share
-    prefill += ["padding"] * bool(buckets) + list(EAGER_DUMMY) * eager
+    prefill += ["padding"] * bool(buckets)
+    prefill += [f for f in GRAPH_COLUMNS if cols[f]]
+    prefill += list(EAGER_DUMMY) * eager
     law = {
         "provenance": f"step_linear_fit {form} on {len(runs) * dp} real records "
         f"({', '.join(runs)})",
