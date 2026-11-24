@@ -60,11 +60,13 @@ for what only a start shows, in the directory the check resolved its arguments
 in: `compass run`, or `deploy.sh run` on 1P1D with `ROUTER`'s router arguments,
 its decode side through a local ``--on`` prefix carrying its own variables where
 SPACE names a network; a point offloading to an lmcache server with the run
-file's ``lmcache`` entry, its server at the point's own port. A point answers once the start's ``server.json`` names
-it, and is ``searchable``; a start that leaves first, or does not answer in
-`START_S`, refuses the candidate with the start's last line and each log's
-first raised error. Points whose instances run alike start once. Nothing is
-calibrated or measured.
+file's ``lmcache`` entry, its server at the point's own port; a point of a
+candidate naming a Mooncake Store's entry with that file, every point the same.
+A point answers once the start's ``server.json`` names it, and is
+``searchable``; a start that leaves first, or does not answer in `START_S`,
+refuses the candidate with the start's last line and each log's first raised
+error. Points whose instances run alike start once. Nothing is calibrated or
+measured.
 """
 
 import contextlib
@@ -310,13 +312,18 @@ def serving(machine, candidate, point, verdicts, store, at: Path) -> tuple[list,
     `store`, under the laws its `verdicts` name, into `at`, and the variables
     it runs under: `compass run`, or `deploy.sh run` on 1P1D. A point with an
     ``lmcache_port`` takes ``--lmcache``, its entry written beside `at`
-    (`_lmcache`). A ValueError says why `deploy.sh` cannot start a 1P1D
-    point, or why a point cannot reach its lmcache server."""
+    (`_lmcache`); a point of a candidate naming a ``mooncake_store`` entry
+    takes ``--mooncake-store`` and that file, as each of its points does, since
+    each deployment's Store binds a port of its own. A ValueError says why
+    `deploy.sh` cannot start a 1P1D point, or why a point cannot reach its
+    lmcache server."""
     flags = ["--device", machine["device"], "--ptl", machine["ptl"], "--store", store]
     flags += ["--stack", machine["stack"]] if machine.get("stack") else []
     for flag, i in (("--step-linear", 0), ("--host-laws", 1)):
         for value in dict.fromkeys(v["run"][i] for v in verdicts["law"].values()):
             flags += [flag, value]
+    if "mooncake_store" in candidate:
+        flags += ["--mooncake-store", candidate["mooncake_store"]]
     sides = point["instances"]
     if "lmcache_port" in point:
         entry, sides = _lmcache(candidate, point, at)
