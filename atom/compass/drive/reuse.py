@@ -21,7 +21,9 @@ ladder the config's is a prefix of; of several, reuse comes
 first, then refused, then calibrate. The requirement a verdict names:
 
 1. the same key: none there, a store law, or host laws beside it, at another
-   ATOM digest than the head's, or a law file whose host key states another,
+   ATOM digest than the head's, or host laws beside it fitted by other code
+   than this tree's (`run.fit_digest`), or a law file whose host key states
+   another ATOM digest,
    or a law the runner refuses for the prefill token-graph buckets it records
    whose records ran at another ATOM digest (`records_atom`) or state none,
    since a calibration of the config records them (calibrate); host laws
@@ -189,11 +191,14 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
                 raise
             found.append(_verdict("calibrate", 2, f"{where}: {refused}", **read))
             continue
-        here = {"model": model, "atom_src": atom}
+        here = {"model": model, "atom_src": atom, "fit_src": compass_run.fit_digest()}
         here |= keyed_platform(Kind.HOST_LAWS, platform)
         hosts = _keyed(store, Kind.HOST_LAWS, engine, **here)
         if not hosts:
-            why = f"{where} has no host laws beside it at the head's ATOM digest"
+            why = (
+                f"{where} has no host laws beside it at the head's ATOM digest "
+                "fitted by this tree's fit code"
+            )
             found.append(_verdict("calibrate", 1, why, **read))
             continue
         hosts.sort(key=lambda k: k.values["host_cpu"] != compass_run.host_cpu())

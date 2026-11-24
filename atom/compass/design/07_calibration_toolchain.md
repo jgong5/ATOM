@@ -1127,7 +1127,7 @@ only, and an `op_graph` is keyed by its shape.
 | `memory_readings` | Phase 2, `measure memory`; published with every reading assumed for a device never measured; or carried by a law file, assumed (below) | (model, platform, parallel layout, engine config) |
 | `step_measurement` | Phase 1c, `measure steps` | (model, platform, engine config, source-root digest, sampling, step kind, the batch's digest) |
 | `step_linear_law` | `fit steps --backend step-linear` | (model, platform, engine config, source-root digest, form) |
-| `host_laws` | `fit host` | (host CPU, ATOM source, model, engine config, device, software stack, torch), as the run reads its host key, but for the host CPU, which it takes from the laws: the host they timed is the host it predicts (`09` D54) |
+| `host_laws` | `fit host` | (host CPU, ATOM source, model, engine config, fit code, device, software stack, torch), as the run reads its host key, but for the host CPU and the fit code, which it takes from the laws: the host they timed is the host it predicts, and the code that fitted them, `fit host`'s own and the functions it fits with, says nothing of the run (`09` D54, [Ruling on #3714](https://github.com/jgong5/ATOM/issues/3714#issuecomment-7129586193)) |
 | step grid bundle (`step_grid_bundle`) | `fit steps --backend step-grid` | `17` D101, its `device` field the platform |
 | `projection` | `compass project`, real runs' steps priced on a device none of them ran on | (model, torch, the whole composed machine spec's digest, source-root digest, the cells' step records and engines) |
 

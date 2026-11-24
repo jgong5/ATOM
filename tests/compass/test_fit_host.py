@@ -46,6 +46,7 @@ def host_laws_key(key) -> Key:
         atom_src=key["atom"],
         model=key["model"],
         engine_config=json.dumps(key["engine"], sort_keys=True),
+        fit_src=compass_run.fit_digest(),
         **keyed_platform(Kind.HOST_LAWS, PLATFORM),
     )
 
@@ -66,7 +67,8 @@ def test_the_host_laws_published_are_fit_hosts_and_a_run_file_carrying_them_runs
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     laws, report = fit_host(label_records(paths)[0])
     platform = keyed_platform(Kind.HOST_LAWS, PLATFORM)
-    assert host == {**laws, "key": {**laws["key"], **platform}}
+    fitted = {**platform, "fit_src": compass_run.fit_digest()}
+    assert host == {**laws, "key": {**laws["key"], **fitted}}
     # Records with no tokenizer calls or intake stamps give none of these terms.
     report["unfitted"].update(
         tokenizer=f"no record holds steps/{compass_run.INTAKE_RECORD}",

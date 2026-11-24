@@ -25,7 +25,9 @@ not in its steps. A term the records cannot give, or a kind of
 tokenizer call as ``tokenizer.<kind>`` or a hop as ``hops.<hop>``, is left out
 and its reason listed under the report's ``unfitted``. The host key gains the
 fields of the configuration's platform a `host_laws` key states, which a run's
-spec must match; the entry is keyed by that host key's values and holds the run file's `host` entry as its
+spec must match, and ``fit_src``, the digest of the code fitting it
+(`atom.compass.run.fit_digest`), so a refit by changed code from the same
+records is another entry; the entry is keyed by that host key's values and holds the run file's `host` entry as its
 params.
 
 `--stated-hop NAME=SECONDS` writes a hop no record times into the entry's
@@ -62,7 +64,7 @@ from atom.compass.fit import publish
 from atom.compass.ingress import KEY as INGRESS
 from atom.compass.ingress import check as check_ingress
 from atom.compass.parity.client_run import RAW
-from atom.compass.run import INTAKE_RECORD, LOCAL, TOKENIZER_RECORD
+from atom.compass.run import INTAKE_RECORD, LOCAL, TOKENIZER_RECORD, fit_digest
 from atom.compass.validate.runs import SIDES
 
 PROG = "compass fit host"
@@ -228,6 +230,7 @@ def main(argv: list[str]) -> None:
         report["stated_ingress"] = {"file": args.ingress, INGRESS: ingress}
     k = host["key"]
     k |= keyed_platform(Kind.HOST_LAWS, config["platform"])
+    k["fit_src"] = fit_digest()
     key = Key.of(
         Kind.HOST_LAWS,
         **keyed_platform(Kind.HOST_LAWS, k),
@@ -235,6 +238,7 @@ def main(argv: list[str]) -> None:
         atom_src=k["atom"],
         model=k["model"],
         engine_config=json.dumps(k["engine"], sort_keys=True),
+        fit_src=k["fit_src"],
     )
     command = " ".join([PROG, *argv])
     publish.publish(args, command, key, publish.conditions(config), host, report)

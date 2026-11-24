@@ -244,8 +244,8 @@ def test_two_keys_never_share_a_directory(tmp_path):
         (
             Kind.HOST_LAWS,
             (
-                "(host_cpu, atom_src, model, engine_config, device, software_stack, "
-                "torch)"
+                "(host_cpu, atom_src, model, engine_config, fit_src, device, "
+                "software_stack, torch)"
             ),
         ),
     ],
