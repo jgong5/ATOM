@@ -26,10 +26,15 @@ def _work(tokens: int) -> int:
     return WORK[0] + WORK[1] * tokens
 
 
-def _line(step, t, rows, target, launch, gap):
+def _line(step, t, rows, target, launch, gap, mtp=True):
     """A line of an MTP record at host time `t`, where its device starts, idle
     for `gap` ns before it: its target runs `target` ns, its drafter
-    `DRAFT_NS`, its launch from `t` for `launch` ns."""
+    `DRAFT_NS`, its launch from `t` for `launch` ns. Without `mtp`, a line of
+    a record with no speculative decode: its window is the target's alone."""
+    if not mtp:
+        line = _line(step, t, rows, target - DRAFT_NS, launch, gap)
+        del line["d_target_ns"]
+        return line
     return {
         "step": step,
         "dp_rank": 0,
@@ -49,13 +54,14 @@ def _line(step, t, rows, target, launch, gap):
     }
 
 
-def _plain_record(path, prefills):
-    """A plain MTP record, no trace run's busy time: one decode step, then each
-    of `prefills`, (tokens, paced): a paced one's device runs the launch's
-    span, its work below it; another's work, longer than its launch. The
-    device clock, each line's busy time and the idle before it, keeps the
-    host's, so the host clock leads it by nothing."""
-    lines = [_line(0, 0, [(1, 100, True)], 5 * MS, MS, 0)]
+def _plain_record(path, prefills, mtp=True):
+    """A plain MTP record (without `mtp`, one with no speculative decode), no
+    trace run's busy time: one decode step, then each of `prefills`, (tokens,
+    paced): a paced one's device runs the launch's span, its work below it;
+    another's work, longer than its launch. The device clock, each line's busy
+    time and the idle before it, keeps the host's, so the host clock leads it
+    by nothing."""
+    lines = [_line(0, 0, [(1, 100, True)], 5 * MS, MS, 0, mtp)]
     for i, (tokens, paced) in enumerate(prefills, start=1):
         rows = [(tokens, tokens + 1000 + 7919 * i % 50000, False)]
         work = _work(tokens)
@@ -64,7 +70,7 @@ def _plain_record(path, prefills):
         last = lines[-1]
         t = last["t_exit_ns"] + MS
         idle = t - (last["t_enter_ns"] + last["d_busy_ns"])
-        lines.append(_line(i, t, rows, target, launch, idle))
+        lines.append(_line(i, t, rows, target, launch, idle, mtp))
     path.write_text("".join(json.dumps(line) + "\n" for line in lines))
     _engine_file(path)
     return path
@@ -81,10 +87,14 @@ def record_label(monkeypatch):
     monkeypatch.setenv(step_labels.PREFILL_LABEL_ENV, "record")
 
 
+@pytest.mark.parametrize("mtp", [True, False], ids=["mtp", "no-spec"])
 def test_a_prefill_ending_at_its_launch_end_is_cut_paced_with_its_host_labels(
-    tmp_path, record_label
+    tmp_path, record_label, mtp
 ):
-    record = _plain_record(tmp_path / "dp0.jsonl", PREFILLS)
+    """With no speculative decode (Kimi-K3.1 at #752's deployment: no line
+    carries `d_target_ns`) a prefill's window is its target's alone: labelled
+    from `d_busy_ns`, and cut as paced the same way."""
+    record = _plain_record(tmp_path / "dp0.jsonl", PREFILLS, mtp)
 
     samples = {s.step: s for s in label_records([record])[0]}
 
@@ -99,22 +109,24 @@ def test_a_prefill_ending_at_its_launch_end_is_cut_paced_with_its_host_labels(
     assert samples[0].cut is None
 
 
-def test_trace_labels_cut_no_prefill_as_paced(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mtp", [True, False], ids=["mtp", "no-spec"])
+def test_trace_labels_cut_no_prefill_as_paced(tmp_path, monkeypatch, mtp):
     monkeypatch.delenv(step_labels.PREFILL_LABEL_ENV, raising=False)
-    record = _plain_record(tmp_path / "dp0.jsonl", PREFILLS)
+    record = _plain_record(tmp_path / "dp0.jsonl", PREFILLS, mtp)
 
     cuts = {s.cut for s in label_records([record])[0] if s.step}
 
     assert cuts == {"untraced"}
 
 
+@pytest.mark.parametrize("mtp", [True, False], ids=["mtp", "no-spec"])
 def test_the_prefill_vector_fits_the_device_s_work_not_the_launch(
-    tmp_path, record_label
+    tmp_path, record_label, mtp
 ):
     """Fitted on the paced spans too, the intercept takes up the launch; with
     them cut, the vector prices the work the device ran, and the fit counts
     the paced steps under `cut`."""
-    record = _plain_record(tmp_path / "dp0.jsonl", PREFILLS)
+    record = _plain_record(tmp_path / "dp0.jsonl", PREFILLS, mtp)
     samples = label_records([record])[0]
 
     law = fit(samples, {"form": "base"})[0]

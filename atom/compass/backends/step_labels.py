@@ -81,7 +81,9 @@ plain record and no trace run, a prefill step without busy time that carries
 its MTP target end is labelled from its own device window instead, as an MTP
 decode is: the device label `d_target_ns` (plus the draft-KV pass on a step
 that produces output), the draft label the rest of `d_busy_ns`, and the
-propose label `d_propose_ns`. Such a label holds whatever idle the host paced
+propose label `d_propose_ns`. On a record with no speculative decode (no line
+carries `d_target_ns`: Kimi-K3.1 at #752's deployment) the whole window is the
+target's, so such a step's device label is its `d_busy_ns`. Such a label holds whatever idle the host paced
 inside the window, so it reads the step's device span, not its busy time; its
 sample's provenance says so (`prefill_label`), and a step with busy time keeps
 the trace run's labels. One whose labelled device work, placed on the host
@@ -511,18 +513,21 @@ def host_paced_drafts(lines) -> set[int]:
     }
 
 
-def _paced(lines) -> set[int]:
+def _paced(lines, mtp: bool = True) -> set[int]:
     """The prefill steps of `lines` whose labelled device work, the target's
     and on a step that produces output its draft-KV pass, ends within
     `PACED_S` of their host launch's end, either side, placed on the host
-    clock by the lead `_timed` gives: their device ran at the launch's pace."""
+    clock by the lead `_timed` gives: their device ran at the launch's pace.
+    On a record with no speculative decode (`mtp` false) the target's work is
+    the whole window, `d_busy_ns`."""
     paced = set()
+    target = "d_target_ns" if mtp else "d_busy_ns"
     for s, start, lead, _ in _timed(lines):
-        if s["is_dummy_run"] or "d_target_ns" not in s or "t_launch_ns" not in s:
+        if s["is_dummy_run"] or target not in s or "t_launch_ns" not in s:
             continue
         if not any(not decode for _, _, decode in s["rows"]):
             continue
-        work = s["d_target_ns"] + s.get("d_draft_kv_ns", 0) * s["produces_output"]
+        work = s[target] + s.get("d_draft_kv_ns", 0) * s["produces_output"]
         if abs(start + work + lead - s["t_launch_ns"][1]) <= PACED_S * 1e9:
             paced.add(s["step"])
     return paced
@@ -754,7 +759,7 @@ def _label(
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     window_prefill = _prefill_label() == "record" and not traced
-    paced = _paced(lines) if window_prefill and mtp else set()
+    paced = _paced(lines, mtp) if window_prefill else set()
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
     tbo = (config or {}).get("engine", {}).get("enable_tbo")
@@ -816,11 +821,12 @@ def _label(
             kda=tuple(s["kda"]) if "kda" in s else None,
         )
         cut = None
-        # An untraced prefill labelled from its own window (`PREFILL_LABEL_ENV`).
+        # An untraced prefill labelled from its own window (`PREFILL_LABEL_ENV`):
+        # its MTP target's, or with no speculative decode the whole window.
         windowed = (
             view.prefill
             and "b_target_ns" not in s
-            and "d_target_ns" in s
+            and ("d_target_ns" in s or not mtp)
             and window_prefill
         )
         if view.prefill and view.decode:
