@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """The step linear law's opt-in columns (#3720; LLM-Booster#739 sections 2.1,
-5 and 8): decode `row_padding` and `peer_tokens`, prefill `gather_rows` and
-`moe_imbalance`, and the in-sample rule a decode rung picks its MoE column by.
+5 and 8): decode `row_padding` and `peer_tokens`, prefill `gather_rows` (or
+its pad rows alone, `gather_pad_rows`), `moe_imbalance` and `uneven_rows`, and
+the in-sample rule a decode rung picks its MoE column by.
 
 Each column is counted by one `step_linear` function that `fit` and
 `StepLinearBackend` both call, so a law prices a simulated step as it was
@@ -32,12 +33,15 @@ from atom.compass.backends import (
     StepLinearLaw,
 )
 from atom.compass.backends.step_linear import (
+    gather_column,
+    gather_pad_rows,
     gather_rows,
     moe_imbalance,
     peer_tokens,
     row_padding,
     token_bucket,
     token_padding,
+    uneven_rows,
 )
 from atom.compass.backends.step_linear_fit import (
     SATURATED,
@@ -103,6 +107,29 @@ def test_gather_rows_carry_every_rank_s_bucket_under_a_token_graph():
     assert gather_rows(_prefill(200, moe=350), BUCKETS, DP) is None
 
 
+def test_gather_pad_rows_are_the_gather_s_rows_past_those_its_ranks_scheduled():
+    graphed = _prefill(200, peak=300, moe=350)
+    assert gather_pad_rows(graphed, BUCKETS, DP) == DP * 512 - 350
+    # Run eagerly the variable-length gather carries no pad.
+    assert gather_pad_rows(_prefill(2000, peak=5000, moe=6000), BUCKETS, DP) == 0
+    refused = _prefill(200, peak=300, moe=350, group_needs_eager=True)
+    assert gather_pad_rows(refused, BUCKETS, DP) == 0
+    assert gather_pad_rows(_prefill(200), BUCKETS, DP) == 0  # one rank
+    assert gather_pad_rows(_prefill(200, moe=350), BUCKETS, DP) is None
+    for view in (graphed, _prefill(2000, peak=5000, moe=6000)):
+        rows = gather_rows(view, BUCKETS, DP)
+        assert gather_pad_rows(view, BUCKETS, DP) == rows - view.moe_rows
+        for feature in ("gather_rows", "gather_pad_rows"):
+            got = gather_column(feature, view, BUCKETS, DP)
+            assert got == {
+                "gather_rows": gather_rows,
+                "gather_pad_rows": gather_pad_rows,
+            }[feature](view, BUCKETS, DP)
+    assert gather_column("moe_imbalance", graphed, BUCKETS, DP, 0.2) == 0
+    with pytest.raises(ValueError, match="not one of"):
+        gather_column("padding", graphed, BUCKETS, DP)
+
+
 def test_moe_imbalance_is_the_idle_rows_of_an_uneven_variable_length_gather():
     lone = _prefill(5000, peak=5000, moe=5000)  # one rank prefills
     assert moe_imbalance(lone, BUCKETS, DP, 0.2) == (DP - 1) * 5000
@@ -113,6 +140,20 @@ def test_moe_imbalance_is_the_idle_rows_of_an_uneven_variable_length_gather():
     assert moe_imbalance(_prefill(200, peak=300, moe=350), BUCKETS, DP, 0.2) == 0
     assert moe_imbalance(_prefill(200), BUCKETS, DP, 0.2) == 0
     assert moe_imbalance(_prefill(5000, moe=5000), BUCKETS, DP, 0.2) is None
+
+
+def test_uneven_rows_are_the_rows_of_a_gather_its_group_runs_uneven():
+    lone = _prefill(5000, peak=5000, moe=5003)  # one rank prefills beside dummies
+    assert uneven_rows(lone, BUCKETS, DP, 0.2) == 5003
+    even = _prefill(5000, peak=5200, moe=20000)  # 4%
+    assert uneven_rows(even, BUCKETS, DP, 0.2) == 0
+    assert uneven_rows(even, BUCKETS, DP, 0.0) == 20000
+    assert uneven_rows(_prefill(200, peak=300, moe=350), BUCKETS, DP, 0.0) == 0
+    assert uneven_rows(_prefill(200), BUCKETS, DP, 0.2) == 0  # one rank
+    assert uneven_rows(_prefill(5000, moe=5000), BUCKETS, DP, 0.2) is None
+    for view in (lone, even):
+        got = gather_column("uneven_rows", view, BUCKETS, DP, 0.2)
+        assert got == uneven_rows(view, BUCKETS, DP, 0.2)
 
 
 PREFILL = {
@@ -159,6 +200,38 @@ def test_the_backend_prices_each_column_by_the_function_the_fit_counts_it_with()
         assert terms["prefill.moe_imbalance"] == pytest.approx(3e-6 * idle)
 
 
+def test_the_backend_prices_gather_pad_rows_by_the_function_the_fit_counts_it_with():
+    pad = {
+        k if k != "gather_rows" else "gather_pad_rows": v for k, v in PREFILL.items()
+    }
+    backend = StepLinearBackend(StepLinearLaw(_law(pad)), DP)
+    for view in (_prefill(200, peak=300, moe=350), _prefill(5000, peak=5000, moe=5000)):
+        terms = {t.name: t.seconds for t in backend.price(view).terms}
+        rows = gather_pad_rows(view, BUCKETS, DP)
+        assert terms["prefill.gather_pad_rows"] == pytest.approx(4e-6 * rows)
+        assert "prefill.gather_rows" not in terms
+    with pytest.raises(CostRefused, match="gather_pad_rows is counted from"):
+        backend.price(_prefill(200, moe=350))
+
+
+def _uneven(prefill=None) -> dict:
+    """`PREFILL` with `uneven_rows` in place of `moe_imbalance`."""
+    return {
+        (k if k != "moe_imbalance" else "uneven_rows"): v
+        for k, v in (prefill or PREFILL).items()
+    }
+
+
+def test_the_backend_prices_uneven_rows_by_the_function_the_fit_counts_it_with():
+    backend = StepLinearBackend(StepLinearLaw(_law(_uneven())), DP)
+    for view in (_prefill(200, peak=300, moe=350), _prefill(5000, peak=5000, moe=5003)):
+        terms = {t.name: t.seconds for t in backend.price(view).terms}
+        rows = uneven_rows(view, BUCKETS, DP, 0.2)
+        assert terms["prefill.uneven_rows"] == pytest.approx(3e-6 * rows)
+    with pytest.raises(ValueError, match="uneven_rows and states its min_spread"):
+        StepLinearLaw(_law(_uneven(), min_spread=None))
+
+
 def test_a_step_stating_no_group_count_a_column_reads_is_refused():
     backend = StepLinearBackend(StepLinearLaw(_law()), DP)
     with pytest.raises(CostRefused, match="no MoE group tokens"):
@@ -185,6 +258,17 @@ def test_gather_rows_without_padding_is_refused():
     prefill = {k: v for k, v in PREFILL.items() if k != "padding"}
     with pytest.raises(ValueError, match="gather_rows and no padding"):
         StepLinearLaw(_law(prefill))
+    pad = {
+        k if k != "gather_rows" else "gather_pad_rows": v for k, v in prefill.items()
+    }
+    with pytest.raises(ValueError, match="gather_pad_rows and no padding"):
+        StepLinearLaw(_law(pad))
+
+
+def test_a_vector_takes_gather_rows_or_its_pad_rows_not_both():
+    both = {**PREFILL, "gather_pad_rows": 1e-6}
+    with pytest.raises(ValueError, match="gather_rows and gather_pad_rows"):
+        StepLinearLaw(_law(both))
 
 
 def test_the_switches_read_from_the_environment():
@@ -210,6 +294,13 @@ def test_the_switches_read_from_the_environment():
     spread = {"COMPASS_FIT_MOE_IMBALANCE": "1", "COMPASS_FIT_MOE_MIN_SPREAD": "0.5"}
     assert env_options(spread) == {"moe_imbalance": 0.5}
     assert env_options({"COMPASS_FIT_PEER_TOKENS": "1"}) == {"peer_tokens": "saturated"}
+    assert env_options({"COMPASS_FIT_GATHER_ROWS": "pad"}) == {"gather_rows": "pad"}
+    uneven = {"COMPASS_FIT_UNEVEN_ROWS": "1", "COMPASS_FIT_MOE_MIN_SPREAD": "0.3"}
+    assert env_options(uneven) == {"uneven_rows": 0.3}
+    assert env_options({"COMPASS_FIT_UNEVEN_ROWS": "1"}) == {"uneven_rows": 0.2}
+    assert env_options({"COMPASS_FIT_GATHER_ROWS": "0"}) == {}
+    with pytest.raises(ValueError, match="not 1, pad or 0"):
+        env_options({"COMPASS_FIT_GATHER_ROWS": "rows"})
     with pytest.raises(ValueError, match="COMPASS_FIT_MOE_IMBALANCE=1"):
         env_options({"COMPASS_FIT_MOE_MIN_SPREAD": "0.5"})
     with pytest.raises(ValueError, match="not one of"):
@@ -391,7 +482,9 @@ def _prefill_price(rows, moe, peak, law) -> float:
         "query_cached": (q * (n - q)).sum(),
         "moe_rows": moe,
         "gather_rows": gather_rows(view, BUCKETS, DP),
+        "gather_pad_rows": gather_pad_rows(view, BUCKETS, DP),
         "moe_imbalance": moe_imbalance(view, BUCKETS, DP, 0.2),
+        "uneven_rows": uneven_rows(view, BUCKETS, DP, 0.2),
         "padding": token_padding(view, BUCKETS),
     }
     return float(sum(c * features[f] for f, c in law.items()))
@@ -466,11 +559,51 @@ def test_the_gather_columns_are_fitted_and_the_vector_states_width_and_spread(tm
     assert "gather_rows" not in off["coefficients"] and "ranks" not in off
 
 
+def test_gather_pad_rows_is_fitted_in_place_of_gather_rows_when_asked(tmp_path):
+    truth = {
+        k if k != "gather_rows" else "gather_pad_rows": v for k, v in PREFILL.items()
+    }
+    groups = _prefill_groups(8, 360, truth)
+    paths = _prefill_records(tmp_path / "run", groups)
+    options = {"buckets": BUCKETS, "gather_rows": "pad", "moe_imbalance": 0.2}
+    vector = _fit(paths, **options)["prefill"]
+    assert list(vector["coefficients"]) == [*PREFILL_ORDER, "padding"]
+    assert vector["coefficients"] == pytest.approx(truth, rel=1e-5)
+    assert vector["ranks"] == DP and vector["min_spread"] == 0.2
+    with pytest.raises(ValueError, match="not True or 'pad'"):
+        _fit(paths, buckets=BUCKETS, gather_rows="rows")
+
+
+PREFILL_ORDER = (
+    "step",
+    "tokens",
+    "query_square",
+    "query_cached",
+    "moe_rows",
+    "gather_pad_rows",
+    "moe_imbalance",
+)
+
+
+def test_uneven_rows_is_fitted_at_its_min_spread_when_asked(tmp_path):
+    truth = _uneven()
+    groups = _prefill_groups(9, 360, truth)
+    paths = _prefill_records(tmp_path / "run", groups)
+    vector = _fit(paths, buckets=BUCKETS, gather_rows=True, uneven_rows=0.2)["prefill"]
+    assert list(vector["coefficients"])[5:7] == ["gather_rows", "uneven_rows"]
+    assert vector["coefficients"] == pytest.approx(truth, rel=1e-5)
+    assert vector["ranks"] == DP and vector["min_spread"] == 0.2
+    with pytest.raises(ValueError, match="states one min_spread"):
+        _fit(paths, buckets=BUCKETS, moe_imbalance=0.2, uneven_rows=0.5)
+
+
 def test_a_gather_column_on_one_rank_or_without_buckets_is_refused(tmp_path):
     groups = _prefill_groups(6, 60, PREFILL)
     paths = _prefill_records(tmp_path / "run", groups)
     with pytest.raises(ValueError, match="state none"):
         _fit(paths, gather_rows=True)
+    with pytest.raises(ValueError, match="gather_pad_rows reads"):
+        _fit(paths, gather_rows="pad")
     one = label_records(paths[:1], 1)[0]
     with pytest.raises(ValueError, match="run one rank"):
         fit(one, {"dp": 1, "moe_imbalance": 0.2})
