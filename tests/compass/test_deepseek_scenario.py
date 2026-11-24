@@ -9,7 +9,8 @@ Both serve at ``-tp 4 --kv-cache-dtype fp8``: DeepSeek-V4-Flash's config
 (`deepseek_v4_flash_config.json`), ATOM's `DeepseekV4ForCausalLM`, its
 attention sparse over a sliding window and the compressed KV, at the TP 4
 `.github/benchmark/oot_benchmark_models.json` benchmarks it at and the fp8 KV
-cache of `recipes/DeepSeek-V4.md`; and DeepSeek-R1-0528's in MXFP4
+cache of `recipes/DeepSeek-V4.md`, with the fp8 indexer that recipe names as
+the legacy path (``--index-cache-dtype fp8``, #4058); and DeepSeek-R1-0528's in MXFP4
 (`deepseek_r1_0528_mxfp4_config.json`, amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4's),
 ATOM's `DeepseekV2ForCausalLM`, its attention MLA, as
 `.github/benchmark/models.json` serves it as DeepSeek-R1-0528-MXFP4.
@@ -40,6 +41,12 @@ from test_moe_scenario import LEVELS, ONE_RANK, _terms, walked
 from atom.compass.detect.scenario import check_run
 
 TP4 = ["-tp", "4", "--kv-cache-dtype", "fp8"]
+#: Each form's server flags.
+SERVE = {
+    # fp4, V4's default indexer, dies in aiter's OPUS config on the host (#4058).
+    "deepseek_v4": TP4 + ["--index-cache-dtype", "fp8"],
+    "mla": TP4,
+}
 HERE = pathlib.Path(__file__).parent
 #: Each form: its model's variable, its config fixture, and the roofline terms
 #: its attention prices as.
@@ -77,7 +84,9 @@ def runs(request, tmp_path_factory):
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(test_dp_slice, "MODEL", model)
         done = [
-            run_dp_slice(root / f"seed{s}", s, TP4, 1, machine=machine, backend=backend)
+            run_dp_slice(
+                root / f"seed{s}", s, SERVE[form], 1, machine=machine, backend=backend
+            )
             for s in ("1", "2")
         ]
     return form, level, done
