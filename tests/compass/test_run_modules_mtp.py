@@ -10,8 +10,11 @@ draft terms: the first pass over the step's rows, each later one a row a
 request, the LM head a row a request in each, and on a step that samples
 nothing the first pass alone, unless a data-parallel group proposes for its
 collectives. Each pass runs the first MTP layer; V4's block norms its inputs
-and projects each residual copy, and at TP 2 Qwen3.5's gathers its `fc`'s
-output and its argmax alone. A speculative step then answers
+and projects each residual copy, and reduces and norms its head's input on
+the rows its head samples alone; at TP 2 Qwen3.5's gathers its `fc`'s output
+and its argmax alone, and under a pure data-parallel group of two its later
+passes run at the step's `running_bs`, draft graph or none, the group
+sharding their argmax. A speculative step then answers
 `_group_step_seconds`' "prices no draft" check, the roofline alone or below a
 backend that refuses the step; a run with no drafter laid out, Eagle3's
 (#3962), is still refused.
@@ -25,6 +28,7 @@ walk's modules come back pickled.
 """
 
 import concurrent.futures
+import dataclasses
 import json
 import os
 import pathlib
@@ -35,6 +39,7 @@ from types import SimpleNamespace
 
 import pytest
 from test_dp_step_max import prefill, runner
+from test_op_graph_drafter_width import settled
 
 from atom.compass.backends.base import CostBackend, Granularity
 from atom.compass.backends.provenance import Refusal
@@ -46,6 +51,7 @@ from atom.compass.backends.step_roofline import (
     StepRooflineBackend,
 )
 from atom.compass.backends.work import (
+    Work,
     allgather,
     attention,
     bounds,
@@ -53,6 +59,7 @@ from atom.compass.backends.work import (
     gemm,
     price,
 )
+from atom.compass.run.modules import _dp_argmax
 from atom.compass.spec import MachineSpec
 
 HERE = pathlib.Path(__file__).parent
@@ -72,6 +79,7 @@ BUILDS = {
     "v4-mtp2": (V4_PRO, 8, MI355X, 2, []),
     "qwen3.5-tp2": (CONFIG, 2, MI308X, 1, []),
     "qwen3.5-2layers": (CONFIG, 1, MI308X, 1, []),
+    "qwen3.5-dp2-mtp3": (CONFIG, 1, MI308X, 3, ["--data-parallel-size", "2"]),
 }
 #: Builds whose text config is edited: two MTP layers.
 TEXT = {"qwen3.5-2layers": {"mtp_num_hidden_layers": 2}}
@@ -80,6 +88,7 @@ DRAFTERS = {
     "qwen3.5-mtp3": "Qwen3_5MTP",
     "qwen3.5-tp2": "Qwen3_5MTP",
     "qwen3.5-2layers": "Qwen3_5MTP",
+    "qwen3.5-dp2-mtp3": "Qwen3_5MTP",
     "v3-mtp2": "DeepSeekMTP",
     "v4-mtp2": "DeepseekV4MTP",
 }
@@ -151,15 +160,16 @@ def built(tmp_path_factory):
         return dict(zip(BUILDS, pool.map(build, BUILDS)))
 
 
-def one_pass(rows, heads: int) -> float:
+def one_pass(rows, heads: int, tokens: int = 0, head: float | None = None) -> float:
     """One pass of Qwen3.5-0.8B's MTP layer over `rows` at TP 1, module by
-    module from its config, each one roofline (`work.price`), its LM head on
-    `heads` rows, none for 0."""
+    module from its config, each one roofline (`work.price`), on `tokens`
+    tokens where given, its LM head on `heads` rows, none for 0, or at
+    `head` seconds."""
     text = json.loads(CONFIG.read_text())["text_config"]
     h, d, inter = text["hidden_size"], text["head_dim"], text["intermediate_size"]
     q, kv = text["num_attention_heads"], text["num_key_value_heads"]
     rotary = int(d * text["rope_parameters"]["partial_rotary_factor"])
-    t = sum(r.query_tokens for r in rows)
+    t = tokens or sum(r.query_tokens for r in rows)
     works = [
         elementwise(t * h),  # embed_tokens
         *[elementwise(t * h)] * 5,  # the two pre-fc norms, the layer's two, the last
@@ -175,9 +185,9 @@ def one_pass(rows, heads: int) -> float:
         gemm(t, h, inter),  # down_proj
         elementwise(t * inter, reads=2),  # SiluAndMul
     ]
-    if heads:
+    if heads and head is None:
         works.append(gemm(heads, text["vocab_size"], h))  # lm_head
-    return sum(price(w, MACHINE) for w in works)
+    return sum(price(w, MACHINE) for w in works) + (head or 0.0)
 
 
 def serial(work, machine=MACHINE) -> float:
@@ -335,6 +345,95 @@ def test_v4s_mtp_block_norms_its_inputs_and_projects_each_residual_copy(built):
     mi355x = MachineSpec.from_mapping(json.loads(MI355X.read_text()))
     cost = StepRooflineBackend(mi355x, [h_proj]).price(chunk)
     assert cost.draft_seconds == pytest.approx(price(hand, mi355x), rel=1e-12)
+
+
+def test_v4s_mtp_head_input_runs_on_the_rows_its_head_samples(built):
+    """`DeepseekV4MTPModel._head_input` reduces the target's residual copies
+    by the block's own weights (`ParallelHead.hc_head`) and norms the result,
+    on the rows `compute_draft_ids` samples: none on a pass with no head, a
+    row a request on each pass with one. A named result."""
+    hf = json.loads(V4_PRO.read_text())
+    hc, d = hf["hc_mult"], hf["hidden_size"]
+    block = "drafter.model.mtp.0."
+    found = {
+        m.name.removeprefix(block): m for m in built["v4-mtp2"]["modules"] if m.passes
+    }
+    head = [found["hc_head"], found["norm"]]
+    assert [(m.kind, m.dims, m.head) for m in head] == [
+        ("hc_head", (hc, d), True),
+        ("norm", (d,), True),
+    ]
+    mi355x = MachineSpec.from_mapping(json.loads(MI355X.read_text()))
+    roofline = StepRooflineBackend(mi355x, head)
+    chunk = BatchView((RequestShape(4096, 4096, False),), produces_output=False)
+    headless = roofline.price(chunk)
+    step = verify(2)
+    # A row's copies read and one row written, in bf16; one gate a copy, an
+    # fp32 projection of the row's copies; then the norm over the row.
+    n = len(step.requests)
+    gates = Work({"bf16": 2 * n * hc * hc * d}, n * (hc + 1) * d * 2 + hc * hc * d * 4)
+    hand = 2 * (price(gates, mi355x) + price(elementwise(n * d), mi355x))
+    cost = roofline.price(step)
+    print(
+        f"\nV4-Pro MTP2 head input: headless 4096-token chunk "
+        f"{headless.draft_seconds:.9g} s; 4-row verify {cost.draft_seconds:.9g} s,"
+        f" by hand {hand:.9g} s"
+    )
+    assert {t.name: t.seconds for t in headless.draft_terms} == {
+        "draft roofline.hc_head": 0,
+        "draft roofline.norm": 0,
+    }
+    assert cost.draft_seconds == pytest.approx(hand, rel=1e-12)
+
+
+def test_a_dp2_decode_drafts_its_later_passes_at_running_bs_sharding_their_argmax(
+    built, monkeypatch
+):
+    """A named result: Qwen3.5-0.8B MTP3 at DP2 TP1 on MI308X, a decode of 3
+    rows verifying 4 tokens each beside a peer's 3, its view `batch_view`'s
+    for a drafter with no draft graph (MRoPE's): `running_bs` 4. The first
+    pass runs the 12 tokens, its head the whole vocabulary on 4 rows, a height
+    no peer is told; each later pass 4 rows, its head the group's sharded
+    argmax: 8 rows gathered, half the vocabulary, their (value, id) pairs
+    gathered (`_dp_sharded_logits`)."""
+    rows = [(4, 600 + i, True) for i in range(3)]
+    view = settled(monkeypatch, rows, [(3, 12, False)], step=False, drafts=3)
+    assert view.draft_bs == 4
+    text = json.loads(CONFIG.read_text())["text_config"]
+    h, vocab = text["hidden_size"], text["vocab_size"]
+    found = built["qwen3.5-dp2-mtp3"]["modules"]
+    heads = [(m.passes, m.dims) for m in found if m.kind == "lm_head"]
+    assert heads == [(3, (vocab, h, 2, 256))]  # the drafter's: the target ties
+    sharded = gemm(8, vocab // 2, h) + allgather(2, 8 * h * 2) + allgather(2, 2 * 8 * 8)
+    first = one_pass(view.requests, 4)
+    after = one_pass(later(view), 4, tokens=4, head=serial(sharded))
+    cost = built["qwen3.5-dp2-mtp3"]["installed"].price(view)
+    print(
+        f"\nQwen3.5-0.8B MTP3 DP2: draft {cost.draft_seconds:.9g} s, by hand "
+        f"{first + 2 * after:.9g} s (first {first:.9g} s, later {after:.9g} s)"
+    )
+    assert cost.draft_seconds == pytest.approx(first + 2 * after, rel=1e-12)
+
+
+def test_a_dp_group_shards_no_argmax_past_its_cap(built, monkeypatch):
+    """`_can_use_dp_sharded_argmax` takes at most
+    `ATOM_DP_DRAFT_ARGMAX_MAX_ROWS` rows, 256 by default: a later pass of 300
+    runs the whole vocabulary on every rank, as the first pass does. Off, or
+    on one rank, no head carries the group."""
+    text = json.loads(CONFIG.read_text())["text_config"]
+    h, vocab = text["hidden_size"], text["vocab_size"]
+    found = built["qwen3.5-dp2-mtp3"]["modules"]
+    head = next(m for m in found if m.passes and m.kind == "lm_head")
+    step = dataclasses.replace(verify(3, rows=300), draft_bs=300)
+    cost = StepRooflineBackend(MACHINE, [head]).price(step)
+    assert cost.draft_seconds == pytest.approx(
+        3 * price(gemm(300, vocab, h), MACHINE), rel=1e-12
+    )
+    group = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=2))
+    alone = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=1))
+    assert (_dp_argmax(group), _dp_argmax(alone)) == ((2, 256), ())
+    monkeypatch.setenv("ATOM_DP_DRAFT_ARGMAX", "0")
+    assert _dp_argmax(group) == ()
 
 
 class _Refuses(CostBackend):

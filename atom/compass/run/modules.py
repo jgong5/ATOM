@@ -109,10 +109,16 @@ Its modules carry its passes, the config's `num_speculative_tokens`
 `EagleProposer` passes no `spec_step_idx`. A drafter that holds no LM head of
 its own runs the target's, and its embedding, in each pass (V4's
 `share_with_target`), so those of the target's are its modules too. V4's MTP
-block norms its two inputs and its output itself, as a V4 block does not,
-its hidden-state norm and `h_proj` on each residual copy of a token;
-Qwen3.5's all-gathers its `fc`'s output over the TP group. An Eagle3 drafter
-is not built, and a step under one prices no draft (#3962), nor are the other
+block norms its two inputs itself, as a V4 block does not, its hidden-state
+norm and `h_proj` on each residual copy of a token; before the LM head it
+reduces its residual copies (`hc_head`, by its own mixing weights) and
+norms the result, on the rows the head samples alone (`Module.head`,
+`DeepseekV4MTPModel._head_input`). Qwen3.5's all-gathers its `fc`'s output
+over the TP group. Where a data-parallel group shards a draft's argmax
+(`ATOM_DP_DRAFT_ARGMAX`, a head at TP 1, its vocabulary split evenly), its LM
+head carries the group's width and the most rows it shards
+(`ParallelLMHead._can_use_dp_sharded_argmax`). An Eagle3 drafter is not
+built, and a step under one prices no draft (#3962), nor are the other
 serial drafters ATOM maps (#3984).
 
 A module of any other class is gone into when it has children. One without,
@@ -242,7 +248,8 @@ def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
         return found
     from atom.config import get_current_atom_config
 
-    passes = get_current_atom_config().speculative_config.num_speculative_tokens
+    config = get_current_atom_config()
+    passes = config.speculative_config.num_speculative_tokens
     target = list(found)
     visit(drafted, "drafter", None, 0, passes)
     if not any(m.passes and m.kind == "lm_head" for m in found):
@@ -254,7 +261,24 @@ def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
             )
             for m in shared
         ]
+    shards = _dp_argmax(config)
+    for i, m in enumerate(found):
+        head = m.passes and m.kind == "lm_head" and m.ranks == 1  # at TP 1
+        if shards and head and not m.dims[0] % shards[0]:
+            found[i] = dataclasses.replace(m, dims=m.dims + shards)
     return found
+
+
+def _dp_argmax(config) -> tuple[int, ...]:
+    """The data-parallel group's width and the most rows of a draft pass it
+    shards a TP-1 LM head's argmax over (`ATOM_DP_DRAFT_ARGMAX`,
+    `ATOM_DP_DRAFT_ARGMAX_MAX_ROWS`); none on one rank or with it off."""
+    from atom.utils import envs
+
+    dp = config.parallel_config.data_parallel_size
+    if dp <= 1 or not envs.ATOM_DP_DRAFT_ARGMAX:
+        return ()
+    return dp, envs.ATOM_DP_DRAFT_ARGMAX_MAX_ROWS
 
 
 def drafter(config):
@@ -380,7 +404,10 @@ def _classify(module, name, parent):
     fmt = FORMATS.get(getattr(weight, "dtype", None))
     if _is(module, V4 + "Block"):
         mix = Module(name, "mhc", (module.hc_mult, module.attn_norm.weight.shape[0]))
-        return mix, mix, DESCEND
+        if not _is(module, V4_MTP_BLOCK):
+            return mix, mix, DESCEND
+        head = Module(f"{name}.hc_head", "hc_head", mix.dims, head=True)
+        return mix, mix, head, DESCEND
     if _is(module, V41_BLOCK):
         width = module.attn_norm.weight.shape[0]
         mix = Module(name, "mhc", (module.hc_attn_fn.shape[1] // width, width))
@@ -448,7 +475,8 @@ def _classify(module, name, parent):
             module is n for n in (parent.enorm, parent.hnorm, parent.norm)
         ):
             copies = parent.hc_mult if module is parent.hnorm else 1
-            return Module(name, "norm", (copies * weight.shape[0],))
+            head = module is parent.norm  # its LM head's input
+            return Module(name, "norm", (copies * weight.shape[0],), head=head)
         if parent is not None and _is(parent, V4 + "Block"):
             return NOTHING
         tp = module.tp_size if getattr(module, "fused_allreduce", False) else 1

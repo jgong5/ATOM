@@ -207,19 +207,18 @@ def batch_view(
     first pass runs each rank's target token stream unpadded, so its gather is
     always the variable-length one (`EagleProposer.propose`); a block drafter
     pads its passes to the group and is left out. Its later passes run at
-    `running_bs`, on any step, when it declares a draft graph, else at the
-    rows (`draft_bs`), where the gather carries each rank's rows (`draft_rows`):
-    every rank decoding, its tokens over a row's query, every row's alike; else
-    at least the widest rank's rows and one each peer, an idle one's dummy. A
-    drafter of one draft (`mtp_k`) has no later passes.
+    `running_bs` (`draft_bs`), on any step, whether a draft graph replays them
+    or they run eagerly, each stating that height for every rank; a drafter
+    of one draft (`mtp_k`) has none.
 
     A target that replays no graph pads to it too (`target_bs`): an eager
     decode every rank decodes in, its inputs; a sampling prefill, its LM head.
     """
-    draft_moe_rows = moe_tokens = dp_rank = draft_bs = target_bs = draft_rows = None
+    draft_moe_rows = moe_tokens = dp_rank = draft_bs = target_bs = None
     group_max_tokens = None
     drafter = getattr(runner, "drafter", None)
-    if getattr(drafter, "step", None) is not None:  # `EagleProposer`'s pass
+    # `EagleProposer`, whose mid-step pass `step` is None without a draft graph.
+    if hasattr(drafter, "step") and drafter.mtp_k > 1:
         draft_bs = int(mode.running_bs)
     prefill = batch.total_seqs_num_prefill
     if not mode.use_cudagraph and (
@@ -241,17 +240,6 @@ def batch_view(
             moe_rows = gathered
         if drafter is not None and not drafter.is_block_drafter:
             draft_moe_rows = gathered
-            if draft_bs is None and drafter.mtp_k > 1:
-                draft_rows = (
-                    gathered
-                    // (
-                        int(batch.num_scheduled_tokens[0])
-                        if len(batch.num_scheduled_tokens)
-                        else _dummy_row(batch, mode).query_tokens
-                    )
-                    if mode.running_tokens_are_unified
-                    else mode.sync.max_bs_across_dp + _data_parallel_size(runner) - 1
-                )
     else:
         raise RunnerRefusal(
             "this rank is one of a data-parallel group and its forward mode "
@@ -280,7 +268,6 @@ def batch_view(
         dp_rank=dp_rank,
         dp_dummy=dp_rank is not None and is_dummy(batch),
         group_dummies=dummies if dp_rank is not None else 0,
-        draft_rows=draft_rows,
         group_prefills=dp_rank is not None and not mode.running_tokens_are_unified,
         group_max_tokens=group_max_tokens,
         group_needs_eager=mode.sync is not None and mode.sync.any_rank_needs_eager,

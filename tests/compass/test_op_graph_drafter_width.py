@@ -2,9 +2,10 @@
 """A drafter's later passes, read at the batch ATOM runs them at.
 
 `EagleProposer.propose` runs every pass after its first at the step's
-`running_bs` when the drafter declares a draft graph, on every step:
-`ForwardMode.decide` settles it from the ladder and the DP group whether or
-not the target replays. Each step's mode here is `decide`'s own.
+`running_bs`, on every step, whether the drafter declares a draft graph or
+runs those passes eagerly: `ForwardMode.decide` settles it from the ladder
+and the DP group whether or not the target replays. Each step's mode here is
+`decide`'s own.
 """
 
 import json
@@ -97,7 +98,7 @@ def settled(monkeypatch, rows, peers=(), eager=False, step=True, output=True, dr
         ([(3, 3, False)] * 3, (), False, True, ("prefill", 9, 3, True, 4), 4),
         (DECODE, [(1, 16, True)], False, True, ("decode", 3, 4, True, 25, None), 4),
         (DECODE, [(4, 12, False)], True, True, ("decode", 3, 4, True, 21, None), 4),
-        (DECODE, [(4, 12, False)], True, False, ("decode", 3, 3, True, 21, None), 3),
+        (DECODE, [(4, 12, False)], True, False, ("decode", 3, 4, True, 21, None), 4),
     ],
     ids=["prefill", "beside-a-prefilling-peer", "eager-dp", "no-draft-graph"],
 )
@@ -117,7 +118,7 @@ def test_a_drafter_s_later_passes_read_its_graph_at_the_step_s_running_bs(
 
     # No target replays a graph, yet the later passes pad to the step's batch.
     assert view.capture_rung is None
-    assert view.draft_bs == (4 if step else None)
+    assert view.draft_bs == 4
     assert asked[-1] == drafter
     assert cost.draft_seconds == price(gemm(1000 * width, 64, 64), SPEC)
 
