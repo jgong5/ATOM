@@ -76,7 +76,9 @@ PREFILL = [(b, t, c) for b in (1, 8) for t in (16, 256) for c in (0, 768)]
 GRID = ("--backend", "step-grid", "--grid")
 #: The bench's reply for a batch on `test_bench_window.py`'s planted device,
 #: whose kept repeats a measurement publishes as they are.
-BENCHED = Bench(itertools.repeat(MS), itertools.repeat(BUSY)).bench_step(bench_batch())
+BENCHED = Bench(itertools.repeat(MS), itertools.repeat(BUSY)).bench_step(
+    bench_batch(), window.REPEATS
+)
 
 
 def batch(rows, output=True) -> dict:
@@ -105,6 +107,12 @@ def mixed(seed=1, n=20) -> list[dict]:
         qs, cs = rng.integers(16 // b + 1, 256 // b + 1, b), rng.integers(0, 401, b)
         out.append(batch([(int(q), int(q + c), False) for q, c in zip(qs, cs)], output))
     return out
+
+
+def with_output(lines) -> list[dict]:
+    """`lines` but the prefill chunks that produce no output: a grid planned on
+    them holds no such point, which a fit with no such target refuses."""
+    return [x for x in lines if x["rows"][0][2] or x["produces_output"]]
 
 
 def view(line) -> BatchView:
@@ -185,8 +193,11 @@ def record(
     return directory
 
 
-def measured(tmp_path, run, line, origin="plan", seconds=None, conditions=None):
-    """`line`'s step measurement as `measure steps` publishes one, its token."""
+def measured(
+    tmp_path, run, line, origin="plan", seconds=None, conditions=None, sources=None
+):
+    """`line`'s step measurement as `measure steps` publishes one, its token,
+    measured from the inputs `sources`."""
     r, here, configuration = run
     engine = step_grid.keyed(r.config)
     key = measurement_key(configuration, engine, SAMPLING, line)
@@ -196,7 +207,7 @@ def measured(tmp_path, run, line, origin="plan", seconds=None, conditions=None):
         "statistic": "median",
         "repeats": BENCHED["repeats"],
         "origin": origin,
-        "sources": ["planted"],
+        "sources": sources or ["planted"],
         "traces": ["trace-7"],
         "plan": "sha256:another-plan",
     }
@@ -398,11 +409,70 @@ def test_the_residual_is_fitted_on_records_replays_or_both_and_reported_by_sourc
             sum(map(sum, counts)) == (20 * len(sources))
             and sum(h for _, h in counts) == held
         )
+        # Record `a` and the replays, measured from another input, are two
+        # runs, and one of them is held out whole.
+        assert report["split"] == ("run" if len(sources) == 2 else "step")
+        if len(sources) == 2:
+            assert sorted(counts) == [(0, 20), (20, 0)]
         for spread in report["sources"].values():
-            assert abs(spread["centre"]) < 1e-3 and spread["held_out_error"] < 1e-3
+            assert spread["centre"] is None or abs(spread["centre"]) < 1e-3
+            assert spread["held_out_error"] is None or spread["held_out_error"] < 1e-3
     *runs, planned = copy["report"]["provenance"]
     assert sorted({r["source"] for r in runs}) == sources
     assert (planned["source"], planned["traces"]) == ("plan", ["trace-300"])
+
+
+def test_the_residual_holds_out_whole_runs_a_replay_with_its_record(tmp_path, run):
+    """Records `a`, `b` and `c`, and replays of steps `a` ran: each replay is of
+    `a`'s run, so every kind holds out whole runs of the three and reports, per
+    run, its steps and the share past the kind's hull."""
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    targets = [
+        record(tmp_path, run, mixed(seed=seed), name=name)
+        for name, seed in (("a", 3), ("b", 4), ("c", 5))
+    ]
+    runs = [digest(d / "steps/dp0.jsonl") for d in targets]
+    replays = [
+        measured(tmp_path, run, x, "replay", time(x) * factor(x), sources=runs[:1])
+        for x in mixed(seed=6)
+    ]
+    named = [x for d in (g, *targets) for x in clients(d)]
+
+    copy = fitted(tmp_path, *targets, *replays, *named, grid="grid")
+
+    assert copy["params"]["sources"] == ["record", "replay"]
+    for report in copy["report"]["kinds"].values():
+        held = report["held_out_runs"]
+        assert report["split"] == "run" and set(held) < set(runs)
+        assert list(report["runs"]) == sorted(runs)
+        assert report["runs"][runs[0]]["steps"] == 40  # 20 run, 20 replayed
+        held_out = sum(report["runs"][r]["steps"] for r in held)
+        assert held_out == len(report["held_out"])
+        for n in report["runs"].values():
+            assert n["share"] == n["past_hull"] / n["steps"]
+        assert all("step_held_out_error" in m for m in report["members"].values())
+
+
+def test_a_fit_none_of_whose_targets_is_a_chunk_with_no_output_refuses_on_such_a_grid(
+    tmp_path, run
+):
+    """`a` holds no prefill chunk that produces no output. Planned over a record
+    holding such chunks, the fit refuses: its residual would fit none, and a run
+    would price each at the roofline. Planned over one holding none, it fits."""
+    a = record(tmp_path, run, with_output(mixed(seed=3)))
+    for line in nodes():
+        measured(tmp_path, run, line)
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    h = record(tmp_path, run, with_output(nodes() + mixed(seed=2)), name="h")
+
+    with pytest.raises(SystemExit, match="the grid holds 8 points of prefill chunks"):
+        fitted(tmp_path, a, *clients(g), *clients(a), grid="grid")
+    copy = fitted(tmp_path, a, *clients(h), *clients(a), grid="h")
+
+    assert copy["params"]["grid"]["prefill"]["no_output"] == []
+    assert list(copy["params"]["residual"]["kinds"]) == ["decode", "prefill_output"]
 
 
 def replayed(tmp_path, run, lines, slow=0):
@@ -419,34 +489,28 @@ def replayed(tmp_path, run, lines, slow=0):
 def test_planted_outliers_are_dropped_in_their_own_source_of_the_by_source_report(
     tmp_path, run
 ):
-    """One target per source at 3 times its factor, the only one of its kind
-    there: a record's decode step among replayed ones, and a replayed prefill
-    chunk producing output among the record's. The selected member drops each
-    one it fits, which at seed 0 is both, in its own source, and nothing else;
+    """One target per source at 3 times its factor: a replayed decode step among
+    20, and a record's prefill chunk producing output among 20. Each of those
+    kinds holds out the other source, a run of one target, so the selected
+    member fits each outlier and drops it, in its own source, and nothing else;
     the sources' kept, dropped and held-out counts add up to the member's."""
     g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
     for line in nodes():
         measured(tmp_path, run, line)
     lines, replays = mixed(seed=3), mixed()
-    a = record(tmp_path, run, lines[:1] + lines[20:], slow=1)
-    replays = replayed(tmp_path, run, replays[20:21] + replays[:20], slow=1)
+    a = record(tmp_path, run, lines[20:] + lines[:1], slow=1)
+    replays = replayed(tmp_path, run, replays[:20] + replays[20:21], slow=1)
 
     copy = fitted(tmp_path, a, *replays, *clients(g), *clients(a), grid="grid")
 
-    slow = {("decode", "record"), ("prefill_output", "replay")}
+    slow = {("decode", "replay"), ("prefill_output", "record")}
     kinds = copy["report"]["kinds"]
     assert slow <= {(k, s) for k, report in kinds.items() for s in report["sources"]}
     for k, report in kinds.items():
         (selected,) = copy["params"]["residual"]["kinds"][k]["selected"]
         member, sources = report["members"][selected], report["sources"]
         for s, counts in sources.items():
-            if (k, s) in slow:
-                assert (counts["kept"], counts["dropped"] + counts["held_out"]) == (
-                    0,
-                    1,
-                )
-            else:
-                assert counts["dropped"] == 0
+            assert counts["dropped"] == ((k, s) in slow)
         assert sum(s["dropped"] for s in sources.values()) == member["dropped"]
         assert sum(s["kept"] for s in sources.values()) == member["samples"]
         assert sum(s["held_out"] for s in sources.values()) == len(report["held_out"])
@@ -486,11 +550,12 @@ def test_a_held_out_target_outside_the_band_members_bands_reports_an_error_of_1(
 ):
     """Token bands split at 32 and 128. A record's one-row chunks with output,
     timed at 1.25 times their lookup below 128 tokens and 1.5 times above, so
-    the band member is selected; and a replayed chunk of 20 tokens, the only one
-    in its band, which seed 0 holds out. The member holds no factor for that
-    band, so it prices the replay at a factor of 0, a held-out error of 1."""
+    the band member is selected; and a chunk of 20 tokens replayed from the
+    record, so of its run, the only one in its band, which seed 0 holds out.
+    The member holds no factor for that band, so it prices the replay at a
+    factor of 0, a held-out error of 1."""
     monkeypatch.setattr(step_linear_fit, "TOKEN_BANDS", (32, 128))
-    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    g = record(tmp_path, run, with_output(nodes() + mixed(seed=2)), name="grid")
     for line in nodes():
         measured(tmp_path, run, line)
     rng = np.random.default_rng(5)
@@ -503,7 +568,8 @@ def test_a_held_out_target_outside_the_band_members_bands_reports_an_error_of_1(
     )
     a = record(tmp_path, run, lines)
     lone = batch([(20, 20, False)])
-    replay = measured(tmp_path, run, lone, "replay", time(lone) * 1.25)
+    ran = [digest(a / "steps/dp0.jsonl")]
+    replay = measured(tmp_path, run, lone, "replay", time(lone) * 1.25, sources=ran)
 
     copy = fitted(tmp_path, a, replay, *clients(g), *clients(a), grid="grid")
 
@@ -699,7 +765,7 @@ def test_alpha_is_fitted_on_ragged_views_and_kept_only_where_no_cell_gets_worse(
     rung keeps it; where they run at their mean, alpha moves them away, and the
     grid holds none. Nor does it when the second record has fewer than 100
     steps at the rung: a rung needs two cells."""
-    g = record(tmp_path, run, nodes(), name="g")
+    g = record(tmp_path, run, with_output(nodes()), name="g")
     for line in nodes():
         measured(tmp_path, run, line)
     views = [
@@ -803,7 +869,7 @@ def test_alpha_rising_with_the_mean_context_is_fitted_and_priced(
         return 0.1 + 30 * statistics.fmean(r.context_tokens - 1 for r in rows) / 2**16
 
     monkeypatch.setattr(sys.modules[__name__], "alpha_true", by_mean)
-    g = record(tmp_path, run, nodes(), name="g")
+    g = record(tmp_path, run, with_output(nodes()), name="g")
     for line in nodes():
         measured(tmp_path, run, line)
     views = [

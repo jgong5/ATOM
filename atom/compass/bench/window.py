@@ -20,8 +20,8 @@ qualifies, and its point refuses after more than `DOUBLINGS` misses in a row; a
 host that stalls now and then only discards the repeats it stalls.
 
 `WARMUPS` forwards run first, with no preload, and size the first preload: the
-longest the host took to issue one of them. Then `REPEATS` repeats are kept,
-and the statistic is their median. Every worker runs each forward, and the
+longest the host took to issue one of them. Then the burst asked for is kept,
+and the statistic is its median. Every worker runs each forward, and the
 workers agree on it: a repeat counts only where it counts on every worker, the
 host time sizing the preload is the slowest worker's, and the repeat's times
 are the last-opened worker's, the one whose F to B is shortest. Each worker's
@@ -44,6 +44,13 @@ The reply also states `group_needs_eager`: the `any_rank_needs_eager` of the
 entry, so whether an attention backend refused the batch a graph and it ran
 eagerly. Each forward runs the same batch, so each settles alike; a forward
 that settled no mode states false.
+
+A point's repeats come in bursts (`17` D98): `measure steps` asks each point
+for a burst of `BURST`, and for a second once every point has had its first.
+Where the two medians agree within `AGREE` of the first's, the drafter's parts'
+too under a drafter, the point keeps those ten; otherwise it runs on to
+`REPEATS` at once (`more`). The point's statistic is the median of every repeat
+it kept (`joined`).
 """
 
 import copy
@@ -54,8 +61,14 @@ import torch
 import torch.distributed as dist
 
 #: The measuring protocol's version; it changes whenever a count below does.
-PROTOCOL = 1
+PROTOCOL = 2
 WARMUPS = 3
+#: A burst's repeats; a point's first two bursts run a pass of the bench apart.
+BURST = 5
+#: How near the two bursts' medians are kept, relative to the first's: 0.23%,
+#: the median difference between two of #1233's cards (`17` D98).
+AGREE = 0.0023
+#: The repeats a point whose two bursts disagree runs on to.
 REPEATS = 45
 DOUBLINGS = 5
 
@@ -72,12 +85,13 @@ class BenchWindow:
     group the workers agree over, or None for one worker.
     """
 
-    def bench_step(self, batch) -> dict:
-        """`batch` measured: its kept repeats and their median, or a refusal."""
+    def bench_step(self, batch, repeats: int) -> dict:
+        """`batch` measured, a burst of `repeats` kept repeats and their median,
+        or a refusal."""
         preload = max(self._repeat(batch, 0)[-1] for _ in range(WARMUPS))
         longest = preload << DOUBLINGS
         kept, discarded, in_a_row = [], 0, 0
-        while len(kept) < REPEATS:
+        while len(kept) < repeats:
             missed, *times, _host = self._repeat(batch, preload)
             if not missed:
                 kept.append(times)
@@ -95,18 +109,15 @@ class BenchWindow:
                     ),
                 }
             preload = min(2 * preload, longest)
-        result = {
+        return {
             "protocol": PROTOCOL,
-            "median_ns": statistics.median(t[0] - sum(t[3:]) for t in kept),
+            **_medians(kept),
             # each [F to B, F to A, A to B] in ns, and the drafter's part
             "repeats": kept,
             "discarded": discarded,
             "preload_ns": preload,
             "group_needs_eager": self._needs_eager,
         }
-        if len(kept[0]) > 3:
-            result["draft_median_ns"] = statistics.median(t[3] for t in kept)
-        return result
 
     def _repeat(self, batch, preload: int) -> list[int]:
         """One forward behind `preload` ns, agreed by every worker:
@@ -133,6 +144,42 @@ class BenchWindow:
         missed, *_, host = ranks.max(0).values.tolist()
         _, *times, _ = ranks[ranks[:, 1].argmin()].tolist()
         return [missed, *times, host]
+
+
+def more(bursts: list[dict]) -> int:
+    """How many more repeats a point runs after `bursts`, `bench_step`'s
+    results, at least two: none once its first two agree or it holds
+    `REPEATS`, else the rest of `REPEATS`."""
+    first, second = (_medians(b["repeats"]) for b in bursts[:2])
+    agree = all(abs(second[v] - first[v]) <= AGREE * first[v] for v in first)
+    held = sum(len(b["repeats"]) for b in bursts)
+    return 0 if agree or held >= REPEATS else REPEATS - held
+
+
+def joined(bursts: list[dict]) -> dict:
+    """A point's measurement from its `bursts`: every kept repeat and their
+    median, under a drafter their drafter parts' too; how many each burst
+    kept; the repeats discarded and the longest preload; and whether any
+    burst ran the batch eagerly."""
+    kept = [t for b in bursts for t in b["repeats"]]
+    return {
+        "protocol": PROTOCOL,
+        **_medians(kept),
+        "repeats": kept,
+        "bursts": [len(b["repeats"]) for b in bursts],
+        "discarded": sum(b["discarded"] for b in bursts),
+        "preload_ns": max(b["preload_ns"] for b in bursts),
+        "group_needs_eager": any(b["group_needs_eager"] for b in bursts),
+    }
+
+
+def _medians(kept: list) -> dict:
+    """The median of `kept` repeats' target parts, F to B less the drafter's
+    part, and under a drafter that of the drafter's parts."""
+    medians = {"median_ns": statistics.median(t[0] - sum(t[3:]) for t in kept)}
+    if len(kept[0]) > 3:
+        medians["draft_median_ns"] = statistics.median(t[3] for t in kept)
+    return medians
 
 
 class _Forward:

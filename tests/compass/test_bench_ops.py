@@ -3120,7 +3120,10 @@ def test_a_packed_fp4_activation_and_weight_are_built_at_their_shape_and_stride(
         "stride": [4, 1],
         "role": "activation",
     }
-    built = [stub._tensor(x, None, False), stub._weight(x | {"role": "weight"}, 0, 2)]
+    built = [
+        stub._tensor(x, None, False),
+        stub._weight(x | {"role": "weight"}, 0, 2, "x"),
+    ]
 
     for t in built:
         assert t.dtype == torch.float4_e2m1fn_x2
@@ -3135,7 +3138,7 @@ def test_each_weight_a_leaf_cycles_starts_where_the_allocator_starts_a_block():
     stub = ops.Stub(_Runner(), 1)
     w = {"shape": [3], "dtype": F32, "stride": [1], "role": "weight"}
 
-    built = [stub._weight(w, c, 3) for c in range(3)]
+    built = [stub._weight(w, c, 3, "hc_scale") for c in range(3)]
 
     starts = [t.data_ptr() - built[0].data_ptr() for t in built]
     assert [s % 512 for s in starts] == [0, 0, 0] and starts[1] > 0
@@ -3153,10 +3156,10 @@ def test_a_weight_captured_preshuffled_is_built_marked_and_only_that_one():
     [(op, _)] = ops.leaves(_graph(moe)["region"]).values()
     stub = ops.Stub(_Runner(), 1)
 
-    copies = [stub._weight(op["args"]["w1"], c, 2) for c in (0, 1)]
+    copies = [stub._weight(op["args"]["w1"], c, 2, "w1") for c in (0, 1)]
 
     assert all(t.is_shuffled is True for t in copies)
-    assert not hasattr(stub._weight(op["args"]["w2"], 0, 2), "is_shuffled")
+    assert not hasattr(stub._weight(op["args"]["w2"], 0, 2, "w2"), "is_shuffled")
 
 
 def test_a_call_that_fills_a_graph_alone_cycles_no_second_weight():

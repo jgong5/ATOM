@@ -14,12 +14,12 @@ bench, naming the call that got no reply; a device that cannot hold the pool
 stops it naming both counts. The per-request entries `get_num_blocks` replies
 become `config.pool_entries_per_req`, as `EngineCore` carries them to its block
 manager: the state slots a request holds, which the replay rule reads.
-`measure(batch)` runs `bench_step` on every worker and returns rank 0's reply,
-the window's result (`window.py`). `exit()` stops the workers and returns
-once they and every process they had started have exited, or after
-`serve.STOP_GRACE_S`, so a GPU check after it does not find the bench's own
-processes still exiting. Data parallelism above one and pipeline parallelism
-refuse.
+`measure(batch, repeats)` runs `bench_step` on every worker for a burst of
+`repeats` and returns rank 0's reply, the window's result (`window.py`).
+`exit()` stops the workers and returns once they and every process they had
+started have exited, or after `serve.STOP_GRACE_S`, so a GPU check after it
+does not find the bench's own processes still exiting. Data parallelism above
+one and pipeline parallelism refuse.
 
 Under expert parallelism at data-parallel width 1 the workers start as
 without it, every rank runs a point's whole batch, and before the first call
@@ -145,10 +145,12 @@ class Bench:
             self.exit()
             raise
 
-    def measure(self, batch) -> dict:
-        """`batch`'s step, measured on every worker."""
+    def measure(self, batch, repeats: int) -> dict:
+        """`batch`'s step, measured on every worker: a burst of `repeats`."""
         with _refuse_a_stop("bench_step"):
-            return self.runner_mgr.call_func("bench_step", batch, wait_out=True)
+            return self.runner_mgr.call_func(
+                "bench_step", batch, repeats, wait_out=True
+            )
 
     def exit(self) -> None:
         """Stop every worker, then wait at most `serve.STOP_GRACE_S` for the

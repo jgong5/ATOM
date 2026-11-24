@@ -33,11 +33,16 @@ of each rung kept.
 
 Every other target with a device label that the grid answers, past the KV
 pool included, becomes a triple of its view, the lookup and its label, and
-`step_grid_residual.fit` fits the residual on the triples. A target the grid
-refuses is named in the report with the grid's reason; one with no device
-label is counted by why it was cut. A fit with no target the grid answers
-refuses. The targets are taken records first, as they come, then replays in
-their views' order, which the store's order does not move.
+`step_grid_residual.fit` fits the residual on the triples, held out by run: a
+record's own, and a replay's the inputs `measure steps` replayed it from, a
+record named as its run is, so a replayed step is held out with its record. A
+target the grid refuses is named in the report with the grid's reason; one
+with no device label is counted by why it was cut. A fit with no target the
+grid answers refuses, and so does one whose grid holds points of prefill
+chunks that produce no output while no triple is one: its residual would fit
+no `prefill_no_output` step, and a run would price each at the roofline. The
+targets are taken records first, as they come, then replays in their views'
+order, which the store's order does not move.
 
 The bundle is the member `run/step_grid.py` loads: the grid, the residual, the
 plan's bounds, the definition, and the sources its triples came from. The
@@ -45,11 +50,13 @@ report is the residual's by kind, each kind's selected member also broken down
 by source: the triples its MAD pass kept and dropped and those held out, the
 median and scaled MAD of its relative residuals over those kept and dropped,
 as the member's are, and the median absolute one over those held out, a band
-it holds no factor for counting as a factor of 0, as the fit counts it. It
-counts the triples whose lookup is extrapolated past the KV pool, and gives
-per rung each alpha form's terms and errors, the views the grid does not read,
-how many it reads at their longest row past the KV pool, the cells' p50
-without and with alpha, and whether the rung keeps it.
+it holds no factor for counting as a factor of 0, as the fit counts it; and
+by run (`runs`), its triples, how many lie past the kind's hull and that
+share, which a run of them would extrapolate. It counts the triples whose
+lookup is extrapolated past the KV pool, and gives per rung each alpha form's
+terms and errors, the views the grid does not read, how many it reads at their
+longest row past the KV pool, the cells' p50 without and with alpha, and
+whether the rung keeps it.
 
 Under a drafter, which the plan states by its draft width, each measurement
 also holds the drafter's value, `draft_seconds`, which becomes its point's
@@ -152,7 +159,7 @@ def _part(grid: dict, views, targets, seed: int, drafter: bool) -> tuple:
     kept = _kept(grid, terms, labelled, seed, alphas, drafter)
     grid = _alpha_grid(grid, {r: terms[r] for r in kept}, drafter)
     lookup = StepGrid(grid, drafter)
-    triples, sources, unpriced, past = [], [], [], 0
+    triples, sources, runs, unpriced, past = [], [], [], [], 0
     cut = Counter(s.cut for s in targets if _label(s, drafter) is None)
     for s in labelled:
         try:
@@ -167,16 +174,26 @@ def _part(grid: dict, views, targets, seed: int, drafter: bool) -> tuple:
         past += bool(beyond)
         triples.append((s.view, float(value * lookup.unit), _label(s, drafter)))
         sources.append(s.provenance["source"])
+        runs.append(_run(s))
+    label = "a draft" if drafter else "a device"
     if not triples:
         raise ValueError(
             f"none of the {len(targets)} targets is a step the grid answers, "
-            f"with a {'draft' if drafter else 'device'} label and inside a "
-            "complete cell"
+            f"with {label} label and inside a complete cell"
         )
-    residual, kinds = fit(triples, seed)
+    residual, kinds = fit(triples, seed, runs)
+    if grid["prefill"]["no_output"] and "prefill_no_output" not in kinds:
+        raise ValueError(
+            f"the grid holds {len(grid['prefill']['no_output'])} points of prefill "
+            "chunks that produce no output, and none of the targets is such a "
+            f"chunk the grid answers, with {label} label: the "
+            f"{'drafter ' if drafter else ''}residual would fit no "
+            "prefill_no_output step, and a run would price each at the roofline"
+        )
     fitted = Residual(residual).kinds
     for k, report in kinds.items():
         held, dropped, by = set(report["held_out"]), set(report["dropped"]), {}
+        hull, by_run = fitted[k].hull, {}
         for i, (view, looked_up, measured) in enumerate(triples):
             if kind(view) != k:
                 continue
@@ -188,9 +205,23 @@ def _part(grid: dict, views, targets, seed: int, drafter: bool) -> tuple:
             part = 2 if i in held else 1 if i in dropped else 0
             errors = by.setdefault(sources[i], ([], [], []))
             errors[part].append(factor * looked_up / measured - 1.0)
+            run = by_run.setdefault(runs[i], {"steps": 0, "past_hull": 0})
+            run["steps"] += 1
+            run["past_hull"] += not hull.contains(x)
         report["sources"] = {source: _spread(*e) for source, e in sorted(by.items())}
+        report["runs"] = {
+            run: n | {"share": n["past_hull"] / n["steps"]}
+            for run, n in sorted(by_run.items())
+        }
     report = {"kinds": kinds, "unpriced": unpriced, "cut": dict(cut)}
     return grid, residual, report | {"past_pool": past, "alpha": alphas}, sources
+
+
+def _run(s) -> str:
+    """The run a target came from: a record's own, and a replay's, the inputs
+    `measure steps` replayed it from (`inputs`), a record's named as its run."""
+    inputs = s.provenance.get("inputs")
+    return "; ".join(inputs) if inputs else s.provenance["run"]
 
 
 def _alpha(grid: StepGrid, views, seed: int, drafter=False) -> tuple[dict, dict]:
@@ -308,13 +339,11 @@ def _p50s(grid: dict, terms: dict, decode, cells, rungs, seed: int, drafter) -> 
             continue
     out = {}
     for cell in cells:
-        others = [
-            (s.view, g, _label(s, drafter))
-            for s, g in priced
-            if s.provenance["run"] != cell
-        ]
+        theirs = [(s, g) for s, g in priced if s.provenance["run"] != cell]
+        others = [(s.view, g, _label(s, drafter)) for s, g in theirs]
+        runs = [_run(s) for s, _ in theirs]
         try:
-            fitted = Residual(fit(others, seed)[0]).kinds["decode"]
+            fitted = Residual(fit(others, seed, runs)[0]).kinds["decode"]
         except ValueError:
             continue
         errors = {}
