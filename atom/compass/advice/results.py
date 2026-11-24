@@ -260,7 +260,7 @@ def _calibrating(expansion, candidate, point, run: Path, out: Path) -> list[str]
     if ended:
         why = (
             f"the calibration in {ended} has ended, so calibrate.sh records nothing "
-            "more there, and its records taken again in a new OUT fit the same "
+            "more there, and its records taken again in a new directory fit the same "
             "vectors, which refuse these steps again"
         )
         return [f"no calibrate.sh command: {why}"]

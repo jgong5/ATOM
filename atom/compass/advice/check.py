@@ -44,8 +44,9 @@ that calibration publishes into, unless they are at their key there; into the
 calibration's own store, only once it has started, as a publish there before
 would leave its directory holding files, which `calibrate.sh` refuses.
 A calibration that has ended records nothing more, so the next goes into a new
-directory; where it would take what the ended one took (`_refits`), it would
-refit the same law, and the verdict says so in place of a command.
+directory; where it would take what the ended one took and the law it fitted is
+at the configuration's key at the head's ATOM digest (`_refits`), it would refit
+that law, and the verdict says so in place of a command.
 A readings verdict ``measure`` names the `compass measure memory` command,
 under the instance's variables, a 1P1D side's on the connector a real start of
 it takes.
@@ -76,7 +77,6 @@ import functools
 import itertools
 import json
 import os
-import re
 import shlex
 import shutil
 import signal
@@ -124,12 +124,15 @@ INPUTS = "inputs"
 #: A candidate's calibration directory after its first, in OUT's `CAL`, by
 #: its count from 2: no candidate's name holds a ``+``.
 AGAIN = "{}+{}"
+#: The step linear law a calibration fits, in its directory, as `calibrate.sh`
+#: writes it.
+FITTED = Path("fit_steps", "step_linear_law.json")
 #: What stands for the command of a candidate whose calibration has ended,
-#: when one in a new directory would take what it took (`_refits`).
+#: when one in a new directory would refit its law (`_refits`).
 REFITS = (
     "no calibrate.sh command: the calibration in {} has ended on the inputs a "
-    "new one would take, at the head's ATOM digest, so a new one refits the law "
-    "it published into {}"
+    "new one would take, its law at this configuration's key at the head's ATOM "
+    "digest, so a new one refits the law it published into {}"
 )
 #: What a start runs: a server on one node, a deployment on 1P1D.
 COMPASS, DEPLOY = (
@@ -536,8 +539,8 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     over this process's ``AITER_LOG_LEVEL``, with those the script sets over
     them (`drive_run.side_env`). `made` is the calibration's directory, traces
     and the shared store a ``calibrate`` verdict's command takes, and the
-    directory of one that ended before it, or None, whose law a command taking
-    its inputs refits, named `REFITS` in its place (`_refits`); a
+    directory of one that ended before it, or None, whose law a command
+    refitting it (`_refits`) gives way to `REFITS`; a
     `calibrate.sh` command's verdict states, for `_borrowing`, its
     ``calibration``: the ``key`` its law is published at, by model, platform
     and engine config, its directory, ``in``, and the store it publishes
@@ -575,7 +578,7 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                     key = [config.model, machine_platform(machine), keyed(config)]
                     into = str(into or made[0] / "store")
                     law["calibration"] = {"key": key, "in": str(made[0]), "into": into}
-                    if (ended := made[3]) and _refits(ended, command, atom):
+                    if (ended := made[3]) and _refits(ended, command, config, atom):
                         held = started_store(ended) or ended / "store"
                         law["made_by"] = [REFITS.format(ended, held)]
                         del law["calibration"]  # nothing for `_borrowing` to name
@@ -655,12 +658,16 @@ def started_store(directory: Path) -> str | None:
     return next((s[len("store ") :] for s in given if s.startswith("store ")), None)
 
 
-def _refits(ended: Path, command: str, atom: str) -> bool:
-    """Whether the `calibrate.sh` `command` takes what the calibration that
-    ended in `ended` took, as its `INPUTS` state it: ATOM's arguments, the
-    traces and the records, on a tree whose ATOM digest is the head's, `atom`;
-    in a new directory it would record the same and refit the same law. No
-    command, as `lacking.calibration` words why there is none, takes nothing."""
+def _refits(ended: Path, command: str, config, atom: str) -> bool:
+    """Whether the `calibrate.sh` `command` for `config` refits the law the
+    calibration that ended in `ended` fitted: it takes what that one took, as
+    its `INPUTS` state it (ATOM's arguments, the traces and the records), and
+    that law's key states `config`'s model, the head's ATOM digest `atom`, and
+    `config`'s engine config as `keyed` states it under this environment, the
+    instance's, whose performance variables the command sets, as `reuse.law`
+    matches a store law to `config`. No command, as `lacking.calibration`
+    words why there is none, takes nothing; a directory holding no law refits
+    none."""
     if str(lacking.CALIBRATE) not in (line := command.split("\n")[0]):
         return False
     words = shlex.split(line)
@@ -671,24 +678,15 @@ def _refits(ended: Path, command: str, atom: str) -> bool:
     taken += [f"record {record}" for record in words[at + 2 :]]
     inputs = ended / INPUTS
     given = inputs.read_text().splitlines() if inputs.is_file() else []
-    # calibrate.sh writes `traces TRACES CAL_TRACES` and `tree <commit>`.
+    # calibrate.sh writes `traces TRACES CAL_TRACES`.
     took = [s.rsplit(" ", 1)[0] if s.startswith("traces ") else s for s in given]
     took = [s for s in took if s.startswith(("atom ", "traces ", "record "))]
-    tree = next((s[len("tree ") :] for s in given if s.startswith("tree ")), "")
-    return took == taken and _atom_of(tree) == atom
-
-
-@functools.cache
-def _atom_of(commit: str) -> str | None:
-    """The ATOM digest of the ``atom/`` `commit` holds in the repository of the
-    tree `atom` resolves under, None when it is not a commit's hex name or git
-    cannot read it there."""
-    if not re.fullmatch("[0-9a-f]+", commit):
-        return None
-    try:
-        return compass_run.committed_atom_digest(reuse.TREE, commit)
-    except ValueError:
-        return None
+    if took != taken or not (ended / FITTED).is_file():
+        return False
+    key = json.loads((ended / FITTED).read_text())["key"]
+    model = compass_run._file_digest(config.model, "config.json")
+    held = {"model": model, "source_root": compass_run.source_root(atom)}
+    return reuse.at_key(key, keyed(config), **held)
 
 
 def _resolved(args, arch: str):

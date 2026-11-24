@@ -9,8 +9,8 @@ its candidate ``calibrating``, its command the one that resumes it once none
 runs, while its status file ends in a step's start or end, and ``missing a
 law`` again, its command resuming it, once that file ends in a failure. Once
 it ends in the calibration's end, the next calibration goes into
-``cal/<candidate>+2``, unless it would take what the ended one took, at the
-head's ATOM digest, and refit the same law.
+``cal/<candidate>+2``, unless it would take what the ended one took and refit
+its law, at the candidate's key at the head's ATOM digest.
 
 The configuration, its stubbed resolution and starts are `test_advice_check`'s:
 the store holds readings of the configuration as the deployment resolves it,
@@ -45,6 +45,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.drive import lacking, reuse
 from atom.compass.run import memory
+from atom.compass.run.step_grid import keyed
 
 #: A candidate with no readings at its key in the store, and one with them,
 #: whose argument the stubbed resolution reads none of; the first's
@@ -58,6 +59,22 @@ def _env(found: dict, name: str) -> dict:
     (command,) = found[name]["made_by"]
     words = shlex.split(command.split("\n")[0])
     return dict(w.split("=", 1) for w in words if "=" in w and w[0].isupper())
+
+
+def _fitted(directory, config, atom=None) -> None:
+    """The law the stub's fit wrote in `directory`, keyed as `compass fit steps`
+    keys it: `config`'s model and engine config, under this process's
+    environment, its records at the ATOM digest `atom`, else this tree's."""
+    law = directory / check.FITTED
+    held = json.loads(law.read_text())
+    held["key"] = {
+        "model": compass_run._file_digest(config.model, "config.json"),
+        "engine_config": json.dumps(keyed(config), sort_keys=True),
+        "source_root": compass_run.source_root(atom),
+        "form": "history",
+        **keyed_platform(Kind.STEP_LINEAR_LAW, PLATFORM),
+    }
+    law.write_text(json.dumps(held))
 
 
 def _readings_at_another_digest(store, config) -> None:
@@ -151,7 +168,7 @@ def test_a_started_calibration_s_command_keeps_the_store_its_inputs_name(
         ("fail cal2-c4 12 s: client.sh exit 1; see x", "missing a law", 1),
     ],
 )
-def test_a_calibration_s_status_makes_it_calibrating_until_it_fails_or_ends(
+def test_a_calibration_s_status_makes_it_calibrating_until_it_fails(
     tmp_path, stubbed, capsys, last, state, ended  # noqa: F811
 ):
     status = tmp_path / "out" / "cal" / "b" / "status"
@@ -182,28 +199,32 @@ def test_a_calibration_s_status_makes_it_calibrating_until_it_fails_or_ends(
 
 
 @pytest.mark.parametrize(
-    "since", ["the tree moved", "its arguments changed", "nothing"]
+    "since",
+    ["the tree moved", "its arguments changed", "its environment changed", "nothing"],
 )
 def test_an_ended_calibration_s_candidate_calibrates_anew_unless_that_refits_its_law(
     tmp_path, stubbed, monkeypatch, since  # noqa: F811
 ):
     """b's printed calibration, run by `calibrate.sh` in `test_calibrate`'s
-    stub tree at its commit ``cafe``, ends. The next search prints the next
-    calibration into ``cal/b+2``, where it records, its status read for b's
-    state, or why none serves where it would take what the ended one took at
-    the head's ATOM digest."""
+    stub tree at its commit ``cafe``, ends, its law keyed as a fit keys it. The
+    next search prints the next calibration into ``cal/b+2``, where it records,
+    its status read for b's state, or why none serves where it would take what
+    the ended one took and that law is at b's key at the head's ATOM digest."""
     monkeypatch.setenv("AIPERF_PYTHON", "/real/python")
-    cal, args = tmp_path / "out" / "cal", UNREAD["args"]
-    (first,) = advise(tmp_path, {"b": UNREAD})["b"]["made_by"]
+    cal, b = tmp_path / "out" / "cal", UNREAD
+    (first,) = advise(tmp_path, {"b": b})["b"]["made_by"]
     assert _calibrated(tmp_path, first)[0] == 0
-    atom = "0" * 64 if since == "the tree moved" else compass_run.atom_digest()
-    monkeypatch.setattr(check, "_atom_of", {"cafe": atom}.get)
+    atom = "0" * 64 if since == "the tree moved" else None
+    _fitted(cal / "b", resolved(stubbed.config, ["--max-num-seqs", "4"]), atom)
     if since == "the tree moved":
         (tmp_path / "ATOM" / ".compass-commit").write_text("beef\n")
     elif since == "its arguments changed":
-        args = {"--max-num-seqs": 2}
+        # One the stubbed resolution reads none of: its inputs move, its key not.
+        b = {"args": UNREAD["args"] | READ["args"]}
+    elif since == "its environment changed":
+        b = UNREAD | {"env": {"ATOM_USE_TRITON_MOE": "1"}}
 
-    found = advise(tmp_path, {"b": {"args": args}})["b"]
+    found = advise(tmp_path, {"b": b})["b"]
 
     assert (found["state"], "calibration" in found) == ("missing a law", False)
     (command,) = found["made_by"]
@@ -214,7 +235,7 @@ def test_an_ended_calibration_s_candidate_calibrates_anew_unless_that_refits_its
     assert f" {lacking.CALIBRATE} {cal / 'b+2'} " in command
     # Its first record fails, and the next search reads cal/b+2's status.
     assert _calibrated(tmp_path, command, CLIENT_FAIL="cal1-c")[0] == 1
-    stopped = advise(tmp_path, {"b": {"args": args}})["b"]
+    stopped = advise(tmp_path, {"b": b})["b"]
     assert stopped["calibration"].startswith(f"{cal / 'b+2' / 'status'}, ")
     (resumed,) = stopped["made_by"]
     status, log = _calibrated(tmp_path, resumed)
