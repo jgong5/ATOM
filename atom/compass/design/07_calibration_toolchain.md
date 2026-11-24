@@ -2106,7 +2106,7 @@ The layouts and the step kinds no vector fits:
 | DP dummy forwards, and decodes beside a prefilling peer | no record fits either: a dummy rank gives no row, and a step whose ranks fall to different vectors is cut (`step_linear_fit.py::_groups`); T131 |
 | a pipeline stage | `fit steps` reads a record's stage 0 alone (`atom/compass/fit/samples.py::_record`), and `--trace` refuses PP (`atom/compass/drive/record.py::refuse_trace`); T129 |
 | a 1P1D side | T121 |
-| context parallel | out: the fit refuses it (`step_linear_fit.py::refuse_context_parallel`) |
+| context parallel | decode: the law's engine config states the width and the DCP knobs (`atom/compass/run/step_grid.py::keyed`), so a run at another refuses it (`run/__init__.py::refuse_unfitted_law`); prefill: out, the fit refuses it (`step_linear_fit.py::refuse_context_parallel`) |
 
 ### Reason
 

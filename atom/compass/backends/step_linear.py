@@ -41,6 +41,22 @@ DeepSeek-V4.1 DP2 EP2, store_bF5) steps whose largest rank ran 8k-24k tokens
 beside a peer under a quarter of them ran 21-28 ms over the law on every
 record, beside a larger peer 6-10 ms and beside a dummy 1-3 ms, both ranks'
 device windows alike and their host launches long done.
+Then, for a model with KDA layers (`kda_layers`: Kimi-K3), it may add `KDA`, the
+recurrent state work its step does beside the tokens (`kda_columns`), four of
+them the step's `BatchView.kda` counts: `kda_seqs`, the rows holding a KDA
+state (each read and written once); `kda_saves`, the midstep checkpoints the
+forward writes; `kda_forks`, the rows that read their state from another slot
+(a prefix-cache hit resuming at a checkpoint slot; Kimi-K3.1's PAGE-backed
+checkpoints restore instead, a move); `kda_moves`, the state slot moves and
+paged checkpoint copies run before the forward; and, off the rows,
+`kda_pad_blocks`, the padding of the prefill rows' last chunks in chunks,
+`Sum ceil(N_Q / c) - N_Q / c` at the recurrence's chunk `c` (`KDA_CHUNK`). The chunk kernel's work is
+`Sum ceil(N_Q / c)` chunks, which `tokens` holds but for that padding: a column
+of the chunks themselves is `tokens / c` but for it: on synthetic Kimi records
+(`tests/compass/test_step_linear_kda.py`) its VIF against the other columns was
+1.2e5, the padding's 2.0. A vector with these columns states its
+`kda_chunk`, which must be `KDA_CHUNK`, and a step stating no `kda` counts is
+refused.
 Last, a prefill vector may add `padding`, the rows its token graph runs past
 the step's tokens (`token_padding`): ATOM replays a prefill's first layers at
 the smallest of the vector's `buckets`, the prefill token-graph buckets the
@@ -158,6 +174,7 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
               "hull": HULL,
               "rowmod": k,    # a decode vector with a `rowmod` coefficient only
               "duty_tau": s,  # a prefill vector with a `cold_peer_rows` coefficient only
+              "kda_chunk": c, # a prefill vector with `KDA` coefficients only
               "declared": "<where it was fitted>",  # optional
               "held_out": {"hull": HULL, "bands": {<band>: ERRORS, ...}}}  # optional
 
@@ -201,6 +218,14 @@ from atom.compass.backends.work import activated_experts
 
 PREFILL = ("step", "tokens", "query_square", "query_cached")
 HISTORY = PREFILL + ("history",)
+#: A KDA model's prefill columns: `BatchView.kda`'s counts in its order, then the
+#: prefill rows' chunk padding (`kda_columns`).
+KDA = ("kda_seqs", "kda_saves", "kda_forks", "kda_moves", "kda_pad_blocks")
+#: The chunk, in tokens, Kimi-K3's KDA prefill recurrence runs its rows in: aiter's
+#: FlashKDA path (`kimi_delta_attn.flash_kda.FLASH_KDA_CHUNK`), which its
+#: `chunk_kimi_delta_attn` takes at Kimi-K3's K = V = 128 with a safe gate; its
+#: default pipeline runs 64.
+KDA_CHUNK = 32
 #: The prefill vector's optional features, in the order they follow `PREFILL`.
 PREFILL_EXTRA = (
     "history",
@@ -212,6 +237,7 @@ PREFILL_EXTRA = (
     "out",
     "peer_small",
     "peer_large",
+    *KDA,
     "padding",
     "eager_dummy",
     "eager_dummy_tail",
@@ -273,6 +299,12 @@ class _Vector:
                     f"constant {self.duty_tau!r}; a view states its duty at "
                     f"{DUTY_TAU} s"
                 )
+        if any(f in KDA for f in features) and spec.get("kda_chunk") != KDA_CHUNK:
+            raise ValueError(
+                f"the {name} vector carries KDA columns over a chunk of "
+                f"{spec.get('kda_chunk')!r} tokens; a view states its padding at "
+                f"{KDA_CHUNK}"
+            )
         self.buckets = None
         if "padding" in features:
             self.buckets = tuple(sorted(int(b) for b in spec.get("buckets") or ()))
@@ -281,6 +313,28 @@ class _Vector:
                     f"the {name} vector carries padding and states no buckets, "
                     "the prefill token-graph buckets it pads to"
                 )
+
+
+def kda_layers(hf_config) -> int:
+    """How many KDA layers the model config `hf_config` states, in its text
+    config's `linear_attn_config` (Kimi-K3's, Kimi-Linear's); 0 for none."""
+    text = getattr(hf_config, "text_config", None) or hf_config
+    linear = getattr(text, "linear_attn_config", None) or {}
+    return len(linear.get("kda_layers") or ()) if isinstance(linear, Mapping) else 0
+
+
+def kda_columns(view: BatchView) -> tuple | None:
+    """`KDA`'s columns of `view`'s step: its `kda` counts, then the padding of
+    its prefill rows' last chunks of `KDA_CHUNK` tokens, in chunks, the
+    chunked recurrence running each row from its own first token; no padding
+    on a step whose rows hold no state (a data-parallel dummy's). None for a
+    view stating no counts."""
+    if view.kda is None:
+        return None
+    padded = (
+        sum(-r.query_tokens % KDA_CHUNK for r in view.prefill) if view.kda[0] else 0
+    )
+    return (*view.kda, padded / KDA_CHUNK)
 
 
 def moe_tokens(view: BatchView) -> int | None:
@@ -343,7 +397,8 @@ def dummy_view(view: BatchView) -> BatchView:
     """The view of a data-parallel rank's dummy forward at the prefill step a
     peer's `view` states: the one-token row at position 0 a record's dummy
     line holds (`ModelRunner.dummy_execution`), producing output as those
-    lines say, with the group's fields its peer states."""
+    lines say, with the group's fields its peer states; under a KDA model no
+    state work, as its batch schedules no request holding a state."""
     import dataclasses
 
     return dataclasses.replace(
@@ -356,6 +411,7 @@ def dummy_view(view: BatchView) -> BatchView:
         draft_bs=None,
         target_bs=None,
         image_tokens=0,
+        kda=None if view.kda is None else (0,) * len(view.kda),
     )
 
 
@@ -582,6 +638,14 @@ class StepLinearBackend(CostBackend):
             if share := [f for f in PEER_SHARE if f in vector.features]:
                 got = dict(zip(PEER_SHARE, peer_share(batch_view)))
                 counts += tuple(got[f] for f in share)
+            if kda := [f for f in KDA if f in vector.features]:
+                if (columns := kda_columns(batch_view)) is None:
+                    raise self._refuse(
+                        batch_view,
+                        "no KDA state counts on this step, which its prefill "
+                        "vector's KDA columns price",
+                    )
+                counts += tuple(dict(zip(KDA, columns))[f] for f in kda)
             if vector.buckets:
                 padding = token_padding(batch_view, vector.buckets)
                 if padding is None:

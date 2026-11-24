@@ -586,8 +586,8 @@ def test_a_context_parallel_record_states_its_width_and_the_step_linear_fit_refu
         )
     assert str(refused.value) == (
         "the records' engine config states prefill_context_parallel_size 2, and "
-        "a step linear law states no context-parallel width, so a run at width 1 "
-        "would price with it"
+        "a step linear law states no prefill context-parallel width, so a run at "
+        "width 1 would price with it"
     )
     assert not (tmp_path / "law.json").exists()
 
