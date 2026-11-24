@@ -83,9 +83,11 @@ def runs(request, tmp_path_factory):
 
 
 def test_each_model_meets_every_scenario_check(runs):
-    """At level 1, every check but the hand-computed timeline, which only a
-    constant stub's run has; there, the model's attention and its routed
-    experts are among the terms the roofline priced."""
+    """At level 1, the level-0 case's checks but one: the engine's
+    hand-computed timeline, `check_run`'s records, which it computes only for a
+    constant step stub, from that stub's prefill and decode costs. There the
+    model's attention and its routed experts are among the terms the roofline
+    priced."""
     form, level, done = runs
     run = done[0]
     print(
