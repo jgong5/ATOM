@@ -60,9 +60,16 @@ Set up QUICKSTART's [Environment](QUICKSTART.md#environment) and
   cd /
   ```
 
-The store the space file names must hold the platform readings of the target's
-cards (QUICKSTART's Environment, "The platform"), or every candidate is refused
-with the store's reason.
+A search reads the platform readings of the target's cards (QUICKSTART's
+Environment, "The platform") from the store the space file names. Where that
+store holds none at SPACE's machine, it reads the copy committed for that
+machine under [laws/platform_readings/](laws/platform_readings/), and looks
+every law and readings entry up at the copy's stack, the `software_stack` and
+`torch` of its `key`; with neither, every candidate is refused with the store's
+reason. A calibration publishes at the stack it ran at, so a store holding no
+platform readings serves what it published only when that stack is the copy's:
+unless the target runs that stack, publish the target's readings into the shared
+store, as QUICKSTART's Environment does, before the first calibration.
 
 ## 1. Fill the space file
 
@@ -296,19 +303,20 @@ calibration beside other work fits that load into its laws.
 
 **Where it publishes.** With `STORE=<the shared store>`, as printed when the
 shared store holds neither readings at the configuration's key nor a law of it
-at the head, it publishes the law and the memory readings there, beside the
-platform readings, and the next `compass advice SPACE OUT` reads them. Without
+at the head, it publishes the law and the memory readings there, and the next
+`compass advice SPACE OUT` reads them. Without
 `STORE`, as printed when the shared store holds one of them, which a second
 publish at its key would meet, it publishes into its own
 `OUT/cal/<candidate>/store`. Once a calibration has started, its printed command
 keeps the store it started with, which its `OUT/cal/<candidate>/inputs` names,
 so a resume publishes where the first run did. A search looks each candidate up
-in those stores, the latest published into first, then in the shared store, but
-passes by a store with no platform readings for SPACE's machine, and a
-calibration's own store starts with none. Once such a calibration has ended,
-take them into its store on two idle cards of the target, as QUICKSTART's
-Environment ("The platform") takes them, `<token>` the one the first command
-prints:
+in those stores, the latest published into first, then in the shared store. A
+store holding no platform readings, as a calibration's own store starts, is read
+with the copy committed for SPACE's machine (Before the first search), and
+passed by where there is none. So once a calibration has ended whose stack is
+not the copy's, or whose machine has no copy, take the platform readings into
+its store on two idle cards of the target, as QUICKSTART's Environment ("The
+platform") takes them, `<token>` the one the first command prints:
 
 ```bash
 compass measure device --gpu <a card>,<another card> --store OUT/cal/S1/store --out OUT/cal/S1.device
@@ -418,4 +426,4 @@ An agent that runs this guide for a user keeps these rules:
 | `before it runs, set AIPERF_PYTHON` under a printed command | the shell that ran the search did not set it | set it in the shell that starts the calibration |
 | a candidate `refused` with `ATOM's parser: unrecognized arguments: ...` | a flag ATOM does not have, such as a misspelt one | correct the space file |
 | a candidate `refused` with `--server-port ... is among ATOM's arguments; the driver owns it` | an argument `compass run` assigns, `--host` or a port | leave it out, as What a space file leaves out says |
-| a calibrated candidate still `missing a law` | its calibration failed, or it published into its own store, which holds no platform readings | its `calibration:` line; resume it, or take its store's `measure device` and `fit device` (step 3) |
+| a calibrated candidate still `missing a law` | its calibration failed, or it published into a store holding no platform readings, at another stack than the committed copy's or on a machine with none | its `calibration:` line; resume it, or take its store's `measure device` and `fit device` (step 3) |

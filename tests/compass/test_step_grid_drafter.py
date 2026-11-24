@@ -178,7 +178,7 @@ def test_its_line_names_the_drafters_residual():
         backend(drafted())
         .describe()
         .endswith(
-            "; drafter recipe step-grid-residual v3, members decode: half; "
+            "; drafter recipe step-grid-residual v4, members decode: half; "
             "prefill_output: half; prefill_no_output: half"
         )
     )
@@ -261,7 +261,7 @@ def test_each_kv_limit_is_the_largest_context_the_replay_rule_fits_in_the_pool(
     for rung, bs in nodes["B"].items():
         for b in bs:
             limit = 16 * (30 // b) - width - lookahead
-            assert limit in nodes["c"][rung] or limit >= 2048 - width
+            assert limit in nodes["c"][rung] or limit >= 2048 - width - lookahead
             fits = {"rows": [[width, limit + width, True]] * b, "produces_output": True}
             rule.batch(fits)
             over = {**fits, "rows": [[width, limit + 1 + width, True]] * b}
@@ -269,7 +269,7 @@ def test_each_kv_limit_is_the_largest_context_the_replay_rule_fits_in_the_pool(
                 ValueError, match="KV blocks of 16 tokens, and the pool"
             ):
                 rule.batch(over)
-        assert 2048 - width in nodes["c"][rung]
+        assert 2048 - width - lookahead in nodes["c"][rung]
     assert planned["decode"]["pool"] == {
         "block_size": 16,
         "blocks": 30,
@@ -341,24 +341,42 @@ def target(line) -> float:
     return grid_fit.planted_time(line) * grid_fit.factor(line)
 
 
+def flash_ahead() -> int:
+    """The positions past a row that DSpark5's draft round writes, as the
+    planner reads them from the engine."""
+    engine = {**BOUNDS, "kv_cache_block_size": 256, "num_kvcache_blocks": 1}
+    engine |= {"ladder": [8], "speculative": ["dspark", K]}
+    target = step_grid_plan._target(grid_fit.DEFINITION, {"flash": engine})
+    return target["lookahead"]
+
+
 def flash_nodes() -> list[dict]:
     """Every node batch of the grid the planner places for `BOUNDS` under
-    DSpark5: decode's top c node is max_model_len less a verify step's 6."""
+    DSpark5: both top c nodes are less the draft round's positions past a
+    row, decode's max_model_len less a verify step's 6 too."""
+    top = BOUNDS["max_model_len"] - flash_ahead()
     out = [
         grid_fit.batch([(K + 1, c + K + 1, True)] * b)
         for b in (1, 8)
-        for c in (0, 512, 1018)
+        for c in (0, 512, top - K - 1)
     ]
-    return out + [x for x in grid_fit.nodes() if not x["rows"][0][2]]
+    top -= BOUNDS["max_num_batched_tokens"]
+    prefill = [(b, t, c) for b in (1, 8) for t in (16, 256) for c in (0, top)]
+    for output in (True, False):
+        out += [
+            grid_fit.batch([(t // b, c + t // b, False)] * b, output)
+            for b, t, c in prefill
+        ]
+    return out
 
 
 def flash_mixed(seed=1, n=20) -> list[dict]:
-    """`n` verify steps of 2 to 8 rows on cached contexts 0 to 1018, and
-    `test_backend_step_grid_fit.mixed`'s prefill chunks."""
+    """`n` verify steps of 2 to 8 rows on cached contexts 0 to decode's top c
+    node, and `test_backend_step_grid_fit.mixed`'s prefill chunks."""
     rng = np.random.default_rng(seed)
-    out = []
+    out, top = [], BOUNDS["max_model_len"] - flash_ahead()
     for _ in range(n):
-        ks = rng.integers(K + 1, 1025, rng.integers(2, 9))
+        ks = rng.integers(K + 1, top + 1, rng.integers(2, 9))
         out.append(grid_fit.batch([(K + 1, int(k), True) for k in ks]))
     return out + grid_fit.mixed(seed, n)[n:]
 
@@ -415,7 +433,10 @@ def test_a_v41_flash_dspark5_verify_step_is_priced_from_a_fitted_bundle(
     for line in flash_nodes():
         flash_measured(tmp_path, flash, line)
 
-    copy = fit_steps(tmp_path, a, *clients(a))
+    # Seed 1 holds out ragged chunks of every kind; seed 0 holds out only
+    # homogeneous nodes of the chunks without output, where every member
+    # prices 1.25 to within 1e-8 and a band member is as likely selected.
+    copy = fit_steps(tmp_path, a, *clients(a), "--seed", "1")
     backend = loaded(tmp_path, flash, copy)
 
     params, report = copy["params"], copy["report"]

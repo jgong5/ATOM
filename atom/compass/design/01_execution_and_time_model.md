@@ -28,6 +28,10 @@ its renewal waits as D6.1's blocking lookup does, with D6.1's park in a DP group
 (b), as the owner's ruling on [#3804](https://github.com/jgong5/ATOM/issues/3804) directs:**
 D3 grants a TAR an arrival on an offering channel first, and I4 lets a handler offer a send.
 
+**Revised 2026-11-24 by [#3799](https://github.com/jgong5/ATOM/issues/3799):** D6.2's LP
+answers a put of a key in flight as Mooncake does; the allocator flags are accepted, not
+modelled.
+
 **Scope of this document.** The execution architecture: what a simulated run *is*,
 which processes exist, how virtual time advances, and what contract the rest of the
 system must honour. It does **not** cover the cost model, the memory model, model
@@ -2636,7 +2640,20 @@ which keeps v0.3.14's rules below):
   existence query grants each present key's group `--default_kv_lease_ttl` from the
   query ([`MasterService::ReadExistence`](https://github.com/kvcache-ai/Mooncake/blob/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store/src/master_service.cpp)),
   a published object's lease starts at its publication (`PutEnd`'s zero-length grant),
-  and a put of a key the Store holds is a read of it (`PutStart`).
+  and a put of a key the Store holds is a read of it (`PutStart`). A put of a key an
+  earlier put holds in flight, from that save's start to its end (*Saves*), takes no
+  bytes and grants no lease, and the object stays the earlier put's: `PutStart` answers
+  it `OBJECT_ALREADY_EXISTS` and leases only a readable replica, which an unpublished
+  object lacks, and Mooncake's client answers the key 0 with no transfer
+  ([`client_service.cpp`](https://github.com/kvcache-ai/Mooncake/blob/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store/src/client_service.cpp)),
+  so ATOM's worker counts the chunk saved
+  (`worker.py::MooncakeStoreOffloadConnector._do_save_req`). A later put that comes
+  more than `put_start_discard_timeout_sec` after the key's `PutStart` (30 s,
+  [`types.h`](https://github.com/kvcache-ai/Mooncake/blob/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store/include/types.h);
+  the entry refuses the flag) discards the earlier put instead, but `_do_save_req`
+  makes one `client.put` per window, so that time runs from the key's window, not the
+  save's start: a put 30 s into a save meets each key absent, published or inside its
+  window's put, and neither save fails. The LP's save-long span is `12` T135's.
 - **Eviction**, `MasterService::EvictionThreadFunc` every 10 ms
   (`master_service.h::kEvictionThreadSleepMs`): while used bytes over capacity exceed
   `--eviction_high_watermark_ratio`, a round evicts
@@ -2786,12 +2803,18 @@ estimated here.
   (`share_cache`, `prefix_spread`); every other policy keeps per-NIC pools on distinct
   masters;
 - a master flag other than those the entry models (`--default_kv_lease_ttl`,
-  `--eviction_high_watermark_ratio`, `--eviction_ratio`, `--rpc_thread_num`) or accepts
-  as changing nothing a requester is told: `--rpc_port`, `--enable_http_metadata_server`,
-  `--http_metadata_server_host`, `--http_metadata_server_port`, `--metrics_port`,
-  `--client_ttl` (no simulated client dies), and `--allocation_strategy` and
-  `--memory_allocator` (one pool of the owners' summed bytes, used counted at the
-  requested size as `OffsetBufferAllocator::allocate` records it). Soft pins, SSD or DFS
+  `--eviction_high_watermark_ratio`, `--eviction_ratio`, `--rpc_thread_num`) or accepts.
+  It accepts as changing nothing a requester is told `--rpc_port`,
+  `--enable_http_metadata_server`, `--http_metadata_server_host`,
+  `--http_metadata_server_port`, `--metrics_port` and `--client_ttl` (no simulated
+  client dies). It accepts `--allocation_strategy` and `--memory_allocator` as not
+  modelled (`12` T135): the LP holds one pool of the owners' summed bytes, used counted
+  at the requested size as `OffsetBufferAllocator::allocate` records it, where the
+  master places each object on one owner's segment, tried from a random start
+  ([`RandomAllocationStrategy::Allocate`](https://github.com/kvcache-ai/Mooncake/blob/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store/include/allocation_strategy.h)),
+  so a put can fail with `NO_AVAILABLE_HANDLE` below the summed capacity, and that
+  failure starts an eviction round below the mark (`MasterService::AllocateReplicas`
+  sets `need_mem_eviction_`, which `EvictionThreadFunc` reads). Soft pins, SSD or DFS
   offloading, NoF and tenants refuse with the rest;
 - master flags that set no positive `--rpc_thread_num`: the master then runs as many
   handler threads as the smaller of 16 and its host's cores
@@ -2833,6 +2856,25 @@ put{keys, groups, s, e} -------> transfer#dp1, at t+r
                                                                  start l < v+ttl, end m
                                                                  at m: _do_load_req, all keys
                                                                  present: finished_loading
+```
+
+**Two instances save one new prefix at once** (#3799). Both missed it, and their ranks
+put the same keys:
+
+```text
+engine-P0.dp0 (step loop)        LP mooncake_store               engine-P1.dp0 (step loop)
+save of chunks 0-3 on a save
+lane, start s0, end e0
+put{keys, groups, s0, e0} -----> at s0: take 4 objects' bytes
+                                                                 save of chunks 0-3 on a save
+                                                                 lane, start s1, end e1
+                                 at s1 <------------------------ put{keys, groups, s1, e1}
+                                 s0 < s1 < e0:
+                                 in flight, no bytes, no lease
+                                 at e0: publish P0's objects;
+                                 leases to e0
+                                                                 at e1: _do_save_req, every
+                                                                 key 0: counted saved
 ```
 
 **A stale hit renewed inside a DP group:**
@@ -2996,6 +3038,12 @@ marker, contention at the owners, fragmentation. Code tasks, after this text lan
    step tables, an eviction round runs, and the simulated KV budget holds the real
    reserve.
 6. **Calibration and validation** [GPU], then the C1228 run through `deploy.sh`.
+7. **The allocator flags stated as not modelled**
+   ([#3998](https://github.com/jgong5/ATOM/issues/3998)):
+   `kv/mooncake_store_server.py`'s module docstring and `ACCEPTED`'s comment state
+   `--allocation_strategy` and `--memory_allocator` as accepted, not modelled. About 5
+   lines; a CPU test: a put of a key in flight, through the LP's frames, takes no bytes
+   and grants no lease.
 
 Acceptance: the C1228 run's TTFT p50 and p99, ITL p50 and output throughput; the Store's
 lookups, hit chunks, loads across instances, evicted objects and renewals; the
@@ -3438,7 +3486,7 @@ Ordered by how much they could cost.
 | D5.1 | The simulated run uses stdlib asyncio, not uvloop: only a Python event loop can host virtual time | 2026-09-28 |
 | D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only; a rank pair's writes queue on its link | 2026-09-18; revised 2026-09-28; link sharing 2026-10-16 (#1157); first-write setup 2026-10-16 (#1172); per-pair links kept under RDMA 2026-11-09 (#1179) |
 | D6.1 | The lmcache MP server is LP `lmcache`, a Compass stand-in on the real ZMQ channels with a content index and two stations; a store or load completes as a stamped reply that the step loop takes in timestamp order; a blocking lookup is a request and reply whose wait is an idle point; inside a DP group each member parks before its forward, amending member join rules 1, 2 and 5, and the last park releases every member at the group's time; it sizes a chunk and the state image from its deployment's published plan before its first job, and its transfer channels are one per DP rank | 2026-10-16 (#1087, #1162); revised 2026-11-17 (#3687) |
-| D6.2 | A shared Mooncake Store's master is LP `mooncake_store`, a Compass stand-in holding objects, leases and Mooncake's eviction, its loop LP `lmcache`'s factored; each rank's lookups and renewals are requests and replies on its lookup channel, a renewal's wait an idle point with D6.1's park in a DP group; each rank's saves and loads are priced on its own lanes (`03` D13.1), a put sent as the save is queued carrying its priced start and end; ATOM's scheduler half runs as real code; the code is `dsv41/dev`'s | 2026-11-19 (#3762) |
+| D6.2 | A shared Mooncake Store's master is LP `mooncake_store`, a Compass stand-in holding objects, leases and Mooncake's eviction, its loop LP `lmcache`'s factored; each rank's lookups and renewals are requests and replies on its lookup channel, a renewal's wait an idle point with D6.1's park in a DP group; each rank's saves and loads are priced on its own lanes (`03` D13.1), a put sent as the save is queued carrying its priced start and end; ATOM's scheduler half runs as real code; the code is `dsv41/dev`'s | 2026-11-19 (#3762); revised 2026-11-24 (#3799) |
 | D7 | Atomesh gets no virtual clock: mesh-only mode; in 1P1D the router is one segment of a channel, not an LP, and its relay latency is that channel's lookahead; its bounds are configured (health check and circuit breaker off, `--worker-request-timeout-secs` set large); timestamps ride carriers it already relays; under `--dp-aware`, or with several instances per role, the router is LP `router`, handling requests, prefill responses and stream events in timestamp order (#449, #1085) | 2026-09-18; revised 2026-09-30, 2026-10-15, 2026-10-16 |
 | D8 | Arrivals are messages in transit, covered by the send and receive counts for closed and open workloads alike; the arrival timestamp rides the `tracestate` header | 2026-09-18; revised 2026-09-28 |
 | D9 | The ATOM diff is enumerated (~1,980 lines with tests) and completeness enforced by test rather than by review; ATOM's own suite is the gate (`08` D43.1) | 2026-09-18; revised 2026-09-28 |

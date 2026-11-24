@@ -49,8 +49,9 @@ bench ran it eagerly), its device seconds (`seconds`), under a drafter the
 target's, and the drafter's (`draft_seconds`), its `origin` (`replay`,
 `plan` or `ragged`) and the `traces` the batch came from.
 Its sample's provenance holds its `source`, the origin, its `run`, the entry's
-digest, those `traces`, and `profiled` false: the bench times a
-replay unprofiled.
+digest, those `traces`, its `inputs`, the inputs `measure steps` read it from
+(`sources`, a record named as a record's `run` is), and `profiled` false: the
+bench times a replay unprofiled.
 
 Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
@@ -364,6 +365,7 @@ def _measurement(store: ArtifactStore, key) -> tuple[Sample, dict]:
             "requests": [],
             "config": None,
             "traces": sorted(m["traces"]),
+            "inputs": sorted(m.get("sources", ())),
             "profiled": False,
         }
         values = key.values

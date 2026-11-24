@@ -280,7 +280,7 @@ class LMCacheMPShell:
                     rt.check_arrival(ch, arrival, seq)
                     self._read[ch, seq] = (arrival, frames)
                 with rt.lock:
-                    if rt.released[back] <= rt.arrived[back]:
+                    if not rt.unread[back]:
                         break
                 sock.poll()
         with rt.lock:

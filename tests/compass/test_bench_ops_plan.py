@@ -17,16 +17,15 @@ from unittest.mock import patch
 import pytest
 import torch
 from test_artifact_store import (
-    CONDITIONS,
-    GATES,
     clean_checkout,  # noqa: F401  autouse
     stanza,
 )
 from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
 from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
+from test_op_graph_arch import run_readings
 
 from atom.compass import capture, cli, ir
-from atom.compass.artifacts import ArtifactStore, Topology, member_name
+from atom.compass.artifacts import ArtifactStore, GateState, Topology, member_name
 from atom.compass.bench import ops
 from atom.compass.capture import driverless, forward, graph_key
 from atom.compass.capture.forward import decode, prefill, structure
@@ -957,15 +956,16 @@ def test_an_integer_activation_indexes_a_dimension_of_one():
 
 
 def _publish_graph(store, config, arch, shape):
-    """A graph of `shape` keyed on `arch`, its one leaf named for the arch."""
+    """A graph of `shape` keyed on `arch`, its one leaf named for the arch,
+    handed off under this process's readings, as `trace ops` hands one off."""
     key = graph_key(structure(config, shape.phase, device=arch), str(shape))
     leaf = _leaf(f"aiter.{arch}", ("x", _t([shape.seqs, 8], "activation")))
     store.publish(
         key,
         provenance=stanza("compass trace ops"),
         topology=Topology(),
-        conditions=CONDITIONS,
-        gates=GATES,
+        conditions=run_readings(config.model),
+        gates=GateState.of(),
         members={
             member_name("graph", ops.RANK, "json"): json.dumps(
                 _graph(leaf, layers=1)
@@ -1318,8 +1318,8 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
             key,
             provenance=stanza("compass trace ops"),
             topology=Topology(),
-            conditions=CONDITIONS,
-            gates=GATES,
+            conditions=run_readings(str(tmp_path / "model")),
+            gates=GateState.of(),
             members={
                 member_name("graph", ops.RANK, "json"): json.dumps(
                     _graph_at(store, None, at.shape)
@@ -1507,3 +1507,30 @@ def test_a_filled_prefill_point_the_bench_refuses_is_asked_once(
 
     refused = [(r["shape"], r["context"]) for r in records if "refused" in r]
     assert refused == [("prefill T=60 B=1", None)] and len(asked) == 1
+
+
+def test_a_plan_fills_prefill_families_at_one_and_four_rows_on_one_skeleton(
+    bench, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ops, "_child", _moving_bench)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[1, 1, False]], None),  # B = 1 at T = 1, fewer tokens than B = 4's rows
+        ([[40, 2040, False]], None),
+        ([[150, 150, False]], None),
+        ([[10, 10, False]] * 4, None),  # B = 4 at T = 40
+        ([[50, 50, False]] * 4, None),  # and at T = 200
+    )
+
+    records = _plan(bench, tmp_path, plan)
+
+    attn = {
+        (ops._shape(r["shape"]).seqs, ops._shape(r["shape"]).tokens)
+        for r in records
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill")
+    }
+    # Both row counts' attention shares one token axis, which holds B = 1's T = 1:
+    # B = 4 fills T = 150, B = 1's between its own 40 and 200, and nothing under 4.
+    assert {t for b, t in attn if b == 4} == {40, 150, 200}
+    assert {t for b, t in attn if b == 1} == {1, 40, 150}
