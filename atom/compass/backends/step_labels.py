@@ -9,8 +9,11 @@ prices them; neither reads a step's stamps. Neither takes a record whose
 run.json names `BUILDS`, the JIT compiles its server ran while it served, unless
 run.json also times each (`COMPILES`) and places them on the step record's
 clock (`CLOCK`): then each rank's steps that overlap a compile are cut whole as
-`JIT`, no device, draft or host label, and the record is taken unless they are
-more than `JIT_BOUND` of a rank's forwards. `refusal` says why one is not.
+`JIT`, no device, draft or host label, a forward whose host segments overlap
+one loses its host labels (below), and the record is taken unless the steps
+cut whole are more than `JIT_BOUND` of a rank's forwards. `cut_refusal` says
+why one is not. Grading takes no real run that names `BUILDS` (`refusal`): a
+stall delays every request after it, so its error is no longer the simulator's.
 
 A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
 `dp_rank`. An older record's lines state neither count: `group_tokens`
@@ -130,7 +133,9 @@ pipeline stage, `W_recv` runs from the launch to the receive of its input.
 Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
 pull after the previous exit, and `E_out` from the exit to the pull after it.
 `L_mtp` is `mtp_copy`'s time on a forward whose MTP status wait began before
-the event it waits for.
+the event it waits for. A forward has no host label when a timed compile
+overlaps its segments, from the previous line's exit to its own pull
+(`jit_hosts`): one between two forwards would sit in the later one's `E`.
 `label_run` labels a run's DP ranks together: there `E` runs from the latest
 pull, else exit, over the ranks before the same forward, where the group's
 `_sync_dp_state` releases each of them.
@@ -143,7 +148,7 @@ group's launch path, eagerly past the largest prefill token graph, for as long
 as a prefill's own body, after waiting for the step before it at its MTP status
 wait, and the group's next forward enters only once it has left. Each holds its
 view (`step_linear.dummy_view` of the group's fields) and the launch features its
-line states.
+line states. A dummy forward whose segments overlap a timed compile gives none.
 
 A step's `admitted` is what its `E` spent admitting requests (`admissions`):
 the scheduler allocates a request's whole prompt the first time it schedules
@@ -230,36 +235,46 @@ def _prefill_label() -> str:
 ACCEPT_BUILDS_ENV = "COMPASS_ACCEPT_JIT_BUILDS"
 
 
-def refusal(run: dict, ranks: Iterable[list[dict]]) -> str | None:
-    """Why grading, a fit or `validate.cost` refuses a record whose run.json is
-    `run` and whose rank records' lines are `ranks`, naming the modules of its
-    `BUILDS`: run.json does not time them, or the steps they cut (`jit_steps`)
-    are more than `JIT_BOUND` of a rank's forwards. None when it names none,
-    or when `ACCEPT_BUILDS_ENV` is ``1`` (then a warning names them)."""
-    if not (builds := run.get(BUILDS)):
-        return None
-    if os.environ.get(ACCEPT_BUILDS_ENV) == "1":
-        print(
-            f"WARNING: {ACCEPT_BUILDS_ENV}=1 takes a record whose server ran "
-            f"a JIT compile of {builds} while it served; a step may have "
-            "waited on it",
-            file=sys.stderr,
+def refusal(run: dict) -> str | None:
+    """Why grading refuses a real run whose run.json is `run`, naming the
+    modules of its `BUILDS`; None when it names none, or when
+    `ACCEPT_BUILDS_ENV` is ``1`` (then a warning names them)."""
+    if builds := run.get(BUILDS):
+        if os.environ.get(ACCEPT_BUILDS_ENV) == "1":
+            print(
+                f"WARNING: {ACCEPT_BUILDS_ENV}=1 takes a record whose server ran "
+                f"a JIT compile of {builds} while it served; a step may have "
+                "waited on it",
+                file=sys.stderr,
+            )
+            return None
+        return (
+            f"its server ran a JIT compile of {builds} while it served, "
+            "so a step may have waited on it"
         )
+    return None
+
+
+def cut_refusal(run: dict, ranks: Iterable[list[dict]]) -> str | None:
+    """Why a fit or `validate.cost` refuses a record whose run.json is `run`
+    and whose rank records' lines are `ranks`, as `refusal` does, unless
+    run.json times its `BUILDS` and the steps they cut (`jit_steps`) are at
+    most `JIT_BOUND` of each rank's forwards."""
+    if (why := refusal(run)) is None:
         return None
     if COMPILES not in run or CLOCK not in run:
         return (
-            f"its server ran a JIT compile of {builds} while it served, "
-            f"so a step may have waited on it, and its run.json has no {COMPILES} "
-            f"and {CLOCK} to place them among its steps"
+            f"{why}, and its run.json has no {COMPILES} and {CLOCK} to place "
+            "them among its steps"
         )
     spans = compile_spans(run)
     for lines in ranks:
         forwards = [s for s in lines if not s["is_dummy_run"]]
         if (n := len(jit_steps(forwards, spans))) > JIT_BOUND * len(forwards):
             return (
-                f"its server's JIT compiles of {builds} overlap {n} of DP rank "
-                f"{forwards[0]['dp_rank']}'s {len(forwards)} forwards, more than "
-                f"{JIT_BOUND:.0%}"
+                f"its server's JIT compiles of {run[BUILDS]} overlap {n} of DP "
+                f"rank {forwards[0]['dp_rank']}'s {len(forwards)} forwards, more "
+                f"than {JIT_BOUND:.0%}"
             )
     return None
 
@@ -290,6 +305,18 @@ def jit_steps(lines, spans) -> set[int]:
     }
 
 
+def jit_hosts(lines, spans) -> set[int]:
+    """The steps of `lines`, one rank's record, whose host segments overlap one
+    of `spans`: from the previous line's exit, where its `E` may start, or the
+    first line's entry, to the step's own pull, where its `E_out` ends."""
+    out, start = set(), lines[0]["t_enter_ns"] if lines else None
+    for s in lines:
+        if any(lo <= _pull(s) and start <= hi for lo, hi in spans):
+            out.add(s["step"])
+        start = s["t_exit_ns"]
+    return out
+
+
 def _spans(record: Path) -> list[tuple[int, int]]:
     """`compile_spans` of the run.json in `record`'s run directory, beside its
     `steps`; none without one, or when `ACCEPT_BUILDS_ENV` takes it whole."""
@@ -314,7 +341,7 @@ class Sample:
     drafter's draft-KV pass, on a step that produces output; None elsewhere.
     `host` holds the segments it has, in seconds: no `W_post` on a middle chunk,
     no `E` on the record's first forward or after an idle engine (`idle`), none
-    on a step cut `JIT`.
+    on a step cut `JIT` or whose segments overlap a compile (`jit_hosts`).
     `provenance` holds `source`, `run` (the run's digest), `requests` (the
     request ids the step served) and `config` (the host key the record states,
     or None).
@@ -762,17 +789,20 @@ def _segments(s: dict, output: bool) -> dict:
 DUMMY_SEGMENTS = ("W_pre", "W_inputs", "W_launch", "W_post")
 
 
-def _dummy_hosts(lines, peaks, tails) -> tuple:
+def _dummy_hosts(lines, peaks, tails, dropped) -> tuple:
     """`Sample.dummy_host` of a rank's `lines`: each dummy forward at a step
     its group prefills, its line holding a prefill row, with its view, the
     group's fields from `peaks` and `tails` (`group_peaks`, `group_tails`), its
-    `DUMMY_SEGMENTS` in seconds and its line's launch features."""
+    `DUMMY_SEGMENTS` in seconds and its line's launch features; none at a step
+    of `dropped`, whose host segments overlap a compile (`jit_hosts`)."""
     from atom.compass.backends.step_linear import dummy_view
 
     out = []
     for s in lines:
         rows = s.get("rows") or ()
         if not (s["is_dummy_run"] and "t_launch_ns" in s and rows) or rows[0][2]:
+            continue
+        if s["step"] in dropped:
             continue
         view = dummy_view(
             BatchView(
@@ -818,7 +848,8 @@ def _label(
             "by its device time"
         )
     (exposed, early), traced = _host_cut(lines), _traced(path)
-    jit = jit_steps(lines, _spans(path))
+    spans = _spans(path)
+    jit, jit_host = jit_steps(lines, spans), jit_hosts(lines, spans)
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     window_prefill = _prefill_label() == "record" and not traced
@@ -840,7 +871,7 @@ def _label(
             peers = [read_jsonl(p) for p in _peers(path)]
             dummy_ranks, peaks = group_dummies(peers), group_peaks(peers)
             tails = group_tails(peers)
-        dummy_host = _dummy_hosts(lines, peaks, tails or frozenset())
+        dummy_host = _dummy_hosts(lines, peaks, tails or frozenset(), jit_host)
     for i, s in enumerate(lines):
         if s["is_dummy_run"]:
             prev = s
@@ -932,7 +963,9 @@ def _label(
         idle = prev is not None and not busy[i]
         if prev is not None and not idle:
             host["E"] = enter - starts[i - 1]
-        host = {} if traced or cut == JIT else {k: v * 1e-9 for k, v in host.items()}
+        if traced or s["step"] in jit_host:
+            host = {}
+        host = {k: v * 1e-9 for k, v in host.items()}
         provenance = {
             "source": "record",
             "run": run,

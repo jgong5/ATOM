@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 """The aiter JIT modules a real server built, or began to, while it served,
 which run.json names as ``aiter_jit_builds`` and times as ``jit_compiles``, one
-entry per compile with its artifact and its first and last file's mtime;
-grading, the fits and `validate.cost` cut the steps that overlap one, or refuse
-the record (`step_labels.refusal`).
+entry per compile with its artifact and its first and last file's mtime. The
+fits and `validate.cost` cut the steps that overlap one, or refuse the record
+(`step_labels.cut_refusal`); grading refuses a run that names one
+(`step_labels.refusal`).
 
 aiter builds a module the first time a process meets a kernel variant its
 image did not prebuild, and keeps it for every later process of that aiter
@@ -43,7 +44,12 @@ from pathlib import Path
 from torch._inductor.runtime.cache_dir_utils import default_cache_dir
 from triton import knobs
 
-from atom.compass.backends.step_labels import BUILDS, COMPILES, refusal  # noqa: F401
+from atom.compass.backends.step_labels import (  # noqa: F401
+    BUILDS,
+    COMPILES,
+    cut_refusal,
+    refusal,
+)
 from atom.compass.run import _write_whole
 
 

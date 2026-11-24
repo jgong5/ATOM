@@ -124,7 +124,7 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     some ranks only are refused, and so is a record whose every rank ran only
     dummy forwards.
     So is a record whose run.json, beside `record`, names `aiter_jit_builds`
-    that `step_labels.refusal` refuses; a step overlapping a timed compile is cut.
+    that `step_labels.cut_refusal` refuses; a step overlapping a timed compile is cut.
     On several ranks, the report's ``ranks`` holds per kind and rank number
     the graded steps that rank was priced as (`accuracy._rank`), with its cards' buses.
     """
@@ -132,7 +132,7 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     identity = read_json(run) if run.is_file() else None
     ranks = sorted(Path(record).glob("dp*[0-9].jsonl"))
     records = [read_jsonl(r) for r in ranks]
-    if identity is not None and (built := aiter_jit.refusal(identity, records)):
+    if identity is not None and (built := aiter_jit.cut_refusal(identity, records)):
         raise ValueError(f"{record} is not costed: {built}")
     lines = {r.name: len(x) for r, x in zip(ranks, records)}
     if not ranks or max(lines.values()) - min(lines.values()) > 1:

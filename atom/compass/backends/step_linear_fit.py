@@ -21,7 +21,8 @@ Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 states the labels; the command writes each record's per-step table beside it.
 A record refuses, before any table is written, when the run.json beside the
 `steps` directory its path resolves into names JIT compiles its server ran
-(`step_labels.refusal`).
+that it does not time, or that cut too many of its steps
+(`step_labels.cut_refusal`).
 A step whose device label is cut is counted under its reason and not fitted.
 Prefill labels come from trace runs alone (`step_labels`); given none, the
 prefill vector is left out and named under `unfitted`. A trace run gives no
@@ -3115,12 +3116,13 @@ def _records_parser(prog: str, description: str) -> argparse.ArgumentParser:
 def _labelled(args) -> tuple[list, dict, dict, dict]:
     """`args.records`' samples, each record's table, the options `fit` takes
     on them and the engine config they ran under. A record whose server built
-    an aiter JIT module refuses, and so does an engine file that contradicts
+    an aiter JIT module refuses as `step_labels.cut_refusal` says, and so does
+    an engine file that contradicts
     `--engine` at the records' longest ladder."""
     for record in args.records:
         run = Path(record).resolve().parent.parent / "run.json"
         if run.is_file() and (
-            built := step_labels.refusal(
+            built := step_labels.cut_refusal(
                 json.loads(run.read_text()), [json_file.read_jsonl(record)]
             )
         ):

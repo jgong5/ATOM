@@ -1575,10 +1575,11 @@ not prebuild, such as `mha_varlen_fwd`'s for a prefill step of one new token a
 row, about 60 s inside the run, and keeps it in the container's aiter tree, which
 no cache directory above holds. A record names each module its server built, or
 began to, in run.json's `aiter_jit_builds`, times each in `jit_compiles` with
-the clocks that place it among the steps (`clock_ns`), and grading, `compass fit
-steps`, `compass fit host`, `step_linear_fit` and `validate.cost` cut the steps
-that overlap one. They refuse the record, naming them, when its run.json times
-none, or the cut is above `step_labels.JIT_BOUND` of a rank's forwards.
+the clocks that place it among the steps (`clock_ns`). `compass fit steps`,
+`compass fit host`, `step_linear_fit` and `validate.cost` cut the steps that
+overlap one, and refuse the record, naming them, when its run.json times none,
+or the cut is above `step_labels.JIT_BOUND` of a rank's forwards. Grading
+refuses the run, naming them: a stall delays every later request.
 So sweep a fresh container before its first record, on a server whose record
 nothing reads: `compass record --sweep --gpu G $S --out $R/sweep1 -- $ATOM` with
 `client.sh $R/sweep1 --sweep --traces A-B --stop`, A to B every trace the cell's

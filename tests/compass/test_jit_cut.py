@@ -2,12 +2,15 @@
 """A record whose server compiled while it served: each compile timed from its
 cache files (`aiter_jit.builds_since`) and placed on the step record's clock by
 run.json's clock pair, each rank's steps that overlap it cut whole as `jit` by
-`validate.cost` and the fits, the record refused only when its compiles carry
-no times or cut too many steps, and one-run grading counting them."""
+`validate.cost` and the fits, a forward whose host segments overlap one left
+without host labels, the record refused only when its compiles carry no times
+or cut too many steps; and grading, by `validate.runs` or `one_real.py`,
+refusing the run whole however few steps they cut."""
 
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -21,6 +24,7 @@ from test_fit_steps import (  # noqa: F401  planted_roots: autouse
     record,
 )
 from test_validate_cost import LAW, _record, _steps
+from test_validate_runs import GRADED, _four, _recorded
 
 from atom.compass.backends import step_labels
 from atom.compass.backends.step_labels import (
@@ -32,24 +36,29 @@ from atom.compass.backends.step_labels import (
     JIT_SLACK_NS,
 )
 from atom.compass.drive import aiter_jit
-from atom.compass.validate import stalls
 from atom.compass.validate.cost import cost_accuracy
+from atom.compass.validate.runs import grade
 
 #: The wall clock when the step record's monotonic clock read 0.
 WALL = 1_795_000_000_000_000_000
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "compass" / "one_real.py"
 
 
-def _compiled(run_dir, *spans):
-    """run.json naming a kernel compiled over each of `spans`, (first, last)
-    file written on the step record's clock, timed and with the clock pair."""
+def _timed(*spans) -> dict:
+    """run.json's entries naming a kernel compiled over each of `spans`,
+    (first, last) file written on the step record's clock, timed and with the
+    clock pair."""
     compiles = [
         {"compiler": "triton", "name": "_k", "artifact": f"/c/{i}"}
         | {"first_ns": WALL + a, "last_ns": WALL + b}
         for i, (a, b) in enumerate(spans)
     ]
-    run = {BUILDS: ["_k"], COMPILES: compiles, CLOCK: [WALL, 0]}
-    (run_dir / "run.json").write_text(json.dumps(run))
+    return {BUILDS: ["_k"], COMPILES: compiles, CLOCK: [WALL, 0]}
+
+
+def _compiled(run_dir, *spans):
+    """run.json holding only `_timed`'s entries."""
+    (run_dir / "run.json").write_text(json.dumps(_timed(*spans)))
 
 
 def _windowed(record):
@@ -175,32 +184,93 @@ def test_builds_since_times_each_compile_by_its_artifact(tmp_path, monkeypatch):
     ]
 
 
-def test_one_real_counts_the_compiles_in_its_graded_window_and_the_steps_they_cut(
+def test_a_compile_between_two_forwards_leaves_the_later_one_no_host_label(
     tmp_path, monkeypatch
 ):
-    """Two ranks of 1 s steps; one compile before the window, two in step 5."""
+    """Decode steps 14 and 15 enter one device busy time apart; a compile in
+    between overlaps neither's window, so neither is cut, and step 15, whose
+    `E` holds it, loses its host labels."""
+    monkeypatch.delenv(ACCEPT_BUILDS_ENV, raising=False)
+    monkeypatch.setattr(step_labels, "JIT_SLACK_NS", 0)
+    record = _record(tmp_path / "steps", _steps()) / "dp0.jsonl"
+    lines = [json.loads(x) for x in record.read_text().splitlines()]
+    at = (lines[14]["t_exit_ns"] + lines[15]["t_enter_ns"]) // 2
+    _compiled(tmp_path, (at, at))
+
+    samples = {s.step: s for s in step_labels.label(record)[0]}
+
+    assert samples[15].cut is None and samples[15].device_s is not None
+    assert samples[15].host == {}
+    assert "E" in samples[14].host and "E" in samples[16].host
+
+
+def test_a_dummy_forward_that_overlaps_a_compile_gives_no_dummy_host(
+    tmp_path, monkeypatch
+):
+    """Steps 3 and 7 are a DP rank's dummy forwards, each running one prefill
+    row, as at a step its group prefills; a compile overlaps step 3's."""
+    monkeypatch.delenv(ACCEPT_BUILDS_ENV, raising=False)
+    monkeypatch.setattr(step_labels, "JIT_SLACK_NS", 0)
+    steps = [(None, None) if i in (3, 7) else x for i, x in enumerate(_steps())]
+    record = _record(tmp_path / "steps", steps, group=[steps, _steps()]) / "dp0.jsonl"
+    lines = [json.loads(x) for x in record.read_text().splitlines()]
+    for i in (3, 7):
+        lines[i]["rows"] = [[1, 1, False]]
+    record.write_text("".join(json.dumps(s) + "\n" for s in lines))
+    _compiled(tmp_path, (lines[3]["t_enter_ns"], lines[3]["t_enter_ns"]))
+
+    samples = step_labels.label(record)[0]
+
+    assert [d[0] for d in samples[0].dummy_host] == [7]
+
+
+def test_grading_refuses_a_record_whose_timed_compiles_a_fit_takes(
+    tmp_path, monkeypatch
+):
+    """A real run's steps timed 1 ms apart and a compile after them all: the
+    fits and `validate.cost` cut nothing and take its record; grading, which
+    takes the cell without it, refuses it whole."""
+    monkeypatch.delenv(ACCEPT_BUILDS_ENV, raising=False)
+    *real, simulated = _four(tmp_path)
+    for cell in real:
+        _recorded(cell)
+    _recorded(simulated, **GRADED)
+    grade(real, simulated)
+    _recorded(real[1], **_timed((10**15, 10**15)))
+    run = json.loads((real[1] / "run.json").read_text())
+    path = real[1] / "steps" / "dp0.jsonl"
+    lines = [
+        json.loads(x) | {"t_enter_ns": i * 10**6, "t_exit_ns": (i + 1) * 10**6 - 1}
+        for i, x in enumerate(path.read_text().splitlines())
+    ]
+    path.write_text("".join(json.dumps(s) + "\n" for s in lines))
+
+    assert step_labels.cut_refusal(run, [lines]) is None
+    named = re.escape("its server ran a JIT compile of ['_k'] while it served")
+    with pytest.raises(ValueError, match=f"r1 is not graded: {named}, so a step"):
+        grade(real, simulated)
+
+
+def test_one_real_refuses_a_real_run_that_compiled_while_it_served(
+    tmp_path, monkeypatch, capsys
+):
+    """However few steps its compiles cut, as `validate.runs` refuses it: of a
+    deployment, naming the side whose server compiled."""
+    monkeypatch.delenv(ACCEPT_BUILDS_ENV, raising=False)
     spec = importlib.util.spec_from_file_location("one_real", SCRIPT)
     one_real = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(one_real)
-    real = tmp_path / "real"
-    (real / "steps").mkdir(parents=True)
-    for rank in (0, 1):
-        lines = [
-            {"step": i, "t_enter_ns": i * 10**9, "t_exit_ns": (i + 1) * 10**9 - 1}
-            for i in range(10)
-        ]
-        (real / "steps" / f"dp{rank}.jsonl").write_text(
-            "".join(json.dumps(s) + "\n" for s in lines)
-        )
-    _compiled(
-        real,
-        (1_500_000_000, 1_500_000_000),
-        (5_500_000_000, 5_500_000_000),
-        (5_600_000_000, 5_700_000_000),
-    )
-    monkeypatch.setattr(stalls, "window", lambda run: (2.0, 8.0))
+    real, sim = tmp_path / "real", tmp_path / "sim"
+    for run in (real, sim):
+        (run / "artifacts").mkdir(parents=True)
+        (run / "artifacts/client_run.json").write_text('{"arguments": {}}')
+    for side in ("prefill", "decode"):
+        (real / side).mkdir()
+        (real / side / "run.json").write_text("{}")
+    _compiled(real / "decode", (10**15, 10**15))
 
-    assert one_real.compiled(real) == (
-        "real: 2 of 3 JIT compiles in the graded window; the steps they cut "
-        "there: 2 forwards over its ranks, 1.000 s on the rank they cut most"
+    assert one_real.main([str(real), str(sim)]) == 1
+    named = "its server ran a JIT compile of ['_k'] while it served"
+    assert capsys.readouterr().err == (
+        f"{real / 'decode'} is not graded: {named}, so a step may have waited on it\n"
     )

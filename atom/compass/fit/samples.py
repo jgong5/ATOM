@@ -14,7 +14,7 @@ no sample; its file still counts in the run's digest. An empty
 rank file lost its lines, and refuses.
 A record whose run.json names `ptl_changes` refuses, naming them, and so does
 one whose `source` counts uncommitted files, or one whose `aiter_jit_builds`
-`step_labels.refusal` refuses; a step that overlaps a timed compile is cut.
+`step_labels.cut_refusal` refuses; a step that overlaps a timed compile is cut.
 With `GRADED_ONLY_ENV` set to ``1``, a record's samples are its graded steps
 (`graded_steps`): those within some client run's graded span, from the first
 step in which a rank holds one of the requests it names as sent (its export's
@@ -192,7 +192,7 @@ def _record(
             f"{steps} holds {ARRIVALS}, so its steps are not numbered as its lines"
         )
     record = served(steps, client_runs)
-    if built := aiter_jit.refusal(run, record.values()):
+    if built := aiter_jit.cut_refusal(run, record.values()):
         raise ValueError(f"{directory} is not fitted: {built}")
     spans = client_spans(record)
     # Each step within a calibration ladder's span, to the rungs it calibrates.

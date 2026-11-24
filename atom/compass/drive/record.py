@@ -52,10 +52,11 @@ run.json's ``aiter_jit_builds`` names each aiter JIT module or kernel built, or 
 since serve wrote ``server.json``, when ``/health`` first answered
 (`aiter_jit`), ``jit_compiles`` times each compile, and ``clock_ns`` copies
 ``server.json``'s pair of clocks, which places them among the steps: a step
-may have waited on a build, so grading, `compass fit steps`, `compass fit
-host`, `step_linear_fit` and `validate.cost` cut each step that overlaps one,
-and refuse the record when they cut too many (`step_labels.refusal`). A
-server that built none leaves no entry.
+may have waited on a build, so `compass fit steps`, `compass fit host`,
+`step_linear_fit` and `validate.cost` cut each step that overlaps one, and
+refuse the record when they cut too many (`step_labels.cut_refusal`), and
+grading refuses it (`step_labels.refusal`). A server that built none leaves no
+entry.
 Its ``ptl_changes`` names each change of its cards' PTL state from then until
 the stop (`identity.ptl_changes`), which the fits refuse; ``ptl`` is the
 state at the stop.
