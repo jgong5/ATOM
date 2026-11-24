@@ -70,8 +70,8 @@ FORMS = {
     "ep_dp": Form("DP-attention with EP on a MoE model", issue="#2668"),
     "tbo": Form("two-batch overlap", issue="#2668"),
     "pure_dp": Form("DP without DP-attention", issue="#2668"),
-    "cuda_graph": Form("CUDA graph mode", issue="#2669"),
-    "hbm_prefix_hit": Form("a prefix hit in HBM", issue="#2669"),
+    "cuda_graph": Form("CUDA graph mode"),
+    "hbm_prefix_hit": Form("a prefix hit in HBM"),
     "deepseek_v4": Form("DeepSeek-V4 sparse attention", issue="#2671"),
     "mla": Form("MLA (DeepSeek-R1)", issue="#2671"),
     "router_cache_aware": Form(
