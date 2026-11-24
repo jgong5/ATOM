@@ -17,10 +17,12 @@ pads to, `capture_rung` rows of the decode rows' query length, or at the real
 rows when built with `padded=False` (the run file's ``padding: none``).
 Attention runs over the real rows, a pad row holding no context. The LM head
 runs on the rows that sample: each prefill row's last token and every decode
-token, none on a step that produces no output. Routed experts run on the
-real rows among those the data-parallel group's gather carries (`moe_rows`,
-`moe_tokens`), on one rank on the step's own tokens, and under expert
-parallelism on the busiest rank's expected share of them (`routing_rows`):
+token, none on a step that produces no output; V4's `hc_head`, which reduces
+the residual copies its input is normed from, on every row of a step whose
+LM head samples (`DeepseekV4ForCausalLM.compute_logits`). Routed experts run
+on the real rows among those the data-parallel group's gather carries
+(`moe_rows`, `moe_tokens`), on one rank on the step's own tokens, and under
+expert parallelism on the busiest rank's expected share of them (`routing_rows`):
 a pad row, a gather's or a graph's, routes to no expert, and one rank's
 takes no shared expert either. MoRI's exchange sends a rank's own real
 tokens: a graph's pad row, routed to no expert, goes to no rank.
@@ -166,7 +168,8 @@ class Module:
     `gemm` (n, k, then the rows it runs a token where more than one),
     `lm_head` (n, k, then, where a serial drafter's data-parallel group may
     shard its argmax, that group's width and the most rows it shards),
-    `hc_head` (residual copies, width), a pass (elements a token; a `norm`'s
+    `hc_head` (residual copies, width; none where the LM head samples
+    none), a pass (elements a token; a `norm`'s
     second, those of them it writes in fp8), `act` (output
     elements a token), `attention` (heads, KV heads, head dim),
     `linear_attention` (value heads, key heads, key dim, value dim), `mhc`
@@ -230,7 +233,10 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
         return gemm(rows, d[0], d[1], m.act, m.fmt) + comm
     if m.kind == "hc_head":
         # Reduce the widened residual to one row by gates its fp32 projection
-        # of the row computes: read the copies, write the row.
+        # of the row computes: read the copies, write the row. It feeds the
+        # LM head: none where that samples none.
+        if not sampled:
+            return None
         copies, width = d
         moved = tokens * (copies + 1) * width * act
         moved += copies * copies * width * ELEMENT_BYTES["fp32"]

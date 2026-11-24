@@ -346,6 +346,9 @@ def test_the_v41_flash_tp4_dspark_build_classifies_every_module(built):
         (5120,): 1,
     }
     assert not target["gemm", (128, 512)]
+    # Its stack ends by collapsing its streams at the last seam's mix
+    # (`SinglePassHCState.collapse`): it holds no `hc_head` before its norm.
+    assert not [k for k in target if k[0] == "hc_head"]
     # The drafter: three stages over blocks of 5 attending the window, the
     # LM head and the sampler on a quarter of the vocabulary, and its KV pass
     # on the target's rows, on a replayed prefill's window as the decoder.
