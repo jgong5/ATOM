@@ -5,16 +5,16 @@ ATOM's segment tokenizer (`atom.model_engine.segment_tokenizer`) keeps each
 API server's own cache of a prompt's segments. In a multi-instance deployment
 a conversation's next turn often reaches another prefill instance, and at high
 concurrency a server's own cache evicts histories it encoded, so the same text
-is encoded again. In an 8P16D C1228 sim's steady state, 84% of the prefill
-frontends' encode wall time was such text: 53% encoded only by another
-frontend, 31% by the same one before eviction. In a simulated server that
+is encoded again (jgong5/ATOM#3993 measured it). In a simulated server that
 encode runs while its clock stands still, and every other LP waits on it.
 
 `install` wraps a Rust backend's ``encode_batch`` so that each text of a
 segment tokenizer call, ``encode_batch(texts, add_special_tokens=False)``,
 that some frontend of the deployment has encoded before is read back instead
 of encoded. Its ids are the encoding's own: the file is the ids of exactly
-that text, under a directory named by the backend's serialized state. A call
+that text, under a directory named by the ``tokenizers`` library's version and
+the backend's serialized state, so neither another vocabulary nor another
+library build reads them. A call
 in any other shape, or with the backend's truncation or padding set, goes to
 the backend untouched, as does a text shorter than `MIN_CHARS`. The wrapper
 returns one object per text with the ids as ``ids``, which is all the segment
@@ -73,8 +73,12 @@ def directory(run: dict) -> Path | None:
 
 def install(backend, root: Path) -> None:
     """Wrap `backend`'s ``encode_batch`` with the ids kept under `root`, in a
-    directory of their own for its serialized state."""
-    state = hashlib.sha256(backend.to_str().encode()).hexdigest()[:16]
+    directory of their own for the ``tokenizers`` version and the backend's
+    serialized state."""
+    import tokenizers
+
+    keyed = f"{tokenizers.__version__}\0{backend.to_str()}"
+    state = hashlib.sha256(keyed.encode()).hexdigest()[:16]
     backend.encode_batch = shared(backend.encode_batch, backend, root / state)
 
 

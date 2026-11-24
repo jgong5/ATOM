@@ -2809,7 +2809,7 @@ def tokenizer(tok, config) -> None:
     entry, its engine config's among several: a term fitted on another backend
     is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
     ends the run before the server serves (`_end_before_serving`). With no
-    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer,
+    term, `tok` is charged 0 s; ``segment`` wraps the segment tokenizer,
     and its ``chars_per_s`` charges each comparison of its stored-prefix search.
     Beneath those charges, a segment text any frontend of the deployment has
     encoded is read back rather than encoded again (`token_ids`), charged the

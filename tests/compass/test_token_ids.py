@@ -136,6 +136,18 @@ def test_another_tokenizer_keeps_its_ids_apart(tmp_path):
     assert len({p.parent.parent for p in tmp_path.rglob("*/*/*")}) == 2
 
 
+def test_another_tokenizers_build_keeps_its_ids_apart(tmp_path, monkeypatch):
+    import tokenizers
+
+    text = _prompt(4)[: token_ids.MIN_CHARS * 2]
+    for version in ("0.0.1", "0.0.2"):
+        monkeypatch.setattr(tokenizers, "__version__", version)
+        backend = _tokenizer()._tokenizer
+        token_ids.install(backend, tmp_path)
+        backend.encode_batch([text], add_special_tokens=False)
+    assert len({p.parent.parent for p in tmp_path.rglob("*/*/*")}) == 2
+
+
 def test_the_ids_go_under_the_run_s_out_dir_or_where_the_variable_says(
     monkeypatch, tmp_path
 ):
