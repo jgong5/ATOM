@@ -353,7 +353,12 @@ class HostDeviceRecurrence:
     `columns[kind][segment]` prices launch features, a batch's `compass_launch`,
     which its caller sets from `predicted`; `launch`, the provider and graph
     sets predicting them, refuses a column naming a feature it lacks; a
-    pipeline stage refuses any column.
+    pipeline stage refuses any column. `paths[kind][segment]`, from a host
+    fit under `COMPASS_FIT_HOST_KIND_BLOCKS=1` (`fit.host_blocks`), maps a
+    launch path (`launch_features.path`), a batch's `compass_path`, which its
+    caller sets from `path`, to the constant that segment takes on it in
+    place of its law's own; a path it does not name keeps the law's. A
+    pipeline stage refuses them, as it does columns.
     With `own_draft`, true unless it defers, an output forward that waits for its own
     target leaves no earlier than its device end, as one that reads its own draft ids does.
     A batch whose `compass_dummy` is true, a DP rank's dummy forward at a step
@@ -385,9 +390,17 @@ class HostDeviceRecurrence:
         columns=None,
         launch=(None, None),
         defer=True,
+        paths=None,
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
         self.admit, self.columns, self.launch = admit, columns or {}, launch
+        self.paths = paths or {}
+        if self.paths and stage is not None:
+            raise ValueError(
+                "the host laws state launch-path constants, and a pipeline stage "
+                "posts its receive at a prepare end `pp_recv_posted` prices "
+                "without its forward's path"
+            )
         named = {f for v in self.columns.values() for c in v.values() for f in c}
         if lacks := sorted(named - set(getattr(launch[0], "features", ()))):
             raise ValueError(
@@ -469,7 +482,10 @@ class HostDeviceRecurrence:
         now = self.now()
         called, meta = getattr(batch, "compass_pp_host", (now, -math.inf))
         admit_s = self.admit_s(batch)
-        prepared, self.segments = self.prepare_end(called, kind, x, admit_s, features)
+        path = getattr(batch, "compass_path", None)
+        prepared, self.segments = self.prepare_end(
+            called, kind, x, admit_s, features, path
+        )
         self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)
@@ -498,11 +514,29 @@ class HostDeviceRecurrence:
             return {**self.columns.get("decode", {}), **self.columns.get(kind, {})}
         return self.columns.get(kind, {})
 
+    def _paths(self, kind: str) -> dict:
+        """`kind`'s launch-path constants by segment, as `_law` takes its laws."""
+        if kind == DUMMY_KIND:
+            return {**self.paths.get("decode", {}), **self.paths.get(kind, {})}
+        return self.paths.get(kind, {})
+
     def predicted(self, view: Any) -> dict:
         """A step's launch features by `launch`'s provider, from its
         `BatchView` `view`; none where no law adopts a column."""
         provider, graphs = self.launch
         return provider.predict(view, graphs) if self.columns else {}
+
+    def path(self, view: Any) -> str | None:
+        """A step's launch path (`launch_features.path`) from its `BatchView`
+        `view` and the features `launch`'s provider predicts for it, which a
+        batch's `compass_path` holds; None where no law states `paths`."""
+        from atom.compass.backends.launch_features import path
+
+        if not self.paths:
+            return None
+        provider, graphs = self.launch
+        features = provider.predict(view, graphs) if graphs is not None else {}
+        return path(view, features)
 
     def admit_s(self, batch: Any) -> float:
         """What `batch`'s admissions add to its `E`."""
@@ -514,16 +548,32 @@ class HostDeviceRecurrence:
         return float(np.dot(self.admit, admit_x(a)))
 
     def prepare_end(
-        self, called: float, kind: str, x: tuple, admit_s: float = 0.0, features=None
+        self,
+        called: float,
+        kind: str,
+        x: tuple,
+        admit_s: float = 0.0,
+        features=None,
+        path=None,
     ) -> tuple[float, dict]:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
         `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, and each column a segment
-        adopts prices `features`' value of its feature, 0 where absent."""
+        adopts prices `features`' value of its feature, 0 where absent. A
+        segment whose `paths` state a constant for the forward's launch `path`
+        takes it in place of its law's own constant, ``law[0]``, which prices
+        every other path."""
         law, columns = self._law(kind), self._columns(kind)
+        paths = self._paths(kind)
         features = features or {}
+
+        def constant(s: str) -> float:
+            own = paths.get(s, {}).get(path)
+            return 0.0 if own is None or s not in law else own - law[s][0]
+
         seg = {
             s: (
                 float(np.dot(law.get(s, (0, 0, 0)), x))
+                + constant(s) * x[0]
                 + admit_s * (s == "E")
                 + sum(c * features.get(f, 0.0) for f, c in columns.get(s, {}).items())
             )
@@ -2242,6 +2292,7 @@ def _group_step_seconds(
             view = dataclasses.replace(view, prefill_duty=duty.at(entered))
         if isinstance(host, HostDeviceRecurrence):
             batch.compass_launch = host.predicted(view)
+            batch.compass_path = host.path(view)
             batch.compass_dummy = bool(view.dp_dummy and view.prefill)
         cost = backend.price(view)
         dummy = {EAGER_DP_DUMMY, IDLE_DP_GROUP} & set(cost.treatments)

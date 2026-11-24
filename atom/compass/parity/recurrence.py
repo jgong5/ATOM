@@ -308,7 +308,8 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     and its host segments by the law's host laws, `law["host"]["laws"]`, its
     `E` with what its admissions cost (`law["host"]["admit"]`), and its
     launch columns (`law["host"]["columns"]`) on the features its sample's view
-    predicts under the host key's graph sets, graded against the same
+    predicts under the host key's graph sets, and the constants its launch
+    path takes where the host laws state `paths`, graded against the same
     measured period. After each forward the engine
     runs its `E_out` before the next call. An idle forward's `E`, the first's
     too, stays measured from the last pull or exit, admissions and all: it
@@ -338,6 +339,7 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
         columns=columns,
         launch=launch,
         defer=defer,
+        paths=law["host"].get(launch_features.PATHS),
     )
     rec.own_draft = any("t_draft_read_ns" in s for s in steps)
     kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]
@@ -362,11 +364,16 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
             produces_output=lambda out=s["produces_output"]: out,
             compass_admitted=None if kind == "idle" else admitted,
             compass_launch=rec.predicted(view),
+            compass_path=rec.path(view),
         )
         clock[0] = exit_ + out_s
         shape = forward_shape(batch)
         prepared = rec.prepare_end(
-            clock[0], *shape, rec.admit_s(batch), batch.compass_launch
+            clock[0],
+            *shape,
+            rec.admit_s(batch),
+            batch.compass_launch,
+            batch.compass_path,
         )
         queued = rec.ends[1] - prepared[0]
         graded = s["step"] not in {*warm, *apart}
