@@ -14,9 +14,11 @@ from test_fit_steps import (  # noqa: F401
     ENGINE,
     HOST,
     PLATFORM,
+    PP2,
     clients,
     fit,
     member,
+    pipeline,
     planted_roots,
     record,
     served,
@@ -827,3 +829,15 @@ def test_the_relay_term_is_fitted_from_prefill_s_last_output_row_to_decode_s_app
 def test_a_relay_with_no_request_alone_on_it_is_left_unfitted(tmp_path):
     with pytest.raises(ValueError, match="0 forwards for 2 coefficients"):
         fit_relay(_relayed(tmp_path, [], 1.5e-3, 11e-9))
+
+
+def test_a_pipeline_s_host_laws_are_its_stage_0_s(tmp_path):
+    # Stage 1 spends twice stage 0's W_pre, which pooled laws would take.
+    scale = {(n, "W_pre"): 2.0 for n in range(240)}
+    a = pipeline(tmp_path / "a", 19, scale=scale)
+    fit(tmp_path, "fit host", a, *clients(a))
+
+    key = {**HOST, "engine": PP2}
+    host = member(tmp_path / "store", host_laws_key(key), "params")
+    laws, _ = fit_host(label_records([a / "steps/dp0.jsonl"])[0])
+    assert host["laws"] == laws["laws"]
