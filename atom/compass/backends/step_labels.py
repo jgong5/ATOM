@@ -155,9 +155,9 @@ overlaps its segments, from the previous line's exit to its own pull
 pull, else exit, over the ranks before the same forward, where the group's
 `_sync_dp_state` releases each of them. On a pipeline stage it runs from no
 earlier than the forward's release (`released`), read with the pipeline's
-other stages: the head's at the last stage's exit of the forward whose tokens
-it waits for, a later stage's at the head's call, so neither holds a wait for
-another stage.
+other stages: the head's at the last stage's exit of the forward whose ack it
+waits for, its tokens or a middle chunk's bare ack, a later stage's at the
+head's call, so neither holds a wait for another stage.
 
 A DP rank's dummy forward at a step some rank of its group prefills, its line
 holding the one prefill row `ModelRunner.dummy_execution` runs, gives no
@@ -741,23 +741,24 @@ def _pull(step: dict) -> int:
 
 
 def waited(steps: list[dict], n: int, pp: int) -> int | None:
-    """The head's last forward before `n` whose tokens `n` is scheduled after,
-    or None, in a pipeline of `pp` stages whose head ran `steps`: `n - pp`,
-    which leaves the in-flight queue only with its tokens, or a later one
-    holding a request of `n`'s, every request of a batch with a decode in it,
-    else the requests `n` decodes."""
+    """The head's last forward before `n` whose ack `n` is scheduled after, or
+    None, in a pipeline of `pp` stages whose head ran `steps`: `n - pp`, which
+    leaves the in-flight queue only at the last stage's ack, its tokens or a
+    middle chunk's bare ack, or a later one producing output and holding a
+    request of `n`'s, every request of a batch with a decode in it, else the
+    requests `n` decodes."""
     mine = {k: d for (k, *_), (*_, d) in zip(steps[n]["batch"], steps[n]["rows"])}
     for m in range(n - 1, max(n - pp, 0) - 1, -1):
         s, decode = steps[m], any(d for *_, d in steps[m]["rows"])
         held = any(k in mine and (decode or mine[k]) for k, *_ in s["batch"])
-        if s["produces_output"] and (m == n - pp or held):
+        if m == n - pp or (s["produces_output"] and held):
             return m
     return None
 
 
 def released(head: list[dict], n: int, pp: int, exit_of) -> tuple:
     """Forward `n`'s releases in a pipeline of `pp` stages whose head ran
-    `head`: the head's, at the last stage's exit of the forward whose tokens it
+    `head`: the head's, at the last stage's exit of the forward whose ack it
     waits for (`waited`), and every later stage's, at the head's call, the later
     of the head's previous exit and that release; each None where nothing holds
     it. `exit_of(k, m)` is stage `k`'s exit of forward `m`, measured or

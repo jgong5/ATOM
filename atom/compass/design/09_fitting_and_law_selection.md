@@ -516,7 +516,7 @@ a PP4 law and a one-stage law of one model and width share an engine config.
    stage, a drafter priced where none runs.
 6. **Host laws per stage**, fitted on each stage's lines in the untraced records, a
    pipeline's stages labelled together: a stage's `E` runs from its release, the head's at
-   the last stage's exit of the forward whose tokens it waits for, a later stage's at the
+   the last stage's exit of the forward whose ack it waits for, a later stage's at the
    head's call, as `parity/recurrence.py::pipeline` derives them, and a later stage's
    `W_recv` is fitted as `fit host` fits it now. Basis: `01` D4 refuses a later stage
    whose law lacks `W_recv`, and a pipeline's record stamps no input pull

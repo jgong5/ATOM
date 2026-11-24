@@ -538,15 +538,15 @@ def test_a_dp_view_counts_its_step_s_dummy_forwards_from_every_rank_s_line(tmp_p
 QUARTER, RECV = 0.25, [2e-5, 2e-9, 5e-6]
 
 
-def pp2(steps, seed, key=KEY) -> tuple[list[dict], list[dict]]:
+def pp2(steps, seed, key=KEY, later=QUARTER) -> tuple[list[dict], list[dict]]:
     """Each stage's lines of a two-stage pipeline's record in `steps`, under
     `key`, of `_steps(seed)`'s prefills, every fourth a middle chunk, one
     request's chunk in each beside those it admits, written by the wait rules:
     the head called at the later of its last exit and stage 1's exit of the
-    forward two back, when that one produced output, and stage 1 at the later
-    of its own last exit and the head's call, each entering its `E` after.
+    forward two back, which acks it, and stage 1 at the later of its own last
+    exit and the head's call, each entering its `E` after.
     The head runs `LAWS`' segments and its admissions' `HOST_ADMIT`, and reads
-    no token; stage 1 runs `LAWS`' at `QUARTER`, its launch waiting after `RECV`
+    no token; stage 1 runs `LAWS`' at `later`, its launch waiting after `RECV`
     for the head's launch end, and reads an output forward's token at its
     device end, after the head's. A device runs a hundredth of every fourth
     forward's price, from the fourth, and a millionth of the others': the head
@@ -559,10 +559,10 @@ def pp2(steps, seed, key=KEY) -> tuple[list[dict], list[dict]]:
         output, x = bool(n % 4), (1, sum(r[0] for r in rows), len(rows))
         new = [(q, c - q) for q, c, _ in rows[1:]]
         admit = (min(len(new), 1), sum(q for q, _ in new), sum(c for _, c in new))
-        tokens = n > 1 and head[n - 2]["produces_output"] and last[n - 2]["t_exit_ns"]
-        call = max(head[-1]["t_exit_ns"] if n else 0, tokens or 0)
+        ack = n > 1 and last[n - 2]["t_exit_ns"]
+        call = max(head[-1]["t_exit_ns"] if n else 0, ack or 0)
         ids = [0] + [10_000 + n * 10 + j for j in range(len(rows) - 1)]
-        for k, (lines, scale) in enumerate(zip(stages, (1, QUARTER))):
+        for k, (lines, scale) in enumerate(zip(stages, (1, later))):
             law = LAWS["prefill" if output else "middle"]
             ns = {g: round(scale * np.dot(c, x) * 1e9) for g, c in law.items()}
             if k:
@@ -601,7 +601,7 @@ def test_each_pipeline_stage_s_segments_are_its_own_its_e_from_its_release(
 ):
     """Labelled as its stage, each forward's segments on `pp2`'s record are
     those planted: the head's `E` from stage 1's exit of the forward whose
-    tokens it waits for, its admissions aside, and stage 1's from the head's
+    ack it waits for, its admissions aside, and stage 1's from the head's
     call; stage 1's `W_recv`, and its `W_launch` less its receive's wait. The
     head reads no token, and still labels."""
     stages = pp2(tmp_path, 19)

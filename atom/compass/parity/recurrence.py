@@ -108,7 +108,7 @@ def pipeline(stages: list[list[dict]], carriers=None) -> list[dict]:
     """One DP rank's stages charged step by step, `check`'s report for each:
     each entry released as `step_labels.released` releases it, on the measured
     exits, and called at that release on the predicted ones: the head's at the
-    last stage's exit of the forward whose tokens it waits for, each
+    last stage's exit of the forward whose ack it waits for, each
     downstream entry at the head's call. With `carriers`, ``(models,
     row_bytes)``, each send rides the carriers (`_charged`)."""
     if len({len(s) for s in stages}) > 1:
