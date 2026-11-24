@@ -277,12 +277,28 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
 def answer_as(arch: str) -> None:
     """`install`'s `torch.cuda` answers for a device of `arch`, and `torch._C`'s
     device query, for the life of this process. `is_available` keeps this
-    host's answer, and nothing else `install` declares is declared."""
+    host's answer, and nothing else `install` declares is declared. aiter's
+    MLA planner's arch probe answers `arch` too (`_mla_arch_as`)."""
     cuda = _cuda(_props(arch))
     del cuda["is_available"]
     for name, value in cuda.items():
         setattr(torch.cuda, name, value)
     torch._C._cuda_getDevice = lambda: 0
+    _mla_arch_as(arch)
+
+
+def _mla_arch_as(arch: str) -> None:
+    """aiter's MLA planner's device arch, `ops.attention._mla_cpp_gpu_arch`,
+    answering `arch`. Asked with no arch, the planner reads the device's in
+    C++ (`get_gpu_arch`), and with no driver its `hipGetDeviceCount` aborts
+    the process: a decode context-parallel MLA layer asks it as it builds
+    (`atom.distributed.dcp_utils.dcp_persistent_supported`), so a simulated
+    Kimi-K3.1 at DCP8 lost every rank there. An aiter without the probe is
+    left as it is."""
+    from aiter.ops import attention
+
+    if hasattr(attention, "_mla_cpp_gpu_arch"):
+        attention._mla_cpp_gpu_arch = lambda device_index: arch
 
 
 #: The operators outside torch that the fake mode's dispatch cache takes: each
