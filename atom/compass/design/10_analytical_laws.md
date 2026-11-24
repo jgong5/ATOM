@@ -47,7 +47,7 @@ A0's probed one (D67.1, D69, D70).
 
 **Revised 2026-11-24 by [#2483](https://github.com/jgong5/ATOM/issues/2483), reversing
 for one case #815's ruling that host time has no transfer:** a host CPU no `compass record`
-ran on is priced by a `host_laws` entry of its own (D120). Its terms outside the forward
+ran on is priced by a `host_laws` entry of its own (D121). Its terms outside the forward
 are fitted from a simulated run on that CPU, with no device. Its forward segments are
 carried from a recorded host's laws by two probed CPU ratios, declared. `L_mtp` is carried
 as it stands, declared. A host law fitted on the host's own records still prices first.
@@ -58,7 +58,7 @@ onto MI455 before it ran, at step and op level, now frozen, and the bound on MI4
 runs in stage 4; the analytical fallback, for what an
 empirical source declines; and the step roofline, usable on day zero. The method gives a
 reasonable theoretical bound: possibly unreachable, but not far from it. It is neither the
-datasheet at derate 1 nor an efficiency measured on ATOM's own kernels (#1392). D120 adds
+datasheet at derate 1 nor an efficiency measured on ATOM's own kernels (#1392). D121 adds
 host time on a host no record ran on. It observes another host and the target CPU, so it
 is no bound, and its forward segments are declared.
 
@@ -192,7 +192,7 @@ composed per runner, so the host floor the prior work established, `t_step = max
 launches × h)`, leaves both granularities. The `max` it states survives in `01` D4's
 recurrence, whose device `end` is no earlier than `launch_end`, which plays the part of
 `launches × h`. The launch time comes from the measured `W_launch` host law (`09`
-D54), or on a host no record ran on from D120's carried one, not from the machine spec.
+D54), or on a host no record ran on from D121's carried one, not from the machine spec.
 The evidence below is why that `max` is kept. `t0` is the
 device's own floor on one kernel, not this host floor.
 
@@ -535,7 +535,7 @@ claimed. That is what the empirical op-level backend exists for.
 
 ---
 
-## D120. Host time on a host no record ran on
+## D121. Host time on a host no record ran on
 
 **Proposed 2026-11-24 by [#2483](https://github.com/jgong5/ATOM/issues/2483).** For a host
 CPU no `compass record` ran on, it reverses #815's ruling that host time is measured with
@@ -559,7 +559,7 @@ their prose provenance calls it assumed, and a run that charges it reports nothi
 
 ### What prices first
 
-An entry fitted on the host's own records prices that host. D120's entry answers only
+An entry fitted on the host's own records prices that host. D121's entry answers only
 where there is none, as an analytical law answers only where no measured price does
 (D68). `compass fit host --carry` (below) refuses a key whose store entry was fitted on
 records, and a later `fit host` over the host's own records replaces a carried entry.
@@ -594,7 +594,7 @@ T_s(k, x | B) = T_s^py(k, x | A) · r_py + T_s^hip(k, x | A) · r_hip
 the launch thread's time inside enqueue calls at each segment's stamps, as it reads
 blocked time (`parity/blocked.py`, whose rocprofiler-sdk tool gains the enqueue calls), and
 `T_s^py = T_s − T_s^hip`. A record without that time gives `T_s^hip = 0`: the whole
-segment scales by `r_py`, and the term's note says so. This is the case D120 builds:
+segment scales by `r_py`, and the term's note says so. This is the case D121 builds:
 MI455 B0, gfx1250 as A0 is, runs A0's cells. A model or engine config no recorded host
 ran needs `N`, and `c(A)` needs A's own counts, from a census (T137).
 
@@ -629,7 +629,7 @@ ran needs `N`, and `c(A)` needs A's own counts, from a census (T137).
   DMA, its completion signal and the host thread's wake (`01` D4). No CPU ratio scales it.
   B takes A's `L_mtp` law as it stands, declared, as D69 carries a link latency no
   datasheet states.
-- **The hops** (`07` D38, Phase 1c) are outside D120. A run without them names them under
+- **The hops** (`07` D38, Phase 1c) are outside D121. A run without them names them under
   `unmeasured_hops`, as today.
 
 ### The probes and the datasheet
@@ -663,7 +663,7 @@ simulated run. It writes a `host_laws` entry under the existing key, stating B's
 and B's platform. Beside the terms it writes `methods`, keyed by term (`<kind>.<segment>`,
 `admit`, `tokenizer.<kind>`, `http_intake`), each value `{method, note}`. A declared
 term's note names A's key, `r_py`, `r_hip` and their origin, probe or datasheet. An entry
-without `methods` is all `estimated`, which covers every entry fitted before D120. The
+without `methods` is all `estimated`, which covers every entry fitted before D121. The
 MI455 A0 files' carried `tokenizer` becomes `declared`, its note naming mi355-gpu-40 and
 no ratio.
 
@@ -682,7 +682,7 @@ no ratio.
 
 The device side's analytical method is a bound and carries no measured efficiency
 (D67.1, D68). A host bound, counts times a probe's per-call floor, would charge every
-host-bound forward short, and such a forward's period is its host time. So D120 predicts.
+host-bound forward short, and such a forward's period is its host time. So D121 predicts.
 It carries A's per-call cost, ATOM's efficiency over the probe in D68's sense, and
 declares it. That departure from D68 is part of what the owner rules on here.
 
@@ -695,7 +695,7 @@ CPU's segments: decode at 1, 4 and 16 rows, output prefill at 1024 and 2048 toke
 largest of 237%. Decode `W_pre` reads 1.13, decode `W_launch` 0.52 to 0.60, and prefill
 `E` 2.87, or 1.46 with `admit` added, since the two fits split admission differently.
 Those laws also differ in device, stack, torch and `OMP_NUM_THREADS`. The spread bounds
-what one per-host factor can do there, not what D120 does; T37 measures that.
+what one per-host factor can do there, not what D121 does; T37 measures that.
 
 ### Validation (T37)
 
@@ -732,7 +732,7 @@ and no census exists.
 | D68 | Implementation efficiency, measured over analytical, is a diagnostic reported per op kind and per phase as a distribution, with no threshold yet; it is never a projection input. The analytical method is on M2's critical path for the MI455 projection of DeepSeek-V4-Pro's families (`16` D95). An op-level backend answers an unpriced leaf by its analytical law, and as an empirical backend's fallback the method answers its own price, reported apart; no law moves ahead of a measurement. Replaces the efficiency first stated here as a calibration self-check, carried declared to another device. | 2026-09-19; revised 2026-10-10, 2026-10-14 (#952) and 2026-10-17 (#1392) |
 | D69 | Peaks are probed on the device; a device with no hardware takes its datasheet times the ratio probed on a device that was run, so its terms are declared, as the frozen stage-3c projection took MI355X's for MI455 and MI455's B0 spec takes them until a B0 node is probed; since stage 4, MI455's A0 samples are probed on their node, and what they measure keys to A0. Report each carried ratio with a ±20% sensitivity band; carry the kernel floor and link latencies as they stand, banded at ±20% and the latencies also at 2 and 4 times, uncapped, each cell's seconds reported by roofline part; prefer ranking claims to absolute ones; measure the method from MI308X to MI355X, and on MI455 from the frozen spec to A0's probed one. Replaces the assumed derate first stated here. | 2026-09-19; revised 2026-10-17 (#1392), 2026-10-25 (#2073), 2026-10-25 (#2138) and 2026-10-28 (#2141) |
 | D70 | Expected accuracy is stated in advance, per use: below the measured time on a measured device, MI455's A0 samples included since stage 4; declared in the frozen MI455 projection, and on MI455 B0 until a B0 node is probed. Single-digit latency error is not a target for the analytical method. | 2026-09-19; revised 2026-10-17 (#1392), 2026-10-25 (#2138) and 2026-10-28 (#2141) |
-| D120 | A host CPU no record ran on gets a `host_laws` entry of its own, written by `compass fit host --carry`. Its tokenizer, HTTP intake, `E`, `E_out` and `admit` are fitted from a simulated run on that CPU, with no device, `estimated`. Its `W_pre`, `W_inputs`, `W_launch` and `W_post` are carried from a recorded host A's laws: each split into time inside HIP enqueue calls and the rest, scaled by `r_hip` and `r_py`, the ratios of the two CPUs' probed per-call times or a datasheet boost-clock ratio; another model or engine config takes call counts times A's per-call cost. Those are `declared`, and so is `L_mtp`, A's as it stands. An entry fitted on the host's own records prices first. Each term's method is in the entry's `methods`; the run summary and run.json report host seconds by method and each declared term. Validated by T37. | 2026-11-24 (#2483), reversing for this case #815's no-transfer ruling |
+| D121 | A host CPU no record ran on gets a `host_laws` entry of its own, written by `compass fit host --carry`. Its tokenizer, HTTP intake, `E`, `E_out` and `admit` are fitted from a simulated run on that CPU, with no device, `estimated`. Its `W_pre`, `W_inputs`, `W_launch` and `W_post` are carried from a recorded host A's laws: each split into time inside HIP enqueue calls and the rest, scaled by `r_hip` and `r_py`, the ratios of the two CPUs' probed per-call times or a datasheet boost-clock ratio; another model or engine config takes call counts times A's per-call cost. Those are `declared`, and so is `L_mtp`, A's as it stands. An entry fitted on the host's own records prices first. Each term's method is in the entry's `methods`; the run summary and run.json report host seconds by method and each declared term. Validated by T37. | 2026-11-24 (#2483), reversing for this case #815's no-transfer ruling |
 
 ---
 
@@ -746,8 +746,8 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | ~~T34~~ | ~~Test whether the activation coefficient `k_model` is derivable from geometry~~ — closed 2026-10-16 by [#965](https://github.com/jgong5/ATOM/issues/965): not within 25% ([#705](https://github.com/jgong5/ATOM/issues/705)) | — |
 | T35 | Derive the work of the opaque leaves: op-kind extractors at op level ([#1402](https://github.com/jgong5/ATOM/issues/1402), [#1403](https://github.com/jgong5/ATOM/issues/1403)) and module extractors at step level ([#1398](https://github.com/jgong5/ATOM/issues/1398), [#1399](https://github.com/jgong5/ATOM/issues/1399)) | Class A is free from the IR for aten ops, but an opaque leaf's internal work must be described by hand (doc 04 D20's parameter extractor, extended) |
 | ~~T36~~ | ~~Name the collective algorithm per code path in the machine spec schema~~ — **withdrawn 2026-10-17 by [#1392](https://github.com/jgong5/ATOM/issues/1392)**: collectives take an algorithm-free lower bound (D66) | — |
-| T37 | Validate D120 per segment and forward kind: `predicted / measured − 1` at p50 and p90, node 18 (Qwen3.8-27B) and mi355-gpu-45 (DeepSeek-V4-Pro) each predicted with no input from its own records ([#2483](https://github.com/jgong5/ATOM/issues/2483)). Ruled 2026-10-11 on #815 as measured host laws with no transfer; reopened 2026-11-24 by D120 | needs records with the `hip` split, a census of each model, and both hosts' laws refitted at one `fit host` tree |
+| T37 | Validate D121 per segment and forward kind: `predicted / measured − 1` at p50 and p90, node 18 (Qwen3.8-27B) and mi355-gpu-45 (DeepSeek-V4-Pro) each predicted with no input from its own records ([#2483](https://github.com/jgong5/ATOM/issues/2483)). Ruled 2026-10-11 on #815 as measured host laws with no transfer; reopened 2026-11-24 by D121 | needs records with the `hip` split, a census of each model, and both hosts' laws refitted at one `fit host` tree |
 | T38 | Build the measured-over-analytical report per op kind and per phase, beside the bound gate ([#1405](https://github.com/jgong5/ATOM/issues/1405)) | needs both granularities' prices and a real run's step records |
 | ~~T39~~ | ~~Establish a dispatch-band table from geometry for leaves with no measured bands~~ — **withdrawn 2026-10-17 with D65's band (#1392)** | — |
 | T56 | Quote the method's error from MI308X to MI355X with the MI455 projection, so a user of an unmeasured device sees a range rather than a promise ([#1406](https://github.com/jgong5/ATOM/issues/1406)) | needs real MI355X runs and both machines' probes |
-| T137 | D120's counts `N` for a model or engine config no recorded host ran. A census record needs the model on a device of its arch; whether capture's FakeTensorMode (`04` D18) counts `W_launch`'s eager calls without one is open, since it sees no graph replay and no launch inside an opaque leaf | until a model is priced on a host before any device of its arch ran it |
+| T137 | D121's counts `N` for a model or engine config no recorded host ran. A census record needs the model on a device of its arch; whether capture's FakeTensorMode (`04` D18) counts `W_launch`'s eager calls without one is open, since it sees no graph replay and no launch inside an opaque leaf | until a model is priced on a host before any device of its arch ran it |

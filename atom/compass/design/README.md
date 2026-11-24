@@ -2,7 +2,7 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header.
-**Decisions D0–D120, with no gaps, and their sub-decisions** are indexed at the end of this
+**Decisions D0–D121, with no gaps, and their sub-decisions** are indexed at the end of this
 file. The TODOs are registered in **`12_open_items.md`**, with the load-bearing assumptions
 and the cross-cutting issues. Implementation follows the execution plan in `16`.
 
@@ -235,7 +235,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L3 | Memory model, KV pool reuse, the `lmcache_offload` tier | [`03_memory_and_kv_model.md`](03_memory_and_kv_model.md) | D13–D16 (+ D13.1) |
 | L3 | Model capture, Cost IR | [`04_model_capture_and_cost_ir.md`](04_model_capture_and_cost_ir.md) | D17–D23 (+ D18.1) |
 | L3 | Fitting, law selection, hull guard | [`09_fitting_and_law_selection.md`](09_fitting_and_law_selection.md) | D53–D62 |
-| L3 | Analytical laws, the step roofline; host time on a host no record ran on | [`10_analytical_laws.md`](10_analytical_laws.md) | D63–D70, D120 |
+| L3 | Analytical laws, the step roofline; host time on a host no record ran on | [`10_analytical_laws.md`](10_analytical_laws.md) | D63–D70, D121 |
 | L3 | Step grid backend (step-level), a stage-2 candidate | [`17`](17_step_grid_backend.md) | D96–D105 |
 | L3 | The pass record and the one label rule for host-paced device time | [`18`](18_pass_record_and_host_paced_time.md) | D107 |
 | L4 | Harness contract, wire fields, adapter | [`06_workload_harness_contract.md`](06_workload_harness_contract.md) | D27–D35 (+ D35.1) |
@@ -621,7 +621,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D36 – D43 (+ D38.1, D40.1), D106, D118, D119 | `07` Calibration and Benchmarking Toolchain |
 | D43.1, D44 – D52 (+ D45.1, D50.1, D50.2, D50.3) | `08` Validation Protocol |
 | D53 – D62 | `09` Fitting and Law Selection |
-| D63 – D70 (+ D67.1), D120 | `10` Analytical Laws |
+| D63 – D70 (+ D67.1), D121 | `10` Analytical Laws |
 | D71 – D77 | `11` Engine Metrics under Virtual Time |
 | D78 – D81 | `13` The Configuration Surface |
 | D82 – D87 (+ D87.1, D87.2) | `14` Speculative Decoding and MTP |
