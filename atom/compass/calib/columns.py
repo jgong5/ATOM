@@ -20,6 +20,8 @@ from atom.compass.backends.shape import DUTY_TAU, BatchView, sum_context, sum_to
 from atom.compass.backends.step_linear import (
     DECODE,
     EAGER,
+    KDA,
+    KDA_CHUNK,
     PREFILL,
     StepLinearBackend,
     StepLinearLaw,
@@ -117,6 +119,8 @@ def _ones(
             names
         ):  # a gather column states its group
             extra |= {"ranks": max(dp, 2), "min_spread": min_spread}
+        if set(KDA) & set(names):  # a KDA column states the recurrence's chunk
+            extra["kda_chunk"] = KDA_CHUNK
         law = {"provenance": "ones", "prefill": _vector(names, extra), "decode": {}}
     else:
         key = EAGER if rung is None else str(rung)

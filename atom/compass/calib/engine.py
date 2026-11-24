@@ -273,10 +273,11 @@ class Engine:
         moe = sum(tokens.values())  # a dummy's row reaches no expert (#3682)
         ranks = []
         for k, rows in plan.items():
+            shapes = tuple(
+                RequestShape(q, req.cached + req.done + q, False) for req, q in rows
+            )
             view = BatchView(
-                tuple(
-                    RequestShape(q, req.cached + req.done + q, False) for req, q in rows
-                ),
+                shapes,
                 moe_rows=moe if dp else None,
                 moe_tokens=moe if dp else None,
                 produces_output=any(q == req.left for req, q in rows),
@@ -286,6 +287,7 @@ class Engine:
                 group_max_tokens=max(tokens.values()) if dp else None,
                 group_tail=tail and dp,
                 prefill_duty=self.ranks[k].duty.at(t),
+                kda=dep.kda(shapes),
             )
             ranks.append((k, view, *self.law.price(view)))
         peer = ranks[0][1]
@@ -371,6 +373,7 @@ class Engine:
                 dp_rank=k if dp else None,
                 group_dummies=dummies,
                 prefill_duty=self.ranks[k].duty.at(t),
+                kda=dep.kda(rows),
             )
             ranks.append((k, view, *self.law.price(view)))
         priced = max(range(len(ranks)), key=lambda i: (ranks[i][2], i))
