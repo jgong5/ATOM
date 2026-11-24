@@ -375,7 +375,8 @@ def dummy_view(view: BatchView) -> BatchView:
     """The view of a data-parallel rank's dummy forward at the prefill step a
     peer's `view` states: the one-token row at position 0 a record's dummy
     line holds (`ModelRunner.dummy_execution`), producing output as those
-    lines say, with the group's fields its peer states."""
+    lines say, with the group's fields its peer states; under a KDA model no
+    state work, as its batch schedules no request holding a state."""
     import dataclasses
 
     return dataclasses.replace(
@@ -388,6 +389,7 @@ def dummy_view(view: BatchView) -> BatchView:
         draft_bs=None,
         target_bs=None,
         image_tokens=0,
+        kda=None if view.kda is None else (0,) * len(view.kda),
     )
 
 

@@ -278,3 +278,12 @@ def test_fit_steps_model_turns_the_columns_on_for_a_model_with_kda_layers(tmp_pa
         directory.mkdir()
         (directory / "config.json").write_text(config.read_text())
     assert _model_kda(str(kimi)) and not _model_kda(str(other))
+
+
+def test_a_data_parallel_dummy_runs_no_state_work_beside_a_kda_peer():
+    from atom.compass.backends.step_linear import dummy_view, kda_columns
+
+    peer = BatchView((RequestShape(300, 300, False),), kda=(1, 1, 0, 2))
+    assert dummy_view(peer).kda == (0, 0, 0, 0)
+    assert kda_columns(dummy_view(peer)) == (0, 0, 0, 0, 0.0)
+    assert dummy_view(BatchView((RequestShape(300, 300, False),))).kda is None
