@@ -1,6 +1,6 @@
 {
  "name": "cellA_k31",
- "about": "Kimi-K3.1-Pro on 8 MI355X: TP8 + DCP8, ONE DP rank, bf16 KV, block 128, max-num-seqs 64, max len 1048576, no speculative decode, KDA recurrent state with a checkpoint every 8192 tokens: a prefix hit lands on a checkpoint boundary only (prefix_unit 8192) (#752; ~/agent_scratch/752/kimi/env_k31.sh). Rungs: ATOM's default capture sizes up to 64; max-num-batched-tokens and the prefill chunk at ATOM's 16384. One DP rank: rule 2.4.6 as for M3.1. tp 8 and dcp 8, and prefix_unit the state checkpoint interval 8192, are what `deploy.from_record` reads off a K3.1 record (the simulated DCP8 smoke, pit2-p03-g08 /var/tmp/perzhang_compass/p752/kimi/smoke_sim_dcp8, states them). kv_tokens is a PLACEHOLDER (#752: the pool holds about three 940k-token requests) until a real smoke record's run.json replaces it (`gen_v1.py --record`). The prefill's KDA state columns (752-kimi: kda_seqs, kda_saves, kda_forks, kda_moves, kda_pad_blocks) are a variant this tree's backend does not count: they report an error until that tree lands and the rehearsal's views carry KDA counts. Decode variant `rows`: the per-sequence, context-independent cost DCP's exchange adds at each full-attention layer (provisional column). The KDA layers carry no context term; `context` stands for the 24 full-attention layers. Dry run: waits for a law fitted on the smoke record.",
+ "about": "Kimi-K3.1-Pro on 8 MI355X: TP8 + DCP8, ONE DP rank, bf16 KV, block 128, max-num-seqs 64, max len 1048576, no speculative decode, KDA recurrent state with a checkpoint every 8192 tokens: a prefix hit lands on a checkpoint boundary only (prefix_unit 8192) (#752; ~/agent_scratch/752/kimi/env_k31.sh). The deployment is the step-A smoke record's (pit2-p03-g27 /var/tmp/perzhang_compass/p752/kimi/smoke_c8, memory readings e00003ea7bce; `deploy.from_record` on it gives these fields): rungs ATOM's default capture sizes up to 64, max-num-batched-tokens and the prefill chunk ATOM's 16384, no prefill token-graph buckets, kv_tokens 5929 blocks x 128 x DCP 8 = 6,071,296 sequence tokens (KDA checkpoints share the pool but are evictable, so not taken off), kda_state (the views state the KDA state work the law's KDA prefill columns read). One DP rank: graph_padding and row_padding alias (rule 2.4.6) as for M3.1. Prefill columns: the history form of a record with no drafter (no seqs or out), plus the KDA columns `compass fit steps --model` adds; kda_saves and kda_forks stay 0 (no midstep save; a hit restores a paged checkpoint) and kda_pad_blocks is 0 on whole trace blocks, so the rehearsal names all three structural and only the record can judge kda_pad_blocks. Decode variant `rows`: the per-sequence, context-independent cost DCP's exchange adds at each full-attention layer (provisional column). The KDA layers carry no context term; `context` stands for the full-attention layers. server_start_s: step A's warm start took 7.7 min.",
  "deployment": {
   "dp": 1,
   "tp": 8,
@@ -11,10 +11,11 @@
   "chunk": 16384,
   "block_size": 128,
   "max_model_len": 1048576,
-  "kv_tokens": 2800000,
+  "kv_tokens": 6071296,
   "drafts": 0,
   "acceptance": 1.0,
   "prefix_unit": 8192,
+  "kda_state": true,
   "prefill_buckets": [],
   "moe_routing": [896, 16],
   "trace_model": "kimi-k3.1",
@@ -23,8 +24,8 @@
  "columns": {
   "decode": ["step", "context", "graph_padding", "row_padding"],
   "decode_variants": [[], ["moe_tokens"], ["moe_experts"], ["rows"]],
-  "prefill": ["step", "tokens", "query_square", "query_cached", "history", "seqs", "out"],
-  "prefill_variants": [[], ["kda_seqs", "kda_saves", "kda_forks", "kda_moves", "kda_pad_blocks"]],
+  "prefill": ["step", "tokens", "query_square", "query_cached", "history"],
+  "prefill_variants": [["kda_seqs", "kda_saves", "kda_forks", "kda_moves", "kda_pad_blocks"]],
   "min_spread": 0.2
  },
  "noise": {
@@ -44,13 +45,13 @@
   "min_seq_tokens": 128
  },
  "timing": {
-  "server_start_s": 900,
+  "server_start_s": 480,
   "segment_overhead_s": 35
  },
  "segments": [
-  {"name": "D-v1", "kind": "drain", "purpose": "each rung's fixed cost at small context", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}]},
+  {"name": "D-v1", "kind": "drain", "purpose": "each rung's fixed cost at small context; prompts spread 2-8k so row padding takes a level of its own at each rung", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": [2048, 8192]}]}]},
   {"name": "D-v2", "kind": "drain", "purpose": "row padding at low context: one long anchor among short rows", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0, "minus": 1}, "prompt": 4096, "then": 512}, {"rows": 1, "prompt": {"len_share": 0.8583}, "last": true, "then": 512}]}]},
-  {"name": "D-v3", "kind": "drain", "purpose": "long context at the high rungs: half the KV pool over 64 rows", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": {"kv_share": 0.5}, "then": 512}]}]},
+  {"name": "D-v3", "kind": "drain", "purpose": "long context at the high rungs: 0.35-0.65 of the KV pool over 64 rows (about half of it), spread so row padding takes levels of its own at every rung", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": [{"kv_share": 0.35}, {"kv_share": 0.65}], "then": 512}]}]},
   {"name": "D-v3low", "kind": "drain", "purpose": "long context at the low rungs: nine anchors leave last", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0, "minus": 9}, "prompt": 7168, "then": 512}, {"rows": 9, "prompt": {"kv_share": 0.5, "over": 9}, "last": true, "then": 512}]}]},
   {"name": "P-quads", "kind": "quads", "purpose": "prefill scale x density; checkpoint crossings", "scales": [1024, 2048, 4096, {"budget_share": 0.5}, {"budget_share": 0.75}, {"budget_share": 1.0}], "shares": [1.0], "sparse_steps": [0, 150, 0, 0, 300, 0]},
   {"name": "P-backlog", "kind": "backlog", "purpose": "long chunks sharing the step budget with short prompts", "long": [{"len_share": 0.28613}, {"len_share": 0.5625}], "short": [512, {"budget_share": 1.0}], "short_turns": 40, "short_sessions": 3},
