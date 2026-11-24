@@ -233,10 +233,6 @@ PLATFORM_AND_STORE = ["--device", "d", "--ptl", "disabled", "--store", "s"]
     "flags,named",
     [
         (
-            PLATFORM_AND_STORE,
-            "one of the arguments --step-stub --step-linear --step-grid",
-        ),
-        (
             [*PLATFORM_AND_STORE, "--step-grid", "a", "--step-linear", "b"],
             "not allowed",
         ),
@@ -245,11 +241,11 @@ PLATFORM_AND_STORE = ["--device", "d", "--ptl", "disabled", "--store", "s"]
             "the following arguments are required: --device, --ptl, --store",
         ),
     ],
-    ids=["no-backend", "two-backends", "no-platform-or-store"],
+    ids=["two-backends", "no-platform-or-store"],
 )
-def test_the_flags_refuse_without_one_backend_a_platform_and_a_store(
-    capsys, flags, named
-):
+def test_the_flags_refuse_two_backends_and_no_platform_or_store(capsys, flags, named):
+    # No backend flag parses: --step-roofline alone names the backend, which
+    # `runfile.named_backend` checks (test_run_step_roofline_alone).
     parser = argparse.ArgumentParser()
     runfile.add_arguments(parser)
 

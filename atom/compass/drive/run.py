@@ -14,7 +14,8 @@ reach it until it is stopped, with run.json recording what grading reads.
 `runfile` builds the run file from the flags, the platform composed from
 `--device`'s datasheet and the readings `--store` holds for it at `--ptl` and
 at the stack the backend's and host laws' entries state, or `--stack` where
-they state none (`runfile.spec`), the backend exactly one with no default, and
+they state none (`runfile.spec`), the backend exactly one, or the step roofline
+alone, with no default (`runfile.named_backend`), and
 `serve` starts the server simulated from it with the step record on, and
 ATOM's GPU forward timer unless the environment sets it (`timer_env`). `--out`
 holds what `serve` writes and what the run writes there: each DP rank's step
@@ -87,14 +88,7 @@ from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.step_grid_plan import BOUNDS, coverage
 from atom.compass.backends.step_labels import group_peaks
 from atom.compass.drive import lacking, runfile, serve
-from atom.compass.run import (
-    OP_GRAPH,
-    PRICE_LIST,
-    STEP_GRID,
-    STEP_LINEAR,
-    STEP_STUB,
-    step_grid,
-)
+from atom.compass.run import OP_GRAPH, PRICE_LIST, STEP_GRID, step_grid
 from atom.compass.validate.bound import _split
 
 PROG = "compass run"
@@ -128,8 +122,8 @@ def main(argv: list[str]) -> None:
         return
     parser = _parser()
     args = parser.parse_args(argv[:cut])
-    if args.coverage and not (getattr(args, STEP_GRID) or getattr(args, OP_GRAPH)):
-        key = next(k for k in (STEP_STUB, STEP_LINEAR) if getattr(args, k))
+    key = runfile.named_backend(args)
+    if args.coverage and key not in (STEP_GRID, OP_GRAPH):
         raise ValueError(
             f"--coverage: --{key.replace('_', '-')} has no coverage check; only "
             "--step-grid's and --op-graph's steps are checked"
