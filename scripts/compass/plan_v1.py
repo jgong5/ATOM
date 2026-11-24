@@ -84,6 +84,7 @@ def rehearse(cfg, segments, law_path: Path, host_path: Path | None, targets=()) 
         read_law(law_path),
         json.loads(Path(host_path).read_text()) if host_path else None,
         cfg.deployment.dp,
+        cfg.deployment.rungs,
     )
     t0 = time.time()
     got = engine.rehearse(cfg, segments, law)
@@ -98,6 +99,7 @@ def rehearse(cfg, segments, law_path: Path, host_path: Path | None, targets=()) 
         "gpu_minutes": round(got.gpu_minutes, 2),
         "wall_s": round(got.wall_s, 1),
         "refused": got.refused,
+        "proxy": {str(k): v for k, v in law.proxy.items()},
         "segments": report.segment_rows(got.steps, got.runs),
         "combos": report.combos(got.steps, cfg.deployment),
         "vectors": vectors,
@@ -119,6 +121,12 @@ def markdown(cfg, plan: dict) -> str:
         "## Sequence (chained by events)",
         "",
     ]
+    if plan.get("skipped"):
+        lines += [
+            "Skipped, the deployment has too few DP ranks (`min_dp`): "
+            + ", ".join(f"{k} (needs {v})" for k, v in plan["skipped"].items()),
+            "",
+        ]
     lines += [
         "| # | segment | starts after | lanes (pin, concurrency, traces) |",
         "|--:|---|---|---|",
@@ -144,6 +152,19 @@ def markdown(cfg, plan: dict) -> str:
             f"refused; rehearsed in {r['cpu_seconds']} CPU s."
         ),
         "",
+    ]
+    if r.get("proxy"):
+        near = ", ".join(f"{k} by {v}" for k, v in r["proxy"].items())
+        lines += [
+            (
+                f"Rungs the law holds no vector for, priced by its nearest rung's "
+                f"(`engine.proxied`): {near}. Their counts, and so rank, VIF and "
+                "levels, are their own; their prices, GPU minutes and GPU-bound cut "
+                "are the neighbour's."
+            ),
+            "",
+        ]
+    lines += [
         "| segment | starts at s | lasts s | requests | decode steps | prefill steps | not GPU-bound |",
         "|---|--:|--:|--:|--:|--:|--:|",
     ]
@@ -225,6 +246,7 @@ def main(argv=None) -> None:
         "server_env": SERVER_ENV,
         "event": EVENT,
         "sequence": sequence(doc),
+        "skipped": doc.get("skipped", {}),
     }
     if a.law:
         segments = design.read(a.design, cfg)

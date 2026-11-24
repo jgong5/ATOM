@@ -45,6 +45,7 @@ def main(argv=None) -> int:
         law_doc.get("params", law_doc),
         json.loads(a.host.read_text()) if a.host else None,
         cfg.deployment.dp,
+        cfg.deployment.rungs,
     )
     steps, measured = check.record_steps(a.record, doc, cfg, law)
     actual = report.combos(steps, cfg.deployment)
