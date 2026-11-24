@@ -28,8 +28,10 @@ The server runs this driver's tree in its own process group, so its engine
 processes stop with it, with the open-file soft limit raised as ATOM's own
 server raises it (`atom.utils.set_ulimit`), and writes ``<out>/server.log`` and its step record in
 ``<out>/steps``. Once its ``/health`` first answers, ``<out>/server.json``
-names its URL and process id, for a simulated server its clock endpoint and
-run file, and, given an artifact store, the JIT cache library's absolute path.
+names its URL and process id, its host's wall clock and monotonic nanoseconds
+read together then (`step_labels.CLOCK`), for a simulated server its clock
+endpoint and run file, and, given an artifact store, the JIT cache library's
+absolute path.
 SIGINT or SIGTERM to the command, or the server's exit, stops the whole group:
 SIGTERM first, SIGKILL for what is left after `STOP_GRACE_S`.
 A real server's stop, for the GPU check after it, lasts until KFD, which
@@ -55,10 +57,10 @@ from pathlib import Path
 
 import atom
 from atom.compass import parity
-from atom.compass.backends.step_labels import TRACE
+from atom.compass.backends.step_labels import CLOCK, TRACE
 from atom.compass.drive import jit_cache
 from atom.compass.drive.gpu import KFD, hip_visible, quiet
-from atom.compass.drive.identity import _device, _stack, identity
+from atom.compass.drive.identity import _device, _stack, clock_ns, identity
 from atom.compass.run import ATOM_ARGS, CLOCK_ENV, ENV, OP_GRAPH, _machine, _write_whole
 from atom.utils import set_ulimit
 from atom.utils.arg_parser import FlexibleArgumentParser
@@ -257,6 +259,7 @@ def serve(
                 if trace:
                     _post(host, server_port, "/start_profile", STOP_GRACE_S)
                 ready["pid"] = server.pid
+                ready[CLOCK] = clock_ns()
                 _write_whole(out / READY_FILE, json.dumps(ready))
             while not stopped and server.poll() is None:
                 time.sleep(POLL_S)

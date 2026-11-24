@@ -71,7 +71,7 @@ def _key(tokens):
 
 
 def _config(dp_rank=0, pipeline_parallel_size=1, budget=BUDGET, blocks=4096, **extra):
-    return MockConfig(
+    config = MockConfig(
         **extra,
         max_num_seqs=8,
         num_kvcache_blocks=blocks,
@@ -90,6 +90,10 @@ def _config(dp_rank=0, pipeline_parallel_size=1, budget=BUDGET, blocks=4096, **e
         tensor_parallel_size=1,
         kv_transfer_config={},
     )
+    if pipeline_parallel_size > 1:
+        # A pipeline's record states each stage's span of the model's layers.
+        config.hf_config.num_hidden_layers = 4 * pipeline_parallel_size
+    return config
 
 
 class _Runner(NonAllocatingRunner):

@@ -116,7 +116,9 @@ essential work is left, and the last one's end finishes the run),
 ``local_grants`` (optional, ``true``, the default, or ``false``: with ``true``
 the authority gives each grant a ceiling, below which the LP answers its own
 clock calls and reports them with its next one, a DP member at its settle,
-`ClockAuthority`; the step table is the same),
+`ClockAuthority`; the sends are the same, and so is the step table but for an
+own step walking an arrival on an offering channel: one ``TAR`` row where a
+run with ``false`` records ``ARRIVAL`` and ``TAR``),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -227,8 +229,8 @@ its ``kv_transfer_config`` as ``compass_instance``; above one, its LPs carry
 the index (``engine-P1``), and the router is the ``router`` LP, which chooses
 among them. An optional ``worker_order`` gives, by side (``P`` or ``D``), the
 (instance, DP rank) pairs in the order that LP's policies list the side's
-workers, each once (`worker_order`); a side it does not name is sorted by URL
-and rank. `frontend(config)` refuses such a
+workers, each once (`worker_order`); a side it does not name lists them by
+instance, then rank. `frontend(config)` refuses such a
 deployment unless the authority is standalone: a prefill-decode run spans two
 API servers that must share one.
 
@@ -866,19 +868,24 @@ def _dp(run: dict, side: str | None = None) -> int:
 
 
 def worker_order(run: dict) -> dict:
-    """The run file's ``worker_order``, ``{}`` when absent. Refuses a side
-    other than ``P`` and ``D``, and a list that is not each of the side's
-    (instance, DP rank) pairs once."""
-    order = run.get(WORKER_ORDER, {})
-    for side, pairs in order.items():
-        known = side in INSTANCES
-        n, dp = (run.get(INSTANCES[side], 1), _dp(run, side)) if known else (0, 0)
-        if not n or sorted(pairs) != [[k, r] for k in range(n) for r in range(dp)]:
+    """Each side's (instance, DP rank) pairs, ``P`` then ``D``, in the order
+    the router LP lists that side's workers: the run file's ``worker_order``
+    where it names the side, else by instance, then rank, never by the
+    workers' URLs, whose ports deploy.sh draws afresh each run. Refuses a
+    side other than ``P`` and ``D``, and a list that is not each of the
+    side's (instance, DP rank) pairs once."""
+    named = run.get(WORKER_ORDER, {})
+    order = {
+        side: [[k, r] for k in range(run.get(key, 1)) for r in range(_dp(run, side))]
+        for side, key in INSTANCES.items()
+    }
+    for side, pairs in named.items():
+        if not order.get(side) or sorted(pairs) != order[side]:
             raise ValueError(
                 f"{WORKER_ORDER}[{side!r}] is {pairs}: name side P or D, and list "
                 "each of its deployments' (instance, DP rank) pairs once"
             )
-    return order
+    return order | named
 
 
 def _widths(run: dict) -> int | tuple[int, int]:

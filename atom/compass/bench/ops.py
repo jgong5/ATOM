@@ -122,7 +122,9 @@ that takes it, as its loader builds it before the runner's KV pool is sized,
 its runners' peer memory with it (`_comm_fused`), with the leaf's arguments,
 its stated group width and reduction aside, and, where it holds no shared
 expert's output, as under ATOM's dual-stream MoE, zeros at the rows its
-stage 2 asks for, built once (`Stub._comm_fused`).
+stage 2 asks for, built once (`Stub._comm_fused`). One DP rank alone builds
+no runtime, a drafter's load included, its layers keeping their backend with
+none (`_unbuilt_comm_fused`), and the leaf refuses as a collective does.
 MORI's dispatch and combine are methods of a handle no graph holds: each is
 called at MORI's entry point on the handle ATOM builds for the model's MoE,
 with the leaf's arguments, and, since neither runs twice in a row, timed
@@ -1119,7 +1121,8 @@ def _runner(config, rank: int):
     on the device and then freed for the weights each leaf builds, and with
     the MORI exchange ATOM's loader builds before it, MORI's heap with it, in
     its `mori` (`_prepare_finalize`) where its MoE exchanges through MORI, and
-    the runtime of aiter's comm-fused MoE in its `comm_fused` (`_comm_fused`);
+    the runtime of aiter's comm-fused MoE in its `comm_fused` (`_comm_fused`),
+    but for one DP rank run alone (`_unbuilt_comm_fused`);
     the runner attributes the allocation set are in its `kv_held`, and by path each
     tensor it bound on a metadata builder (`BUILDERS`, `_bound`) but a view the
     builder cut from one of the runner's (`_cut_from`); and, when
@@ -1158,7 +1161,9 @@ def _runner(config, rank: int):
             wait_for_workers=False,
         )
         pc.data_parallel_base_port, pc._managed_distributed_store = store.port, True
-    runner = MetaRunner(rank, config)
+    alone = getattr(config, "dp_logical_size", 0)
+    with _unbuilt_comm_fused(config) if alone else contextlib.nullcontext():
+        runner = MetaRunner(rank, config)
     runner.store = store
     nbytes = sum(p.nbytes for p in runner.model.parameters())
     held = torch.empty(nbytes, dtype=torch.uint8, device=runner.device)
@@ -1166,7 +1171,8 @@ def _runner(config, rank: int):
     # leaf instead, the heap took room the pool left the leaves' weights
     modules = dict(runner.model.named_modules())
     runner.mori = _prepare_finalize(modules, mori_only=True)
-    runner.comm_fused = _comm_fused(modules)
+    # one rank alone has no group to build it on, and `Stub` refuses its leaf
+    runner.comm_fused = None if alone else _comm_fused(modules)
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     del held
     _release()  # the pool takes the room the hold had
@@ -1234,6 +1240,20 @@ def _comm_fused(modules: dict):
         return None
     layer._comm_fused_moe.initialize(layer)
     return layer._comm_fused_moe.runtime
+
+
+def _unbuilt_comm_fused(config):
+    """A context in which ATOM's runner for one DP rank alone loads its
+    drafter's weights with no runtime built for aiter's comm-fused MoE: ATOM's
+    loader builds one there (`init_prepare_finalize`), on a group of the
+    layout's ranks, which a rank alone holds none of, and refuses a group of
+    one. Each layer keeps the backend the layout gives it, with no runtime, as
+    the target's layers do, whose parameters on the meta device load nothing."""
+    if not getattr(config, "speculative_config", None):
+        return contextlib.nullcontext()
+    from atom.model_ops.fused_moe.comm_fused_moe import CommFusedMoeBackend
+
+    return patch.object(CommFusedMoeBackend, "initialize", lambda self, layer: None)
 
 
 class Stub:

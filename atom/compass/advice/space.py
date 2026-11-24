@@ -12,16 +12,19 @@ point's add each argument that varies with the concurrency, its factor times
 the point's concurrency. A candidate whose blocks set ``lmcache_server``
 holds those `lmcache server` flags, and each of its points
 ``lmcache_port``, its own from `LMCACHE_PORTS` in the points' order, so
-points started at once each reach their own server.
+points started at once each reach their own server. A candidate whose blocks
+set ``mooncake_store`` holds that path, the run file's ``mooncake_store``
+entry, which every one of its points runs with: each starts a Store of its
+own at a port it draws itself.
 
 Every refusal is a ValueError naming the file and the field: an unknown field,
 a key given twice in one object, a value of the wrong kind, an lmcache server's
 ``--host`` or ``--port``; contradictory values, two blocks of one candidate
 that set an argument, a variable, an lmcache server flag, a departure's
-reason, its basis or its deployment apart, or an argument both fixed and
-varying with the concurrency; a candidate that names no basis; an empty
-expansion; and more offloading points than `LMCACHE_PORTS` holds. An excluded
-combination is never judged.
+reason, its basis, its deployment or its Store's entry apart, or an argument
+both fixed and varying with the concurrency; a candidate that names no basis;
+an empty expansion; and more offloading points than `LMCACHE_PORTS` holds. An
+excluded combination is never judged.
 """
 
 import itertools
@@ -46,6 +49,7 @@ BLOCK = (
     "deployment",
     "departures",
     "lmcache_server",
+    "mooncake_store",
     *INSTANCES["1p1d"],
 )
 #: The `lmcache server` flags `compass advice` sets itself: its address.
@@ -140,7 +144,7 @@ def _candidate(chosen: dict, blocks: list, model: str, where: str) -> dict:
     where = f"{where}: candidate {name}"
     once, departures, server = {}, {}, {}
     for source, block in blocks:
-        for field in ("basis", "deployment"):
+        for field in ("basis", "deployment", "mooncake_store"):
             if field in block:
                 value = block[field]
                 _put(once, field, value, f"{field} {value}", source, where)
@@ -179,6 +183,8 @@ def _candidate(chosen: dict, blocks: list, model: str, where: str) -> dict:
         candidate["lmcache_server"] = [
             w for words, *_ in server.values() for w in words
         ]
+    if "mooncake_store" in once:
+        candidate["mooncake_store"] = once["mooncake_store"][0]
     return candidate
 
 
@@ -311,6 +317,9 @@ def _block(where: str, block, sides: bool = True) -> None:
         _is(f"{at}.{flag}", _count(factor), "a positive integer factor")
     if "basis" in block:
         _is(f"{where}.basis", _text(block["basis"]), "a recipe, as a string")
+    if "mooncake_store" in block:
+        ok = _absolute(block["mooncake_store"])
+        _is(f"{where}.mooncake_store", ok, "its entry file's absolute path")
     if "deployment" in block:
         ok = isinstance(block["deployment"], str) and block["deployment"] in INSTANCES
         _is(f"{where}.deployment", ok, " or ".join(INSTANCES))

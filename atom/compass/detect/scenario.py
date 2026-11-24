@@ -40,11 +40,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from atom.compass.backends.step_grid_plan import DEFERS_OUTPUT
+from atom.compass.backends.step_labels import waited
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.clock import ARRIVAL, TAR
 from atom.compass.detect.determinism import CONFIGURATION_PREFIX, compare_step_tables
 from atom.compass.parity import read
-from atom.compass.parity.recurrence import _waited
 from atom.compass.run import (
     RAPIDSERVE,
     STEP_TABLE_FILE,
@@ -274,16 +274,19 @@ def stage_timelines(table: str, engine: str, stages, layers: int, parts) -> list
     `tokens`-row forward as `pp_send` parts. Stage k's forward is the stub's at
     its share of the layers (`get_pp_indices`); its host takes no time, so it
     returns at its launch, which waits for its device work `pp` forwards back
-    and on a later stage for its metadata, and on the last stage at its device
-    end. Its sends, receives and acks are `pp_send.StageSends`', each priced by
-    the machine's carriers. The stage loops are ATOM's:
+    and on a later stage for its metadata, and on the last stage, producing
+    output, at its device end. Its sends, receives and acks are
+    `pp_send.StageSends`', each priced by the machine's carriers. The stage
+    loops are ATOM's:
 
+    - the last stage acks each forward to the head on ``tokens`` as it
+      returns, with its tokens or, a middle chunk, none;
     - the head launches while fewer than `pp` forwards are in flight and the
-      tokens its batch waits for (`recurrence._waited`) are taken. A batch with
-      a request the head has not run starts where the table starts it: when
-      the request reached the head is the traffic's. Launching none, the head
-      flushes its last send, then waits for the first in flight's tokens, or
-      that start;
+      forward its batch waits for (`step_labels.waited`) is retired, each
+      retired at its ack. A batch with a request the head has not run starts
+      where the table starts it: when the request reached the head is the
+      traffic's. Launching none, the head flushes its last send, then waits
+      for the first in flight's ack, or that start;
     - a later stage takes its batch at its ``meta`` release; each arrival
       before it ends the stage's poll, which flushes its last send;
     - a send or flush waits for the last send's ack; a host that blocked on it
@@ -350,8 +353,8 @@ def stage_timelines(table: str, engine: str, stages, layers: int, parts) -> list
             sent[k, n], s.pending = (s.now, s.ends[-1]), n
             data = ch(k, k + 1, "pp_data#dp0")
             stamp(data, n, s.now + channels.lookahead(data))
-        elif out:
-            tokens[n] = stamp(
+        else:  # its ack, with the tokens of a forward that produces output
+            completed[n] = stamp(
                 ch(k, 0, "tokens"), n, s.now + channels.lookahead(ch(k, 0, "tokens"))
             )
 
@@ -376,7 +379,7 @@ def stage_timelines(table: str, engine: str, stages, layers: int, parts) -> list
         acks[k - 1, n] = stamp(ch(k, k - 1, "pp_ack#dp0"), n, done), s.done
         forward(k, n, called, meta, end)
 
-    head, s, tokens = stages[0], st[0], {}
+    head, s, completed = stages[0], st[0], {}
     flight, taken, seen, n = deque(), set(), set(), 0
 
     def arrival(n):  # where the table starts a forward with a request not run before
@@ -393,7 +396,7 @@ def stage_timelines(table: str, engine: str, stages, layers: int, parts) -> list
             while (
                 n < len(head)
                 and len(flight) < pp
-                and _waited(head, n, pp) in {None, *taken}
+                and waited(head, n, pp) in {None, *taken}
                 and (arrival(n) <= s.now or math.isclose(arrival(n), s.now))
             ):
                 for k in range(1, pp):
@@ -407,18 +410,17 @@ def stage_timelines(table: str, engine: str, stages, layers: int, parts) -> list
                 n, launched = n + 1, launched + 1
             if not launched:
                 settle(0)
-            # Take the tokens out, waiting for the first only if none launched.
+            # Retire each at its ack, waiting for the first only if none launched.
             while flight:
                 m = flight[0]
-                if head[m]["produces_output"]:
-                    if tokens[m] > s.now:
-                        if launched:
-                            break
-                        if s.now < (t := arrival(n)) < tokens[m]:
-                            s.now = t
-                            break
-                        s.now = tokens[m]
-                    launched = 1
+                if completed[m] > s.now:
+                    if launched:
+                        break
+                    if s.now < (t := arrival(n)) < completed[m]:
+                        s.now = t
+                        break
+                    s.now = completed[m]
+                launched = 1
                 taken.add(flight.popleft())
             else:
                 if not launched and n < len(head):  # idle until the request

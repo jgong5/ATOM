@@ -104,42 +104,36 @@ def _kind(step, busy: bool) -> str:
     return "decode" if all(d for *_, d in step["rows"]) else "prefill"
 
 
-def _waited(steps: list[dict], n: int, pp: int):
-    """The head's last forward before `n` whose tokens `n` is scheduled after,
-    or None: `n - pp`, which leaves the in-flight queue only with its tokens,
-    or a later one holding a request of `n`'s, every request of a batch with a
-    decode in it, else the requests `n` decodes."""
-    mine = {k: d for (k, *_), (*_, d) in zip(steps[n]["batch"], steps[n]["rows"])}
-    for m in range(n - 1, max(n - pp, 0) - 1, -1):
-        s, decode = steps[m], any(d for *_, d in steps[m]["rows"])
-        held = any(k in mine and (decode or mine[k]) for k, *_ in s["batch"])
-        if s["produces_output"] and (m == n - pp or held):
-            return m
-    return None
-
-
 def pipeline(stages: list[list[dict]], carriers=None) -> list[dict]:
     """One DP rank's stages charged step by step, `check`'s report for each:
-    the head's entry released at the last stage's exit of the forward whose
-    tokens it waits for, each downstream entry at the head's call. With
-    `carriers`, ``(models, row_bytes)``, each send rides the carriers
-    (`_charged`)."""
+    each entry released as `step_labels.released` releases it, on the measured
+    exits, and called at that release on the predicted ones: the head's at the
+    last stage's exit of the forward whose ack it waits for, each
+    downstream entry at the head's call. With `carriers`, ``(models,
+    row_bytes)``, each send rides the carriers (`_charged`)."""
     if len({len(s) for s in stages}) > 1:
         raise ValueError(f"stages of {[len(s) for s in stages]} steps")
-    pp, head, tail = len(stages), stages[0], stages[-1]
+    pp, head = len(stages), stages[0]
     out, held = [[] for _ in stages], [[] for _ in stages]
     runs = [
         _charged(s, (i, pp), out[i - 1] if i else None, held[i], carriers, nxt)
         for i, (s, nxt) in enumerate(zip(stages, [*out[1:], None]))
     ]
+
+    def measured(k: int, m: int) -> int:
+        return stages[k][m]["t_exit_ns"]
+
+    def predicted(k: int, m: int) -> int:
+        return out[k][m][3]
+
     for n in range(len(head)):
-        w = _waited(head, n, pp)
-        tokens = w is not None and (tail[w]["t_exit_ns"], out[-1][w][3])
-        held[0].append(tokens)
+        (tokens, call), (due, called) = (
+            step_labels.released(head, n, pp, exits) for exits in (measured, predicted)
+        )
+        held[0].append(tokens is not None and (tokens, due))
         out[0].append(next(runs[0]))
-        call = n and (max(head[n - 1]["t_exit_ns"], tokens and tokens[0]), out[0][n][2])
         for i in range(1, pp):
-            held[i].append(call)
+            held[i].append(call is not None and (call, called))
             out[i].append(next(runs[i]))
     return [next(r) for r in runs]
 
