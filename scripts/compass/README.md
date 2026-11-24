@@ -1029,9 +1029,9 @@ hull. Host keys and the fp4 indexer as the gpu-45 pair's.
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-{prefill,decode}.json.xz`
 are the EP8 pair for the cell on crsuse2-m2m-v3-005 (prefill) and -013 (decode), keyed by
-the platform their `platform` states, in the image of that stack: the `base` form with host
-laws, each written by `step_linear_fit` from its side's cells. The cells are the gpu-40 EP8
-pair's, run by `calib_capture.sh` at `--gpu-memory-utilization 0.75` with each side's EP8
+the platform their `platform` states, in the image of that stack: the `base` form, each written
+by `step_linear_fit` from its side's cells, with host laws from `compass fit host`. The cells are
+the gpu-40 EP8 pair's, run by `calib_capture.sh` at `--gpu-memory-utilization 0.75` with each side's EP8
 arguments, the prefill side's on 005. -013's page cache served other bytes than its disk while
 its first decode cells ran ([#2794](https://github.com/jgong5/ATOM/issues/2794)), so the decode
 cells were run again, on 005 and, after -013's reboot, on both nodes at once, each started once
@@ -1043,12 +1043,15 @@ prefill vector, and the decode law's rung 1, 2, 4 and 8 vectors with `--moe-rout
 DeepSeek-V4-Pro's routed experts and top-k, are refitted on their side's lone cells and on their
 side of three 1P1D `deploy.sh record` cells at c=256 over traces 256 to 392, seeds 20260707,
 20260708 and 20260709, the prefill side at `--gpu-memory-utilization 0.72`. Each law's other
-vectors, the prefill law's rung-1 vector among them, and its host laws are the ones fitted on its
-lone cells alone, and its `sources` names the records each came from. The prefill law's rung-2
+vectors, the prefill law's rung-1 vector among them, are the ones fitted on its lone cells alone,
+and its `sources` names the records each came from. Its host laws are fitted on its side's lone
+cells re-recorded with the fp8 index cache, at a tree whose recorded engine holds its stamps
+([#2838](https://github.com/jgong5/ATOM/issues/2838)), and its `host_fit.provenance` names
+their records. The prefill law's rung-2
 vector is not: it is the decode law's, stating `declared`, since no prefill-side record decodes at
 rung 2, which the 1P1D prefill side reaches at c=64 ([#2878](https://github.com/jgong5/ATOM/issues/2878)).
-Host keys and the fp8 indexer key as the crs005 DPA-TP8 pair's, its lone cells fp4 and its 1P1D
-cells fp8; the gap between the two is unmeasured on this pair.
+Host keys and the fp8 indexer key as the crs005 DPA-TP8 pair's. The step vectors' lone cells ran
+fp4 and their 1P1D cells fp8; the gap between the two is unmeasured on this pair.
 
 `scripts/compass/laws/deepseek-v4-pro-tp8-mi355x-crs005-{prefill,decode}-host.json.xz` hold host
 laws alone (`host`, `host_fit`, `platform` and `provenance`, no step law), one per side of
