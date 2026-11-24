@@ -34,7 +34,7 @@ from types import SimpleNamespace
 
 import pytest
 import test_dp_slice
-from capabilities import capability
+from capabilities import ROOFLINE, ROOFLINE_MACHINE, capability, cost_overrides
 from test_dp_slice import DP_MACHINE, MAX_TOKENS
 from test_kv_remote_prefill import Script, connector
 from test_kv_simulated_connector import PEAKS, geometry, model_for  # noqa: F401
@@ -447,9 +447,9 @@ def run_xpyd(
     cell=None,
     publish=publish_entry,
 ) -> dict:
-    """One 2P2D run under `pd_sim.sh`, round robin on each side, or with the
-    run file keys `run` and the environment `cell` over those, its readings
-    published by `publish`."""
+    """One 2P2D run under `pd_sim.sh`, round robin on each side, under a
+    constant stub, or with the run file keys `run` and the environment `cell`
+    over those, its readings published by `publish`."""
     out.mkdir()
     run, cell = run or {}, cell or {}
     with held_ports(1, lambda q: range(q[0] + 1, q[0] + 72)) as [base]:
@@ -457,10 +457,7 @@ def run_xpyd(
         run_file = _run_file(
             out,
             clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
-            step_stub=CONSTANT,
-            **XPYD,
-            **PD,
-            **run,
+            **{"step_stub": CONSTANT, **XPYD, **PD, **run},
         )
         env = (
             dict(
@@ -516,9 +513,11 @@ def xpyd_runs(tmp_path_factory):
     return [run_xpyd(root / f"seed{s}", s) for s in ("1", "2")]
 
 
-def _every_check_with_requests_on_every_deployment(runs) -> list[str]:
-    """Both seeds' `runs` meet every scenario check, each request's KV moving
-    once, every deployment of each side taking one; the transfers' channels."""
+def _every_check_with_requests_on_every_deployment(runs, timeline=True) -> list[str]:
+    """Both seeds' `runs` meet every scenario check, the hand-computed timeline
+    only with `timeline`, which only a constant stub's run has, each request's
+    KV moving once, every deployment of each side taking one; the transfers'
+    channels."""
     run = runs[0]
     rows = [r.split() for r in run["table"].splitlines()[1:]]
     channels = [r[4] for r in rows if r[3] == "release" and ":kv_write_req" in r[4]]
@@ -536,7 +535,7 @@ def _every_check_with_requests_on_every_deployment(runs) -> list[str]:
         [r["out"] for r in runs],
         MAX_TOKENS,
         [line for _, line in run["events"]],
-        records,
+        records if timeline else None,
     )
     assert not failed, "\n".join(failed)
     assert sum(pairs.values()) == len(MAX_TOKENS)
@@ -552,6 +551,26 @@ def test_2p2d_meets_every_scenario_check_with_requests_on_every_deployment(
     xpyd_runs,
 ):
     _every_check_with_requests_on_every_deployment(xpyd_runs)
+
+
+@pytest.fixture(scope="module")
+def xpyd_roofline_runs(tmp_path_factory):
+    root = tmp_path_factory.mktemp("xpyd_roofline")
+    run = cost_overrides(ROOFLINE, ROOFLINE_MACHINE)
+    return [run_xpyd(root / f"seed{s}", s, run=run) for s in ("1", "2")]
+
+
+@NEEDS_A_PD_RUN
+@capability("pd_xpyd", 1)
+def test_2p2d_meets_every_scenario_check_under_the_step_roofline(xpyd_roofline_runs):
+    """The level-0 case's checks but one: the hand-computed timelines, which
+    `check_run` computes only for a constant step stub. Round robin places
+    each request by its order, whatever the step cost."""
+    summary = json.loads(
+        (xpyd_roofline_runs[0]["out"] / compass_run.SUMMARY_FILE).read_text()
+    )
+    print(f"\n{summary['schedule']['seconds_by_method']}")
+    _every_check_with_requests_on_every_deployment(xpyd_roofline_runs, timeline=False)
 
 
 # --- the share-cache recipe's router, at DP 2, with no driver ------------------

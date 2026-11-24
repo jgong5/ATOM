@@ -12,6 +12,11 @@ unprefetched and look up blocking, and with ``OFFLOAD_LOOKUP_DEFER_S=0`` the
 prefetched one is deferred once, then looks up blocking too: a lookup job is
 priced above a step, so its reply is not in by the next pass.
 
+The same runs under the step roofline alone, on the level-1 machine at the
+cards' platform, meet the same checks, and a request whose prefix a load
+brought back prefills on fewer uncached tokens than the first request's whole
+first pass: a load reaches the price only as cached tokens.
+
 Two more runs serve DeepSeek-V4.1-Flash as the prefill instance of ROCm/ATOM's
 6P16D C1228 share-cache recipe (`P_INSTANCE`), routed by ``--dp-load-balance
 share_cache`` over this tier in place of the recipe's ``mooncake_store``, with
@@ -24,6 +29,7 @@ The runs need a driver and `ATOM_COMPASS_SLICE_MODEL`, as in
 `test_vertical_slice`, and as many GPUs in ``HIP_VISIBLE_DEVICES`` as DP ranks.
 """
 
+import copy
 import gzip
 import json
 import math
@@ -37,7 +43,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import pytest
-from capabilities import capability
+from capabilities import ROOFLINE, ROOFLINE_MACHINE, capability, cost_overrides
 from test_lmcache_lp import lmcache_port  # noqa: F401  the lmcache_port fixture
 from test_lmcache_mp_engine import on_cards
 from test_parity_record import _config as _parity_config
@@ -56,6 +62,7 @@ from test_vertical_slice import (
 
 from atom.compass import parity
 from atom.compass import run as compass_run
+from atom.compass.backends.json_file import read_jsonl
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.carriers import tracestate_with
 from atom.compass.clock import TAR
@@ -175,10 +182,13 @@ def run_scenario(
     ports: list[int],
     argv: list,
     named: tuple = (),
+    backend=CONSTANT,
+    store=None,
 ) -> dict:
-    """One run in its own process tree of a server of flags `argv`, reading
-    the readings in ``root/store``, its clock and server on `ports`; with
-    `named`, request k names DP rank ``named[k]``."""
+    """One run in its own process tree of a server of flags `argv`, priced by
+    `backend` (`cost_overrides`) on ``root/machine.json``, reading the readings
+    in `store`, by default ``root/store``, its clock and server on `ports`;
+    with `named`, request k names DP rank ``named[k]``."""
     out = root / f"seed{seed}"
     out.mkdir()
     (clock_port, port), flags = ports, _server(server_port)
@@ -186,9 +196,8 @@ def run_scenario(
     run_file = _run_file(
         out,
         clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
-        step_stub=CONSTANT,
-        machine=machine,
-        store=str(root / "store"),
+        **cost_overrides(backend, machine),
+        store=str(store or root / "store"),
         data_parallel_size=dp,
         bound_s=60.0,
         lmcache={"server": flags, "lookup_s": [STATION_S, 0.0], "request_s": STATION_S},
@@ -252,22 +261,61 @@ def _priced_machine(root: Path, machine: dict) -> dict:
     return machine
 
 
+def _cards() -> str:
+    return os.environ.get("HIP_VISIBLE_DEVICES", "0")
+
+
 @pytest.fixture(scope="module", params=[1, 2], ids=["dp1", "dp2"])
-def runs(request, tmp_path_factory, lmcache_port):  # noqa: F811
+def measured(request, tmp_path_factory, lmcache_port):  # noqa: F811
+    """A server's flags at DP width 1 or 2, and the root whose store holds the
+    readings taken for them on this host's cards."""
     dp = request.param
     root = tmp_path_factory.mktemp(f"lmcache_dp{dp}")
-    _priced_machine(root, on_cards(os.environ.get("HIP_VISIBLE_DEVICES", "0")))
+    _priced_machine(root, on_cards(_cards()))
     width = DP2 if dp > 1 else []
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("AITER_LOG_LEVEL", "WARNING")  # the readings are keyed by it
         for name, value in _offload(lmcache_port).items():
             mp.setenv(name, value)
         _measure(root, root / "machine.json", width, lmcache_port)
-    argv = [*ATOM_ARGS, *width, "--no-enable_prefix_caching"]
+    return dp, root, [*ATOM_ARGS, *width, "--no-enable_prefix_caching"]
+
+
+@pytest.fixture(scope="module")
+def runs(measured, lmcache_port):  # noqa: F811
+    dp, root, argv = measured
     # The run file names the lmcache port, so both runs share it.
     with held_ports(4) as ports:
         return dp, [
             run_scenario(root, seed, dp, lmcache_port, ports[2 * i : 2 * i + 2], argv)
+            for i, seed in enumerate(("1", "2"))
+        ]
+
+
+@pytest.fixture(scope="module")
+def roofline_runs(measured, lmcache_port):  # noqa: F811
+    """`runs` under the step roofline alone, on `ROOFLINE_MACHINE` at the
+    cards' platform, which the readings were taken on."""
+    dp, root, argv = measured
+    priced = root / "roofline"
+    priced.mkdir()
+    machine = copy.deepcopy(ROOFLINE_MACHINE)
+    cards = on_cards(_cards())["device"]
+    for field in ("name", "arch", "ptl", "software_pinned_to"):
+        machine["device"][field] = cards[field]
+    _priced_machine(priced, machine)
+    with held_ports(4) as ports:
+        return dp, [
+            run_scenario(
+                priced,
+                seed,
+                dp,
+                lmcache_port,
+                ports[2 * i : 2 * i + 2],
+                argv,
+                backend=ROOFLINE,
+                store=root / "store",
+            )
             for i, seed in enumerate(("1", "2"))
         ]
 
@@ -367,16 +415,19 @@ def step_starts(table: str, record) -> list[float]:
 # --- (a) ----------------------------------------------------------------------
 
 
-def _meet_every_check_and_load_the_prefix_back(seeds: list, dp: int) -> None:
-    """Both seeds' runs `seeds` meet every scenario check, and a request loads
-    the stored prefix back, at DP width above one on a rank that did not store
-    it."""
+def _meet_every_check_and_load_the_prefix_back(
+    seeds: list, dp: int, timeline: bool = True
+) -> None:
+    """Both seeds' runs `seeds` meet every scenario check, the hand-computed
+    timeline only with `timeline`, which only a constant stub's run has, and a
+    request loads the stored prefix back, at DP width above one on a rank that
+    did not store it."""
     run = seeds[0]
     failed = check_run(
         [r["out"] for r in seeds],
         run["sent"],
         run["taken"],
-        {"engine": run["out"] / "parity"},
+        {"engine": run["out"] / "parity"} if timeline else None,
     )
     assert not failed, "\n".join(failed)
     transfers = re.findall(
@@ -394,6 +445,51 @@ def _meet_every_check_and_load_the_prefix_back(seeds: list, dp: int) -> None:
 @capability("lmcache_mp")
 def test_each_run_meets_every_scenario_check_and_loads_the_prefix_back(runs):
     _meet_every_check_and_load_the_prefix_back(runs[1], runs[0])
+
+
+def _first_prefills(out: Path) -> dict[str, tuple]:
+    """Each request's first prefill row, by its key: the engine clock its step
+    started at, the tokens it computes, its context and the step's price."""
+    first = {}
+    for rank, steps in read(out / "parity").items():
+        lines = read_jsonl(out / "parity" / f"dp{rank}.cost.jsonl")[1:]
+        cost = {line["step"]: line for line in lines}
+        for step in steps:
+            for key, tokens, context in step["batch"]:
+                c = cost[step["step"]]
+                first.setdefault(key, (c["t_s"], tokens, context, c["device_s"]))
+    return first
+
+
+@NEEDS_A_RUN
+@capability("lmcache_mp", 1)
+def test_each_run_meets_every_scenario_check_under_the_step_roofline(roofline_runs):
+    """The level-0 case's checks but one, the hand-computed timeline, which
+    `check_run` computes only for a constant step stub: the burst, sent at
+    once well after the first request ends, still spreads over both ranks.
+    And the first request's prefill computes its whole prompt, and each
+    request a load served prefills on fewer uncached tokens than its own
+    prompt and than that first pass, its loaded ones read as cached."""
+    dp, seeds = roofline_runs
+    run = seeds[0]
+    print(f"\n{json.loads((run['out'] / compass_run.SUMMARY_FILE).read_text())}")
+    _meet_every_check_and_load_the_prefix_back(seeds, dp, timeline=False)
+    loaded = {
+        key
+        for steps in read(run["out"] / "parity").values()
+        for step in steps
+        for key, kind, *_ in step.get("kv", ())
+        if kind == "load"
+    }
+    first = _first_prefills(run["out"])
+    _, tokens0, context0, price0 = min(first.values())
+    print(f"first pass: {tokens0} of {context0} tokens, priced {price0} s")
+    assert tokens0 == context0
+    assert loaded
+    for key in sorted(loaded):
+        _, tokens, context, price = first[key]
+        print(f"loaded {key}: {tokens} of {context} tokens, step priced {price} s")
+        assert tokens < context and tokens < tokens0, key
 
 
 def _last(out: Path, family: str) -> dict[str, float]:
