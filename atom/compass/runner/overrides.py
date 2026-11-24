@@ -2077,7 +2077,8 @@ def _group_step_seconds(
 
     A pipeline stage runs only its own layers, so it is refused unless its
     backend states the `stage_share` it prices; any other backend prices the
-    whole step, and every stage would charge the whole model.
+    whole step, and every stage would charge the whole model. A fallback
+    states the share of the backend it asks first, and is refused naming it.
 
     A step the cost backend refuses charges no device time on this rank, its
     answered terms included, and still counts as a priced step; its reason,
@@ -2123,9 +2124,11 @@ def _group_step_seconds(
         return 0.0
     pp = int(_config_field(runner, "pipeline_parallel_size") or 1)
     if pp > 1 and getattr(backend, "stage_share", None) is None:
+        # A fallback states the share of the backend it asks first.
+        whole = getattr(backend, "first", backend)
         raise RunnerRefusal(
             "this runner is one stage of a pipeline and runs only its own "
-            f"layers, but {type(backend).__name__} prices a whole step; charging "
+            f"layers, but {type(whole).__name__} prices a whole step; charging "
             "each stage the whole model would count it once per stage"
         )
     from atom.compass.backends.cost import (
