@@ -10,7 +10,8 @@ once memory-bound and once compute-bound. The published V4.1-Flash config at
 TP4 under DSpark5, expert parallelism off and at EP4, builds on the meta
 device with its drafter, every module classified, and prices on MI455 B0's
 spec; the build owns its process because the driverless declarations are
-process-global.
+process-global. Built as its recipe serves it at DP4 (each rank at TP 1) on
+MI355X's arch, its LM head is sharded over the group on a decode.
 """
 
 import collections
@@ -33,6 +34,7 @@ from atom.compass.backends.step_roofline import (
     StepRooflineBackend,
 )
 from atom.compass.backends.work import Work, allgather, elementwise, gemm
+from atom.compass.spec import MachineSpec
 
 TREE = pathlib.Path(__file__).resolve().parents[2]
 CONFIG = TREE / "tests" / "models" / "deepseek_v41" / "fixtures" / "config.json"
@@ -389,3 +391,73 @@ def test_the_v41_flash_tp4_dspark_steps_price_target_and_draft_apart(built):
     assert target["middle"] < target["prefill"]
     assert "roofline.lm_head" not in priced["middle"][0]
     assert draft["middle"] == 0 < draft["prefill"]
+
+
+MI355X = TREE / "tests" / "compass" / "machines" / "mi355x-gpu40.json"
+#: V4.1-Flash as its recipe serves it at DP4 on MI355X (`--enable-dp-attention
+#: -tp 4 --enable-expert-parallel`: four ranks, each at TP 1, EP4), built on
+#: gfx950's meta device, its walk's LM heads as JSON, under ATOM's default
+#: `ATOM_DP_LM_HEAD_MODE`.
+DEP4 = """
+import json, sys
+root = sys.argv[1]
+from atom.compass.validate.bound import _build
+args = ["--kv_cache_dtype", "bf16", "--index-cache-dtype", "fp8",
+        "--enable-dp-attention", "--enable-expert-parallel"]
+config, tree = _build(root + "/model", 4, args, "gfx950", root)
+from atom.compass.run.modules import walk
+heads = [[m.name, m.dims, m.fmt, m.ranks] for m in walk(tree) if m.kind == "lm_head"]
+print(json.dumps({"dp": config.parallel_config.data_parallel_size, "heads": heads}))
+"""
+
+
+def test_a_v41_flash_dep4_decode_shards_its_lm_head_over_the_group(tmp_path):
+    """A named result: V4.1-Flash at DP4 TP1 on MI355X, 64 requests a rank
+    decoding in a rung-64 graph. Before, its LM head was one GEMM of the
+    whole vocabulary on the rank's 64 rows, no collective; ATOM gathers the
+    group's 256 rows, multiplies them by a quarter of the vocabulary and
+    sends each rank the logits of its rows (`_dp_sharded_logits`, all2all)."""
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_bytes(CONFIG.read_bytes())
+    env = {k: v for k, v in os.environ.items() if k != "ATOM_DP_LM_HEAD_MODE"}
+    done = subprocess.run(
+        [sys.executable, "-c", DEP4, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=900,
+        cwd=TREE,
+        env={**env, "PYTHONPATH": str(TREE)},
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    built = json.loads(done.stdout.splitlines()[-1])
+    text = json.loads(CONFIG.read_text())["text_config"]
+    vocab, d = text["vocab_size"], text["hidden_size"]
+    shard = vocab // 4
+    assert built == {"dp": 4, "heads": [["head", [vocab, d, 4, shard], "bf16", 1]]}
+    spec = MachineSpec.from_mapping(json.loads(MI355X.read_text()))
+    head = Module("head", "lm_head", (vocab, d, 4, shard))
+    before = Module("head", "lm_head", (vocab, d))
+    decode = BatchView(
+        (RequestShape(1, 4096, True),) * 64, capture_rung=64, produces_output=True
+    )
+
+    def priced(module):
+        cost = StepRooflineBackend(spec, [module]).price(decode)
+        return {t.name: t.seconds for t in cost.terms}["roofline.lm_head"]
+
+    # The rows and the weight read and the logits written, in bf16.
+    whole = Work({"bf16": 2 * 64 * vocab * d}, (64 * d + vocab * d + 64 * vocab) * 2)
+    sharded = Work(
+        {"bf16": 2 * 256 * shard * d}, (256 * d + shard * d + 256 * shard) * 2
+    )
+    # The 256 rows gathered, and each rank's 256 x shard logits spread over
+    # the group.
+    sharded += allgather(4, 256 * d * 2) + allgather(4, 256 * shard * 2)
+    was, now = priced(before), priced(head)
+    print(
+        f"\nV4.1-Flash DP4 TP1 on MI355X, 64 requests a rank at rung 64: LM head "
+        f"{was * 1e6:.2f} us before, {now * 1e6:.2f} us after"
+    )
+    assert was == pytest.approx(_module(whole, spec), rel=1e-12)
+    assert now == pytest.approx(_module(sharded, spec), rel=1e-12)

@@ -90,6 +90,18 @@
    "mechanism_why": "arithmetic inside the cost backend, which cannot park"
   },
   {
+   "id": "atom/compass/backends/step_roofline.py::_work::all_to_all(dp, rows * d[3] * act)::collective#0",
+   "file": "atom/compass/backends/step_roofline.py",
+   "symbol": "_work",
+   "call": "all_to_all",
+   "expr": "all_to_all(dp, rows * d[3] * act)",
+   "shape": "collective",
+   "peer": "none",
+   "why": "a work primitive that counts the bytes a data-parallel group's sharded LM head exchanges its logits with, so the step roofline can price it; nothing is sent",
+   "mechanism": "K9",
+   "mechanism_why": "arithmetic inside the cost backend, which cannot park"
+  },
+  {
    "id": "atom/compass/kv/connector.py::SimulatedKVConnectorScheduler._send::self._socks[key].send(message, at=a)::p2p#0",
    "file": "atom/compass/kv/connector.py",
    "symbol": "SimulatedKVConnectorScheduler._send",
