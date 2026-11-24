@@ -34,12 +34,12 @@ roots: each point is planned once, on the rank its place in the walk names.
   budget doubling, then the last aligned context a whole budget fits behind
   in the longest prompt; with prefix caching on, a prefix another request
   computed, from one KV block up. A step's chunked rows take as many earlier
-  chunks each. A row on a context is planned where ATOM starts its forward
-  (`BlockManager.replay_start`): at a prefix hit, where the engine states
-  ``replays_state``, a hash block below the hit; and finishing a prompt in
-  fewer rows than the engine's ``min_final_prefill_rows``, that many rows
-  before the prompt's end, on the hash-block grid. A row past the budget,
-  which ATOM cuts into chunks, is not planned.
+  chunks each. A final chunk of fewer rows than the engine's
+  ``min_final_prefill_rows`` is planned as the row ATOM runs, which starts at
+  least that many rows before the prompt's end, on the hash-block grid
+  (`BlockManager.replay_start`), and so is a prefix row: where the engine
+  states ``replays_state``, on a hit of whole hash blocks from one up, and a
+  block below it first. A row past the budget, which ATOM cuts, is not planned.
 
 Every request asks for two output tokens, so its decode is reached too, with
 the workload's other sampling arguments copied unchanged; a parked decode asks
@@ -329,15 +329,19 @@ def plan(engine, workload: dict, a_only: bool = False) -> list[Point]:
             ]
         )
     align = chunk_alignment(e["kv_cache_block_size"])
+    least, grid = e.get(MIN_FINAL_ROWS, 0), _grid(e)
+    # The hash block a replaying hit's forward starts below.
+    replayed = grid if e.get(REPLAYS_STATE) else 0
     starts = {"chunk": align}
     if e["enable_prefix_caching"]:
-        starts["prefix"] = e["kv_cache_block_size"]
-    least, grid = e.get(MIN_FINAL_ROWS, 0), _grid(e)
+        starts["prefix"] = replayed or e["kv_cache_block_size"]
     for kind, start in starts.items():
-        below = grid if kind == "prefix" and e.get(REPLAYS_STATE) else 0
+        below = replayed if kind == "prefix" else 0
+        # ATOM hits a prefix in whole hash blocks.
+        hits = sorted({c - c % (below or 1) for c in _contexts(start, b, cap)})
         rows = [
             _final(c, q, least, grid, below)
-            for c in _contexts(start, b, cap)
+            for c in hits
             for q in _queries(b, align)
             if c + q <= cap
         ]

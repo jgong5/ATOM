@@ -214,9 +214,9 @@ def test_a_final_chunk_under_the_last_forwards_rows_is_planned_where_atom_runs_i
 def test_a_prefix_row_is_planned_where_atom_starts_it_at_the_hit_the_sweep_sends(
     tmp_path, dcp
 ):
-    # DeepSeek-V4.1's 128-token blocks, so a prefix's hits are the chunk cuts
-    # and its designs the chunk rows unmoved; then its 128-row minimum and its
-    # encoder SWA bounded replay, a `replay` state transfer.
+    # DeepSeek-V4.1's 128-token blocks, so at DCP 1 a prefix's hits are the
+    # chunk cuts and its designs the chunk rows unmoved; then its 128-row
+    # minimum and its encoder SWA bounded replay, a `replay` state transfer.
     engine = _engine(
         data_parallel_size=1,
         kv_cache_block_size=128,
@@ -226,34 +226,42 @@ def test_a_prefix_row_is_planned_where_atom_starts_it_at_the_hit_the_sweep_sends
     designed = plan(_write(tmp_path, engine), _workload(3000))
     v41 = engine | {"min_final_prefill_rows": 128, "replays_state": True}
     points = plan(_write(tmp_path, v41), _workload(3000))
+    hbs = hash_block_size_for(128, dcp)
     manager = SimpleNamespace(
         min_final_prefill_rows=128,
-        hash_block_size=hash_block_size_for(128, dcp),
+        hash_block_size=hbs,
         state=SimpleNamespace(transfer=StateTransfer.replay()),
     )
 
     def ran(q, c):
-        # ATOM's own `replay_start` on a prompt's last `q` tokens at a hit `c`.
+        # ATOM on a prompt's last `q` tokens behind `c` another request
+        # computed: its hit, whole hash blocks short of the prompt's last
+        # (`_walk_prefix`), then its own `replay_start`.
+        at = min(c // hbs, -(-(c + q) // hbs) - 1) * hbs
         seq = SimpleNamespace(has_per_req_cache=True, num_tokens=c + q)
-        return c + q - BlockManager.replay_start(manager, seq, c, hit=True), c + q
+        return c + q - BlockManager.replay_start(manager, seq, at, hit=True), c + q
 
-    # Each design as ATOM runs it, once, where no chunk point runs it and the
-    # budget holds it; the sweep's hit for each is where ATOM starts it.
-    chunks = {p.rows for p in points if p.cached == ("chunk",)}
-    designs = [p.rows[0] for p in designed if p.cached == ("chunk",)]
-    want = dict.fromkeys(ran(q, c - q) for q, c in designs)
-    want = [r for r in want if (r,) not in chunks and r[0] <= 1024]
-    prefix = [p for p in points if p.cached == ("prefix",)]
-    assert [p.rows[0] for p in prefix] == want and len(want) > 100
-    assert all(ran(c - hit(v41, (q, c)), hit(v41, (q, c))) == (q, c) for q, c in want)
+    # Each row is ATOM's at the hit the sweep sends, on every whole hash
+    # block a design's context holds, and within the budget.
+    prefix = [p.rows[0] for p in points if p.cached == ("prefix",)]
+    assert all(ran(c - hit(v41, (q, c)), hit(v41, (q, c))) == (q, c) for q, c in prefix)
+    hits = {hit(v41, r) for r in prefix}
+    assert hits == {128 * dcp, 256, 512, 1024, 1920 // hbs * hbs, 2048}
+    assert len(prefix) > 100 and max(q for q, _ in prefix) <= 1024
     assert hit(engine, (5, 640)) == 635
     if dcp == 1:
-        # Query 128 at hit 512 runs as [256, 640]; query 1 as [129, 513],
-        # the final chunk's own row.
-        assert ((256, 640),) in {p.rows for p in prefix} and ((129, 513),) in chunks
+        # Each design as ATOM runs it, once, where no chunk point runs it:
+        # query 128 at hit 512 as [256, 640], query 1 as the final chunk's
+        # own row, [129, 513].
+        chunks = {p.rows for p in points if p.cached == ("chunk",)}
+        designs = [p.rows[0] for p in designed if p.cached == ("chunk",)]
+        want = dict.fromkeys(ran(q, c - q) for q, c in designs)
+        assert prefix == [r for r in want if (r,) not in chunks and r[0] <= 1024]
+        assert (256, 640) in prefix and ((129, 513),) in chunks
     # A line of the row ATOM runs covers a moved point.
-    line = {"rows": [[*want[0], False], [1, 9, True]], "is_dummy_run": False}
-    assert covered(prefix[:1], {0: [line]}) == (prefix[:1], [])
+    moved = next(p for p in points if p.cached == ("prefix",))
+    line = {"rows": [[*moved.rows[0], False], [1, 9, True]], "is_dummy_run": False}
+    assert covered([moved], {0: [line]}) == ([moved], [])
 
 
 def test_no_point_leaves_the_engine_or_the_workload(tmp_path):
