@@ -27,8 +27,9 @@ Compass's own code raises other than as a refusal, a defect, which fails
 `compass advice` with its traceback. A law
 verdict ``calibrate``
 names the command that makes the law as `compass run --check` prints it: on
-one node the `calibrate.sh` command of its records into OUT's
-``cal/<candidate>``, its clients on SPACE's traces, publishing into the store
+one node the `calibrate.sh` command of its records into the candidate's
+calibration directory under OUT's ``cal/`` (`calibrating`), its clients on
+SPACE's traces, publishing into the store
 the `INPUTS` of a calibration started there name, or its own when they name
 none, as a resume must take the store it started with; before one starts, into
 the shared store when the verdicts were judged there and it holds neither a
@@ -42,14 +43,17 @@ second law at the key, with the command measuring its readings into the store
 that calibration publishes into, unless they are at their key there; into the
 calibration's own store, only once it has started, as a publish there before
 would leave its directory holding files, which `calibrate.sh` refuses.
+A calibration that has ended records nothing more, so the next goes into a new
+directory; where it would take what the ended one took (`_refits`), it would
+refit the same law, and the verdict says so in place of a command.
 A readings verdict ``measure`` names the `compass measure memory` command,
 under the instance's variables, a 1P1D side's on the connector a real start of
 it takes.
 
 `states` gives each candidate one state: ``refused``, with each refusal
 verbatim, when any verdict is; else, when a law's verdict is ``calibrate``,
-``calibrating`` while the `STATUS` file of the calibration into
-``cal/<candidate>`` ends in a step's start or end, with each command as the
+``calibrating`` while the `STATUS` file in the candidate's calibration
+directory ends in a step's start or end, with each command as the
 one that resumes it once no `calibrate.sh` runs, as after a kill that records
 no failure; else ``missing a law``, with each command, which resumes a
 calibration that stopped; either with the status file's last line and how many
@@ -72,6 +76,8 @@ import functools
 import itertools
 import json
 import os
+import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -79,6 +85,7 @@ import time
 import traceback
 from pathlib import Path
 
+from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal, machine_platform
 from atom.compass.drive import lacking, reuse, runfile, serve
 from atom.compass.drive import run as drive_run
@@ -114,6 +121,17 @@ PENDING = (
 #: The file a calibration writes its inputs to, in its directory: a line
 #: ``store <path>`` names the store it publishes into, when one was named.
 INPUTS = "inputs"
+#: A candidate's calibration directory after its first, in OUT's `CAL`, by
+#: its count from 2: no candidate's name holds a ``+``.
+AGAIN = "{}+{}"
+#: What stands for the command of a candidate whose calibration has ended,
+#: when one in a new directory would take what it took (`_refits`).
+REFITS = (
+    "no calibrate.sh command: the calibration in {} has ended, at the head's "
+    "ATOM digest, on the ATOM arguments, traces and records a new one would "
+    "take, so a new one records the same and refits the law it published "
+    "into {}"
+)
 #: What a start runs: a server on one node, a deployment on 1P1D.
 COMPASS, DEPLOY = (
     serve.TREE / "scripts" / "compass" / n for n in ("compass", "deploy.sh")
@@ -158,12 +176,13 @@ def check(expansion: dict, out: Path) -> dict:
             judged[candidate["name"]] = {"store": None, "points": verdicts}
             continue
         holding_law = None
+        directory, ended = calibrating(out, candidate["name"])
         for store in reuse.stores(expansion["store"], out):
             given = (machine["device"], store, machine["ptl"])
             given += (machine.get("stack"), machine.get("network"))
             spec = _or_refused(compose, *given)
-            made = out / CAL / candidate["name"], expansion["workload"]["traces"]
-            made += (expansion["store"],)
+            made = directory, expansion["workload"]["traces"]
+            made += (expansion["store"], ended)
             judge = functools.partial(_judged, store, spec, head["atom"], seen, made)
             verdicts = {p["name"]: _point(p, judge) for p in points}
             if isinstance(spec, dict):
@@ -213,7 +232,8 @@ def states(expansion: dict, judged: dict, out: Path) -> dict:
         if refused := [v for v in _each(held["points"]) if v["verdict"] == "refused"]:
             state = _state("refused", refused, points={})
         elif calibrate := [v for v in laws if v["verdict"] == "calibrate"]:
-            state = _calibration(out / CAL / candidate["name"], calibrate)
+            directory, _ = calibrating(out, candidate["name"])
+            state = _calibration(directory, calibrate)
         else:
             state = _searchable(expansion, candidate, held, out)
         found[candidate["name"]] = state
@@ -242,6 +262,26 @@ def state_lines(state: dict) -> list[str]:
     for point, held in state["points"].items():
         out += [f"    {point}: {held['state']}, made by: {c}" for c in held["made_by"]]
     return out
+
+
+def calibrating(out: Path, name: str) -> tuple[Path, Path | None]:
+    """Where candidate `name`'s calibration runs, in `out`'s `CAL`: its latest
+    directory, ``<name>`` or the last of ``<name>+2``, ``<name>+3``, ... there,
+    and None; or, once the calibration there has ended, the next, and that
+    one, since `calibrate.sh` records nothing more where one has ended."""
+    cal, k = Path(out) / CAL, 2
+    while (cal / AGAIN.format(name, k)).is_dir():
+        k += 1
+    latest = cal / (AGAIN.format(name, k - 1) if k > 2 else name)
+    return (cal / AGAIN.format(name, k), latest) if _ended(latest) else (latest, None)
+
+
+def _ended(directory: Path) -> bool:
+    """Whether the calibration in `directory` has ended: its status file's
+    last line is the ``end calibration`` a run that fits both laws writes."""
+    status = directory / STATUS
+    said = status.read_text().splitlines() if status.is_file() else []
+    return bool(said) and said[-1].split()[1:3] == ["end", "calibration"]
 
 
 def _calibration(at: Path, calibrate: list) -> dict:
@@ -496,11 +536,13 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     `deploy.sh` adds, on the simulated connector, and runs under its variables
     over this process's ``AITER_LOG_LEVEL``, with those the script sets over
     them (`drive_run.side_env`). `made` is the calibration's directory, traces
-    and the shared store a ``calibrate`` verdict's command takes; a
-    `calibrate.sh` command's verdict states, for `_borrowing`, its
-    ``calibration``: the ``key`` its law is published at, by model, platform
-    and engine config, its directory, ``in``, and the store it publishes
-    ``into``."""
+    and the shared store a ``calibrate`` verdict's command takes, and the
+    directory of the calibration that ended before it, None where none did;
+    when the command takes what that one took (`_refits`), the verdict names
+    why none serves (`REFITS`) in its place. A `calibrate.sh` command's verdict
+    states, for `_borrowing`, its ``calibration``: the ``key`` its law is
+    published at, by model, platform and engine config, its directory, ``in``,
+    and the store it publishes ``into``."""
     if isinstance(machine, dict):
         return machine, machine
     args, env = one["args"], one["env"]
@@ -530,10 +572,18 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                     into = _publishing(store, made, law, readings)
                     with _env({"TRACES": made[1]}):
                         command = lacking.calibration(made[0], args, config, into)
+                    if (ended := made[3]) and _refits(ended, command, atom):
+                        held = started_store(ended) or ended / "store"
+                        law["made_by"] = [REFITS.format(ended, held)]
+                    else:
                         law["made_by"] = [command]
-                    key = [config.model, machine_platform(machine), keyed(config)]
-                    into = str(into or made[0] / "store")
-                    law["calibration"] = {"key": key, "in": str(made[0]), "into": into}
+                        key = [config.model, machine_platform(machine), keyed(config)]
+                        into = str(into or made[0] / "store")
+                        law["calibration"] = {
+                            "key": key,
+                            "in": str(made[0]),
+                            "into": into,
+                        }
                 if readings["verdict"] == "measure":
                     real = args
                     if side in drive_run.ROLES:
@@ -595,7 +645,7 @@ def _publishing(store, made, law: dict, readings: dict) -> str | None:
     there now hold their keys. Before then, `made`'s shared store when it is
     `store` and holds neither a step linear law at the head's ATOM digest nor
     readings at their key, since a store refuses a second publish at a key."""
-    directory, _, shared = made
+    directory, _, shared, _ = made
     if (directory / INPUTS).is_file():
         return started_store(directory)
     held = "store" in law or readings["verdict"] == "reuse" or readings.get("held")
@@ -608,6 +658,49 @@ def started_store(directory: Path) -> str | None:
     inputs = directory / INPUTS
     given = inputs.read_text().splitlines() if inputs.is_file() else []
     return next((s[len("store ") :] for s in given if s.startswith("store ")), None)
+
+
+def _refits(ended: Path, command: str, atom: str) -> bool:
+    """Whether the `calibrate.sh` `command` takes what the calibration that
+    ended in `ended` took, as its `INPUTS` state it: ATOM's arguments, the
+    traces and the records, on a tree whose ATOM digest is the head's, `atom`.
+    In a new directory it would then record the same and refit the same law.
+    No command, as `lacking.calibration` words why there is none, takes
+    nothing."""
+    if str(lacking.CALIBRATE) not in (line := command.split("\n")[0]):
+        return False
+    words = shlex.split(line)
+    at = words.index(str(lacking.CALIBRATE))
+    env = dict(word.split("=", 1) for word in words[:at])
+    taken = [f"atom --model {env['MODEL']} {env['SERVER_ARGS']}"]
+    taken += [f"record {record}" for record in words[at + 2 :]]
+    inputs = ended / INPUTS
+    given = inputs.read_text().splitlines() if inputs.is_file() else []
+    took = [line for line in given if line.startswith(("atom ", "record "))]
+    # calibrate.sh writes `traces TRACES CAL_TRACES` and `tree <commit>`.
+    traces = [
+        s[len("traces ") :].rsplit(" ", 1)[0] for s in given if s.startswith("traces ")
+    ]
+    trees = [s[len("tree ") :] for s in given if s.startswith("tree ")]
+    return (
+        took == taken
+        and traces == [env.get("TRACES")]
+        and len(trees) == 1
+        and _atom_of(trees[0]) == atom
+    )
+
+
+@functools.cache
+def _atom_of(commit: str) -> str | None:
+    """The ATOM digest of the ``atom/`` `commit` holds in the repository of the
+    tree `atom` resolves under, None when it is not a commit's hex name or git
+    cannot read it there."""
+    if not re.fullmatch("[0-9a-f]+", commit):
+        return None
+    try:
+        return compass_run.committed_atom_digest(reuse.TREE, commit)
+    except ValueError:
+        return None
 
 
 def _resolved(args, arch: str):

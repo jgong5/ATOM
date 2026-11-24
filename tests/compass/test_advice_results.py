@@ -561,3 +561,44 @@ def test_a_calibrated_candidate_s_coverage_command_resumes_it_or_says_why_none(
     assert why.startswith(
         f"no calibrate.sh command: the calibration in {out / 'cal' / 'b'} has ended"
     )
+
+
+def test_a_coverage_report_s_command_reads_the_candidate_s_latest_calibration(
+    tmp_path, simulating, monkeypatch  # noqa: F811
+):
+    """b's one point a coverage report under the suite's law file, with its
+    first calibration, ``cal/b``, and its next, ``cal/b+2``, both ended: why
+    no command serves names the latter, whose records the law was fitted on."""
+    for name, text in (("server", SERVER), ("client", CLIENT)):
+        (tmp_path / name).write_text(text.format(python=sys.executable))
+        (tmp_path / name).chmod(0o755)
+    monkeypatch.setattr(check, "COMPASS", tmp_path / "server")
+    monkeypatch.setattr(simulate, "CLIENT", tmp_path / "client")
+    monkeypatch.setenv("STUB_DIR", str(tmp_path))
+    (tmp_path / "summaries.json").write_text(json.dumps({"*": COVERAGE}))
+    (tmp_path / "run_file.json").write_text(json.dumps({"machine": DOCUMENT}))
+    made(tmp_path / "made" / "b-c1", 1, summary=None)
+    flags = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
+    space = {
+        "model": str(tmp_path),
+        "machine": {"device": flags[1], "ptl": flags[3]},
+        "store": str(tmp_path / "store"),
+        "workload": {"traces": str(tmp_path / "traces.jsonl"), "select": "agentx"},
+        "slo": {},
+        "common": {"basis": "a recipe"},
+        "dimensions": {"config": {"b": {"args": {"--max-num-seqs": 8}}}},
+    }
+    space["workload"]["concurrency"] = [1]
+    (tmp_path / "space.json").write_text(json.dumps(space))
+    out = tmp_path / "out"
+    for name in ("b", "b+2"):
+        (out / "cal" / name).mkdir(parents=True)
+        ended = "2026-11-24T07:00:00Z end calibration 0.20 node-hours\n"
+        (out / "cal" / name / "status").write_text(ended)
+
+    cli.main(["advice", str(tmp_path / "space.json"), str(out)])
+
+    (why,) = rows(json.loads((out / results.RESULTS).read_text()))["b-c1"]["made_by"]
+    assert why.startswith(
+        f"no calibrate.sh command: the calibration in {out / 'cal' / 'b+2'} has ended"
+    )

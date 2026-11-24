@@ -7,8 +7,10 @@ its command then keeps the store the calibration's inputs name, so a resume
 takes the same inputs; and a calibration into OUT's ``cal/<candidate>`` makes
 its candidate ``calibrating``, its command the one that resumes it once none
 runs, while its status file ends in a step's start or end, and ``missing a
-law`` again, its command resuming it, once that file ends in a failure or the
-calibration's end.
+law`` again, its command resuming it, once that file ends in a failure. Once
+it ends in the calibration's end, the next calibration goes into
+``cal/<candidate>+2``, unless it would take what the ended one took, at the
+head's ATOM digest, and refit the same law.
 
 The configuration, its stubbed resolution and starts are `test_advice_check`'s:
 the store holds readings of the configuration as the deployment resolves it,
@@ -25,10 +27,13 @@ from test_advice_check import (
     starts,
     stubbed,  # noqa: F401  the fixture
 )
+from test_advice_results import _calibrated
 from test_artifact_invalidation import STANZA, moved
 from test_memory_readings import READINGS, publish_readings
 from test_run_step_grid import PLATFORM
 
+from atom.compass import run as compass_run
+from atom.compass.advice import check
 from atom.compass.artifacts import (
     ArtifactStore,
     Axis,
@@ -38,7 +43,7 @@ from atom.compass.artifacts import (
     keyed_platform,
     member_name,
 )
-from atom.compass.drive import reuse
+from atom.compass.drive import lacking, reuse
 from atom.compass.run import memory
 
 #: A candidate with no readings at its key in the store, and one with them,
@@ -144,7 +149,6 @@ def test_a_started_calibration_s_command_keeps_the_store_its_inputs_name(
         ("start cal2-c4", "calibrating", 1),
         ("end cal2-c4 12 s", "calibrating", 2),
         ("fail cal2-c4 12 s: client.sh exit 1; see x", "missing a law", 1),
-        ("end calibration 0.17 node-hours", "missing a law", 1),
     ],
 )
 def test_a_calibration_s_status_makes_it_calibrating_until_it_fails_or_ends(
@@ -175,3 +179,46 @@ def test_a_calibration_s_status_makes_it_calibrating_until_it_fails_or_ends(
     assert starts(tmp_path) == []
     printed = capsys.readouterr().out
     assert f"  state: {state}\n    calibration: {said}\n{shown}" in printed
+
+
+@pytest.mark.parametrize(
+    "since", ["the tree moved", "its arguments changed", "nothing"]
+)
+def test_an_ended_calibration_s_candidate_calibrates_anew_unless_that_refits_its_law(
+    tmp_path, stubbed, monkeypatch, since  # noqa: F811
+):
+    """b's printed calibration, run by `calibrate.sh` in `test_calibrate`'s
+    stub tree at its commit ``cafe``, ends. The next search prints the next
+    calibration into ``cal/b+2``, where it records, its status read for b's
+    state, or why none serves where it would take what the ended one took at
+    the head's ATOM digest."""
+    monkeypatch.setenv("AIPERF_PYTHON", "/real/python")
+    cal, args = tmp_path / "out" / "cal", UNREAD["args"]
+    (first,) = advise(tmp_path, {"b": UNREAD})["b"]["made_by"]
+    assert _calibrated(tmp_path, first)[0] == 0
+    atom = "0" * 64 if since == "the tree moved" else compass_run.atom_digest()
+    monkeypatch.setattr(check, "_atom_of", {"cafe": atom}.get)
+    if since == "the tree moved":
+        (tmp_path / "ATOM" / ".compass-commit").write_text("beef\n")
+    elif since == "its arguments changed":
+        args = {"--max-num-seqs": 2}
+
+    found = advise(tmp_path, {"b": {"args": args}})["b"]
+
+    assert (found["state"], "calibration" in found) == ("missing a law", False)
+    (command,) = found["made_by"]
+    if since == "nothing":
+        ended = cal / "b"
+        assert command == check.REFITS.format(ended, check.started_store(ended))
+        return
+    assert f" {lacking.CALIBRATE} {cal / 'b+2'} " in command
+    # Its first record fails, and the next search reads cal/b+2's status.
+    assert _calibrated(tmp_path, command, CLIENT_FAIL="cal1-c")[0] == 1
+    stopped = advise(tmp_path, {"b": {"args": args}})["b"]
+    assert stopped["calibration"].startswith(f"{cal / 'b+2' / 'status'}, ")
+    (resumed,) = stopped["made_by"]
+    status, log = _calibrated(tmp_path, resumed)
+    assert status == 0
+    served = [line.split(" --out ")[1] for line in log if line.startswith("record ")]
+    assert served[0].startswith(f"{cal / 'b+2' / 'cal1-c'}")
+    assert all(s.startswith(f"{cal / 'b+2'}/") for s in served)

@@ -243,7 +243,7 @@ takes up the rest.
 | State | What it prints | Next |
 |---|---|---|
 | `searchable` | `N of M points searchable`, each other point with its own state | step 3 simulates it |
-| `missing a law` | `made by:` the command that makes the law; `calibration:` the last line of one that stopped or ended | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
+| `missing a law` | `made by:` the command that makes the law, or why none can; `calibration:` the last line of one that stopped | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
 | `calibrating` | `calibration:` its status file, how many steps have ended and its last line; `resumed, once no calibrate.sh runs, by:` its command | run the search again later |
 | `missing readings`, a point of a searchable candidate | `made by:` its `compass measure memory` command | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
 | `refused` | `refused:` ATOM's or Compass's refusal, verbatim | below |
@@ -333,6 +333,14 @@ compass fit device <token> --store OUT/cal/S1/store --out OUT/cal/S1.readings
   each step's wall seconds, the node-hours every take of every step held, and
   this run's wall time; the status file's last line is then `end calibration
   <h> node-hours`.
+- **Calibrate again**: once a calibration has ended, a search that still finds
+  the law missing, as after the head has moved, prints the next one into a new
+  directory, `OUT/cal/S1+2`, then `OUT/cal/S1+3`, and reads that one's status;
+  start it as above, its log in `OUT/cal/S1+2.log`. Where the next one would
+  take the ATOM arguments, traces and records the ended one took, at the head's
+  ATOM digest, it would refit the same law, so `made by:` says so in place of a
+  command and names the store that law is in; the law's verdict line says what
+  it lacks.
 
 **A missing point's readings** take `compass measure memory --gpu G --out D
 --store <store> -- <ATOM's arguments>`, as printed, under the variables it
@@ -418,4 +426,4 @@ An agent that runs this guide for a user keeps these rules:
 | `before it runs, set AIPERF_PYTHON` under a printed command | the shell that ran the search did not set it | set it in the shell that starts the calibration |
 | a candidate `refused` with `ATOM's parser: unrecognized arguments: ...` | a flag ATOM does not have, such as a misspelt one | correct the space file |
 | a candidate `refused` with `--server-port ... is among ATOM's arguments; the driver owns it` | an argument `compass run` assigns, `--host` or a port | leave it out, as What a space file leaves out says |
-| a calibrated candidate still `missing a law` | its calibration failed, or it published into its own store, which holds no platform readings | its `calibration:` line; resume it, or take its store's `measure device` and `fit device` (step 3) |
+| a calibrated candidate still `missing a law` | its calibration failed, or it published into its own store, which holds no platform readings | its `calibration:` line; resume it, or take its store's `measure device` and `fit device` (step 3), the store `made by: no calibrate.sh command` names when it ended |
