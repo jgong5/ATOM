@@ -15,7 +15,9 @@ Exits 1, naming each, on a finding: a file that does not collect; a mark naming
 a form the vocabulary does not hold, a refused form, or a level other than 0 or
 1; a supported form with no level-0 case; a refused form whose refusal test does
 not collect. A form whose entry names an open issue to add its first case, or
-its refusal test, is exempt from the last two until that issue lands.
+its refusal test, is exempt from the last two; once a case of it collects, or
+its entry names its refusal test, naming the issue is itself a finding, so the
+exemption ends with the case or test the issue adds.
 """
 
 import argparse
@@ -87,8 +89,15 @@ def findings(cases, ids, errors=()) -> list[str]:
         elif c["level"] not in capabilities.LEVELS:
             found.append(f"{case}: marks {name!r} at level {c['level']!r}, not 0 or 1")
     level0 = {c["name"] for c in cases if c["level"] == 0}
+    marked = {c["name"] for c in cases}
     for name, form in forms.items():
         if form.issue:
+            if form.test if form.refused else name in marked:
+                what = "refusal test" if form.refused else "first case"
+                found.append(
+                    f"{name}: names {form.issue} to add its {what}, which it has; "
+                    "drop the issue from its entry"
+                )
             continue
         if form.refused and not collects(form.test, ids):
             found.append(
