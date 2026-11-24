@@ -182,12 +182,10 @@ def test_ops_profiling_dummy_weights_and_owned_flags_refuse_before_a_server_star
     [
         ["-dp", "2"],
         ["--enable-dp-attention", "-tp", "2"],
-        ["--pipeline-parallel-size=2"],
+        ["--pipeline-parallel-size=2", "-dp", "2"],
     ],
 )
-def test_a_dp_or_pipeline_trace_run_refuses_before_a_server_starts(
-    tmp_path, monkeypatch, atoms
-):
+def test_a_dp_trace_run_refuses_before_a_server_starts(tmp_path, monkeypatch, atoms):
     monkeypatch.setattr(serve, "SERVER", (sys.executable, "-c", "pass"))
     out = tmp_path / "out"
     argv = ["record", "--gpu", "7", "--out", str(out), "--trace", "--", "--model", "m"]
@@ -195,6 +193,12 @@ def test_a_dp_or_pipeline_trace_run_refuses_before_a_server_starts(
     with pytest.raises(SystemExit, match="^compass record: --trace reduces each TP"):
         cli.main([*argv, *atoms])
     assert not out.exists()
+
+
+@pytest.mark.parametrize("pp", ["2", "4"])
+def test_a_pipeline_trace_run_is_taken(pp):
+    """Each stage's ranks are reduced against its own record (`parity.busy`)."""
+    record.refuse_trace(["--model", "m", "--pipeline-parallel-size", pp])
 
 
 @pytest.fixture
