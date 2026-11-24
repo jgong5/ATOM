@@ -10,9 +10,9 @@ person and an agent follow the same steps; an agent also keeps the rules in
 
 [QUICKSTART.md](QUICKSTART.md) is the developer's path for one configuration:
 records, fits, real runs and grading. This page uses its variables, its platform
-readings and, for the commands a search prints, its GPU container, and never
-grades. [USER_QUICKSTART.md](USER_QUICKSTART.md) predicts one configuration on a
-host with no GPU at all.
+readings and, for a search that prints a command and the commands it prints, its
+GPU container, and never grades. [USER_QUICKSTART.md](USER_QUICKSTART.md) predicts
+one configuration on a host with no GPU at all.
 
 ## Limits
 
