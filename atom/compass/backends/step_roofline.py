@@ -40,6 +40,18 @@ KV, and replays as the target's modules do. On a step that samples, a decode
 step or a prefill that produces output, that pass runs before
 `forward_done_event`, inside the target's time.
 
+A module with `passes` is a serial drafter's (MTP), which runs once for each
+draft token. Its first pass runs the step's own rows, unpadded, its MoE
+gathering `draft_moe_rows`; on a step that samples nothing that pass alone
+runs, writing the drafter's KV. On a step that drafts, one that samples or,
+under a data-parallel group, a middle chunk, whose propose runs for the
+group's collectives, its LM head samples a row a request in every pass, and
+each later pass runs a row a request at its context: at `draft_bs` rows where
+the drafter replays a draft graph, its MoE gathering `draft_rows`, or every
+rank's `draft_bs`. Every pass prices among the step's `draft_terms`. Its LM
+head's TP group gathers each rank's argmax alone, a (value, id) pair a row in
+fp32 (`compute_argmax_token`), not the logits.
+
 Two-batch overlap. A step the data-parallel group split (`tbo_tokens`) runs
 this rank's tokens as two micro-batches, cut at the first one's token count,
 a cut request's second part attending the first as history. Each layer's
@@ -145,7 +157,8 @@ class Module:
     """One module of one rank, as the walk read it off the meta build.
 
     `kind` picks its work; `dims` are its per-rank shapes in that kind's order:
-    `gemm` and `lm_head` (n, k), a pass (elements a token; a `norm`'s
+    `gemm` (n, k, then the rows it runs a token where more than one),
+    `lm_head` (n, k), a pass (elements a token; a `norm`'s
     second, those of them it writes in fp8), `act` (output
     elements a token), `attention` (heads, KV heads, head dim),
     `linear_attention` (value heads, key heads, key dim, value dim), `mhc`
@@ -166,7 +179,10 @@ class Module:
     every row; `draft` a drafter's block width, `CONTEXT` for a drafter's
     module on the target's rows, 0 for the target's; `kv` the format of the
     cache an `mla_up` gathers a prefill's context from, and `chunk` the
-    cached tokens past which it gathers only those, 0 for none.
+    cached tokens past which it gathers only those, 0 for none; `passes` a
+    serial drafter's passes, one a draft token, 0 for any other module;
+    `gathers` that a `gemm`'s collective all-gathers its output shards over
+    `ranks` rather than all-reducing its output.
     An unclassified module's `name` says what it is.
     """
 
@@ -184,13 +200,20 @@ class Module:
     draft: int = 0
     kv: str = "fp8"
     chunk: int = 0
+    passes: int = 0
+    gathers: bool = False
 
 
 def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
     """`m`'s work on a step of `tokens` executed tokens; None if it runs none."""
     d, act = m.dims, ELEMENT_BYTES[ACT]
     if m.kind == "gemm":
-        return gemm(tokens, *d, m.act, m.fmt) + allreduce(m.ranks, tokens * d[0] * act)
+        rows = tokens * (d[2] if len(d) > 2 else 1)
+        out = rows * d[0] * act
+        comm = (
+            allgather(m.ranks, out * m.ranks) if m.gathers else allreduce(m.ranks, out)
+        )
+        return gemm(rows, d[0], d[1], m.act, m.fmt) + comm
     if m.kind == "mhc":
         # Fold the sub-layer's output into the widened residual and reduce it:
         # read and write both, and the mixing weights' fp32 projection.
@@ -215,6 +238,8 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
         if not sampled:
             return None
         gathered = sampled * d[0] * m.ranks * act
+        if m.passes:  # a serial drafter's argmax: each rank's (value, id) pair
+            gathered = sampled * 2 * ELEMENT_BYTES["fp32"] * m.ranks
         return gemm(sampled, *d, b=m.fmt) + allgather(m.ranks, gathered)
     if m.kind in PASSES:
         # ponytail: one pass over the module's own width; a per-head norm or
@@ -586,7 +611,7 @@ class StepRooflineBackend(CostBackend):
         modules = tuple(modules)
         self.unclassified = [m.name for m in modules if m.kind == UNCLASSIFIED]
         classified = [m for m in modules if m.kind != UNCLASSIFIED]
-        target = [m for m in classified if not m.draft]
+        target = [m for m in classified if not (m.draft or m.passes)]
         # Modules of one shape price alike: count them, price each shape once.
         self.shapes = Counter(dataclasses.replace(m, name="", layer=-1) for m in target)
         self.outside = Counter(
@@ -594,7 +619,9 @@ class StepRooflineBackend(CostBackend):
         )
         self.layered = [m for m in target if m.layer >= 0]
         self.drafted = Counter(
-            dataclasses.replace(m, name="", layer=-1) for m in classified if m.draft
+            dataclasses.replace(m, name="", layer=-1)
+            for m in classified
+            if m.draft or m.passes
         )
         self.count = len(modules)
         self.name = machine.values.get("name", "")
@@ -718,8 +745,13 @@ class StepRooflineBackend(CostBackend):
         drafts: tuple[dict, dict, dict] = ({}, {}, {})
         kv: tuple[dict, dict, dict] = ({}, {}, {})
         samples = bool(decode or batch_view.produces_output)
+        drafting = bool(sampled) or batch_view.moe_rows is not None
         for m, count in self.drafted.items():
             sums = kv if samples and m.draft == CONTEXT else drafts
+            if m.passes:
+                for at, heads, alike in self._serial(m, batch_view, drafting):
+                    self._add(m, count * alike, at, heads, refuse, sums)
+                continue
             self._add(m, count, self._at(m, batch_view, tokens), 0, refuse, sums)
         if refuse:
             reasons = dict.fromkeys(refuse)
@@ -752,6 +784,27 @@ class StepRooflineBackend(CostBackend):
         tail = min(rows[0].query_tokens, m.replay)
         return BatchView((RequestShape(tail, tail, False),)), tail
 
+    def _serial(self, m: Module, view: BatchView, drafting: bool):
+        """A serial drafter's passes on this step, each as `_at` gives one,
+        the rows its LM head samples and how many passes run alike: the first,
+        and, where the step drafts, each later one (`Drafter` above)."""
+        rows = view.requests
+        first = BatchView(rows, moe_rows=view.draft_moe_rows), sum_tokens(rows)
+        if not drafting:
+            return [(first, 0, 1)]
+        width = (self.padded and view.draft_bs) or len(rows)
+        runs = [(first, width, 1)]
+        if m.passes > 1:
+            gathered = view.draft_rows
+            if gathered is None and view.draft_moe_rows is not None:
+                # Every rank's draft graph, padded alike; read by a MoE alone.
+                gathered = m.dims[6] * width if m.kind == "moe" else None
+            later = tuple(RequestShape(1, r.context_tokens, True) for r in rows)
+            runs.append(
+                ((BatchView(later, moe_rows=gathered), width), width, m.passes - 1)
+            )
+        return runs
+
     def _add(self, m: Module, count: int, at, sampled: int, refuse, sums) -> None:
         """Add `count` times `m`'s price on `at` (`_at`) to `sums`, its
         seconds, seconds by bound and notes by kind, or why not to `refuse`. A
@@ -761,7 +814,7 @@ class StepRooflineBackend(CostBackend):
         if isinstance(unit, str):
             refuse.append(unit)
             return
-        if m.draft:
+        if m.draft or m.passes:
             priced.setdefault(m.kind, [])
         if unit:
             priced.setdefault(m.kind, []).append(sum(unit[0]) * count)

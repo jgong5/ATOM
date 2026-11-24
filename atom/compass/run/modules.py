@@ -102,6 +102,19 @@ the stages' KV projections, one fp8 product, and the first stage's
 window before it; the block's LM head, the target's, runs on its vocabulary
 shard, and the Markov sampler on that shard, once a position.
 
+It reads a serial drafter's model too, the MTP layer `EagleProposer` runs once
+for each draft token: Qwen3.5's, DeepSeek-V3's and DeepSeek-V4's (`SERIAL`).
+Its modules carry its passes, the config's `num_speculative_tokens`
+(`Module.passes`). Each pass runs the first of its MTP layers, since
+`EagleProposer` passes no `spec_step_idx`. A drafter that holds no LM head of
+its own runs the target's, and its embedding, in each pass (V4's
+`share_with_target`), so those of the target's are its modules too. V4's MTP
+block norms its two inputs and its output itself, as a V4 block does not,
+its hidden-state norm and `h_proj` on each residual copy of a token;
+Qwen3.5's all-gathers its `fc`'s output over the TP group. An Eagle3 drafter
+is not built, and a step under one prices no draft (#3962), nor are the other
+serial drafters ATOM maps (#3984).
+
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
 first of each class comes back as an `unclassified` module named by class
@@ -159,6 +172,15 @@ DRAFT_ATTENTION = V41 + "dspark.DraftAttention"
 COMPRESSOR = "atom.model_ops.deepseek_v41.compressor.Compressor"
 #: The block drafter whose passes the step roofline lays out.
 DSPARK = V41 + "dspark.DeepseekV41DSpark"
+#: The serial drafters whose passes it lays out, one a draft token.
+SERIAL = (
+    "atom.models.qwen3_5_mtp.Qwen3_5MTP",
+    "atom.models.deepseek_mtp.DeepSeekMTP",
+    "atom.models.deepseek_v4_mtp.DeepseekV4MTP",
+)
+#: V4's MTP block and Qwen3.5's MTP layer, read apart (`walk`).
+V4_MTP_BLOCK = "atom.models.deepseek_v4_mtp.MTPBlock"
+QWEN35_MTP = "atom.models.qwen3_5_mtp.Qwen3_5MultiTokenPredictor"
 #: V4.1's rotary tables, read inside its attention and index kernels, its
 #: vision tower, the runtime's compiled stages, and DSpark's Markov tables,
 #: priced at the drafter's root.
@@ -171,17 +193,20 @@ V41_SILENT = (
 )
 #: What the routed experts' kernel reads once for each expert it runs.
 HELD = tuple(f"w{w}_{p}" for w in (13, 2) for p in ("weight", "weight_scale", "bias"))
+#: The containers a serial drafter's model holds its MTP layers in.
+LISTS = (torch.nn.ModuleList, torch.nn.ModuleDict)
 LAYER = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
 def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
     """The modules of `tree` the step roofline prices, in visiting order, then
-    those of `drafted`, the model its block drafter runs (`drafter`)."""
+    those of `drafted`, the model its drafter runs (`drafter`): a block
+    drafter's at its block width, a serial drafter's at its passes."""
     found: list[Module] = []
     seen: set[type] = set()
     replay = _replay(tree)
 
-    def visit(module, name, parent, draft):
+    def visit(module, name, parent, draft, passes=0):
         m = _classify(module, name, parent)
         *priced, then = m if isinstance(m, tuple) else (m,)
         if isinstance(then, Module):
@@ -189,23 +214,46 @@ def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
         layer = LAYER.search(name)
         layer = int(layer.group(1)) if layer else -1
         for p in priced:
-            p = dataclasses.replace(p, layer=layer, draft=p.draft or draft)
-            rows = _replayed(replay, layer, name, p.kind) if not p.draft else 0
+            p = dataclasses.replace(
+                p, layer=layer, draft=p.draft or draft, passes=passes
+            )
+            rows = 0 if p.draft or passes else _replayed(replay, layer, name, p.kind)
             if p.draft == CONTEXT and replay:
                 rows = replay[2]
             found.append(dataclasses.replace(p, replay=rows))
         if then is DESCEND:
-            for child, sub in module.named_children():
+            children = list(module.named_children())
+            if passes and parent is drafted.model and isinstance(module, LISTS):
+                children = children[:1]  # its MTP layers: the first runs
+            for child, sub in children:
                 inner = CONTEXT if _drafts_kv(sub, module) else draft
-                visit(sub, f"{name}.{child}" if name else child, module, inner)
+                at = f"{name}.{child}" if name else child
+                visit(sub, at, module, inner, passes)
         elif then is None and type(module) not in seen:
             seen.add(type(module))
             where = f"{type(module).__name__} at {name or 'the root'}"
             found.append(Module(where, UNCLASSIFIED))
 
     visit(tree, "", None, 0)
-    if drafted is not None:
+    if drafted is None:
+        return found
+    if not _is(drafted, *SERIAL):
         visit(drafted, "drafter", None, drafted.block_size)
+        return found
+    from atom.config import get_current_atom_config
+
+    passes = get_current_atom_config().speculative_config.num_speculative_tokens
+    target = list(found)
+    visit(drafted, "drafter", None, 0, passes)
+    if not any(m.passes and m.kind == "lm_head" for m in found):
+        # V4's MTP blocks run the target's (`share_with_target`).
+        shared = [m for m in target if m.kind in ("embedding", "lm_head")]
+        found += [
+            dataclasses.replace(
+                m, name=f"drafter, the target's {m.name}", passes=passes
+            )
+            for m in shared
+        ]
     return found
 
 
@@ -213,7 +261,8 @@ def drafter(config):
     """The model `config`'s drafter runs, built on the meta device as a
     simulated run builds its target, its post-load hooks run; None without a
     drafter, or for one whose passes the step roofline does not lay out: any
-    but DeepSeek-V4.1's DSpark, whose weights ship with the target's.
+    but DeepSeek-V4.1's DSpark, whose weights ship with the target's, and the
+    serial drafters of `SERIAL`, which ATOM builds from the target's config.
 
     It registers its layers in a copy of ATOM's forward context: ATOM's own
     drafter build registers the same names, and refuses one twice."""
@@ -223,7 +272,8 @@ def drafter(config):
     from atom.spec_decode.drafter import support_draft_model_arch_dict
 
     arch = spec.draft_model_hf_config.architectures[0]
-    if support_draft_model_arch_dict.get(arch) != DSPARK:
+    built = support_draft_model_arch_dict.get(arch)
+    if built not in (DSPARK, *SERIAL):
         return None
     import copy
 
@@ -239,7 +289,7 @@ def drafter(config):
     own.compilation_config = copy.copy(config.compilation_config)
     own.compilation_config.static_forward_context = {}
     with use_custom_atom_config(own), FactoriesOnMeta(), simulated_arch():
-        model = resolve_obj_by_qualname(DSPARK)(own)
+        model = resolve_obj_by_qualname(built)(own)
         process_weights_after_loading(model)
     return model
 
@@ -388,8 +438,17 @@ def _classify(module, name, parent):
             chunk = get_current_atom_config().attn_prefill_chunk_size
             return kv and Module(name, "mla_up", dims, fmt, act=act, kv=kv, chunk=chunk)
         dims = (weight.shape[0], _in_width(module))
-        return Module(name, "gemm", dims, fmt, ranks, act=act)
+        if _is(parent, V4_MTP_BLOCK) and module is parent.h_proj:
+            dims += (parent.hc_mult,)  # each residual copy of each token
+        if gathers := _is(parent, QWEN35_MTP) and module is parent.fc:
+            ranks = module.tp_size
+        return Module(name, "gemm", dims, fmt, ranks, act=act, gathers=gathers)
     if _is(module, *NORMS):
+        if _is(parent, V4_MTP_BLOCK) and any(
+            module is n for n in (parent.enorm, parent.hnorm, parent.norm)
+        ):
+            copies = parent.hc_mult if module is parent.hnorm else 1
+            return Module(name, "norm", (copies * weight.shape[0],))
         if parent is not None and _is(parent, V4 + "Block"):
             return NOTHING
         tp = module.tp_size if getattr(module, "fused_allreduce", False) else 1
