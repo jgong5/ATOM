@@ -82,6 +82,7 @@ def test_a_block_drafter_warms_up_on_no_more_sequences_than_a_step_holds(
     block drafter's two-sequence warmup floor stops at one (a deployment that
     never batches two requests never needs the batch dim dynamic); two wrote
     past the sampling buffers and failed every rank's warmup."""
+    monkeypatch.setenv("ATOM_PREWARM_NATIVE_A8", "0")
     monkeypatch.setattr(runner_module.torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(
         runner_module.torch.cuda, "reset_peak_memory_stats", lambda: None
