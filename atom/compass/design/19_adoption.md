@@ -567,13 +567,13 @@ both (README finding 2).
   borrowed, as on one server (`atom/compass/advice/check.py::_borrowing`), with no
   readings command of its own where its readings key is the lender side's, as B's prefill
   side's is A's. Its store is the one a side's lender
-  publishes into, when that holds nothing at the keys of the sides it fits, once the
-  lender has started where it is the lender's own; else the one a lone server's
-  calibration would take, judged over the sides it fits. Into a store of its own it fits
-  both sides, as that store holds neither. Its records are the decode side's rungs at its
-  DP width when it fits the decode, and the trace runs when it fits the prefill. D116's
-  configurations are the first 1P1D ones to need a new law (#4053); scenario 5 walks A,
-  then B.
+  publishes into, an ended lender's too, when that holds nothing at the keys of the sides
+  it fits, once the lender has started where it is the lender's own; else the one a lone
+  server's calibration would take, judged over the sides it fits. Into a store of its own
+  it fits both sides, as that store holds neither. Its records are the decode side's
+  rungs at its DP width, on which a prefill side's host laws fit too, and the trace runs
+  when it fits the prefill. D116's configurations are the first 1P1D ones to need a new
+  law (#4053); scenario 5 walks A, then B.
 - **A readings gap is measured**: `compass measure memory` for the point, the command
   `compass run --check` prints, into the store its candidate's law is read from, the
   shared one for a checked-in law.
