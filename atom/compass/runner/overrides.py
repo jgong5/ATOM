@@ -721,10 +721,13 @@ def _mqa_logits_config_on_host(runner: Any, config: Any) -> None:
     residency it asks HIP for, and the instance sets the table width the
     builder reads: the logits width in whole KV tiles, counted in table entries
     of `page_size * pages_per_block` rows. Every instance's tile is aiter's
-    `_TILE`, on gfx950 and gfx1250 alike, so the width needs no device. The
-    answer holds it beside the config's other public fields, the arch of the
-    run's machine spec and the bounds asked; the instance and its schedule are
-    a launch's, and no launch runs on the host."""
+    `_TILE` on gfx950 and gfx1250, and the builder's 64-row page is one tile an
+    entry, so the width needs no device. The answer holds it beside the
+    config's other public fields, the arch of the run's machine spec and the
+    bounds asked; the instance and its schedule are a launch's, and no launch
+    runs on the host. A request the builder does not make (other heads or
+    pages, an arch aiter has no rule for, a bound aiter refuses) is refused by
+    name, as a device's aiter would refuse it or pick another instance."""
     from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
         FP4_GFX950_OPUS,
         FP4_GFX1250_NATURAL,
@@ -737,15 +740,28 @@ def _mqa_logits_config_on_host(runner: Any, config: Any) -> None:
         return
     mqa = importlib.import_module("aiter.ops.opus.pa_mqa_logits_mxfp4")
     real, tile = mqa.mqa_logits_mxfp4_config, mqa._TILE
+    built = {"heads": 64, "page_size": tile, "pages_per_block": 1}
 
     @wraps(real)
     def answered(device: Any, **bounds: Any) -> Any:
         if torch.device(device) != runner.device:
             return real(device, **bounds)
         bounds = {"pages_per_block": 1} | bounds
-        keys = -(-bounds["max_seq_len"] // tile) * tile
-        entry = bounds["page_size"] * bounds["pages_per_block"]
-        return SimpleNamespace(arch=arch, **bounds, block_table_width=-(-keys // entry))
+        sizes = [bounds[k] for k in ("max_rows", "max_seqs", "max_qlen", "max_seq_len")]
+        if (
+            arch not in mqa._RULES
+            or {k: bounds[k] for k in built} != built
+            or min(sizes) < 1
+            or bounds["max_seq_len"] >= mqa._MAX_SEQ_LEN
+        ):
+            raise RunnerRefusal(
+                "on the host aiter's mqa_logits_mxfp4_config answers DeepSeek-V4's "
+                f"attention builder alone: {built}, on an arch aiter has a rule "
+                f"for ({', '.join(mqa._RULES)}), each bound 1 or more and "
+                f"max_seq_len under {mqa._MAX_SEQ_LEN}; asked {bounds} on {arch}"
+            )
+        width = -(-bounds["max_seq_len"] // tile)  # one tile an entry
+        return SimpleNamespace(arch=arch, **bounds, block_table_width=width)
 
     mqa.mqa_logits_mxfp4_config = answered
 

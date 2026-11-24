@@ -243,25 +243,30 @@ MACHINES = {
 ON_DEVICE = {(1000, 1): 4, (2048, 512): 8, (100003, 16): 391, (1048576, 512): 4096}
 
 
-def _indexed(monkeypatch, model, index, arch, backend="opus", run_file=True):
+def _indexed(monkeypatch, model, index, arch, backend="opus", machine=True):
     """`_config()` for `model` under `--index-cache-dtype index`, its indexer
     layout resolved as `Config` resolves it on a device of `arch`, under a run
-    file whose machine is of `arch`, with aiter's MQA-logits module stood in:
-    its config function answers a card, and its `_TILE` is the device's."""
+    file whose machine is of `arch` (of `machine` when it names one, none when
+    None), with aiter's MQA-logits module stood in: its config function
+    answers a card, and its tile, rules and width bound are aiter's."""
     monkeypatch.setitem(
         sys.modules,
         "aiter.jit.utils.chip_info",
         SimpleNamespace(get_gfx_runtime=lambda: arch),
     )
     monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", backend)
-    machine = json.loads((REPO / "tests/compass/machines" / MACHINES[arch]).read_text())
-    spec = {"machine": machine} if run_file else None
+    name = MACHINES[arch if machine is True else machine] if machine else None
+    machines = REPO / "tests/compass/machines"
+    spec = {"machine": json.loads((machines / name).read_text())} if name else None
     monkeypatch.setattr(compass_run, "spec", lambda: spec)
 
     def card(device, **bounds):
         return "card", device, bounds
 
-    mqa = SimpleNamespace(mqa_logits_mxfp4_config=card, _TILE=64)
+    rules = {"gfx950": None, "gfx1250": None}
+    mqa = SimpleNamespace(
+        mqa_logits_mxfp4_config=card, _TILE=64, _RULES=rules, _MAX_SEQ_LEN=1 << 29
+    )
     monkeypatch.setitem(sys.modules, "aiter.ops.opus.pa_mqa_logits_mxfp4", mqa)
     config = _config()
     config.hf_config, config.index_cache_dtype = model, index
@@ -305,25 +310,50 @@ def test_deepseek_v4_under_the_fp4_indexer_gets_its_devices_table_width_on_the_h
 
 
 @pytest.mark.parametrize(
-    "model, index, arch, backend, run_file",
+    "machine, asked",
+    [
+        ("gfx942", {}),
+        ("gfx950", {"heads": 32}),
+        ("gfx950", {"page_size": 8}),
+        ("gfx950", {"pages_per_block": 2}),
+        ("gfx950", {"max_rows": 0}),
+        ("gfx950", {"max_seq_len": 1 << 29}),
+    ],
+    ids=["no-rule", "heads", "page", "entry", "rows", "width"],
+)
+def test_a_request_the_v4_builder_does_not_make_is_refused_on_the_host(
+    started, monkeypatch, machine, asked
+):
+    """Answered on the host is the builder's request alone: 64 index heads on
+    64-row pages, on an arch aiter has a rule for, bounds aiter takes. Any other
+    a device's aiter would refuse or answer with another instance."""
+    config, mqa, _ = _indexed(monkeypatch, V4, "fp4", "gfx950", machine=machine)
+    runner, _ = started(config)
+    request = _builders_request(2048, 512) | asked
+    with pytest.raises(RunnerRefusal, match="DeepSeek-V4's attention builder alone"):
+        mqa.mqa_logits_mxfp4_config(runner.device, **request)
+
+
+@pytest.mark.parametrize(
+    "model, index, arch, backend, machine",
     [
         (V4, "fp8", "gfx950", "opus", True),
         (V4, "fp4", "gfx942", "opus", True),
         (V4, "fp4", "gfx950", "flydsl", True),
         (V41, "fp4", "gfx950", "opus", True),
-        (V4, "fp4", "gfx950", "opus", False),
+        (V4, "fp4", "gfx950", "opus", None),
     ],
     ids=["v4-fp8", "v4-fp4-on-gfx942", "v4-fp4-flydsl", "v41-fp4", "no-run-file"],
 )
 def test_a_start_whose_builder_asks_aiter_nothing_of_the_device_leaves_it_aiters(
-    started, monkeypatch, model, index, arch, backend, run_file
+    started, monkeypatch, model, index, arch, backend, machine
 ):
     """fp8, and fp4 on gfx942, where V4 falls back to the fp8 indexer, leave
     V4 no FP4 layout; the flydsl backend's preshuffled layout sizes its table
     without aiter; DeepSeek-V4.1's fp4 plane has its own layout names, and
     `_resident` answers for it. Each starts as before, aiter's config function
     as it was, as is every start without a run file, which states no device."""
-    config, mqa, card = _indexed(monkeypatch, model, index, arch, backend, run_file)
+    config, mqa, card = _indexed(monkeypatch, model, index, arch, backend, machine)
     runner, calls = started(config)
     assert runner.device == torch.device("cpu")
     assert [k["backend"] for _, k in calls[:1]] == ["gloo"]
