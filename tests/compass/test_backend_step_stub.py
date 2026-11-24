@@ -162,7 +162,9 @@ class TestPerRequestSums:
         gather rows, their real tokens and the agreed two-batch-overlap split
         of the data-parallel group, and whether it samples, what its vision
         encoder fills of the step and whether it is a DP rank's dummy forward,
-        not of any row.
+        not of any row; so is `kda`, a KDA model's state work, which the rows
+        do not carry: the rows holding a state, the checkpoints saved, the
+        forks and the state moves.
         """
         assert [f.name for f in fields(BatchView)] == [
             "requests",
@@ -184,6 +186,7 @@ class TestPerRequestSums:
             "group_needs_eager",
             "group_tail",
             "prefill_duty",
+            "kda",
         ]
         assert [f.name for f in fields(RequestShape)] == [
             "query_tokens",
