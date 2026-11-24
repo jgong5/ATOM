@@ -600,7 +600,7 @@ def test_each_pipeline_stage_s_segments_are_its_own_its_e_from_its_release(
 ):
     """Labelled as its stage, each forward's segments on `pp2`'s record are
     those planted: the head's `E` from stage 1's exit of the forward whose
-    tokens it waits for, its admissions aside, and stage 1's from the head's
+    ack it waits for, its admissions aside, and stage 1's from the head's
     call; stage 1's `W_recv`, and its `W_launch` less its receive's wait. The
     head reads no token, and still labels."""
     stages = pp2(tmp_path, 19)
