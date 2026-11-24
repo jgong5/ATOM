@@ -986,21 +986,60 @@ def mhc_packed_on_meta():
             setattr(m, name, pack)
 
 
+@contextlib.contextmanager
+def shared_mxfp8_fused_on_meta():
+    """An MXFP8 shared expert staged on meta is fused into its MXFP4 slot as on
+    the GPU: in place, so the weights left are the slots the build made.
+
+    Under ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 a MoE of MiniMax-M3.1's Quark MXFP4
+    export stages its shared expert's MXFP8 tensors as they load, and after the
+    load `Mxfp8SharedIntoMxfp4.fuse` re-quantizes them into the expert's MXFP4
+    slot, which the MoE built with its routed experts, and frees the staging. A
+    meta build loads nothing, so the fuse finds no tensor staged and refuses.
+    Here a staging on meta is freed as the fuse frees it, and the slot keeps
+    the shape and dtype the fuse writes into; a staging of real bytes fuses as
+    before. Without the staging's module loaded nothing is swapped.
+    """
+    staging = getattr(
+        sys.modules.get("atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4"),
+        "Mxfp8SharedIntoMxfp4",
+        None,
+    )
+    if staging is None:
+        yield
+        return
+    fuse = staging.fuse
+
+    @wraps(fuse)
+    def fused(self, layer):
+        staged = self.staged or {}
+        if not staged or not all(t.is_meta for t in staged.values()):
+            return fuse(self, layer)
+        self.staged = None
+
+    staging.fuse = fused
+    try:
+        yield
+    finally:
+        staging.fuse = fuse
+
+
 def process_weights_after_loading(tree: torch.nn.Module) -> None:
     """Run on a meta tree the post-load hooks `load_model` runs after a load.
 
     The same walk, parent first: each module's own hook, then its quant
     method's. The hooks re-lay weights (an MXFP4 MoE pads its expert scales),
     so the storages they leave are the ones a real start holds; a gather
-    across a process group answers with its shape (`gathers_by_shape`), and
-    V4.1's mHC pack packs as on the GPU (`mhc_packed_on_meta`). The
-    loader's `init_prepare_finalize` is not run: it sets up an MoE's dispatch
-    and holds no weight. A hook that fails on the meta device refuses the
+    across a process group answers with its shape (`gathers_by_shape`),
+    V4.1's mHC pack packs as on the GPU (`mhc_packed_on_meta`), and an MXFP8
+    shared expert fuses into its MXFP4 slot in place
+    (`shared_mxfp8_fused_on_meta`). The loader's `init_prepare_finalize` is not
+    run: it sets up an MoE's dispatch and holds no weight. A hook that fails on the meta device refuses the
     start by name.
     """
     if not isinstance(tree, torch.nn.Module):
         return
-    with gathers_by_shape(), mhc_packed_on_meta():
+    with gathers_by_shape(), mhc_packed_on_meta(), shared_mxfp8_fused_on_meta():
         _run_post_load_hooks(tree)
 
 
@@ -1105,6 +1144,13 @@ class UnbuiltModel(torch.nn.Module):
             "forward pass costs instead of running one, so there are no weights "
             "to call."
         )
+
+    def bind_mono_drafter(self, drafter: Any) -> None:
+        """Bind `drafter` into the tree's mono decode router, as MiniMax-M3's
+        installer binds a DSpark drafter into the loaded model after the build
+        (`install_mono_decode`). The router is built with the tree and never
+        runs a step here; a tree with no router refuses as the model would."""
+        self.tree.bind_mono_drafter(drafter)
 
 
 def publish_planned_transfer(runner: Any) -> None:
