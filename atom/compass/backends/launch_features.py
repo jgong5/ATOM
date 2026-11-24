@@ -202,3 +202,27 @@ def stated(key: dict | None) -> tuple[LaunchFeatures, dict | None]:
     """The provider and graph sets the host key `key` states, if any."""
     graphs = ((key or {}).get("engine") or {}).get(GRAPHS)
     return provider(graphs and graphs["architecture"]), graphs
+
+
+#: The host entry's key holding one constant per launch path (`path`), which a
+#: `COMPASS_FIT_HOST_KIND_BLOCKS=1` host fit writes (`fit.host_blocks`).
+PATHS = "paths"
+
+
+def path(view, launch: dict) -> str:
+    """The launch path of a forward of the `BatchView` `view` whose launch ran
+    `launch`, its launch features (`LaunchFeatures.predict`): a decode's CUDA
+    graph, ``rung<r>`` at its capture rung, or ``eager``; any other forward's
+    ``replay``; then each feature `launch` states true, sorted, all joined by
+    ``+`` (a feature replaces ``replay``). One function for a fit, on a
+    sample's view and its line's features, and for a run, on the view it
+    prices and the features its provider predicts. DeepSeek-V4.1: a decode
+    ``rung16``, a prefill ``replay``, ``eager_body``, ``eager_tail`` or
+    ``eager_body+eager_tail``."""
+    flags = sorted(f for f, v in launch.items() if v)
+    if view.produces_output and not view.prefill:
+        rung = view.capture_rung
+        head = ["eager" if rung is None else f"rung{rung}"]
+    else:
+        head = [] if flags else ["replay"]
+    return "+".join(head + flags)
