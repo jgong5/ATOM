@@ -56,10 +56,13 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+#: The worst relative prediction error #739 section 2.2 allows a vector, in
+#: percent as #739 states it.
+G_PERCENT = {"decode": 1, "prefill": 2}
 #: The acceptance criteria #739 section 2.2 freezes, which a config may tighten.
 ACCEPTANCE = {
     "vif": 10.0,
-    "g": {"decode": 0.01, "prefill": 0.02},
+    "g": {kind: pct / 100 for kind, pct in G_PERCENT.items()},
     "g_z": 2.0,
     "rung_steps": 60,
     "levels": 3,
