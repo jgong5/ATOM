@@ -248,11 +248,12 @@ class BatchView:
     draft's first pass, which runs each rank's own token count; None on one
     rank or with no such drafter. `draft_bs` is the batch an MTP drafter's
     later passes run at, a row a sequence, padded past the rows: the step's
-    `running_bs`, for a drafter that declares a draft graph; None for one
-    that runs them at the rows, or with none. `draft_rows` is the rows the
-    gather carries on the later passes of an MTP drafter that runs them at
-    the rows: every rank's, or, where a rank prefills, a floor on them, the
-    widest rank's and one a peer; None on one rank or with no such drafter.
+    `running_bs`, a draft graph replaying them or not; None for a block
+    drafter or one of one draft, or with none. `draft_rows` is the rows the
+    gather carried on the later passes of an MTP drafter that ran them at
+    the rows, as a record's line from before ATOM padded them states: every
+    rank's, or, where a rank prefilled, a floor on them, the widest rank's and
+    one a peer; None in any other view.
     `target_bs` is the step's
     `running_bs` where a target that replays no graph pads past its rows: an
     eager decode every DP rank decodes in, its model; a sampling prefill, its

@@ -381,7 +381,7 @@ def serial_passes(view: BatchView, passes: int) -> list[tuple]:
     """The `PREFILL` features of each of a serial drafter's `passes` draft
     forwards over `view`'s step: the first runs the step's own rows; each
     later one a row a request, at its context, run at `view.draft_bs` rows
-    where the drafter pads them to a draft graph's batch."""
+    where the view states the step's batch the drafter pads them to."""
     first = view.requests
     later = tuple(RequestShape(1, r.context_tokens, True) for r in first)
     rows = len(later) if view.draft_bs is None else view.draft_bs

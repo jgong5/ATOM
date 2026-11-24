@@ -46,11 +46,17 @@ gathering `draft_moe_rows`; on a step that samples nothing that pass alone
 runs, writing the drafter's KV. On a step that drafts, one that samples or,
 under a data-parallel group, a middle chunk, whose propose runs for the
 group's collectives, its LM head samples a row a request in every pass, and
-each later pass runs a row a request at its context: at `draft_bs` rows where
-the drafter replays a draft graph, its MoE gathering `draft_rows`, or every
-rank's `draft_bs`. Every pass prices among the step's `draft_terms`. Its LM
-head's TP group gathers each rank's argmax alone, a (value, id) pair a row in
-fp32 (`compute_argmax_token`), not the logits.
+each later pass runs a row a request at its context: at `draft_bs` rows, the
+step's `running_bs`, where the view states it, its MoE gathering every
+rank's `draft_bs`, or `draft_rows` where a record states those. A module
+with `head` (V4's head input, its `hc_head` and `norm`) runs on the rows the
+LM head samples alone. Every pass prices among the step's `draft_terms`. Its
+LM head's TP group gathers each rank's argmax alone, a (value, id) pair a row
+in fp32 (`compute_argmax_token`), not the logits. A head at TP 1 whose
+data-parallel group shards the argmax (`ATOM_DP_DRAFT_ARGMAX`) does so on a
+later pass of at most its cap of rows, the one pass whose height every rank
+states alike: it gathers the group's rows, multiplies them by its vocabulary
+shard and gathers each rank's (value, id) pairs (`_dp_sharded_logits`).
 
 Two-batch overlap. A step the data-parallel group split (`tbo_tokens`) runs
 this rank's tokens as two micro-batches, cut at the first one's token count,
@@ -158,7 +164,9 @@ class Module:
 
     `kind` picks its work; `dims` are its per-rank shapes in that kind's order:
     `gemm` (n, k, then the rows it runs a token where more than one),
-    `lm_head` (n, k), a pass (elements a token; a `norm`'s
+    `lm_head` (n, k, then, where a serial drafter's data-parallel group may
+    shard its argmax, that group's width and the most rows it shards),
+    `hc_head` (residual copies, width), a pass (elements a token; a `norm`'s
     second, those of them it writes in fp8), `act` (output
     elements a token), `attention` (heads, KV heads, head dim),
     `linear_attention` (value heads, key heads, key dim, value dim), `mhc`
@@ -182,7 +190,8 @@ class Module:
     cached tokens past which it gathers only those, 0 for none; `passes` a
     serial drafter's passes, one a draft token, 0 for any other module;
     `gathers` that a `gemm`'s collective all-gathers its output shards over
-    `ranks` rather than all-reducing its output.
+    `ranks` rather than all-reducing its output; `head` that it runs on the
+    rows the LM head samples, before it, none where that samples none.
     An unclassified module's `name` says what it is.
     """
 
@@ -202,11 +211,16 @@ class Module:
     chunk: int = 0
     passes: int = 0
     gathers: bool = False
+    head: bool = False
 
 
 def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
     """`m`'s work on a step of `tokens` executed tokens; None if it runs none."""
     d, act = m.dims, ELEMENT_BYTES[ACT]
+    if m.head:
+        if not sampled:
+            return None
+        tokens = sampled
     if m.kind == "gemm":
         rows = tokens * (d[2] if len(d) > 2 else 1)
         out = rows * d[0] * act
@@ -214,6 +228,13 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
             allgather(m.ranks, out * m.ranks) if m.gathers else allreduce(m.ranks, out)
         )
         return gemm(rows, d[0], d[1], m.act, m.fmt) + comm
+    if m.kind == "hc_head":
+        # Reduce the widened residual to one row by gates its fp32 projection
+        # of the row computes: read the copies, write the row.
+        copies, width = d
+        moved = tokens * (copies + 1) * width * act
+        moved += copies * copies * width * ELEMENT_BYTES["fp32"]
+        return Work({ACT: 2 * tokens * copies * copies * width}, moved)
     if m.kind == "mhc":
         # Fold the sub-layer's output into the widened residual and reduce it:
         # read and write both, and the mixing weights' fp32 projection.
@@ -237,9 +258,15 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
     if m.kind == "lm_head":
         if not sampled:
             return None
+        pair = 2 * ELEMENT_BYTES["fp32"]  # an argmax's (value, id)
+        if len(d) > 2:  # the data-parallel group's sharded argmax (`_serial`)
+            dp, rows = d[2], d[2] * sampled
+            hidden = allgather(dp, rows * d[1] * act)
+            pairs = allgather(dp, dp * rows * pair)
+            return gemm(rows, d[0] // dp, d[1], b=m.fmt) + hidden + pairs
         gathered = sampled * d[0] * m.ranks * act
         if m.passes:  # a serial drafter's argmax: each rank's (value, id) pair
-            gathered = sampled * 2 * ELEMENT_BYTES["fp32"] * m.ranks
+            gathered = sampled * pair * m.ranks
         return gemm(sampled, *d, b=m.fmt) + allgather(m.ranks, gathered)
     if m.kind in PASSES:
         # ponytail: one pass over the module's own width; a per-head norm or
@@ -749,8 +776,8 @@ class StepRooflineBackend(CostBackend):
         for m, count in self.drafted.items():
             sums = kv if samples and m.draft == CONTEXT else drafts
             if m.passes:
-                for at, heads, alike in self._serial(m, batch_view, drafting):
-                    self._add(m, count * alike, at, heads, refuse, sums)
+                for own, at, heads, alike in self._serial(m, batch_view, drafting):
+                    self._add(own, count * alike, at, heads, refuse, sums)
                 continue
             self._add(m, count, self._at(m, batch_view, tokens), 0, refuse, sums)
         if refuse:
@@ -785,24 +812,29 @@ class StepRooflineBackend(CostBackend):
         return BatchView((RequestShape(tail, tail, False),)), tail
 
     def _serial(self, m: Module, view: BatchView, drafting: bool):
-        """A serial drafter's passes on this step, each as `_at` gives one,
-        the rows its LM head samples and how many passes run alike: the first,
-        and, where the step drafts, each later one (`Drafter` above)."""
+        """A serial drafter's passes on this step, each as the module it runs
+        as, the batch `_at` gives, the rows its LM head samples and how many
+        passes run alike: the first, and, where the step drafts, each later
+        one (`Drafter` above)."""
         rows = view.requests
+        own = m
+        if m.kind == "lm_head" and len(m.dims) > 2:  # unsharded, as on the first
+            own = dataclasses.replace(m, dims=m.dims[:2])
         first = BatchView(rows, moe_rows=view.draft_moe_rows), sum_tokens(rows)
         if not drafting:
-            return [(first, 0, 1)]
+            return [(own, first, 0, 1)]
         width = (self.padded and view.draft_bs) or len(rows)
-        runs = [(first, width, 1)]
+        runs = [(own, first, width, 1)]
         if m.passes > 1:
             gathered = view.draft_rows
             if gathered is None and view.draft_moe_rows is not None:
-                # Every rank's draft graph, padded alike; read by a MoE alone.
+                # Every rank's later pass, padded alike; read by a MoE alone.
                 gathered = m.dims[6] * width if m.kind == "moe" else None
             later = tuple(RequestShape(1, r.context_tokens, True) for r in rows)
-            runs.append(
-                ((BatchView(later, moe_rows=gathered), width), width, m.passes - 1)
-            )
+            if own is not m and width <= m.dims[3]:
+                own = m  # the group shards its argmax
+            at = BatchView(later, moe_rows=gathered), width
+            runs.append((own, at, width, m.passes - 1))
         return runs
 
     def _add(self, m: Module, count: int, at, sampled: int, refuse, sums) -> None:

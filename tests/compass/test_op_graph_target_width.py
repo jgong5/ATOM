@@ -539,16 +539,16 @@ def test_a_drafter_prices_its_later_passes_at_draft_bs(dp, gathered, params):
 
 
 @pytest.mark.parametrize(
-    "peers,step,draft_rows",
+    "peers,step,width",
     [
-        # Every rank decoding: 9 + 12 tokens, 3 a row.
-        ([(4, 12, False)], False, 7),
-        # Beside a prefilling peer, 3 rows and one each peer, of 6.
-        ([(2, 40, True), (1, 3, False)], False, 5),
-        # Beside a wider prefilling peer, its 5 rows and one each peer, of 8.
-        ([(5, 40, True)], False, 6),
-        ([(4, 12, False)], True, None),
-        ((), False, None),
+        # Every rank decoding: the wider of 3 and 4 rows.
+        ([(4, 12, False)], False, 4),
+        # Beside a prefilling peer: the widest of 3, 2 and 1.
+        ([(2, 40, True), (1, 3, False)], False, 3),
+        # Beside a wider prefilling peer: its 5.
+        ([(5, 40, True)], False, 5),
+        ([(4, 12, False)], True, 4),
+        ((), False, 3),
     ],
     ids=[
         "dp2",
@@ -558,44 +558,43 @@ def test_a_drafter_prices_its_later_passes_at_draft_bs(dp, gathered, params):
         "one-rank",
     ],
 )
-def test_an_eager_drafter_s_later_passes_gather_every_rank_s_rows(
-    monkeypatch, peers, step, draft_rows
+def test_an_eager_drafter_s_later_passes_run_at_the_group_s_running_bs(
+    monkeypatch, peers, step, width
 ):
+    # `EagleProposer._propose` pads every later pass to `running_bs`, a draft
+    # graph or none, and states that height for every rank.
     view = settled(monkeypatch, DECODE, peers, eager=True, step=step)
 
-    assert view.draft_rows == draft_rows
+    assert (view.draft_bs, view.draft_rows) == (width, None)
 
 
 @pytest.mark.parametrize(
-    "rows,peer,drafts,draft_rows",
+    "rows,peer,drafts,width",
     [
         # Three rows verifying one draft beside a peer's three: no later pass.
         ([(2, 90, True)] * 3, (3, 6, False), 1, None),
-        # MTP2 beside a peer's four: its later passes gather 3 + 4 rows.
-        (DECODE, (4, 12, False), 2, 7),
+        # MTP2 beside a peer's four: its later passes run 4 rows on each rank.
+        (DECODE, (4, 12, False), 2, 4),
     ],
     ids=["mtp1", "mtp2"],
 )
-def test_an_eager_dp_drafter_gathers_later_pass_rows_only_when_it_has_later_passes(
-    monkeypatch, rows, peer, drafts, draft_rows
+def test_an_eager_dp_drafter_pads_later_passes_only_when_it_has_later_passes(
+    monkeypatch, rows, peer, drafts, width
 ):
     view = settled(monkeypatch, rows, [peer], eager=True, step=False, drafts=drafts)
 
-    assert view.draft_rows == draft_rows
+    assert (view.draft_bs, view.draft_rows) == (width, None)
 
 
-def test_an_eager_dp_drafter_asks_its_later_passes_at_the_g_they_gathered(
+def test_an_eager_dp_drafter_asks_its_later_passes_at_the_group_s_running_bs(
     monkeypatch,
 ):
     # V4-Pro MTP2 at DP2 with no draft graph, 3 rows beside a peer's 4: its
-    # first pass's MoE gathers 9 + 12, its later passes' 3 + 4, which a capture
-    # states as this rank's 3 at each rank.
+    # first pass's MoE gathers 9 + 12; its later passes run 4 rows on each
+    # rank, gathering 8, as a drafter's that replays a draft graph do.
     view = settled(monkeypatch, DECODE, [(4, 12, False)], eager=True, step=False)
-    drafted = [g(9, 64, 64), g(21, 32, 64), argmax(3), g(3, 64, 64)]
-    graphs = {
-        False: {"seq": [g(4, 64, 64)]},
-        True: {"seq": drafted + [g(6, 32, 64), g(7, 32, 64)]},
-    }
+    drafted = [g(9, 64, 64), g(21, 32, 64), argmax(3), g(4, 64, 64), g(8, 32, 64)]
+    graphs = {False: {"seq": [g(4, 64, 64)]}, True: {"seq": drafted}}
     listing = AskedG()
     backend = OpGraphBackend(
         SPEC,
@@ -611,10 +610,9 @@ def test_an_eager_dp_drafter_asks_its_later_passes_at_the_g_they_gathered(
         (GEMM, 4, 4, 4, None),
         (GEMM, 9, 3, 3, 21),
         (GEMM, 21, 3, 3, 21),
-        (ARGMAX, 3, 3, 3, 7),
-        (GEMM, 3, 3, 3, 7),
-        (GEMM, 6, 3, 3, 7),
-        (GEMM, 7, 3, 3, 7),
+        (ARGMAX, 3, 3, 3, 21),
+        (GEMM, 4, 4, 4, 8),
+        (GEMM, 8, 4, 4, 8),
     ]
 
 
@@ -771,8 +769,8 @@ def test_a_reader_asks_a_recorded_eager_dp_drafter_what_a_simulated_run_asks(
     monkeypatch, tmp_path, reader
 ):
     # MTP2 at DP2 with no draft graph, 3 rows beside a peer's 4: its later
-    # passes gather 3 + 4 rows. Its line is the one the step recorder writes
-    # of its batch, run alike on two ranks.
+    # passes run 4 rows on each rank, gathering 8. Its line is the one the step
+    # recorder writes of its batch, run alike on two ranks.
     view = settled(monkeypatch, DECODE, [(4, 12, False)], eager=True, step=False)
     monkeypatch.setattr(projection, "forward_mode", lambda *_: None)
     monkeypatch.setattr(projection, "batch_view", lambda *_: view)
@@ -790,8 +788,7 @@ def test_a_reader_asks_a_recorded_eager_dp_drafter_what_a_simulated_run_asks(
     line = json.loads((tmp_path / "recorded" / "dp0.jsonl").read_text())
     del line["step"], line["dp_rank"]
     record = padded_record(tmp_path, [line] * 2)
-    drafted = [g(9, 64, 64), g(21, 32, 64), argmax(3), g(3, 64, 64)]
-    drafted += [g(6, 32, 64), g(7, 32, 64)]
+    drafted = [g(9, 64, 64), g(21, 32, 64), argmax(3), g(4, 64, 64), g(8, 32, 64)]
     graphs = {False: {"seq": [g(4, 64, 64)]}, True: {"seq": drafted}}
 
     def asked(read):

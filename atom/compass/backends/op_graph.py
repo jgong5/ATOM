@@ -690,9 +690,10 @@ class OpGraphBackend(CostBackend):
         With `draft`, its drafter's: its first pass at its rows, unpadded, G
         `draft_moe_rows` off its rows' default; its later passes at `draft_bs`,
         G every rank's `draft_bs`; the first pass's gathered a rows' count, the
-        later passes' a width's. An eager DP drafter with later passes runs
-        them at its rows, G `draft_rows`, a capture's MoE gathering this rank's
-        rows at every peer. A leaf with both counts is asked at its rows'
+        later passes' a width's. A view stating `draft_rows`, a record's from
+        before ATOM padded an eager drafter's later passes, runs them at its
+        rows, G `draft_rows`, a capture's MoE gathering this rank's rows at
+        every peer. A leaf with both counts is asked at its rows'
         T and B and the smaller G: on a drafter its rows carry the first
         pass's G, above a later pass's. A block drafter's pass on a decode
         that replayed a rung runs its block at the rung: the width's counts
