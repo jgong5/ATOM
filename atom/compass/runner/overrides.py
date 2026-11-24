@@ -993,15 +993,46 @@ def process_weights_after_loading(tree: torch.nn.Module) -> None:
     method's. The hooks re-lay weights (an MXFP4 MoE pads its expert scales),
     so the storages they leave are the ones a real start holds; a gather
     across a process group answers with its shape (`gathers_by_shape`), and
-    V4.1's mHC pack packs as on the GPU (`mhc_packed_on_meta`). The
-    loader's `init_prepare_finalize` is not run: it sets up an MoE's dispatch
-    and holds no weight. A hook that fails on the meta device refuses the
-    start by name.
+    V4.1's mHC pack packs as on the GPU (`mhc_packed_on_meta`). A hook that
+    checks its module's load first finds the whole checkpoint loaded
+    (`loaded_whole`). The loader's `init_prepare_finalize` is not run: it sets
+    up an MoE's dispatch and holds no weight. A hook that fails on the meta
+    device refuses the start by name.
     """
     if not isinstance(tree, torch.nn.Module):
         return
+    loaded_whole(tree)
     with gathers_by_shape(), mhc_packed_on_meta():
         _run_post_load_hooks(tree)
+
+
+#: Each module class whose loader records the checkpoint slices it took, and
+#: whose post-load hook refuses a load missing one: by its module and name, the
+#: attribute it records them in, and every slice a whole load takes.
+SLICE_RECORDS = (
+    # The fused q_a, kv_a, indexer wk and weights_proj projection of an MLA
+    # layer with a V3.2-style indexer (Kimi-K3.1's DSA layers).
+    (
+        "atom.models.deepseek_v2",
+        "FusedIndexerProjection",
+        "_checkpoint_shards",
+        {0, 1, 2, 3},
+    ),
+)
+
+
+def loaded_whole(tree: torch.nn.Module) -> None:
+    """Record on each module of `tree` that `SLICE_RECORDS` names every slice a
+    whole checkpoint load gives it: a simulated start loads no checkpoint and
+    stands for a start that loaded all of it. A class whose module is not
+    loaded is in no tree."""
+    for module_name, name, field, whole in SLICE_RECORDS:
+        cls = getattr(sys.modules.get(module_name), name, None)
+        if cls is None:
+            continue
+        for module in tree.modules():
+            if isinstance(module, cls):
+                setattr(module, field, set(whole))
 
 
 def _run_post_load_hooks(tree: torch.nn.Module) -> None:
