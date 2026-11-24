@@ -13,6 +13,10 @@
 #                 --gpu G --store S; run: --step-linear LAW --host-laws HOST
 #                 --device D --ptl P --store S), then the serve arguments
 #   MODEL, HARNESS_PYTHON   as client.sh takes them
+#   CAL_AIPERF_EXTRA_ARGS   more aiperf arguments for every lane, before the
+#                 lane's own (client.sh's AIPERF_EXTRA_ARGS, which this script
+#                 sets per lane): a model whose tokenizer runs its own code
+#                 (Kimi-K3.1) needs --tokenizer-trust-remote-code (default none)
 #   DRAIN_TRIES   polls of the server's in-flight requests, 5 s apart, before a
 #                 segment counts as drained anyway (default 180; a simulated
 #                 server reports its last requests running until the next
@@ -69,7 +73,8 @@ for ((k = 0; k < n; k++)); do
         L=$OUT/$SEG/$lane
         mkdir -p "$L"
         cp "$OUT/real/server.json" "$L/"
-        extra="--apply-chat-template --trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"
+        extra="${CAL_AIPERF_EXTRA_ARGS:+$CAL_AIPERF_EXTRA_ARGS }--apply-chat-template"
+        extra+=" --trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0"
         extra+=" --random-seed $seed --num-conversations $traces"
         [[ $pin == None ]] || extra+=" --extra-inputs data_parallel_rank:$pin"
         TRACES=$D/$file AIPERF_EXTRA_ARGS=$extra \
