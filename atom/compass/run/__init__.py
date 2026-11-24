@@ -587,11 +587,14 @@ def refuse_unfitted_law(run: dict, config) -> None:
 def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     """Refuse the run file's step linear law on a runner that records the
     prefill token-graph buckets `buckets`, ascending, where the law states none
-    or others: in its engine config, which `refuse_unfitted_law` held to
-    `config`'s, or else in its prefill vector, those its records' runner
-    recorded. An engine config states them only off ATOM's default, which can
-    move between a fit and a run, so one stating none says nothing of them. Host
-    laws refuse where their key's graph sets state others; `run` replaces `spec()`."""
+    or others: in its prefill vector, those its records' runner recorded, or
+    else in its engine config, which `refuse_unfitted_law` held to `config`'s.
+    An engine config states them only off ATOM's default, which can move
+    between a fit and a run, so one stating none says nothing of them; one
+    stating them states ATOM's list, which a runner records only up to
+    `warmup_max_tokens`, a bound no engine config keys, so a prefill vector's
+    are held to `buckets` either way. Host laws refuse where their key's graph
+    sets state others; `run` replaces `spec()`."""
     if not buckets or (run := spec() if run is None else run) is None:
         return
     from atom.compass.backends import launch_features
@@ -610,9 +613,11 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     pick_fitted(run, STEP_LINEAR, config)
     law = run[STEP_LINEAR]
     stated = sorted((law.get("prefill") or {}).get("buckets") or ())
-    if BUCKETS not in law["engine_config"]["env"] and stated != list(buckets):
+    env = law["engine_config"]["env"]
+    if (stated or BUCKETS not in env) and stated != list(buckets):
+        said = f"{BUCKETS}={env[BUCKETS]}" if BUCKETS in env else f"no {BUCKETS}"
         raise ValueError(
-            f"the step linear law states no {BUCKETS} in its engine config and "
+            f"the step linear law states {said} in its engine config and "
             f"{stated or 'none'} as its prefill vector's buckets, and this run's "
             f"runner records the prefill token-graph buckets {list(buckets)}"
         )
