@@ -14,7 +14,9 @@ which holds the ladder the runner replays; the scheduler's bounds
 only above 1, so a width-1 engine file is unchanged and a step linear fit
 refuses a context-parallel record by name; `min_final_prefill_rows`, only
 above 0 and in no key, the fewest rows the forward finishing a prompt runs,
-which a JIT sweep's plan reads; and `prefill_buckets`, the prefill
+and `replays_state`, only when true and in no key, whether a prefix hit
+rebuilds the per-request state a hash block below it, both of which a JIT
+sweep's plan reads; and `prefill_buckets`, the prefill
 token-graph buckets the runner recorded, empty where it recorded none, which a
 step linear fit pads prefill to.
 A simulated run also writes `dp<r>.cost.jsonl`, a line per step saying what
