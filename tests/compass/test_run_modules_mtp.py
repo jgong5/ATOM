@@ -8,7 +8,10 @@ with its passes, one a draft token; V4's, which holds no LM head, runs the
 target's embedding and LM head. The step roofline prices them as the step's
 draft terms: the first pass over the step's rows, each later one a row a
 request, the LM head a row a request in each, and on a step that samples
-nothing the first pass alone. A speculative step then answers
+nothing the first pass alone, unless a data-parallel group proposes for its
+collectives. Each pass runs the first MTP layer; V4's block norms its inputs
+and projects each residual copy, and at TP 2 Qwen3.5's gathers its `fc`'s
+output and its argmax alone. A speculative step then answers
 `_group_step_seconds`' "prices no draft" check, the roofline alone or below a
 backend that refuses the step; a run with no drafter laid out, Eagle3's
 (#3962), is still refused.
@@ -36,13 +39,20 @@ from test_dp_step_max import prefill, runner
 from atom.compass.backends.base import CostBackend, Granularity
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.resolver import CostRefused
-from atom.compass.backends.shape import BatchView, RequestShape
+from atom.compass.backends.shape import BatchView, RequestShape, sum_tokens
 from atom.compass.backends.step_roofline import (
     UNCLASSIFIED,
     StepFallbackBackend,
     StepRooflineBackend,
 )
-from atom.compass.backends.work import attention, elementwise, gemm, price
+from atom.compass.backends.work import (
+    allgather,
+    attention,
+    bounds,
+    elementwise,
+    gemm,
+    price,
+)
 from atom.compass.spec import MachineSpec
 
 HERE = pathlib.Path(__file__).parent
@@ -52,17 +62,24 @@ MI308X = HERE / "machines" / "mi308x-hjbog18.json"
 #: V4-Pro's fp4 experts build on an MI355X's arch.
 MI355X = HERE / "machines" / "mi355x-gpu40.json"
 MACHINE = MachineSpec.from_mapping(json.loads(MI308X.read_text()))
+V4_PRO = HERE / "deepseek_v4_pro_config.json"
 V3 = ["--kv_cache_dtype", "fp8"]
 #: Each build: its config, TP width, machine, draft tokens, ATOM arguments.
 BUILDS = {
     "qwen3.5-mtp1": (CONFIG, 1, MI308X, 1, []),
     "qwen3.5-mtp3": (CONFIG, 1, MI308X, 3, []),
     "v3-mtp2": (HERE / "deepseek_v3_config.json", 8, MI308X, 2, V3),
-    "v4-mtp2": (HERE / "deepseek_v4_pro_config.json", 8, MI355X, 2, []),
+    "v4-mtp2": (V4_PRO, 8, MI355X, 2, []),
+    "qwen3.5-tp2": (CONFIG, 2, MI308X, 1, []),
+    "qwen3.5-2layers": (CONFIG, 1, MI308X, 1, []),
 }
+#: Builds whose text config is edited: two MTP layers.
+TEXT = {"qwen3.5-2layers": {"mtp_num_hidden_layers": 2}}
 DRAFTERS = {
     "qwen3.5-mtp1": "Qwen3_5MTP",
     "qwen3.5-mtp3": "Qwen3_5MTP",
+    "qwen3.5-tp2": "Qwen3_5MTP",
+    "qwen3.5-2layers": "Qwen3_5MTP",
     "v3-mtp2": "DeepSeekMTP",
     "v4-mtp2": "DeepseekV4MTP",
 }
@@ -113,6 +130,7 @@ def built(tmp_path_factory):
         config, tp, machine, k, args = BUILDS[name]
         hf = json.loads(config.read_text())
         hf.pop("auto_map", None)  # DeepSeek-V3's names remote code it never runs
+        hf.get("text_config", {}).update(TEXT.get(name, {}))
         (root / name / "model").mkdir(parents=True)
         (root / name / "model" / "config.json").write_text(json.dumps(hf))
         args = [*args, "--method", "mtp", "--num-speculative-tokens", str(k)]
@@ -160,6 +178,13 @@ def one_pass(rows, heads: int) -> float:
     if heads:
         works.append(gemm(heads, text["vocab_size"], h))  # lm_head
     return sum(price(w, MACHINE) for w in works)
+
+
+def serial(work, machine=MACHINE) -> float:
+    """`work`'s kernel bound and then its collectives, as the roofline prices
+    a module whose kernel runs no collective of its own."""
+    b = bounds(work, machine)
+    return max(b["floor"], b["compute"], b["memory"]) + b["comm"]
 
 
 def verify(k: int, rows: int = 4) -> BatchView:
@@ -248,6 +273,68 @@ def test_a_middle_chunk_runs_the_first_pass_alone_and_no_head(built):
 
     assert by_name["draft roofline.lm_head"] == 0
     assert cost.draft_seconds == pytest.approx(one_pass(chunk.requests, 0), rel=1e-12)
+
+
+def test_a_dp_middle_chunk_runs_every_pass_with_its_head(built):
+    """Under a data-parallel group a middle chunk proposes for the group's
+    collectives (`propose(align_only=True)`): the first pass with its LM head,
+    then each later one, a row a request."""
+    chunk = BatchView(
+        (RequestShape(512, 512, False),),
+        moe_rows=1024,
+        draft_moe_rows=1024,
+        produces_output=False,
+    )
+    cost = built["qwen3.5-mtp3"]["installed"].price(chunk)
+    first, after = one_pass(chunk.requests, 1), one_pass(later(chunk), 1)
+    assert cost.draft_seconds == pytest.approx(first + 2 * after, rel=1e-12)
+
+
+def test_a_drafter_of_two_mtp_layers_runs_its_first_in_each_pass(built):
+    """`EagleProposer` passes no `spec_step_idx`, so each pass runs layer 0."""
+
+    def drafted(name):
+        return sorted((m.kind, m.dims) for m in built[name]["modules"] if m.passes)
+
+    assert drafted("qwen3.5-2layers") == drafted("qwen3.5-mtp1")
+
+
+def test_at_tp2_qwen3_5_gathers_its_fc_and_its_argmax_alone(built):
+    """`fc`'s output shards are all-gathered; the LM head gathers each rank's
+    (value, id) pair a row in fp32 (`compute_argmax_token`), not the logits."""
+    text = json.loads(CONFIG.read_text())["text_config"]
+    h, vocab = text["hidden_size"], text["vocab_size"]
+    found = {m.name: m for m in built["qwen3.5-tp2"]["modules"] if m.passes}
+    step = verify(1, rows=64)
+    t = sum_tokens(step.requests)
+    hands = {
+        "drafter.model.fc": gemm(t, h // 2, 2 * h) + allgather(2, t * h * 2),
+        "drafter.lm_head": gemm(64, vocab // 2, h) + allgather(2, 64 * 2 * 4 * 2),
+    }
+    for name, hand in hands.items():
+        cost = StepRooflineBackend(MACHINE, [found[name]]).price(step)
+        assert cost.draft_seconds == pytest.approx(serial(hand), rel=1e-12)
+
+
+def test_v4s_mtp_block_norms_its_inputs_and_projects_each_residual_copy(built):
+    """`MTPBlock.forward` norms the token's embedding (`enorm`) and each of
+    the target's residual copies (`hnorm`), projecting each copy (`h_proj`);
+    `norm` runs before the head (`_head_input`)."""
+    hf = json.loads(V4_PRO.read_text())
+    hc, d = hf["hc_mult"], hf["hidden_size"]
+    block = "drafter.model.mtp.0."
+    found = {
+        m.name.removeprefix(block): m for m in built["v4-mtp2"]["modules"] if m.passes
+    }
+    norms = [(found[n].kind, found[n].dims) for n in ("enorm", "hnorm", "norm")]
+    assert norms == [("norm", (d,)), ("norm", (hc * d,)), ("norm", (d,))]
+    h_proj = found["h_proj"]
+    assert (found["e_proj"].dims, h_proj.dims) == ((d, d), (d, d, hc))
+    chunk = BatchView((RequestShape(4096, 4096, False),), produces_output=False)
+    hand = gemm(hc * 4096, d, d, h_proj.act, h_proj.fmt)
+    mi355x = MachineSpec.from_mapping(json.loads(MI355X.read_text()))
+    cost = StepRooflineBackend(mi355x, [h_proj]).price(chunk)
+    assert cost.draft_seconds == pytest.approx(price(hand, mi355x), rel=1e-12)
 
 
 class _Refuses(CostBackend):

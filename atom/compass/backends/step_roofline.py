@@ -48,7 +48,9 @@ under a data-parallel group, a middle chunk, whose propose runs for the
 group's collectives, its LM head samples a row a request in every pass, and
 each later pass runs a row a request at its context: at `draft_bs` rows where
 the drafter replays a draft graph, its MoE gathering `draft_rows`, or every
-rank's `draft_bs`. Every pass prices among the step's `draft_terms`.
+rank's `draft_bs`. Every pass prices among the step's `draft_terms`. Its LM
+head's TP group gathers each rank's argmax alone, a (value, id) pair a row in
+fp32 (`compute_argmax_token`), not the logits.
 
 Two-batch overlap. A step the data-parallel group split (`tbo_tokens`) runs
 this rank's tokens as two micro-batches, cut at the first one's token count,
@@ -155,7 +157,8 @@ class Module:
     """One module of one rank, as the walk read it off the meta build.
 
     `kind` picks its work; `dims` are its per-rank shapes in that kind's order:
-    `gemm` and `lm_head` (n, k), a pass (elements a token; a `norm`'s
+    `gemm` (n, k, then the rows it runs a token where more than one),
+    `lm_head` (n, k), a pass (elements a token; a `norm`'s
     second, those of them it writes in fp8), `act` (output
     elements a token), `attention` (heads, KV heads, head dim),
     `linear_attention` (value heads, key heads, key dim, value dim), `mhc`
@@ -177,7 +180,9 @@ class Module:
     module on the target's rows, 0 for the target's; `kv` the format of the
     cache an `mla_up` gathers a prefill's context from, and `chunk` the
     cached tokens past which it gathers only those, 0 for none; `passes` a
-    serial drafter's passes, one a draft token, 0 for any other module.
+    serial drafter's passes, one a draft token, 0 for any other module;
+    `gathers` that a `gemm`'s collective all-gathers its output shards over
+    `ranks` rather than all-reducing its output.
     An unclassified module's `name` says what it is.
     """
 
@@ -196,13 +201,19 @@ class Module:
     kv: str = "fp8"
     chunk: int = 0
     passes: int = 0
+    gathers: bool = False
 
 
 def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
     """`m`'s work on a step of `tokens` executed tokens; None if it runs none."""
     d, act = m.dims, ELEMENT_BYTES[ACT]
     if m.kind == "gemm":
-        return gemm(tokens, *d, m.act, m.fmt) + allreduce(m.ranks, tokens * d[0] * act)
+        rows = tokens * (d[2] if len(d) > 2 else 1)
+        out = rows * d[0] * act
+        comm = (
+            allgather(m.ranks, out * m.ranks) if m.gathers else allreduce(m.ranks, out)
+        )
+        return gemm(rows, d[0], d[1], m.act, m.fmt) + comm
     if m.kind == "mhc":
         # Fold the sub-layer's output into the widened residual and reduce it:
         # read and write both, and the mixing weights' fp32 projection.
@@ -227,6 +238,8 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
         if not sampled:
             return None
         gathered = sampled * d[0] * m.ranks * act
+        if m.passes:  # a serial drafter's argmax: each rank's (value, id) pair
+            gathered = sampled * 2 * ELEMENT_BYTES["fp32"] * m.ranks
         return gemm(sampled, *d, b=m.fmt) + allgather(m.ranks, gathered)
     if m.kind in PASSES:
         # ponytail: one pass over the module's own width; a per-head norm or
