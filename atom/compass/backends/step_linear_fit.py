@@ -1045,7 +1045,7 @@ def _blocked(samples) -> tuple[dict, list[str]]:
     return blocked, sorted(runs.keys() - blocked.keys())
 
 
-def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
+def fit_tokenizer(paths, intakes, windows=None) -> tuple[dict, dict]:
     """The ``tokenizer`` term over the lone calls (`_lone_calls`) each
     tokenizer record in `paths` holds, beside the intake stamps in `intakes`,
     and its report: the records' backend and fingerprint, and per kind of
@@ -1060,7 +1060,11 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
     calls cannot give is left out and its reason listed under the report's
     ``unfitted``, a ``segment`` without ``chars_per_s`` as
     ``segment.chars_per_s``; the report gives each record's p10, p50 and p90
-    relative residual per kind. Raises on records of two tokenizers."""
+    relative residual per kind. Raises on records of two tokenizers. With
+    `windows`, per record its host-clock spans ``(start ns, end ns)``, or None
+    for all of it, only the calls that start within one are fitted
+    (`within`): each is still judged lone, and a segment call's own work
+    found, among all of the record's calls."""
     from scipy.spatial import QhullError
 
     heads, rows = {}, []
@@ -1068,11 +1072,15 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
         head, *lines = Path(path).read_text().splitlines()
         heads[json.dumps(json.loads(head), sort_keys=True)] = None
         got = [json.loads(line) for line in lines]
+        span = windows[i] if windows else None
         for c in _lone_calls([c for c in got if c["call"] != "segment"], intake):
+            if not within(c["t_start_ns"], span):
+                continue
             kind = c["call"] if c["items"] > 1 or c["call"] == "decode" else "encode"
             s = (c["t_end_ns"] - c["t_start_ns"]) * 1e-9
             rows.append((i, kind, c["tokens"], s))
-        rows += [(i, "segment", n, s, chars) for n, chars, s in _own_work(got, intake)]
+        work = _own_work(got, intake, span)
+        rows += [(i, "segment", n, s, chars) for n, chars, s in work]
     if len(heads) != 1:
         raise ValueError(f"the records name {len(heads)} tokenizers: {sorted(heads)}")
     term, report = json.loads(next(iter(heads))), {"unfitted": {}}
@@ -1115,6 +1123,12 @@ def fit_tokenizer(paths, intakes) -> tuple[dict, dict]:
         }
         report[kind] = fitted
     return term, report
+
+
+def within(ns: int, windows) -> bool:
+    """Whether the host-clock time `ns` falls in one of `windows`, ``(start
+    ns, end ns)`` spans; any time does where `windows` is None."""
+    return windows is None or any(a <= ns < b for a, b in windows)
 
 
 def _span(fitted: dict, name: str) -> list:
@@ -1166,11 +1180,14 @@ def _lone_calls(calls: list[dict], intake) -> list[dict]:
     return [c for c, k in zip(calls, lone) if k]
 
 
-def _own_work(calls: list[dict], intake) -> list[tuple[int, int | None, float]]:
+def _own_work(
+    calls: list[dict], intake, windows=None
+) -> list[tuple[int, int | None, float]]:
     """Each ``segment`` call among `calls` lone (`_lone_calls`) among the calls it
     did not make, its thread's that start in its span, as the ids those returned,
     the characters its stored-prefix search compared if its record holds them,
-    and its wall seconds less theirs."""
+    and its wall seconds less theirs; with `windows`, only those that start
+    within one (`within`)."""
     own, ids, made, last = {}, {}, set(), None
     for c in sorted(calls, key=lambda c: (c["thread"], c["t_start_ns"])):
         start, end = c["t_start_ns"], c["t_end_ns"]
@@ -1184,7 +1201,7 @@ def _own_work(calls: list[dict], intake) -> list[tuple[int, int | None, float]]:
     return [
         (ids[id(c)], c.get("compared_chars"), own[id(c)] * 1e-9)
         for c in lone
-        if c["call"] == "segment"
+        if c["call"] == "segment" and within(c["t_start_ns"], windows)
     ]
 
 
@@ -1202,7 +1219,7 @@ def _tokenizing(calls) -> dict:
     return {t: np.array(sorted(v), dtype=np.int64).T for t, v in spans.items()}
 
 
-def _intakes(path, calls=None) -> tuple[list, list, list]:
+def _intakes(path, calls=None, windows=None) -> tuple[list, list, list]:
     """The HTTP intake stamps `path` holds as each lone request's ``(body
     bytes, CPU seconds)``, each burst's ``(body bytes, mark ns, mark CPU
     ns)`` per request, and every request's body bytes.
@@ -1224,7 +1241,10 @@ def _intakes(path, calls=None) -> tuple[list, list, list]:
     renders none, its pool job's submit: either follows its body's parse. A
     burst is a run of requests each of whose app call came before the mark of
     the one ahead of it, the loop taking them in one after another, its marks
-    on the loop's thread, the only one whose CPU clock their gaps read."""
+    on the loop's thread, the only one whose CPU clock their gaps read.
+    With `windows`, host-clock spans (`within`), only the lone requests whose
+    app call, the bursts whose first mark and the bodies whose read starts
+    within one are given: each is still read among all of the record's stamps."""
     ev = _stamps(path)
     tokenized = _tokenizing(calls)
     # Arrays, searched once per request: np.searchsorted converts a list on
@@ -1259,27 +1279,30 @@ def _intakes(path, calls=None) -> tuple[list, list, list]:
         starts = np.asarray(tokenized.get(prep[6], ((), ()))[0])
         if not rendered and not np.any((prep[0] <= starts) & (starts <= prep[1])):
             seconds += prep[1] - prep[0]
-        lone.append((body[3], seconds * 1e-9))
+        if within(call, windows):
+            lone.append((body[3], seconds * 1e-9))
     # The loop parses each request's body as soon as it is read, then renders
     # its template, if the server renders one, and submits its pool job; since
     # the API server hands a template to a thread, no gap of theirs is the loop's.
     loops = {e[6] for e in ev if e[2] == "app"}
     mark = "tmpl" if any(e[2] == "tmpl" for e in ev) else "wait"
     marks = [e for e in ev if e[2] == mark and e[6] in loops]
-    sizes = [e[3] for e in sorted(ev, key=lambda e: e[1]) if e[2] == "body"]
+    bodies = [e for e in sorted(ev, key=lambda e: e[1]) if e[2] == "body"]
+    sizes = [e[3] for e in bodies]
     # A mark that finds a later request arrived and not yet marked.
     queued = [np.searchsorted(called, m[0]) > k + 1 for k, m in enumerate(marks)]
     bursts, run = [], []
     for k, m in enumerate(marks):
         run.append((sizes[k], m[0], m[4]))
         if not queued[k]:
-            if len(run) > 1:
+            if len(run) > 1 and within(run[0][1], windows):
                 bursts.append(run)
             run = []
+    sizes = [n for n, e in zip(sizes, bodies) if within(e[0], windows)]
     return lone, bursts, sizes
 
 
-def fit_intake(paths, calls=None) -> tuple[dict, dict]:
+def fit_intake(paths, calls=None, windows=None) -> tuple[dict, dict]:
     """The ``http_intake`` term over the intake stamps each record in `paths`
     holds (`_intakes`), each beside the tokenizer record `calls` names in the
     same order (none where `calls` is None), and its report: ``idle_s`` and ``per_byte_s`` by the
@@ -1290,10 +1313,12 @@ def fit_intake(paths, calls=None) -> tuple[dict, dict]:
     ``burst`` giving the bursts, their requests and those values' p10 and p90;
     or ``idle_s`` where that mean is negative or there is no burst, the
     report's ``fixed_s_is_idle_s`` saying which. Raises on too few lone
-    requests."""
+    requests. With `windows`, per record its host-clock spans or None, each
+    record's requests within them (`_intakes`)."""
     lone, bursts, bodies = [], [], []
-    for path, made in zip(paths, calls or [None] * len(paths)):
-        got = _intakes(path, made)
+    spans = windows or [None] * len(paths)
+    for path, made, span in zip(paths, calls or [None] * len(paths), spans):
+        got = _intakes(path, made, span)
         lone += got[0]
         bursts += got[1]
         bodies += got[2]
