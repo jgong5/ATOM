@@ -281,11 +281,13 @@ out instead (`cpu_gate_exclude.txt`).
 This image's `/opt/venv` holds no `aiperf`, so a gate there sets
 `COMPASS_AIPERF_PYTHON=/opt/agentx-venv/bin/python`, the image's own
 agentx-harness. Its `COMPASS_HARNESS_PYTHON`, a venv holding the agentx-harness
-wheel and compass-harness, takes every other package from `/opt/agentx-venv`
-too, through a `.pth` file naming that venv's `site-packages`: `/opt/venv`
-holds no `cyclopts`, which `aiperf` imports, and without it each
-`test_cctraces_sim_smoke.py` cell waits out its deployment for an `aiperf`
-that never started. `test_dp_slice.py`'s DP servers draw no master port of their
+wheel and compass-harness, takes every other package from `/opt/agentx-venv`,
+then from `/opt/venv`, through a `.pth` file naming both `site-packages` in that
+order. `/opt/venv` holds no `cyclopts`, which `aiperf` imports, and versions of
+`aiohttp`, `pyzmq`, `pandas` and others outside `aiperf`'s pins, which
+`/opt/agentx-venv` meets; compass-harness imports `atom`, whose `torch` only
+`/opt/venv` holds. Without either, each `test_cctraces_sim_smoke.py` cell waits
+out its deployment for an `aiperf` service that died at import. `test_dp_slice.py`'s DP servers draw no master port of their
 own and take ATOM's default, 29500, so a gate needs that port free; another
 job's DP group on the host fails them. Setting `ATOM_DP_MASTER_PORT` does not
 help: it overrides the `--data-parallel-master-port` that `pd_sim.sh` gives
