@@ -100,6 +100,7 @@ def _tree(tmp_path, driver=DRIVER, smoke=SMOKE):
     for name in ("Qwen3-0.6B", "Qwen3.5-9B", "Qwen3.5-0.8B", "Qwen3.8-27B"):
         (hub / f"models--Qwen--{name}" / "snapshots" / "abc").mkdir(parents=True)
     (tmp_path / "dspark").mkdir()
+    (tmp_path / "moe").mkdir()
     (tmp_path / "bin").mkdir()
     (tmp_path / "bin" / "atomesh").write_text("")
     (tmp_path / "traces.jsonl").write_text("{}\n")
@@ -118,6 +119,7 @@ def _run(tmp_path, root, **env_over):
     env["ATOMESH"] = str(tmp_path / "bin" / "atomesh")
     env["ATOM_COMPASS_CCTRACES"] = str(tmp_path / "traces.jsonl")
     env["ATOM_COMPASS_DSPARK_MODEL"] = str(tmp_path / "dspark")
+    env["ATOM_COMPASS_MOE_MODEL"] = str(tmp_path / "moe")
     env["COMPASS_HARNESS_PYTHON"] = env["COMPASS_AIPERF_PYTHON"] = sys.executable
     env["HIP_VISIBLE_DEVICES"] = "4,5,6,7"
     env["RUNS"] = str(root / "runs.txt")
@@ -162,6 +164,14 @@ def test_the_speculative_models_reach_the_tests(tmp_path):
     assert f"{mtp} {tmp_path}/dspark 4,5,6,7 " in (root / "runs.txt").read_text()
 
 
+def test_the_moe_model_reaches_the_tests(tmp_path):
+    moe = "os.environ['ATOM_COMPASS_MOE_MODEL']"
+    root = _tree(tmp_path, DRIVER.replace("'compass'", moe))
+    out, verdict = _run(tmp_path, root)
+    assert verdict == "GATE_GPU_RC=0 PASSED", out.stdout[-3000:]
+    assert f"{tmp_path}/moe 4,5,6,7 " in (root / "runs.txt").read_text()
+
+
 @pytest.mark.parametrize(
     "env, named",
     [
@@ -174,6 +184,10 @@ def test_the_speculative_models_reach_the_tests(tmp_path):
         (
             {"ATOM_COMPASS_DSPARK_MODEL": "/nonexistent"},
             "ATOM_COMPASS_DSPARK_MODEL /nonexistent",
+        ),
+        (
+            {"ATOM_COMPASS_MOE_MODEL": "/nonexistent"},
+            "ATOM_COMPASS_MOE_MODEL /nonexistent",
         ),
         (
             {"ATOM_COMPASS_CCTRACES_MODEL": "/nonexistent"},
@@ -217,6 +231,7 @@ def test_a_missing_input_refuses_by_name_before_any_test(tmp_path, env, named):
         ("smoke", "needs COMPASS_AIPERF_PYTHON", "test_cctraces_sim_smoke.py"),
         ("driver", "needs ATOM_COMPASS_MTP_MODEL naming a model", "test_d.py"),
         ("driver", "needs ATOM_COMPASS_DSPARK_MODEL naming a model", "test_d.py"),
+        ("driver", "needs ATOM_COMPASS_MOE_MODEL naming a model", "test_d.py"),
     ],
 )
 def test_a_driver_run_skip_fails_by_name(tmp_path, which, reason, where):

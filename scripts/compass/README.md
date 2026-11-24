@@ -759,6 +759,7 @@ file instead, for the daily run.
 | `ATOM_COMPASS_IMAGE_MODEL` | the Qwen3.5-9B snapshot there |
 | `ATOM_COMPASS_MTP_MODEL` | the Qwen3.5-0.8B snapshot there, for `test_spec_scenario.py`'s MTP1 run |
 | `ATOM_COMPASS_DSPARK_MODEL` | `/root/cells/deepseek-v41-flash-dspark`, for its DSpark run: `tests/models/deepseek_v41/fixtures/config.json` as `config.json` beside DeepSeek-V4-Flash's `tokenizer.json` and `tokenizer_config.json`. Both speculative runs read a config and a tokenizer, never a weight |
+| `ATOM_COMPASS_MOE_MODEL` | `/root/cells/qwen3-30b-a3b`, for `test_moe_scenario.py`'s expert forms: `tests/compass/qwen3_30b_a3b_config.json` (Qwen3-30B-A3B-Instruct-2507's) as `config.json` beside that model's `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, `merges.txt` and `generation_config.json`; no weight is read. On a pit2 node, `/share_nfs/models/Qwen/Qwen3-30B-A3B-Instruct-2507`, whose config the fixture equals |
 | `ATOM_COMPASS_CCTRACES_MODEL` | the Qwen3.8-27B snapshot there: the cc-traces smoke runs alone with it as its slice model, since its first turn is longer than Qwen3-0.6B's context |
 | `ATOM_COMPASS_CCTRACES` | `/root/cells/cc-traces-256k/traces.jsonl` |
 | `COMPASS_HARNESS_PYTHON` | `/root/cells/venv/bin/python`, agentx-harness with compass-harness installed; the smoke runs with this tree's `compass_harness` first on `PYTHONPATH` |
