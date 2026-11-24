@@ -25,8 +25,8 @@ master LP `mooncake_store`, each rank's copies priced on its own lanes, on `dsv4
 its renewal waits as D6.1's blocking lookup does, with D6.1's park in a DP group.
 
 **Revised 2026-11-24 by [#3799](https://github.com/jgong5/ATOM/issues/3799):** D6.2's LP
-answers a put of a key in flight as Mooncake does, and refuses one past Mooncake's discard
-window; the allocator flags are accepted, not modelled.
+answers a put of a key in flight as Mooncake does; the allocator flags are accepted, not
+modelled.
 
 **Scope of this document.** The execution architecture: what a simulated run *is*,
 which processes exist, how virtual time advances, and what contract the rest of the
@@ -2594,16 +2594,18 @@ which keeps v0.3.14's rules below):
   a published object's lease starts at its publication (`PutEnd`'s zero-length grant),
   and a put of a key the Store holds is a read of it (`PutStart`). A put of a key an
   earlier put holds in flight, from that save's start to its end (*Saves*), takes no
-  bytes and grants no lease, and the object stays the earlier put's. While the earlier
-  put started at most `put_start_discard_timeout_sec` before (30 s,
-  [`types.h`](https://github.com/kvcache-ai/Mooncake/blob/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store/include/types.h);
-  the entry refuses the flag), `PutStart` answers such a put `OBJECT_ALREADY_EXISTS`
-  and leases only a readable replica, which an unpublished object lacks; Mooncake's
-  client answers the key 0 with no transfer
+  bytes and grants no lease, and the object stays the earlier put's: `PutStart` answers
+  it `OBJECT_ALREADY_EXISTS` and leases only a readable replica, which an unpublished
+  object lacks, and Mooncake's client answers the key 0 with no transfer
   ([`client_service.cpp`](https://github.com/kvcache-ai/Mooncake/blob/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store/src/client_service.cpp)),
   so ATOM's worker counts the chunk saved
-  (`worker.py::MooncakeStoreOffloadConnector._do_save_req`). Past that window Mooncake
-  discards the earlier put, whose `PutEnd` then fails: refused (*Refusals*).
+  (`worker.py::MooncakeStoreOffloadConnector._do_save_req`). A later put that comes
+  more than `put_start_discard_timeout_sec` after the key's `PutStart` (30 s,
+  [`types.h`](https://github.com/kvcache-ai/Mooncake/blob/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store/include/types.h);
+  the entry refuses the flag) discards the earlier put instead, but `_do_save_req`
+  makes one `client.put` per window, so that time runs from the key's window, not the
+  save's start: a put 30 s into a save meets each key absent, published or inside its
+  window's put, and neither save fails. The LP's save-long span is `12` T135's.
 - **Eviction**, `MasterService::EvictionThreadFunc` every 10 ms
   (`master_service.h::kEvictionThreadSleepMs`): while used bytes over capacity exceed
   `--eviction_high_watermark_ratio`, a round evicts
@@ -2774,10 +2776,6 @@ estimated here.
   requester pools and windows not modelled apart;
 - a put the capacity left cannot hold, which Mooncake fails at once
   (`AllocateReplicas`: `NO_AVAILABLE_HANDLE`) and ATOM answers with its failed-save path;
-- a put of a key an earlier put has held in flight for more than
-  `put_start_discard_timeout_sec` (*Leases*): Mooncake discards the earlier put's
-  replicas and allocates this one, and the earlier put's `PutEnd` fails with
-  `ILLEGAL_CLIENT`;
 - a load whose lane starts after its lease (*Loads*).
 
 ATOM refuses by itself DCP above 1, other layouts and a chunk off the block
@@ -2823,13 +2821,12 @@ put{keys, groups, s0, e0} -----> at s0: take 4 objects' bytes
                                                                  save of chunks 0-3 on a save
                                                                  lane, start s1, end e1
                                  at s1 <------------------------ put{keys, groups, s1, e1}
-                                 s0 < s1 < e0 and s1 - s0 <= 30 s:
+                                 s0 < s1 < e0:
                                  in flight, no bytes, no lease
                                  at e0: publish P0's objects;
                                  leases to e0
                                                                  at e1: _do_save_req, every
                                                                  key 0: counted saved
-had s1 - s0 passed 30 s, the objects still unpublished: refused by name
 ```
 
 **A stale hit renewed inside a DP group:**
@@ -2974,12 +2971,12 @@ marker, contention at the owners, fragmentation. Code tasks, after this text lan
    step tables, an eviction round runs, and the simulated KV budget holds the real
    reserve.
 6. **Calibration and validation** [GPU], then the C1228 run through `deploy.sh`.
-7. **A put past the discard window refused**
+7. **The allocator flags stated as not modelled**
    ([#3998](https://github.com/jgong5/ATOM/issues/3998)):
-   `kv/mooncake_store_server.py`'s `Master.put` keeps each pending object's start and
-   refuses that put by name, and the module's docstring and `ACCEPTED`'s comment state
-   the allocator flags as accepted, not modelled. About 15 lines; a CPU test: a put of
-   a key in flight takes nothing, and one past 30 s is refused.
+   `kv/mooncake_store_server.py`'s module docstring and `ACCEPTED`'s comment state
+   `--allocation_strategy` and `--memory_allocator` as accepted, not modelled. About 5
+   lines; a CPU test: a put of a key in flight, through the LP's frames, takes no bytes
+   and grants no lease.
 
 Acceptance: the C1228 run's TTFT p50 and p99, ITL p50 and output throughput; the Store's
 lookups, hit chunks, loads across instances, evicted objects and renewals; the
@@ -3002,8 +2999,6 @@ validation's table.
   instead.
 - *A get request to the LP at each load*: a round trip per load to cover only a lane
   queued past its lease.
-- *A put past the discard window, not modelled*: it answers the earlier put's failed
-  save as a success, where the refusal is one comparison against a start the LP keeps.
 - *One set of records for the step law and the offload laws*: the DEBUG lookup lines
   would sit in the step law's host terms, unmeasured.
 
