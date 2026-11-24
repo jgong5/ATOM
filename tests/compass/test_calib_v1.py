@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: MIT
 """The unified calibration procedure v1.1's design tooling
 (wuhuikx/LLM-Booster#739): `atom.compass.calib`'s config and the deployment it
-reads from a record (`deploy`), and each step's column counts (`columns`), on
-synthetic configs, records and laws."""
+reads from a record (`deploy`), each step's column counts (`columns`), and the
+segments generated from the deployment (`design`), on synthetic configs,
+records and laws."""
 
 import copy
 import json
+import math
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,7 +18,9 @@ import pytest
 from atom.compass.backends.shape import DUTY_TAU, BatchView, RequestShape
 from atom.compass.backends.step_grid_plan import TARGET
 from atom.compass.backends.step_linear import StepLinearBackend, StepLinearLaw
-from atom.compass.calib import columns, deploy
+from atom.compass.calib import columns, deploy, design
+
+ROOT = Path(__file__).resolve().parents[2]
 
 DEPLOYMENT = {
     "dp": 2,
@@ -513,3 +520,348 @@ def test_rowmod_is_the_backends_column_and_refuses_without_its_laws_modulus():
     names = ["step", "context", "graph_padding", "rowmod"]
     with pytest.raises(ValueError, match="modulus"):
         columns.values(view, "decode", names, _dep())
+
+
+# -- the design ---------------------------------------------------------------
+
+
+def _design_config(**deployment) -> dict:
+    """`_config` at the default acceptance criteria (60 decode steps a rung)
+    with one segment of each kind, drains of each shape among them."""
+    raw = _config(acceptance={})
+    raw["deployment"] = {**DEPLOYMENT, **deployment}
+    raw["segments"] = [
+        {
+            "name": "D-a",
+            "kind": "drain",
+            "lanes": [{"pin": 0, "groups": [{"rows": 8, "prompt": 1024}]}],
+        },
+        {
+            "name": "D-b",
+            "kind": "drain",
+            "lanes": [
+                {
+                    "pin": 0,
+                    "groups": [
+                        {"rows": 7, "prompt": 512, "then": 128},
+                        {"rows": 1, "prompt": 20000, "last": True},
+                    ],
+                },
+                {
+                    "name": "peer",
+                    "pin": 1,
+                    "hold": True,
+                    "groups": [{"rows": 1, "prompt": 30000}],
+                },
+            ],
+        },
+        {
+            "name": "D-c",
+            "kind": "drain",
+            "lanes": [
+                {
+                    "pin": None,
+                    "groups": [
+                        {
+                            "rows": {"seqs_share": 1.0, "dp": True},
+                            "prompt": [512, {"budget_share": 2.0}],
+                        }
+                    ],
+                }
+            ],
+        },
+        {
+            "name": "D-k",
+            "kind": "drain",
+            "lanes": [
+                {
+                    "pin": 0,
+                    "groups": [
+                        {"rows": {"seqs_share": 1.0}, "prompt": {"kv_share": 0.5}}
+                    ],
+                },
+                {
+                    "name": "r1",
+                    "pin": 1,
+                    "groups": [{"rows": {"seqs_share": 0.5}, "prompt": 4096}],
+                },
+            ],
+        },
+        {
+            "name": "D-m",
+            "kind": "drain",
+            "min_dp": 4,
+            "lanes": [{"pin": 3, "groups": [{"rows": 2, "prompt": 1024}]}],
+        },
+        {
+            "name": "P-q",
+            "kind": "quads",
+            "scales": [512, 2048, {"budget_share": 1.0}],
+            "shares": [0.0, 1.0],
+            "sparse_steps": [0, 20],
+        },
+        {
+            "name": "P-b",
+            "kind": "backlog",
+            "long": [8192, {"len_share": 0.25}],
+            "short": [256, {"budget_share": 0.5}],
+            "short_turns": 6,
+        },
+        {
+            "name": "P-t",
+            "kind": "trickle",
+            "firsts": [8192, 16384],
+            "deltas": [1024, 2048],
+            "outs": [1, 4],
+            "gaps": [0.1, 0.5],
+            "turns": 4,
+        },
+        {
+            "name": "P-r",
+            "kind": "rows",
+            "requests": 1000,
+            "prompt": [64, {"bucket_share": 1.0}],
+            "concurrency": {"seqs_share": 1.0, "dp": True},
+        },
+        {"name": "A-a", "kind": "copy", "of": "D-a"},
+    ]
+    return raw
+
+
+def _made(**deployment) -> tuple:
+    cfg = deploy.parse(_design_config(**deployment))
+    return cfg, {s.name: s for s in design.generate(cfg)}
+
+
+def _rank_departures(seg, lane, dep) -> list[int]:
+    """The decode step each of a rank's rows leaves at, counted from every
+    rank decoding, read off the output each row's last turn asks for."""
+    lag = seg.plan["lanes"][lane.name]["lag_steps"]
+    width = 1 if lane.pin is not None else dep.dp
+    steps = sorted(
+        math.ceil((s.turns[-1].out - 1) / dep.per_step) - lag for s in lane.sessions
+    )
+    return steps[::width]
+
+
+@pytest.mark.parametrize(
+    "deployment",
+    [{}, {"rungs": [1, 2, 4, 8, 16], "max_num_seqs": 12}, {"max_num_seqs": 10}],
+    ids=["max-num-seqs-a-rung", "widest-rung-past-max-num-seqs", "eager-rows"],
+)
+def test_every_drain_holds_each_rung_it_passes_for_60_steps_on_one_shared_schedule(
+    deployment,
+):
+    cfg, made = _made(**deployment)
+    dep, need = cfg.deployment, cfg.acceptance["rung_steps"]
+    assert need == 60
+    reach = {}  # each rung's row counts a rank reaches; None: past the widest
+    for n in range(1, dep.max_num_seqs + 1):
+        reach.setdefault(dep.rung(n), []).append(n)
+    shared, checked = {}, set()
+    for seg in made.values():
+        for lane in seg.lanes if seg.kind == "drain" else ():
+            if seg.plan["lanes"][lane.name]["hold"]:
+                continue
+            leave = _rank_departures(seg, lane, dep)
+            lag = seg.plan["lanes"][lane.name]["lag_steps"]
+            assert [lag + x for x in leave] == seg.plan["lanes"][lane.name][
+                "leave_steps"
+            ]
+            held = {
+                len(leave) - i: at - before
+                for i, (before, at) in enumerate(zip([0] + leave, leave))
+            }
+            for n, steps in held.items():  # one schedule, whatever the drain
+                assert shared.setdefault(n, steps) == steps, (seg.name, n)
+            for rung, counts in reach.items():
+                if max(counts) <= len(leave):  # passed from its top
+                    steps = sum(held[n] for n in counts)
+                    assert steps >= need, (seg.name, lane.name, rung, steps)
+                    checked.add(rung)
+    assert checked == set(reach)
+
+
+def test_the_same_config_writes_byte_identical_traces_whatever_the_hash_seed(
+    tmp_path,
+):
+    (tmp_path / "cfg.json").write_text(json.dumps(_design_config()))
+    script = (
+        "import sys; from pathlib import Path; "
+        "from atom.compass.calib import deploy, design; "
+        "cfg = deploy.load(sys.argv[1]); "
+        "design.write(design.generate(cfg), cfg, Path(sys.argv[2]))"
+    )
+    path = os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH")) if p)
+    for seed in ("1", "2"):
+        subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path / "cfg.json"), seed],
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": path},
+            check=True,
+        )
+    files = sorted(p.name for p in (tmp_path / "1").iterdir())
+    assert files == sorted(p.name for p in (tmp_path / "2").iterdir())
+    assert "design.json" in files and "D-b.peer.jsonl" in files
+    for name in files:
+        assert (tmp_path / "1" / name).read_bytes() == (
+            tmp_path / "2" / name
+        ).read_bytes(), name
+
+
+def test_a_design_is_weka_traces_whose_later_turns_extend_the_history(tmp_path):
+    cfg, made = _made()
+    doc = design.write(list(made.values()), cfg, tmp_path)
+    ids = []
+    for seg in doc["segments"]:
+        for lane in seg["lanes"]:
+            lines = (tmp_path / lane["file"]).read_text().splitlines()
+            traces = [json.loads(x) for x in lines]
+            assert len(traces) == lane["traces"]
+            for t in traces:
+                ids.append(t["id"])
+                assert t["id"].startswith(f"{seg['name']}.{lane['name']}.")
+                assert (t["block_size"], t["hash_id_scope"]) == (64, "local")
+                for prev, r in zip(t["requests"], t["requests"][1:]):
+                    assert r["hash_ids"][: len(prev["hash_ids"])] == prev["hash_ids"]
+                    assert r["t"] >= prev["t"] and r["in"] > prev["in"]
+                for r in t["requests"]:
+                    assert r["in"] % 64 == 0 and len(r["hash_ids"]) == r["in"] // 64
+                    assert r["in"] + r["out"] <= cfg.deployment.max_model_len
+    assert len(set(ids)) == len(ids)
+    back = design.read(tmp_path)
+    assert [(s.name, s.kind, s.plan) for s in back] == [
+        (s.name, s.kind, json.loads(json.dumps(s.plan))) for s in made.values()
+    ]
+    for got, want in zip(back, made.values()):
+        assert [(x.name, x.pin, x.concurrency) for x in got.lanes] == [
+            (x.name, x.pin, x.concurrency) for x in want.lanes
+        ]
+        for x, y in zip(got.lanes, want.lanes):
+            assert [s.turns for s in x.sessions] == [s.turns for s in y.sessions]
+
+
+def test_a_pinned_lane_carries_its_rank_and_a_held_peer_stays_to_the_end(tmp_path):
+    cfg, made = _made()
+    dep = cfg.deployment
+    doc = design.write(list(made.values()), cfg, tmp_path)
+    pins = {
+        (s["name"], x["name"]): x["pin"] for s in doc["segments"] for x in s["lanes"]
+    }
+    assert pins[("D-b", "l0")] == 0 and pins[("D-b", "peer")] == 1
+    assert pins[("D-k", "r1")] == 1 and pins[("D-c", "l0")] is None
+    seg = made["D-b"]
+    busy, peer = seg.lanes
+    outs = [s.turns[-1].out for s in busy.sessions]
+    assert outs[-1] == max(outs) and busy.sessions[-1].role == "anchor"
+    # the peer holds its row until the busy rank's anchor leaves: the same
+    # group step, each counted from the end of its own rank's prefill
+    plan, chunks = seg.plan["lanes"], seg.plan["prefill_chunks"]
+    assert (
+        max(plan["l0"]["leave_steps"]) + chunks[0]
+        == plan["peer"]["leave_steps"][0] + chunks[1]
+    )
+    assert plan["l0"]["lag_steps"] == chunks[1] - chunks[0] > 0
+    (held,) = peer.sessions
+    assert held.turns[-1].out == design.out_for(plan["peer"]["leave_steps"][0], dep)
+    # a `then` row: one token, then a 128-token turn on its prompt and output
+    first, second = busy.sessions[0].turns
+    assert (first.prompt, first.out) == (512, 1)
+    assert second.prompt == 512 + 64 + 128 and second.out == outs[0]
+
+
+def test_a_copy_repeats_its_segment_on_new_prompt_ids(tmp_path):
+    cfg, made = _made()
+    src, again = made["D-a"], made["A-a"]
+    assert again.kind == "drain" and again.purpose == "anchor: D-a again"
+    assert again.plan == src.plan
+    assert [[t for t in s.turns] for s in again.lanes[0].sessions] == [
+        [t for t in s.turns] for s in src.lanes[0].sessions
+    ]
+    design.write([src, again], cfg, tmp_path)
+
+    def ids(name):
+        lines = (tmp_path / f"{name}.l0.jsonl").read_text().splitlines()
+        return {json.loads(x)["id"] for x in lines}
+
+    # hash ids are local to a trace: new trace ids are new prompts
+    assert len(ids("A-a")) == 8 and ids("A-a").isdisjoint(ids("D-a"))
+
+
+def test_a_segment_needing_more_dp_ranks_than_the_deployment_has_is_skipped(
+    tmp_path,
+):
+    cfg, made = _made()
+    assert design.skipped(cfg) == {"D-m": 4}
+    assert "D-m" not in made and "D-a" in made
+    assert design.write(list(made.values()), cfg, tmp_path)["skipped"] == {"D-m": 4}
+    cfg, made = _made(dp=4)
+    assert design.skipped(cfg) == {} and made["D-m"].lanes[0].pin == 3
+
+
+def test_the_prefill_kinds_shape_their_turns_from_the_deployment():
+    cfg, made = _made()
+    dep = cfg.deployment
+
+    def deltas(s):  # each later turn's new tokens, past the previous output
+        return [
+            b.prompt - a.prompt - 64 * design.blocks(a.out, dep)
+            for a, b in zip(s.turns, s.turns[1:])
+        ]
+
+    # quads: one session a rank; the busy rank, turning over, prefills the scale
+    quads = made["P-q"].lanes[0].sessions
+    levels = made["P-q"].plan["quads"]
+    assert len(quads) == dep.dp and [x["scale"] for x in levels][-1] == 4096
+    for q, level in enumerate(levels[1:], 1):
+        for r, s in enumerate(quads):
+            share = 1.0 if r == q % dep.dp else level["share"]
+            assert deltas(s)[q - 1] == max(64, share * level["scale"])
+            steps = level["decode_steps"]
+            assert s.turns[q].out == (design.out_for(steps, dep) if steps else 1)
+    # backlog: a long session growing to each `long`, a short one a peer rank
+    long, *short = made["P-b"].lanes[0].sessions
+    assert [t.prompt for t in long.turns] == [8192, 16384 + 64]
+    assert len(short) == dep.dp - 1 and len(short[0].turns) == 6
+    assert all(256 <= d <= 2048 for d in deltas(short[0]))
+    # trickle: a session a first prompt, short turns cycled on its history
+    trickle = made["P-t"].lanes[0].sessions
+    assert [s.turns[0].prompt for s in trickle] == [8192, 16384]
+    assert all(len(s.turns) == 4 and set(deltas(s)) <= {1024, 2048} for s in trickle)
+    assert {t.gap for s in trickle for t in s.turns[1:]} == {0.1, 0.5}
+    # rows: single turns at the group's concurrency, interleaved over the range
+    (lane,) = made["P-r"].lanes
+    prompts = [s.turns[0].prompt for s in lane.sessions]
+    assert lane.concurrency == 16
+    assert sorted(prompts) == design.spread(64, 1024, 1000, dep)
+    assert min(prompts[:4]) <= 128 and max(prompts[:4]) >= 512
+    one = sum(len(s.turns) == 1 and s.turns[0].out == 1 for s in lane.sessions)
+    assert one == 800  # `out1` of a thousand requests
+
+
+def test_a_design_follows_a_doubled_max_num_seqs():
+    cfg, made = _made(max_num_seqs=16, rungs=[1, 2, 4, 8, 16])
+    busy, half = made["D-k"].lanes
+    assert (len(busy.sessions), len(half.sessions)) == (16, 8)
+    pool = deploy.tokens({"kv_share": 0.5}, cfg.deployment, over=16)
+    assert {s.turns[0].prompt for s in busy.sessions} == {pool}
+    assert len(made["D-c"].lanes[0].sessions) == 32
+    assert made["P-r"].lanes[0].concurrency == 32
+
+
+def test_a_segment_the_deployment_cannot_run_is_refused_by_name():
+    def refused(segment, match):
+        raw = _design_config()
+        raw["segments"] = [*raw["segments"], segment]
+        with pytest.raises(ValueError, match=match):
+            design.generate(deploy.parse(raw))
+
+    lane = {"pin": 0, "groups": [{"rows": 2, "prompt": 1024}]}
+    refused({"name": "X", "kind": "drain", "lanes": [{**lane, "pin": 2}]}, "past dp")
+    twins = [{**lane, "name": "l1"}, lane]  # the second's name is l1 by default
+    refused({"name": "X", "kind": "drain", "lanes": twins}, "lane names")
+    past = {**lane, "groups": [{"rows": 1, "prompt": 65536}]}
+    refused({"name": "X", "kind": "drain", "lanes": [past]}, "model length")
+    refused({"name": "X", "kind": "fill"}, "no generator")
+    refused({"name": "X", "kind": "copy", "of": "A-a"}, "copies a copy")
+    refused({"name": "X", "kind": "copy", "of": "no-such"}, "copies no segment")

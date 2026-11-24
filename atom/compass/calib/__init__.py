@@ -15,4 +15,6 @@ segments, each a kind with its parameters.
 - `columns`: a step's value of each named column: the step linear backend's
   own counts for every column it prices, and a provisional definition for an
   opt-in column this tree's backend does not price yet.
+- `design`: the segments, generated from the deployment: the weka traces each
+  lane sends, each lane's pin, and the departure schedule every drain shares.
 """
