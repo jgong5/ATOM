@@ -356,16 +356,22 @@ def roofline_runs(tmp_path_factory):
 def test_one_request_meets_every_scenario_check_under_the_step_roofline(
     roofline_runs,
 ):
-    """Every check but the hand-computed timeline, which only a constant
-    stub's run has."""
+    """The level-0 case's checks but one: the engine's hand-computed
+    timeline, `check_run`'s records, which it computes only for a constant
+    step stub, from that stub's prefill and decode costs."""
     run = roofline_runs[0]
-    print(f"\n{run['summary']['schedule']['seconds_by_method']}\n{run['table']}")
+    arrive, first_token, leave = run["request"]
+    print(f"\nrequest 0: arrive {arrive!r} first token {first_token!r} leave {leave!r}")
+    print(f"{run['summary']['schedule']['seconds_by_method']}\n{run['table']}")
     failed = check_run(
         [r["out"] for r in roofline_runs],
         [MAX_TOKENS],
         [line for _, line in run["events"]],
     )
     assert not failed, "\n".join(failed)
+    assert 0 < arrive < first_token <= leave
+    assert 0 < run["summary"]["cost"]["wall_seconds"]
+    assert run["bound"] == (600.0, "run file bound_s")
 
 
 def _release(table: str, lp: str, channel: str, seq: int) -> float:
