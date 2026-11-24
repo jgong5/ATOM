@@ -40,6 +40,12 @@ def _peer_tokens(view: BatchView, dp: int, buckets, min_spread: float = 0.0) -> 
     return float(max(view.moe_tokens - sum_tokens(view.decode), 0))
 
 
+def _rows(view: BatchView, dp: int, buckets, min_spread: float = 0.0) -> float:
+    """Decode: the rows the rank decodes, a per-sequence cost apart from their
+    context (Kimi-K3.1's DCP exchange at each full-attention layer)."""
+    return float(len(view.decode))
+
+
 def _bucket(view: BatchView, buckets) -> int | None:
     """The token-graph bucket the step replays; None when it runs eagerly."""
     if view.group_needs_eager or view.tbo_tokens:
@@ -76,7 +82,7 @@ def _gather_rows(view: BatchView, dp: int, buckets, min_spread: float = 0.0) -> 
 #: fit-column change states (row_padding, peer_tokens, gather_rows and
 #: moe_imbalance over `min_spread`).
 PROVISIONAL = {
-    "decode": {"row_padding": _row_padding, "peer_tokens": _peer_tokens},
+    "decode": {"row_padding": _row_padding, "peer_tokens": _peer_tokens, "rows": _rows},
     "prefill": {"moe_imbalance": _moe_imbalance, "gather_rows": _gather_rows},
 }
 
@@ -156,10 +162,11 @@ def values(
         )
     got = {}
     if known:
+        # a law's vector holds its kind's base columns, whichever are asked;
         # gather_rows reads the vector's buckets, which come with padding
-        need = known + (
-            ("padding",) if "gather_rows" in known and "padding" not in known else ()
-        )
+        base = PREFILL if kind == "prefill" else DECODE
+        pad = ("padding",) if "gather_rows" in known else ()
+        need = tuple(dict.fromkeys((*base, *known, *pad)))
         backend = _ones(
             kind,
             need,

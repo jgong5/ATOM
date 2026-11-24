@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """A design's run plan, segments chained by events, and its CPU rehearsal on a law.
 
-    PYTHONPATH=$T python3 scripts/compass/plan_v1.py DESIGN [--law LAW --host HOST]
+    PYTHONPATH=$T python3 scripts/compass/plan_v1.py DESIGN [--law LAW --host HOST [--target RECORD]...]
 
 DESIGN is `gen_v1.py`'s OUT. Writes DESIGN/plan.json, which `cal_v1.sh` runs:
 the segments in config order, each started by an event, never by a predicted
@@ -22,7 +22,12 @@ GPU-bound steps and its combinations (`report.combos`, what `check_v1.py`
 compares a record against); the predicted GPU minutes, the server's start
 and every segment's overhead included; and each vector's identifiability over
 the GPU-bound steps (`atom.compass.calib.ident`: rank, VIF, G, levels) against
-the config's acceptance criteria. DESIGN/plan.md holds the same as tables.
+the config's acceptance criteria. With TARGET (repeatable), a target
+workload's record, real or simulated (`compass run` writes the same step
+lines), each vector's error is also reported at that record's GPU-bound
+steps: its mean, the target-weighted I criterion, its 95th percentile and its
+worst, beside the verdict, not gating it. DESIGN/plan.md holds the same as
+tables.
 """
 
 import argparse
@@ -30,7 +35,7 @@ import json
 import time
 from pathlib import Path
 
-from atom.compass.calib import deploy, design, engine, ident, report
+from atom.compass.calib import check, deploy, design, engine, ident, report
 
 SERVER_ENV = {"ATOM_DP_SESSION_AFFINITY": "1", "ATOM_DP_LB_REQ_EQUIV": "1000000000"}
 EVENT = "every lane of the segment before has exited and the server holds no request"
@@ -74,7 +79,7 @@ def read_law(path: Path) -> dict:
     return doc.get("params", doc)
 
 
-def rehearse(cfg, segments, law_path: Path, host_path: Path | None) -> dict:
+def rehearse(cfg, segments, law_path: Path, host_path: Path | None, targets=()) -> dict:
     law = engine.Law(
         read_law(law_path),
         json.loads(Path(host_path).read_text()) if host_path else None,
@@ -82,7 +87,10 @@ def rehearse(cfg, segments, law_path: Path, host_path: Path | None) -> dict:
     )
     t0 = time.time()
     got = engine.rehearse(cfg, segments, law)
-    vectors = ident.vectors(cfg, got.steps, law)
+    aimed = []
+    for path in targets:
+        aimed += check.record_steps(path, None, cfg, law, segment=f"target {path}")[0]
+    vectors = ident.vectors(cfg, got.steps, law, aimed)
     return {
         "law": str(law_path),
         "host": str(host_path) if host_path else None,
@@ -93,6 +101,7 @@ def rehearse(cfg, segments, law_path: Path, host_path: Path | None) -> dict:
         "segments": report.segment_rows(got.steps, got.runs),
         "combos": report.combos(got.steps, cfg.deployment),
         "vectors": vectors,
+        "targets": [str(t) for t in targets],
         "pass": all(v["pass"] for v in vectors),
     }
 
@@ -177,6 +186,16 @@ def markdown(cfg, plan: dict) -> str:
         "",
     ]
     lines += report.render_vif(r["vectors"])
+    if r.get("targets"):
+        lines += [
+            "",
+            (
+                f"Error at the target workload's GPU-bound steps ({', '.join(r['targets'])}; "
+                "the target-weighted I criterion is the mean; not gated):"
+            ),
+            "",
+        ]
+        lines += report.render_target(r["vectors"])
     lines += [
         "",
         f"Verdict: **{'pass' if r['pass'] else 'fail'}** (a vector passes when one of its variants does).",
@@ -191,6 +210,13 @@ def main(argv=None) -> None:
         "--law", type=Path, help="step linear law (step_linear_law.json or law.json)"
     )
     p.add_argument("--host", type=Path, help="host_laws.json")
+    p.add_argument(
+        "--target",
+        type=Path,
+        action="append",
+        default=[],
+        help="a target workload's record (real or simulated): report the error there",
+    )
     a = p.parse_args(argv)
     doc = json.loads((a.design / "design.json").read_text())
     cfg = deploy.parse(doc["config"])
@@ -201,7 +227,8 @@ def main(argv=None) -> None:
         "sequence": sequence(doc),
     }
     if a.law:
-        plan["rehearsal"] = rehearse(cfg, design.read(a.design, cfg), a.law, a.host)
+        segments = design.read(a.design, cfg)
+        plan["rehearsal"] = rehearse(cfg, segments, a.law, a.host, a.target)
     (a.design / "plan.json").write_text(json.dumps(plan, indent=1))
     text = markdown(cfg, plan)
     (a.design / "plan.md").write_text(text)

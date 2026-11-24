@@ -603,3 +603,92 @@ def test_a_config_states_its_intercept_first():
     raw["columns"]["decode"] = ["context", "step"]
     with pytest.raises(ValueError, match="intercept"):
         deploy.parse(raw)
+
+
+# -- anchors, extensions, target error and opt-in columns --------------------------
+
+
+def test_a_config_extends_another_and_copies_a_segment_as_an_anchor(tmp_path):
+    (tmp_path / "base.json").write_text(json.dumps(_config()))
+    (tmp_path / "more.json").write_text(
+        json.dumps(
+            {
+                "name": "more",
+                "extends": "base.json",
+                "insert": [
+                    {
+                        "after": "D-b",
+                        "segments": [{"name": "A-mid", "kind": "copy", "of": "D-a"}],
+                    },
+                    {
+                        "after": None,
+                        "segments": [{"name": "A-0", "kind": "copy", "of": "D-a"}],
+                    },
+                ],
+            }
+        )
+    )
+    cfg = deploy.load(tmp_path / "more.json")
+    assert cfg.name == "more" and cfg.deployment.dp == 2
+    names = [s["name"] for s in cfg.segments]
+    assert names[:4] == ["A-0", "D-a", "D-b", "A-mid"]
+    made = {s.name: s for s in design.generate(cfg)}
+    src, copy_ = made["D-a"], made["A-mid"]
+    assert copy_.kind == "drain" and copy_.plan == src.plan
+    turns = lambda seg: [
+        [(t.prompt, t.out) for t in s.turns] for s in seg.lanes[0].sessions
+    ]
+    assert turns(copy_) == turns(src)
+    doc = design.write(list(made.values()), cfg, tmp_path / "d")
+    ids = [
+        json.loads(x)["id"]
+        for s in doc["segments"]
+        for lane in s["lanes"]
+        for x in (tmp_path / "d" / lane["file"]).read_text().splitlines()
+    ]
+    assert len(set(ids)) == len(
+        ids
+    )  # new traces: an anchor hits no cache the first left
+
+
+def test_rows_is_a_per_sequence_decode_column():
+    dep = deploy.parse(_config()).deployment
+    view = BatchView(
+        tuple(RequestShape(2, c, True) for c in (1000, 2000, 3000)),
+        capture_rung=4,
+        moe_rows=16,
+        moe_tokens=6,
+        produces_output=True,
+        dp_rank=0,
+    )
+    assert columns.values(view, "decode", ["step", "rows"], dep) == (1.0, 3.0)
+
+
+def test_the_error_at_a_target_workload_is_reported_beside_the_verdict(tiny):
+    cfg, law, _, got = tiny
+    target = [s for s in got.steps if s.seg in ("D-c", "P-t")]
+    vectors = ident.vectors(cfg, got.steps, law, target)
+    for v in vectors:
+        for x in v["variants"]:
+            if "target" in x:
+                t = x["target"]
+                assert t["steps"] > 0 and t["i"] <= t["p95"] <= t["max"]
+    rung8 = next(v for v in vectors if v["vector"] == "decode rung 8")
+    assert rung8["variants"][0]["target"]["steps"] == sum(
+        1 for s in target if s.kind == "decode" and s.rung == 8 and s.gpu_bound
+    )
+    assert "I (mean)" in "\n".join(report.render_target(vectors))
+    # the same design with and without a target: the target gates nothing
+    plain = ident.vectors(cfg, got.steps, law)
+    assert [v["pass"] for v in plain] == [v["pass"] for v in vectors]
+
+
+def test_a_target_record_is_read_whole_as_one_segment(tmp_path):
+    cfg = deploy.parse(_config())
+    doc = design.write(design.generate(cfg), cfg, tmp_path / "design")
+    law = engine.Law(_law(cfg.deployment.rungs, 2), HOST, 2)
+    rec = _record(tmp_path, cfg, doc)
+    steps, _ = check.record_steps(
+        rec / "real" / "steps", None, cfg, law, segment="target"
+    )
+    assert len(steps) == 30 and {s.seg for s in steps} == {"target"}
