@@ -458,7 +458,7 @@ and output prefill laws adopt the column at 193 and 197 ms, and a split middle c
 
 Decided 2026-11-24 by [#4050](https://github.com/jgong5/ATOM/issues/4050), for the
 development template's PP4 x TP1 prefill, whose law `19` D116 calibrates anew. It answers
-[#3030](https://github.com/jgong5/ATOM/issues/3030)'s three questions and narrows `07` T129.
+[#3030](https://github.com/jgong5/ATOM/issues/3030)'s questions and narrows `07` T129.
 
 ### Problem
 
@@ -642,7 +642,7 @@ fallback over a stage, both refused as today (`run/__init__.py::runner`,
 | Issue | Where | Change | Named result |
 |---|---|---|---|
 | [#4066](https://github.com/jgong5/ATOM/issues/4066) | `drive/record.py`, `parity/__init__.py`, `parity/busy.py` | `--trace` under stages; the handoff's ranges and `d_send_ns`; each stage reduced, the handoff in no pass | planted stage traces: each stage's busy lines, a queued kernel behind the receive counting none of its wait |
-| [#4067](https://github.com/jgong5/ATOM/issues/4067) | `run/step_grid.py`, `fit/samples.py`, `fit/steps.py`, `backends/step_linear_fit.py` | the key; every stage's samples; one law with `stages`, each folded; a stage's decode cut | a planted PP2 trace pair's law: two parts, the second with its draft |
+| [#4067](https://github.com/jgong5/ATOM/issues/4067) | `run/step_grid.py`, `fit/samples.py`, `fit/steps.py`, `backends/step_linear_fit.py`, `backends/step_labels.py` | the key; every stage's samples; one law with `stages`, each folded; a stage's decode cut | a planted PP2 trace pair's law: two parts, the second with its draft |
 | [#4068](https://github.com/jgong5/ATOM/issues/4068) | `backends/step_labels.py`, `parity/recurrence.py`, `fit/host.py` | a pipeline's stages labelled together, `E` from its release; host laws with `stages` | a planted PP2 record's host laws: `W_recv` on stage 1, its `E` free of the head's wait |
 | [#4069](https://github.com/jgong5/ATOM/issues/4069) | `run/__init__.py`, `runner/overrides.py`, `backends/step_linear.py` | each stage's parts built; the backend states its stage; draft terms on the last stage alone | a simulated PP2 run on a planted law: every step priced, draft on stage 1 alone |
 | [#4070](https://github.com/jgong5/ATOM/issues/4070) | `drive/reuse.py`, `drive/lacking.py` | each stage's figures judged; no command for a decoding pipeline | the verdicts on planted laws, one stage past 5% |
