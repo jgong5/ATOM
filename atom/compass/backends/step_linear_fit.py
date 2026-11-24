@@ -274,6 +274,8 @@ from atom.compass.backends.step_linear import (
     EAGER,
     EAGER_DUMMY,
     HISTORY,
+    KDA,
+    KDA_CHUNK,
     MOE_COLUMNS,
     PREFILL,
     PROPOSE,
@@ -282,6 +284,7 @@ from atom.compass.backends.step_linear import (
     dummy_view,
     eager_dummy,
     hull_axes,
+    kda_columns,
     moe_column,
     moe_tokens,
     rowmod,
@@ -377,10 +380,11 @@ def _prefill_counts(
     buckets,
     eager,
     cold: bool = False,
+    kda: bool = False,
 ) -> tuple:
     """The prefill vector's features of `view`'s step, `where` naming it in a
     refusal, as `_features` states them; under `eager` its `EAGER_DUMMY`,
-    under `cold` its `cold_peer_rows`."""
+    under `cold` its `cold_peer_rows`, under `kda` its `KDA` columns."""
     r = view.prefill
     counts = (1, sum_tokens(r), sum_query_square(r), sum_query_cached(r))
     if form == "history":
@@ -406,6 +410,13 @@ def _prefill_counts(
     if out:
         output = bool(view.produces_output)
         counts += (len(r) if output else 0, int(output))
+    if kda:
+        if (columns := kda_columns(view)) is None:
+            raise ValueError(
+                f"{where} states no kda counts, which a KDA model's law prices "
+                "prefill from; its record predates them"
+            )
+        counts += columns
     if buckets:
         if (padding := token_padding(view, buckets)) is None:
             raise ValueError(
@@ -438,6 +449,14 @@ def _cold(options) -> bool:
     return True
 
 
+def _kda(options) -> bool:
+    """Whether the prefill vector adds `KDA`'s columns: as `options`' `kda`
+    states, False by default; `compass fit steps --model` sets it for a model
+    with KDA layers (`step_linear.kda_layers`). A fitted prefill step whose
+    view states no `kda` counts refuses (`_prefill_counts`)."""
+    return bool((options or {}).get("kda"))
+
+
 def _eager_dummies(samples, options) -> bool:
     """Whether the prefill vector adds `EAGER_DUMMY`: as `options` states, else
     above `dp` 1 when some prefill step of `samples` had a dummy peer and ran
@@ -465,6 +484,7 @@ def _features(
     buckets: tuple[int, ...] = (),
     eager: bool = False,
     cold: bool = False,
+    kda: bool = False,
 ) -> tuple[list[tuple], dict]:
     """One rank's fittable samples as (vector, features, seconds, step, context,
     tokens, dummies, dummy), and how many were cut, per reason.
@@ -472,8 +492,9 @@ def _features(
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
     order, plus `history` or `cached_seqs` in its form, above `dp` 1 `moe_rows` on prefill and
     under `serial` `serial_moe_rows`, under `cold` `cold_peer_rows`, and under `draft` or on a step with a draft
-    label `seqs` and `out` on prefill, with `buckets` its `padding`, and under
-    `eager` its `EAGER_DUMMY`, as `StepLinearBackend` counts them;
+    label `seqs` and `out` on prefill, under `kda` its `KDA` columns, with
+    `buckets` its `padding`, and under `eager` its `EAGER_DUMMY`, as
+    `StepLinearBackend` counts them;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill;
     `tokens` a decode step's real MoE tokens under `routing`, the model's
     (experts, top-k), which its MoE column reads, else None; `dummies` its
@@ -493,10 +514,10 @@ def _features(
                 key = "prefill"
                 where = f"{s.provenance['run']} step {s.step}"
                 shape = (form, dp, serial, draft or s.draft_s is not None, buckets)
-                counts = _prefill_counts(view, where, *shape, eager, cold)
+                counts = _prefill_counts(view, where, *shape, eager, cold, kda)
                 if dp > 1 and not draft:
                     dummy = _prefill_counts(
-                        dummy_view(view), where, *shape, eager, cold
+                        dummy_view(view), where, *shape, eager, cold, kda
                     )
             else:
                 key = _rung_key(view.capture_rung)
@@ -2032,6 +2053,7 @@ def _groups(
     buckets: tuple[int, ...] = (),
     eager: bool = False,
     cold: bool = False,
+    kda: bool = False,
 ) -> tuple[list[dict[int, tuple]], dict, list[float]]:
     """One run's steps, each {rank: its `_features` row} labelled with the
     smallest rank label; what was cut; and each step's rank label spread. A
@@ -2039,15 +2061,17 @@ def _groups(
     dummy (`_features`' `dummy`), labelled the same, since the backend prices
     it as a rank of the group and the step waits for it; one that ran a decode
     step or, under `draft`, any step so holds none. With `steps`, only the
-    steps numbered in it; `serial`, `routing`, `buckets`, `eager` and `cold`
-    as `_features` reads them;
+    steps numbered in it; `serial`, `routing`, `buckets`, `eager`, `cold` and
+    `kda` as `_features` reads them;
     `dummies`, each rank's steps run as dummy forwards, read from its samples
     when None: a rank that gave no sample needs them given."""
     if dummies is None:
         dummies = [rank[0].dummies for rank in run]
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
     got = [
-        _features(rank, form, len(run), draft, serial, routing, buckets, eager, cold)
+        _features(
+            rank, form, len(run), draft, serial, routing, buckets, eager, cold, kda
+        )
         for rank in run
     ]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
@@ -2133,8 +2157,9 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     top-k), under which each decode rung but the draft law's may adopt a MoE
     column (`_moe_column`), `draft_moe_routing`, the drafter's, under which
     above `dp` 1 the draft law's may (`_draft_options`), and `buckets`, the records' prefill token-graph
-    buckets, under which the prefill vector adds `padding`, and `cold`, under
-    which above `dp` 1 it adds `cold_peer_rows` (`_cold`); `seed` fixes the
+    buckets, under which the prefill vector adds `padding`, `cold`, under
+    which above `dp` 1 it adds `cold_peer_rows` (`_cold`), and `kda`, under
+    which it adds `KDA`'s columns and states `kda_chunk` (`_kda`); `seed` fixes the
     `rowmod` shuffles; `draft`, or a sample with a draft label, adds `seqs` and
     `out` to the prefill vector.
     """
@@ -2146,6 +2171,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     buckets = _buckets(options)
     eager = not draft and _eager_dummies(samples, options)
     cold = not draft and _cold(options)
+    kda = not draft and _kda(options)
     samples = [
         (
             s
@@ -2166,6 +2192,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             buckets=buckets,
             eager=eager,
             cold=cold,
+            kda=kda,
         )
         groups += [[(i, *r) for r in g.values()] for g in got]
         spread += s
@@ -2175,6 +2202,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     prefill += ["cached_seqs"] * (form == "cached_seqs") + ["moe_rows"] * (dp > 1)
     prefill += ["serial_moe_rows"] * serial + ["cold_peer_rows"] * cold
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
+    prefill += list(KDA) * kda
     prefill += ["padding"] * bool(buckets) + list(EAGER_DUMMY) * eager
     law = {
         "provenance": f"step_linear_fit {form} on {len(runs) * dp} real records "
@@ -2305,6 +2333,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     vector["buckets"] = list(buckets)
                 if cold:
                     vector["duty_tau"] = DUTY_TAU
+                if kda:
+                    vector["kda_chunk"] = KDA_CHUNK
                 law["prefill"] = vector
             else:
                 law["decode"][k] = vector
@@ -2528,6 +2558,7 @@ def _fold_laws(samples, options, seed, draft: bool = False):
         "serial": _serial(samples, options),
         "eager_dummies": _eager_dummies(samples, options),
         "cold": _cold(options),
+        "kda": _kda(options),
     }
     for run, ranks in _runs(samples, _options(options)[1]).items():
         others = [s for s in samples if s.provenance["run"] != run]
@@ -2546,6 +2577,7 @@ def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None
         "serial": _serial(samples, options),
         "eager_dummies": _eager_dummies(samples, options),
         "cold": _cold(options),
+        "kda": _kda(options),
     }
     if warm is None:
         warm = fit(samples, options, seed, draft)[0]["warm_steps"]
@@ -2561,6 +2593,7 @@ def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None
             buckets=_buckets(options),
             eager=not draft and options["eager_dummies"],
             cold=not draft and options["cold"],
+            kda=not draft and options["kda"],
         )[0]:
             key, _, seconds, step, *_ = next(iter(group.values()))
             if step in warm[i]:
@@ -3182,7 +3215,7 @@ def figures_main(argv) -> None:
     The records must be the runs LAW states under `runs`, and are folded under
     their engine config as the command fits them, and under the `form` and
     `moe_routing` LAW states, a `--form` or `--moe-routing` that contradicts
-    them refusing. A law whose `sources` splits its vectors takes one source's
+    them refusing, with `KDA`'s columns where its prefill vector has them. A law whose `sources` splits its vectors takes one source's
     at a time: `--source` names it, the records must be its `runs`, they are
     folded under `--form` and `--moe-routing`, as its provenance states them,
     and the figures, of the steps its `vectors` price, go under it; a source
@@ -3226,6 +3259,8 @@ def figures_main(argv) -> None:
         raise ValueError(f"{args.law} states no runs to hold the records to")
     samples, _, options, _ = _labelled(args)
     options["draft_moe_routing"] = _law_routing(law.get("draft", {}))
+    fitted_with = (law.get("prefill") or {}).get("coefficients", {})
+    options["kda"] = any(f in fitted_with for f in KDA)
     given = {s.provenance["run"] for s in samples}
     if differ := sorted(given ^ set(runs)):
         raise ValueError(
