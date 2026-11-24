@@ -574,8 +574,10 @@ both (README finding 2).
   server's calibration would take, judged over the sides it fits. Into a store of its own
   it fits both sides, as that store holds neither. Its records are the decode side's
   rungs at its DP width, on which a prefill side's host laws fit too, and the trace runs
-  when it fits the prefill. D116's configurations are the first 1P1D ones to need a new
-  law (#4053); scenario 5 walks A, then B.
+  when it fits the prefill. Both sides take cards of one node: a configuration whose
+  sides take more cards than one node holds gets why no command serves, as a deployment
+  across two nodes is not one command, and lends no side. D116's configurations are the
+  first 1P1D ones to need a new law (#4053); scenario 5 walks A, then B.
 - **A readings gap is measured**: `compass measure memory` for the point, the command
   `compass run --check` prints, into the store its candidate's law is read from, the
   shared one for a checked-in law.
