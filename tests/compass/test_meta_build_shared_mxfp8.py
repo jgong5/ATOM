@@ -132,11 +132,11 @@ def test_minimax_binds_its_drafter_into_the_meta_tree(arch):
     held = UnbuiltModel(Tree)
     held.tree = Tree()
     drafter = object()
-    for arch in (
+    for architecture in (
         "MiniMaxM3SparseForConditionalGeneration",
         "MiniMaxM3SparseForCausalLM",
     ):
-        install = resolve_obj_by_qualname(mono_decode_installers[arch])
+        install = resolve_obj_by_qualname(mono_decode_installers[architecture])
         assert install(held, None, drafter) is held
     assert bound == [drafter, drafter]
     held.tree = nn.Module()
