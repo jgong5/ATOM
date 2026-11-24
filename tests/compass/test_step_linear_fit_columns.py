@@ -214,6 +214,8 @@ def test_the_switches_read_from_the_environment():
         env_options({"COMPASS_FIT_MOE_MIN_SPREAD": "0.5"})
     with pytest.raises(ValueError, match="not one of"):
         env_options({"COMPASS_FIT_MOE_SELECT": "median"})
+    zero = {"COMPASS_FIT_MOE_IMBALANCE": "1", "COMPASS_FIT_MOE_MIN_SPREAD": "0"}
+    assert env_options(zero) == {"moe_imbalance": 0.0}
 
 
 RUNG = 8
@@ -416,7 +418,7 @@ def test_the_saturation_rule_adds_peer_tokens_where_the_experts_column_is_flat(
     assert reached["many"] >= SATURATED > reached["few"]
 
 
-def _prefill_price(rows, moe, peak, law) -> float:
+def _prefill_price(rows, moe, peak, law, spread=0.2) -> float:
     q = np.array([r[0] for r in rows])
     n = np.array([r[1] for r in rows])
     view = _prefill(int(q.sum()), peak=peak, moe=moe)
@@ -427,16 +429,16 @@ def _prefill_price(rows, moe, peak, law) -> float:
         "query_cached": (q * (n - q)).sum(),
         "moe_rows": moe,
         "gather_rows": gather_rows(view, BUCKETS, DP),
-        "moe_imbalance": moe_imbalance(view, BUCKETS, DP, 0.2),
+        "moe_imbalance": moe_imbalance(view, BUCKETS, DP, spread),
         "padding": token_padding(view, BUCKETS),
     }
     return float(sum(c * features[f] for f, c in law.items()))
 
 
-def _prefill_groups(seed, n, law):
+def _prefill_groups(seed, n, law, spread=0.2):
     """`n` prefill steps over `DP` ranks, rank `i % DP` the busiest, a third
     of them under a token graph, the rest past its largest bucket, some even
-    and some uneven."""
+    and some uneven, each priced at `moe_imbalance`'s `spread`."""
     rng = np.random.default_rng(seed)
     out = []
     for i in range(n):
@@ -454,9 +456,8 @@ def _prefill_groups(seed, n, law):
             )
         moe = sum(rows[0][0] for rows in ranks)
         peak = max(rows[0][0] for rows in ranks)
-        out.append(
-            (ranks, moe, peak, max(_prefill_price(r, moe, peak, law) for r in ranks))
-        )
+        prices = [_prefill_price(r, moe, peak, law, spread) for r in ranks]
+        out.append((ranks, moe, peak, max(prices)))
     return out
 
 
@@ -477,14 +478,19 @@ def _prefill_records(path, groups):
     return paths
 
 
-def test_the_gather_columns_are_fitted_and_the_vector_states_width_and_spread(tmp_path):
-    groups = _prefill_groups(5, 360, PREFILL)
+@pytest.mark.parametrize("spread", [0.2, 0.0])
+def test_the_gather_columns_are_fitted_and_the_vector_states_width_and_spread(
+    tmp_path, spread
+):
+    """A `min_spread` of 0 is a share like any other: its column is counted
+    and named alike."""
+    groups = _prefill_groups(5, 360, PREFILL, spread)
     paths = _prefill_records(tmp_path / "run", groups)
-    options = {"buckets": BUCKETS, "gather_rows": True, "moe_imbalance": 0.2}
+    options = {"buckets": BUCKETS, "gather_rows": True, "moe_imbalance": spread}
     law = _fit(paths, **options)
     vector = law["prefill"]
     assert vector["coefficients"] == pytest.approx(PREFILL, rel=1e-5)
-    assert vector["ranks"] == DP and vector["min_spread"] == 0.2
+    assert vector["ranks"] == DP and vector["min_spread"] == spread
     assert set(vector["fit"]["vif"]) == {"gather_rows", "moe_imbalance"}
     backend = StepLinearBackend(StepLinearLaw(law), DP)
     for ranks, moe, peak, seconds in groups[:30]:
@@ -508,9 +514,12 @@ def test_a_gather_column_on_one_rank_or_without_buckets_is_refused(tmp_path):
     paths = _prefill_records(tmp_path / "run", groups)
     with pytest.raises(ValueError, match="state none"):
         _fit(paths, gather_rows=True)
+    with pytest.raises(ValueError, match="0 or more"):
+        _fit(paths, buckets=BUCKETS, moe_imbalance=-0.1)
     one = label_records(paths[:1], 1)[0]
-    with pytest.raises(ValueError, match="run one rank"):
-        fit(one, {"dp": 1, "moe_imbalance": 0.2})
+    for spread in (0.2, 0.0):
+        with pytest.raises(ValueError, match="run one rank"):
+            fit(one, {"dp": 1, "moe_imbalance": spread})
     with pytest.raises(ValueError, match="run one rank"):
         fit(one, {"dp": 1, "peer_tokens": (4,)})
 

@@ -440,8 +440,8 @@ def _prefill_counts(
 ) -> tuple:
     """The prefill vector's features of `view`'s step, `where` naming it in a
     refusal, as `_features` states them; under `eager` its `EAGER_DUMMY`,
-    under `cold` its `cold_peer_rows`, those of `GATHER_COLUMNS` `cols`
-    (`_columns`) holds, under `share` its `PEER_SHARE`, under `kda` its `KDA`
+    under `cold` its `cold_peer_rows`, the `GATHER_COLUMNS` `cols` turns on
+    (`_gathered`), under `share` its `PEER_SHARE`, under `kda` its `KDA`
     columns."""
     r = view.prefill
     counts = (1, sum_tokens(r), sum_query_square(r), sum_query_cached(r))
@@ -465,13 +465,11 @@ def _prefill_counts(
                     "are priced by"
                 )
             counts += (peers,)
-        for feature in GATHER_COLUMNS if cols else ():
-            if feature == "gather_rows" and cols["gather_rows"]:
+        for feature in _gathered(cols):
+            if feature == "gather_rows":
                 got = gather_rows(view, buckets, dp)
-            elif feature == "moe_imbalance" and cols["moe_imbalance"] is not None:
-                got = moe_imbalance(view, buckets, dp, cols["moe_imbalance"])
             else:
-                continue
+                got = moe_imbalance(view, buckets, dp, cols["moe_imbalance"])
             if got is None:
                 raise ValueError(
                     f"{where} has no group_max_tokens, which its {feature} is "
@@ -561,22 +559,29 @@ def _kda(options) -> bool:
 
 def _columns(options, draft: bool = False) -> dict:
     """The opt-in columns `options` asks a law's vectors to add (`env_options`):
-    `row_padding` on decode, `gather_rows` and `moe_imbalance` (its
-    `min_spread`, or None) on prefill; none on a draft law. Each prefill one
-    prices a data-parallel group's gather, so `dp` 1 refuses it, and
-    `gather_rows`, which reads which steps replay a token graph, refuses
-    records stating no prefill buckets; the `shared` form refuses
+    `row_padding` on decode, True or False, and on prefill `gather_rows`, True
+    or None, and `moe_imbalance`, its `min_spread` or None; none on a draft
+    law. Each prefill one prices a data-parallel group's gather, so `dp` 1
+    refuses it, and `gather_rows`, which reads which steps replay a token
+    graph, refuses records stating no prefill buckets; a `min_spread` below 0,
+    which `StepLinearLaw` refuses, is refused; the `shared` form refuses
     `row_padding`, whose decode solve shares the base columns over rungs."""
     options = options or {}
     cols = {
         "row_padding": bool(options.get("row_padding")),
-        "gather_rows": bool(options.get("gather_rows")),
+        "gather_rows": True if options.get("gather_rows") else None,
         "moe_imbalance": options.get("moe_imbalance"),
     }
     if draft:
-        return {"row_padding": False, "gather_rows": False, "moe_imbalance": None}
+        return {"row_padding": False, "gather_rows": None, "moe_imbalance": None}
     form, dp = _options(options)
-    gathered = [f for f in GATHER_COLUMNS if cols[f] not in (False, None)]
+    spread = cols["moe_imbalance"]
+    if spread is not None and not spread >= 0:
+        raise ValueError(
+            f"moe_imbalance's min_spread is a share of moe_rows, 0 or more, not "
+            f"{spread!r}"
+        )
+    gathered = _gathered(cols)
     if gathered and dp == 1:
         raise ValueError(
             f"{' and '.join(gathered)} price a data-parallel group's MoE gather, "
@@ -590,6 +595,13 @@ def _columns(options, draft: bool = False) -> dict:
     if cols["row_padding"] and form == "shared":
         raise ValueError("the shared form fits no row_padding column")
     return cols
+
+
+def _gathered(cols) -> list[str]:
+    """The prefill `GATHER_COLUMNS` that `cols` (`_columns`) turns on, each
+    one whose entry is not None, so `moe_imbalance` at a `min_spread` of 0
+    is on; none when `cols` is None."""
+    return [f for f in GATHER_COLUMNS if cols and cols[f] is not None]
 
 
 def env_options(environ=None) -> dict:
@@ -2544,7 +2556,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     prefill = list(HISTORY if form == "history" else PREFILL)
     prefill += ["cached_seqs"] * (form == "cached_seqs") + ["moe_rows"] * (dp > 1)
     prefill += ["serial_moe_rows"] * serial + ["cold_peer_rows"] * cold
-    gathered = [f for f in GATHER_COLUMNS if cols[f] not in (False, None)]
+    gathered = _gathered(cols)
     prefill += gathered
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
     prefill += list(PEER_SHARE) * share
