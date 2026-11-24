@@ -526,6 +526,9 @@ a PP run by name. `compass measure device --pp` fits them on two GPUs over RCCL 
 completes only once its receive is posted, at every size probed, so each of its parts is
 rendezvous and each send takes an ack.
 
+**A stage's step linear law prices none of this handoff**, only the stage's own work, so
+the send is charged here once (`09` D54.1).
+
 ### Q4: memory — layers split, and the split is ATOM's
 
 `get_pp_indices(num_hidden_layers, pp_rank, pp_size)` (`atom/models/utils.py`, used at

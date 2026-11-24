@@ -26,7 +26,7 @@ refusal is a coverage report, every other ungraded.
 - A point with a refusal, a coverage report, is out of all three: its row
   names what it lacks, each refusal with its count, and the commands that
   calibrate its configuration anew, as the check names them for a missing law,
-  or, once the calibration into its ``cal/<candidate>`` has ended, why none can.
+  or, once its candidate's latest calibration has ended, why none can.
   At an earlier candidate's law key, by model, platform and engine config, the
   row names that candidate's calibration instead, as the check names it, with
   the command measuring its readings into the store that calibration publishes
@@ -260,10 +260,11 @@ def _calibrating(
     """The commands that calibrate `candidate`'s law anew, as the check names
     them for a missing one: on 1P1D each side's fits after a record of the
     deployment; else the `calibrate.sh` command of `point`'s instance into
-    OUT's ``cal/<candidate>``, its clients on SPACE's traces, resolved under
-    its variables on the device arch of the machine its run file states,
-    publishing into the store a calibration started there names, as its resume
-    must. Once that calibration has ended, why no command serves instead.
+    the candidate's latest calibration directory (`check.calibrating`), its
+    clients on SPACE's traces, resolved under its variables on the device arch
+    of the machine its run file states, publishing into the store a
+    calibration started there names, as its resume must. Once that calibration
+    has ended, why no command serves instead.
 
     That calibration joins `calibrations` at its law key, by model, platform
     and engine config, unless an earlier row's calibration is there, since a
@@ -286,31 +287,25 @@ def _calibrating(
     with check._env(one["env"] | traces):
         config = drive_run._config(one["args"], machine.value("device.arch"))
         key = [config.model, machine_platform(machine), keyed(config)]
-        made = out / check.CAL / candidate["name"]
-        lender = calibrations.setdefault(json.dumps(key, sort_keys=True), made)
+        made, ended = check.calibrating(out, candidate["name"])
+        latest = ended or made
+        lender = calibrations.setdefault(json.dumps(key, sort_keys=True), latest)
         started = check.started_store(lender)
         into = started or str(lender / "store")
         # The point's own calibration, or one whose store it was looked up in.
         store = judged["candidates"][candidate["name"]]["store"]
-        reads = lender == made or Path(into) == Path(store)
-        if reads and _ended(lender / check.STATUS):
+        reads = lender == latest or Path(into) == Path(store)
+        if reads and check._ended(lender):
             why = (
                 f"the calibration in {lender} has ended, so calibrate.sh records "
-                "nothing more there, and its records taken again in a new OUT fit "
-                "the same vectors, which refuse these steps again"
+                "nothing more there, and its records taken again in a new directory "
+                "fit the same vectors, which refuse these steps again"
             )
             return [f"no calibrate.sh command: {why}"]
-        if lender == made:
+        if lender == latest:
             return [lacking.calibration(made, one["args"], config, started)]
-        borrowed = [check.BORROWED.format(lender.name, into)]
+        borrowed = [check.BORROWED.format(check._candidate(lender), lender, into)]
         return borrowed + ([] if reads else [check._readings_by(lender, into, one)])
-
-
-def _ended(status: Path) -> bool:
-    """Whether the calibration whose status file is `status` has ended: its
-    last line is the ``end calibration`` a run that fits both laws writes."""
-    said = status.read_text().splitlines() if status.is_file() else []
-    return bool(said) and said[-1].split()[1:3] == ["end", "calibration"]
 
 
 def _meets(value, slo: dict, bound: str) -> bool:
