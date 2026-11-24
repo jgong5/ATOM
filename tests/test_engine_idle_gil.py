@@ -28,6 +28,8 @@ def _idle_engine(passes):
         pull_and_process_input_queue=lambda: next(passes),
         _is_engine_held=lambda: False,
         has_pending_kv_work=lambda: False,
+        # An idle pass parks on its input queue before it yields.
+        _wait_for_input=lambda next_metrics_push: None,
         _drain_kv_work_at_exit=lambda: None,
         scheduler=SimpleNamespace(
             heartbeat_throughput=lambda _: None,

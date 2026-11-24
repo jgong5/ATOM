@@ -19,9 +19,14 @@ from types import SimpleNamespace
 import pytest
 
 from atom.compass.backends.step_linear_fit import offload_main
+from atom.kv_transfer.offload.kv_store import worker as kv_store_worker
 from atom.kv_transfer.offload.mooncake_store import scheduler as store_scheduler
+from atom.kv_transfer.offload.mooncake_store.worker import (
+    MooncakeStoreOffloadConnector,
+)
 
-WORKER = Path(store_scheduler.__file__).with_name("worker.py")
+#: The store-agnostic worker the Mooncake Store subclasses, which logs its lines.
+WORKER = Path(kv_store_worker.__file__)
 CHUNKED = Path(store_scheduler.__file__).parents[1] / "chunked_scheduler.py"
 FLAGS = (
     "--rpc_thread_num=32 --default_kv_lease_ttl=10000 "
@@ -61,9 +66,9 @@ MATCHED = {
 FIXED_MS, PER_KEY_MS = 0.30, 0.02
 
 
-def logged(start: str, values, source: Path = WORKER) -> str:
+def logged(start: str, values, source: Path = WORKER, unnamed=()) -> str:
     """The line `source`'s logger call whose format starts `start` writes for
-    `values`."""
+    `values`, a bare ``%s`` taking the value each of `unnamed` names in turn."""
     [fmt] = [
         node.args[0].value
         for node in ast.walk(ast.parse(source.read_text()))
@@ -73,8 +78,19 @@ def logged(start: str, values, source: Path = WORKER) -> str:
         and isinstance(node.args[0], ast.Constant)
         and str(node.args[0].value).startswith(start)
     ]
-    names = re.findall(r"(\w+)=%", fmt)
+    bare = iter(unnamed)
+    names = [m.group(1) or next(bare) for m in re.finditer(r"(\w+)=%|%s", fmt)]
     return "[atom 12:00:00] " + fmt % tuple(values[name] for name in names)
+
+
+def started(values) -> str:
+    """A Store worker's start line: the store-agnostic worker's format under
+    the Mooncake Store's label, its endpoint as the Mooncake worker names it."""
+    endpoint = MooncakeStoreOffloadConnector._endpoint_log(
+        SimpleNamespace(), (values["nic"], SimpleNamespace(master=values["master"]))
+    )
+    fields = {"label": MooncakeStoreOffloadConnector.LABEL, "endpoint": endpoint}
+    return logged("%s worker rank=", fields | values, unnamed=("label", "endpoint"))
 
 
 def copy(tag: str, chunks: int, status: str = "ok", **ms) -> str:
@@ -122,7 +138,7 @@ def store_logs(tmp_path, monkeypatch, caplog, **changed) -> list[Path]:
     for i, half in enumerate((range(1, 5), range(5, 9))):
         for rank in range(START["world"]):
             values = START | {"rank": rank} | (changed if i else {})
-            lines[i].append(logged("Mooncake Store offload worker", values))
+            lines[i].append(started(values))
         for n in half:
             ms = {"total_ms": 1.0 + 2.0 * n, "pack_ms": 0.5 * n, "put_ms": 1.5 * n}
             lines[i].append(copy("[OFFLOAD-SAVE-PROF]", n, **ms))

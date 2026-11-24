@@ -128,12 +128,31 @@ def _hip_runtime():
 
     Not `CDLL("libamdhip64.so")`: that is the system's unversioned dev link,
     which a wheel-only install lacks (the shard would quietly take the host
-    path) and which can name a second, different runtime
-    than torch's, with its own allocations and last error.
+    path) and which can name a second, different runtime than torch's, with
+    its own allocations and last error: memory it page-locks is pageable to
+    torch, whose copies from it faulted on MI455. So a runtime the process
+    maps is bound as it is (`RTLD_NOLOAD`, nothing new mapped), and with
+    several mapped none is, since which is torch's cannot be told: the shard
+    then takes the host path.
     """
     if not torch.version.hip:
         return None
-    candidates = _mapped_libraries("libamdhip64.so")
+    mapped = _mapped_libraries("libamdhip64.so")
+    if len(mapped) > 1:
+        logger.warning(
+            "engram: several HIP runtimes mapped (%s); no UVA shard is page-locked",
+            ", ".join(mapped),
+        )
+        return None
+    if mapped:
+        try:
+            hip = ctypes.CDLL(mapped[0], mode=os.RTLD_NOLOAD)
+        except OSError:
+            logger.warning("engram: HIP runtime %s not bound", mapped[0], exc_info=True)
+            return None
+        logger.info("engram: HIP runtime for page-locking: %s", mapped[0])
+        return hip
+    candidates = []
     torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
     try:
         candidates += sorted(

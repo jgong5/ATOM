@@ -88,7 +88,9 @@ def _built(monkeypatch, tmp_path, model_class=TiedPacked):
         ),
     )
     with_readings(runner, tmp_path / "store")
-    NonAllocatingRunner._build_and_load_model(runner, model_class)
+    runner.model = NonAllocatingRunner._build_and_load_model(
+        runner, runner.config, model_class, None
+    )
     return runner
 
 

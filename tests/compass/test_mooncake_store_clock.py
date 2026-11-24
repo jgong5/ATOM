@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from atom.kv_transfer.offload import _offload_common, chunked_scheduler
+from atom.kv_transfer.offload.kv_store import scheduler as store_scheduler_mod
 from atom.kv_transfer.offload.lookup_client import LookupClient
 from atom.kv_transfer.offload.metadata import LoadSpec
 from atom.kv_transfer.offload.mooncake_store import scheduler as scheduler_mod
@@ -58,7 +59,12 @@ def clk(request, monkeypatch):
         monotonic=(lambda: HOST) if lp else (lambda: state.t),
         perf_counter=time.perf_counter,
     )
-    for module in (scheduler_mod, chunked_scheduler, _offload_common):
+    for module in (
+        scheduler_mod,
+        store_scheduler_mod,
+        chunked_scheduler,
+        _offload_common,
+    ):
         monkeypatch.setattr(module, "time", host)
     if lp:
         clock.install(_LP(state))

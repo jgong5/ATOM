@@ -1667,7 +1667,8 @@ def _build_runner(config, fake_mode):
     honest width with its transport declined, and ATOM's own path would rebuild
     it through `init_dist_env` and then reach for `apply_simulated_tp`.
     """
-    from atom.model_engine.model_runner import ModelRunner, support_model_arch_dict
+    from atom.model_engine.model_runner import ModelRunner
+    from atom.models.registry import support_model_arch_dict
     from atom.utils import h2d, resolve_obj_by_qualname
 
     architecture = config.hf_config.architectures[0]
@@ -1682,9 +1683,12 @@ def _build_runner(config, fake_mode):
         def _setup_device_and_distributed(self, rank, config):
             self.device = torch.device("cuda:0")
 
-        def _build_and_load_model(self, built_class):
-            self.model = built_class(config)
-            torch.set_default_device(None)
+        def _build_and_load_model(self, config, built_class, device):
+            torch.set_default_device(device)
+            try:
+                return built_class(config)
+            finally:
+                torch.set_default_device(None)
 
         def _maybe_warmup(self):
             return
@@ -2317,11 +2321,13 @@ def test_apply_simulated_tp_is_called_only_where_the_capture_does_not_go():
     """The premise under the sentinel, held by reading ATOM rather than stated.
 
     The sentinel in `_watch_simulated_tp` is a forward guard because ATOM calls
-    `apply_simulated_tp` from exactly one method, and `_build_runner` overrides
-    that method. Nothing checked the first half: a second call site in another
+    `apply_simulated_tp` from exactly one function, `init_model_env`, which a
+    runner reaches through one method, and `_build_runner` overrides that
+    method. Nothing checked the first half: a second call site in another
     overridden method would leave every capture test green and the account
-    false. So every call to the name, anywhere under `atom/`, is listed with the
-    function it sits in, and the list is held.
+    false. So every call to either name, anywhere under `atom/`, is listed with
+    the function it sits in, and the list is held; the weight cache daemon's is
+    a process of its own, which builds no runner.
 
     Calls are matched by name, as a bare name or as an attribute, which is how
     both bindings of it are spelled. A call through an alias under another name
@@ -2329,7 +2335,7 @@ def test_apply_simulated_tp_is_called_only_where_the_capture_does_not_go():
     """
     tree_root = pathlib.Path(__file__).resolve().parents[2]
     scanned = 0
-    callers = set()
+    callers = {"apply_simulated_tp": set(), "init_model_env": set()}
     for path in sorted((tree_root / "atom").rglob("*.py")):
         scanned += 1
         module = ast.parse(path.read_text(), filename=str(path))
@@ -2340,12 +2346,16 @@ def test_apply_simulated_tp_is_called_only_where_the_capture_does_not_go():
                 if not isinstance(node, ast.Call):
                     continue
                 called = getattr(node.func, "id", getattr(node.func, "attr", None))
-                if called == "apply_simulated_tp":
+                if called in callers:
                     rel = path.relative_to(tree_root).as_posix()
-                    callers.add((rel, function.name))
+                    callers[called].add((rel, function.name))
     assert scanned > 100
     assert callers == {
-        ("atom/model_engine/model_runner.py", "_setup_device_and_distributed")
+        "apply_simulated_tp": {("atom/model_engine/model_setup.py", "init_model_env")},
+        "init_model_env": {
+            ("atom/model_engine/model_runner.py", "_setup_device_and_distributed"),
+            ("atom/model_loader/weight_cache/daemon.py", "_serve_rank"),
+        },
     }
     # And that method is the one the capture's runner replaces.
     assert "def _setup_device_and_distributed" in inspect.getsource(_build_runner)
