@@ -1165,7 +1165,8 @@ def drafts_on_meta() -> None:
     worker process.
 
     `ModelRunner.__init__` builds the drafter on this rank's device and loads it
-    right after `_build_and_load_model`, with no override point between. The
+    (`_build_and_load_drafter`) right after `_build_and_load_model`, the
+    building in each flavor's `_build_draft_model`. The
     drafter's own buffers stay on the host; only the draft model is meta. Every
     subclass of `Drafter` is patched, at any depth; a hook `Drafter` no longer
     defines is refused by name, since the flavors would then build on this
@@ -1381,7 +1382,7 @@ def _staging_row_bytes(runner: Any) -> int:
 def _refused(method: str):
     """A worker method that answers with its refusal instead of doing its work."""
 
-    def refuse(self, *args: Any) -> str:
+    def refuse(self, *args: Any, **kwargs: Any) -> str:
         reason = f"command:{method}"
         vars(self).setdefault("_refused_commands", []).append(reason)
         logger.warning(
@@ -1411,6 +1412,7 @@ class RefusedControlCommands:
     update_weights = _refused("update_weights")
     update_weights_from_shm = _refused("update_weights_from_shm")
     update_weights_from_ipc = _refused("update_weights_from_ipc")
+    receive_weights_rdma = _refused("receive_weights_rdma")
     discard_failed_weight_sync = _refused("discard_failed_weight_sync")
     release_memory = _refused("release_memory")
     resume_memory = _refused("resume_memory")
@@ -1634,11 +1636,11 @@ class NonAllocatingRunner(
 ):
     """Overrides that construct a model runner without touching device memory."""
 
-    def _build_and_load_model(self, model_class: Any) -> None:
+    def _build_and_load_model(self, config: Any, model_class: Any, device: Any) -> Any:
         """Build the module tree on the meta device and read no checkpoint.
 
-        The base class constructs the model with the default device set to this
-        rank's GPU and then fills it from disk. Here it is built on the meta
+        The base class constructs the model on this rank's GPU and then fills
+        it from disk, and `__init__` keeps what it returns. Here it is built on the meta
         device, shapes and no bytes, a factory function's tensor on a named
         device included, because ATOM sizes the KV pool by walking its attention
         modules; the load is skipped, so no checkpoint is read. The tree is
@@ -1655,10 +1657,10 @@ class NonAllocatingRunner(
         What stands in for the model is installed here instead, on a simulated
         run: the cost backend and the device readings its run file declares.
         """
-        self.model = UnbuiltModel(model_class)
-        # Cleared on the way out, as both of ATOM's own implementations do: the
-        # caller set the default device to this rank's GPU before calling, and
-        # the code that runs next is written against a cleared default.
+        model = UnbuiltModel(model_class)
+        # Cleared on the way out, as ATOM's own `build_model` does: the caller
+        # set the default device to this rank's GPU before calling, and the
+        # code that runs next is written against a cleared default.
         torch.set_default_device(None)
         spec = _config_field(self, "speculative_config")
         if spec is not None:
@@ -1676,15 +1678,16 @@ class NonAllocatingRunner(
             drafts_on_meta()
         engram_tables_unread()
         with FactoriesOnMeta(), simulated_arch():
-            self.model.tree = model_class(self.config)
-            process_weights_after_loading(self.model.tree)
+            model.tree = model_class(config)
+            process_weights_after_loading(model.tree)
         from atom.compass import run
 
-        run.runner(self, self.model.tree)
+        run.runner(self, model.tree)
         logger.info(
             "%s built on meta and no checkpoint read; no weight bytes on a device.",
-            self.model.model_class_name,
+            model.model_class_name,
         )
+        return model
 
     def _maybe_warmup(self) -> None:
         """Skip warmup.

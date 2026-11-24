@@ -10,6 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use rand::RngCore;
 use xxhash_rust::xxh3::Xxh3;
 
 use super::{
@@ -61,7 +62,7 @@ impl RoundRobinPolicy {
         Self {
             positions: DashMap::new(),
             generation: AtomicU64::new(1),
-            created: Instant::now(),
+            created: crate::determinism::now(),
             swept_at_ms: AtomicU64::new(0),
             sweep_interval,
             sweeping: AtomicBool::new(false),
@@ -81,7 +82,7 @@ impl RoundRobinPolicy {
         }
         self.sweep_if_due();
         let position = self.positions.entry(key).or_insert_with(|| Position {
-            next: AtomicUsize::new(rand::random::<u32>() as usize),
+            next: AtomicUsize::new(crate::determinism::rng().next_u32() as usize),
             used: AtomicU64::new(0),
         });
         self.take(&position)
@@ -97,7 +98,9 @@ impl RoundRobinPolicy {
 
     /// Drops the sets unused since the last sweep, once the sweep interval has passed.
     fn sweep_if_due(&self) {
-        let now_ms = self.created.elapsed().as_millis() as u64;
+        let now_ms = crate::determinism::now()
+            .duration_since(self.created)
+            .as_millis() as u64;
         let due = || {
             let swept_at_ms = self.swept_at_ms.load(Ordering::Relaxed);
             now_ms >= swept_at_ms + self.sweep_interval.as_millis() as u64
