@@ -76,9 +76,11 @@ NEEDS_A_RUN = pytest.mark.skipif(
 #: The server's flags past its model, host and port: the law's engine config
 #: states graph mode at ATOM's default ladder, so no ``--enforce-eager``.
 FLAGS = ["--max-model-len", "4096"]
-#: The first turn's prefix words, and the turns; the later ones are sent at
-#: `LATER_S`, past the first one's end under the law.
-PREFIX_WORDS = 160
+#: The first turn's prefix words: enough that its request body, the smallest,
+#: takes over 3,300 bytes whatever the model's path, past the 2,482 the law's
+#: HTTP intake was fitted from at its least (#3932). The later turns are sent
+#: at `LATER_S`, past the first one's end under the law.
+PREFIX_WORDS = 560
 REQUESTS = 4
 LATER_S = 2.0
 
@@ -296,7 +298,8 @@ def test_a_run_under_the_law_meets_every_scenario_check_with_no_refusal(runs):
     recording no prefill token-graph bucket, so the law's prefill vector, which
     states none, is not refused for them; the first turn prefills with no
     cached token and each later one on a prefix in HBM, its first prefill
-    row's context less its tokens."""
+    row's context less its tokens. Every request body is inside the bytes the
+    law's HTTP intake was fitted on, where it states them."""
     run = runs[0]
     law = read_json(LAW)
     engine = run["engine"]
@@ -308,6 +311,10 @@ def test_a_run_under_the_law_meets_every_scenario_check_with_no_refusal(runs):
     print(f"\n{run['summary']['schedule']['seconds_by_method']}")
     print(f"cached tokens of each request: {cached}")
     assert read_json(MODEL + "/config.json") == read_json(CONFIG)
+    sizes = [len(json.dumps(body)) for body in turns()]
+    low, high = law["host"]["http_intake"].get("bytes", (0, math.inf))
+    print(f"request body bytes: {sizes}; the intake was fitted on {low} to {high}")
+    assert all(low <= n <= high for n in sizes), (sizes, low, high)
     failed = check_run(
         [r["out"] for r in runs], run["sent"], [line for _, line in run["events"]]
     )
