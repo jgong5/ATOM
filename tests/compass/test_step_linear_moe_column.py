@@ -175,7 +175,8 @@ def test_the_pick_weighs_each_held_out_record_by_its_steps(tmp_path):
     """Two large records the experts price exactly, and a small one at the
     first's tokens that costs 3% less: held out, the column misses the small
     one by more than no column does, and is adopted on the steps however far
-    it moves that one record."""
+    it moves that one record. Each form's error weighs the p50 of each held-out
+    record's MoE-token bands, which split its steps, by their steps."""
     cheaper = {**WIDE, "step": WIDE["step"] - 0.0011}
     records = _records(tmp_path / "full", _groups(0, 200, FULL, WIDE))
     records += _records(tmp_path / "sparse", _groups(1, 200, SPARSE, WIDE))
@@ -184,13 +185,58 @@ def test_the_pick_weighs_each_held_out_record_by_its_steps(tmp_path):
     figures = vector["fit"]["moe_column"]
     held = figures["held_out"]
     for got in held.values():
-        folds = got["folds"].values()
-        weighted = sum(n * abs(p) for n, p in folds) / sum(n for n, _ in folds)
+        bands = got["bands"].values()
+        weighted = sum(n * abs(p) for n, p in bands) / sum(n for n, _ in bands)
         assert got["error"] == pytest.approx(weighted)
+        per_record = {}
+        for cell, (n, _) in got["bands"].items():
+            record = cell.split(":")[0]
+            per_record[record] = per_record.get(record, 0) + n
+        assert per_record == {c: n for c, (n, _) in got["folds"].items()}
     small = {f: abs(held[f]["folds"]["2"][1]) for f in held}
     assert small["moe_experts"] > small["none"] + 0.02
     assert figures["picked"] == figures["adopted"] == "moe_experts"
     assert list(vector["coefficients"]) == list(WIDE)
+
+
+#: Routing whose experts a few tokens all reach: over 7 to 16 group tokens the
+#: experts column barely moves, as 384 experts top-6 past ~200 (#3720).
+SATURATING = (16, 4)
+LINEAR = {"step": 0.015, "context": 2e-9, "graph_padding": 1e-10, "moe_tokens": 6e-5}
+
+
+def test_a_column_that_holds_each_record_s_median_but_misses_its_fullest_steps_is_not_adopted(
+    tmp_path,
+):
+    """Three records over the same group tokens, half `SPARSE` and half `FULL`,
+    under a cost linear in the tokens, each 0.5% dearer than the one before (a
+    node's or a day's level). The experts, which `SATURATING` holds nearly flat,
+    take up each held-out record's level at its median step and hold out
+    nearest by record, but price its fullest steps low and its emptiest high;
+    graded per MoE-token band, the tokens hold out nearest and are adopted
+    (#3720 cell B's D rung 16)."""
+    records = []
+    for i, level in enumerate((0.995, 1.0, 1.005)):
+        groups = _groups(2 * i, 100, SPARSE, LINEAR) + _groups(
+            2 * i + 1, 100, FULL, LINEAR
+        )
+        groups = [(views, seconds * level) for views, seconds in groups]
+        records += _records(tmp_path / f"r{i}", groups)
+    samples = label_records(records, DP)[0]
+    options = {"form": "base", "dp": DP, "moe_routing": SATURATING}
+    vector = fit(samples, options)[0]["decode"][str(RUNG)]
+    figures = vector["fit"]["moe_column"]
+    held = figures["held_out"]
+    by_record = {}
+    for form, got in held.items():
+        folds = got["folds"].values()
+        by_record[form] = sum(n * abs(p) for n, p in folds) / sum(n for n, _ in folds)
+    assert by_record["moe_experts"] < min(by_record["moe_tokens"], by_record["none"])
+    error = {f: v["error"] for f, v in held.items()}
+    assert error["moe_tokens"] < error["moe_experts"] < error["none"]
+    assert figures["picked"] == figures["adopted"] == "moe_tokens"
+    assert len(figures["token_bands"]) == 3
+    assert list(vector["coefficients"]) == list(LINEAR)
 
 
 SKEWED = {"step": 0.015, "context": 2e-8, "graph_padding": 3e-8, "moe_tokens": 4e-4}
@@ -288,7 +334,10 @@ def test_a_rung_of_one_record_and_one_composition_has_no_held_out_error_and_adop
     figures = vector["fit"]["moe_column"]
     assert figures["held_out_by"] == "group_dummies"
     assert figures["picked"] is None and figures["adopted"] is None
-    assert all(v == {"error": None, "folds": {}} for v in figures["held_out"].values())
+    assert all(
+        v == {"error": None, "folds": {}, "bands": {}}
+        for v in figures["held_out"].values()
+    )
     assert list(vector["coefficients"]) == list(BASE)
 
 
@@ -298,13 +347,13 @@ def test_a_routed_rung_fits_each_fold_of_the_form_it_adopts_once(cells, monkeypa
     was chosen on, and the law is the one it writes fitting them again."""
     from atom.compass.backends import step_linear_fit
 
-    folds, fitted = step_linear_fit._max_affine_folds, []
+    errors, fitted = step_linear_fit._max_affine_errors, []
 
     def counted(steps, vector, routing, cell=None):
         fitted.append(tuple(vector["coefficients"]))
-        return folds(steps, vector, routing, cell)
+        return errors(steps, vector, routing, cell)
 
-    monkeypatch.setattr(step_linear_fit, "_max_affine_folds", counted)
+    monkeypatch.setattr(step_linear_fit, "_max_affine_errors", counted)
     full, sparse = cells
     law = _routed(full + sparse)[0]
     assert law["decode"][str(RUNG)]["fit"]["moe_column"]["adopted"] == "moe_experts"

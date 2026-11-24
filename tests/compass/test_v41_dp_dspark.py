@@ -443,6 +443,8 @@ def test_fit_steps_takes_the_drafter_s_routing_from_the_served_model(fitted, tmp
         moe_routing=None,
         model=str(tmp_path),
         cold_peer_rows=False,
+        peer_share=None,
+        keep_peer_tail=None,
         ladder_run=None,
     )
     law = steps._step_linear(samples, config, args)[1]

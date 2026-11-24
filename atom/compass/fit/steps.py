@@ -20,7 +20,10 @@ the fit labels whose label keeps that kernel's recorded length.
 
 `step-linear` takes real runs only and fits `step_linear_fit.FORMS`' `--form`,
 `history` by default, with `--cold-peer-rows` its prefill vector's
-`cold_peer_rows` (`step_linear_fit._cold`), joining each step's ranks at the engine config's
+`cold_peer_rows` (`step_linear_fit._cold`), with `--peer-share` its
+`peer_small` and `peer_large` (`step_linear_fit._share`), with
+`--keep-peer-tail` the MAD rounds keeping the slower steps they mark
+(`step_linear_fit._keep_peer_tail`), joining each step's ranks at the engine config's
 `data_parallel_size`, so a record with a
 rank that gave no sample refuses; it pads prefill to the records'
 `prefill_buckets`, naming under `unfitted` records stating none, and holds
@@ -142,6 +145,10 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
         options["draft_moe_routing"] = drafter
     options["buckets"] = config.get("prefill_buckets")
     options["cold"] = bool(args.cold_peer_rows)
+    if args.peer_share:
+        options["peer_share"] = True
+    if args.keep_peer_tail:
+        options["keep_peer_tail"] = True
     law, report = step_linear_fit.fit(samples, options, args.seed)
     if options["buckets"] is None:
         law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
@@ -245,6 +252,8 @@ BACKENDS = {
 OWN = {
     "form": "step-linear",
     "cold_peer_rows": "step-linear",
+    "peer_share": "step-linear",
+    "keep_peer_tail": "step-linear",
     "moe_routing": "step-linear",
     "model": "step-linear",
     "ladder_run": "step-linear",
@@ -293,6 +302,21 @@ def main(argv: list[str]) -> None:
         const=True,
         help="the prefill vector adds cold_peer_rows: its peers' MoE rows on a "
         "step outside a stretch of prefill steps (data-parallel records only)",
+    )
+    parser.add_argument(
+        "--peer-share",
+        action="store_const",
+        const=True,
+        help="the prefill vector adds peer_small and peer_large: a prefill whose "
+        "data-parallel peers run real rows under a quarter of its own, and at or "
+        "above it (data-parallel records only)",
+    )
+    parser.add_argument(
+        "--keep-peer-tail",
+        action="store_const",
+        const=True,
+        help="with --peer-share, the prefill vector's MAD rounds keep the slower "
+        "steps those columns mark, so the columns price their class's mean",
     )
     parser.add_argument(
         "--ladder-run",
