@@ -178,7 +178,7 @@ def test_its_line_names_the_drafters_residual():
         backend(drafted())
         .describe()
         .endswith(
-            "; drafter recipe step-grid-residual v3, members decode: half; "
+            "; drafter recipe step-grid-residual v4, members decode: half; "
             "prefill_output: half; prefill_no_output: half"
         )
     )
@@ -415,7 +415,10 @@ def test_a_v41_flash_dspark5_verify_step_is_priced_from_a_fitted_bundle(
     for line in flash_nodes():
         flash_measured(tmp_path, flash, line)
 
-    copy = fit_steps(tmp_path, a, *clients(a))
+    # Seed 1 holds out ragged chunks of every kind; seed 0 holds out only
+    # homogeneous nodes of the chunks without output, where every member
+    # prices 1.25 to within 1e-8 and a band member is as likely selected.
+    copy = fit_steps(tmp_path, a, *clients(a), "--seed", "1")
     backend = loaded(tmp_path, flash, copy)
 
     params, report = copy["params"], copy["report"]
