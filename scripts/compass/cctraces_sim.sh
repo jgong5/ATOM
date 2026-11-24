@@ -259,12 +259,9 @@ serving_ns=$(date +%s%N)
 
 rc=0
 aiperf=(-m aiperf)
-# Without compass-harness, the benchmark id is pinned here as it pins it, so
-# both modes send the same prompts.
-((REAL)) && aiperf=(-c 'import uuid, aiperf.cli_runner as r
-r.uuid4 = lambda: uuid.UUID(int=0)
-from aiperf.cli import app
-app()')
+# Without compass-harness, what it fixes is fixed here, so both modes send the
+# same requests.
+((REAL)) && aiperf=(-c "$COMPASS_REAL_AIPERF" "$ROOT/compass_harness/compass_harness/session_ids.py")
 # Its own process group, so stopping it stops its workers too. Its raw records
 # leave out each request's payload, its prompt.
 (cd "$OUT" && ATOM_COMPASS_RUN=$OUT/run.json AIPERF_DATASET_MMAP_BASE_PATH=$OUT AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true \

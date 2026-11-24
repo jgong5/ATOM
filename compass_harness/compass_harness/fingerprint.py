@@ -84,6 +84,18 @@ PINNED = {
     "aiperf.timing.replay_dependencies:ReplayBarrierCoordinator.cancel_pending": "c8cebac957f4a7ef679c8509f8b16144f9aea7c9c717ff113f0f025d452e1921",
     "aiperf.timing.phase_orchestrator:PhaseOrchestrator._execute_phases": "7181bf33a2d4e6c440c2291390feb96a8c31f76bab258e9a3df633006f125abd",
     "aiperf.cli_runner:_make_benchmark_run": "f804f11878e985466855f13604390f7b68143da9f8fccb9f22255d67b884f1cc",
+    # Each session id these mint, with the locals session_ids.SITES names.
+    "aiperf.timing.conversation_source:ConversationSource.next": "6beaae8bfb078f049e60a0bb7e56d4e608208184ce56dafb2bc0896997af9bc9",
+    "aiperf.timing.conversation_source:ConversationSource.start_branch_child": "299dd080548ac89b26cfadfa47805ef8d82ea3ab618367feba2a491fb41ea208",
+    "aiperf.timing.conversation_source:ConversationSource.start_pre_session_child": "877527bafd4fdb2c3d1f03f3ea39bd516083225c3da0b32edd53010c8ba5e4d5",
+    "aiperf.timing.trajectory_source:Trajectory": "3f6a4447a770d6f8410fff7d9bec5204bca90b61f7855460450dc5495340531a",
+    "aiperf.timing.trajectory_source:TrajectorySource._snapshot_for": "01c859011e34d7d002c27c8b985f7d247168916b2da2e74bde8f82b514371ed0",
+    "aiperf.timing.strategies.agentic_replay:AgenticReplayStrategy._build_handoff_trajectories": "75dc4d46289b7a5667333b3f762705aaeaf88a55aa2b66dfa74545f0e8a73208",
+    "aiperf.timing.strategies.agentic_replay:AgenticReplayStrategy._build_session_for_trace": "2f67d9a0e6786baf71409b4423f17d1848884e39450cbd8d32c3ee427a89a871",
+    # A real run's services take that binding by fork (session_ids.bind_by_fork):
+    # the one start-method setting aiperf makes, and the service start.
+    "aiperf.cli_runner._process_setup:_configure_multiprocessing_start_method": "09f9ae3d4d97fec66f7c3559af51b638d51a8330cb9c6f2f2da9e18b9a3c5ceb",
+    "aiperf.controller.multiprocess_service_manager:MultiProcessServiceManager.run_service": "555fbe13a7a51fd7797df905382a8f678752dbb4971bed8092c682d6a1c667ce",
 }
 
 #: Call sites the router relies on being the only ones: every credit leaves

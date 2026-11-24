@@ -862,7 +862,9 @@ so a real and a simulated cell at one seed, concurrency and traces hash send the
 same requests and warm up on the same ones. The server runs ATOM's own runner
 (no `--compass-run`), and aiperf runs as shipped: `HARNESS_PYTHON` must have
 agentx-harness without compass-harness (exit 92 otherwise), and the script pins
-the benchmark id as compass-harness does. The result line reads aiperf's export
+the benchmark id and draws each session's id from its trace and branch as
+compass-harness does (`_lib.sh`'s `COMPASS_REAL_AIPERF`), so both send one
+session id, which ATOM's DP router breaks a tie by. The result line reads aiperf's export
 alone and adds `contaminated`, true when `rocm-smi` lists any process on one of the
 cell's GPUs before or after it, with each one's pid and VRAM bytes. Both modes
 write the TP1 step record to `steps/dp0.jsonl` (`atom/compass/parity`);
