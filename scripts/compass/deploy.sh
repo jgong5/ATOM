@@ -443,9 +443,9 @@ ROUTER+=("${router[@]}")
 router_env=()
 [[ -z $ROUTER_LP ]] || router_env=(ATOM_COMPASS_CLOCK_ENDPOINT="$CLOCK" ATOM_COMPASS_SEED="${SEED:-20260707}" ATOM_COMPASS_ROUTER_LOOKAHEADS="$LOOKAHEADS")
 if [[ -n $ROUTER_LP ]] && ((NP > 1 || ND > 1)); then
-    # As pd_sim.sh gives them: the router LP's workers in the run file's
-    # worker_order as (URL, DP rank) pairs, and above one instance of a side
-    # each URL's frontend LP.
+    # As pd_sim.sh gives them: the router LP's workers in `worker_order`'s
+    # order as (URL, DP rank) pairs, and above one instance of a side each
+    # URL's frontend LP.
     order=$(python3 - "$RUN_FILE" "$NP" "${urls[@]}" <<'EOF'
 import json, sys
 from atom.compass.run import worker_order

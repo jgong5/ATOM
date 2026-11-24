@@ -101,7 +101,7 @@ MADE_BY = {
     "fit steps --backend step-grid",
     "host": "compass record, then compass fit host",
     "memory readings": "compass measure memory --gpu G --out D "
-    "--store {store} -- {atom}",
+    "--store {store}{beside} -- {atom}",
     PRICE_LIST: "compass trace ops --population, compass measure ops --plan, then "
     "compass fit ops",
     "acceptance record": "compass record of a speculative run",
@@ -301,20 +301,23 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     return lacks, apart
 
 
-def measure_memory(store, atom_args, env=None) -> str:
+def measure_memory(store, atom_args, env=None, beside=None) -> str:
     """The command that measures the memory readings of a start under ATOM's
-    arguments `atom_args` into `store`, run under the variables `env`."""
-    made = MADE_BY["memory readings"].format(store=store, atom=shlex.join(atom_args))
+    arguments `atom_args` into `store`, run under the variables `env`, with
+    the command `beside`, a list of words, run beside the engine when given."""
+    beside = f" --beside {shlex.quote(shlex.join(beside))}" if beside else ""
+    atom = shlex.join(atom_args)
+    made = MADE_BY["memory readings"].format(store=store, beside=beside, atom=atom)
     return " ".join([*(f"{k}={shlex.quote(v)}" for k, v in (env or {}).items()), made])
 
 
-def measuring(store, key, atom_args, env=None) -> str:
+def measuring(store, key, atom_args, env=None, beside=None) -> str:
     """`measure_memory`'s command for the readings at `key` into `store`, or,
     once an entry there holds their key, which the store refuses a second
     publish at, `MEASURED`."""
     if holds(store, key):
         return MEASURED.format(store)
-    return measure_memory(store, atom_args, env)
+    return measure_memory(store, atom_args, env, beside)
 
 
 def readings_store(beside, digest: str) -> Path:

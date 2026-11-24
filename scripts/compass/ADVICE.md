@@ -264,7 +264,7 @@ takes up the rest.
 | State | What it prints | Next |
 |---|---|---|
 | `searchable` | `N of M points searchable`, each other point with its own state | step 3 simulates it |
-| `missing a law` | `made by:` the command that makes the law; `calibration:` the last line of one that stopped or ended | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
+| `missing a law` | `made by:` the command that makes the law, or why none can; `calibration:` the last line of one that stopped | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
 | `calibrating` | `calibration:` its status file, how many steps have ended and its last line; `resumed, once no calibrate.sh runs, by:` its command | run the search again later |
 | `missing readings`, a point of a searchable candidate | `made by:` its `compass measure memory` command | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
 | `refused` | `refused:` ATOM's or Compass's refusal, verbatim | below |
@@ -355,6 +355,16 @@ compass fit device <token> --store OUT/cal/S1/store --out OUT/cal/S1.readings
   each step's wall seconds, the node-hours every take of every step held, and
   this run's wall time; the status file's last line is then `end calibration
   <h> node-hours`.
+- **Calibrate again**: once a calibration has ended, a search that still finds
+  the law missing, as after the head has moved or the performance variables
+  have changed, prints the next one into a new directory, `OUT/cal/S1+2`, then
+  `OUT/cal/S1+3`, and reads that one's status; start it as above, its log in
+  `OUT/cal/S1+2.log`. Where the next one would take the ATOM arguments, traces
+  and records the ended one took, and the law that one fitted is at the
+  configuration's key (its model, the machine's platform, the head's ATOM
+  digest, and its engine config with the performance variables), it would refit
+  that law, so `made by:` says so in place of a command and names the store
+  that law is in; the law's verdict line says what it lacks.
 
 **A missing point's readings** take `compass measure memory --gpu G --out D
 --store <store> -- <ATOM's arguments>`, as printed, under the variables it
@@ -381,11 +391,11 @@ Its records are the decode side's rungs, and the trace runs when it fits the
 prefill side. It fits only the sides its store will lack. A side whose law an
 earlier candidate's calibration publishes into that store, as the development
 template's B shares A's prefill side, is borrowed: the candidate prints that
-calibration for it, as `<A>'s calibration, whose law is at this configuration's
-key, publishing into <store>`, and its own command fits the other side alone,
-`FIT=decode`, into the same store. Where that store is A's own, B's command
-reads `its calibration, into <store>, once A's calibration has started` until
-A has started; run `compass advice SPACE OUT` again then. Its status file,
+calibration for it, as `<A>'s calibration in OUT/cal/A, whose law is at this
+configuration's key, publishing into <store>`, and its own command fits the
+other side alone, `FIT=decode`, into the same store. Where that store is A's
+own, B's command reads `its calibration, into <store>, once A's calibration in
+OUT/cal/A has started` until A has started; run `compass advice SPACE OUT` again then. Its status file,
 resume and end are one server's, above, and its end prints each fitted side's
 tokens and held-out errors. Show the user every command the candidate prints.
 Where the sides take more cards than one node holds, as two TP8 sides on an
@@ -467,4 +477,4 @@ An agent that runs this guide for a user keeps these rules:
 | a candidate `refused` with `ATOM's parser: unrecognized arguments: ...` | a flag ATOM does not have, such as a misspelt one | correct the space file |
 | a candidate `refused` with `--server-port ... is among ATOM's arguments; the driver owns it` | an argument `compass run` assigns, `--host` or a port | leave it out, as What a space file leaves out says |
 | a candidate `refused` with `this deployment offloads KV to a Mooncake Store and the run file has no mooncake_store entry` | its prefill offloads to a Mooncake Store and no block of it names the entry | the entry's path in its block's `mooncake_store` (step 1) |
-| a calibrated candidate still `missing a law` | its calibration failed, or it published into a store holding no platform readings, at another stack than the committed copy's or on a machine with none | its `calibration:` line; resume it, or take its store's `measure device` and `fit device` (step 3) |
+| a calibrated candidate still `missing a law` | its calibration failed, or it published into a store holding no platform readings, at another stack than the committed copy's or on a machine with none | its `calibration:` line; resume it, or take its store's `measure device` and `fit device` (step 3), the store `made by: no calibrate.sh command` names when it ended |

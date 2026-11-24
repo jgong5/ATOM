@@ -4,8 +4,11 @@
 A trace run is `compass record --trace`: its server ran under ATOM's kineto
 profiler on every TP rank, without Python stacks, from before the first
 request to its stop, and each rank wrote ``OUT/trace/rank_<r>/`` one gzipped
-chrome trace. `reduce` writes ``OUT/steps/dp0.busy.jsonl``: per line of the
-record, its ``step`` and ``b_target_ns``, and on an MTP record ``b_draft_ns``
+chrome trace, or under pipeline stages ``OUT/trace/pp<k>_rank_<r>/``, stage
+k's. Each stage is reduced on its own, against its own record: `reduce` writes
+``OUT/steps/dp0.busy.jsonl`` beside stage 0's and ``pp<k>.dp0.busy.jsonl``
+beside stage k's ``pp<k>.dp0.jsonl``: per line of the record, its ``step``
+and ``b_target_ns``, and on an MTP record ``b_draft_ns``
 and, for each drafter pass `PASSES` names that the line times, its busy time
 under that pass's ``b_`` name. `step_labels` labels a prefill pass by them, and
 under a `step_labels.Floor` by `floored`'s: each drafter part's busy time on
@@ -20,23 +23,28 @@ copies to the host and no kernel does, so they are left out. The target's are
 launched before the recorder's `TARGET_DONE` range opens, on a forward with
 none before its first drafter pass, and outside every drafter pass range; the
 rest are the draft's, and those launched inside a drafter pass's range that
-pass's too.
+pass's too. A stage's handoff, the receive of its input and the send of its
+output, is the recorder's `PP_RECV` and `PP_SEND` ranges: a kernel launched
+inside one joins no pass, and neither range ends one.
 
 A pass's busy time is the union of its kernels' device intervals plus each gap
 before one of them on the forward's device timeline: whole where that kernel's
 launch call had returned when the gap opened, so the device idled on its own,
 else capped at the rank's median such queued gap, since the device then waited
 for the host's launch. That median leaves out each queued gap of `ROUNDING` or
-less, one timestamp rounding step between two kernels that abut. A TP
+less, one timestamp rounding step between two kernels that abut. No gap counts
+the receive's device span, from its first kernel's start to its last one's
+end: a kernel the host queued behind the receive waited there for the stage
+before. A TP
 collective's kernel on one rank includes its wait for the peers: the n-th
 collective kernel (`COLLECTIVE`) of a forward, the target's or the drafter's,
 counts on every rank from its latest rank's start, and as queued once its
 latest rank's launch call returned. Each pass's busy time is its largest over
-the ranks.
+the stage's ranks.
 
-A trace directory not named ``rank_<r>``, a DP or a pipeline run's, refuses:
-per-rank busy time under DP is not reduced. So does a trace that lacks a
-forward's device rows: a forward with no kernel, or a launch call naming a
+A trace directory named neither ``rank_<r>`` nor ``pp<k>_rank_<r>``, a DP
+run's, refuses: per-rank busy time under DP is not reduced. So does a trace
+that lacks a forward's device rows: a forward with no kernel, or a launch call naming a
 kernel whose device row the trace does not hold. kineto keeps at most
 ROCTRACER_MAX_EVENTS rows a process, launch calls and device rows alike, and
 drops every later row unmarked; on a TP4 trace run its default of 5,000,000
@@ -55,9 +63,13 @@ from pathlib import Path
 
 from atom.compass.backends.json_file import read_jsonl
 from atom.compass.backends.step_labels import TRACE
-from atom.compass.parity import MARK, TARGET_DONE
+from atom.compass.parity import MARK, PP_RECV, PP_SEND, TARGET_DONE
 
 RECORD = "steps/dp0.jsonl"
+#: A trace directory: a TP rank's, or under pipeline stages a stage's TP rank's.
+RANK = re.compile(r"(?:pp(\d+)_)?rank_\d+")
+#: The recorder's ranges around a pipeline stage's handoff.
+HANDOFF = (PP_RECV, PP_SEND)
 GPU = ("kernel", "gpu_memcpy", "gpu_memset")
 RUNTIME = ("cuda_runtime", "cuda_driver")
 #: A kernel whose name matches is a TP collective: aiter's custom all-reduces,
@@ -111,7 +123,8 @@ def forwards(path) -> list[dict]:
     (start, end, launch return, pass, its drafter pass's line field or None,
     name, grid), in start order, the grid None for a copy, a memory set or a
     kernel replayed from a graph, and ``lost``, its launch calls that name a
-    kernel whose device row the trace does not hold."""
+    kernel whose device row the trace does not hold. A kernel launched in a
+    handoff range has no pass and the range's name for its field."""
     ranges, runs, marks, launches, kernels, computes = [], [], [], {}, [], set()
     named, rows = [], set()
     for e in events(path):
@@ -143,13 +156,15 @@ def forwards(path) -> list[dict]:
     for f0, f1, name in ranges:
         mine = [m for m in marks if f0 <= m[0] <= f1]
         done = [m[0] for m in mine if m[2] == TARGET_DONE]
-        drafts = [m for m in mine if m[2] != TARGET_DONE]
+        handoff = [m for m in mine if m[2] in HANDOFF]
+        drafts = [m for m in mine if m[2] != TARGET_DONE and m[2] not in HANDOFF]
         out.append(
             {
                 "tokens": int(re.search(r"tokens=(\d+)", name).group(1)),
                 "run": min((t for t in runs if f0 <= t <= f1), default=f0),
                 "end": min(done or [m[0] for m in drafts] or [f1 + 1]),
                 "drafts": drafts,
+                "handoff": handoff,
                 "kernels": [],
                 "lost": 0,
             }
@@ -165,6 +180,8 @@ def forwards(path) -> list[dict]:
         inside = [m[2] for m in f["drafts"] if m[0] <= launch <= m[1]]
         part = "target" if launch < f["end"] and not inside else "draft"
         key = next((m[len(MARK) :] for m in inside), None)
+        if hand := [m[2] for m in f["handoff"] if m[0] <= launch <= m[1]]:
+            part, key = None, hand[0]
         f["kernels"].append((launch, start, stop, queued, part, key, name, grid))
     for launch, corr in named:
         i = bisect_right(starts, launch) - 1
@@ -196,11 +213,15 @@ def _whole(dirs, ranks: list[list[dict]]) -> None:
 
 
 def _align(ranks: list[list[dict]]) -> None:
-    """Start each forward's n-th collective kernel on every rank no earlier
-    than its latest rank's start, queued at its latest launch return."""
+    """Start each forward's n-th collective kernel of a pass on every rank no
+    earlier than its latest rank's start, queued at its latest launch return."""
     for fs in zip(*ranks):
         calls = [
-            [j for j, k in enumerate(f["kernels"]) if COLLECTIVE.search(k[5])]
+            [
+                j
+                for j, k in enumerate(f["kernels"])
+                if k[3] is not None and COLLECTIVE.search(k[5])
+            ]
             for f in fs
         ]
         if len({len(c) for c in calls}) > 1:
@@ -218,11 +239,18 @@ def _align(ranks: list[list[dict]]) -> None:
 
 
 def _walk(kernels):
-    """Per kernel in start order: its passes, the union it adds, and the gap
-    before it with whether it was queued when the gap opened."""
+    """Per kernel of a pass in start order: its passes, the union it adds, and
+    the gap before it, less its overlap with the receive's device span, with
+    whether it was queued when the gap opened."""
+    recv = [k[:2] for k in kernels if k[4] == PP_RECV]
+    span = (min(a for a, _ in recv), max(b for _, b in recv)) if recv else None
     end = None
     for start, stop, queued, part, key, *_ in kernels:
+        if part is None:
+            continue
         gap = start - end if end is not None and start > end else 0.0
+        if gap and span:
+            gap -= max(min(start, span[1]) - max(end, span[0]), 0.0)
         was = end is not None and queued is not None and queued <= end
         add = stop - max(start, end) if end is not None else stop - start
         end = stop if end is None else max(end, stop)
@@ -248,23 +276,48 @@ def busy(fs: list[dict]) -> list[dict]:
     return out
 
 
-def _ranks(out) -> tuple[list[dict], list[list[dict]]]:
-    """The trace run in `out`'s record lines and each rank's forwards, whole
-    and with their collectives aligned."""
-    out = Path(out)
-    dirs = sorted((out / TRACE).iterdir())
-    if not dirs or any(not re.fullmatch(r"rank_\d+", d.name) for d in dirs):
+def _stages(out) -> dict[int, list[Path]]:
+    """The trace run in `out`'s trace directories by pipeline stage, in order:
+    a one-stage run's ``rank_<r>`` stage 0's, else ``pp<k>_rank_<r>`` stage k's."""
+    dirs = sorted((Path(out) / TRACE).iterdir())
+    names = [RANK.fullmatch(d.name) for d in dirs]
+    if not dirs or not all(names) or len({m[1] is None for m in names}) > 1:
         raise ValueError(
-            f"{out / TRACE} holds {[d.name for d in dirs]}, not rank_<r> alone: a "
-            "trace run under DP or pipeline stages is not reduced"
+            f"{Path(out) / TRACE} holds {[d.name for d in dirs]}, not rank_<r> "
+            "alone or pp<k>_rank_<r> alone: a trace run under DP is not reduced"
         )
+    stages = defaultdict(list)
+    for d, m in zip(dirs, names):
+        stages[int(m[1] or 0)].append(d)
+    return dict(sorted(stages.items()))
+
+
+def _record(out, stage: int) -> Path:
+    """Stage `stage`'s record in the run directory `out`."""
+    path = Path(out) / RECORD
+    return path.with_name(f"pp{stage}.{path.name}") if stage else path
+
+
+def _stage(record) -> int:
+    """The pipeline stage `record` is: k of ``pp<k>.dp<r>.jsonl``, else 0."""
+    named = re.match(r"pp(\d+)\.", Path(record).name)
+    return int(named[1]) if named else 0
+
+
+def _ranks(out, stage: int = 0) -> tuple[list[dict], list[list[dict]]]:
+    """The trace run in `out`'s `stage`: its record lines and each of its
+    ranks' forwards, whole and with their collectives aligned."""
+    out, stages = Path(out), _stages(out)
+    if stage not in stages:
+        raise ValueError(f"{out / TRACE} holds no trace of pipeline stage {stage}")
+    dirs = stages[stage]
     ranks = []
     for d in dirs:
         traces = sorted(d.glob("*.pt.trace.json.gz"))
         if len(traces) != 1:
             raise ValueError(f"{d} holds {len(traces)} traces, not one")
         ranks.append(forwards(traces[0]))
-    lines = read_jsonl(out / RECORD)
+    lines = read_jsonl(_record(out, stage))
     tokens = [sum(r[0] for r in s["rows"]) for s in lines]
     if any([f["tokens"] for f in fs] != tokens for fs in ranks):
         raise ValueError(
@@ -277,9 +330,16 @@ def _ranks(out) -> tuple[list[dict], list[list[dict]]]:
 
 
 def reduce(out) -> Path:
-    """Write the trace run in `out`'s busy lines beside its record; return
-    their path."""
-    lines, ranks = _ranks(out)
+    """Write the trace run in `out`'s busy lines beside each pipeline stage's
+    record; return the first stage's path."""
+    paths = [_reduce(out, stage) for stage in _stages(out)]
+    return paths[0]
+
+
+def _reduce(out, stage: int) -> Path:
+    """Write the busy lines of the trace run in `out`'s `stage` beside its
+    record; return their path."""
+    lines, ranks = _ranks(out, stage)
     per_rank = [busy(fs) for fs in ranks]
     rows = []
     for i, s in enumerate(lines):
@@ -294,18 +354,18 @@ def reduce(out) -> Path:
             if key in s:
                 row["b" + key[1:]] = got[key]
         rows.append(row)
-    path = (Path(out) / RECORD).with_suffix(".busy.jsonl")
+    path = _record(out, stage).with_suffix(".busy.jsonl")
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
     return path
 
 
-def drafter(out) -> list[list[tuple[dict, list]]]:
-    """Per line of the trace run in `out`'s record, per rank: the busy ns of
-    each drafter part `reduce` times on it, ``draft`` and each of `PASSES` the
+def drafter(out, stage: int = 0) -> list[list[tuple[dict, list]]]:
+    """Per line of the trace run in `out`'s `stage`'s record, per rank: the
+    busy ns of each drafter part `reduce` times on it, ``draft`` and each of `PASSES` the
     line times, and the draft's kernels, each (its pass's line field or None,
     name, grid, recorded ns), the grid None as `forwards` holds it; a line
     with no drafter has neither."""
-    lines, ranks = _ranks(out)
+    lines, ranks = _ranks(out, stage)
     per_rank = [busy(fs) for fs in ranks]
     got = []
     for i, s in enumerate(lines):
@@ -331,8 +391,9 @@ def floored(record, floor) -> list[dict]:
     less its kernels' known terms under `floor` (`step_labels.Floor.term`) on
     each rank, at its largest rank, by its busy line field; and under
     ``floor`` why a term is not known, per field. A kernel's shape is its
-    pass's, as `capture.population_steps` places the step: the draft-KV pass
-    at the step's, the rest of the draft at its drafter's."""
+    pass's, as `capture.population_steps` places the step in the record's
+    stage: the draft-KV pass at the step's, the rest of the draft at its
+    drafter's."""
     from atom.compass.capture import population_steps
 
     run = Path(record).parent.parent
@@ -341,11 +402,11 @@ def floored(record, floor) -> list[dict]:
             f"{record} is a trace run's record whose run directory holds no "
             f"{TRACE}/, from which the profiler's floor reads each drafter kernel"
         )
-    shapes = defaultdict(list)
-    for shape, line in population_steps([run], drafters=True):
+    shapes, stage = defaultdict(list), _stage(record)
+    for shape, line in population_steps([run], drafters=True, stage=stage):
         shapes[line["step"]].append(str(shape))
     rows = []
-    for s, ranks in zip(read_jsonl(record), drafter(run)):
+    for s, ranks in zip(read_jsonl(record), drafter(run, stage)):
         at, best, why = shapes[s["step"]], {}, defaultdict(set)
         for parts, kernels in ranks:
             got = dict(parts)
