@@ -9,9 +9,10 @@ person and an agent follow the same steps; an agent also keeps the rules in
 [With an agent](#with-an-agent).
 
 [QUICKSTART.md](QUICKSTART.md) is the developer's path for one configuration:
-records, fits, real runs and grading. This page uses its container, variables and
-platform readings, and never grades. [USER_QUICKSTART.md](USER_QUICKSTART.md)
-predicts one configuration on a host with no GPU at all.
+records, fits, real runs and grading. This page uses its variables, its platform
+readings and, for the commands a search prints, its GPU container, and never
+grades. [USER_QUICKSTART.md](USER_QUICKSTART.md) predicts one configuration on a
+host with no GPU at all.
 
 ## Limits
 
@@ -34,6 +35,13 @@ predicts one configuration on a host with no GPU at all.
 
 Set up QUICKSTART's [Environment](QUICKSTART.md#environment) and
 [Variables](QUICKSTART.md#variables), with these differences.
+
+- **A search whose candidates the store serves takes no GPU device.** It runs in
+  the container [Limits](#limits) names, set up as USER_QUICKSTART's
+  [Environment](USER_QUICKSTART.md#environment) does, not in QUICKSTART's GPU
+  container, which takes `--device /dev/kfd`. The GPU container, on a node of the
+  type the search predicts, is for a search that prints a calibration or a
+  readings measurement, and for the commands it prints.
 
 - **The tree is a clone, not a snapshot.** The check reads the head from git, so
   `$T` is a clone of `https://github.com/jgong5/ATOM` checked out at the head, and
