@@ -344,7 +344,7 @@ def test_a_record_states_its_deployment(tmp_path):
         "dp": 4,
         "tp": 1,
         "rungs": [1, 2, 4, 8, 16, 32],
-        "kv_tokens": 1000 * 64,  # run.json's engine, over its rank 0's
+        "kv_tokens": 1000 * 64 * 2,  # run.json's engine, over its rank 0's, at DCP 2
         "prefill_buckets": [256, 512],
         "chunk": 8192,
         "dcp": 2,
@@ -352,6 +352,36 @@ def test_a_record_states_its_deployment(tmp_path):
         "acceptance": 2.5,
         "moe_routing": [64, 4],
     }
+
+
+def test_a_dcp_record_s_kv_pool_holds_its_width_times_one_gpu_s_tokens(
+    tmp_path, monkeypatch
+):
+    """With decode context parallelism every GPU of the group holds a block's
+    tokens of a sequence in a block of its own, so a rank's pool holds the DCP
+    width times one GPU's `num_kvcache_blocks` x block in sequence tokens:
+    Kimi-K3.1's TP8 DCP8 smoke (5929 blocks of 128) holds 6,071,296, not
+    758,912. At DCP 1 (the serve line omits the option) it is one GPU's, as
+    before; a `run_json` pool reads its own serve line the same way."""
+    serve = ["-tp", "8", "--decode-context-parallel-size", "8"]
+    rec = _record_dir(tmp_path / "dcp8", kda=True, forced=False, serve=serve)
+    run = json.loads((rec / "run.json").read_text())
+    run["engine"] |= {"num_kvcache_blocks": 5929, "kv_cache_block_size": 128}
+    (rec / "run.json").write_text(json.dumps(run))
+    got = deploy.from_record(rec)
+    assert (got["dcp"], got["block_size"]) == (8, 128)
+    assert got["kv_tokens"] == 5929 * 128 * 8 == 6_071_296
+    assert deploy.pool_tokens(5929, 128, 1) == 758_912
+    monkeypatch.setenv("CALIB_RUN", str(rec))
+    assert deploy.kv_tokens({"run_json": "$CALIB_RUN/run.json"}, 64) == 6_071_296
+    raw = _config()
+    raw["deployment"] = {"from_record": str(rec), "trace_model": "k"}
+    assert deploy.parse(raw).deployment.kv_tokens == 6_071_296
+    one = _record_dir(tmp_path / "dcp1", serve=["-tp", "4"])
+    got = deploy.from_record(one)
+    assert (got["dcp"], got["kv_tokens"]) == (1, 1000 * 64)
+    monkeypatch.setenv("CALIB_RUN", str(one))
+    assert deploy.kv_tokens({"run_json": "$CALIB_RUN/run.json"}, 128) == 64000
 
 
 def test_a_kda_model_hits_at_its_state_checkpoint_and_acceptance_falls_back(tmp_path):
@@ -401,7 +431,7 @@ def test_a_field_beside_from_record_overrides_it_and_a_given_record_replaces_the
     dep = cfg.deployment
     assert dep.max_num_seqs == 16 and dep.trace_model == "m"
     assert dep.rungs == (1, 2, 4, 8, 16, 32) and dep.dcp == 2
-    assert cfg.raw["deployment"]["kv_tokens"] == 64000  # stated plain
+    assert cfg.raw["deployment"]["kv_tokens"] == 128000  # stated plain, at DCP 2
     raw["deployment"] = dict(DEPLOYMENT)
     followed = deploy.parse(raw, record=rec).deployment
     assert followed.max_num_seqs == 32 and followed.dp == 4 and followed.dcp == 2

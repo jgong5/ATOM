@@ -16,9 +16,10 @@ A config is a JSON document:
         "chunk": 65536,                  # --attn-prefill-chunk-size
         "block_size": 128,               # KV block
         "max_model_len": 1048576,
-        "kv_tokens": N | {"run_json": PATH},  # a rank's KV pool, in tokens:
-                                         # num_kvcache_blocks x block_size of
-                                         # a record's run.json engine
+        "kv_tokens": N | {"run_json": PATH},  # a rank's KV pool, in tokens
+                                         # of its sequences: num_kvcache_blocks
+                                         # x block_size of a record's run.json
+                                         # engine, times its DCP width
         "drafts": 5, "acceptance": 3.51, # speculative drafts and the forced
                                          # acceptance length (0 and 1: none)
         "prefix_unit": 128,              # tokens a prefix-cache hit comes in
@@ -223,15 +224,41 @@ def tokens(spec, dep: Deployment, over: int = 1) -> int:
 
 
 def kv_tokens(spec, block_size: int) -> int:
-    """A rank's KV pool in tokens: the number, or a run.json's engine
-    `num_kvcache_blocks` times its block (`$VAR`s in the path expand)."""
+    """A rank's KV pool in tokens of its sequences: the number, or a run.json's
+    engine `num_kvcache_blocks` times its block, times the decode context
+    parallel width its serve line ran (`pool_tokens`; `$VAR`s in the path
+    expand)."""
     if isinstance(spec, int):
         return spec
     path = Path(os.path.expandvars(spec["run_json"]))
-    engine = json.loads(path.read_text())["engine"]
-    return int(engine["num_kvcache_blocks"]) * int(
-        engine.get("kv_cache_block_size", block_size)
+    run = json.loads(path.read_text())
+    engine = run["engine"]
+    return pool_tokens(
+        int(engine["num_kvcache_blocks"]),
+        int(engine.get("kv_cache_block_size", block_size)),
+        int(_serve_args(run).decode_context_parallel_size),
     )
+
+
+def pool_tokens(blocks: int, block_size: int, dcp: int) -> int:
+    """The sequence tokens a rank's KV pool of `blocks` holds. ATOM's
+    `num_kvcache_blocks` is one GPU's pool; with decode context parallelism
+    (`--decode-context-parallel-size`, `dcp` > 1) each of the `dcp` GPUs holds
+    `block_size` tokens of a sequence in a block of its own (a sequence's
+    tokens are spread over them), so the pool holds `dcp` times one GPU's
+    share. KDA state checkpoints, stored in the same pool, are evictable and
+    take no running capacity (`page_unit_checkpoint.PageUnitCheckpointStore`):
+    they are not taken off."""
+    return blocks * block_size * dcp
+
+
+def _serve_args(run: dict):
+    """A run.json's serve line (``argv`` after ``--``, or all of it) read by
+    ATOM's own parser, so an option the line omits takes ATOM's default."""
+    from atom.compass.drive.runfile import _engine_args
+
+    argv = [str(a) for a in run.get("argv") or ()]
+    return _engine_args(argv[argv.index("--") + 1 :] if "--" in argv else argv)
 
 
 #: The keys of a routed-expert count and of a top-k in a model's config.json,
@@ -243,8 +270,9 @@ TOP_K = ("num_experts_per_tok", "num_experts_per_token", "moe_topk")
 def from_record(record) -> dict:
     """The deployment fields a record states, by the names `parse` reads: its
     run.json's engine (over its rank 0's ``dp0.engine.json``) for the ladder,
-    the scheduler's bounds, the block, the KV pool and the token-graph buckets,
-    the DP and TP widths and the drafter's width; its serve command line
+    the scheduler's bounds, the block, the KV pool (in sequence tokens, so
+    times the DCP width: `pool_tokens`) and the token-graph buckets, the DP and
+    TP widths and the drafter's width; its serve command line
     (run.json ``argv`` after ``--``), read by ATOM's own parser, so an option
     the line omits takes ATOM's default, for the prefill chunk, the DCP width
     and the forced acceptance (else one plus the mean accepted drafts of
@@ -253,8 +281,6 @@ def from_record(record) -> dict:
     (``linear_attn_config``) the state checkpoint interval a prefix hit lands
     on, refused below one token. `$VAR`s in the path expand. A field the
     record does not state is left out."""
-    from atom.compass.drive.runfile import _engine_args
-
     record = Path(os.path.expandvars(str(record)))
     if not (record / "run.json").exists() and (record / "real" / "run.json").exists():
         record = record / "real"  # a calibration run's: its server's record
@@ -264,8 +290,7 @@ def from_record(record) -> dict:
     if (steps / "dp0.engine.json").exists():
         engine = json.loads((steps / "dp0.engine.json").read_text())
     engine |= run.get("engine") or {}
-    argv = [str(a) for a in run.get("argv") or ()]
-    args = _engine_args(argv[argv.index("--") + 1 :] if "--" in argv else argv)
+    args = _serve_args(run)
     out = {}
     for name, key in (
         ("max_num_seqs", "max_num_seqs"),
@@ -280,7 +305,11 @@ def from_record(record) -> dict:
     if "ladder" in engine:
         out["rungs"] = [int(r) for r in engine["ladder"]]
     if "num_kvcache_blocks" in engine and "block_size" in out:
-        out["kv_tokens"] = int(engine["num_kvcache_blocks"]) * out["block_size"]
+        out["kv_tokens"] = pool_tokens(
+            int(engine["num_kvcache_blocks"]),
+            out["block_size"],
+            int(args.decode_context_parallel_size),
+        )
     if "prefill_buckets" in engine:
         out["prefill_buckets"] = [int(b) for b in engine["prefill_buckets"] or ()]
     out["chunk"] = int(args.attn_prefill_chunk_size)
