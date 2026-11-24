@@ -61,6 +61,7 @@ python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["rehears
 if (($#)); then
     [[ $1 == run ]] || { echo "$USAGE" >&2; exit 2; }
     "$ROOT/scripts/compass/cal_v1.sh" "$OUT/design" "$OUT/sim" "$@"
-    python3 -P "$ROOT/scripts/compass/check_v1.py" "$OUT/design" "$OUT/sim" --law "$LAW" "${HOST[@]}" || rc=1
+    COMPASS_PREFILL_LABEL=record python3 -P "$ROOT/scripts/compass/check_v1.py" "$OUT/design" "$OUT/sim" \
+        --law "$LAW" "${HOST[@]}" || rc=1
 fi
 exit $rc

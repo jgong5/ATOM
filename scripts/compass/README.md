@@ -1206,7 +1206,7 @@ PYTHONPATH=$T python3 $T/scripts/compass/gen_v1.py CONFIG DESIGN       # traces,
 PYTHONPATH=$T python3 $T/scripts/compass/plan_v1.py DESIGN --law LAW --host HOST   # plan.json, plan.md
 $T/scripts/compass/dry_v1.sh CONFIG LAW_DIR OUT                         # both, and the verdict
 MODEL=... HARNESS_PYTHON=$REAL_PY $T/scripts/compass/cal_v1.sh DESIGN OUT record --gpu 0,1,2,3 --store $ST -- $(args agg)
-PYTHONPATH=$T python3 $T/scripts/compass/check_v1.py DESIGN OUT --law LAW --host HOST
+COMPASS_PREFILL_LABEL=record PYTHONPATH=$T python3 $T/scripts/compass/check_v1.py DESIGN OUT --law LAW --host HOST
 ```
 
 - `gen_v1.py` writes each segment's lanes as weka traces (`atom/compass/calib/design.py`):

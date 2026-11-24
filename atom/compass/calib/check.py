@@ -69,8 +69,12 @@ def steps_dir(record) -> Path:
 def record_steps(record: Path, design: dict | None, cfg, law: Law, segment=None):
     """The record's steps as `engine.Step`s, each under its segment, and
     per step its measured device seconds at the priced rank (None where none).
-    With `segment`, every step of the record is that segment's and no client
-    run is read: a target workload's record (`ident.vectors`' `target`)."""
+    A step is its segment's where every real rank's rows belong to client runs
+    of that one segment, whatever its lanes (a lockstep drain's ranks each run
+    a lane of their own); a step whose rows no client run or two segments
+    claim is left out. With `segment`, every step of the record is that
+    segment's and no client run is read: a target workload's record
+    (`ident.vectors`' `target`)."""
     dep = cfg.deployment
     sdir = steps_dir(record)
     paths = sorted(sdir.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
@@ -95,9 +99,10 @@ def record_steps(record: Path, design: dict | None, cfg, law: Law, segment=None)
         group = {r: x[n] for r, x in enumerate(at) if n in x}
         real = {r: g for r, g in group.items() if not g[0]["is_dummy_run"]}
         runs = {whose.get((r, n)) for r in real} - {None}
-        if not real or (len(runs) != 1 and not segment):
+        segs = sorted({seg_of[k] for k in runs})
+        if not real or (len(segs) != 1 and not segment):
             continue
-        seg = segment or seg_of[min(runs)]  # the one client run
+        seg = segment or segs[0]  # the one segment, whatever its lanes
         kinds = {bool(row[2]) for s, _ in real.values() for row in s["rows"]}
         if len(kinds) != 1:
             continue  # mixed rows: a fit cuts it

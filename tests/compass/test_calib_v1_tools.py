@@ -488,6 +488,57 @@ def test_check_reads_a_record_per_segment_and_compares_it_with_the_plan(tmp_path
     assert short["decode r8 own 1rk"]["short"]
 
 
+def _lockstep_record(tmp_path, design_doc):
+    """A two-rank record of the two-lane segment D-b: each rank decodes its
+    own lane's requests at rung 2 for 30 steps, as a lockstep drain runs."""
+    seg = next(s for s in design_doc["segments"] if s["name"] == "D-b")
+    names = {0: ["a", "b"], 1: ["c"]}
+    steps = tmp_path / "rec" / "real" / "steps"
+    steps.mkdir(parents=True)
+    for r, mine in names.items():
+        lines = []
+        for n in range(30):
+            rows = [[2, 1000 + 7 * n + 100 * k, True] for k in range(len(mine))]
+            lines.append(
+                {
+                    "step": n,
+                    "dp_rank": r,
+                    "is_dummy_run": False,
+                    "named": [[k, k] for k in mine] if n == 0 else [],
+                    "batch": [[k] for k in mine],
+                    "rows": rows,
+                    "rung": 2,
+                    "moe_rows": 3 * 2 * 2,
+                    "moe_tokens": 6,
+                    "produces_output": True,
+                    "t_enter_ns": n * 10_000_000,
+                    "t_exit_ns": n * 10_000_000 + 9_000_000,
+                    "d_target_ns": 8_000_000,
+                }
+            )
+        (steps / f"dp{r}.jsonl").write_text(
+            "".join(json.dumps(x) + "\n" for x in lines)
+        )
+    for lane, mine in zip(seg["lanes"], names.values()):
+        export = tmp_path / "rec" / seg["name"] / lane["name"] / "artifacts"
+        export.mkdir(parents=True)
+        trace = f"{seg['name']}.{lane['name']}.x"
+        requests = {k: {"trace": trace, "sampling": {"ignore_eos": True}} for k in mine}
+        (export / "client_run.json").write_text(json.dumps({"requests": requests}))
+    return tmp_path / "rec"
+
+
+def test_check_reads_a_step_whose_ranks_run_lanes_of_one_segment(tmp_path):
+    """A lockstep drain's ranks each run a lane of their own: its steps hold
+    rows of two client runs, of one segment, and are that segment's."""
+    cfg = deploy.parse(_config())
+    doc = design.write(design.generate(cfg), cfg, tmp_path / "design")
+    law = engine.Law(_law(cfg.deployment.rungs, 2), HOST, 2)
+    steps, _ = check.record_steps(_lockstep_record(tmp_path, doc), doc, cfg, law)
+    assert len(steps) == 30 and {s.seg for s in steps} == {"D-b"}
+    assert all(sorted(r for r, *_ in s.ranks) == [0, 1] for s in steps)
+
+
 def test_check_v1_writes_its_report(tmp_path):
     cfg_raw = _config()
     cfg = deploy.parse(cfg_raw)
@@ -510,6 +561,8 @@ def test_check_v1_writes_its_report(tmp_path):
     assert got.returncode in (0, 1), got.stderr
     out = json.loads((rec / "check.json").read_text())
     assert out["steps"] == 30 and out["combos"][0]["actual"] == 30
+    # Unset, its prefill steps are labelled as the record's fit labels them.
+    assert out["prefill_label"] == "record"
     assert "## Identifiability on the record" in (rec / "check.md").read_text()
 
 

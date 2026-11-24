@@ -105,7 +105,7 @@ the config field to set by hand when no record states it.
    ```
 7. **Check** the record against its plan:
    ```
-   PYTHONPATH=$T python3 $T/scripts/compass/check_v1.py OUT/design REC --law LAW --host HOST
+   COMPASS_PREFILL_LABEL=record PYTHONPATH=$T python3 $T/scripts/compass/check_v1.py OUT/design REC --law LAW --host HOST
    ```
    A combination far short of the plan, or a vector that fails on the record's own steps,
    goes back to step 4.

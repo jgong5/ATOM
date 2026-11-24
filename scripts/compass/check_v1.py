@@ -19,13 +19,22 @@ and actual, those under half the plan (`short`) and those not planned
 steps (`atom.compass.calib.ident`); and per vector the relative residuals of
 its base form fitted on the record, overall and per segment (I5). Exits 1
 when a vector fails or a planned combination falls short.
+
+The record's steps are labelled as its fit labels them: an untraced prefill
+step from its own device window, `COMPASS_PREFILL_LABEL=record`
+(`step_labels.PREFILL_LABEL_ENV`), which it sets where unset; under the
+default ``trace`` labelling a calibration record, taken with no prefill trace,
+would hold no GPU-bound prefill step. check.json states the labelling under
+``prefill_label``.
 """
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
+from atom.compass.backends.step_labels import PREFILL_LABEL_ENV
 from atom.compass.calib import check, deploy, engine, ident, report
 
 
@@ -37,6 +46,7 @@ def main(argv=None) -> int:
     p.add_argument("--host", type=Path)
     p.add_argument("--floor", type=int, default=20)
     a = p.parse_args(argv)
+    os.environ.setdefault(PREFILL_LABEL_ENV, "record")
     doc = check.load_design(a.design)
     cfg = deploy.parse(doc["config"])
     plan = json.loads((a.design / "plan.json").read_text())
@@ -55,6 +65,7 @@ def main(argv=None) -> int:
     fits = check.residuals(cfg, steps, measured)
     out = {
         "record": str(a.record),
+        "prefill_label": os.environ[PREFILL_LABEL_ENV],
         "steps": len(steps),
         "combos": rows,
         "vectors": vectors,

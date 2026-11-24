@@ -21,7 +21,8 @@ commands, what each dry-run failure asks for, and what never changes.
 - Both, plus the verdict: `[RECORD=...] [TARGET=...] scripts/compass/dry_v1.sh CONFIG LAW_DIR OUT`.
 - Record on one server: `scripts/compass/cal_v1.sh DESIGN OUT record ...`. Hold a gpool
   lease for it.
-- Check a record against its plan: `scripts/compass/check_v1.py DESIGN REC --law LAW --host HOST`.
+- Check a record against its plan: `COMPASS_PREFILL_LABEL=record scripts/compass/check_v1.py DESIGN REC --law LAW --host HOST`
+  (the record's prefill steps labelled as its fit labels them).
 
 ## Rules
 

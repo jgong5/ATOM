@@ -28,7 +28,9 @@
 # lane has exited and the server holds no request (atom:requests_running plus
 # atom:requests_waiting at 0), then SETTLE_S. After the last, the command that
 # started the server is stopped and waited for. Exits 1 naming the segment
-# whose client failed, 2 on bad arguments.
+# whose client failed, 2 on bad arguments. Check the record against its plan
+# with COMPASS_PREFILL_LABEL=record check_v1.py DESIGN OUT --law LAW --host
+# HOST, which labels its prefill steps as the record's fit does.
 set -euo pipefail
 here=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")
 USAGE="usage: cal_v1.sh DESIGN OUT record|run COMPASS_ARGS... -- SERVE_ARGS..."
