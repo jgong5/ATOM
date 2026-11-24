@@ -233,7 +233,8 @@ adopted `moe_experts` column its median step holds at `SATURATED` of the
 experts (`_peer_rung`, `PEER_TOKENS_ENV`); `draft_peer_tokens` adds it to the
 draft law's decode rungs above `dp` 1, every one as ``all``
 (`DRAFT_PEER_TOKENS_ENV`): a draft's MoE runs on its group's rows too. The draft
-law takes none of the others. A vector carrying one of these columns states,
+law takes none of the others. The `shared` form, whose one decode solve shares
+the base columns over rungs, refuses `row_padding` and `peer_tokens`. A vector carrying one of these columns states,
 under `fit.vif`, each one's variance inflation factor over the rows it was
 fitted on (`_vif`), how far the other columns already hold it.
 
@@ -394,8 +395,9 @@ NO_BUCKETS = "no record states prefill buckets, so the prefill vector adds no pa
 #: stated here, as this package imports nothing from the engine.
 LEVEL = "level"
 DEFAULT_LEVEL = 3
-#: The switches of the opt-in columns (`env_options`), each off unless set to
-#: ``1``: decode `row_padding`, prefill `gather_rows` and `moe_imbalance`.
+#: The switches of the opt-in columns (`env_options`), each on at ``1``, off at
+#: ``0`` or unset, and refused at any other value (`_switch`): decode
+#: `row_padding`, prefill `gather_rows` and `moe_imbalance`.
 ROW_PADDING_ENV = "COMPASS_FIT_ROW_PADDING"
 GATHER_ROWS_ENV = "COMPASS_FIT_GATHER_ROWS"
 MOE_IMBALANCE_ENV = "COMPASS_FIT_MOE_IMBALANCE"
@@ -440,8 +442,8 @@ def _prefill_counts(
 ) -> tuple:
     """The prefill vector's features of `view`'s step, `where` naming it in a
     refusal, as `_features` states them; under `eager` its `EAGER_DUMMY`,
-    under `cold` its `cold_peer_rows`, those of `GATHER_COLUMNS` `cols`
-    (`_columns`) holds, under `share` its `PEER_SHARE`, under `kda` its `KDA`
+    under `cold` its `cold_peer_rows`, the `GATHER_COLUMNS` `cols` turns on
+    (`_gathered`), under `share` its `PEER_SHARE`, under `kda` its `KDA`
     columns."""
     r = view.prefill
     counts = (1, sum_tokens(r), sum_query_square(r), sum_query_cached(r))
@@ -465,13 +467,11 @@ def _prefill_counts(
                     "are priced by"
                 )
             counts += (peers,)
-        for feature in GATHER_COLUMNS if cols else ():
-            if feature == "gather_rows" and cols["gather_rows"]:
+        for feature in _gathered(cols):
+            if feature == "gather_rows":
                 got = gather_rows(view, buckets, dp)
-            elif feature == "moe_imbalance" and cols["moe_imbalance"] is not None:
-                got = moe_imbalance(view, buckets, dp, cols["moe_imbalance"])
             else:
-                continue
+                got = moe_imbalance(view, buckets, dp, cols["moe_imbalance"])
             if got is None:
                 raise ValueError(
                     f"{where} has no group_max_tokens, which its {feature} is "
@@ -561,22 +561,29 @@ def _kda(options) -> bool:
 
 def _columns(options, draft: bool = False) -> dict:
     """The opt-in columns `options` asks a law's vectors to add (`env_options`):
-    `row_padding` on decode, `gather_rows` and `moe_imbalance` (its
-    `min_spread`, or None) on prefill; none on a draft law. Each prefill one
-    prices a data-parallel group's gather, so `dp` 1 refuses it, and
-    `gather_rows`, which reads which steps replay a token graph, refuses
-    records stating no prefill buckets; the `shared` form refuses
+    `row_padding` on decode, True or False, and on prefill `gather_rows`, True
+    or None, and `moe_imbalance`, its `min_spread` or None; none on a draft
+    law. Each prefill one prices a data-parallel group's gather, so `dp` 1
+    refuses it, and `gather_rows`, which reads which steps replay a token
+    graph, refuses records stating no prefill buckets; a `min_spread` below 0,
+    which `StepLinearLaw` refuses, is refused; the `shared` form refuses
     `row_padding`, whose decode solve shares the base columns over rungs."""
     options = options or {}
     cols = {
         "row_padding": bool(options.get("row_padding")),
-        "gather_rows": bool(options.get("gather_rows")),
+        "gather_rows": True if options.get("gather_rows") else None,
         "moe_imbalance": options.get("moe_imbalance"),
     }
     if draft:
-        return {"row_padding": False, "gather_rows": False, "moe_imbalance": None}
+        return {"row_padding": False, "gather_rows": None, "moe_imbalance": None}
     form, dp = _options(options)
-    gathered = [f for f in GATHER_COLUMNS if cols[f] not in (False, None)]
+    spread = cols["moe_imbalance"]
+    if spread is not None and not spread >= 0:
+        raise ValueError(
+            f"moe_imbalance's min_spread is a share of moe_rows, 0 or more, not "
+            f"{spread!r}"
+        )
+    gathered = _gathered(cols)
     if gathered and dp == 1:
         raise ValueError(
             f"{' and '.join(gathered)} price a data-parallel group's MoE gather, "
@@ -592,22 +599,39 @@ def _columns(options, draft: bool = False) -> dict:
     return cols
 
 
+def _gathered(cols) -> list[str]:
+    """The prefill `GATHER_COLUMNS` that `cols` (`_columns`) turns on, each
+    one whose entry is not None, so `moe_imbalance` at a `min_spread` of 0
+    is on; none when `cols` is None."""
+    return [f for f in GATHER_COLUMNS if cols and cols[f] is not None]
+
+
+def _switch(env, name: str) -> bool:
+    """Whether the switch `name` in `env` is on: ``1`` on, ``0`` or unset
+    off, and any other value refused."""
+    value = env.get(name) or "0"
+    if value not in ("0", "1"):
+        raise ValueError(f"{name}={value} is not 0 or 1")
+    return value == "1"
+
+
 def env_options(environ=None) -> dict:
     """The `fit` options the opt-in column switches in `environ`, the process's
     environment by default, set: `ROW_PADDING_ENV`, `GATHER_ROWS_ENV` and
     `MOE_IMBALANCE_ENV` at ``1`` (with `MOE_MIN_SPREAD_ENV`'s share), the
     `MOE_SELECT_ENV` rule and the `PEER_TOKENS_ENV` and `DRAFT_PEER_TOKENS_ENV`
-    rungs; none set, none."""
+    rungs; none set, none. A switch set to anything but ``0`` or ``1`` is
+    refused (`_switch`)."""
     env = os.environ if environ is None else environ
     out = {}
     for key, name in (
         ("row_padding", ROW_PADDING_ENV),
         ("gather_rows", GATHER_ROWS_ENV),
     ):
-        if env.get(name) == "1":
+        if _switch(env, name):
             out[key] = True
     spread = env.get(MOE_MIN_SPREAD_ENV)
-    if env.get(MOE_IMBALANCE_ENV) == "1":
+    if _switch(env, MOE_IMBALANCE_ENV):
         out["moe_imbalance"] = MOE_MIN_SPREAD if spread is None else float(spread)
     elif spread is not None:
         raise ValueError(
@@ -2532,6 +2556,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             "peer_tokens counts a data-parallel group's peers' tokens, and these "
             "records run one rank"
         )
+    if peers and form == "shared":
+        raise ValueError("the shared form fits no peer_tokens column")
     samples = [
         (
             s
@@ -2563,7 +2589,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     prefill = list(HISTORY if form == "history" else PREFILL)
     prefill += ["cached_seqs"] * (form == "cached_seqs") + ["moe_rows"] * (dp > 1)
     prefill += ["serial_moe_rows"] * serial + ["cold_peer_rows"] * cold
-    gathered = [f for f in GATHER_COLUMNS if cols[f] not in (False, None)]
+    gathered = _gathered(cols)
     prefill += gathered
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
     prefill += list(PEER_SHARE) * share
