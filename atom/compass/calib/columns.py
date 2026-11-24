@@ -119,7 +119,9 @@ def _ones(
         law = {"provenance": "ones", "prefill": _vector(names, extra), "decode": {}}
     else:
         key = EAGER if rung is None else str(rung)
-        law = {"provenance": "ones", "decode": {key: _vector(names)}}
+        # rowmod counts at its vector's modulus; one probes that it is priced
+        modulus = {"rowmod": 1} if "rowmod" in names else None
+        law = {"provenance": "ones", "decode": {key: _vector(names, modulus)}}
     if routing:
         law["moe_routing"] = {"experts": routing[0], "top_k": routing[1]}
     return StepLinearBackend(StepLinearLaw(law), dp=dp)
@@ -134,7 +136,7 @@ def backend_prices(kind: str, name: str) -> bool:
     probe = (*base, name) + (("padding",) if name == "gather_rows" else ())
     try:
         _ones(kind, probe, 1, (256,), (8, 2))
-    except (ValueError, KeyError):
+    except ValueError:
         return False
     return True
 
@@ -149,8 +151,14 @@ def values(
 ) -> tuple[float, ...]:
     """`view`'s value of each of `names`, a `kind` vector's columns, in order;
     `min_spread` the share of the gather's rows below which `moe_imbalance`
-    reads 0, the floor the law's fit took."""
+    reads 0, the floor the law's fit took. `rowmod` refuses: its count is
+    over the modulus a fitted law's vector states, which a config does not."""
     names = tuple(names)
+    if kind == "decode" and "rowmod" in names:
+        raise ValueError(
+            "decode column rowmod is counted at its law's modulus, which a "
+            "config does not state"
+        )
     known = tuple(n for n in names if backend_prices(kind, n))
     other = [n for n in names if n not in known]
     unknown = [n for n in other if n not in PROVISIONAL[kind]]
