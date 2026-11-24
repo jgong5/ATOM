@@ -46,14 +46,14 @@
   "segment_overhead_s": 35
  },
  "segments": [
-  {"name": "D-v1", "kind": "drain", "purpose": "each rung's fixed cost at small context", "lanes": [{"pin": 0, "groups": [{"rows": 64, "prompt": 4096}]}]},
-  {"name": "D-v2", "kind": "drain", "purpose": "row padding at low context: one long anchor among short rows", "lanes": [{"pin": 0, "groups": [{"rows": 63, "prompt": 4096, "then": 512}, {"rows": 1, "prompt": 900000, "last": true, "then": 512}]}]},
-  {"name": "D-v3", "kind": "drain", "purpose": "long context at the high rungs: half the KV pool over 64 rows", "lanes": [{"pin": 0, "groups": [{"rows": 64, "prompt": {"kv_share": 0.5}, "then": 512}]}]},
-  {"name": "D-v3low", "kind": "drain", "purpose": "long context at the low rungs: nine anchors leave last", "lanes": [{"pin": 0, "groups": [{"rows": 55, "prompt": 7168, "then": 512}, {"rows": 9, "prompt": {"kv_share": 0.5, "over": 9}, "last": true, "then": 512}]}]},
-  {"name": "P-quads", "kind": "quads", "purpose": "prefill scale x density; checkpoint crossings", "scales": [1024, 2048, 4096, 8192, 12288, 16384], "shares": [1.0], "sparse_steps": [0, 150, 0, 0, 300, 0]},
-  {"name": "P-backlog", "kind": "backlog", "purpose": "long chunks sharing the step budget with short prompts", "long": [300032, 589824], "short": [512, 16384], "short_turns": 40, "short_sessions": 3},
-  {"name": "P-trickle", "kind": "trickle", "purpose": "short prefills on long histories: hits at checkpoint boundaries, recomputed tails", "firsts": [200704, 400384, 600064], "deltas": [4096, 8192, 12288, 16384, 2048], "outs": [16, 64, 1], "gaps": [0.5, 1.0, 2.0], "turns": 11},
-  {"name": "P-rows-a", "kind": "rows", "purpose": "prefill steps of many rows", "requests": 2000, "prompt": [64, 4096], "out1": 0.8, "outs": [1, 4, 16], "concurrency": 64},
-  {"name": "P-rows-b", "kind": "rows", "purpose": "single-row prompts of 8-16k: query_square apart from tokens at output steps", "requests": 160, "prompt": [8192, 16384], "out1": 0.8, "outs": [1, 8, 32], "concurrency": 1}
+  {"name": "D-v1", "kind": "drain", "purpose": "each rung's fixed cost at small context", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}]},
+  {"name": "D-v2", "kind": "drain", "purpose": "row padding at low context: one long anchor among short rows", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0, "minus": 1}, "prompt": 4096, "then": 512}, {"rows": 1, "prompt": {"len_share": 0.8583}, "last": true, "then": 512}]}]},
+  {"name": "D-v3", "kind": "drain", "purpose": "long context at the high rungs: half the KV pool over 64 rows", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": {"kv_share": 0.5}, "then": 512}]}]},
+  {"name": "D-v3low", "kind": "drain", "purpose": "long context at the low rungs: nine anchors leave last", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0, "minus": 9}, "prompt": 7168, "then": 512}, {"rows": 9, "prompt": {"kv_share": 0.5, "over": 9}, "last": true, "then": 512}]}]},
+  {"name": "P-quads", "kind": "quads", "purpose": "prefill scale x density; checkpoint crossings", "scales": [1024, 2048, 4096, {"budget_share": 0.5}, {"budget_share": 0.75}, {"budget_share": 1.0}], "shares": [1.0], "sparse_steps": [0, 150, 0, 0, 300, 0]},
+  {"name": "P-backlog", "kind": "backlog", "purpose": "long chunks sharing the step budget with short prompts", "long": [{"len_share": 0.28613}, {"len_share": 0.5625}], "short": [512, {"budget_share": 1.0}], "short_turns": 40, "short_sessions": 3},
+  {"name": "P-trickle", "kind": "trickle", "purpose": "short prefills on long histories: hits at checkpoint boundaries, recomputed tails", "firsts": [{"len_share": 0.1914}, {"len_share": 0.38184}, {"len_share": 0.57227}], "deltas": [4096, 8192, 12288, 16384, 2048], "outs": [16, 64, 1], "gaps": [0.5, 1.0, 2.0], "turns": 11},
+  {"name": "P-rows-a", "kind": "rows", "purpose": "prefill steps of many rows", "requests": 2000, "prompt": [64, 4096], "out1": 0.8, "outs": [1, 4, 16], "concurrency": {"seqs_share": 1.0, "dp": true}},
+  {"name": "P-rows-b", "kind": "rows", "purpose": "single-row prompts of 8-16k: query_square apart from tokens at output steps", "requests": 160, "prompt": [{"budget_share": 0.5}, {"budget_share": 1.0}], "out1": 0.8, "outs": [1, 8, 32], "concurrency": {"per_rank": 1, "dp": true}}
  ]
 }

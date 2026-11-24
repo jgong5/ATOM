@@ -1242,6 +1242,15 @@ PYTHONPATH=$T python3 $T/scripts/compass/check_v1.py DESIGN OUT --law LAW --host
   GPU-bound steps: the mean (target-weighted I criterion), 95th percentile and worst, not
   gated. G and I are variance under the stated form; form bias shows only in the record's
   residuals per segment and in held-out grading.
+- A design follows its deployment: `gen_v1.py --record RECORD` (`RECORD=` for `dry_v1.sh`)
+  takes the deployment a record ran (`atom/compass/calib/deploy.py` `from_record`: the
+  ladder, the scheduler's bounds, the KV pool, the widths, the drafts and acceptance, the
+  MoE routing), a deployment block may hold `from_record` with fields that override it, and
+  a segment's sizes are relative to the deployment (`design.count`, `design.tokens`); a
+  segment needing more DP ranks than the deployment has is skipped (`min_dp`), and a rung
+  the law holds no vector for is rehearsed on its nearest rung's (`engine.proxied`).
+  `scripts/compass/calib/README.md` is the procedure for a deployment change, and the
+  `compass-calibration` skill points at it.
 - A config may `extend` another and `insert` segments into it, and a segment of kind
   `copy` generates another segment again under its own name (new traces, so it hits no
   cache the first left): `cellA_v1x.json` is `cellA_v1.json` with D-v1 repeated mid-record

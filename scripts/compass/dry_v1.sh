@@ -12,6 +12,14 @@
 #             laws, host/host_laws.json when there
 #   OUT       an absent directory: OUT/design (gen_v1.py, plan_v1.py: the
 #             traces, design.json, plan.json, plan.md)
+#   RECORD    a record whose deployment the design takes in place of the
+#             config's own fields (gen_v1.py --record); unset, the config's
+#   TARGET    records of target workloads, space-separated, whose GPU-bound
+#             steps the report gives each vector's error at (plan_v1.py --target)
+#
+# A rung the law holds no vector for (a deployment that captures more) is
+# rehearsed on its nearest rung's prices (atom/compass/calib/engine.py proxied),
+# and plan.md names it.
 #
 # The rehearsal (atom/compass/calib/engine.py) forms the steps a DP engine
 # would from the design, prices them on the law, keeps the GPU-bound ones,
@@ -39,8 +47,13 @@ LAW=$LAW_DIR/law.json
 HOST=()
 [[ -s $LAW_DIR/host/host_laws.json ]] && HOST=(--host "$LAW_DIR/host/host_laws.json")
 export PYTHONPATH=$ROOT
-python3 -P "$ROOT/scripts/compass/gen_v1.py" "$CONFIG" "$OUT/design"
-python3 -P "$ROOT/scripts/compass/plan_v1.py" "$OUT/design" --law "$LAW" "${HOST[@]}" > "$OUT/plan.log"
+FROM=()
+[[ -z ${RECORD-} ]] || FROM=(--record "$RECORD")
+TARGETS=()
+for t in ${TARGET-}; do TARGETS+=(--target "$t"); done
+python3 -P "$ROOT/scripts/compass/gen_v1.py" "$CONFIG" "$OUT/design" "${FROM[@]}"
+python3 -P "$ROOT/scripts/compass/plan_v1.py" "$OUT/design" --law "$LAW" "${HOST[@]}" "${TARGETS[@]}" \
+    > "$OUT/plan.log"
 cat "$OUT/design/plan.md"
 rc=0
 python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["rehearsal"]["pass"] else 1)' \

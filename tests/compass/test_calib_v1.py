@@ -692,3 +692,193 @@ def test_a_target_record_is_read_whole_as_one_segment(tmp_path):
         rec / "real" / "steps", None, cfg, law, segment="target"
     )
     assert len(steps) == 30 and {s.seg for s in steps} == {"target"}
+
+
+# -- a design that follows the deployment -------------------------------------------
+
+
+def _dep(**over):
+    raw = _config()
+    raw["deployment"] = {**DEPLOYMENT, **over}
+    return deploy.parse(raw).deployment
+
+
+def test_a_count_is_a_share_of_max_num_seqs_a_rank_or_the_group():
+    dep = _dep(max_num_seqs=64, dp=4)
+    assert design.count(7, dep) == 7
+    assert design.count({"seqs_share": 1.0}, dep) == 64
+    assert design.count({"seqs_share": 1.0, "minus": 9}, dep) == 55
+    assert design.count({"seqs_share": 0.125}, dep) == 8
+    assert design.count({"seqs_share": 1.0, "dp": True}, dep) == 256
+    assert design.count({"seqs_share": 1.0, "per_rank": -1, "dp": True}, dep) == 252
+    assert design.count({"per_rank": 1, "dp": True}, dep) == 4
+    with pytest.raises(ValueError, match="takes"):
+        design.count({"seqs": 1}, dep)
+    with pytest.raises(ValueError, match="is 0"):
+        design.count({"seqs_share": 1.0, "minus": 64}, dep)
+
+
+def test_a_token_size_is_a_share_of_the_pool_the_model_the_budget_or_a_bucket():
+    dep = _dep(kv_tokens=1_000_000, max_model_len=65536, max_num_batched_tokens=4096)
+    assert design.tokens(1000, dep) == 1000  # a number is taken as given
+    assert design.tokens({"kv_share": 0.5}, dep, over=10) == design.whole(50_000, dep)
+    # held under LEN_CAP of the model length
+    assert design.tokens({"kv_share": 0.5}, dep) == design.whole(0.9 * 65536, dep)
+    assert design.tokens({"len_share": 0.5}, dep) == 32768
+    # under the pool split over the rows
+    assert design.tokens({"len_share": 1.0}, dep, over=100) == design.whole(10_000, dep)
+    assert design.tokens({"budget_share": 0.75}, dep) == 3072
+    assert design.tokens({"bucket_share": 1.0}, dep) == 1024
+    with pytest.raises(ValueError, match="buckets"):
+        design.tokens({"bucket_share": 1.0}, _dep(prefill_buckets=[]))
+    with pytest.raises(ValueError, match="takes"):
+        design.tokens({"kv": 0.5}, dep)
+
+
+def _record_dir(path: Path, kda: bool = False, forced: bool = True, cal: bool = False):
+    """A record as `compass record` lays it out (or `cal_v1.sh`'s OUT with `cal`),
+    its model's config.json beside it."""
+    model = path / "model"
+    model.mkdir(parents=True)
+    hf = {"n_routed_experts": 64, "num_experts_per_tok": 4, "top_k": 50}
+    if kda:
+        hf = {"text_config": {"num_experts": 32, "num_experts_per_token": 8}}
+        hf["text_config"]["linear_attn_config"] = {"kda_layers": [1, 2]}
+    (model / "config.json").write_text(json.dumps(hf))
+    rec = path / "rec" / ("real" if cal else "")
+    (rec / "steps").mkdir(parents=True)
+    serve = [
+        "--model",
+        str(model),
+        "-tp",
+        "4",
+        "--enable-dp-attention",
+        "--attn-prefill-chunk-size",
+        "8192",
+        "--state-checkpoint-interval-tokens",
+        "4096",
+        "--decode-context-parallel-size",
+        "2",
+        "--num-speculative-tokens",
+        "3",
+    ]
+    if forced:
+        serve += ["--spec-decode-acceptance-length", "2.5"]
+    run = {
+        "argv": ["-c", "record", "--gpu", "0", "--", *serve],
+        "engine": {
+            "max_num_seqs": 32,
+            "max_num_batched_tokens": 8192,
+            "max_model_len": 131072,
+            "kv_cache_block_size": 64,
+            "num_kvcache_blocks": 1000,
+            "ladder": [1, 2, 4, 8, 16, 32],
+        },
+    }
+    (rec / "run.json").write_text(json.dumps(run))
+    engine = {
+        "speculative": ["dspark", 3],
+        "ladder": [1, 2, 4, 8, 16, 32],
+        "data_parallel_size": 4,
+        "tensor_parallel_size": 1,
+        "num_kvcache_blocks": 999,
+        "kv_cache_block_size": 64,
+        "prefill_buckets": [256, 512],
+    }
+    (rec / "steps" / "dp0.engine.json").write_text(json.dumps(engine))
+    (rec / "steps" / "dp0.acceptance.json").write_text(
+        json.dumps({"draft_tokens": 3, "distribution": {"1": 1, "2": 3}})
+    )
+    return path / "rec"
+
+
+def test_a_record_states_its_deployment(tmp_path):
+    got = deploy.from_record(_record_dir(tmp_path))
+    assert got == {
+        "max_num_seqs": 32,
+        "max_num_batched_tokens": 8192,
+        "max_model_len": 131072,
+        "block_size": 64,
+        "dp": 4,
+        "tp": 1,
+        "rungs": [1, 2, 4, 8, 16, 32],
+        "kv_tokens": 1000 * 64,  # the run's engine, over its rank 0's
+        "prefill_buckets": [256, 512],
+        "chunk": 8192,
+        "dcp": 2,
+        "drafts": 3,
+        "acceptance": 2.5,
+        "moe_routing": [64, 4],
+    }
+
+
+def test_a_kda_model_hits_at_its_state_checkpoint_and_acceptance_falls_back(tmp_path):
+    got = deploy.from_record(_record_dir(tmp_path, kda=True, forced=False, cal=True))
+    assert got["moe_routing"] == [32, 8] and got["prefix_unit"] == 4096
+    assert got["acceptance"] == pytest.approx(1 + (1 * 1 + 2 * 3) / 4)
+
+
+def test_a_field_beside_from_record_overrides_it_and_a_given_record_replaces_the_config(
+    tmp_path,
+):
+    rec = _record_dir(tmp_path)
+    raw = _config()
+    raw["deployment"] = {
+        "from_record": str(rec),
+        "max_num_seqs": 16,
+        "trace_model": "m",
+    }
+    dep = deploy.parse(raw).deployment
+    assert (
+        dep.max_num_seqs == 16
+        and dep.rungs == (1, 2, 4, 8, 16, 32)
+        and dep.trace_model == "m"
+    )
+    assert (
+        deploy.parse(raw).raw["deployment"]["kv_tokens"] == 64000
+    )  # design.json states it plain
+    raw["deployment"] = dict(DEPLOYMENT)
+    followed = deploy.parse(raw, record=rec).deployment
+    assert followed.max_num_seqs == 32 and followed.dp == 4 and followed.dcp == 2
+    assert followed.trace_block == 64  # what a record does not state stays the config's
+
+
+def test_every_config_in_the_tree_follows_a_doubled_max_num_seqs():
+    for path in sorted(CONFIGS.glob("*.json")):
+        raw = deploy.resolve(json.loads(path.read_text()), path.parent)
+        dep = raw["deployment"]
+        raw["deployment"] = {
+            **dep,
+            "max_num_seqs": 2 * dep["max_num_seqs"],
+            "rungs": [*dep["rungs"], 2 * dep["max_num_seqs"]],
+        }
+        cfg = deploy.parse(raw)
+        made = {s.name: s for s in design.generate(cfg)}
+        v1 = made["D-v1"].lanes[0]
+        assert len(v1.sessions) == cfg.deployment.max_num_seqs, path.name
+
+
+def test_a_rung_the_law_lacks_is_priced_by_its_nearest():
+    params = _law([1, 2], 2)
+    params["draft"] = {
+        "provenance": "synthetic",
+        "decode": {"2": params["decode"]["2"]},
+    }
+    got, proxy = engine.proxied(params, (1, 2, 4, 8))
+    assert proxy == {4: 2, 8: 2}
+    assert got["decode"]["8"] == params["decode"]["2"] and got["draft"]["decode"]["4"]
+    assert "4" not in params["decode"]  # the law given is left as it was
+    law = engine.Law(params, HOST, 2, (1, 2, 4))
+    assert law.proxy == {4: 2}
+
+
+def test_a_segment_needing_more_dp_ranks_than_the_deployment_has_is_skipped(tmp_path):
+    path = CONFIGS / "cellA_v1.json"
+    raw = deploy.resolve(json.loads(path.read_text()), path.parent)
+    raw["deployment"] = {**raw["deployment"], "dp": 1}
+    cfg = deploy.parse(raw)
+    assert set(design.skipped(cfg)) == {"D-sym", "D-multi"}
+    names = [s.name for s in design.generate(cfg)]
+    assert "D-sym" not in names and "D-v1" in names
+    doc = design.write(design.generate(cfg), cfg, tmp_path)
+    assert doc["skipped"] == {"D-sym": 2, "D-multi": 4}
