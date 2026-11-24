@@ -86,7 +86,12 @@ import traceback
 from pathlib import Path
 
 from atom.compass import run as compass_run
-from atom.compass.artifacts import ArtifactRefusal, machine_platform
+from atom.compass.artifacts import (
+    ArtifactRefusal,
+    Kind,
+    keyed_platform,
+    machine_platform,
+)
 from atom.compass.drive import lacking, reuse, runfile, serve
 from atom.compass.drive import run as drive_run
 from atom.compass.fit.device import compose
@@ -578,7 +583,7 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                     key = [config.model, machine_platform(machine), keyed(config)]
                     into = str(into or made[0] / "store")
                     law["calibration"] = {"key": key, "in": str(made[0]), "into": into}
-                    if (ended := made[3]) and _refits(ended, command, config, atom):
+                    if (ended := made[3]) and _refits(ended, command, key, atom):
                         held = started_store(ended) or ended / "store"
                         law["made_by"] = [REFITS.format(ended, held)]
                         del law["calibration"]  # nothing for `_borrowing` to name
@@ -658,16 +663,16 @@ def started_store(directory: Path) -> str | None:
     return next((s[len("store ") :] for s in given if s.startswith("store ")), None)
 
 
-def _refits(ended: Path, command: str, config, atom: str) -> bool:
-    """Whether the `calibrate.sh` `command` for `config` refits the law the
-    calibration that ended in `ended` fitted: it takes what that one took, as
-    its `INPUTS` state it (ATOM's arguments, the traces and the records), and
-    that law's key states `config`'s model, the head's ATOM digest `atom`, and
-    `config`'s engine config as `keyed` states it under this environment, the
-    instance's, whose performance variables the command sets, as `reuse.law`
-    matches a store law to `config`. No command, as `lacking.calibration`
-    words why there is none, takes nothing; a directory holding no law refits
-    none."""
+def _refits(ended: Path, command: str, key: list, atom: str) -> bool:
+    """Whether the `calibrate.sh` `command` refits the law the calibration
+    that ended in `ended` fitted: it takes what that one took, as its `INPUTS`
+    state it (ATOM's arguments, the traces and the records), and that law is
+    at `key`, where the command's law publishes, at the head's ATOM digest
+    `atom`, as `reuse.law` matches a store law: `key`'s model, the platform of
+    the machine, and the engine config as `keyed` states it under the
+    instance's environment, whose performance variables the command sets. No
+    command, as `lacking.calibration` words why there is none, takes nothing;
+    a directory holding no law refits none."""
     if str(lacking.CALIBRATE) not in (line := command.split("\n")[0]):
         return False
     words = shlex.split(line)
@@ -683,10 +688,12 @@ def _refits(ended: Path, command: str, config, atom: str) -> bool:
     took = [s for s in took if s.startswith(("atom ", "traces ", "record "))]
     if took != taken or not (ended / FITTED).is_file():
         return False
-    key = json.loads((ended / FITTED).read_text())["key"]
-    model = compass_run._file_digest(config.model, "config.json")
+    model, platform, engine = key
+    model = compass_run._file_digest(model, "config.json")
     held = {"model": model, "source_root": compass_run.source_root(atom)}
-    return reuse.at_key(key, keyed(config), **held)
+    held |= keyed_platform(Kind.STEP_LINEAR_LAW, platform)
+    fitted = json.loads((ended / FITTED).read_text())["key"]
+    return reuse.at_key(fitted, engine, **held)
 
 
 def _resolved(args, arch: str):

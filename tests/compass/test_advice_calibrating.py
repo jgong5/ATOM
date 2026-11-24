@@ -61,10 +61,11 @@ def _env(found: dict, name: str) -> dict:
     return dict(w.split("=", 1) for w in words if "=" in w and w[0].isupper())
 
 
-def _fitted(directory, config, atom=None) -> None:
+def _fitted(directory, config, atom=None, platform=PLATFORM) -> None:
     """The law the stub's fit wrote in `directory`, keyed as `compass fit steps`
     keys it: `config`'s model and engine config, under this process's
-    environment, its records at the ATOM digest `atom`, else this tree's."""
+    environment, its records at the ATOM digest `atom`, else this tree's, on
+    `platform`."""
     law = directory / check.FITTED
     held = json.loads(law.read_text())
     held["key"] = {
@@ -72,7 +73,7 @@ def _fitted(directory, config, atom=None) -> None:
         "engine_config": json.dumps(keyed(config), sort_keys=True),
         "source_root": compass_run.source_root(atom),
         "form": "history",
-        **keyed_platform(Kind.STEP_LINEAR_LAW, PLATFORM),
+        **keyed_platform(Kind.STEP_LINEAR_LAW, platform),
     }
     law.write_text(json.dumps(held))
 
@@ -200,7 +201,13 @@ def test_a_calibration_s_status_makes_it_calibrating_until_it_fails(
 
 @pytest.mark.parametrize(
     "since",
-    ["the tree moved", "its arguments changed", "its environment changed", "nothing"],
+    [
+        "the tree moved",
+        "its arguments changed",
+        "its environment changed",
+        "it ran on another device",
+        "nothing",
+    ],
 )
 def test_an_ended_calibration_s_candidate_calibrates_anew_unless_that_refits_its_law(
     tmp_path, stubbed, monkeypatch, since  # noqa: F811
@@ -215,7 +222,10 @@ def test_an_ended_calibration_s_candidate_calibrates_anew_unless_that_refits_its
     (first,) = advise(tmp_path, {"b": b})["b"]["made_by"]
     assert _calibrated(tmp_path, first)[0] == 0
     atom = "0" * 64 if since == "the tree moved" else None
-    _fitted(cal / "b", resolved(stubbed.config, ["--max-num-seqs", "4"]), atom)
+    # The law a calibration of b on another card fits, OUT then taken here.
+    elsewhere = {"device": "MI300X gfx942"} if since.endswith("device") else {}
+    config = resolved(stubbed.config, ["--max-num-seqs", "4"])
+    _fitted(cal / "b", config, atom, PLATFORM | elsewhere)
     if since == "the tree moved":
         (tmp_path / "ATOM" / ".compass-commit").write_text("beef\n")
     elif since == "its arguments changed":

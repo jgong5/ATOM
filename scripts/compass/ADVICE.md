@@ -339,10 +339,10 @@ compass fit device <token> --store OUT/cal/S1/store --out OUT/cal/S1.readings
   `OUT/cal/S1+3`, and reads that one's status; start it as above, its log in
   `OUT/cal/S1+2.log`. Where the next one would take the ATOM arguments, traces
   and records the ended one took, and the law that one fitted is at the
-  configuration's key (its model, the head's ATOM digest, and its engine config
-  with the performance variables), it would refit that law, so `made by:` says
-  so in place of a command and names the store that law is in; the law's
-  verdict line says what it lacks.
+  configuration's key (its model, the machine's platform, the head's ATOM
+  digest, and its engine config with the performance variables), it would refit
+  that law, so `made by:` says so in place of a command and names the store
+  that law is in; the law's verdict line says what it lacks.
 
 **A missing point's readings** take `compass measure memory --gpu G --out D
 --store <store> -- <ATOM's arguments>`, as printed, under the variables it
