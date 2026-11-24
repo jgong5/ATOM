@@ -45,6 +45,9 @@ would leave its directory holding files, which `calibrate.sh` refuses.
 A readings verdict ``measure`` names the `compass measure memory` command,
 under the instance's variables, a 1P1D side's on the connector a real start of
 it takes.
+Where an entry holds their key in the store a candidate is looked up in, that
+command measures them into a new store under OUT's ``cal/`` (`READINGS`,
+`lacking.measuring`), which `reuse.stores` looks every candidate up in.
 
 `states` gives each candidate one state: ``refused``, with each refusal
 verbatim, when any verdict is; else, when a law's verdict is ``calibrate``,
@@ -84,6 +87,7 @@ from atom.compass.drive import lacking, reuse, runfile, serve
 from atom.compass.drive import run as drive_run
 from atom.compass.fit.device import compose
 from atom.compass.kv.lmcache_server import DECLARED_LAWS
+from atom.compass.run import memory
 from atom.compass.run.step_grid import keyed
 from atom.compass.spec import SpecRefusal
 
@@ -97,6 +101,10 @@ OWN = Path(__file__).resolve().parents[1]
 STATES = "states.json"
 #: Where each candidate's calibration writes, and each point starts, in OUT.
 CAL, STARTS = "cal", "starts"
+#: Beside what, in `CAL`, readings meeting a stale entry at their key are
+#: measured into a new store (`lacking.measuring`); no candidate's name holds
+#: the ``@`` its store's directory name does.
+READINGS = "readings"
 #: The file a calibration appends each step's start, end or failure to, in its
 #: directory, and ``end calibration`` once it has fitted both laws.
 STATUS = "status"
@@ -538,8 +546,10 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                     real = args
                     if side in drive_run.ROLES:
                         real = drive_run.side_args(side, one["args"], drive_run.REAL)
+                    at = memory.key_of(config, machine)
+                    beside = made[0].parent / READINGS
                     readings["made_by"] = [
-                        lacking.measure_memory(store.root, real, env)
+                        lacking.measuring(store.root, at, beside, real, env)
                     ]
                 verdicts = law, readings
         seen[(store.root, *instance)] = verdicts
