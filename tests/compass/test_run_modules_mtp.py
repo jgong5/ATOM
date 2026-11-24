@@ -11,8 +11,9 @@ request, the LM head a row a request in each, and on a step that samples
 nothing the first pass alone, unless a data-parallel group proposes for its
 collectives. Each pass runs the first MTP layer; V4's block norms its inputs
 and projects each residual copy, and reduces and norms its head's input on
-the rows its head samples alone, where V4-Pro's target reduces every row
-before its logits; at TP 2 Qwen3.5's gathers its `fc`'s output
+the rows its head samples alone, where V4-Pro's target reduces and norms
+every row before its logits, none on a middle chunk, and its LM head runs a
+decode graph's pad rows too; at TP 2 Qwen3.5's gathers its `fc`'s output
 and its argmax alone, and under a pure data-parallel group of two its later
 passes run at the step's `running_bs`, draft graph or none, the group
 sharding their argmax. A speculative step then answers
@@ -396,10 +397,11 @@ def test_v4_pro_s_target_reduces_every_row_before_its_logits(built):
     hc, d = hf["hc_mult"], hf["hidden_size"]
     modules = built["v4-mtp2"]["modules"]
     (head,) = [m for m in modules if m.kind == "hc_head" and not m.passes]
-    assert (head.name, head.dims, head.head, head.layer) == (
+    assert (head.name, head.dims, head.head, head.logits, head.layer) == (
         "model.hc_head",
         (hc, d),
         False,
+        True,
         -1,
     )
     installed = built["v4-mtp2"]["installed"]
@@ -431,6 +433,58 @@ def test_v4_pro_s_target_reduces_every_row_before_its_logits(built):
             f"{by_name['roofline.hc_head'] / whole:.4%} of the step's {whole:.9g} s"
         )
     print("\nV4-Pro TP8 MTP2 target hc_head: " + "; ".join(lines))
+
+
+def test_v4_pro_s_final_norm_and_lm_head_run_on_the_rows_atom_hands_them(built):
+    """`DeepseekV4ForCausalLM.compute_logits` runs the final norm, which a
+    middle chunk never calls, and the LM head on every row the runner hands
+    it, a decode graph's pad rows too. A named result: a 4096-token V4-Pro
+    TP8 middle chunk's final norm and the LM head of 60 requests verifying 2
+    drafts in a rung-64 graph, on MI355X, before and after."""
+    d = json.loads(V4_PRO.read_text())["hidden_size"]
+    modules = built["v4-mtp2"]["modules"]
+    (norm,) = [m for m in modules if m.name == "model.norm"]
+    (lm_head,) = [m for m in modules if m.kind == "lm_head" and not m.passes]
+    assert (norm.kind, norm.dims, norm.ranks, norm.logits) == ("norm", (d,), 1, True)
+    assert (lm_head.dims[1], lm_head.fmt, lm_head.ranks) == (d, "bf16", 8)
+    installed = built["v4-mtp2"]["installed"]
+    machine, shard = installed.machine, lm_head.dims[0]
+    # Before: the final norm on every step, the LM head on the real rows.
+    every = [dataclasses.replace(m, logits=False) if m is norm else m for m in modules]
+    before = StepRooflineBackend(machine, every)
+    real = StepRooflineBackend(machine, modules, padded=False)
+
+    def terms(backend, step):
+        return {t.name: t.seconds for t in backend.price(step).terms}
+
+    def head(rows):
+        # The vocabulary shard over each row in bf16: the rows and the shard
+        # read, the logits written, and gathered from the 8 ranks.
+        moved = (rows * d + shard * d + rows * shard) * 2
+        work = Work({"bf16": 2 * rows * shard * d}, moved)
+        return serial(work + allgather(8, rows * shard * 8 * 2), machine)
+
+    chunk = BatchView((RequestShape(4096, 4096, False),), produces_output=False)
+    # Each row read and written once, in bf16.
+    normed = price(Work({}, 4096 * d * 2 * 2), machine)
+    was, now = terms(before, chunk), terms(installed, chunk)
+    assert was.pop("roofline.norm") - now.pop("roofline.norm", 0) == (
+        pytest.approx(normed, rel=1e-12)
+    )
+    assert now == was
+    decode = BatchView(
+        (RequestShape(3, 4096, True),) * 60, capture_rung=64, produces_output=True
+    )
+    padded = terms(installed, decode)["roofline.lm_head"]
+    unpadded = terms(real, decode)["roofline.lm_head"]
+    assert padded == pytest.approx(head(64 * 3), rel=1e-12)
+    assert unpadded == pytest.approx(head(60 * 3), rel=1e-12)
+    print(
+        f"\nV4-Pro TP8 MTP2 on MI355X: a 4096-token middle chunk's final norm "
+        f"{normed * 1e6:.2f} us before, none after; the LM head of 60 requests "
+        f"of 3 tokens at rung 64, {unpadded * 1e6:.2f} us on 180 rows before, "
+        f"{padded * 1e6:.2f} us on 192 after"
+    )
 
 
 def test_a_dp2_decode_drafts_its_later_passes_at_running_bs_sharding_their_argmax(

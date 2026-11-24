@@ -50,7 +50,8 @@ DeepSeek-V4's modules, each priced and then gone into:
 - `DeepseekV4Model`: its `hc_head`, which reduces each row's residual copies
   by the model's own mixing weights before the final norm and the LM head
   (`DeepseekV4ForCausalLM.compute_logits`, a method of the LM head, not a
-  module).
+  module). It and the final norm run in `compute_logits` alone, on a step
+  whose LM head samples (`Module.logits`).
 - `Block`: two hyper-connection mixes, one per sub-layer, each folding the
   previous sub-layer's output into the widened residual and reducing it to the
   next input; the block's two norms run inside them.
@@ -92,6 +93,8 @@ bf16 nor fp4 is unclassified:
   its indexer's key projection and norm in those index keys.
 - the rotary tables, the vision tower and the runtime's compiled stages,
   which hold the model outside the tree: nothing.
+- the final norm, as V4's: in `compute_logits` alone
+  (`DeepseekV41RuntimeModel.compute_logits`), on a step whose LM head samples.
 
 On a prefill that replays its decoder (`replay`), its layers after the first
 decoder layer run on each finishing request's last window of rows, the last
@@ -177,6 +180,9 @@ M3 = "atom.models.minimax_m3.model."
 V4_ROPE = V4 + "_V4RoPE"
 V41 = "atom.models.deepseek_v41."
 V41_BLOCK, DRAFT_BLOCK = V41 + "model.Block", V41 + "dspark.DraftBlock"
+V41_RUNTIME = V41 + "runtime.DeepseekV41RuntimeModel"
+#: The models whose final norm runs in `compute_logits`, not in the forward.
+NORMED_IN_LOGITS = (V4 + "DeepseekV4Model", V41_RUNTIME)
 V41_ATTENTION, V41_INDEXER = V41 + "attention.Attention", V41 + "attention.Indexer"
 DRAFT_ATTENTION = V41 + "dspark.DraftAttention"
 COMPRESSOR = "atom.model_ops.deepseek_v41.compressor.Compressor"
@@ -325,7 +331,7 @@ def drafter(config):
 def _replay(tree):
     """The first decoder layer, the last layer and the window of a V4.1
     `tree` that replays its decoder on a prefill's last rows, else None."""
-    if not (_is(tree, V41 + "runtime.DeepseekV41RuntimeModel") and tree.replay):
+    if not (_is(tree, V41_RUNTIME) and tree.replay):
         return None
     return tree.decoder_start, tree.last_layer, tree.config.sliding_window
 
@@ -414,7 +420,7 @@ def _classify(module, name, parent):
         return mix, mix, head, DESCEND
     if _is(module, V4 + "DeepseekV4Model"):
         dims = (module.hc_mult, module.norm.weight.shape[0])
-        return Module(f"{name}.hc_head", "hc_head", dims), DESCEND
+        return Module(f"{name}.hc_head", "hc_head", dims, logits=True), DESCEND
     if _is(module, V41_BLOCK):
         width = module.attn_norm.weight.shape[0]
         mix = Module(name, "mhc", (module.hc_attn_fn.shape[1] // width, width))
@@ -488,7 +494,9 @@ def _classify(module, name, parent):
             return NOTHING
         tp = module.tp_size if getattr(module, "fused_allreduce", False) else 1
         tp = _tp_width() if _m3_reduces(module, name, parent) else tp
-        return Module(name, "norm", (weight.shape[0],), ranks=tp, fused=tp > 1)
+        logits = _is(parent, *NORMED_IN_LOGITS) and module is parent.norm
+        dims = (weight.shape[0],)
+        return Module(name, "norm", dims, ranks=tp, fused=tp > 1, logits=logits)
     if _is(module, "aiter.rotary_embedding.RotaryEmbedding"):
         return Module(name, "rotary", (module.rotary_dim,))
     if _is(module, OPS + "paged_attention.Attention"):
