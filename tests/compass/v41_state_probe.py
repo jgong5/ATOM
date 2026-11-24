@@ -32,6 +32,8 @@ import numpy as np
 
 #: The cache's PAGE, the replay rule's block size; DSpark5's drafts.
 BLOCK, DRAFTS = 32, 5
+#: The compressor that owns layer 1's pool rows, at ratio 2.
+OWNER = 1
 
 
 def cache_of(drafts=DRAFTS, kv="bf16"):
@@ -50,6 +52,7 @@ def cache_of(drafts=DRAFTS, kv="bf16"):
 def assembled(cache, rows, tokens):
     """V4.1's builder over `cache`, assembled by hand, its buffers for `rows`
     requests of `tokens` tokens in all."""
+    from atom.model_engine.model_runner import tokenIDProcessor
     from atom.model_ops.attentions.deepseek_v41.backend import (
         DeepseekV41MetadataBuilder,
     )
@@ -58,9 +61,13 @@ def assembled(cache, rows, tokens):
     built = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     built.geometry, built.device, built.block_size = cache.geometry, "cpu", BLOCK
     built.cache, built.score_workspace = cache, None
+    # Before any sampler output: ATOM's own `verify_ctx_lens`, which a verify
+    # step's `prepare_decode` calls, then moves no context length.
+    processor = SimpleNamespace(num_rejected=None, is_deferred_out=True)
+    processor.verify_ctx_lens = tokenIDProcessor.verify_ctx_lens.__get__(processor)
     built.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(rows, tokens, 8, "cpu", cache.geometry),
-        tokenID_processor=SimpleNamespace(num_rejected=None),
+        tokenID_processor=processor,
     )
     return built
 
@@ -121,7 +128,8 @@ def ops_placements(
     With `tail`, the step publishes a bounded replay's tail `tail` rows wide,
     each request's window starting at its first row (`_publish_decoder`).
     At `kv` fp8, each pool view is taken as its values and scales, `_scale`,
-    as `fp8_attention._split` passes them."""
+    as `fp8_attention._split` passes them: the main pool's owner's planes and
+    the ring's (`main_view`, `ring_view`)."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -189,7 +197,7 @@ def ops_placements(
             )
 
             capture = PagedAttentionCache(cache.geometry, 4, slots, "cpu")
-            states = [("pool", capture.pool)]
+            states = [("pool", capture.main_view(OWNER))]
             states += [("ring", capture.ring_view(1))] if pool == "ring" else []
             states = [v for f, t in states for v in split(f, t)]
         dtyped = [(f, _t(t.shape, "kv", t.stride(), str(t.dtype))) for f, t in states]
@@ -209,8 +217,8 @@ def ops_placements(
             leaf = dataclasses.replace(leaf, args=(*leaf.args, given))
         if pool:  # its `reach` ring rows; beside a ring at a ratio, top-k 1 a row
             pages = point.seqs if pool != "whole" and ratio else 0
-            ring = reach * capture.pool[0].nbytes
-            read = ring + pages * capture.pool[0].nbytes
+            row = _row_bytes(capture.main_view(OWNER))
+            ring, read = reach * row, (reach + pages) * row
         llc = 3 * (16 * query + read)  # 7 copies of the activation and the states
     found = ops.leaves(_graph(leaf, layers=1)["region"])
     real, replay.seat_states = replay.seat_states, seat
@@ -224,13 +232,20 @@ def ops_placements(
         replay.seat_states = real
     kept = {"slots": runner.batches, "refused": refused, "got": got}
     if pool:
-        atom = {"pool": built.cache.pool, "ring": built.cache.ring_view(1)}
+        atom = {"pool": built.cache.main_view(OWNER), "ring": built.cache.ring_view(1)}
         atom = dict(v for f, t in atom.items() for v in split(f, t))
         kept["bound"] = {
             p: [n, v if v is None else v.data_ptr() - atom[p].data_ptr()]
             for (_, p), (n, v) in stub.kv.items()
         }
     return kept | {"read": read, "ring": ring}
+
+
+def _row_bytes(pool) -> int:
+    """A pool row's bytes: at FP8, on the planes upstream b7b5ec3f2 gives it,
+    its values' and its scales'."""
+    planes = pool if isinstance(pool, tuple) else (pool,)
+    return sum(plane[0].nbytes for plane in planes)
 
 
 def kv_bound(slots):

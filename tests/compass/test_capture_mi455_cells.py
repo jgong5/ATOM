@@ -95,7 +95,11 @@ def test_a_cell_s_forced_acceptance_traces_and_prices(ep, tmp_path, monkeypatch)
     backend = compass_run.op_graph(store, config, MI455, ep=TP if ep else 1)
     for step in STEPS:
         cost = backend.price(step)
-        assert cost.target_seconds > 0 and cost.draft_seconds > 0
+        # A middle chunk's drafter only cuts its taps, which the draft-KV pass
+        # of the chunk that samples quantizes in place since upstream
+        # b7b5ec3f2 (#3131): it launches nothing.
+        assert cost.target_seconds > 0
+        assert (cost.draft_seconds > 0) == step.produces_output
 
 
 def test_a_card_is_declared_as_it_reads_at_its_arch_s_key(tmp_path):

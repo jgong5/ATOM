@@ -3,8 +3,9 @@
 
 `ForwardMode.decide` settles `running_bs` on every step. An eager decode every
 rank of whose DP group decodes runs its model at it
-(`ModelRunner._padded_decode_inputs`), and a prefill that samples runs its LM
-head at it (`cu_seqlens_q`). Each step's mode here is `decide`'s own. A step
+(`ModelRunner._padded_decode_inputs`); a prefill that samples runs its LM head
+at its scheduled requests' last tokens, as ATOM does since upstream b7b5ec3f2
+(`ModelRunner.postprocess`). Each step's mode here is `decide`'s own. A step
 record's line states that width, and a drafter's, and each reader of a record
 reads the step there: `compass run --coverage`, the bound and cost accuracy.
 """
@@ -126,14 +127,15 @@ def test_a_capture_runs_a_padded_target_at_its_width_and_samples_its_rows(tmp_pa
     # The decode's model takes 4 rows, its MoE 4 from each of 8 ranks.
     assert rows("decode B=3 W=4", EMBED, "indices") == [4]
     assert set(rows("decode B=3 W=4", MOE, "hidden_states")) == {32}
-    # The prefill's model takes its 192 tokens, its LM head 4 rows.
+    # The prefill's model takes its 192 tokens, its LM head its 3 requests'
+    # last tokens.
     assert rows("prefill T=192 B=3 W=4", EMBED, "indices") == [192]
     head = [
         o["args"]["A"]["shape"][0]
         for o in graphs["prefill T=192 B=3 W=4"]
         if o["op"] == GEMM and o["args"]["B"]["shape"][0] == VOCAB
     ]
-    assert head == [4]
+    assert head == [3]
     # Each samples its 3 rows.
     for shape in graphs:
         assert rows(shape, ARGMAX, "scores") == [3]
