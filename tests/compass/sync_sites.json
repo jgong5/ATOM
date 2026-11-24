@@ -4537,6 +4537,18 @@
    "mechanism_why": "a loop over a file in a measuring command, which cannot park"
   },
   {
+   "id": "atom/compass/calib/engine.py::Engine.run_segment::while self._open::spin_loop#0",
+   "file": "atom/compass/calib/engine.py",
+   "symbol": "Engine.run_segment",
+   "call": "while self._open",
+   "expr": "while self._open",
+   "shape": "spin_loop",
+   "peer": "none",
+   "why": "the calibration rehearsal's loop over one segment's requests: each turn forms and prices one step on a law, on the CPU, until every request has ended; it waits on no peer",
+   "mechanism": "K9",
+   "mechanism_why": "a loop of a planning command (plan_v1.py, dry_v1.sh) over its own arithmetic, which cannot park; no server or simulated run starts it"
+  },
+  {
    "id": "atom/compass/capture/driverless.py::group.broadcast::functional.broadcast(tensor, src, group or dist.group.WORLD)::collective#0",
    "file": "atom/compass/capture/driverless.py",
    "symbol": "group.broadcast",

@@ -97,11 +97,11 @@ def record_steps(record: Path, design: dict | None, cfg, law: Law, segment=None)
         runs = {whose.get((r, n)) for r in real} - {None}
         if not real or (len(runs) != 1 and not segment):
             continue
-        seg = segment or seg_of[runs.pop()]
+        seg = segment or seg_of[min(runs)]  # the one client run
         kinds = {bool(row[2]) for s, _ in real.values() for row in s["rows"]}
         if len(kinds) != 1:
             continue  # mixed rows: a fit cuts it
-        decode = kinds.pop()
+        decode = min(kinds)  # the one kind
         views = []
         for r, (s, duty) in sorted(group.items()):
             if s["is_dummy_run"] and decode:
