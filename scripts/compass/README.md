@@ -280,10 +280,12 @@ refuses a source root with uncommitted files. The CPU gate leaves these files
 out instead (`cpu_gate_exclude.txt`).
 This image's `/opt/venv` holds no `aiperf`, so a gate there sets
 `COMPASS_AIPERF_PYTHON=/opt/agentx-venv/bin/python`, the image's own
-agentx-harness. On a host where another job's DP group holds port 29500,
-ATOM's default DP master port, a gate sets `ATOM_DP_MASTER_PORT` to a free one:
-the driver-run tests that start a DP server without drawing a port of their
-own, as `test_dp_slice.py` does, take it.
+agentx-harness. `test_dp_slice.py`'s DP servers draw no master port of their
+own and take ATOM's default, 29500, so a gate needs that port free; another
+job's DP group on the host fails them. Setting `ATOM_DP_MASTER_PORT` does not
+help: it overrides the `--data-parallel-master-port` that `pd_sim.sh` gives
+each server, so the DP instances of one run, as the Store scenario's two
+prefills and its decode, all start on that one port.
 
 ## The compass_harness tests need an agentx-harness wheel
 
