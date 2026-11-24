@@ -76,7 +76,10 @@ no service time. Narrowing the offload exclusion to the backends a simulated run
 brought in `lmcache_mp` and the chunked offload scheduler it builds on: the
 LOOKUP sent ahead of admission (K4), a blocking lookup's poll loop (K3), the
 step loop's looks at a reply the client's own thread delivers (K6), and the
-worker connector's submits (K9). The rows per mechanism,
+worker connector's submits (K9). The blocking subprocess calls the scanner
+found once it knew that shape are K9, in commands and launchers that are no LP,
+but for the git command that names a source root, which an op-graph run's lazy
+trace runs in the engine LP's own trace process (K6). The rows per mechanism,
 crossed with the first classification's categories, are printed by
 `pytest tests/compass/test_sync_inventory.py -s -k crosstab`.
 
@@ -87,7 +90,9 @@ and reports calls whose **shape** can
 park a thread: sleeps, socket receives, pollers, queue operations, joins, lock
 and event waits, collectives (object collectives included), device
 synchronization, sends, thread-pool hand-offs (`asyncio.to_thread` included),
-the worker RPC, and a loop polling a device event's `query()`. It also reports
+the worker RPC, a loop polling a device event's `query()`, and a child process
+run to its exit (`subprocess.run` and the module's other blocking helpers, and
+`communicate`). It also reports
 `while` loops that go around without calling anything that parks. Shapes match
 on the call's own text and argument form, never on what a name is bound to at
 runtime.
@@ -102,7 +107,10 @@ a row someone has to place in an LP.
 Where a name alone is ambiguous, the argument form settles it, because only the
 blocking reading can take that form: `d.get(key)` always passes the key
 positionally and `q.get()` never does; `",".join(parts)` always passes one
-iterable and `t.join(5)` a lone number. Those rules have their own tests.
+iterable and `t.join(5)` a lone number. Where the name is a common one, the
+call's own text settles it: `run` and `call` count only as `subprocess.run`
+and `subprocess.call`, never as `asyncio.run(main())` or a method of that
+name. Those rules have their own tests.
 
 **The scanned set is read off the tree, minus named exclusions**, as the
 clock-source lint reads `CORE_ROOTS`. An allow-list declares its blind spot

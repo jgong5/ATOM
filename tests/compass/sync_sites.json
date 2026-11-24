@@ -25,7 +25,7 @@
   "traffic": "the request source: Compass's traffic generator and its reader threads",
   "frontend": "an API server process: its event loop owns the clock and its other threads are transport; one per deployment",
   "engine": "an engine process with its worker processes, one tensor-parallel group; one per deployment, and a data-parallel group's members join it",
-  "none": "no LP: the clock authority's own threads"
+  "none": "no LP: the clock authority's own threads, and a command's own threads and processes, outside any simulated run"
  },
  "history": "category and why are the first classification, kept as written; rows added since carry none. mechanism and mechanism_why are what a simulated run does at the site: mechanism_why is empty only where the mechanism is the one the row's category named (A K1, B K5, C1 K8, C2 K7, ignore K9) and why already says it.",
  "sites": [
@@ -4138,6 +4138,18 @@
    "mechanism_why": "in the measuring command, which is no LP, before its run starts or after it stops; a GPU command serves no simulated run, so the bound stays real"
   },
   {
+   "id": "atom/compass/drive/gpu.py::smi::subprocess.run( [\"rocm-smi\", *args], capture_output=True, text=True, timeout=SMI_TIMEOUT_S, check=False, )::subprocess_wait#0",
+   "file": "atom/compass/drive/gpu.py",
+   "symbol": "smi",
+   "call": "subprocess.run",
+   "expr": "subprocess.run( [\"rocm-smi\", *args], capture_output=True, text=True, timeout=SMI_TIMEOUT_S, check=False, )",
+   "shape": "subprocess_wait",
+   "peer": "process",
+   "why": "a GPU command runs rocm-smi, up to SMI_TIMEOUT_S: for its checks' process listing and KFD nodes, for run.json's device entries, and for the bus listing the record's PTL watch reads the cards' PTL state under",
+   "mechanism": "K9",
+   "mechanism_why": "in a GPU command, which is no LP, the record's PTL watch thread included; a GPU command serves no simulated run, so the bound stays real"
+  },
+  {
    "id": "atom/compass/drive/identity.py::ptl_changes::threading.Thread(target=watch, daemon=True)::thread_start#0",
    "file": "atom/compass/drive/identity.py",
    "symbol": "ptl_changes",
@@ -4158,7 +4170,7 @@
    "expr": "stop.wait(PTL_POLL_S)",
    "shape": "event_wait",
    "peer": "thread",
-   "why": "the record's PTL watch waits a wall second at a time: for server.json to exist, then between its readings of the cards' PTL state while the server serves, until the record stops",
+   "why": "the record's PTL watch waits PTL_POLL_S at a time: for server.json to exist, then between its readings of the cards' PTL state while the server serves, until the record stops",
    "mechanism": "K9",
    "mechanism_why": "in `compass record`, which is no LP: it serves a real server on the GPUs it names and refuses a run file and a clock, so no simulated clock reads this"
   },
@@ -4170,7 +4182,7 @@
    "expr": "stop.wait(PTL_POLL_S)",
    "shape": "event_wait",
    "peer": "thread",
-   "why": "the record's PTL watch waits a wall second at a time: for server.json to exist, then between its readings of the cards' PTL state while the server serves, until the record stops",
+   "why": "the record's PTL watch waits PTL_POLL_S at a time: for server.json to exist, then between its readings of the cards' PTL state while the server serves, until the record stops",
    "mechanism": "K9",
    "mechanism_why": "in `compass record`, which is no LP: it serves a real server on the GPUs it names and refuses a run file and a clock, so no simulated clock reads this"
   },
@@ -4436,7 +4448,7 @@
    "expr": "time.sleep(POLL_S)",
    "shape": "sleep",
    "peer": "process",
-   "why": "the serve command's half-second cadence between its checks on its server: /health while it starts, its exit while it serves",
+   "why": "the serve command's cadence, POLL_S, between its checks on its server: /health while it starts, its exit while it serves",
    "mechanism": "K9",
    "mechanism_why": "serve refuses a run file and a clock, in ATOM's arguments and in the environment, so its server is a real one and the command is no LP, whose cadence no simulated clock reads"
   },
@@ -4460,7 +4472,7 @@
    "expr": "time.sleep(POLL_S)",
    "shape": "sleep",
    "peer": "process",
-   "why": "the serve command's half-second cadence between its checks on its server: /health while it starts, its exit while it serves",
+   "why": "the serve command's cadence, POLL_S, between its checks on its server: /health while it starts, its exit while it serves",
    "mechanism": "K9",
    "mechanism_why": "serve refuses a run file and a clock, in ATOM's arguments and in the environment, so its server is a real one and the command is no LP, whose cadence no simulated clock reads"
   },
@@ -4484,7 +4496,7 @@
    "expr": "time.sleep(POLL_S)",
    "shape": "sleep",
    "peer": "process",
-   "why": "the serve command's stop waits in half seconds, up to a wall bound, for the server's process group to exit after SIGTERM and then after SIGKILL",
+   "why": "the serve command's stop waits POLL_S at a time, up to a wall bound, for the server's process group to exit after SIGTERM and then after SIGKILL",
    "mechanism": "K9",
    "mechanism_why": "the server is stopping; serve refuses a run file and a clock, in ATOM's arguments and in the environment, so its server is a real one and the command is no LP, and the bound only decides when SIGTERM gives way to SIGKILL"
   },
@@ -4535,6 +4547,30 @@
    "why": "trace ops routes ATOM's legacy broadcast to its functional form under a fake tensor mode, on a fake process group of one process, so the capture records its shapes and nothing is sent",
    "mechanism": "K9",
    "mechanism_why": "a capture runs in the trace ops command, which is no LP and serves no simulated run, and its group has no peer to wait for"
+  },
+  {
+   "id": "atom/compass/capture/driverless.py::card::subprocess.run([sys.executable, \"-c\", _READ], **run)::subprocess_wait#0",
+   "file": "atom/compass/capture/driverless.py",
+   "symbol": "card",
+   "call": "subprocess.run",
+   "expr": "subprocess.run([sys.executable, \"-c\", _READ], **run)",
+   "shape": "subprocess_wait",
+   "peer": "process",
+   "why": "trace ops --gpu reads the card's properties as HIP reports them, in a child that sees that card alone, up to a wall bound",
+   "mechanism": "K9",
+   "mechanism_why": "a capture runs in the trace ops command, which is no LP and serves no simulated run, and it reads the card before it traces any shape"
+  },
+  {
+   "id": "atom/compass/capture/driverless.py::card::subprocess.run([\"rocminfo\"], **run)::subprocess_wait#0",
+   "file": "atom/compass/capture/driverless.py",
+   "symbol": "card",
+   "call": "subprocess.run",
+   "expr": "subprocess.run([\"rocminfo\"], **run)",
+   "shape": "subprocess_wait",
+   "peer": "process",
+   "why": "trace ops --gpu reads rocminfo's agents, in a child that sees the card alone, for the stepping it states for the card's arch, up to a wall bound",
+   "mechanism": "K9",
+   "mechanism_why": "a capture runs in the trace ops command, which is no LP and serves no simulated run, and it reads the card before it traces any shape"
   },
   {
    "id": "atom/compass/capture/forward.py::_Recorder.wait::self.wait(waiter, waited)::event_wait#0",
@@ -4628,7 +4664,7 @@
    "expr": "time.sleep(serve.POLL_S)",
    "shape": "sleep",
    "peer": "process",
-   "why": "the bench's stop waits in half seconds, up to a wall bound, for its workers and every process they started to exit, so the measuring command's after-run GPU check does not find them still exiting",
+   "why": "the bench's stop waits serve.POLL_S at a time, up to a wall bound, for its workers and every process they started to exit, so the measuring command's after-run GPU check does not find them still exiting",
    "mechanism": "K9",
    "mechanism_why": "the bench is stopping; it measures real forwards on a real runner for a measuring command, and no simulated run starts one"
   },
@@ -5116,7 +5152,7 @@
    "expr": "time.sleep(serve.POLL_S)",
    "shape": "sleep",
    "peer": "process",
-   "why": "compass measure device's half-second cadence between its checks on a probe process",
+   "why": "compass measure device's cadence, serve.POLL_S, between its checks on a probe process",
    "mechanism": "K9",
    "mechanism_why": "in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so its cadence no simulated clock reads"
   },
@@ -5128,7 +5164,7 @@
    "expr": "time.sleep(serve.POLL_S)",
    "shape": "sleep",
    "peer": "none",
-   "why": "compass measure device's half-second cadence while it waits, up to SETTLE_S, for the driver to free an exited probe's memory before the next check",
+   "why": "compass measure device's cadence, serve.POLL_S, while it waits, up to SETTLE_S, for the driver to free an exited probe's memory before the next check",
    "mechanism": "K9",
    "mechanism_why": "in the measuring command, which is no LP, around real probes it makes; a GPU command serves no simulated run, so its cadence no simulated clock reads"
   },
@@ -5272,7 +5308,7 @@
    "expr": "threading.Event().wait(ENDPOINT_LOOK_S)",
    "shape": "event_wait",
    "peer": "process",
-   "why": "before the shell's first send it looks, every twentieth of a wall second up to a bound, for LP mooncake_store to name the endpoint it serves at",
+   "why": "before the shell's first send it looks, every ENDPOINT_LOOK_S up to a bound, for LP mooncake_store to name the endpoint it serves at",
    "mechanism": "K9",
    "mechanism_why": "the LP names its endpoint before its first clock call, so before any grant lets a request reach the engine: the wait ends before it is read in a run, reads no clock and moves none; the bound only turns a missing LP into an error naming the file"
   },
@@ -6504,6 +6540,42 @@
    "mechanism_why": "the engine waits at startup, while it is built and before its step loop's first clock request, so outside the simulated window; a shared server's LP's first stamped request comes after every engine it serves has published, before it said READY, so its wait cannot park; the wall bound only turns a missing block into an error naming the engine"
   },
   {
+   "id": "atom/compass/run/__init__.py::router_binary::subprocess.run( [exe, \"--version-verbose\"], capture_output=True, text=True, check=True )::subprocess_wait#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "router_binary",
+   "call": "subprocess.run",
+   "expr": "subprocess.run( [exe, \"--version-verbose\"], capture_output=True, text=True, check=True )",
+   "shape": "subprocess_wait",
+   "peer": "process",
+   "why": "asks the router binary, with no bound, for the commit and git status it was built at, for the run file's router entry",
+   "mechanism": "K9",
+   "mechanism_why": "called before any LP starts, by a launcher writing a run file with a router LP or by the GPU gate checking the router binary its tests start; neither is an LP, so no simulated time passes in it"
+  },
+  {
+   "id": "atom/compass/run/__init__.py::router_binary::subprocess.run( [\"git\", \"-C\", mesh, \"diff\", \"--quiet\", commit, \"--\", \".\"], capture_output=True, text=True, check=False, )::subprocess_wait#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "router_binary",
+   "call": "subprocess.run",
+   "expr": "subprocess.run( [\"git\", \"-C\", mesh, \"diff\", \"--quiet\", commit, \"--\", \".\"], capture_output=True, text=True, check=False, )",
+   "shape": "subprocess_wait",
+   "peer": "process",
+   "why": "runs `git diff --quiet`, with no bound, between the router binary's commit and the tree's atom/mesh, so a binary built from other router source is refused; a stamped snapshot compares commits instead",
+   "mechanism": "K9",
+   "mechanism_why": "called before any LP starts, by a launcher writing a run file with a router LP or by the GPU gate checking the router binary its tests start; neither is an LP, so no simulated time passes in it"
+  },
+  {
+   "id": "atom/compass/run/__init__.py::committed_atom_digest::subprocess.run( [\"git\", \"-C\", str(repo), \"archive\", commit, \"atom\"], capture_output=True, check=False, )::subprocess_wait#0",
+   "file": "atom/compass/run/__init__.py",
+   "symbol": "committed_atom_digest",
+   "call": "subprocess.run",
+   "expr": "subprocess.run( [\"git\", \"-C\", str(repo), \"archive\", commit, \"atom\"], capture_output=True, check=False, )",
+   "shape": "subprocess_wait",
+   "peer": "process",
+   "why": "the reuse check runs `git archive`, with no bound, for the atom/ the head's commit holds, to digest it",
+   "mechanism": "K9",
+   "mechanism_why": "the advice command is no LP: the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
+  },
+  {
    "id": "atom/compass/capture/__init__.py::_keyed_by_files::ThreadPoolExecutor(16)::thread_start#0",
    "file": "atom/compass/capture/__init__.py",
    "symbol": "_keyed_by_files",
@@ -6561,7 +6633,7 @@
    "expr": "time.sleep(serve.POLL_S)",
    "shape": "sleep",
    "peer": "process",
-   "why": "compass advice's half-second cadence between its checks on a command it started, up to the bound its caller gives",
+   "why": "compass advice's cadence, serve.POLL_S, between its checks on a command it started, up to the bound its caller gives",
    "mechanism": "K9",
    "mechanism_why": "the advice command is no LP: a start serves no request, and the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command; a bound only decides when a server is reported as not answering"
   },
@@ -6622,7 +6694,7 @@
    "expr": "concurrent.futures.wait(running, timeout=serve.POLL_S)",
    "shape": "event_wait",
    "peer": "thread",
-   "why": "compass advice waits for its points' threads, half a second at a time, so a stop signal reaches each point's commands",
+   "why": "compass advice waits for its points' threads, serve.POLL_S at a time, so a stop signal reaches each point's commands",
    "mechanism": "K9",
    "mechanism_why": "the advice command is no LP: the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
   },
@@ -6662,6 +6734,18 @@
    "why": "a run's Prometheus report starts a Prometheus that scrapes nothing, to serve the series the run's LPs wrote to CI's report",
    "mechanism": "K9",
    "mechanism_why": "starting a process cannot park; the report runs once the run has stopped, from client.sh or deploy.sh, and is no LP, so no simulated time passes in it"
+  },
+  {
+   "id": "atom/compass/report/prometheus.py::_backfill::subprocess.run( [promtool, \"tsdb\", \"create-blocks-from\", \"openmetrics\", text, tsdb], capture_output=True, text=True, check=False, )::subprocess_wait#0",
+   "file": "atom/compass/report/prometheus.py",
+   "symbol": "_backfill",
+   "call": "subprocess.run",
+   "expr": "subprocess.run( [promtool, \"tsdb\", \"create-blocks-from\", \"openmetrics\", text, tsdb], capture_output=True, text=True, check=False, )",
+   "shape": "subprocess_wait",
+   "peer": "process",
+   "why": "a run's Prometheus report backfills each series file the run's LPs wrote into a TSDB with promtool, with no bound, before it starts Prometheus on it",
+   "mechanism": "K9",
+   "mechanism_why": "the report runs once the run has stopped, from client.sh or deploy.sh, and is no LP, so no simulated time passes in it"
   },
   {
    "id": "atom/distributed/comm_utils.py::gather_rows::gather( [t.view(torch.uint8) if t.element_size() == 1 else t for t in rows] )::collective#0",
@@ -7214,7 +7298,7 @@
    "expr": "future.result(timeout=RENEW_TIMEOUT_S)",
    "shape": "event_wait",
    "peer": "process",
-   "why": "the scheduler thread waits up to RENEW_TIMEOUT_S, 1 s, for that renewal's Store call, then dispatches the load with or without it",
+   "why": "the scheduler thread waits up to RENEW_TIMEOUT_S for that renewal's Store call, then dispatches the load with or without it",
    "mechanism": "K3",
    "mechanism_why": "an idle point of the step loop: NER until the reply's arrival, its RENEW_TIMEOUT_S bound a daemon deadline that keeps no run alive; in a DP group the waiting member asks NER alone and its peers park before their forwards (run.engine arms the park for mooncake_store)"
   },
@@ -7462,7 +7546,7 @@
    "expr": "self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)",
    "shape": "event_wait",
    "peer": "process",
-   "why": "an engine with KV work and nothing to run waits a millisecond for its workers' or input thread's progress",
+   "why": "an engine with KV work and nothing to run waits up to KV_IDLE_DRAIN_INTERVAL_S for its workers' or input thread's progress",
    "mechanism": "K6",
    "mechanism_why": "a bounded wait on progress the engine's own threads and workers report, inside the engine LP; it returns to the step loop, whose idle point is clock.idle"
   },
@@ -7750,6 +7834,42 @@
    "why": "prepares a tool call's grammar for a request on a worker thread",
    "mechanism": "K9",
    "mechanism_why": "structured output is not modelled: a simulated run neither prices nor refuses a request with a JSON schema"
+  },
+  {
+   "id": "atom/compass/artifacts/provenance.py::_run::subprocess.run( list(argv), capture_output=True, text=True, timeout=GIT_TIMEOUT_S, check=False )::subprocess_wait#0",
+   "file": "atom/compass/artifacts/provenance.py",
+   "symbol": "_run",
+   "call": "subprocess.run",
+   "expr": "subprocess.run( list(argv), capture_output=True, text=True, timeout=GIT_TIMEOUT_S, check=False )",
+   "shape": "subprocess_wait",
+   "peer": "process",
+   "why": "runs one git command, up to GIT_TIMEOUT_S, to name the tree or commit of a source root: the clock authority's tree as it is built, the trees a lazy trace checks before it publishes, and the trees a command records as its provenance",
+   "mechanism": "K6",
+   "mechanism_why": "mid-run it is reached only in an op-graph run's lazy-trace process, the engine LP's own, while the worker waits at `done.result()`: part of that wait, never reported to the clock authority; the clock authority reads its tree in its constructor, before its first grant, and every other caller is a command that is no LP"
+  },
+  {
+   "id": "atom/compass/drive/reuse.py::head.git::subprocess.run( [\"git\", \"-C\", str(TREE), *args], capture_output=True, text=True, check=False, )::subprocess_wait#0",
+   "file": "atom/compass/drive/reuse.py",
+   "symbol": "head.git",
+   "call": "subprocess.run",
+   "expr": "subprocess.run( [\"git\", \"-C\", str(TREE), *args], capture_output=True, text=True, check=False, )",
+   "shape": "subprocess_wait",
+   "peer": "process",
+   "why": "the reuse check runs git in the tree atom resolves under, with no bound, to find the head: the repository's root, its remotes, and the integration branch's tip at each",
+   "mechanism": "K9",
+   "mechanism_why": "the advice command is no LP: the server a point runs, `compass run` or `deploy.sh run`, and the client run that drives it start their LPs from their own run file, so no simulated time passes in the command"
+  },
+  {
+   "id": "atom/compass/parity/blocked.py::build::subprocess.run( [ *(\"g++\", \"-std=c++17\", \"-O2\", \"-shared\", \"-fPIC\", \"-D__HIP_PLATFORM_AMD__\"), *(f\"-I{rocm}/include\", str(SOURCE), f\"-L{rocm}/lib\", \"-lrocprofil::subprocess_wait#0",
+   "file": "atom/compass/parity/blocked.py",
+   "symbol": "build",
+   "call": "subprocess.run",
+   "expr": "subprocess.run( [ *(\"g++\", \"-std=c++17\", \"-O2\", \"-shared\", \"-fPIC\", \"-D__HIP_PLATFORM_AMD__\"), *(f\"-I{rocm}/include\", str(SOURCE), f\"-L{rocm}/lib\", \"-lrocprofil",
+   "shape": "subprocess_wait",
+   "peer": "process",
+   "why": "`python -m atom.compass.parity.blocked DIR` compiles the blocking-call tool with g++, with no bound, before a script starts a recording real server with it",
+   "mechanism": "K9",
+   "mechanism_why": "a build step before a real server starts; it is no LP and serves no simulated run"
   }
  ],
  "anchors": [
