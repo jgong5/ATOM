@@ -1815,7 +1815,7 @@ class NonAllocatingRunner(
 
         What a replacement owes its callers. These sites broadcast this name --
         `EngineCore._process_engine_step_inner` and
-        `DecodeEngineCore._process_engine_step` in
+        `DecodeEngineCore._process_engine_step_inner` in
         `atom/model_engine/engine_core.py`, and
         `PPEngineCoreProc._pp_head_step` (which waits and discards the reply)
         and `PPEngineCoreProc._downstream_busy_loop` in
