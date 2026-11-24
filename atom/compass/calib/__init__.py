@@ -16,5 +16,17 @@ segments, each a kind with its parameters.
   own counts for every column it prices, and a provisional definition for an
   opt-in column this tree's backend does not price yet.
 - `design`: the segments, generated from the deployment: the weka traces each
-  lane sends, each lane's pin, and the departure schedule every drain shares.
+  lane sends, each lane's pin, and the departure schedule every drain shares
+  (`scripts/compass/gen_v1.py`).
+- `engine`: a CPU rehearsal of a design on a law (`dry_v1.sh`): the engine's
+  steps as a simplified DP scheduler forms them, priced by the law and the host
+  law, each marked GPU-bound or not, and the predicted GPU minutes
+  (`plan_v1.py`).
+- `ident`: identifiability per vector, over the GPU-bound steps only: rank,
+  VIF, the worst relative prediction error G over the reachable range, and
+  the levels each column takes.
+- `check`: after a record, each segment's actual combinations against the
+  plan's, and the same identifiability on the record's own steps
+  (`check_v1.py`).
+- `report`: the tables `plan_v1.py` and `check_v1.py` print.
 """

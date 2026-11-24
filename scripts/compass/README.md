@@ -1186,6 +1186,84 @@ inputs, so grading cannot check its fitted traces against the cell's; it takes t
 since calibration replays traces no cell is graded on (the
 [#2698 ruling](https://github.com/jgong5/ATOM/issues/2698#issuecomment-6591251259)).
 
+## A calibration designed from the deployment — `gen_v1.py`, `plan_v1.py`, `dry_v1.sh`, `cal_v1.sh`, `check_v1.py`
+
+The unified calibration procedure v1.1
+([LLM-Booster#739](https://github.com/wuhuikx/LLM-Booster/issues/739) sections 2-4): one
+step-law calibration record whose workload is derived from the deployment's configuration
+and the law's columns, never from a target workload or a concurrency, the same for every
+model. A config (`scripts/compass/calib/*.json`, `atom/compass/calib/deploy.py`) states the
+deployment (DP ranks, capture rungs, scheduler bounds, a rank's KV pool, drafts and forced
+acceptance, the prefix-cache unit), the column set per vector (an input: a column this
+tree's backend prices is counted by it, an opt-in one plugs in by name), the hardware noise,
+the acceptance criteria frozen before a record, and the segments. Configs: `cellA_v1.json`
+(DeepSeek-V4.1-Flash, DPA4-EP4), `cellA_m31.json` (MiniMax-M3.1-Flash, TP4, one DP rank) and
+`cellA_k31.json` (Kimi-K3.1, TP8 + DCP8, one DP rank); the last two hold placeholder KV
+pools until their smoke records state theirs.
+
+```
+PYTHONPATH=$T python3 $T/scripts/compass/gen_v1.py CONFIG DESIGN       # traces, design.json
+PYTHONPATH=$T python3 $T/scripts/compass/plan_v1.py DESIGN --law LAW --host HOST   # plan.json, plan.md
+$T/scripts/compass/dry_v1.sh CONFIG LAW_DIR OUT                         # both, and the verdict
+MODEL=... HARNESS_PYTHON=$REAL_PY $T/scripts/compass/cal_v1.sh DESIGN OUT record --gpu 0,1,2,3 --store $ST -- $(args agg)
+PYTHONPATH=$T python3 $T/scripts/compass/check_v1.py DESIGN OUT --law LAW --host HOST
+```
+
+- `gen_v1.py` writes each segment's lanes as weka traces (`atom/compass/calib/design.py`):
+  decode drains whose rows leave on one departure schedule shared by every drain (each rung
+  a drain passes holds `rung_steps` steps, 60 by default), a lane pinned to a DP rank by
+  `data_parallel_rank` or placed by the router, and prefill quads, backlogs, trickles and
+  many-row bursts.
+- `plan_v1.py` writes plan.json: the segments in order, each started by an event (every
+  lane of the one before has exited and the server holds no request), never by a predicted
+  time. With a law it rehearses the design (`atom/compass/calib/engine.py`: a simplified DP
+  scheduler, deterministic, seconds of CPU; no prefill cost balancing, no KV eviction),
+  prices each step on the step and host laws, keeps the GPU-bound ones (a decode whose
+  device outlasts the host's step, a prefill whose device outlasts its launch by
+  `PACED_S`: what a fit keeps), and judges each vector (`atom/compass/calib/ident.py`):
+  full rank, VIF at most 10, G, the worst relative prediction error over the reachable
+  range (`g_z` standard errors of a fitted law's price at the range's vertices under the
+  stated noise), at most 1% decode and 2% prefill, and three levels a column. With one DP
+  rank `graph_padding` and `row_padding` stay, their check is reported failed and the rung
+  is judged by G (#739 2.4 rule 6). It predicts the GPU minutes, the server's start and a
+  segment's client start and drain included.
+- `dry_v1.sh` runs both on a law directory and exits 1 when a vector fails; given
+  `run ... -- SERVE_ARGS`, it also replays the design on a simulated server (`cal_v1.sh` in
+  `run` mode) and checks that record, many CPU minutes.
+- `cal_v1.sh` records the design on one server: its lanes start together, each a
+  `client.sh` run, pinned ones with `--extra-inputs data_parallel_rank:R`, under
+  `ATOM_DP_SESSION_AFFINITY=1 ATOM_DP_LB_REQ_EQUIV=1000000000`.
+- `check_v1.py` reads the record per segment and lane (`parity.served`), compares each
+  segment's step combinations (rung, who holds it, ranks busy; ranks prefilling, tokens,
+  rows, history, duty) with the plan's, and repeats the identifiability on the record's own
+  GPU-bound steps, with each base form's residuals per segment.
+- `plan_v1.py --target RECORD` (repeatable; a real record, or a simulated one, which writes
+  the same step lines) also reports each vector's error at the target workload's own
+  GPU-bound steps: the mean (target-weighted I criterion), 95th percentile and worst, not
+  gated. G and I are variance under the stated form; form bias shows only in the record's
+  residuals per segment and in held-out grading.
+- A design follows its deployment: `gen_v1.py --record RECORD` (`RECORD=` for `dry_v1.sh`)
+  takes the deployment a record ran (`atom/compass/calib/deploy.py` `from_record`: the
+  ladder, the scheduler's bounds, the KV pool, the widths, the drafts and acceptance, the
+  MoE routing), a deployment block may hold `from_record` with fields that override it, and
+  a segment's sizes are relative to the deployment (`deploy.count`, `deploy.tokens`); a
+  segment needing more DP ranks than the deployment has is skipped (`min_dp`), and a rung
+  the law holds no vector for is rehearsed on its nearest rung's (`engine.proxied`).
+  `scripts/compass/calib/README.md` is the procedure for a deployment change, and the
+  `compass-calibration` skill points at it.
+- A config may `extend` another and `insert` segments into it, and a segment of kind
+  `copy` generates another segment again under its own name (new traces, so it hits no
+  cache the first left): `cellA_v1x.json` is `cellA_v1.json` with D-v1 repeated mid-record
+  and at the end as anchors (a per-record scale factor), and lockstep drains of k = 2, 3, 4
+  ranks at one per-rank size plus a 64/32/16/8 mix, for a lockstep term the law does not
+  price yet: about 30 GPU minutes rehearsed, against cellA_v1's 25.
+
+On pit2-p03-g08, `cellA_v1.json` rehearsed on the e3v2 baseline law p752b0 (LAW
+70714789a2a1, HOST cb0f72ca70f2) in 2 CPU s: 11 segments, about 25 GPU minutes predicted
+(the same rehearsal of recipe C's record, `design_trace.py`'s traces, predicts its real
+client spans of 115, 865 and 219 s within -5% to +13%), every vector passing: decode
+G 0.10-0.58% per rung with VIF at most 2.1, prefill G 1.4% with VIF at most 8.5.
+
 ## Cost accuracy on a real run's own steps — `validate.cost`
 
 `PYTHONPATH=$T python -m atom.compass.validate.cost RECORD LAW` prices each step of a real
