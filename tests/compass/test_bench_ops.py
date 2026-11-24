@@ -4120,6 +4120,7 @@ def test_the_prefill_top_k_launches_the_workspace_aiter_builds_for_its_path(
     # power of two; otherwise the one-block path, on scratch of its own each
     # cold copy. Both sized for prefill.
     from aiter.ops import topk
+    from aiter.utility import graph_alloc
 
     rows, stride, k = 4, 65536, 2048
 
@@ -4157,9 +4158,11 @@ def test_the_prefill_top_k_launches_the_workspace_aiter_builds_for_its_path(
         patch.object(topk, "topk_use_mulblocks", query("use", multi)),
         patch.object(topk, "topk_mb_workspace_size", query("mb", 1000)),
         patch.object(topk, "topk_ob_workspace_size", query("ob", 700)),
-        # the device's stream and memory pool aiter's cached buffer is kept in
+        # the device's stream and memory pool aiter's cached buffer is kept in,
+        # and the stream's graph capture, which aiter keys it by: none
         patch.object(torch.cuda, "current_stream", lambda device: stream),
         patch.object(topk, "persistent_alloc", lambda device: contextlib.nullcontext()),
+        patch.object(graph_alloc, "_capture_id", lambda stream: None),
         patch.object(ops, "_function", return_value=lambda **kwargs: None),
         patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
         patch.object(ops, "_replay", side_effect=replay),
@@ -4279,12 +4282,14 @@ def test_a_multi_block_top_k_leaf_counts_aiter_s_one_buffer_once(
     # 4-byte buckets a row, 256-byte aligned, plus 255) and rounded up to a
     # power of two: no copy's own bytes, so the footprint holds it once.
     from aiter.ops import topk
+    from aiter.utility import graph_alloc
 
     stream = SimpleNamespace(cuda_stream=0)
     monkeypatch.setattr(topk, "topk_use_mulblocks", lambda *q: True)
     monkeypatch.setattr(topk, "topk_mb_workspace_size", lambda r, *q: 25344 * r + 255)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
     monkeypatch.setattr(topk, "persistent_alloc", lambda d: contextlib.nullcontext())
+    monkeypatch.setattr(graph_alloc, "_capture_id", lambda stream: None)
     monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
     monkeypatch.setattr(ops.Stub, "_time", lambda self, op, s, i, n: {"copies": n})
     vector = _t([rows], "activation", [1], "torch.int32")

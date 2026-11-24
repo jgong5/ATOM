@@ -56,18 +56,18 @@ WINDOW = "--prefill 128 1"
 #: sized to its own rows' KV blocks: the indexer's scorer, its top-k and the
 #: candidate pick's block maxima. Past 8192 cached tokens their row bounds
 #: reach past those columns, and `measure ops` widens the plane to the point's.
+#: V4.1's decode top-k on gfx1250, on a scorer's logits or the candidate pick's
+#: maxima: aiter's routed operator, which V4.1's scorer calls since upstream
+#: b7b5ec3f2, each row bounded by `seqLens`; a prefill's too.
+TOPK = "aiter_routed.top_k_per_row_decode.default"
 PLANE_BOUND = {
     "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
     "flydsl_fp8_paged_mqa_logits_gfx1250",
-    "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
+    TOPK,
     "atom.model_ops.deepseek_v41.indexer:_block_maxima",
 }
 #: V4.1's RoPE, over a query's heads or a ratio's index keys, one head.
 ROPE = "aiter.rope_cached_positions_fwd_impl.default"
-#: V4.1's decode top-k on gfx1250, on a scorer's logits or the candidate pick's
-#: maxima: aiter's routed operator, which V4.1's scorer calls since upstream
-#: b7b5ec3f2, each row bounded by `seqLens`.
-TOPK = "aiter_routed.top_k_per_row_decode.default"
 #: V4.1's read of its state cursors back to the host, `.cpu()`, a copy into
 #: pageable memory, which no CUDA graph captures: `measure ops` refuses it.
 HOST_COPY = "aten.to.dtype_layout"

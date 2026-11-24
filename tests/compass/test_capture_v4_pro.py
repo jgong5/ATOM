@@ -384,8 +384,10 @@ def test_tp8_without_dp_attention_reduces_in_each_layer_and_declares_nothing(
         assert len(layers) == LAYERS
         for layer in layers:
             names = [op["op"] for op in layer]
-            # The attention's output projection and the MoE each reduce.
-            assert names.count("aiter.all_reduce_.default") == 2
+            # The attention's output projection and the MoE each reduce, the
+            # MoE's with its shared expert's add folded in (upstream #3020).
+            assert names.count("aiter.all_reduce_.default") == 1
+            assert names.count("aiter.all_reduce_add_.default") == 1
             assert not [op for op in layer if op["kind"] == "declared"]
 
 

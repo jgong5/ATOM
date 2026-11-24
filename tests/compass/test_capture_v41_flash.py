@@ -42,12 +42,12 @@ TP = 4
 MOE = "aiter.fused_moe_.default"
 #: gfx950's FP8 scorer: aiter's function that launches its compiled kernel.
 COMPILED = "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits"
-#: V4.1's index top-k at a decode of 16 rows, as aiter launches it by arch:
-#: FlyDSL's one-block kernel, and on gfx950 its multi-CTA one.
-TOPKS = {
-    "gfx1250": "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
-    "gfx950": "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode",
-}
+#: V4.1's index top-k at a decode of 16 rows on each arch: aiter's routed
+#: operator, which picks its kernel itself, as V4.1's scorer calls it since
+#: upstream b7b5ec3f2.
+TOPKS = dict.fromkeys(
+    ("gfx1250", "gfx950"), "aiter_routed.top_k_per_row_decode.default"
+)
 #: A decode V4.1's mono decode serves: gfx950, expert parallelism off.
 MONO = "--width 16" + ARGS
 #: Two such decodes and a prefill, which mono never serves.

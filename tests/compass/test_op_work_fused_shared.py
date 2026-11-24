@@ -25,6 +25,7 @@ from test_op_work_v4 import F32, close, moe
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import Work, activated_experts, max_rank_load
+from atom.compass.capture.forward import FUSED_MOES
 
 TREE = pathlib.Path(__file__).resolve().parents[2]
 CONFIG = pathlib.Path(__file__).with_name("deepseek_v3_config.json")
@@ -114,7 +115,9 @@ def _decode_moes(tmp_path_factory, atom_args=(), env=None):
     entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
     rank = next(iter(Topology().ranks()))
     graph = json.loads(entry.read_member("graph", rank, "json"))
-    moes = [op for op in _ops(graph["region"]) if "fused_moe" in op["op"]]
+    # aiter's fused-MoE kinds, not the gathered batch's shared-id copy beside
+    # them (`atom.model_ops.fused_moe.gathered_shared_ids`)
+    moes = [op for op in _ops(graph["region"]) if op["op"] in FUSED_MOES]
     _CAPTURES[atom_args] = moes
     return moes
 
