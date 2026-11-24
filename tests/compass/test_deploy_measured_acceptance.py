@@ -60,7 +60,7 @@ def joined(monkeypatch, tmp_path, run, side, atom) -> list[str]:
     path.write_text(json.dumps(run | {"out_dir": "o", "clock_endpoint": "tcp://x:1"}))
     seen = {}
     monkeypatch.setattr(
-        serve, "serve", lambda atom_args, out, run, joined: seen.update(atom=atom_args)
+        serve, "serve", lambda atom_args, out, **_: seen.update(atom=atom_args)
     )
     monkeypatch.setattr(drive_run, "write_grading", lambda out, report, side: None)
     kv = json.dumps({"kv_role": ROLES[side], "kv_connector": "compass"})
