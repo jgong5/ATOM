@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""A DP request's session header, from the client to ATOM's router, and each
-request's rank compared between a real and a simulated record.
+"""A DP request's session header, from the client to ATOM's router, the session
+id a real and a simulated client's aiperf mint, and each request's rank
+compared between a real and a simulated record.
 
 `client.sh` runs with the stand-ins of ``test_client_sh.py``; the headers are
 the ones aiperf's own transport builds under the environment it handed aiperf,
@@ -15,6 +16,7 @@ import os
 import pickle
 import subprocess
 import sys
+from importlib import metadata
 from types import SimpleNamespace
 
 import pytest
@@ -84,6 +86,124 @@ def test_the_client_sends_the_submission_s_headers_and_atom_keys_them_alike(
         _get_dp_session_affinity_ids(SimpleNamespace(headers=Headers(h))) for h in sent
     ]
     assert keys == [("c", None), ("c", "p")]
+
+
+#: aiperf minting one run's sessions: three lanes drawing traces t0, t1 and t0,
+#: each from one instant of it, where its root and first subagent run, then
+#: each root's next subagent spawned in the order $ORDER names, then t1 drawn
+#: again as a lane is recycled. Prints each session's headers by lane and
+#: conversation.
+MINT = """
+import json, os
+from types import SimpleNamespace as N
+from aiperf.common.models import ConversationMetadata, DatasetMetadata, TurnMetadata
+from aiperf.common.models.branch import ConversationBranchInfo
+from aiperf.timing.strategies.agentic_replay import AgenticReplayStrategy
+from aiperf.timing.trajectory_source import TrajectorySource
+from aiperf.transports.base_transports import BaseTransport
+def conv(cid, *ts, **kw):
+    turns = [TurnMetadata(timestamp_ms=t) for t in ts]
+    return ConversationMetadata(conversation_id=cid, turns=turns, **kw)
+convs = []
+for t in ("t0", "t1"):
+    subagents = [f"{t}::sa:{k}" for k in (0, 2)]
+    branches = [ConversationBranchInfo(branch_id=f"{t}:{c[-1]}", mode="spawn",
+                                       child_conversation_ids=[c]) for c in subagents]
+    convs.append(conv(t, 0, 1000, 2000, 3000, branches=branches))
+    convs += [conv(c, 500 * (2 * k + 1), 500 * (2 * k + 3), is_root=False, agent_depth=1)
+              for k, c in zip((0, 2), subagents)]
+draws = iter(["t0", "t1", "t0"])
+dataset = DatasetMetadata(conversations=convs, sampling_strategy="sequential")
+lanes = TrajectorySource(dataset_metadata=dataset, concurrency=3, random_seed=1,
+    dataset_sampler=N(next_conversation_id=lambda: next(draws)),
+    start_min_ratio=0.4, start_max_ratio=0.4, allow_dataset_wrap=True)
+sessions = {f"{k}/{s.conversation_id}": s
+            for k, lane in enumerate(lanes.trajectories) for s in lane.snapshot.states}
+for k in map(int, os.environ["ORDER"]):
+    root = lanes.trajectories[k].conversation_id
+    parent = sessions[f"{k}/{root}"].x_correlation_id
+    sessions[f"{k}/{root}::sa:2"] = lanes.start_branch_child(parent, f"{root}::sa:2", 1)
+replay = N(conversation_source=lanes)
+sessions["3/t1"] = AgenticReplayStrategy._build_session_for_trace(replay, "t1")
+endpoint = N(endpoint=N(session_header=None))
+transport = N(base_headers={}, get_transport_headers=lambda _: {})
+print(json.dumps({name: BaseTransport.build_headers(transport, N(
+    x_request_id="r", x_correlation_id=s.x_correlation_id, endpoint_headers={},
+    parent_correlation_id=s.parent_correlation_id, model_endpoint=endpoint, turns=[]))
+    for name, s in sessions.items()}))
+"""
+#: Runs a real client's aiperf as client.sh does, its arguments after ``-c``
+#: given, under the default start method $START and no compass-harness. Its CLI
+#: sets the start method $SET where given, as aiperf may, then starts a
+#: process as aiperf starts its timing manager, which runs `MINT`.
+REAL_AIPERF = """
+import multiprocessing as mp, os, sys, types
+mp.set_start_method(os.environ["START"])
+sys.modules["compass_harness"] = None
+def app():
+    if "SET" in os.environ:
+        mp.set_start_method(os.environ["SET"], force=True)
+    mint = "import sys\\nsys.modules['compass_harness'] = None\\n" + os.environ["MINT"]
+    service = mp.Process(target=exec, args=(mint, {}))
+    service.start()
+    service.join()
+    sys.exit(service.exitcode)
+cli = sys.modules["aiperf.cli"] = types.ModuleType("aiperf.cli")
+cli.app = app
+exec(sys.argv.pop(1), {})
+"""
+#: A simulated client's aiperf service, started by spawn: compass-harness as
+#: aiperf's plugin discovery imports it in each process, then `MINT`.
+SIMULATED_AIPERF = """
+import multiprocessing as mp, os
+mint = "from aiperf.plugin import plugins\\n" + os.environ["MINT"]
+service = mp.get_context("spawn").Process(target=exec, args=(mint, {}))
+service.start()
+service.join()
+"""
+
+
+def test_a_real_and_a_simulated_run_send_one_session_id_per_trace_and_branch(
+    tmp_path,
+):
+    pytest.importorskip("aiperf")
+    try:
+        metadata.version("compass-harness")
+    except metadata.PackageNotFoundError:
+        pytest.skip("needs compass-harness installed as aiperf's plugin")
+    out, env = _setup(tmp_path, REAL)
+    done = _client(out, *AGENTX, env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    real = [REAL_AIPERF, *json.loads((tmp_path / "seen.json").read_text())[0][1:3]]
+    run = {k: v for k, v in os.environ.items() if not k.startswith("AIPERF_")}
+
+    def aiperf(code, **more):
+        return subprocess.run(
+            [sys.executable, "-c", *code],
+            env=run | {DYNAMO: "1", "MINT": MINT} | more,
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd="/",
+        )
+
+    # Each run spawns the subagents in its own order, as its clock has it.
+    done = aiperf([SIMULATED_AIPERF], ORDER="210")
+    assert done.returncode == 0, done.stderr
+    sent = json.loads(done.stdout.splitlines()[-1])
+    for start in ("fork", "spawn", "forkserver"):  # forkserver from Python 3.14
+        done = aiperf(real, ORDER="012", START=start)
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout.splitlines()[-1]) == sent, start
+    done = aiperf(real, ORDER="012", START="fork", SET="spawn")
+    assert done.returncode == 1 and not done.stdout
+    assert "aiperf asked for start method spawn" in done.stderr
+    ids = {name: headers["X-Dynamo-Session-ID"] for name, headers in sent.items()}
+    assert len(set(ids.values())) == len(ids) == 3 * 3 + 1
+    for k, root in enumerate(["t0", "t1", "t0"]):
+        for child in (0, 2):
+            headers = sent[f"{k}/{root}::sa:{child}"]
+            assert headers["X-Dynamo-Parent-Session-ID"] == ids[f"{k}/{root}"]
 
 
 def test_without_the_arm_s_header_the_client_sends_x_session_id_as_before(

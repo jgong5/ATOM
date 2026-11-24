@@ -368,7 +368,7 @@ class _Authority:
 
     def __init__(self, until):
         self.now, self.until, self.asked = 0.0, until, []
-        self.released = self.arrived = {}
+        self.unread = {}
         self.conn, self.peer = socket.socketpair()
         self.peer.send(b"!")
 

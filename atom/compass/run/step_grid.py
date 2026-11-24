@@ -66,9 +66,11 @@ summary records the digest of the bundle it priced with.
 
 import functools
 import importlib.util
+import io
 import json
 import os
 import pickle
+import sys
 import tempfile
 from collections.abc import Mapping
 from types import FunctionType, SimpleNamespace
@@ -208,15 +210,35 @@ def quantization(config) -> str:
     them before it builds: by `remapped` where the runner has not, and as it is
     where the packed modules the remap leaves on it say it has, since a second
     remap can rename a name again. A config naming no layer, or with no remap,
-    has none to apply."""
+    has none to apply. Both reach the remap pickled by `_ByName`."""
     held = config.quant_config
     if (
         hasattr(held, "remap_layer_name")
         and not hasattr(held, "packed_modules_mapping")
         and any(getattr(held, name) for name in LAYERS)
     ):
-        return remapped(pickle.dumps((held, config.hf_config)))
+        out = io.BytesIO()
+        _ByName(out).dump((held, config.hf_config))
+        return remapped(out.getvalue())
     return held.compute_hash()
+
+
+class _ByName(pickle.Pickler):
+    """Pickles a class its module no longer binds as the class its module now
+    binds by that name. A tokenizer load runs a remote-code config module again
+    where it was imported by name, as `drive.run._config` imports it unpickling
+    its child's config, so the config holds a class pickle refuses; the remap's
+    own process reads either class by its name."""
+
+    def reducer_override(self, obj):
+        if isinstance(obj, type):
+            name = obj.__qualname__
+            now = getattr(sys.modules.get(obj.__module__), name, obj)
+            if isinstance(now, type) and now is not obj and now.__qualname__ == name:
+                from atom.utils import resolve_obj_by_qualname
+
+                return resolve_obj_by_qualname, (f"{obj.__module__}.{name}",)
+        return NotImplemented
 
 
 @functools.cache

@@ -412,6 +412,7 @@ def _record(runner):
             directory = record_dir(directory, runner.config)
             from atom.compass.backends.step_grid_plan import (
                 DEFERS_OUTPUT,
+                MIN_FINAL_ROWS,
                 PREFILL_BUCKETS,
                 UNKEYED,
             )
@@ -431,6 +432,8 @@ def _record(runner):
             for name in CONTEXT_PARALLEL:
                 if (width := getattr(runner.config, name, 1)) > 1:
                     engine[name] = width
+            if (rows := getattr(runner.config, MIN_FINAL_ROWS, 0)) > 0:
+                engine[MIN_FINAL_ROWS] = rows
             engine[PREFILL_BUCKETS] = list(TokenGraph.captured_sizes("prefill"))
             processor = getattr(runner, "tokenID_processor", None)
             engine[DEFERS_OUTPUT] = getattr(processor, "is_deferred_out", True)

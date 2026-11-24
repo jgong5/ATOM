@@ -675,6 +675,70 @@ def test_a_grant_resolves_only_the_clock_waits_it_makes_due(tmp_path):
     assert calls == [2.0, 2.0, 5.0]
 
 
+def test_due_waits_resolve_in_the_order_asked_and_a_withdrawn_one_asks_nothing(
+    tmp_path,
+):
+    """At 5, waits are asked for 4, then 3, then 2, the last withdrawn: the
+    first two are due at once and resolve in the order asked, not by time.
+    Then waits for 7 and 6, the 6 withdrawn: the clock is asked for 7 alone."""
+
+    async def main():
+        rt = ScriptedRuntime([])
+        rt.now = 5.0
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        order = []
+        first, second, dropped = traffic.wait(4.0), traffic.wait(3.0), traffic.wait(2.0)
+        for name, fut in (("4.0", first), ("3.0", second)):
+            fut.add_done_callback(lambda _, name=name: order.append(name))
+        traffic.withdraw(dropped)
+        await asyncio.wait_for(asyncio.gather(first, second), 5)
+        later, sooner = traffic.wait(7.0), traffic.wait(6.0)
+        traffic.withdraw(sooner)
+        await asyncio.wait_for(later, 5)
+        traffic.done.cancel()
+        return order, rt.calls, dict(traffic._waiters)
+
+    order, calls, left = _run(main())
+    assert order == ["4.0", "3.0"] and calls == [7.0] and left == {}
+
+
+def test_the_hold_s_look_finds_the_tasks_asyncio_all_tasks_finds():
+    """`_look` reads the loop's tasks in one pass; what it returns is what the
+    same look over `asyncio.all_tasks` returns: the ready tasks, those not
+    done, and whether one it saw last time has ended."""
+    from compass_harness.traffic_lp import _look
+
+    def reference(alive):
+        me = asyncio.current_task()
+        tasks = {t for t in asyncio.all_tasks() if t is not me and not t.done()}
+        ready = sorted(
+            t.get_name() for t in tasks if t._fut_waiter is None or t._fut_waiter.done()
+        )
+        return ready, tasks, alive is None or any(t.done() for t in alive)
+
+    async def main():
+        gate = asyncio.Event()
+        blocked = [asyncio.ensure_future(gate.wait()) for _ in range(50)]
+        await asyncio.sleep(0)
+        looks = []
+        ready, alive, ended = _look(None)
+        looks.append(((sorted(ready), alive, ended), reference(None)))
+        blocked[3].cancel()  # ends at its next step
+        fresh = asyncio.ensure_future(asyncio.sleep(0))  # ready, not yet run
+        ready, now_alive, ended = _look(alive)
+        looks.append(((sorted(ready), now_alive, ended), reference(alive)))
+        await asyncio.sleep(0)
+        ready, later, ended = _look(now_alive)
+        looks.append(((sorted(ready), later, ended), reference(now_alive)))
+        gate.set()
+        await asyncio.gather(*blocked, fresh, return_exceptions=True)
+        return looks
+
+    looks = _run(main())
+    assert [ours for ours, _ in looks] == [theirs for _, theirs in looks]
+    assert looks[1][0][2] is False and looks[2][0][2] is True  # the cancel ended one
+
+
 def test_a_task_ending_while_the_hold_waits_on_a_return_has_its_callbacks_run_first(
     tmp_path,
 ):
