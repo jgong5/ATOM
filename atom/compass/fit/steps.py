@@ -31,7 +31,9 @@ the law states them as `moe_routing`, and each decode rung may adopt a MoE
 column over them, as that command's `--moe-routing` fits it. `--model DIR`
 reads them from the model directory the records served, as ATOM loads its
 config, and refuses one whose config.json is not the records'; a model that
-names no routed experts gives none. The law states,
+names no routed experts gives none. It reads a block drafter's own routing too
+(`DRAFT_ROUTING`), over which a draft law fitted above data-parallel width 1
+may adopt a MoE column. The law states,
 as `platform`, the platform fields of its key,
 and `engine_config`, as that command's does, and the key holds them, and
 `records_atom` as that command's states it. The report's
@@ -82,13 +84,18 @@ TARGETS = ("the targets'", "the targets' sampling is")
 #: ATOM's models read them, the first one set taken.
 EXPERTS = ("n_routed_experts", "num_local_experts", "num_experts")
 TOP_K = ("num_experts_per_tok", "num_experts_per_token")
+#: The names a block drafter's config gives its own routed experts and top-k by.
+DRAFT_ROUTING = (("dspark_n_routed_experts",), ("dspark_num_experts_per_tok",))
 
 
-def _model_routing(model: str, served: str) -> tuple[int, int] | None:
-    """The routed experts and top-k the model directory `model` states, read
-    from its config as ATOM's `Config` loads it, in its text config where it
-    has one; None for a model naming no routed experts. Refused unless its
-    config.json is `served`, the records' digest of theirs."""
+def _model_routing(
+    model: str, served: str, names=(EXPERTS, TOP_K)
+) -> tuple[int, int] | None:
+    """The routed experts and top-k the model directory `model` states under
+    `names`, the target's by default, read from its config as ATOM's `Config`
+    loads it, in its text config where it has one; None for a model naming no
+    routed experts. Refused unless its config.json is `served`, the records'
+    digest of theirs."""
     from atom.config import _normalize_minimax_m3_text_config, get_hf_config
 
     if (digest := _file_digest(model, "config.json")) != served:
@@ -99,13 +106,13 @@ def _model_routing(model: str, served: str) -> tuple[int, int] | None:
     _normalize_minimax_m3_text_config(config)
     config = getattr(config, "text_config", config)
     experts, top_k = (
-        next((v for v in (getattr(config, n, None) for n in names) if v), None)
-        for names in (EXPERTS, TOP_K)
+        next((v for v in (getattr(config, n, None) for n in kind) if v), None)
+        for kind in names
     )
     if experts and not top_k:
         raise ValueError(
             f"--model {model} names {experts} routed experts and no top-k "
-            f"({', '.join(TOP_K)})"
+            f"({', '.join(names[1])})"
         )
     return (experts, top_k) if experts else None
 
@@ -116,6 +123,9 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     options["moe_routing"] = args.moe_routing or (
         args.model and _model_routing(args.model, config["model"])
     )
+    if args.model:
+        drafter = _model_routing(args.model, config["model"], DRAFT_ROUTING)
+        options["draft_moe_routing"] = drafter
     options["buckets"] = config.get("prefill_buckets")
     law, report = step_linear_fit.fit(samples, options, args.seed)
     if options["buckets"] is None:
