@@ -19,7 +19,10 @@ the run none has started, and after it every one has exited, so any other
 process listed on a named GPU at either check is not this run's.
 
 `--gpu` and the listing use rocm-smi's GPU indexes; HIP and KFD's memory number
-GPUs by KFD node, the one `rocm-smi --showhw` lists for each (`_nodes`).
+GPUs by KFD node, the one `rocm-smi --showhw` lists for each (`_nodes`). Under
+ROCm's own mask, `ROCR_VISIBLE_DEVICES` (a shared node's GPU pool hands out
+GPUs as their `GPU-<unique id>`), HIP numbers only the GPUs it lists, in its
+order (`_masked`), and rocm-smi still lists every GPU of the node.
 """
 
 import argparse
@@ -37,6 +40,9 @@ SMI_TIMEOUT_S = 60
 _ON = re.compile(r"PID (\d+) is using \d+ DRM device\(s\):\n([\d ]*)")
 #: A `rocm-smi --showhw` row: the GPU's index, then its KFD node.
 _NODE = re.compile(r"^(\d+) +(\d+) ", re.MULTILINE)
+#: A `rocm-smi --showuniqueid` row: the GPU's index, then its unique id.
+_UNIQUE = re.compile(r"GPU\[(\d+)\][\s:]*Unique ID: (?:0x)?([0-9a-fA-F]+)")
+MASK = "ROCR_VISIBLE_DEVICES"
 _PID = re.compile(r"PID (\d+) is using")
 KFD = Path("/sys/class/kfd/kfd")
 SCHED = Path("/proc/self/sched")
@@ -96,10 +102,59 @@ def _nodes(gpus: tuple[int, ...]) -> dict[int, int]:
 
 def hip_visible(gpus: tuple[int, ...]) -> str:
     """`HIP_VISIBLE_DEVICES` for the rocm-smi GPUs `gpus`: each one's HIP
-    ordinal is its KFD node's rank among the nodes `rocm-smi --showhw` lists."""
+    ordinal is its KFD node's rank among the nodes `rocm-smi --showhw` lists,
+    or under `MASK` its place among the GPUs the mask lists (`_masked`); a GPU
+    the mask hides refuses."""
     node = _nodes(gpus)
-    order = sorted(node.values())
-    return ",".join(str(order.index(node[gpu])) for gpu in gpus)
+    listed = _masked(node)
+    if listed is None:
+        order = sorted(node.values())
+        return ",".join(str(order.index(node[gpu])) for gpu in gpus)
+    if hidden := [gpu for gpu in gpus if gpu not in listed]:
+        raise GpuRefusal(
+            f"{MASK} shows HIP rocm-smi GPUs {listed} alone, and the run names "
+            f"GPU {hidden}"
+        )
+    return ",".join(str(listed.index(gpu)) for gpu in gpus)
+
+
+def _masked(node: dict[int, int]) -> list[int] | None:
+    """The rocm-smi GPUs `MASK` shows HIP, in the order it lists them, which is
+    the order HIP numbers them in; None where it is unset. Set but blank, it
+    shows none, as ROCm reads it. An entry is a GPU's `GPU-<unique id>`, as
+    `rocm-smi --showuniqueid` prints it, or ROCm's own ordinal: the rank of the
+    GPU's KFD node, `node` mapping each rocm-smi GPU to its own. An entry that
+    names no GPU, or one an earlier entry names, refuses."""
+    mask = os.environ.get(MASK)
+    if mask is None:
+        return None
+    ranked = sorted(node, key=node.__getitem__)
+    unique = None
+    listed = []
+    entries = mask.split(",") if mask.strip() else []
+    for entry in (e.strip() for e in entries):
+        gpu = None
+        if entry.isdigit() and int(entry) < len(ranked):
+            gpu = ranked[int(entry)]
+        elif entry[:4].upper() == "GPU-":
+            if unique is None:
+                found = _UNIQUE.findall(smi("--showuniqueid"))
+                unique = {_unique_id(u): int(g) for g, u in found}
+            gpu = unique.get(_unique_id(entry[4:]))
+        if gpu is None:
+            raise GpuRefusal(
+                f"{MASK}={mask}: {entry!r} is neither a GPU's unique id rocm-smi "
+                f"--showuniqueid prints nor an ordinal below {len(ranked)}"
+            )
+        if gpu in listed:
+            raise GpuRefusal(f"{MASK}={mask}: {entry!r} names GPU {gpu} again")
+        listed.append(gpu)
+    return listed
+
+
+def _unique_id(text: str) -> str:
+    """A unique id as hex digits, so `GPU-00ab` and rocm-smi's `0xab` match."""
+    return text.lower().removeprefix("0x").lstrip("0")
 
 
 @contextmanager
