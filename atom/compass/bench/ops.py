@@ -917,7 +917,9 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     runs its target's leaves less the LM head and the sampler, so the
     target's points at output cover both. A graph traced under this ATOM
     source and torch answers (`capture.graph_key`), else one whose files read
-    here as in its trace (`capture.lookup_by_files`). A miss where the store
+    here as in its trace (`capture.lookup_by_files`), loaded as a run loads it
+    (`run.load_graph`): one whose row states another torch, ATOM source or
+    model refuses, naming the axis. A miss where the store
     holds the shape under another engine config or torch, or of a file that
     reads otherwise, refuses naming what differs. A
     two-batch-overlap micro-batch's `shape` reads its own graph, and a shape
@@ -925,6 +927,7 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture import graph_key, lookup_by_files
     from atom.compass.capture.forward import missed, structure
+    from atom.compass.run import graph_readings, load_graph
 
     shape = shape._replace(real=None)
     at = structure(
@@ -948,7 +951,8 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
             f"source and torch{why}",
             "compass trace ops captures one under this process's environment",
         )
-    return json.loads(store.read(key).read_member("graph", RANK, "json"))
+    entry = load_graph(store, key, graph_readings(config.model))
+    return json.loads(entry.read_member("graph", RANK, "json"))
 
 
 def leaves_at(
@@ -961,8 +965,9 @@ def leaves_at(
     step's (`parts`), where a capture keeps a decode's drafter's graph alone:
     the leaves of the drafter's graphs there at each output (`graph`'s
     `output`) `own` holds, as its steps read them. With `drafter`, only the
-    leaves some graph of the drafter's holds, each as the whole shape has it."""
-    from atom.compass.artifacts import ArtifactRefusal
+    leaves some graph of the drafter's holds, each as the whole shape has it.
+    A drafter's graph the store holds that refuses here (`graph`) refuses."""
+    from atom.compass.artifacts import ArtifactRefusal, Rule
 
     if own:
         found, target = {}, set()
@@ -976,7 +981,9 @@ def leaves_at(
         for output, draft in DRAFTED if spec else ():
             try:
                 region = graph(store, config, shape, arch, output, draft)["region"]
-            except ArtifactRefusal:
+            except ArtifactRefusal as refused:
+                if refused.rule is not Rule.RESOLUTION:
+                    raise
                 continue
             held |= leaves(region).keys()
             leaves(region, None, found)
@@ -4923,14 +4930,17 @@ def _load(
     """Each of `shapes`' leaves (`leaves_at`, a drafter's own at a shape `own`
     maps to its outputs) into `graphs`, its op_graph captured first when the
     store has none (`_capture`, naming the record directories `records` the
-    shapes are of)."""
-    from atom.compass.artifacts import ArtifactRefusal
+    shapes are of). One the store holds that refuses here (`graph`) refuses:
+    a capture of its shape would be keyed as it is."""
+    from atom.compass.artifacts import ArtifactRefusal, Rule
 
     own, missing = own or {}, []
     for shape in sorted(shapes - graphs.keys(), key=str):  # G and W: None or a count
         try:
             graphs[shape] = leaves_at(store, config, shape, arch, own.get(shape, ()))
-        except ArtifactRefusal:
+        except ArtifactRefusal as refused:
+            if refused.rule is not Rule.RESOLUTION:
+                raise
             missing.append(shape)
     if missing:
         _capture(config, missing, root, arch, atom_args, records)
