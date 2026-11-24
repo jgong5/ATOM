@@ -4,14 +4,17 @@ stage all-gathers it, as ATOM's `async_send_intermediate_tensors` and aiter's
 `recv_tensor_dict` do with `pp_send_allgather_group` on: the receive of each
 part after a sharded one is posted once its all-gather ends.
 
-The run test needs a driver and `ATOM_COMPASS_SLICE_MODEL`, as in
-`test_vertical_slice`; the rest run anywhere.
+The run test runs PP2 at TP 2 under a constant step stub, and again priced by
+the step roofline alone on node 18's spec, which prices each all-gather by the
+spec's link (`test_step_roofline_stage`). The run tests need a driver and
+`ATOM_COMPASS_SLICE_MODEL`, as in `test_vertical_slice`; the rest run anywhere.
 """
 
 import json
 from types import SimpleNamespace
 
 import pytest
+import test_dp_slice
 import test_pp_launch_send as launch
 from test_backend_step_linear import law
 from test_dp_slice import (  # noqa: F401
@@ -22,6 +25,7 @@ from test_dp_slice import (  # noqa: F401
 from test_dp_step_max import prefill
 from test_memory_readings import META_8B
 from test_pp_launch_send import PRE, E
+from test_pp_stages import NODE18, each_stage_prices_its_own_layers, roofline_run_file
 from test_pp_stream_holds import ALL_RDV
 from test_pp_stream_holds import _stage as real_stage
 from test_run_step_grid import deployment, run_file
@@ -162,3 +166,25 @@ def test_a_tp2_pipeline_meets_the_run_properties(tmp_path, monkeypatch):
     rows = [line.split() for line in runs[0]["table"].splitlines()[1:]]
     released = {r[4] for r in rows if r[3] == "release"}
     assert "engine-pp0->engine-pp1:pp_data#dp0" in released
+
+
+@NEEDS_A_RUN
+def test_a_tp2_pipeline_meets_the_run_properties_under_the_step_roofline(
+    tmp_path, monkeypatch
+):
+    """Every check but the stages' timeline, which only a constant stub's run
+    has computed; each stage prices its own layers."""
+    monkeypatch.setenv("ATOM_PP_SEND_ALLGATHER", "1")
+    monkeypatch.setattr(test_dp_slice, "_run_file", roofline_run_file)
+    width = ["-pp", "2", "-tp", "2"]
+    runs = [
+        run_dp_slice(tmp_path / s, s, width, dp=1, pp=2, machine=NODE18)
+        for s in ("1", "2")
+    ]
+    print(f"\n{runs[0]['summary']['schedule']['seconds_by_method']}")
+    print(runs[0]["table"])
+    taken = [line for _, line in runs[0]["events"]]
+    failed = check_run([r["out"] for r in runs], MAX_TOKENS, taken)
+    assert not failed, "\n".join(failed)
+    stages = each_stage_prices_its_own_layers(runs[0]["out"] / "parity")
+    print(f"mean decode price: PP2 TP2 stages {stages!r} s")
