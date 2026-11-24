@@ -1,0 +1,59 @@
+{
+ "name": "cellA_k31",
+ "about": "Kimi-K3.1-Pro on 8 MI355X: TP8 + DCP8, ONE DP rank, bf16 KV, block 128, max-num-seqs 64, max len 1048576, no speculative decode, KDA recurrent state with a checkpoint every 8192 tokens: a prefix hit lands on a checkpoint boundary only (prefix_unit 8192) (#752; ~/agent_scratch/752/kimi/env_k31.sh). Rungs: ATOM's default capture sizes up to 64; max-num-batched-tokens and the prefill chunk at ATOM's 16384. One DP rank: rule 2.4.6 as for M3.1. kv_tokens is a PLACEHOLDER (#752: the pool holds about three 940k-token requests) until the smoke record's run.json replaces it. The prefill's KDA state columns (752-kimi: kda_seqs, kda_saves, kda_forks, kda_moves, kda_pad_blocks) are a variant this tree's backend does not count: they report an error until that tree lands and the rehearsal's views carry KDA counts. Dry run: waits for a law fitted on the smoke record.",
+ "deployment": {
+  "dp": 1,
+  "rungs": [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64],
+  "max_num_seqs": 64,
+  "max_num_batched_tokens": 16384,
+  "chunk": 16384,
+  "block_size": 128,
+  "max_model_len": 1048576,
+  "kv_tokens": 2800000,
+  "drafts": 0,
+  "acceptance": 1.0,
+  "prefix_unit": 8192,
+  "prefill_buckets": [],
+  "moe_routing": [896, 16],
+  "trace_model": "kimi-k3.1",
+  "trace_block": 64
+ },
+ "columns": {
+  "decode": ["step", "context", "graph_padding", "row_padding"],
+  "decode_variants": [[], ["moe_tokens"], ["moe_experts"]],
+  "prefill": ["step", "tokens", "query_square", "query_cached", "history"],
+  "prefill_variants": [[], ["kda_seqs", "kda_saves", "kda_forks", "kda_moves", "kda_pad_blocks"]],
+  "min_spread": 0.2
+ },
+ "noise": {
+  "decode": 0.0063,
+  "prefill": 0.0037
+ },
+ "acceptance": {
+  "vif": 10,
+  "g": {"decode": 0.01, "prefill": 0.02},
+  "g_z": 2.0,
+  "rung_steps": 60,
+  "levels": 3
+ },
+ "range": {
+  "min_context": 1024,
+  "min_prompt": 512,
+  "min_seq_tokens": 128
+ },
+ "timing": {
+  "server_start_s": 900,
+  "segment_overhead_s": 35
+ },
+ "segments": [
+  {"name": "D-v1", "kind": "drain", "purpose": "each rung's fixed cost at small context", "lanes": [{"pin": 0, "groups": [{"rows": 64, "prompt": 4096}]}]},
+  {"name": "D-v2", "kind": "drain", "purpose": "row padding at low context: one long anchor among short rows", "lanes": [{"pin": 0, "groups": [{"rows": 63, "prompt": 4096, "then": 512}, {"rows": 1, "prompt": 900000, "last": true, "then": 512}]}]},
+  {"name": "D-v3", "kind": "drain", "purpose": "long context at the high rungs: half the KV pool over 64 rows", "lanes": [{"pin": 0, "groups": [{"rows": 64, "prompt": {"kv_share": 0.5}, "then": 512}]}]},
+  {"name": "D-v3low", "kind": "drain", "purpose": "long context at the low rungs: nine anchors leave last", "lanes": [{"pin": 0, "groups": [{"rows": 55, "prompt": 7168, "then": 512}, {"rows": 9, "prompt": {"kv_share": 0.5, "over": 9}, "last": true, "then": 512}]}]},
+  {"name": "P-quads", "kind": "quads", "purpose": "prefill scale x density; checkpoint crossings", "scales": [1024, 2048, 4096, 8192, 12288, 16384], "shares": [1.0], "sparse_steps": [0, 150, 0, 0, 300, 0]},
+  {"name": "P-backlog", "kind": "backlog", "purpose": "long chunks sharing the step budget with short prompts", "long": [300032, 589824], "short": [512, 16384], "short_turns": 40, "short_sessions": 3},
+  {"name": "P-trickle", "kind": "trickle", "purpose": "short prefills on long histories: hits at checkpoint boundaries, recomputed tails", "firsts": [200704, 400384, 600064], "deltas": [4096, 8192, 12288, 16384, 2048], "outs": [16, 64, 1], "gaps": [0.5, 1.0, 2.0], "turns": 11},
+  {"name": "P-rows-a", "kind": "rows", "purpose": "prefill steps of many rows", "requests": 2000, "prompt": [64, 4096], "out1": 0.8, "outs": [1, 4, 16], "concurrency": 64},
+  {"name": "P-rows-b", "kind": "rows", "purpose": "single-row prompts of 8-16k: query_square apart from tokens at output steps", "requests": 160, "prompt": [8192, 16384], "out1": 0.8, "outs": [1, 8, 32], "concurrency": 1}
+ ]
+}
