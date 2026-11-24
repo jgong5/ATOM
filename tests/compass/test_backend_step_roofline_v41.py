@@ -264,9 +264,11 @@ for name, step in steps.items():
     priced[name] = [{t.name: t.seconds for t in terms}
                     for terms in (cost.terms, cost.draft_terms)]
 found = [[m.draft, m.replay, m.kind, m.dims, m.fmt, m.act] for m in modules]
+logits = [m.name for m in modules if m.logits]
 config.kv_cache_dtype = "fp8"  # a pool format the walk does not price
 other = [m.name for m in walk(tree, draft) if m.kind == "unclassified"]
-print(json.dumps({"kept": kept, "modules": found, "priced": priced, "fp8": other}))
+print(json.dumps({"kept": kept, "modules": found, "priced": priced, "fp8": other,
+                  "logits": logits}))
 """
 
 
@@ -349,6 +351,8 @@ def test_the_v41_flash_tp4_dspark_build_classifies_every_module(built):
     # Its stack ends by collapsing its streams at the last seam's mix
     # (`SinglePassHCState.collapse`): it holds no `hc_head` before its norm.
     assert not [k for k in target if k[0] == "hc_head"]
+    # The final norm runs in `compute_logits` alone, as V4's.
+    assert done["logits"] == ["norm"]
     # The drafter: three stages over blocks of 5 attending the window, the
     # LM head and the sampler on a quarter of the vocabulary, and its KV pass
     # on the target's rows, on a replayed prefill's window as the decoder.

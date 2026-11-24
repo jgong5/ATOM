@@ -124,6 +124,23 @@ def test_the_lm_head_runs_on_each_prefill_rows_last_token_and_each_decode_token(
     assert [t.seconds for t in terms if t.name == "roofline.lm_head"] == priced
 
 
+@pytest.mark.parametrize("padded,rows", [(True, 8), (False, 4)])
+def test_a_decode_graphs_lm_head_runs_on_its_pad_rows_unless_padding_is_none(
+    padded, rows
+):
+    """The runner hands the LM head a graph's `running_tokens`, its pad rows
+    included; `ParallelLMHead.forward` cuts a prefill alone."""
+    head = [Module("lm_head", "lm_head", (1000, 64), ranks=2)]
+    # Two decode rows of 2 tokens in a rung-4 graph: 2 pad rows of 2.
+    step = view((2, 40, True), (2, 90, True), rung=4)
+    backend = StepRooflineBackend(MACHINE, head, padded=padded)
+    (term,) = backend.price(step).terms
+    # Each rank's logits shard of 1000 bf16 a row, gathered over the 2 ranks.
+    comm = 2e-6 + rows * 1000 * 2 * 2 / 2 / (1.0e12 * 0.80)
+
+    assert term.seconds == _module(gemm(rows, 1000, 64)) + comm
+
+
 @pytest.mark.parametrize("bf16", [2.5e15, 1e9], ids=["memory-bound", "compute-bound"])
 def test_linear_attention_and_act_on_a_padded_two_token_decode_step_by_hand(bf16):
     document = copy.deepcopy(ROOFLINE)

@@ -204,13 +204,16 @@ def test_sparse_attention_and_the_hyper_connection_mix_by_hand(spec):
 
 
 @BOUND
-def test_the_targets_hc_head_reduces_every_row_of_a_step_that_samples(spec):
+def test_the_targets_compute_logits_runs_on_every_row_of_a_step_that_samples(spec):
     """`DeepseekV4ForCausalLM.compute_logits` reduces each row the forward ran
     (`hc_head`), then norms it and runs the LM head, which takes a prefill's
-    last row; a middle chunk computes no logits."""
-    hc_head = Module("model.hc_head", "hc_head", (4, 16))
+    last row and a decode graph's every row, pad rows too; a middle chunk
+    computes no logits."""
+    hc_head = Module("model.hc_head", "hc_head", (4, 16), logits=True)
+    norm = Module("model.norm", "norm", (16,), logits=True)
     lm_head = Module("model.head", "lm_head", (32, 16))
     proj = Module("layers.0.proj", "gemm", (16, 16))
+    head = [hc_head, norm, lm_head]
 
     def reduced(rows):
         # Each row's four copies read and one row written, in bf16; one gate
@@ -218,18 +221,30 @@ def test_the_targets_hc_head_reduces_every_row_of_a_step_that_samples(spec):
         moved = rows * 5 * 16 * 2 + 4 * 4 * 16 * 4
         return _module(Work({"bf16": 2 * rows * 4 * 4 * 16}, moved), spec)
 
+    def normed(rows):
+        # Each row read and written once, in bf16.
+        return _module(Work({}, rows * 16 * 2 * 2), spec)
+
     step = view((3, 10, False), (5, 5, False))
-    by_name = _price([hc_head, lm_head], step, spec)
     # A graph's rung of 4 decode rows of 2 tokens: its pad row's 2 too.
     padded = BatchView((RequestShape(2, 9, True),) * 3, capture_rung=4)
     chunk = dataclasses.replace(step, produces_output=False)
 
-    assert by_name["roofline.hc_head"] == pytest.approx(reduced(8))
-    assert by_name["roofline.lm_head"] == pytest.approx(_module(gemm(2, 32, 16), spec))
-    assert _price([hc_head], padded, spec) == pytest.approx(
-        {"roofline.hc_head": reduced(8)}
+    assert _price(head, step, spec) == pytest.approx(
+        {
+            "roofline.hc_head": reduced(8),
+            "roofline.norm": normed(8),
+            "roofline.lm_head": _module(gemm(2, 32, 16), spec),
+        }
     )
-    assert set(_price([hc_head, lm_head, proj], chunk, spec)) == {"roofline.gemm"}
+    assert _price(head, padded, spec) == pytest.approx(
+        {
+            "roofline.hc_head": reduced(8),
+            "roofline.norm": normed(8),
+            "roofline.lm_head": _module(gemm(8, 32, 16), spec),
+        }
+    )
+    assert set(_price([*head, proj], chunk, spec)) == {"roofline.gemm"}
 
 
 @BOUND
