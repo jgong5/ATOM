@@ -559,6 +559,9 @@ V41_NAMES = {
     (_PICK, "seqLens"): "step.visible.{ratio}",
     (_ROUTED, "seqLens"): "step.visible.{ratio}",
     (_FUSED, "plan_gpu"): _PLAN,
+    # the rows its pool write takes, a plan of the ratio's own since upstream
+    # b7b5ec3f2
+    (_FUSED, "write_plan"): "step.plans.{ratio}.write_plan_gpu",
     ("atom.model_ops.deepseek_v41.index_write:write_index_rows", "plan"): _PLAN,
     (_INDICES, "pptr"): f"{_CACHE}.0",
     (_INDICES, "eptr"): f"{_CACHE}.1",
@@ -591,6 +594,9 @@ V41_NAMES = {
     },
     ("aiter.fused_moe_.default", "num_local_tokens"): "scheduled_tokens_gpu",
     ("aiter.topk_gating_fwd.default", "num_valid_rows"): "scheduled_tokens_gpu",
+    # aiter's routed top-k gating, which V4.1's router calls since upstream
+    # b7b5ec3f2
+    ("aiter_routed.topk_gating.default", "num_valid_rows"): "scheduled_tokens_gpu",
 }
 #: DeepSeek-V4's arguments, keyed and bound as `V4_METADATA`'s, to operators
 #: other models run too, which a runner binds so only beside a DeepSeek-V4 CSA
