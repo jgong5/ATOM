@@ -215,8 +215,6 @@ def batch_view(
 
     A target that replays no graph pads to it too (`target_bs`): an eager
     decode every rank decodes in, its inputs; a sampling prefill, its LM head.
-
-    A model with KDA layers states its step's state work (`kda`, `kda_counts`).
     """
     draft_moe_rows = moe_tokens = dp_rank = draft_bs = target_bs = draft_rows = None
     group_max_tokens = None
@@ -291,43 +289,6 @@ def batch_view(
             and mode.sync is not None
             and mode.sync.max_final_requests_across_dp > 0
         ),
-        kda=kda_counts(batch, runner),
-    )
-
-
-def kda_counts(batch: Any, runner: Any) -> tuple[int, ...] | None:
-    """`BatchView.kda` of `batch`, for a runner whose model has KDA layers
-    (`step_linear.kda_layers`), else None: the one count a real record and a
-    simulated run both read off the scheduled batch.
-
-    The rows holding a state are `ScheduledBatch.state_rows`; the midstep
-    checkpoints its forward writes, each of `state_save_all`'s positions; the
-    forks, the rows whose `state_fork_srcs` names a slot to read from; the
-    moves, its `state_maintenance_ops`' relocations, checkpoint stores and
-    restores, which the attention builder runs before the forward; and the
-    padded tokens, over its state rows that prefill (the first
-    `total_seqs_num_prefill` rows), the tokens filling each one's last chunk of
-    `step_linear.KDA_CHUNK`, as the chunked recurrence runs each row from its
-    own first token.
-    """
-    from atom.compass.backends.step_linear import KDA_CHUNK, kda_layers
-
-    if not kda_layers(getattr(getattr(runner, "config", None), "hf_config", None)):
-        return None
-    rows = list(getattr(batch, "state_rows", ()))
-    prefill = batch.total_seqs_num_prefill
-    tokens = batch.num_scheduled_tokens
-    ops = getattr(batch, "state_maintenance_ops", None)
-    moves = sum(
-        len(getattr(ops, name, ()))
-        for name in ("relocations", "checkpoint_stores", "checkpoint_restores")
-    )
-    return (
-        len(rows),
-        sum(len(saves) for saves in getattr(batch, "state_save_all", ())),
-        sum(1 for src in getattr(batch, "state_fork_srcs", ()) if src >= 0),
-        moves,
-        sum(-int(tokens[r]) % KDA_CHUNK for r in rows if r < prefill),
     )
 
 

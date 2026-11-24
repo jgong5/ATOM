@@ -35,9 +35,7 @@ the law states them as `moe_routing`, and each decode rung may adopt a MoE
 column over them, as that command's `--moe-routing` fits it. `--model DIR`
 reads them from the model directory the records served, as ATOM loads its
 config, and refuses one whose config.json is not the records'; a model that
-names no routed experts gives none. For a model with KDA layers (Kimi-K3,
-`step_linear.kda_layers`) `--model` also adds the prefill vector's KDA state
-columns (`step_linear_fit._kda`), which the records' lines must state. It reads a block drafter's own routing too
+names no routed experts gives none. It reads a block drafter's own routing too
 (`DRAFT_ROUTING`), over which a draft law fitted above data-parallel width 1
 may adopt a MoE column. The law states,
 as `platform`, the platform fields of its key,
@@ -135,16 +133,6 @@ def _model_routing(
     return (experts, top_k) if experts else None
 
 
-def _model_kda(model: str) -> bool:
-    """Whether the model directory `model` states KDA layers
-    (`step_linear.kda_layers`), its config read as ATOM's `Config` loads it;
-    `_model_routing` has checked its config.json is the records'."""
-    from atom.compass.backends.step_linear import kda_layers
-    from atom.config import get_hf_config
-
-    return bool(kda_layers(get_hf_config(model)))
-
-
 def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     form = args.form or "history"
     samples, ladder = step_linear_fit.ladder_cut(samples)
@@ -161,7 +149,6 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
         options["peer_share"] = True
     if args.keep_peer_tail:
         options["keep_peer_tail"] = True
-    options["kda"] = bool(args.model) and _model_kda(args.model)
     law, report = step_linear_fit.fit(samples, options, args.seed)
     if options["buckets"] is None:
         law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS

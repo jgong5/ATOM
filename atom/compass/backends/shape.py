@@ -290,12 +290,6 @@ class BatchView:
     `image_tokens` counts the
     scheduled tokens whose embedding the step's vision encoder supplies; a
     backend that has no basis for pricing that encoder refuses a step with any.
-    `kda` is a KDA model's recurrent state work on the step, five counts: the
-    rows holding a state, the midstep checkpoints the forward writes, the rows
-    reading their state from another slot (a fork), the state moves and
-    checkpoint copies run before the forward, and the tokens padding the
-    prefill rows' last recurrence chunks; None for a model with no KDA layer
-    or when the caller did not say (`runner.projection.kda_counts`).
 
     What this does not do is make the collapsed form unreachable: one row is
     a legal batch, and a one-row batch is `tokens x history` by construction.
@@ -321,7 +315,6 @@ class BatchView:
     group_needs_eager: bool = False
     group_tail: bool = False
     prefill_duty: float | None = None
-    kda: tuple[int, int, int, int, int] | None = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -339,14 +332,6 @@ class BatchView:
         for row in rows:
             if not isinstance(row, RequestShape):
                 raise TypeError(f"not a request shape: {row!r}")
-        if self.kda is not None:
-            kda = tuple(self.kda)
-            object.__setattr__(self, "kda", kda)
-            if len(kda) != 5 or any(type(n) is not int or n < 0 for n in kda):
-                raise ValueError(
-                    f"kda {kda!r} is not five counts: state rows, saves, forks, "
-                    "moves and padded chunk tokens"
-                )
         peak = self.group_max_tokens
         if peak is not None and peak < sum_tokens(rows):
             raise ValueError(
