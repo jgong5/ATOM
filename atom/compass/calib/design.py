@@ -15,6 +15,13 @@ there: `dp` sessions started at once land one a rank. A later turn's prompt
 extends the previous one's (its history, output and delta in whole trace
 blocks), so its history is a prefix-cache hit on that rank.
 
+A segment's sizes are plain numbers or relative to the deployment, resolved
+before its generator runs (`resolved`): a count (a group's rows, requests,
+concurrency) as a share of `max_num_seqs`, a rank's or the group's (`count`);
+a token size (a prompt, a scale, a history) as a share of the KV pool, the
+model length, the step budget or the largest token-graph bucket (`tokens`).
+A design stated that way follows a deployment change with no edit.
+
 Kinds (`GENERATORS`):
 
 - ``drain``: decode drains. Each lane's rows start together and leave on the
@@ -162,15 +169,108 @@ def out_for(steps: int, dep: Deployment) -> int:
     return 1 + math.floor(dep.per_step * steps)
 
 
+#: A count relative to the deployment (`count`): rows, requests, concurrency.
+COUNT = ("seqs_share", "per_rank", "dp", "minus", "plus")
+#: A token size relative to the deployment (`tokens`).
+TOKENS = ("kv_share", "len_share", "budget_share", "bucket_share", "over")
+#: The segment entries that are counts, and those that are token sizes (a
+#: number or a list of them); a drain group's `rows` and `prompt` besides.
+COUNT_KEYS = (
+    "rows",
+    "requests",
+    "concurrency",
+    "short_sessions",
+    "short_turns",
+    "turns",
+)
+TOKEN_KEYS = ("prompt", "scales", "long", "short", "firsts", "deltas", "then")
+#: The share of the model length a share of the KV pool is held under.
+LEN_CAP = 0.9
+
+
+def count(spec, dep: Deployment) -> int:
+    """A count: a number as given, or ``{"seqs_share": f, "per_rank": k,
+    "dp": bool, "minus": m, "plus": p}``, `f` of a rank's `max_num_seqs` and
+    `k` more, times the DP ranks with `dp` (a group's total), less `m`, plus `p`."""
+    if not isinstance(spec, dict):
+        return spec
+    if extra := set(spec) - set(COUNT):
+        raise ValueError(f"a count states {sorted(extra)}; it takes {list(COUNT)}")
+    width = dep.dp if spec.get("dp") else 1
+    base = spec.get("seqs_share", 0) * dep.max_num_seqs + spec.get("per_rank", 0)
+    n = round(base * width) - spec.get("minus", 0) + spec.get("plus", 0)
+    if n < 1:
+        raise ValueError(f"the count {spec} is {n} at this deployment")
+    return n
+
+
+def tokens(spec, dep: Deployment, over: int = 1) -> int:
+    """A token size: a number as given, or the least of what a dict states,
+    in whole trace blocks: `kv_share` of the KV pool split `over` ways (by
+    default a drain group's rows), held under `len_share` (default `LEN_CAP`)
+    of the model length; `len_share` of the model length, under the pool split
+    `over` ways; `budget_share` of the step budget; `bucket_share` of the
+    largest token-graph bucket."""
+    if not isinstance(spec, dict):
+        return spec
+    if extra := set(spec) - set(TOKENS):
+        raise ValueError(
+            f"a token size states {sorted(extra)}; it takes {list(TOKENS)}"
+        )
+    over = spec.get("over", over)
+    sizes = []
+    if "kv_share" in spec:
+        sizes.append(spec["kv_share"] * dep.kv_tokens / over)
+        sizes.append(spec.get("len_share", LEN_CAP) * dep.max_model_len)
+    elif "len_share" in spec:
+        sizes += [spec["len_share"] * dep.max_model_len, dep.kv_tokens / over]
+    if "budget_share" in spec:
+        sizes.append(spec["budget_share"] * dep.max_num_batched_tokens)
+    if "bucket_share" in spec:
+        if not dep.prefill_buckets:
+            raise ValueError(f"{spec}: the deployment states no token-graph buckets")
+        sizes.append(spec["bucket_share"] * max(dep.prefill_buckets))
+    if not sizes:
+        raise ValueError(f"the token size {spec} states no share")
+    return whole(min(sizes), dep)
+
+
+def resolved(seg: dict, dep: Deployment) -> dict:
+    """`seg` with every relative size a number at `dep` (`count`, `tokens`); a
+    drain group's prompt stays, `_prompts` sizes it over its rows."""
+    out = {}
+    for key, value in seg.items():
+        if key == "lanes":
+            out[key] = [
+                {**lane, "groups": [_group(g, dep) for g in lane["groups"]]}
+                for lane in value
+            ]
+        elif key in COUNT_KEYS:
+            out[key] = count(value, dep)
+        elif key in TOKEN_KEYS:
+            if isinstance(value, list):
+                out[key] = [tokens(v, dep) for v in value]
+            else:
+                out[key] = tokens(value, dep)
+        else:
+            out[key] = value
+    return out
+
+
+def _group(group: dict, dep: Deployment) -> dict:
+    out = {**group, "rows": count(group["rows"], dep)}
+    if "then" in group:
+        out["then"] = tokens(group["then"], dep)
+    return out
+
+
 def _prompts(group: dict, rows: int, dep: Deployment) -> list[int]:
     p = group["prompt"]
-    if isinstance(p, dict):  # a share of the rank's KV pool, split over the rows
-        tokens = min(
-            p["kv_share"] * dep.kv_tokens / p.get("over", rows), dep.max_model_len * 0.9
-        )
-        return [whole(tokens, dep)] * rows
+    if isinstance(p, dict):  # a share of the KV pool or the model, over the rows
+        return [tokens(p, dep, rows)] * rows
     if isinstance(p, list):
-        return interleave(spread(p[0], p[1], rows, dep), rows)
+        lo, hi = (tokens(x, dep, rows) for x in p)
+        return interleave(spread(lo, hi, rows, dep), rows)
     return [whole(p, dep)] * rows
 
 
@@ -343,9 +443,9 @@ GENERATORS = {
 }
 
 
-def generate(cfg: Config) -> list[Segment]:
-    out = []
-    specs = {s["name"]: s for s in cfg.segments}
+def _expanded(cfg: Config) -> list[dict]:
+    """The config's segments, a `copy` as the segment it copies."""
+    specs, out = {s["name"]: s for s in cfg.segments}, []
     for seg in cfg.segments:
         if seg["kind"] == "copy":  # the same segment again, as an anchor
             src = specs[seg["of"]]
@@ -353,9 +453,28 @@ def generate(cfg: Config) -> list[Segment]:
                 raise ValueError(f"segment {seg['name']}: copies a copy, {seg['of']}")
             purpose = seg.get("purpose", f"anchor: {seg['of']} again")
             seg = {**src, "name": seg["name"], "purpose": purpose}
+        out.append(seg)
+    return out
+
+
+def skipped(cfg: Config) -> dict[str, int]:
+    """The segments the deployment has too few DP ranks for, by name: each
+    states the ranks it needs, `min_dp` (its lanes pin ranks past a smaller
+    group's, or it decodes on several ranks at once)."""
+    dp = cfg.deployment.dp
+    return {s["name"]: s["min_dp"] for s in _expanded(cfg) if s.get("min_dp", 1) > dp}
+
+
+def generate(cfg: Config) -> list[Segment]:
+    """Every segment the deployment runs, generated (`skipped`: those it has
+    too few DP ranks for)."""
+    out, skip = [], skipped(cfg)
+    for seg in _expanded(cfg):
+        if seg["name"] in skip:
+            continue
         if seg["kind"] not in GENERATORS:
             raise ValueError(f"segment {seg['name']}: no generator {seg['kind']!r}")
-        made = GENERATORS[seg["kind"]](seg, cfg)
+        made = GENERATORS[seg["kind"]](resolved(seg, cfg.deployment), cfg)
         for lane in made.lanes:
             if lane.pin is not None and not 0 <= lane.pin < cfg.deployment.dp:
                 raise ValueError(f"{made.name} {lane.name}: pin {lane.pin} past dp")
@@ -398,7 +517,7 @@ def write(segments: list[Segment], cfg: Config, out: Path) -> dict:
     tokens, concurrency, pin) and what its generator planned."""
     out.mkdir(parents=True, exist_ok=True)
     dep = cfg.deployment
-    doc = {"config": cfg.raw, "segments": []}
+    doc = {"config": cfg.raw, "skipped": skipped(cfg), "segments": []}
     for seg in segments:
         lanes = []
         for lane in seg.lanes:

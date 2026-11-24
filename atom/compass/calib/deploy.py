@@ -6,7 +6,10 @@ A config is a JSON document:
 
     {"name": ..., "about": ...,
      "deployment": {
+        "from_record": RECORD,           # optional: every field below a
+                                         # record states (`from_record`)
         "dp": 4,                         # data-parallel ranks (DP attention)
+        "tp": 1, "dcp": 1,               # a rank's TP and DCP widths
         "rungs": [1, 2, ..., 64],        # decode capture sizes a rank
         "max_num_seqs": 64,              # a rank's running requests
         "max_num_batched_tokens": 32768, # a rank's prefill tokens a step
@@ -42,8 +45,13 @@ its own (`ident.variants`); `min_spread` the fit's `moe_imbalance` floor. A
 column this tree's step linear backend prices is counted by it (`columns`);
 a newer opt-in column plugs in by name.
 
+A deployment field given beside `from_record` overrides the record's
+(`parse`); `load`'s `record` instead replaces the config's own fields with
+those a record states, so a design follows a deployment change with no edit.
+
 A segment's kind is one `design.GENERATORS` names, its other entries that
-generator's parameters; or ``copy``, ``{"name": ..., "kind": "copy", "of":
+generator's parameters, its sizes plain numbers or relative to the deployment
+(`design.count`, `design.tokens`); or ``copy``, ``{"name": ..., "kind": "copy", "of":
 NAME}``, the segment NAME generated again under its own name (an anchor
 repeated through a record: its traces are new, so it hits no cache the first
 left). A config may `extend` another (`resolve`), inserting segments into it.
@@ -90,6 +98,8 @@ class Deployment:
     moe_routing: tuple[int, int] | None = None
     trace_model: str = "calibration"
     trace_block: int = 64
+    tp: int = 1
+    dcp: int = 1
 
     def __post_init__(self) -> None:
         if self.dp < 1 or not self.rungs or list(self.rungs) != sorted(set(self.rungs)):
@@ -150,8 +160,117 @@ def kv_tokens(spec, block_size: int) -> int:
     )
 
 
-def parse(raw: dict) -> Config:
-    d = dict(raw["deployment"])
+#: The keys of a routed-expert count and of a top-k in a model's config.json,
+#: in the order they are read (`top_k` alone is a sampling default there).
+EXPERTS = ("n_routed_experts", "num_local_experts", "num_experts")
+TOP_K = ("num_experts_per_tok", "num_experts_per_token", "moe_topk")
+
+
+def _flags(argv) -> dict:
+    """A serve command line's `--name value` options, `-` and `_` alike, a
+    switch with no value as True."""
+    out = {}
+    for i, word in enumerate(argv):
+        if not word.startswith("-") or _number(word):
+            continue  # a value, read with its option
+        value = argv[i + 1] if i + 1 < len(argv) else None
+        switch = value is None or (value.startswith("-") and not _number(value))
+        out[word.lstrip("-").replace("-", "_")] = True if switch else value
+    return out
+
+
+def _number(word: str) -> bool:
+    try:
+        float(word)
+    except ValueError:
+        return False
+    return True
+
+
+def _steps(record: Path) -> Path:
+    return record / "steps"
+
+
+def from_record(record) -> dict:
+    """The deployment fields a record states, by the names `parse` reads: its
+    run.json's engine (over its rank 0's ``dp0.engine.json``) for the ladder,
+    the scheduler's bounds, the block, the KV pool and the token-graph buckets,
+    the DP and TP widths and the drafter's width; its serve command line
+    (run.json ``argv`` after ``--``) for the prefill chunk, the DCP width and
+    the forced acceptance (else one plus the mean accepted drafts of
+    ``dp0.acceptance.json``); and the model's config.json, where it can be
+    read, for the routed experts and top-k, and for a model with KDA layers
+    (``linear_attn_config``) the state checkpoint a prefix hit lands on.
+    `$VAR`s in the path expand. A field the record does not state is left out."""
+    record = Path(os.path.expandvars(str(record)))
+    if not (record / "run.json").exists() and (record / "real" / "run.json").exists():
+        record = record / "real"  # cal_v1.sh's OUT: its server's --out
+    run = json.loads((record / "run.json").read_text())
+    steps = _steps(record)
+    engine = {}
+    if (steps / "dp0.engine.json").exists():
+        engine = json.loads((steps / "dp0.engine.json").read_text())
+    engine |= run.get("engine") or {}
+    argv = [str(a) for a in run.get("argv") or ()]
+    flags = _flags(argv[argv.index("--") + 1 :] if "--" in argv else argv)
+    out = {}
+    for name, key in (
+        ("max_num_seqs", "max_num_seqs"),
+        ("max_num_batched_tokens", "max_num_batched_tokens"),
+        ("max_model_len", "max_model_len"),
+        ("block_size", "kv_cache_block_size"),
+        ("dp", "data_parallel_size"),
+        ("tp", "tensor_parallel_size"),
+    ):
+        if key in engine:
+            out[name] = int(engine[key])
+    if "ladder" in engine:
+        out["rungs"] = [int(r) for r in engine["ladder"]]
+    if "num_kvcache_blocks" in engine and "block_size" in out:
+        out["kv_tokens"] = int(engine["num_kvcache_blocks"]) * out["block_size"]
+    if "prefill_buckets" in engine:
+        out["prefill_buckets"] = [int(b) for b in engine["prefill_buckets"] or ()]
+    if "attn_prefill_chunk_size" in flags:
+        out["chunk"] = int(flags["attn_prefill_chunk_size"])
+    if "decode_context_parallel_size" in flags:
+        out["dcp"] = int(flags["decode_context_parallel_size"])
+    spec = engine.get("speculative")
+    out["drafts"] = int(spec[1]) if spec else 0
+    if spec and "spec_decode_acceptance_length" in flags:
+        out["acceptance"] = float(flags["spec_decode_acceptance_length"])
+    elif spec and (steps / "dp0.acceptance.json").exists():
+        seen = json.loads((steps / "dp0.acceptance.json").read_text())["distribution"]
+        total = sum(seen.values())
+        if total:
+            out["acceptance"] = 1 + sum(int(k) * n for k, n in seen.items()) / total
+    model = Path(str(flags.get("model", ""))) / "config.json"
+    if flags.get("model") and model.exists():
+        hf = json.loads(model.read_text())
+        hf = hf.get("text_config", hf)
+        experts = next((hf[k] for k in EXPERTS if k in hf), None)
+        top_k = next((hf[k] for k in TOP_K if k in hf), None)
+        if experts and top_k:
+            out["moe_routing"] = [int(experts), int(top_k)]
+        kda = (hf.get("linear_attn_config") or {}).get("kda_layers")
+        if kda and "state_checkpoint_interval_tokens" in flags:
+            out["prefix_unit"] = int(flags["state_checkpoint_interval_tokens"])
+    return out
+
+
+def deployment_of(d: dict, record=None) -> dict:
+    """A config's deployment block as plain fields: `from_record`'s under the
+    block's own (which override it), or, given `record`, that record's over the
+    block's (which it replaces wherever it states a field)."""
+    d = dict(d)
+    stated = from_record(d.pop("from_record")) if "from_record" in d else {}
+    d = {**stated, **d}
+    if record is not None:
+        d = {**d, **from_record(record)}
+    return d
+
+
+def parse(raw: dict, record=None) -> Config:
+    d = deployment_of(raw["deployment"], record)
     block = int(d["block_size"])
     routing = d.get("moe_routing")
     deployment = Deployment(
@@ -170,6 +289,8 @@ def parse(raw: dict) -> Config:
         moe_routing=tuple(routing) if routing else None,
         trace_model=str(d.get("trace_model", "calibration")),
         trace_block=int(d.get("trace_block", 64)),
+        tp=int(d.get("tp", 1)),
+        dcp=int(d.get("dcp", 1)),
     )
     columns = raw["columns"]
     for kind in ("decode", "prefill"):
@@ -190,7 +311,7 @@ def parse(raw: dict) -> Config:
         timing={**TIMING, **raw.get("timing", {})},
         segments=list(raw["segments"]),
         about=raw.get("about", ""),
-        raw=raw,
+        raw={**raw, "deployment": {**d, "kv_tokens": deployment.kv_tokens}},
     )
 
 
@@ -213,6 +334,7 @@ def resolve(raw: dict, here: Path) -> dict:
     return out
 
 
-def load(path) -> Config:
+def load(path, record=None) -> Config:
+    """The config at `path`, its deployment `record`'s where given (`parse`)."""
     path = Path(path)
-    return parse(resolve(json.loads(path.read_text()), path.parent))
+    return parse(resolve(json.loads(path.read_text()), path.parent), record)

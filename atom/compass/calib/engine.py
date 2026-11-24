@@ -39,6 +39,7 @@ tokenizer time.
 
 from __future__ import annotations
 
+import copy
 import heapq
 import itertools
 from collections import deque
@@ -48,6 +49,7 @@ from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView, PrefillDuty, RequestShape
 from atom.compass.backends.step_labels import PACED_S
 from atom.compass.backends.step_linear import (
+    EAGER,
     StepLinearBackend,
     StepLinearLaw,
     dummy_view,
@@ -60,12 +62,38 @@ REQ_EQUIV = 10**9
 HOST_STEP = ("E", "W_pre", "W_inputs", "W_launch", "W_post")
 
 
+def proxied(params: dict, rungs) -> tuple[dict, dict]:
+    """`params` with a decode vector, target's and draft's, for each of
+    `rungs` it holds none for: its nearest rung's (the larger on a tie), and
+    {rung: the rung it copies}. A deployment that captures a rung the law was
+    never fitted at is rehearsed on its neighbour's prices: the column counts
+    identifiability reads are the step's own, and only the prices, and with
+    them the GPU minutes and the GPU-bound cut, are its neighbour's."""
+    have = sorted(int(k) for k in params.get("decode") or {} if k != EAGER)
+    missing = [r for r in rungs or () if r not in have]
+    if not have or not missing:
+        return params, {}
+    params = copy.deepcopy(params)
+    proxy = {}
+    for rung in missing:
+        near = min(have, key=lambda h: (abs(h - rung), -h))
+        proxy[rung] = near
+        for law in (params, params.get("draft")):
+            if law and str(near) in (law.get("decode") or {}):
+                law["decode"][str(rung)] = law["decode"][str(near)]
+    return params, proxy
+
+
 class Law:
     """A step law (`params` of `step_linear_law.json`, or law.json) and a host
-    law (`params` of host_laws.json), pricing one rank's view."""
+    law (`params` of host_laws.json), pricing one rank's view; given the
+    deployment's `rungs`, a rung the law holds no vector for is priced by its
+    nearest rung's (`proxied`, named in `proxy`)."""
 
-    def __init__(self, step_law: dict, host_law: dict | None, dp: int) -> None:
-        params = step_law.get("params", step_law)
+    def __init__(
+        self, step_law: dict, host_law: dict | None, dp: int, rungs=()
+    ) -> None:
+        params, self.proxy = proxied(step_law.get("params", step_law), rungs)
         self.params = params
         self.backend = StepLinearBackend(StepLinearLaw(params), dp=dp)
         self.host = (host_law or {}).get("params", host_law or {}).get("laws", {})
