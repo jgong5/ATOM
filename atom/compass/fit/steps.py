@@ -20,7 +20,20 @@ the fit labels whose label keeps that kernel's recorded length.
 
 `step-linear` takes real runs only and fits `step_linear_fit.FORMS`' `--form`,
 `history` by default, with `--cold-peer-rows` its prefill vector's
-`cold_peer_rows` (`step_linear_fit._cold`), joining each step's ranks at the engine config's
+`cold_peer_rows` (`step_linear_fit._cold`), with `--peer-share` its
+`peer_small` and `peer_large` (`step_linear_fit._share`), with
+`--keep-peer-tail` the MAD rounds keeping the slower steps they mark
+(`step_linear_fit._keep_peer_tail`), and the opt-in columns and rules
+`step_linear_fit.env_options` reads from the environment, each off unless set:
+`COMPASS_FIT_ROW_PADDING=1` (decode `row_padding`), `COMPASS_FIT_GATHER_ROWS=1`
+(prefill `gather_rows`), `COMPASS_FIT_MOE_IMBALANCE=1` (prefill
+`moe_imbalance`, over `COMPASS_FIT_MOE_MIN_SPREAD`, 0.2 by default),
+`COMPASS_FIT_MOE_SELECT=insample` (each decode rung's MoE column by its fit on
+all its steps), `COMPASS_FIT_PEER_TOKENS` (decode `peer_tokens`: ``1`` at
+each rung whose `moe_experts` column is saturated, else the rungs named) and
+`COMPASS_FIT_DRAFT_PEER_TOKENS` (the draft law's: ``1`` at every rung, else
+the rungs named),
+joining each step's ranks at the engine config's
 `data_parallel_size`, so a record with a
 rank that gave no sample refuses; it pads prefill to the records'
 `prefill_buckets`, naming under `unfitted` records stating none, and holds
@@ -32,7 +45,9 @@ the law states them as `moe_routing`, and each decode rung may adopt a MoE
 column over them, as that command's `--moe-routing` fits it. `--model DIR`
 reads them from the model directory the records served, as ATOM loads its
 config, and refuses one whose config.json is not the records'; a model that
-names no routed experts gives none. It reads a block drafter's own routing too
+names no routed experts gives none. For a model with KDA layers (Kimi-K3,
+`step_linear.kda_layers`) `--model` also adds the prefill vector's KDA state
+columns (`step_linear_fit._kda`), which the records' lines must state. It reads a block drafter's own routing too
 (`DRAFT_ROUTING`), over which a draft law fitted above data-parallel width 1
 may adopt a MoE column. The law states,
 as `platform`, the platform fields of its key,
@@ -130,6 +145,16 @@ def _model_routing(
     return (experts, top_k) if experts else None
 
 
+def _model_kda(model: str) -> bool:
+    """Whether the model directory `model` states KDA layers
+    (`step_linear.kda_layers`), its config read as ATOM's `Config` loads it;
+    `_model_routing` has checked its config.json is the records'."""
+    from atom.compass.backends.step_linear import kda_layers
+    from atom.config import get_hf_config
+
+    return bool(kda_layers(get_hf_config(model)))
+
+
 def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     form = args.form or "history"
     samples, ladder = step_linear_fit.ladder_cut(samples)
@@ -142,6 +167,12 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
         options["draft_moe_routing"] = drafter
     options["buckets"] = config.get("prefill_buckets")
     options["cold"] = bool(args.cold_peer_rows)
+    if args.peer_share:
+        options["peer_share"] = True
+    if args.keep_peer_tail:
+        options["keep_peer_tail"] = True
+    options["kda"] = bool(args.model) and _model_kda(args.model)
+    options |= step_linear_fit.env_options()
     law, report = step_linear_fit.fit(samples, options, args.seed)
     if options["buckets"] is None:
         law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
@@ -245,6 +276,8 @@ BACKENDS = {
 OWN = {
     "form": "step-linear",
     "cold_peer_rows": "step-linear",
+    "peer_share": "step-linear",
+    "keep_peer_tail": "step-linear",
     "moe_routing": "step-linear",
     "model": "step-linear",
     "ladder_run": "step-linear",
@@ -293,6 +326,21 @@ def main(argv: list[str]) -> None:
         const=True,
         help="the prefill vector adds cold_peer_rows: its peers' MoE rows on a "
         "step outside a stretch of prefill steps (data-parallel records only)",
+    )
+    parser.add_argument(
+        "--peer-share",
+        action="store_const",
+        const=True,
+        help="the prefill vector adds peer_small and peer_large: a prefill whose "
+        "data-parallel peers run real rows under a quarter of its own, and at or "
+        "above it (data-parallel records only)",
+    )
+    parser.add_argument(
+        "--keep-peer-tail",
+        action="store_const",
+        const=True,
+        help="with --peer-share, the prefill vector's MAD rounds keep the slower "
+        "steps those columns mark, so the columns price their class's mean",
     )
     parser.add_argument(
         "--ladder-run",

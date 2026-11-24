@@ -32,7 +32,8 @@ DP widths, DP attention, expert parallelism, TBO, the MoE backend, the
 all-to-all backend, EPLB, DeepSeek-V4.1 decoder SWA bounded replay and the
 compilation level when off ATOM's default, the index cache's dtype where ATOM
 resolved it apart from the KV cache's, whether mori imports where it does not,
-MiniMax-M3's indexer-only context parallelism when on, the model config's
+MiniMax-M3's indexer-only context parallelism when on, the decode
+context-parallel width above one with its sub-config's knobs, the model config's
 ``--hf-overrides`` when it states any, the performance environment, each
 variable of `READ_OFF_DEFAULT` in it when ATOM reads it off its default too,
 and, under speculation, its method and draft width, and the digest of the
@@ -143,17 +144,32 @@ REMAP_ARCH = "gfx950"
 #: The digest of a drafter's config.json, keyed only where it is not the
 #: target's, which every key already holds as its model's.
 DRAFT = "draft_model"
+#: The decode context-parallel width, keyed only above one, so keys written at
+#: width one do not move: a step linear law fitted on a DCP record states it in
+#: its engine config, and a run at another width refuses that law by name.
+DCP = "decode_context_parallel_size"
+#: Beside it, the DCP sub-config's knobs that change its kernels and collectives
+#: at one width, as ATOM resolved them (`DCPConfig`, its defaults for a config
+#: holding none; query replication is turned off where it cannot run).
+DCP_CONFIG = "dcp_config"
+DCP_KNOBS = (
+    "interleave_size",
+    "enable_query_replication",
+    "enable_project_before_merge",
+    "comm_backend",
+)
 
 
 def keyed(config, ladder: bool = True) -> dict:
     """The conditions a bundle is measured under, as the resolved config holds them,
     `OFF_DEFAULT` and `LEVEL` only off their default, `MORI` only where mori does
-    not import, MiniMax-M3's indexer-only context parallelism only when on, the
-    model config's overrides only when it states some, and the performance
-    environment of this process less the client's and the device selection
-    (`keyed_env`), and under speculation its method and draft width, and
-    `DRAFT` (`_draft`); the ladder only with `ladder`."""
-    from atom.config import Config
+    not import, MiniMax-M3's indexer-only context parallelism only when on,
+    `DCP` with `DCP_CONFIG` only above one, the model config's overrides only
+    when it states some, and the performance environment of this process less
+    the client's and the device selection (`keyed_env`), and under speculation
+    its method and draft width, and `DRAFT` (`_draft`); the ladder only with
+    `ladder`."""
+    from atom.config import Config, DCPConfig
     from atom.model_engine.arg_utils import EngineArgs
 
     spec = getattr(config, "speculative_config", None)
@@ -174,6 +190,10 @@ def keyed(config, ladder: bool = True) -> dict:
         drafts[LEVEL] = compilation.level
     if getattr(getattr(config, "dcp_config", None), "indexer_dcp_only", False):
         drafts["indexer_dcp_only"] = True
+    if (dcp := getattr(config, DCP, 1)) > 1:
+        drafts[DCP] = dcp
+        knobs = getattr(config, DCP_CONFIG, None) or DCPConfig()
+        drafts[DCP_CONFIG] = {k: getattr(knobs, k) for k in DCP_KNOBS}
     # ATOM applies them to the model config after it reads config.json.
     if overrides := getattr(config, "hf_overrides", None):
         drafts["hf_overrides"] = overrides

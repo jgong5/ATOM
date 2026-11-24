@@ -487,7 +487,13 @@ decoding one request does (`BatchView.group_dummies`,
 or compute-bound; the data picks. Each of the three forms, no column, `n` and `X`, is fitted
 on its own rows (D54) with each record held out of the rung's steps, each held-out step
 priced as the max over its ranks, and its held-out error is the magnitude of
-each held-out record's p50 error, averaged with the record's steps as weights. A rung adopts
+each held-out record's p50 error per MoE-token band (the rung's real MoE tokens cut at its
+quartiles), averaged with the band's steps as weights, as a host law's columns are graded
+per launch path. One p50 over a whole record is its commonest token count's: at cell B's D
+rung 16 (384 experts, top-6) `X`, which nearly every expert reached past ~200 group tokens
+holds flat, held out nearest by record (0.25% to `n`'s 0.35%) and priced the rung's fullest
+steps 2-5% low out of sample, the load the requests that make TPOT p90 decode at
+([#3720](https://github.com/jgong5/ATOM/issues/3720)). A rung adopts
 the form of smallest held-out error, none on a tie; a rung that adopts neither column keeps
 its three columns, and a rung of one record has no held-out error to pick by. No bar vetoes
 the pick: a veto counts the records a column pushes out of a bar and none it brings in (at

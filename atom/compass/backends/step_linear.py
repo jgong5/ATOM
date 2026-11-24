@@ -29,6 +29,49 @@ column priced the stretches (the warmup's first turns, c=256's prefill queue)
 about 5% high and the isolated prefills of c=8 to c=128 2-4% low (#3747). A
 vector with the column states its `duty_tau`, which must be `DUTY_TAU`, and a
 step stating no `prefill_duty` is refused.
+After it a prefill vector may add `gather_rows` and `moe_imbalance`, each over
+its data-parallel group's MoE gather and 0 on one rank. `gather_rows`
+(`gather_rows`) is the rows the gather carries: on a step whose group replays a
+prefill token graph every rank runs the bucket (`token_bucket`,
+`ForwardMode._pad_to_token_graph`), so the gather carries `ranks` buckets,
+however few tokens each rank scheduled, its pad rows reaching no expert; on one
+it runs eagerly the variable-length gather carries each rank's own count,
+`moe_rows`. `moe_imbalance` (`moe_imbalance`) is the rows by which a group
+running that variable-length gather is uneven: `ranks` times its
+`group_max_tokens` less its `moe_rows`, the rows its busiest rank holds past an
+even share, where that is at least `min_spread` of `moe_rows`, else 0, and 0
+on a step that replays a token graph, whose ranks all run the bucket. A vector
+with either states `ranks`, its group's width, and one with `moe_imbalance` its
+`min_spread`; `gather_rows` takes the vector's `buckets`, so it comes with
+`padding`. A data-parallel step stating no `group_max_tokens` is refused.
+After `seqs` and `out` it may add `peer_small` and `peer_large` (`peer_share`):
+on a data-parallel rank's own prefill forward, output or middle chunk, whose
+peers run real rows (its group's MoE gather, `BatchView.moe_rows`, carrying
+more rows than its own tokens), 1 in the first where those peer rows are under
+`PEER_SMALL` of its own and 1 in the second where they are not, else 0; 0 on
+one rank and on a dummy forward. Each rank's forward waits on its peers' at
+every layer's MoE collective, and a peer's small real prefill costs the group
+device time a max over its ranks' prices does not hold: on cell B's P (#3720,
+DeepSeek-V4.1 DP2 EP2, store_bF5) steps whose largest rank ran 8k-24k tokens
+beside a peer under a quarter of them ran 21-28 ms over the law on every
+record, beside a larger peer 6-10 ms and beside a dummy 1-3 ms, both ranks'
+device windows alike and their host launches long done.
+Then, for a model with KDA layers (`kda_layers`: Kimi-K3), it may add `KDA`, the
+recurrent state work its step does beside the tokens (`kda_columns`), four of
+them the step's `BatchView.kda` counts: `kda_seqs`, the rows holding a KDA
+state (each read and written once); `kda_saves`, the midstep checkpoints the
+forward writes; `kda_forks`, the rows that read their state from another slot
+(a prefix-cache hit resuming at a checkpoint slot; Kimi-K3.1's PAGE-backed
+checkpoints restore instead, a move); `kda_moves`, the state slot moves and
+paged checkpoint copies run before the forward; and, off the rows,
+`kda_pad_blocks`, the padding of the prefill rows' last chunks in chunks,
+`Sum ceil(N_Q / c) - N_Q / c` at the recurrence's chunk `c` (`KDA_CHUNK`). The chunk kernel's work is
+`Sum ceil(N_Q / c)` chunks, which `tokens` holds but for that padding: a column
+of the chunks themselves is `tokens / c` but for it: on synthetic Kimi records
+(`tests/compass/test_step_linear_kda.py`) its VIF against the other columns was
+1.2e5, the padding's 2.0. A vector with these columns states its
+`kda_chunk`, which must be `KDA_CHUNK`, and a step stating no `kda` counts is
+refused.
 Last, a prefill vector may add `padding`, the rows its token graph runs past
 the step's tokens (`token_padding`): ATOM replays a prefill's first layers at
 the smallest of the vector's `buckets`, the prefill token-graph buckets the
@@ -70,6 +113,16 @@ The gather pads every rank to the rung, and a pad row reaches no expert
 follows the group's real tokens, which an uneven spread over the ranks leaves
 well below the rung's rows. A law whose decode vector carries `moe_experts`
 and that states no `moe_routing` is refused.
+Before the MoE column a decode vector may add `row_padding` (`row_padding`), its
+rows' own rectangle less their context, `len.max N_KV - Sum N_KV`: how uneven
+the requests the step decodes are, apart from the slots its rung adds past them,
+which `graph_padding` also holds. At one data-parallel rank the two follow each
+other within a rung; a step whose rung a wider peer set separates them.
+After the MoE column it may add `peer_tokens` (`peer_tokens`), the real MoE
+tokens its data-parallel peers bring to the gather, `moe_tokens` less its own
+decode rows' tokens, 0 on one rank: at a rung whose `moe_experts` reaches
+nearly every expert, the column no longer grows with the group's tokens while
+the gather and the experts' rows still do.
 After it a decode vector may add `rowmod`, `rowmod(k)` over its rows in scheduled
 order: the largest summed N_KV over the rows `i = r (mod k)`, with `k` the
 vector's `"rowmod"` entry. It prices an order the same multiset of rows can
@@ -146,6 +199,9 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
               "hull": HULL,
               "rowmod": k,    # a decode vector with a `rowmod` coefficient only
               "duty_tau": s,  # a prefill vector with a `cold_peer_rows` coefficient only
+              "kda_chunk": c, # a prefill vector with `KDA` coefficients only
+              "ranks": n,     # a prefill vector with `gather_rows` or `moe_imbalance` only
+              "min_spread": f,  # a prefill vector with `moe_imbalance` only
               "declared": "<where it was fitted>",  # optional
               "held_out": {"hull": HULL, "bands": {<band>: ERRORS, ...}}}  # optional
 
@@ -189,6 +245,14 @@ from atom.compass.backends.work import activated_experts
 
 PREFILL = ("step", "tokens", "query_square", "query_cached")
 HISTORY = PREFILL + ("history",)
+#: A KDA model's prefill columns: `BatchView.kda`'s counts in its order, then the
+#: prefill rows' chunk padding (`kda_columns`).
+KDA = ("kda_seqs", "kda_saves", "kda_forks", "kda_moves", "kda_pad_blocks")
+#: The chunk, in tokens, Kimi-K3's KDA prefill recurrence runs its rows in: aiter's
+#: FlashKDA path (`kimi_delta_attn.flash_kda.FLASH_KDA_CHUNK`), which its
+#: `chunk_kimi_delta_attn` takes at Kimi-K3's K = V = 128 with a safe gate; its
+#: default pipeline runs 64.
+KDA_CHUNK = 32
 #: The prefill vector's optional features, in the order they follow `PREFILL`.
 PREFILL_EXTRA = (
     "history",
@@ -196,19 +260,31 @@ PREFILL_EXTRA = (
     "moe_rows",
     "serial_moe_rows",
     "cold_peer_rows",
+    "gather_rows",
+    "moe_imbalance",
     "seqs",
     "out",
+    "peer_small",
+    "peer_large",
+    *KDA,
     "padding",
     "eager_dummy",
     "eager_dummy_tail",
 )
 #: The prefill vector's columns over a DP dummy forward run eagerly (`eager_dummy`).
 EAGER_DUMMY = ("eager_dummy", "eager_dummy_tail")
+#: The prefill vector's columns over its data-parallel peers' share of its rows
+#: (`peer_share`): below `PEER_SMALL` of them, and at or above it.
+PEER_SHARE = ("peer_small", "peer_large")
+PEER_SMALL = 0.25
 DECODE = ("step", "context", "graph_padding")
 #: The MoE columns a decode vector may add, over its step's real MoE tokens.
 MOE_COLUMNS = ("moe_tokens", "moe_experts")
 #: The decode vector's optional features, in the order they follow `DECODE`.
-DECODE_EXTRA = MOE_COLUMNS + ("rowmod",)
+DECODE_EXTRA = ("row_padding",) + MOE_COLUMNS + ("peer_tokens", "rowmod")
+#: The prefill vector's columns over its data-parallel group's MoE gather that
+#: state the group's width, `ranks`.
+GATHER_COLUMNS = ("gather_rows", "moe_imbalance")
 PROPOSE = ("step", "seqs")
 EAGER = "eager"
 SOURCE = "step-linear"
@@ -255,6 +331,12 @@ class _Vector:
                     f"constant {self.duty_tau!r}; a view states its duty at "
                     f"{DUTY_TAU} s"
                 )
+        if any(f in KDA for f in features) and spec.get("kda_chunk") != KDA_CHUNK:
+            raise ValueError(
+                f"the {name} vector carries KDA columns over a chunk of "
+                f"{spec.get('kda_chunk')!r} tokens; a view states its padding at "
+                f"{KDA_CHUNK}"
+            )
         self.buckets = None
         if "padding" in features:
             self.buckets = tuple(sorted(int(b) for b in spec.get("buckets") or ()))
@@ -263,6 +345,49 @@ class _Vector:
                     f"the {name} vector carries padding and states no buckets, "
                     "the prefill token-graph buckets it pads to"
                 )
+        self.ranks = self.min_spread = None
+        if gathered := [f for f in GATHER_COLUMNS if f in features]:
+            self.ranks = spec.get("ranks")
+            if not isinstance(self.ranks, int) or self.ranks < 2:
+                raise ValueError(
+                    f"the {name} vector carries {' and '.join(gathered)} over a "
+                    f"data-parallel group of {self.ranks!r} ranks; it states its "
+                    "group's width, 2 or more, under ranks"
+                )
+        if "gather_rows" in features and not self.buckets:
+            raise ValueError(
+                f"the {name} vector carries gather_rows and no padding, whose "
+                "buckets say which steps replay a token graph"
+            )
+        if "moe_imbalance" in features:
+            self.min_spread = spec.get("min_spread")
+            if not isinstance(self.min_spread, (int, float)) or self.min_spread < 0:
+                raise ValueError(
+                    f"the {name} vector carries moe_imbalance and states its "
+                    f"min_spread as {self.min_spread!r}, not a non-negative share"
+                )
+
+
+def kda_layers(hf_config) -> int:
+    """How many KDA layers the model config `hf_config` states, in its text
+    config's `linear_attn_config` (Kimi-K3's, Kimi-Linear's); 0 for none."""
+    text = getattr(hf_config, "text_config", None) or hf_config
+    linear = getattr(text, "linear_attn_config", None) or {}
+    return len(linear.get("kda_layers") or ()) if isinstance(linear, Mapping) else 0
+
+
+def kda_columns(view: BatchView) -> tuple | None:
+    """`KDA`'s columns of `view`'s step: its `kda` counts, then the padding of
+    its prefill rows' last chunks of `KDA_CHUNK` tokens, in chunks, the
+    chunked recurrence running each row from its own first token; no padding
+    on a step whose rows hold no state (a data-parallel dummy's). None for a
+    view stating no counts."""
+    if view.kda is None:
+        return None
+    padded = (
+        sum(-r.query_tokens % KDA_CHUNK for r in view.prefill) if view.kda[0] else 0
+    )
+    return (*view.kda, padded / KDA_CHUNK)
 
 
 def moe_tokens(view: BatchView) -> int | None:
@@ -292,36 +417,101 @@ def moe_column(
     return float(tokens)
 
 
-def token_padding(view: BatchView, buckets: tuple[int, ...]) -> int | None:
-    """The rows `view`'s prefill token graph runs past its tokens: the smallest
-    of `buckets`, ascending, that holds its group's `group_max_tokens` (on one
-    rank its own tokens), less its own; 0 past the largest, on a step the
-    group split for two-batch overlap and on one an attention backend refuses
-    a graph for (`group_needs_eager`), all of which ATOM runs eagerly
+def token_bucket(view: BatchView, buckets: tuple[int, ...]) -> int | None:
+    """The prefill token-graph bucket `view`'s step replays: the smallest of
+    `buckets`, ascending, that holds its group's `group_max_tokens` (on one
+    rank its own tokens); 0 past the largest, on a step the group split for
+    two-batch overlap and on one an attention backend refuses a graph for
+    (`group_needs_eager`), all of which ATOM runs eagerly
     (`ForwardMode._pad_to_token_graph`). None for a data-parallel view
     stating no `group_max_tokens`."""
     if view.tbo_tokens or view.group_needs_eager:
         return 0
-    tokens = sum_tokens(view.requests)
-    peak = tokens if view.moe_rows is None else view.group_max_tokens
+    peak = sum_tokens(view.requests) if view.moe_rows is None else view.group_max_tokens
     if peak is None:
         return None
-    return next((b - tokens for b in buckets if b >= peak), 0)
+    return next((b for b in buckets if b >= peak), 0)
+
+
+def token_padding(view: BatchView, buckets: tuple[int, ...]) -> int | None:
+    """The rows `view`'s prefill token graph runs past its tokens: its
+    `token_bucket` less its own tokens; 0 where it runs eagerly. None for a
+    data-parallel view stating no `group_max_tokens`."""
+    bucket = token_bucket(view, buckets)
+    return bucket and bucket - sum_tokens(view.requests)
+
+
+def gather_rows(view: BatchView, buckets: tuple[int, ...], ranks: int) -> int | None:
+    """The rows `view`'s data-parallel group's MoE gather carries on a prefill
+    step of `ranks` ranks: `ranks` times the `token_bucket` it replays, to
+    which every rank pads its rows, or, run eagerly, the variable-length
+    gather's `moe_rows`; 0 on one rank. None for a data-parallel view stating
+    no `group_max_tokens`."""
+    if view.moe_rows is None:
+        return 0
+    bucket = token_bucket(view, buckets)
+    if bucket is None:
+        return None
+    return ranks * bucket if bucket else view.moe_rows
+
+
+def moe_imbalance(
+    view: BatchView, buckets: tuple[int, ...], ranks: int, min_spread: float
+) -> int | None:
+    """The rows by which `view`'s group of `ranks` ranks runs its
+    variable-length MoE gather uneven: `ranks` times its `group_max_tokens`
+    less its `moe_rows`, where that is at least `min_spread` times
+    `moe_rows`, else 0; 0 on a step that replays a token graph
+    (`token_bucket`), whose ranks all run the bucket, and on one rank. None
+    for a data-parallel view stating no `group_max_tokens`."""
+    if view.moe_rows is None:
+        return 0
+    bucket = token_bucket(view, buckets)
+    if bucket is None or view.group_max_tokens is None:
+        return None
+    if bucket:
+        return 0
+    idle = ranks * view.group_max_tokens - view.moe_rows
+    return idle if idle > 0 and idle >= min_spread * view.moe_rows else 0
+
+
+def row_padding(rows) -> int:
+    """`rows`' own rectangle less their context, `len.max N_KV - Sum N_KV`: how
+    uneven the decode rows are, apart from the slots a rung adds past them."""
+    if not rows:
+        return 0
+    return len(rows) * max(r.context_tokens for r in rows) - sum_context(rows)
+
+
+def peer_tokens(view: BatchView) -> int | None:
+    """The real MoE tokens `view`'s data-parallel peers bring to its group's
+    gather: `moe_tokens` less its own decode rows' tokens, 0 on one rank. None
+    for a data-parallel view stating no `moe_tokens`."""
+    if view.moe_rows is None:
+        return 0
+    if view.moe_tokens is None:
+        return None
+    return max(view.moe_tokens - sum_tokens(view.decode), 0)
 
 
 def hull_axes(features) -> tuple[int, ...]:
     """The positions in `features` of a vector's hull coordinates: all but the
-    intercept, first, and the `EAGER_DUMMY` indicators, which a hull in their
-    extra dimensions would only split into its 0 and 1 faces, at a cost
-    qhull's facet count grows by."""
-    return tuple(i for i, f in enumerate(features) if i and f not in EAGER_DUMMY)
+    intercept, first, and the `EAGER_DUMMY` and `PEER_SHARE` indicators, which
+    a hull in their extra dimensions would only split into its 0 and 1 faces,
+    at a cost qhull's facet count grows by."""
+    return tuple(
+        i
+        for i, f in enumerate(features)
+        if i and f not in EAGER_DUMMY and f not in PEER_SHARE
+    )
 
 
 def dummy_view(view: BatchView) -> BatchView:
     """The view of a data-parallel rank's dummy forward at the prefill step a
     peer's `view` states: the one-token row at position 0 a record's dummy
     line holds (`ModelRunner.dummy_execution`), producing output as those
-    lines say, with the group's fields its peer states."""
+    lines say, with the group's fields its peer states; under a KDA model no
+    state work, as its batch schedules no request holding a state."""
     import dataclasses
 
     return dataclasses.replace(
@@ -334,6 +524,7 @@ def dummy_view(view: BatchView) -> BatchView:
         draft_bs=None,
         target_bs=None,
         image_tokens=0,
+        kda=None if view.kda is None else (0,) * len(view.kda),
     )
 
 
@@ -352,6 +543,22 @@ def eager_dummy(view: BatchView, buckets: tuple[int, ...]) -> tuple[int, int] | 
         if padding:
             return 0, 0
     return 1, int(view.group_tail)
+
+
+def peer_share(view: BatchView) -> tuple[int, int]:
+    """`PEER_SHARE`'s counts for `view`: on a data-parallel rank's own prefill
+    forward whose peers run real rows, `moe_rows` less its own tokens, (1, 0)
+    where those rows are under `PEER_SMALL` of its own and (0, 1) where they
+    are not; else (0, 0), on one rank, which has no `moe_rows`, and on a dummy
+    forward too."""
+    if view.moe_rows is None or view.dp_dummy:
+        return 0, 0
+    own = sum_tokens(view.requests)
+    peers = view.moe_rows - own
+    if own <= 0 or peers <= 0:
+        return 0, 0
+    small = peers < PEER_SMALL * own
+    return int(small), int(not small)
 
 
 def cold_peer_rows(view: BatchView) -> float | None:
@@ -528,6 +735,25 @@ class StepLinearBackend(CostBackend):
                         "peers' MoE rows are priced by",
                     )
                 counts += (cold,)
+            for feature in GATHER_COLUMNS:
+                if feature not in vector.features:
+                    continue
+                if feature == "gather_rows":
+                    got = gather_rows(batch_view, vector.buckets, vector.ranks)
+                else:
+                    got = moe_imbalance(
+                        batch_view,
+                        vector.buckets or (),
+                        vector.ranks,
+                        vector.min_spread,
+                    )
+                if got is None:
+                    raise self._refuse(
+                        batch_view,
+                        "no group_max_tokens on this data-parallel step, which "
+                        f"its group's MoE gather's {feature} is counted from",
+                    )
+                counts += (got,)
             output = batch_view.produces_output
             by_output = {
                 "seqs": len(prefill) if output else 0,
@@ -541,6 +767,17 @@ class StepLinearBackend(CostBackend):
                     f"which its {what}prefill terms depend on",
                 )
             counts += tuple(by_output[f] for f in mine)
+            if share := [f for f in PEER_SHARE if f in vector.features]:
+                got = dict(zip(PEER_SHARE, peer_share(batch_view)))
+                counts += tuple(got[f] for f in share)
+            if kda := [f for f in KDA if f in vector.features]:
+                if (columns := kda_columns(batch_view)) is None:
+                    raise self._refuse(
+                        batch_view,
+                        "no KDA state counts on this step, which its prefill "
+                        "vector's KDA columns price",
+                    )
+                counts += tuple(dict(zip(KDA, columns))[f] for f in kda)
             if vector.buckets:
                 padding = token_padding(batch_view, vector.buckets)
                 if padding is None:
@@ -568,6 +805,8 @@ class StepLinearBackend(CostBackend):
                     f"no {what}decode vector for rung {EAGER if rung is None else rung}",
                 )
             counts = (1, sum_context(decode), batch_view.graph_padding)
+            if "row_padding" in vector.features:
+                counts += (row_padding(decode),)
             if moe := [f for f in MOE_COLUMNS if f in vector.features]:
                 tokens = moe_tokens(batch_view)
                 if tokens is None:
@@ -576,6 +815,10 @@ class StepLinearBackend(CostBackend):
                 counts += tuple(
                     moe_column(f, tokens, law.moe_routing, dummies) for f in moe
                 )
+            if "peer_tokens" in vector.features:
+                if (peers := peer_tokens(batch_view)) is None:
+                    raise self._refuse(batch_view, "no MoE group tokens on this step")
+                counts += (peers,)
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
         terms, kv = self._priced(law, vector, kind, counts, what), []

@@ -36,7 +36,10 @@ The law states the records' `engine_config`, read from the `.engine.json`
 beside each (`engine_config`) or from `--engine FILE` in their place, a record's
 over the compilation level its run.json names (`recorded_level`), and a run
 under another engine config refuses it, records whose ladders are prefixes of
-the longest read at it (`step_grid_plan.pooled`). At its `data_parallel_size` N above 1
+the longest read at it (`step_grid_plan.pooled`). Records at a decode
+context-parallel width state it there (`run.step_grid.keyed`), so their law is
+keyed by it and a run at another width refuses it; records stating a prefill
+context-parallel width refuse. At its `data_parallel_size` N above 1
 (EP off) the records come in runs of
 N, each run's `dp0.jsonl` to `dp<N-1>.jsonl`. A step is its ranks' lines
 joined on step index, labelled with the smallest rank label (the others wait
@@ -216,6 +219,25 @@ reads a block drafter's), its decode rungs adopt one by the same rule, as a
 drafter's routed experts run on its group's rows in the arm's layout, as the
 target's do.
 
+Opt-in columns and rules (`env_options`, each off unless asked for, so a fit
+without them writes the law it wrote before them), each column counted by the
+`step_linear` function the backend prices it with: `row_padding` adds the decode
+column of that name to every rung (`ROW_PADDING_ENV`); `gather_rows` and
+`moe_imbalance` add the prefill columns of those names above `dp` 1, the vector
+stating `ranks` and `moe_imbalance`'s `min_spread` (`GATHER_ROWS_ENV`,
+`MOE_IMBALANCE_ENV`, `MOE_MIN_SPREAD_ENV`); `moe_select` ``insample`` makes each
+target decode rung adopt the MoE column its fit on all its steps prices nearest
+(`_moe_column`, `MOE_SELECT_ENV`); `peer_tokens` adds that decode column, after
+the MoE column, to the rungs it names or, as ``saturated``, to each rung whose
+adopted `moe_experts` column its median step holds at `SATURATED` of the
+experts (`_peer_rung`, `PEER_TOKENS_ENV`); `draft_peer_tokens` adds it to the
+draft law's decode rungs above `dp` 1, every one as ``all``
+(`DRAFT_PEER_TOKENS_ENV`): a draft's MoE runs on its group's rows too. The draft
+law takes none of the others. The `shared` form, whose one decode solve shares
+the base columns over rungs, refuses `row_padding` and `peer_tokens`. A vector carrying one of these columns states,
+under `fit.vif`, each one's variance inflation factor over the rows it was
+fitted on (`_vif`), how far the other columns already hold it.
+
 Outside `shared`, a decode rung may adopt a `rowmod(k)` column (`StepLinearLaw`),
 read from its rows in scheduled order, by the rule `_rowmod` states; the
 vector then names `k` and records, under `fit.rowmod`, the MAD without the
@@ -247,6 +269,7 @@ import dataclasses
 import itertools
 import json
 import math
+import os
 import re
 import shlex
 import sys
@@ -270,24 +293,38 @@ from atom.compass.backends.step_linear import (
     DECODE,
     EAGER,
     EAGER_DUMMY,
+    GATHER_COLUMNS,
     HISTORY,
+    KDA,
+    KDA_CHUNK,
     MOE_COLUMNS,
+    PEER_SHARE,
     PREFILL,
     PROPOSE,
     cached_seqs,
     cold_peer_rows,
     dummy_view,
     eager_dummy,
+    gather_rows,
     hull_axes,
+    kda_columns,
     moe_column,
+    moe_imbalance,
     moe_tokens,
+    peer_share,
+    peer_tokens,
+    row_padding,
     rowmod,
     serial_passes,
     token_padding,
 )
 
 FORMS = ("base", "history", "shared", "cached_seqs")
+#: The context-parallel widths a record's engine file states above one (`parity`).
 CONTEXT_PARALLEL = ("prefill_context_parallel_size", "decode_context_parallel_size")
+#: Those a law cannot price at: the decode width is keyed in the law's engine
+#: config (`run.step_grid.keyed`), so a run at another width refuses it there.
+UNKEYED_CONTEXT_PARALLEL = ("prefill_context_parallel_size",)
 MAD_K = 3.5
 #: A relative residual this small is never an outlier, however tight the rest.
 MAD_FLOOR = 0.01
@@ -313,6 +350,10 @@ ROWMOD_CELL_STEPS = 100
 ROWMOD_GAIN = 0.1
 #: Seeded shuffles of each step's rows whose mean MAD the `rowmod` column must not beat.
 ROWMOD_SHUFFLES = 8
+#: The MoE-token bands, quantiles of a decode rung's real MoE tokens, a record
+#: held out of the rung is graded on, a p50 each, when the rung picks its MoE
+#: column (`_moe_column`).
+MOE_BANDS = 4
 #: The free features up to which `_hull` is qhull's exact hull; past them it
 #: is the intersection of each pair's 2-D hull, whose facets the pairs' edges
 #: bound (#3720: real_pw_c128's prefill points, 8 features, hulled exactly to
@@ -354,6 +395,31 @@ NO_BUCKETS = "no record states prefill buckets, so the prefill vector adds no pa
 #: stated here, as this package imports nothing from the engine.
 LEVEL = "level"
 DEFAULT_LEVEL = 3
+#: The switches of the opt-in columns (`env_options`), each on at ``1``, off at
+#: ``0`` or unset, and refused at any other value (`_switch`): decode
+#: `row_padding`, prefill `gather_rows` and `moe_imbalance`.
+ROW_PADDING_ENV = "COMPASS_FIT_ROW_PADDING"
+GATHER_ROWS_ENV = "COMPASS_FIT_GATHER_ROWS"
+MOE_IMBALANCE_ENV = "COMPASS_FIT_MOE_IMBALANCE"
+#: `moe_imbalance`'s `min_spread`, `MOE_MIN_SPREAD` when unset.
+MOE_MIN_SPREAD_ENV = "COMPASS_FIT_MOE_MIN_SPREAD"
+MOE_MIN_SPREAD = 0.2
+#: How a decode rung picks its MoE column (`_moe_column`), one of `MOE_SELECTS`,
+#: the first when unset.
+MOE_SELECT_ENV = "COMPASS_FIT_MOE_SELECT"
+MOE_SELECTS = ("held_out", "insample")
+#: The decode rungs that add `peer_tokens` (`_peer_rung`): ``1`` for each
+#: rung whose `moe_experts` column is `SATURATED`, else the rungs, comma separated.
+PEER_TOKENS_ENV = "COMPASS_FIT_PEER_TOKENS"
+#: The draft law's decode rungs that add `peer_tokens` above `dp` 1: ``1`` for
+#: every rung, else the rungs, comma separated.
+DRAFT_PEER_TOKENS_ENV = "COMPASS_FIT_DRAFT_PEER_TOKENS"
+#: The share of the routed experts past which a rung's median step's
+#: `moe_experts` count is saturated: past it the column barely moves with the
+#: group's tokens.
+SATURATED = 0.9
+#: The opt-in columns whose variance inflation factor a vector states (`_vif`).
+OPT_IN = ("row_padding", "peer_tokens", *GATHER_COLUMNS)
 
 
 def _rung_key(rung: int | None) -> str:
@@ -370,10 +436,15 @@ def _prefill_counts(
     buckets,
     eager,
     cold: bool = False,
+    share: bool = False,
+    kda: bool = False,
+    cols=None,
 ) -> tuple:
     """The prefill vector's features of `view`'s step, `where` naming it in a
     refusal, as `_features` states them; under `eager` its `EAGER_DUMMY`,
-    under `cold` its `cold_peer_rows`."""
+    under `cold` its `cold_peer_rows`, the `GATHER_COLUMNS` `cols` turns on
+    (`_gathered`), under `share` its `PEER_SHARE`, under `kda` its `KDA`
+    columns."""
     r = view.prefill
     counts = (1, sum_tokens(r), sum_query_square(r), sum_query_cached(r))
     if form == "history":
@@ -396,9 +467,29 @@ def _prefill_counts(
                     "are priced by"
                 )
             counts += (peers,)
+        for feature in _gathered(cols):
+            if feature == "gather_rows":
+                got = gather_rows(view, buckets, dp)
+            else:
+                got = moe_imbalance(view, buckets, dp, cols["moe_imbalance"])
+            if got is None:
+                raise ValueError(
+                    f"{where} has no group_max_tokens, which its {feature} is "
+                    "counted from"
+                )
+            counts += (got,)
     if out:
         output = bool(view.produces_output)
         counts += (len(r) if output else 0, int(output))
+    if share:
+        counts += peer_share(view)
+    if kda:
+        if (columns := kda_columns(view)) is None:
+            raise ValueError(
+                f"{where} states no kda counts, which a KDA model's law prices "
+                "prefill from; its record predates them"
+            )
+        counts += columns
     if buckets:
         if (padding := token_padding(view, buckets)) is None:
             raise ValueError(
@@ -431,6 +522,175 @@ def _cold(options) -> bool:
     return True
 
 
+def _share(options) -> bool:
+    """Whether the prefill vector adds `PEER_SHARE`: as `options`'
+    `peer_share` states, False by default. Its columns mark a rank whose
+    data-parallel peers run real rows, so `dp` 1 refuses them."""
+    if not (options or {}).get("peer_share"):
+        return False
+    if _options(options)[1] == 1:
+        raise ValueError(
+            "peer_small and peer_large mark a prefill beside a data-parallel "
+            "peer's real rows, and these records run one rank"
+        )
+    return True
+
+
+def _keep_peer_tail(options) -> bool:
+    """Whether the prefill vector's solve keeps the slower steps a
+    `PEER_SHARE` column marks (`_fit_form`'s `protect`): as `options`'
+    `keep_peer_tail` states, False by default; without `peer_share` there
+    is no such column, which refuses it."""
+    if not (options or {}).get("keep_peer_tail"):
+        return False
+    if not _share(options):
+        raise ValueError(
+            "keep_peer_tail keeps the steps a peer_small or peer_large column "
+            "marks, and the fit adds neither without peer_share"
+        )
+    return True
+
+
+def _kda(options) -> bool:
+    """Whether the prefill vector adds `KDA`'s columns: as `options`' `kda`
+    states, False by default; `compass fit steps --model` sets it for a model
+    with KDA layers (`step_linear.kda_layers`). A fitted prefill step whose
+    view states no `kda` counts refuses (`_prefill_counts`)."""
+    return bool((options or {}).get("kda"))
+
+
+def _columns(options, draft: bool = False) -> dict:
+    """The opt-in columns `options` asks a law's vectors to add (`env_options`):
+    `row_padding` on decode, True or False, and on prefill `gather_rows`, True
+    or None, and `moe_imbalance`, its `min_spread` or None; none on a draft
+    law. Each prefill one prices a data-parallel group's gather, so `dp` 1
+    refuses it, and `gather_rows`, which reads which steps replay a token
+    graph, refuses records stating no prefill buckets; a `min_spread` below 0,
+    which `StepLinearLaw` refuses, is refused; the `shared` form refuses
+    `row_padding`, whose decode solve shares the base columns over rungs."""
+    options = options or {}
+    cols = {
+        "row_padding": bool(options.get("row_padding")),
+        "gather_rows": True if options.get("gather_rows") else None,
+        "moe_imbalance": options.get("moe_imbalance"),
+    }
+    if draft:
+        return {"row_padding": False, "gather_rows": None, "moe_imbalance": None}
+    form, dp = _options(options)
+    spread = cols["moe_imbalance"]
+    if spread is not None and not spread >= 0:
+        raise ValueError(
+            f"moe_imbalance's min_spread is a share of moe_rows, 0 or more, not "
+            f"{spread!r}"
+        )
+    gathered = _gathered(cols)
+    if gathered and dp == 1:
+        raise ValueError(
+            f"{' and '.join(gathered)} price a data-parallel group's MoE gather, "
+            "and these records run one rank"
+        )
+    if cols["gather_rows"] and not _buckets(options):
+        raise ValueError(
+            "gather_rows reads which prefill steps replay a token graph from the "
+            "records' prefill buckets, and they state none"
+        )
+    if cols["row_padding"] and form == "shared":
+        raise ValueError("the shared form fits no row_padding column")
+    return cols
+
+
+def _gathered(cols) -> list[str]:
+    """The prefill `GATHER_COLUMNS` that `cols` (`_columns`) turns on, each
+    one whose entry is not None, so `moe_imbalance` at a `min_spread` of 0
+    is on; none when `cols` is None."""
+    return [f for f in GATHER_COLUMNS if cols and cols[f] is not None]
+
+
+def _switch(env, name: str) -> bool:
+    """Whether the switch `name` in `env` is on: ``1`` on, ``0`` or unset
+    off, and any other value refused."""
+    value = env.get(name) or "0"
+    if value not in ("0", "1"):
+        raise ValueError(f"{name}={value} is not 0 or 1")
+    return value == "1"
+
+
+def env_options(environ=None) -> dict:
+    """The `fit` options the opt-in column switches in `environ`, the process's
+    environment by default, set: `ROW_PADDING_ENV`, `GATHER_ROWS_ENV` and
+    `MOE_IMBALANCE_ENV` at ``1`` (with `MOE_MIN_SPREAD_ENV`'s share), the
+    `MOE_SELECT_ENV` rule and the `PEER_TOKENS_ENV` and `DRAFT_PEER_TOKENS_ENV`
+    rungs; none set, none. A switch set to anything but ``0`` or ``1`` is
+    refused (`_switch`)."""
+    env = os.environ if environ is None else environ
+    out = {}
+    for key, name in (
+        ("row_padding", ROW_PADDING_ENV),
+        ("gather_rows", GATHER_ROWS_ENV),
+    ):
+        if _switch(env, name):
+            out[key] = True
+    spread = env.get(MOE_MIN_SPREAD_ENV)
+    if _switch(env, MOE_IMBALANCE_ENV):
+        out["moe_imbalance"] = MOE_MIN_SPREAD if spread is None else float(spread)
+    elif spread is not None:
+        raise ValueError(
+            f"{MOE_MIN_SPREAD_ENV} is moe_imbalance's; set {MOE_IMBALANCE_ENV}=1"
+        )
+    if select := env.get(MOE_SELECT_ENV):
+        if select not in MOE_SELECTS:
+            raise ValueError(f"{MOE_SELECT_ENV}={select} is not one of {MOE_SELECTS}")
+        out["moe_select"] = select
+    if peers := env.get(PEER_TOKENS_ENV):
+        out["peer_tokens"] = (
+            "saturated" if peers == "1" else tuple(int(r) for r in peers.split(","))
+        )
+    if peers := env.get(DRAFT_PEER_TOKENS_ENV):
+        out["draft_peer_tokens"] = (
+            "all" if peers == "1" else tuple(int(r) for r in peers.split(","))
+        )
+    return out
+
+
+def _peer_rung(steps, rung: int, vector: dict, routing, peers) -> bool:
+    """Whether decode rung `rung`, its `steps` and the `vector` it adopted, adds
+    `peer_tokens` under `peers`, the `peer_tokens` option or a draft law's
+    `draft_peer_tokens`: a rung it names, every rung under ``all``, or under
+    ``saturated`` a rung that adopted `moe_experts` and whose median step
+    reaches `SATURATED` of the routed experts or more."""
+    if not peers:
+        return False
+    if peers == "all":
+        return True
+    if peers != "saturated":
+        return rung in peers
+    if not routing:
+        return False
+    if "moe_experts" not in vector["coefficients"]:
+        return False
+    reached = [moe_column("moe_experts", s[0][6], routing, s[0][7]) for s in steps]
+    return float(np.median(reached)) >= SATURATED * routing[0]
+
+
+def _vif(points, features, columns) -> dict:
+    """Each of `columns`' variance inflation factor over `points`, the rows a
+    vector of `features`, the intercept first, was fitted on: the column's
+    variance over its residual's on the other columns and an intercept,
+    `1 / (1 - R^2)`, infinite where they hold it exactly. A column that does
+    not vary has none."""
+    x = np.asarray(points, dtype=np.float64)[:, 1:]
+    out = {}
+    for f in columns:
+        j = features.index(f) - 1
+        others = np.column_stack([np.ones(len(x)), np.delete(x, j, axis=1)])
+        fitted = others @ np.linalg.lstsq(others, x[:, j], rcond=None)[0]
+        spread = float(((x[:, j] - x[:, j].mean()) ** 2).sum())
+        residual = float(((x[:, j] - fitted) ** 2).sum())
+        if spread > 0:
+            out[f] = spread / residual if residual > 0 else math.inf
+    return out
+
+
 def _eager_dummies(samples, options) -> bool:
     """Whether the prefill vector adds `EAGER_DUMMY`: as `options` states, else
     above `dp` 1 when some prefill step of `samples` had a dummy peer and ran
@@ -458,20 +718,25 @@ def _features(
     buckets: tuple[int, ...] = (),
     eager: bool = False,
     cold: bool = False,
+    share: bool = False,
+    kda: bool = False,
+    cols=None,
 ) -> tuple[list[tuple], dict]:
     """One rank's fittable samples as (vector, features, seconds, step, context,
-    tokens, dummies, dummy), and how many were cut, per reason.
+    tokens, dummies, peers, dummy), and how many were cut, per reason.
 
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
     order, plus `history` or `cached_seqs` in its form, above `dp` 1 `moe_rows` on prefill and
     under `serial` `serial_moe_rows`, under `cold` `cold_peer_rows`, and under `draft` or on a step with a draft
-    label `seqs` and `out` on prefill, with `buckets` its `padding`, and under
-    `eager` its `EAGER_DUMMY`, as `StepLinearBackend` counts them;
+    label `seqs` and `out` on prefill, under `share` its `PEER_SHARE`, under `kda` its `KDA` columns, with
+    `buckets` its `padding`, and under `eager` its `EAGER_DUMMY`, as `StepLinearBackend` counts them;
+    `cols` (`_columns`) adds `row_padding` on decode and `GATHER_COLUMNS` on prefill;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill;
     `tokens` a decode step's real MoE tokens under `routing`, the model's
     (experts, top-k), which its MoE column reads, else None; `dummies` its
     group's dummy forwards (`BatchView.group_dummies`), which the column's
-    `moe_experts` counts as one token; `dummy`, on a prefill step above `dp` 1
+    `moe_experts` counts as one token; `peers` its `peer_tokens`, None where
+    its view states no group tokens; `dummy`, on a prefill step above `dp` 1
     and not under `draft`, the features of a peer's dummy forward at that step
     (`dummy_view`), as the backend prices that rank, else None.
     """
@@ -482,18 +747,21 @@ def _features(
             cut[s.cut] += 1
         else:
             tokens = dummy = None
+            peers = 0
             if view.prefill:
                 key = "prefill"
                 where = f"{s.provenance['run']} step {s.step}"
                 shape = (form, dp, serial, draft or s.draft_s is not None, buckets)
-                counts = _prefill_counts(view, where, *shape, eager, cold)
+                flags = (eager, cold, share, kda, cols)
+                counts = _prefill_counts(view, where, *shape, *flags)
                 if dp > 1 and not draft:
-                    dummy = _prefill_counts(
-                        dummy_view(view), where, *shape, eager, cold
-                    )
+                    dummy = _prefill_counts(dummy_view(view), where, *shape, *flags)
             else:
                 key = _rung_key(view.capture_rung)
                 counts = (1, sum_context(view.decode), view.graph_padding)
+                if cols and cols["row_padding"]:
+                    counts += (row_padding(view.decode),)
+                peers = peer_tokens(view)
                 if routing and (tokens := moe_tokens(view)) is None:
                     raise ValueError(
                         f"{s.provenance['run']} step {s.step} has no moe_tokens, "
@@ -502,7 +770,17 @@ def _features(
             context = tuple(r.context_tokens for r in view.decode)
             dummies = view.group_dummies
             rows.append(
-                (key, counts, s.device_s, s.step, context, tokens, dummies, dummy)
+                (
+                    key,
+                    counts,
+                    s.device_s,
+                    s.step,
+                    context,
+                    tokens,
+                    dummies,
+                    peers,
+                    dummy,
+                )
             )
     return rows, cut
 
@@ -1571,6 +1849,7 @@ def _fit_form(
     offset=0.0,
     kept: str = "step",
     drops: bool = True,
+    protect: np.ndarray | None = None,
 ) -> dict:
     """One form fitted by max-affine regression: step `i`'s label `y[i]` is the
     max over its ranks' rows `x[i, r]`, those `real[i, r]` holds, of their
@@ -1595,7 +1874,11 @@ def _fit_form(
     label, over its price. Steps whose residual is more than
     `MAD_K` scaled MADs from the median are then dropped and the passes rerun
     from there, until the kept set settles, for `MAD_PASSES` rounds, or until
-    the passes reach the limit; with `drops` false none is dropped. A kept step
+    the passes reach the limit; with `drops` false none is dropped. A step
+    `protect` marks is not dropped for running slower than its price, the
+    median's side of the scatter, unless it ran `WARM_FACTOR` times its price
+    or more: a class whose cost a one-sided tail carries is then priced at its
+    mean, not its median. A kept step
     priced at no time, which no equation can be divided by, ends the
     reweighting, and a MAD round drops it.
 
@@ -1709,6 +1992,9 @@ def _fit_form(
         centre = np.median(residual)
         mad = 1.4826 * np.median(np.abs(residual - centre))
         moved = np.abs(residual - centre) <= max(MAD_K * mad, MAD_FLOOR)
+        if protect is not None:
+            # A residual is (price - label) / price: a slower step's is lower.
+            moved |= protect & (residual < centre) & (residual > 1.0 - WARM_FACTOR)
         if (
             not drops
             or stop == "limit"
@@ -1776,11 +2062,11 @@ def _folds(design, y, cell, names, path=None) -> dict:
     return out
 
 
-def _max_affine_folds(steps, vector: dict, routing, cell=None) -> dict:
-    """Per cell beside which another holds steps, (its steps, the p50 error
-    on them, each priced as the max over its ranks, of `_fit_vector` of
-    `vector` on the other cells' steps). `cell` is each step's cell, its
-    record when None."""
+def _max_affine_errors(steps, vector: dict, routing, cell=None) -> dict:
+    """Per cell beside which another holds steps, (the positions of its steps
+    in `steps`, the error on each, priced as the max over its ranks, of
+    `_fit_vector` of `vector` on the other cells' steps). `cell` is each
+    step's cell, its record when None."""
     if cell is None:
         cell = np.array([s[0][0] for s in steps])
     out = {}
@@ -1789,15 +2075,52 @@ def _max_affine_folds(steps, vector: dict, routing, cell=None) -> dict:
         if other.any():
             fold = [s for s, o in zip(steps, other) if o]
             coef = _fit_vector(fold, vector, routing)["coef"]
-            error = [
-                max(np.dot(coef, _counts(vector, routing, r[2], *r[5:])) for r in s)
-                / s[0][3]
-                - 1.0
-                for s, o in zip(steps, other)
-                if not o
-            ]
-            out[c] = (len(error), float(np.median(error)))
+            at = np.flatnonzero(~other)
+            error = np.array(
+                [
+                    max(
+                        np.dot(coef, _counts(vector, routing, r[2], *r[5:]))
+                        for r in steps[i]
+                    )
+                    / steps[i][0][3]
+                    - 1.0
+                    for i in at
+                ]
+            )
+            out[c] = (at, error)
     return out
+
+
+def _p50s(errors: dict, band=None) -> dict:
+    """Per held-out cell of `errors`, `_max_affine_errors`', (its steps, the
+    p50 error on them); given `band`, a value per step, the same per cell and
+    value, keyed by both, as `_folds` takes a path."""
+    out = {}
+    for c, (at, error) in errors.items():
+        if band is None:
+            out[c] = (len(error), float(np.median(error)))
+            continue
+        held = band[at]
+        for b in sorted(set(held.tolist())):
+            mine = error[held == b]
+            out[c, b] = (len(mine), float(np.median(mine)))
+    return out
+
+
+def _max_affine_folds(steps, vector: dict, routing, cell=None) -> dict:
+    """Per cell beside which another holds steps, (its steps, the p50 error
+    on them, each priced as the max over its ranks, of `_fit_vector` of
+    `vector` on the other cells' steps). `cell` is each step's cell, its
+    record when None."""
+    return _p50s(_max_affine_errors(steps, vector, routing, cell))
+
+
+def _token_bands(steps) -> tuple[np.ndarray, list[float]]:
+    """Each of `steps`' MoE-token band, the `MOE_BANDS` quantile of the steps'
+    real MoE tokens it lies in, counted from 0, and the quantiles' edges."""
+    tokens = np.array([s[0][6] for s in steps], dtype=np.float64)
+    edges = np.quantile(tokens, np.arange(1, MOE_BANDS) / MOE_BANDS)
+    return np.searchsorted(edges, tokens, side="right"), edges.tolist()
 
 
 def _held_out_error(folds: dict) -> float | None:
@@ -1808,16 +2131,29 @@ def _held_out_error(folds: dict) -> float | None:
     return sum(n * abs(p) for n, p in folds.values()) / rows if rows else None
 
 
-def _moe_column(steps, routing) -> tuple:
+def _moe_column(steps, routing, base=DECODE, select: str = "held_out") -> tuple:
     """The vector decode rung `steps` adopts with a MoE column, or None, the
     figures the rule read, as the vector records them under `fit.moe_column`,
-    and the held-out folds of the form adopted, a column or none.
+    and the held-out folds of the form adopted, a column or none (None under
+    ``insample``). Each form adds its column to `base`, the rung's columns.
 
     `steps` are the rung's steps, each its ranks' `fit` rows. The forms are no
     column and each of `MOE_COLUMNS` over the steps' real MoE tokens,
     `moe_experts` under `routing` and with each step's group dummies as one
     token (`moe_column`). Each form is fitted with each record held out of the
-    rung's steps (`_max_affine_folds`), its held-out error `_held_out_error`'s.
+    rung's steps (`_max_affine_errors`), its held-out error `_held_out_error`'s
+    over each held-out record's p50 error per MoE-token band (`_token_bands`:
+    `MOE_BANDS` quantiles of the rung's real MoE tokens), as a host law's
+    columns are chosen per launch path (`_launch_columns`). One p50 over all
+    of a record's steps is its commonest token count's, which a column its
+    fullest steps need barely moves (#3720 rung 16 of cell B's D, 384 experts
+    top-6: `moe_experts`, which nearly every expert reached past ~200 group
+    tokens holds flat, held out nearest by record, 0.25% against
+    `moe_tokens`' 0.35%, yet priced the rung's fullest steps 2-5% low out of
+    sample, the load the requests making TPOT p90 decode at, where
+    `moe_tokens`' error stays level across the rows). Each record's own p50
+    stays under `folds`, the p50s graded under `bands`, keyed "record:band",
+    and the bands' edges under `token_bands`.
     A rung of one record holds out each group composition instead, the steps
     with as many dummy forwards beside them (`BatchView.group_dummies`): what a
     run at another concurrency changes at a rung is how many of its ranks are
@@ -1827,26 +2163,51 @@ def _moe_column(steps, routing) -> tuple:
     no column on a tie, and a picked column is adopted, returned as the vector
     `_counts` reads. A rung of one record and one composition has no held-out
     error and adopts none.
+
+    Under `select` ``insample`` (`MOE_SELECT_ENV`) the rung adopts one of
+    `MOE_COLUMNS` whatever its records: the one whose fit on all its steps has
+    the smaller scaled MAD of its relative residuals, the first on a tie, the
+    figures stating each under `in_sample`.
     """
-    forms = {"none": {"coefficients": list(DECODE)}}
-    forms |= {f: {"coefficients": [*DECODE, f]} for f in MOE_COLUMNS}
+    forms = {"none": {"coefficients": list(base)}}
+    forms |= {f: {"coefficients": [*base, f]} for f in MOE_COLUMNS}
+    if select == "insample":
+        fits = {f: _fit_vector(steps, forms[f], routing) for f in MOE_COLUMNS}
+        error = {f: fits[f]["mad"] for f in MOE_COLUMNS}
+        picked = min(error, key=error.get)
+        figures = {
+            "picked": picked,
+            "adopted": picked,
+            "selected_by": select,
+            "in_sample": {
+                f: {"mad": fits[f]["mad"], "F": fits[f]["passes"]["F"]}
+                for f in MOE_COLUMNS
+            },
+        }
+        return forms[picked], figures, None
+    if select != "held_out":
+        raise ValueError(f"MoE column rule {select!r} is not one of {MOE_SELECTS}")
     cell, by = np.array([s[0][0] for s in steps]), "record"
     if len(set(cell.tolist())) == 1:
         cell, by = np.array([s[0][7] for s in steps]), "group_dummies"
-    held, error = {}, {}
+    band, edges = _token_bands(steps)
+    held, banded, error = {}, {}, {}
     for form, vector in forms.items():
-        held[form] = _max_affine_folds(steps, vector, routing, cell)
-        error[form] = _held_out_error(held[form])
+        errors = _max_affine_errors(steps, vector, routing, cell)
+        held[form], banded[form] = _p50s(errors), _p50s(errors, band)
+        error[form] = _held_out_error(banded[form])
     picked = min(error, key=error.get) if held["none"] else None
     adopted = None if picked in (None, "none") else picked
     figures = {
         "picked": picked,
         "adopted": adopted,
         "held_out_by": by,
+        "token_bands": edges,
         "held_out": {
             form: {
                 "error": error[form],
                 "folds": {str(c): list(f) for c, f in held[form].items()},
+                "bands": {f"{c}:{b}": list(f) for (c, b), f in banded[form].items()},
             }
             for form in forms
         },
@@ -2025,6 +2386,9 @@ def _groups(
     buckets: tuple[int, ...] = (),
     eager: bool = False,
     cold: bool = False,
+    share: bool = False,
+    kda: bool = False,
+    cols=None,
 ) -> tuple[list[dict[int, tuple]], dict, list[float]]:
     """One run's steps, each {rank: its `_features` row} labelled with the
     smallest rank label; what was cut; and each step's rank label spread. A
@@ -2032,20 +2396,33 @@ def _groups(
     dummy (`_features`' `dummy`), labelled the same, since the backend prices
     it as a rank of the group and the step waits for it; one that ran a decode
     step or, under `draft`, any step so holds none. With `steps`, only the
-    steps numbered in it; `serial`, `routing`, `buckets`, `eager` and `cold`
-    as `_features` reads them;
+    steps numbered in it; `serial`, `routing`, `buckets`, `eager`, `cold`,
+    `share`, `kda` and `cols` as `_features` reads them;
     `dummies`, each rank's steps run as dummy forwards, read from its samples
     when None: a rank that gave no sample needs them given."""
     if dummies is None:
         dummies = [rank[0].dummies for rank in run]
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
     got = [
-        _features(rank, form, len(run), draft, serial, routing, buckets, eager, cold)
+        _features(
+            rank,
+            form,
+            len(run),
+            draft,
+            serial,
+            routing,
+            buckets,
+            eager,
+            cold,
+            share,
+            kda,
+            cols,
+        )
         for rank in run
     ]
     cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
     if len(run) == 1:
-        return [{0: r[:7]} for r in got[0][0]], cut, []
+        return [{0: r[:8]} for r in got[0][0]], cut, []
     ranks = [{r[3]: r for r in rows} for rows, _ in got]
     groups, spread, cut["ranks"] = [], [], 0
     for step in sorted(set().union(*ranks)):
@@ -2059,17 +2436,20 @@ def _groups(
             continue
         labels = [r[2] for r in group.values()]
         spread.append(max(labels) / min(labels) - 1.0)
-        rows = {i: (*r[:2], min(labels), *r[3:7]) for i, r in group.items()}
+        rows = {i: (*r[:2], min(labels), *r[3:8]) for i, r in group.items()}
         peer = next(iter(group.values()))
-        if peer[7] is not None:
-            rows |= {i: (peer[0], peer[7], min(labels), *peer[3:7]) for i in idle}
+        if peer[8] is not None:
+            rows |= {i: (peer[0], peer[8], min(labels), *peer[3:8]) for i in idle}
         groups.append(dict(sorted(rows.items())))
     return groups, cut, spread
 
 
-def _fit_steps(steps: list[list[tuple]], names: list[str], design) -> dict:
+def _fit_steps(
+    steps: list[list[tuple]], names: list[str], design, protect=None
+) -> dict:
     """`_fit_form` of `steps`, each its ranks' `fit` rows, on `design(row)`, the
-    form's features of a row; with `rows`, each step's row at the rank picked.
+    form's features of a row, with `protect`, a step's mark, as `_fit_form`
+    takes it; with `rows`, each step's row at the rank picked.
     A rank that ran the step as a dummy forward holds its dummy's row, or none
     (`_groups`)."""
     width = max(map(len, steps))
@@ -2078,7 +2458,9 @@ def _fit_steps(steps: list[list[tuple]], names: list[str], design) -> dict:
     for i, step in enumerate(steps):
         for r, row in enumerate(step):
             x[i, r], real[i, r] = design(row), True
-    solved = _fit_form(x, real, np.array([s[0][3] for s in steps]), names)
+    marks = None if protect is None else np.array([protect(s) for s in steps])
+    y = np.array([s[0][3] for s in steps])
+    solved = _fit_form(x, real, y, names, protect=marks)
     solved["rows"] = [s[p] for s, p in zip(steps, solved["pick"])]
     return solved
 
@@ -2126,10 +2508,15 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     top-k), under which each decode rung but the draft law's may adopt a MoE
     column (`_moe_column`), `draft_moe_routing`, the drafter's, under which
     above `dp` 1 the draft law's may (`_draft_options`), and `buckets`, the records' prefill token-graph
-    buckets, under which the prefill vector adds `padding`, and `cold`, under
-    which above `dp` 1 it adds `cold_peer_rows` (`_cold`); `seed` fixes the
+    buckets, under which the prefill vector adds `padding`, `cold`, under
+    which above `dp` 1 it adds `cold_peer_rows` (`_cold`), and `kda`, under
+    which it adds `KDA`'s columns and states `kda_chunk` (`_kda`); `seed` fixes the
     `rowmod` shuffles; `draft`, or a sample with a draft label, adds `seqs` and
-    `out` to the prefill vector.
+    `out` to the prefill vector. `peer_share`, false by default, adds
+    `PEER_SHARE` to it above `dp` 1 (`_share`), and `keep_peer_tail`, false by
+    default and only with `peer_share`, keeps in its solve the slower steps a
+    `PEER_SHARE` column marks on some rank (`_fit_form`'s `protect`); its
+    `fit` then counts under `peer_tail` those kept past the MAD band.
     """
     from scipy.spatial import QhullError
 
@@ -2139,6 +2526,19 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     buckets = _buckets(options)
     eager = not draft and _eager_dummies(samples, options)
     cold = not draft and _cold(options)
+    share = not draft and _share(options)
+    keep_tail = not draft and _keep_peer_tail(options)
+    kda = not draft and _kda(options)
+    cols = _columns(options, draft)
+    select = (not draft and (options or {}).get("moe_select")) or MOE_SELECTS[0]
+    peers = (options or {}).get("draft_peer_tokens" if draft else "peer_tokens")
+    if peers and dp == 1:
+        raise ValueError(
+            "peer_tokens counts a data-parallel group's peers' tokens, and these "
+            "records run one rank"
+        )
+    if peers and form == "shared":
+        raise ValueError("the shared form fits no peer_tokens column")
     samples = [
         (
             s
@@ -2159,6 +2559,9 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             buckets=buckets,
             eager=eager,
             cold=cold,
+            share=share,
+            kda=kda,
+            cols=cols,
         )
         groups += [[(i, *r) for r in g.values()] for g in got]
         spread += s
@@ -2167,7 +2570,11 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     prefill = list(HISTORY if form == "history" else PREFILL)
     prefill += ["cached_seqs"] * (form == "cached_seqs") + ["moe_rows"] * (dp > 1)
     prefill += ["serial_moe_rows"] * serial + ["cold_peer_rows"] * cold
+    gathered = _gathered(cols)
+    prefill += gathered
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
+    prefill += list(PEER_SHARE) * share
+    prefill += list(KDA) * kda
     prefill += ["padding"] * bool(buckets) + list(EAGER_DUMMY) * eager
     law = {
         "provenance": f"step_linear_fit {form} on {len(runs) * dp} real records "
@@ -2195,7 +2602,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             (None, ["context", "graph_padding"] + [f"step@{k}" for k in rungs])
         )
     else:
-        solves += [(k, list(DECODE)) for k in rungs]
+        base = list(DECODE) + ["row_padding"] * cols["row_padding"]
+        solves += [(k, base) for k in rungs]
     for key, names in solves:
         steps = [
             g
@@ -2213,15 +2621,26 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             solved = _fit_steps(
                 steps, names, lambda r: (*r[2][1:], *(r[1] == k for k in rungs))
             )
+        elif key == "prefill" and keep_tail:
+            marks = [names.index(f) for f in PEER_SHARE]
+            solved = _fit_steps(
+                steps,
+                names,
+                lambda r: r[2],
+                lambda step, marks=marks: any(r[2][j] for r in step for j in marks),
+            )
         else:
             solved = _fit_steps(steps, names, lambda r: r[2])
         rowmod_k = figures = folds = None
         if key and key.isdigit():
             vector = {"coefficients": names}
             if routing:
-                chosen, figures, folds = _moe_column(steps, routing)
+                chosen, figures, folds = _moe_column(steps, routing, names, select)
                 if chosen:
                     vector, solved = chosen, _fit_vector(steps, chosen, routing)
+            if _peer_rung(steps, int(key), vector, routing, peers):
+                vector = {"coefficients": [*vector["coefficients"], "peer_tokens"]}
+                solved, folds = _fit_vector(steps, vector, routing), None
             chosen = _rowmod(steps, int(key), vector, solved, seed, routing, folds)
             if chosen:
                 rowmod_k, solved, evidence = chosen
@@ -2290,6 +2709,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                 vector["fit"]["passes"] = solved["passes"]
             if figures:
                 vector["fit"]["moe_column"] = figures
+            if carried := [f for f in OPT_IN if f in features]:
+                vector["fit"]["vif"] = _vif(points, list(features), carried)
             if rowmod_k:
                 vector["rowmod"] = rowmod_k
                 vector["fit"]["rowmod"] = evidence
@@ -2298,6 +2719,16 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     vector["buckets"] = list(buckets)
                 if cold:
                     vector["duty_tau"] = DUTY_TAU
+                if keep_tail:
+                    band = max(MAD_K * solved["mad"], MAD_FLOOR)
+                    past = np.abs(solved["residual"] - solved["centre"]) > band
+                    vector["fit"]["peer_tail"] = int((solved["keep"] & past).sum())
+                if kda:
+                    vector["kda_chunk"] = KDA_CHUNK
+                if gathered:
+                    vector["ranks"] = dp
+                if cols["moe_imbalance"] is not None:
+                    vector["min_spread"] = cols["moe_imbalance"]
                 law["prefill"] = vector
             else:
                 law["decode"][k] = vector
@@ -2521,6 +2952,8 @@ def _fold_laws(samples, options, seed, draft: bool = False):
         "serial": _serial(samples, options),
         "eager_dummies": _eager_dummies(samples, options),
         "cold": _cold(options),
+        "peer_share": _share(options),
+        "kda": _kda(options),
     }
     for run, ranks in _runs(samples, _options(options)[1]).items():
         others = [s for s in samples if s.provenance["run"] != run]
@@ -2532,13 +2965,15 @@ def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None
     by the law fitted on the other runs, `folds`' when given, else
     `_fold_laws`', under `draft` as `fit` fits a draft law: (run, vector,
     band, that rank's (counts, context, tokens, dummies), relative error), the
-    error nan where that law has no vector."""
+    error nan where that law has no vector; `counts` with its `peer_tokens`."""
     form = _options(options)[0]
     options = {
         **(options or {}),
         "serial": _serial(samples, options),
         "eager_dummies": _eager_dummies(samples, options),
         "cold": _cold(options),
+        "peer_share": _share(options),
+        "kda": _kda(options),
     }
     if warm is None:
         warm = fit(samples, options, seed, draft)[0]["warm_steps"]
@@ -2554,12 +2989,15 @@ def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None
             buckets=_buckets(options),
             eager=not draft and options["eager_dummies"],
             cold=not draft and options["cold"],
+            share=not draft and options["peer_share"],
+            kda=not draft and options["kda"],
+            cols=_columns(options, draft),
         )[0]:
             key, _, seconds, step, *_ = next(iter(group.values()))
             if step in warm[i]:
                 continue
             vector = law["decode"].get(key) if key != "prefill" else law.get(key)
-            mine = [(r[1], *r[4:7]) for r in group.values()]
+            mine = [(r[1], *r[4:8]) for r in group.values()]
             price, error = [c[1] for c, *_ in mine], float("nan")
             if vector is not None:
                 c = list(vector["coefficients"].values())
@@ -2569,12 +3007,17 @@ def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None
             yield run, key, _band(key, top[0]), top, error
 
 
-def _counts(vector: dict, routing, counts, context, tokens, dummies) -> tuple:
-    """A step's `counts` with the MoE column and `rowmod` count `vector` adds,
-    over its rows' `context` and its real MoE `tokens`, `dummies` of them its
-    group's dummy forwards', under `routing`."""
+def _counts(vector: dict, routing, counts, context, tokens, dummies, peers=0) -> tuple:
+    """A step's `counts` with the MoE column, `peer_tokens` and `rowmod`
+    count `vector` adds, over its rows' `context`, its real MoE `tokens`,
+    `dummies` of them its group's dummy forwards', under `routing`, and its
+    `peers`, its `peer_tokens`."""
     moe = [f for f in MOE_COLUMNS if f in vector["coefficients"]]
     counts = (*counts, *(moe_column(f, tokens, routing, dummies) for f in moe))
+    if "peer_tokens" in vector["coefficients"]:
+        if peers is None:
+            raise ValueError("a step stating no group tokens has no peer_tokens")
+        counts += (peers,)
     return counts + ((rowmod(context, vector["rowmod"]),) if "rowmod" in vector else ())
 
 
@@ -3007,18 +3450,21 @@ def refuse_contradicting(own, held: dict, stated, engine: dict) -> None:
 
 
 def refuse_context_parallel(engine: dict, where: str) -> None:
-    """Refuse an engine config that states a context-parallel width: a step
-    linear law states none, so a run at width 1 would price with it."""
-    if widths := [f"{k} {engine[k]}" for k in CONTEXT_PARALLEL if k in engine]:
+    """Refuse an engine config that states a prefill context-parallel width: a
+    step linear law states none, so a run at width 1 would price with it. A
+    decode context-parallel width is the law's engine config's, which a run
+    holds to its own (`run.refuse_unfitted_law`)."""
+    if widths := [f"{k} {engine[k]}" for k in UNKEYED_CONTEXT_PARALLEL if k in engine]:
         raise ValueError(
             f"{where} states {' and '.join(widths)}, and a step linear law states "
-            "no context-parallel width, so a run at width 1 would price with it"
+            "no prefill context-parallel width, so a run at width 1 would price "
+            "with it"
         )
 
 
 def join_width(engine: dict) -> int:
     """The ranks a run's records join at: `engine`'s `data_parallel_size`.
-    An engine config stating a context-parallel width refuses."""
+    An engine config stating a prefill context-parallel width refuses."""
     refuse_context_parallel(engine, "the records' engine config")
     if "data_parallel_size" not in engine:
         raise ValueError(
@@ -3172,7 +3618,7 @@ def figures_main(argv) -> None:
     The records must be the runs LAW states under `runs`, and are folded under
     their engine config as the command fits them, and under the `form` and
     `moe_routing` LAW states, a `--form` or `--moe-routing` that contradicts
-    them refusing. A law whose `sources` splits its vectors takes one source's
+    them refusing, with `KDA`'s columns where its prefill vector has them. A law whose `sources` splits its vectors takes one source's
     at a time: `--source` names it, the records must be its `runs`, they are
     folded under `--form` and `--moe-routing`, as its provenance states them,
     and the figures, of the steps its `vectors` price, go under it; a source
@@ -3216,6 +3662,8 @@ def figures_main(argv) -> None:
         raise ValueError(f"{args.law} states no runs to hold the records to")
     samples, _, options, _ = _labelled(args)
     options["draft_moe_routing"] = _law_routing(law.get("draft", {}))
+    fitted_with = (law.get("prefill") or {}).get("coefficients", {})
+    options["kda"] = any(f in fitted_with for f in KDA)
     given = {s.provenance["run"] for s in samples}
     if differ := sorted(given ^ set(runs)):
         raise ValueError(
