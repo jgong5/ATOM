@@ -22,7 +22,7 @@ LIST = "scripts/compass/gpu_gate_driver_run.txt"
 #: A skip reason naming an input gate_gpu.sh sets, or the router it puts on PATH;
 #: `_lib.sh`'s COMPASS_DRIVER_RUN_SKIP matches a SKIPPED line by the same pattern.
 DRIVER_RUN = re.compile(
-    r"ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK|MOE|CCTRACES)|COMPASS_(HARNESS|AIPERF)_PYTHON"
+    r"ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK|MOE|V4_FLASH|R1|CCTRACES)|COMPASS_(HARNESS|AIPERF)_PYTHON"
     r"|ATOMESH|needs atomesh|atomesh on PATH"
 )
 

@@ -232,6 +232,9 @@ if [ -z "$NO_DRIVER_RUN" ] && grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/co
     export ATOM_COMPASS_DSPARK_MODEL=${ATOM_COMPASS_DSPARK_MODEL:-/root/cells/deepseek-v41-flash-dspark}
     # The expert forms read Qwen3-30B-A3B's config and tokenizer, no weights.
     export ATOM_COMPASS_MOE_MODEL=${ATOM_COMPASS_MOE_MODEL:-/root/cells/qwen3-30b-a3b}
+    # DeepSeek-V4-Flash's and DeepSeek-R1-0528 MXFP4's, at TP4, the same.
+    export ATOM_COMPASS_V4_FLASH_MODEL=${ATOM_COMPASS_V4_FLASH_MODEL:-/root/cells/deepseek-v4-flash}
+    export ATOM_COMPASS_R1_MODEL=${ATOM_COMPASS_R1_MODEL:-/root/cells/deepseek-r1-0528-mxfp4}
     # The cc-traces smoke replays turns longer than the slice model's context, so
     # it runs alone, with this model as its slice model.
     SMOKE=tests/compass/test_cctraces_sim_smoke.py
@@ -251,6 +254,8 @@ if [ -z "$NO_DRIVER_RUN" ] && grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/co
     [ -d "$ATOM_COMPASS_MTP_MODEL" ] || MISSING+="ATOM_COMPASS_MTP_MODEL, a Qwen3.5-0.8B directory; "
     [ -d "$ATOM_COMPASS_DSPARK_MODEL" ] || MISSING+="ATOM_COMPASS_DSPARK_MODEL $ATOM_COMPASS_DSPARK_MODEL; "
     [ -d "$ATOM_COMPASS_MOE_MODEL" ] || MISSING+="ATOM_COMPASS_MOE_MODEL $ATOM_COMPASS_MOE_MODEL; "
+    [ -d "$ATOM_COMPASS_V4_FLASH_MODEL" ] || MISSING+="ATOM_COMPASS_V4_FLASH_MODEL $ATOM_COMPASS_V4_FLASH_MODEL; "
+    [ -d "$ATOM_COMPASS_R1_MODEL" ] || MISSING+="ATOM_COMPASS_R1_MODEL $ATOM_COMPASS_R1_MODEL; "
     [ -d "$ATOM_COMPASS_CCTRACES_MODEL" ] || MISSING+="ATOM_COMPASS_CCTRACES_MODEL, a Qwen3.8-27B directory; "
     [ -r "$ATOM_COMPASS_CCTRACES" ] || MISSING+="ATOM_COMPASS_CCTRACES $ATOM_COMPASS_CCTRACES; "
     [ -x "$COMPASS_HARNESS_PYTHON" ] || MISSING+="COMPASS_HARNESS_PYTHON $COMPASS_HARNESS_PYTHON; "
@@ -264,6 +269,7 @@ if [ -z "$NO_DRIVER_RUN" ] && grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/co
         "$ATOM_COMPASS_SLICE_MODEL" "$ATOM_COMPASS_IMAGE_MODEL" "$ATOMESH"
     printf 'spec:       mtp %s\n            dspark %s\n' "$ATOM_COMPASS_MTP_MODEL" "$ATOM_COMPASS_DSPARK_MODEL"
     printf 'moe:        %s\n' "$ATOM_COMPASS_MOE_MODEL"
+    printf 'deepseek:   v4-flash %s\n            r1 %s\n' "$ATOM_COMPASS_V4_FLASH_MODEL" "$ATOM_COMPASS_R1_MODEL"
     printf 'cc-traces:  model %s\n            traces %s\n            harness %s\n            aiperf %s\n' \
         "$ATOM_COMPASS_CCTRACES_MODEL" "$ATOM_COMPASS_CCTRACES" "$COMPASS_HARNESS_PYTHON" "$COMPASS_AIPERF_PYTHON"
 fi
