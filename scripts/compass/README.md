@@ -1066,10 +1066,16 @@ blocking-call tool through `ROCP_TOOL_LIBRARIES`; the c=1 cell's prefill side ra
 holds each band's errors with each record held out in turn. A term a side's records cannot give is
 the crs005 DPA8 law's of that side, as `provenance` names: `admission_s` and `stream_s`, since a
 side's requests and streams pass the router; `kv_write_req_s` and `router_s`, which `compass fit
-host` does not fit; the prefill side's `ipc_out_s`, since no output message ran alone on it; and the
-decode side's `http_intake`, since its requests render no chat template
-([#3229](https://github.com/jgong5/ATOM/issues/3229)). A decode side encodes no prompt and admits no
-request, so its entry states no encode term and `admit` null.
+host` does not fit; and the prefill side's `ipc_out_s`, since no output message ran alone on it. A
+decode side encodes no prompt and admits no request, so its entry states no encode term and `admit`
+null. Each side's `http_intake` is refitted by `compass fit host` on that side of twelve records:
+those three cells and [#3179](https://github.com/jgong5/ATOM/issues/3179)'s nine graded rounds,
+c=1, 4 and 16 three each over traces 0 to 255 for 3600 s at ATOM 82df6c583
+([#3919](https://github.com/jgong5/ATOM/issues/3919)). The prefill side's
+spans bodies of 1,547 to 971,174 bytes. The decode side renders no chat template, so its requests
+are timed from the app call to the engine send ([#3229](https://github.com/jgong5/ATOM/issues/3229)),
+and its term spans the relayed bodies, which carry the prompt's ids, of 3,593 to 2,195,990 bytes. A
+body outside its side's range is refused and charged nothing.
 
 `scripts/compass/laws/deepseek-v4-pro-tp8-mtp3-mi355x-crs005-{prefill,decode}.json.xz` and
 `deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-{prefill,decode}.json.xz` hold host laws alone, one per
@@ -1484,10 +1490,11 @@ list, Runs and Grading steps, with these differences:
   No graph or point key holds the utilization, so the decode side's simulated run stays at 0.70.
 - **Host laws only.** `P` and `D` are the tree's
   `laws/deepseek-v4-pro-tp8-mi355x-crs005-prefill-host.json.xz` and `-decode-host.json.xz`,
-  host terms with no step linear law: the op-level backend prices every device step. The
-  decode side's `http_intake` is the crs005 DPA8 law's, whose fitted body range stops below
-  the largest bodies traces 0 to 255 send, so a run of them refuses each larger intake and
-  `validate` grades no such run ([#3919](https://github.com/jgong5/ATOM/issues/3919)).
+  host terms with no step linear law: the op-level backend prices every device step. Each
+  side's `http_intake` spans the bodies the cell's real rounds over traces 0 to 255 sent
+  (above). A simulated relayed body runs 50 to 54 bytes over the real one, so a decode-side
+  intake above 2,195,990 bytes stays refused, and `validate` grades no run that refused one
+  ([#3919](https://github.com/jgong5/ATOM/issues/3919)).
 
 ### The EP8 cell under the op-level backend
 
