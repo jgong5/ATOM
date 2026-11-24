@@ -106,6 +106,8 @@ class Deployment:
             raise ValueError(f"dp {self.dp}, rungs {self.rungs}: rungs ascend, dp >= 1")
         if self.drafts and self.acceptance < 1.0:
             raise ValueError(f"acceptance {self.acceptance} is below one token a step")
+        if self.prefix_unit < 0:
+            raise ValueError(f"prefix_unit {self.prefix_unit}: a hit is whole tokens")
         if not self.prefix_unit:
             object.__setattr__(self, "prefix_unit", self.block_size)
 
@@ -226,38 +228,21 @@ EXPERTS = ("n_routed_experts", "num_local_experts", "num_experts")
 TOP_K = ("num_experts_per_tok", "num_experts_per_token", "moe_topk")
 
 
-def _flags(argv) -> dict:
-    """A serve command line's `--name value` options, `-` and `_` alike, a
-    switch with no value as True."""
-    out = {}
-    for i, word in enumerate(argv):
-        if not word.startswith("-") or _number(word):
-            continue  # a value, read with its option
-        value = argv[i + 1] if i + 1 < len(argv) else None
-        switch = value is None or (value.startswith("-") and not _number(value))
-        out[word.lstrip("-").replace("-", "_")] = True if switch else value
-    return out
-
-
-def _number(word: str) -> bool:
-    try:
-        float(word)
-    except ValueError:
-        return False
-    return True
-
-
 def from_record(record) -> dict:
     """The deployment fields a record states, by the names `parse` reads: its
     run.json's engine (over its rank 0's ``dp0.engine.json``) for the ladder,
     the scheduler's bounds, the block, the KV pool and the token-graph buckets,
     the DP and TP widths and the drafter's width; its serve command line
-    (run.json ``argv`` after ``--``) for the prefill chunk, the DCP width and
-    the forced acceptance (else one plus the mean accepted drafts of
+    (run.json ``argv`` after ``--``), read by ATOM's own parser, so an option
+    the line omits takes ATOM's default, for the prefill chunk, the DCP width
+    and the forced acceptance (else one plus the mean accepted drafts of
     ``dp0.acceptance.json``); and the model's config.json, where it can be
     read, for the routed experts and top-k, and for a model with KDA layers
-    (``linear_attn_config``) the state checkpoint a prefix hit lands on.
-    `$VAR`s in the path expand. A field the record does not state is left out."""
+    (``linear_attn_config``) the state checkpoint interval a prefix hit lands
+    on, refused below one token. `$VAR`s in the path expand. A field the
+    record does not state is left out."""
+    from atom.compass.drive.runfile import _engine_args
+
     record = Path(os.path.expandvars(str(record)))
     if not (record / "run.json").exists() and (record / "real" / "run.json").exists():
         record = record / "real"  # a calibration run's: its server's record
@@ -268,7 +253,7 @@ def from_record(record) -> dict:
         engine = json.loads((steps / "dp0.engine.json").read_text())
     engine |= run.get("engine") or {}
     argv = [str(a) for a in run.get("argv") or ()]
-    flags = _flags(argv[argv.index("--") + 1 :] if "--" in argv else argv)
+    args = _engine_args(argv[argv.index("--") + 1 :] if "--" in argv else argv)
     out = {}
     for name, key in (
         ("max_num_seqs", "max_num_seqs"),
@@ -286,30 +271,34 @@ def from_record(record) -> dict:
         out["kv_tokens"] = int(engine["num_kvcache_blocks"]) * out["block_size"]
     if "prefill_buckets" in engine:
         out["prefill_buckets"] = [int(b) for b in engine["prefill_buckets"] or ()]
-    if "attn_prefill_chunk_size" in flags:
-        out["chunk"] = int(flags["attn_prefill_chunk_size"])
-    if "decode_context_parallel_size" in flags:
-        out["dcp"] = int(flags["decode_context_parallel_size"])
+    out["chunk"] = int(args.attn_prefill_chunk_size)
+    out["dcp"] = int(args.decode_context_parallel_size)
     spec = engine.get("speculative")
     out["drafts"] = int(spec[1]) if spec else 0
-    if spec and "spec_decode_acceptance_length" in flags:
-        out["acceptance"] = float(flags["spec_decode_acceptance_length"])
+    if spec and args.spec_decode_acceptance_length is not None:
+        out["acceptance"] = float(args.spec_decode_acceptance_length)
     elif spec and (steps / "dp0.acceptance.json").exists():
         seen = json.loads((steps / "dp0.acceptance.json").read_text())["distribution"]
         total = sum(seen.values())
         if total:
             out["acceptance"] = 1 + sum(int(k) * n for k, n in seen.items()) / total
-    model = Path(str(flags.get("model", ""))) / "config.json"
-    if flags.get("model") and model.exists():
+    model = Path(args.model) / "config.json"
+    if model.exists():
         hf = json.loads(model.read_text())
         hf = hf.get("text_config", hf)
         experts = next((hf[k] for k in EXPERTS if k in hf), None)
         top_k = next((hf[k] for k in TOP_K if k in hf), None)
         if experts and top_k:
             out["moe_routing"] = [int(experts), int(top_k)]
-        kda = (hf.get("linear_attn_config") or {}).get("kda_layers")
-        if kda and "state_checkpoint_interval_tokens" in flags:
-            out["prefix_unit"] = int(flags["state_checkpoint_interval_tokens"])
+        if (hf.get("linear_attn_config") or {}).get("kda_layers"):
+            interval = int(args.state_checkpoint_interval_tokens)
+            if interval < 1:
+                raise ValueError(
+                    f"{record}: --state-checkpoint-interval-tokens {interval} "
+                    "keeps no checkpoint every so many tokens, so a KDA model's "
+                    "prefix hit lands on no fixed unit"
+                )
+            out["prefix_unit"] = interval
     return out
 
 
@@ -334,7 +323,7 @@ def parse(raw: dict, record=None) -> Config:
         rungs=tuple(int(r) for r in d["rungs"]),
         max_num_seqs=int(d["max_num_seqs"]),
         max_num_batched_tokens=int(d["max_num_batched_tokens"]),
-        chunk=int(d.get("chunk", d["max_num_batched_tokens"])),
+        chunk=int(d["chunk"]),
         block_size=block,
         max_model_len=int(d["max_model_len"]),
         kv_tokens=kv_tokens(d["kv_tokens"], block),

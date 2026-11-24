@@ -20,6 +20,7 @@ DEPLOYMENT = {
     "rungs": [1, 2, 4, 8],
     "max_num_seqs": 8,
     "max_num_batched_tokens": 4096,
+    "chunk": 4096,
     "block_size": 128,
     "max_model_len": 65536,
     "kv_tokens": 400000,
@@ -167,6 +168,8 @@ def test_a_deployment_names_the_rung_a_step_replays_and_its_cache_unit():
         _dep(rungs=[1, 4, 2])
     with pytest.raises(ValueError, match="below one token"):
         _dep(acceptance=0.9)
+    with pytest.raises(ValueError, match="whole tokens"):
+        _dep(prefix_unit=-1)
 
 
 def test_the_kv_pool_is_a_number_or_a_run_json_engines(tmp_path, monkeypatch):
@@ -222,11 +225,30 @@ def test_a_token_size_is_a_share_of_the_pool_the_model_the_budget_or_a_bucket():
 # -- a deployment read from a record ----------------------------------------------
 
 
-def _record_dir(path: Path, kda: bool = False, forced: bool = True, cal: bool = False):
+#: The serve line's options after its model, all in long form.
+SERVE = [
+    "-tp",
+    "4",
+    "--enable-dp-attention",
+    "--attn-prefill-chunk-size",
+    "8192",
+    "--state-checkpoint-interval-tokens",
+    "4096",
+    "--decode-context-parallel-size",
+    "2",
+    "--num-speculative-tokens",
+    "3",
+]
+
+
+def _record_dir(
+    path: Path, kda: bool = False, forced: bool = True, cal: bool = False, serve=SERVE
+):
     """A record as `compass record` lays it out (with `cal`, under the calibration
     run's real/), its model's config.json beside it: each rank's engine file,
     and run.json's engine, the `TARGET` fields of rank 0's at the fewest KV
-    blocks any rank states, as `drive.record.write_engine_and_costs` writes it."""
+    blocks any rank states, as `drive.record.write_engine_and_costs` writes it;
+    `serve` the serve line's options after its model."""
     model = path / "model"
     model.mkdir(parents=True)
     hf = {"n_routed_experts": 64, "num_experts_per_tok": 4, "top_k": 50}
@@ -236,21 +258,7 @@ def _record_dir(path: Path, kda: bool = False, forced: bool = True, cal: bool = 
     (model / "config.json").write_text(json.dumps(hf))
     rec = path / "rec" / ("real" if cal else "")
     (rec / "steps").mkdir(parents=True)
-    serve = [
-        "--model",
-        str(model),
-        "-tp",
-        "4",
-        "--enable-dp-attention",
-        "--attn-prefill-chunk-size",
-        "8192",
-        "--state-checkpoint-interval-tokens",
-        "4096",
-        "--decode-context-parallel-size",
-        "2",
-        "--num-speculative-tokens",
-        "3",
-    ]
+    serve = ["--model", str(model), *serve]
     if forced:
         serve += ["--spec-decode-acceptance-length", "2.5"]
     engines = {}
@@ -304,6 +312,33 @@ def test_a_kda_model_hits_at_its_state_checkpoint_and_acceptance_falls_back(tmp_
     got = deploy.from_record(_record_dir(tmp_path, kda=True, forced=False, cal=True))
     assert got["moe_routing"] == [32, 8] and got["prefix_unit"] == 4096
     assert got["acceptance"] == pytest.approx(1 + (1 * 1 + 2 * 3) / 4)
+
+
+def test_a_serve_line_reads_as_atoms_parser_reads_it(tmp_path):
+    """Short flags and ``--name=value`` read as the server read them, and an
+    option the line omits takes ATOM's default."""
+    from atom.model_engine.arg_utils import EngineArgs
+
+    short = ["-tp", "4", "-dcp", "2", "--attn_prefill_chunk_size=8192"]
+    got = deploy.from_record(_record_dir(tmp_path / "short", kda=True, serve=short))
+    assert (got["dcp"], got["chunk"]) == (2, 8192)
+    assert got["prefix_unit"] == EngineArgs.state_checkpoint_interval_tokens
+    got = deploy.from_record(_record_dir(tmp_path / "bare", serve=[]))
+    assert got["chunk"] == EngineArgs.attn_prefill_chunk_size
+    assert got["dcp"] == EngineArgs.decode_context_parallel_size
+    assert "prefix_unit" not in got  # not a KDA model: the block
+    raw = _config()
+    del raw["deployment"]["chunk"]
+    with pytest.raises(KeyError, match="chunk"):
+        deploy.parse(raw)  # stated by neither the config nor a record
+
+
+def test_a_kda_model_refuses_a_checkpoint_interval_below_one_token(tmp_path):
+    for interval in ("0", "-1"):
+        flags = ["--state-checkpoint-interval-tokens", interval]
+        rec = _record_dir(tmp_path / interval, kda=True, serve=flags)
+        with pytest.raises(ValueError, match="no fixed unit"):
+            deploy.from_record(rec)
 
 
 def test_a_field_beside_from_record_overrides_it_and_a_given_record_replaces_the_config(
@@ -464,3 +499,17 @@ def test_a_step_the_backend_refuses_is_refused_by_name():
     )
     with pytest.raises(ValueError, match="refuses the prefill view"):
         columns.values(no_gather, "prefill", names, _dep())
+
+
+def test_rowmod_is_the_backends_column_and_refuses_without_its_laws_modulus():
+    assert columns.backend_prices("decode", "rowmod")
+    assert columns.provisional("decode", ["step", "context", "rowmod"]) == []
+    view = BatchView(
+        (RequestShape(2, 1000, True), RequestShape(2, 3000, True)),
+        capture_rung=2,
+        produces_output=True,
+        dp_rank=0,
+    )
+    names = ["step", "context", "graph_padding", "rowmod"]
+    with pytest.raises(ValueError, match="modulus"):
+        columns.values(view, "decode", names, _dep())
