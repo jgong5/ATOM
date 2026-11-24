@@ -228,6 +228,9 @@ def test_a_graph_run_meets_every_scenario_check_each_decode_step_at_its_rung(
 def test_a_graph_run_meets_every_scenario_check_under_the_step_roofline(
     graph_roofline_runs,
 ):
+    """The level-0 case's checks but one: the hand-computed timeline, which
+    `check_run` computes only for a constant step stub. Every request arrives
+    at 0, so the decode batches and their rungs follow no step cost."""
     _checked(graph_roofline_runs, timeline=False)
     _each_decode_step_at_its_rung(graph_roofline_runs[0])
 
@@ -299,5 +302,9 @@ def test_a_prefix_run_meets_every_scenario_check_later_requests_hitting_in_hbm(
 def test_a_prefix_run_meets_every_scenario_check_under_the_step_roofline(
     prefix_roofline_runs,
 ):
+    """The level-0 case's checks but one: the hand-computed timeline, which
+    `check_run` computes only for a constant step stub. The later requests are
+    sent once the first has ended (`Later` checks it), so their hits follow no
+    step cost."""
     _checked(prefix_roofline_runs, timeline=False)
     _later_requests_prefill_on_the_shared_blocks(prefix_roofline_runs[0])
