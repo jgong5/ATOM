@@ -71,9 +71,9 @@ def test_tails_name_each_simulated_error_against_the_real_run_s_block_interval(
 
 def _replayed(d, sends, idle=None):
     """A run at c=8 of profiling requests `sends`, each (conversation, turn,
-    send s, end s, input tokens) with 10 output tokens, its aiperf log stating
-    the global idle cap's `idle` (jumps, skipped s) at the profiling phase's
-    end after the warmup's none, or no log."""
+    send s, end s, input tokens[, cached tokens]) with 10 output tokens, its
+    aiperf log stating the global idle cap's `idle` (jumps, skipped s) at the
+    profiling phase's end after the warmup's none, or no log."""
     run = _run(d, 8, server=False)
     records = [
         {
@@ -90,9 +90,14 @@ def _replayed(d, sends, idle=None):
                 "request_latency": {"value": (end - start) * 1e3, "unit": "ms"},
                 "input_sequence_length": {"value": tokens, "unit": "tokens"},
                 "output_sequence_length": {"value": 10, "unit": "tokens"},
-            },
+            }
+            | (
+                {"usage_prompt_cache_read_tokens": {"value": cached[0]}}
+                if cached
+                else {}
+            ),
         }
-        for conversation, turn, start, end, tokens in sends
+        for conversation, turn, start, end, tokens, *cached in sends
     ]
     (run / curves.RECORDS).write_text("".join(json.dumps(r) + "\n" for r in records))
     if idle is not None:
@@ -152,3 +157,46 @@ def test_paired_throughput_is_each_run_s_tokens_of_them_over_its_own_span(tmp_pa
     line = _window_line(done.stdout, "step_linear")
     assert "over the 2 requests both ran +25.0%" in line
     assert "idle cap skipped real -, step_linear -" in line
+
+
+def _hits_line(out, name):
+    (line,) = [x for x in out.splitlines() if x.startswith(f"{name}: prefix hits")]
+    return line
+
+
+def test_prefix_hits_over_the_requests_both_ran_are_each_run_s_own_cached_share(
+    tmp_path,
+):
+    real = _replayed(
+        tmp_path / "real1",
+        [("a", 0, 0.0, 10.0, 1000, 800), ("b", 0, 2.0, 20.0, 3000, 2400)],
+    )
+    sim = _replayed(
+        tmp_path / "step_linear",
+        [
+            ("a", 0, 0.0, 10.0, 1000, 600),
+            ("b", 0, 2.0, 20.0, 3000, 2000),
+            ("c", 0, 3.0, 9.0, 5000, 5000),
+        ],
+    )
+
+    done = _one_real(real, sim)
+
+    assert done.returncode == 0, done.stderr
+    assert _hits_line(done.stdout, "step_linear") == (
+        "step_linear: prefix hits over the 2 requests both ran 65.0% against "
+        "the real run's 80.0% (-15.0 pt), their uncached input tokens +75.0%"
+    )
+    json.loads(done.stdout.splitlines()[-1])  # the table's JSON stays last
+
+
+def test_prefix_hits_name_none_where_no_record_states_its_cached_tokens(tmp_path):
+    real = _replayed(tmp_path / "real1", [("a", 0, 0.0, 10.0, 1000)])
+    sim = _replayed(tmp_path / "step_linear", [("a", 0, 0.0, 10.0, 1000, 10)])
+
+    done = _one_real(real, sim)
+
+    assert done.returncode == 0, done.stderr
+    assert _hits_line(done.stdout, "step_linear") == (
+        "step_linear: prefix hits: no request both ran states its cached tokens"
+    )
