@@ -4,7 +4,7 @@ records, or assumed from another device's for a device never run.
 
     compass fit device RECORD... --store S --out D
     compass fit device --device DATASHEET --assume-from DEVICE --ptl P
-        --store S --out D
+        [--stack STACK] --store S --out D
 
 Each RECORD is a `probe_record` in S, named by the token its key prints. The
 `platform_readings` entry published in S, keyed by the records' device, stack,
@@ -18,9 +18,10 @@ torches refuse, naming each record's value, and so does a key S already holds.
 
 With `--assume-from`, DEVICE is a device name a datasheet under
 `atom/compass/devices/` states. The one measured `platform_readings` entry S
-holds for it at `--ptl` is taken by `assumed`, and published for the device
-`--device` names, a datasheet by SKU or path, keyed by the source's stack and
-torch, every field assumed. None, or several, refuse, listing them.
+holds for it at `--ptl`, and at `--stack` when given (`stack_of`), is taken by
+`assumed`, and published for the device `--device` names, a datasheet by SKU
+or path, keyed by the source's stack and torch, every field assumed. None, or
+several, refuse, listing them.
 
 `--out` gets a readable copy of the entry, ``platform_readings.json``, with
 its key and token.
@@ -264,7 +265,9 @@ def main(argv: list[str]) -> None:
     if args.assume_from:
         if args.records or not (args.device and args.ptl):
             raise ValueError("--assume-from takes --device and --ptl and no RECORD")
-        found, document, source, _ = assumed_entry(store, args.assume_from, args.ptl)
+        found, document, source, _ = assumed_entry(
+            store, args.assume_from, args.ptl, args.stack
+        )
         values = {k: v for k, v in document.items() if k not in READINGS_HEADER}
         target = datasheet(args.device)
         platform = found.values | {"device": _device(target)}
@@ -274,7 +277,7 @@ def main(argv: list[str]) -> None:
             f"the {source.name} datasheet; the stack and torch are that entry's"
         )
     else:
-        if not args.records or args.device or args.ptl:
+        if not args.records or args.device or args.ptl or args.stack:
             raise ValueError("name the probe records, or --assume-from a device")
         records, platform = _records(store, args.records)
         values, origins = fold(records)
@@ -328,6 +331,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--device", help="with --assume-from: the datasheet, SKU or path")
     p.add_argument("--assume-from", help="the device name whose readings to assume")
     p.add_argument("--ptl", help="with --assume-from: the PTL state to take")
+    p.add_argument(
+        "--stack", help="with --assume-from: the stack and torch to take, of several"
+    )
     p.add_argument("--store", required=True, help="the artifact store's root")
     p.add_argument("--out", required=True, help="a directory for the readable copy")
     return p
