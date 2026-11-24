@@ -59,13 +59,17 @@ a table, the placement's, a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
 experts' ids ATOM fuses into them, at a point that states its real MoE
 rows (``R=``) each row past them routed to no expert as ATOM routes a pad
-row, one rank's batch holding its real rows alone (`_route`), the
+row, one rank's batch holding its real rows alone (`_route`), the count
+of rows MORI's dispatch hands aiter's fused MoE, every row the leaf holds
+(`RECEIVED`), the
 `NM_OUTPUT` slot at
 one KV split, a view at the start of twice its span, and aiter's top-k
 scratch (`TOPK_WORKSPACE`), one byte in the graph, built as aiter builds it
 on the device for the call's rows, row stride, k and path
 (`_topk_workspace`); a weight is random at its
-shape, dtype and stride, one tensor per occurrence of the leaf in the step;
+shape, dtype and stride, one tensor per occurrence of the leaf in the step,
+but an expert mask its MoE layers' own, ones on the rank's experts
+(`EXPERT_MASK`);
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
@@ -319,7 +323,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 42
+PROTOCOL = 44
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -358,6 +362,18 @@ CLEAR_S, CLEAR_SLACK = 3.0, 256 << 20
 #: aiter's Mega-MHC launcher aborts the process on an `hc_scale` that is not
 #: 16-byte aligned, as three in four three-float slices packed back to back are.
 WEIGHT_ALIGN = 512
+#: The weight slot in which ATOM passes aiter's MoE operators their layer's
+#: expert mask under expert parallelism: ones on the rank's own experts, which
+#: aiter's sorting reads to drop each route to another rank's
+#: (`get_topk_valid_mask`). Drawn as another integer weight is, all zero, it
+#: leaves no route to compute; a leaf takes the layer's own (`Stub._mask`).
+EXPERT_MASK = "expert_mask"
+#: The integer activation, by operator and slot, in which MORI's dispatch hands
+#: aiter's fused MoE how many of its rows it received: aiter sorts those rows
+#: alone. Drawn as another integer activation is, zero, it leaves no row to
+#: compute; a copy takes every row its expert ids hold (`routed_rows`), a pad
+#: row among them routed to no expert (`Stub._route`).
+RECEIVED = {("aiter.fused_moe_.default", "num_local_tokens")}
 #: The release waits since a point last recorded them: seconds, and how many
 #: ended at `CLEAR_S`.
 _waited: Counter = Counter()
@@ -1244,6 +1260,14 @@ class Stub:
         drafter = getattr(runner, "drafter", None)
         self.moe = _moe(runner.model)
         self.draft_moe = _moe(drafter.model) if drafter else []
+        # the expert masks the model's and its drafter's MoE layers hold under
+        # expert parallelism, which ATOM built for this rank (`_mask`)
+        self.masks = [
+            m.expert_mask
+            for model in [runner.model, *([drafter.model] if drafter else [])]
+            for m in model.modules()
+            if torch.is_tensor(getattr(m, EXPERT_MASK, None))
+        ]
         # ATOM's top-k weights and ids buffers when its MoE layers fuse shared
         # experts into top-k (`init_aiter_topK_meta_data`), live metadata a
         # leaf may read: past top-k, the shared experts' ids, under EP one
@@ -1685,8 +1709,9 @@ class Stub:
             dp = self.alone or self.runner.config.parallel_config.data_parallel_size
             moe = shape.gathered or dp * shape.tokens * (drafts + 1)
             self.real = shape.real, dp, moe
-            if dp == 1:  # one rank's batch holds its real rows, padded to the rung
-                batch = shape._replace(tokens=shape.real // (drafts + 1))
+            if dp == 1:  # one rank's batch holds its real rows, padded to the
+                # rung: as few rows as hold them, each verifying its drafts
+                batch = shape._replace(tokens=-(-shape.real // (drafts + 1)))
         rows = point_rows(batch, context, pool, rule.block_size, bool(uncut), drafts)
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
@@ -2171,11 +2196,16 @@ class Stub:
                 return out.copy_(self.built["rows"][at].view(out.shape))
             if isinstance(value, dict) and self._routed(value, sig, path, drafted):
                 return self._route(value, c, drafted)
+            received = (op["op"], path) in RECEIVED and isinstance(value, dict)
+            if received and value.get("role") == "activation":
+                if (rows := routed_rows(op)) is None:
+                    raise ValueError(f"{op['op']} holds no expert ids to count")
+                return _random(value, self.runner.device).fill_(rows)
             if isinstance(value, dict) and value.get("role") == "weight":
                 # each cache-sized copy takes a weight of its own, as it does
                 # activations; a gathered table's copies share one
                 count = max(op["occurrences"], self.cold_copies.get(sig, 1))
-                return self._weight(value, c, 1 if path == table else count)
+                return self._weight(value, c, 1 if path == table else count, path)
             if isinstance(value, dict) and "object" in value:
                 got = rebuild_object(value["object"], build(path, value["state"], None))
                 cache = getattr(snap.attn_metadata, "cache", None)
@@ -2392,7 +2422,7 @@ class Stub:
             if isinstance(value, dict) and value.get("device") == "cpu":
                 return old  # the copy's own, built on the host
             if isinstance(value, dict) and value.get("role") == "weight":
-                return self._weight(value, c, op["occurrences"])
+                return self._weight(value, c, op["occurrences"], path)
             if isinstance(value, dict) and self._routed(value, sig, path, drafted):
                 return self._route(value, c, drafted)
             return old
@@ -2410,11 +2440,14 @@ class Stub:
             return _clone(meta[1]) if fresh and role != "kv" else meta[1]
         raise ValueError(f"a {role} tensor argument {_text(spec)} is not built")
 
-    def _weight(self, spec, c, count):
+    def _weight(self, spec, c, count, path):
         """Weight `c mod count` of `spec`, random: the `count` of a leaf are
         built once, as slices of one tensor each starting on a `WEIGHT_ALIGN`
         boundary, each marked preshuffled when ATOM marked the captured one, so
-        the operator picks the kernel it picked."""
+        the operator picks the kernel it picked. At the `EXPERT_MASK` slot
+        `path`, the MoE layer's own mask (`_mask`)."""
+        if path == EXPERT_MASK:
+            return self._mask(spec)
         if (_spec_of(spec), 0) not in self.built:
             n = _span(spec["shape"], spec["stride"])
             dtype, device = _dtype(spec["dtype"]), self.runner.device
@@ -2429,6 +2462,18 @@ class Stub:
                     view.is_shuffled = True
                 self.built[_spec_of(spec), i] = view
         return self.built[_spec_of(spec), c % count]
+
+    def _mask(self, spec):
+        """The expert mask of `spec`'s shape and dtype that the model's or its
+        drafter's MoE layers hold, as ATOM built it for this rank: ones on the
+        experts the rank owns; refused by name where no MoE layer holds one."""
+        want = tuple(spec["shape"]), _dtype(spec["dtype"])
+        for mask in self.masks:
+            if (tuple(mask.shape), mask.dtype) == want:
+                return mask.to(self.runner.device)
+        raise ValueError(
+            f"no MoE layer of the model holds an expert mask of {_text(spec)}"
+        )
 
 
 def _alive(device) -> None:
