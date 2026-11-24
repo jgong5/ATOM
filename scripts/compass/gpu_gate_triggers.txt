@@ -44,19 +44,19 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at 540993517de254f729739c80ee490bf191531923 over this tree:
-#   tests/       1317 files  = 92 in tests/plugin/ + 91 excluded + 1134 CPU gate
-#   CPU gate     1053 files collect >=1 test, 81 collect none
+# Measured at cf33a4cf8a19e8e34fae1f00c62fcafb438f2af8 over this tree:
+#   tests/       1317 files  = 92 in tests/plugin/ + 93 excluded + 1132 CPU gate
+#   CPU gate     1051 files collect >=1 test, 81 collect none
 #   imports      2109 indented `import atom.*` lines in non-plugin test files
-#   collected  25491 tests by --collect-only. A run of the same set reports
-#              the same 25491 outcomes. Its "skipped" total is LARGER than any
+#   collected  25462 tests by --collect-only. A run of the same set reports
+#              the same 25462 outcomes. Its "skipped" total is LARGER than any
 #              skip count here, because a module-level skip in one of the 81
 #              files that collect nothing is counted as skipped without ever
 #              becoming a collected test. This file states the set; gate_cpu.sh
 #              prints the run, and is the only source for its outcome counts.
-#   candidates    256 paths named by an excluded test, any indentation
-#   covered       546 paths named at module level by a live CPU-gate file
-#   triggers      132 derived paths below, then 4 listed by name
+#   candidates    259 paths named by an excluded test, any indentation
+#   covered       544 paths named at module level by a live CPU-gate file
+#   triggers      134 derived paths below, then 4 listed by name
 atom/distributed/pcp_utils.py
 atom/distributed/pp_comm.py
 atom/model_engine/pp_engine_core.py
@@ -155,6 +155,8 @@ atom/models/kimi_k3/mono/weights.py
 atom/models/kimi_k3_dspark.py
 atom/models/kimi_k3_dspark_gqa.py
 atom/models/minimax_m3/dspark.py
+atom/models/minimax_m3/mono/contract.py
+atom/models/minimax_m3/mono/kernels/dense_post.py
 atom/models/qwen38/mono/config.py
 atom/models/qwen38/mono/dispatch.py
 atom/models/qwen38/mono/draft_fallback.py
