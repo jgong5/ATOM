@@ -519,8 +519,7 @@ class StationLP:
 
     def _settle(self) -> None:
         """Wait until every frame released to this LP has physically arrived."""
-        rt = self.rt
-        while any(rt.released[c] - rt.arrived[c] for c in rt.released):
+        while any(self.rt.unread.values()):
             self.sock.poll()
             self._pull()
 

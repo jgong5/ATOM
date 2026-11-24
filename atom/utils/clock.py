@@ -184,6 +184,9 @@ class LPRuntime:
         self.unread: dict[str, set[int]] = {ch: set() for ch in into}
         self.unhandled: dict[str, int] = dict.fromkeys(into, 0)
         self.inline = tuple(c for c in into if table.recv_mode(c) is ReceiveMode.INLINE)
+        self.threaded = tuple(
+            c for c in into if table.recv_mode(c) is ReceiveMode.THREAD
+        )
         # Frames read but not released, (channel, seq) -> arrival: checked at each drain.
         self.unreleased: dict[tuple[str, int], float] = {}
         self.taken_by: dict[threading.Thread, tuple[str, int]] = {}
@@ -588,11 +591,13 @@ class LPRuntime:
     def holds_unstamped(self) -> bool:
         """Caller holds `lock`. In the run, a frame sent outside it, a sender's
         shutdown, waits until no frame a thread channel brought is unhandled:
-        the grant that ends the run releases any still held back."""
-        return self.in_run and any(
-            self.arrived[ch] - self.handled[ch]
-            for ch in self.arrived
-            if self.table.recv_mode(ch) is ReceiveMode.THREAD
+        the grant that ends the run releases any still held back. A frame is
+        handled only once read and released, so such a frame is read ahead of
+        its release (`unreleased`), or one of its channel's `unhandled` that is
+        not `unread`."""
+        return self.in_run and (
+            any(self.unhandled[ch] > len(self.unread[ch]) for ch in self.threaded)
+            or any(ch in self.threaded for ch, _ in self.unreleased)
         )
 
     def handed_over(self, ch: str, seq: int) -> None:
@@ -678,8 +683,6 @@ class WrappedSocket:
 
     def _first_ready(self) -> int | None:
         with self.rt.lock:
-            # `holds_unstamped` reads every frame the run brought: ask it only
-            # when a frame sent outside the run is here for it to decide.
             held = any(f[1] is None for f in self.buf) and self.rt.holds_unstamped()
             for k, (ch, arrival, seq, _) in enumerate(self.buf):
                 if (arrival is None and not held) or (
