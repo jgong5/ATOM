@@ -129,7 +129,8 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
         "date; it runs offline on probe records and never inside a simulated run"
     ),
     "atom/compass/drive/identity.py": (
-        "a command's phase boundaries in run.json, which are wall and monotonic "
+        "a command's phase boundaries in run.json, and the clock pair that places "
+        "its server's JIT compiles among its steps, which are wall and monotonic "
         "time by definition; the tool process reads them, and no simulated time"
     ),
     "atom/compass/bench/measure.py": (

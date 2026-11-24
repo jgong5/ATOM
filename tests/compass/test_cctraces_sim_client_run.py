@@ -18,9 +18,13 @@ from pathlib import Path
 import pytest
 from test_drive_gpu import SHOWHW
 from test_parity_client_run import ARGUMENTS, CONFIG, PARAMETERS, raw, sse
+from test_validate_cost import LAW, _record, _steps
 
+from atom.compass.backends import step_labels
+from atom.compass.backends.step_labels import ACCEPT_BUILDS_ENV, CLOCK, JIT
 from atom.compass.drive.aiter_jit import BUILDS
 from atom.compass.parity.client_run import NAME, RAW
+from atom.compass.validate.cost import cost_accuracy
 
 TREE = Path(__file__).resolve().parents[2]
 SCRIPT = TREE / "scripts/compass/cctraces_sim.sh"
@@ -204,3 +208,105 @@ def test_a_real_cell_names_the_aiter_module_its_server_built_while_it_served(
 
     run = json.loads((cell / "run.json").read_text())
     assert run.get(BUILDS) == ["served"], done.stdout + done.stderr
+
+
+def test_a_real_cell_s_compile_is_placed_on_its_steps_and_cuts_the_one_it_ran_in(
+    tmp_path, monkeypatch
+):
+    """Its server, once the cell has seen it ready, compiles a Triton kernel and
+    notes its own monotonic clock around the compile. A step record on that
+    clock, prefill step 4 centred on the compile and running ten times its
+    price, is costed with step 4 cut, by the clock pair the cell wrote. One
+    step of twenty is past the bound a record of thousands takes."""
+    monkeypatch.delenv(ACCEPT_BUILDS_ENV, raising=False)
+    monkeypatch.setattr(step_labels, "JIT_BOUND", 0.1)
+    triton, compiled = tmp_path / "triton", tmp_path / "compiled"
+    site = tmp_path / "site"
+    (site / "aiter").mkdir(parents=True)
+    (site / "aiter" / "__init__.py").write_text("")
+    compile_ = tmp_path / "compile.py"
+    compile_.write_text(
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "kernel = Path(sys.argv[1], 'k')\n"
+        "kernel.mkdir(parents=True)\n"
+        "start = time.monotonic_ns()\n"
+        "(kernel / '_k.source').write_text('')\n"
+        "time.sleep(0.05)\n"
+        "(kernel / '_k.json').write_text('')\n"
+        "Path(sys.argv[2]).write_text(f'{start} {time.monotonic_ns()}')\n"
+    )
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "python3").write_text(
+        "#!/bin/sh\n"
+        'if [ "$2" = atom.entrypoints.openai.api_server ]; then\n'
+        '    echo "Uvicorn running"; sleep 3\n'
+        f"    {sys.executable} {compile_} {triton} {compiled}; exec sleep 600\n"
+        "fi\n"
+        # An aiter of its own: the installed one's JIT directory is the container's.
+        f'PYTHONPATH={site}:$PYTHONPATH exec {sys.executable} "$@"\n'
+    )
+    (bin_ / "harness-python").write_text(
+        "#!/bin/sh\n"
+        'case "$2" in\n'
+        '*"import compass_harness"*) exec echo "${PYTHONPATH%%:*}/compass_harness/x.py" ;;\n'
+        "*entry_points*) exit 0 ;;\n"
+        "esac\n"
+        # aiperf, ended once the server has compiled
+        f"for _ in $(seq 300); do [ -e {compiled} ] && exit 0; sleep 0.1; done\n"
+    )
+    (tmp_path / "showhw").write_text(SHOWHW)
+    (bin_ / "rocm-smi").write_text(
+        f'#!/bin/sh\ncase "$*" in *--showhw*) cat {tmp_path}/showhw;; esac\n'
+    )
+    for f in bin_.iterdir():
+        f.chmod(0o755)
+    traces = tmp_path / "traces.jsonl"
+    traces.write_text('{"id": "s0"}\n')
+    run_file = tmp_path / "run.json"
+    run_file.write_text("{}")
+    env = dict(
+        {k: v for k, v in os.environ.items() if k != "AITER_JIT_DIR"},
+        PATH=f"{bin_}:{os.environ['PATH']}",
+        HOME=str(tmp_path / "home"),
+        AITER_ROOT_DIR=str(tmp_path / "aiter_root"),
+        TORCHINDUCTOR_CACHE_DIR=str(tmp_path / "inductor"),
+        TRITON_CACHE_DIR=str(triton),
+        FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path / "flydsl"),
+        REAL="1",
+        MODEL=str(tmp_path),
+        TRACES=str(traces),
+        SESSIONS="1",
+        HARNESS_PYTHON=str(bin_ / "harness-python"),
+        WAIT_S="30",
+    )
+    cell = tmp_path / "cell"
+    done = subprocess.run(
+        ["bash", str(SCRIPT), str(run_file), str(cell)],
+        cwd="/",
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    run = json.loads((cell / "run.json").read_text())
+    assert run.get(BUILDS) == ["_k"] and CLOCK in run, done.stdout + done.stderr
+    start, end = map(int, compiled.read_text().split())
+    path = _record(cell / "steps", _steps(), stretch={4: 10.0}) / "dp0.jsonl"
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    step = lines[4]
+    shift = (start + end) // 2 - step["t_enter_ns"] - step["d_busy_ns"] // 2
+    for s in lines:  # each exits when its device work ends
+        s["t_enter_ns"] += shift
+        s["t_exit_ns"] = s["t_enter_ns"] + s["d_busy_ns"]
+        s["t_launch_ns"] = s["t_recv_ns"] = [s["t_enter_ns"]] * 2
+    path.write_text("".join(json.dumps(s) + "\n" for s in lines))
+
+    report = cost_accuracy(cell / "steps", LAW)
+
+    assert report["cut"][JIT] == 1
+    prefill = report["validated"]["prefill"]
+    assert prefill["steps"] == 9
+    assert prefill["on_totals"] == pytest.approx(0.0, abs=1e-9)

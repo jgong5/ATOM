@@ -67,8 +67,11 @@
 # gpu_before.txt and gpu_after.txt, and its result names the processes on its
 # GPUs (HIP_VISIBLE_DEVICES, default 0, as rocm-smi indexes them), with their
 # VRAM bytes; its run.json names in `aiter_jit_builds` each JIT module or kernel
-# built, or begun, while its server served, which grading, the fits and
-# `validate.cost` refuse (atom/compass/drive/aiter_jit.py).
+# built, or begun, while its server served, times each compile in
+# `jit_compiles`, and states in `clock_ns` its host's wall clock and monotonic
+# nanoseconds read together when its server first answered, which place the
+# compiles among its steps: the fits and `validate.cost` cut the steps they
+# overlap, and grading refuses the run (atom/compass/drive/aiter_jit.py).
 # It keeps Triton's autotune results in TRITON_CACHE_DIR, the caller's or the
 # directory Triton resolves (~/.triton/cache by default), as `compass record`
 # does, and its run.json's `env` states both variables, so a kernel tuned by a
@@ -236,10 +239,12 @@ else
     # Its own process group, so a real server's workers stop with it. A held
     # DP master port, as `compass record` gives one: the port keys ATOM's
     # compiled-graph cache, and the first start that loads it autotunes again.
-    # No later start loads it, so the server's stop removes it, as there.
+    # No later start loads it, so the server's stop removes it, as there. Its
+    # record keeps a real step's line until the exit, as `compass record`'s
+    # does, whatever the caller exports (parity.WRITE_THROUGH).
     # shellcheck disable=SC2086 # SERVER_ARGS and on_arch are word lists
-    ATOM_DP_MASTER_PORT=$(compass_held_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
-        python3 $on_arch "${main[@]}" \
+    ATOM_DP_MASTER_PORT=$(compass_held_port) ATOM_COMPASS_PARITY_RECORD=$record \
+        ATOM_COMPASS_PARITY_WRITE_THROUGH=0 setsid python3 $on_arch "${main[@]}" \
         --model "$MODEL" --host 127.0.0.1 --server-port "$PORT" --timeout-keep-alive 1000000 \
         $SERVER_ARGS "${compass[@]}" >"$OUT/server.log" 2>&1 &
     # Ready once uvicorn listens; the frontend answers /health from then on,
@@ -253,16 +258,15 @@ until grep -q "${ready[@]}"; do
     ((SECONDS < deadline)) || { echo "cctraces_sim: no deployment after $WAIT_S s" >&2; exit 1; }
     sleep 1
 done
-serving_ns=$(date +%s%N)
+# Read together: the compiles counted are those written since the wall clock
+# one, and the pair places them on the step record's monotonic clock.
+read -r serving_ns serving_monotonic_ns < <(python3 -c 'import time; print(time.time_ns(), time.monotonic_ns())')
 
 rc=0
 aiperf=(-m aiperf)
-# Without compass-harness, the benchmark id is pinned here as it pins it, so
-# both modes send the same prompts.
-((REAL)) && aiperf=(-c 'import uuid, aiperf.cli_runner as r
-r.uuid4 = lambda: uuid.UUID(int=0)
-from aiperf.cli import app
-app()')
+# Without compass-harness, what it fixes is fixed here, so both modes send the
+# same requests.
+((REAL)) && aiperf=(-c "$COMPASS_REAL_AIPERF" "$ROOT/compass_harness/compass_harness/session_ids.py")
 # Its own process group, so stopping it stops its workers too. Its raw records
 # leave out each request's payload, its prompt.
 (cd "$OUT" && ATOM_COMPASS_RUN=$OUT/run.json AIPERF_DATASET_MMAP_BASE_PATH=$OUT AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true \
@@ -288,7 +292,7 @@ kill -0 $server 2>/dev/null && { echo "cctraces_sim: the deployment is still up 
 wait $server || rc=$((rc || REAL ? rc : $?))
 ((REAL)) && { kill -KILL -- -$server 2>/dev/null || true; gpu_processes after; }
 [[ $MODE == 1p1d ]] || python3 -c 'import sys; from atom.compass.drive import serve; serve.drop_compiled(sys.argv[1])' "$OUT/server.log"
-((REAL)) && { python3 -m atom.compass.drive.aiter_jit "$OUT/run.json" "$serving_ns" || rc=$((rc ? rc : 1)); }
+((REAL)) && { python3 -m atom.compass.drive.aiter_jit "$OUT/run.json" "$serving_ns" "$serving_monotonic_ns" || rc=$((rc ? rc : 1)); }
 ((REAL)) && [[ -n ${STORE:-} ]] && { python3 -m atom.compass.drive.jit_cache save "$STORE" "$gpu" "$jit_since" || rc=$((rc ? rc : 1)); }
 # The raw records keep each response's chunks, so the export names each request
 # by its response id; once it is written, they are compressed. A run that

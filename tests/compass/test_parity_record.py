@@ -40,6 +40,7 @@ from atom.compass.parity import (
     compare,
     read,
 )
+from atom.compass.run.step_grid import keyed_of
 from atom.compass.runner import overrides, projection
 from atom.compass.runner.overrides import NonAllocatingRunner, install_cost_backend
 from atom.compass.runner.step_output import DeferredTokenStream
@@ -590,6 +591,17 @@ def test_a_context_parallel_record_states_its_width_and_the_step_linear_fit_refu
         "would price with it"
     )
     assert not (tmp_path / "law.json").exists()
+
+
+@pytest.mark.parametrize("rows", [0, 128])
+def test_a_record_states_the_last_forwards_fewest_rows_only_above_0_and_keys_none(
+    tmp_path, monkeypatch, rows
+):
+    monkeypatch.setenv(ENV, str(tmp_path))
+    runner = SimpleNamespace(rank=0, config=_config(min_final_prefill_rows=rows))
+    engine = json.loads(_record(runner).path.with_suffix(".engine.json").read_text())
+    assert engine.get("min_final_prefill_rows") == (rows or None)
+    assert "min_final_prefill_rows" not in keyed_of(engine)
 
 
 def test_the_mixin_records_from_the_first_forward_after_construction(

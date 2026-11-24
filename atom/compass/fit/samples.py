@@ -12,8 +12,9 @@ Under `floored`, a trace run's drafter labels lose the profiler's floor
 (`parity.busy.floored`). A DP rank no request reached writes a line per dummy forward it runs, and gives
 no sample; its file still counts in the run's digest. An empty
 rank file lost its lines, and refuses.
-A record whose run.json names `aiter_jit_builds` or `ptl_changes` refuses,
-naming them, and so does one whose `source` counts uncommitted files.
+A record whose run.json names `ptl_changes` refuses, naming them, and so does
+one whose `source` counts uncommitted files, or one whose `aiter_jit_builds`
+`step_labels.cut_refusal` refuses; a step that overlaps a timed compile is cut.
 With `GRADED_ONLY_ENV` set to ``1``, a record's samples are its graded steps
 (`graded_steps`): those within some client run's graded span, from the first
 step in which a rank holds one of the requests it names as sent (its export's
@@ -49,8 +50,9 @@ bench ran it eagerly), its device seconds (`seconds`), under a drafter the
 target's, and the drafter's (`draft_seconds`), its `origin` (`replay`,
 `plan` or `ragged`) and the `traces` the batch came from.
 Its sample's provenance holds its `source`, the origin, its `run`, the entry's
-digest, those `traces`, and `profiled` false: the bench times a
-replay unprofiled.
+digest, those `traces`, its `inputs`, the inputs `measure steps` read it from
+(`sources`, a record named as a record's `run` is), and `profiled` false: the
+bench times a replay unprofiled.
 
 Every input states one configuration. A record reads it from its `run.json`,
 its `dp0.engine.json` and the requests it served: `model`, the served
@@ -85,7 +87,7 @@ from atom.compass.artifacts import ArtifactStore, Topology
 from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, pooled
-from atom.compass.backends.step_labels import Sample, digest, label_run
+from atom.compass.backends.step_labels import Sample, cut_spans, digest, label_run
 from atom.compass.backends.step_linear_fit import (
     recorded_buckets,
     recorded_level,
@@ -177,8 +179,6 @@ def _record(
             f"{directory} was profiled, and profiling splits the steps it times, "
             "so no fit takes them"
         )
-    if built := aiter_jit.refusal(run):
-        raise ValueError(f"{directory} is not fitted: {built}")
     if changes := run.get(PTL_CHANGES):
         named = ", ".join(f"{c['from']} to {c['to']} at {c['at']}" for c in changes)
         raise ValueError(
@@ -193,6 +193,8 @@ def _record(
             f"{steps} holds {ARRIVALS}, so its steps are not numbered as its lines"
         )
     record = served(steps, client_runs)
+    if built := aiter_jit.cut_refusal(run, record.values()):
+        raise ValueError(f"{directory} is not fitted: {built}")
     spans = client_spans(record)
     # Each step within a calibration ladder's span, to the rungs it calibrates.
     laddered = {
@@ -230,7 +232,7 @@ def _record(
         engine, buckets = _stated(own, level | held, buckets, stated)
     files = sorted(steps.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
     name, samples = ", ".join(map(digest, files)), []
-    for got, _ in label_run(files, name, _split, floored):
+    for got, _ in label_run(files, name, _split, floored, cut_spans(run)):
         dummies = None
         for s in got:
             if graded is not None and s.step not in graded:
@@ -364,6 +366,7 @@ def _measurement(store: ArtifactStore, key) -> tuple[Sample, dict]:
             "requests": [],
             "config": None,
             "traces": sorted(m["traces"]),
+            "inputs": sorted(m.get("sources", ())),
             "profiled": False,
         }
         values = key.values
