@@ -158,6 +158,55 @@ def test_the_runner_builds_the_runtime_before_atom_sizes_its_pool(monkeypatch):
     assert built == [(layer, 0)] and runner.comm_fused is backend.runtime
 
 
+class _Backend:
+    """ATOM's comm-fused backend (`CommFusedMoeBackend`) of a layer the layout
+    gives it over eight ranks: the runtime its loader builds refuses a group of
+    one."""
+
+    runtime = None
+
+    def initialize(self, layer):
+        raise ValueError(
+            "Communication-fused MoE TP all-reduce layout mismatch: group=1, "
+            "moe_tp=8, dp=1, use_ep=False"
+        )
+
+
+@pytest.mark.parametrize("drafter", [False, True], ids=["target", "drafter"])
+def test_one_dp_rank_alone_builds_no_runtime_for_its_target_or_drafter(
+    drafter, monkeypatch
+):
+    # DP-attention MTP1 decode on one card: the target's parameters load
+    # nothing, and a drafter's load builds each MoE layer's runtime
+    comm = SimpleNamespace(CommFusedMoeBackend=_Backend)
+    monkeypatch.setitem(sys.modules, "atom.model_ops.fused_moe.comm_fused_moe", comm)
+    draft = torch.nn.Module()
+    draft._comm_fused_moe = _Backend()
+
+    class Runner(_AtomRunner):
+        def __init__(self, rank, config):
+            super().__init__(rank, config)
+            self.model.append(torch.nn.Module())
+            self.model[-1]._comm_fused_moe = _Backend()
+            if config.speculative_config:  # as ATOM's loader, after the weights
+                self.drafter = SimpleNamespace(model=torch.nn.Sequential(draft))
+                draft._comm_fused_moe.initialize(draft)
+
+    _atom_runner(monkeypatch)
+    engine = SimpleNamespace(ModelRunner=Runner, RapidServeModelRunner=None)
+    monkeypatch.setitem(sys.modules, "atom.model_engine.model_runner", engine)
+    config = _dpa_config(8)
+    config.speculative_config = SimpleNamespace() if drafter else None
+    ranks.layout(config)
+
+    runner = ops._runner(config, 0)
+
+    assert runner.config.dp_logical_size == 8 and runner.comm_fused is None
+    # and ATOM's own build is back once the runner is built
+    with pytest.raises(ValueError, match="group=1"):
+        draft._comm_fused_moe.initialize(draft)
+
+
 #: The leaf's cold ns at three DP-attention decode widths, eight ranks' rows in.
 COLD_NS = {8: 61000.0, 16: 64000.0, 32: 70000.0}
 
