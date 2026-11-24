@@ -127,10 +127,9 @@ AGAIN = "{}+{}"
 #: What stands for the command of a candidate whose calibration has ended,
 #: when one in a new directory would take what it took (`_refits`).
 REFITS = (
-    "no calibrate.sh command: the calibration in {} has ended, at the head's "
-    "ATOM digest, on the ATOM arguments, traces and records a new one would "
-    "take, so a new one records the same and refits the law it published "
-    "into {}"
+    "no calibrate.sh command: the calibration in {} has ended on the inputs a "
+    "new one would take, at the head's ATOM digest, so a new one refits the law "
+    "it published into {}"
 )
 #: What a start runs: a server on one node, a deployment on 1P1D.
 COMPASS, DEPLOY = (
@@ -537,12 +536,12 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     over this process's ``AITER_LOG_LEVEL``, with those the script sets over
     them (`drive_run.side_env`). `made` is the calibration's directory, traces
     and the shared store a ``calibrate`` verdict's command takes, and the
-    directory of the calibration that ended before it, None where none did;
-    when the command takes what that one took (`_refits`), the verdict names
-    why none serves (`REFITS`) in its place. A `calibrate.sh` command's verdict
-    states, for `_borrowing`, its ``calibration``: the ``key`` its law is
-    published at, by model, platform and engine config, its directory, ``in``,
-    and the store it publishes ``into``."""
+    directory of one that ended before it, or None, whose law a command taking
+    its inputs refits, named `REFITS` in its place (`_refits`); a
+    `calibrate.sh` command's verdict states, for `_borrowing`, its
+    ``calibration``: the ``key`` its law is published at, by model, platform
+    and engine config, its directory, ``in``, and the store it publishes
+    ``into``."""
     if isinstance(machine, dict):
         return machine, machine
     args, env = one["args"], one["env"]
@@ -572,18 +571,14 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                     into = _publishing(store, made, law, readings)
                     with _env({"TRACES": made[1]}):
                         command = lacking.calibration(made[0], args, config, into)
+                        law["made_by"] = [command]
+                    key = [config.model, machine_platform(machine), keyed(config)]
+                    into = str(into or made[0] / "store")
+                    law["calibration"] = {"key": key, "in": str(made[0]), "into": into}
                     if (ended := made[3]) and _refits(ended, command, atom):
                         held = started_store(ended) or ended / "store"
                         law["made_by"] = [REFITS.format(ended, held)]
-                    else:
-                        law["made_by"] = [command]
-                        key = [config.model, machine_platform(machine), keyed(config)]
-                        into = str(into or made[0] / "store")
-                        law["calibration"] = {
-                            "key": key,
-                            "in": str(made[0]),
-                            "into": into,
-                        }
+                        del law["calibration"]  # nothing for `_borrowing` to name
                 if readings["verdict"] == "measure":
                     real = args
                     if side in drive_run.ROLES:
@@ -663,31 +658,24 @@ def started_store(directory: Path) -> str | None:
 def _refits(ended: Path, command: str, atom: str) -> bool:
     """Whether the `calibrate.sh` `command` takes what the calibration that
     ended in `ended` took, as its `INPUTS` state it: ATOM's arguments, the
-    traces and the records, on a tree whose ATOM digest is the head's, `atom`.
-    In a new directory it would then record the same and refit the same law.
-    No command, as `lacking.calibration` words why there is none, takes
-    nothing."""
+    traces and the records, on a tree whose ATOM digest is the head's, `atom`;
+    in a new directory it would record the same and refit the same law. No
+    command, as `lacking.calibration` words why there is none, takes nothing."""
     if str(lacking.CALIBRATE) not in (line := command.split("\n")[0]):
         return False
     words = shlex.split(line)
     at = words.index(str(lacking.CALIBRATE))
     env = dict(word.split("=", 1) for word in words[:at])
     taken = [f"atom --model {env['MODEL']} {env['SERVER_ARGS']}"]
+    taken += [f"traces {env.get('TRACES')}"]
     taken += [f"record {record}" for record in words[at + 2 :]]
     inputs = ended / INPUTS
     given = inputs.read_text().splitlines() if inputs.is_file() else []
-    took = [line for line in given if line.startswith(("atom ", "record "))]
     # calibrate.sh writes `traces TRACES CAL_TRACES` and `tree <commit>`.
-    traces = [
-        s[len("traces ") :].rsplit(" ", 1)[0] for s in given if s.startswith("traces ")
-    ]
-    trees = [s[len("tree ") :] for s in given if s.startswith("tree ")]
-    return (
-        took == taken
-        and traces == [env.get("TRACES")]
-        and len(trees) == 1
-        and _atom_of(trees[0]) == atom
-    )
+    took = [s.rsplit(" ", 1)[0] if s.startswith("traces ") else s for s in given]
+    took = [s for s in took if s.startswith(("atom ", "traces ", "record "))]
+    tree = next((s[len("tree ") :] for s in given if s.startswith("tree ")), "")
+    return took == taken and _atom_of(tree) == atom
 
 
 @functools.cache
