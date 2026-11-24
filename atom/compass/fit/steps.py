@@ -23,7 +23,17 @@ the fit labels whose label keeps that kernel's recorded length.
 `cold_peer_rows` (`step_linear_fit._cold`), with `--peer-share` its
 `peer_small` and `peer_large` (`step_linear_fit._share`), with
 `--keep-peer-tail` the MAD rounds keeping the slower steps they mark
-(`step_linear_fit._keep_peer_tail`), joining each step's ranks at the engine config's
+(`step_linear_fit._keep_peer_tail`), and the opt-in columns and rules
+`step_linear_fit.env_options` reads from the environment, each off unless set:
+`COMPASS_FIT_ROW_PADDING=1` (decode `row_padding`), `COMPASS_FIT_GATHER_ROWS=1`
+(prefill `gather_rows`), `COMPASS_FIT_MOE_IMBALANCE=1` (prefill
+`moe_imbalance`, over `COMPASS_FIT_MOE_MIN_SPREAD`, 0.2 by default),
+`COMPASS_FIT_MOE_SELECT=insample` (each decode rung's MoE column by its fit on
+all its steps), `COMPASS_FIT_PEER_TOKENS` (decode `peer_tokens`: ``1`` at
+each rung whose `moe_experts` column is saturated, else the rungs named) and
+`COMPASS_FIT_DRAFT_PEER_TOKENS` (the draft law's: ``1`` at every rung, else
+the rungs named),
+joining each step's ranks at the engine config's
 `data_parallel_size`, so a record with a
 rank that gave no sample refuses; it pads prefill to the records'
 `prefill_buckets`, naming under `unfitted` records stating none, and holds
@@ -162,6 +172,7 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     if args.keep_peer_tail:
         options["keep_peer_tail"] = True
     options["kda"] = bool(args.model) and _model_kda(args.model)
+    options |= step_linear_fit.env_options()
     law, report = step_linear_fit.fit(samples, options, args.seed)
     if options["buckets"] is None:
         law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS

@@ -29,6 +29,21 @@ column priced the stretches (the warmup's first turns, c=256's prefill queue)
 about 5% high and the isolated prefills of c=8 to c=128 2-4% low (#3747). A
 vector with the column states its `duty_tau`, which must be `DUTY_TAU`, and a
 step stating no `prefill_duty` is refused.
+After it a prefill vector may add `gather_rows` and `moe_imbalance`, each over
+its data-parallel group's MoE gather and 0 on one rank. `gather_rows`
+(`gather_rows`) is the rows the gather carries: on a step whose group replays a
+prefill token graph every rank runs the bucket (`token_bucket`,
+`ForwardMode._pad_to_token_graph`), so the gather carries `ranks` buckets,
+however few tokens each rank scheduled, its pad rows reaching no expert; on one
+it runs eagerly the variable-length gather carries each rank's own count,
+`moe_rows`. `moe_imbalance` (`moe_imbalance`) is the rows by which a group
+running that variable-length gather is uneven: `ranks` times its
+`group_max_tokens` less its `moe_rows`, the rows its busiest rank holds past an
+even share, where that is at least `min_spread` of `moe_rows`, else 0, and 0
+on a step that replays a token graph, whose ranks all run the bucket. A vector
+with either states `ranks`, its group's width, and one with `moe_imbalance` its
+`min_spread`; `gather_rows` takes the vector's `buckets`, so it comes with
+`padding`. A data-parallel step stating no `group_max_tokens` is refused.
 After `seqs` and `out` it may add `peer_small` and `peer_large` (`peer_share`):
 on a data-parallel rank's own prefill forward, output or middle chunk, whose
 peers run real rows (its group's MoE gather, `BatchView.moe_rows`, carrying
@@ -97,6 +112,16 @@ The gather pads every rank to the rung, and a pad row reaches no expert
 follows the group's real tokens, which an uneven spread over the ranks leaves
 well below the rung's rows. A law whose decode vector carries `moe_experts`
 and that states no `moe_routing` is refused.
+Before the MoE column a decode vector may add `row_padding` (`row_padding`), its
+rows' own rectangle less their context, `len.max N_KV - Sum N_KV`: how uneven
+the requests the step decodes are, apart from the slots its rung adds past them,
+which `graph_padding` also holds. At one data-parallel rank the two follow each
+other within a rung; a step whose rung a wider peer set separates them.
+After the MoE column it may add `peer_tokens` (`peer_tokens`), the real MoE
+tokens its data-parallel peers bring to the gather, `moe_tokens` less its own
+decode rows' tokens, 0 on one rank: at a rung whose `moe_experts` reaches
+nearly every expert, the column no longer grows with the group's tokens while
+the gather and the experts' rows still do.
 After it a decode vector may add `rowmod`, `rowmod(k)` over its rows in scheduled
 order: the largest summed N_KV over the rows `i = r (mod k)`, with `k` the
 vector's `"rowmod"` entry. It prices an order the same multiset of rows can
@@ -174,6 +199,8 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
               "rowmod": k,    # a decode vector with a `rowmod` coefficient only
               "duty_tau": s,  # a prefill vector with a `cold_peer_rows` coefficient only
               "kda_chunk": c, # a prefill vector with `KDA` coefficients only
+              "ranks": n,     # a prefill vector with `gather_rows` or `moe_imbalance` only
+              "min_spread": f,  # a prefill vector with `moe_imbalance` only
               "declared": "<where it was fitted>",  # optional
               "held_out": {"hull": HULL, "bands": {<band>: ERRORS, ...}}}  # optional
 
@@ -231,6 +258,8 @@ PREFILL_EXTRA = (
     "moe_rows",
     "serial_moe_rows",
     "cold_peer_rows",
+    "gather_rows",
+    "moe_imbalance",
     "seqs",
     "out",
     "peer_small",
@@ -250,7 +279,10 @@ DECODE = ("step", "context", "graph_padding")
 #: The MoE columns a decode vector may add, over its step's real MoE tokens.
 MOE_COLUMNS = ("moe_tokens", "moe_experts")
 #: The decode vector's optional features, in the order they follow `DECODE`.
-DECODE_EXTRA = MOE_COLUMNS + ("rowmod",)
+DECODE_EXTRA = ("row_padding",) + MOE_COLUMNS + ("peer_tokens", "rowmod")
+#: The prefill vector's columns over its data-parallel group's MoE gather that
+#: state the group's width, `ranks`.
+GATHER_COLUMNS = ("gather_rows", "moe_imbalance")
 PROPOSE = ("step", "seqs")
 EAGER = "eager"
 SOURCE = "step-linear"
@@ -311,6 +343,27 @@ class _Vector:
                     f"the {name} vector carries padding and states no buckets, "
                     "the prefill token-graph buckets it pads to"
                 )
+        self.ranks = self.min_spread = None
+        if gathered := [f for f in GATHER_COLUMNS if f in features]:
+            self.ranks = spec.get("ranks")
+            if not isinstance(self.ranks, int) or self.ranks < 2:
+                raise ValueError(
+                    f"the {name} vector carries {' and '.join(gathered)} over a "
+                    f"data-parallel group of {self.ranks!r} ranks; it states its "
+                    "group's width, 2 or more, under ranks"
+                )
+        if "gather_rows" in features and not self.buckets:
+            raise ValueError(
+                f"the {name} vector carries gather_rows and no padding, whose "
+                "buckets say which steps replay a token graph"
+            )
+        if "moe_imbalance" in features:
+            self.min_spread = spec.get("min_spread")
+            if not isinstance(self.min_spread, (int, float)) or self.min_spread < 0:
+                raise ValueError(
+                    f"the {name} vector carries moe_imbalance and states its "
+                    f"min_spread as {self.min_spread!r}, not a non-negative share"
+                )
 
 
 def kda_layers(hf_config) -> int:
@@ -357,21 +410,81 @@ def moe_column(
     return float(tokens)
 
 
-def token_padding(view: BatchView, buckets: tuple[int, ...]) -> int | None:
-    """The rows `view`'s prefill token graph runs past its tokens: the smallest
-    of `buckets`, ascending, that holds its group's `group_max_tokens` (on one
-    rank its own tokens), less its own; 0 past the largest, on a step the
-    group split for two-batch overlap and on one an attention backend refuses
-    a graph for (`group_needs_eager`), all of which ATOM runs eagerly
+def token_bucket(view: BatchView, buckets: tuple[int, ...]) -> int | None:
+    """The prefill token-graph bucket `view`'s step replays: the smallest of
+    `buckets`, ascending, that holds its group's `group_max_tokens` (on one
+    rank its own tokens); 0 past the largest, on a step the group split for
+    two-batch overlap and on one an attention backend refuses a graph for
+    (`group_needs_eager`), all of which ATOM runs eagerly
     (`ForwardMode._pad_to_token_graph`). None for a data-parallel view
     stating no `group_max_tokens`."""
     if view.tbo_tokens or view.group_needs_eager:
         return 0
-    tokens = sum_tokens(view.requests)
-    peak = tokens if view.moe_rows is None else view.group_max_tokens
+    peak = sum_tokens(view.requests) if view.moe_rows is None else view.group_max_tokens
     if peak is None:
         return None
-    return next((b - tokens for b in buckets if b >= peak), 0)
+    return next((b for b in buckets if b >= peak), 0)
+
+
+def token_padding(view: BatchView, buckets: tuple[int, ...]) -> int | None:
+    """The rows `view`'s prefill token graph runs past its tokens: its
+    `token_bucket` less its own tokens; 0 where it runs eagerly. None for a
+    data-parallel view stating no `group_max_tokens`."""
+    bucket = token_bucket(view, buckets)
+    return bucket and bucket - sum_tokens(view.requests)
+
+
+def gather_rows(view: BatchView, buckets: tuple[int, ...], ranks: int) -> int | None:
+    """The rows `view`'s data-parallel group's MoE gather carries on a prefill
+    step of `ranks` ranks: `ranks` times the `token_bucket` it replays, to
+    which every rank pads its rows, or, run eagerly, the variable-length
+    gather's `moe_rows`; 0 on one rank. None for a data-parallel view stating
+    no `group_max_tokens`."""
+    if view.moe_rows is None:
+        return 0
+    bucket = token_bucket(view, buckets)
+    if bucket is None:
+        return None
+    return ranks * bucket if bucket else view.moe_rows
+
+
+def moe_imbalance(
+    view: BatchView, buckets: tuple[int, ...], ranks: int, min_spread: float
+) -> int | None:
+    """The rows by which `view`'s group of `ranks` ranks runs its
+    variable-length MoE gather uneven: `ranks` times its `group_max_tokens`
+    less its `moe_rows`, where that is at least `min_spread` times
+    `moe_rows`, else 0; 0 on a step that replays a token graph
+    (`token_bucket`), whose ranks all run the bucket, and on one rank. None
+    for a data-parallel view stating no `group_max_tokens`."""
+    if view.moe_rows is None:
+        return 0
+    bucket = token_bucket(view, buckets)
+    if bucket is None or view.group_max_tokens is None:
+        return None
+    if bucket:
+        return 0
+    idle = ranks * view.group_max_tokens - view.moe_rows
+    return idle if idle > 0 and idle >= min_spread * view.moe_rows else 0
+
+
+def row_padding(rows) -> int:
+    """`rows`' own rectangle less their context, `len.max N_KV - Sum N_KV`: how
+    uneven the decode rows are, apart from the slots a rung adds past them."""
+    if not rows:
+        return 0
+    return len(rows) * max(r.context_tokens for r in rows) - sum_context(rows)
+
+
+def peer_tokens(view: BatchView) -> int | None:
+    """The real MoE tokens `view`'s data-parallel peers bring to its group's
+    gather: `moe_tokens` less its own decode rows' tokens, 0 on one rank. None
+    for a data-parallel view stating no `moe_tokens`."""
+    if view.moe_rows is None:
+        return 0
+    if view.moe_tokens is None:
+        return None
+    return max(view.moe_tokens - sum_tokens(view.decode), 0)
 
 
 def hull_axes(features) -> tuple[int, ...]:
@@ -615,6 +728,25 @@ class StepLinearBackend(CostBackend):
                         "peers' MoE rows are priced by",
                     )
                 counts += (cold,)
+            for feature in GATHER_COLUMNS:
+                if feature not in vector.features:
+                    continue
+                if feature == "gather_rows":
+                    got = gather_rows(batch_view, vector.buckets, vector.ranks)
+                else:
+                    got = moe_imbalance(
+                        batch_view,
+                        vector.buckets or (),
+                        vector.ranks,
+                        vector.min_spread,
+                    )
+                if got is None:
+                    raise self._refuse(
+                        batch_view,
+                        "no group_max_tokens on this data-parallel step, which "
+                        f"its group's MoE gather's {feature} is counted from",
+                    )
+                counts += (got,)
             output = batch_view.produces_output
             by_output = {
                 "seqs": len(prefill) if output else 0,
@@ -666,6 +798,8 @@ class StepLinearBackend(CostBackend):
                     f"no {what}decode vector for rung {EAGER if rung is None else rung}",
                 )
             counts = (1, sum_context(decode), batch_view.graph_padding)
+            if "row_padding" in vector.features:
+                counts += (row_padding(decode),)
             if moe := [f for f in MOE_COLUMNS if f in vector.features]:
                 tokens = moe_tokens(batch_view)
                 if tokens is None:
@@ -674,6 +808,10 @@ class StepLinearBackend(CostBackend):
                 counts += tuple(
                     moe_column(f, tokens, law.moe_routing, dummies) for f in moe
                 )
+            if "peer_tokens" in vector.features:
+                if (peers := peer_tokens(batch_view)) is None:
+                    raise self._refuse(batch_view, "no MoE group tokens on this step")
+                counts += (peers,)
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
         terms, kv = self._priced(law, vector, kind, counts, what), []
