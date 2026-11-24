@@ -829,7 +829,7 @@ record 907 s measured
 | ATOM main `a62134f99` and image `nightly_202611240650`: the branch's upstream base, `b7b5ec3f2`, has neither MiniMax's PP-to-TP PAGE staging, nor `pd_admission`'s decode reserve, nor the shared kv_store layer | A, B | #4047, a sync |
 | the upstream tip holding ROCm/ATOM#3563 and ROCm/ATOM#3564, which B waits for. No Compass code: the step linear law prices DP-attention ranks, their experts over the group (`run/__init__.py::runner`), as DeepSeek-V4-Pro's DPA8-EP8 law (`scripts/compass/laws/`) does | B | #4048, a sync to that tip, checking DEP4 |
 | a pipeline with a drafter, refused on a stale reason (`runner/overrides.py::NonAllocatingRunner._build_and_load_model`) | the prefill | #4049 |
-| a step linear law of a pipeline stage: `_group_step_seconds` refuses one, `fit steps` reads stage 0 alone, `record --trace` refuses PP (`07` T129) | the prefill | #4050, a design |
+| a step linear law of a pipeline stage: `_group_step_seconds` refuses one, `fit steps` reads stage 0 alone, `record --trace` refuses PP; designed in `09` D54.1 | the prefill | #4066 to #4071 |
 | the Store under a pipelined prefill, which `01` D6.2 refuses, its entry one chunk size for every writer | the prefill | #4051, a design |
 | a space file naming the Store's entry | A, B | #4052 (D110) |
 | a 1P1D calibration through `calibrate.sh` (D113) | A, B | #4053 |
