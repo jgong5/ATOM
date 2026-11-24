@@ -36,7 +36,10 @@ The law states the records' `engine_config`, read from the `.engine.json`
 beside each (`engine_config`) or from `--engine FILE` in their place, a record's
 over the compilation level its run.json names (`recorded_level`), and a run
 under another engine config refuses it, records whose ladders are prefixes of
-the longest read at it (`step_grid_plan.pooled`). At its `data_parallel_size` N above 1
+the longest read at it (`step_grid_plan.pooled`). Records at a decode
+context-parallel width state it there (`run.step_grid.keyed`), so their law is
+keyed by it and a run at another width refuses it; records stating a prefill
+context-parallel width refuse. At its `data_parallel_size` N above 1
 (EP off) the records come in runs of
 N, each run's `dp0.jsonl` to `dp<N-1>.jsonl`. A step is its ranks' lines
 joined on step index, labelled with the smallest rank label (the others wait
@@ -287,7 +290,11 @@ from atom.compass.backends.step_linear import (
 )
 
 FORMS = ("base", "history", "shared", "cached_seqs")
+#: The context-parallel widths a record's engine file states above one (`parity`).
 CONTEXT_PARALLEL = ("prefill_context_parallel_size", "decode_context_parallel_size")
+#: Those a law cannot price at: the decode width is keyed in the law's engine
+#: config (`run.step_grid.keyed`), so a run at another width refuses it there.
+UNKEYED_CONTEXT_PARALLEL = ("prefill_context_parallel_size",)
 MAD_K = 3.5
 #: A relative residual this small is never an outlier, however tight the rest.
 MAD_FLOOR = 0.01
@@ -3007,18 +3014,21 @@ def refuse_contradicting(own, held: dict, stated, engine: dict) -> None:
 
 
 def refuse_context_parallel(engine: dict, where: str) -> None:
-    """Refuse an engine config that states a context-parallel width: a step
-    linear law states none, so a run at width 1 would price with it."""
-    if widths := [f"{k} {engine[k]}" for k in CONTEXT_PARALLEL if k in engine]:
+    """Refuse an engine config that states a prefill context-parallel width: a
+    step linear law states none, so a run at width 1 would price with it. A
+    decode context-parallel width is the law's engine config's, which a run
+    holds to its own (`run.refuse_unfitted_law`)."""
+    if widths := [f"{k} {engine[k]}" for k in UNKEYED_CONTEXT_PARALLEL if k in engine]:
         raise ValueError(
             f"{where} states {' and '.join(widths)}, and a step linear law states "
-            "no context-parallel width, so a run at width 1 would price with it"
+            "no prefill context-parallel width, so a run at width 1 would price "
+            "with it"
         )
 
 
 def join_width(engine: dict) -> int:
     """The ranks a run's records join at: `engine`'s `data_parallel_size`.
-    An engine config stating a context-parallel width refuses."""
+    An engine config stating a prefill context-parallel width refuses."""
     refuse_context_parallel(engine, "the records' engine config")
     if "data_parallel_size" not in engine:
         raise ValueError(

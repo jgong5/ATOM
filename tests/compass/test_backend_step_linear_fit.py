@@ -1231,18 +1231,51 @@ def test_the_command_refuses_records_without_one_engine_config_naming_the_field(
     assert not (tmp_path / "law.json").exists()
 
 
+DCP2 = {"decode_context_parallel_size": 2, "dcp_config": {"interleave_size": 1}}
+
+
 @pytest.mark.parametrize("stated", [False, True], ids=["beside", "--engine"])
-def test_the_command_refuses_a_record_at_decode_context_parallel_width_by_name(
+def test_a_record_at_decode_context_parallel_width_fits_a_law_keyed_by_it(
     tmp_path, stated
 ):
     record = _record(tmp_path / "dp0.jsonl", _steps(6))
-    _engine_file(record, ENGINE | {"decode_context_parallel_size": 2})
+    _engine_file(record, ENGINE | DCP2)
+    (tmp_path / "engine.json").write_text(json.dumps(ENGINE | DCP2))
+    engine = ["--engine", str(tmp_path / "engine.json")] if stated else []
+    main([str(record), "--out", str(tmp_path / "law.json"), *SPEC, *engine])
+
+    law = json.loads((tmp_path / "law.json").read_text())
+    assert law["engine_config"] == ENGINE | DCP2
+    assert law["prefill"]["coefficients"] == pytest.approx(PREFILL, rel=1e-6)
+
+
+def test_the_command_refuses_an_engine_file_omitting_the_records_decode_width(
+    tmp_path,
+):
+    record = _record(tmp_path / "dp0.jsonl", _steps(6))
+    _engine_file(record, ENGINE | DCP2)
+    (tmp_path / "engine.json").write_text(json.dumps(ENGINE))
+    with pytest.raises(ValueError, match="contradicts") as refused:
+        main(
+            [str(record), "--out", str(tmp_path / "law.json"), *SPEC]
+            + ["--engine", str(tmp_path / "engine.json")]
+        )
+    assert "decode_context_parallel_size" in str(refused.value)
+    assert not (tmp_path / "law.json").exists()
+
+
+@pytest.mark.parametrize("stated", [False, True], ids=["beside", "--engine"])
+def test_the_command_refuses_a_record_at_prefill_context_parallel_width_by_name(
+    tmp_path, stated
+):
+    record = _record(tmp_path / "dp0.jsonl", _steps(6))
+    _engine_file(record, ENGINE | {"prefill_context_parallel_size": 2})
     (tmp_path / "engine.json").write_text(json.dumps(ENGINE))
     engine = ["--engine", str(tmp_path / "engine.json")] if stated else []
     where = str(record.with_suffix(".engine.json")) if stated else "the records'"
     with pytest.raises(ValueError, match=re.escape(where)) as refused:
         main([str(record), "--out", str(tmp_path / "law.json"), *SPEC, *engine])
-    assert "states decode_context_parallel_size 2, and a step linear law" in str(
+    assert "states prefill_context_parallel_size 2, and a step linear law" in str(
         refused.value
     )
     assert not (tmp_path / "law.json").exists()
