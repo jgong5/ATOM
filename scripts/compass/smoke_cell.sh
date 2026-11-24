@@ -15,8 +15,11 @@
 # prices, costs no more GPU time.
 # Before calibration, a record nothing reads, warm/, serves the cell's traces
 # once, so that it takes the aiter JIT builds a fresh container meets while
-# serving, which grading, the fits and `validate.cost` refuse in a record
-# (run.json's `aiter_jit_builds`).
+# serving (run.json's `aiter_jit_builds`). Grading refuses a run whose server
+# compiled (`step_labels.refusal`); the fits and `validate.cost` cut the steps a
+# timed compile overlaps, and refuse a record only when its run.json does not
+# place its compiles among its steps or they cut more than `JIT_BOUND` of a
+# rank's forwards (`step_labels.cut_refusal`).
 # Calibration serves traces 353 on: at client.sh's seed, its sampled start reaches
 # subagents and batches 1 to 7 requests a step, so the law has a decode vector for
 # each batch size the cell takes; traces 256 on start at a first request.
