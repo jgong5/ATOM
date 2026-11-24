@@ -20,7 +20,17 @@ the fit labels whose label keeps that kernel's recorded length.
 
 `step-linear` takes real runs only and fits `step_linear_fit.FORMS`' `--form`,
 `history` by default, with `--cold-peer-rows` its prefill vector's
-`cold_peer_rows` (`step_linear_fit._cold`), joining each step's ranks at the engine config's
+`cold_peer_rows` (`step_linear_fit._cold`), and the opt-in columns and rules
+`step_linear_fit.env_options` reads from the environment, each off unless set:
+`COMPASS_FIT_ROW_PADDING=1` (decode `row_padding`), `COMPASS_FIT_GATHER_ROWS=1`
+(prefill `gather_rows`), `COMPASS_FIT_MOE_IMBALANCE=1` (prefill
+`moe_imbalance`, over `COMPASS_FIT_MOE_MIN_SPREAD`, 0.2 by default),
+`COMPASS_FIT_MOE_SELECT=insample` (each decode rung's MoE column by its fit on
+all its steps), `COMPASS_FIT_PEER_TOKENS` (decode `peer_tokens`: ``1`` at
+each rung whose `moe_experts` column is saturated, else the rungs named) and
+`COMPASS_FIT_DRAFT_PEER_TOKENS` (the draft law's: ``1`` at every rung, else
+the rungs named),
+joining each step's ranks at the engine config's
 `data_parallel_size`, so a record with a
 rank that gave no sample refuses; it pads prefill to the records'
 `prefill_buckets`, naming under `unfitted` records stating none, and holds
@@ -142,6 +152,7 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
         options["draft_moe_routing"] = drafter
     options["buckets"] = config.get("prefill_buckets")
     options["cold"] = bool(args.cold_peer_rows)
+    options |= step_linear_fit.env_options()
     law, report = step_linear_fit.fit(samples, options, args.seed)
     if options["buckets"] is None:
         law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
