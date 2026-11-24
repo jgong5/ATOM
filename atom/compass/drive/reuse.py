@@ -149,8 +149,10 @@ def refuse_another_tree(taken: dict) -> None:
 
 
 def stores(shared: str, out: Path) -> list[ArtifactStore]:
-    """The stores a candidate is looked up in, in order: each calibration's own
-    under `out`'s ``cal/``, the latest published into first, then `shared`."""
+    """The stores a candidate is looked up in, in order: each under `out`'s
+    ``cal/``, a calibration's own or the one readings meeting a stale entry are
+    measured into (`check.READINGS`), the latest published into first, then
+    `shared`."""
 
     def latest(root: Path) -> float:
         entries = root.glob(f"*/*/{ENTRY_FILE}")

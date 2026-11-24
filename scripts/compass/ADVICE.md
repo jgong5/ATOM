@@ -15,12 +15,15 @@ predicts one configuration on a host with no GPU at all.
 
 ## Limits
 
-- **A GPU container.** The search uses no GPU compute, but a simulated server
-  imports aiter, which needs a ROCm driver. Run it in the GPU container of
-  QUICKSTART's [Environment](QUICKSTART.md#environment).
-- **The target machine type.** Host laws are keyed on the host's CPU, so the search
-  runs on a node of the type it predicts, and another CPU is refused by name. A
-  calibration runs there too, on the GPUs the configuration uses.
+- **A GPU only to calibrate.** The search needs no GPU device and runs on any
+  host's CPU: a simulated server starts with no ROCm driver, and host laws fitted
+  on another CPU serve, predicting the host they timed. A search whose candidates
+  the store serves runs in a container with no GPU device, as USER_QUICKSTART's
+  [Environment](USER_QUICKSTART.md#environment) sets one up. Each command a
+  search prints for step 3, a calibration or a readings measurement, takes the
+  target's GPUs, so a search that prints one runs on a node of the type it
+  predicts, in the GPU container of QUICKSTART's
+  [Environment](QUICKSTART.md#environment).
 - **The integration head.** The tree runs at the tip of
   `origin/feature/atomcompass_new` as last fetched, or at the commit the space file
   freezes. A tree whose ATOM digest (`atom/compass/run/__init__.py::atom_digest`)
@@ -366,7 +369,12 @@ compass fit device <token> --store OUT/cal/S1/store --out OUT/cal/S1.readings
 **A missing point's readings** take `compass measure memory --gpu G --out D
 --store <store> -- <ATOM's arguments>`, as printed, under the variables it
 names: `G` the cards the configuration uses, `D` a fresh directory. It is one
-engine start on those cards.
+engine start on those cards. Where the store the candidate is looked up in holds
+stale readings at one point's key, which it refuses a second publish at, every
+point's command names a new store, `OUT/cal/readings@<digest>/store`, those
+whose readings that store holds too, as a run reads one store. A search looks
+it up as it does a calibration's own: it starts with no platform readings, so
+take them into it as a calibration's store takes them (above).
 
 **A 1P1D side's law** prints `deploy.sh OUT record of the deployment, then
 compass fit steps --backend step-linear on each OUT/prefill`, and the same for
