@@ -294,7 +294,8 @@ compass measure ops    --coverage RECORD [--coverage RECORD]... --out D --store 
 compass measure memory [--beside CMD] --out D --store S -- <ATOM args>       [GPU]
 compass measure device --gpu G... [--pp] --out D --store S        [GPU, every card]
 compass fit device     RECORD... --out D --store S
-compass fit device     --assume-from DEVICE --ptl P --device DATASHEET --out D --store S
+compass fit device     --assume-from DEVICE --ptl P [--stack STACK] --device DATASHEET \
+                       --out D --store S
 compass fit steps      --backend step-linear [--form FORM] \
                        [--moe-routing E,K | --model DIR] [--seed SEED] RECORD... \
                        --client-run RECORD EXPORT... [--ops MEASURED...] --out D --store S
