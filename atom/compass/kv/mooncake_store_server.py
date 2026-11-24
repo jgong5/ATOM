@@ -59,12 +59,10 @@ the eviction thread's phase. The master flags it reads are
 ``--default_kv_lease_ttl``, ``--eviction_high_watermark_ratio``,
 ``--eviction_ratio`` and ``--rpc_thread_num``. It accepts `ACCEPTED`: the
 endpoint and client-death flags, which change nothing a requester is told, and
-``--allocation_strategy`` and ``--memory_allocator``, which it does not model.
-It holds one pool of the owners' summed bytes, where the master places each
-object on one owner's segment, so a real put can fail below the summed
-capacity and start an eviction round below the mark. It refuses any other
-flag, and flags that set no positive ``--rpc_thread_num``, since the master
-then runs as many handler threads as its host has cores, up to 16.
+``--allocation_strategy`` and ``--memory_allocator``, which it does not model
+(`ACCEPTED` says what they change). It refuses any other flag, and flags that
+set no positive ``--rpc_thread_num``, since the master then runs as many
+handler threads as its host has cores, up to 16.
 
 Importing this module loads lmcache's server module, which imports only the
 standard library.
@@ -110,8 +108,9 @@ MATCHED = (
 #: Master flags accepted. Endpoints and a client's death, which no simulated
 #: client dies of, change nothing a requester is told. The allocator's strategy
 #: and kind are not modelled: the Store is one pool of the owners' summed bytes
-#: here, where the master places each object on one owner's segment and can
-#: fail a put below the summed capacity.
+#: here, where the master places each object on one owner's segment, so a put
+#: can fail below the summed capacity and start an eviction round below the
+#: mark.
 ACCEPTED = (
     "--rpc_port",
     "--enable_http_metadata_server",
