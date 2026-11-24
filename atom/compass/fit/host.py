@@ -214,13 +214,16 @@ def drain_cut(samples, decode) -> tuple[list, list]:
         for k, (a, b) in sorted(client_spans(steps).items()):
             cut = {n for n in prefills if a <= n <= b}
             bursts.setdefault(name, set()).update(cut)
-            drains = set(range(a, b + 1)) - cut
+            # In step order: a set read in hash order is refused
+            # (test_set_iteration_lint), whatever the sum.
+            drains = [n for n in range(a, b + 1) if n not in cut]
+            held = set(drains)
             report.append(
                 {
                     "record": str(record),
                     "export": exports[k],
                     "span": [a, b],
-                    "drains": sum(n - 1 not in drains for n in drains),
+                    "drains": sum(n - 1 not in held for n in drains),
                     "drain_steps": len(drains),
                     "dropped": sum(at[n] for n in cut),
                     "kept": sum(at[n] for n in drains),

@@ -99,7 +99,7 @@ def record_steps(record: Path, design: dict | None, cfg, law: Law, segment=None)
         group = {r: x[n] for r, x in enumerate(at) if n in x}
         real = {r: g for r, g in group.items() if not g[0]["is_dummy_run"]}
         runs = {whose.get((r, n)) for r in real} - {None}
-        segs = sorted({seg_of[k] for k in runs})
+        segs = sorted({seg_of[k] for k in sorted(runs)})
         if not real or (len(segs) != 1 and not segment):
             continue
         seg = segment or segs[0]  # the one segment, whatever its lanes
