@@ -128,8 +128,9 @@ def test_each_rank_s_receive_spans_its_own_wait(tmp_path):
 
 
 def test_a_trace_run_mixing_stage_names_refuses(tmp_path):
-    out = _run(tmp_path, [[SENDING]], names="rank_{r}")
-    _trace(out / "trace" / "pp1_rank_0" / "m.pt.trace.json.gz", *RECEIVING)
+    """Stage 0's trace named as a one-stage run's, beside stage 1's."""
+    out = _run(tmp_path, [[SENDING], [RECEIVING]])
+    (out / "trace" / "pp0_rank_0").rename(out / "trace" / "rank_0")
 
     with pytest.raises(ValueError, match="not rank_<r> alone or pp<k>_rank_<r>"):
         busy.reduce(out)
