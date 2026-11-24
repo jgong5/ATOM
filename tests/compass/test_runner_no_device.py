@@ -243,20 +243,31 @@ def _indexed(monkeypatch, model, index, arch, backend="opus"):
     return config
 
 
-@pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
+@pytest.mark.parametrize(
+    "arch, remedies",
+    [
+        ("gfx950", ["ATOM_V4_UNIFIED_MQA=flydsl", "--index-cache-dtype fp8"]),
+        ("gfx1250", ["--index-cache-dtype fp8"]),
+    ],
+    ids=["gfx950", "gfx1250"],
+)
 def test_deepseek_v4_under_the_fp4_indexer_is_refused_by_name_before_anything_is_replaced(
-    started, monkeypatch, arch
+    started, monkeypatch, arch, remedies
 ):
     """An unset `--index-cache-dtype` resolves to fp4 for DeepSeek-V4 off
     gfx942, and there its attention builder sizes its block table from aiter's
     `mqa_logits_mxfp4_config` on the runner's device, the host after this
-    start, which aiter refuses on every rank: refused before that, naming the
-    flag that starts."""
+    start, which aiter refuses on every rank: refused before that, naming what
+    starts. On gfx950 that is first the flydsl backend, which keeps the fp4
+    indexer that step laws are keyed by; on gfx1250 it leaves the layout as is."""
     config = _indexed(monkeypatch, V4, "fp4", arch)
     stream, event = torch.cuda.Stream, torch.cuda.Event
     with pytest.raises(RunnerRefusal, match="pass --index-cache-dtype fp8") as e:
         started(config)
-    assert config.index_cache_layout in str(e.value)
+    message = str(e.value)
+    assert config.index_cache_layout in message
+    named = ("ATOM_V4_UNIFIED_MQA=flydsl", "--index-cache-dtype fp8")
+    assert sorted([r for r in named if r in message], key=message.index) == remedies
     assert torch.cuda.Stream is stream
     assert torch.cuda.Event is event
 
@@ -276,8 +287,8 @@ def test_a_start_whose_builder_asks_aiter_nothing_of_the_device_is_not_refused(
 ):
     """fp8, and fp4 on gfx942, where V4 falls back to the fp8 indexer, leave
     V4 no FP4 layout; the flydsl backend's preshuffled layout sizes its table
-    without aiter; DeepSeek-V4.1 builds another builder, whose fp4 plane
-    `_resident` answers for. Each starts as before."""
+    without aiter; DeepSeek-V4.1's fp4 plane has its own layout names, and
+    `_resident` answers for it. Each starts as before."""
     runner, calls = started(_indexed(monkeypatch, model, index, arch, backend))
     assert runner.device == torch.device("cpu")
     assert [k["backend"] for _, k in calls[:1]] == ["gloo"]

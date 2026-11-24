@@ -712,9 +712,10 @@ def _resident(readings: DeviceReadings, config: Any) -> int:
 def _refuse_v4_opus_indexer(config: Any) -> None:
     """Refuse DeepSeek-V4 under an FP4 indexer layout whose attention builder
     asks aiter's `mqa_logits_mxfp4_config` about `self.device`, the host here,
-    before the start replaces anything. fp8 and gfx942 leave V4 no such layout
-    (`index_cache_layout` None); DeepSeek-V4.1 builds another builder, whose
-    fp4 plane `_resident` answers for."""
+    before the start replaces anything. `Config` gives these layout names to V4
+    alone: fp8 and gfx942 leave it none, and DeepSeek-V4.1's fp4 plane has its
+    own names, which `_resident` answers for. On gfx950 the flydsl backend's
+    layout keeps the fp4 indexer, which keys step laws and memory readings."""
     from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
         FP4_GFX950_OPUS,
         FP4_GFX1250_NATURAL,
@@ -723,18 +724,16 @@ def _refuse_v4_opus_indexer(config: Any) -> None:
     layout = getattr(config, "index_cache_layout", None)
     if layout not in (FP4_GFX950_OPUS, FP4_GFX1250_NATURAL):
         return
-    from atom.utils import get_hf_text_config
-    from atom.utils.selector import Family, attn_family
-
-    if attn_family(get_hf_text_config(config.hf_config)) is not Family.V4:
-        return
+    flydsl = "set ATOM_V4_UNIFIED_MQA=flydsl, which keeps --index-cache-dtype fp4 "
+    flydsl += "in a layout whose builder does not ask the device, or "
     raise RunnerRefusal(
-        f"DeepSeek-V4 under the FP4 indexer ({layout}), which an unset "
+        f"DeepSeek-V4 under the FP4 indexer layout {layout}, which an unset "
         "--index-cache-dtype resolves to off gfx942, sizes its attention "
         "builder's block table from aiter's mqa_logits_mxfp4_config, which "
-        "reads the arch off a GPU tensor of the runner's device, and a "
-        "simulated start keeps that device the host; pass --index-cache-dtype "
-        "fp8, whose builder does not ask aiter."
+        "reads the properties of the runner's device, and a simulated start "
+        "keeps that device the host; "
+        + (flydsl if layout == FP4_GFX950_OPUS else "")
+        + "pass --index-cache-dtype fp8."
     )
 
 
