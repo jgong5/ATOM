@@ -170,8 +170,8 @@ def test_the_padding_column_is_identifiable_where_the_chunks_are_not(tmp_path):
     names = [*list(PREFILL)[1:], *KDA]
     base = len(PREFILL) - 1
 
-    # #739's gate: each column added at most 10, and none that was at most 10
-    # without them above it.
+    # The collinearity gate: each column added at most 10, and none that was at
+    # most 10 without them above it.
     without = dict(zip(names, _vif(x[:, :base])))
     padded = dict(zip(names, _vif(x)))
     print(f"\nVIF, base: {without}\nVIF, padded chunks: {padded}")
