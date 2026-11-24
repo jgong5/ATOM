@@ -94,6 +94,20 @@ scheduled. A data-parallel step stating no `group_max_tokens` is refused unless
 its group split it for two-batch overlap or runs it eagerly for an attention
 backend (`token_padding`), and a vector with a `padding` coefficient states its
 `buckets`.
+After it a prefill vector may add `graph_tokens` and `graph_query_cached`
+(`GRAPH_COLUMNS`, `graph_columns`): its `tokens` and its `query_cached`,
+Sum N_Q.(N_KV - N_Q), on a step that replays a prefill token graph
+(`token_bucket` above 0), else 0. On #3720's cell A (DeepSeek-V4.1, DPA4-EP4)
+a chunk the token graph replays pays about 3.5-4 us more per token than an
+eager one, about what `padding` prices each pad row at, whatever its history:
+the vector fitted without the columns priced eager prefills within 1% (p50)
+and the prefilling rank of a token-graph step of 3k-7k tokens 10-20% low, on
+the e3v2 calibration record and on the agentic targets alike. Its dummy peers,
+priced at the bucket's pad rows, then set the group's price, which so holds
+none of the chunk's attention over its history: 10-18% low at 150k-400k
+cached tokens. Those chunks are the follow-up turns of agentic sessions, whose
+device time sits on their TTFT at low concurrency. A vector with either column
+states its `buckets`.
 After it a prefill vector may add `eager_dummy` and `eager_dummy_tail`
 (`eager_dummy`): 1 on a data-parallel rank's dummy forward in a prefill step
 its group runs eagerly, past the largest of `buckets` (or with none), and the
@@ -284,11 +298,16 @@ PREFILL_EXTRA = (
     "peer_large",
     *KDA,
     "padding",
+    "graph_tokens",
+    "graph_query_cached",
     "eager_dummy",
     "eager_dummy_tail",
 )
 #: The prefill vector's columns over a DP dummy forward run eagerly (`eager_dummy`).
 EAGER_DUMMY = ("eager_dummy", "eager_dummy_tail")
+#: The prefill vector's columns over a step that replays a prefill token graph
+#: (`graph_columns`): its tokens and its Sum N_Q.(N_KV - N_Q) there, else 0.
+GRAPH_COLUMNS = ("graph_tokens", "graph_query_cached")
 #: The prefill vector's columns over its data-parallel peers' share of its rows
 #: (`peer_share`): below `PEER_SMALL` of them, and at or above it.
 PEER_SHARE = ("peer_small", "peer_large")
@@ -372,6 +391,12 @@ class _Vector:
                     f"data-parallel group of {self.ranks!r} ranks; it states its "
                     "group's width, 2 or more, under ranks"
                 )
+        graphed = [f for f in GRAPH_COLUMNS if f in features]
+        if graphed and not self.buckets:
+            raise ValueError(
+                f"the {name} vector carries {' and '.join(graphed)} and no "
+                "padding, whose buckets say which steps replay a token graph"
+            )
         if "gather_rows" in features and "gather_pad_rows" in features:
             raise ValueError(
                 f"the {name} vector carries gather_rows and gather_pad_rows, "
@@ -463,6 +488,19 @@ def token_padding(view: BatchView, buckets: tuple[int, ...]) -> int | None:
     data-parallel view stating no `group_max_tokens`."""
     bucket = token_bucket(view, buckets)
     return bucket and bucket - sum_tokens(view.requests)
+
+
+def graph_columns(view: BatchView, buckets: tuple[int, ...]) -> tuple | None:
+    """`GRAPH_COLUMNS`' counts for `view`: its prefill rows' tokens and their
+    Sum N_Q.(N_KV - N_Q) where its step replays a prefill token graph
+    (`token_bucket` above 0), else (0, 0), as on a step run eagerly. None for
+    a data-parallel view stating no `group_max_tokens`."""
+    bucket = token_bucket(view, buckets)
+    if bucket is None:
+        return None
+    if not bucket:
+        return 0, 0
+    return sum_tokens(view.prefill), sum_query_cached(view.prefill)
 
 
 def gather_rows(view: BatchView, buckets: tuple[int, ...], ranks: int) -> int | None:
@@ -860,6 +898,11 @@ class StepLinearBackend(CostBackend):
                         "its prefill token graph's bucket holds",
                     )
                 counts += (padding,)
+            if graph := [f for f in GRAPH_COLUMNS if f in vector.features]:
+                got = dict(
+                    zip(GRAPH_COLUMNS, graph_columns(batch_view, vector.buckets))
+                )
+                counts += tuple(got[f] for f in graph)
             if eager := [f for f in EAGER_DUMMY if f in vector.features]:
                 got = eager_dummy(batch_view, vector.buckets or ())
                 if got is None:
