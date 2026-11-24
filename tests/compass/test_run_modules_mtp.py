@@ -1,0 +1,291 @@
+# SPDX-License-Identifier: MIT
+"""The step roofline lays out a serial MTP drafter's passes.
+
+`run.modules.drafter` builds the drafter ATOM maps Qwen3.5's, DeepSeek-V3's
+and DeepSeek-V4's MTP configs to (`Qwen3_5MTP`, `DeepSeekMTP`,
+`DeepseekV4MTP`) on the meta device, and `walk` marks each of its modules
+with its passes, one a draft token; V4's, which holds no LM head, runs the
+target's embedding and LM head. The step roofline prices them as the step's
+draft terms: the first pass over the step's rows, each later one a row a
+request, the LM head a row a request in each, and on a step that samples
+nothing the first pass alone. A speculative step then answers
+`_group_step_seconds`' "prices no draft" check, the roofline alone or below a
+backend that refuses the step; a run with no drafter laid out, Eagle3's
+(#3962), is still refused.
+
+Each model is built in a process of its own, as
+`test_backend_step_roofline_v41` builds V4.1's. Qwen3.5-0.8B's config is its
+Hugging Face checkpoint's (`qwen3_5_0_8b_config.json`), and it is installed
+through `run.runner` as the run's only backend on
+`tests/compass/machines/mi308x-hjbog18.json`; the installed backend and the
+walk's modules come back pickled.
+"""
+
+import concurrent.futures
+import json
+import os
+import pathlib
+import pickle
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+from test_dp_step_max import prefill, runner
+
+from atom.compass.backends.base import CostBackend, Granularity
+from atom.compass.backends.provenance import Refusal
+from atom.compass.backends.resolver import CostRefused
+from atom.compass.backends.shape import BatchView, RequestShape
+from atom.compass.backends.step_roofline import (
+    UNCLASSIFIED,
+    StepFallbackBackend,
+    StepRooflineBackend,
+)
+from atom.compass.backends.work import attention, elementwise, gemm, price
+from atom.compass.spec import MachineSpec
+
+HERE = pathlib.Path(__file__).parent
+TREE = HERE.parents[1]
+CONFIG = HERE / "qwen3_5_0_8b_config.json"
+MI308X = HERE / "machines" / "mi308x-hjbog18.json"
+#: V4-Pro's fp4 experts build on an MI355X's arch.
+MI355X = HERE / "machines" / "mi355x-gpu40.json"
+MACHINE = MachineSpec.from_mapping(json.loads(MI308X.read_text()))
+V3 = ["--kv_cache_dtype", "fp8"]
+#: Each build: its config, TP width, machine, draft tokens, ATOM arguments.
+BUILDS = {
+    "qwen3.5-mtp1": (CONFIG, 1, MI308X, 1, []),
+    "qwen3.5-mtp3": (CONFIG, 1, MI308X, 3, []),
+    "v3-mtp2": (HERE / "deepseek_v3_config.json", 8, MI308X, 2, V3),
+    "v4-mtp2": (HERE / "deepseek_v4_pro_config.json", 8, MI355X, 2, []),
+}
+DRAFTERS = {
+    "qwen3.5-mtp1": "Qwen3_5MTP",
+    "qwen3.5-mtp3": "Qwen3_5MTP",
+    "v3-mtp2": "DeepSeekMTP",
+    "v4-mtp2": "DeepseekV4MTP",
+}
+
+#: Builds the model under argv's root and its drafter on the meta device at
+#: argv's TP width and machine's arch, as a simulated run builds them, walks them,
+#: installs the step roofline alone through `run.runner` with the model's
+#: memory readings published, then builds ATOM's own drafter, as ATOM does
+#: after the install, and pickles the walk's modules and the installed backend.
+BUILD = """
+import json, os, pathlib, pickle, sys
+from types import SimpleNamespace
+root, machine = pathlib.Path(sys.argv[1]), json.loads(pathlib.Path(sys.argv[2]).read_text())
+sys.path.insert(0, sys.argv[3])
+tp, *atom_args = sys.argv[4:]
+from atom.compass.validate.bound import _build
+arch = machine["device"]["arch"]
+config, tree = _build(str(root / "model"), int(tp), atom_args, arch, str(root))
+from atom.compass.run.modules import drafter, walk
+from atom.compass.runner.overrides import FactoriesOnMeta, _installed_backend
+held = set(config.compilation_config.static_forward_context)
+draft = drafter(config)
+kept = set(config.compilation_config.static_forward_context) == held
+modules = walk(tree, draft)
+from test_memory_readings import publish_readings
+from atom.compass import run as compass_run
+publish_readings(root / "store", config, document=machine)
+run = {"bound_s": 600.0, "step_roofline": True, "machine": machine, "store": str(root / "store")}
+(root / "run.json").write_text(json.dumps(run))
+os.environ[compass_run.ENV] = str(root / "run.json")
+runner = SimpleNamespace(config=config, rank=0, _tr_hybrid_active=lambda: False)
+compass_run.runner(runner, tree)
+with FactoriesOnMeta():  # ATOM builds its own drafter after, of the same names
+    type(draft)(config)
+built = {"drafter": type(draft).__name__, "kept": kept, "modules": modules,
+         "installed": _installed_backend(runner)}
+(root / "built.pkl").write_bytes(pickle.dumps(built))
+"""
+
+
+@pytest.fixture(scope="module")
+def built(tmp_path_factory):
+    """By build name, its drafter's class name, whether ATOM's forward context
+    kept its names, the walk's modules and the installed backend."""
+    root = tmp_path_factory.mktemp("mtp")
+
+    def build(name):
+        config, tp, machine, k, args = BUILDS[name]
+        hf = json.loads(config.read_text())
+        hf.pop("auto_map", None)  # DeepSeek-V3's names remote code it never runs
+        (root / name / "model").mkdir(parents=True)
+        (root / name / "model" / "config.json").write_text(json.dumps(hf))
+        args = [*args, "--method", "mtp", "--num-speculative-tokens", str(k)]
+        argv = [str(root / name), str(machine), str(HERE), str(tp), *args]
+        done = subprocess.run(
+            [sys.executable, "-c", BUILD, *argv],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=900,
+            cwd=TREE,
+            env={**os.environ, "PYTHONPATH": str(TREE)},
+        )
+        assert done.returncode == 0, done.stderr[-4000:]
+        return pickle.loads((root / name / "built.pkl").read_bytes())
+
+    with concurrent.futures.ThreadPoolExecutor(len(BUILDS)) as pool:
+        return dict(zip(BUILDS, pool.map(build, BUILDS)))
+
+
+def one_pass(rows, heads: int) -> float:
+    """One pass of Qwen3.5-0.8B's MTP layer over `rows` at TP 1, module by
+    module from its config, each one roofline (`work.price`), its LM head on
+    `heads` rows, none for 0."""
+    text = json.loads(CONFIG.read_text())["text_config"]
+    h, d, inter = text["hidden_size"], text["head_dim"], text["intermediate_size"]
+    q, kv = text["num_attention_heads"], text["num_key_value_heads"]
+    rotary = int(d * text["rope_parameters"]["partial_rotary_factor"])
+    t = sum(r.query_tokens for r in rows)
+    works = [
+        elementwise(t * h),  # embed_tokens
+        *[elementwise(t * h)] * 5,  # the two pre-fc norms, the layer's two, the last
+        gemm(t, h, 2 * h),  # fc, over the embedding and the hidden state
+        gemm(t, 2 * q * d + 2 * kv * d, h),  # qkv_proj, its query gated
+        gemm(t, h, q * d),  # o_proj
+        elementwise(t * rotary),  # rotary_emb, a quarter of the head
+        *[elementwise(t * d)] * 2,  # q_norm, k_norm
+        attention(
+            [r.query_tokens for r in rows], [r.context_tokens for r in rows], q, d, kv
+        ),
+        gemm(t, 2 * inter, h),  # gate_up_proj
+        gemm(t, h, inter),  # down_proj
+        elementwise(t * inter, reads=2),  # SiluAndMul
+    ]
+    if heads:
+        works.append(gemm(heads, text["vocab_size"], h))  # lm_head
+    return sum(price(w, MACHINE) for w in works)
+
+
+def verify(k: int, rows: int = 4) -> BatchView:
+    """A decode step verifying `k` drafts of each of `rows` requests."""
+    return BatchView(
+        tuple(RequestShape(k + 1, 600 + i, True) for i in range(rows)),
+        produces_output=True,
+    )
+
+
+def later(view: BatchView):
+    """A serial drafter's later pass over `view`: a row a request."""
+    return tuple(RequestShape(1, r.context_tokens, True) for r in view.requests)
+
+
+@pytest.mark.parametrize("name", BUILDS)
+def test_each_mtp_drafter_is_built_and_every_module_classified(built, name):
+    found = built[name]
+    k = BUILDS[name][3]
+    drafted = [m for m in found["modules"] if m.passes]
+
+    assert found["drafter"] == DRAFTERS[name]
+    assert found["kept"]
+    assert [m.name for m in found["modules"] if m.kind == UNCLASSIFIED] == []
+    assert drafted and {m.passes for m in drafted} == {k}
+    assert all(m.name.startswith("drafter") for m in drafted)
+    # Each pass samples through an LM head and embeds its input.
+    assert {"embedding", "lm_head"} <= {m.kind for m in drafted}
+    assert type(found["installed"]) is StepRooflineBackend
+
+
+def test_a_drafter_with_no_head_of_its_own_runs_the_targets(built):
+    shared = [m for m in built["v4-mtp2"]["modules"] if "the target's" in m.name]
+    assert [(m.kind, m.passes) for m in shared] == [("embedding", 2), ("lm_head", 2)]
+
+
+def test_qwen3_5_0_8b_drafter_runs_its_mtp_layer_at_the_configs_shapes(built):
+    drafted = sorted(
+        (m.kind, m.dims) for m in built["qwen3.5-mtp1"]["modules"] if m.passes
+    )
+    assert drafted == sorted(
+        [("embedding", (1024,)), ("gemm", (1024, 2048)), ("gemm", (5120, 1024))]
+        + [
+            ("gemm", (1024, 2048)),
+            ("rotary", (64,)),
+            ("norm", (256,)),
+            ("norm", (256,)),
+        ]
+        + [("attention", (8, 2, 256)), ("gemm", (7168, 1024)), ("gemm", (1024, 3584))]
+        + [("act", (3584,)), ("lm_head", (248320, 1024))]
+        + [("norm", (1024,))] * 5
+    )
+
+
+def test_the_draft_term_of_an_mtp1_decode_step_at_batch_4_by_hand(built):
+    """The named result: Qwen3.5-0.8B MTP1 at TP 1 on MI308X."""
+    step = verify(1)
+    cost = built["qwen3.5-mtp1"]["installed"].price(step)
+    hand = one_pass(step.requests, 4)
+    print(
+        f"\ntarget {cost.target_seconds:.9g} s, draft {cost.draft_seconds:.9g} s,"
+        f" by hand {hand:.9g} s"
+    )
+    assert cost.terms and all(t.name.startswith("roofline.") for t in cost.terms)
+    assert cost.draft_terms
+    assert all(t.name.startswith("draft roofline.") for t in cost.draft_terms)
+    assert cost.draft_seconds == pytest.approx(hand, rel=1e-12)
+
+
+def test_a_verify_step_drafts_one_pass_a_draft_token(built):
+    """MTP3: the first pass over the four rows of four tokens, two more a row
+    a request, each with its LM head on the four rows."""
+    step = verify(3)
+    cost = built["qwen3.5-mtp3"]["installed"].price(step)
+    first, after = one_pass(step.requests, 4), one_pass(later(step), 4)
+    assert cost.draft_seconds == pytest.approx(first + 2 * after, rel=1e-12)
+    one = built["qwen3.5-mtp1"]["installed"].price(step)
+    assert one.draft_seconds == pytest.approx(first, rel=1e-12)
+    assert one.target_seconds == cost.target_seconds
+
+
+def test_a_middle_chunk_runs_the_first_pass_alone_and_no_head(built):
+    chunk = BatchView((RequestShape(512, 512, False),), produces_output=False)
+    cost = built["qwen3.5-mtp3"]["installed"].price(chunk)
+    by_name = {t.name: t.seconds for t in cost.draft_terms}
+
+    assert by_name["draft roofline.lm_head"] == 0
+    assert cost.draft_seconds == pytest.approx(one_pass(chunk.requests, 0), rel=1e-12)
+
+
+class _Refuses(CostBackend):
+    """A step-level backend that prices no step, as a step grid with no point
+    near one."""
+
+    @property
+    def granularity(self) -> Granularity:
+        return Granularity.STEP
+
+    def price(self, batch_view):
+        raise CostRefused(batch_view, [Refusal("grid", "no point")])
+
+    def describe(self) -> str:
+        return "refuses every step"
+
+
+def speculative(backend):
+    """A runner priced by `backend` under a speculative config."""
+    r = runner(backend)
+    r.config.speculative_config = SimpleNamespace(synthetic_acceptance_rates=(0.5,))
+    return r
+
+
+def test_a_speculative_step_under_the_roofline_states_its_draft(built):
+    roofline = built["qwen3.5-mtp1"]["installed"]
+    alone = speculative(roofline)
+    assert alone.forward(prefill(8)).predicted_s > 0
+    assert alone.refused_commands() == ()
+    below = speculative(StepFallbackBackend(_Refuses(), roofline))
+    assert below.forward(prefill(8)).predicted_s > 0
+    assert below.refused_commands() == ()
+
+
+def test_a_run_whose_drafter_is_not_laid_out_is_still_refused(built):
+    """As an Eagle3 run is (#3962): its drafter is not built, and the roofline
+    over the target alone prices no draft."""
+    target = [m for m in built["qwen3.5-mtp1"]["modules"] if not m.passes]
+    r = speculative(StepRooflineBackend(MACHINE, target))
+    assert r.forward(prefill(8)).predicted_s == 0
+    assert r.refused_commands() == ("cost:StepRooflineBackend: prices no draft",)
