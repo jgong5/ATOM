@@ -31,9 +31,9 @@ law's is the `calibrate.sh` command that records and fits one for this
 configuration (`calibration`), into `--out`, or `cal` in the current directory
 without one, naming each client variable it requires that this environment
 does not set, with its expected time, unknown, as no earlier calibration's
-status is read for it. Memory readings an entry at their key holds, stale, are
+status is read for it. Memory readings whose key holds a stale entry are
 measured into a new store beside that directory (`measuring`), as the store
-refuses a second publish at their key.
+refuses a second publish at the key.
 
 A prefill or decode instance's run reads a network file across nodes, as
 `deploy.sh run` hands it one, and its readings command takes the ATOM
@@ -103,8 +103,8 @@ MADE_BY = {
     "arguments",
     "coverage": "compass measure steps --grid, or compass measure ops --plan",
 }
-#: What makes readings already at their key in the new store a measure that
-#: meets a stale entry publishes into (`measuring`), which refuses them again.
+#: What `measuring` gives once the new store holds the readings at their key,
+#: where a second measure would be refused.
 MEASURED = (
     "none: they are at their key in {}, which a run reads once it holds the "
     "run's other inputs too, its platform readings among them"

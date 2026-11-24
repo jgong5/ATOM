@@ -338,7 +338,7 @@ compass fit device <token> --store OUT/cal/S1/store --out OUT/cal/S1.readings
 --store <store> -- <ATOM's arguments>`, as printed, under the variables it
 names: `G` the cards the configuration uses, `D` a fresh directory. It is one
 engine start on those cards. Where the store the candidate is looked up in holds
-older readings at their key, which it refuses a second publish at, the command
+stale readings at their key, which it refuses a second publish at, the command
 names a new store, `OUT/cal/readings@<digest>/store`, which a search looks up
 as it does a calibration's own: it starts with no platform readings, so take
 them into it as a calibration's store takes them (above).
