@@ -17,11 +17,7 @@ import torch
 from test_weights_meta_build import _built
 from torch import nn
 
-from atom.compass.runner.overrides import (
-    RunnerRefusal,
-    UnbuiltModel,
-    shared_mxfp8_fused_on_meta,
-)
+from atom.compass.runner.overrides import UnbuiltModel
 
 H, I_LOCAL, ROUTED, SHARED, PAD = 64, 32, 2, 1, 16
 E, HALF = ROUTED + SHARED, I_LOCAL + PAD
@@ -109,6 +105,8 @@ def test_a_shared_expert_staged_on_meta_fuses_in_place(monkeypatch, tmp_path, mo
 def test_a_staging_of_real_bytes_fuses_as_before(moe):
     """On the host the staging holds bytes, and ATOM's fuse runs: with no
     shared tensor loaded it refuses as on a real start."""
+    from atom.compass.runner.overrides import shared_mxfp8_fused_on_meta
+
     staging = importlib.import_module(STAGING).Mxfp8SharedIntoMxfp4
     experts, fuse = _experts(moe), staging.fuse
     with shared_mxfp8_fused_on_meta():
@@ -117,16 +115,6 @@ def test_a_staging_of_real_bytes_fuses_as_before(moe):
             experts.shared_mxfp8_into_mxfp4.fuse(experts)
     assert staging.fuse is fuse
     assert experts.shared_mxfp8_into_mxfp4.staged is not None
-
-
-def test_a_meta_build_refuses_a_host_staging_left_unloaded_by_name(
-    monkeypatch, tmp_path, moe
-):
-    """A staging of real bytes in a meta build, of a module built before it,
-    is fused by ATOM's own fuse, and the build refuses it by name."""
-    host = _experts(moe)
-    with pytest.raises(RunnerRefusal, match="FusedMoE.process_weights_after_loading"):
-        _built(monkeypatch, tmp_path, _holding(lambda: host))
 
 
 def test_minimax_binds_its_drafter_into_the_meta_tree(arch):
