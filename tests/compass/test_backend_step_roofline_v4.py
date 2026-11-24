@@ -204,6 +204,35 @@ def test_sparse_attention_and_the_hyper_connection_mix_by_hand(spec):
 
 
 @BOUND
+def test_the_targets_hc_head_reduces_every_row_of_a_step_that_samples(spec):
+    """`DeepseekV4ForCausalLM.compute_logits` reduces each row the forward ran
+    (`hc_head`), then norms it and runs the LM head, which takes a prefill's
+    last row; a middle chunk computes no logits."""
+    hc_head = Module("model.hc_head", "hc_head", (4, 16))
+    lm_head = Module("model.head", "lm_head", (32, 16))
+    proj = Module("layers.0.proj", "gemm", (16, 16))
+
+    def reduced(rows):
+        # Each row's four copies read and one row written, in bf16; one gate
+        # a copy, the fp32 weights' projection of the row's copies.
+        moved = rows * 5 * 16 * 2 + 4 * 4 * 16 * 4
+        return _module(Work({"bf16": 2 * rows * 4 * 4 * 16}, moved), spec)
+
+    step = view((3, 10, False), (5, 5, False))
+    by_name = _price([hc_head, lm_head], step, spec)
+    # A graph's rung of 4 decode rows of 2 tokens: its pad row's 2 too.
+    padded = BatchView((RequestShape(2, 9, True),) * 3, capture_rung=4)
+    chunk = dataclasses.replace(step, produces_output=False)
+
+    assert by_name["roofline.hc_head"] == pytest.approx(reduced(8))
+    assert by_name["roofline.lm_head"] == pytest.approx(_module(gemm(2, 32, 16), spec))
+    assert _price([hc_head], padded, spec) == pytest.approx(
+        {"roofline.hc_head": reduced(8)}
+    )
+    assert set(_price([hc_head, lm_head, proj], chunk, spec)) == {"roofline.gemm"}
+
+
+@BOUND
 def test_sparse_attention_over_an_fp8_q_and_without_an_indexer_by_hand(spec):
     # Window 4, every 3 tokens compressed; Q in fp8 as the KV is.
     csa = Module("attn", "sparse_attention", (2, 8, 4, 3, 2, 3, 4), "fp8", act="fp8")
@@ -525,6 +554,10 @@ def test_the_v4_pro_dpa_tp8_build_classifies_every_module(ep, tmp_path):
     assert found[("gemm", (16384, 4096), "fp8", "fp8")] == 61
     assert found[("act", (3072,), "bf16", "bf16")] == 61
     assert found[("norm", (7168,), "bf16", "bf16")] == 1
+    # The target's head input: its four residual copies reduced, then normed.
+    assert [w for w in walked if w[0] == "hc_head"] == [
+        ["hc_head", [4, 7168], "bf16", "bf16", -1]
+    ]
 
 
 #: The build at the indexer cache format the third argument names, ATOM's

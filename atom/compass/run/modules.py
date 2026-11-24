@@ -47,6 +47,10 @@ module's own per-rank parameter shapes and attributes:
 
 DeepSeek-V4's modules, each priced and then gone into:
 
+- `DeepseekV4Model`: its `hc_head`, which reduces each row's residual copies
+  by the model's own mixing weights before the final norm and the LM head
+  (`DeepseekV4ForCausalLM.compute_logits`, a method of the LM head, not a
+  module).
 - `Block`: two hyper-connection mixes, one per sub-layer, each folding the
   previous sub-layer's output into the widened residual and reducing it to the
   next input; the block's two norms run inside them.
@@ -408,6 +412,9 @@ def _classify(module, name, parent):
             return mix, mix, DESCEND
         head = Module(f"{name}.hc_head", "hc_head", mix.dims, head=True)
         return mix, mix, head, DESCEND
+    if _is(module, V4 + "DeepseekV4Model"):
+        dims = (module.hc_mult, module.norm.weight.shape[0])
+        return Module(f"{name}.hc_head", "hc_head", dims), DESCEND
     if _is(module, V41_BLOCK):
         width = module.attn_norm.weight.shape[0]
         mix = Module(name, "mhc", (module.hc_attn_fn.shape[1] // width, width))

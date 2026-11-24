@@ -11,7 +11,8 @@ request, the LM head a row a request in each, and on a step that samples
 nothing the first pass alone, unless a data-parallel group proposes for its
 collectives. Each pass runs the first MTP layer; V4's block norms its inputs
 and projects each residual copy, and reduces and norms its head's input on
-the rows its head samples alone; at TP 2 Qwen3.5's gathers its `fc`'s output
+the rows its head samples alone, where V4-Pro's target reduces every row
+before its logits; at TP 2 Qwen3.5's gathers its `fc`'s output
 and its argmax alone, and under a pure data-parallel group of two its later
 passes run at the step's `running_bs`, draft graph or none, the group
 sharding their argmax. A speculative step then answers
@@ -384,6 +385,52 @@ def test_v4s_mtp_head_input_runs_on_the_rows_its_head_samples(built):
         "draft roofline.norm": 0,
     }
     assert cost.draft_seconds == pytest.approx(hand, rel=1e-12)
+
+
+def test_v4_pro_s_target_reduces_every_row_before_its_logits(built):
+    """`DeepseekV4ForCausalLM.compute_logits` reduces the target's residual
+    copies by the model's own weights (`ParallelHead.hc_head`) on every row
+    the forward ran, before the final norm and the LM head. A named result:
+    its share of a V4-Pro TP8 MTP2 decode and prefill step on MI355X."""
+    hf = json.loads(V4_PRO.read_text())
+    hc, d = hf["hc_mult"], hf["hidden_size"]
+    modules = built["v4-mtp2"]["modules"]
+    (head,) = [m for m in modules if m.kind == "hc_head" and not m.passes]
+    assert (head.name, head.dims, head.head, head.layer) == (
+        "model.hc_head",
+        (hc, d),
+        False,
+        -1,
+    )
+    installed = built["v4-mtp2"]["installed"]
+    machine = installed.machine
+    others = StepRooflineBackend(machine, [m for m in modules if m is not head])
+    # 64 requests verifying 2 drafts each; a 4096-token prompt.
+    steps = {
+        "decode": BatchView((RequestShape(3, 4096, True),) * 64, produces_output=True),
+        "prefill": BatchView((RequestShape(4096, 4096, False),), produces_output=True),
+    }
+    lines = []
+    for name, step in steps.items():
+        n = sum_tokens(step.requests)
+        # A row's copies read and one row written, in bf16; one gate a copy,
+        # an fp32 projection of the row's copies.
+        moved = n * (hc + 1) * d * 2 + hc * hc * d * 4
+        hand = price(Work({"bf16": 2 * n * hc * hc * d}, moved), machine)
+        cost = installed.price(step)
+        by_name = {t.name: t.seconds for t in cost.terms}
+        whole = cost.target_seconds + cost.draft_seconds
+        assert by_name["roofline.hc_head"] == pytest.approx(hand, rel=1e-12)
+        assert cost.target_seconds - others.price(step).target_seconds == (
+            pytest.approx(hand, rel=1e-9)
+        )
+        lines.append(
+            f"{name} {n} rows: {hand:.9g} s by hand, "
+            f"{by_name['roofline.hc_head'] / cost.target_seconds:.4%} of the "
+            f"target's {cost.target_seconds:.9g} s, "
+            f"{by_name['roofline.hc_head'] / whole:.4%} of the step's {whole:.9g} s"
+        )
+    print("\nV4-Pro TP8 MTP2 target hc_head: " + "; ".join(lines))
 
 
 def test_a_dp2_decode_drafts_its_later_passes_at_running_bs_sharding_their_argmax(
