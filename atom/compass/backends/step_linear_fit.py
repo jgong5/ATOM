@@ -1063,7 +1063,8 @@ def fit_tokenizer(paths, intakes, windows=None) -> tuple[dict, dict]:
     relative residual per kind. Raises on records of two tokenizers. With
     `windows`, per record its host-clock spans ``(start ns, end ns)``, or None
     for all of it, only the calls that start within one are fitted
-    (`within`)."""
+    (`within`): each is still judged lone, and a segment call's own work
+    found, among all of the record's calls."""
     from scipy.spatial import QhullError
 
     heads, rows = {}, []
@@ -1071,13 +1072,15 @@ def fit_tokenizer(paths, intakes, windows=None) -> tuple[dict, dict]:
         head, *lines = Path(path).read_text().splitlines()
         heads[json.dumps(json.loads(head), sort_keys=True)] = None
         got = [json.loads(line) for line in lines]
-        if windows and windows[i] is not None:
-            got = [c for c in got if within(c["t_start_ns"], windows[i])]
+        span = windows[i] if windows else None
         for c in _lone_calls([c for c in got if c["call"] != "segment"], intake):
+            if not within(c["t_start_ns"], span):
+                continue
             kind = c["call"] if c["items"] > 1 or c["call"] == "decode" else "encode"
             s = (c["t_end_ns"] - c["t_start_ns"]) * 1e-9
             rows.append((i, kind, c["tokens"], s))
-        rows += [(i, "segment", n, s, chars) for n, chars, s in _own_work(got, intake)]
+        work = _own_work(got, intake, span)
+        rows += [(i, "segment", n, s, chars) for n, chars, s in work]
     if len(heads) != 1:
         raise ValueError(f"the records name {len(heads)} tokenizers: {sorted(heads)}")
     term, report = json.loads(next(iter(heads))), {"unfitted": {}}
@@ -1177,11 +1180,14 @@ def _lone_calls(calls: list[dict], intake) -> list[dict]:
     return [c for c, k in zip(calls, lone) if k]
 
 
-def _own_work(calls: list[dict], intake) -> list[tuple[int, int | None, float]]:
+def _own_work(
+    calls: list[dict], intake, windows=None
+) -> list[tuple[int, int | None, float]]:
     """Each ``segment`` call among `calls` lone (`_lone_calls`) among the calls it
     did not make, its thread's that start in its span, as the ids those returned,
     the characters its stored-prefix search compared if its record holds them,
-    and its wall seconds less theirs."""
+    and its wall seconds less theirs; with `windows`, only those that start
+    within one (`within`)."""
     own, ids, made, last = {}, {}, set(), None
     for c in sorted(calls, key=lambda c: (c["thread"], c["t_start_ns"])):
         start, end = c["t_start_ns"], c["t_end_ns"]
@@ -1195,7 +1201,7 @@ def _own_work(calls: list[dict], intake) -> list[tuple[int, int | None, float]]:
     return [
         (ids[id(c)], c.get("compared_chars"), own[id(c)] * 1e-9)
         for c in lone
-        if c["call"] == "segment"
+        if c["call"] == "segment" and within(c["t_start_ns"], windows)
     ]
 
 
