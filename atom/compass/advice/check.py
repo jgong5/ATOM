@@ -56,6 +56,11 @@ measures them.
 A readings verdict ``measure`` names the `compass measure memory` command,
 under the instance's variables, a 1P1D side's on the connector a real start of
 it takes.
+Where a verdict sends a point's readings to measure though an entry holds their
+key in the store a candidate is looked up in, every point's command measures
+its readings into a new store under OUT's ``cal/`` (`READINGS`), those at their
+key in that store too, as a run reads one store; `reuse.stores` looks every
+candidate up there.
 
 `states` gives each candidate one state: ``refused``, with each refusal
 verbatim, when any verdict is; else, when a law's verdict is ``calibrate``,
@@ -119,6 +124,17 @@ OWN = Path(__file__).resolve().parents[1]
 STATES = "states.json"
 #: Where each candidate's calibration writes, and each point starts, in OUT.
 CAL, STARTS = "cal", "starts"
+#: Beside what, in `CAL`, readings meeting a stale entry at their key are
+#: measured into a new store (`lacking.readings_store`); no candidate's name
+#: holds the ``@`` its store's directory name does.
+READINGS = "readings"
+#: Why readings at their key in a candidate's store are measured into the new
+#: store, with those of its points whose key holds a stale entry there.
+MOVED = (
+    "at their key in {}, which holds a stale entry at another of the "
+    "candidate's readings keys, so they go into {} with the others: a run "
+    "reads one store"
+)
 #: The file a calibration appends each step's start, end or failure to, in its
 #: directory, and ``end calibration`` once it has fitted both laws.
 STATUS = "status"
@@ -207,6 +223,8 @@ def check(expansion: dict, out: Path) -> dict:
             store, verdicts = holding_law or (store, verdicts)
         judged[candidate["name"]] = {"store": str(store.root), "points": verdicts}
         _borrowing(candidate, points, judged[candidate["name"]], calibrations, made)
+        new = lacking.readings_store(out / CAL / READINGS, head["atom"])
+        _measuring(judged[candidate["name"]], new)
     written = {"head": head, "refused": refused, "candidates": judged}
     (out / REUSE).write_text(json.dumps(written, indent=1) + "\n")
     return written
@@ -568,11 +586,9 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                         law["made_by"] = [command]
                     into = str(into or made[0] / "store")
                     law["calibration"] |= {"in": str(made[0]), "into": into}
-                if readings["verdict"] == "measure":
+                if readings["verdict"] != "refused":
                     real = _side(side, one, drive_run.REAL)[0]
-                    readings["made_by"] = [
-                        lacking.measure_memory(store.root, real, env)
-                    ]
+                    readings["measuring"] = memory.key_of(config, machine), real, env
                 verdicts = law, readings
         seen[(store.root, *instance)] = verdicts
     return seen[(store.root, *instance)]
@@ -751,6 +767,30 @@ def _deployed(directory: Path, lookup: str | None, keys, lent, sides) -> tuple:
     if lookup and not any(_holds(lookup, sides[s]) for s in keys):
         return lookup, list(keys), None
     return None, list(sides), None
+
+
+def _measuring(held: dict, new: Path) -> None:
+    """Name the command of each readings verdict in `held`, a candidate's in
+    its store, that sends them to measure: into that store, or, once one sends
+    readings whose key an entry there holds, which it refuses a second publish
+    at, into `new` for every point, those at their key there too (`MOVED`), as
+    a run reads one store. Each verdict sheds ``measuring``, its key, real ATOM
+    arguments and variables, which `_judged` gives it."""
+    taken = []
+    for point in held["points"].values():
+        for side, readings in point["readings"].items():
+            readings = point["readings"][side] = dict(readings)
+            if (measuring := readings.pop("measuring", None)) is not None:
+                taken.append((readings, *measuring))
+    moved = any(v["verdict"] == "measure" and v["held"] for v, *_ in taken)
+    into = new if moved else held["store"]
+    for readings, key, real, env in taken:
+        reused = readings["verdict"] == "reuse"
+        if moved and reused and lacking.holds(held["store"], key):
+            why = MOVED.format(held["store"], into)
+            readings |= {"verdict": "measure", "reason": why}
+        if readings["verdict"] == "measure":
+            readings["made_by"] = [lacking.measuring(into, key, real, env)]
 
 
 def _readings_by(lender: Path, into: str, one: dict) -> str:
