@@ -1702,8 +1702,9 @@ class Stub:
             dp = self.alone or self.runner.config.parallel_config.data_parallel_size
             moe = shape.gathered or dp * shape.tokens * (drafts + 1)
             self.real = shape.real, dp, moe
-            if dp == 1:  # one rank's batch holds its real rows, padded to the rung
-                batch = shape._replace(tokens=shape.real // (drafts + 1))
+            if dp == 1:  # one rank's batch holds its real rows, padded to the
+                # rung: as few rows as hold them, each verifying its drafts
+                batch = shape._replace(tokens=-(-shape.real // (drafts + 1)))
         rows = point_rows(batch, context, pool, rule.block_size, bool(uncut), drafts)
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
