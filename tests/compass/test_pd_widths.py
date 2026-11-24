@@ -19,7 +19,7 @@ from collections import Counter
 from types import SimpleNamespace
 
 import pytest
-from capabilities import capability
+from capabilities import ROOFLINE, ROOFLINE_MACHINE, capability
 from test_dp_slice import MAX_TOKENS, _deployment
 from test_kv_remote_prefill import Script, connector
 from test_kv_simulated_connector import PEAKS, geometry, model_for  # noqa: F401
@@ -173,10 +173,11 @@ def runs(request, tmp_path_factory):
     return sides, [run_pd_dp(root / f"seed{s}", s, form, sides) for s in ("1", "2")]
 
 
-@NEEDS_A_PD_RUN
-@capability("pd_widths")
-def test_two_widths_meet_every_scenario_check_with_a_transfer_per_request(runs):
-    (p, d), runs = runs
+def _two_widths_with_a_transfer_per_request(sides, runs, timeline=True) -> None:
+    """Both seeds' `runs` at `sides` meet every scenario check, the
+    hand-computed timeline only with `timeline`, which only a constant stub's
+    run has, each request's KV moving once, over every rank of each side."""
+    p, d = sides
     run = runs[0]
     rows = [r.split() for r in run["table"].splitlines()[1:]]
     pairs = Counter(
@@ -190,7 +191,11 @@ def test_two_widths_meet_every_scenario_check_with_a_transfer_per_request(runs):
         [r["out"] for r in runs],
         MAX_TOKENS,
         [line for _, line in run["events"]],
-        {"engine-P": parity / "prefill", "engine-D": parity / "decode"},
+        (
+            {"engine-P": parity / "prefill", "engine-D": parity / "decode"}
+            if timeline
+            else None
+        ),
     )
     assert not failed, "\n".join(failed)
     assert sum(pairs.values()) == len(MAX_TOKENS)
@@ -206,3 +211,31 @@ def test_two_widths_meet_every_scenario_check_with_a_transfer_per_request(runs):
             for r in range(n)
         ]
     )
+
+
+@NEEDS_A_PD_RUN
+@capability("pd_widths")
+def test_two_widths_meet_every_scenario_check_with_a_transfer_per_request(runs):
+    _two_widths_with_a_transfer_per_request(*runs)
+
+
+@pytest.fixture(
+    scope="module",
+    params=[(form, sides) for form in FORMS for sides in SIDES],
+    ids=lambda x: f"{x[0]}-P{x[1][0]}D{x[1][1]}",
+)
+def roofline_runs(request, tmp_path_factory):
+    form, sides = request.param
+    root = tmp_path_factory.mktemp(f"pd_widths_roofline_{form}_{sides[0]}{sides[1]}")
+    return sides, [
+        run_pd_dp(root / f"seed{s}", s, form, sides, ROOFLINE, ROOFLINE_MACHINE)
+        for s in ("1", "2")
+    ]
+
+
+@NEEDS_A_PD_RUN
+@capability("pd_widths", 1)
+def test_two_widths_meet_every_scenario_check_under_the_step_roofline(roofline_runs):
+    sides, runs = roofline_runs
+    print(f"\n{runs[0]['summary']['schedule']['seconds_by_method']}")
+    _two_widths_with_a_transfer_per_request(sides, runs, timeline=False)
