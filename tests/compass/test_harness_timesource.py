@@ -164,7 +164,7 @@ def test_a_deadline_met_early_withdraws_its_clock_wait(tmp_path, monkeypatch):
 
     timed_out, traffic = asyncio.run(main())
     assert not timed_out
-    assert traffic.rt.calls == [5.0] and traffic._waiters == []
+    assert traffic.rt.calls == [5.0] and traffic._waiters == {}
 
 
 def test_a_wait_on_an_event_already_set_leaves_the_clock_alone(tmp_path, monkeypatch):
@@ -338,7 +338,7 @@ def test_a_drain_met_early_ends_the_phase_when_its_event_is_set(tmp_path, monkey
 
     runner, traffic = asyncio.run(main())
     assert traffic.rt.calls == [DURATION + GRACE, DURATION + GRACE + 2.0]
-    assert traffic._waiters == []
+    assert traffic._waiters == {}
     assert runner._lifecycle.complete_at_ns == sim_ns(DURATION + GRACE + 2.0)
 
 

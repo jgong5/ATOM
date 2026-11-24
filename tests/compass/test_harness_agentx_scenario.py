@@ -279,7 +279,7 @@ def test_a_trace_idle_past_the_cap_resumes_at_the_cap_on_the_clock(
     assert barrier._root_idle_seconds_skipped == gap - starts_at
     assert barrier._root_idle_jumps == (gap > CAP)
     assert max(traffic.rt.calls) == starts_at
-    assert traffic._waiters == []
+    assert traffic._waiters == {}
 
 
 def test_the_cap_is_per_trace_a_busy_trace_keeps_its_own_gap(
@@ -335,4 +335,4 @@ def test_the_warmup_drain_ends_at_its_last_return_on_the_clock(
     assert 5.0 <= at <= 5.1 + 1e-9
     assert max(traffic.rt.calls) < GRACE
     assert progress.all_credits_returned_event.is_set()
-    assert traffic._waiters == []
+    assert traffic._waiters == {}
