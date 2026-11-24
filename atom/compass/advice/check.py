@@ -46,7 +46,9 @@ would leave its directory holding files, which `calibrate.sh` refuses.
 A calibration that has ended records nothing more, so the next goes into a new
 directory; where it would take what the ended one took and the law it fitted is
 at the configuration's key at the head's ATOM digest (`_refits`), it would refit
-that law, and the verdict says so in place of a command.
+that law, and the verdict says so in place of a command, as does a later
+candidate's at that key, with the command measuring its readings into the store
+that law was published into, unless they are at their key there.
 A readings verdict ``measure`` names the `compass measure memory` command,
 under the instance's variables, a 1P1D side's on the connector a real start of
 it takes.
@@ -557,7 +559,8 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     `calibrate.sh` command's verdict states, for `_borrowing`, its
     ``calibration``: the ``key`` its law is published at, by model, platform
     and engine config, its directory, ``in``, and the store it publishes
-    ``into``."""
+    ``into``; one giving way to `REFITS`, the ended one's directory and the
+    store its law was published into, and that it ``refits``."""
     if isinstance(machine, dict):
         return machine, machine
     args, env = one["args"], one["env"]
@@ -592,9 +595,10 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                     into = str(into or made[0] / "store")
                     law["calibration"] = {"key": key, "in": str(made[0]), "into": into}
                     if (ended := made[3]) and _refits(ended, command, key, atom):
-                        held = started_store(ended) or ended / "store"
+                        held = started_store(ended) or str(ended / "store")
                         law["made_by"] = [REFITS.format(ended, held)]
-                        del law["calibration"]  # nothing for `_borrowing` to name
+                        refitting = {"in": str(ended), "into": held, "refits": True}
+                        law["calibration"] |= refitting
                 if readings["verdict"] == "measure":
                     real = args
                     if side in drive_run.ROLES:
@@ -612,11 +616,12 @@ def _borrowing(points: list, held: dict, calibrations: dict) -> None:
     `held`, a candidate's at its `points`, and name, in place of a verdict's own
     `calibrate.sh` command, the calibration an earlier candidate's in
     `calibrations` makes at its key, since the store refuses a second law at a
-    key: such a verdict is made by that calibration and by what measures this
-    candidate's readings into the store it publishes into (`_readings_by`),
-    unless they are at their key there. Each other calibration joins
-    `calibrations`, unless a verdict of the candidate is refused, whose state
-    prints no command."""
+    key: such a verdict is made by that calibration, or, where a new one would
+    refit the law that one fitted, by why none serves (`REFITS`), and by what
+    measures this candidate's readings into the store it publishes into
+    (`_readings_by`), unless they are at their key there. Each other
+    calibration joins `calibrations`, unless a verdict of the candidate is
+    refused, whose state prints no command."""
     refused = any(v["verdict"] == "refused" for v in _each(held["points"]))
     for point in points:
         verdicts = held["points"][point["name"]]
@@ -630,7 +635,10 @@ def _borrowing(points: list, held: dict, calibrations: dict) -> None:
                 calibrations[key] = mine
             elif made["in"] != mine["in"]:
                 lender, into = Path(made["in"]), made["into"]
-                law["made_by"] = [BORROWED.format(_candidate(lender), lender, into)]
+                if made.get("refits"):
+                    law["made_by"] = [REFITS.format(lender, into)]
+                else:
+                    law["made_by"] = [BORROWED.format(_candidate(lender), lender, into)]
                 there = Path(into) == Path(held["store"])
                 if verdicts["readings"][side]["verdict"] != "reuse" or not there:
                     one = point["instances"][side]

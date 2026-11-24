@@ -5,18 +5,21 @@ first prints its `calibrate.sh` command, and the other names that calibration
 and the command measuring its readings into the store it publishes into,
 unless they are at their key there; into the calibration's own store, only
 once it has started. A candidate refused at some point prints no command, so
-the next at its key prints the calibration.
+the next at its key prints the calibration. Once the first's calibration has
+ended where a new one would refit its law, the other says so too, with the
+command measuring its readings into the store that law was published into.
 
 The configuration, its stubbed resolution and starts are `test_advice_check`'s.
 """
 
 import pytest
-from test_advice_calibrating import _env, _readings_at_another_digest
+from test_advice_calibrating import _env, _fitted, _readings_at_another_digest
 from test_advice_check import (
     advise,
     resolved,
     stubbed,  # noqa: F401  the fixture
 )
+from test_advice_results import _calibrated
 from test_advice_reuse import resolved_here
 from test_memory_readings import publish_readings
 
@@ -128,3 +131,28 @@ def test_a_calibration_taken_again_is_named_by_its_candidate_and_its_directory(
         check.BORROWED.format("S2", again, into),
         check.PENDING.format(into, "S2", again),
     ]
+
+
+def test_a_candidate_at_the_key_of_a_calibration_that_refits_names_it_not_its_own(
+    tmp_path, stubbed, monkeypatch  # noqa: F811
+):
+    """S2's calibration into its own store, as the store refuses its readings
+    again, run by `calibrate.sh` in `test_calibrate`'s stub tree, ends, its law
+    keyed at S2's key as a fit keys it, so a new one would refit that law: S5,
+    at that key, says so as S2 does, with the command measuring its readings
+    into S2's store, and prints no calibration of its own."""
+    monkeypatch.setenv("AIPERF_PYTHON", "/real/python")
+    store, cal = tmp_path / "store", tmp_path / "out" / "cal" / "S2"
+    _readings_at_another_digest(store, resolved(stubbed.config, ARGS2))
+    (first,) = _calibrations(advise(tmp_path, {"S2": S2, "S5": S5}))
+    assert _calibrated(tmp_path, first)[0] == 0
+    _fitted(cal, resolved(stubbed.config, ARGS2))
+
+    found = advise(tmp_path, {"S2": S2, "S5": S5})
+
+    into = str(cal / "store")
+    refits = check.REFITS.format(cal, into)
+    assert found["S2"]["made_by"] == [refits]
+    measure = f"compass measure memory --gpu G --out D --store {into} -- --model "
+    measure += " ".join([str(tmp_path), *ARGS5])
+    assert found["S5"]["made_by"] == [refits, measure]
