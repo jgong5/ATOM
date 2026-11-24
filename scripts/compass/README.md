@@ -1198,8 +1198,9 @@ acceptance, the prefix-cache unit), the column set per vector (an input: a colum
 tree's backend prices is counted by it, an opt-in one plugs in by name), the hardware noise,
 the acceptance criteria frozen before a record, and the segments. Configs: `cellA_v1.json`
 (DeepSeek-V4.1-Flash, DPA4-EP4), `cellA_m31.json` (MiniMax-M3.1-Flash, TP4, one DP rank) and
-`cellA_k31.json` (Kimi-K3.1, TP8 + DCP8, one DP rank); the last two hold placeholder KV
-pools until their smoke records state theirs.
+`cellA_k31.json` (Kimi-K3.1, TP8 + DCP8, one DP rank); `cellA_m31.json` states its step-A smoke
+record's deployment, and `cellA_k31.json` holds a placeholder KV pool until its smoke record
+states one.
 
 ```
 PYTHONPATH=$T python3 $T/scripts/compass/gen_v1.py CONFIG DESIGN       # traces, design.json
