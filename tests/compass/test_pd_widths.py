@@ -173,10 +173,10 @@ def runs(request, tmp_path_factory):
     return sides, [run_pd_dp(root / f"seed{s}", s, form, sides) for s in ("1", "2")]
 
 
-def _two_widths_with_a_transfer_per_request(sides, runs, timeline=True) -> None:
-    """Both seeds' `runs` at `sides` meet every scenario check, the
-    hand-computed timeline only with `timeline`, which only a constant stub's
-    run has, each request's KV moving once, over every rank of each side."""
+def _two_widths_with_a_transfer_per_request(sides, runs, stub=True) -> None:
+    """Both seeds' `runs` at `sides` meet every scenario check, each request's
+    KV moving once; under a constant `stub`, also on its hand-computed
+    timelines, the transfers spread over every rank of each side."""
     p, d = sides
     run = runs[0]
     rows = [r.split() for r in run["table"].splitlines()[1:]]
@@ -193,14 +193,15 @@ def _two_widths_with_a_transfer_per_request(sides, runs, timeline=True) -> None:
         [line for _, line in run["events"]],
         (
             {"engine-P": parity / "prefill", "engine-D": parity / "decode"}
-            if timeline
+            if stub
             else None
         ),
     )
     assert not failed, "\n".join(failed)
     assert sum(pairs.values()) == len(MAX_TOKENS)
-    assert {x.split(".")[0] for x in pairs} == {f"dp{r}" for r in range(d)}
-    assert {x.split(".")[1] for x in pairs} == {f"dp{r}" for r in range(p)}
+    if stub:
+        assert {x.split(".")[0] for x in pairs} == {f"dp{r}" for r in range(d)}
+        assert {x.split(".")[1] for x in pairs} == {f"dp{r}" for r in range(p)}
     members = {"P": p, "D": d}
     assert run["handed_in"] == sorted(
         compass_run.LP_FILE.format(n)
@@ -236,6 +237,11 @@ def roofline_runs(request, tmp_path_factory):
 @NEEDS_A_PD_RUN
 @capability("pd_widths", 1)
 def test_two_widths_meet_every_scenario_check_under_the_step_roofline(roofline_runs):
+    """The level-0 case's checks but two, as `test_pd_dp`'s roofline case
+    leaves them: the hand-computed timelines, which `check_run` computes only
+    for a constant step stub, and that the transfers spread over every rank of
+    each side, since the rank a request lands on follows when earlier requests
+    finish, and so the step cost."""
     sides, runs = roofline_runs
     print(f"\n{runs[0]['summary']['schedule']['seconds_by_method']}")
-    _two_widths_with_a_transfer_per_request(sides, runs, timeline=False)
+    _two_widths_with_a_transfer_per_request(sides, runs, stub=False)

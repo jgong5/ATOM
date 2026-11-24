@@ -464,11 +464,12 @@ def _first_prefills(out: Path) -> dict[str, tuple]:
 @NEEDS_A_RUN
 @capability("lmcache_mp", 1)
 def test_each_run_meets_every_scenario_check_under_the_step_roofline(roofline_runs):
-    """Both seeds' runs meet every scenario check under the step roofline
-    alone and load the prefix back; the first request's prefill computes its
-    whole prompt, and each request a load served prefills on fewer uncached
-    tokens than its own prompt and than that first pass, its loaded ones read
-    as cached."""
+    """The level-0 case's checks but one, the hand-computed timeline, which
+    `check_run` computes only for a constant step stub: the burst, sent at
+    once well after the first request ends, still spreads over both ranks.
+    And the first request's prefill computes its whole prompt, and each
+    request a load served prefills on fewer uncached tokens than its own
+    prompt and than that first pass, its loaded ones read as cached."""
     dp, seeds = roofline_runs
     run = seeds[0]
     print(f"\n{json.loads((run['out'] / compass_run.SUMMARY_FILE).read_text())}")

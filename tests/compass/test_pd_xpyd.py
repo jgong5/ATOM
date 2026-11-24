@@ -563,6 +563,9 @@ def xpyd_roofline_runs(tmp_path_factory):
 @NEEDS_A_PD_RUN
 @capability("pd_xpyd", 1)
 def test_2p2d_meets_every_scenario_check_under_the_step_roofline(xpyd_roofline_runs):
+    """The level-0 case's checks but one: the hand-computed timelines, which
+    `check_run` computes only for a constant step stub. Round robin places
+    each request by its order, whatever the step cost."""
     summary = json.loads(
         (xpyd_roofline_runs[0]["out"] / compass_run.SUMMARY_FILE).read_text()
     )
