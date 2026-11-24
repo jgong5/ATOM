@@ -17,7 +17,11 @@ import pytest
 
 from atom.compass.backends.shape import DUTY_TAU, BatchView, RequestShape
 from atom.compass.backends.step_grid_plan import TARGET
-from atom.compass.backends.step_linear import StepLinearBackend, StepLinearLaw
+from atom.compass.backends.step_linear import (
+    StepLinearBackend,
+    StepLinearLaw,
+    gather_rows,
+)
 from atom.compass.calib import columns, deploy, design
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +40,15 @@ DEPLOYMENT = {
     "prefill_buckets": [256, 512, 1024],
     "moe_routing": [16, 2],
 }
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _small_designs():
+    """These tests' configs hold 12 decode steps a rung, below #739's frozen
+    60, to keep their designs small: the test-only path that loosens it."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(deploy.LOOSEN_ENV, "1")
+        yield
 
 
 def _config(**over) -> dict:
@@ -118,6 +131,32 @@ def test_a_config_tightens_an_acceptance_bound_and_keeps_the_others():
     loose = deploy.parse(_config(acceptance={}, range={}, timing={}))
     assert loose.acceptance["g"] == {"decode": 0.01, "prefill": 0.02}
     assert loose.range == deploy.RANGE and loose.timing == deploy.TIMING
+
+
+def test_a_config_may_only_tighten_the_frozen_criteria(monkeypatch):
+    """#739's criteria are frozen before a record: a config tightens them,
+    each its own way (`deploy.TIGHTER`), and never loosens one or names one
+    they lack, outside the tests' own path (`deploy.LOOSEN_ENV`)."""
+    monkeypatch.delenv(deploy.LOOSEN_ENV)
+    tight = {"vif": 5, "g": {"prefill": 0.01}, "g_z": 3, "rung_steps": 90}
+    cfg = deploy.parse(_config(acceptance={**tight, "levels": 4}))
+    assert cfg.acceptance["g"] == {"decode": 0.01, "prefill": 0.01}
+    assert (cfg.acceptance["g_z"], cfg.acceptance["rung_steps"]) == (3, 90)
+    for loose, named in (
+        ({"vif": 20}, "vif 20 "),
+        ({"g": {"decode": 0.02}}, "g.decode 0.02 "),
+        ({"g_z": 1.0}, "g_z 1.0 "),
+        ({"rung_steps": 12}, "rung_steps 12 "),
+        ({"levels": 2}, "levels 2 "),
+    ):
+        with pytest.raises(ValueError, match=f"loosens .*{named}"):
+            deploy.parse(_config(acceptance=loose))
+    with pytest.raises(ValueError, match="acceptance states .'steps'."):
+        deploy.parse(_config(acceptance={"steps": 60}))
+    with pytest.raises(ValueError, match="acceptance.g states .'draft'."):
+        deploy.parse(_config(acceptance={"g": {"draft": 0.01}}))
+    monkeypatch.setenv(deploy.LOOSEN_ENV, "1")
+    assert deploy.parse(_config()).acceptance["rung_steps"] == 12
 
 
 def test_a_config_extends_another_and_inserts_segments_into_it(tmp_path):
@@ -487,6 +526,27 @@ def test_an_opt_in_column_the_backend_lacks_is_counted_by_its_provisional_defini
         dp_rank=0,
     )
     assert columns.values(graphed, "prefill", gather, dep) == (1.0, 2.0 * 512, 0.0)
+
+
+def test_a_provisional_gather_counts_no_rows_on_one_rank_as_the_backend_does():
+    """`gather_rows`' provisional definition, for a tree whose backend lacks
+    the column: one rank runs no gather, so it counts 0 there, as its sibling
+    columns and the backend's own `step_linear.gather_rows` do; over a group
+    it counts what the backend counts."""
+    gather = columns.PROVISIONAL["prefill"]["gather_rows"]
+    lone = BatchView((RequestShape(450, 450, False),), produces_output=True)
+    buckets = DEPLOYMENT["prefill_buckets"]
+    assert gather(lone, 1, buckets) == 0.0 == gather_rows(lone, tuple(buckets), 1)
+    assert columns.PROVISIONAL["prefill"]["moe_imbalance"](lone, 1, buckets) == 0.0
+    for peak, moe in ((450, 800), (2000, 3000)):  # a token graph, then eager
+        group = BatchView(
+            (RequestShape(peak, peak, False),),
+            moe_rows=moe,
+            group_max_tokens=peak,
+            produces_output=True,
+            dp_rank=0,
+        )
+        assert gather(group, 2, buckets) == gather_rows(group, tuple(buckets), 2)
 
 
 def test_a_step_the_backend_refuses_is_refused_by_name():

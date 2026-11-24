@@ -39,6 +39,15 @@ DEPLOYMENT = {
 }
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _small_designs():
+    """These tests' configs hold 12 decode steps a rung, below #739's frozen
+    60, to keep their designs small: the test-only path that loosens it."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(deploy.LOOSEN_ENV, "1")
+        yield
+
+
 def _config(**over) -> dict:
     raw = {
         "name": "tiny",
@@ -349,6 +358,7 @@ def test_one_dp_rank_keeps_both_paddings_and_is_judged_by_g():
 def _run(*argv, **kw):
     path = f"{Path(sys.executable).parent}:/usr/bin:/bin"  # the python3 the scripts run is this one
     env = {"PYTHONPATH": str(ROOT), "PATH": path, "PYTHONDONTWRITEBYTECODE": "1"}
+    env[deploy.LOOSEN_ENV] = "1"  # `_config`'s 12 steps a rung
     return subprocess.run(
         [*argv], check=False, capture_output=True, text=True, env=env, **kw
     )

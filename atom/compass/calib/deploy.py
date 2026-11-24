@@ -45,6 +45,11 @@ its own; `min_spread` the fit's `moe_imbalance` floor. A
 column this tree's step linear backend prices is counted by it (`columns`);
 a newer opt-in column plugs in by name.
 
+`acceptance` may only tighten LLM-Booster#739's frozen criteria, `ACCEPTANCE`
+(`TIGHTER` says which way each tightens): a looser bound, or a criterion it
+does not know, is refused, unless `LOOSEN_ENV` is ``1``, a path for tests
+whose small designs hold fewer steps a rung.
+
 A deployment field given beside `from_record` overrides the record's
 (`parse`); `load`'s `record` instead replaces the config's own fields with
 those a record states, so a design follows a deployment change with no edit.
@@ -67,7 +72,7 @@ from pathlib import Path
 #: percent as it states it.
 G_PERCENT = {"decode": 1, "prefill": 2}
 #: The acceptance criteria LLM-Booster#739 freezes before a record, which a
-#: config may tighten.
+#: config may tighten and never loosen (`acceptance`).
 ACCEPTANCE = {
     "vif": 10.0,
     "g": {kind: pct / 100 for kind, pct in G_PERCENT.items()},
@@ -75,6 +80,13 @@ ACCEPTANCE = {
     "rung_steps": 60,
     "levels": 3,
 }
+#: Which way each criterion tightens: -1, a lower bound is tighter (the worst
+#: VIF and G allowed); +1, a higher one (G's standard errors, a rung's decode
+#: steps, a column's levels).
+TIGHTER = {"vif": -1, "g": -1, "g_z": 1, "rung_steps": 1, "levels": 1}
+#: The variable that, set to ``1``, lets a config loosen `ACCEPTANCE`: for
+#: tests alone, whose small designs hold fewer decode steps a rung.
+LOOSEN_ENV = "COMPASS_CALIB_TEST_LOOSEN"
 TIMING = {"server_start_s": 450.0, "segment_overhead_s": 20.0}
 RANGE = {"min_context": 1024, "min_prompt": 512}
 
@@ -341,8 +353,7 @@ def parse(raw: dict, record=None) -> Config:
     for kind in ("decode", "prefill"):
         if not columns.get(kind) or columns[kind][0] != "step":
             raise ValueError(f"columns.{kind} starts with the intercept, step")
-    acceptance = {**ACCEPTANCE, **raw.get("acceptance", {})}
-    acceptance["g"] = {**ACCEPTANCE["g"], **raw.get("acceptance", {}).get("g", {})}
+    acceptance = criteria(raw.get("acceptance", {}))
     names = [s["name"] for s in raw["segments"]]
     if len(set(names)) != len(names):
         raise ValueError(f"segment names repeat: {names}")
@@ -358,6 +369,31 @@ def parse(raw: dict, record=None) -> Config:
         about=raw.get("about", ""),
         raw={**raw, "deployment": {**d, "kv_tokens": deployment.kv_tokens}},
     )
+
+
+def criteria(given: dict) -> dict:
+    """`ACCEPTANCE` with the bounds a config's `acceptance`, `given`, states,
+    each only tightening #739's (`TIGHTER`): a looser one, or a criterion
+    `ACCEPTANCE` does not name, is refused unless `LOOSEN_ENV` is ``1``."""
+    out = {**ACCEPTANCE, **given, "g": {**ACCEPTANCE["g"], **given.get("g", {})}}
+    if unknown := sorted(set(given) - set(ACCEPTANCE)):
+        raise ValueError(f"acceptance states {unknown}; it takes {list(ACCEPTANCE)}")
+    if unknown := sorted(set(given.get("g", {})) - set(ACCEPTANCE["g"])):
+        raise ValueError(f"acceptance.g states {unknown}; it takes {list(G_PERCENT)}")
+    looser = [
+        f"{name} {value} (#739: {frozen})"
+        for name, value, frozen in (
+            *((f"g.{k}", out["g"][k], v) for k, v in ACCEPTANCE["g"].items()),
+            *((k, out[k], v) for k, v in ACCEPTANCE.items() if k != "g"),
+        )
+        if (value - frozen) * TIGHTER[name.split(".")[0]] < 0
+    ]
+    if looser and os.environ.get(LOOSEN_ENV) != "1":
+        raise ValueError(
+            f"acceptance loosens #739's frozen criteria: {', '.join(looser)}; a "
+            "config may only tighten them"
+        )
+    return out
 
 
 def resolve(raw: dict, here: Path) -> dict:

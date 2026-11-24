@@ -70,7 +70,10 @@ def _moe_imbalance(view: BatchView, dp: int, buckets, min_spread: float = 0.0) -
 def _gather_rows(view: BatchView, dp: int, buckets, min_spread: float = 0.0) -> float:
     """Prefill: the rows the gather moves, every rank at the whole token-graph
     bucket the busiest rank's tokens take, or the group's rows past the
-    largest bucket (eager)."""
+    largest bucket (eager); 0 on one rank, which runs no gather, as the step
+    linear backend counts it (`step_linear.gather_rows`)."""
+    if view.moe_rows is None or dp < 2:
+        return 0.0
     bucket = _bucket(view, buckets)
     if bucket is None:
         return float(view.moe_rows or sum_tokens(view.requests))
