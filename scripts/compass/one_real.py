@@ -31,7 +31,9 @@ per GPU over the requests both runs finished, and the seconds aiperf's agentic
 replay skipped in each run under its global system-idle cap (`window`): a
 short window's throughput is the tokens of the requests the client sent in it,
 and a run whose system went idle where the other's did not jumps its whole
-replay ahead.
+replay ahead. Last, per SIM, its prefix hits over the requests both ran beside
+REAL's (`hits`): which DP rank a follow-up lands on, and so whether it finds
+its conversation's prefix, is a draw of the schedule.
 """
 
 import json
@@ -113,6 +115,8 @@ def main(argv: list[str]) -> int:
         print(paired(real, sim))
     for sim in sims:
         print(window(real, sim))
+    for sim in sims:
+        print(hits(real, sim))
     print(json.dumps(rows))
     return 0
 
@@ -271,6 +275,51 @@ def window(real: Path, sim: Path) -> str:
         f"{error(per_gpu(real, a), per_gpu(sim, b))} ({len(a) - len(both)} ran in "
         f"the real run only, {len(b) - len(both)} in {sim.name} only); the "
         f"client's global idle cap skipped {caps}"
+    )
+
+
+def _cached(run: Path) -> dict:
+    """Each profiled request of `run` by (conversation, turn): its input tokens
+    and those its engine served from the prefix cache (aiperf's
+    ``usage_prompt_cache_read_tokens``), None where its record states none."""
+    out = {}
+    for r in profiled(read_jsonl(run / RECORDS)):
+        m = r.get("metadata", {})
+        isl = _metric(r, "input_sequence_length", int)
+        if isl and "conversation_id" in m and "turn_index" in m:
+            out[m["conversation_id"], m["turn_index"]] = (
+                isl,
+                _metric(r, "usage_prompt_cache_read_tokens", int),
+            )
+    return out
+
+
+def hits(real: Path, sim: Path) -> str:
+    """`sim`'s prefix hits against `real`'s over the requests both ran: each
+    run's cached share of their input tokens and the change in their uncached
+    ones. The DP router places a request on the rank with the fewest in
+    flight, blind to where its conversation's prefix lives, so whether a
+    follow-up lands on its history is a draw of the schedule; where prefill
+    bounds the run, the draw moves throughput and the TTFT tail (#3720 c=256:
+    one rank prefilling while the other three wait held 72% of the time; over
+    26 simulated runs each point of hit rate moved throughput per GPU +1.7%
+    and p90 TTFT -2.8%, and the hit rates spread 1.0 point (sd) about a mean
+    1.2 points below the one real run's). A gap here beside `window`'s ~0%
+    over the same requests is that draw, not the law."""
+    a, b = _cached(real), _cached(sim)
+    both = [
+        k for k in set(a) & set(b) if a[k][1] is not None and b[k][1] is not None
+    ]
+    if not both:
+        return f"{sim.name}: prefix hits: no request both ran states its cached tokens"
+    (ia, ca), (ib, cb) = (
+        (sum(x[k][0] for k in both), sum(x[k][1] for k in both)) for x in (a, b)
+    )
+    shift = f"{(ib - cb) / (ia - ca) - 1:+.1%}" if ia > ca else "-"
+    return (
+        f"{sim.name}: prefix hits over the {len(both)} requests both ran "
+        f"{cb / ib:.1%} against the real run's {ca / ia:.1%} "
+        f"({100 * (cb / ib - ca / ia):+.1f} pt), their uncached input tokens {shift}"
     )
 
 
