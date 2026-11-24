@@ -2,6 +2,7 @@
 """`compass fit host`: the host laws, fitted on real runs' records and published.
 
     compass fit host RECORD... --client-run RECORD EXPORT... --store ROOT
+        [--decode-client-run RECORD EXPORT...]
         [--stated-hop NAME=SECONDS...] [--ingress FILE] --out DIR
 
 `host_laws` fits the samples' host labels by `step_linear_fit.fit_host`, under
@@ -41,6 +42,16 @@ entry's ``ingress`` term (`atom.compass.ingress`): FILE's ``ingress``, as
 here holds. The report's ``stated_ingress`` names FILE and the term. Fit such
 an entry on records taken behind that ingress: their server took each prompt's
 token ids, so it rendered and tokenized nothing, and read larger bodies.
+
+`--decode-client-run RECORD EXPORT` names a client run RECORD's server served,
+as `--client-run` does, whose decode drains alone give host samples, its
+admissions' bursts left out (`host_blocks.drain_cut`); the report's
+``decode_client_runs`` says what each kept and left out. With
+`host_blocks.KIND_BLOCKS_ENV` set to ``1`` the decode, prefill and middle
+laws take one constant per launch path, held out in blocks per path kind, the
+tokenizer and intake terms are fitted on the `--client-run` windows alone,
+and the report's ``kind_blocks`` states the checks H1 to H5
+(`host_blocks`). Unset and with no `--decode-client-run`, the fit is as it was.
 """
 
 import gzip
@@ -58,7 +69,7 @@ from atom.compass.backends.step_linear_fit import (
     fit_tokenizer,
     streams,
 )
-from atom.compass.fit import publish
+from atom.compass.fit import host_blocks, publish
 from atom.compass.ingress import KEY as INGRESS
 from atom.compass.ingress import check as check_ingress
 from atom.compass.parity.client_run import RAW
@@ -68,11 +79,15 @@ from atom.compass.validate.runs import SIDES
 PROG = "compass fit host"
 
 
-def host_laws(samples, records=(), client_runs=()) -> tuple[dict, dict]:
+def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, dict]:
     """The host laws over `samples`, with the tokenizer, HTTP intake and hop
     terms of the record directories `records`, each served the client runs
     `client_runs` pairs it with by their exports, as a run file's `host` entry,
-    and their report; samples with no host labels under a host key refuse."""
+    and their report; samples with no host labels under a host key refuse.
+    Under `host_blocks.KIND_BLOCKS_ENV` the laws are refitted per launch path
+    (`host_blocks.refit`); `steady`, per record its host-clock windows, keeps
+    the tokenizer and intake terms to the calls and requests within them, and
+    the report's ``kind_blocks`` gains H3 and H5 on them (`host_blocks.spans`)."""
     from scipy.spatial import QhullError
 
     bare = sorted(
@@ -93,7 +108,12 @@ def host_laws(samples, records=(), client_runs=()) -> tuple[dict, dict]:
                     f"them, {named.read_text().strip()}"
                 )
     host, report = fit_host(samples)
+    if host_blocks.enabled():
+        host_blocks.refit(samples, host, report)
     stamped = [r for r in records if (Path(r) / "steps" / INTAKE_RECORD).is_file()]
+    windows = None
+    if steady is not None:
+        windows = [steady.get(str(Path(r))) for r in stamped]
     steps = [Path(r) / "steps" / INTAKE_RECORD for r in stamped]
     calls = [d.with_name(TOKENIZER_RECORD) for d in steps]
     clients = [
@@ -110,8 +130,8 @@ def host_laws(samples, records=(), client_runs=()) -> tuple[dict, dict]:
     # prefill-decode prefill side, sends no event to price.
     streamed = any(streams(d) for d in steps)
     for term, fit in (
-        ("tokenizer", lambda: fit_tokenizer(calls, steps)),
-        ("http_intake", lambda: fit_intake(steps, calls)),
+        ("tokenizer", lambda: fit_tokenizer(calls, steps, windows)),
+        ("http_intake", lambda: fit_intake(steps, calls, windows)),
         ("hops", lambda: fit_hops(steps, clients)),
         *([("http_stream", lambda: fit_stream(steps))] if streamed else []),
         *([("relay", lambda: fit_relay(relayed))] if relayed else []),
@@ -127,6 +147,9 @@ def host_laws(samples, records=(), client_runs=()) -> tuple[dict, dict]:
             report["unfitted"][f"{term}.{kind}"] = why.splitlines()[0]
     if host.get("hops") == {}:
         del host["hops"]
+    if host_blocks.enabled() and steady is not None:
+        found = host_blocks.spans([str(Path(r)) for r in stamped], steady)
+        report["kind_blocks"] = {**report.get("kind_blocks", {}), **found}
     return host, {"provenance": publish.runs(samples), **report}
 
 
@@ -210,6 +233,16 @@ def main(argv: list[str]) -> None:
         "into the entry's hops and named under the report's stated_hops",
     )
     parser.add_argument(
+        "--decode-client-run",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("RECORD", "EXPORT"),
+        help="a client run RECORD's server served, by its export, whose decode "
+        "drains alone give host samples: the steps of its span in which no rank "
+        "prefills (fit.host_blocks.drain_cut)",
+    )
+    parser.add_argument(
         "--ingress",
         metavar="FILE",
         help="the encoding ingress in front of the deployment, compass fit "
@@ -218,8 +251,28 @@ def main(argv: list[str]) -> None:
     )
     args = parser.parse_args(argv)
     ingress = stated_ingress(args.ingress) if args.ingress else None
+    decode = {(str(Path(r)), e) for r, e in args.decode_client_run}
+    args.client_run = [*args.client_run, *args.decode_client_run]
     samples, config = publish.inputs(args, ("record",))
-    host, report = host_laws(samples, args.inputs, args.client_run)
+    runs, steady = {}, None
+    if decode or host_blocks.enabled():
+        exports: dict = {}
+        for r, e in args.client_run:
+            exports.setdefault(str(Path(r)), []).append(e)
+        # Each record's client runs, in the order `publish.inputs` served them.
+        runs = {
+            r: list(zip(e, host_blocks.client_runs(r, e))) for r, e in exports.items()
+        }
+    drained = []
+    if decode:
+        samples, drained = host_blocks.drain_cut(samples, runs, decode)
+    if host_blocks.enabled():
+        steady = host_blocks.steady_windows(runs, decode)
+    host, report = host_laws(samples, args.inputs, args.client_run, steady)
+    if decode:
+        report["decode_client_runs"] = drained
+    if host_blocks.enabled():
+        report.setdefault("kind_blocks", {})["H4"] = host_blocks.h4(drained)
     if stated := stated_hops(args.stated_hop, host.get("hops", {})):
         host["hops"] = {**host.get("hops", {}), **stated}
         report["stated_hops"] = stated
