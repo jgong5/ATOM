@@ -3,9 +3,10 @@
 its decode drains alone, the steps of its span in which no rank prefills
 (`fit.host.drain_cut`).
 
-The record is `test_fit_steps.record`'s, alternating prefill and decode steps,
-served by two client runs one after another: `steady.json` sends the requests
-of the steps before `SPLIT`, `decode.json` the rest.
+The record is `test_fit_steps.record`'s, alternating prefill and decode steps
+but at `LONG`, a decode, served by two client runs one after another:
+`steady.json` sends the requests of the steps before `SPLIT`, `decode.json`
+the rest.
 """
 
 import dataclasses
@@ -29,12 +30,17 @@ from atom.compass.fit.host import drain_cut
 from atom.compass.validate.runs import SIDES
 
 SPLIT = 120
+#: A step of the decode client run's span that decodes where the others
+#: prefill: its drain runs from the step before it to the step after.
+LONG = SPLIT + 2
 
 
 def _two_runs(directory):
     steps = directory / "steps"
     steps.mkdir(parents=True)
-    _timed_record(steps / "dp0.jsonl", _steps(19), idle_after=(SPLIT - 1,), key=HOST)
+    shapes = _steps(19)
+    shapes[LONG] = shapes[LONG - 1]
+    _timed_record(steps / "dp0.jsonl", shapes, idle_after=(SPLIT - 1,), key=HOST)
     as_record(directory)
     sent = json.loads((directory / "client.json").read_text())["requests"]
     lines = [json.loads(x) for x in (steps / "dp0.jsonl").read_text().splitlines()]
@@ -46,8 +52,9 @@ def _two_runs(directory):
 
 
 def _drained(samples) -> list:
-    """`samples` less the decode client run's prefill steps, its even ones."""
-    return [s for s in samples if s.step < SPLIT or s.step % 2]
+    """`samples` less the decode client run's prefill steps, its even ones
+    but `LONG`."""
+    return [s for s in samples if s.step < SPLIT or s.step % 2 or s.step == LONG]
 
 
 def test_a_decode_client_run_keeps_only_its_drains_and_their_dummies(tmp_path):
@@ -60,17 +67,18 @@ def test_a_decode_client_run_keeps_only_its_drains_and_their_dummies(tmp_path):
     assert kept == [
         dataclasses.replace(s, dummy_host=dummies[:1]) for s in _drained(samples)
     ]
-    # Each odd step of the span is a drain of its own, between two prefills.
-    odd = [s for s in samples if s.step >= SPLIT and s.step % 2]
+    # Each odd step of the span is a drain of its own, between two prefills,
+    # but the three from LONG - 1 to LONG + 1.
+    drained = [s for s in _drained(samples) if s.step >= SPLIT]
     assert report == [
         {
             "record": str(a),
             "export": str(a / "decode.json"),
             "span": [SPLIT, 239],
-            "drains": 60,
-            "drain_steps": 60,
+            "drains": 59,
+            "drain_steps": 61,
             "dropped": len(samples) - len(_drained(samples)),
-            "kept": len(odd),
+            "kept": len(drained),
         }
     ]
 
@@ -90,6 +98,13 @@ def test_the_command_fits_a_decode_client_run_on_its_drains(tmp_path):
     report = member(tmp_path / "d" / "store", host_laws_key(HOST), "report")
     (run,) = report["decode_client_runs"]
     assert run["export"] == str(a / "decode.json") and run["span"] == [SPLIT, 239]
+
+
+def test_a_decode_client_run_of_no_record_is_refused_by_its_own_flag(tmp_path):
+    a = _two_runs(tmp_path / "a")
+    runs = ("--client-run", a, a / "steady.json", "--decode-client-run")
+    with pytest.raises(SystemExit, match="--decode-client-run names .*b, which"):
+        fit(tmp_path, "fit host", a, *runs, tmp_path / "b", a / "decode.json")
 
 
 def test_a_prefill_side_refuses_as_a_decode_client_run(tmp_path):

@@ -289,6 +289,12 @@ def main(argv: list[str]) -> None:
     )
     args = parser.parse_args(argv)
     ingress = stated_ingress(args.ingress) if args.ingress else None
+    records = {Path(i) for i in args.inputs if (Path(i) / "run.json").is_file()}
+    for record, _ in args.decode_client_run:
+        if Path(record) not in records:
+            raise ValueError(
+                f"--decode-client-run names {record}, which is not a RECORD"
+            )
     args.client_run = [*args.client_run, *args.decode_client_run]
     samples, config = publish.inputs(args, ("record",))
     if args.decode_client_run:
