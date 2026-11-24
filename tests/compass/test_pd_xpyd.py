@@ -250,6 +250,7 @@ class InstanceFrontend(Frontend):
 
     def __init__(self, run: dict, side: str, delay, lp: str, http) -> None:
         self.run, self.side, self.delay, self.lp = run, side, delay, LpId(lp)
+        self.model = "m"  # the model discovery answers, which its traffic names
         self.cv = threading.Condition()
         self.bodies, self.replies, self.ranks, self.errors = {}, {}, {}, []
         self.http, self.url = http, f"http://127.0.0.1:{http.server_port}"
