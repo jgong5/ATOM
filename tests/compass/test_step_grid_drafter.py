@@ -339,16 +339,27 @@ def target(line) -> float:
     return grid_fit.planted_time(line) * grid_fit.factor(line)
 
 
+def flash_ahead() -> int:
+    """The positions past a row that DSpark5's draft round writes, as the
+    planner reads them from the engine."""
+    engine = {**BOUNDS, "kv_cache_block_size": 256, "num_kvcache_blocks": 1}
+    engine |= {"ladder": [8], "speculative": ["dspark", K]}
+    target = step_grid_plan._target(grid_fit.DEFINITION, {"flash": engine})
+    return target["lookahead"]
+
+
 def flash_nodes() -> list[dict]:
     """Every node batch of the grid the planner places for `BOUNDS` under
-    DSpark5: both top c nodes are less the draft round's 4 positions past a
+    DSpark5: both top c nodes are less the draft round's positions past a
     row, decode's max_model_len less a verify step's 6 too."""
+    top = BOUNDS["max_model_len"] - flash_ahead()
     out = [
         grid_fit.batch([(K + 1, c + K + 1, True)] * b)
         for b in (1, 8)
-        for c in (0, 512, 1014)
+        for c in (0, 512, top - K - 1)
     ]
-    prefill = [(b, t, c) for b in (1, 8) for t in (16, 256) for c in (0, 764)]
+    top -= BOUNDS["max_num_batched_tokens"]
+    prefill = [(b, t, c) for b in (1, 8) for t in (16, 256) for c in (0, top)]
     for output in (True, False):
         out += [
             grid_fit.batch([(t // b, c + t // b, False)] * b, output)
@@ -358,12 +369,12 @@ def flash_nodes() -> list[dict]:
 
 
 def flash_mixed(seed=1, n=20) -> list[dict]:
-    """`n` verify steps of 2 to 8 rows on cached contexts 0 to 1014, and
-    `test_backend_step_grid_fit.mixed`'s prefill chunks."""
+    """`n` verify steps of 2 to 8 rows on cached contexts 0 to decode's top c
+    node, and `test_backend_step_grid_fit.mixed`'s prefill chunks."""
     rng = np.random.default_rng(seed)
-    out = []
+    out, top = [], BOUNDS["max_model_len"] - flash_ahead()
     for _ in range(n):
-        ks = rng.integers(K + 1, 1021, rng.integers(2, 9))
+        ks = rng.integers(K + 1, top + 1, rng.integers(2, 9))
         out.append(grid_fit.batch([(K + 1, int(k), True) for k in ks]))
     return out + grid_fit.mixed(seed, n)[n:]
 

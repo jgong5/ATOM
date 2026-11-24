@@ -36,18 +36,20 @@ def table(rows):
 def test_the_top_corners_fill_atoms_block_table_and_one_position_more_is_refused(
     model_dir, drafter  # noqa: F811
 ):
-    """DSpark5 verifies 6 tokens a row and writes 4 positions past it, MTP1 2
-    and none: decode's top c node is 2048 - 6 - 4 = 2038 or 2046, prefill's
-    2048 - 64 - 4 = 1980 or 1984. Every planned point fits the table; one
-    position more takes a 129th block, which the planner, the replay rule and
-    ATOM's table each refuse."""
+    """DSpark5 verifies 6 tokens a row and its draft round writes the positions
+    ATOM's scheduler allocates past it, MTP1 2 and none: decode's top c node is
+    2048 - 6 less those positions or 2046, prefill's 2048 - 64 less them or
+    1984. Every planned point fits the table; one position more takes a 129th
+    block, which the planner, the replay rule and ATOM's table each refuse."""
     steps, engines = recorded(model_dir, drafter)
     width = SPECULATIVE[drafter][1] + 1
-    ahead = max(0, width - 2)
     for row in ([width, 1900 + width, True], [48, 1900 + 48, False]):
         line = {"rows": [row], "rung": 1 if row[2] else None, "produces_output": True}
         steps.append((f"near {row}", line))
     rule = replay.ReplayRule(config(model_dir, drafter))
+    ahead = rule.lookahead
+    target = step_grid_plan._target(DEFINITION, engines)
+    assert target["lookahead"] == ahead and (ahead > 0) == (width > 2)
 
     planned = step_grid_plan.plan(DEFINITION, steps, engines)
 
@@ -59,7 +61,6 @@ def test_the_top_corners_fill_atoms_block_table_and_one_position_more_is_refused
     rows = [line["rows"] for line in planned["lines"]]
     for phase, (q, c) in top.items():
         assert [[q, c + q, phase == "decode"]] in rows
-    target = step_grid_plan._target(DEFINITION, engines)
     for phase, (q, c) in top.items():
         decode, held = phase == "decode", c + 1 + q + ahead
         why = step_grid_plan._infeasible(target, 1, q, c + 1, not decode)
@@ -75,8 +76,8 @@ def test_a_model_length_short_of_the_token_budget_and_lookahead_is_refused(
     model_dir, drafter, top  # noqa: F811
 ):
     """At max_model_len 67, three tokens above the 64-token budget, prefill's
-    top c node is 67 - 64 - 4 = -1 under DSpark5, whose draft round writes 4
-    positions past a row, so the plan refuses; MTP1's writes none and its top
+    top c node is 67 - 64 less the positions DSpark5's draft round writes past
+    a row, more than 3, so the plan refuses; MTP1's writes none and its top
     node is 3."""
     steps, engines = recorded(model_dir, drafter)
     (engine,) = engines.values()
