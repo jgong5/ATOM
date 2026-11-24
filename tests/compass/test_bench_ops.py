@@ -668,7 +668,7 @@ def test_a_v41_prefill_past_cached_tokens_scores_on_a_plane_its_rows_blocks_wide
     # the FP4 index plane packs its logits over the whole block table, the
     # candidate pick's block maxima flat, which no context widens
     runner.attn_metadata_builder.geometry = dataclasses.replace(
-        geometry, index_dim=128, index_fp4=True
+        geometry, index_dim=128, index_fp4=True, index_layout="preshuffle"
     )
     maxima = _leaf(
         ops._MAXIMA,
@@ -719,7 +719,11 @@ def _v41_index(monkeypatch, visible, leaves, shape, context, fp4=False):
     geometry = V41PoolGeometry(1, ((0, 1),), 32, 4, 512, 32, layer_ratios=(1,))
     if fp4:  # whole 128-dim K tiles on 8-row pages
         geometry = dataclasses.replace(
-            geometry, index_dim=128, index_block_rows=8, index_fp4=True
+            geometry,
+            index_dim=128,
+            index_block_rows=8,
+            index_fp4=True,
+            index_layout="preshuffle",
         )
     runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
     runner.forward_vars["logits"] = torch.zeros(128)
@@ -2906,7 +2910,10 @@ def test_a_v41_attention_reads_its_pass_s_indptrs_whatever_was_timed_before_it(
 
         def indptrs(self, step):
             for p, _ in (step.indptr_buffers or self.indptr_buffers).values():
-                p[0], p[1 : step.width + 1] = 0, (step.batch_ids >= 0).cumsum(0) * 2
+                p[0], p[1 : step.running_tokens + 1] = (
+                    0,
+                    (step.batch_ids >= 0).cumsum(0) * 2,
+                )
 
     taken, held = {}, {"cache": Cache()}
 
@@ -3113,7 +3120,10 @@ def test_a_packed_fp4_activation_and_weight_are_built_at_their_shape_and_stride(
         "stride": [4, 1],
         "role": "activation",
     }
-    built = [stub._tensor(x, None, False), stub._weight(x | {"role": "weight"}, 0, 2)]
+    built = [
+        stub._tensor(x, None, False),
+        stub._weight(x | {"role": "weight"}, 0, 2, "x"),
+    ]
 
     for t in built:
         assert t.dtype == torch.float4_e2m1fn_x2
@@ -3128,7 +3138,7 @@ def test_each_weight_a_leaf_cycles_starts_where_the_allocator_starts_a_block():
     stub = ops.Stub(_Runner(), 1)
     w = {"shape": [3], "dtype": F32, "stride": [1], "role": "weight"}
 
-    built = [stub._weight(w, c, 3) for c in range(3)]
+    built = [stub._weight(w, c, 3, "hc_scale") for c in range(3)]
 
     starts = [t.data_ptr() - built[0].data_ptr() for t in built]
     assert [s % 512 for s in starts] == [0, 0, 0] and starts[1] > 0
@@ -3146,10 +3156,10 @@ def test_a_weight_captured_preshuffled_is_built_marked_and_only_that_one():
     [(op, _)] = ops.leaves(_graph(moe)["region"]).values()
     stub = ops.Stub(_Runner(), 1)
 
-    copies = [stub._weight(op["args"]["w1"], c, 2) for c in (0, 1)]
+    copies = [stub._weight(op["args"]["w1"], c, 2, "w1") for c in (0, 1)]
 
     assert all(t.is_shuffled is True for t in copies)
-    assert not hasattr(stub._weight(op["args"]["w2"], 0, 2), "is_shuffled")
+    assert not hasattr(stub._weight(op["args"]["w2"], 0, 2, "w2"), "is_shuffled")
 
 
 def test_a_call_that_fills_a_graph_alone_cycles_no_second_weight():
@@ -3963,8 +3973,8 @@ def _forced(monkeypatch, end=lambda: None):
         "target_logits_indices": torch.arange(10),
         "num_spec_steps": 5,
         "cu_num_draft_tokens": torch.tensor([5, 10], dtype=torch.int32),
-        "draft_probs": None,
-        "target_probs": torch.ones(10, 8),
+        "ratio": None,
+        "target_logits": torch.ones(10, 8),
         "bonus_token_ids": torch.zeros(2, 1, dtype=torch.int32),
         "bonus_logits_indices": torch.tensor([5, 11]),
         "synthetic_acceptance_rates": (1.0, 1.0, 0.0, 0.0, 0.0),

@@ -402,12 +402,16 @@ def test_the_server_wraps_its_tokenizer_after_the_delta_reuse_probe():
     """The probe decodes at startup, before the run has traffic; a charged
     decode there waits on a clock that no request will advance."""
     tree = ast.parse((REPO / "atom/entrypoints/openai/api_server.py").read_text())
-    main = next(
-        f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "main"
-    )
-    body = [ast.unparse(s) for s in main.body]
 
-    def first(text):
-        return next(i for i, s in enumerate(body) if text in s)
+    def body(name):
+        f = next(
+            f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == name
+        )
+        return [ast.unparse(s) for s in f.body]
 
-    assert first("enable_delta_reuse(") < first("compass_run.tokenizer(")
+    def first(text, name="main"):
+        return next(i for i, s in enumerate(body(name)) if text in s)
+
+    # The probe runs where the stream dispatcher is set up.
+    assert first("enable_delta_reuse(", "_setup_stream_dispatch") >= 0
+    assert first("_setup_stream_dispatch(") < first("compass_run.tokenizer(")

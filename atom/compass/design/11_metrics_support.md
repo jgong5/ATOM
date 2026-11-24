@@ -545,8 +545,14 @@ and an empty batch, as on a real run, though `_group_step_seconds` prices a dumm
 `StepCost.target_seconds` is the target forward's device seconds as the cost backend
 prices the rank's batch, with no host time, no draft and no DP group maximum, which
 `_group_step_seconds` folds into the step's `predicted_s`. CI's panel reads the same span,
-a forward that excludes input preparation, sampling and drafting
-(`GPUForwardMetrics.steps`' description).
+a forward that excludes input preparation, sampling and drafting, and includes its
+stream's communication waits (`GPUForwardMetrics.steps`' description). *Revised
+(2026-11-18, #3720 c=64):* under DP with a `HostDeviceRecurrence`, each rank's
+observation adds its lockstep wait, from its own target end to the group's last, which
+the `all_reduce(MAX)` that already ends every rank's target at the group's latest
+reports: a rank prefilling a short chunk beside a long one times the long one, as its
+device events do. Before it, cell A's c=64 runs read the prefill request series' p50
+-22.5% and its mean -10.5% against the real run's, c=32's p50 -21.4%.
 `atom:prefill_request_gpu_forward_seconds` sums it over a request's prefill chunks, as
 `GPUForwardMetrics.poll` does. TP rank 0 observes it through ATOM's
 `GPUForwardMetrics.measure` and `poll` inside its `forward`, before it replies (#3586; D74,
@@ -555,9 +561,10 @@ publishes no sum, since `GPUForwardMetrics` publishes a request's sum only once 
 timed every chunk from the first to the final in order. A duration on the simulated clock
 (class D, D77), which the report labels predicted (`19` D115); the telemetry row above
 stands. Rejected: `predicted_s`, a step's whole charge, which holds host time and the draft
-the panel excludes; the DP group's largest `target_seconds`, to stand in for the wait on
-slower ranks a real rank's events include: that wait runs from the rank's own launch to
-the slowest rank's arrival at each collective, which no price states. `compass run` starts
+the panel excludes; the DP group's largest `target_seconds` alone, which drops each
+rank's own host-paced start (the wait runs from the rank's own launch to the slowest
+rank's arrival at each collective; the revision above reads both ends off the run's own
+recurrence, whose last collective it takes as the forward's). `compass run` starts
 a simulated server with
 `ATOM_ENABLE_METRICS_DEVICE_TIMER=1` unless its environment sets the variable, as CI's
 `pd_server_atom.sh` starts both sides; no readings or law key holds it
@@ -903,7 +910,7 @@ and any change to `export_report.py` or the page it renders.
 | D72 | Counters and gauges are valid by construction. **The metrics push and refresh are timers on simulated time, marked daemon**, so they never keep a run alive (`01` D3, D5); `_last_refresh` stamps simulated time. The traffic LP's scrape is not built: its render would read other LPs' files off the channels. | 2026-09-19; revised 2026-10-02; the scrape 2026-11-16 ([#3584](https://github.com/jgong5/ATOM/issues/3584)) |
 | D73 | Histograms observe durations, so the clock audit extends from clock *reads* to observation *arguments*. Ask for classic histograms and for instrumentation that is handed a duration rather than computing one inline. They landed classic, handed `time_shim` durations. | 2026-09-19; how they landed 2026-11-16 (#3584) |
 | D74 | First: **sample once per engine step**, transport on D72's push cadence, OpenMetrics with virtual timestamps backfilled into a TSDB, the real run treated identically. **Revised:** each engine member and frontend LP samples its own processes' instruments on its own clock at ATOM's metrics push or refresh, of an engine's workers TP rank 0 alone observing, inside its `forward`, the families of its class table, the ones `export_report.py` queries, with CI's scrape labels, each request-context series once; it writes `metrics-<lp>.om.gz` (OpenMetrics, `ALLOWUTF8`, gzip) whole at its last hand-in, before `lp-<lp>.json`, on the LP clock from 0 with no epoch; no sampler on a real run. Each sampler samples once more at its last hand-in, at its LP's last finite clock, replacing a point at that instant. | 2026-09-19; revised 2026-11-16 (#3584); the final sample 2026-11-17 ([#3611](https://github.com/jgong5/ATOM/issues/3611)) |
-| D75 | Four classes of invalid metric, refused rather than reported. Emission never advances the virtual clock, and that is asserted. A simulated run's GPU forward histograms observe the `StepCost.target_seconds` of each step `GPUForwardMetrics.measure` times, a simulated duration, not telemetry. | 2026-09-19; the GPU forward histograms 2026-11-16 (#3584) |
+| D75 | Four classes of invalid metric, refused rather than reported. Emission never advances the virtual clock, and that is asserted. A simulated run's GPU forward histograms observe the `StepCost.target_seconds` of each step `GPUForwardMetrics.measure` times, under DP with a host recurrence plus the rank's lockstep wait for the group's last target end, a simulated duration, not telemetry. | 2026-09-19; the GPU forward histograms 2026-11-16 (#3584); the lockstep wait 2026-11-18 (#3720) |
 | D76 | The gauges supply `08`'s counting invariants for free; a histogram's `_count` is one too, and `_sum/_count` is a mean comparable at the noise floor. A simulated run's GPU forward `_count`, TP rank 0's alone, compares with a real run's `tp_rank="0"` series. | 2026-09-19; the GPU forward `_count` 2026-11-16 (#3584) |
 | D77 | Classify every metric by the **provenance of its value** (state, event tally, duration, rate, timestamp, external), not by its Prometheus type. Declare the class at construction; an unclassified metric refuses to export under simulation. The backfill writer uses the OpenMetrics serializer and the `timestamp=` argument that `add_metric` already provides. The first build declares the class where a simulated run exports, in its sampler's class table, which writes no family it lacks, and the report names each one it queries that is missing. | 2026-09-19; the first build 2026-11-16 (#3584) |
 

@@ -211,7 +211,9 @@ def test_each_crs005_side_reads_the_readings_its_law_file_carries(
         monkeypatch.delenv(name)
     atom_args = side_args(tmp_path, monkeypatch, side)
 
-    # The store holds the platform's readings and no memory readings.
-    assert side_checked(pair(tmp_path), side, atom_args) == 1
+    # The store holds the platform's readings and no memory readings. The
+    # prefill side, a producer, schedules no decode rung its law could lack.
+    lacking = [COVERAGE] if side == "decode" else []
+    assert side_checked(pair(tmp_path), side, atom_args) == (1 if lacking else 0)
 
-    assert lacked(capsys.readouterr().out) == [COVERAGE]
+    assert lacked(capsys.readouterr().out) == lacking

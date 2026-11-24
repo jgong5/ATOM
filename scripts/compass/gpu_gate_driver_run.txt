@@ -13,6 +13,7 @@ tests/compass/test_image_scenario.py
 tests/compass/test_lmcache_mp_engine.py
 tests/compass/test_lmcache_mp_scenario.py
 tests/compass/test_meta_build_device.py
+tests/compass/test_mooncake_store_scenario.py
 tests/compass/test_multinode_dp.py
 tests/compass/test_pd_dp.py
 tests/compass/test_pd_prefill_pp.py

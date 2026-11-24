@@ -109,10 +109,11 @@ def test_gdn_chunk_indices_follow_the_host_lengths(monkeypatch):
         cu_seqlens_q=torch.tensor(stale_cu, dtype=torch.int32),
         num_cached_tokens=None,
     )
+    # The attention metadata `stage_prefill` staged; GDN's own finishes it.
     monkeypatch.setattr(
         aiter_attention.AiterAttentionMetadataBuilder,
-        "prepare_prefill",
-        lambda self, b, rbs, rts: (attn_metadata, None),
+        "finish_prefill",
+        lambda self, b, md, rbs, rts: None,
     )
     # The causal-conv1d program map is a device kernel's; not this test's.
     monkeypatch.setattr(
@@ -125,6 +126,7 @@ def test_gdn_chunk_indices_follow_the_host_lengths(monkeypatch):
             config=SimpleNamespace(hf_config=SimpleNamespace(linear_conv_kernel_dim=4)),
         ),
         use_spec_decode=False,
+        _has_state_fork=False,
         replayssm=False,
         device="cpu",
         prepare_state_indices=lambda batch, with_spec: None,
@@ -141,8 +143,8 @@ def test_gdn_chunk_indices_follow_the_host_lengths(monkeypatch):
         total_tokens_num=26,
     )
 
-    md, _ = builder.prepare_prefill(batch, 3, 26)
-    cu = md.gdn_metadata.non_spec_query_start_loc
+    builder.finish_prefill(batch, attn_metadata, 3, 26)
+    cu = attn_metadata.gdn_metadata.non_spec_query_start_loc
     var["cu_seqlens_q"].np[:4] = 0  # the next step reuses the buffer
     indices = index.prepare_chunk_indices(cu, 16)
 

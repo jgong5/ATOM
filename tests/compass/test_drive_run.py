@@ -701,9 +701,9 @@ def test_coverage_of_a_v4_pro_dpa_run_reads_graphs_at_the_widths_its_ranks_run(
 
 #: Each rank's lines, each its rows, the rows its MoE gathers and whether it is
 #: a dummy run. At step 0 each of two DP ranks prefills 9000 tokens, past the
-#: 8192-token bar the test sets, so the group splits it: at the token midpoint,
-#: or on a request boundary, each rank its own way round. At step 1 rank 1 runs
-#: a dummy, which cannot split, so rank 0 runs whole.
+#: 8192-token bar the test sets, so the group splits it, each rank at its token
+#: midpoint. At step 1 rank 1 runs a dummy, which cannot split, so rank 0 runs
+#: whole.
 FIRST, SECOND = [6000, 6000, False], [3000, 3000, False]
 GROUP = [
     [([FIRST, SECOND], 18000, False), ([[9000, 9000, False]], 9001, False)],
@@ -713,18 +713,13 @@ GROUP = [
 ALONE = [[([FIRST, SECOND], None, False)]]
 
 
-@pytest.mark.parametrize(
-    "token_split,ranks",
-    [("1", GROUP), ("0", GROUP), ("1", ALONE)],
-    ids=["midpoint", "request", "one-rank"],
-)
+@pytest.mark.parametrize("ranks", [GROUP, ALONE], ids=["group", "one-rank"])
 def test_coverage_under_tbo_reads_a_step_its_dp_group_split_as_its_micro_batches(
-    tmp_path, monkeypatch, token_split, ranks
+    tmp_path, monkeypatch, ranks
 ):
     # The store holds the graphs `trace ops --population` traces from the
     # record, all priced.
     monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
-    monkeypatch.setenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", token_split)
     directory = tmp_path / "record"
     (directory / serve.STEPS).mkdir(parents=True)
     (directory / serve.RUN_JSON).write_text(json.dumps(IDENTITY))

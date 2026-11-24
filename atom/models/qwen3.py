@@ -364,7 +364,7 @@ class Qwen3ForCausalLM(nn.Module):
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
             if self.hf_config.tie_word_embeddings:
-                self.lm_head.weight.data = self.model.embed_tokens.weight.data
+                self.lm_head.weight = self.model.embed_tokens.weight
         else:
             self.lm_head = PPMissingLayer()
 

@@ -456,7 +456,8 @@ compass measure device --gpu G... [--pp] --store S --out D     [GPU, every card 
     -> one probe record per node
 compass fit device     RECORD... --store S --out D   [no GPU]
     -> one platform_readings entry per (device, stack, PTL, torch)
-compass fit device     --device DATASHEET --assume-from DEVICE --ptl P --store S --out D
+compass fit device     --device DATASHEET --assume-from DEVICE --ptl P [--stack STACK] \
+                       --store S --out D
     -> one platform_readings entry, every field assumed
 ```
 
@@ -478,8 +479,9 @@ are immutable (`07` D41 rule 4). A node probed after the fit adds a record and l
 entry as it is.
 
 **A device never run gets an assumed entry.** `fit device --assume-from DEVICE` takes the
-one readings entry the store holds for DEVICE at `--ptl`, divides it by DEVICE's
-datasheet, and states the ratios for the device `--device` names, every field assumed:
+one readings entry the store holds for DEVICE at `--ptl`, and at `--stack` when given,
+divides it by DEVICE's datasheet, and states the ratios for the device `--device` names,
+every field assumed:
 each derate, the bandwidth curve over DEVICE's bandwidth, and the kernel floor and the
 link and carrier terms as they are; a compute format the source states no rate for is
 left out, so the composition leaves its peak out (D25 rule 2). This is the rule `compass

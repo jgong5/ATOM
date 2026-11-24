@@ -638,7 +638,7 @@ def test_get_num_blocks_refuses_and_the_keys_its_caller_reads_are_named():
         and getattr(n.func.value, "id", None) == "block_info"
     }
     assert required == {"num_kvcache_blocks", "state_runtime"}
-    assert optional == {"pool_entries", "pool_entries_per_req"}
+    assert optional == {"pool_entries", "pool_entry_bytes", "pool_entries_per_req"}
     answered = next(
         n
         for n in ast.walk(_classes(ATOM_RUNNER)["ModelRunner"])
@@ -650,7 +650,7 @@ def test_get_num_blocks_refuses_and_the_keys_its_caller_reads_are_named():
         if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict)
     )
     assert required | optional == returned
-    # The four keys are now forwarded from the base rather than described in a
+    # The keys are now forwarded from the base rather than described in a
     # refusal, so what is left to check on this side is that the one path that
     # answers nothing still names what would make it answer.
     with pytest.raises(RunnerRefusal, match="install_device_readings"):
@@ -700,13 +700,13 @@ def test_the_fourth_value_is_a_two_key_wire_dict_and_not_an_opaque_object():
     assert "assert num_blocks > 0" in block_manager
 
 
-def test_forward_refuses_and_its_reply_is_one_object_read_for_nine_attributes():
+def test_forward_refuses_and_its_reply_is_one_object_read_by_attribute():
     """What a successor owes: one value, never unpacked, read by attribute.
 
     Four sites broadcast it, two per file. Three use the reply and the fourth
     discards it -- `PPEngineCoreProc._pp_head_step`, the head's launch, whose
-    tokens come back over the transport instead. The nine attribute names are
-    recovered from the consumers rather than listed, so a tenth read, or a
+    tokens come back over the transport instead. The attribute names are
+    recovered from the consumers rather than listed, so a new read, or a
     rename, fails here.
     """
     assert collections.Counter(s.file for s in SITES["forward"]) == {
@@ -740,6 +740,7 @@ def test_forward_refuses_and_its_reply_is_one_object_read_for_nine_attributes():
         "num_rejected",
         "num_bonus",
         "dspark_ell",
+        "constraint_errors",
     }
     with pytest.raises(RunnerRefusal, match="produces output"):
         Runner().forward(object())
@@ -751,8 +752,8 @@ def test_the_pp_reply_is_read_in_the_head_and_not_at_the_last_stages_call():
     The `forward` call in `PPEngineCoreProc._downstream_busy_loop` is in the
     **last** stage. Nothing there reads the reply: the two nearby `.req_ids`
     reads are on `batch`, and `fwd_out` is handed whole to `send_completion`. The
-    `.req_ids` read is one ZMQ hop later, in the head's `_pp_head_step`, on
-    what `recv_completion()` returned. So the reply must survive a pickle round
+    `.req_ids` read is one ZMQ hop later, in the head's
+    `_collect_pp_completions`, on what `recv_completion()` returned. So the reply must survive a pickle round
     trip, which reading only the call site would never say.
     """
     tree = ast.parse((ENGINE / "pp_engine_core.py").read_text())
@@ -766,7 +767,7 @@ def test_the_pp_reply_is_read_in_the_head_and_not_at_the_last_stages_call():
                 and getattr(n.value, "id", None) == "fwd_out"
             ):
                 enclosing.setdefault(n.attr, set()).add(fn.name)
-    assert enclosing == {"req_ids": {"_pp_head_step"}}
+    assert enclosing == {"req_ids": {"_collect_pp_completions"}}
 
     downstream = next(
         n
@@ -990,7 +991,7 @@ def test_the_names_no_caller_waits_for_and_what_replying_costs():
         "poll_forward_metrics",
         "process_kvconnector_output",
         "release_multimodal_requests",
-        "release_structured_requests",
+        "release_constraints",
     }
     bodies = {
         n.name: n
@@ -1001,7 +1002,7 @@ def test_the_names_no_caller_waits_for_and_what_replying_costs():
         "poll_forward_metrics",
         "process_kvconnector_output",
         "release_multimodal_requests",
-        "release_structured_requests",
+        "release_constraints",
     ):
         returns = [n for n in ast.walk(bodies[name]) if isinstance(n, ast.Return)]
         assert not [n for n in returns if n.value], name

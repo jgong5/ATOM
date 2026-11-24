@@ -59,13 +59,17 @@ a table, the placement's, a router's
 top-k expert ids, drawn uniformly on every copy, past top-k the shared
 experts' ids ATOM fuses into them, at a point that states its real MoE
 rows (``R=``) each row past them routed to no expert as ATOM routes a pad
-row, one rank's batch holding its real rows alone (`_route`), the
+row, one rank's batch holding its real rows alone (`_route`), the count
+of rows MORI's dispatch hands aiter's fused MoE, every row the leaf holds
+(`RECEIVED`), the
 `NM_OUTPUT` slot at
 one KV split, a view at the start of twice its span, and aiter's top-k
 scratch (`TOPK_WORKSPACE`), one byte in the graph, built as aiter builds it
 on the device for the call's rows, row stride, k and path
 (`_topk_workspace`); a weight is random at its
-shape, dtype and stride, one tensor per occurrence of the leaf in the step;
+shape, dtype and stride, one tensor per occurrence of the leaf in the step,
+but an expert mask its MoE layers' own, ones on the rank's experts
+(`EXPERT_MASK`);
 a metadata tensor is a
 view of ATOM's live metadata (`meta`), whose name the point records, or of
 the token ids ATOM prepared (`TOKEN_IDS`), or of the field of DeepSeek-V4's
@@ -319,7 +323,7 @@ COPIES = ("aten.copy_.", "aten.copy.", "aten._to_copy.", "aten.to.")
 #: times, a count below, the copies a graph reads, what a capture waits for or
 #: what a replay follows
 #: change.
-PROTOCOL = 42
+PROTOCOL = 44
 WARMUPS = 3
 REPEATS = 20
 #: Calls a graph holds, and so the copies it cycles over at most. One count for
@@ -358,6 +362,18 @@ CLEAR_S, CLEAR_SLACK = 3.0, 256 << 20
 #: aiter's Mega-MHC launcher aborts the process on an `hc_scale` that is not
 #: 16-byte aligned, as three in four three-float slices packed back to back are.
 WEIGHT_ALIGN = 512
+#: The weight slot in which ATOM passes aiter's MoE operators their layer's
+#: expert mask under expert parallelism: ones on the rank's own experts, which
+#: aiter's sorting reads to drop each route to another rank's
+#: (`get_topk_valid_mask`). Drawn as another integer weight is, all zero, it
+#: leaves no route to compute; a leaf takes the layer's own (`Stub._mask`).
+EXPERT_MASK = "expert_mask"
+#: The integer activation, by operator and slot, in which MORI's dispatch hands
+#: aiter's fused MoE how many of its rows it received: aiter sorts those rows
+#: alone. Drawn as another integer activation is, zero, it leaves no row to
+#: compute; a copy takes every row its expert ids hold (`routed_rows`), a pad
+#: row among them routed to no expert (`Stub._route`).
+RECEIVED = {("aiter.fused_moe_.default", "num_local_tokens")}
 #: The release waits since a point last recorded them: seconds, and how many
 #: ended at `CLEAR_S`.
 _waited: Counter = Counter()
@@ -509,6 +525,9 @@ _TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
 # aiter's other decode top-ks: FlyDSL's multi-CTA one (gfx950's) and HIP's
 _MULTI = "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode"
 _PICK = "aiter._top_k_per_row_decode.default"
+# aiter's decode top-k as its routed operator, which picks its kernel itself:
+# what DeepSeek-V4.1's scorer calls since upstream b7b5ec3f2
+_ROUTED = "aiter_routed.top_k_per_row_decode.default"
 _INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
 _SCAN = f"{_INDPTRS}:_launch_indptr_scan"
 _INDICES = f"{_INDPTRS}:_launch_indices"
@@ -538,6 +557,7 @@ V41_NAMES = {
     (_MULTI, "row_starts", "packed"): _OFFSETS,
     (_MULTI, "seq_lens"): "step.visible.{ratio}",
     (_PICK, "seqLens"): "step.visible.{ratio}",
+    (_ROUTED, "seqLens"): "step.visible.{ratio}",
     (_FUSED, "plan_gpu"): _PLAN,
     ("atom.model_ops.deepseek_v41.index_write:write_index_rows", "plan"): _PLAN,
     (_INDICES, "pptr"): f"{_CACHE}.0",
@@ -615,6 +635,7 @@ PAGE_WIDE = {
     _TOPK: ("row_ends", "logits", "stride0"),
     _MULTI: ("seq_lens", "logits", "stride0"),
     _PICK: ("seqLens", "logits", "stride0"),
+    _ROUTED: ("seqLens", "logits", "stride0"),
     _MAXIMA: ("visible", "logits", "maxima", "blocks"),
     f"{_V41}.unit_table:unit_table": ("block_tables", "block_tables"),
 }
@@ -664,6 +685,7 @@ _WRITTEN = {
     (_MULTI, "row_starts"): "context",
     (_MULTI, "seq_lens"): "context",
     (_PICK, "seqLens"): "context",
+    (_ROUTED, "seqLens"): "context",
     (_MAXIMA, "packed.0"): "offsets",
     (_MAXIMA, "packed.1"): "block_offsets",
     **{
@@ -1238,6 +1260,14 @@ class Stub:
         drafter = getattr(runner, "drafter", None)
         self.moe = _moe(runner.model)
         self.draft_moe = _moe(drafter.model) if drafter else []
+        # the expert masks the model's and its drafter's MoE layers hold under
+        # expert parallelism, which ATOM built for this rank (`_mask`)
+        self.masks = [
+            m.expert_mask
+            for model in [runner.model, *([drafter.model] if drafter else [])]
+            for m in model.modules()
+            if torch.is_tensor(getattr(m, EXPERT_MASK, None))
+        ]
         # ATOM's top-k weights and ids buffers when its MoE layers fuse shared
         # experts into top-k (`init_aiter_topK_meta_data`), live metadata a
         # leaf may read: past top-k, the shared experts' ids, under EP one
@@ -1362,7 +1392,7 @@ class Stub:
         for rows, (step, _) in passes.items():
             if hasattr(step, "request_floors"):
                 split = np.maximum(step.request_positions, step.request_cached_until)
-                self.reach[rows or step.width] = split - step.request_floors
+                self.reach[rows or step.running_tokens] = split - step.request_floors
         # DeepSeek-V4's persistent HCA decode workspace, one per device: a slot
         # of `HCA_DECODE` named as one of its fields is a view of that field
         hca = sys.modules.get("atom.model_ops.v4_kernels.hca_persist")
@@ -1451,7 +1481,8 @@ class Stub:
                                 "cannot tell which ratio's compress plan holds its "
                                 f"{spec['shape'][-1]} rows: trace its shape again"
                             )
-                        top_k = op["op"] in (_TOPK, _MULTI, _PICK) and not index
+                        top_k = op["op"] in (_TOPK, _MULTI, _PICK, _ROUTED)
+                        top_k = top_k and not index
                         bound = V41_NAMES.get(key) == "step.visible.{ratio}"
                         if top_k and ratio is None and untold and bound:
                             raise ValueError(  # a row bound ATOM stages, its ratio's
@@ -1678,8 +1709,9 @@ class Stub:
             dp = self.alone or self.runner.config.parallel_config.data_parallel_size
             moe = shape.gathered or dp * shape.tokens * (drafts + 1)
             self.real = shape.real, dp, moe
-            if dp == 1:  # one rank's batch holds its real rows, padded to the rung
-                batch = shape._replace(tokens=shape.real // (drafts + 1))
+            if dp == 1:  # one rank's batch holds its real rows, padded to the
+                # rung: as few rows as hold them, each verifying its drafts
+                batch = shape._replace(tokens=-(-shape.real // (drafts + 1)))
         rows = point_rows(batch, context, pool, rule.block_size, bool(uncut), drafts)
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
@@ -2164,16 +2196,24 @@ class Stub:
                 return out.copy_(self.built["rows"][at].view(out.shape))
             if isinstance(value, dict) and self._routed(value, sig, path, drafted):
                 return self._route(value, c, drafted)
+            received = (op["op"], path) in RECEIVED and isinstance(value, dict)
+            if received and value.get("role") == "activation":
+                if (rows := routed_rows(op)) is None:
+                    raise ValueError(f"{op['op']} holds no expert ids to count")
+                return _random(value, self.runner.device).fill_(rows)
             if isinstance(value, dict) and value.get("role") == "weight":
                 # each cache-sized copy takes a weight of its own, as it does
                 # activations; a gathered table's copies share one
                 count = max(op["occurrences"], self.cold_copies.get(sig, 1))
-                return self._weight(value, c, 1 if path == table else count)
+                return self._weight(value, c, 1 if path == table else count, path)
             if isinstance(value, dict) and "object" in value:
                 got = rebuild_object(value["object"], build(path, value["state"], None))
                 cache = getattr(snap.attn_metadata, "cache", None)
                 geometry = getattr(cache, "geometry", None)
-                if value["object"] == RING and hasattr(geometry, "window_bytes"):
+                # A V4.1 pool places its BF16 window rings after its pages; an
+                # FP8 window's ring is on planes of its own, whatever the pages.
+                placed = hasattr(geometry, "window") and not geometry.window_fp8
+                if value["object"] == RING and placed:
                     at = _captured(geometry, op.get("rings", ()))
                     return _ring(geometry, cache.num_pages, got, at)
                 return got
@@ -2382,7 +2422,7 @@ class Stub:
             if isinstance(value, dict) and value.get("device") == "cpu":
                 return old  # the copy's own, built on the host
             if isinstance(value, dict) and value.get("role") == "weight":
-                return self._weight(value, c, op["occurrences"])
+                return self._weight(value, c, op["occurrences"], path)
             if isinstance(value, dict) and self._routed(value, sig, path, drafted):
                 return self._route(value, c, drafted)
             return old
@@ -2400,11 +2440,14 @@ class Stub:
             return _clone(meta[1]) if fresh and role != "kv" else meta[1]
         raise ValueError(f"a {role} tensor argument {_text(spec)} is not built")
 
-    def _weight(self, spec, c, count):
+    def _weight(self, spec, c, count, path):
         """Weight `c mod count` of `spec`, random: the `count` of a leaf are
         built once, as slices of one tensor each starting on a `WEIGHT_ALIGN`
         boundary, each marked preshuffled when ATOM marked the captured one, so
-        the operator picks the kernel it picked."""
+        the operator picks the kernel it picked. At the `EXPERT_MASK` slot
+        `path`, the MoE layer's own mask (`_mask`)."""
+        if path == EXPERT_MASK:
+            return self._mask(spec)
         if (_spec_of(spec), 0) not in self.built:
             n = _span(spec["shape"], spec["stride"])
             dtype, device = _dtype(spec["dtype"]), self.runner.device
@@ -2419,6 +2462,18 @@ class Stub:
                     view.is_shuffled = True
                 self.built[_spec_of(spec), i] = view
         return self.built[_spec_of(spec), c % count]
+
+    def _mask(self, spec):
+        """The expert mask of `spec`'s shape and dtype that the model's or its
+        drafter's MoE layers hold, as ATOM built it for this rank: ones on the
+        experts the rank owns; refused by name where no MoE layer holds one."""
+        want = tuple(spec["shape"]), _dtype(spec["dtype"])
+        for mask in self.masks:
+            if (tuple(mask.shape), mask.dtype) == want:
+                return mask.to(self.runner.device)
+        raise ValueError(
+            f"no MoE layer of the model holds an expert mask of {_text(spec)}"
+        )
 
 
 def _alive(device) -> None:
@@ -3034,12 +3089,12 @@ def _widest(shape, stride) -> int:
 def _layers(geometry, captured) -> dict:
     """By page count, the layer of DeepSeek-V4.1's pool `geometry` whose window
     ring a pool of that many pages starts where `captured` (`RING`) does, and
-    its build (`V41PoolGeometry.window`, or `window_bytes` in bytes)."""
+    its build (`V41PoolGeometry.window`)."""
     found = {}
-    for build in (geometry.window, geometry.window_bytes)[: 1 + geometry.window_fp8]:
+    for build in (geometry.window,):
         first = build(0, 0)
         if dataclasses.replace(first, ring_start=captured.ring_start) != captured:
-            continue  # counted in the other unit
+            continue  # not this pool's ring
         # a layer's ring starts this far past the last's, on any pool
         step = build(min(1, geometry.layers - 1), 0).ring_start - first.ring_start
         for layer in range(geometry.layers):
@@ -4981,5 +5036,16 @@ def _child(fn, *args):
     """`fn(*args)` in a spawned process of its own: the device is free again
     at its end, and a capture's process-wide patches end with it."""
     spawn = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(1, mp_context=spawn) as child:
-        return child.submit(fn, *args).result()
+    # A script read on stdin (`python3 -`, as deploy.sh builds its run file) names itself `<stdin>`, a file spawn
+    # cannot re-import in the child (BrokenProcessPool); `fn` is imported by name, so the child needs no main module.
+    main = sys.modules["__main__"]
+    path = getattr(main, "__file__", None)
+    hidden = path is not None and not os.path.exists(path)
+    if hidden:
+        del main.__file__
+    try:
+        with ProcessPoolExecutor(1, mp_context=spawn) as child:
+            return child.submit(fn, *args).result()
+    finally:
+        if hidden:
+            main.__file__ = path

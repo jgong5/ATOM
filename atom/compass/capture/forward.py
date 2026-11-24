@@ -149,6 +149,9 @@ V41_TOPKS = (
     "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode",
     "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
     "aiter._top_k_per_row_decode.default",
+    # aiter's routed operator, which picks its kernel itself: what V4.1's
+    # scorer calls since upstream b7b5ec3f2
+    "aiter_routed.top_k_per_row_decode.default",
 )
 #: DeepSeek-V4.1's RoPE, which its index keys take at their ratio's compress
 #: plan's positions: with no drafter both ratios' plans hold as many rows.
@@ -1253,10 +1256,11 @@ def _mono(recorder, unpatched):
     """
     from torch.utils._python_dispatch import _disable_current_modes
 
+    from atom.distributed import group_agreement
     from atom.mono.runtime import consensus, lifecycle, route, uncached, widths
     from atom.mono.runtime.compile import compile_kernels, scratch_bytes
 
-    agree, init = consensus.tp_agree, route.LazyRunner.__init__
+    agree, init = group_agreement.group_agree, route.LazyRunner.__init__
     ready, prepare = route.LazyRunner.ready, widths.WidthBuilds.prepare
     refused = {}  # each refusal, by its runner and width (None for a bind)
 
@@ -1353,8 +1357,11 @@ def _mono(recorder, unpatched):
         return held
 
     return (
-        (consensus, "tp_agree", host_agree),
-        (widths, "tp_agree", host_agree),
+        # Upstream's `group_agree` (was `consensus.tp_agree`), where the mono
+        # runtime binds it and where a caller imports it at its call.
+        (consensus, "group_agree", host_agree),
+        (widths, "group_agree", host_agree),
+        (group_agreement, "group_agree", host_agree),
         (lifecycle, "PeerBuffer", driverless.PeerBuffer),
         (route.LazyRunner, "__init__", lazy),
         (route.LazyRunner, "ready", turned_away),
@@ -1519,12 +1526,24 @@ def _build_runner(config, fake_mode):
             total = torch.cuda.get_device_properties(0).total_memory
             return DeviceMemoryReadings(total, total, 0, 0)
 
+    from atom.utils import packed_h2d
+
     # A fake tensor has no address: the alias check sees each buffer empty.
-    # Built in the inference mode its steps run in, so their views of its
-    # weights and buffers keep the keys of what they view.
+    # Nor host bytes: packed H2D (upstream's `packed_h2d.PackedCopy`) maps its
+    # pinned staging as numpy, so each group keeps the direct transport it
+    # falls back to on any device packing cannot serve. Built in the inference
+    # mode its steps run in, so their views of its weights and buffers keep
+    # the keys of what they view.
     with (
         fake_mode,
         patch.object(h2d, "_range", lambda t: (0, 0)),
+        patch.object(
+            packed_h2d.PackedCopy,
+            "create",
+            classmethod(
+                lambda cls, members, device: (None, "a capture packs no bytes")
+            ),
+        ),
         torch.inference_mode(),
     ):
         return _CapturedRunner(0, config)

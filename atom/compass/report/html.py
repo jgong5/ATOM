@@ -176,7 +176,9 @@ def _run(run: Path, meta: dict) -> str:
         rows.append(("machine", _spec(run_file)))
     each = sides(run)
     if len(each) > 1:
-        rows.append(("deployment", f"1P1D, KV link {meta.get('kv_link')}"))
+        n = collections.Counter(s.name.rstrip("0123456789") for s in each)
+        shape = f"{n['prefill']}P{n['decode']}D"
+        rows.append(("deployment", f"{shape}, KV link {meta.get('kv_link')}"))
         rows.append(("router", " ".join(meta.get("router") or ["not stated"])))
     else:
         rows.append(("deployment", "one instance"))
@@ -312,6 +314,27 @@ def _split(run: Path) -> str:
             f", the decode side's joined to it at {high:.4f} s, its bounds"
             f" {low:.4f} s to {high:.4f} s"
         )
+    for node, joined in made.get("node_offsets_s", {}).items():
+        if not joined:
+            continue
+        low, high = (
+            "none" if b is None else f"{b:.4f} s"
+            for b in joined["bounds_s"] or (None, None)
+        )
+        if joined.get("source") == "measured":
+            least, most = joined["measured_s"]
+            clock += (
+                f", {node}'s instances joined to it by {joined['samples']} measured"
+                f" offsets, {least:.4f} s to {most:.4f} s, each within"
+                f" {joined['error_s'] * 1e3:.3f} ms, which put"
+                f" {joined['order_violations']} requests out of order, its bounds"
+                f" {low} to {high}"
+            )
+        else:
+            clock += (
+                f", {node}'s instances joined to it at {joined['offset_s']:.4f} s,"
+                f" its bounds {low} to {high}"
+            )
     counted = _counted(made)
     text = (
         f"{len(requests)} requests split, on {clock}; {len(unsplit)} not. Below,"

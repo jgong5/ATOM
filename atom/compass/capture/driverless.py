@@ -256,9 +256,6 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
     flags = {
         # The default custom vocab gather needs the device communicator.
         "ATOM_USE_CUSTOM_ALL_GATHER": "0",
-        # The packed H2D transport reads `.numpy()` and device pointers off one
-        # staging block; direct copies each buffer with its own `copy_`.
-        "ATOM_H2D_BACKEND": "direct",
         # aiter's CU count, which it would otherwise ask rocminfo for.
         "CU_NUM": str(props.multi_processor_count),
         # aiter's check that every rank sets it all-reduces over a group whose
@@ -480,12 +477,19 @@ def group(tp: int, dp: int) -> dict:
     dist.all_gather_into_tensor, dist.broadcast = all_gather_into_tensor, broadcast
     dist.all_to_all_single = all_to_all_single
     dist.barrier = lambda *args, **kwargs: None  # no shape, nobody to wait for
+    # A rank-local verdict every rank of a CPU group takes alike (the agreed KV
+    # budget among them): every rank of a capture is this one, so the group's
+    # most is this rank's own value, with no all-reduce on a fake tensor.
+    from atom.distributed import group_agreement
+
+    group_agreement.group_max = lambda value, group: value
     return {
         "world_size": parallel_state.get_tp_group().world_size,
         "dp": parallel_state.get_dp_group().world_size,
         "declined": ["device_communicator", "message_queue_broadcaster", "barrier"],
         "functional": ["all_gather_into_tensor", "broadcast", "all_to_all_single"],
         "communicator_checked_only": ["fused_allreduce_rmsnorm_quant_per_group"],
+        "own_verdict": ["group_max"],
     }
 
 

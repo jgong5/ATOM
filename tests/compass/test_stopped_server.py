@@ -565,6 +565,7 @@ def test_an_engine_whose_input_thread_reads_shutdown_first_takes_the_released_re
         clock.name_endpoints(0, *addrs, "")
         engine = EngineCore.__new__(EngineCore)
         engine.label, engine.input_queue = "engine", queue.Queue()
+        engine._kv_progress_event = threading.Event()
         reader = threading.Thread(
             target=engine.process_input_sockets, args=addrs, daemon=True
         )
