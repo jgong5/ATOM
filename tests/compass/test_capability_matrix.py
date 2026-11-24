@@ -3,7 +3,8 @@
 
 Every scenario case's mark names a form `capabilities.FORMS` holds, at level 0
 or 1; every supported form has a level-0 case and every refused form's refusal
-test collects, unless its entry names the open issue that adds it.
+test collects, unless its entry names the open issue that adds it, which it
+names only until that case or test lands.
 `scripts/compass/capability_table.py` reads the marks off pytest's collection
 of `tests/compass`, run here as a reader runs it, and names each defect; the six
 slices each hold a level-1 case of their forms. A level-1 case's run file names
@@ -118,6 +119,19 @@ def test_the_table_names_each_defect_and_spares_a_form_an_open_issue_holds(
     got = table.findings(cases, ids, errors)
     assert len(got) == len(found), got
     assert all(g.startswith(f) for g, f in zip(got, found)), got
+
+
+def test_an_open_issue_spares_a_form_only_until_its_case_or_refusal_test_lands(
+    monkeypatch,
+):
+    vocabulary = {**VOCABULARY, "q": refused("refused", "t.py::test_q", issue="#2")}
+    monkeypatch.setattr(table.capabilities, "FORMS", vocabulary)
+    b1 = {"case": "t.py::test_b", "name": "b", "level": 1}
+    found = [f.split(";")[0] for f in table.findings([A0, b1], R + ["t.py::test_q"])]
+    assert found == [
+        "b: names #1 to add its first case, which it has",
+        "q: names #2 to add its refusal test, which it has",
+    ]
 
 
 def test_a_log_counts_only_a_case_it_reports_passed(monkeypatch):

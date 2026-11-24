@@ -185,8 +185,12 @@ def roofline_runs(tmp_path_factory):
 def test_two_trees_of_two_ranks_meet_every_scenario_check_under_the_step_roofline(
     roofline_runs,
 ):
-    """Every check but the hand-computed timeline, which only a constant
-    stub's run has."""
+    """The level-0 case's checks but two. The engine's hand-computed
+    timeline, `check_run`'s records, which it computes only for a constant
+    step stub, from that stub's prefill and decode costs. And that the worker
+    node's ranks served requests: the rank a request lands on follows the
+    in-flight load when it arrives, which turns on when earlier requests
+    finish, and so on the step cost."""
     run = roofline_runs[0]
     summary = json.loads((run["out"] / compass_run.SUMMARY_FILE).read_text())
     print(f"\n{summary['schedule']['seconds_by_method']}")
@@ -196,6 +200,10 @@ def test_two_trees_of_two_ranks_meet_every_scenario_check_under_the_step_rooflin
         [line for _, line in run["events"]],
     )
     assert not failed, "\n".join(failed)
+    assert run["handed_in"] == sorted(
+        compass_run.LP_FILE.format(n)
+        for n in ["frontend"] + [f"engine.dp{r}" for r in range(DP)]
+    )
 
 
 # --- without a driver ---------------------------------------------------------
