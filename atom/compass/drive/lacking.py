@@ -532,7 +532,7 @@ def calibration(out, atom_args, config, store=None, env=None) -> str:
     return _command(out, held["env"], env, planned, store, untraced)
 
 
-def deployment_calibration(out, sides: dict, fit, router, store=None) -> str:
+def deployment_calibration(out, sides: dict, fit, router, node: int, store=None) -> str:
     """The `calibrate.sh` command that records a 1P1D configuration, each
     record one `deploy.sh record` of both sides, its router on the arguments
     `router`, and fits the laws of each side `fit` names, into `out`,
@@ -541,19 +541,27 @@ def deployment_calibration(out, sides: dict, fit, router, store=None) -> str:
     Its records are a first-turn record of each decode rung the decode side
     schedules, whose prefill side the prefill side's laws are fitted on too,
     and, when it fits the prefill side, the trace runs, where `compass record
-    --trace` takes the prefill side. The prefill side takes the first cards,
-    the decode side the next. The variables both sides run under alike are
-    the command's, and each side's others its ``PREFILL_ENV`` or
-    ``DECODE_ENV``. Where `calibrate.sh` cannot take a side's arguments or
-    variables, or the sides serve two models, why."""
+    --trace` takes the prefill side. Both sides take cards of one node, which
+    holds `node`: the prefill side the first, the decode side the next. The
+    variables both sides run under alike are the command's, and each side's
+    others its ``PREFILL_ENV`` or ``DECODE_ENV``. A ValueError says why no
+    command serves: `calibrate.sh` cannot take a side's arguments or
+    variables, or the sides serve two models or take more cards than one node
+    holds, as a deployment across two nodes does."""
     for side, held in sides.items():
         if "refused" in held:
-            return f"no calibrate.sh command: the {side} side: {held['refused']}"
+            raise ValueError(f"the {side} side: {held['refused']}")
     prefill, decode = sides["prefill"], sides["decode"]
     if prefill["model"] != decode["model"]:
-        return (
-            "no calibrate.sh command: it takes one MODEL, and the prefill side "
+        raise ValueError(
+            "it takes one MODEL, and the prefill side "
             f"serves {prefill['model']} and the decode side {decode['model']}"
+        )
+    if (cards := prefill["gpus"] + decode["gpus"]) > node:
+        raise ValueError(
+            f"it records both sides on one node, and they take {cards} cards, "
+            f"where a node holds {node}; a deployment across two nodes is not one "
+            "command"
         )
     both = {k: v for k, v in prefill["env"].items() if decode["env"].get(k) == v}
     env, first, own = {"MODEL": prefill["model"]}, 0, {}
@@ -563,9 +571,9 @@ def deployment_calibration(out, sides: dict, fit, router, store=None) -> str:
         first += held["gpus"]
         own[side] = [f"{k}={v}" for k, v in held["env"].items() if k not in both]
         if spaced := [word for word in own[side] if len(word.split()) != 1]:
-            return (
-                f"no calibrate.sh command: deploy.sh splits {side.upper()}_ENV on "
-                f"whitespace, and {', '.join(spaced)} holds whitespace"
+            raise ValueError(
+                f"deploy.sh splits {side.upper()}_ENV on whitespace, and "
+                f"{', '.join(spaced)} holds whitespace"
             )
     for side in SIDES.values():
         env[f"{side.upper()}_ARGS"] = " ".join(sides[side]["server"])

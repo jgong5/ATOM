@@ -388,6 +388,10 @@ reads `its calibration, into <store>, once A's calibration has started` until
 A has started; run `compass advice SPACE OUT` again then. Its status file,
 resume and end are one server's, above, and its end prints each fitted side's
 tokens and held-out errors. Show the user every command the candidate prints.
+Where the sides take more cards than one node holds, as two TP8 sides on an
+8-card MI355X do, it prints `no calibrate.sh command:` and why: a deployment on
+two nodes, as [the 1P1D deployment](README.md#a-1p1d-deployment-across-crsuse2-m2m-v3-005-and--013)
+takes one, is not one command.
 
 Then run `compass advice SPACE OUT` again, now or in a later session, rather than
 waiting on the calibration: a candidate whose law has published is searchable,

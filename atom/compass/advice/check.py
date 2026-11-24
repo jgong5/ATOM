@@ -50,9 +50,12 @@ it holds nothing the sides sent to calibrate would publish, the store the
 candidate is looked up in, when a lone server's calibration would take it or a
 side reuses a law there, as from a lender that has ended; else its own, into
 which it fits both sides, as that store holds neither. Once one has started,
-the command takes the store and the sides its `INPUTS` name. A borrowed side
-whose readings key is its lender side's takes no readings command: the lender
-measures them.
+the command takes the store and the sides its `INPUTS` name, and a side they
+leave out that no earlier candidate's calibration makes gets why none fits it.
+A borrowed side whose readings key is its lender side's takes no readings
+command: the lender measures them. Where no command serves, as when the sides
+take more cards than one node holds, each side it would fit gets why, and the
+calibration lends no side.
 A readings verdict ``measure`` names the `compass measure memory` command,
 under the instance's variables, a 1P1D side's on the connector a real start of
 it takes.
@@ -154,6 +157,15 @@ PENDING = (
 WAITING = (
     "its calibration, into {}, once {}'s calibration has started: compass advice "
     "then prints its command"
+)
+#: Why a 1P1D side sent to calibrate gets no command: the calibration started
+#: in its candidate's directory fits the other side alone, and no earlier
+#: candidate's calibration makes its law.
+UNFITTED = (
+    "no calibrate.sh command: the calibration started in {} fits {} alone, as "
+    "its inputs name, and no earlier candidate's calibration makes this side's "
+    "law; once it no longer runs, rename that directory in place, as compass "
+    "advice still reads its store, and run compass advice again"
 )
 #: The file a calibration writes its inputs to, in its directory: a line
 #: ``store <path>`` names the store it publishes into, when one was named, and
@@ -551,9 +563,10 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     is published at, by model, platform and engine config, and on one server
     its directory, ``in``, and the store it publishes ``into``. A 1P1D side's
     law verdict states what the one command of its deployment takes of it,
-    ``side``: its `lacking.calibrate_inputs` and where a calibration of it
-    publishes (`_keys`); `seen` keeps nothing of one candidate's there, as two
-    candidates' deployments may run a side alike."""
+    ``side``: its `lacking.calibrate_inputs`, where a calibration of it
+    publishes (`_keys`), and the cards one node of `machine` holds, ``node``;
+    `seen` keeps nothing of one candidate's there, as two candidates'
+    deployments may run a side alike."""
     if isinstance(machine, dict):
         return machine, machine
     args, env = _side(side, one, drive_run.SIMULATED)
@@ -575,6 +588,7 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                     given = one["args"], config, one["env"]
                     law["side"] = lacking.calibrate_inputs(*given)
                     law["side"] |= _keys(config, machine, atom)
+                    law["side"]["node"] = machine.value("device.count_per_node")
                 if law["verdict"] == "calibrate":
                     key = [config.model, machine_platform(machine), keyed(config)]
                     law["calibration"] = {"key": key}
@@ -680,9 +694,11 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
     borrowed, made by the calibration an earlier candidate's in
     `calibrations` makes at its key, which publishes into that store, and by
     the command measuring its readings there (`_readings_by`), unless its
-    readings key is that calibration's side's or they are at their key there.
-    While `_deployed` waits on that calibration, each side it fits is
-    `WAITING`; else each joins `calibrations`."""
+    readings key is that calibration's side's or they are at their key there;
+    one no such calibration makes and a started calibration's `INPUTS` leave
+    out is `UNFITTED`. While `_deployed` waits on that calibration, each side
+    it fits is `WAITING`; else each joins `calibrations`, unless no command
+    serves, which names why on each side it fits."""
     laws, mine, sides = held["points"][point["name"]]["law"], {}, {}
     for side, law in laws.items():
         laws[side] = law = dict(law)
@@ -702,6 +718,9 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
     lookup = judged_in if shared_in or judged_in in reused else None
     into, fit, waiting = _deployed(directory, lookup, keys, lent, sides)
     for side in (side for side in keys if side not in fit):
+        if side not in lent:
+            laws[side]["made_by"] = [UNFITTED.format(directory, " ".join(fit))]
+            continue
         lender, there = Path(lent[side]["in"]), lent[side]["into"]
         laws[side]["made_by"] = [BORROWED.format(lender.name, there)]
         read = sides[side]["readings"]
@@ -714,8 +733,14 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
         for side in fitted:
             laws[side]["made_by"] = [WAITING.format(waiting["into"], waiting["name"])]
         return
-    with _env({"TRACES": traces}):
-        command = lacking.deployment_calibration(directory, sides, fit, ROUTER, into)
+    try:
+        with _env({"TRACES": traces}):
+            given = directory, sides, fit, ROUTER, sides["prefill"]["node"], into
+            command = lacking.deployment_calibration(*given)
+    except ValueError as why:
+        for side in fitted:
+            laws[side]["made_by"] = [f"no calibrate.sh command: {why}"]
+        return
     published = str(into or directory / "store")
     for side in fitted:
         laws[side]["made_by"] = [command]

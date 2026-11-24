@@ -229,7 +229,7 @@ def sides(tmp_path, monkeypatch, stubbed):  # noqa: F811
 def _calibrate(found: dict, name: str) -> tuple[dict, list]:
     """The variables and the arguments of `name`'s one printed calibrate.sh
     command."""
-    (command,) = [c for c in found[name]["made_by"] if "calibrate.sh " in c]
+    (command,) = [c for c in found[name]["made_by"] if str(lacking.CALIBRATE) in c]
     words = shlex.split(command.split("\n")[0])
     at = words.index(str(lacking.CALIBRATE))
     return dict(w.split("=", 1) for w in words[:at]), words[at + 1 :]
@@ -353,3 +353,54 @@ def test_a_1p1d_side_an_ended_calibration_published_leaves_the_other_to_fit_ther
     env, words = _calibrate(found, "B")
     assert words == [str(cal / "B"), *[f"{n} {FIRST_TURN}" for n in (1, 2, 4, 8)]]
     assert (env["FIT"], env["STORE"]) == ("decode", str(own))
+
+
+def _tp(side: dict, size: int) -> dict:
+    """`side` at tensor parallel size `size`."""
+    return side | {"args": side["args"] | {"--tensor-parallel-size": size}}
+
+
+def test_a_1p1d_candidate_whose_sides_pass_one_node_gets_why_and_lends_no_side(
+    tmp_path, sides
+):
+    # A's sides take 4 and 8 cards; B's, the same prefill side as A's, 4 and 4.
+    pair = {name: dict(PAIR[name], prefill=_tp(PREFILL, 4)) for name in PAIR}
+    pair["A"]["decode"] = _tp(PAIR["A"]["decode"], 8)
+    pair["B"]["decode"] = _tp(PAIR["B"]["decode"], 4)
+
+    found = advise(tmp_path, pair, network=NETWORK)
+
+    node = DOCUMENT["device"]["count_per_node"]
+    why = (
+        "no calibrate.sh command: it records both sides on one node, and they "
+        f"take 12 cards, where a node holds {node}; a deployment across two "
+        "nodes is not one command"
+    )
+    assert found["A"]["made_by"] == [why]
+    # B borrows no side of A's, which no command runs: it fits both sides.
+    assert len(found["B"]["made_by"]) == 1
+    env, _ = _calibrate(found, "B")
+    assert {k: env[k] for k in ("FIT", "PREFILL_GPU", "DECODE_GPU", "STORE")} == {
+        "FIT": "prefill decode",
+        "PREFILL_GPU": "0,1,2,3",
+        "DECODE_GPU": "4,5,6,7",
+        "STORE": str(tmp_path / "store"),
+    }
+
+
+def test_a_side_a_started_1p1d_calibration_leaves_out_and_none_lends_gets_why(
+    tmp_path, sides
+):
+    store, b = tmp_path / "store", tmp_path / "out" / "cal" / "B"
+    # B started fitting its decode alone while A lent its prefill side, and
+    # the space has since dropped A.
+    b.mkdir(parents=True)
+    (b / "inputs").write_text(f"tree c0ffee\nfit decode\nstore {store}\n")
+
+    found = advise(tmp_path, {"B": PAIR["B"]}, network=NETWORK)
+
+    assert found["B"]["state"] == "missing a law"
+    assert found["B"]["made_by"][0] == check.UNFITTED.format(b, "decode")
+    env, words = _calibrate(found, "B")
+    assert (env["FIT"], env["STORE"]) == ("decode", str(store))
+    assert words == [str(b), *[f"{n} {FIRST_TURN}" for n in (1, 2, 4, 8)]]
