@@ -338,10 +338,11 @@ compass fit device <token> --store OUT/cal/S1/store --out OUT/cal/S1.readings
 --store <store> -- <ATOM's arguments>`, as printed, under the variables it
 names: `G` the cards the configuration uses, `D` a fresh directory. It is one
 engine start on those cards. Where the store the candidate is looked up in holds
-stale readings at their key, which it refuses a second publish at, the command
-names a new store, `OUT/cal/readings@<digest>/store`, which a search looks up
-as it does a calibration's own: it starts with no platform readings, so take
-them into it as a calibration's store takes them (above).
+stale readings at one point's key, which it refuses a second publish at, every
+point's command names a new store, `OUT/cal/readings@<digest>/store`, those
+whose readings that store holds too, as a run reads one store. A search looks
+it up as it does a calibration's own: it starts with no platform readings, so
+take them into it as a calibration's store takes them (above).
 
 **A 1P1D side's law** prints `deploy.sh OUT record of the deployment, then
 compass fit steps --backend step-linear on each OUT/prefill`, and the same for

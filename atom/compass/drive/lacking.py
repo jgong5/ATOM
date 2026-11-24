@@ -32,8 +32,8 @@ configuration (`calibration`), into `--out`, or `cal` in the current directory
 without one, naming each client variable it requires that this environment
 does not set, with its expected time, unknown, as no earlier calibration's
 status is read for it. Memory readings whose key holds a stale entry are
-measured into a new store beside that directory (`measuring`), as the store
-refuses a second publish at the key.
+measured into a new store beside that directory (`readings_store`), as the
+store refuses a second publish at the key.
 
 A prefill or decode instance's run reads a network file across nodes, as
 `deploy.sh run` hands it one, and its readings command takes the ATOM
@@ -160,10 +160,12 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
 
     def met(name, made_by, check, *given, state=None):
         """`check(*given)`'s value, True for None, or False when it refuses,
-        its refusal recorded as `name` lacking."""
+        its refusal recorded as `name` lacking, made by `made_by`, or what it
+        gives when it is a callable."""
         try:
             return check(*given) or True
         except (ArtifactRefusal, SpecRefusal, ValueError) as refused:
+            made_by = made_by() if callable(made_by) else made_by
             lacks.append((name, state or _state(refused), str(refused), made_by))
             return False
 
@@ -249,13 +251,20 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
         met(grid, made, compass_run.refuse_context_parallel, STEP_GRID, config)
         and met(grid, made, step_grid.load, run[STEP_GRID], config, machine)
     )
-    key, beside = memory.key_of(config, machine), Path(out).resolve()
-    made = measuring(args.store, key, beside, real or atom_args, env)
+
+    def made() -> str:
+        """The readings command, built only once they lack: into the run's
+        store, else, where an entry there holds their key, the new store."""
+        into, key = args.store, memory.key_of(config, machine)
+        if holds(into, key):
+            into = readings_store(Path(out).resolve(), compass_run.atom_digest())
+        return measuring(into, key, real or atom_args, env)
+
     carried = runfile.carried(runfile.priced_by(args))
     given = run["store"], config, machine, 0, carried
     read = met("memory readings", made, memory.load, *given)
     if read and (why := stale_page_bound(read, config)):
-        lacks.append(("memory readings", "stale", why, made))
+        lacks.append(("memory readings", "stale", why, made()))
 
     if getattr(args, OP_GRAPH):
         run[OP_GRAPH], key = True, runfile._price_list_key(atom_args, machine)
@@ -293,21 +302,25 @@ def measure_memory(store, atom_args, env=None) -> str:
     return " ".join([*(f"{k}={shlex.quote(v)}" for k, v in (env or {}).items()), made])
 
 
-def measuring(store, key, beside, atom_args, env=None) -> str:
-    """`measure_memory`'s command for the readings at `key` into `store`; where
-    an entry there holds their key, which the store refuses a second publish at,
-    as one an older tree measured still does, into a new store,
-    ``<beside>@<digest>/store``, `digest` the first 12 hex digits of this tree's
-    ATOM digest, which no older tree's entry is in; once that one holds them
-    too, `MEASURED`."""
-    if _holds(store, key):
-        store = Path(f"{beside}@{compass_run.atom_digest()[:12]}") / "store"
-        if _holds(store, key):
-            return MEASURED.format(store)
+def measuring(store, key, atom_args, env=None) -> str:
+    """`measure_memory`'s command for the readings at `key` into `store`, or,
+    once an entry there holds their key, which the store refuses a second
+    publish at, `MEASURED`."""
+    if holds(store, key):
+        return MEASURED.format(store)
     return measure_memory(store, atom_args, env)
 
 
-def _holds(store, key) -> bool:
+def readings_store(beside, digest: str) -> Path:
+    """The new store readings are measured into where an entry holds their key
+    in the store a run reads, as one an older tree measured still does:
+    ``<beside>@<d>/store``, `d` the first 12 hex digits of this tree's ATOM
+    digest `digest`, which no older tree's entry is in."""
+    return Path(f"{beside}@{digest[:12]}") / "store"
+
+
+def holds(store, key) -> bool:
+    """Whether an entry is at `key` in `store`, valid or not."""
     return (ArtifactStore(store).directory_for(key) / ENTRY_FILE).is_file()
 
 

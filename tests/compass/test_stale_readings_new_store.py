@@ -6,9 +6,11 @@ the reuse check looks the candidate up there once the readings have landed.
 
 The entry is DeepSeek-V4.1's fp4 one without the PAGE bound, or one measured at
 another ATOM digest; the run is `test_run_lacking`'s, the search
-`test_advice_reuse`'s, its law a law file.
+`test_advice_reuse`'s, its law a law file. Once one point of a candidate is
+measured into the new store, each of its points is, as a run reads one store.
 """
 
+import copy
 import json
 import re
 import shutil
@@ -21,6 +23,7 @@ from test_advice_reuse import (  # noqa: F401
     digested_once,
     law,
     law_file,
+    resolved_here,
     searched,
     verdicts,
 )
@@ -40,6 +43,8 @@ from atom.compass.drive.lacking import MEASURED
 from atom.compass.memory.readings import PAGE_BOUND
 
 WHY = ["no PAGE bound", "another ATOM digest"]
+#: The shared store's readings of a candidate's other point: none, or valid ones.
+OTHER = ["missing", "at their key"]
 
 
 def stale(store, config, why, monkeypatch):
@@ -64,6 +69,12 @@ def store_named(command: str) -> str:
 
 def holds(store, key) -> bool:
     return (ArtifactStore(store).directory_for(key) / ENTRY_FILE).is_file()
+
+
+def made(tmp_path) -> set:
+    """Each readings command `compass advice` printed for candidate ``a``."""
+    states = json.loads((tmp_path / "out" / STATES).read_text())
+    return {c for p in states["a"]["points"].values() for c in p["made_by"]}
 
 
 @pytest.mark.parametrize("why", WHY)
@@ -102,23 +113,58 @@ def test_advice_measures_into_a_new_store_it_looks_the_candidate_up_in(
         held["prefill"]["buckets"] = RECORDED
     law_file(tmp_path, held)
 
-    def made() -> set:
-        states = json.loads((tmp_path / "out" / STATES).read_text())
-        return {c for p in states["a"]["points"].values() for c in p["made_by"]}
-
     assert advise(tmp_path)["candidates"]["a"]["store"] == str(tmp_path / "store")
 
-    (command,) = made()
+    (command,) = made(tmp_path)
     new = new_store(tmp_path / "out" / "cal" / "readings")
     assert store_named(command) == new and not holds(new, key)
     publish_readings(new, searched.config, readings=READINGS[1] | {PAGE_BOUND: 3})
     advise(tmp_path)
 
-    assert made() == {MEASURED.format(new)}
+    assert made(tmp_path) == {MEASURED.format(new)}
     platforms.flags(new, DOCUMENT, tmp_path)
 
     judged = advise(tmp_path)
 
     assert judged["candidates"]["a"]["store"] == new
     assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
-    assert made() == set()
+    assert made(tmp_path) == set()
+
+
+@pytest.mark.parametrize("other", OTHER)
+def test_advice_measures_each_point_into_the_new_store_once_one_goes_there(
+    tmp_path, searched, monkeypatch, other  # noqa: F811
+):
+    """Concurrencies 1 and 2, `--max-model-len` scaled by each, so each point
+    has its own readings key: concurrency 1's stale in the shared store, 2's
+    `other` there."""
+    longer = copy.copy(searched.config)
+    vars(longer).update(max_model_len=2 * searched.config.max_model_len)
+
+    def resolve(atom_args):
+        at = int(atom_args[atom_args.index("--max-model-len") + 1])
+        return longer if at == longer.max_model_len else searched.config
+
+    resolved_here(monkeypatch, resolve)
+    stale(tmp_path / "store", searched.config, WHY[1], monkeypatch)
+    if other == OTHER[1]:
+        publish_readings(tmp_path / "store", longer)
+    law_file(tmp_path, law(searched))
+    scaled = {"--max-model-len": searched.config.max_model_len}
+    common = {"basis": "a recipe", "per_concurrency": scaled}
+    workload = {"traces": "/t.jsonl", "select": "agentx", "concurrency": [1, 2]}
+    new = new_store(tmp_path / "out" / "cal" / "readings")
+
+    judged = advise(tmp_path, common=common, workload=workload)
+
+    assert {v["verdict"] for v in verdicts(judged, "readings")} == {"measure"}
+    assert [store_named(c) for c in made(tmp_path)] == [new] * 2
+    for config in (searched.config, longer):
+        publish_readings(new, config)
+    platforms.flags(new, DOCUMENT, tmp_path)
+
+    judged = advise(tmp_path, common=common, workload=workload)
+
+    assert judged["candidates"]["a"]["store"] == new
+    assert {v["verdict"] for v in verdicts(judged, "readings")} == {"reuse"}
+    assert made(tmp_path) == set()
