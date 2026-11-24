@@ -621,24 +621,26 @@ def test_a_ladder_run_refuses_off_step_linear_and_naming_no_rungs(
 PP2 = {**ENGINE, "pipeline_parallel_size": 2, "pp_layers": [[0, 14], [14, 28]]}
 
 
-def pipeline(directory, seed, trace="trace", scale=None):
+def pipeline(directory, seed, trace="trace"):
     """`directory`, a two-stage pipeline's record of `_steps(seed)`: stage 0's
     lines as `record` writes them, and stage 1's, the same batches at twice
     their price, a quarter of each step the drafter's, which only the last
-    stage runs, and their host segments scaled by `scale` (`_timed_record`).
+    stage runs, on stage 0's host stamps, so that each stage enters after its
+    release (`step_labels.released`).
     Each prefill's busy time, as a trace run's, is its target's and its
     draft's."""
     key = {**HOST, "engine": PP2}
     steps = directory / "steps"
     steps.mkdir(parents=True)
-    _timed_record(steps / "dp0.jsonl", _steps(seed), key=key)
+    head, _ = _timed_record(steps / "dp0.jsonl", _steps(seed), key=key)
     doubled = [(rows, rung, 2 * seconds) for rows, rung, seconds in _steps(seed)]
-    last, _ = _timed_record(steps / "pp1.dp0.jsonl", doubled, key=key, scale=scale)
+    last, _ = _timed_record(steps / "pp1.dp0.jsonl", doubled, key=key)
     lines = [json.loads(x) for x in last.read_text().splitlines()]
-    for s in lines:
+    for s, h in zip(lines, head.read_text().splitlines()):
         for k in [k for k in s if k[:2] == "b_"]:
             del s[k]
         s["d_target_ns"] = s["d_busy_ns"] * 3 // 4
+        s.update((k, v) for k, v in json.loads(h).items() if k[:2] == "t_")
     last.write_text("".join(json.dumps(traced(s)) + "\n" for s in lines))
     return as_record(directory, key, trace=trace)
 

@@ -40,11 +40,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from atom.compass.backends.step_grid_plan import DEFERS_OUTPUT
+from atom.compass.backends.step_labels import waited
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.clock import ARRIVAL, TAR
 from atom.compass.detect.determinism import CONFIGURATION_PREFIX, compare_step_tables
 from atom.compass.parity import read
-from atom.compass.parity.recurrence import _waited
 from atom.compass.run import (
     RAPIDSERVE,
     STEP_TABLE_FILE,
@@ -279,7 +279,7 @@ def stage_timelines(table: str, engine: str, stages, layers: int, parts) -> list
     the machine's carriers. The stage loops are ATOM's:
 
     - the head launches while fewer than `pp` forwards are in flight and the
-      tokens its batch waits for (`recurrence._waited`) are taken. A batch with
+      tokens its batch waits for (`step_labels.waited`) are taken. A batch with
       a request the head has not run starts where the table starts it: when
       the request reached the head is the traffic's. Launching none, the head
       flushes its last send, then waits for the first in flight's tokens, or
@@ -393,7 +393,7 @@ def stage_timelines(table: str, engine: str, stages, layers: int, parts) -> list
             while (
                 n < len(head)
                 and len(flight) < pp
-                and _waited(head, n, pp) in {None, *taken}
+                and waited(head, n, pp) in {None, *taken}
                 and (arrival(n) <= s.now or math.isclose(arrival(n), s.now))
             ):
                 for k in range(1, pp):
