@@ -69,7 +69,7 @@ PROMPT = list(range(40))
 L = 2.0**-10
 KV = "engine-D->engine-P:kv_write_req"
 TABLE = prefill_decode_table(
-    admission_path="serving",
+    admission_s=0.54e-3,
     ipc_s=L,
     stream_s=L,
     router_s=L,
@@ -424,6 +424,31 @@ def test_an_abort_mid_write_frees_nothing_until_the_write_is_done(
     assert free_blocks(pd.p) == total
 
 
+def test_a_decode_abort_before_its_write_request_frees_prefill(pd, seq_factory):
+    """Decode aborts a request it has not admitted, so it never asks for the
+    write, and prefill hears no abort: its leg of the request is over. Decode
+    tells it that no write will come, on the write request's channel, and
+    prefill's send is done at that notice's arrival, reported as a write-done
+    is."""
+    total = free_blocks(pd.p)
+    (x,) = prefilled(pd, 1, R)
+    at(pd.rt_d, SEND)
+    y = seq_factory(PROMPT, kv_transfer_params=dict(x.kv_transfer_params_output))
+    pd.d.add(y)
+
+    assert pd.d.abort_request(y.id) is True
+    a = SEND + L
+    assert pd.rt_d.send_log == [(KV, 0, a)], "the notice's arrival"
+    assert pd.d.kv_connector.has_pending_work() is False, "nothing comes back"
+
+    engine_step(pd.p, pd.rt_p, a, (0, a))
+    assert x.id in pd.p.deferred_free_blocks, "one poll in flight, as any report"
+    engine_step(pd.p, pd.rt_p, a + TICK)
+    assert pd.p.deferred_free_blocks == {}
+    assert pd.p.is_finished()
+    assert free_blocks(pd.p) == total
+
+
 #: The decode pool's block size (`MockConfig`'s), and a different one.
 HBS = 4
 
@@ -572,6 +597,41 @@ def test_a_parked_request_is_not_counted_as_admittable_work(pd, seq_factory):
 # -- The blob ------------------------------------------------------------
 
 
+def literal_keys(blob: ast.Dict, source: pathlib.Path) -> frozenset:
+    """The keys of a dict display: string constants, and the keys of a
+    `**helper(...)` whose helper, a function of Mooncake's own package,
+    returns one dict display."""
+    keys = set()
+    for key, value in zip(blob.keys, blob.values):
+        if key is None:
+            assert isinstance(value, ast.Call) and isinstance(
+                value.func, ast.Name
+            ), f"{source.name} unpacks something other than a helper's call"
+            keys |= helper_keys(value.func.id)
+            continue
+        assert isinstance(key, ast.Constant) and isinstance(
+            key.value, str
+        ), f"{source.name} builds its blob with computed keys"
+        keys.add(key.value)
+    return frozenset(keys)
+
+
+def helper_keys(name: str) -> frozenset:
+    """The keys of the one dict display function `name` returns, found in a
+    module beside Mooncake's connector."""
+    found = []
+    for source in sorted(MOONCAKE_SOURCE.parent.glob("*.py")):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                returns = [r for r in ast.walk(node) if isinstance(r, ast.Return)]
+                assert len(returns) == 1 and isinstance(
+                    returns[0].value, ast.Dict
+                ), f"{source.name}: {name} does not return one dict display"
+                found.append(literal_keys(returns[0].value, source))
+    assert len(found) == 1, f"expected one definition of {name}, found {len(found)}"
+    return found[0]
+
+
 def relayed_fields() -> frozenset:
     """The keys of Mooncake's own transfer blob, read from its source.
 
@@ -589,11 +649,7 @@ def relayed_fields() -> frozenset:
             for target in node.targets
         ):
             continue
-        assert all(
-            isinstance(key, ast.Constant) and isinstance(key.value, str)
-            for key in node.value.keys
-        ), f"{MOONCAKE_SOURCE.name} builds its blob with computed keys"
-        found.append(frozenset(key.value for key in node.value.keys))
+        found.append(literal_keys(node.value, MOONCAKE_SOURCE))
     assert len(found) == 1, f"expected one blob assignment, found {len(found)}"
     return found[0]
 

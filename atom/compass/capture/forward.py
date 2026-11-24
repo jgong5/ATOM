@@ -10,8 +10,9 @@ differs between the two is affine in the context (`ir.Affine`), or the shape
 is refused by operator and slot.
 
 Each leaf carries its contract: its arguments by schema slot, a tensor as its
-shape, dtype, stride, role and the `is_shuffled` mark ATOM sets on a
-preshuffled weight. A tensor's role is where its storage came from:
+shape, dtype, stride, role, the `is_shuffled` mark ATOM sets on a
+preshuffled weight, and its device when ATOM holds it on the host (a copy's
+host-staged source), pinned or not. A tensor's role is where its storage came from:
 the model's parameters, buffers and tensor attributes are weights, what
 `allocate_kv_cache` allocated is KV, what the model's forward and the sampler
 after it allocated is an activation, and anything else (the runner's buffers,
@@ -22,8 +23,8 @@ A raw Triton or FlyDSL launch lifts to the function that issues it
 (`_Recorder`): one leaf, that function by its module and name, its parameters at
 call entry as the arguments, with whatever else the call ran folded in. An
 argument that is an attribute of the runner is a `ModuleRef` `runner.<attr>`;
-any other object is held as pickle reduces it (`ir.nodes.Reduced`), or refused
-by its type.
+a NamedTuple is held as its class and fields, and any other object as pickle
+reduces it (`ir.nodes.Reduced`), or refused by its type.
 
 The engine is ATOM's own `Config` for ATOM's engine arguments, on a declared
 device of one arch. Under DP the capture runs one rank, and its peers the rest of
@@ -67,19 +68,21 @@ from typing import NamedTuple
 from unittest.mock import patch
 
 import numpy
+import sympy
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils import _pytree
 from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils.weak import WeakIdKeyDictionary
 
 import atom
 from atom.compass import ir
 from atom.compass.backends.op_graph import KV, gathered_off_default
 from atom.compass.ir.nodes import Reduced
 
-from . import driverless, peers
-from .graph import LAYER, Fork, Join, Traced, _json, build
+from . import driverless, files_of, peers
+from .graph import LAYER, Fork, Join, Traced, _json, build, to_json
 
 #: The fewest KV blocks a capture allocates; a shape that needs more gets more.
 KV_BLOCKS = 64
@@ -112,6 +115,12 @@ V4_QKNS = (
     "aiter._fused_qk_norm_rope_group_quant_kernel.default",
     "aiter.ops.flydsl.kernels.qk_norm_rope_quant:flydsl_qk_norm_rope_quant",
 )
+#: DeepSeek-V4's prefill attention, the fp8 KV cache's and the bf16 one's,
+#: which take the prefix index list and indptr of their layer's compress ratio.
+V4_PREFILLS = (
+    "aiter.pa_sparse_prefill_fp8_opus.default",
+    "aiter.pa_sparse_prefill_opus.default",
+)
 #: DeepSeek-V4.1's guarded ops a capture runs the bodies of: attention,
 #: Engram and the step's staging hold kernels of their own.
 V41_OPENED = (
@@ -121,9 +130,10 @@ V41_OPENED = (
     "v41_end_forward",
     "v41_record_tbo_expert_output",
 )
-#: DeepSeek-V4.1's sparse attention, and its indexer's scorers, gfx1250's
-#: and gfx950's.
+#: DeepSeek-V4.1's sparse attention, over its FP8 pool the second, and its
+#: indexer's scorers, gfx1250's and gfx950's.
 V41_ATTENTION = "aiter.pa_sparse_prefill_opus.default"
+V41_FP8_ATTENTION = "aiter.mla_sparse_prefill_v41.default"
 V41_SCORERS = (
     (
         "aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250:"
@@ -131,12 +141,65 @@ V41_SCORERS = (
     ),
     "aiter.ops.triton.attention.pa_mqa_logits:deepgemm_fp8_paged_mqa_logits",
 )
+#: DeepSeek-V4.1's top-k, as aiter's decode top-k launches it: FlyDSL's
+#: multi-CTA kernel where the arch's gates take the call's width and rows
+#: (gfx950's), else FlyDSL's one-block kernel, else, on logits narrower than
+#: k, its HIP kernel.
+V41_TOPKS = (
+    "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode",
+    "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
+    "aiter._top_k_per_row_decode.default",
+)
+#: DeepSeek-V4.1's RoPE, which its index keys take at their ratio's compress
+#: plan's positions: with no drafter both ratios' plans hold as many rows.
+V41_ROPE = "aiter.rope_cached_positions_fwd_impl.default"
 #: Where a drafter's step ends its target's work: ATOM records `forward_done_event`.
 CUT = "forward_done_event"
+#: aiter's fused-MoE leaves, as its op and as ATOM's wrapper of it.
+FUSED_MOES = ("aiter.fused_moe_.default", "aiter.rocm_aiter_fused_moe.default")
 
 _ROOT = pathlib.Path(atom.__file__).resolve().parent.parent
 _IS_ATOM: dict = {}
 logger = logging.getLogger(__name__)
+#: The path of each data file this process opened to read since its first
+#: capture began (`watch_reads`); None before that.
+_READ: set | None = None
+#: Python's own files, which count as run when imported, not when read: ATOM's
+#: source reading, a traceback or `inspect` reads them without running them.
+_PYTHON = (".py", ".pyc")
+
+
+def watch_reads() -> set:
+    """The absolute path of each file but Python's own (`_PYTHON`) this process
+    opens to read from its first call on, as the `open` audit event names it
+    (`_opened`). An audit hook cannot be removed, so one serves the process."""
+    global _READ
+    if _READ is None:
+        _READ = set()
+        sys.addaudithook(_opened)
+    return _READ
+
+
+def _opened(event, args):
+    """A file opened to read by name, in an `open` audit event: its path is
+    `watch_reads`'s. A hook that raises fails the open, so an event of another
+    form is passed over."""
+    if event != "open" or len(args) != 3:
+        return
+    path, mode, flags = args
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        return
+    if (
+        mode is None
+        and isinstance(flags, int)
+        and flags & os.O_ACCMODE == os.O_RDONLY
+        or (isinstance(mode, str) and not set(mode) & set("wax+"))
+    ):
+        try:
+            if not (path := os.fsdecode(path)).endswith(_PYTHON):
+                _READ.add(os.path.abspath(path))
+        except (OSError, ValueError):
+            pass
 
 
 class Shape(NamedTuple):
@@ -144,20 +207,27 @@ class Shape(NamedTuple):
     `tokens` its rows, fewer than `seqs` padded to a rung of `seqs`; under DP
     `gathered`, the rows the group's MoE gathers, None at every rank's `tokens`;
     and `width`, the batch a step that replays no graph pads to past its
-    rows, None at its rows."""
+    rows, None at its rows. `micro_batch` marks a two-batch-overlap
+    micro-batch, which its structure names (`structure`), not its text.
+    `real` is how many of a padded decode's MoE rows are real, the rest pad
+    rows that route to no expert, None at all of them: a `measure ops` point
+    states it, and a graph is read at its shape without it."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
     seqs: int
     gathered: int | None = None
     width: int | None = None
+    micro_batch: bool = False
+    real: int | None = None
 
     def __str__(self) -> str:
         text = f"{self.phase} T={self.tokens} B={self.seqs}"
         if self.phase == "decode" and self.tokens == self.seqs:
             text = f"decode B={self.seqs}"
         text += f" W={self.width}" * bool(self.width)
-        return text if self.gathered is None else f"{text} G={self.gathered}"
+        text += "" if self.gathered is None else f" G={self.gathered}"
+        return text + ("" if self.real is None else f" R={self.real}")
 
     def at(self, dp: int, drafts: int = 0) -> "Shape":
         """This shape in a DP group of `dp` under a drafter of `drafts`:
@@ -194,9 +264,94 @@ def _gathering(shape: Shape) -> Shape:
     return shape
 
 
+def symbolic_shape(shape: Shape) -> str:
+    """The shape the graph of the DP prefill `shape` that holds G
+    (`Tracer.symbolic`) is keyed by: its tokens, sequences and width, at any G."""
+    return f"{shape._replace(gathered=None)} G={ir.G}"
+
+
+class PerG(Exception):
+    """A DP prefill whose graph cannot hold G (`Tracer.symbolic`), and why:
+    each of its G is traced as it is."""
+
+
+#: G as a condition of a graph's guards names it.
+_G = sympy.Symbol(ir.G.name, integer=True, positive=True)
+
+
+@functools.cache
+def _condition(text: str):
+    """A guard's `text` as a sympy condition in `_G`, torch's own functions
+    (`FloorDiv`, `Mod`) read by name."""
+    from torch.utils._sympy import functions
+
+    names = {name: getattr(functions, name) for name in functions.__all__}
+    return sympy.sympify(text, locals={**names, ir.G.name: _G})
+
+
+def admits(guards, g: int) -> bool:
+    """Whether every guard of `guards`, each a condition in G, holds at `g`."""
+    return all(_condition(text).subs(_G, g) is sympy.true for text in guards)
+
+
+def _guards(env, symbol) -> tuple[str, ...]:
+    """The guards a symbolic trace installed on its `symbol` in the shape
+    env `env`, each a condition in G as text, which `admits` reads back true
+    at the symbol's hint; refused (`PerG`) where the trace fixed the symbol
+    to a value instead, or a guard does not read back."""
+    raw, hint = symbol.node._expr, symbol.node.hint
+    if raw in env.replacements:
+        raise PerG(f"the trace fixed G={hint} at {env.replacements[raw]}")
+    texts = tuple(
+        dict.fromkeys(
+            str(guard.expr.xreplace({raw: _G}))
+            for guard in env.guards
+            if raw in guard.expr.free_symbols
+        )
+    )
+    for text in texts:
+        try:
+            held = admits((text,), hint)
+        except (SyntaxError, TypeError, ValueError, sympy.SympifyError):
+            held = False
+        if not held:
+            raise PerG(f"its guard {text} does not read back true at G={hint}")
+    return texts
+
+
+def _differ(a, b, op=None, path=()) -> str:
+    """Where two graphs' JSON first differ: the op and its slot, and each
+    one's value there."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        if "op" in a:
+            op, path = a["op"], ()
+        items = [(k, a.get(k), b.get(k)) for k in dict.fromkeys([*a, *b])]
+    elif isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
+        items = [(k, x, y) for k, (x, y) in enumerate(zip(a, b))]
+    else:
+        where = "/".join(map(str, path))
+        return (
+            f"{op or 'the graph'} at {where or 'its root'}: {a!r:.60} against {b!r:.60}"
+        )
+    k, x, y = next(item for item in items if item[1] != item[2])
+    return _differ(x, y, op, (*path, k))
+
+
 def device_arch() -> str:
     """The visible device's arch, its target features dropped."""
     return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+
+def graph_engine(config) -> dict:
+    """The engine config an `op_graph` of `config` is keyed by: the one a step
+    law is keyed by (`run.step_grid.keyed`) less its ladder and compilation
+    level, since every trace runs eager at level 0 and serves a run at any
+    level."""
+    from atom.compass.run.step_grid import LEVEL, keyed
+
+    engine = keyed(config, ladder=False)
+    engine.pop(LEVEL, None)
+    return engine
 
 
 def structure(
@@ -206,21 +361,28 @@ def structure(
     device: str | None = None,
     output: bool = True,
     draft: bool = False,
+    env: dict | None = None,
+    micro_batch: bool = False,
 ) -> str:
     """The structure an `op_graph` of `config` at a `phase` step is keyed by: the
     architecture, the config.json digest, the arch of `device`, else
-    `device_arch()`, the engine config a step law is keyed by less its ladder
-    (`run.step_grid.keyed`), which names every variable that picks a kernel and
-    a drafter's method and width, the TP width, the DP width and the EP group's
-    when they are set, the phase and the mode, `config`'s unless `eager` names
-    it, ``no output`` unless the step produces output (`output`), and ``draft``
-    for the drafter's part of the step (`draft`), ``draft kv`` for a block
-    drafter's draft-KV pass on a step that samples (`draft` is `KV`)."""
+    `device_arch()`, its engine config (`graph_engine`), which names every
+    variable that picks a kernel and a drafter's method and width, its
+    performance environment `env` when given, as an engine file states one,
+    else this process's, the TP width, the DP
+    width and the EP group's when they are set, the phase and the mode,
+    `config`'s unless `eager` names it, ``no output`` unless the step produces
+    output (`output`), and ``draft`` for the drafter's part of the step
+    (`draft`), ``draft kv`` for a block drafter's draft-KV pass on a step that
+    samples (`draft` is `KV`). ``micro-batch`` follows the mode for a
+    two-batch-overlap micro-batch (`micro_batch`), which ATOM runs otherwise
+    than a whole step of its shape."""
     from atom.compass.run import _file_digest
-    from atom.compass.run.step_grid import keyed
 
     digest = _file_digest(config.model, "config.json")
-    engine = keyed(config, ladder=False)
+    engine = graph_engine(config)
+    if env is not None:
+        engine["env"] = env
     engine = json.dumps(engine, sort_keys=True, separators=(",", ":"))
     mode = "eager" if (config.enforce_eager if eager is None else eager) else "graph"
     arch, device = config.hf_config.architectures[0], device or device_arch()
@@ -228,6 +390,7 @@ def structure(
     widths = f"tp={tp}" + (f" dp={dp}" if dp > 1 else "")
     widths += f" ep={tp * dp}" if config.enable_expert_parallel else ""
     key = f"{arch} {device} {digest} {engine} {widths} {phase} {mode}"
+    key = f"{key} micro-batch" if micro_batch else key
     key = key if output else f"{key} no output"
     key = f"{key} draft" if draft else key
     return f"{key} {KV}" if draft == KV else key
@@ -245,10 +408,14 @@ def _engine(text: str):
 
 
 def missed(store, key) -> str:
-    """For an `op_graph` `key` `store` holds no entry at, each engine field
-    (`step_grid.differ`) in which a graph it holds at the key's shape and
-    otherwise the key's structure differs, as text; "" when it holds none."""
+    """For an `op_graph` `key` `store` holds no entry at, each field in which
+    a graph it holds at the key's shape and otherwise the key's structure
+    differs, as text: the ATOM source or torch it was traced under, or each
+    file of one keyed by its files that reads otherwise here (`changed`), then
+    each engine field (`step_grid.differ`); "" when it holds none."""
+    from atom.compass.artifacts import Key
     from atom.compass.artifacts.store import ENTRY_FILE
+    from atom.compass.capture import FILES, changed
     from atom.compass.run.step_grid import differ
 
     head, here, tail = _engine(key.values["structure"])
@@ -258,10 +425,22 @@ def missed(store, key) -> str:
         if there.get("shape") == key.values["shape"]:
             at = _engine(there.get("structure", ""))
             if at and (at[0], at[2]) == (head, tail):
-                named.append(", ".join(differ(at[1], here, "the graph")))
+                files = str(there.get("source_root")).startswith(f"{FILES}-")
+                fields = [
+                    f"{name} {there.get(name)!r} in the graph and {value!r} here"
+                    for name, value in key.fields
+                    if name not in ("structure", "shape")
+                    and there.get(name) != value
+                    and not (files and name == "source_root")
+                ]
+                if files and (moved := changed(store, Key.of(key.kind, **there))):
+                    more = f" and {len(moved) - 5} more" * (len(moved) > 5)
+                    fields.append(f"files {', '.join(moved[:5])}{more}")
+                if engine := differ(at[1], here, "the graph"):
+                    fields.append(f"engine config: {', '.join(engine)}")
+                named.append(", ".join(fields))
     return "".join(
-        f"; a graph the store holds at this shape and structure differs in engine "
-        f"config: {n}"
+        f"; a graph the store holds at this shape and structure differs in {n}"
         for n in named
     )
 
@@ -348,11 +527,11 @@ def _call(fn, values):
 def _rebuilt(value, live):
     """An argument value as a call takes it: a `Reduced` object rebuilt (an
     enum member from its value, a dict from its items, any other object from
-    its class and state), tuples item by item, and `Tensor` and `ContextRef`
-    values through `live`."""
+    its class and state), tuples item by item, and `Tensor`, `ContextRef` and
+    `Symbol` values through `live`."""
     if isinstance(value, tuple):
         return tuple(_rebuilt(item, live) for item in value)
-    if isinstance(value, (ir.Tensor, ir.ContextRef)):
+    if isinstance(value, (ir.Tensor, ir.ContextRef, ir.Symbol)):
         return live(value)
     if not isinstance(value, Reduced):
         return value
@@ -361,14 +540,17 @@ def _rebuilt(value, live):
 
 def rebuild_object(cls: str, state):
     """The object pickle reduced to class `cls`, `module:qualname`, and `state`:
-    an enum member from its value, a dict from its (key, value) pairs, any other
-    object from its (attribute, value) pairs."""
+    an enum member from its value, a dict from its (key, value) pairs, a
+    NamedTuple from its (field, value) pairs, any other object from its
+    (attribute, value) pairs."""
     cls = _function(cls)
     if issubclass(cls, enum.Enum):
         return cls(state)
     state = dict(state)
     if cls is dict:
         return state
+    if _pytree.is_namedtuple_class(cls):
+        return cls(**state)
     obj = cls.__new__(cls)
     if setstate := getattr(obj, "__setstate__", None):
         setstate(state)
@@ -421,6 +603,10 @@ class _Recorder(TorchDispatchMode):
     is refused, and so is a leaf that raises after it launched, or is still
     open when the step ends; one that raises having launched nothing gives
     back what it ran.
+
+    In a symbolic trace `symbol` is G, the rows the step's MoE gathers, a
+    `SymInt` the peers' stand-ins give out (`rows`): each size that is G
+    itself is held as `ir.G`, and any other symbolic size is refused.
     """
 
     def __init__(self, contexts, fake_mode=None):
@@ -433,7 +619,24 @@ class _Recorder(TorchDispatchMode):
         self.counted = None  # what a size the step's data sets counts, if stated
         self.lands = False  # whether a device value read on the host reads zeros
         self.declined = []  # the mono refusals this shape's steps met (`_mono`)
+        self.pins, self.twins = {}, WeakIdKeyDictionary()  # ATOM pinned (`pin`)
+        self.symbol = None  # G in a symbolic trace, else None
         self.start()
+
+    def rows(self, height):
+        """`height` rows, G where they are its hint in a symbolic trace."""
+        held = self.symbol is not None and height == self.symbol.node.hint
+        return self.symbol if held else height
+
+    def _dims(self, dims) -> tuple:
+        """`dims`, each that is G itself `ir.G`, each another check bound to
+        one value that int (`_concrete`)."""
+        return tuple(map(self._dim, _concrete(dims)))
+
+    def _dim(self, dim):
+        g = self.symbol
+        held = g is not None and isinstance(dim, torch.SymInt)
+        return ir.G if held and dim.node.expr == g.node.expr else dim
 
     def start(self):
         self.layer, self.items, self.left_out = None, [], []
@@ -463,6 +666,19 @@ class _Recorder(TorchDispatchMode):
         finally:
             self.on = on
 
+    def pin(self, tensor):
+        """`tensor`, a host tensor ATOM asked to pin, held pinned with its views;
+        a real one's fake twin too, which the fake mode computes on, kept as
+        long as it is."""
+        if not isinstance(tensor, FakeTensor) and self.fake_mode is not None:
+            self.twins[tensor] = self.pin(self._fake(tensor))
+        self.pins[_storage(tensor)] = _storage(tensor)
+        return tensor
+
+    def pinned(self, tensor) -> bool:
+        held = self.pins.get(_storage(tensor))
+        return held is not None and not held.expired()
+
     def _fake(self, tensor):
         if not isinstance(tensor, FakeTensor):  # at its sizes, none symbolic
             return self.fake_mode.from_tensor(tensor, static_shapes=True)
@@ -485,6 +701,8 @@ class _Recorder(TorchDispatchMode):
             for dim in (d for t in outs for d in _concrete(t.shape)):
                 if isinstance(dim, torch.SymInt):
                     torch._check(dim == self.counted)
+        if kwargs.get("pin_memory"):
+            outs = [self.pin(t) for t in outs]
         if self.creating is not None:
             read = set(map(_storage, ins))
             for storage in map(_storage, outs):
@@ -516,7 +734,7 @@ class _Recorder(TorchDispatchMode):
         if self.leaf is not None:  # part of the leaf call in progress
             self.inner.append(lambda: self.add(name, kind, slots, outs, why))
             return
-        op = self._op(name, kind, slots, [_concrete(t.shape) for t in outs])
+        op = self._op(name, kind, slots, [self._dims(t.shape) for t in outs])
         if why:
             self.left_out.append((why, op))
         else:
@@ -626,11 +844,16 @@ class _Recorder(TorchDispatchMode):
             self.on, self.creating, self.replaying = on, creating, None
 
     def _live(self, value):
+        if isinstance(value, ir.Symbol):
+            return self.symbol
         if isinstance(value, ir.Tensor):
             dtype = getattr(torch, value.dtype.removeprefix("torch."))
-            return torch.empty_strided(
-                value.shape, value.stride, dtype=dtype, device="cuda"
+            shape, stride = (
+                [self._live(d) if d is ir.G else d for d in s]
+                for s in (value.shape, value.stride)
             )
+            device = "cpu" if value.host else "cuda"
+            return torch.empty_strided(shape, stride, dtype=dtype, device=device)
         if isinstance(value, ir.ContextRef) and LAYER in value.index_names:
             value = value.bind(**{LAYER: self.layer})
         if not isinstance(value, ir.ModuleRef):
@@ -666,15 +889,24 @@ class _Recorder(TorchDispatchMode):
             ) from None
 
     def _arg(self, value):
+        if self._dim(value) is ir.G:
+            return ir.G
         if isinstance(value, torch.Tensor):
             role = self.roles.get(_storage(value), ir.Role.METADATA)
-            shape, stride = _concrete(value.shape), value.stride()
+            shape, stride = self._dims(value.shape), tuple(
+                map(self._dim, value.stride())
+            )
             shuffled = bool(getattr(value, "is_shuffled", False))
-            return ir.Tensor(shape, str(value.dtype), stride, role, shuffled)
+            host = value.device.type == "cpu"
+            marks = shuffled, host, host and not self.pinned(value)
+            return ir.Tensor(shape, str(value.dtype), stride, role, *marks)
         if isinstance(value, torch.nn.Module) and id(value) in self.modules:
             return ir.ModuleRef(self._layered(self.modules[id(value)]))
         if isinstance(value, str) and value in self.contexts:
             return ir.ContextRef(self._layered(value))
+        if _pytree.is_namedtuple_instance(value):  # its callee reads fields by name
+            items = value._asdict().items()
+            return Reduced(_class(value), tuple((k, self._arg(v)) for k, v in items))
         if isinstance(value, (list, tuple)):
             return tuple(self._arg(v) for v in value)
         if isinstance(value, (torch.dtype, torch.device, torch.layout)):
@@ -722,6 +954,20 @@ class _Recorder(TorchDispatchMode):
         return re.sub(rf"\blayers\.{self.layer}\b", f"layers.{{{LAYER}}}", path)
 
 
+class _Pinned(TorchDispatchMode):
+    """What ATOM allocates with `pin_memory=True` where the recorder is off, as
+    the runner is built and sizes its pools, held pinned (`_Recorder.pin`);
+    nothing else is touched, a host array headed for the device among it."""
+
+    def __init__(self, recorder):
+        super().__init__()
+        self.pin = recorder.pin
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        return self.pin(out) if (kwargs or {}).get("pin_memory") else out
+
+
 def _coordinator(group_name: str) -> str:
     """The aiter coordinator (`tp:0`) whose device group torch names
     `group_name`, or the name as it is when none is: torch numbers groups in
@@ -750,9 +996,18 @@ def _patches(recorder):
       that unwinds a frame, on every function.
     * `CpuGpuBuffer.__init__` (ATOM's own) allocates its host side and that
       side's numpy view outside the fake mode, unpinned (pinning is a driver
-      allocation); its device side is ATOM's `zeros_like`, faked.
-    * GDN's causal-conv1d metadata is host arithmetic over the staged
-      `cu_seqlens`, and it runs outside the fake mode too.
+      allocation); its device side is ATOM's `zeros_like`, faked. torch
+      caches the constructors a default device places at their first call,
+      made here before that patch: cached under it, they would leave every
+      later `torch.zeros` of ATOM's on the host, not on the runner's device.
+    * A host tensor ATOM asks to pin (that host side, `pin_memory=True`, a
+      `pin_memory()` copy) is held pinned (`_Recorder.pin`), as `is_pinned`
+      answers, and so is `torch.from_numpy` over a numpy view of one, which
+      shares its bytes. `torch.tensor` and `torch.arange` build one unpinned
+      where torch builds it, a `torch.tensor` for a device on the host and
+      then copied there, as torch stages it: torch pins through the driver,
+      and the fake mode refuses to pin an `arange`. Beside `out`, torch
+      ignores `pin_memory`, and so does the capture.
     * A GDN prefill under ReplaySSM parks the cursors of its live state
       slots, a count of the device's slot indices no fake tensor holds: the
       host-staged indices state it (`_Recorder.counted`).
@@ -762,9 +1017,21 @@ def _patches(recorder):
       drafter's runner reads back the last step's MTP status and draft ids).
       Otherwise such a read raises.
     * ATOM's MoE wrappers run their bodies, not their fakes: inside are the
-      collectives, the streams and the expert kernels.
+      collectives, the streams and the expert kernels. A two-batch-overlap
+      micro-batch's MoE runs on one stream, as under overlap, where
+      `tbo_active()` turns the dual-stream MoE off. aiter's comm-fused MoE
+      runs as one leaf (`peers.comm_fused`).
+    * The aiter fused-MoE leaves (`FUSED_MOES`) of a layer whose top-k ids
+      aiter's table widens with its fused shared experts (`LEGACY_AITER`)
+      state the layer's `top_k` and `fused_shared_experts`: the ids' width
+      does not tell the router's columns from those.
     * The checkpoint's weights iterator yields nothing: ATOM's dummy load still
       runs it, which would open every shard, or download them for a hub name.
+    * No KV connector is built (`get_kvconnector` answers none): under a P/D
+      side's `--kv-transfer-config`, ATOM's KV allocation would start the
+      worker's transfer engine and register the fake KV pool with it, which
+      has no address. The config's other effects on the model stay, such as
+      DeepSeek-V4's indexer cache in fp8.
     * A step ATOM splits into two micro-batches (`--enable-tbo`) is refused by
       name before its threads start: one graph cannot hold the two.
     * The step's DP exchange (`sync_dp_metadata`) runs on the host, outside
@@ -775,20 +1042,26 @@ def _patches(recorder):
       the call allocates holds one byte.
     * A mono runner binds and builds its widths as its deployment does
       (`_mono`).
+    * A forced acceptance (`--spec-decode-acceptance-length`) draws with a
+      device generator seeded by its sampler's count of steps: the generator
+      is a host one, the declared device having none, and the count stays at
+      zero, so a decode's two contexts seed alike.
     """
     import flydsl
     import triton
     from aiter.ops import topk
     from flydsl.compiler import jit_function as fly
     from torch._subclasses.fake_tensor import unset_fake_temporarily
+    from torch.utils import _device
     from torch.utils._python_dispatch import _disable_current_modes
     from triton.compiler.compiler import CompiledKernel
     from triton.runtime.jit import JITFunction
 
     from atom.model_loader import loader
-    from atom.model_ops import module_dispatch_ops, moe
+    from atom.model_ops import module_dispatch_ops, moe, rejection_sampler
     from atom.model_ops.attentions import gdn_attn
-    from atom.utils import CpuGpuBuffer
+    from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
+    from atom.utils import CpuGpuBuffer, forward_context
     from atom.utils.tbo import ubatching
     from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
@@ -820,9 +1093,11 @@ def _patches(recorder):
         recorder.launch(f"flydsl.{jit.func.__name__}", compiled, jit)
 
     init, zeros, numpy = CpuGpuBuffer.__init__, torch.zeros, torch.Tensor.numpy
-    conv1d, tolist = gdn_attn.compute_causal_conv1d_metadata, torch.Tensor.tolist
+    from_numpy, tensor, arange = torch.from_numpy, torch.tensor, torch.arange
+    tolist = torch.Tensor.tolist
     attach = gdn_attn.GDNStateMixin._attach_replayssm
     fake_tolist, sync = FakeTensor.tolist, ubatching.sync_dp_metadata
+    dual_stream = module_dispatch_ops._dual_stream_is_active
 
     def landed(tensor):
         if not (recorder.lands or getattr(recorder.runner, "drafter", None)):
@@ -843,11 +1118,36 @@ def _patches(recorder):
         if torch.device(kwargs.get("device") or "cpu").type != "cpu":
             return zeros(*size, **kwargs)
         with unset_fake_temporarily():
-            return zeros(*size, **kwargs)
+            out = zeros(*size, **kwargs)
+        return recorder.pin(out) if pin_memory else out
 
     def host_numpy(tensor, *args, **kwargs):
         with unset_fake_temporarily():
             return numpy(tensor, *args, **kwargs)
+
+    def host_from_numpy(array):
+        out, base = from_numpy(array), array.base
+        while hasattr(base, "base"):  # past the views, to what holds the bytes
+            base = base.base
+        held = isinstance(base, torch.Tensor) and recorder.pinned(base)
+        return recorder.pin(out) if held else out
+
+    def staged(build, moves):
+        def call(*args, **kwargs):
+            if not kwargs.get("pin_memory") or kwargs.get("out") is not None:
+                return build(*args, **kwargs)
+            del kwargs["pin_memory"]
+            with recorder.quiet():  # the device torch builds it on, index and all
+                device = torch.empty(0, device=kwargs.get("device")).device
+            if device.type == "cpu" or not moves:
+                out = build(*args, **kwargs)
+                return recorder.pin(out) if device.type == "cpu" else out
+            grad = kwargs.pop("requires_grad", False)
+            out = recorder.pin(build(*args, **{**kwargs, "device": "cpu"}))
+            out = torch.ops.aten._to_copy.default(out, device=device)  # as torch's
+            return out.requires_grad_() if grad else out
+
+        return call
 
     def staged_init(self, *args, **kwargs):
         with (
@@ -862,9 +1162,18 @@ def _patches(recorder):
             "one op_graph cannot hold"
         )
 
-    def host_conv1d(*args, **kwargs):
-        with unset_fake_temporarily():
-            return conv1d(*args, **kwargs)
+    def one_stream_in_micro_batch(moe, num_tokens):
+        return not recorder.shape.micro_batch and dual_stream(moe, num_tokens)
+
+    def moe_forward(hidden_states, router_logits, layer_name):
+        layer = recorder.contexts[layer_name]
+        if layer.expert_layout.mode is not SharedExpertMode.LEGACY_AITER:
+            return moe.moe_forward(hidden_states, router_logits, layer_name)
+        shared = layer.num_fused_shared_experts
+        counts = ("top_k", layer.top_k), ("fused_shared_experts", shared)
+        stated = recorder.stated | dict.fromkeys(FUSED_MOES, counts)
+        with patch.object(recorder, "stated", stated):
+            return moe.moe_forward(hidden_states, router_logits, layer_name)
 
     def host_sync(**kwargs):
         # Outside every mode: host arithmetic, not the step's device work.
@@ -877,6 +1186,7 @@ def _patches(recorder):
         with patch.object(recorder, "counted", live):
             return attach(builder, md, num_reqs, is_prefill)
 
+    _device._device_constructors()  # cached while the constructors are torch's
     unpatched = [
         (fly.JitFunction, "__call__", fly.JitFunction.__call__),
         (fly, "_compile_impl", fly._compile_impl),
@@ -891,25 +1201,36 @@ def _patches(recorder):
         (fly, "_compile_impl", compile_impl),
         (fly.CompiledFunction, "__call__", compiled_call),
         (CpuGpuBuffer, "__init__", staged_init),
-        (gdn_attn, "compute_causal_conv1d_metadata", host_conv1d),
         (ubatching, "sync_dp_metadata", host_sync),
         (gdn_attn.GDNStateMixin, "_attach_replayssm", replayssm),
         (torch.Tensor, "tolist", host_tolist),
+        (torch.Tensor, "pin_memory", lambda t, *a, **k: recorder.pin(t.clone())),
+        (torch.Tensor, "is_pinned", lambda t, *a, **k: recorder.pinned(t)),
+        (torch, "from_numpy", host_from_numpy),
+        (torch, "tensor", staged(tensor, moves=True)),
+        (torch, "arange", staged(arange, moves=False)),
         (FakeTensor, "tolist", host_tolist),
         (torch.Tensor, "numpy", lambda t, *a, **k: host_numpy(landed(t), *a, **k)),
         (loader, "safetensors_weights_iterator", lambda *a, **k: iter(())),
+        (forward_context, "get_kvconnector", lambda *a, **k: None),
         (UBatchWrapper, "_run_ubatches", micro_batches),
         (topk, "topk_ob_workspace_size", lambda *a: 0),
         (topk, "topk_mb_workspace_size", lambda *a: 0),
-        (torch.ops.aiter, "moe_forward", moe.moe_forward),
+        (torch.ops.aiter, "moe_forward", moe_forward),
         (
             torch.ops.aiter,
             "maybe_dual_stream_forward",
             module_dispatch_ops.maybe_dual_stream_forward,
         ),
+        (module_dispatch_ops, "_dual_stream_is_active", one_stream_in_micro_batch),
+        (rejection_sampler, "_synthetic_generator", lambda device: torch.Generator()),
+        *peers.comm_fused(recorder),
         *_mono(recorder, unpatched),
     ):
         stack.enter_context(patch.object(owner, name, value))
+    steps = property(lambda sampler: 0, lambda sampler, step: None)
+    sampler = rejection_sampler.RejectionSampler
+    stack.enter_context(patch.object(sampler, "_synthetic_step", steps, create=True))
     stack.enter_context(_entries(recorder))
     return stack
 
@@ -922,16 +1243,17 @@ def _mono(recorder, unpatched):
     Every rank of a capture is this one: the TP consensus runs on the host,
     outside the fake mode and the recorder, and agrees with this rank, and the
     peer buffer is one of the sizes the runner asks for on the declared device
-    (`driverless.PeerBuffer`). A width's kernels compile for real, compile-only
-    at the declared arch through `unpatched`, so their scratch is read off
-    their binaries. A refusal the deployment makes too, a bind check's
+    (`driverless.PeerBuffer`), as is each uncached scratch a bind or a build
+    takes (`driverless.uncached_bytes`). A width's kernels compile for real,
+    compile-only at the declared arch through `unpatched`, so their scratch is
+    read off their binaries. A refusal the deployment makes too, a bind check's
     `MonoUnsupported` or a kernel that needs scratch, leaves the original path
     to trace and is told to `recorder.declined` by every step it turns away;
     any other bind or build failure is refused by name.
     """
     from torch.utils._python_dispatch import _disable_current_modes
 
-    from atom.mono.runtime import consensus, lifecycle, route, widths
+    from atom.mono.runtime import consensus, lifecycle, route, uncached, widths
     from atom.mono.runtime.compile import compile_kernels, scratch_bytes
 
     agree, init = consensus.tp_agree, route.LazyRunner.__init__
@@ -942,9 +1264,22 @@ def _mono(recorder, unpatched):
         with _disable_current_modes():
             return agree(ok, group)
 
+    def driverless_scratch():
+        """Each loaded module's `uncached_bytes`, ATOM's ctypes HIP allocation,
+        as `driverless.uncached_bytes`: a runner module binds the name at its
+        import, so the name is replaced where each one holds it."""
+        held, real = contextlib.ExitStack(), uncached.uncached_bytes
+        for module in list(sys.modules.values()):
+            if getattr(module, "__dict__", {}).get("uncached_bytes") is real:
+                held.enter_context(
+                    patch.object(module, "uncached_bytes", driverless.uncached_bytes)
+                )
+        return held
+
     def bound(create, lazy):
         try:
-            return create()
+            with driverless_scratch():
+                return create()
         except consensus.MonoUnsupported as why:
             if why.__cause__ is not None:  # a failure `bind_agreed` converted
                 raise ValueError(
@@ -1005,6 +1340,7 @@ def _mono(recorder, unpatched):
             noting.enter_context(
                 patch.object(widths, "compile_kernels", noted(compiled))
             )
+            noting.enter_context(driverless_scratch())
             held = prepare(self, width)
         if failed or not (held or any(scratch)):
             why = repr(failed[0]) if failed else "no kernel needs scratch"
@@ -1060,8 +1396,9 @@ def _v4_attention(v4, recorder):
 
     The decode leaves (`V4_DECODES`) state the layer's `window_size`,
     `compress_ratio` and `index_topk` (None when it has no indexer), and the
-    indexer's and the fused QK-norms (`V4_QKNS`) its `compress_ratio`, none of
-    which they are passed: read off the layer `layer_name` names.
+    indexer's, the fused QK-norms (`V4_QKNS`) and the prefill attention
+    (`V4_PREFILLS`) its `compress_ratio`, none of which they are passed: read
+    off the layer `layer_name` names.
     """
     from atom.utils.forward_context import get_forward_context
 
@@ -1072,7 +1409,7 @@ def _v4_attention(v4, recorder):
         geometry = (("window_size", layer.window_size), *ratio, ("index_topk", top))
         stated = {
             **dict.fromkeys(V4_DECODES, geometry),
-            **dict.fromkeys((V4_INDEXER, *V4_QKNS), ratio),
+            **dict.fromkeys((V4_INDEXER, *V4_QKNS, *V4_PREFILLS), ratio),
         }
         with (
             patch.object(recorder, "stated", stated),
@@ -1100,17 +1437,22 @@ def _v41(recorder, hf):
     each request's state is where the scheduler put it has no values to
     judge.
 
-    Its sparse attention (`V41_ATTENTION`) states the layer's `window_size`,
+    Its sparse attention (`V41_ATTENTION`, `V41_FP8_ATTENTION`) states the
+    layer's `window_size`,
     `compress_ratio` and `index_topk` (None where it compresses nothing), and
     its indexer's scorers (`V41_SCORERS`) the `compress_ratio` and
     `index_candidates`, the most entries it scores where an earlier layer
     chose its candidates, else None: read off the layer `layer_name` names
-    and the model's config `hf`.
+    and the model's config `hf`. Its index keys' RoPE (`V41_ROPE`) states
+    their indexer's `compress_ratio`; its query's, on the step's positions
+    at every ratio, states none. Its top-k (`V41_TOPKS`) states the scorers'
+    `compress_ratio`.
     """
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.models.deepseek_v41.attention import Indexer
 
     bodies = {name: _implementation(name) for name in V41_OPENED}
-    attend = bodies["v41_attention"]
+    attend, project_keys = bodies["v41_attention"], Indexer.project_keys
 
     def attention(hidden, layer_name, *args, **kwargs):
         attn = recorder.contexts[layer_name][0].attn
@@ -1122,10 +1464,17 @@ def _v41(recorder, hf):
         scored = ("compress_ratio", ratio), ("index_candidates", candidates)
         stated = {
             V41_ATTENTION: (*geometry, ("index_topk", top)),
+            V41_FP8_ATTENTION: (*geometry, ("index_topk", top)),
             **dict.fromkeys(V41_SCORERS, scored),
+            **dict.fromkeys(V41_TOPKS, scored[:1]),
         }
         with patch.object(recorder, "stated", stated):
             return attend(hidden, layer_name, *args, **kwargs)
+
+    def keys(indexer, *args):
+        ratio = {V41_ROPE: (("compress_ratio", indexer.spec.ratio),)}
+        with patch.object(recorder, "stated", recorder.stated | ratio):
+            return project_keys(indexer, *args)
 
     bodies["v41_attention"] = attention
     recorder.lands = True
@@ -1135,6 +1484,7 @@ def _v41(recorder, hf):
     stack.enter_context(
         patch.object(PagedAttentionCache, "_report_stale_state", lambda *a: None)
     )
+    stack.enter_context(patch.object(Indexer, "project_keys", keys))
     return stack
 
 
@@ -1370,62 +1720,113 @@ def capture(
     atom_args=(),
     arch="gfx942",
     population=(),
+    read=None,
     whole=False,
+    symbolic=False,
 ):
     """Trace one step of `model` at TP `tp` at each of `shapes`, in this process,
-    under ATOM's engine arguments `atom_args` on a declared `arch`.
+    under ATOM's engine arguments `atom_args` on a declared `arch`, or on the
+    card `read` declares (`driverless.card`), as `Tracer.trace` traces them.
 
-    Yields, per shape, the graph, the model's config digest, what the capture
-    declared, the operators it left out of the graph among it; per prefill
-    shape, the middle chunk's and then the final one's. Under a drafter each
-    step is two graphs, its target's and then its drafter's (`_drafter`), and a
-    decode step verifies the drafter's tokens in each row. The steps of the
-    record directories `population` are shapes too (`population_shapes`),
-    under two-batch overlap a split one's two micro-batches; each of their
-    prefills runs as one forward, as it ran, this rank answering that it
-    cannot split it; with `whole`, each prefill of `shapes` too.
+    The steps of the record directories `population` are shapes too
+    (`population_shapes`), under two-batch overlap a split one's two
+    micro-batches, each keyed as one (`structure`); each of their prefills
+    runs as one forward, as it ran, this rank answering that it cannot split
+    it; with `whole`, each prefill of
+    `shapes` too. With `symbolic`, each prefill's (T, B) of a DP group with no
+    drafter, at its width, is then traced with G a symbol, as a run's lookup
+    traces it (`Tracer.symbolic`); one whose two ends differ is named on
+    stderr. Without DP, or under a drafter, `symbolic` is refused before any
+    trace.
     """
-    declared = driverless.install(tmpdir, arch)
-
-    from torch.fx.experimental.symbolic_shapes import ShapeEnv
-
     from atom.compass.capture import population_shapes
-    from atom.compass.run import _file_digest
-    from atom.config import set_current_atom_config
 
-    config = _config(model, tp, atom_args)
-    tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
-    ep = int(config.enable_expert_parallel)
-    ran = population_shapes(population, config.enable_tbo)
-    unsplit = {s for s in ([*ran, *shapes] if whole else ran) if s.phase == "prefill"}
+    tracer = Tracer(model, tp, tmpdir, atom_args, arch, read)
+    config = tracer.config
+    if symbolic and (
+        config.parallel_config.data_parallel_size == 1 or config.speculative_config
+    ):
+        raise ValueError("--symbolic: only a DP prefill with no drafter holds G")
+    ran = population_shapes(population, tracer.config.enable_tbo)
     shapes = list(dict.fromkeys([*shapes, *ran]))
     if not shapes:
         raise ValueError(f"{', '.join(population)} hold no step to trace")
-    if dp == 1 and (gathering := [s for s in shapes if s.gathered is not None]):
-        raise ValueError(f"{gathering[0]} gathers a DP group's rows on one rank")
-    declared["group"] = driverless.group(tp, dp)
-    set_current_atom_config(config)
-    digest = _file_digest(config.model, "config.json")
-    fake_mode = driverless.driverless_mode(ShapeEnv())
-    contexts = config.compilation_config.static_forward_context
-    recorder, block_size = _Recorder(contexts, fake_mode), config.kv_cache_block_size
-    driverless.on_wait = recorder.wait
-    # A drafter's runner imports inductor, whose decomposition table walks
-    # every `torch.ops.aiter` op, which the patches below replace by functions.
-    import torch._inductor.decomposition
+    with contextlib.closing(tracer):
+        yield from tracer.trace(shapes, [*ran, *shapes] if whole else ran)
+        held = (s for s in shapes if symbolic and s.phase == "prefill")
+        for shape in dict.fromkeys(s._replace(gathered=None) for s in held):
+            try:
+                yield from tracer.symbolic(shape)
+            except PerG as why:
+                print(f"each G traced as it is: {why}", file=sys.stderr)
 
-    stack = _patches(recorder)
-    if dp > 1:
-        for owner, name, value in peers.patches(recorder):
-            stack.enter_context(patch.object(owner, name, value))
-        if ep:
-            peers.install_mori(recorder)
-    with stack:
-        runner = _build_runner(config, fake_mode)
+
+class Tracer:
+    """ATOM's runner of `model` at TP `tp` under ATOM's engine arguments
+    `atom_args`, on a declared `arch` or the card `read` declares
+    (`driverless.card`), stepped at shapes (`trace`). It is built at the first
+    `trace`, once, and every later one steps the same runner. The capture's
+    patches hold until `close`; the declared device, for the process. Each
+    graph states the files its process ran and read up to its step
+    (`capture.files_of`), from the reads watched since this one was made."""
+
+    def __init__(self, model, tp, tmpdir, atom_args=(), arch="gfx942", read=None):
+        self.reads = watch_reads()
+        self.declared = driverless.install(tmpdir, arch, read)
+        self.config = _config(model, tp, atom_args)
+        self.stack, self.runner, self.blocks = contextlib.ExitStack(), None, 0
+
+    def close(self):
+        self.stack.close()
+
+    def _symbol(self, hint: int):
+        """A new symbol of the fake mode's shape env at `hint`, a `SymInt`
+        with a source of its own, so no earlier trace's guards bind it."""
+        from torch._dynamo.source import ConstantSource
+        from torch.fx.experimental.symbolic_shapes import DimDynamic
+
+        env = self.fake_mode.shape_env
+        source = ConstantSource(f"{ir.G}{len(env.var_to_val)}")
+        expr = env.create_symbol(hint, source, dynamic_dim=DimDynamic.DYNAMIC)
+        return env.create_symintnode(expr, hint=hint, source=source)
+
+    def _build(self):
+        """The runner, built under the capture's modes and patches, its layers
+        and its drafter's cuts told to the recorder, its pools sized as
+        `EngineCore` sizes them."""
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from atom.compass.run import _file_digest
+        from atom.config import set_current_atom_config
+        from atom.model_engine.llm_engine import InputOutputProcessor
+
+        config, stack = self.config, self.stack
+        tp, dp = config.tensor_parallel_size, config.parallel_config.data_parallel_size
+        self.declared["group"] = driverless.group(tp, dp)
+        set_current_atom_config(config)
+        self.digest = _file_digest(config.model, "config.json")
+        fake_mode = self.fake_mode = driverless.driverless_mode(ShapeEnv())
+        contexts = config.compilation_config.static_forward_context
+        recorder = self.recorder = _Recorder(contexts, fake_mode)
+        driverless.on_wait = recorder.wait
+        # A drafter's runner imports inductor, whose decomposition table walks
+        # every `torch.ops.aiter` op, which the patches below replace by functions.
+        import torch._inductor.decomposition
+
+        stack.enter_context(_patches(recorder))
+        if dp > 1:
+            for owner, name, value in peers.patches(recorder):
+                stack.enter_context(patch.object(owner, name, value))
+            if config.enable_expert_parallel:
+                peers.install_mori(recorder)
+        pinned = _Pinned(recorder)
+        with pinned:
+            runner = _build_runner(config, fake_mode)
         if v4 := sys.modules.get("atom.models.deepseek_v4"):
             stack.enter_context(_v4_attention(v4, recorder))
         if v41 := "atom.models.deepseek_v41.runtime" in sys.modules:
             stack.enter_context(_v41(recorder, config.hf_config))
+        self.v41 = v41
         stacks = [
             module
             for name, module in runner.model.named_modules()
@@ -1445,28 +1846,126 @@ def capture(
         )
         recorder.runner = runner
         recorder.modules = {id(m): n for n, m in runner.model.named_modules() if n}
-        drafts, drafted = _drafter(runner, recorder)
+        self.drafts, drafted = _drafter(runner, recorder)
         models = [runner.model, *drafted]
         weights = map(_storage, (w for m in models for w in _weights(m)))
         recorder.roles = dict.fromkeys(weights, ir.Role.WEIGHT)
-        recorder.creating = ir.Role.KV
-        from atom.model_engine.llm_engine import InputOutputProcessor
-
         per_req = InputOutputProcessor._per_req_cache_model_types()
-        stateful = config.hf_config.model_type in per_req
-        blocks = max(
-            _batch(s, block_size, max(CONTEXTS), True, drafts)[1] for s in shapes
-        )
-        with fake_mode, torch.inference_mode():
+        self.stateful = config.hf_config.model_type in per_req
+        with fake_mode, pinned, torch.inference_mode():
             runner.get_num_blocks()  # sizes the pools, as `EngineCore` does
         # A warmup copy whose bytes nobody reads, like `_maybe_warmup`.
         runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
-        with fake_mode, recorder, torch.inference_mode():
-            runner.allocate_kv_cache(max(KV_BLOCKS, blocks))
-        # The runner, its drafter and its KV pool live to the end: no
-        # collection need walk them again.
-        gc.collect()
-        gc.freeze()
+        # This rank's own two-batch overlap answer, which a prefill `trace`
+        # runs as one forward replaces.
+        self.own = runner._local_tbo_eligibility
+        self.runner = runner
+
+    def symbolic(self, shape):
+        """The graphs of the DP prefill `shape`, at its tokens, sequences and
+        width, that hold G, the rows its MoE gathers, as `trace` yields them,
+        each run as one forward: traced with G a symbol at both ends of its
+        range, from a prefilling peer's one row past this rank's tokens to each
+        peer at `max_num_batched_tokens`. The upper end's are kept, with the
+        guards its trace installed on G (MORI's trim admits G up to its hint),
+        once the two agree with G and each exchange's `sizes` put at either end
+        (`peers.at`); else `PerG` names where they differ, and each G of the
+        shape is traced as it is."""
+        dp = self.config.parallel_config.data_parallel_size
+        tokens = shape.tokens
+        top = self.config.max_num_batched_tokens
+        lo, hi = hints = tokens + 1, tokens + (dp - 1) * top
+        text = symbolic_shape(shape)
+        if self.runner is None:
+            self._build()
+        if dp == 1 or self.drafts:
+            raise ValueError(f"{text}: only a DP prefill with no drafter holds G")
+        # The upper end first, after warm-up steps as any trace; the lower end
+        # follows its steps at the same (T, B), with none of its own.
+        ends = {}
+        for g, warm in ((hi, True), (lo, False)):
+            at = shape._replace(gathered=g).at(dp)
+            try:
+                ends[g] = [*self.trace([at], [at], symbolic=True, warm=warm)]
+            except PerG:
+                raise
+            except Exception as exc:  # its G are each traced instead
+                raise PerG(f"{text} at G={g}: {type(exc).__name__}: {exc}") from exc
+        low, high = (
+            [json.loads(to_json(graph)) for graph, *_ in ends[g]] for g in hints
+        )
+        if [x["structure"] for x in low] != [y["structure"] for y in high]:
+            raise PerG(f"{text} traces other graphs at G={lo} than at G={hi}")
+        for x, y in zip(low, high):
+            chunk = "middle" if x["structure"].endswith("no output") else "final"
+            (a, in_a), (b, in_b) = (
+                (r, peers.slots(r)) for r in (x["region"], y["region"])
+            )
+            # Each end as it traced, against the upper end's graph put there.
+            ran = {
+                lo: peers.at(a, in_a, lo, dp, False),
+                hi: peers.at(b, in_b, hi, dp, False),
+            }
+            for g, traced in ran.items():
+                if traced != (put := peers.at(b, in_b, g, dp)):
+                    why = _differ(traced, put)
+                    raise PerG(f"{text}, its {chunk} chunk at G={g}: {why}")
+        kept = []
+        for graph, digest, declared in ends[hi]:
+            applies = dataclasses.replace(graph.applicability, hints=hints)
+            graph = dataclasses.replace(graph, applicability=applies)
+            kept.append((graph, digest, declared))
+        return kept
+
+    def trace(self, shapes, unsplit=(), symbolic=False, warm=True):
+        """Yields, per shape of `shapes`, the graph, the model's config digest,
+        what the capture declared, the operators it left out of the graph among
+        it; per prefill shape, the middle chunk's and then the final one's.
+        Under a drafter each step is two graphs, its target's and then its
+        drafter's (`_drafter`), and a decode step verifies the drafter's tokens
+        in each row. A prefill of `unsplit` runs as one forward, this rank
+        answering that it cannot split it. The KV pool is the one a capture of
+        `shapes` alone allocates: the blocks the widest of them takes,
+        `KV_BLOCKS` at the fewest.
+
+        `symbolic` traces each shape, a DP prefill, with the rows its MoE
+        gathers G, a symbol at that shape's (`_Recorder.symbol`): its graph is
+        keyed by `symbolic_shape` and holds the guards the trace installed on
+        G (`_guards`). Unless `warm`, no step runs before a traced one: the
+        caller has just stepped the runner at that shape."""
+        config = self.config
+        dp = config.parallel_config.data_parallel_size
+        if dp == 1 and (gathering := [s for s in shapes if s.gathered is not None]):
+            raise ValueError(f"{gathering[0]} gathers a DP group's rows on one rank")
+        if symbolic and (dp == 1 or any(s.phase != "prefill" for s in shapes)):
+            raise ValueError("only a DP prefill's graph holds the rows it gathers")
+        if self.runner is None:
+            self._build()
+        declared, drafts = self.declared, self.drafts
+        runner, recorder, fake_mode = self.runner, self.recorder, self.fake_mode
+        stateful, v41, own = self.stateful, self.v41, self.own
+        block_size = config.kv_cache_block_size
+        blocks = max(
+            KV_BLOCKS,
+            *(_batch(s, block_size, max(CONTEXTS), True, drafts)[1] for s in shapes),
+        )
+        if blocks != self.blocks:
+            self.blocks = blocks
+            recorder.creating = ir.Role.KV
+            with fake_mode, recorder, torch.inference_mode():
+                runner.allocate_kv_cache(self.blocks)
+            # The runner, its drafter and its KV pool live to the next pool: no
+            # collection need walk them again.
+            gc.collect()
+            gc.freeze()
+        # What earlier steps left answers none of these steps: the roles of
+        # storages that died, the leaves replayed, the fake mode's cached
+        # outputs. A runner stepped through many shapes holds one call's worth.
+        recorder.roles = {k: v for k, v in recorder.roles.items() if not k.expired()}
+        recorder.replayed.clear()
+        FakeTensorMode.cache_clear()
+        # A prefill of `unsplit` ran as one forward: this rank cannot split it.
+        unsplit = {s for s in unsplit if s.phase == "prefill"}
         # A prefill is traced as a middle chunk, which samples nothing, then as
         # a final one; a decode step always samples, as does a prefill whose
         # LM head pads, except a DP middle chunk's drafter at its later passes.
@@ -1476,8 +1975,6 @@ def capture(
             for output in ((False, True) if shape.phase == "prefill" else (True,))
             if output or not shape.width or dp > 1 and drafts
         ]
-        # A population's prefill ran as one forward: this rank cannot split it.
-        own = runner._local_tbo_eligibility
 
         def unsplittable(batch):
             return (False, False, 0, 0)
@@ -1488,22 +1985,31 @@ def capture(
             ladder = [shape.width or shape.seqs]
             runner.capture_sizes_np = numpy.array(ladder, dtype=numpy.int32)
             runner._local_tbo_eligibility = unsplittable if shape in unsplit else own
-            traces = []
+            traces, symbol = [], None
             for context in CONTEXTS if shape.phase == "decode" else CONTEXTS[:1]:
                 recorder.creating = ir.Role.METADATA
                 batch = (shape, block_size, context, output, drafts, stateful, v41)
-                with fake_mode, recorder:
-                    # A runner's first step takes its own path (a decode
-                    # fills no deferred ids), so the traced step follows two
-                    # of its own shape, which find its launching functions:
-                    # no graph depends on another's.
-                    for _ in range(2):
+                try:
+                    with fake_mode, recorder:
+                        # A runner's first step takes its own path (a decode
+                        # fills no deferred ids), so the traced step follows two
+                        # of its own shape, which find its launching functions:
+                        # no graph depends on another's.
+                        for _ in range(2 * warm):
+                            runner.forward(_batch(*batch)[0])
+                        recorder.start()
+                        recorder.creating, recorder.on = ir.Role.METADATA, True
+                        if symbolic:
+                            recorder.symbol = self._symbol(
+                                shape.gathered or dp * shape.tokens
+                            )
                         runner.forward(_batch(*batch)[0])
-                    recorder.start()
-                    recorder.creating, recorder.on = ir.Role.METADATA, True
-                    runner.forward(_batch(*batch)[0])
-                recorder.creating, recorder.on = None, False
+                finally:
+                    symbol, recorder.symbol = recorder.symbol, None
+                    recorder.creating, recorder.on = None, False
                 traces.append((recorder.items, recorder.left_out))
+            guards = _guards(fake_mode.shape_env, symbol) if symbol is not None else ()
+            at = symbolic_shape(shape) if symbolic else str(shape)
             items, left_out = traces[0]
             if len(traces) > 1:
                 items = _affine(str(shape), items, traces[1][0])
@@ -1516,12 +2022,18 @@ def capture(
                     skip = shape.tokens < shape.seqs or shape.width and not output
                 if skip:
                     continue
-                key = structure(config, shape.phase, output=output, draft=draft)
-                crossing, traced = [], Traced(key, str(shape))
+                key = structure(
+                    config,
+                    shape.phase,
+                    output=output,
+                    draft=draft,
+                    micro_batch=shape.micro_batch,
+                )
+                crossing, traced = [], Traced(key, at, guards)
                 graph = build(part, traced, crossing)
                 gone = [*left_out, *(("step-crossing", op) for op in crossing)]
                 declared["left_out"] = [{"why": why, **_json(op)} for why, op in gone]
                 declared.pop("mono", None)
                 if mono := list({id(why): why for why in recorder.declined}.values()):
                     declared["mono"] = mono
-                yield graph, digest, dict(declared)
+                yield graph, self.digest, {**declared, "files": files_of(self.reads)}

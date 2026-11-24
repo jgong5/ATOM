@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""A simulated server whose machine spec refuses its tokenizer exits on the refusal.
+"""A simulated server whose host laws refuse its tokenizer exits on the refusal.
 
-The API server checks its tokenizer against the machine spec once its engines
+The API server checks its tokenizer against its host entry once its engines
 have said READY, before it serves. Its engine is a process of its own that the
 server's exit waits for, as ATOM's ``EngineCore-DP<n>`` is: a non-daemon
 `multiprocessing.Process`. The refusal stops the run, as a signal would, so the
@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 import pytest
-from test_memory_readings import DOCUMENT
+from test_served_tokenizer import TERM
 
 from atom.compass import run as compass_run
 from tests.compass.held_ports import held_ports
@@ -32,8 +32,8 @@ EXIT_S = 30.0
 ENGINE_LINE = re.compile(r"^engine (\d+)$", re.MULTILINE)
 #: A co-hosting frontend over an engine LP in a spawned non-daemon process, which
 #: asks for time until its ``+inf`` grant; once the engine has bound, the
-#: frontend checks a tokenizer for an architecture the machine spec has no
-#: entry for. It prints the engine's pid before the check.
+#: frontend checks a fast tokenizer against a term fitted on the slow backend.
+#: It prints the engine's pid before the check.
 SERVER = """\
 import math, multiprocessing
 from types import SimpleNamespace
@@ -87,10 +87,10 @@ def test_a_server_whose_tokenizer_is_refused_exits_with_its_engine_gone(tmp_path
                 {
                     "clock_endpoint": f"tcp://127.0.0.1:{clock_port}",
                     "bound_s": 100.0,
-                    "admission_path": "serving",
+                    "admission_s": 0.54e-3,
                     "ipc_s": 2.0**-10,
                     "stream_s": 2.0**-9,
-                    "machine": DOCUMENT,
+                    "host": {"tokenizer": TERM | {"backend": "slow"}},
                     "out_dir": str(tmp_path),
                 }
             )
@@ -126,7 +126,7 @@ def test_a_server_whose_tokenizer_is_refused_exits_with_its_engine_gone(tmp_path
             server.wait()
     out = log.read_text()
     print(f"\nexit {code} {took:.2f} wall seconds after the tokenizer check")
-    assert code != 0 and "no tokenizer probed for 'LlamaForCausalLM'" in out, out
+    assert code != 0 and "fitted on the slow backend" in out, out
     pid = int(engine[1])
     assert not Path(f"/proc/{pid}").exists(), f"engine {pid} outlived the server"
     # The engine left its loop at its +inf grant, rather than being killed.
@@ -135,4 +135,4 @@ def test_a_server_whose_tokenizer_is_refused_exits_with_its_engine_gone(tmp_path
         (tmp_path / compass_run.LP_FILE.format("frontend")).read_text()
     )
     [ended] = frontend["refusals"]
-    assert ended.startswith("ended:frontend raised SpecRefusal("), ended
+    assert ended.startswith("ended:frontend raised ValueError("), ended

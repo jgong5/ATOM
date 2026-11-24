@@ -10,23 +10,29 @@ deployment, whose bundle the step grid tests use.
 import argparse
 import dataclasses
 import hashlib
+import http.server
 import json
+import math
+import threading
 from types import SimpleNamespace
 
+import platforms
 import pytest
+from huggingface_hub import constants
 from test_artifact_invalidation import STANZA
 from test_backend_step_linear import law
-from test_memory_readings import DOCUMENT, META_8B
+from test_memory_readings import CONFIG_JSON, DOCUMENT, META_8B
 from test_op_graph import FLAT
 from test_run_step_grid import (
     KEY,
     NEW_KINDS,
-    SPEC_DIGEST,
+    PLATFORM,
     deployment,
     host_laws_key,
     publish,
     readings,
 )
+from test_vertical_slice import _run_file
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import (
@@ -35,21 +41,20 @@ from atom.compass.artifacts import (
     GateState,
     Key,
     Kind,
-    Topology,
-    git_tree_root,
+    keyed_platform,
     member_name,
-    module_root,
 )
 from atom.compass.backends import StepGridBackend, StepLinearBackend, StepStubBackend
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.step_linear import UNIFORM_ROUTING
 from atom.compass.backends.step_roofline import StepFallbackBackend
 from atom.compass.backends.step_stub import Coefficients
+from atom.compass.clock import NER, LpId
 from atom.compass.detect import scenario
 from atom.compass.detect.determinism import CONFIGURATION_PREFIX
 from atom.compass.drive import run as drive_run
 from atom.compass.drive import runfile, serve
-from atom.compass.fit.publish import RANK
+from atom.compass.fit.publish import ranks
 from atom.compass.run.step_grid import keyed
 from atom.compass.spec import SpecRefusal
 from atom.compass.validate import runs
@@ -59,22 +64,26 @@ REPORT = {"provenance": [{"source": "record", "run": "r1", "traces": ["trace-a"]
 
 
 def published(tmp_path, r, kind, key, params, report=REPORT):
-    """`params` and `report` handed off at `key` as `fit` hands them off."""
+    """`params` and `report` handed off at `key` as `fit` hands them off, at
+    each rank of the layout `key` states."""
+    key = Key.of(kind, **key)
+    at = ranks(key)
     return ArtifactStore(tmp_path / "store").publish(
-        Key.of(kind, **key),
+        key,
         provenance=STANZA,
-        topology=Topology(),
+        topology=at[0].topology,
         conditions=readings(r),
         gates=GateState.of(),
         members={
-            member_name(stem, RANK, "json"): json.dumps(body).encode()
+            member_name(stem, rank, "json"): json.dumps(body).encode()
             for stem, body in {"params": params, "report": report}.items()
+            for rank in at
         },
     )
 
 
 def host_laws(tmp_path, r):
-    key = {**compass_run.host_key(r.config), "machine_spec": SPEC_DIGEST}
+    key = {**compass_run.host_key(r.config), **keyed_platform(Kind.HOST_LAWS, PLATFORM)}
     return published(
         tmp_path, r, Kind.HOST_LAWS, host_laws_key(r), {"key": key, "laws": LAWS}
     )
@@ -86,12 +95,12 @@ def step_linear(tmp_path, r):
     return published(tmp_path, r, Kind.STEP_LINEAR_LAW, key, law())
 
 
-def build(tmp_path, *flags, atom=(), machine=DOCUMENT):
-    """The run file of `flags`, with the suite's machine and the store."""
-    (tmp_path / "machine.json").write_text(json.dumps(machine))
+def build(tmp_path, *flags, atom=(), machine=DOCUMENT, platform=None):
+    """The run file of `flags`, with the suite's machine, or the `platform`
+    flags, and the store."""
     parser = argparse.ArgumentParser()
     runfile.add_arguments(parser)
-    common = ["--machine", str(tmp_path / "machine.json")]
+    common = platform or platforms.flags(tmp_path / "store", machine, tmp_path)
     args = parser.parse_args([*common, "--store", str(tmp_path / "store"), *flags])
     return runfile.build(args, ["--model", str(tmp_path), *atom])
 
@@ -217,25 +226,28 @@ def test_a_step_stub_file_is_stated_with_its_digest(monkeypatch, tmp_path):
     assert run["backend"] == {"digest": digest, "provenance": None}
 
 
-MACHINE_AND_STORE = ["--machine", "m", "--store", "s"]
+PLATFORM_AND_STORE = ["--device", "d", "--ptl", "disabled", "--store", "s"]
 
 
 @pytest.mark.parametrize(
     "flags,named",
     [
         (
-            MACHINE_AND_STORE,
+            PLATFORM_AND_STORE,
             "one of the arguments --step-stub --step-linear --step-grid",
         ),
-        ([*MACHINE_AND_STORE, "--step-grid", "a", "--step-linear", "b"], "not allowed"),
+        (
+            [*PLATFORM_AND_STORE, "--step-grid", "a", "--step-linear", "b"],
+            "not allowed",
+        ),
         (
             ["--step-grid", "a"],
-            "the following arguments are required: --machine, --store",
+            "the following arguments are required: --device, --ptl, --store",
         ),
     ],
-    ids=["no-backend", "two-backends", "no-machine-or-store"],
+    ids=["no-backend", "two-backends", "no-platform-or-store"],
 )
-def test_the_flags_refuse_without_one_backend_a_machine_and_a_store(
+def test_the_flags_refuse_without_one_backend_a_platform_and_a_store(
     capsys, flags, named
 ):
     parser = argparse.ArgumentParser()
@@ -280,9 +292,44 @@ def test_the_fixed_keys_and_the_dp_width_from_atoms_arguments(tmp_path, atom, wi
     assert run["client_runs"] is None
 
 
-def test_a_machine_file_that_is_no_spec_refuses_before_any_entry_is_read(tmp_path):
+@pytest.mark.parametrize(
+    "flags, on",
+    [((), True), (("--local-grants",), True), (("--no-local-grants",), False)],
+)
+def test_local_grants_are_on_unless_the_command_turns_them_off(tmp_path, flags, on):
+    stub = tmp_path / "stub.json"
+    stub.write_text(json.dumps(dataclasses.asdict(Coefficients())))
+
+    run = build(tmp_path, "--step-stub", str(stub), *flags)
+
+    assert run[compass_run.LOCAL_GRANTS] is on
+
+
+@pytest.mark.parametrize(
+    "key, ceilings", [({}, True), ({"local_grants": False}, False)]
+)
+def test_a_run_file_without_the_key_gives_grants_their_ceilings(
+    tmp_path, key, ceilings
+):
+    run = json.loads(_run_file(tmp_path, **key).read_text())
+    authority = compass_run._RecordingAuthority(run)
+
+    replies = authority.on_request(LpId("traffic"), NER, math.inf, [])
+    for lp in (compass_run.ENGINE, compass_run.FRONTEND):
+        replies += authority.on_request(lp, NER, 1.0, [])
+
+    assert [(i, g) for i, g, _ in replies] == [
+        (compass_run.ENGINE, 1.0),
+        (compass_run.FRONTEND, 1.0),
+    ]
+    assert all((r.ceiling is not None) is ceilings for _, _, r in replies)
+
+
+def test_a_datasheet_that_is_no_datasheet_refuses_before_any_entry_is_read(tmp_path):
+    (tmp_path / "sheet.json").write_text(json.dumps({"device": {}}))
+    platform = ["--device", str(tmp_path / "sheet.json"), "--ptl", "disabled"]
     with pytest.raises(SpecRefusal):
-        build(tmp_path, "--step-grid", "0123456789ab", machine={"device": {}})
+        build(tmp_path, "--step-grid", "0123456789ab", platform=platform)
 
 
 def test_padding_none_prices_real_rows_under_the_step_roofline(monkeypatch, tmp_path):
@@ -329,7 +376,10 @@ def planted_pair(tmp_path, monkeypatch):
         key = {**NEW_KINDS[Kind.STEP_LINEAR_LAW], "engine_config": engine}
         params = {**law(), "provenance": name}
         fitted = published(tmp_path, r, Kind.STEP_LINEAR_LAW, key, params)
-        host = {**compass_run.host_key(r.config), "machine_spec": SPEC_DIGEST}
+        host = {
+            **compass_run.host_key(r.config),
+            **keyed_platform(Kind.HOST_LAWS, PLATFORM),
+        }
         laws = {**LAWS, "prefill": {"E": [i, 0, 0]}}
         params = {"key": host, "laws": laws}
         hosts = published(tmp_path, r, Kind.HOST_LAWS, host_laws_key(r), params)
@@ -428,10 +478,10 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
 ):
     stub = tmp_path / "stub.json"
     stub.write_text(json.dumps(dataclasses.asdict(Coefficients())))
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     parser = argparse.ArgumentParser()
     runfile.add_arguments(parser)
-    flags = ["--step-stub", str(stub), "--machine", str(tmp_path / "machine.json")]
+    flags = ["--step-stub", str(stub), *platforms.network(DOCUMENT, tmp_path)]
+    flags += platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
     args = parser.parse_args([*flags, "--store", str(tmp_path / "store")])
     model = ["--model", str(tmp_path)]
 
@@ -441,21 +491,21 @@ def test_a_prefill_decode_run_file_reads_each_side_s_width_and_the_router_s_cost
 
     assert "data_parallel_size" not in run
     assert compass_run._widths(run) == (2, 1)
-    assert run["router_s"] == DOCUMENT["interconnect"]["router_relay_s"]
+    # No host laws state the router's hop: it takes the floor.
+    assert run["router_s"] is None
     assert run["kv_link"] == "inter_node"
     table = compass_run.channel_table(run)
     lps = {lp.name for lp in table.registry.ids()}
     assert lps == {"traffic", "frontend-P", "engine-P", "frontend-D", "engine-D"}
     write = [f"engine-D->engine-P:kv_write_req#dp0.dp{p}" for p in (0, 1)]
-    assert [table.lookahead(c) for c in write] == [runfile.KV_WRITE_REQ_S] * 2
+    assert [table.lookahead(c) for c in write] == [compass_run.HOP_FLOOR_S] * 2
     relay = table.lookahead("frontend-P->frontend-D:relay")
-    assert relay == run["router_s"]
+    assert relay == compass_run.HOP_FLOOR_S
 
 
 def price_list_key(tmp_path, **layout):
     """The `price_list` key fields of the suite's model, on its machine, from
-    this tree, at the deployment's layout less `layout`."""
-    tree = git_tree_root("atom", module_root("atom"))
+    this ATOM source, at the deployment's layout less `layout`."""
     config = (tmp_path / "config.json").read_bytes()
     return {
         "model": "sha256:" + hashlib.sha256(config).hexdigest(),
@@ -466,8 +516,8 @@ def price_list_key(tmp_path, **layout):
         "decode_context_parallel_size": 1,
         "enable_expert_parallel": False,
         "enable_dp_attention": False,
-        "machine_spec": SPEC_DIGEST,
-        "source_root": f"{tree.revision_kind}-{tree.revision}",
+        **keyed_platform(Kind.PRICE_LIST, PLATFORM),
+        "source_root": compass_run.source_root(),
         **layout,
     }
 
@@ -506,17 +556,100 @@ def test_op_graph_with_no_price_list_at_its_key_installs_analytically(
     assert run["backend"] == {"digest": digest, "provenance": None}
 
 
+@pytest.mark.parametrize("layout", [["-tp", "8"], ["-tp", "4", "-dp", "2"]])
+def test_a_dp_attention_op_graph_names_the_price_list_at_the_layout_its_ranks_run(
+    tmp_path, layout
+):
+    # `fit ops` publishes at the layout `CoreManager` runs, each TP rank a DP
+    # rank of TP 1: eight DP ranks of TP 1 for either layout.
+    r = deployment(tmp_path)
+    key = price_list_key(tmp_path, dp=8, enable_dp_attention=True)
+    entry = published(tmp_path, r, Kind.PRICE_LIST, key, FLAT.params)
+
+    run = build(tmp_path, "--op-graph", atom=[*layout, "--enable-dp-attention"])
+
+    assert run["price_list"] == key
+    assert run["backend"]["digest"] == entry.digest
+
+
 def test_a_prefill_decode_op_graph_whose_sides_name_two_price_lists_refuses(
     tmp_path,
 ):
     r = deployment(tmp_path)
     published(tmp_path, r, Kind.PRICE_LIST, price_list_key(tmp_path), {})
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     parser = argparse.ArgumentParser()
     runfile.add_arguments(parser)
-    flags = ["--op-graph", "--machine", str(tmp_path / "machine.json")]
+    flags = ["--op-graph", *platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)]
     args = parser.parse_args([*flags, "--store", str(tmp_path / "store")])
     model = ["--model", str(tmp_path)]
 
     with pytest.raises(ValueError, match="the decode side's .*'tp': 2"):
         runfile.prefill_decode(args, model, [*model, "-tp", "2"], "intra_node")
+
+
+#: A hub id with no local copy of its config.json.
+HUB_ID = "Qwen/Qwen3-0.6B"
+
+
+class Hub(http.server.BaseHTTPRequestHandler):
+    """A hub serving the suite's config.json as every repo's file."""
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("X-Repo-Commit", "0" * 40)
+        self.send_header("ETag", '"config"')
+        self.send_header("Content-Length", str(len(CONFIG_JSON.read_bytes())))
+        self.end_headers()
+
+    def do_GET(self):
+        self.do_HEAD()
+        self.wfile.write(CONFIG_JSON.read_bytes())
+
+
+@pytest.fixture
+def hub(monkeypatch, tmp_path):
+    """An empty hub cache, with `Hub` as the hub."""
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Hub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}"
+    template = url + "/{repo_id}/resolve/{revision}/{filename}"
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
+    monkeypatch.setattr(constants, "ENDPOINT", url)
+    monkeypatch.setattr(constants, "HUGGINGFACE_CO_URL_TEMPLATE", template)
+    yield
+    server.shutdown()
+    server.server_close()
+
+
+def test_a_hub_model_with_no_local_config_json_fetches_it_and_its_law_loads(
+    hub, tmp_path
+):
+    r = deployment(tmp_path)
+    entry = step_linear(tmp_path, r)
+
+    run = build(tmp_path, "--step-linear", entry.key.token(), atom=["--model", HUB_ID])
+
+    assert run["backend"]["digest"] == entry.digest
+
+
+def test_op_graph_names_the_price_list_at_a_hub_model_s_fetched_config_json(
+    hub, tmp_path
+):
+    r = deployment(tmp_path)
+    key = price_list_key(tmp_path)
+    published(tmp_path, r, Kind.PRICE_LIST, key, FLAT.params)
+
+    run = build(tmp_path, "--op-graph", atom=["--model", HUB_ID])
+
+    assert run["price_list"] == key
+
+
+def test_a_hub_model_whose_config_json_cannot_be_fetched_refuses_naming_it(
+    hub, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
+    token = step_linear(tmp_path, deployment(tmp_path)).key.token()
+
+    named = f"--model {HUB_ID}: its config.json is neither local nor fetchable: "
+    with pytest.raises(ValueError, match=named + "We couldn't connect"):
+        build(tmp_path, "--step-linear", token, atom=["--model", HUB_ID])

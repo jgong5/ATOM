@@ -15,9 +15,10 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from pathlib import Path
 
+import psutil
 import pytest
 from test_drive_gpu import FREE, GPU45, LISTING, _kfd, _plant
 from test_launcher_held_ports import HELD, _squat
@@ -25,6 +26,7 @@ from test_launcher_held_ports import HELD, _squat
 from atom.compass.drive import gpu as drive_gpu
 from atom.compass.drive import serve
 from atom.compass.drive.gpu import GpuRefusal
+from atom.compass.memory.check import recorded
 from atom.compass.run import ENV
 
 TREE = Path(__file__).resolve().parents[2]
@@ -104,7 +106,7 @@ def planted(tmp_path, monkeypatch):
 def _running(pid) -> bool:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # reaped before or mid-read
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
@@ -113,14 +115,29 @@ def _seen(planted: Path) -> dict:
     return json.loads((planted / "argv.json").read_text())
 
 
-def _ready(out: Path, driver, polls: int, poll_s: float) -> dict:
-    """The ready file, once the driver in `driver` has written it."""
-    for _ in range(polls):
-        if (out / serve.READY_FILE).exists():
-            return json.loads((out / serve.READY_FILE).read_text())
+#: How long `_ready` waits for a driver's ready file: well past the longest a
+#: start has taken on a loaded host, where each process that imports torch, the
+#: driver and a planted server that reads ATOM's envs among them, can wait
+#: seconds on a run queue.
+READY_S = 300
+
+
+def _ready(out: Path, driver) -> dict:
+    """The ready file, once the driver in `driver` has written it. Fail if the
+    driver exits first, or after `READY_S`, once it and every process under it
+    are killed."""
+    deadline = time.monotonic() + READY_S
+    while not (out / serve.READY_FILE).exists():
         assert driver.poll() is None, (out / serve.LOG_FILE).read_text()[-4000:]
-        time.sleep(poll_s)
-    pytest.fail(f"no {serve.READY_FILE} after {polls * poll_s} s")
+        if time.monotonic() > deadline:
+            top = psutil.Process(driver.pid)
+            for proc in [top, *top.children(recursive=True)]:
+                with suppress(psutil.NoSuchProcess):
+                    proc.kill()
+            driver.wait()
+            pytest.fail(f"no {serve.READY_FILE} after {READY_S} s")
+        time.sleep(0.05)
+    return json.loads((out / serve.READY_FILE).read_text())
 
 
 def test_a_server_runs_atom_arguments_verbatim_on_its_gpus_between_the_checks(
@@ -172,6 +189,70 @@ def test_the_stop_removes_the_compiled_graph_cache_directory_its_ranks_used(
 
     assert not mine.exists()
     assert other.exists() and configured.exists()
+
+
+#: Four runners of a DP2 TP2 engine, forked once ATOM's logger is set up under
+#: this process's environment, each logging through it what the readers of an
+#: engine's log read: its ranks, a compiled-graph directory it used under
+#: `RUNNERS_CACHE`, its warmup and its Memory budget line, at non_torch
+#: 10.<dp><tp> GB. Writes the environment's ATOM_LOG_MORE to `RUNNERS_SEEN`.
+RUNNERS = """\
+import os
+from atom.utils import logger
+with open(os.environ["RUNNERS_SEEN"], "w") as f:
+    f.write(os.environ.get("ATOM_LOG_MORE", "unset"))
+cache = os.path.join(os.environ["RUNNERS_CACHE"], "torch_compile_cache")
+for dp, tp in ((0, 0), (0, 1), (1, 0), (1, 1)):
+    if os.fork() == 0:
+        used = os.path.join(cache, f"dp{dp}tp{tp}", "rank_0", "backbone")
+        os.makedirs(used)
+        logger.info("ModelRunner rank=%d, dp_rank_local=%d, pp_rank=0", tp, dp)
+        logger.info("Using cache directory: %s for vLLM's torch.compile", used)
+        logger.info("Model Runner%d/2: warmup_model 2.2 seconds with 1 reqs 64 tokens", tp)
+        logger.info("Memory budget: peak_torch=3.87GB, non_torch=10.%d%dGB", dp, tp)
+        os._exit(0)
+for _ in range(4):
+    os.wait()
+"""
+
+
+def runners_logged(log: Path, cache: Path) -> None:
+    """Assert `log` was written as `RUNNERS` writes it under ATOM_LOG_MORE:
+    `memory.check` reads each DP rank's TP lines in TP order, and the stop
+    removed every directory the runners used."""
+    for dp in (0, 1):
+        runs, _ = recorded(log, 2, tp=2, dp=dp)
+        read = [r.by_name()["non_torch"].nbytes for r in runs]
+        assert read == [round(float(f"10.{dp}{tp}") * (1 << 30)) for tp in (0, 1)]
+    assert not any((cache / "torch_compile_cache").iterdir())
+
+
+@pytest.mark.parametrize(
+    "widths, seen",
+    [
+        (["-dp", "2", "-tp", "2"], "1"),
+        (["--data_parallel_size=2", "--tensor-parallel-size", "2"], "1"),
+        (["-tp", "2"], "unset"),
+        (["-dp", "2"], "unset"),
+        (["-dp", "2", "-tp", "2", "--enable_dp_attention"], "unset"),
+    ],
+)
+def test_a_server_at_dp_and_tp_above_1_logs_each_line_s_process(
+    planted, monkeypatch, widths, seen
+):
+    (planted / "planted.py").write_text(RUNNERS + PLANTED)
+    monkeypatch.delenv("ATOM_LOG_MORE", raising=False)
+    monkeypatch.setenv("RUNNERS_SEEN", str(planted / "seen"))
+    monkeypatch.setenv("RUNNERS_CACHE", str(planted / "cache"))
+    monkeypatch.setattr(serve, "CACHE_ROOT", str(planted / "cache"))
+    monkeypatch.setenv("PLANTED_EXIT", "late:0")
+    out = planted / "out"
+
+    serve.serve(["--model", "m", *widths], out, (7,))
+
+    assert (planted / "seen").read_text() == seen
+    if seen == "1":
+        runners_logged(out / serve.LOG_FILE, planted / "cache")
 
 
 #: The stop's cache removal in a process of its own: what it imports, then,
@@ -351,7 +432,7 @@ def test_the_ready_file_follows_the_first_answer_and_a_stop_leaves_nothing(
         ],
         env=env,
     )
-    server = _ready(out, driver, 600, 0.05)["pid"]
+    server = _ready(out, driver)["pid"]
     assert (planted / "answered").exists()
     child = int((planted / "child").read_text())
     assert _running(server) and _running(child)
@@ -544,7 +625,7 @@ def test_a_worker_blocked_past_atom_s_default_wait_at_the_stop_keeps_its_record(
         [sys.executable, "-c", DRIVE, str(planted / "recorded.py"), str(out), *ARGS],
         env=env,
     )
-    _ready(out, driver, 600, 0.05)
+    _ready(out, driver)
     driver.send_signal(signal.SIGTERM)
     assert driver.wait(timeout=serve.STOP_GRACE_S) == 0
     lines = (out / serve.STEPS / "dp0.jsonl").read_text().splitlines()

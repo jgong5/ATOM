@@ -2,25 +2,50 @@
 # SPDX-License-Identifier: MIT
 #
 # One client run against a `compass record` or `compass run` server: aiperf
-# with cctraces_sim.sh's arguments over traces A to B, then the run's export.
+# with cctraces_sim.sh's arguments over traces A to B, or with InferenceX's
+# agentx client over every trace, then the run's export.
 #
 # Usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop]
+#        client.sh OUT --agentx --concurrency C [--duration S] [--stop]
 #        client.sh OUT --sweep --traces A-B --stop
 #   OUT              the server's --out, whose server.json names its URL and,
-#                    for a simulated server, its run file
+#                    for a simulated server, its run file; a deploy.sh OUT's
+#                    prefill/server.json names its prefill instance's URL
 #   --traces A-B     TRACES' traces A to B, each counted from 0
 #   --concurrency C  aiperf --concurrency
 #   --duration S     aiperf --benchmark-duration, seconds on the server's clock
-#                    (default 1800)
+#                    (default 1800, 3600 with --agentx)
+#   --agentx         in place of --traces, the defaults of agentx-harness's
+#                    agentx scenario, which InferenceX's agentic submissions
+#                    run, as flags on the base scenario: every trace in TRACES
+#                    (the scenario's is the full-length corpus; a warmup
+#                    request longer than the server's context aborts aiperf's
+#                    run, so a shorter context takes the 256k-capped copy), seed
+#                    42, a trajectory start between 0.25 and 0.75 of each
+#                    trace, 10 warmup requests per lane with 1800 s grace, a
+#                    per-trace idle cap of 300 s, a system idle cap of 10 s,
+#                    the chat template applied, and against a real server
+#                    aiperf's scrape of its /metrics, which InferenceX takes
+#                    hit rates from
 #   --stop           then SIGTERM the command that started the server, wait
 #                    WAIT_S (default 600) for it to write OUT/run.json and leave,
-#                    and set the export's server_stopped
+#                    a trace run's (OUT/trace) serve.TRACE_STOP_S more, set
+#                    the export's server_stopped and, for an instance, write
+#                    each request's split, OUT/request_split.json
+#                    (atom/compass/report/split.py), then CI's Prometheus
+#                    report of a simulated run's series, OUT/prometheus.html,
+#                    or why there is none, OUT/prometheus.txt
+#                    (atom/compass/report/prometheus.py), a failure of which
+#                    fails no stop, then the run's report, OUT/report.html
+#                    (atom/compass/report/html.py), all of which deploy.sh
+#                    writes for a deployment as it stops
 #   --sweep          in place of aiperf, send the JIT sweep of the cell the
 #                    server's engine and traces A to B make, then after the
 #                    stop keep the points its record covers in the server's
 #                    JIT cache library (atom/compass/drive/sweep.py); only
 #                    points not yet covered are sent, and the last line says
-#                    whether the cell is swept. Needs TRACES alone
+#                    whether the cell is swept. Refuses a server that
+#                    `compass record --sweep` did not start. Needs TRACES alone
 #   MODEL, TRACES    as cctraces_sim.sh takes them
 #   HARNESS_PYTHON   the Python with agentx-harness, and with compass-harness
 #                    when the server is simulated and only then
@@ -37,7 +62,8 @@
 # warmup. OUT/client/ holds the traces aiperf is given, each a file
 # named by its line in TRACES, aiperf's dataset and its log; OUT/artifacts/
 # aiperf's artifacts at --export-level raw, its raw records with no payload
-# and gzipped (profile_export_raw.jsonl.gz), and the client run's export,
+# and gzipped (profile_export_raw.jsonl.gz), that scrape's export
+# (server_metrics_export.json) where it ran, and the client run's export,
 # client_run.json (atom/compass/parity/client_run.py), and its workload,
 # workload.json, as cctraces_sim.sh writes it into run.json, so
 # `python -m atom.compass.validate` grades the two in one cell. One client run per OUT:
@@ -48,12 +74,12 @@
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
-USAGE="usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop] | OUT --sweep --traces A-B --stop"
+USAGE="usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop] | OUT --agentx --concurrency C [--duration S] [--stop] | OUT --sweep --traces A-B --stop"
 bad() { echo "client: $1; $USAGE" >&2; exit 2; }
 fail() { echo "client: $1" >&2; exit 1; }
 ROOT=$(compass_tree_root) || exit $?
 (($#)) && [[ $1 != -* ]] || bad "no OUT"
-OUT=$1 duration=1800 stop=0 sweep=0
+OUT=$1 stop=0 sweep=0 agentx=0
 shift
 while (($#)); do
     case $1 in
@@ -66,11 +92,16 @@ while (($#)); do
     --duration) [[ ${2-} =~ ^[1-9][0-9]*$ ]] || bad "--duration takes whole seconds"; duration=$2; shift ;;
     --stop) stop=1 ;;
     --sweep) sweep=1 ;;
+    --agentx) agentx=1 ;;
     *) bad "unknown argument $1" ;;
     esac
     shift
 done
-if ((sweep)); then
+if ((agentx)); then
+    ((!sweep)) && [[ -z ${first-} ]] || bad "--agentx takes every trace, and neither --traces nor --sweep"
+    [[ -n ${c-} ]] || bad "--concurrency is required"
+    need=(MODEL TRACES HARNESS_PYTHON)
+elif ((sweep)); then
     [[ -n ${first-} ]] && ((stop)) || bad "--sweep takes --traces and --stop"
     need=(TRACES)
 else
@@ -78,6 +109,18 @@ else
     need=(MODEL TRACES HARNESS_PYTHON)
 fi
 for v in "${need[@]}"; do [[ -n ${!v-} ]] || bad "$v is not set"; done
+# The agentx scenario's defaults, as flags on the base scenario: the scenario
+# itself arrived in a later agentx-harness than the one compass-harness pins.
+agentx_args=()
+if ((agentx)); then
+    last=$(awk 'END {print NR - 1}' "$TRACES") || fail "traces: cannot read $TRACES"
+    ((last >= 0)) || fail "traces: $TRACES holds no trace"
+    first=0 duration=${duration:-3600} random_seed=42
+    agentx_args=(--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75
+        --warmup-requests-per-lane 10 --agentic-warmup-grace-period 1800
+        --trace-idle-gap-cap-seconds 300 --system-idle-gap-cap-seconds 10 --apply-chat-template)
+fi
+duration=${duration:-1800}
 
 [[ -s $OUT/server.json ]] || fail "server: no $OUT/server.json; a compass record or compass run --out $OUT writes it once its server answers"
 OUT=$(realpath "$OUT")
@@ -90,20 +133,29 @@ curl -sf --max-time 10 "$url/health" >/dev/null || fail "server: $url/health doe
 compass_env "$ROOT"
 export PYTHONPATH=$ROOT:$ROOT/compass_harness
 compass_require_tree "$ROOT" || exit $?
-unset ATOM_COMPASS_RUN ATOM_COMPASS_CLOCK_ENDPOINT
+unset ATOM_COMPASS_RUN ATOM_COMPASS_CLOCK_ENDPOINT COMPASS_HARNESS_PREFILL_URL
 
 stop_server() {
     # The command that started the server is its parent.
-    local stat command deadline
+    local stat command deadline allow=${WAIT_S:-600} more
     stat=$(cat "/proc/$pid/stat" 2>/dev/null) || fail "stop: the server, process $pid, has left"
     read -r _ command _ <<<"${stat##*\) }"
     [[ $(tr '\0' ' ' <"/proc/$command/cmdline") == *compass* ]] ||
         fail "stop: process $command, the server's parent, is no compass command"
+    # A trace run's command first writes every rank's trace, which serve gives
+    # TRACE_STOP_S, then reduces them (parity.busy). With every profiler row
+    # kept, a 120 s V4.1-Flash TP4 trace run's command left about 11 min after
+    # SIGTERM: 178 s to export, 445 s to reduce (#3106).
+    if [[ -d $OUT/trace ]]; then
+        more=$(cd / && python3 -c 'from atom.compass.drive.serve import TRACE_STOP_S as s; print(s)') ||
+            fail "stop: cannot read serve's TRACE_STOP_S"
+        allow=$((allow + more))
+    fi
     kill -TERM "$command" || fail "stop: SIGTERM to process $command failed"
-    deadline=$((SECONDS + ${WAIT_S:-600}))
+    deadline=$((SECONDS + allow))
     # Until it has exited; a zombie has.
     while stat=$(cat "/proc/$command/stat" 2>/dev/null) && [[ ${stat##*\) } != Z* ]]; do
-        ((SECONDS < deadline)) || fail "stop: the command, process $command, is up ${WAIT_S:-600} s after SIGTERM"
+        ((SECONDS < deadline)) || fail "stop: the command, process $command, is up $allow s after SIGTERM"
         sleep 1
     done
     [[ -s $OUT/run.json ]] || fail "stop: the command left without writing $OUT/run.json"
@@ -132,6 +184,14 @@ print(*(p.value for p in e(group="aiperf.plugins")))') ||
 if [[ -n $run_file ]]; then
     [[ $plugins == *compass_harness* ]] || fail "harness: the server is simulated, and $HARNESS_PYTHON has no compass-harness installed"
     export ATOM_COMPASS_RUN=$run_file
+    # deploy.sh's prefill instance: behind a router that is no LP, the traffic
+    # LP posts each cancel there (compass_harness/traffic_lp.py).
+    if [[ -s $OUT/prefill/server.json ]]; then
+        COMPASS_HARNESS_PREFILL_URL=$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1]))["url"])' "$OUT/prefill/server.json") ||
+            fail "server: $OUT/prefill/server.json names no url"
+        export COMPASS_HARNESS_PREFILL_URL
+    fi
     aiperf=(-m aiperf)
 else
     [[ $plugins != *compass_harness* ]] || fail "harness: the server is real, and $HARNESS_PYTHON has compass-harness installed"
@@ -149,14 +209,25 @@ awk -v d="$OUT/client/traces" -v first="$first" -v last="$last" '
 n=$(find "$OUT/client/traces" -type f | wc -l)
 ((n == last - first + 1)) || fail "traces: $TRACES holds $n of traces $first to $last"
 read -rd '' -a extra <<<"${AIPERF_EXTRA_ARGS-}" || :
-[[ " ${extra[*]} " =~ \ --random-seed[\ =] ]] && seed=() || seed=(--random-seed 20260707)
-# What aiperf sends: all but paths, the URL and the export level, as cctraces_sim.sh
-# hashes them into its run.json's workload.
+[[ " ${extra[*]} " =~ \ --random-seed[\ =] ]] && seed=() || seed=(--random-seed "${random_seed:-20260707}")
+# aiperf's scrape of the server's /metrics changes what aiperf writes, not what
+# it sends. Base mode turns it off in the hashed arguments, as its graded runs
+# recorded them; --agentx leaves it out of them, as the export level, so a real
+# and a simulated run hash alike: on against a real server, as InferenceX's
+# agentx client runs it, off against a simulated one, whose compass-harness
+# refuses it.
+hashed_scrape=(--no-server-metrics) scrape=()
+if ((agentx)); then
+    hashed_scrape=()
+    [[ -z $run_file ]] || scrape=(--no-server-metrics)
+fi
+# What aiperf sends: all but paths, the URL, the export level and the scrape
+# --agentx sets, as cctraces_sim.sh hashes them into its run.json's workload.
 args=(--endpoint-type chat --custom-dataset-type weka_trace
     --concurrency "$c" --benchmark-duration "$duration"
     "${seed[@]}" --scenario inferencex-agentx-mvp --unsafe-override
     --streaming --use-server-token-count --extra-inputs ignore_eos:true
-    --no-server-metrics --no-gpu-telemetry --ui none "${extra[@]}")
+    "${hashed_scrape[@]}" --no-gpu-telemetry --ui none "${agentx_args[@]}" "${extra[@]}")
 
 # Each request carries X-Session-ID, as the nightly's agentic cell sends it: a
 # dp_sticky router keys off it, and a server alone ignores it. The raw records
@@ -167,7 +238,8 @@ trap 'set +e; kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
 (cd "$OUT/client" && AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true \
     AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true exec "$HARNESS_PYTHON" "${aiperf[@]}" \
     profile --url "${url#http://}" --model "$MODEL" --tokenizer "$MODEL" \
-    --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" --export-level raw "${args[@]}") \
+    --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" "${scrape[@]}" \
+    --export-level raw "${args[@]}") \
     >"$OUT/client/aiperf.log" 2>&1 &
 # The coverage check wants a first token or a request's end in the duration's
 # last 5%. A request in flight across that window, which aiperf cancels at the
@@ -207,3 +279,10 @@ path = Path(sys.argv[1])
 export = json.loads(path.read_text()) | {"server_stopped": True}
 path.write_text(json.dumps(export, sort_keys=True))
 EOF
+[[ -d $OUT/prefill ]] && exit 0
+(cd / && python3 -m atom.compass.report.split "$OUT") ||
+    fail "split: atom.compass.report.split exited $?"
+(cd / && python3 -m atom.compass.report.prometheus "$OUT") ||
+    echo "client: prometheus: atom.compass.report.prometheus exited $?" >&2
+(cd / && python3 -m atom.compass.report.html "$OUT") ||
+    fail "report: atom.compass.report.html exited $?"

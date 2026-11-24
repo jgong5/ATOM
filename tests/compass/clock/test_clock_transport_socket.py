@@ -13,7 +13,6 @@ import socket
 import subprocess
 import sys
 import threading
-from unittest import mock
 
 import pytest
 
@@ -29,7 +28,6 @@ from atom.compass.clock import (
     prefill_decode_table,
     single_engine_table,
 )
-from atom.compass.clock.channels import ADMISSION_DELAY_S
 from atom.compass.clock_transport import MalformedMessage, connect, serve
 
 from .test_clock_transport import (
@@ -53,8 +51,17 @@ LOCAL = "tcp://127.0.0.1:0"
 #: endpoint. A loaded gate host can take longer than the replies' `WAIT_S`.
 START_S = 120.0
 
-THREE_LP = {"admission_path": "serving", "ipc_s": IPC_S, "stream_s": STREAM_S}
-FIVE_LP = {**THREE_LP, "router_s": 0.003, "kv_write_req_s": 0.004}
+#: The hand-written three-LP script assumes the engine's 2 ms daemon wake comes
+#: before the request, as it does at a 1.6 ms request lookahead. At 0.54 ms the
+#: request arrives first, the authority rightly grants every LP the finish, and
+#: the script then sends past it.
+THREE_LP = {"admission_s": 1.6e-3, "ipc_s": IPC_S, "stream_s": STREAM_S}
+FIVE_LP = {
+    **THREE_LP,
+    "admission_s": 0.54e-3,
+    "router_s": 0.003,
+    "kv_write_req_s": 0.004,
+}
 
 #: One request through prefill and decode, on the five-LP table: the prefill
 #: engine computes and answers, the relay hands the request to decode, decode
@@ -154,13 +161,7 @@ def test_a_scripted_run_gives_each_lp_the_same_reply_bytes_over_both_carriers(
     served, run
 ):
     build, kwargs, scripts = RUNS[run]
-    # The hand-written three-LP script assumes the engine's 2 ms daemon wake
-    # comes before the request, as it does at a 1.6 ms request lookahead. At
-    # the shipped one the request arrives first, the authority rightly grants
-    # every LP the finish, and the script then sends past it.
-    old = {"serving": 1.6e-3} if run == "three-lp" else {}
-    with mock.patch.dict(ADMISSION_DELAY_S, old):
-        table = build(**kwargs)
+    table = build(**kwargs)
     over = {
         endpoint: _replies(served(ClockAuthority(table), endpoint), table, scripts)
         for endpoint in ("inproc:conformance", LOCAL)

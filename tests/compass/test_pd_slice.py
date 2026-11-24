@@ -74,7 +74,13 @@ LPS = ["engine-D", "engine-P", "frontend-D", "frontend-P", "traffic"]
 RELAY = "frontend-P->frontend-D:relay"
 KV_WRITE_REQ = "engine-D->engine-P:kv_write_req"
 STREAM = "frontend-D->traffic:stream"
-PD = {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10, "kv_link": "intra_node"}
+#: The prefill-decode keys over `_run_file`'s; the stream is decode's hop.
+PD = {
+    "router_s": 2.0**-12,
+    "kv_write_req_s": 2.0**-10,
+    "kv_link": "intra_node",
+    "decode_hops": {"stream_s": 2.0**-12},
+}
 PORTS = (
     "CLOCK_PORT",
     "PREFILL_PORT",
@@ -208,7 +214,7 @@ def test_one_request_meets_every_scenario_check(runs):
 
 # --- without a driver ---------------------------------------------------------
 
-TABLE = single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002)
+TABLE = single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002)
 
 
 def test_a_frontend_answers_a_request_from_outside_the_run_while_its_grant_is_out(
@@ -269,7 +275,7 @@ def test_a_frontend_answers_a_request_from_outside_the_run_while_its_grant_is_ou
 
 def _frontend(monkeypatch, lp: str) -> LPRuntime:
     table = prefill_decode_table(
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=0.001,
         stream_s=0.002,
         router_s=PD["router_s"],

@@ -2,7 +2,7 @@
 """`compass record`: one instance's real server, with its step record, serving
 whatever client runs reach it until it is stopped.
 
-    compass record --gpu G [--host H] [--store S] --out DIR -- <ATOM args>
+    compass record --gpu G [--host H] [--store S] [--sweep] [--trace] --out DIR -- <ATOM args>
 
 `serve` starts the server on the GPUs `--gpu` names with the step record on,
 bound to `--host`, 127.0.0.1 unless named, an address a router on another node
@@ -17,12 +17,32 @@ each rank sizes its pool from its own free memory. DP ranks whose engine files
 state different bounds otherwise refuse the entry, naming each. A speculative
 engine's stop writes ``steps/dp<r>.acceptance.json``, which `compass run
 --acceptance-record` reads.
+Beside them the frontend writes ``steps/tokenizer.jsonl``, each call of the
+served tokenizer with its tokens and its start and end, under a line naming
+the tokenizer's backend and fingerprint, and ``steps/intake.stamps``, each HTTP
+request's intake stamps with its body's bytes (`atom.compass.run.tokenizer`).
+Until the server stops, their lines are in files in its temp directory, which
+``steps/<name>.local`` names; the stop, the server's exit or the SIGTERM a stop
+sends, moves them into ``steps/``. A temp directory on NFS or CIFS refuses. A
+server that died first leaves the ``.local`` file, naming a path inside the
+server's container, and `compass fit host` refuses the record: while that
+container runs, ``podman cp <container>:<path> <out>/steps/<name>``, then delete
+the ``.local`` file. A container whose ``/tmp`` is a tmpfs, as the quickstart's
+is, loses the file at its stop, and the record is taken again.
 One record spans the server's lifetime, every
 client run it served included; `parity.served` splits it per client run.
 
+`--trace` makes it a trace run, a second run of a record's recipe and client
+that labels its prefill passes: the server runs ATOM's profiler on every rank
+from before the first request to its stop (`serve`), and the record gets its
+busy lines (`parity.busy`) before its cost lines. A run under DP or pipeline
+stages refuses it before its server starts.
+
 The server's environment holds `AUTOTUNE_CACHE` as the command's does, 1 when
 the command's has none, and ``TRITON_CACHE_DIR`` as the command's does, or the
-directory Triton resolves when it has none; run.json's ``env`` states both.
+directory Triton resolves when it has none, and `parity.WRITE_THROUGH` at 0,
+or 1 under `--sweep`, whatever the command's says; run.json's ``env`` states
+all three.
 Naming the directory keeps Inductor from putting its own there mid-run. With
 the switch on, Triton loads an autotuned kernel's choice for a shape an earlier
 server of the same directory tuned; a shape the cache lacks still tunes on its
@@ -41,6 +61,12 @@ With `--store`, the server's start merges the store's JIT cache library for
 this stack into the container's caches, and its stop writes back each artifact
 it finished compiling (`jit_cache`); without it no library is touched.
 
+With `--sweep` the server also holds the pacing variables a JIT sweep's steps
+need (`sweep.pacing`), which `client.sh --sweep` checks it has, and
+`parity.WRITE_THROUGH` at 1: nothing grades a sweep's record, so each rank
+writes its lines as they finish, and a rank that dies mid-sweep leaves `sweep
+cover` the steps it ran. At 0, a timing record's lines wait for its exit.
+
 `--profile-ops` and `--profile-steps A:B`, the op-level half's profiled pass,
 refuse; so does ATOM's ``--load_dummy``: a record times real weights, and MoE
 routing follows them.
@@ -56,9 +82,11 @@ from triton import knobs
 from atom.compass.backends.step_grid_plan import TARGET
 from atom.compass.backends.step_labels import label_run, write_table
 from atom.compass.cli import OPS
-from atom.compass.drive import aiter_jit, serve
+from atom.compass.drive import aiter_jit, runfile, serve
 from atom.compass.drive.gpu import add_gpu_flag
 from atom.compass.drive.identity import PTL_CHANGES, ptl_changes
+from atom.compass.drive.sweep import pacing
+from atom.compass.parity import WRITE_THROUGH, busy
 from atom.compass.run import _write_whole
 
 PROG = "compass record"
@@ -82,10 +110,16 @@ def main(argv: list[str]) -> None:
                 f"{arg} is among ATOM's arguments; a record times real weights, "
                 "and MoE routing follows them"
             )
+    if args.trace:
+        refuse_trace(atom_args)
     env = {
         AUTOTUNE_CACHE: os.environ.get(AUTOTUNE_CACHE, "1"),
         "TRITON_CACHE_DIR": knobs.cache.dir,
+        # Set either way, so a timing record never inherits the command's 1.
+        WRITE_THROUGH: "1" if args.sweep else "0",
     }
+    if args.sweep:
+        env |= pacing(atom_args)
     # serve writes server.json when /health first answers, so its mtime is
     # when serving began; a server that never answered served nothing.
     ready = Path(args.out) / serve.READY_FILE
@@ -97,6 +131,7 @@ def main(argv: list[str]) -> None:
             extra_env=env,
             host=args.host,
             store=args.store,
+            trace=args.trace,
         )
     run_json = Path(args.out) / serve.RUN_JSON
     builds = aiter_jit.builds_since(ready.stat().st_mtime_ns) if ready.exists() else {}
@@ -104,7 +139,22 @@ def main(argv: list[str]) -> None:
     if changes:
         run[PTL_CHANGES] = changes
     _write_whole(run_json, json.dumps(run))
+    if args.trace:
+        busy.reduce(args.out)
     write_engine_and_costs(args.out)
+
+
+def refuse_trace(atom_args) -> None:
+    """Refuse a trace run of ATOM's arguments `atom_args` that runs DP ranks or
+    pipeline stages: its busy time is reduced per TP rank."""
+    if (
+        runfile._dp_width(atom_args) > 1
+        or runfile._engine_args(atom_args).pipeline_parallel_size > 1
+    ):
+        raise ValueError(
+            "--trace reduces each TP rank's busy time, and ATOM's arguments run "
+            "DP ranks or pipeline stages"
+        )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -115,7 +165,18 @@ def _parser() -> argparse.ArgumentParser:
         "--store", help="the artifact store whose JIT cache library the server uses"
     )
     p.add_argument(
+        "--sweep",
+        action="store_true",
+        help="start the server with the pacing variables client.sh --sweep needs, "
+        "its record written as its lines finish",
+    )
+    p.add_argument(
         "--out", required=True, help="an empty directory for the record and logs"
+    )
+    p.add_argument(
+        "--trace",
+        action="store_true",
+        help="a trace run: profile the ranks and reduce its prefill busy time",
     )
     p.add_argument("--profile-ops", action="store_true", help="refused: ops half")
     p.add_argument("--profile-steps", metavar="A:B", help="refused: ops half")

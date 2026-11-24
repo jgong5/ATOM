@@ -100,7 +100,7 @@ def test_the_scheduler_half_refuses_what_it_cannot_invent(
     kv.pop(missing, None)
     if missing is not None:
         table = prefill_decode_table(
-            admission_path="serving",
+            admission_s=0.54e-3,
             ipc_s=0.0,
             stream_s=0.0,
             router_s=0.0,
@@ -177,8 +177,7 @@ def test_a_spec_that_cannot_answer_for_the_link_refuses(geometry):
             path: value
             for path, value in spec.values.items()
             if not path.startswith("interconnect.inter_node")
-        },
-        tokenizers=spec.tokenizers,
+        }
     )
     TransferModel.from_spec(without, geometry.bytes_per_block, Scope.INTRA_NODE)
     with pytest.raises(SpecRefusal) as refusal:

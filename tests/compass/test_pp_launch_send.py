@@ -80,7 +80,7 @@ def _stage(monkeypatch, rank, *grants, frames=(), pp=2, models=MODELS):
     """Stage `rank` of `pp`: its runtime, its loop's runner calls through
     `StageSends`, and the frames it sent."""
     table = single_engine_table(
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=0.5,
         stream_s=0.5,
         pp=pp,

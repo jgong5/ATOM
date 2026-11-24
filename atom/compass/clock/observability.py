@@ -208,6 +208,7 @@ class RunSummary:
     detectors: DetectorState = field(default_factory=DetectorState)
     refusals: RefusalTally = field(default_factory=RefusalTally)
     ended_by: str | None = "end_workload"
+    requests: tuple[tuple[str, int], ...] = ()
 
     @classmethod
     def of(
@@ -249,6 +250,7 @@ class RunSummary:
             detectors if detectors is not None else DetectorState(),
             refusals,
             ended_by,
+            tuple(authority.requests_served.items()),
         )
 
     @property
@@ -300,6 +302,10 @@ class RunSummary:
             "lazy_traces": self.lazy_traces,
             "lazy_trace_wall_seconds": self.lazy_trace_wall_seconds,
             "diagnostics": self.diagnostics,
+            # Below a ceiling an LP answers its own calls: how many it made
+            # turns on when each grant found the others.
+            "requests": [[name, count] for name, count in self.requests],
+            "requests_total": sum(count for _, count in self.requests),
         }
 
     def as_record(self) -> dict:

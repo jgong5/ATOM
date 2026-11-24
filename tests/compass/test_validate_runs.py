@@ -986,6 +986,14 @@ def test_a_real_cctraces_sim_cell_whose_server_began_an_aiter_build_is_refused(
     that script gives it, from the time its server began serving: a build
     the stop cut short, with no module written, counts."""
     jit = _aiter(tmp_path, monkeypatch)
+    # Kernel caches of its own too: an earlier `import aiter` points FlyDSL's
+    # and Inductor's at the container's, and Triton read its home on import.
+    for var in (
+        "FLYDSL_RUNTIME_CACHE_DIR",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TRITON_CACHE_DIR",
+    ):
+        monkeypatch.setenv(var, str(tmp_path / var.lower()))
     *real, simulated = _four(tmp_path / "cells")
     for cell in (*real, simulated):
         _recorded(cell)

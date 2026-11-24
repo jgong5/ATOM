@@ -21,7 +21,7 @@ from transformers import PreTrainedTokenizerFast
 from atom.model_engine import prefix_block_hashes as pb
 from atom.model_engine import prefix_hash as ph
 from atom.model_engine import segment_tokenizer as st
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.sequence import Sequence, new_token_ids
 from atom.sampling_params import SamplingParams
 
 
@@ -59,7 +59,7 @@ def prompt():
 
 def assert_block_hashes(encoded, tokenizer, text, block, seed=-1):
     ids = tokenizer.encode(text)
-    assert encoded.token_ids == ids
+    assert encoded.token_ids == new_token_ids(ids)
     hashes = encoded.block_hashes
     assert hashes is not None and hashes.num_tokens == len(ids)
     assert list(hashes.as_array()) == ph.chained_block_hashes(
@@ -144,7 +144,7 @@ def test_no_block_hashes_when_prefix_reuse_is_off(tokenizer):
     with patch.object(st, "extend_block_hashes", wraps=st.extend_block_hashes) as proj:
         for _ in range(2):
             encoded = cache.encode_with_prefix(text, 16)
-            assert encoded.token_ids == tokenizer.encode(text)
+            assert encoded.token_ids == new_token_ids(tokenizer.encode(text))
             assert encoded.block_hashes is None
     assert proj.call_count == 0
 
@@ -164,7 +164,7 @@ def test_disable_during_encode_drops_the_hint_and_cached_hashes(tokenizer, monke
     monkeypatch.setattr(cache._split.backend, "encode_batch", disable)
     text = prompt() + "new text<END><U>more<A>"
     encoded = cache.encode_with_prefix(text, 16)
-    assert encoded.token_ids == tokenizer.encode(text)
+    assert encoded.token_ids == new_token_ids(tokenizer.encode(text))
     assert encoded.block_hashes is None
     assert cache._lru.bytes == 0 and not cache._buckets
 

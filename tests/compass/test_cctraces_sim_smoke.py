@@ -64,14 +64,12 @@ DEFAULTS = {
 
 
 def _template(path: Path, **extra) -> Path:
-    """A run file whose declared tokenizer also covers the model's architecture,
-    and whose store holds the entry of each server the script starts for it."""
+    """A run file whose store holds the entry of each server the script starts
+    for it."""
     machine = copy.deepcopy(DOCUMENT)
-    arch = json.loads((Path(MODEL) / "config.json").read_text())["architectures"][0]
-    machine["host"]["tokenizers"][0]["applies_to"].append(arch)
     run = {
         "bound_s": 1e7,
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 2.0**-14,
         "stream_s": 2.0**-12,
         "step_stub": dataclasses.asdict(Coefficients()),
@@ -81,7 +79,7 @@ def _template(path: Path, **extra) -> Path:
     }
     path.write_text(json.dumps(run))
     env = DEFAULTS | dict(os.environ)
-    if "kv_write_req_s" in run:
+    if "router_s" in run:
         publish_pd_entries(run["store"], machine, env)
     else:
         argv = ["--model", MODEL, *env["SERVER_ARGS"].split()]

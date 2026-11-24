@@ -23,11 +23,11 @@ KV_WRITE_REQ_S = 2.0**-10
 
 DEPLOYMENTS = {
     "single-deployment": functools.partial(
-        single_engine_table, admission_path="serving", ipc_s=IPC_S, stream_s=STREAM_S
+        single_engine_table, admission_s=0.54e-3, ipc_s=IPC_S, stream_s=STREAM_S
     ),
     "prefill-decode-1p1d": functools.partial(
         prefill_decode_table,
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=IPC_S,
         stream_s=STREAM_S,
         router_s=ROUTER_S,

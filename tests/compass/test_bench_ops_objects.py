@@ -130,6 +130,12 @@ def test_v4_pro_s_index_writing_leaves_rebuild_their_arguments_and_launch(
         "swa_dest_hca",
     ):
         runner.forward_vars[f"v4_{name}"] = torch.zeros(1 << 16, dtype=torch.int32)
+    # and a prefill's, which its builder makes for the step
+    for name in ("batch_id_per_q_token", "state_slot_out", "num_cached_tokens"):
+        runner.forward_vars[name] = torch.zeros(1 << 10, dtype=torch.int32)
+    for kind in ("extend", "prefix_swa", "prefix_csa", "prefix_hca"):
+        for part, n in (("indptr", 1 << 10), ("indices", 1 << 20)):
+            runner.forward_vars[f"kv_{part}_{kind}"] = torch.zeros(n, dtype=torch.int32)
     runner.positions = torch.zeros(1 << 14, dtype=torch.int64)
     placed = SimpleNamespace(block_size=16, batch=lambda view, block, slot: (1, slot))
 

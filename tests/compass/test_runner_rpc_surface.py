@@ -257,6 +257,7 @@ class Runner(NonAllocatingRunner):
             max_num_batched_tokens=16384,
             enable_tbo_decode=False,
         )
+        self.attn_metadata_builder = SimpleNamespace(supports_token_graph=False)
 
 
 # --- the surface, derived rather than typed ---------------------------------
@@ -270,7 +271,7 @@ def test_the_surface_is_every_dispatched_name_a_model_runner_answers():
     `ModelRunner` are exactly this intersection -- no list, no judgement.
     """
     assert set(RPC_SURFACE) == set(SITES) & BASE
-    assert len(RPC_SURFACE) == 17
+    assert len(RPC_SURFACE) == 18
 
 
 def test_both_filters_in_the_derivation_drop_nothing():
@@ -286,18 +287,20 @@ def test_both_filters_in_the_derivation_drop_nothing():
 
     The compass-side broadcasts accounted for: the bench starts its runner as
     `EngineCore` does, sending `get_num_blocks`, `allocate_kv_cache`,
-    `capture_cudagraph`, `freeze_gc_heap` and `exit`, and asks it for a
-    measurement, `bench_step`; the run bootstrap reads the Compass runner's refusal tally,
+    `capture_cudagraph`, `freeze_gc_heap` and `exit`, under expert parallelism
+    first `route_uniformly`, and asks it for a measurement, `bench_step`; the
+    run bootstrap reads the Compass runner's refusal tally,
     `refused_commands`, what its steps cost, `priced_steps`, the memory it
     predicts, `predicted_memory`, and its step grid bundle,
-    `step_grid_bundle`. No ATOM site sends `bench_step` or the bootstrap's
-    names, so no `ModelRunner` is ever asked for them.
+    `step_grid_bundle`. No ATOM site sends `route_uniformly`, `bench_step` or
+    the bootstrap's names, so no `ModelRunner` is ever asked for them.
     """
     assert NON_LITERAL == []
-    assert [where.rsplit(":", 1)[0] for where in FROM_COMPASS] == 6 * [
+    assert [where.rsplit(":", 1)[0] for where in FROM_COMPASS] == 7 * [
         "atom/compass/bench/engine.py"
     ] + 4 * ["atom/compass/run/__init__.py"]
     compass = {
+        "route_uniformly",
         "bench_step",
         "refused_commands",
         "priced_steps",
@@ -987,6 +990,7 @@ def test_the_names_no_caller_waits_for_and_what_replying_costs():
         "poll_forward_metrics",
         "process_kvconnector_output",
         "release_multimodal_requests",
+        "release_structured_requests",
     }
     bodies = {
         n.name: n
@@ -997,6 +1001,7 @@ def test_the_names_no_caller_waits_for_and_what_replying_costs():
         "poll_forward_metrics",
         "process_kvconnector_output",
         "release_multimodal_requests",
+        "release_structured_requests",
     ):
         returns = [n for n in ast.walk(bodies[name]) if isinstance(n, ast.Return)]
         assert not [n for n in returns if n.value], name
@@ -1063,11 +1068,16 @@ def test_what_a_hole_at_exit_loses_is_what_exit_does():
         for n in ast.walk(_classes(ATOM_RUNNER)["ModelRunner"])
         if isinstance(n, ast.FunctionDef) and n.name == "exit"
     )
-    # Statements of the body itself: a call inside a lambda, a branch or a
-    # nested def is one `exit` may never make.
+    # Statements of the body itself, and of a `finally` it holds, which runs
+    # whatever the `try` did: a call inside a lambda, a branch or a nested def
+    # is one `exit` may never make.
+    statements = [
+        *body.body,
+        *(n for t in body.body if isinstance(t, ast.Try) for n in t.finalbody),
+    ]
     calls = {
         ast.unparse(n.value.func)
-        for n in body.body
+        for n in statements
         if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
     }
     assert {"destroy_dist_env", "torch.cuda.empty_cache"} <= calls

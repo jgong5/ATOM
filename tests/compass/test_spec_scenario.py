@@ -23,7 +23,6 @@ from test_dp_slice import (  # noqa: F401
     device_classes_put_back,
     run_dp_slice,
 )
-from test_memory_readings import TOKENIZER
 from test_vertical_slice import CONSTANT
 
 from atom.compass.backends.shape import BatchView, RequestShape
@@ -43,16 +42,8 @@ METHODS = {
         "5",
     ),
 }
-#: The slice's machine, with a declared tokenizer for DeepSeek's.
+#: The slice's machine.
 MACHINE = copy.deepcopy(DP_MACHINE)
-MACHINE["host"]["tokenizers"].append(
-    TOKENIZER
-    | {
-        "id": "deepseek-v4-129k-bpe",
-        "vocab_size": 129280,
-        "applies_to": ["DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"],
-    }
-)
 
 
 @pytest.fixture(scope="module", params=sorted(METHODS))

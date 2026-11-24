@@ -7,8 +7,13 @@ capture owns its process.
 """
 
 import contextlib
+import json
 import os
 import pathlib
+import re
+import subprocess
+import sys
+import tempfile
 import types
 
 import torch
@@ -17,13 +22,30 @@ from atom.mono.runtime import peer_memory
 
 #: The devices a capture can declare, by arch: compute units, capability and
 #: memory. ATOM and aiter branch on the arch and size grids by the CU count.
-#: Nothing here reads a device.
+#: Nothing here reads a device; `card` reads one in their place.
 DEVICES = {
     "gfx942": (80, (9, 4), 192 << 30),  # MI308X
     "gfx950": (256, (9, 5), 288 << 30),  # MI355X
     # MI455X, assumed: AMD counts 256 work-group processors and 432 GB of HBM4.
+    # Its capability is card 0's of the MI455 A0 node.
     "gfx1250": (256, (12, 5), 432 << 30),
 }
+#: The card's product name, by arch, as rocm-smi's series and the datasheet
+#: in `compass/devices` name it: aiter reads the model it keys its comm-fused
+#: MoE's winners on off the name. An arch without one is named by its arch.
+NAMES = {
+    "gfx942": "AMD Instinct MI308X",
+    "gfx950": "AMD Instinct MI355X",
+}
+#: The rest of a declared device, by arch, where a source states it: warp size,
+#: threads per CU, L2 bytes, registers per CU and shared memory per block.
+PROPERTIES = {
+    # Card 0 of the MI455 A0 node as `card` read it on 2026-11-04; gfx1250 runs
+    # wave32 on every stepping.
+    "gfx1250": (32, 2048, 4 << 20, 131072, 320 << 10),
+}
+#: What an arch with no `PROPERTIES` entry declares, stated with no source.
+UNSOURCED = (64, 2048, 8 << 20, 65536, 65536)
 #: The stepping `rocminfo` states, where not the first: aiter runs no shipped
 #: asm kernel on gfx1250 A0, revision 0.
 REVISIONS = {
@@ -31,20 +53,62 @@ REVISIONS = {
 }
 
 
-def _props(arch):
+#: What `card` reads, in a process that sees the one card: the properties
+#: `_props` declares, as HIP reports them.
+_READ = (
+    "import json, torch; p = torch.cuda.get_device_properties(0); print(json.dumps("
+    "{f: getattr(p, f) for f in ('multi_processor_count', 'gcnArchName', 'name', "
+    "'major', 'minor', 'total_memory', 'warp_size', 'max_threads_per_multi_processor', "
+    "'L2_cache_size', 'regs_per_multiprocessor', 'shared_memory_per_block')}))"
+)
+
+
+def card(index: int) -> dict:
+    """Card `index` as a capture declares it in place of `DEVICES`: its
+    properties as HIP reports them (``props``), its arch and the stepping
+    rocminfo states for it (``revision``), each read in a child that sees that
+    card alone, so this process holds nothing on it."""
+    env = {**os.environ, "ROCR_VISIBLE_DEVICES": str(index)}
+    for name in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        env.pop(name, None)
+    run = dict(env=env, capture_output=True, text=True, timeout=300, check=False)
+    read = subprocess.run([sys.executable, "-c", _READ], **run)
+    if read.returncode:
+        raise ValueError(f"card {index} reads no device: {read.stderr[-2000:]}")
+    props = json.loads(read.stdout.splitlines()[-1])
+    arch = props["gcnArchName"].split(":")[0]
+    # rocminfo's agents, each with its header fields: aiter reads its stepping
+    # off the GPU agent of its arch.
+    states = []
+    info = subprocess.run(["rocminfo"], **run).stdout
+    for agent in re.split(r"^\s*Agent\s+\d+\s*$", info, flags=re.M):
+        gpu = re.search(r"^  Device Type:\s*GPU\s*$", agent, re.M)
+        named = re.search(rf"^  Name:\s*{arch}\b", agent, re.M)
+        stepping = re.search(r"^  ASIC Revision:\s*(\d+)", agent, re.M)
+        if gpu and named and stepping:
+            states.append(int(stepping[1]))
+    if len(states) != 1:
+        raise ValueError(f"rocminfo states {len(states)} steppings for card {index}")
+    return {"index": index, "arch": arch, "revision": states[0], "props": props}
+
+
+def _props(arch, read=None):
+    if read:
+        return types.SimpleNamespace(**read["props"])
     cus, (major, minor), memory = DEVICES[arch]
+    warp, threads, l2, regs, shared = PROPERTIES.get(arch, UNSOURCED)
     return types.SimpleNamespace(
         multi_processor_count=cus,
         gcnArchName=arch,
-        name=arch,
+        name=NAMES.get(arch, arch),
         major=major,
         minor=minor,
         total_memory=memory,
-        warp_size=64,
-        max_threads_per_multi_processor=2048,
-        L2_cache_size=8 << 20,
-        regs_per_multiprocessor=65536,
-        shared_memory_per_block=65536,
+        warp_size=warp,
+        max_threads_per_multi_processor=threads,
+        L2_cache_size=l2,
+        regs_per_multiprocessor=regs,
+        shared_memory_per_block=shared,
     )
 
 
@@ -126,11 +190,9 @@ def _stream(stream):
         current[0] = previous
 
 
-def install(tmpdir: str, arch: str) -> dict:
-    """Declare the device of `arch`; say what."""
-    if arch not in DEVICES:
-        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
-    cuda = {
+def _cuda(props) -> dict:
+    """`torch.cuda`'s answers as the one device `props` declares."""
+    return {
         # True: on False ATOM takes paths no deployment runs. The fake mode is
         # told otherwise by `driverless_mode`.
         "is_available": lambda: True,
@@ -138,9 +200,9 @@ def install(tmpdir: str, arch: str) -> dict:
         "_lazy_init": lambda *a, **k: None,
         "get_rng_state": lambda *a, **k: torch.zeros(16, dtype=torch.uint8),
         "set_rng_state": lambda *a, **k: None,
-        "get_device_properties": lambda *a, **k: _props(arch),
+        "get_device_properties": lambda *a, **k: props,
         "current_device": lambda: 0,
-        "get_device_capability": lambda *a, **k: DEVICES[arch][1],
+        "get_device_capability": lambda *a, **k: (props.major, props.minor),
         "Stream": Stream,
         "Event": Event,
         "current_stream": lambda *a, **k: current[0],
@@ -158,7 +220,7 @@ def install(tmpdir: str, arch: str) -> dict:
         },
         "memory_allocated": lambda *a, **k: 0,
         # Free and total: nothing is allocated on the declared device.
-        "mem_get_info": lambda *a, **k: (DEVICES[arch][2],) * 2,
+        "mem_get_info": lambda *a, **k: (props.total_memory,) * 2,
         "reset_peak_memory_stats": lambda *a, **k: None,
         "empty_cache": lambda *a, **k: None,
         "is_current_stream_capturing": lambda: False,
@@ -166,13 +228,26 @@ def install(tmpdir: str, arch: str) -> dict:
         "MemPool": lambda *a, **k: None,
         "use_mem_pool": lambda *a, **k: contextlib.nullcontext(),
     }
+
+
+def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
+    """Declare the device of `arch`, or the card `read` (`card`); say what."""
+    if read is None and arch not in DEVICES:
+        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
+    props = _props(arch, read)
+    cuda = _cuda(props)
     for name, value in cuda.items():
         setattr(torch.cuda, name, value)
-    # ATOM's H2D publication reads the current stream's id off `torch._C`.
+    # ATOM's H2D publication reads the current stream's id off `torch._C`, and
+    # aiter's top-k the current device and the raw stream.
     torch._C._cuda_getCurrentStream = lambda *a: (current[0].stream_id, 0, 1)
+    torch._C._cuda_getDevice = lambda: 0
+    torch._C._cuda_getCurrentRawStream = lambda *a: current[0].cuda_stream
     # No checkpoint is read, so a parameter's fill is arbitrary either way, and
     # the in-place RNG fills ask the device for a generator.
     torch.Tensor.uniform_ = torch.Tensor.normal_ = lambda self, *a, **k: self
+    # The allocator's note that another stream uses a block: none is allocated.
+    torch.Tensor.record_stream = lambda self, stream: None
 
     from torch._subclasses import fake_tensor
 
@@ -185,14 +260,32 @@ def install(tmpdir: str, arch: str) -> dict:
         # staging block; direct copies each buffer with its own `copy_`.
         "ATOM_H2D_BACKEND": "direct",
         # aiter's CU count, which it would otherwise ask rocminfo for.
-        "CU_NUM": str(DEVICES[arch][0]),
+        "CU_NUM": str(props.multi_processor_count),
+        # aiter's check that every rank sets it all-reduces over a group whose
+        # collectives reduce nothing; what it shares, the device
+        # communicators, a capture declines.
+        "AITER_REUSE_IDENTICAL_COMM_GROUPS": "0",
         # `group` names GPUs to HIP, which then holds memory on the first at
         # its first device query; ROCm's own mask, below HIP's, hides them all.
         "ROCR_VISIBLE_DEVICES": "",
     }
     os.environ.update(flags)
-    _declare_arch(tmpdir, arch)
-    return {"cuda": sorted(cuda), "arch": arch, "flags": flags}
+    revision = read["revision"] if read else REVISIONS.get(arch, 0)
+    _declare_arch(tmpdir, arch, props.multi_processor_count, revision, props.warp_size)
+    return {"cuda": sorted(cuda), "arch": arch, "flags": flags} | (
+        {"card": read} if read else {}
+    )
+
+
+def answer_as(arch: str) -> None:
+    """`install`'s `torch.cuda` answers for a device of `arch`, and `torch._C`'s
+    device query, for the life of this process. `is_available` keeps this
+    host's answer, and nothing else `install` declares is declared."""
+    cuda = _cuda(_props(arch))
+    del cuda["is_available"]
+    for name, value in cuda.items():
+        setattr(torch.cuda, name, value)
+    torch._C._cuda_getDevice = lambda: 0
 
 
 #: The operators outside torch that the fake mode's dispatch cache takes: each
@@ -248,8 +341,13 @@ def driverless_mode(shape_env):
     return _DriverlessFakeTensorMode(shape_env=shape_env, allow_non_fake_inputs=True)
 
 
-def _declare_arch(tmpdir: str, arch: str) -> None:
-    """Answer aiter's `rocminfo` shell-out and Triton's target query with `arch`."""
+def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None, warp=None) -> None:
+    """Answer aiter's `rocminfo` shell-out and Triton's target query with `arch`,
+    its `cus`, stepping `revision` and `warp` size, those `DEVICES`, `REVISIONS`
+    and `_props` declare unless given."""
+    cus = DEVICES[arch][0] if cus is None else cus
+    revision = REVISIONS.get(arch, 0) if revision is None else revision
+    warp = _props(arch).warp_size if warp is None else warp
     import triton
     from triton.backends.compiler import GPUTarget
 
@@ -257,7 +355,7 @@ def _declare_arch(tmpdir: str, arch: str) -> None:
     rocminfo.parent.mkdir(parents=True, exist_ok=True)
     rocminfo.write_text(
         f"#!/bin/sh\necho 'Agent 1\n  Name: {arch}\n  Device Type: GPU\n"
-        f"  Compute Unit: {DEVICES[arch][0]}\n  ASIC Revision: {REVISIONS.get(arch, 0)}'\n"
+        f"  Compute Unit: {cus}\n  ASIC Revision: {revision}'\n"
     )
     rocminfo.chmod(0o755)
     os.environ["PATH"] = f"{rocminfo.parent}:{os.environ.get('PATH', '')}"
@@ -265,12 +363,41 @@ def _declare_arch(tmpdir: str, arch: str) -> None:
 
     class _DeclaredTarget:
         def get_current_target(self):
-            return GPUTarget("hip", arch, 64)
+            return GPUTarget("hip", arch, warp)
 
         def __getattr__(self, name):
             raise RuntimeError(f"a device-free capture has no Triton driver: {name}")
 
     triton.runtime.driver.set_active(_DeclaredTarget())
+
+
+def import_aiter_on(arch: str) -> None:
+    """Import aiter in this process as on a device of `arch`, whatever device
+    this host has. aiter resolves its fp8 dtype at import, ``uint8`` where no
+    device is available, and caches each arch probe's first answer; those
+    answers stay, as does Triton's target (`_declare_arch`). The device query
+    and the environment are put back, so a process this one starts finds this
+    host's own."""
+    if arch not in DEVICES:
+        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
+    if "aiter" in sys.modules:
+        raise RuntimeError("aiter is loaded already, its fp8 dtype resolved")
+    environ = {name: os.environ.get(name) for name in ("PATH", "GPU_ARCHS")}
+    available, torch.cuda.is_available = torch.cuda.is_available, lambda: True
+    try:
+        with tempfile.TemporaryDirectory(prefix="compass-arch-") as tmpdir:
+            _declare_arch(tmpdir, arch)
+            from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+            from aiter.utility import dtypes  # noqa: F401  its fp8 resolves here
+
+            get_gfx(), get_gfx_runtime()
+    finally:
+        torch.cuda.is_available = available
+        for name, value in environ.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def group(tp: int, dp: int) -> dict:
@@ -360,6 +487,13 @@ def group(tp: int, dp: int) -> dict:
         "functional": ["all_gather_into_tensor", "broadcast", "all_to_all_single"],
         "communicator_checked_only": ["fused_allreduce_rmsnorm_quant_per_group"],
     }
+
+
+def uncached_bytes(nbytes, device):
+    """A mono runner's uncached scratch, of the size it asks for, on the
+    declared device: a plain tensor, since a capture reads no value through
+    it and every rank of a capture is this one."""
+    return torch.empty(nbytes, dtype=torch.uint8, device=device)
 
 
 class PeerBuffer(peer_memory.PeerBuffer):

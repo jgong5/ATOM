@@ -30,6 +30,7 @@ from atom.compass import cli
 from atom.compass.backends.step_labels import TABLE_VERSION, label
 from atom.compass.drive import aiter_jit, gpu, identity, record, serve
 from atom.compass.fit.samples import load
+from atom.compass.parity import WRITE_THROUGH
 
 PLANTED = """\
 import http.server, os, shutil, sys
@@ -176,6 +177,26 @@ def test_ops_profiling_dummy_weights_and_owned_flags_refuse_before_a_server_star
     assert not out.exists()
 
 
+@pytest.mark.parametrize(
+    "atoms",
+    [
+        ["-dp", "2"],
+        ["--enable-dp-attention", "-tp", "2"],
+        ["--pipeline-parallel-size=2"],
+    ],
+)
+def test_a_dp_or_pipeline_trace_run_refuses_before_a_server_starts(
+    tmp_path, monkeypatch, atoms
+):
+    monkeypatch.setattr(serve, "SERVER", (sys.executable, "-c", "pass"))
+    out = tmp_path / "out"
+    argv = ["record", "--gpu", "7", "--out", str(out), "--trace", "--", "--model", "m"]
+
+    with pytest.raises(SystemExit, match="^compass record: --trace reduces each TP"):
+        cli.main([*argv, *atoms])
+    assert not out.exists()
+
+
 @pytest.fixture
 def planted_gpu(tmp_path, monkeypatch):
     """The planted server, `rocm-smi` listing GPU 7 free, `rocminfo`, a
@@ -210,9 +231,17 @@ def planted_gpu(tmp_path, monkeypatch):
     (tmp_path / "rocm" / ".info").mkdir(parents=True)
     (tmp_path / "rocm" / ".info" / "version").write_text("7.2.4\n")
     monkeypatch.setenv("ROCM_PATH", str(tmp_path / "rocm"))
-    # The record names what any process writes to Inductor's and Triton's
-    # caches while it serves: the test's own, not the ones its box shares.
-    for var in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+    # The record names what any process writes to aiter's, FlyDSL's, Inductor's
+    # and Triton's caches while it serves: the test's own, not the ones its box
+    # shares. FlyDSL's is set beside aiter's own: importing the installed aiter
+    # points FLYDSL_RUNTIME_CACHE_DIR at its jit/flydsl_cache for the rest of
+    # the process.
+    _aiter(tmp_path / "box", monkeypatch)
+    for var in (
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TRITON_CACHE_DIR",
+        "FLYDSL_RUNTIME_CACHE_DIR",
+    ):
         monkeypatch.setenv(var, str(tmp_path / var.lower()))
     (tmp_path / "model").mkdir()
     (tmp_path / "model" / "config.json").write_text('{"hidden_size": 8}')
@@ -284,7 +313,7 @@ def test_a_record_s_server_keeps_triton_s_autotune_choices_unless_the_caller_say
 
     assert (tmp_path / "seen").read_text() == repr(held)
     run = json.loads((out / "run.json").read_text())
-    assert run["env"] == dict(zip(names, held))
+    assert run["env"] == dict(zip(names, held)) | {WRITE_THROUGH: "0"}
     assert [os.environ.get(name) for name in names] == list(caller)
 
 
@@ -405,14 +434,17 @@ def test_a_record_names_each_compile_its_server_ran_while_it_served(
 
 
 #: Put after the planted server: once `compass record` has read its card's PTL
-#: state while it serves (``PLANTED_READ``), PTL is disabled on that card.
+#: state while it serves (``PLANTED_READ``), PTL is disabled on that card by a
+#: file renamed over ``ptl_enable``, so no reading finds it empty, as on sysfs.
 FLIPS = """
 import os, pathlib, time
 for _ in range(600):
     if os.path.exists(os.environ["PLANTED_READ"]):
         break
     time.sleep(0.05)
-pathlib.Path(os.environ["PLANTED_PTL"]).write_text("disabled\\n")
+staged = pathlib.Path(os.environ["PLANTED_PTL"] + ".new")
+staged.write_text("disabled\\n")
+staged.replace(os.environ["PLANTED_PTL"])
 """
 
 

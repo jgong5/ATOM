@@ -11,9 +11,10 @@ its scheduler half is `MultiShell`.
 native-state as its `bind_block_manager` picks) with the workers' transfers
 moved onto the step loop. It keeps one ATOM worker connector per TP rank, with
 no device: `build_connector_meta` hands each rank the metadata, and the rank's
-adapter sends each STORE or RETRIEVE it submits to LP ``lmcache`` on its
-writer's ``transfer`` channel, stamped now. A native-state rank takes its
-checkpoint units as named and restores a load at no cost.
+adapter sends each STORE or RETRIEVE it submits to LP ``lmcache`` on its DP
+rank's ``transfer`` channel, stamped now and carrying its worker id, so every
+writer rank's request leaves in rank order on one DEALER. A native-state rank
+takes its checkpoint units as named and restores a load at no cost.
 `process_completions` takes, inline, every reply released so far and reports
 what the ranks' `get_finished`, aggregated over the TP group, gave at the
 previous call, since the engine's aggregation answers one poll behind.
@@ -121,7 +122,7 @@ class LMCacheMPShell:
         self._inner = connector.LMCacheMPConnectorScheduler(config)
         self._config, self._url, self._rt = config, url, clock.installed()
         self._ranks: list = []
-        self._socks: dict = {}  # reply channel -> its DEALER, one per writer
+        self._socks: dict = {}  # reply channel -> its DEALER
         self._futures: dict = {}  # (reply channel, request id) -> its future
         self._read: dict = {}  # (reply channel, seq) -> (arrival, frames), untaken
         self._ids = itertools.count()
@@ -134,7 +135,6 @@ class LMCacheMPShell:
         return getattr(inner, name)
 
     def bind_block_manager(self, block_manager) -> None:
-        from atom.compass.run import spec
         from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
         from atom.kv_transfer.offload.mp.deployment import _tp_replication_factor
         from atom.kv_transfer.offload.mp.native_state_scheduler import (
@@ -150,13 +150,6 @@ class LMCacheMPShell:
             return
         impl, config = self._inner._impl, self._config
         native = isinstance(impl, NativeStateLMCacheMPConnectorScheduler)
-        checkpoints = block_manager.paged_state_checkpoints
-        image = checkpoints.store.spec.image_bytes if native else 0
-        if (declared := spec()["lmcache"].get("state_bytes", 0)) != image:
-            raise ValueError(
-                f"the run file's lmcache state_bytes is {declared}; this deployment "
-                f"offloads a recurrent-state image of {image} bytes a rank"
-            )
         tp, group = config.tensor_parallel_size, _tp_replication_factor(config)
         dp = config.parallel_config.data_parallel_rank
         for k in range(tp):
@@ -164,7 +157,7 @@ class LMCacheMPShell:
                 config
             )
             rank.chunk_size, rank._is_kv_writer = impl.chunk_size, k % group == 0
-            rank._adapter = _Rank(self, f"transfer#dp{dp}.tp{k // group}", k // group)
+            rank._adapter = _Rank(self, f"transfer#dp{dp}", k // group)
             if native:
                 rank._native_layout = _units_as_named(config)
                 rank._begin_restore = _restored
@@ -290,7 +283,8 @@ class LMCacheMPShell:
 
 class _Rank:
     """One TP rank's lmcache worker adapter: each STORE and RETRIEVE it is given
-    goes to LP ``lmcache`` on its writer's channel, as its worker would send it."""
+    goes to LP ``lmcache`` on its DP rank's channel, under its writer's worker
+    id, as its worker would send it."""
 
     def __init__(self, shell: LMCacheMPShell, kind: str, worker_id: int) -> None:
         self.shell, self.kind, self.worker_id = shell, kind, worker_id

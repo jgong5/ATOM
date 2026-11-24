@@ -10,6 +10,10 @@
 #   2. rocm-smi --showuse     compute busy?
 #   3. rocm-smi --showmemuse  VRAM held?   <- the one that gets missed
 #
+# Check 2 does not read a gfx1250 card (MI455): it reports 100% use with no
+# process on it. There a card is busy when a process has a queue on it, which
+# `rocm-smi --showpidgpus` lists as the GPUs that PID "is using".
+#
 # Check 3 is not optional: a node can read 0% utilisation and 99% VRAM (a loaded,
 # idle model), and `non_torch` is a device-wide reading, so a neighbour's
 # allocation is indistinguishable from ours.
@@ -107,6 +111,12 @@ fi
 # Sampled before rocminfo, whose own device init reads as 1% use on every GPU.
 USE=$(rocm-smi --showuse 2>&1)
 MEM=$(rocm-smi --showmemuse 2>&1)
+# rocm-smi's index of each gfx1250 card and, when there is one, of each GPU a
+# process has a queue on.
+G1250=$(rocm-smi --showhw 2>&1 | awk '/^[0-9]+ +[0-9]+ / && / gfx1250 / { print $1 }')
+QUEUED=
+[ -z "$G1250" ] || QUEUED=$(rocm-smi --showpids --showpidgpus 2>&1 |
+    awk 'q && /^[0-9 ]+$/ { print } { q = / DRM device\(s\):$/ }' | tr -s ' ' '\n')
 
 printf '\n=== 1. rocminfo (25 s) ===\n'
 if timeout 25 rocminfo >/dev/null 2>&1; then
@@ -118,6 +128,8 @@ else
 fi
 
 printf '\n=== 2. compute ===\n%s\n' "$(printf '%s\n' "$USE" | grep -E '^GPU\[')"
+[ -z "$G1250" ] || printf 'gfx1250 (MI455) GPU(s) %s: use reads 100 idle, so a queue stands for it; queues on: %s\n' \
+    "$(echo $G1250)" "$(echo ${QUEUED:-none})"
 printf '\n=== 3. VRAM ===\n%s\n' "$(printf '%s\n' "$MEM" | grep -E '^GPU\[.*VRAM%')"
 
 # Name what is bookable. Deliberately not part of RC: our own run trips any
@@ -128,6 +140,10 @@ FREE=
 for i in $(printf '%s\n' "$USE" | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -un); do
     u=$(printf '%s\n' "$USE" | grep -E "^GPU\[$i\].*use" | grep -oE '[0-9]+$' | tail -1)
     m=$(printf '%s\n' "$MEM" | grep -E "^GPU\[$i\].*VRAM%" | grep -oE '[0-9]+$' | tail -1)
+    if grep -qx "$i" <<<"$G1250"; then
+        u=0
+        grep -qx "$i" <<<"$QUEUED" && u=100
+    fi
     if [ "${u:-100}" -eq 0 ] && [ "${m:-100}" -eq 0 ]; then FREE="$FREE $i"; fi
 done
 if [ -n "$FREE" ]; then

@@ -19,7 +19,6 @@ from types import SimpleNamespace
 import pytest
 
 from atom.compass.clock import LpId, RefusalTally, single_engine_table
-from atom.compass.spec.tokenizers import Backend, table
 from atom.metrics.exporter import AtomMetricsExporter
 from atom.model_engine import llm_engine
 from atom.sampling_params import SamplingParams
@@ -27,23 +26,17 @@ from atom.utils import clock
 from atom.utils.clock import LPRuntime
 from atom.utils.compass_loop import Refused, SimExecutor, Station, wrap_encode
 
-ENCODE_FIXED_S, ENCODE_TOKENS_PER_S, DERATE = 0.001, 1000.0, 0.5
+ENCODE_FIXED_S, ENCODE_TOKENS_PER_S = 0.001, 500.0
 
 
 def _entry():
-    raw = {
-        "id": "test-bpe",
+    """A host entry's tokenizer term."""
+    return {
         "backend": "fast",
-        "vocab_size": 1000,
         "fingerprint": "sha256:0",
-        "applies_to": ["LlamaForCausalLM"],
-        "encode_fixed_s": ENCODE_FIXED_S,
-        "encode_tokens_per_s": ENCODE_TOKENS_PER_S,
-        "decode_fixed_s": 0.001,
-        "decode_tokens_per_s": 1000.0,
-        "derate": DERATE,
+        "encode": {"fixed_s": ENCODE_FIXED_S, "tokens_per_s": ENCODE_TOKENS_PER_S},
+        "decode": {"fixed_s": 0.001, "tokens_per_s": 500.0},
     }
-    return table([raw]).resolve("LlamaForCausalLM", Backend.FAST)
 
 
 class _GrantAll:
@@ -78,7 +71,7 @@ class _Loop(asyncio.SelectorEventLoop):
 def loop():
     rt = LPRuntime(
         LpId("frontend"),
-        single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002),
+        single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002),
         _GrantAll(),
     )
     loop = _Loop(rt)
@@ -134,14 +127,14 @@ def test_start_of_waits_for_earlier_jobs_with_one_diagnostic(caplog):
 
 def test_five_jobs_at_width_two_predicted_beside_observed(loop):
     tokens = [100, 50, 150, 25, 200]
-    rate = ENCODE_TOKENS_PER_S * DERATE
+    rate = ENCODE_TOKENS_PER_S
     service = [ENCODE_FIXED_S + n / rate for n in tokens]
     # Predicted by hand: all five submitted at 0; each starts on the earlier free
     # of the two servers, in submission order.
     s = [0.0, 0.0, service[1], service[0], service[0] + service[3]]
     predicted = [(s[k], s[k] + service[k]) for k in range(5)]
 
-    encode = wrap_encode(lambda text: list(range(int(text))), _entry())
+    encode = wrap_encode(lambda text: list(range(int(text))), _entry()["encode"])
     config = SimpleNamespace(
         hf_config=SimpleNamespace(model_type="llama"), speculative_config=None
     )
@@ -176,7 +169,7 @@ def test_five_jobs_at_width_two_predicted_beside_observed(loop):
 def test_jobs_at_one_instant_draw_request_ids_in_submission_order(loop):
     # Job 0's real thread is the slow one: a job run beside it would finish
     # first and draw the lower request id.
-    encode = wrap_encode(lambda text: list(range(int(text))), _entry())
+    encode = wrap_encode(lambda text: list(range(int(text))), _entry()["encode"])
 
     def slow_first(text):
         if text == "100":
@@ -226,7 +219,7 @@ def test_a_wait_job_submitted_during_the_run_passes_through(loop):
 
 
 def test_a_job_cancelled_before_it_starts_is_skipped_and_the_next_one_places(loop):
-    encode = wrap_encode(lambda text: list(range(int(text))), _entry())
+    encode = wrap_encode(lambda text: list(range(int(text))), _entry()["encode"])
     ex, release = _executor(loop, width=1)
     go = threading.Event()
 

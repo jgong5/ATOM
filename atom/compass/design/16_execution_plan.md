@@ -4,7 +4,7 @@
 interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
 written against it yet; implementation follows the execution plan in `16`.
 
-**Depends on:** all of `01`–`15`, and `17`. This document turns those topics' decisions,
+**Depends on:** all of `01`–`15`, `17` and `19`. This document turns those topics' decisions,
 and the register of open items in [`12_open_items.md`](12_open_items.md), into work that
 can be allocated. Neither is counted here. The register is owned by `12`, restated once on
 `README.md`'s front page, and it moves as tasks land; a third copy in a document that does
@@ -44,6 +44,19 @@ concrete.
 *Stage 4* measures DeepSeek-V4.1-Flash on MI455 and grades it in two cells of its own, the
 last step of v1; stage 3c's projection stays frozen as the before side of the method error
 (D95).
+
+**Revised 2026-11-12 by the owner's rulings on
+[#3256](https://github.com/jgong5/ATOM/issues/3256) and
+[#3257](https://github.com/jgong5/ATOM/issues/3257):** *Stage M3-Agentic* simulates ATOM's
+MiniMax-M3 AgentX submission on MI355X and grades it point by point (D95.1).
+
+**Revised 2026-11-13 by [#3355](https://github.com/jgong5/ATOM/issues/3355):** *After v1*
+lists adoption (`19`) and the order its work runs in.
+
+**Revised 2026-11-14 by the owner's ruling on
+[#3423](https://github.com/jgong5/ATOM/issues/3423):** *Stage DSv41-DPEP* simulates the DP
+points of ATOM's DeepSeek-V4.1-Flash AgentX submission on MI355X and grades them as
+M3-Agentic does (D95.2).
 
 **Scope.** How the work is organised, allocated and gated; what happens first; and what
 each stage must produce. It is **detailed through M2**. Work after v1 is listed, not
@@ -147,6 +160,91 @@ part of v1, added after that
 
 ---
 
+## D95.1. The M3-Agentic stage: MiniMax-M3's AgentX submission on MI355X
+
+Owner rulings of 2026-11-12, on [#3256](https://github.com/jgong5/ATOM/issues/3256) for
+the stage and on [#3257](https://github.com/jgong5/ATOM/issues/3257) for its design. The
+stage is named for the model; it is not the retired milestone M3 of D95.
+
+- **Target.** Compass reproduces every point of ATOM's MiniMax-M3 AgentX submission to
+  InferenceX on MI355X, entry `minimaxm3-fp4-mi355x-atom-agentic-mtp` as InferenceX run
+  [37598205362](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37598205362)
+  ran it. #3256 holds its arms, their arguments and concurrencies, and InferenceX's values;
+  this document does not copy them. The 8k/1k and disaggregated MiniMax-M3 entries are out
+  of scope, and MiniMax-M3.1 until ATOM's InferenceX entry for it lands.
+- **The real curve is this branch's ATOM** serving the submission's arguments on
+  mi355-gpu-40, three spaced rounds per point (`08` D45). The submission's own image is
+  not run again and InferenceX's published points are not drawn: Compass grades a
+  simulated run against real runs of its own tree.
+- **Platform.** gpu-40 on the nightly 20261026 stack, not InferenceX's nightly 20261007;
+  each registration states it.
+- **One frozen commit.** Calibration and every graded run use the commit frozen at
+  #3266's first registration. A later ATOM change re-keys the laws
+  ([#2350](https://github.com/jgong5/ATOM/issues/2350)), so moving needs a new
+  registration.
+- **What Compass adds for it:** EAGLE3 (`14` D87.1), ATOM's `lmcache_offload` connector
+  (`03` D13.1), InferenceX's `agentx` client (`06` D35.1) and the overlap criterion that
+  grades each point (`08` D45.1).
+- **Memory readings per point.** `--max-num-seqs` is twice the concurrency, and a
+  readings entry is keyed by the scheduler's bounds (`run/memory.py::key_fields`), so
+  each point takes its own entry.
+- **Laws per arm:** one step linear law each for TP4, TP4 with indexer CP and TP2. The
+  TP4 law is fitted on records from its own arm's points; the TP2 law on records from the
+  TP2 arm's and the TP2 LMCache arm's points, and the TP4 indexer-CP law on records from
+  its own arm's and the TP4 indexer-CP LMCache arm's, so each pools records with the tier
+  off and on. The LMCache arms reuse those two laws with the offload terms of `03` D13.1.
+  A law's key holds the capture ladder (`run/step_grid.py::keyed`), which ATOM clips at
+  `--max-num-seqs`; a law, its host laws and a step grid bundle serve each point whose
+  ladder is a prefix of their own ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)), so an arm's entry keyed at its
+  top point serves its lower ones. `fit steps` and `fit host` pool the arm's records at
+  every point into it; a bundle's plan and step measurements stay at one point. An indexer-CP arm's law
+  waits on #3054's indexer-CP key, without which its runs would read a law fitted
+  without indexer CP.
+
+---
+
+## D95.2. The DSv41-DPEP stage: DeepSeek-V4.1-Flash's DP points on MI355X
+
+Owner ruling of 2026-11-14 on [#3423](https://github.com/jgong5/ATOM/issues/3423), for the
+stage and its design ([#3424](https://github.com/jgong5/ATOM/issues/3424)). The stage is
+named for the model and the parallelism of its arms.
+
+- **Target.** Compass reproduces the DP points of ATOM's DeepSeek-V4.1-Flash AgentX
+  submission to InferenceX on MI355X, entry `dsv41flash-fp4-mi355x-atom-agentic-dspark`
+  as InferenceX run
+  [43180092301](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/43180092301)
+  ran it: DTP2 (DP attention, MoE over TP) at concurrency 64, and DEP2 (DP attention
+  with expert parallelism) at 128 and 256. #3423 holds their arguments and InferenceX's
+  values; this document does not copy them. The entry's nine plain-TP points stay with
+  [#3126](https://github.com/jgong5/ATOM/issues/3126).
+- **The real curve is this branch's ATOM**, as D95.1 rules for M3-Agentic. Its ATOM
+  base is ROCm/ATOM `e893780f4`, 120 commits behind the submission's `e5b74bc86`. Every
+  DP change the submission names is in the base; later ones change a DP point
+  (ROCm/ATOM#2456, ROCm/ATOM#2727, ROCm/ATOM#3106, ROCm/ATOM#3098 and
+  ROCm/ATOM#2912), so each registration states the gap
+  [#3425](https://github.com/jgong5/ATOM/issues/3425) measures.
+- **Platform and freeze as D95.1's:** gpu-40 on nightly 20261026, and the commit #3266
+  freezes, or this stage's first registration if it comes first.
+- **What Compass adds for it:** a V4.1 engine's DP routing and prefill scheduling checked
+  against a real record (`15` D90.1), MoE over TP and over EP2 keyed apart (`15` D92.1)
+  and DSpark5 under DP attention (`14` D87.2). The client, the overlap criterion and the
+  curves are M3-Agentic's (`06` D35.1, `08` D45.1).
+- **Keys.** ATOM serves V4.1 at a KV block of 128 whatever `--block-size` says
+  (`atom/config.py`, its `deepseek_v41_text` branch), so the submission's 16 changes no
+  key. Every point keeps ATOM's default `--max-num-seqs`; c=64 and c=128 share a capture
+  ladder and c=256 adds 256. One step linear law and one `host_laws` entry each for DTP2
+  c=64 and for DEP2, keyed at c=256's ladder, which serves c=128 at its prefix
+  ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)), with memory readings per point. `fit host` compares the graph
+  sets V4.1's host key records exactly, so DEP2's two points pool into one `host_laws`
+  entry only where their decoder's graph keys agree.
+- **Two backends**, the step linear law and the step grid, each graded by `08` D45.1, as
+  #3256 rules for M3-Agentic: the submission's inputs reach 525k tokens at p95, past a
+  law's hull.
+- **Small case** at DTP2 c=16 and c=64. c=16 is not a submission point, but it keys as
+  c=64 does, so one law serves both.
+
+---
+
 ## The module layout, which is also the task boundary
 
 Tasks are cut so each touches one module plus its tests.
@@ -160,13 +258,13 @@ atom/compass/
   memory/     device-reading substitution, per-term model
   ir/         Cost IR (Seq/Repeat/Par), nested-Repeat detector, opaque leaves
   capture/    FakeTensorMode capture, one concrete graph per shape, leaf contracts
-  spec/       machine-spec schema, probes, merge / validate / explain
+  spec/       machine-spec schema, the reader, layer composition, the cross-rank spread check
   artifacts/  store, keys, digests, invalidation matrix
   drive/      serving ATOM for record, trace steps and run; measure memory; run.json; the GPU checks
   bench/      the step bench: replay by rule, the window, measure; the op bench
   fit/        samples for fit and publishing; each backend owns its fit
   validate/   grading: whether a client run is gradeable, the separable results
-  metrics/    per-step sampling, backfill
+  metrics/    not built: the series is run/metrics.py, its report in report/ (11 D74)
   kv/         simulated KV connector
   cli.py      the `compass` console script, registered in pyproject.toml (13 D80); it parses and dispatches only
 tests/compass/          mirrors the above
@@ -234,8 +332,8 @@ question, not an engineering one.
 P0.2's result, and the reason the agents' original test gate cannot be run as written.
 That gate, `08` D43.1 and ATOM's own `CLAUDE.md` all assert the same thing — that the
 187-file suite under `tests/` runs GPU-free and green — and P0.2 measured both halves
-false. What is GPU-free is the **CPU gate**, run per task; the rest is the GPU gate, a superset, run per
-wave as a delta. Re-derived on 2026-09-20 after review: the first derivation iterated
+false. What is GPU-free is the **CPU gate**, run per landing batch; the rest is the GPU gate, a superset,
+run on a batch that touches a trigger and daily by hand, as a delta. Re-derived on 2026-09-20 after review: the first derivation iterated
 *whole-suite collection* to a fixed point, which measures a property of the collection
 order, not of the files.
 
@@ -263,7 +361,7 @@ both carried, "32 files reach the driver, 28 of them at collection time via `roc
 joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* suite,
 `tests/plugin/` included (25 + 3), and was attached to a non-plugin set of 32.
 
-- **Per task — the CPU gate, re-measured by P0.1 and superseding the counts above.**
+- **The CPU gate, re-measured by P0.1 and superseding the counts above.**
   `tests/` minus `tests/plugin/` (30 files) minus the 29 driver-dependent files in
   `scripts/compass/cpu_gate_exclude.txt`, driven by `scripts/compass/gate_cpu.sh`:
   **130 of the 189 test files at `105ca4197`, 4030 passed, 0 failed, 149 skipped, 3 xfailed,
@@ -291,7 +389,7 @@ joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* sui
   128-file gate whose 149 skips were 68 distinct reasons: 66 skipped tests name a device, 83
   do not. Both carry to `105ca4197`: its `tests/` and code differ from `b963c9411`'s only by
   the two `tests/compass/` files above, which collect tests and skip none.
-- **Per wave — the GPU superset, re-measured by P0.1.** `tests/ --ignore=tests/plugin` in the
+- **The GPU superset, re-measured by P0.1.** `tests/ --ignore=tests/plugin` in the
   GPU container, driven by `scripts/compass/gate_gpu.sh`, judged as a **delta**, never as
   "green". The baseline is **4779 passed / 5 failed**, 0 errors, 105 skipped, 3 xfailed,
   72.6 s, measured 2026-09-20 at `fe9ea043c` on node 18 in `xiaobizh_n18` with
@@ -348,9 +446,11 @@ covered). The rule it applies: an `atom` module named by an excluded test is a b
 **unless a CPU-gate test that actually runs names it too**. A module both gates import is
 covered when the CPU gate runs, so triggering on it would make the gate cry wolf. A trailing
 `/` matches a subtree. `gate_cpu.sh` matches the diff against that file and **exits 98 unless
-`COMPASS_GPU_GATE_DONE` names this tree's own HEAD**; where it can compute neither a diff nor
-a supplied file list — a `git archive` snapshot with no `.git` — it refuses rather than
-reporting "not required", per principle 6.
+`COMPASS_GPU_GATE_DONE` names this tree's own HEAD, or a tree whose diff from this one touches
+no trigger**, read from git or from a snapshot's `.compass-gpu-carry` stamp (the
+[ruling on #3590](https://github.com/jgong5/ATOM/issues/3590#issuecomment-6910498913)); where
+it can compute neither a diff nor a supplied file list — a `git archive` snapshot with no
+`.git` — it refuses rather than reporting "not required", per principle 6.
 
 The rule has three parts. One was forced by a counter-example measured in this tree, one is
 what kept the headline example at `236abfd9a`, and one changed no path there:
@@ -390,17 +490,25 @@ are read as text, not resolved as a graph, so a transitive import, an `importlib
 re-export is invisible. A path *absent* from `gpu_gate_triggers.txt` is not a claim that the
 CPU gate covers it, and a path *present* is not proof that it does not. Of the two mistakes
 this gate prefers the first, because running the GPU gate when in doubt is never the wrong
-one. Judging that a change sits outside the blind spot remains the task's own call.
+one. Judging that a change sits outside the blind spot remains its reviewer's call.
 
-**A task touching EPLB, CUDA-graph capture bounds, block tables, the paged index builders or
-the prefix-cache kernels runs the GPU superset as part of its own gate, not at wave end.**
-That is where the files running nothing here concentrate — 29 excluded plus 22 exercising
+**A change touching a path in `scripts/compass/gpu_gate_triggers.txt` lands in a batch of its
+own, and its lander runs `gate_gpu.sh` on the batch commit.** The overlay
+(`.claude/agent-team.md`, "The GPU gate") states the same rule.
+EPLB, CUDA-graph capture bounds, block tables, the paged index builders and the prefix-cache
+kernels are where the files running nothing here concentrate — 29 excluded plus 22 exercising
 nothing, 51 in all; the silent 22 include `test_pool_index.py`,
 `test_prefill_indices_paged.py`, `test_decode_indices_paged.py`, `test_postprocess_width.py`
 and `test_prefill_prefix_vs_native.py`, the paged-index and prefix-cache areas `03` D13 and
 `01` D6 lean on. `test_dp_metadata` and `test_dp_sync_layout` are **not** among them: they
 are CPU-green, measured above, and booking a GPU for them spends the resource the booking
 queue below exists to ration.
+The paged index builders and the prefix-cache kernels sit under `atom/model_ops/v4_kernels/`,
+a trigger-list entry. The block tables are on the trigger list by name (`NAMED` in
+`regen_gpu_gate_triggers.sh`), because the derivation cannot see them: the CPU gate runs their
+tests, but without a device, and no excluded test imports their files. EPLB and the capture
+bounds are not on it: neither gate runs their device code, so a GPU gate would test nothing of
+a change there.
 
 **Three files are covered by neither gate**, measured in `xiaobizh_n18` at `83daf636d`:
 `test_prefix_cache_accuracy.py` (`no tests ran`), `test_kv_connector_scheduler.py` and
@@ -466,7 +574,7 @@ the 450–650 range needs re-costing before W1.9 starts:
 | Correction | Effect on W1.9 |
 |---|---|
 | A bootstrap that precedes the first `PhaseRunner` **does** exist. `discover_plugins()` resolves each entry point with `importlib.util.find_spec`, which on a *dotted* value imports the parent package, so `compass_harness.plugin:plugins.yaml` executes `compass_harness/__init__.py` during discovery. The rebind is deferred from there by a stdlib import hook, because that bootstrap runs inside `aiperf.plugin.plugins`' own module body and cannot import `aiperf` — executed, five combinations, 7/7 in the working shape (`06` D34, T73) | **T73 is a packaging choice plus ~20 lines of import hook, inside the existing "plugin manifest, bootstrap, config glue" row — not a precondition of the seam and not W1.9's first deliverable.** The bootstrap shape that *would* be too late is a side effect of the strategy module: phase 0 on the real clock, phase 1 rebound, smoke test passes. That is why the tripwire ships regardless |
-| `runner.py:191` calls `LoopScheduler()` with no arguments, so the rebound class must be no-arg constructible — `ClockPacedLoopScheduler(LoopScheduler)`, a subclass, not the spike's `ClockPacedScheduler(inner)` wrapper | The spike validated option A's shape. "About five lines" was costed against the wrong object, so that component row is **open** |
+| aiperf's `timing/phase/runner.py::PhaseRunner.__init__` calls `LoopScheduler()` with no arguments, so the rebound class must be no-arg constructible — `ClockPacedLoopScheduler(LoopScheduler)`, a subclass, not the spike's `ClockPacedScheduler(inner)` wrapper | The spike validated option A's shape. "About five lines" was costed against the wrong object, so that component row is **open** |
 | One scheduler per `PhaseRunner`, and `seamless=True` keeps two live | T76 — reconcile, or assert `seamless=False` |
 | Two `loop.call_later` idle-cap timers the rebind cannot reach, one of which upstream deliberately keeps outside the scheduler | T75 — override the two `_arm_*` methods, or declare the feature unsupported and assert both caps are `None` |
 
@@ -494,7 +602,7 @@ Depends on Wave 1. The first three are the vertical slice.
 | **W2.3** | Simulated KV connector registered into ATOM's existing factory; `latency + bytes/bandwidth` from the spec | `kv/` | 250–400 | W1.7 |
 | **W2.4** | Artifact store: keys, digests, source-root fingerprints, the invalidation matrix | `artifacts/` | 500–700 | W1.7 |
 | **W2.5** | ~~`FakeTensorMode` capture with the three mandatory disciplines and post-trace assertions; guard-domain evaluation~~ **Superseded by concrete capture** since 2026-10-18 (#1489): one graph per decode width and prefill (T, B), with no disciplines and no guard domain (`04` D18, D19); carried by S3c.8 and S3d.12 | `capture/` | ~~500–800~~ | W1.10, **P0.4** |
-| **W2.6** | Metrics under virtual time: per-step sampling, the class taxonomy, OpenMetrics backfill | `metrics/` | 300–500 | W2.1 |
+| **W2.6** | Metrics under virtual time: ~~per-step sampling~~, the class taxonomy, OpenMetrics backfill. **Revised 2026-11-16** ([#3584](https://github.com/jgong5/ATOM/issues/3584)): each engine and frontend LP samples at ATOM's metrics timer, the class taxonomy as the sampler's class table, the backfill into CI's Prometheus report (`11` D74, D77, *The first build*); carried by #3585 to #3587 | ~~`metrics/`~~ `run/`, `runner/`, `report/` | 300–500 | W2.1 |
 | **W2.7** | Determinism test: byte-diff of two step tables from one configuration, in CI (`01` D3.4) | `tests/compass/` | ~100 | W2.1 |
 | **W2.8** | Model construction under `FakeTensorMode` with `--load_dummy empty` (`02` D10.1), including the buffer audit of T68 | `runner/` | 200–350 | W2.5 |
 
@@ -641,7 +749,7 @@ IR and `OpGraphBackend`. Every issue carries `e2e-stage3d`.
 | **S3d.8** | MoE leaves on independent uniform routing ([#1497](https://github.com/jgong5/ATOM/issues/1497)) | `bench/` | 50–100 | S3d.2, S3c.9 |
 | **S3d.9** | DeepSeek-V4-Pro's DPA and TP cells under the op-level backend, graded ([#1498](https://github.com/jgong5/ATOM/issues/1498)) | `scripts/compass/` | 40–80, README and a run file | S3d.5, S3d.7, S3d.8 |
 | **S3d.10** | The MTP cells, and the four-configuration ranking ([#1499](https://github.com/jgong5/ATOM/issues/1499)) | `scripts/compass/` | 30–60, README and two run files | S3d.9, #1270, #1090 |
-| **S3d.11** | MORI dispatch and combine measured, and the EP8 cells graded ([#1500](https://github.com/jgong5/ATOM/issues/1500)) | `bench/`, `scripts/compass/` | 150–250 | S3d.9, #1111 |
+| **S3d.11** | MORI dispatch and combine measured at EP8, priced over their analytical bound ([#1500](https://github.com/jgong5/ATOM/issues/1500)); the EP8 cells are graded after S3d.9 by [#3409](https://github.com/jgong5/ATOM/issues/3409) ([Ruling](https://github.com/jgong5/ATOM/issues/1500#issuecomment-6870338230)) | `bench/`, `scripts/compass/` | 150–250 | #1111 |
 | **S3d.12** | Concrete capture per decode width and prefill (T, B), with each leaf's contract (`04` D18, D20; [#1539](https://github.com/jgong5/ATOM/issues/1539)) | `capture/`, `ir/`, `cli.py` | 300–400, about 100 removed | S3c.8, S3c.9 |
 | **S3d.13** | `measure ops` runs no forward: its runner holds meta weights and skips warmup, each point prepared by `ModelRunner.prepare_model`, a weight argument random at its contract's spec (`07` D38, D39; [#1869](https://github.com/jgong5/ATOM/issues/1869)) | `bench/` | 120–200 | S3d.8, #1837, GPU queue |
 | **S3d.14** | `measure ops` times a DP-attention layout's leaves other than collectives on one GPU, the runner at one rank's own width, the records keyed by the deployed layout (`07` D39; [#1870](https://github.com/jgong5/ATOM/issues/1870)) | `bench/` | 60–120 | S3d.13, GPU queue |
@@ -739,6 +847,56 @@ still open at exit loses `e2e-stage4`:
 | **S4.21** | `measure ops` on MI455 ([#2154](https://github.com/jgong5/ATOM/issues/2154)) | `bench/` | 30–80 | S4.15, GPU queue |
 | **S4.22** | The op-level empirical backend graded on the MI455 cells (`08` D50.3; [#2155](https://github.com/jgong5/ATOM/issues/2155)) | `scripts/compass/` | ~10 | S4.21, S3d.10, S3d.11, S4.9, S4.10 |
 
+### Stage M3-Agentic — MiniMax-M3's AgentX submission on MI355X
+
+Tracked on [#3256](https://github.com/jgong5/ATOM/issues/3256) and ruled there and on
+#3257 on 2026-11-12 (D95.1). Every issue carries `M3-Agentic`; #3256 holds the stage's
+coordination on gpu-40 and the work outside the stage that it waits on.
+
+| ID | Task | Module | Effort | Depends on |
+|---|---|---|---|---|
+| **MA.1** | The design text ([#3257](https://github.com/jgong5/ATOM/issues/3257)) | design | 200–300 design text | — |
+| **MA.2** | MiniMax-M3 served on gpu-40 with the submission's arguments, every arm ([#3258](https://github.com/jgong5/ATOM/issues/3258)) | none, results on the issue | 0 | GPU queue |
+| **MA.3** | `compass run --check` on gpu-40's platform lacking only the stage's own records ([#3259](https://github.com/jgong5/ATOM/issues/3259)) | none, results on the issue | 0 | — |
+| **MA.4** | A fractional forced acceptance length through record, fit and run ([#3260](https://github.com/jgong5/ATOM/issues/3260)) | `runner/` | up to 50 | — |
+| **MA.5** | The `agentx` client, its per-trace idle cap on the Compass clock (`06` D35.1; [#3261](https://github.com/jgong5/ATOM/issues/3261)) | `compass_harness/`, `scripts/compass/` | 100–200 | MA.1 |
+| **MA.6** | EAGLE3 run, recorded and priced (`14` D87.1; [#3262](https://github.com/jgong5/ATOM/issues/3262)) | `runner/`, `backends/`, `run/` | 150–300 | MA.1 |
+| **MA.7** | The `lmcache_offload` connector simulated (`03` D13.1; [#3263](https://github.com/jgong5/ATOM/issues/3263)) | `kv/`, `run/`, `backends/` | 300–500 | MA.1 |
+| **MA.8** | Real and simulated curves drawn, with a verdict per point (`08` D45.1; [#3264](https://github.com/jgong5/ATOM/issues/3264)) | `validate/` | 150–250 | MA.1 |
+| **MA.9** | The small case, TP4 at concurrency 1 and 4 for 600 s ([#3265](https://github.com/jgong5/ATOM/issues/3265)) | none, results on the issue | 0 | MA.2–MA.6 |
+| **MA.10** | Calibration: memory readings at every point, a law per arm and the offload terms ([#3266](https://github.com/jgong5/ATOM/issues/3266)) | `scripts/compass/laws/` | ~10 | MA.9, MA.7, #3054 |
+| **MA.11** | Cell A, TP4 ([#3267](https://github.com/jgong5/ATOM/issues/3267)) | `scripts/compass/` | ~10 | MA.10, MA.8 |
+| **MA.12** | Cell B, TP4 with indexer CP ([#3268](https://github.com/jgong5/ATOM/issues/3268)) | `scripts/compass/` | ~10 | MA.10, MA.8, #3054 |
+| **MA.13** | Cell C, TP2 ([#3269](https://github.com/jgong5/ATOM/issues/3269)) | `scripts/compass/` | ~10 | MA.10, MA.8 |
+| **MA.14** | Cell D, TP2 with LMCache ([#3270](https://github.com/jgong5/ATOM/issues/3270)) | `scripts/compass/` | ~10 | MA.10, MA.8, MA.7 |
+| **MA.15** | Cell E, TP4 with indexer CP and LMCache ([#3271](https://github.com/jgong5/ATOM/issues/3271)) | `scripts/compass/` | ~10 | MA.10, MA.8, MA.7, #3054 |
+
+**Exit:** MA.11 to MA.15 closed, each with a chart that meets `08` D45.1 at every point.
+
+### Stage DSv41-DPEP — DeepSeek-V4.1-Flash's DP points on MI355X
+
+Tracked on [#3423](https://github.com/jgong5/ATOM/issues/3423) and ruled there on 2026-11-14
+(D95.2). Every issue carries `scale: agentic` and `M3`; #3423 holds the stage's
+coordination on gpu-40, which it shares with M3-Agentic, and the work outside the stage
+that it waits on.
+
+| ID | Task | Module | Effort | Depends on |
+|---|---|---|---|---|
+| **DPEP.1** | The design text ([#3424](https://github.com/jgong5/ATOM/issues/3424)) | design | 120–200 design text | — |
+| **DPEP.2** | DeepSeek-V4.1-Flash served on gpu-40 at DTP2 and DEP2 with the submission's arguments ([#3425](https://github.com/jgong5/ATOM/issues/3425)) | none, results on the issue | 0 | GPU queue |
+| **DPEP.3** | `compass run --check` lacking only the stage's own records ([#3426](https://github.com/jgong5/ATOM/issues/3426)) | none, results on the issue | 0 | — |
+| **DPEP.4** | The submission's session header, and each request's rank compared real against simulated (`15` D90.1; [#3427](https://github.com/jgong5/ATOM/issues/3427)) | `scripts/compass/` | 20–60 | DPEP.1 |
+| **DPEP.5** | A simulated V4.1 DP run's prefill scheduling against a real record (`15` D90.1; [#3428](https://github.com/jgong5/ATOM/issues/3428)) | `runner/` | 50–150 | DPEP.1 |
+| **DPEP.6** | DSpark5 at DTP2 and DEP2 recorded and priced on an MXFP8 pool (`14` D87.2, `15` D92.1; [#3429](https://github.com/jgong5/ATOM/issues/3429)) | `backends/`, `run/` | 100–250 | DPEP.1 |
+| **DPEP.7** | The step grid at DTP2 and DEP2, EP2 routing replayed ([#3430](https://github.com/jgong5/ATOM/issues/3430)) | `run/`, `backends/` | 50–150 | DPEP.1, #3285–#3287 |
+| **DPEP.8** | The small case, DTP2 at concurrency 16 and 64 for 600 s ([#3431](https://github.com/jgong5/ATOM/issues/3431)) | none, results on the issue | 0 | DPEP.2–DPEP.6 |
+| **DPEP.9** | Calibration: memory readings at each point, the DTP2 and DEP2 laws ([#3432](https://github.com/jgong5/ATOM/issues/3432)) | `scripts/compass/laws/` | ~10 | DPEP.8, #3275 |
+| **DPEP.10** | Cell A, DTP2 at 64 ([#3433](https://github.com/jgong5/ATOM/issues/3433)) | `scripts/compass/` | ~10 | DPEP.9, DPEP.7 |
+| **DPEP.11** | Cell B, DEP2 at 128 and 256 ([#3434](https://github.com/jgong5/ATOM/issues/3434)) | `scripts/compass/` | ~10 | DPEP.9, DPEP.7 |
+
+**Exit:** DPEP.10 and DPEP.11 closed, each with a chart that meets `08` D45.1 at every
+point on both backends.
+
 ---
 
 ## After v1
@@ -753,6 +911,12 @@ Listed so it is not mistaken for an omission; each is re-planned when v1 lands.
   an optional recipe (`17` D100).
 - Width transfer (T21) as a claim.
 - The upstream RFC for ATOM-core edits.
+- Adoption (`19`), its tasks cut from [#3355](https://github.com/jgong5/ATOM/issues/3355):
+  first with no GPU compute, on DeepSeek-V4-Pro's laws that pass `19` D112, the search,
+  the reuse check, the record list, the per-request split, the views and the guide's
+  draft; then on GPUs, `calibrate.sh`'s store and status, the development calibration and
+  the guide walked through; last, the op-family split once #1498 closes. The move to
+  MiniMax-M3 starts whenever `19` D117's conditions hold, its steps in D117's order.
 
 ---
 

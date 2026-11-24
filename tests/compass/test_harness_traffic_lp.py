@@ -75,6 +75,7 @@ from compass_harness.strategy import ClockPhaseRunner
 from compass_harness.timesource import ClockTimer
 from compass_harness.traffic_lp import (
     HTTP,
+    PREFILL_URL_ENV,
     STREAM,
     SendAfterCancel,
     TrafficLP,
@@ -97,7 +98,7 @@ from atom.utils.clock import LPRuntime, Straggler
 from compass_harness import ADDRESS_ENV, fingerprint, traffic_lp
 
 #: The run file's table keys, as the deployment writes them.
-RUN = {"admission_path": "serving", "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+RUN = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
 TABLE = single_engine_table(**RUN)
 FRONTEND, ENGINE = LpId("frontend"), LpId("engine")
 INF = math.inf
@@ -639,6 +640,90 @@ def test_a_slow_report_with_no_errored_request_keeps_the_hold_waiting(
     assert passed == [None] and calls[-1] == INF
 
 
+def test_a_grant_resolves_only_the_clock_waits_it_makes_due(tmp_path):
+    """Waits for 2 and 5, with a grant at 1 that comes before the time asked,
+    as an arrival's does: each wait resolves at the grant that reaches its
+    time, and each clock call asks for the earliest one pending."""
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, set())])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        resolved = {}
+
+        async def waiter(t):
+            await traffic.wait(t)
+            resolved[t] = traffic.now()
+
+        await asyncio.gather(waiter(2.0), waiter(5.0))
+        traffic.done.cancel()
+        return resolved, rt.calls
+
+    resolved, calls = _run(main())
+    assert resolved == {2.0: 2.0, 5.0: 5.0}
+    assert calls == [2.0, 2.0, 5.0]
+
+
+def test_a_task_ending_while_the_hold_waits_on_a_return_has_its_callbacks_run_first(
+    tmp_path,
+):
+    """aiperf's return callback yields, so the hold waits for it, then starts a
+    task that ends at its first step, as a turn the replay barrier holds does:
+    that task's done callbacks run before the traffic LP asks for time again."""
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, {0})])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        calls_at_done = []
+
+        async def ends_at_once():
+            pass
+
+        async def on_return(worker_id, ret):
+            await asyncio.sleep(0)
+            ended = asyncio.ensure_future(ends_at_once())
+            ended.add_done_callback(lambda _: calls_at_done.append(len(rt.calls)))
+
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(str(tmp_path / "lp"))[1])
+        traffic.send(_key(0))
+        push.send_pyobj((_key(0), 0, 1.0, True))
+        await traffic.hold(on_return)(
+            "worker_0", SimpleNamespace(credit=_credit(0), error=None)
+        )
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 5)
+        finally:
+            push.close(linger=0)
+        return calls_at_done
+
+    # The final event's grant answers the first clock call; the task ends in its hold.
+    assert _run(main()) == [1]
+
+
+def test_a_task_ending_while_the_owner_idles_has_its_callbacks_run_first(tmp_path):
+    """The owner idles with no request open, no clock wait and no finish; a
+    task sends a request and ends in one step, so its done callbacks queue
+    behind the owner's wake: they run before the traffic LP asks for time."""
+
+    async def main():
+        rt = ScriptedRuntime([(1.0, {0})])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        calls_at_done = []
+        await asyncio.sleep(0.05)  # the owner settles, then idles
+
+        async def sends():
+            traffic.send(_key(0))
+
+        sent = asyncio.ensure_future(sends())
+        sent.add_done_callback(lambda _: calls_at_done.append(len(rt.calls)))
+        await asyncio.sleep(0.05)
+        traffic.done.cancel()
+        return calls_at_done
+
+    assert _run(main()) == [0]
+
+
 class ScriptedConn:
     """A Clock Authority connection whose grants are scripted: grant ``k``
     releases stream seq ``k`` at ``k + 1``, then ``+inf`` ends the run. Each
@@ -689,6 +774,76 @@ def test_a_pass_scans_only_the_open_stream_events(tmp_path):
     passed, held_at_call, rt = _run(main())
     assert passed == list(range(n)) and rt.now == INF
     assert held_at_call == [0] * (n + 1)
+
+
+class ReportedDuringTheCall(ScriptedConn):
+    """Grant ``k`` releases stream seq ``k - 1`` of request 0, the last one
+    final; that event's report reaches the traffic LP's socket while the owner
+    is blocked in the clock call, as a worker's report usually does. Each grant
+    also puts a marker on the event loop, and each clock call records how many
+    markers have run: the loop's turns since the first grant."""
+
+    def __init__(self, grants: int) -> None:
+        super().__init__(grants)
+        self.push = self.pull = None
+        self.turns, self.turns_at_call = [], []
+
+    def send(self, msg) -> None:
+        super().send(msg)
+        self.turns_at_call.append(len(self.turns))
+
+    def recv(self):
+        if self.k < self.grants:
+            seq = self.k
+            last = seq == self.grants - 1
+            self.push.send_pyobj((_key(0), seq, float(seq + 1), last))
+            while not self.pull.get(zmq.EVENTS) & zmq.POLLIN:
+                time.sleep(0.001)
+            asyncio.get_running_loop().call_soon(self.turns.append, seq)
+        return super().recv()
+
+
+def test_a_report_in_the_socket_at_its_grant_counts_without_a_turn_of_the_event_loop(
+    tmp_path, monkeypatch
+):
+    """The owner takes each report already in its socket and asks for its next
+    time with no turn of the event loop between, while a pacing timer waits on
+    the clock for a time past every grant; only the final event's grant, whose
+    return aiperf must take, waits for one."""
+    n = 20
+
+    async def main():
+        conn = ReportedDuringTheCall(n)
+        conn.rt = rt = LPRuntime(LpId("traffic"), TABLE, conn)
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        monkeypatch.setattr(ClockPacedLoopScheduler, "clock", traffic)
+        scheduler = ClockPacedLoopScheduler()
+        scheduler.schedule_later(10.0 * n, _nothing())
+        conn.pull = traffic._pull
+        conn.push = zmq.Context.instance().socket(zmq.PUSH)
+        conn.push.connect(addresses(str(tmp_path / "lp"))[1])
+        passed = []
+
+        async def on_return(worker_id, ret):
+            passed.append(ret.credit.id)
+
+        traffic.send(_key(0))
+        await traffic.hold(on_return)(
+            "worker_0", SimpleNamespace(credit=_credit(0), error=None)
+        )
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 10)
+        finally:
+            conn.push.close(linger=0)
+            scheduler.cancel_all()
+        return passed, conn.turns_at_call
+
+    passed, turns_at_call = _run(main())
+    assert passed == [0]
+    # Call k follows grant k; the loop first turns in the final event's hold,
+    # after grant n.
+    assert turns_at_call == [0] * n + [n]
 
 
 def test_a_raising_return_callback_does_not_stop_later_returns(tmp_path, caplog):
@@ -847,6 +1002,90 @@ def test_behind_the_router_lp_requests_cancels_and_the_stream_cross_it(
     assert (http, stream) == ("traffic->router:http", "router->traffic:stream")
     assert sent == [http, http]
     assert published[1] == (_key(0), 2.0 + ADMIT, 1, "cancel")
+
+
+#: frontend-P's URL, as a launcher names it.
+PREFILL_URL = "http://127.0.0.1:8010"
+
+
+@pytest.mark.parametrize(
+    "router_in_s, channels, to",
+    [
+        (
+            None,
+            ("traffic->frontend-P:http", "frontend-D->traffic:stream"),
+            (PREFILL_URL,),
+        ),
+        (2.0**-14, ("traffic->router:http", "router->traffic:stream"), ()),
+    ],
+    ids=["plain-router", "router-lp"],
+)
+def test_only_behind_a_plain_router_a_cancel_carries_frontend_p_s_url(
+    router_in_s, channels, to, tmp_path, monkeypatch
+):
+    """With frontend-P's URL named, aiperf's cancel of a request open at the
+    grace deadline, 2.0, is stamped on the request's channel and published with
+    that URL behind a PD router that is no LP, which answers a cancel 400, and
+    without it behind the router LP, which hands it on."""
+    pd = {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10}
+    if router_in_s is not None:
+        pd["router_in_s"] = router_in_s
+    endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
+    server = clock_transport.serve(
+        ClockAuthority(prefill_decode_table(**RUN, **pd)), endpoint
+    )
+    run_file = tmp_path / "run.json"
+    run_file.write_text(
+        json.dumps({"clock_endpoint": endpoint, "bound_s": 1e6, **RUN, **pd})
+    )
+    monkeypatch.setenv(RUN_ENV, str(run_file))
+    monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / "lp"))
+    monkeypatch.setenv(PREFILL_URL_ENV, PREFILL_URL)
+    stream = channels[1]
+    monkeypatch.setattr(
+        traffic_lp, "LPRuntime", lambda *_: ScriptedRuntime([(2.0, set())], stream)
+    )
+
+    async def main():
+        traffic = TrafficLP.from_env()
+        stamps, reports = addresses(str(tmp_path / "lp"))
+        sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+        sub.connect(stamps)
+        sub.subscribe(b"")
+        await traffic.subscribed(1)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(reports)
+
+        async def on_return(worker_id, ret):
+            pass
+
+        held = traffic.hold(on_return)
+
+        async def worker():
+            published = [await sub.recv_pyobj() for _ in range(2)]
+            push.send_pyobj((_key(0),))
+            await held("w", SimpleNamespace(credit=_credit(0), error=None))
+            return published
+
+        worker = asyncio.ensure_future(worker())
+        traffic.send(_key(0))
+        while traffic.now() < 2.0:
+            await traffic.wait(2.0)
+        await traffic.cancel()
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 5)
+        finally:
+            push.close(linger=0)
+            sub.close(linger=0)
+        return traffic.http, await worker
+
+    try:
+        http, published = _run(main())
+    finally:
+        server.close()
+    assert http == channels[0]
+    assert published[1] == (_key(0), 2.0 + ADMIT, 1, "cancel", *to)
 
 
 def test_a_1p1d_hold_settles_the_frontend_d_stream(tmp_path):

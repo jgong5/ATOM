@@ -207,13 +207,16 @@ class Traffic:
         if self.done != len(self.requests):
             raise RuntimeError(f"{len(self.requests) - self.done} requests never ended")
 
-    def _read(self, body: dict, tracestate: str) -> None:
+    def _read(self, body: dict, tracestate: str, first=None) -> None:
+        """Read the request to its end; `first`, an event, is set at its first frame."""
         try:
             stamp = None
             for line in post(self.port, body, {"tracestate": tracestate}):
                 stamp = sse_stamp(line) or stamp
                 if line.startswith("data:") and stamp is not None:
                     self.rt.check_arrival(self.stream, *stamp)
+                    if first is not None:
+                        first.set()
                     with self.cv:
                         self.frames[stamp[1]] = line
                         self.cv.notify_all()

@@ -26,7 +26,7 @@ from atom.utils.distributed import utils
 @pytest.fixture
 def run_file(monkeypatch, tmp_path):
     run = {
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 0.001,
         "stream_s": 0.002,
         "bound_s": 10.0,
@@ -153,7 +153,7 @@ def test_a_sync_utility_command_on_the_clock_owner_is_refused(run_file, call, cm
 
 def test_a_second_instance_of_one_role_is_refused_naming_xpyd(tmp_path):
     table = prefill_decode_table(
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=0.001,
         stream_s=0.002,
         router_s=0.003,

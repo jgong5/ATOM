@@ -4,15 +4,22 @@ run resumed, and a resume under other inputs refused.
 
 It runs from a copy in a stub tree, as `test_smoke_cell.py` drives
 `smoke_cell.sh`: `atom.compass.cli` logs each command; a `record` writes
-server.json and waits for the SIGTERM `client.sh --stop` sends; `measure
+server.json and waits for the SIGTERM `client.sh --stop` sends, then with
+`--trace` writes its busy lines, or exits 1 without them when NO_BUSY; `measure
 memory` and a fit write their readable copy with a token, the law with one
 held-out band; FAIL, matched against a command's words, makes it refuse.
 `client.sh` logs its arguments, its Python and its scenario, stops its server
 and writes its export marked `server_stopped`, or writes it unmarked and exits 1
 without stopping the server when CLIENT_FAIL is in its OUT.
+
+The stub tree's `python3` runs without site imports (`-S`), first on the PATH
+`_path` gives every test that runs a script in the tree. In an image whose site
+imports torch at start, as the MI455 image's `.pth` does, rocprofiler-sdk would
+load the empty tool `record` gets in ROCP_TOOL_LIBRARIES, and abort.
 """
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,13 +41,27 @@ def main():
     out = Path(argv[argv.index("--out") + 1])
     out.mkdir(parents=True)
     if argv[0] == "record":
-        stop = lambda *_: (out.joinpath("run.json").write_text("{}"), sys.exit(0))
+        def stop(*_):
+            out.joinpath("run.json").write_text("{}")
+            if "--trace" in argv:
+                os.environ.get("NO_BUSY") and sys.exit(1)
+                out.joinpath("steps").mkdir()
+                out.joinpath("steps", "dp0.busy.jsonl").write_text("{}")
+            sys.exit(0)
         signal.signal(signal.SIGTERM, stop)
+        out.joinpath("tool").write_text(os.environ.get("ROCP_TOOL_LIBRARIES", ""))
         out.joinpath("server.json").write_text(json.dumps({"pid": os.getpid()}))
         time.sleep(600)
     law = {"unfitted": {}, "decode": {"1": {"held_out": {"bands": BAND}}}}
     copy = {"token": "tok-" + argv[1], "params": law}
     out.joinpath(COPY[argv[1]] + ".json").write_text(json.dumps(copy))
+"""
+BLOCKED = """import sys
+from pathlib import Path
+tool = Path(sys.argv[1], "libcompass_blocked.so")
+tool.parent.mkdir(parents=True)
+tool.write_text("")
+print(tool)
 """
 CLIENT = """#!/bin/bash
 echo "client $* $HARNESS_PYTHON [$AIPERF_EXTRA_ARGS]" >> "$LOG"
@@ -65,8 +86,21 @@ def _tree(tmp_path):
     (tmp_path / "ATOM" / ".compass-commit").write_text("cafe\n")
     (tmp_path / "ATOM" / "atom" / "compass").mkdir(parents=True)
     (tmp_path / "ATOM" / "atom" / "compass" / "cli.py").write_text(CLI)
-    for d in ("atom", "atom/compass"):
+    (tmp_path / "ATOM" / "atom" / "compass" / "parity").mkdir()
+    (tmp_path / "ATOM" / "atom" / "compass" / "parity" / "blocked.py").write_text(
+        BLOCKED
+    )
+    for d in ("atom", "atom/compass", "atom/compass/parity"):
         (tmp_path / "ATOM" / d / "__init__.py").write_text("")
+    shim = tmp_path / "bin" / "python3"
+    shim.parent.mkdir()
+    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -S "$@"\n')
+    shim.chmod(0o755)
+
+
+def _path(tmp_path):
+    """PATH for a script in the stub tree: its `python3`, then this Python's."""
+    return f"{tmp_path / 'bin'}:{Path(sys.executable).parent}:{os.environ['PATH']}"
 
 
 def _calibrate(tmp_path, *records, **env):
@@ -75,14 +109,12 @@ def _calibrate(tmp_path, *records, **env):
         _tree(tmp_path)
     log = tmp_path / "log"
     log.unlink(missing_ok=True)
-    path = f"{Path(sys.executable).parent}:{os.environ['PATH']}"
     env = {
         **os.environ,
-        "PATH": path,
+        "PATH": _path(tmp_path),
         "LOG": str(log),
         "GPU": "7",
         "MODEL": str(tmp_path / "m"),
-        "MACHINE": str(tmp_path / "spec.json"),
         "TRACES": "/cc/traces.jsonl",
         "AIPERF_PYTHON": "/real/python",
         **env,
@@ -105,7 +137,7 @@ def test_the_steps_run_in_order_and_print_the_tokens_and_the_run_line(tmp_path):
     r, log = _calibrate(tmp_path, "1", FIRST_TURN)
     assert r.returncode == 0, r.stderr
     o, client = tmp_path / "o", "--duration 1800 --stop /real/python"
-    machine = f"--machine {tmp_path}/spec.json --store {o}/store"
+    store = f"--store {o}/store"
     cal = f"{o}/cal1-c1 {o}/cal2-c8"
     runs = " ".join(
         f"--client-run {o}/{d} {o}/{d}/artifacts/client_run.json"
@@ -114,13 +146,13 @@ def test_the_steps_run_in_order_and_print_the_tokens_and_the_run_line(tmp_path):
     assert log == [
         f"record --gpu 7 --out {o}/warm",
         f"client {o}/warm --traces 0-7 --concurrency 1 --duration 600 --stop /real/python []",
-        f"measure memory --gpu 7 {machine} --out {o}/memory",
+        f"measure memory --gpu 7 {store} --out {o}/memory",
         f"record --gpu 7 --out {o}/cal1-c1",
         f"client {o}/cal1-c1 --traces 256-392 --concurrency 1 {client} []",
         f"record --gpu 7 --out {o}/cal2-c8",
         f"client {o}/cal2-c8 --traces 256-392 --concurrency 8 {client} [{FIRST_TURN[2:]}]",
-        f"fit steps --backend step-linear --form history {cal} {runs} {machine} --out {o}/fit_steps",
-        f"fit host {cal} {runs} {machine} --out {o}/fit_host",
+        f"fit steps --backend step-linear --form history --model {tmp_path}/m {cal} {runs} {store} --out {o}/fit_steps",
+        f"fit host {cal} {runs} {store} --out {o}/fit_host",
     ]
     assert (
         "memory_readings tok-memory, step_linear_law tok-steps, host_laws tok-host"
@@ -128,7 +160,8 @@ def test_the_steps_run_in_order_and_print_the_tokens_and_the_run_line(tmp_path):
     )
     assert "decode rung 1 | 9 | -1.2% | +0.1% | +2.0%" in r.stdout
     compass = tmp_path / "ATOM" / "scripts" / "compass" / "compass"
-    run = f"{compass} run --step-linear tok-steps --host-laws tok-host {machine} --out DIR"
+    run = f"{compass} run --step-linear tok-steps --host-laws tok-host"
+    run += f" --device DATASHEET --ptl PTL {store} --out DIR"
     assert f"{run} -- --model {tmp_path}/m --max-model-len 262144" in r.stdout
 
 
@@ -194,3 +227,44 @@ def test_a_record_left_after_a_fit_refuses_and_records_nothing(tmp_path):
     assert f"step cal1-c1 failed: {law} was fitted without it" in r.stderr
     assert "calibrate into a new OUT" in r.stderr
     assert log == []
+
+
+def test_trace_runs_go_to_fit_steps_alone(tmp_path):
+    r, log = _calibrate(tmp_path, "1", "trace 16", "trace 4")
+    assert r.returncode == 0, r.stderr
+    o, client = tmp_path / "o", "--stop /real/python []"
+    store = f"--store {o}/store"
+    dirs = ("cal1-c1", "trace2-c16", "trace3-c4")
+    runs = [f"--client-run {o}/{d} {o}/{d}/artifacts/client_run.json" for d in dirs]
+    inputs = " ".join([*(f"{o}/{d}" for d in dirs), *runs])
+    assert log[3:] == [
+        f"record --gpu 7 --out {o}/cal1-c1",
+        f"client {o}/cal1-c1 --traces 256-392 --concurrency 1 --duration 1800 {client}",
+        f"record --gpu 7 --trace --out {o}/trace2-c16",
+        f"client {o}/trace2-c16 --traces 256-392 --concurrency 16 --duration 120 {client}",
+        f"record --gpu 7 --trace --out {o}/trace3-c4",
+        f"client {o}/trace3-c4 --traces 256-392 --concurrency 4 --duration 120 {client}",
+        f"fit steps --backend step-linear --form history --model {tmp_path}/m {inputs} {store} --out {o}/fit_steps",
+        f"fit host {o}/cal1-c1 {runs[0]} {store} --out {o}/fit_host",
+    ]
+
+
+def test_a_trace_run_refused_at_its_stop_is_taken_again(tmp_path):
+    r, _ = _calibrate(tmp_path, "1", "trace 4", NO_BUSY="1")
+    assert r.returncode == 1
+    assert "calibrate: step trace2-c4 failed: its server exit 1" in r.stderr
+    exported = tmp_path / "o" / "trace2-c4" / "artifacts" / "client_run.json"
+    assert "server_stopped" in exported.read_text()
+    r, log = _calibrate(tmp_path, "1", "trace 4")
+    assert r.returncode == 0, r.stderr
+    assert "calibrate: trace2-c4 was stopped; taking it again" in r.stdout
+    assert log[0] == f"record --gpu 7 --trace --out {tmp_path}/o/trace2-c4"
+
+
+def test_every_server_but_a_trace_run_s_loads_the_tool(tmp_path):
+    r, _ = _calibrate(tmp_path, "1", "trace 4")
+    assert r.returncode == 0, r.stderr
+    o = tmp_path / "o"
+    tool = f"{o}/tool/libcompass_blocked.so"
+    loaded = [(o / d / "tool").read_text() for d in ("warm", "cal1-c1", "trace2-c4")]
+    assert loaded == [tool, tool, ""]

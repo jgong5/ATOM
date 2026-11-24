@@ -42,7 +42,7 @@ def _stage(rank, *grants, frames=(), ready=C, parts=(), pp=2, post=0.0):
     device work `ready` after the call, and whose `W_post` is `post`; its
     runner calls by name and frame."""
     table = single_engine_table(
-        admission_path="serving",
+        admission_s=0.54e-3,
         ipc_s=0.5,
         stream_s=0.5,
         pp=pp,
@@ -583,8 +583,8 @@ def _record_last_stage(tmp_path, monkeypatch, pp):
             return next(self.clock)
 
         @staticmethod
-        def device_event():
-            return _Event()
+        def device_event(event=None):
+            return event or _Event()
 
     monkeypatch.setenv(ENV, str(tmp_path / "real"))
     runner = _Recorded(0, config)

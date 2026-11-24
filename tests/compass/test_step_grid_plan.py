@@ -17,6 +17,7 @@ import re
 import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import test_parity_record
@@ -26,7 +27,13 @@ from test_parity_record import _drive
 from test_run_step_grid import KEY, deployment, publish
 
 from atom.compass import parity
-from atom.compass.backends import BatchView, RequestShape, StepGrid, step_grid_plan
+from atom.compass.backends import (
+    BatchView,
+    RequestShape,
+    StepGrid,
+    step_grid_fit,
+    step_grid_plan,
+)
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.step_grid_fit import VALUE
 from atom.compass.run.step_grid import load
@@ -756,3 +763,66 @@ def test_coverage_names_a_missing_corner_of_the_longest_rows_cell_alpha_reads(
     assert out["missing"] == {"decode rung 4": [[3, 256]]}
     declined = [d["step"] for d in out["declined"]]
     assert declined == refusing(backend, named) != []
+
+
+def pool_of_40(tmp_path, monkeypatch):
+    """MIXED's steps, and the engine they ran on with a pool of 40 blocks: rung
+    4's c nodes are then 0, 64, 128, 159, 192, 207, 256 and 2047, 159 and 207
+    the KV limits of B 4 and B 3, and rung 8's 0, 64, 79, 127, 128, 192, 256
+    and 2047, 79 and 127 those of B 8 and B 5."""
+    named, engines = steps(record(tmp_path, monkeypatch, *MIXED))
+    return named, {rank: {**e, "num_kvcache_blocks": 40} for rank, e in engines.items()}
+
+
+def decode_line(rung, *cached):
+    return {
+        "rows": [[1, c + 1, True] for c in cached],
+        "rung": rung,
+        "produces_output": True,
+    }
+
+
+def test_a_ragged_views_longest_row_is_planned_so_alpha_reads_it_inside_the_pool(
+    tmp_path, monkeypatch
+):
+    """MIXED's steps plan B 3 up to c 207. A ragged view of three rows on c 20,
+    50 and 240 reads its longest row in c 207..256, and three rows on c 256
+    hold 51 blocks: planned with the view, that corner is measured with the
+    rows sharing 6, and alpha's fit reads the view there, where without it the
+    fit extends B 3's in-pool edge past the pool."""
+    named, engines = pool_of_40(tmp_path, monkeypatch)
+    line = decode_line(4, 20, 50, 240)
+    alone = step_grid_plan.plan(DEFINITION, named, engines)
+    planned = step_grid_plan.plan(DEFINITION, named, engines, [("view", line)])
+
+    before = located(tmp_path, alone)["decode"]
+    assert sorted(located(tmp_path, planned)["decode"]) == sorted(
+        before + [[4, 3, 256]]
+    )
+    rows = decode_line(4, 256, 256, 256)["rows"]
+    assert [x.get("shared") for x in planned["lines"] if x["rows"] == rows] == [6]
+    ragged = [SimpleNamespace(view=view(line), device_s=1e-3)]
+    for got, past in ((alone, 1), (planned, 0)):
+        grid = StepGrid(measured(got, located(tmp_path, got))["grid"])
+        report = step_grid_fit._alpha(grid, ragged, seed=0)[1]["4"]
+        assert (report["unread"], report["past_pool"]) == ([], past)
+
+
+def test_a_ragged_view_places_no_node_where_the_same_batch_as_a_step_does(
+    tmp_path, monkeypatch
+):
+    """Six rows on c 100 to 150 on rung 8 are past its KV limit, c 79: as a
+    step they make B 6 a node of the rung; as a view they are planned on B 5
+    and B 8, the steps' nodes, from their mean's cell to their longest row's."""
+    named, engines = pool_of_40(tmp_path, monkeypatch)
+    six = decode_line(8, *[100] * 5, 150)
+    alone = step_grid_plan.plan(DEFINITION, named, engines)
+    as_view = step_grid_plan.plan(DEFINITION, named, engines, [("six", six)])
+    as_step = step_grid_plan.plan(DEFINITION, [*named, ("six", six)], engines)
+
+    assert as_view["decode"]["nodes"] == alone["decode"]["nodes"]
+    assert alone["decode"]["nodes"]["B"]["8"] == [5, 8]
+    assert as_step["decode"]["nodes"]["B"]["8"] == [5, 6, 8]
+    assert [p for p in located(tmp_path, as_view)["decode"] if p[0] == 8] == [
+        [8, b, c] for b in (5, 8) for c in (79, 127, 128, 192)
+    ]

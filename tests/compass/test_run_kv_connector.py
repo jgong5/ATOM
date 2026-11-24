@@ -42,7 +42,7 @@ def run_file(tmp_path, monkeypatch):
     run = {
         "clock_endpoint": f"inproc:test-run-kv-{uuid.uuid4().hex}",
         "bound_s": 60.0,
-        "admission_path": "serving",
+        "admission_s": 0.54e-3,
         "ipc_s": 2.0**-14,
         "stream_s": 2.0**-12,
         "router_s": 2.0**-12,

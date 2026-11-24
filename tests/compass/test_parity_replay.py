@@ -79,7 +79,7 @@ def _run(directory, monkeypatch, late=(None, 0), replay=None, at=None):
     if at is not None:
         lp = LPRuntime(
             LpId("engine"),
-            single_engine_table(admission_path="serving", ipc_s=0.001, stream_s=0.002),
+            single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002),
             _Arrival(at, lambda: scheduler.add(sequences[late[0]])),
         )
         monkeypatch.setattr("atom.utils.clock._installed", lp)

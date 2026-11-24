@@ -1,34 +1,50 @@
 # SPDX-License-Identifier: MIT
 """`compass project`: real runs' steps priced on a device none of them
-ran on, published as a projection that ranks the cells and names each assumed
-spec field a price read; and `validate.bound --ratios-from`, a device that ran
-priced at another's probed ratios, the method's error on its own records.
+ran on, published as a projection that ranks the cells, names each assumed
+spec field a price read and each cell's engine as its op graphs are keyed by;
+and `validate.bound --ratios-from`, a device that ran priced at another's
+probed ratios, the method's error on its own records.
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
 from test_backend_step_roofline import STACK
-from test_probe_device import SCRIPTS
-from test_validate_bound import LINES, _main, graph, record
+from test_key_index_cache_dtype import QWEN
+from test_validate_bound import LINES, _main, drafted, graph, record
 
 from atom.compass.artifacts import ArtifactStore, Kind, Topology
 from atom.compass.backends.step_roofline import StepRooflineBackend
-from atom.compass.spec import MachineSpec, SpecRefusal
+from atom.compass.capture.forward import _config
+from atom.compass.run.step_grid import LEVEL, keyed
+from atom.compass.spec import MachineSpec
 from atom.compass.validate import bound, project
 
-MACHINES = SCRIPTS / "machines"
+MACHINES = Path(__file__).resolve().parent / "machines"
 #: MI455's B0 spec is MI355X's probed ratios on MI455X's datasheet, for a
 #: device no engine has run on.
-MI308X, MI355X, MI455 = (
-    MACHINES / f"{name}.json" for name in ("mi308x-hjbog18", "mi355x-gpu45", "mi455-b0")
+MI355X, MI455 = (MACHINES / f"{name}.json" for name in ("mi355x-gpu45", "mi455-b0"))
+#: What a spec at another device's ratios takes from that device's spec as it
+#: stands, no datasheet stating it.
+CARRIED = (
+    "device.kernel_floor_s",
+    "device.software_pinned_to.",
+    "interconnect.intra_node.link_latency_s",
+    "interconnect.inter_node.link_latency_s",
 )
 
 
 def spec(path):
     return MachineSpec.from_mapping(json.loads(path.read_text()))
+
+
+def on_mi455(store, directory) -> list[str]:
+    """The platform flags of MI455's B0 spec, its readings in `store`."""
+    return platforms.flags(store, json.loads(MI455.read_text()), directory)
 
 
 def ran(path, lines):
@@ -38,63 +54,56 @@ def ran(path, lines):
     return path
 
 
-def test_a_projected_device_keeps_its_peaks_at_the_others_probed_ratios():
-    mi355x, mi308x = spec(MI355X), spec(MI308X)
-    p = project.projected(mi355x, mi308x)
-
-    for path in ("device.arch", "device.compute.bf16_flops", project.BANDWIDTH):
-        assert p.value(path) == mi355x.value(path)
-    for path in (
-        "device.compute.derate.bf16",
-        "device.memory.derate",
-        "device.kernel_floor_s",
-        "interconnect.intra_node.link_latency_s",
-    ):
-        assert (p.value(path), p.origin(path)["origin"]) == (
-            mi308x.value(path),
-            "assumed",
-        )
-    scale = mi355x.value(project.BANDWIDTH) / mi308x.value(project.BANDWIDTH)
-    for (size, rate), (at, probed) in zip(
-        p.value(project.CURVE), mi308x.value(project.CURVE)
-    ):
-        assert (size, rate) == (at, pytest.approx(probed * scale))
-    # MI308X probed no FP4 rate, so a price that reads one is refused.
-    with pytest.raises(SpecRefusal, match="fp4_flops"):
-        p.value("device.compute.fp4_flops")
-    # MI455's spec is the same method applied to MI355X.
-    mi455 = project.projected(spec(MI455), mi355x).values
-    assert mi455 | {"name": None} == spec(MI455).values | {"name": None}
-
-
-def test_bound_ratios_from_prices_records_at_the_projected_spec(monkeypatch, tmp_path):
+def test_bound_ratios_from_prices_records_at_the_other_devices_ratios(
+    monkeypatch, tmp_path
+):
     rec = ran(tmp_path / "rec", LINES[:3])
     reports = []
     monkeypatch.setattr(bound, "text", lambda r: reports.append(r) or "")
-    for more in ([], ["--ratios-from", str(MI308X)]):
-        _main(monkeypatch, tmp_path, [rec], more=["--machine", str(MI355X), *more])
+    mi308x = MACHINES / "mi308x-hjbog39.json"
+    platforms.flags(tmp_path / "store", json.loads(mi308x.read_text()), tmp_path)
+    mi355x = json.loads(MI355X.read_text())
+    for more in ([], ["--ratios-from", "MI308X"]):
+        _main(monkeypatch, tmp_path, [rec], more=more, document=mi355x)
 
     own, at_ratios = (r["step"]["analytical_s"]["prefill"]["total"] for r in reports)
-    machine = project.projected(spec(MI355X), spec(MI308X))
+    # MI355X's peaks at MI308X's derates, MI308X's curve at MI355X's bandwidth,
+    # and MI308X's values no datasheet states.
+    target, probed = spec(MI355X), spec(mi308x)
+
+    def taken(path):
+        return "derate" in path.split(".") or path.startswith(CARRIED)
+
+    values = {p: v for p, v in target.values.items() if not taken(p)}
+    values |= {p: v for p, v in probed.values.items() if taken(p)}
+    scale = target.value(project.BANDWIDTH) / probed.value(project.BANDWIDTH)
+    values[project.CURVE] = [[s, r * scale] for s, r in probed.value(project.CURVE)]
+    machine = MachineSpec(values)
     direct = bound.gate([rec], {"step": StepRooflineBackend(machine, STACK)})
-    assert at_ratios == direct["step"]["analytical_s"]["prefill"]["total"] != own
+    assert at_ratios == pytest.approx(
+        direct["step"]["analytical_s"]["prefill"]["total"]
+    )
+    assert at_ratios != own
 
 
-def _priced_here(monkeypatch):
-    """Each cell priced in this process, by the stack and graphs `_main` uses."""
+def _priced_here(monkeypatch, drafter=None):
+    """Each cell priced in this process, by the stack and graphs `_main` uses,
+    under `drafter`, a speculative config."""
     config = SimpleNamespace(
         model="m",
         tensor_parallel_size=1,
         kv_cache_dtype="bf16",
         enable_tbo=False,
         enable_tbo_decode=False,
-        speculative_config=None,
+        enable_expert_parallel=False,
+        speculative_config=drafter,
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
     tree = SimpleNamespace(modules=list)
     monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
-    monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree: STACK)
-    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a: graph)
+    monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
+    monkeypatch.setattr("atom.compass.run.modules.drafter", lambda config: None)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: graph)
     monkeypatch.setattr("atom.compass.run._file_digest", lambda *a: "sha256:m")
     monkeypatch.setattr("atom.compass.run.step_grid.keyed", lambda *a, **k: {})
     monkeypatch.setattr(project, "_each", lambda jobs: [project.cell(*j) for j in jobs])
@@ -108,7 +117,7 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
     decode = ran(tmp_path / "decode", LINES[:1])
     prefill = ran(tmp_path / "prefill", LINES[1:2])
     store = tmp_path / "store"
-    argv = ["--model", "m", "--machine", str(MI455), "--store", str(store)]
+    argv = ["--model", "m", *on_mi455(store, tmp_path), "--store", str(store)]
     project.main([*argv, "--", str(decode), "--enable-tbo", "--", str(prefill)])
 
     token = capsys.readouterr().out.split()[-1]
@@ -129,8 +138,9 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
     # The assumed gfx1250 device the graphs were traced at: 256 CUs, B0.
     declared = {"capture.compute_units": 256, "capture.revision": 1}
     assert declared.items() <= doc["assumed"].items()
-    assert mi455.origin("host.ipc.zmq_roundtrip_s")["origin"] == "assumed"
-    for unread in ("host.ipc.zmq_roundtrip_s", "device.compute.bf16_flops"):
+    never_read = "interconnect.inter_node.link_latency_s"
+    assert mi455.origin(never_read)["origin"] == "assumed"
+    for unread in (never_read, "device.compute.bf16_flops"):
         assert unread not in doc["assumed"]
     # Each assumed ratio and the kernel floor read, every cell priced again at
     # 0.8 and 1.2 of it.
@@ -145,6 +155,44 @@ def test_main_publishes_the_cells_ranked_naming_each_assumed_field_read(
         assert slower[level][str(prefill)] < base
 
 
+def test_a_cell_under_a_drafter_states_the_drafters_seconds_apart(
+    monkeypatch, tmp_path
+):
+    mtp1 = SimpleNamespace(num_speculative_tokens=1, use_dspark=lambda: False)
+    _priced_here(monkeypatch, mtp1)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: drafted)
+    line = {"rows": [[2, 900, True]] * 2, "rung": 2, "d_target_ns": 10**9}
+    decode = ran(tmp_path / "mtp", [line])
+
+    cell = project.cell("m", 1, json.loads(MI455.read_text()), "s", str(decode), [])
+
+    op = cell["levels"]["op"]
+    # The drafter costs more than the target, and is not in its seconds.
+    assert op["draft_s"]["decode"] > op["analytical_s"]["decode"]["total"] > 0
+
+
+def test_a_cell_at_atoms_default_level_names_no_level_in_its_engine(
+    monkeypatch, tmp_path
+):
+    """A cell is built eager at level 0, as its op graphs are traced, and they
+    serve a run at any level: its engine is the one they are keyed by."""
+    _priced_here(monkeypatch)
+    monkeypatch.setattr("atom.compass.run.step_grid.keyed", keyed)
+    monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx", lambda: "gfx950")
+    tree = SimpleNamespace(modules=list)
+    monkeypatch.setattr(bound, "_build", lambda m, tp, a, *_: (_config(m, tp, a), tree))
+    model = tmp_path / "qwen3"
+    model.mkdir()
+    (model / "config.json").write_bytes(QWEN.read_bytes())
+    decode = ran(tmp_path / "decode", LINES[:1])
+    mi455 = json.loads(MI455.read_text())
+
+    cell = project.cell(str(model), 1, mi455, "s", str(decode), [])
+
+    assert cell["engine"]["tensor_parallel_size"] == 1
+    assert LEVEL not in cell["engine"]
+
+
 def test_main_reads_a_records_atom_arguments_from_its_run_json(monkeypatch, tmp_path):
     """Less the server's and `--model`; a record whose run.json names none is
     refused alone and priced under its own `--` group."""
@@ -156,7 +204,8 @@ def test_main_reads_a_records_atom_arguments_from_its_run_json(monkeypatch, tmp_
     line += ["--enable-tbo", "--tool-call-parser", "qwen3"]
     (served / "run.json").write_text(json.dumps({"argv": line}))
     (bare / "run.json").write_text(json.dumps({"argv": ["compass", "record"]}))
-    argv = ["--model", "m", "--machine", str(MI455), "--store", str(tmp_path / "s")]
+    argv = ["--model", "m", *on_mi455(tmp_path / "s", tmp_path)]
+    argv += ["--store", str(tmp_path / "s")]
 
     with pytest.raises(ValueError) as refused:
         project.main([*argv, str(served), str(bare)])
@@ -183,10 +232,11 @@ def test_a_record_naming_a_draft_model_is_refused_naming_the_dash_form(tmp_path,
     )
 
 
-def test_main_refuses_cells_of_two_models_and_a_run_with_no_cell(monkeypatch):
+def test_main_refuses_cells_of_two_models_and_a_run_with_no_cell(monkeypatch, tmp_path):
     two = [{"model": "sha256:a"}, {"model": "sha256:b"}]
     monkeypatch.setattr(project, "_each", lambda jobs: two)
-    argv = ["--model", "m", "--machine", str(MI455), "--store", "s"]
+    store = tmp_path / "s"
+    argv = ["--model", "m", *on_mi455(store, tmp_path), "--store", str(store)]
 
     with pytest.raises(ValueError, match="different models"):
         project.main([*argv, "--", "a", "--", "b"])
@@ -213,7 +263,7 @@ def test_a_ratio_times_its_factor_is_capped_at_the_datasheet_and_says_so():
 def test_the_band_ranks_the_cells_again_at_each_ratio_one_at_a_time(monkeypatch):
     bf16, link = "device.compute.derate.bf16", "interconnect.intra_node.derate"
     mi455 = spec(MI455)
-    machine = MachineSpec(mi455.values | {link: 0.9}, mi455.tokenizers)
+    machine = MachineSpec(mi455.values | {link: 0.9})
 
     def rates(jobs):
         """Each cell's tokens a second, read off the spec it was priced on."""

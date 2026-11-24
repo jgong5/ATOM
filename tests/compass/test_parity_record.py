@@ -21,7 +21,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from conftest import MockConfig
+from test_backend_step_linear_fit import platform_arg
 from test_dp_step_max import dp2  # noqa: F401  the dp2 fixture
+from test_memory_readings import DOCUMENT
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
 from atom.compass import run
@@ -53,7 +55,9 @@ PROMPT, BUDGET, BLOCK = 200, 64, 16
 #: The capture ladder every runner here replays decode steps from.
 LADDER = [1, 2, 4, 8]
 #: An attention builder that runs every decode from a graph, as ATOM's base does.
-GRAPHABLE = SimpleNamespace(step_needs_eager=lambda batch: False)
+GRAPHABLE = SimpleNamespace(
+    step_needs_eager=lambda batch: False, supports_token_graph=False
+)
 
 
 def _prompt(i):
@@ -489,6 +493,7 @@ def _engine(blocks):
         "max_model_len": 2048,
         "num_kvcache_blocks": blocks,
         "enable_prefix_caching": False,
+        "prefill_buckets": [],
     }
 
 
@@ -575,7 +580,7 @@ def test_a_context_parallel_record_states_its_width_and_the_step_linear_fit_refu
     with pytest.raises(ValueError) as refused:
         step_linear_fit.main(
             [str(record), "--out", str(tmp_path / "law.json")]
-            + ["--machine-spec", "sha256:" + "0" * 64]
+            + [*platform_arg(DOCUMENT)]
         )
     assert str(refused.value) == (
         "the records' engine config states prefill_context_parallel_size 2, and "
@@ -723,8 +728,10 @@ def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
         step_clock_ns = staticmethod(time.monotonic_ns)
 
         @staticmethod
-        def device_event():
-            return SimpleNamespace(query=lambda: True, elapsed_time=lambda _: 1.0)
+        def device_event(event=None):
+            return event or SimpleNamespace(
+                query=lambda: True, elapsed_time=lambda _: 1.0
+            )
 
     monkeypatch.setenv(ENV, str(tmp_path / "real"))
     runners = [_Recorded(rank) for rank in (0, 1)]

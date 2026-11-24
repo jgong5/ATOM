@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import types
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -176,6 +177,17 @@ def _planned(x, plan, pool):
     assert plan.mode is _Mode.FAST and plan.table[2].shape == plan.rows.shape
     assert pool is _RECORDER["pool"]
     _run(_kernel, x, plan.rows)
+
+
+class _Units(NamedTuple):
+    values: torch.Tensor
+    scales: torch.Tensor
+
+
+def _written(x, units):
+    # Reads its planes by field, as DeepSeek-V4.1's FP4 index write does: a
+    # replay passes `units` rebuilt as its class.
+    _run(_kernel, x, units.values, units.scales)
 
 
 def test_a_launch_lifts_past_closures_and_generic_launchers_with_its_entry_arguments(
@@ -349,6 +361,21 @@ def test_an_object_argument_is_held_as_pickle_reduces_it_or_as_the_runner_s(
     )
     assert dict(leaf.args)["plan"] == Reduced(f"{__name__}:_Plan", plan)
     assert dict(leaf.args)["pool"] == ir.ModuleRef("runner.pool")
+
+
+def test_a_named_tuple_argument_is_held_as_its_class_and_fields(recorder):
+    def call(x):
+        scales = torch.empty(2, dtype=torch.uint8, device="cuda")
+        _written(x, _Units(torch.empty(2, 8, device="cuda"), scales))
+
+    steps(recorder, call, call)
+
+    leaf = recorder.items[-1][1]
+    assert leaf.name == f"{__name__}:_written"
+    values = ir.Tensor((2, 8), "torch.float32", (8, 1), ir.Role.METADATA)
+    scales = ir.Tensor((2,), "torch.uint8", (1,), ir.Role.METADATA)
+    fields = (("values", values), ("scales", scales))
+    assert dict(leaf.args)["units"] == Reduced(f"{__name__}:_Units", fields)
 
 
 def test_an_argument_neither_a_value_nor_reducible_is_refused_by_its_type(

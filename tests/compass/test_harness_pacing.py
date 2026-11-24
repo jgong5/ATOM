@@ -10,6 +10,7 @@ otherwise.
 """
 
 import asyncio
+import random
 import re
 import subprocess
 import sys
@@ -54,6 +55,8 @@ from aiperf.timing.trajectory_source import TrajectorySource
 from compass_harness.scheduler import ClockPacedLoopScheduler
 from compass_harness.strategy import CompassAgenticReplay
 
+from compass_harness import scheduler as scheduler_module
+
 AIPERF = Path(aiperf.__file__).parent
 T0 = 1000.0
 PACING = (
@@ -69,14 +72,19 @@ OTHER_TIMING_MODES = {
 
 
 class StandInClock:
+    """A clock that reaches each time it is asked for at once."""
+
     def __init__(self) -> None:
         self.t = T0
 
     def now(self) -> float:
         return self.t
 
-    async def advance_to(self, t: float) -> None:
+    def wait(self, t: float) -> asyncio.Future:
         self.t = t
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result(None)
+        return fut
 
 
 def _wall_timer(*args, **kwargs):
@@ -400,7 +408,8 @@ def test_an_unbound_clock_refuses_the_phase_runner(monkeypatch):
 
 
 class GrantingClock:
-    """A clock whose ``advance_to`` suspends until ``grant()`` wakes every wait at once."""
+    """A clock whose ``grant()`` moves it to the earliest wait and resolves the
+    waits due then, as the traffic LP's grants do."""
 
     def __init__(self) -> None:
         self.t = T0
@@ -409,15 +418,21 @@ class GrantingClock:
     def now(self) -> float:
         return self.t
 
-    async def advance_to(self, t: float) -> None:
+    def wait(self, t: float) -> asyncio.Future:
         fut = asyncio.get_running_loop().create_future()
         self.waits.append((t, fut))
-        await fut
+        return fut
+
+    def withdraw(self, fut: asyncio.Future) -> None:
+        self.waits = [w for w in self.waits if w[1] is not fut]
+        if not fut.done():
+            fut.set_result(None)
 
     def grant(self) -> None:
-        waits, self.waits = self.waits, []
-        self.t = min(t for t, _ in waits)
-        for _, fut in waits:
+        self.t = min(t for t, _ in self.waits)
+        due = [fut for t, fut in self.waits if t <= self.t]
+        self.waits = [w for w in self.waits if w[0] > self.t]
+        for fut in due:
             fut.set_result(None)
 
 
@@ -490,11 +505,38 @@ def test_a_timer_due_before_the_driver_wait_starts_at_its_own_time(
     assert asyncio.run(main()) == expected
 
 
+def test_a_cancel_moves_the_clock_wait_to_the_next_timer_or_withdraws_it(
+    monkeypatch,
+):
+    """The driver waits on the clock for the earlier of two timers. Its cancel
+    leaves the clock waiting for the other; the phase end's ``cancel_all()``
+    leaves it waiting for nothing."""
+
+    async def main():
+        clock = GrantingClock()
+        monkeypatch.setattr(ClockPacedLoopScheduler, "clock", clock)
+        scheduler = ClockPacedLoopScheduler()
+        first = scheduler.schedule_later(1.0, _nothing())
+        scheduler.schedule_later(5.0, _nothing())
+        asked = []
+        for cancel in (
+            lambda: None,
+            lambda: scheduler.cancel_handle_id(first),
+            scheduler.cancel_all,
+        ):
+            cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+            asked.append([t - T0 for t, _ in clock.waits])
+        return asked
+
+    assert asyncio.run(main()) == [[1.0], [5.0], []]
+
+
 @pytest.mark.parametrize(
     "option, name",
     [
         ({"seamless": True}, "seamless"),
-        ({"trace_cap": 30.0}, "trace_idle_gap_cap_seconds"),
         ({"metrics_off": False}, "server metrics"),
         ({"gpu_off": False}, "GPU telemetry"),
         ({"prefill_concurrency": 2}, "prefill concurrency (--prefill-concurrency)"),
@@ -510,3 +552,88 @@ def test_each_unpaced_option_is_refused_by_name(option, name, monkeypatch):
 
     with pytest.raises(ValueError, match=f"turn them off: {re.escape(name)}"):
         asyncio.run(main())
+
+
+def test_timers_fire_at_their_own_times_and_in_arming_order_when_due_together(
+    monkeypatch,
+):
+    """Timers armed with tied delays, some cancelled and one group capped earlier."""
+    rng = random.Random(2823)
+
+    async def main():
+        clock = GrantingClock()
+        monkeypatch.setattr(ClockPacedLoopScheduler, "clock", clock)
+        scheduler = ClockPacedLoopScheduler()
+        fired = []
+
+        async def turn(k):
+            fired.append((k, clock.now() - T0))
+
+        armed = []
+        for k in range(300):
+            delay, group = rng.randrange(1, 40) / 4, f"g{rng.randrange(5)}"
+            armed.append((k, delay, group))
+            handle = scheduler.schedule_later(delay, turn(k), group_id=group)
+            if rng.random() < 0.2:
+                scheduler.cancel_handle_id(handle)
+                armed.pop()
+        # g2's timers move earlier together, its first then due at +0.125.
+        shift = min(d for _, d, g in armed if g == "g2") - 0.125
+        scheduler.cap_pending_delay_for_group("g2", 0.125)
+        due = {k: d - shift if g == "g2" else d for k, d, g in armed}
+        for _ in range(100 * len(due)):
+            if len(fired) == len(due):
+                break
+            await asyncio.sleep(0)
+            if clock.waits:
+                clock.grant()
+        return fired, due
+
+    fired, due = asyncio.run(main())
+    assert fired == sorted(due.items(), key=lambda kd: (kd[1], kd[0]))
+
+
+class _CountedTimer(scheduler_module._Timer):
+    """A scheduler timer that counts each read of its due time."""
+
+    __slots__ = ("_at",)
+    reads = 0
+
+    @property
+    def at(self):
+        _CountedTimer.reads += 1
+        return self._at
+
+    @at.setter
+    def at(self, at):
+        self._at = at
+
+
+def test_a_wake_with_nothing_due_reads_as_many_timers_with_2000_pending_as_with_10(
+    monkeypatch,
+):
+    """A cancel wakes the driver; one that finds no timer due costs the same
+    however many timers are pending."""
+
+    async def reads_a_wake(pending):
+        clock = GrantingClock()
+        monkeypatch.setattr(ClockPacedLoopScheduler, "clock", clock)
+        monkeypatch.setattr(scheduler_module, "_Timer", _CountedTimer)
+        scheduler = ClockPacedLoopScheduler()
+        for k in range(pending):
+            scheduler.schedule_later(100.0 + k, _nothing())
+        # Due after all the others: each one's cancel wakes the driver, which
+        # then finds the same timer first.
+        later = [scheduler.schedule_later(10_000.0 + k, _nothing()) for k in range(20)]
+        await asyncio.sleep(0)
+        reads = []
+        for handle_id in later:
+            before = _CountedTimer.reads
+            scheduler.cancel_handle_id(handle_id)
+            for _ in range(3):
+                await asyncio.sleep(0)
+            reads.append(_CountedTimer.reads - before)
+        scheduler.cancel_all()
+        return reads
+
+    assert asyncio.run(reads_a_wake(2000)) == asyncio.run(reads_a_wake(10))

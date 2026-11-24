@@ -199,7 +199,7 @@ def test_client_runs_is_1_without_a_client_and_at_least_1_with_one():
 
 def _single(dp=1):
     return single_engine_table(
-        admission_path="serving", ipc_s=IPC_S, stream_s=STREAM_S, dp=dp
+        admission_s=0.54e-3, ipc_s=IPC_S, stream_s=STREAM_S, dp=dp
     )
 
 
@@ -266,9 +266,7 @@ def _ask(conn, request):
 
 
 def test_a_resigned_client_closes_and_the_next_binds_where_it_left(tmp_path):
-    table = single_engine_table(
-        admission_path="serving", ipc_s=IPC_S, stream_s=STREAM_S
-    )
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=IPC_S, stream_s=STREAM_S)
     http, stream = "traffic->frontend:http", "frontend->traffic:stream"
     L, S = table.lookahead(http), table.lookahead(stream)
     server = serve(
@@ -323,9 +321,7 @@ def test_a_resigned_client_closes_and_the_next_binds_where_it_left(tmp_path):
 
 
 def test_a_marked_grant_calls_the_lp_s_hand_in_with_the_client_run(tmp_path):
-    table = single_engine_table(
-        admission_path="serving", ipc_s=IPC_S, stream_s=STREAM_S
-    )
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=IPC_S, stream_s=STREAM_S)
     endpoint = f"inproc:{tmp_path}"
     server = serve(ClockAuthority(table, client=TRAFFIC, client_runs=3), endpoint)
     try:

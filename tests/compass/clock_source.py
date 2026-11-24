@@ -103,8 +103,10 @@ CLOCK_READS = (
 #: does not collect the exemption.
 DEFAULT_ALLOW_LIST: dict[str, str] = {
     "atom/compass/run/__init__.py": (
-        "the run summary's wall seconds, from the run's start to its finish, "
-        "and each lazy trace's: the speed result, which no simulated time reads"
+        "the run summary's wall seconds, each client run's from its client's "
+        "first request to its end, and each lazy trace's: the speed result, "
+        "which no simulated time reads; and a recorded real run's tokenizer-call "
+        "and HTTP intake stamps, which a simulated run never installs"
     ),
     "atom/compass/parity/runner.py": (
         "a real runner's step timestamps; a simulated run runs its own runner "
@@ -121,6 +123,10 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
     "atom/compass/fit/publish.py": (
         "when a fit published its entry, for the entry's provenance; a fit runs "
         "offline on recorded steps and never inside a simulated run"
+    ),
+    "atom/compass/fit/device.py": (
+        "when fit device published its entry, for the entry's provenance and "
+        "date; it runs offline on probe records and never inside a simulated run"
     ),
     "atom/compass/drive/identity.py": (
         "a command's phase boundaries in run.json, which are wall and monotonic "
@@ -142,6 +148,15 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
     "atom/compass/drive/measure_memory.py": (
         "when measure memory published its entry, for the entry's provenance; it "
         "starts a real engine and never runs inside a simulated run"
+    ),
+    "atom/compass/drive/measure_device.py": (
+        "when measure device published its record, for the entry's provenance; "
+        "it probes real devices and never runs inside a simulated run"
+    ),
+    "atom/compass/drive/pp_probe.py": (
+        "the PP carrier probe's send and receive stamps, on the monotonic clock "
+        "both its ranks share; it times two real devices and never runs inside "
+        "a simulated run"
     ),
     "atom/compass/validate/project.py": (
         "when compass project published its projection, for the entry's "
@@ -304,12 +319,19 @@ _KEPT_REAL = (
                 ("__init__", "monotonic", 1), ("quarantine", "monotonic", 1),
                 ("_retire_locked", "monotonic", 1), ("_scatter", "monotonic", 2),
                 ("sweep", "monotonic", 1), ("_unquarantine_locked", "monotonic", 1))),
+            ("disaggregation/chunked_prefill.py", (
+                ("__init__", "monotonic", 1), ("publish", "monotonic", 1),
+                ("finish", "monotonic", 1), ("source_safe", "monotonic", 1))),
             ("disaggregation/mooncake/mooncake_connector.py", (
-                ("_complete_recv", "monotonic", 1), ("_expire_pending_recvs", "monotonic", 1),
+                ("admission_ready", "monotonic", 1), ("build_connector_meta", "monotonic", 1),
+                ("_complete_recv", "monotonic", 1),
+                ("_dispatch_ready_chunked_requests", "monotonic", 1),
+                ("_execute_chunked_transfer", "monotonic", 1),
+                ("_expire_pending_recvs", "monotonic", 1),
                 ("get_finished", "monotonic", 1), ("_rdma_write", "monotonic", 3),
                 ("record_kv_cache_ready", "monotonic", 1), ("_record_write_ack", "monotonic", 1),
                 ("_report_held_failures", "monotonic", 1), ("start_load_kv", "monotonic", 1),
-                ("_write_listener", "monotonic", 1), ("_write_mla_slot", "monotonic", 1))),
+                ("_write_listener", "monotonic", 2), ("_write_mla_slot", "monotonic", 1))),
             ("disaggregation/moriio/moriio_connector.py", (
                 ("_accept_write_request", "monotonic", 1),
                 ("_collect_write_reports", "time", 1), ("_finish_write", "monotonic", 1),
@@ -355,6 +377,9 @@ _KEPT_REAL = (
     ("atom/observability/tracing.py", "now", "time.perf_counter_ns", "K9", _TRACE, 1),
     ("atom/observability/tracing.py", "enqueue", "time.perf_counter_ns", "K9", _TRACE, 1),
     ("atom/observability/tracing.py", "enqueue", "time.time_ns", "K9", _TRACE, 1),
+    ("atom/structured_output/validation.py", "_prepare", "time.monotonic", "K8", (
+        "the 60 s bound on structured-output admission's worker grammar "
+        "preflight; a simulated run does not model structured output"), 3),
     ("atom/rollout/weight_sync.py", "load_weights_via_ipc", "time.time",
      "K9", "pushes real weights to the GPU, which a simulated run never holds", 2),
     ("atom/utils/__init__.py", "shutdown_all_processes", "time.monotonic",

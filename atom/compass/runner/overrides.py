@@ -105,6 +105,7 @@ import os
 import pickle
 import sys
 from functools import partial, wraps
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -114,6 +115,7 @@ from torch.utils._device import _device_constructors
 
 from atom.compass.backends.base import CostBackend
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
+from atom.compass.memory.readings import PAGE_BOUND
 from atom.compass.runner.step_output import DeferredTokenStream, filler_token_ids
 
 logger = logging.getLogger(__name__)
@@ -161,13 +163,15 @@ RPC_SURFACE: dict[str, bool] = {
     "flush_pp_send": True,
     "poll_forward_metrics": False,  # EngineUtilityHandler does not wait
     # EngineCore.__init__ hands the reply to its Scheduler; ATOM's own reads the
-    # prefill token graphs recorded, and this runner records none.
+    # prefill token graphs recorded, which this runner states without recording
+    # (`state_prefill_buckets`).
     "prefill_token_graphs": True,
     # Refused by `RefusedDynamicChunking`: a fit needs timed real forwards.
     "profile_dynamic_chunking": True,  # EngineCore.__init__ reads the reply
     # Reached only after a fit, so never: ATOM's own.
     "take_dynamic_chunking_fit": True,  # EngineCore reads the reply
     "release_multimodal_requests": False,  # EngineCore does not wait
+    "release_structured_requests": False,  # EngineCore does not wait
     # Refused by `RefusedControlCommands`: ATOM's own starts a real profiler.
     "start_profiler": True,  # EngineUtilityHandler forwards the reply unread
     "stop_profiler": True,  # EngineUtilityHandler forwards the reply unread
@@ -276,9 +280,15 @@ MTP_COPY = "L_mtp"
 PP_RECV_SEGMENT = "W_recv"
 #: The engine loop from a forward's exit to its next input pull: the charge's `out_s`.
 OUT_SEGMENT = "E_out"
+#: The wall seconds an op-graph run's `compass_lazy` sums: its lookups, and its
+#: backend's `price` calls, the lookups among them.
+WALLS = ("lookup_wall_seconds", "price_wall_seconds")
 #: Every segment a law may price.
 SEGMENTS = (*HOST_SEGMENTS, MTP_SEGMENT, MTP_COPY, PP_RECV_SEGMENT, OUT_SEGMENT)
 FORWARD_KINDS = ("decode", "prefill", "middle")
+#: `admit` for a host entry fitted before admissions were priced apart, whose
+#: `E` laws hold them: they cost nothing on top.
+ADMISSION_IN_E = (0.0, 0.0, 0.0)
 #: The format of a simulated run's `dp<r>.cost.jsonl`, its first line.
 COST_TABLE_VERSION = 1
 
@@ -290,15 +300,38 @@ def forward_shape(batch: Any) -> tuple[str, tuple]:
     return kind, (1, batch.total_tokens_num, batch.total_seqs_num)
 
 
+def admitted(batch: Any, seen: set, tokens_per_entry: int) -> tuple[int, int, int]:
+    """``(requests, uncached, cached)`` of the requests `batch` admits: those
+    a prefill row schedules for the first time, not in `seen`, which takes
+    every request the batch holds. The scheduler allocated each one's whole
+    prompt there, so its prompt is its block table's entries times
+    `tokens_per_entry`, and its prefix-cache hit is the tokens its row starts
+    from."""
+    if len(batch.block_tables) != len(batch.req_ids):
+        raise RunnerRefusal(
+            f"a batch of {len(batch.req_ids)} requests holds "
+            f"{len(batch.block_tables)} block tables, so a request's prompt "
+            "cannot be read off its own"
+        )
+    n = uncached = cached = 0
+    for i, (r, table) in enumerate(zip(batch.req_ids, batch.block_tables)):
+        if r not in seen and i < batch.total_seqs_num_prefill:
+            hit = int(batch.num_cached_tokens[i])
+            n, uncached = n + 1, uncached + len(table) * tokens_per_entry - hit
+            cached += hit
+        seen.add(r)
+    return n, uncached, cached
+
+
 class HostDeviceRecurrence:
     """One runner's host and device timelines, composed into each forward's charge.
 
     The host runs `HOST_SEGMENTS` from `now`. A forward's entry waits for the
     device work two forwards back, or on a pipeline stage `stage = (rank, pp)`,
     `pp` forwards back; an output forward, after launch, waits for the previous
-    output forward's, or on the last stage for its own, and on any other stage
+    output forward's, or for its own on the last stage or a single stage that does not `defer` its output, and on any other stage
     for nothing. With `mtp`, a forward's device work is its target's and then
-    its draft's, and a single-stage output forward waits before launch, for
+    its draft's, and an output forward on a single stage that defers waits before launch, for
     the previous output forward's target and then `MTP_COPY`; `MTP_SEGMENT`
     runs after that wait, before the launch. A batch's `compass_queued_s`,
     the device work its prepare queued ahead of its launch, runs after
@@ -308,19 +341,52 @@ class HostDeviceRecurrence:
     does. `ends[-1]` is the last forward's device end. `laws[kind][segment]` are coefficients on `(1,
     tokens, seqs)`; `charge` says what an absent one costs. `now` reads the engine LP's clock.
     `segments` holds the seconds the last `charge` charged each segment, 0 for
-    one in `skip`.
+    one in `skip`. `admit`, coefficients on `admit_x` of a batch's
+    `compass_admitted`, adds what its admissions cost to its `E`, except on a
+    pipeline stage that receives its input; None, a fit that priced them apart
+    and fitted no law for them, and `device_end` refuses a forward that admits.
+    `columns[kind][segment]` prices launch features, a batch's `compass_launch`,
+    which its caller sets from `predicted`; `launch`, the provider and graph
+    sets predicting them, refuses a column naming a feature it lacks; a
+    pipeline stage refuses any column.
+    With `own_draft`, true unless it defers, an output forward that waits for its own
+    target leaves no earlier than its device end, as one that reads its own draft ids does.
     """
 
     def __init__(
-        self, laws: dict, skip, now, stage=None, mtp=False, sync=False
+        self,
+        laws: dict,
+        skip,
+        now,
+        stage=None,
+        mtp=False,
+        sync=False,
+        admit=ADMISSION_IN_E,
+        columns=None,
+        launch=(None, None),
+        defer=True,
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
+        self.admit, self.columns, self.launch = admit, columns or {}, launch
+        named = {f for v in self.columns.values() for c in v.values() for f in c}
+        if lacks := sorted(named - set(getattr(launch[0], "features", ()))):
+            raise ValueError(
+                f"the host laws adopt launch features {lacks}, which this model's "
+                f"launch provider, {type(launch[0]).__name__}, does not declare"
+            )
+        if self.columns and stage is not None:
+            raise ValueError(
+                "the host laws adopt launch columns, and a pipeline stage posts "
+                "its receive at a prepare end `pp_recv_posted` prices without them"
+            )
         ring = 2 if stage is None else stage[1]
         self.ends = collections.deque([-math.inf] * ring, maxlen=ring)  # n-ring..n-1
         self.last = None if stage is None else stage[0] == stage[1] - 1
+        self.last = True if stage is None and not defer else self.last
         self.recv = stage is not None and stage[0] > 0  # a later stage receives
         self.output_end = -math.inf  # target end of the last output forward
         self.mtp = mtp
+        self.own_draft = not defer
 
     def charge(
         self, batch: Any, device_s: float, draft_s: float, refuse: bool = True
@@ -334,15 +400,18 @@ class HostDeviceRecurrence:
         self, batch: Any, device_s: float, draft_s: float, refuse: bool = True
     ) -> float:
         """The end of the forward's device work, launch included, for `device_s`
-        of target device time and then `draft_s` of draft, starting no earlier
-        than the batch's `compass_pp_release` or `compass_queued_s` after
-        `ends[-1]`; `target_end` is the target's
-        end, and `release` follows. A batch's
+        of target device time, starting no earlier than the batch's
+        `compass_pp_release` or `compass_queued_s` after `ends[-1]`, then
+        `draft_s` of draft, starting no earlier than the forward's exit, since
+        its host queues the draft before it exits; under `sync`, whose exit
+        waits for this end, no earlier than its launch's end. `target_end` is
+        the target's end, and `release` follows. A batch's
         `compass_pp_host = (called, meta)` runs the host from `called` in place
         of `now`; its launch posts the receive after `PP_RECV_SEGMENT` and
         runs the rest once `meta` is in. With any
         laws and `refuse`, a forward whose kind lacks one for a segment it runs
-        is refused, naming each ``<kind>.<segment>``, the state as it was;
+        is refused, naming each ``<kind>.<segment>``, the state as it was, as
+        is one that admits a request with `admit` None, naming ``admit``;
         without `refuse` that segment is 0. A segment in `skip` needs none, a
         middle chunk runs no `W_post`, and only an output forward under `mtp`
         runs `MTP_SEGMENT`, and on a single stage `MTP_COPY`; a stage after the
@@ -357,15 +426,27 @@ class HostDeviceRecurrence:
         ran += (PP_RECV_SEGMENT,) if self.recv else ()
         out = any(OUT_SEGMENT in v for v in self.laws.values())
         ran += (OUT_SEGMENT,) if out else ()
-        missing = [s for s in ran if s not in {*law, *self.skip}]
+        missing = [f"{kind}.{s}" for s in ran if s not in {*law, *self.skip}]
+        features = getattr(batch, "compass_launch", None) or {}
+        columns = self.columns.get(kind, {})
+        missing += [
+            f"{kind}.{s}.{f}"
+            for s in ran
+            for f in columns.get(s, ())
+            if f not in features
+        ]
+        a = getattr(batch, "compass_admitted", None)
+        if self.admit is None and a and a[0] and not self.recv and "E" not in self.skip:
+            missing.append("admit")
         if refuse and self.laws and missing:
             from atom.compass.backends.resolver import CostRefused, Refusal
 
-            named = ", ".join(f"{kind}.{s}" for s in missing)
+            named = ", ".join(missing)
             raise CostRefused(kind, [Refusal("host", f"no law for {named}")])
         now = self.now()
         called, meta = getattr(batch, "compass_pp_host", (now, -math.inf))
-        prepared, self.segments = self.prepare_end(called, kind, x)
+        admit_s = self.admit_s(batch)
+        prepared, self.segments = self.prepare_end(called, kind, x, admit_s, features)
         self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)
@@ -375,25 +456,41 @@ class HostDeviceRecurrence:
         queued_end = self.ends[-1] + getattr(batch, "compass_queued_s", 0.0)
         self.target_end = max(queued_end, host, release) + device_s
         self._held = now, launch_end, output, post
-        return max(self.target_end + draft_s, launch_end)
+        if not draft_s:
+            return max(self.target_end, launch_end)
+        queued = launch_end if self.sync else self._exit(self.target_end)
+        return max(self.target_end, queued) + draft_s
 
-    def start_lag(self, batch: Any) -> float | None:
-        """`BatchView.start_lag_s` of an output forward on a single stage, as
-        `device_end` and `release` would place it: its device start less the
-        host's return from the previous output forward's wait; else None."""
-        if not batch.produces_output() or self.last is not None or self.sync:
-            return None
-        kind, x = forward_shape(batch)
-        prepared, seg = self.prepare_end(self.now(), kind, x)
-        start = max(self.ends[-1] + getattr(batch, "compass_queued_s", 0.0), prepared)
-        return start - max(prepared + seg["W_launch"], self.output_end)
+    def predicted(self, view: Any) -> dict:
+        """A step's launch features by `launch`'s provider, from its
+        `BatchView` `view`; none where no law adopts a column."""
+        provider, graphs = self.launch
+        return provider.predict(view, graphs) if self.columns else {}
 
-    def prepare_end(self, called: float, kind: str, x: tuple) -> tuple[float, dict]:
+    def admit_s(self, batch: Any) -> float:
+        """What `batch`'s admissions add to its `E`."""
+        from atom.compass.backends.step_labels import admit_x
+
+        a = getattr(batch, "compass_admitted", None)
+        if not (self.admit and a) or self.recv:
+            return 0.0
+        return float(np.dot(self.admit, admit_x(a)))
+
+    def prepare_end(
+        self, called: float, kind: str, x: tuple, admit_s: float = 0.0, features=None
+    ) -> tuple[float, dict]:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
-        `PP_RECV_SEGMENT`'s too."""
-        law = self.laws.get(kind, {})
+        `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, and each column a segment
+        adopts prices `features`' value of its feature, 0 where absent."""
+        law, columns = self.laws.get(kind, {}), self.columns.get(kind, {})
+        features = features or {}
         seg = {
-            s: float(np.dot(law.get(s, (0, 0, 0)), x)) * (s not in self.skip)
+            s: (
+                float(np.dot(law.get(s, (0, 0, 0)), x))
+                + admit_s * (s == "E")
+                + sum(c * features.get(f, 0.0) for f, c in columns.get(s, {}).items())
+            )
+            * (s not in self.skip)
             for s in SEGMENTS
         }
         host = max(called + seg["E"], self.ends[0]) + seg["W_pre"]
@@ -405,28 +502,75 @@ class HostDeviceRecurrence:
         """The exit less `now` of the forward `device_end` priced, its device
         work ending at `end` and its target's at `target_end`, no earlier than
         it said."""
-        now, launch_end, output, post = self._held
+        now, _, output, _ = self._held
         self.ends.append(end)
+        exit_ = self._exit(target_end, end)
+        if output and self.last is None and not self.sync:
+            self.output_end = target_end
+        return exit_ - now
+
+    def _exit(self, target_end: float, end: float = -math.inf) -> float:
+        """The exit of the forward `device_end` priced, its device work ending
+        at `end` and its target's at `target_end`: `W_post` after its launch
+        and the wait that follows it, an output forward's for the previous
+        output forward's target on a single stage that defers or its own on the last or one that does not, or
+        under `sync` for `end`; with `own_draft`, one waiting for its own target leaves no earlier than `end`."""
+        _, launch_end, output, post = self._held
         released = launch_end
         if self.sync:
             released = max(launch_end, end)
-        elif output:
-            if self.last is None:
-                released, self.output_end = max(launch_end, self.output_end), target_end
-            elif self.last:
-                released = max(launch_end, target_end)
-        return released + post - now
+        elif output and self.last is None:
+            released = max(launch_end, self.output_end)
+        elif output and self.last:
+            released = max(launch_end, target_end)
+            if self.own_draft:  # its own draft ids, read once its draft ends
+                return max(released + post, end)
+        return released + post
 
 
-def schedulable_ladder(config: Any) -> list[int]:
-    """The capture sizes the scheduler can produce, ascending: ATOM's capture
-    bound, each sequence charged one token plus its drafts.
+def schedulable_bound(config: Any) -> int:
+    """The widest decode batch the scheduler can produce: ATOM's capture bound,
+    each sequence charged one token plus its drafts.
     `max_schedulable_decode_bs` holds it; importing that would pull the engine,
     and its kernels, into a driver-free process."""
     spec = getattr(config, "speculative_config", None)
     q = 1 + (spec.num_speculative_tokens if spec else 0)
-    bound = min(config.max_num_seqs, config.max_num_batched_tokens // q)
+    return min(config.max_num_seqs, config.max_num_batched_tokens // q)
+
+
+def schedulable_ladder(config: Any) -> list[int]:
+    """The capture sizes the scheduler can produce (`schedulable_bound`),
+    ascending."""
+    bound = schedulable_bound(config)
     return sorted(s for s in config.capture_sizes if s <= bound)
+
+
+def state_prefill_buckets(runner: Any) -> tuple[int, ...]:
+    """State, recording none, the prefill token-graph buckets ATOM's capture
+    records (`ModelRunner._record_prefill_graphs`): `ATOM_TOKEN_GRAPH_SIZES`
+    up to `warmup_max_tokens`, when the attention builder
+    `supports_token_graph` and the runner is no disaggregated decode instance.
+    One `TokenGraph`, held on the runner, counts each among its prefill
+    recordings, so `TokenGraph.captured_sizes("prefill")` answers them, as
+    after a real capture: ATOM's `prefill_token_graphs` then has the scheduler
+    give a DP rank with no prefill of its own the group's dummy prefill, and
+    `ForwardMode.decide` pads a prefill step to its group's bucket. Returns
+    the buckets."""
+    builder = runner.attn_metadata_builder
+    if not builder.supports_token_graph or runner.config.disagg_is_decode:
+        return ()
+    from atom.utils import envs
+    from atom.utils.region_graph import TokenGraph
+
+    limit = runner.warmup_max_tokens()
+    graph = TokenGraph()
+    for n in envs.ATOM_TOKEN_GRAPH_SIZES:
+        if 0 < n <= limit:
+            # A recording's key is its tensor arguments' shapes, rows first.
+            graph._captured[("prefill", ((n,),))] = {"prefill"}
+    TokenGraph._sizes.clear()
+    vars(runner)["_prefill_token_graph"] = graph
+    return TokenGraph.captured_sizes("prefill")
 
 
 def _installed_backend(runner: Any) -> CostBackend:
@@ -468,6 +612,25 @@ class HostEvent:
         pass
 
 
+class PredictedEvent:
+    """A timing event of ATOM's `GPUForwardMetrics` on a runner that runs no
+    forward, in place of the `torch.cuda.Event` its factory makes: it records
+    the runner's `_timed_s`, the predicted target seconds of the steps
+    `_time_target` has timed, and is complete once recorded."""
+
+    def __init__(self, runner: Any) -> None:
+        self.runner, self.s = runner, 0.0
+
+    def record(self, stream: Any = None) -> None:
+        self.s = self.runner._timed_s
+
+    def query(self) -> bool:
+        return True
+
+    def elapsed_time(self, end: PredictedEvent) -> float:
+        return (end.s - self.s) * 1000  # milliseconds, as a device event's
+
+
 def _device_memory(read: Any, runner: Any, answer: Any) -> Any:
     """`read`, a `torch.cuda` memory reading, answering about `runner.device`
     with `answer` of the runner's installed readings, and about any other
@@ -488,21 +651,24 @@ def _resident(readings: DeviceReadings, config: Any) -> int:
     after the load. Its `persistent` is read at the KV budget, after the
     attention builder that asks this has allocated, so none of it is counted.
 
-    Refused under `--index-cache-dtype fp4`, where DeepSeek-V4.1 sizes its
-    packed score workspace by the PAGEs left after this; on the fp8 plane the
-    answer sizes nothing."""
-    if getattr(config, "index_cache_dtype", None) == "fp4":
+    Under `--index-cache-dtype fp4`, where DeepSeek-V4.1 sizes its packed score
+    workspace by the PAGEs left after this, it adds `readings.page_bound`, what
+    a real start holds there above its load, and is refused without it; on the
+    fp8 plane the answer sizes nothing."""
+    fp4 = getattr(config, "index_cache_dtype", None) == "fp4"
+    if fp4 and readings.page_bound is None:
         raise RunnerRefusal(
             "under --index-cache-dtype fp4 DeepSeek-V4.1 bounds its score "
             "workspace by the PAGEs `memory_allocated` leaves, and a simulated "
             "start reads only the weights, buffers and load residue there; a "
             "real start also holds the drafter, the forward buffers and the "
-            "attention builder's own, which no memory reading separates, so "
-            "the PAGE bound would exceed a real start's. Pass "
+            "attention builder's own, and the run's memory readings state no "
+            f"{PAGE_BOUND}; take them again with compass measure memory, or pass "
             "--index-cache-dtype fp8, whose workspace does not read it."
         )
     held = ("weights", "buffers", "load residue")
-    return sum(t.nbytes for t in readings.peak_torch.terms if t.name in held)
+    resident = sum(t.nbytes for t in readings.peak_torch.terms if t.name in held)
+    return resident + (readings.page_bound.nbytes if fp4 else 0)
 
 
 @contextlib.contextmanager
@@ -563,7 +729,9 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
     after the stages before it -- on gloo and with an empty custom group
     configuration, under which aiter builds no device communicator for any
     group. A simulated TP width is refused: it starts fewer workers than the
-    TP group `apply_simulated_tp` then reports on a device group.
+    TP group `apply_simulated_tp` then reports on a device group. In a simulated
+    run the DP group then runs its small collectives over shared memory when
+    its ranks share a host (`shm_collectives`).
     """
     pc = config.parallel_config
     if config.tp_world_size != config.tensor_parallel_size:
@@ -633,6 +801,15 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
         prefill_context_model_parallel_size=pcp,
         custom_group_config={},
     )
+    from atom.compass import run
+
+    if pc.data_parallel_size > 1 and run.spec() is not None:
+        from aiter.dist.parallel_state import get_dp_group
+
+        from atom.compass.runner import shm_collectives
+
+        shm_collectives.install()
+        shm_collectives.attach(get_dp_group().cpu_group)
 
 
 def _config_field(runner: Any, name: str) -> Any:
@@ -679,17 +856,117 @@ def _gpu(arg: Any) -> bool:
     return isinstance(arg, (str, torch.device)) and torch.device(arg).type == "cuda"
 
 
+@contextlib.contextmanager
+def gathers_by_shape():
+    """A process group's gather of a meta tensor answers with its shape.
+
+    A hook that re-quantizes a sharded weight first gathers it whole across
+    its group: online quantization does, to a per-token target on a
+    row-parallel layer (`LinearBase.online_quantize_weight`). A meta shard has
+    no bytes to send, and the collective refuses it. Here it gets a meta
+    tensor of the gathered shape, its size along the gathered dim times the
+    group's width, and no collective runs; a gather of real bytes runs as
+    before.
+    """
+    from aiter.dist.parallel_state import GroupCoordinator
+
+    gather = GroupCoordinator.all_gather
+
+    def by_shape(group, input_, use_custom=False, dim=-1):
+        if not input_.is_meta:
+            return gather(group, input_, use_custom, dim)
+        shape = list(input_.shape)
+        shape[dim] *= group.world_size
+        return input_.new_empty(shape)
+
+    GroupCoordinator.all_gather = by_shape
+    try:
+        yield
+    finally:
+        GroupCoordinator.all_gather = gather
+
+
+_IS_CUDA = torch.Tensor.is_cuda.__get__
+
+
+class _MetaOnDevice(TorchFunctionMode):
+    """A meta tensor says it is on the GPU, as the tensor it stands for is."""
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if func == _IS_CUDA and args[0].is_meta:
+            return True
+        return func(*args, **(kwargs or {}))
+
+
+@contextlib.contextmanager
+def mhc_packed_on_meta():
+    """DeepSeek-V4.1's mHC pack packs a meta weight as it packs one on the GPU.
+
+    A V4.1 block keeps each mHC projection packed in a buffer after load
+    (`pack_mhc_fn`), but only for a weight on a gfx950 GPU, and a meta weight
+    is on none. Inside the pack a meta tensor says it is on the GPU and a meta
+    device's properties name the arch aiter's probe answers (the simulated
+    device's under `simulated_arch`), so ATOM's and aiter's code leave the
+    meta tensor a real start keeps, or nothing where that device keeps none.
+    Without the pack's module loaded nothing is swapped.
+    """
+    name = "pack_mhc_fn"
+    pack = getattr(
+        sys.modules.get("atom.model_ops.deepseek_v41.mhc_pre_delayed"), name, None
+    )
+    if pack is None:
+        yield
+        return
+    properties = torch.cuda.get_device_properties
+
+    def on_device(device=None):
+        if device is None or torch.device(device).type != "meta":
+            return properties(device)
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return SimpleNamespace(gcnArchName=get_gfx())
+
+    @wraps(pack)
+    def packed(fn):
+        if not fn.is_meta:
+            return pack(fn)
+        torch.cuda.get_device_properties = on_device
+        try:
+            with _MetaOnDevice():
+                return pack(fn)
+        finally:
+            torch.cuda.get_device_properties = properties
+
+    loaded = list(sys.modules.values())
+    bound = [m for m in loaded if getattr(m, "__dict__", {}).get(name) is pack]
+    for m in bound:
+        setattr(m, name, packed)
+    try:
+        yield
+    finally:
+        for m in bound:
+            setattr(m, name, pack)
+
+
 def process_weights_after_loading(tree: torch.nn.Module) -> None:
     """Run on a meta tree the post-load hooks `load_model` runs after a load.
 
     The same walk, parent first: each module's own hook, then its quant
     method's. The hooks re-lay weights (an MXFP4 MoE pads its expert scales),
-    so the storages they leave are the ones a real start holds. The loader's
-    `init_prepare_finalize` is not run: it sets up an MoE's dispatch and holds
-    no weight. A hook that fails on the meta device refuses the start by name.
+    so the storages they leave are the ones a real start holds; a gather
+    across a process group answers with its shape (`gathers_by_shape`), and
+    V4.1's mHC pack packs as on the GPU (`mhc_packed_on_meta`). The
+    loader's `init_prepare_finalize` is not run: it sets up an MoE's dispatch
+    and holds no weight. A hook that fails on the meta device refuses the
+    start by name.
     """
     if not isinstance(tree, torch.nn.Module):
         return
+    with gathers_by_shape(), mhc_packed_on_meta():
+        _run_post_load_hooks(tree)
+
+
+def _run_post_load_hooks(tree: torch.nn.Module) -> None:
     from atom.model_ops.base_config import QuantizeMethodBase
 
     for name, module in tree.named_modules():
@@ -796,24 +1073,42 @@ def publish_planned_transfer(runner: Any) -> None:
     """Publish one entry of the paged class `get_num_blocks` planned, the state
     slot a transfer moves beside a request's blocks (`_transferred_slot`),
     the staging row a second write moves after them (`_staging_row_bytes`),
-    and the runner's TP width, at the file `compass_block_file` names, which
-    `run.runner` gives TP rank 0 of a prefill-decode deployment: its connector
-    prices a transfer at them. Refused for a pipeline stage of Kimi's hybrid,
-    whose KDA state regions ATOM's builder refuses to publish there
+    the state image an lmcache save carries (`_saved_image_bytes`) and the
+    runner's TP width, at the file `compass_block_file` names, which
+    `run.runner` gives TP rank 0 of a prefill-decode deployment and of one that
+    offloads to an lmcache server: its connector prices a transfer at them, and
+    LP lmcache sizes a chunk and an image. A prefill-decode deployment is
+    refused for a pipeline stage of Kimi's hybrid, whose KDA state regions
+    ATOM's builder refuses to publish there
     (`_refuse_kda_regions_across_stages`), and for an MLA builder whose sparse
     indexer scores in FP4, whose regions no P/D backend parses
     (`_refuse_fp4_indexer_regions`)."""
     if path := getattr(runner, "compass_block_file", None):
         from atom.compass import run
 
-        _refuse_kda_regions_across_stages(runner)
-        _refuse_fp4_indexer_regions(runner)
+        if run._pd_side(runner.config) is not None:
+            _refuse_kda_regions_across_stages(runner)
+            _refuse_fp4_indexer_regions(runner)
         plan = runner.pool_plan
         tp = runner.config.tensor_parallel_size
         slot, after_blocks = _transferred_slot(runner)
         staging = _staging_row_bytes(runner)
         block = plan.entry_bytes[plan.paged_class]
-        run.publish_transfer(path, block, tp, slot, staging, after_blocks)
+        image = _saved_image_bytes(runner)
+        run.publish_transfer(path, block, tp, slot, staging, after_blocks, image)
+
+
+def _saved_image_bytes(runner: Any) -> int:
+    """The state image a native-state lmcache save carries beside its chunks:
+    that of the PAGE-backed checkpoint spec `get_num_blocks` planned, where
+    saves carry one at the engine's replay length (`stores_state_images`),
+    else 0, as for a runner that planned no checkpoint spec."""
+    from atom.kv_transfer.offload.mp.native_state_worker import stores_state_images
+
+    spec = runner.state_runtime.checkpoint_spec
+    if spec is None or not stores_state_images(runner.config.state_replay_tokens):
+        return 0
+    return int(spec.image_bytes)
 
 
 def _refuse_kda_regions_across_stages(runner: Any) -> None:
@@ -838,7 +1133,8 @@ def _refuse_fp4_indexer_regions(runner: Any) -> None:
     with the reason ATOM's builder gives as it refuses to publish its regions to
     a P/D backend, which the simulated connector stands for: this runner
     allocates no cache, so the builder is never asked. A run whose only region
-    reader is `lmcache_mp` is no prefill-decode run and publishes nothing here."""
+    reader is `lmcache_mp`, which takes those regions, is no prefill-decode run
+    and is not refused here."""
     from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
 
     builder = runner.attn_metadata_builder
@@ -969,12 +1265,16 @@ class PricedSteps:
         priced, before the max over the DP group, with the steps and seconds
         of each of `GROUPS` apart, and the steps a source extrapolated and
         those a fallback priced after a source declined, and under an op graph
-        its lazy traces and their wall seconds (`compass_lazy`). A dict even
-        before the first step, since a None reply parks the engine that asks.
+        its lazy traces and their wall seconds (`compass_lazy`); on a DP
+        group's first rank, or a rank of no group, the wall seconds the group
+        waited on its slowest rank's lookups and the rest of its pricing,
+        summed over its steps (`group_waited_seconds`). A dict even before the
+        first step, since a None reply parks the engine that asks.
         """
         from atom.compass.backends.cost import GROUPS, ProvenanceMix, group
 
         mix = vars(self).get("_priced") or ProvenanceMix()
+        waited = vars(self).get("_waited")
         steps = {group(*k): n for k, n in mix.steps_by_method().items()}
         seconds = {group(*k): s for k, s in mix.seconds_by_method().items()}
         return {
@@ -988,6 +1288,7 @@ class PricedSteps:
             **{f"{g}_seconds": seconds.get(g, 0.0) for g in GROUPS},
             "treatments": dict(mix.treatments),
             **vars(self).get("compass_lazy", {}),
+            **({"group_waited_seconds": waited} if waited else {}),
         }
 
 
@@ -1281,9 +1582,10 @@ class NonAllocatingRunner(
         it is a coefficient somebody wrote down rather than a measurement of
         the card being modelled; `kv_pool_sizing` keeps the count beside the
         readings, so which terms those were is recoverable from the runner and
-        not only from a log line somebody kept. On a prefill-decode run the
-        planned block, transferred state slot and staging row are published as
-        well (`publish_planned_transfer`).
+        not only from a log line somebody kept. On a prefill-decode run, and on
+        one offloading to an lmcache server, the planned block, transferred
+        state slot, staging row and saved state image are published as well
+        (`publish_planned_transfer`).
 
         The decode process of intra-GPU prefill/decode disaggregation is
         refused rather than sized. ATOM's own runner for that answers a block
@@ -1324,10 +1626,11 @@ class NonAllocatingRunner(
 
         An empty registry still goes through ATOM's `set_kv_cache_data`: it is
         the one call that builds the worker-side KV connector, which the engine
-        polls for transfer completions. An `lmcache_mp` one, alone or in a
-        `multi`, is built as `compass`'s worker half, which moves nothing.
+        polls for transfer completions. An `lmcache_mp` or `lmcache_offload`
+        one, alone or in a `multi`, is built as `compass`'s worker half, which
+        moves nothing.
         """
-        from atom.compass.kv.lmcache_mp import substitute
+        from atom.compass.kv import lmcache_mp, lmcache_offload
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
         from atom.utils.forward_context import set_kv_cache_data
 
@@ -1336,15 +1639,16 @@ class NonAllocatingRunner(
             names = [
                 n for n, _ in KVConnectorFactory.leaf_connectors(self.config) or ()
             ]
+        simulated = {"lmcache_mp": lmcache_mp, "lmcache_offload": lmcache_offload}
         for name in names:
-            if name not in ("compass", "lmcache_mp"):
+            if name != "compass" and name not in simulated:
                 raise RunnerRefusal(
                     f"kv_connector {name!r} is a real transfer backend; this "
-                    "runner simulates only 'compass' and 'lmcache_mp', and an "
-                    "unset kv_connector means 'moriio'."
+                    "runner simulates only 'compass', 'lmcache_mp' and "
+                    "'lmcache_offload', and an unset kv_connector means 'moriio'."
                 )
-        if "lmcache_mp" in names:
-            substitute()
+        for name in sorted(simulated.keys() & set(names)):
+            simulated[name].substitute()
         set_kv_cache_data({}, self.config, num_blocks=num_kvcache_blocks)
         self.config.num_kvcache_blocks = num_kvcache_blocks
         logger.info(
@@ -1377,7 +1681,10 @@ class NonAllocatingRunner(
         `tbo_decode_graphs` is set as the base's capture sets it, so a decode
         the DP group splits replays where a real one does. An empty narrowed ladder is refused: ATOM's capture asserts
         on it, so that deployment never starts. The reply still sends `[]` for the batch sizes, since no
-        graph exists; the caller only formats it into a log line.
+        graph exists; the caller only formats it into a log line. The prefill
+        token-graph buckets the base's capture would record are stated
+        (`state_prefill_buckets`), so the scheduler and `decide` see them, and
+        the run file's laws are held to them (`run.refuse_other_buckets`).
 
         `EngineCore.__init__` reaches this method only when `not enforce_eager
         and not disagg_is_decode`, so on an eager deployment the override never
@@ -1396,10 +1703,15 @@ class NonAllocatingRunner(
         self.tbo_decode_graphs = (
             self.config.enable_tbo_decode and not self._tr_hybrid_active()
         )
+        buckets = state_prefill_buckets(self)
+        from atom.compass import run
+
+        run.refuse_other_buckets(self.config, buckets)
         logger.info(
             "no cudagraph captured: there are no weights to trace; steps "
-            "dispatch on the ladder %s.",
+            "dispatch on the ladder %s and prefill token-graph buckets %s.",
             self.capture_sizes,
+            buckets,
         )
         return 0.0, [], 0
 
@@ -1468,6 +1780,8 @@ class NonAllocatingRunner(
         A runner with no backend refuses the step rather than report one that
         took no time. ATOM's `dummy_execution` answers with this reply too, so
         an idle DP rank's dummy batch is priced and joins the group's targets.
+        Before it replies, the step's target seconds are timed as ATOM's
+        `run_model` is timed on a real run (`_time_target`).
         """
         if not hasattr(batch, "produces_output"):
             # Not reachable from the engine, which only ever passes a scheduled
@@ -1490,7 +1804,7 @@ class NonAllocatingRunner(
         from atom.compass.parity import record_step
         from atom.model_engine.scheduler import ScheduledBatchOutput
 
-        mode = record_step(self, batch)
+        mode, view = record_step(self, batch) or (None, None)
         record = getattr(self, "_parity_record", None)
         if record is not None and record.step == 1:
             # The record was just created, replacing an earlier run's; so is
@@ -1504,11 +1818,11 @@ class NonAllocatingRunner(
             # control, and `self.config` is what this reads. The ids are vetted
             # against the tokenizer the frontend serves with, loaded the same
             # way.
-            from atom.model_engine.llm_engine import _load_tokenizer
+            from atom.model_engine.llm_engine import load_tokenizer
 
             model = _config_field(self, "model")
             fillers = filler_token_ids(
-                _load_tokenizer(model, _config_field(self, "trust_remote_code")),
+                load_tokenizer(model, _config_field(self, "trust_remote_code")),
                 _config_field(self, "eos_token_id"),
                 _config_field(self, "stop_token_ids"),
             )
@@ -1533,7 +1847,8 @@ class NonAllocatingRunner(
             )
             self._token_stream = stream
         tokens = stream.step(batch)
-        seconds = _group_step_seconds(self, batch, backend, mode)
+        seconds = _group_step_seconds(self, batch, backend, mode, view)
+        _time_target(self, batch)
         out = ScheduledBatchOutput(
             **tokens,
             predicted_s=seconds,
@@ -1557,21 +1872,53 @@ def _start_cost_table(runner: Any, record: Any) -> None:
     vars(runner)["_cost_table"] = table
 
 
+def _time_target(runner: Any, batch: Any) -> None:
+    """Time the step `_group_step_seconds` just priced through the
+    `GPUForwardMetrics` ATOM's `ModelRunner` builds on `runner` with the
+    device timer on: `measure` around the step's `StepCost.target_seconds` on
+    `PredictedEvent`s, then `poll`, so its observations, a prefill request's
+    sum over its chunks included, are in the worker's file before `forward`
+    replies. `measure` skips a DP dummy run and an empty batch, as on a real
+    run. Nothing is timed with the timer off, on a TP rank other than 0, which
+    prices nothing, or for a refused step, so a request with a refused chunk
+    publishes no sum."""
+    metrics = getattr(runner, "gpu_forward_metrics", None)
+    target_s = vars(runner).pop("_target_s", None)
+    if metrics is None or target_s is None:
+        return
+    # In place of ATOM's factory, whose `torch.cuda.Event` times a device.
+    metrics.event_factory = partial(PredictedEvent, runner)
+    timed_s = vars(runner).setdefault("_timed_s", 0.0)
+    with metrics.measure(batch):
+        runner._timed_s = timed_s + target_s
+    metrics.poll()
+
+
 def _group_step_seconds(
-    runner: Any, batch: Any, backend: CostBackend, mode: Any = None
+    runner: Any,
+    batch: Any,
+    backend: CostBackend,
+    mode: Any = None,
+    view: Any = None,
 ) -> float:
     """This rank's step priced from its own batch, then its DP group target.
 
     Only TP rank 0 prices; any other TP rank of the engine charges 0 s.
 
     `mode` is the step's `ForwardMode` when the step record already settled
-    it; without one it is settled here, which runs the DP collective.
+    it; without one it is settled here, which runs the DP collective; `view`,
+    the `BatchView` the record built from it, is priced in place of a new one.
+    Under DP the group then sums its dummy forwards (`projection.dummy_ranks`),
+    which the view states as its `group_dummies`.
 
     In a run, `compass_host` composes the price, the target's device seconds
     and then the draft's (`StepCost.target_seconds`, `draft_seconds`), with
-    host time; a `HostDeviceRecurrence` gives the view its `start_lag_s`.
+    host time; a `HostDeviceRecurrence`, unless its `admit` is
+    `ADMISSION_IN_E`, reads the batch's
+    `compass_admitted`, set here first (`admitted`, over the requests this
+    runner has seen).
     Under DP, a `HostDeviceRecurrence`'s device end, and its output mark
-    (the device end, or under MTP the target end), are first replaced by
+    (the device end, or with MTP or a draft the target end), are replaced by
     the group's latest, an `all_reduce(MAX)` standing in
     for a real forward's cross-rank collectives, and every rank leaves at its
     own charge. With no
@@ -1580,7 +1927,11 @@ def _group_step_seconds(
     by rank, or None with one rank. `_out_s` is the host's ``out_s`` for this
     step, the seconds from its return to the engine's next input pull, or
     None; `_group_out` holds each rank's target plus its ``out_s``, for the
-    ranks with one, or None.
+    ranks with one, or None. `_target_s` is the step's `target_seconds`, or
+    None for a refused step. In an op-graph run, the group's first rank, or a
+    rank of no group, adds to `_waited` the wall seconds of the step's price
+    the group waited on: the lookups and the rest of the price (`WALLS`) of
+    the rank whose sum of the two is largest.
 
     A pipeline stage runs only its own layers, so it is refused unless its
     backend states the `stage_share` it prices; any other backend prices the
@@ -1598,7 +1949,10 @@ def _group_step_seconds(
     has one reason.
 
     On the rank that keeps the parity record, each step also appends its cost
-    line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`; with a
+    line, flushed, to `dp<r>.cost.jsonl` beside it: the record's `step`;
+    `t_s`, the engine's clock at the forward's entry, read through the
+    `compass_host`'s `now`, or None without one, so the forward runs from
+    `t_s` to `t_s` plus `group_s`, which it returns; with a
     `compass_host` that reports them, each of `HOST_SEGMENTS` and
     `MTP_SEGMENT` and `PP_RECV_SEGMENT`, the part of `W_launch` before a
     later stage's receive, in seconds, each 0.0 where the law has none, and `skipped`,
@@ -1611,7 +1965,12 @@ def _group_step_seconds(
     `{"version": COST_TABLE_VERSION}` as the record starts, replacing an
     earlier run's file, and keeps it open in `_cost_table` for the run.
     """
-    from atom.compass.runner.projection import batch_view, dp_group, forward_mode
+    from atom.compass.runner.projection import (
+        batch_view,
+        dp_group,
+        dummy_ranks,
+        forward_mode,
+    )
 
     if runner.rank != 0:
         # The engine reads TP rank 0's reply only, and the other ranks'
@@ -1633,10 +1992,23 @@ def _group_step_seconds(
     spec = getattr(runner.config, "speculative_config", None)
     terms, refused = (), None
     host = getattr(runner, "compass_host", None)
+    if isinstance(host, HostDeviceRecurrence) and host.admit != ADMISSION_IN_E:
+        # A block-table entry holds a block's tokens on each DCP rank.
+        entry = _config_field(runner, "kv_cache_block_size") * _config_field(
+            runner, "decode_context_parallel_size"
+        )
+        seen = vars(runner).setdefault("_admitted", set())
+        batch.compass_admitted = admitted(batch, seen, entry)
+    dummies = dummy_ranks(batch, mode)
+    lazy = vars(runner).get("compass_lazy", {})
+    walls = [lazy.get(k, 0) for k in WALLS]
     try:
-        view = batch_view(batch, mode, runner)
+        if view is None:
+            view = batch_view(batch, mode, runner, dummies)
+        elif view.dp_rank is not None:
+            view = dataclasses.replace(view, group_dummies=dummies)
         if isinstance(host, HostDeviceRecurrence):
-            view = dataclasses.replace(view, start_lag_s=host.start_lag(batch))
+            batch.compass_launch = host.predicted(view)
         cost = backend.price(view)
         if spec and not cost.draft_terms and EAGER_DP_DUMMY not in cost.treatments:
             name = type(backend).__name__
@@ -1652,6 +2024,8 @@ def _group_step_seconds(
         mix.record(cost)
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
         terms = (*cost.terms, *cost.draft_terms)
+    lookup_s, price_s = (lazy.get(k, 0) - w for k, w in zip(WALLS, walls))
+    pricing_s = price_s - lookup_s
     # `decide` returns the collective's rows for a group of one too.
     many = mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1
     group = dp_group() if many else None
@@ -1660,8 +2034,8 @@ def _group_step_seconds(
 
         def charge(batch, device_s, draft_s, refuse=True):
             end = host.device_end(batch, device_s, draft_s, refuse)
-            # The output end: the group's device end, or under MTP its target end.
-            mark = host.target_end if host.mtp else end
+            # The output end: the device end, or with MTP or a draft the target end.
+            mark = host.target_end if host.mtp or draft_s else end
             t = torch.tensor([end, mark], dtype=torch.float64)
             torch.distributed.all_reduce(t, torch.distributed.ReduceOp.MAX, group)
             return host.release(*t.tolist())
@@ -1679,20 +2053,29 @@ def _group_step_seconds(
         vars(runner).setdefault("_refused_commands", []).append(refused)
     group_s, targets, pulls = charge_s, None, None
     out_s = getattr(host, "out_s", None)
+    waited = lookup_s, pricing_s
     if group is not None:
         waits = host is None and batch.produces_output() and not batch.is_dummy_run
         out = math.nan if out_s is None else out_s
-        mine = torch.tensor([charge_s, waits, out], dtype=torch.float64)
+        mine = [charge_s, waits, out, lookup_s, pricing_s]
+        mine = torch.tensor(mine, dtype=torch.float64)
         rows = [torch.empty_like(mine) for _ in range(group.size())]
         torch.distributed.all_gather(rows, mine, group=group)
-        top = max(r[0].item() for r in rows)
         rows = [r.tolist() for r in rows]
-        targets = tuple(top if w else s for s, w, _ in rows)
-        ends = zip(targets, (o for *_, o in rows))
+        top = max(s for s, *_ in rows)
+        targets = tuple(top if w else s for s, w, *_ in rows)
+        ends = zip(targets, (o for _, _, o, *_ in rows))
         pulls = tuple(t + o for t, o in ends if not math.isnan(o)) or None
         group_s = targets[group.rank()]
+        # The group leaves the gather when its slowest rank to price arrives.
+        waited = max((r[3:] for r in rows), key=sum)
+    # An op-graph run's group waits, kept once: on its first rank.
+    if lazy and (group is None or group.rank() == 0):
+        kept = vars(runner).setdefault("_waited", [0.0, 0.0])
+        kept[:] = [k + w for k, w in zip(kept, waited)]
     vars(runner)["_group_targets"] = targets
     vars(runner)["_out_s"], vars(runner)["_group_out"] = out_s, pulls
+    vars(runner)["_target_s"] = None if refused else device_s
     record = getattr(runner, "_parity_record", None)
     if record is None:
         return group_s
@@ -1701,8 +2084,10 @@ def _group_step_seconds(
     if hasattr(host, "segments"):
         skipped = [s for s in host.segments if s in host.skip]
         segments = {**host.segments, "skipped": skipped}
+    now = getattr(host, "now", None)
     line = {
         "step": step,
+        "t_s": None if now is None else now(),
         **segments,
         "device_s": device_s,
         "draft_s": draft_s,

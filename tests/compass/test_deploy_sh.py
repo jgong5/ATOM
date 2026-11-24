@@ -12,6 +12,7 @@ Every other `python3` is the real one, so the run file is
 `runfile.prefill_decode`'s. Nothing needs a driver.
 """
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -22,6 +23,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import platforms
+import psutil
 import pytest
 from test_launcher_held_ports import HELD, SQUAT
 from test_memory_readings import DOCUMENT
@@ -116,11 +119,12 @@ http.server.HTTPServer(("127.0.0.1", port), Models).serve_forever()
 """
 PREFILL = ["-tp", "2", "--enable-dp-attention"]
 ROUTER_ARGS = ["--policy", "random", "--backend", "atom", "--disable-health-check"]
+ROUTER_LP_ARGS = [*ROUTER_ARGS, "--disable-retries", "--dp-aware"]
 
 
 @pytest.fixture
 def planted(tmp_path):
-    """The stubbed `python3` and router, the suite's machine and a step stub;
+    """The stubbed `python3` and router, the suite's platform and a step stub;
     returns the environment and the run flags."""
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -137,7 +141,6 @@ def planted(tmp_path):
     (bindir / "atomesh").write_text(f"#!{sys.executable}\n" + ROUTER)
     for tool in ("python3", "atomesh"):
         (bindir / tool).chmod(0o755)
-    (tmp_path / "machine.json").write_text(json.dumps(DOCUMENT))
     (tmp_path / "stub.json").write_text(json.dumps(dataclasses.asdict(Coefficients())))
     # The router stub records every ATOM_COMPASS_* it inherits, so none come
     # from the caller (the GPU gate sets the slice model's).
@@ -150,9 +153,18 @@ def planted(tmp_path):
         "WAIT_S": "60",
     }
     flags = ["--step-stub", str(tmp_path / "stub.json")]
-    flags += ["--machine", str(tmp_path / "machine.json")]
+    flags += platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
     flags += ["--store", str(tmp_path / "store")]
     return env, flags
+
+
+def router_hop(tmp_path) -> list[str]:
+    """`--host-laws` naming a law file whose host entry states the router's hop
+    alone: a router LP splits it around its hop in, which the floor cannot hold."""
+    law = tmp_path / "router_hop.json"
+    host = {"key": {}, "laws": {}, "hops": {"router_s": 1.5e-3}}
+    law.write_text(json.dumps({"host": host}))
+    return ["--host-laws", str(law)]
 
 
 def argv(tmp_path, flags, prefill=PREFILL, router=ROUTER_ARGS):
@@ -165,17 +177,30 @@ def argv(tmp_path, flags, prefill=PREFILL, router=ROUTER_ARGS):
     ]  # fmt: skip
 
 
+#: How long `_until` waits for deploy.sh's file: a few times the longest a
+#: deployment has taken to write it on a loaded host, its run-file build
+#: resolving each side's config in a process of its own.
+UNTIL_S = 300
+
+
 def _until(path: Path, script) -> None:
+    """Return once deploy.sh `script` has written `path`. Fail if it exits
+    first, or after UNTIL_S, once it and every process under it are killed."""
     router = path.with_name("router.log")
-    for _ in range(600):
-        if path.exists():
-            return
+    deadline = time.monotonic() + UNTIL_S
+    while not path.exists():
         assert script.poll() is None, (
             script.communicate(),
             router.read_text() if router.exists() else "no router.log",
         )
+        if time.monotonic() > deadline:
+            top = psutil.Process(script.pid)
+            for proc in [top, *top.children(recursive=True)]:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    proc.kill()
+            script.wait()
+            pytest.fail(f"no {path} after {UNTIL_S} s")
         time.sleep(0.1)
-    pytest.fail(f"no {path}")
 
 
 def _parent(pid: int) -> int:
@@ -276,7 +301,7 @@ def test_a_dp_aware_router_runs_as_the_router_lp_on_the_run_s_clock(tmp_path, pl
     env, flags = planted
     env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
     d = tmp_path / "d"
-    words = argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"])
+    words = argv(tmp_path, flags + router_hop(tmp_path), router=ROUTER_LP_ARGS)
     script = subprocess.Popen(
         words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
     )
@@ -288,7 +313,7 @@ def test_a_dp_aware_router_runs_as_the_router_lp_on_the_run_s_clock(tmp_path, pl
         "commit": _tree_commit(),
         "status": "clean",
     }
-    assert run["router_in_s"] == run["ipc_s"]
+    assert run["router_in_s"] == compass_run.hop(run, "ipc_s")
     table = compass_run.channel_table(run)
     assert compass_run.ROUTER in table.registry.ids()
     router = json.loads((tmp_path / "router.json").read_text())
@@ -323,7 +348,7 @@ def test_a_router_lp_that_leaves_as_the_traffic_closes_waits_for_the_client_s_st
     env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
     env["PLANTED_LEAVE"] = str(tmp_path / "leave")
     d = tmp_path / "d"
-    words = argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"])
+    words = argv(tmp_path, flags + router_hop(tmp_path), router=ROUTER_LP_ARGS)
     script = subprocess.Popen(
         words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True,
@@ -358,7 +383,7 @@ def test_a_dp_aware_run_refuses_a_router_built_dirty_before_anything_starts(
 ):
     env, flags = planted
     env["PLANTED_BUILD"] = f"{_tree_commit()} dirty"
-    words = argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"])
+    words = argv(tmp_path, flags, router=ROUTER_LP_ARGS)
 
     done = subprocess.run(
         words, env=env, cwd=tmp_path, capture_output=True, text=True, check=False
@@ -431,6 +456,26 @@ def test_a_simulated_router_refuses_a_worker_more_or_a_limiter_before_anything_s
 
     assert done.returncode == 2, done.stderr
     assert f"the router's arguments carry {flag}," in done.stderr
+    assert not (tmp_path / "d").exists()
+
+
+def test_a_router_lp_without_disable_retries_exits_2_before_anything_starts(
+    tmp_path, planted
+):
+    env, flags = planted
+
+    done = subprocess.run(
+        argv(tmp_path, flags, router=[*ROUTER_ARGS, "--dp-aware"]),
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert done.returncode == 2, done.stderr
+    assert "carry --dp-aware but not --disable-retries:" in done.stderr
     assert not (tmp_path / "d").exists()
 
 

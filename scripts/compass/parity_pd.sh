@@ -26,7 +26,14 @@
 #                    simulated run sees the first prefill server's and
 #                    allocates nothing
 #   ATOMESH          the router binary (default atomesh), on both runs
-#   MACHINE          machine spec (default scripts/compass/machines/mi308x-hjbog18.json)
+#   DEVICE PTL       the GPUs' datasheet, by SKU or path, and their PTL state, as
+#                    `compass run --device` and `--ptl` take them (required
+#                    without HTTP_INTAKE)
+#   READINGS         artifact store holding the GPUs' platform_readings, which
+#                    the run file's machine block is composed from (required
+#                    without HTTP_INTAKE)
+#   STACK            the readings' stack, as `compass run --stack` takes it, when
+#                    READINGS holds several
 #   STORE            artifact store holding the simulated configuration's memory
 #                    readings, taken by `compass measure memory` (required
 #                    without HTTP_INTAKE)
@@ -56,6 +63,7 @@ PREFILL_DP=${PREFILL_DP:-2} DECODE_DP=${DECODE_DP:-2}
 dp_args() { if (($1 > 1)); then echo "-tp $1 --enable-dp-attention"; else echo "-tp 1"; fi; }
 mkdir -p "$OUT/real/record" "$OUT/sim"
 OUT=$(realpath "$OUT")
+[[ -n ${HTTP_INTAKE:-} ]] || compass_machine "$OUT/sim/machine.json"
 pids=()
 trap 'kill -KILL -- "${pids[@]/#/-}" 2>/dev/null || true' EXIT
 ROUTER_PORT=$(compass_held_port)
@@ -116,21 +124,14 @@ for record in "$OUT"/real/record/*/; do cp "$OUT/real/record/arrivals.json" "$re
 
 RUN=$OUT/sim/run.json
 CLOCK_PORT=$(compass_held_port)
-python3 - "$RUN" "$OUT" "${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}" \
+python3 - "$RUN" "$OUT" "$OUT/sim/machine.json" \
     "$MODEL" "$STORE" "$CLOCK_PORT" "${#prefill_gpus[@]}" "${#decode_gpus[@]}" \
     "$PREFILL_DP" "$DECODE_DP" "${urls[@]}" <<'EOF'
 import json, re, sys
 from pathlib import Path
-from atom.compass.drive.runfile import KV_WRITE_REQ_S
 
 run, out, machine, model, store, port, prefills, decodes, dp_p, dp_d, *urls = sys.argv[1:]
 machine = json.loads(Path(machine).read_text())
-# ponytail: a spec that measured no tokenizer for the model prices it as its
-# first entry, as parity_one_node.sh does; only arrival latency reads it.
-arch = json.loads((Path(model) / "config.json").read_text())["architectures"][0]
-tokenizers = machine["host"]["tokenizers"]
-if not any(arch in entry["applies_to"] for entry in tokenizers):
-    tokenizers[0]["applies_to"].append(arch)
 # Each side's (instance, DP rank) pairs in the order the real router logged
 # registering them.
 deployment, count = {}, {"--prefill": 0, "--decode": 0}
@@ -144,8 +145,11 @@ for url, rank in re.findall(r"Registered worker (\S+)@(\d+) ", log):
     order.setdefault(side, []).append([k, int(rank)])
 Path(run).write_text(json.dumps({
     "clock_endpoint": f"tcp://127.0.0.1:{port}", "bound_s": 1e7,
-    "admission_path": "serving", "ipc_s": 2.0**-14, "stream_s": 2.0**-12,
-    "router_s": 2.0**-12, "kv_write_req_s": KV_WRITE_REQ_S, "kv_link": "intra_node",
+    # Declared, but for the node-18 HTTP transport and write request, as the
+    # law files state them.
+    "admission_s": 0.54e-3, "ipc_s": 2.0**-14, "router_s": 2.0**-12,
+    "kv_write_req_s": 106e-6, "decode_hops": {"ipc_s": 2.0**-14, "stream_s": 2.0**-12},
+    "kv_link": "intra_node",
     "replay": f"{out}/real/record", "step_stub": {}, "machine": machine, "store": store,
     "prefill_data_parallel_size": int(dp_p), "decode_data_parallel_size": int(dp_d),
     "out_dir": f"{out}/sim",

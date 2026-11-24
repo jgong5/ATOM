@@ -16,17 +16,23 @@ whose body names the cancelled request's seq: ``{"compass_cancel": <seq>}``.
 A router hands a cancel on along the request's path; on a relay it carries
 its own stamp in the body, after the seq:
 ``{"compass_cancel": <seq>, "kv_transfer_params": {"compass": "a:<arrival>;s:<seq>"}}``.
+
+A client's own records carry simulated time as aiperf's ns stamps, each the
+simulated seconds in ns plus `EPOCH_NS`.
 """
 
-import json
 import re
+from typing import Any
 
-from atom.utils.clock import channel_of
+import msgspec
 
 _NUM = r"(inf|\d[\d.e+-]*)"
 _ENTRY = re.compile(rf"a:{_NUM};s:(\d+)")
 _COMMENT = re.compile(rf": compass a={_NUM} s=(\d+)")
 _MAX_ENTRIES = 32
+#: Added to every simulated ns stamp a client records. Simulated time starts at
+#: 0, and aiperf reads a 0 start stamp as missing.
+EPOCH_NS = 10**9
 
 
 def _parse(pattern: re.Pattern, text: str, what: str) -> tuple[float, int]:
@@ -75,6 +81,10 @@ def stamp_events(text: str, rt) -> str:
     A write must end its last frame in a blank line: text after it is refused,
     since the next write's comment would land inside that frame.
     """
+    # Here, not at the top: the harness reads EPOCH_NS while aiperf imports its
+    # phase runner, and `atom.utils` would load torch there.
+    from atom.utils.clock import channel_of
+
     ch = channel_of(rt, "stream")
     *events, tail = text.split("\n\n")
     if tail:
@@ -94,34 +104,46 @@ def sse_stamp(line: str) -> tuple[float, int] | None:
     return _parse(_COMMENT, line, "SSE comment")
 
 
-def _relayed(body: bytes) -> dict | None:
-    """`body` parsed, when it is a JSON object whose ``kv_transfer_params`` is one."""
-    try:
-        doc = json.loads(body)
-    except ValueError:
-        return None
-    if isinstance(doc, dict) and isinstance(doc.get("kv_transfer_params"), dict):
-        return doc
-    return None
+class _Params(msgspec.Struct):
+    compass: Any = None
+
+
+class _Relayed(msgspec.Struct):
+    kv_transfer_params: _Params | None = None
+
+
+# A relayed body carries the prompt's ids, beside its ``kv_transfer_params`` from
+# prefill and inside it to decode. Reading or writing the stamp decodes neither:
+# `_STAMP` reads the one entry, `_MEMBERS` leaves each member's value as its text.
+_STAMP = msgspec.json.Decoder(_Relayed)
+_MEMBERS = msgspec.json.Decoder(dict[str, msgspec.Raw])
+_ENCODE = msgspec.json.Encoder()
 
 
 def relay_stamp(body: bytes) -> tuple[float, int] | None:
     """The ``(arrival, seq)`` a JSON request body's ``kv_transfer_params`` carries;
     None without one."""
-    doc = _relayed(body)
-    value = None if doc is None else doc["kv_transfer_params"].get("compass")
+    try:
+        params = _STAMP.decode(body).kv_transfer_params
+    except msgspec.DecodeError:
+        return None
+    value = None if params is None else params.compass
     return None if value is None else _parse(_ENTRY, value, "kv_transfer_params entry")
 
 
 def with_relay_stamp(body: bytes, stamp) -> bytes:
     """`body` with ``stamp()``'s ``(arrival, seq)`` in its ``kv_transfer_params``;
-    `body` itself, and `stamp` not called, when it has no such object."""
-    doc = _relayed(body)
-    if doc is None:
+    `body` itself, and `stamp` not called, when it has no such object. Every
+    other value keeps its JSON text."""
+    try:
+        doc = _MEMBERS.decode(body)
+        params = _MEMBERS.decode(doc["kv_transfer_params"])
+    except (msgspec.DecodeError, KeyError):
         return body
     arrival, seq = stamp()
-    doc["kv_transfer_params"]["compass"] = f"a:{arrival!r};s:{seq}"
-    return json.dumps(doc).encode()
+    params["compass"] = f"a:{arrival!r};s:{seq}"
+    doc["kv_transfer_params"] = msgspec.Raw(_ENCODE.encode(params))
+    return _ENCODE.encode(doc)
 
 
 _CANCEL = re.compile(

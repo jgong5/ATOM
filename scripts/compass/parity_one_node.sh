@@ -12,7 +12,7 @@
 #                    DeepSeek-V4-Pro's nightly DP-attention prefill server of
 #                    recipes/mesh/DeepSeek-V4.md, aggregated, MTP and expert
 #                    parallelism off: -tp 8 --enable-dp-attention --enable-tbo with
-#                    the nightly's flags and environment; it needs MACHINE.
+#                    the nightly's flags and environment.
 #                    Under DP-attention the DP width is the -tp width.
 #                    rapidserve: -tp 1 --enable-rapidserve, eager at compile
 #                    level 0; each engine records, and is compared, in its own
@@ -39,8 +39,12 @@
 #   LONG_TOKENS      output tokens request 0 asks for, to keep one request (and
 #                    under LMCACHE its server session) alive for long (default
 #                    0: its usual count)
-#   MACHINE          machine spec (default scripts/compass/machines/mi308x-hjbog18.json,
-#                    node 18's, PP carriers included; dsv4-dpa8 has no default)
+#   DEVICE PTL       the GPUs' datasheet, by SKU or path, and their PTL state, as
+#                    `compass run --device` and `--ptl` take them (required)
+#   READINGS         artifact store holding the GPUs' platform_readings, which
+#                    the run file's machine block is composed from (required)
+#   STACK            the readings' stack, as `compass run --stack` takes it, when
+#                    READINGS holds several
 #   STORE            artifact store holding the simulated configuration's memory
 #                    readings, taken by `compass measure memory`. Unset, the
 #                    script takes them first into OUT_DIR/store: `compass measure
@@ -54,8 +58,9 @@
 #                    tokens; the real run to a real `lmcache server` started
 #                    beside it with LMCACHE_FLAGS, the simulated one to LP lmcache
 #                    with the same flags, its request loop on the declared laws
-#                    below and its copies on MACHINE's interconnect.host_link,
-#                    which it then needs. Every request starts with PREFIX_WORDS
+#                    of atom/compass/kv/lmcache_server.py (DECLARED_LAWS) and its
+#                    copies on the readings' interconnect.host_link,
+#                    which they then hold. Every request starts with PREFIX_WORDS
 #                    shared words (default 600). Default 0.
 #   FAMILIES         prefix families: above 1, request k shares PREFIX_WORDS
 #                    only with the requests of family k % FAMILIES (default 1)
@@ -68,8 +73,8 @@
 #                    seconds (default 0.01)
 # The real run uses HIP_VISIBLE_DEVICES as set, and the measurement those GPUs
 # (unset, the first -tp of them). OUT_DIR gets memory/ when it measures, real/
-# and sim/, each with its server log and step record (sim/ also has the run
-# file, step table and summary), and compare.json; the last lines are the real run's
+# and sim/, each with its server log and step record (sim/ also has the machine
+# spec, run file, step table and summary), and compare.json; the last lines are the real run's
 # admission, send to response headers, and the compare per DP rank. Under
 # LMCACHE they also give the requests whose offload loads and saves differ, and
 # each run's expired-session sweeps and eviction ticks, from its server's log. A
@@ -92,7 +97,6 @@ tp2 | tp2-plain | dp-two-trees)
 dsv4-dpa8)
     TP=8 ARGS="--trust-remote-code --no-enable_prefix_caching --kv_cache_dtype fp8
         --block-size 16 --gpu-memory-utilization 0.85 --max-num-seqs 512 --enable-tbo"
-    MACHINE=${MACHINE:?CONFIG=dsv4-dpa8 needs MACHINE, the MI355X machine spec}
     export AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1 GPU_MAX_HW_QUEUES=5 ATOM_NUMA_BIND=1
     ;;
 rapidserve)
@@ -104,7 +108,6 @@ pp2)
     ;;
 *) echo "parity_one_node: CONFIG is tp2, tp2-plain, dp-two-trees, dsv4-dpa8, rapidserve or pp2, not $CONFIG" >&2; exit 2 ;;
 esac
-MACHINE=${MACHINE:-$ROOT/scripts/compass/machines/mi308x-hjbog18.json}
 TREES=1 MEASURE_DP=
 if [[ $CONFIG == dp-two-trees ]]; then
     TREES=2 MEASURE_DP="--data-parallel-size 2"
@@ -120,6 +123,7 @@ ALONE=${ALONE:-0} GAP=0.05
 [[ $ALONE == 1 ]] && GAP=0.25
 mkdir -p "$OUT/real" "$OUT/sim"
 OUT=$(realpath "$OUT")
+compass_machine "$OUT/sim/machine.json"
 LMCACHE=${LMCACHE:-0} PREFIX=0 LM_FLAGS=
 if [[ $LMCACHE == 1 ]]; then
     PREFIX=${PREFIX_WORDS:-600} LM_PORT=$(compass_held_port)
@@ -137,7 +141,7 @@ if [[ -z ${STORE:-} ]]; then
     # shellcheck disable=SC2086 # SERVER_ARGS is a word list
     ATOM_DP_MASTER_PORT=$(compass_held_port) python3 -c \
         "from atom.compass.cli import main; main()" measure memory \
-        --gpu "$gpus" --machine "$MACHINE" \
+        --gpu "$gpus" \
         ${LM_FLAGS:+--beside "lmcache server $LM_FLAGS"} \
         --store "$STORE" --out "$OUT/memory" -- --model "$MODEL" -tp "$TP" \
         $PPA $DPA $MEASURE_DP $SERVER_ARGS
@@ -165,9 +169,9 @@ serve() {
             dp=(--data-parallel-size "$TREES" --data-parallel-size-local 1
                 --data-parallel-rank "$k" --data-parallel-base-port "$base")
         fi
-        # shellcheck disable=SC2086 # SERVER_ARGS is a word list
+        # shellcheck disable=SC2086 # SERVER_ARGS and on_arch, the sim side's, are word lists
         env ATOM_DP_MASTER_PORT="$master" ATOM_COMPASS_PARITY_RECORD="$OUT/$side/record" \
-            "${devices[@]}" setsid python3 -m atom.entrypoints.openai.api_server \
+            "${devices[@]}" setsid python3 ${on_arch-} -m atom.entrypoints.openai.api_server \
             --model "$MODEL" --host 127.0.0.1 --server-port "$port" \
             --port "$(compass_held_port)" -tp "$TP" $PPA $DPA "${dp[@]}" $SERVER_ARGS "$@" \
             >"$log" 2>&1 &
@@ -219,22 +223,17 @@ for side in $SIDES; do
 done
 
 RUN=$OUT/sim/run.json CLOCK_PORT=$(compass_held_port)
-python3 - "$RUN" "$OUT" "$MACHINE" "$MODEL" "$STORE" "$CLOCK_PORT" "${DPA:+$((TP * TREES))}" \
-    "$LM_FLAGS" "${IMAGE_S:-0.01}" "$TP" "$SIDES" "$PP" <<'EOF'
-import json, re, sys
+python3 - "$RUN" "$OUT" "$OUT/sim/machine.json" "$MODEL" "$STORE" "$CLOCK_PORT" "${DPA:+$((TP * TREES))}" \
+    "$LM_FLAGS" "${IMAGE_S:-0.01}" "$SIDES" "$PP" <<'EOF'
+import json, sys
 from pathlib import Path
 
-run, out, machine, model, store, port, width, lmcache, image_s, tp, sides, pp = sys.argv[1:]
+run, out, machine, model, store, port, width, lmcache, image_s, sides, pp = sys.argv[1:]
 machine = json.loads(Path(machine).read_text())
-# ponytail: a spec that measured no tokenizer for the model prices it as its
-# first entry; only arrival latency reads it. Measure the model's own to drop this.
-arch = json.loads((Path(model) / "config.json").read_text())["architectures"][0]
-tokenizers = machine["host"]["tokenizers"]
-if not any(arch in entry["applies_to"] for entry in tokenizers):
-    tokenizers[0]["applies_to"].append(arch)
 spec = {
     "clock_endpoint": f"tcp://127.0.0.1:{port}", "bound_s": 1e7,
-    "admission_path": "serving", "ipc_s": 2.0**-14, "stream_s": 2.0**-12,
+    # Declared, but for the node-18 HTTP transport, as the law files state it.
+    "admission_s": 0.54e-3, "ipc_s": 2.0**-14, "stream_s": 2.0**-12,
     "replay": f"{out}/real/record", "step_stub": {}, "machine": machine, "store": store,
     "data_parallel_size": int(width or 1), "out_dir": f"{out}/sim",
     "image_preprocess_s": float(image_s), "pipeline_parallel_size": int(pp),
@@ -242,17 +241,11 @@ spec = {
 if sides != ".":
     spec["rapidserve"] = True
 if lmcache:
-    # Declared, not measured: a LOOKUP 2^-13 s plus 2^-17 s a prompt chunk,
-    # any other request 2^-14 s.
-    laws = {"lookup_s": [2.0**-13, 2.0**-17], "request_s": 2.0**-14}
-    # Writers per DP rank: one under DP-attention, else every TP rank, which
-    # a model whose ranks share one copy refuses by name.
-    writers = 1 if width else int(tp)
-    spec["lmcache"] = {"server": lmcache.split(), "writers": writers, **laws}
-    # A rank's recurrent-state image, as the real run logged it; the simulated
-    # engine refuses a run file that names another.
-    image = re.findall(r"image_bytes=(\d+)", Path(f"{out}/real/server.log").read_text())
-    spec["lmcache"]["state_bytes"] = int(image[0]) if image else 0
+    from atom.compass.kv.lmcache_server import DECLARED_LAWS as laws
+
+    # The entry `compass advice` writes; LP lmcache sizes a rank's state
+    # image from the simulated engine's plan.
+    spec["lmcache"] = {"server": lmcache.split(), **laws}
 Path(run).write_text(json.dumps(spec))
 EOF
 CLOCK=()
@@ -267,6 +260,7 @@ if ((TREES > 1)); then
         sleep 0.2
     done
 fi
+on_arch=$(compass_on_arch "$RUN")
 serve sim --compass-run "$RUN" "${CLOCK[@]}"
 ATOM_COMPASS_RUN=$RUN python3 -m atom.compass.parity.traffic "$PORT" "$MODEL" \
     "$OUT/real/record" >"$OUT/sim/traffic.log" 2>&1 || sim_rc=$?

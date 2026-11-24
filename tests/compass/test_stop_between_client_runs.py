@@ -31,7 +31,7 @@ CLIENT_RUN = ([], {"steps": 3, "seconds": 0.75, "treatments": Counter()}, [])
 
 
 def _run(monkeypatch, tmp_path, client_runs) -> dict:
-    run = {"admission_path": "serving", "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+    run = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
     run.update(bound_s=100.0, out_dir=str(tmp_path), client_runs=client_runs)
     (tmp_path / "run.json").write_text(json.dumps(run))
     monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))

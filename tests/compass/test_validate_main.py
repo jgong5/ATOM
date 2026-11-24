@@ -164,7 +164,7 @@ def test_a_cell_is_graded_from_every_source_and_its_method_shares_grade_nothing(
     )
     # Every step the cost rows leave out is named, a warm one with its real seconds.
     assert rows["cost real0", "left out"][0] == (
-        'not labelled {"exposed": 0, "mixed": 0, "unsplit": 0, "paced": 0}; warm steps, real s {5: 0.81}'
+        'not labelled {"exposed": 0, "mixed": 0, "unsplit": 0, "untraced": 0, "traced": 0}; warm steps, real s {5: 0.81}'
     )
     assert rows["cost real0", "prefill validated"][0].startswith("9 steps")
     assert rows["cost real1", "left out"][0].endswith("warm steps, real s {}")
@@ -438,6 +438,11 @@ def test_a_json_error_no_reader_names_keeps_its_traceback(
         runpy.run_module(command, run_name="__main__")
 
 
+def _run_dirs(cell) -> list:
+    """`cell`'s runs, without the grades grading keeps beside them."""
+    return sorted(d for d in cell.iterdir() if d.is_dir())
+
+
 def _as_recorded(cell, warmup=()):
     """Lay `cell`'s runs out as `record` and `run` write them: each request
     named at its last prefill row, by key `k<id>` and response id `id-<id>`;
@@ -447,7 +452,7 @@ def _as_recorded(cell, warmup=()):
     client; and run.json's identity,
     with `run`'s grading entries for `step_linear/`, its law and host laws in
     its run file and its refusals its summary's."""
-    for d in sorted(cell.iterdir()):
+    for d in _run_dirs(cell):
         path = d / "steps" / "dp0.jsonl"
         lines = [json.loads(x) for x in path.read_text().splitlines()]
         last = {}
@@ -572,7 +577,7 @@ def test_a_cctraces_sim_run_still_finishing_refuses_naming_it(
     once its server has left."""
     _rows(capsys, tmp_path)
     cell = tmp_path / "c4"
-    stated = {d: (d / "run.json").read_text() for d in cell.iterdir()}
+    stated = {d: (d / "run.json").read_text() for d in _run_dirs(cell)}
     _as_recorded(cell)
     for d, run in stated.items():
         (d / "run.json").write_text(run)
@@ -582,7 +587,7 @@ def test_a_cctraces_sim_run_still_finishing_refuses_naming_it(
     validate = [sys.executable, "-m", "atom.compass.validate", str(cell)]
     done = subprocess.run(validate, capture_output=True, text=True, check=False)
 
-    held = sorted(str(d) for d in cell.iterdir() if d.name != finishing)
+    held = sorted(str(d) for d in _run_dirs(cell) if d.name != finishing)
     refusal = (
         f"['{cell / finishing}'] hold no {CLIENT_RUN} and {held} do; "
         "a cctraces_sim.sh run still finishing is not graded\n"
@@ -788,7 +793,7 @@ def _deploy(cell):
     run's engine hand-in as each side's; their requests named as
     `_named_as_deployed` names them."""
     laws = [LAW | {"engine_config": {"enable_tbo": tbo}} for tbo in (True, False)]
-    for d in sorted(cell.iterdir()):
+    for d in _run_dirs(cell):
         for side, tbo in zip(SIDES, (True, False)):
             shutil.copytree(d / "steps", d / side / "steps")
             for name in ("run.json", "server.log"):
@@ -888,6 +893,7 @@ def test_an_op_graph_cell_grades_with_its_method_shares_term_gaps_and_warm_over_
         "host": {"laws": {}},
     }
     (sim / "run.json").write_text(json.dumps(run))
+    (sim / "steps" / "dp0.engine.json").write_text(json.dumps({"env": {}}))
     # Decode's small GEMM is listed at its measured 20 ms, a large one is its
     # roofline, about 30 ms; prefill of 190 tokens has no graph.
     large = gemm_leaf(4096, 4096, 4096)
@@ -903,7 +909,7 @@ def test_an_op_graph_cell_grades_with_its_method_shares_term_gaps_and_warm_over_
     )
     built = []
 
-    def op_graph(run_file, config, machine, ep):
+    def op_graph(run_file, config, machine, ep, env=None):
         built.append((run_file, config.atom_args, ep))
         return OpGraphBackend(
             SPEC,
@@ -915,7 +921,9 @@ def test_an_op_graph_cell_grades_with_its_method_shares_term_gaps_and_warm_over_
     monkeypatch.setattr(
         drive_run,
         "_config",
-        lambda args: SimpleNamespace(atom_args=args, enable_expert_parallel=False),
+        lambda args, arch: SimpleNamespace(
+            atom_args=args, enable_expert_parallel=False
+        ),
     )
     monkeypatch.setattr(compass_run, "op_graph", op_graph)
 

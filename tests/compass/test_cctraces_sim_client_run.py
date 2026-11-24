@@ -137,6 +137,9 @@ def test_a_real_cell_names_the_aiter_module_its_server_built_while_it_served(
     module's build directory, says ``Uvicorn running``, and writes another's
     once the script has had time to see the line, before aiperf ends."""
     root = tmp_path / "aiter_root"
+    site = tmp_path / "site"
+    (site / "aiter").mkdir(parents=True)
+    (site / "aiter" / "__init__.py").write_text("")
     bin_ = tmp_path / "bin"
     bin_.mkdir()
     (bin_ / "python3").write_text(
@@ -147,7 +150,9 @@ def test_a_real_cell_names_the_aiter_module_its_server_built_while_it_served(
         f"    mkdir -p {root}/build/served/blob && : > {root}/build/served/blob/k.cpp\n"
         "    exec sleep 600\n"
         "fi\n"
-        f'exec {sys.executable} "$@"\n'
+        # An aiter of its own, ahead of the PYTHONPATH the script sets: the
+        # installed one's JIT directory is the container's.
+        f'PYTHONPATH={site}:$PYTHONPATH exec {sys.executable} "$@"\n'
     )
     (bin_ / "harness-python").write_text(
         "#!/bin/sh\n"

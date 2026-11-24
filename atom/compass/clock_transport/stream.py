@@ -164,6 +164,9 @@ class _Remote:
 
     def __init__(self, host: str, port: int) -> None:
         self._sock = socket.create_connection((host, port))
+        # Each frame goes at once: a REPORT waits for no reply, so Nagle would
+        # hold the call after it until the report's delayed ACK, 40 ms.
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._stream = self._sock.makefile("rwb")
 
     def bind(self, frame: bytes) -> tuple:

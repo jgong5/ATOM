@@ -10,9 +10,14 @@ import pathlib
 
 import pytest
 from test_artifact_store import clean_checkout  # noqa: F401  autouse
+from test_op_work import leaf, t
 
 from atom.compass import cli, run
 from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, GateState, Key, Kind
+from atom.compass.backends import BatchView, RequestShape
+from atom.compass.backends.op_graph import LISTED, OpGraphBackend
+from atom.compass.backends.provenance import Refusal
+from atom.compass.backends.resolver import CostRefused
 from atom.compass.bench import ops as bench
 from atom.compass.capture.peers import MORI
 from atom.compass.fit import ops, publish
@@ -21,7 +26,7 @@ from atom.compass.spec.fields import PINNED
 
 TREE = pathlib.Path(__file__).resolve().parents[2]
 SPEC = MachineSpec.from_mapping(
-    json.loads((TREE / "scripts/compass/machines/mi308x-hjbog39.json").read_text())
+    json.loads((TREE / "tests/compass/machines/mi308x-hjbog39.json").read_text())
 )
 LAYOUT = {"dp": 1, "pp": 1, "pcp": 1, "tp": 1, "decode_context_parallel_size": 1}
 LAYOUT |= {"enable_expert_parallel": False, "enable_dp_attention": False}
@@ -57,8 +62,8 @@ def _run(ptl="disabled", root="a" * 40):
         "device": [card | {"arch": SPEC.value("device.arch")}],
         "stack": stack,
         "ptl": ptl,
-        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu"},
-        "source": {"revision_kind": "tree", "revision": root},
+        "host_key": {"model": "sha256:" + "0" * 64, "host_cpu": "cpu", "atom": root},
+        "source": {"revision_kind": "tree", "revision": "a" * 40},
     }
 
 
@@ -158,7 +163,7 @@ def test_fit_ops_publishes_its_points_key_and_their_held_out_error(measured, tmp
     got = _fit(tmp_path / "fit", tmp_path / "store", d)
 
     fields = key("decode B=2", 1024, _leaf(2, 128)).values
-    assert got["key"] == {k: v for k, v in fields.items() if k != "point"}
+    assert got["key"] == {k: v for k, v in fields.items() if k != "point"} | LAYOUT
     assert got["report"]["by_op"] == {
         "decode aiter.gemm": {"held_out": 4, "declined": 2, "declining": 1}
         | {"median_error": pytest.approx(0.04), "max_error": pytest.approx(0.04)}
@@ -183,7 +188,7 @@ def test_fit_ops_reads_a_plan_run_s_rounds_as_one_directory(measured, tmp_path):
     got = _fit(tmp_path / "fit", tmp_path / "store", d)
 
     fields = key("decode B=2", 1024, _leaf(2, 128)).values
-    assert got["key"] == {k: v for k, v in fields.items() if k != "point"}
+    assert got["key"] == {k: v for k, v in fields.items() if k != "point"} | LAYOUT
     (f,) = got["params"]["families"].values()
     assert f["points"] == [
         [[b, 1024], ns, ["k"]] for b, ns in ((2, 10.0), (8, 16.0), (4, 12.5))
@@ -236,6 +241,14 @@ def test_fit_ops_holds_out_no_point_between_neighbours_one_apart(
     assert held == ([[2, 512]] if declined else [])
 
 
+def _combine(rows, width=7168):
+    """A MORI combine of `rows` rows of `width` bf16 in, as the capture states
+    it: MORI's whole buffer of 16384 rows out at every width."""
+    x = {"shape": [rows, width], "stride": [width, 1], "dtype": BF16}
+    args = {"input": x | {"role": "activation"}, "weights": None}
+    return {"op": f"{MORI}.combine", "args": args, "out": [[16384, width]]}
+
+
 BEND = "bytes = 8192 reads +10.0%"
 MOE = "atom.model_ops.moe:"
 
@@ -268,10 +281,12 @@ def test_fit_ops_holds_out_no_collective_point_between_neighbours_one_row_apart(
     # row, so a row's bytes are not known; all_gatherv's, reduce_scatterv's and
     # MORI's ranks' rows can differ, so a step can hold between two points' rows;
     # the padded pair pads every rank to the same rows, so a row keeps its bytes
+    # a combine's bytes are its leaf's input's, as many rows of 1024 bytes
     fam = json.dumps(["exchange", {"op": op}])
     points = [
         {"shape": shape.format(b), "context": 1024, "op": op}
-        | {"leaf": "{}", "exchange": [fam, n * 1024], "cold_ns": ns, "kernels": ["k"]}
+        | {"leaf": bench.signature(_combine(n, 512) | {"op": op}), "cold_ns": ns}
+        | {"exchange": [fam, n * 1024], "kernels": ["k"]}
         for b, n, ns in zip(rows, nbytes, (1e4, 1e4, 12e3))
     ]
     d, _ = measured("m", points)
@@ -284,7 +299,10 @@ def test_fit_ops_holds_out_no_collective_point_between_neighbours_one_row_apart(
 
 @pytest.mark.parametrize(
     "moved, cell",
-    [({"ptl": "disabled"}, "PTL"), ({"source_root": "tree-" + "b" * 40}, "ATOM src")],
+    [
+        ({"ptl": "disabled"}, "PTL"),
+        ({"source_root": "atom_py-" + "b" * 40}, "ATOM src"),
+    ],
 )
 def test_a_price_list_refuses_at_load_on_another_ptl_state_or_source_root(
     measured, tmp_path, moved, cell
@@ -509,6 +527,91 @@ def test_a_price_list_prices_a_collective_between_two_measured_sizes(rows, at, p
         assert got.seconds == pytest.approx(priced)
 
 
+#: #3437's first EP8 run on 005: each combine's cold ns by its B, eight ranks'
+#: B rows in, stored at MORI's whole buffer at every B
+STORED_COMBINE_NS = {1: 22179.2, 8: 22208.9, 32: 28080.9}
+
+
+def test_a_combine_point_stored_at_mori_s_whole_buffer_is_priced_at_its_own_rows():
+    whole = 16384 * 7168 * 2  # MORI's buffer, the bytes stored at every B
+    points = [
+        {"shape": f"decode B={b}", "context": 8192, "op": f"{MORI}.combine"}
+        | {"leaf": bench.signature(_combine(8 * b)), "cold_ns": ns, "kernels": ["k"]}
+        | {"exchange": [bench.exchange(_combine(8 * b))[0], whole]}
+        for b, ns in STORED_COMBINE_NS.items()
+    ]
+    params = ops.fit(points)
+    ops.held_out(params)
+
+    got = [
+        ops.PriceList(params).price(
+            (_combine(8 * b), ("decode", None, b, None, 8192, 8192), 0)
+        )
+        for b in STORED_COMBINE_NS
+    ]
+
+    (f,) = params["families"].values()
+    assert [c for c, *_ in f["points"]] == [[8 * b * 7168 * 2] for b in (1, 8, 32)]
+    assert [g.seconds for g in got] == pytest.approx(
+        [ns * 1e-9 for ns in STORED_COMBINE_NS.values()]
+    )
+
+
+V4_DECODE = "aiter.mla:mla_decode_fwd_v4_nm"
+
+
+def _layer(base):
+    """DeepSeek-V4's decode attention over 4 rows in a layer whose view of the
+    one KV pool starts at row `base`, as its `op_graph` holds it."""
+    q = {"shape": [4, 8, 64], "stride": [512, 64, 1], "dtype": BF16}
+    kv = {"shape": [4096 - base, 64], "stride": [64, 1], "dtype": BF16}
+    args = {"q": q | {"role": "activation"}, "kv_buffer": kv | {"role": "kv"}}
+    return {"op": V4_DECODE, "args": args, "out": []}
+
+
+def test_each_layer_s_attention_prices_from_the_point_one_layer_s_view_measured():
+    # measured on the first layer's view at two contexts, its time moving
+    points = [
+        {"shape": "decode B=4", "context": c, "op": V4_DECODE, "cold_ns": ns}
+        | {"leaf": bench.signature(_layer(0)), "kernels": ["mla"]}
+        for c, ns in ((1024, 10e3), (4096, 40e3))
+    ]
+    params = ops.fit(points)
+    ops.held_out(params)
+    at = ("decode", None, 4, None, 4096, 4096)
+
+    got = [ops.PriceList(params).price((_layer(b), at, 0)) for b in (0, 64, 128)]
+
+    assert [getattr(g, "seconds", g) for g in got] == [pytest.approx(40e-6)] * 3
+
+
+V4_WRITE = "atom.model_ops.v4_kernels.state_writes:swa_write"
+
+
+def _write(layer):
+    """DeepSeek-V4's window write of 4 rows in layer `layer`, which ATOM passes
+    that layer's name, as its `op_graph` holds it."""
+    kv = {"shape": [4, 512], "stride": [512, 1], "dtype": BF16, "role": "activation"}
+    args = {"kv": kv, "prefix": f"layers.{layer}.attn.swa_write"}
+    return {"op": V4_WRITE, "args": args, "out": []}
+
+
+def test_each_layer_s_write_prices_from_the_point_one_layer_s_call_measured():
+    # measured on the first layer's call at two contexts
+    points = [
+        {"shape": "decode B=4", "context": c, "op": V4_WRITE, "cold_ns": 5e3}
+        | {"leaf": bench.signature(_write(0)), "kernels": ["swa"]}
+        for c in (1024, 4096)
+    ]
+    params = ops.fit(points)
+    ops.held_out(params)
+    at = ("decode", None, 4, None, 4096, 4096)
+
+    got = [ops.PriceList(params).price((_write(n), at, 0)) for n in (0, 1, 60)]
+
+    assert [getattr(g, "seconds", g) for g in got] == [pytest.approx(5e-6)] * 3
+
+
 @pytest.mark.parametrize(
     "mean, priced",
     [
@@ -546,3 +649,158 @@ def test_a_family_with_ragged_points_leaves_out_a_uniform_point_the_pool_cut(
         assert got.reason == priced
     else:
         assert got.seconds == pytest.approx(priced)
+
+
+def _later(rows):
+    """A drafter's later pass over `rows` rows."""
+    return leaf("aiter.step", x=t([rows, 8]))
+
+
+def _mixed(rows, width):
+    """A product of `rows` rows broadcast across `width`."""
+    out = [[width, rows, 64]]
+    return leaf("aten.mul.Tensor", out, self=t([rows, 64]), other=t([width, 1, 64]))
+
+
+def _at(op, shape, ns, context=None, kernel="k"):
+    """`measure ops`'s point of the leaf `op` at `shape`."""
+    point = {"shape": shape, "context": context, "op": op["op"], "cold_ns": ns}
+    return point | {"leaf": bench.signature(op), "kernels": [kernel]}
+
+
+def _priced(points, step, graph, drafts=0):
+    """`step`'s terms, the region `graph(draft, width)` gives each part priced
+    by the fit of `points`."""
+    params = ops.fit(points)
+    ops.held_out(params)
+    backend = OpGraphBackend(
+        SPEC,
+        lambda *_, draft=False, width=None: graph(draft, width),
+        kv="bf16",
+        drafts=drafts,
+        price_list=ops.PriceList(params),
+    )
+    cost = backend.price(step)
+    return {term.name: term.seconds for term in (*cost.terms, *cost.draft_terms)}
+
+
+@pytest.mark.parametrize(
+    "queries, width, kernel, priced",
+    [
+        ((60,), None, "k", 1e-6),
+        ((40, 40), None, "k", 2e-6),
+        ((60,), 4, "k", 4e-6),
+        ((60,), 4, "k4", 4e-6),
+    ],
+    ids=["one-row", "two-rows", "padded-to-4", "padded-to-4-on-its-own-kernel"],
+)
+def test_a_drafter_s_later_pass_at_a_prefill_s_width_prices_from_its_width_s_point(
+    queries, width, kernel, priced
+):
+    # 1 us a row and flat over a decode's context, measured at a prompt's rows,
+    # 1 and 2, and at 4, the width a prompt of one row padded its later pass to,
+    # there on the rows' kernel or on one of its own
+    points = [_at(_later(2), "decode B=2", 2e3, c) for c in (1000, 3000)]
+    points += [_at(_later(1), "prefill T=60 B=1", 1e3)]
+    points += [_at(_later(2), "prefill T=80 B=2", 2e3)]
+    points += [_at(_later(4), "prefill T=60 B=1 W=4", 4e3, kernel=kernel)]
+    prompts = tuple(RequestShape(q, q, False) for q in queries)
+    step = BatchView(prompts, produces_output=True, draft_bs=width)
+
+    got = _priced(
+        points,
+        step,
+        lambda draft, _: _later(width or len(queries)) if draft else {"seq": []},
+        drafts=2,
+    )
+
+    assert got == {"draft op.aiter.step.price_list": pytest.approx(priced)}
+
+
+@pytest.mark.parametrize("width, priced", [(4, 1e-6), (8, 2e-6)])
+def test_a_leaf_over_a_prefill_s_rows_and_its_width_is_priced_at_each_width_apart(
+    width, priced
+):
+    # A prompt of one row whose LM head pads to 4 or 8: a leaf over both its
+    # row and that width is read at its rows, and each width is its own point
+    points = [_at(_mixed(1, w), f"prefill T=60 B=1 W={w}", w * 250) for w in (4, 8)]
+    prompt = (RequestShape(60, 60, False),)
+    step = BatchView(prompt, produces_output=True, target_bs=width)
+
+    got = _priced(points, step, lambda _, at: _mixed(1, at))
+
+    assert got == {"op.aten.mul.Tensor.price_list": pytest.approx(priced)}
+
+
+#: A drafter's later pass, 1 us a row and flat over a decode's context, at a
+#: prompt's rows, 1 and 2, and at 4, the width a prompt of 60 tokens and one of
+#: 4, its T, padded its later pass to: there it ran 1 row or 4.
+LATER = [_at(_later(2), "decode B=2", 2e3, c) for c in (1000, 3000)]
+LATER += [
+    _at(_later(b), f"prefill T={t} B={b}", b * 1e3) for t, b in ((60, 1), (80, 2))
+]
+LATER += [_at(_later(4), f"prefill T={t} B=1 W=4", 4e3) for t in (60, 4)]
+EITHER = "it leads with its T, a count of its width too, so it ran at "
+
+
+def test_fit_ops_leaves_out_by_name_a_point_that_ran_its_leaf_at_either_b():
+    params = ops.fit(LATER)
+
+    prefill = [f for name, f in params["families"].items() if "prefill" in name]
+    assert [(f["dims"], sorted(c for c, *_ in f["points"])) for f in prefill] == [
+        (["B"], [[1], [2], [4]])
+    ]
+    assert params["left_out"] == [
+        {
+            "shape": "prefill T=4 B=1 W=4",
+            "op": "aiter.step",
+            "why": EITHER + "T=4 B=1 or T=4 B=4",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "queries, width, priced",
+    [((60,), None, 1e-6), ((40, 40), None, 2e-6), ((60,), 4, 4e-6), ((4,), 4, None)],
+    ids=["one-row", "two-rows", "padded-to-4", "t-is-its-w"],
+)
+def test_a_prefill_whose_t_is_its_w_declines_its_later_pass_and_blends_no_width(
+    queries, width, priced
+):
+    prompts = tuple(RequestShape(q, q, False) for q in queries)
+    step = BatchView(prompts, produces_output=True, draft_bs=width)
+    rows = width or len(queries)
+
+    def graph(draft, _):
+        return _later(rows) if draft else {"seq": []}
+
+    if priced is None:
+        with pytest.raises(CostRefused) as refused:
+            _priced(LATER, step, graph, drafts=2)
+        why = "aiter.step: " + EITHER + "T=4 B=1 or T=4 B=4"
+        assert Refusal(LISTED, why) in refused.value.declined
+    else:
+        got = _priced(LATER, step, graph, drafts=2)
+        assert got == {"draft op.aiter.step.price_list": pytest.approx(priced)}
+
+
+def _tokens(n):
+    """A leaf over a prompt's `n` tokens."""
+    return leaf("aiter.embed", x=t([n, 8]))
+
+
+@pytest.mark.parametrize("tokens, width", [(60, None), (4, 4)], ids=["60", "4-of-4"])
+def test_a_leaf_over_a_prompt_s_tokens_keeps_its_t_is_w_point_and_prices_there(
+    tokens, width
+):
+    # 10 ns a token, flat over a decode's context, at 60 and 80 tokens and at 4
+    # padded to 4: its family reads its T alone, so either B prices it alike
+    points = [_at(_tokens(2), "decode B=2", 20.0, c) for c in (1000, 3000)]
+    points += [_at(_tokens(n), f"prefill T={n} B=1", n * 10.0) for n in (60, 80)]
+    points += [_at(_tokens(4), "prefill T=4 B=1 W=4", 40.0)]
+    prompt = (RequestShape(tokens, tokens, False),)
+    step = BatchView(prompt, produces_output=True, target_bs=width)
+
+    got = _priced(points, step, lambda *_: _tokens(tokens))
+
+    assert got == {"op.aiter.embed.price_list": pytest.approx(tokens * 1e-8)}

@@ -13,6 +13,7 @@ from test_backend_step_linear_fit import (
     _steps,
     _timed_record,
     _view,
+    traced,
 )
 from test_dp_step_max import prefill, runner
 from test_speculative_step import _speculative
@@ -56,7 +57,7 @@ def _mtp_record(path, steps):
     lines = [json.loads(x) for x in path.read_text().splitlines()]
     for line, (_, _, s) in zip(lines, steps):
         line["d_target_ns"] = round(s * 1e9)
-    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    path.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
     return path
 
 
@@ -88,7 +89,7 @@ def test_an_mtp_record_s_middle_chunk_without_a_target_end_is_cut_unsplit(tmp_pa
     lines = [json.loads(x) for x in record.read_text().splitlines()]
     lines[0]["produces_output"] = False
     del lines[0]["d_target_ns"]
-    record.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    record.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
 
     samples = label(record)[0]
     assert [(s.step, s.cut, s.device_s) for s in samples if s.cut] == [
@@ -245,7 +246,7 @@ def test_a_final_chunk_s_propose_pass_and_tail_are_fitted_apart_and_a_middle_chu
             line["d_propose_ns"] = round(propose * 1e9)
     # A final chunk whose draft is all `propose` has no draft-KV label to fit.
     lines[2]["d_target_ns"] = lines[2]["d_busy_ns"] - lines[2]["d_propose_ns"]
-    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    path.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
     law = _fit([path])
     propose = law["draft"]["propose"]["coefficients"]
     assert (propose["step"], propose["seqs"]) == pytest.approx(PROPOSE, rel=1e-4)
@@ -288,7 +289,7 @@ def _proposing(path, outlier=None):
         line["d_propose_ns"] = round(seconds * (3 if i == outlier else 1) * 1e9)
         line["d_busy_ns"] += line["d_propose_ns"]
     prefill[0]["produces_output"] = False
-    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    path.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
     return path, prefill
 
 
@@ -315,7 +316,7 @@ def test_the_steps_either_law_names_warm_are_the_run_s_warm_steps(tmp_path):
     lines[0]["d_busy_ns"] += 39 * lines[0]["d_target_ns"]
     lines[0]["d_target_ns"] *= 40
     lines[9]["d_busy_ns"] += 39 * (lines[9]["d_busy_ns"] - lines[9]["d_target_ns"])
-    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    path.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
     law = _fit([path])
     assert recurrence.warm_steps(law, digest(path)) == {0, 9}
     assert recurrence.warm_steps(law, "another run") == set()
@@ -346,6 +347,6 @@ def test_an_mtp_record_s_target_prefill_vector_fits_seqs_and_out(tmp_path):
     lines = [json.loads(x) for x in path.read_text().splitlines()]
     for i, line in enumerate(lines):
         line["produces_output"] = bool(i % 4)
-    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    path.write_text("".join(json.dumps(traced(x)) + "\n" for x in lines))
     target = _fit([path])["prefill"]["coefficients"]
     assert (target["seqs"], target["out"]) == pytest.approx((3e-4, 2e-3), rel=1e-4)

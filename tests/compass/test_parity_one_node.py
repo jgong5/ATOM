@@ -13,17 +13,25 @@ import subprocess
 import sys
 from pathlib import Path
 
+import platforms
 import pytest
 from test_drive_gpu import GPU45, SHOWHW
 from test_launcher_held_ports import HELD, SQUAT
 
-from atom.compass.artifacts import machine_spec_key
+from atom.compass.artifacts import machine_platform
+from atom.compass.kv.lmcache_server import DECLARED_LAWS
 from atom.compass.runner.pp_send import carrier_models
 from atom.compass.spec import MachineSpec
 
 ROOT = Path(__file__).resolve().parents[2]
+#: Node 18's MI308X: its readings, PP carriers included, read at PTL enabled.
+NODE18 = json.loads(
+    (Path(__file__).parent / "machines/mi308x-hjbog18.json").read_text()
+)
 STUB = """#!/bin/bash
 await() { for _ in {1..600}; do [ -e "$1" ] && return; sleep 0.1; done; exit 1; }
+# The simulated run file names a machine: its servers start under on_arch.
+[ "$2" = atom.compass.drive.on_arch ] && shift 3
 case "$1 $2" in
 "-m atom.entrypoints.openai.api_server")
     # As a real DP pair's group handshake orders them: rank 1 starts after rank 0,
@@ -79,18 +87,24 @@ def _parity(tmp_path, showhw=SHOWHW, **env):
     (model / "config.json").write_text('{"architectures": ["DeepseekV4ForCausalLM"]}')
     inherited = (
         "CONFIG",
-        "MACHINE",
+        "DEVICE",
+        "PTL",
+        "READINGS",
+        "STACK",
         "SERVER_ARGS",
         "GPU_MAX_HW_QUEUES",
         "ATOM_NUMA_BIND",
         "HIP_VISIBLE_DEVICES",
     )
+    readings = tmp_path / "readings"
+    _, device, _, ptl = platforms.flags(readings, NODE18, tmp_path)
+    stated = {"DEVICE": device, "PTL": ptl, "READINGS": str(readings)}
     env = {k: v for k, v in os.environ.items() if k not in inherited} | dict(
         PATH=f"{bindir}:{os.environ['PATH']}",
         REAL_PYTHON=sys.executable,
         STUB_LOG=str(tmp_path / "servers.log"),
         MODEL=str(model),
-        **{"STORE": str(tmp_path / "store"), "WAIT_S": "30"} | env,
+        **{"STORE": str(tmp_path / "store"), "WAIT_S": "30", **stated} | env,
     )
     env = {k: v for k, v in env.items() if v is not None}
     r = subprocess.run(
@@ -175,8 +189,7 @@ def test_dp_two_trees_stops_an_authority_still_up_after_wait_s(tmp_path):
 
 
 def test_dsv4_dpa8_runs_the_nightly_prefill_server_at_eight_ranks(tmp_path):
-    machine = ROOT / "scripts/compass/machines/mi308x-hjbog18.json"
-    r, servers, run = _parity(tmp_path, CONFIG="dsv4-dpa8", MACHINE=str(machine))
+    r, servers, run = _parity(tmp_path, CONFIG="dsv4-dpa8")
     assert r.returncode == 0, r.stderr
     assert len(servers) == 2 and "--compass-run" in servers[1]
     for line in servers:
@@ -190,41 +203,23 @@ def test_dsv4_dpa8_runs_the_nightly_prefill_server_at_eight_ranks(tmp_path):
     spec = json.loads(run.read_text())
     assert spec["data_parallel_size"] == 8
     assert spec["store"] == str(tmp_path / "store")
-    assert spec["machine"]["name"] == json.loads(machine.read_text())["name"]
+    assert spec["machine"]["name"].startswith(f"{NODE18['name']} at ")
 
 
-def test_dsv4_dpa8_without_a_machine_starts_nothing(tmp_path):
-    r, servers, _ = _parity(tmp_path, CONFIG="dsv4-dpa8")
+def test_without_a_device_nothing_starts(tmp_path):
+    r, servers, _ = _parity(tmp_path, DEVICE=None)
     assert r.returncode != 0
-    assert "needs MACHINE" in r.stderr
+    assert "DEVICE names the datasheet of the GPUs" in r.stderr
     assert servers == []
 
 
-def test_a_spec_that_measured_the_models_tokenizer_names_it_once(tmp_path):
-    arch = "DeepseekV4ForCausalLM"
-    machine = json.loads(
-        (ROOT / "scripts/compass/machines/mi308x-hjbog18.json").read_text()
-    )
-    machine["host"]["tokenizers"][0]["applies_to"].append(arch)
-    (tmp_path / "spec.json").write_text(json.dumps(machine))
-    r, _, run = _parity(
-        tmp_path, CONFIG="dsv4-dpa8", MACHINE=str(tmp_path / "spec.json")
-    )
-    assert r.returncode == 0, r.stderr
-    tokenizers = json.loads(run.read_text())["machine"]["host"]["tokenizers"]
-    assert [a for t in tokenizers for a in t["applies_to"]].count(arch) == 1
-
-
 def test_unset_store_measures_first_with_the_servers_flags_and_environment(tmp_path):
-    machine = ROOT / "scripts/compass/machines/mi308x-hjbog18.json"
-    r, servers, run = _parity(
-        tmp_path, CONFIG="dsv4-dpa8", MACHINE=str(machine), STORE=None
-    )
+    r, servers, run = _parity(tmp_path, CONFIG="dsv4-dpa8", STORE=None)
     assert r.returncode == 0, r.stderr
     out = tmp_path / "out"
     measure, real, sim = servers
     assert (
-        f" measure memory --gpu 0,1,2,3,4,5,6,7 --machine {machine} "
+        " measure memory --gpu 0,1,2,3,4,5,6,7 "
         f"--store {out}/store --out {out}/memory -- --model {tmp_path}/model -tp 8 "
     ) in measure
     flags = measure.split(" -tp ", 1)[1]
@@ -253,10 +248,10 @@ def test_a_failed_measurement_starts_no_server(tmp_path):
     assert not run.exists()
 
 
-@pytest.mark.parametrize("config, writers", [("tp2", 1), ("tp2-plain", 2)])
-def test_lmcache_writes_from_each_dp_rank_under_dp_attention_else_each_tp_rank(
-    tmp_path, monkeypatch, config, writers
-):
+@pytest.mark.parametrize("config", ["tp2", "tp2-plain"])
+def test_lmcache_writes_the_entry_compass_advice_writes(tmp_path, monkeypatch, config):
+    """The server's flags and the declared laws, at DP attention or not, with
+    no writer count and no image read from the real run's log."""
     lm = tmp_path / "lm"
     lm.mkdir()
     (lm / "lmcache").write_text("#!/bin/bash\nexec sleep 60\n")
@@ -264,7 +259,8 @@ def test_lmcache_writes_from_each_dp_rank_under_dp_attention_else_each_tp_rank(
     monkeypatch.setenv("PATH", f"{lm}:{os.environ['PATH']}")
     r, _, run = _parity(tmp_path, CONFIG=config, LMCACHE="1")
     assert r.returncode == 0, r.stderr
-    assert json.loads(run.read_text())["lmcache"]["writers"] == writers
+    entry = json.loads(run.read_text())["lmcache"]
+    assert entry == {"server": entry["server"], **DECLARED_LAWS}
 
 
 def test_under_lmcache_the_measurement_offloads_to_a_server_of_its_own(
@@ -303,17 +299,16 @@ def test_rapidserve_measures_a_rapidserve_engine_and_compares_each_engine(tmp_pa
 def test_pp2_runs_two_stages_on_two_gpus_and_compares_each_stage(tmp_path):
     r, servers, run = _parity(tmp_path, CONFIG="pp2", STORE=None)
     assert r.returncode == 0, r.stderr
-    machine = ROOT / "scripts/compass/machines/mi308x-hjbog18.json"
-    assert f" measure memory --gpu 0,1 --machine {machine} " in servers[0]
+    assert " measure memory --gpu 0,1 --store " in servers[0]
     assert len(servers) == 3
     for line in servers:
         assert " -tp 1 -pp 2 --enforce-eager --level 0 --max-model-len 8192 " in line
     spec = json.loads(run.read_text())
     assert spec["pipeline_parallel_size"] == 2 and spec["data_parallel_size"] == 1
-    assert spec["machine"]["name"] == json.loads(machine.read_text())["name"]
+    assert spec["machine"]["name"].startswith(f"{NODE18['name']} at ")
     # Node 18's cards read PTL enabled, and a stage send is priced on each carrier.
     stated = MachineSpec.from_mapping(spec["machine"])
-    assert machine_spec_key(stated).values["ptl"] == "enabled"
+    assert machine_platform(stated)["ptl"] == "enabled"
     assert set(carrier_models(stated)) == {"rccl", "gloo"}
     compares = (tmp_path / "servers.log.compare").read_text().splitlines()
     assert [c.rsplit(" --stage ", 1)[1] for c in compares] == ["0", "1"]

@@ -21,6 +21,7 @@ the run, and the next client binds the same LP.
 
 A `KeyError` or `ValueError` from the authority refuses the request: the
 requester's `recv` raises it as the same type, and the server goes on serving.
+A ``REPORT`` waits for no reply, so its refusal ends the run as below.
 A `ClockAbort`, such as `BackdatedEvent`, ends the run: its refusal goes to
 every bound address's slot, waiting or not, and answers every later request.
 Any other exception from the authority, or while framing a reply, ends the run
@@ -57,6 +58,7 @@ from .wire import (
     GRANT,
     REFUSALS,
     REFUSED,
+    REPORT,
     REQUESTS,
     MalformedMessage,
     decode,
@@ -169,13 +171,15 @@ class _Server:
                     )
                     replies = [(i, self._ended) for i in list(self._slots)]
             elif self._ended is None:
-                kind, t, log, t_daemon = request
+                kind, t, log, t_daemon, *steps_ahead_rounds = request
                 try:
                     try:
                         grants = self._authority.on_request(
-                            lp, kind, t, log, t_daemon, member
+                            lp, kind, t, log, t_daemon, member, *steps_ahead_rounds
                         )
                     except (KeyError, ValueError) as refused:
+                        if kind == REPORT:
+                            raise  # its sender reads no refusal
                         replies = [(address, encode(_refusal(refused)))]
                     else:
                         # Outside the refusing branch: a grant that cannot be
@@ -266,8 +270,10 @@ class _Connection:
 
     def __init__(self, server: _Server, lp: LpId, member: str | None = None) -> None:
         self._server = server
-        # `joined`: the clock and next sequence numbers the LP starts from.
+        # `joined`: the clock and next sequence numbers the LP starts from;
+        # `member`: the member of `lp` it is bound as, or None.
         self._lp, self._slot, self.joined = server.bind(encode((BIND, lp, member)))
+        self.member = member
 
     def send(self, request: tuple) -> None:
         self._server.submit(self._lp, encode(request))
@@ -312,6 +318,7 @@ class _HereConnection(_Connection):
         self._lp, self._slot, self.joined = server.bind(
             encode((BIND, lp, member)), _ReadableSlot()
         )
+        self.member = member
 
     def fileno(self) -> int:
         return self._slot.fileno()

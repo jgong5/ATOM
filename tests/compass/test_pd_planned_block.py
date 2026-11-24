@@ -6,7 +6,8 @@ Each engine's runner publishes one entry of the paged class ATOM's
 `get_num_blocks` planned; the engine's connector, built inside
 `compass_run.engine` as `Scheduler` builds it, prices a block at it once every
 engine of the run has published, and refuses deployments that plan different
-blocks. DeepSeek-V4-Pro's compressed cache and DeepSeek-R1-0528's MLA latent
+blocks; LP lmcache sizes a chunk and a state image at the same plan.
+DeepSeek-V4-Pro's compressed cache and DeepSeek-R1-0528's MLA latent
 (`deepseek_r1_0528_config.json`, its config.json byte for byte at revision
 4236a6af538feda4548eca9ab308586007567f52) are planned by ATOM's own runner,
 built driverless in a process of its own as `compass trace ops` builds one.
@@ -26,7 +27,7 @@ from types import SimpleNamespace
 import pytest
 from conftest import atom_config_double
 from test_dp_slice import DP_MACHINE
-from test_lmcache_lp import CHUNK, OFFLOAD, _run
+from test_lmcache_lp import _run
 from test_memory_readings import DOCUMENT
 
 from atom.compass import run as compass_run
@@ -74,15 +75,19 @@ PLAN = BUILD + """
 runner.compass_block_file = pathlib.Path(out)
 publish_planned_transfer(runner)
 plan = runner.pool_plan
+spec = runner.state_runtime.checkpoint_spec
 print(json.dumps({"entry_bytes": plan.entry_bytes[plan.paged_class],
-                  "block_size": config.kv_cache_block_size}))
+                  "block_size": config.kv_cache_block_size,
+                  "image_bytes": spec.image_bytes if spec else 0}))
 """
 
 
-def publish(out_dir, name: str, block: int, tp: int = 1) -> None:
-    """Publish engine `name`'s planned block as its runner does."""
+def publish(out_dir, name: str, block: int, tp: int = 1, image: int = 0) -> None:
+    """Publish engine `name`'s planned block, and the state image its lmcache
+    saves carry, as its runner does."""
     now = pathlib.Path(out_dir) / compass_run.NOW_FILE.format(name)
-    compass_run.publish_transfer(compass_run._block_file(now), block, tp)
+    path = compass_run._block_file(now)
+    compass_run.publish_transfer(path, block, tp, image_bytes=image)
 
 
 @pytest.fixture
@@ -95,7 +100,7 @@ def served(tmp_path, monkeypatch):
         run = {
             "clock_endpoint": f"inproc:test-pd-block-{uuid.uuid4().hex}",
             "bound_s": 60.0,
-            "admission_path": "serving",
+            "admission_s": 0.54e-3,
             "ipc_s": 2.0**-14,
             "stream_s": 2.0**-12,
             "router_s": 2.0**-12,
@@ -235,28 +240,17 @@ def test_an_engine_whose_runner_published_nothing_refuses_at_once(served):
         _connector("kv_consumer")
 
 
-@pytest.mark.parametrize(
-    "model, why",
-    [
-        ("deepseek-v4-pro", "DeepseekV4ForCausalLM states compress_ratios, "),
-        ("deepseek-r1-0528", "DeepseekV3ForCausalLM states kv_lora_rank: "),
-    ],
-)
-def test_the_lmcache_station_refuses_a_cache_the_geometry_cannot_size(
-    tmp_path, monkeypatch, model, why
+@pytest.mark.parametrize("model", CONFIGS)
+def test_lp_lmcache_sizes_a_chunk_and_image_at_what_atom_planned(
+    tmp_path, planned, model
 ):
-    started = []
-    monkeypatch.setattr(
-        compass_run.subprocess, "Popen", lambda *a, **k: started.append(a)
+    shutil.copy(planned[model]["published"], tmp_path / "now-engine.kv_block")
+    image = planned[model]["image_bytes"]
+    # DeepSeek-V4 keeps PAGE-backed state checkpoints, whose image its saves
+    # carry; DeepSeek-R1's MLA latent keeps none.
+    assert (image > 0) == (model == "deepseek-v4-pro")
+    blocks = 256 // planned[model]["block_size"]  # a 256-token server chunk
+    assert compass_run._lmcache_plan(_run(tmp_path), blocks) == (
+        planned[model]["entry_bytes"] * blocks,
+        image,
     )
-    raw = json.loads(CONFIGS[model].read_text())
-    config = atom_config_double(
-        kv_transfer_config=OFFLOAD
-        | {"kv_connector_extra_config": {"lmcache.chunk_size": CHUNK}},
-        hf_config=SimpleNamespace(**raw),
-        kv_cache_block_size=CHUNK,
-        kv_cache_dtype="fp8",
-    )
-    with pytest.raises(ValueError, match=why):
-        compass_run._launch_lmcache(config, _run(tmp_path), None)
-    assert started == []

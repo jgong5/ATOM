@@ -5,7 +5,9 @@
 //! the connection to an LP and is answered `JOINED`; each later request, an
 //! `NER`, carries the sends logged since the previous one and is answered
 //! `GRANT`, with the messages it releases, or `REFUSED`. Times are seconds, and
-//! the two infinities travel as the strings `+inf` and `-inf`.
+//! the two infinities travel as the strings `+inf` and `-inf`. Once a grant
+//! carries a `ceiling`, each request asks for its messages `ahead`, and carries
+//! the `steps` the LP took on its own since the previous one ([`ClockClient::step`]).
 
 use std::collections::HashMap;
 
@@ -52,6 +54,10 @@ pub struct ClockClient {
     stream: TcpStream,
     next_seq: HashMap<String, u64>,
     log: Vec<(String, u64, f64)>,
+    /// Each step taken on its own since the last request: (t, time, sends before it).
+    steps: Vec<(f64, f64, usize)>,
+    /// A grant has carried a ceiling: ask for messages ahead.
+    ahead: bool,
 }
 
 impl ClockClient {
@@ -64,6 +70,8 @@ impl ClockClient {
             stream: TcpStream::connect(address).await?,
             next_seq: HashMap::new(),
             log: Vec::new(),
+            steps: Vec::new(),
+            ahead: false,
         };
         client.write(&json!({"kind": "BIND", "lp": lp})).await?;
         let joined = client.reply("JOINED").await?;
@@ -84,6 +92,13 @@ impl ClockClient {
         seq
     }
 
+    /// Records an NER(`t`) the LP answered on its own at `time`, below its
+    /// last grant's ceiling, after the sends logged so far; it goes with the
+    /// next request.
+    pub fn step(&mut self, t: f64, time: f64) {
+        self.steps.push((t, time, self.log.len()));
+    }
+
     /// Idles until `t`, the daemon deadline `t_daemon` or the earliest arrival.
     pub async fn next_event(&mut self, t: f64, t_daemon: f64) -> Result<Grant, ClockError> {
         let (t, t_daemon) = (time_out(t)?, time_out(t_daemon)?);
@@ -91,9 +106,25 @@ impl ClockClient {
             .into_iter()
             .map(|(ch, seq, arrival)| Ok(json!([ch, seq, time_out(arrival)?])))
             .collect::<Result<Vec<_>, ClockError>>()?;
-        let frame = json!({"kind": "NER", "log": log, "t": t, "t_daemon": t_daemon});
-        self.write(&frame).await?;
+        let steps = std::mem::take(&mut self.steps)
+            .into_iter()
+            .map(|(t, time, n)| Ok(json!(["NER", time_out(t)?, time_out(time)?, n])))
+            .collect::<Result<Vec<_>, ClockError>>()?;
+        // Keys in sorted order: serde_json keeps insertion order here.
+        let mut frame = serde_json::Map::new();
+        if self.ahead {
+            frame.insert("ahead".into(), json!(true));
+        }
+        frame.insert("kind".into(), json!("NER"));
+        frame.insert("log".into(), json!(log));
+        if !steps.is_empty() {
+            frame.insert("steps".into(), json!(steps));
+        }
+        frame.insert("t".into(), t);
+        frame.insert("t_daemon".into(), t_daemon);
+        self.write(&Value::Object(frame)).await?;
         let grant = self.reply("GRANT").await?;
+        self.ahead |= grant.get("ceiling").is_some();
         let mut released = Vec::new();
         for (channel, pairs) in grant["released"].as_object().into_iter().flatten() {
             for pair in pairs.as_array().into_iter().flatten() {

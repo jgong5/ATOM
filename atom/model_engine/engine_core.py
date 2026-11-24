@@ -53,9 +53,9 @@ from atom.utils.gc_utils import (
 
 logger = logging.getLogger("atom")
 
-# Pace of the idle KV drain. The busy loops never block, so an unpaced drain
-# would fire one worker RPC round per spin; 1ms matches the PP head's existing
-# idle token-poll timeout and is far below any transfer latency.
+# Pace of the idle KV drain. No busy loop blocks while KV work is pending, so
+# an unpaced drain would fire one worker RPC round per spin; 1ms matches the PP
+# head's existing idle token-poll timeout and is far below any transfer latency.
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
 
 # Upper bound on the drain that runs after the loop exits. A peer that died
@@ -142,6 +142,7 @@ class EngineCore:
                 config.tp_world_size * config.prefill_context_parallel_size,
                 config.runner_qualname,
                 config,
+                on_worker_failure=self._send_engine_dead,
             )
             self._post_model_load_hook()
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
@@ -218,7 +219,10 @@ class EngineCore:
             if (
                 config.parallel_config.data_parallel_size == 1
                 and config.pipeline_parallel_size == 1
-                and envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+                and (
+                    envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+                    or config.prefill_admit_policy == "adaptive"
+                )
             ):
                 self._init_prefill_delayer(config)
 
@@ -270,6 +274,7 @@ class EngineCore:
                 prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
                 exchange_prefill_costs=self.scheduler.cost_balance,
                 cost_gate=envs.ATOM_PREFILL_DELAYER_COST_GATE,
+                admit_policy=config.prefill_admit_policy,
             )
         )
 
@@ -449,11 +454,27 @@ class EngineCore:
                 if shutdown:
                     break
                 if self._is_idle_rl_weights_offloaded():
+                    # An RL rollout parks the weights for minutes. No forward
+                    # can run meanwhile, so the window must not be charged.
+                    self.scheduler.engine_stats.note_idle(now)
                     continue
                 if not self.scheduler.is_finished():
-                    self._process_engine_step()
-                elif self.has_pending_kv_work():
-                    self._advance_idle_kv_transfer()
+                    # Keyed on the forward, not on having requests:
+                    # `is_finished()` stays False through a deferred offload
+                    # save and while decode spins for PrefillDone, and no
+                    # forward runs in either. `now` was read before the
+                    # forward, so the forward's own time stays in the window.
+                    if self._process_engine_step():
+                        self.scheduler.engine_stats.note_busy(now)
+                        self.scheduler.engine_stats.bump_step()
+                    else:
+                        self.scheduler.engine_stats.note_idle(now)
+                else:
+                    self.scheduler.engine_stats.note_idle(now)
+                    if self.has_pending_kv_work():
+                        self._advance_idle_kv_transfer()
+                    else:
+                        self._wait_for_input(next_metrics_push)
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -468,6 +489,35 @@ class EngineCore:
             finally:
                 tracing.shutdown()
 
+    def _wait_for_input(self, next_metrics_push: float) -> None:
+        """Park an idle loop on its input queue until a request or shutdown is
+        put there, a utility command arrives (`_notify_input`), or the earlier
+        of `_idle_deadline()` and `next_metrics_push` passes.
+
+        A loop that spun instead would hold the GIL, so the input thread would
+        take each request one or more 5 ms switch intervals late. A simulated
+        run's idle point is `clock.idle`, so there this returns at once.
+
+        Both checks run under the lock a put or `_notify_input` takes, so input
+        landing between them and the wait still wakes it. The utility check
+        reads the flag `process_queue` drains on, which the input thread sets
+        before it notifies.
+        """
+        if clock.installed() is not None:
+            return
+        deadline = min(self._idle_deadline(), next_metrics_push)
+        timeout = deadline - clock.now(time.monotonic)
+        q = self.input_queue
+        with q.not_empty:
+            if timeout > 0 and not q._qsize() and not self._has_pending_utility:
+                q.not_empty.wait(min(timeout, threading.TIMEOUT_MAX))
+
+    def _notify_input(self) -> None:
+        """Wake a loop parked in `_wait_for_input`; a put on the input queue
+        wakes it by itself."""
+        with self.input_queue.not_empty:
+            self.input_queue.not_empty.notify()
+
     def _process_engine_step(self):
         try:
             return self._process_engine_step_inner()
@@ -479,7 +529,12 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish in engine-step finally failed")
 
-    def _release_multimodal_requests(self, sequences):
+    def _release_request_resources(self, sequences):
+        structured_ids = [
+            seq.id for seq in sequences if getattr(seq, "json_schema", None) is not None
+        ]
+        if structured_ids:
+            self.runner_mgr.call_func("release_structured_requests", structured_ids)
         request_ids = [
             seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
         ]
@@ -497,7 +552,7 @@ class EngineCore:
         # the rejected seq will never produce.
         rejected = self.scheduler.take_rejected()
         if rejected:
-            self._release_multimodal_requests(rejected)
+            self._release_request_resources(rejected)
             self.output_queue.put_nowait(rejected)
 
         if result is None:
@@ -535,7 +590,9 @@ class EngineCore:
                 # Arm post-prefill decode protection only after the prefill
                 # forward really completed. A delayer FIRE merely grants
                 # admission and can still result in a decode/empty batch.
-                self.scheduler.prefill_delayer.notify_prefill_executed()
+                self.scheduler.prefill_delayer.notify_prefill_executed(
+                    scheduled_batch.total_tokens_num_prefill
+                )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
         self._poll_kv_transfer_progress()
@@ -566,7 +623,7 @@ class EngineCore:
             pass
 
         if finished_seqs:
-            self._release_multimodal_requests(finished_seqs)
+            self._release_request_resources(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
 
     def has_pending_kv_work(self) -> bool:
@@ -718,7 +775,13 @@ class EngineCore:
         if not self.kv_transfer_enabled:
             return
         connector = getattr(self.scheduler, "kv_connector", None)
-        if connector is None or not getattr(connector, "is_offload", False):
+        if connector is None or not (
+            getattr(connector, "is_offload", False)
+            or (
+                getattr(connector, "is_producer", False)
+                and getattr(connector, "enable_chunked_transfer", False)
+            )
+        ):
             return
         # getattr for the same reason as `kv_connector` above: this path is
         # reached with scheduler doubles that implement only the connector
@@ -753,6 +816,23 @@ class EngineCore:
             logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
         return False
+
+    def _offer_tier_lookups(self, reqs) -> None:
+        """Let an offload connector start tier lookups for arrived requests.
+
+        Runs on this IO thread, so a lookup is sent while the engine thread is
+        still inside a forward instead of when it next schedules. Only a
+        connector with a lookup thread defines `offer_lookups`.
+        """
+        connector = getattr(getattr(self, "scheduler", None), "kv_connector", None)
+        offer = getattr(connector, "offer_lookups", None)
+        if not callable(offer):
+            return
+        try:
+            offer(reqs)
+        except Exception:
+            # The scheduler's own prefetch still sends these lookups.
+            logger.warning(f"{self.label}: offering tier lookups failed", exc_info=True)
 
     def process_input_sockets(self, input_address: str, control_address: str):
         """Input IO thread, serving both the request and control sockets.
@@ -811,11 +891,13 @@ class EngineCore:
                             f"{self.label}: input get {request_type} {req_ids}"
                         )
                         self.input_queue.put_nowait(reqs)
+                        self._offer_tier_lookups(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         self.utility_queue.put_nowait((cmd, reqs))
                         self._has_pending_utility = True
+                        self._notify_input()
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
@@ -955,11 +1037,19 @@ class DPEngineCoreProc(EngineCore):
                     break
 
                 if global_offloaded:
+                    # Already engine-wide, which is what `note_idle` wants.
+                    self.scheduler.engine_stats.note_idle(now)
                     time.sleep(0.01)
                     continue
 
                 if not global_has_unfinished and not self.engines_running:
                     self.engines_running = False
+                    # Pass one never lands here -- `engines_running` starts
+                    # True so the first all_reduce runs -- so window one also
+                    # carries that rendezvous. The first line is warmup.
+                    # Global, not local: a locally idle rank reaching the pair
+                    # below is running a dummy for its peers, which is work.
+                    self.scheduler.engine_stats.note_idle(now)
                     if self.scheduler.prefill_delayer is not None:
                         self.scheduler.prefill_delayer.notify_idle()
                     if self.has_pending_kv_work():
@@ -969,9 +1059,13 @@ class DPEngineCoreProc(EngineCore):
                         self._advance_idle_kv_transfer()
                     continue
 
+                self.scheduler.engine_stats.note_busy(now)
                 executed = self._process_engine_step()
                 if not executed:
                     self._execute_dummy_batch()
+                # After the pair, so the idle rank's dummy counts too: that is
+                # what keeps every rank's step number equal. See `bump_step`.
+                self.scheduler.engine_stats.bump_step()
 
                 self.engines_running = global_has_unfinished
         finally:

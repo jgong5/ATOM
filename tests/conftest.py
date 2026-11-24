@@ -33,6 +33,13 @@ if ATOM_ROOT not in sys.path:
 # session takes that first open here.
 from atom.compass.drive.gpu import kfd_pid
 
+# A compass test that skips for want of a driver-run input fails unless
+# scripts/compass/gpu_gate_driver_run.txt lists its file.
+from tests.compass.driver_run_skips import (  # noqa: F401
+    pytest_make_collect_report,
+    pytest_runtest_makereport,
+)
+
 kfd_pid()
 
 from atom.config import Config
@@ -68,6 +75,7 @@ class MockConfig:
             "enable_prefix_caching": False,
             "enable_log_stats": True,
             "throughput_log_interval": 10.0,
+            "throughput_log_interval_steps": 0,
             "cache_hit_rate_window": 1000,
             "enable_chunked_prefill": True,
             "enable_dynamic_chunking": False,
@@ -82,6 +90,7 @@ class MockConfig:
             "eos_token_id": 2,
             "stop_token_ids": [],
             "scheduler_delay_factor": 0.0,
+            "prefill_admit_policy": "interval",
             "speculative_config": None,
             # A Compass step reads it as ModelRunner.prepare_model does.
             "enable_tbo": False,
@@ -273,6 +282,37 @@ def keep_envs_lazy():
             delattr(envs, name)
 
 
+_SHIM_SWAPPED = ("Context", "Poller", "Socket")
+
+
+@pytest.fixture(autouse=True)
+def keep_zmq_shim_choosing():
+    """Fail the test that leaves `zmq_shim` a fixed `Context`, `Poller` or
+    `Socket`, and undo it.
+
+    `atom.utils.zmq_shim` picks each of the three on every read, through a
+    module-level `__getattr__`: pyzmq's with no LP runtime installed, the
+    runtime's own with one. `monkeypatch.setattr` on the shim restores by
+    `setattr`, so the pyzmq class it read stays in the module dict, and a later
+    test that installs a runtime gets pyzmq's: an engine input thread then never
+    reports its requests. Patch it in the shim's dict instead
+    (`monkeypatch.setitem(vars(zmq_shim), ...)`), whose undo deletes it.
+
+    pytest sets autouse fixtures up in name order, and this name sorts before
+    `mono_runs_on_gfx950`, the first to take `monkeypatch`: its check runs
+    after monkeypatch's undo.
+    """
+    yield
+    shim = sys.modules.get("atom.utils.zmq_shim")
+    fixed = [n for n in _SHIM_SWAPPED if shim is not None and n in vars(shim)]
+    for name in fixed:
+        delattr(shim, name)
+    assert not fixed, (
+        f"this test left zmq_shim's {fixed} fixed, which a later test's LP "
+        "runtime would not get; patch it with `monkeypatch.setitem(vars(...))`"
+    )
+
+
 @pytest.fixture
 def seq_factory():
     """Factory for creating Sequence objects with sensible defaults."""
@@ -328,3 +368,19 @@ def mono_runs_on_gfx950(monkeypatch):
     from atom.mono.runtime import deployment
 
     monkeypatch.setattr(deployment, "_gfx", lambda: "gfx950")
+
+
+@pytest.fixture
+def mxfp4_default_backends(monkeypatch):
+    """Pin the MXFP4 linear backend to the default preshuffled ASM path.
+
+    `mxfp4_k_pad_align` and the load-time K check read the backend live
+    (`ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM`, the gfx1250 32x4 switch), so a
+    test of either must not depend on what the shell exported. Imported here
+    lazily: `atom.model_ops.linear` needs AITER.
+    """
+    from atom.model_ops import linear as linear_mod
+
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "_mxfp4_n32k4_backend", lambda: False)

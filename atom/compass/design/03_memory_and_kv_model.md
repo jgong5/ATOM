@@ -16,6 +16,19 @@ activations are that entry's reading too, and no geometry form stands in for one
 coefficient is not derivable from geometry within 25%
 ([#705](https://github.com/jgong5/ATOM/issues/705)), so the reading is its source (D16).
 
+**Revised 2026-11-10 by [#2899](https://github.com/jgong5/ATOM/issues/2899):** a run whose
+store holds no `memory_readings` entry reads the assumed readings of the law file it prices
+by, and refuses with neither (D15; `07` D41).
+
+**Revised 2026-11-12 by the owner's ruling on
+[#3257](https://github.com/jgong5/ATOM/issues/3257):** ATOM's `lmcache_offload` connector
+runs simulated, a CPU tier per rank beside ATOM's real scheduler half and HBM prefix cache
+(D13.1).
+
+**Revised 2026-11-19 by the owner's rulings on
+[#3762](https://github.com/jgong5/ATOM/issues/3762):** D13.1's lanes and per-chunk laws
+also price a shared Mooncake Store's copies, at any DP width (`01` D6.2).
+
 **Depends on:** `02_model_runner_and_cost_backend.md` (the runner that must answer
 `get_num_blocks` and `allocate_kv_cache`).
 
@@ -129,11 +142,12 @@ high-`N_KV`/low-`N_Q` corner specifically — not just for coverage of `tokens` 
 `batch` separately, which is precisely the per-feature bounding-box failure doc `09`
 D58 spent three iterations abandoning.
 
-**What is still not modelled:** the *lookup* cost. Matching a 100k-token prompt against
-the prefix index is host work proportional to block count, and it is charged to nobody
-— it falls inside `01` D4's host segment `E`, whose law (`09` D54) has no block-count
-term. At cc-traces' p50 input of 88,768 tokens that is ~1,387 blocks hashed and
-probed per request. Whether that is 0.1 ms or 10 ms is unmeasured. Recorded as **T49**.
+**The lookup cost.** Matching a 100k-token prompt against the prefix index is host work
+proportional to block count, inside `01` D4's host segment `E`. ATOM's scheduler walks
+the hit and allocates the rest of the prompt when it first schedules a request, so the
+host laws price it apart from `E`'s other work, by
+[`09` D54](09_fitting_and_law_selection.md)'s `admit` on the request's prompt
+tokens past the hit and within it, measured there. That answered **T49**.
 - `hash_blocks` is deliberately called from `Scheduler.postprocess` (`scheduler.py`)
   *after* the forward, because the real engine only publishes a prefix once the KV
   behind it exists. The simulated forward must not disturb that ordering.
@@ -166,6 +180,67 @@ probed per request. Whether that is 0.1 ms or 10 ms is unmeasured. Recorded as *
 - `BlockManager.hash_block_size = block_size * dcp_world_size`
   (`block_manager.py`) — decode context parallelism changes the hash granularity.
   Out of scope now; noted so it is not discovered later.
+
+---
+
+## D13.1. The `lmcache_offload` CPU tier: simulated, its scheduler half real
+
+Owner ruling on [#3257](https://github.com/jgong5/ATOM/issues/3257), 2026-11-12, for the
+M3-Agentic stage's LMCache arms (`16` D95.1), which serve with `ATOM_KV_OFFLOAD=lmcache`,
+ATOM's `lmcache_offload` connector (#3256 holds their arguments).
+
+### Problem
+
+The connector keeps KV that HBM's prefix cache would lose in a CPU tier on each rank, and
+loads it back on a later hit, so the tier's contents decide later hits as D13's pool's do.
+The tier lives in each worker's in-process LMCache engine, which copies through the
+device; `01` D6.1 simulates only the MP server's form, and the simulated runner refuses
+this connector.
+
+### Decision
+
+**ATOM's scheduler half and HBM's prefix cache run as real code; the tier and its copies
+are simulated.**
+
+- **Real.** `LMCacheOffloadConnectorScheduler` (`atom/kv_transfer/offload/connector.py`)
+  and the layout it selects (`hybrid/m3/connector.py::M3OffloadScheduler` for MiniMax-M3,
+  on `chunked_scheduler.py::ChunkedOffloadSchedulerBase`): the lookup, the load and save
+  decisions, the save frontier, deferred frees, and a completion counted once every TP rank
+  reports it (`aggregator.py::KVOutputAggregator`). HBM's prefix cache is ATOM's
+  `BlockPool` under `ATOM_PREFIX_CACHE_POLICY=slru`, protecting at most
+  `ATOM_PREFIX_CACHE_PROTECTED_RATIO` of the pool's blocks, as D13 runs it.
+- **The tier.** One index per rank of 256-token chunk keys, holding no bytes, capped at
+  the rank's configured CPU size over one chunk's bytes, as ATOM's byte codec lays a chunk
+  out for the model. Eviction is ATOM's own `cache_policy.py::SLRUCachePolicy` over that
+  index: a stored chunk enters probation, a hit promotes it, protection holds at most half
+  the resident chunks, and eviction takes probation first and never a pinned chunk.
+- **Lookup** is synchronous on the scheduler thread, as ATOM runs it
+  (`ChunkedOffloadSchedulerBase._fresh_tier_lookup`). It asks every rank that
+  `lookup_server_worker_ids` names and takes the minimum hit, as LMCache's lookup client
+  does, and charges the scheduler step that makes it a per-lookup price over the chunks
+  asked for.
+- **Store and load** are priced per chunk, a store at the device-to-host rate and a load
+  at the host-to-device rate, both measured on the arm's records (`16` D95.1) and fitted
+  beside its step law. Each rank runs its saves and its loads on queues as wide as
+  `OFFLOAD_COPY_WORKERS` and `OFFLOAD_LOAD_WORKERS`, and a copy completes at its priced
+  end.
+- **A shared Mooncake Store** (`mooncake_store`, `01` D6.2, on `dsv41/dev`) prices its
+  saves and loads on these lanes and per-chunk laws, its `store_s` and `load_s` fitted on
+  the Store worker's own lines. Each DP rank's engine process holds its own lanes, so they
+  serve at any DP width; the tier is LP `mooncake_store`, not an index per rank, and the
+  lookup is a request to it, not this tier's synchronous one.
+
+### Consequences
+
+- An LMCache arm's memory readings are taken with the tier on, keyed by `kv_offload`
+  (`run/memory.py::key_fields`), so the connector's device staging buffers are inside
+  them. The tier's pinned host memory is no device term; the stage counts it before
+  running arms side by side (#3256).
+- The GPU and CPU hit rates are ATOM's own counters, kept by the real prefix cache and the
+  real scheduler half (`08` D45.1).
+- Not modelled: a copy's contention with the forward it overlaps. The arm's law pools
+  records with the tier on and off, so it carries that contention only on average.
+- A tier below the CPU's, LMCache's local disk, is refused by name.
 
 ---
 
@@ -380,7 +455,8 @@ none read from a runtime:
 
 The runtime and library memory constants above are not in it (revised 2026-10-14):
 `compass measure memory` takes them on the target per configuration, and a run reads that
-`memory_readings` entry and refuses without it (`07` D38, Phase 2); the spec keeps the
+`memory_readings` entry, or a law file's assumed readings (`07` D41), and refuses with
+neither (`07` D38, Phase 2); the spec keeps the
 capacity alone (revised 2026-10-16, [#1226](https://github.com/jgong5/ATOM/issues/1226)).
 For a card nobody has run, developer tooling outside the CLI states the entry, each
 member stating `assumed` and where its readings were copied from; every term built on it
@@ -408,10 +484,11 @@ KV gate, a spec that cannot be recovered from the artifact makes an error unattr
   type.
 - Three topologies of one model is interpolation, not a law. The prior work said so
   explicitly and could not get a third model because the box was offline.
-- The spec-authoring tools are doc `05` D26's (probe classes emitting fragments,
-  `merge`/`validate`/`explain`); the memory readings are doc `07`'s Phase 2,
-  `measure memory`. The tools probe a real card where one is available and fall back to
-  datasheet values plus a mandatory derate where one is not.
+- A run's machine spec is composed from a device datasheet, a `platform_readings`
+  entry and, across nodes, a network file (`atom/compass/spec/layers.py`); the memory
+  readings are doc `07`'s Phase 2, `measure memory`. A readings entry is measured on a
+  real card where one is available, and otherwise assumed: a mandatory derate on the
+  datasheet values.
 
 ---
 
@@ -516,7 +593,7 @@ for the model — which is the per-term rule above, not the aggregate.
 ### Open issues
 
 - Activations are not blocked on topic `04`: until an op graph exists they come from the
-  entry, and a configuration with no entry refuses. **Cross-check against
+  entry or a law file's readings, and a configuration with neither refuses. **Cross-check against
   `04`, for when the walk lands:** the liveness walk is `04` D22, which resolves observationally
   under fake tensors and treats an opaque leaf's internal scratch as a *stated per-leaf
   constant* rather than a walked one. So this term is not simply "blocked on a graph" —
@@ -540,6 +617,7 @@ for the model — which is the per-term rule above, not the aggregate.
 | # | Decision | Date |
 |---|---|---|
 | D13 | Do not simulate the KV pool. Stub `allocate_kv_cache`; ATOM's real `BlockManager`, `BlockPool`, prefix index and `plan_pools` run unmodified. | 2026-09-18 |
+| D13.1 | `lmcache_offload`, ruled by the owner: a capacity-bounded CPU tier per rank keyed by 256-token chunks, evicting by ATOM's SLRU policy with its protected share; lookup over every rank takes the minimum hit, synchronous and priced; store and load priced per chunk from measured device-to-host and host-to-device rates; ATOM's scheduler half and HBM's SLRU prefix cache run as real code. Extended: the lanes and per-chunk laws also price a shared Mooncake Store's copies, at any DP width (`01` D6.2). | 2026-11-12 (#3257); extended 2026-11-19 (#3762) |
 | D14 | Substitute the five device readings, reuse ATOM's budget arithmetic and `plan_pools`. Compass models a dedicated device; that is a stated scope boundary. | 2026-09-18 |
-| D15 | The device specification is an input artifact authored outside Compass, carrying capacity, compute, bandwidth, interconnect and derate factors. It is echoed into every run artifact. The runtime memory constants, activations included, are `measure memory`'s `memory_readings` entries, per configuration, which a run refuses without; an assumed entry's terms are declared and `run.json` lists its assumption. | 2026-09-18; revised 2026-10-14 (#851); 2026-10-16 (#1226) |
+| D15 | The device specification is an input artifact authored outside Compass, carrying capacity, compute, bandwidth, interconnect and derate factors. It is echoed into every run artifact. The runtime memory constants, activations included, are `measure memory`'s `memory_readings` entries, per configuration, or a law file's (`07` D41), which a run refuses without; an assumed entry's terms are declared and `run.json` lists its assumption. | 2026-09-18; revised 2026-10-14 (#851); 2026-10-16 (#1226); a law file's readings 2026-11-10 ([#2899](https://github.com/jgong5/ATOM/issues/2899)) |
 | D16 | Validate every non-KV memory term individually, never as a sum. Keep ATOM's graph-pool estimator and the measured one as two separate functions. Revised: one source per term. Weights come from a meta build in the simulated runner at the deployment's group widths. Activations come from a coefficient keyed by architecture, `config.json` sha256 and tensor-parallel width, with the scratch inside it and a geometry form as fallback, until the liveness walk lands. The graph pool reserves for the deployment's own capture mode, and the per-term check is wired. Activations from the `memory_readings` entry, with no geometry form. | 2026-09-18; revised 2026-10-10 and 2026-10-16 (#965) |

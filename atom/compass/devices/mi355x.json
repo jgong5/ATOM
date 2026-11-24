@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "name": "mi355x",
+  "provenance": {
+    "authored_by": "compass agent for jgong5",
+    "date": "2026-11-03",
+    "origin": "mixed",
+    "origins": {
+      "device.name": {"origin": "probed"},
+      "device.arch": {"origin": "probed"},
+      "device.count_per_node": {"origin": "probed"},
+      "device.memory.capacity_bytes": {"origin": "probed"},
+      "device.memory.bandwidth_bytes_per_s": {"origin": "datasheet"},
+      "device.compute.bf16_flops": {"origin": "datasheet"},
+      "device.compute.fp8_flops": {"origin": "datasheet"},
+      "device.compute.fp4_flops": {"origin": "datasheet"},
+      "interconnect.intra_node.topology": {"origin": "assumed"},
+      "interconnect.intra_node.domain_devices": {"origin": "datasheet"},
+      "interconnect.intra_node.link_bandwidth_bytes_per_s": {"origin": "datasheet"}
+    },
+    "notes": "name, arch, count and capacity read at one DeepSeek-V4-Pro -tp 8 --enable-dp-attention --enable-tbo engine start on each node, equal on all three: mi355-gpu-45 at 409bedc98 (server log sha256:02618dade3d07bcaac510da11cf8a279a1fe3ef2fce72d41e88a76f2df7c32c6), mi355-gpu-40 at b71c071d3 (sha256:300adea69f618f9da5fd7258c927c14000b2f247a1bad8c02bd74928b62ce787) and crsuse2-m2m-v3-005 at f6e1fa77d (sha256:622cbece7a489b55bf75879131b4456d21af34daa31e8294ba63625f6a354dfb) | AMD Instinct MI355X GPU and platform datasheets: dense peaks, the eight GPUs one fabric connects, and one Infinity Fabric link's one-way rate, half its 153.6 GB/s bidirectional, as a KV transfer streams one way | no probe fills the topology"
+  },
+  "device": {
+    "name": "MI355X",
+    "arch": "gfx950",
+    "count_per_node": 8,
+    "memory": {
+      "capacity_bytes": 309220868096,
+      "bandwidth_bytes_per_s": 8.0e12
+    },
+    "compute": {
+      "bf16_flops": 2.5166e15,
+      "fp8_flops": 5.0332e15,
+      "fp4_flops": 1.00663e16
+    }
+  },
+  "interconnect": {
+    "intra_node": {
+      "topology": "fully_connected",
+      "domain_devices": 8,
+      "link_bandwidth_bytes_per_s": 7.68e10
+    }
+  }
+}

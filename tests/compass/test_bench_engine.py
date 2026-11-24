@@ -64,6 +64,10 @@ class Runner(Bench):
             dist.all_reduce(end, op=dist.ReduceOp.MAX)
             self.free = int(end)
 
+    def route_uniformly(self):
+        self.calls.append("route_uniformly")
+        return 0
+
     def get_num_blocks(self):
         self.calls.append("get_num_blocks")
         return {"num_kvcache_blocks": BLOCKS}
@@ -201,6 +205,24 @@ def test_every_worker_starts_in_engine_cores_order_and_the_slowest_is_charged(
     assert result["discarded"] == 1
 
 
+def test_under_expert_parallelism_every_worker_routes_uniformly_before_it_starts(
+    manager,
+):
+    """And then starts and measures as without it: its log differs by that
+    call alone, and the reply is the group's step as the test above reads it."""
+    bench = engine.Bench(_config(tp=2, ep=True), BLOCKS)
+    try:
+        result = bench.measure(batch())
+        log = bench.runner_mgr.call_func("call_log", wait_out=True)
+    finally:
+        bench.exit()
+
+    startup = ["get_num_blocks", ["allocate_kv_cache", BLOCKS], "capture_cudagraph"]
+    assert log == ["route_uniformly", *startup, "freeze_gc_heap", "bench_step"]
+    busy = BUSY + 1_000
+    assert result["repeats"] == [[PREPARE + busy, PREPARE, busy]] * window.REPEATS
+
+
 def test_the_bench_holds_the_pool_it_is_given_not_the_one_its_budget_gives(manager):
     config = _config(eager=True)
     bench = engine.Bench(config, BLOCKS + 2)
@@ -310,18 +332,18 @@ def test_a_stop_from_the_keyboard_reaches_the_process_that_started_the_bench(
         signal.signal(signal.SIGINT, previous)
 
 
+@pytest.mark.parametrize("ep", [False, True])
 @pytest.mark.parametrize(
     "refused, what",
     [
         ({"dp": 2}, "2 data-parallel ranks"),
         ({"tp": 2, "dp_attention": True}, "2 data-parallel ranks"),
-        ({"ep": True}, "expert parallelism"),
         ({"pp": 2}, "pipeline parallelism"),
     ],
 )
 def test_a_parallelism_the_bench_does_not_build_refuses_before_any_worker_starts(
-    monkeypatch, refused, what
+    monkeypatch, refused, what, ep
 ):
     monkeypatch.setattr(engine, "AsyncIOProcManager", None)  # never called
     with pytest.raises(ValueError, match=f"does not measure under {what}"):
-        engine.Bench(_config(**refused), BLOCKS)
+        engine.Bench(_config(**refused, ep=ep), BLOCKS)

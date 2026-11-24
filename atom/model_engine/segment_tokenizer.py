@@ -21,7 +21,7 @@ Both cut only at added tokens, which keeps them exact; the conditions are in
 `segment_split`. The first prompts are also compared with the plain encoder,
 and any difference turns the cache off for good.
 
-The result is still a list over the whole prompt, so a request costs time
+The result is still one array over the whole prompt, so a request costs time
 linear in its length (splitting the uncovered part, copying ids); what goes
 away is re-encoding text already encoded.
 
@@ -29,6 +29,7 @@ Locking: one lock guards the LRU, the prefix index and the counters; hashing,
 splitting, encoding, comparing and assembling ids all run outside it.
 """
 
+import array
 import hashlib
 import logging
 import sys
@@ -41,6 +42,7 @@ import numpy as np
 from atom.model_engine.byte_lru import ByteLRU
 from atom.model_engine.prefix_block_hashes import PrefixBlockHashes, extend_block_hashes
 from atom.model_engine.segment_split import AddedTokenSplitter
+from atom.model_engine.sequence import new_token_ids
 
 logger = logging.getLogger("atom")
 
@@ -93,7 +95,7 @@ class _Prefix(NamedTuple):
 
 
 class PrefixEncoding(NamedTuple):
-    token_ids: list[int]
+    token_ids: array.array
     block_hashes: PrefixBlockHashes | None
 
 
@@ -118,7 +120,7 @@ def _shared_chars(a: str, b: str, limit: int) -> int:
 
 
 class SegmentTokenizer:
-    """``encode(prompt)`` equal to ``tokenizer.encode(prompt)``, reusing
+    """``encode(prompt)``: ``tokenizer.encode(prompt)``'s ids in an array, reusing
     earlier prompts' ids (module docstring)."""
 
     def __init__(self, tokenizer, budget_bytes: int):
@@ -159,7 +161,7 @@ class SegmentTokenizer:
 
     # -- public ------------------------------------------------------------
 
-    def encode(self, prompt: str) -> list[int]:
+    def encode(self, prompt: str) -> array.array:
         return self._checked_encode(prompt)
 
     def encode_with_prefix(self, prompt, block_size, seed=-1):
@@ -178,6 +180,7 @@ class SegmentTokenizer:
 
     def _checked_encode(self, prompt, hash_spec=None):
         def plain(ids):
+            ids = new_token_ids(ids)
             return ids if hash_spec is None else PrefixEncoding(ids, None)
 
         if not self.enabled or len(prompt) < _MIN_CACHED_CHARS:
@@ -193,7 +196,7 @@ class SegmentTokenizer:
         )
         ids = result if hash_spec is None else result.token_ids
         if verify:
-            ref = self._tokenizer.encode(prompt)
+            ref = new_token_ids(self._tokenizer.encode(prompt))
             with self._lock:
                 if ids != ref:
                     if self.enabled:
@@ -279,7 +282,8 @@ class SegmentTokenizer:
             n_ids += len(ids)
         chunks.append(split.tail)
         body = np.concatenate(chunks)
-        out = body.tolist()
+        out = new_token_ids()  # one buffer copy, no int boxed per id
+        out.frombytes(np.ascontiguousarray(body, dtype=out.typecode).view(np.uint8))
 
         block_hashes = None
         if hash_spec is not None:

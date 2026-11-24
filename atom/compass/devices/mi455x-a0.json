@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "name": "mi455x-a0",
+  "provenance": {
+    "authored_by": "compass agent for jgong5",
+    "date": "2026-11-03",
+    "origin": "mixed",
+    "origins": {
+      "device.name": {"origin": "datasheet"},
+      "device.arch": {
+        "origin": "probed",
+        "source_root": "commit:b71c071d3",
+        "record": "sha256:f264727900f52ebaa1e126f69959cf49ce8595448670b1c0754a832202ce4027"
+      },
+      "device.count_per_node": {"origin": "datasheet"},
+      "device.memory.capacity_bytes": {
+        "origin": "probed",
+        "source_root": "commit:b71c071d3",
+        "record": "sha256:f264727900f52ebaa1e126f69959cf49ce8595448670b1c0754a832202ce4027"
+      },
+      "device.memory.bandwidth_bytes_per_s": {"origin": "datasheet"},
+      "device.compute.bf16_flops": {"origin": "datasheet"},
+      "device.compute.fp8_flops": {"origin": "datasheet"},
+      "device.compute.fp4_flops": {"origin": "datasheet"},
+      "interconnect.intra_node.topology": {"origin": "datasheet"},
+      "interconnect.intra_node.domain_devices": {"origin": "datasheet"},
+      "interconnect.intra_node.link_bandwidth_bytes_per_s": {"origin": "datasheet"}
+    },
+    "notes": "arch and capacity read by probe_device.py's record at b71c071d3 on card 0 of the A0 sample node, gfx1250 cards of 192 compute units | MI455X product page and brochure (07/26), read 2026-10-09: dense matrix-core peaks, HBM4 bandwidth, the four GPUs of a compute tray and the 72 its switched UALoE fabric joins, and one GPU's scale-up rate per direction"
+  },
+  "device": {
+    "name": "MI455X",
+    "arch": "gfx1250",
+    "count_per_node": 4,
+    "memory": {
+      "capacity_bytes": 309237645312,
+      "bandwidth_bytes_per_s": 23.3e12
+    },
+    "compute": {
+      "bf16_flops": 5.033e15,
+      "fp8_flops": 20.133e15,
+      "fp4_flops": 40.265e15
+    }
+  },
+  "interconnect": {
+    "intra_node": {
+      "topology": "switched",
+      "domain_devices": 72,
+      "link_bandwidth_bytes_per_s": 1.8e12
+    }
+  }
+}

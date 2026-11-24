@@ -33,13 +33,14 @@ digest, from the contexts of the positional inputs' decode rows, origin
 `ragged`, naming those inputs and every trace their lines served; a drawn
 prefill view is not measured. `--grid` runs the step grid's planner over its
 inputs' lines for the engine they state and the nodes and margin
-`--grid-definition` states, and its points are measured with origin `plan`,
-the digest of the plan, which `<out>/plan.json` holds, and the `--grid`
-inputs as their sources. A planned
+`--grid-definition` states, under `--ragged` over the ragged views too, whose
+longest rows' cells alpha's fit reads, and its points are measured with
+origin `plan`, the digest of the plan, which `<out>/plan.json` holds, and the
+`--grid` inputs as their sources. A planned
 point that is also a replayed view is measured once, as that replay alone: its
 origin, sources and traces are the replay's, and it names no plan.
 
-A measurement's key is the configuration (model, device,
+A measurement's key is the configuration (model, platform,
 `keyed` engine, source root, `--sampling`), the step kind and the view's
 digest, so a view the store holds is not measured again and a stopped
 invocation resumes; a held entry taken under other readings than this run's
@@ -47,7 +48,9 @@ refuses, naming it. Its member `MEMBER` holds the view, `seconds` (the median
 of the bench's kept repeats, under a drafter of their target's parts, and
 `draft_seconds` that of their drafter's parts), the repeats, the protocol,
 the replay rule, the origin, the inputs it came from (`sources`) and the
-`traces` their lines served. A batch the rule or the bench refuses is not
+`traces` their lines served, and `group_needs_eager`, true, where the bench
+ran the batch eagerly because an attention backend refused it a graph, as a
+step-record line states it. A batch the rule or the bench refuses is not
 published; the command measures the rest, then fails naming each. `<out>`
 also holds run.json, with the warm-up's and the measuring's boundaries, the
 engine file and the GPU checks.
@@ -55,6 +58,9 @@ engine file and the GPU checks.
 The bench holds the largest KV pool its inputs' engines state, whatever this
 device's own budget gives, so every batch they ran, and every point planned
 for that pool, fits it.
+
+The API server's flags `compass record` serves with (`measure_memory.FRONTEND`)
+are taken and dropped; any other flag ATOM's engine lacks refuses.
 """
 
 import argparse
@@ -74,16 +80,17 @@ from atom.compass.artifacts import (
     Kind,
     Provenance,
     Topology,
+    keyed_platform,
     member_name,
     roots_for,
 )
 from atom.compass.backends.step_grid_plan import plan
 from atom.compass.backends.step_labels import digest as file_digest
-from atom.compass.backends.step_linear_fit import token_band
+from atom.compass.backends.step_linear_fit import recorded_level, token_band
 from atom.compass.bench import ragged
 from atom.compass.drive.gpu import add_gpu_flag, hip_visible, kfd_pid, quiet
 from atom.compass.drive.identity import identity, phase
-from atom.compass.fit.publish import conditions
+from atom.compass.fit.publish import conditions, platform
 from atom.compass.fit.samples import MEMBER, run_fields
 from atom.compass.parity.served import served
 from atom.compass.run import _write_whole
@@ -125,10 +132,9 @@ def main(argv: list[str]) -> None:
     command = [*PROG.split(), *argv]
     run, phases = identity(engine_file, config.model, command, args.gpu), {}
     configuration = run_fields(run)
-    readings = conditions(
-        {**configuration, "engine_config": engine}
-        | {k: run[k] for k in ("stack", "host_key", "ptl")}
-    )
+    stated = configuration | {k: run[k] for k in ("stack", "host_key", "ptl")}
+    readings = conditions({**stated, "engine_config": engine})
+    configuration |= keyed_platform(Kind.STEP_MEASUREMENT, platform(stated))
     todo = _todo(points, configuration, engine, sampling, store, readings)
     held = len(points) - len(todo)
     print(f"{len(points)} distinct batches, {held} in the store", flush=True)
@@ -185,8 +191,8 @@ def _todo(points, configuration, engine, sampling, store, readings) -> list:
 
 
 def measurement_key(configuration: dict, engine: dict, sampling, view: dict) -> Key:
-    """The key of `view`'s measurement under `configuration` (model, device,
-    source root), `engine`, `keyed`'s fields, and `sampling`."""
+    """The key of `view`'s measurement under `configuration` (model, source
+    root, platform), `engine`, `keyed`'s fields, and `sampling`."""
     return Key.of(
         Kind.STEP_MEASUREMENT,
         **configuration,
@@ -294,30 +300,43 @@ def _sampling(text: str) -> dict:
 
 def atom_config(atom_args, server: bool = False):
     """ATOM's `Config` for its arguments, as `LLMEngine` resolves one and
-    `CoreManager` rewrites it under DP attention, each TP rank a DP rank of TP 1.
+    `CoreManager` rewrites it under DP attention, each TP rank a DP rank of TP 1:
+    a server's node runs the DP ranks `CoreManager` starts there, and the
+    benches run the whole group on one host.
     With `server`, `atom_args` are a server's, whose own flags pass unread, and
-    no tokenizer loads; otherwise any flag the engine does not define refuses,
-    and the config gets the tokenizer's ids and the end-of-sequence id apart
-    from the stop ids."""
+    no tokenizer loads; otherwise the server's flags `compass record` passes it
+    (`measure_memory.FRONTEND`) are taken and dropped, any other flag the engine
+    does not define refuses, and the config gets the tokenizer's ids and the
+    end-of-sequence id apart from the stop ids."""
     import dataclasses
 
     from atom.compass.bench.ranks import layout
+    from atom.compass.drive.measure_memory import FRONTEND
     from atom.compass.drive.runfile import _engine_args
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
-    from atom.model_engine.llm_engine import _load_tokenizer
+    from atom.model_engine.engine_core_mgr import iter_dp_rank_assignments
+    from atom.model_engine.llm_engine import load_tokenizer
 
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
+    for flag, kind in FRONTEND.items():
+        parser.add_argument(flag, **kind)
     parsed = _engine_args(atom_args) if server else parser.parse_args(atom_args)
     engine_args = EngineArgs.from_cli_args(parsed)
     names = {f.name for f in dataclasses.fields(Config)}
     kwargs = engine_args._get_engine_kwargs().items()
     config = Config(engine_args.model, **{k: v for k, v in kwargs if k in names})
     if config.enable_dp_attention:
+        # The engines `CoreManager` starts on this node, each its (global,
+        # local) DP rank, the first the node's lowest.
+        node = iter_dp_rank_assignments(config)
         layout(config)
+        if server:
+            config.parallel_config.data_parallel_size_local = len(node)
+            config.parallel_config.data_parallel_rank = node[0][0]
     if server:
         return config
-    tokenizer = _load_tokenizer(config.model, config.trust_remote_code)
+    tokenizer = load_tokenizer(config.model, config.trust_remote_code)
     config.bos_token_id = tokenizer.bos_token_id
     config.eos_token_id = tokenizer.eos_token_id
     config.stop_token_ids = sorted(set(config.stop_token_ids) - {config.eos_token_id})
@@ -334,9 +353,9 @@ def start_bench(config, num_blocks: int):
 
 def _points(args, store, engine: dict, sampling: dict, out: Path) -> tuple[dict, int]:
     """Each distinct view to measure, by its digest: replayed views drawn as
-    `--sample` says, then planned points; and the largest KV pool an input's
-    engine states."""
-    read, grid = grid_plan(args, [*args.inputs, *args.grid], store, engine, sampling)
+    `--sample` says, or the ragged views composed from them, then planned
+    points; and the largest KV pool an input's engine states."""
+    read = read_inputs(args, [*args.inputs, *args.grid], store, engine, sampling)
     points = {}
     for name in args.inputs:
         source, lines, _ = read[name]
@@ -353,7 +372,9 @@ def _points(args, store, engine: dict, sampling: dict, out: Path) -> tuple[dict,
         points = {v: p for v, p in points.items() if v in drawn}
     if args.ragged:
         points = _ragged(points, [read[n] for n in args.inputs], args.seed)
-    if grid:
+    if args.grid:
+        composed = [(v, p["view"]) for v, p in points.items()] if args.ragged else []
+        grid = grid_plan(args, read, composed)
         (out / "plan.json").write_text(json.dumps(grid["plan"], indent=1))
         made = grid["provenance"]
         for line in grid["plan"]["lines"]:
@@ -381,22 +402,26 @@ def _ragged(points: dict, read: list, seed) -> dict:
     return out
 
 
-def grid_plan(args, names, store, engine: dict, sampling: dict, against=AGAINST):
+def read_inputs(args, names, store, engine: dict, sampling: dict, against=AGAINST):
     """Each input of `names`, read with the client runs `args.client_run` names
-    for it under `args.sessions`, refusing as `_read` does; and, under
-    `args.grid`, the step grid: the `definition` `args.grid_definition` holds
-    and its digest, `grid`; the `plan` over the `--grid` inputs' lines for the
-    engine they state; and the plan's `provenance`: its digest, `run`, those
-    inputs as sources and the traces their lines served."""
+    for it under `args.sessions`, refusing as `_read` does."""
     read = {}
     for n in dict.fromkeys(names):
         runs = [e for r, e in args.client_run if Path(r) == Path(n)]
         read[n] = _read(n, store, runs, args.sessions, engine, sampling, against)
-    if not args.grid:
-        return read, None
+    return read
+
+
+def grid_plan(args, read: dict, views=()) -> dict:
+    """The step grid: the `definition` `args.grid_definition` holds and its
+    digest, `grid`; the `plan` over the lines of the `--grid` inputs, as
+    `read_inputs` read them into `read`, for the engine they state, and over
+    the ragged `views`, named lines; and the plan's `provenance`: its digest,
+    `run`, those inputs as sources and the traces their lines served."""
     definition = json.loads(Path(args.grid_definition).read_text())
     steps = [(f"{n} step {x['step']}", x) for n in args.grid for x in read[n][1]]
-    planned = plan(definition, steps, {f"{n} dp0": read[n][2] for n in args.grid})
+    engines = {f"{n} dp0": read[n][2] for n in args.grid}
+    planned = plan(definition, steps, engines, views)
     provenance = {
         "source": "plan",
         "run": _digest(planned),
@@ -404,13 +429,14 @@ def grid_plan(args, names, store, engine: dict, sampling: dict, against=AGAINST)
         "traces": sorted({t for _, x in steps for t in x["traces"]}),
     }
     grid = {"definition": definition, "grid": _digest(definition), "plan": planned}
-    return read, grid | {"provenance": provenance}
+    return grid | {"provenance": provenance}
 
 
 def _read(name: str, store, client_runs, sessions, engine, sampling, against=AGAINST):
     """The input `name`: what names it as a source, its kept lines, and the
-    engine its rank states. One whose engine or sampling is not `engine` or
-    `sampling` refuses, naming what states those as `against` does."""
+    engine its rank states. One whose engine, a record's over its level
+    (`recorded_level`), or sampling is not `engine` or `sampling` refuses,
+    naming what states those as `against` does."""
     path = Path(name)
     with tempfile.TemporaryDirectory() as unpacked:
         if (path / "run.json").is_file():
@@ -433,7 +459,7 @@ def _read(name: str, store, client_runs, sessions, engine, sampling, against=AGA
             )
         ((rank, lines),) = record.items()
         stated = json.loads((steps / f"dp{rank}.engine.json").read_text())
-    ran = keyed_of(stated)
+    ran = recorded_level(path / "steps" / "dp0.jsonl") | keyed_of(stated)
     differ = [
         k for k in sorted(ran.keys() | engine.keys()) if ran.get(k) != engine.get(k)
     ]
@@ -552,6 +578,8 @@ def _measure(bench, config, sampling, store, command, readings, todo) -> list[st
             "sources": sorted(point["sources"]),
             "traces": sorted(point["traces"]),
         } | ({"plan": point["plan"]} if "plan" in point else {})
+        if got.get("group_needs_eager"):
+            member["group_needs_eager"] = True
         roots = roots or roots_for({"atom": "atom", "aiter": "aiter"})
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         store.publish(
@@ -563,7 +591,6 @@ def _measure(bench, config, sampling, store, command, readings, todo) -> list[st
             members={member_name(*MEMBER): json.dumps(member).encode()},
         )
         ms = got["median_ns"] / 1e6
-        print(
-            f"measured {key.values['step_kind']} {key.token()}: {ms:.3f} ms", flush=True
-        )
+        named = f"{point['origin']} {key.values['step_kind']} {key.token()}"
+        print(f"measured {named}: {ms:.3f} ms", flush=True)
     return refused

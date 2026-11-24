@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """`gate_cpu.sh` runs tests/compass as COMPASS_GATE_SHARDS pytest processes
-beside the rest of tests/: every file once, its failures still fail the gate.
+and the rest of tests/ as COMPASS_GATE_REST_SHARDS more, each set packed by
+cpu_gate_durations.txt: every file once, its failures still fail the gate.
 
 Each case runs the real script over the throwaway tree of
 ``test_gate_cpu_verdict_through_pipe.py`` plus a tests/compass whose tests
@@ -31,14 +32,25 @@ HEADS = {
 }
 
 
-def _gate(tmp_path, shards, failing=(), excluded=(), args=""):
+def _gate(
+    tmp_path,
+    shards,
+    failing=(),
+    excluded=(),
+    args="",
+    rest=(),
+    rest_shards=None,
+    table=None,
+):
     root = _tree(tmp_path / "ATOM", stamped=True)
     ran = root / "ran"
     ran.mkdir()
     (root / "tests" / "compass" / "deep").mkdir(parents=True)
     tests = {"test_ok.py": "ok"}
     tests |= {f"compass/{name}.py": name for name in COMPASS + list(excluded)}
+    tests |= {f"{name}.py": name for name in rest}
     for path, name in tests.items():
+        (root / "tests" / path).parent.mkdir(parents=True, exist_ok=True)
         name = name.split("/")[-1].removeprefix("test_")
         head = HEADS.get(name, "")
         test = TEST.format(name=name, head=head, ok=name not in failing, ran=str(ran))
@@ -46,7 +58,12 @@ def _gate(tmp_path, shards, failing=(), excluded=(), args=""):
     (root / "scripts" / "compass" / "cpu_gate_exclude.txt").write_text(
         "".join(f"tests/compass/{name}.py\n" for name in excluded)
     )
-    out = _run(root, f"COMPASS_GATE_SHARDS={shards} {{gate}} {args}")
+    if table is not None:
+        (root / "scripts" / "compass" / "cpu_gate_durations.txt").write_text(table)
+    env = f"COMPASS_GATE_SHARDS={shards}"
+    if rest_shards is not None:
+        env += f" COMPASS_GATE_REST_SHARDS={rest_shards}"
+    out = _run(root, f"{env} {{gate}} {args}")
     pids = {}
     for marker in ran.iterdir():
         name, pid = marker.name.split(".")
@@ -110,3 +127,54 @@ def test_a_gate_where_no_process_ran_a_test_fails(tmp_path):
     assert "pytest: rc=5" in out.stdout, out.stdout
     assert out.stdout.splitlines()[-1].startswith("GATE_CPU_RC=5 NOT PASSED")
     assert pids == {}
+
+
+REST = ["test_r1", "test_r2", "sub/test_r3"]
+
+
+@pytest.mark.parametrize("rest_shards", [None, 1, 2, 4])
+def test_every_rest_file_runs_once_apart_from_every_compass_file(tmp_path, rest_shards):
+    out, pids = _gate(tmp_path, 2, rest=REST, rest_shards=rest_shards)
+    assert out.returncode == 98, out.stdout + out.stderr
+    assert "pytest: rc=0" in out.stdout, out.stdout
+    assert sorted(pids) == ["c0", "c1", "c2", "c3", "c4", "ok", "r1", "r2", "r3"]
+    assert all(len(p) == 1 for p in pids.values()), pids
+    rest = {pids[name][0] for name in ("ok", "r1", "r2", "r3")}
+    compass = {pids[f"c{k}"][0] for k in range(5)}
+    assert not rest & compass, pids
+    assert len(rest) == min(rest_shards or 4, 4), pids
+
+
+def test_processes_are_packed_by_the_duration_table(tmp_path):
+    # Round-robin would put c0 beside c2 and c4, and ok beside r2.
+    table = "# seconds\n100.0 tests/compass/test_c0.py\n50.0 tests/test_ok.py\n"
+    table += "".join(f"1.0 tests/{name}.py\n" for name in ["compass/test_c1"] + REST)
+    out, pids = _gate(tmp_path, 2, rest=REST, rest_shards=2, table=table)
+    assert out.returncode == 98, out.stdout + out.stderr
+    by_pid = {}
+    for name, (pid,) in pids.items():
+        by_pid.setdefault(pid, set()).add(name)
+    groups = sorted(map(sorted, by_pid.values()))
+    assert groups == [["c0"], ["c1", "c2", "c3", "c4"], ["ok"], ["r1", "r2", "r3"]]
+
+
+@pytest.mark.parametrize("count", ["0", "four"])
+def test_a_rest_shard_count_that_is_not_a_count_is_refused(tmp_path, count):
+    out, pids = _gate(tmp_path, 2, rest_shards=count)
+    assert out.returncode == 95, out.stdout + out.stderr
+    last = out.stdout.splitlines()[-1]
+    assert f"COMPASS_GATE_REST_SHARDS={count} is not a count" in last
+    assert pids == {}
+
+
+def test_regen_writes_each_test_file_s_seconds_from_a_green_run(tmp_path):
+    root = _tree(tmp_path / "ATOM", stamped=True)
+    slow = "import time\ndef test_slow():\n    time.sleep(0.3)\n"
+    (root / "tests" / "compass").mkdir()
+    (root / "tests" / "compass" / "test_slow.py").write_text(slow)
+    out = _run(root, "scripts/compass/regen_cpu_gate_durations.sh")
+    assert out.returncode == 0, out.stdout + out.stderr
+    table = (root / "scripts" / "compass" / "cpu_gate_durations.txt").read_text()
+    rows = [line.split() for line in table.splitlines() if not line.startswith("#")]
+    assert [path for _, path in rows] == ["tests/compass/test_slow.py"], table
+    assert float(rows[0][0]) >= 0.3, table

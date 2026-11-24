@@ -238,25 +238,37 @@ impl Lp {
     }
 
     /// Run each task due by `time`, in deadline then registration order, with
-    /// the policies' clock at its deadline.
-    fn fire(&self, time: f64) {
+    /// the policies' clock at its deadline. The clock was at `at`: a deadline
+    /// past it is a step the router takes on its own. Returns the clock.
+    fn fire(&self, time: f64, mut at: f64, client: &mut ClockClient) -> f64 {
         while self.next_due() <= time {
             let mut timers = self.timers.lock();
             let first = timers.iter_mut().min_by(|a, b| a.due.total_cmp(&b.due));
             let timer = first.expect("a due task");
+            if timer.due > at {
+                client.step(f64::INFINITY, timer.due);
+                at = timer.due;
+            }
             determinism::set_now(timer.due);
             (timer.task)();
             timer.due += timer.every;
         }
+        at
     }
 
     /// Ask for the next event until the `+inf` grant, handing each release
-    /// the client until it is handled.
+    /// the client until it is handled. A message released ahead of the grant
+    /// is reached by a step the router takes on its own.
     async fn serve(&self, mut client: ClockClient) -> Result<(), ClockError> {
         loop {
             let grant = client.next_event(f64::INFINITY, self.next_due()).await?;
+            let mut at = grant.time;
             for message in grant.released {
-                self.fire(message.arrival);
+                at = self.fire(message.arrival, at, &mut client);
+                if message.arrival > at {
+                    client.step(f64::INFINITY, message.arrival);
+                    at = message.arrival;
+                }
                 determinism::set_now(message.arrival);
                 let take = self.taken(&message.channel, message.seq).await;
                 let (back, done) = oneshot::channel();
@@ -273,7 +285,7 @@ impl Lp {
             if grant.time == f64::INFINITY {
                 return Ok(());
             }
-            self.fire(grant.time);
+            self.fire(grant.time, at, &mut client);
         }
     }
 
@@ -661,6 +673,64 @@ mod tests {
         assert_eq!(sent.len(), 32);
         assert_eq!(sent[..3], ["compass=a:2.0;s:1", "k=v", "k0=v"]);
         assert_eq!(sent[31], "k29=v");
+    }
+
+    /// A grant's messages past its time, and a task due among them, are each
+    /// a step the router takes on its own and reports with its next request.
+    #[tokio::test]
+    async fn messages_and_tasks_past_the_grant_are_its_own_steps() {
+        use super::{ClockClient, Lp, Timer};
+        use serde_json::json;
+        use std::{
+            collections::{BTreeMap, HashMap},
+            sync::{atomic::AtomicBool, Arc},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+        let http = "traffic->router:http";
+        let replies = [
+            json!({"kind": "JOINED", "now": 0.0, "seqs": {}}),
+            json!({"kind": "GRANT", "G": 0.5, "ceiling": 3.0,
+                   "released": {"traffic->router:http": [[0, 0.5], [1, 1.0], [2, 2.0]]}}),
+            json!({"kind": "GRANT", "G": "+inf", "released": {}}),
+        ];
+        let served = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut read = Vec::new();
+            for reply in replies {
+                let mut body = vec![0; sock.read_u32().await.unwrap() as usize];
+                sock.read_exact(&mut body).await.unwrap();
+                read.push(String::from_utf8(body).unwrap());
+                let body = reply.to_string();
+                sock.write_u32(body.len() as u32).await.unwrap();
+                sock.write_all(body.as_bytes()).await.unwrap();
+            }
+            read
+        });
+        let lp = Arc::new(Lp::new(HashMap::new(), BTreeMap::new()));
+        lp.timers.lock().push(Timer {
+            due: 1.5,
+            every: 10.0,
+            stopped: Arc::new(AtomicBool::new(false)),
+            task: Box::new(|| {}),
+        });
+        for seq in 0..3 {
+            let lp = lp.clone();
+            tokio::spawn(async move { drop(lp.hold(http, seq).await) });
+        }
+        let client = ClockClient::bind(&endpoint, "router").await.unwrap();
+        lp.serve(client).await.unwrap();
+        let read = served.await.unwrap();
+        assert_eq!(read[1], r#"{"kind":"NER","log":[],"t":"+inf","t_daemon":1.5}"#);
+        assert_eq!(
+            read[2],
+            concat!(
+                r#"{"ahead":true,"kind":"NER","log":[],"steps":[["NER","+inf",1.0,0],"#,
+                r#"["NER","+inf",1.5,0],["NER","+inf",2.0,0]],"t":"+inf","t_daemon":11.5}"#,
+            )
+        );
     }
 
     #[test]

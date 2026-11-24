@@ -15,6 +15,15 @@ seconds by method (`seconds_by_method`), each with its step count and share (D3.
 LP of its own; inside a DP group a park request amends D3's member join rules 1, 2 and 5
 (ruling on [#1162](https://github.com/jgong5/ATOM/pull/1162)).
 
+**Revised 2026-11-17 by [#3687](https://github.com/jgong5/ATOM/issues/3687):** D6.1's LP
+`lmcache` sizes a chunk and the state image from the plan its deployment's runners
+publish, and its transfer channels are one per DP rank, so no run file states either.
+
+**Revised 2026-11-19 by the owner's rulings on
+[#3762](https://github.com/jgong5/ATOM/issues/3762):** D6.2 makes a shared Mooncake Store's
+master LP `mooncake_store`, each rank's copies priced on its own lanes, on `dsv41/dev`;
+its renewal waits as D6.1's blocking lookup does, with D6.1's park in a DP group.
+
 **Scope of this document.** The execution architecture: what a simulated run *is*,
 which processes exist, how virtual time advances, and what contract the rest of the
 system must honour. It does **not** cover the cost model, the memory model, model
@@ -395,6 +404,7 @@ one LP:
 | Traffic source | — | **1** | |
 | Atomesh router | 1 Rust process | **0** in 1P1D, or **1** under `--dp-aware` or with several P or D instances | Part of the channels that cross it: with one P and one D it has no choice to make, so it contributes only a fixed per-request forward cost, stated in those channels' lookahead (D7). Under `--dp-aware` (DP attention) it chooses among DP ranks on load that responses move, and with several P or D instances among those instances, and is then LP `router` (D7, `channels.py::prefill_decode_table`). |
 | lmcache MP server (`ATOM_KV_OFFLOAD=lmcache_mp`) | 1 process | **1** (`lmcache`) | Its cached chunks decide later hits for every engine that reaches it, so it is a Compass stand-in on the real channels (D6.1). |
+| Mooncake Store master (`mooncake_store`, on `dsv41/dev`) | 1 process, and its owners | **1** (`mooncake_store`) | Its objects, leases and eviction decide what every prefill rank sharing the Store is told, so it is a Compass stand-in; each rank's copies are priced in its own engine (D6.2). |
 | RapidServe (`--enable-rapidserve`) | 2 EngineCores on the same devices | **2** (`engine-P`, `engine-D`) | Each runs its own scheduler and step loop, and no collective joins them: they exchange only `prefill_done` and `block_assignment` over ZMQ, each taken by a handler thread (`channels.py::_rapidserve`). Sharing the devices is a cost question, not a time domain. This holds only without `--disagg-constrained`: with it, decode writes its decode-token count to shared memory and prefill reads it on wall time, off every channel, to pick its CU split, so `run/__init__.py::frontend` refuses the combination. |
 | PP stages | N EngineCores | **N** | The collapse does not cover them either. |
 
@@ -446,16 +456,22 @@ collective) and interact only with lookahead > 0.
 ruling 2026-10-01, `12` T91, #528). Each DP rank is its own `EngineCore` process with its
 own `#dpN` channels and input and output threads, and holds its own LP runtime: its step
 loop is that member's clock owner, registers that rank's sends and releases its received
-frames. The CA completes the LP's request only when every member has called:
+frames. The CA completes each round of the LP only when every member has asked it:
 
-1. Every member makes the same number of CA calls per loop iteration; a per-member call
-   counter refuses a mismatch by name.
+1. Every member asks the same rounds per loop iteration; rounds are counted, not calls
+   (owner ruling on #2820, 2026-11-08). A member's TAR call may ask several rounds,
+   ascending, which the CA queues per member, and a round joins once it heads every
+   member's queue. A member that calls again before its round has joined is refused by
+   name.
 2. One request kind per round: TAR with equal `T` on every member, or NER with `t`
    and `t_daemon` each the minimum over members. Unequal `T` or mixed kinds are refused.
 3. Every member's send log is merged before any grant is computed, so the LP's promised
-   time never rises on a partial request.
+   time never rises on a partial request. Under local grants a group's rounds below its
+   ceiling are granted before the members that owe them report, and the LP's `N` stays
+   at the least clock among those members until each has (#2993, *Local grants* below).
 4. One common grant `G`; each member is released only the messages on its own channels.
-5. A member never advances time alone; a lone call only ships its send log.
+5. A member never advances time alone, but through rounds granted ahead of it under
+   local grants; a lone call only ships its send log.
 
 With `lmcache_mp` above DP width 1, a park request amends rules 1, 2 and 5 (D6.1).
 
@@ -473,8 +489,12 @@ waits on its device, one with output other than the DP dummy, ends at the group'
 any other ends at its own seconds, as a real idle rank's forward returns on its own. Where
 `out_s` is set, each member then returns at its own pull, its end plus its `out_s`, and
 takes in arrivals there before `_sync_dp_state`; the pulls join the ends as rounds
-(`group_out`). Each member asks one TAR per distinct round, ascending, returns at its own
-pull (its own end where there is no `out_s`) and owes the rest. Until they are paid its sends are stamped at its own end; a TAR before
+(`group_out`). Each member asks every distinct round, ascending: those up to its own pull
+in one TAR call, which returns at its pull (its own end where there is no `out_s`), and
+the rest, which it owes, in one more call when it pays them (#2820); under local grants
+those below the ceiling of the grant it returned at are granted ahead, and it steps
+through them and reports them when it pays (#2993). Each round is still its own grant, and a call's one reply releases what each of its rounds released to the
+member. Until the owed rounds are paid its sends are stamped at its own end; a TAR before
 the last owed round and any NER are refused; and every host collective on its clock owner
 thread, a `torch.distributed` collective whose tensors are all on the CPU or that has none,
 pays them first, as it returns at the latest arrival. A device collective returns once
@@ -627,6 +647,38 @@ recovery (below) grants one LP at a time: a single global event loop across proc
 correct, serialized, no parallelism. That is why zero-lookahead couplings stay inside one
 LP (partition principle, above).
 
+**Local grants** (on by default, `compass run --no-local-grants` turns them off; the
+owner's ruling (c) on
+[#2542](https://github.com/jgong5/ATOM/issues/2542#issuecomment-6539617449) and the
+[#3086 ruling](https://github.com/jgong5/ATOM/pull/3086#issuecomment-6739389313)). A grant to an
+LP without members, other than a recovery's, also carries a ceiling: the least of
+`LBTS(i)`, `G` plus the LP's shortest cycle `min over j of D(i->j) + D(j->i)`, its
+earliest unreleased arrival, and the bound on simulated time. Nothing reaches the LP below
+it: a message not yet sent arrives at or past `LBTS(i)`, and one its own sends provoke at
+or past the cycle; a time past the bound is asked for, and aborts as any grant past it
+does. Its owner answers its own TAR and NER below the ceiling as the CA would and reports
+each such step with its next request, with how many of that request's logged sends
+preceded it; the CA keeps `N[i]` at the last grant meanwhile. The CA replays each step as
+the grant its own request would have had: it registers the sends made before it, records
+the reply with what it releases and counts the grant, so the step table and the grant
+counts are those of a run with local grants off, which is why the run-file key is per-run. An
+NER may ask for its messages ahead: every message registered for it below the ceiling goes
+with the grant, and the owner releases each in the step that reaches it. A step outside
+the LP's clock and ceiling, or past a message registered for it since, aborts the run.
+
+A DP group's LP gets its ceiling at a grant at which some members return while others
+still ask later rounds (#2993): the least of `LBTS(i)`, `G` plus the LP's shortest cycle,
+and the bound. The CA grants each later round below it at once, each its own grant, the
+returned members standing in it, as they owe it, and holds each such member's reply until
+the last of them, so that it carries what those rounds release to the member beside the
+ceiling. When it pays its owed rounds, the member steps its own clock through those below
+the ceiling, releasing each message in the step that reaches it, and reports the steps
+with its send log: in its call for the rounds left, or with none left in a `REPORT` that
+waits for no reply. Until it has, the LP's `N` is no later than that member's clock, as
+its sends are stamped there and not yet logged. No step is replayed, since each round was
+granted, and a request from such a member that does not report exactly those rounds
+aborts the run.
+
 #### Invariants
 
 - **Safety (asserted, always on):** every message registered into LP *j* must have
@@ -660,7 +712,8 @@ LP (partition principle, above).
 
 The grant rule relies on these invariants inside each LP:
 
-- **I1** An LP's clock moves only inside its clock owner's CA call (TAR/NER). In a DP
+- **I1** An LP's clock moves only inside its clock owner's CA call (TAR/NER), or under local
+  grants in a step below its last grant's ceiling, which its next call reports. In a DP
   group's LP each member's clock moves only inside its own owner's call, to the common
   grant (above).
 - **I2** In a CA call the owner holds no lock another thread of its LP needs; otherwise a
@@ -780,17 +833,29 @@ receives it itself, at its own receive point.
 
 | Channel | Sender | Receiver (mode) | Lookahead |
 |---|---|---|---|
-| `traffic->frontend:http` | Compass traffic source | event loop (inline) | modelled admission delay. Path-specific; the values and what each was measured on are in `channels.py::ADMISSION_DELAY_S`. On the serving path it is the HTTP transport only, client send to the ASGI app call (#1381): the loop's intake after that call is `host.http_intake`, charged by `HttpChannel` (`06` D33). Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. 1P+1D adds the router hop. |
-| `frontend->traffic:stream` | event loop, writing the SSE stream | traffic source (inline) | `stream_s`, measured (`drive/runfile.py::FIXED`) |
-| `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_request` | engine input thread, `poller.poll()` in `engine_core.py::EngineCore.process_input_sockets` (thread) | `ipc_s`, measured (`drive/runfile.py::FIXED`) |
-| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | `ipc_s`, measured (`drive/runfile.py::FIXED`) |
-| `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | `ipc_out_s`, measured (`drive/runfile.py::FIXED`); `ipc_s` when a run file has none |
-| `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | the router's per-request forward cost (D7) |
-| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline); under prefill PP the head's, `engine-P-pp0` (D6) | stated request latency (D6) |
+| `traffic->frontend:http` | Compass traffic source | event loop (inline) | `admission_s`, the HTTP transport alone, client send to the ASGI app call (#1381): the loop's intake after that call is the host laws' `http_intake`, charged by `HttpChannel` (`06` D33). Prior work measured 13.7 ms end-to-end, worth ~4 points of TTFT. 1P+1D adds the router hop. |
+| `frontend->traffic:stream` | event loop, writing the SSE stream | traffic source (inline) | `stream_s` |
+| `frontend->engine:request#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_request` | engine input thread, `poller.poll()` in `engine_core.py::EngineCore.process_input_sockets` (thread) | `ipc_s` |
+| `frontend->engine:control#dpN` | event loop, `engine_core_mgr.py::CoreManager._send_control`. Its second writer, the frontend output thread sending SHUTDOWN (`process_outputs_socket -> CoreManager._shutdown_engine_core_rank`), runs only outside the window | same (thread) | `ipc_s` |
+| `engine->frontend:output#dpN` | step loop `put` on the `RelayQueue`; output thread sends (`engine_core.py::EngineCore.process_output_sockets`) | frontend output thread, `poller.poll()` in `engine_core_mgr.py::CoreManager._create_output_thread` (thread) | `ipc_out_s` |
+| `frontend-P->frontend-D:relay` | frontend-P's event loop writes prefill's JSON; the router moves `kv_transfer_params` into the decode request (D2) | frontend-D's event loop (inline) | `router_s`, the router's per-request forward cost (D7) |
+| `engine-D->engine-P:kv_write_req` | decode step loop, in the scheduler-side hook `update_state_after_alloc` (`scheduler.py::Scheduler._notify_connector_after_prefill_alloc`); Mooncake's write request, sent from the engine process rather than the worker. For a request that finishes before its write request, aborted while it waits, the scheduler-side `request_finished` (`scheduler.py::Scheduler._cleanup_aborted_load`) sends instead the notice that none will come, which retires prefill's send claim (Mooncake's `MSG_ABORT`) | prefill step loop, drained in `process_completions` (`scheduler.py::Scheduler._update_from_kv_xfer_finished`) (inline); under prefill PP the head's, `engine-P-pp0` (D6) | `kv_write_req_s`, a stated request latency (D6) |
 | PP stage to stage: `meta`, `tokens`, `kv_status` | stage loop, `pp_transport.py::PPStageTransport.send_metadata` / `send_tokens` / `send_kv_status` | the stage loop's own poll and receive (inline) | stated IPC delay: each is one ZMQ message, as on the frontend channels; the head's batch to stage `k` is `meta#pp<k>`. The hidden states between stages are `pp_data` (`15` D91). |
 | `engine-P->engine-D:prefill_done` (RapidServe only, in neither M1 nor M2) | prefill step loop, direct send in `engine_core.py::PrefillEngineCore._process_engine_step` | decode handler thread `DecodeEngineCore._recv_prefill_done`, `sock.recv()` (thread) | stated IPC delay |
 | `engine-D->engine-P:block_assignment` (RapidServe only, in neither M1 nor M2) | decode step loop, direct send in `engine_core.py::DecodeEngineCore._send_block_assignment` | prefill handler thread `PrefillEngineCore._recv_block_assignments`, `sock.recv()` (thread) | stated IPC delay |
-| `engine->lmcache:lookup#dpN`, `engine->lmcache:transfer#dpN.tpK` and their replies (`ATOM_KV_OFFLOAD=lmcache_mp` only) | D6.1 | D6.1 | stated `lmcache_ipc_s` |
+| `engine->lmcache:lookup#dpN`, `engine->lmcache:transfer#dpN` and their replies (`ATOM_KV_OFFLOAD=lmcache_mp` only) | D6.1 | D6.1 | stated `lmcache_ipc_s` |
+| `engine-P<i>->mooncake_store:lookup#dpN` and its reply, `engine-P<i>->mooncake_store:transfer#dpN` (`mooncake_store` only) | D6.2 | D6.2 | `store_rpc_s`, half of the fitted `lookup_s`'s fixed term |
+
+Each hop's lookahead is the run-file key of its name, which `drive/runfile.py` writes
+from the `hops` of the `host_laws` entry (`09` D54): `admission_s`, `ipc_s`,
+`ipc_out_s`, `stream_s`, `kv_write_req_s` and `router_s`. A prefill-decode run takes each
+side's from its own instance's entry, the one fitted under that instance's engine config:
+the top-level keys are prefill's, `decode_hops` holds decode's `ipc_s`, `ipc_out_s` and
+`stream_s`, and the write request, received by prefill, and the router's forward are
+prefill's. A hop no entry
+states takes one floor, 2^-14 s (`run.HOP_FLOOR_S`), and the run summary lists it under
+`unmeasured_hops`. Not 0 s: a zero lookahead puts every serving run on the
+deadlock-recovery path (Invariants). Each hop is one value, the delay it charges.
 
 The RapidServe rows exist only under `--enable-rapidserve` (D2), whose prefill and decode
 `EngineCore`s are two engine LPs of one deployment; they are the only channels received
@@ -1209,7 +1274,7 @@ undecided**.
 |---|---|---|---|
 | K1 | Event cost | TAR: `advance_to(now + d)`, `d` from the cost model or a resource station; for a forward, from the runner's host and device recurrence (below) | the forward, the idle DP rank's dummy batch, KV-transfer completion, tokenization, the DP lockstep `all_reduce`, multimodal preprocessing |
 | K2 | Clock read | returns the LP's logical time | the arrive / leave / first-token stamps, `_passed_delay`, the waiting-prefill age |
-| K3 | Idle point | NER: `next_event(t, t_daemon)` | the step loops' spin, the PP bounded polls, offline `get_output`, a step-loop wait on an lmcache reply (D6.1) |
+| K3 | Idle point | NER: `next_event(t, t_daemon)` | the step loops' spin, the PP bounded polls, offline `get_output`, a step-loop wait on an lmcache reply (D6.1) or on a Store renewal's (D6.2) |
 | K4 | Channel send | timestamped send, logged on the clock owner | PD direct sends, PP sends, output sends through the relay queue |
 | K5 | Channel receive | counted at the wait point, then TSO delivery | the engine input thread, the frontend output thread, the PD handler threads, the PP receives and zero-bound drains, the PP `flush_pp_send` |
 | K6 | Wait inside one LP | LP aggregation: never reported to the CA | TP worker RPC and barriers, frontend coroutines awaiting their own process's data, control commands' calls to workers, the DP group's reductions (the `PrefillDelayer` all_reduce, and the device-end `all_reduce(MAX)` and step-target `all_gather` in the predicted forward) |
@@ -1240,8 +1305,8 @@ The rules that settle the boundaries #53's categories left in the wrong place:
   sizes both). So the TP workers and every rank of a lockstep DP group sit in the engine
   LP, and a startup assertion refuses a process group whose ranks map to more than one
   LP.
-- **A DP step is one TAR per member release and per member pull; each member returns at
-  its own pull** (D3, #988, #1267, #1345). Each rank charges its own forward by the recurrence below, from the group's
+- **A DP step is one TAR round per member release and per member pull; each member
+  returns at its own pull** (D3, #988, #1267, #1345, #2820). Each rank charges its own forward by the recurrence below, from the group's
   device end, the `max` over ranks of each rank's absolute device end by one
   `all_reduce(MAX)`; the ranks exchange the step targets by one `all_gather` inside the
   predicted forward, and every rank calls the CA as a member of the LP (D3). With no host
@@ -1304,7 +1369,9 @@ The rules that settle the boundaries #53's categories left in the wrong place:
   the loops it would have served do, and each spins rather than waits when there is
   nothing to run, because `pull_and_process_input_queue` drains with `get_nowait` and
   nothing else in the turn blocks: `EngineCore.busy_loop`, `DPEngineCoreProc.busy_loop`
-  and `PPEngineCoreProc._head_busy_loop`. D8's measurement of the prior design — first
+  and `PPEngineCoreProc._head_busy_loop`. On a real run `EngineCore.busy_loop` parks on
+  its input queue instead (`_wait_for_input`, #2613), which returns at once under a
+  simulated clock. D8's measurement of the prior design — first
   real step is tick 1, first simulated step is tick **89,336** — is this loop counted.
   Each becomes `next_event(t, t_daemon)`, `t` the LP's earliest essential local event and
   `t_daemon` its next daemon deadline (the metrics push). The PP bounded polls
@@ -1396,6 +1463,13 @@ missed event cost.
 
 ### A forward's charge: host and device, composed per runner
 
+**Replaced in part by [`18`](18_pass_record_and_host_paced_time.md) D107**, which
+starts and ends every pass by one rule: a target that replays one graph starts at its
+graph launch, after a new `W_graph`; one launched otherwise ends no earlier than its
+launch end; and the check no longer feeds an MTP decode's gap as `compass_queued_s`.
+The code applies the recurrence below until the implementation `18`'s *Summary* cuts
+lands, and that implementation rewrites it here.
+
 Owner ruling on [#815](https://github.com/jgong5/ATOM/issues/815), 2026-10-11. It
 supersedes ruling 2 of
 [#627's 2026-10-10 plan](https://github.com/jgong5/ATOM/issues/627#issuecomment-6096543740),
@@ -1420,6 +1494,8 @@ stage and per DP rank, with a TP group modelled on its rank 0.
   forward, where `_sync_dp_state` releases every member, so a member's wait for that
   pull is the group round's, not `E`
   ([#1893](https://github.com/jgong5/ATOM/issues/1893)).
+  A forward that schedules a request for the first time also runs its admission
+  inside `schedule()`, priced apart by the host laws' `admit` (`09` D54).
 - `W_pre`: prepare (`ModelRunner.prepare_model`), which waits only at its two ends;
   under MTP, an output forward's prepare up to R1's wait.
 - `W_inputs`: under MTP, an output forward's prepare after R1's wait: the input ids,
@@ -1447,14 +1523,27 @@ launch_end = max(h, R7 - W_recv) + W_launch    # non-first PP stage: R7, the met
                                                # holds the launch after W_recv
 start      = max(end[n-1], h, R7)
 target_end = start + D_target
-end        = max(target_end + D_draft, launch_end)
 exit       = max(launch_end, R1) + W_post      # no MTP: R1 for an output forward
+end        = max(target_end, exit) + D_draft   # no draft: max(target_end, launch_end)
 charge     = exit - now                        # the K1 TAR: advance_to(exit)
 ```
 
 `end` and `target_end` are the runner's device state, kept across forwards; they never
 touch the clock. A device-bound forward charges device time and a host-bound one host
 time.
+
+**The draft starts no earlier than the exit** (owner ruling on
+[#2917](https://github.com/jgong5/ATOM/issues/2917#issuecomment-6686075949), 2026-11-06).
+The host queues a forward's drafter passes before it exits (the `propose` pass in
+`postprocess`, just before the draft copy wait), and a pass the device reaches first waits
+for it. So `max(target_end, exit)` bounds the draft's start for every drafter, one graph
+or serial passes alike, adds no host segment, and errs only by the host time after the
+pass. The draft's end reaches the timeline through the next forward's `start` and
+R4, which a late pass moves only when it outlasts the next forward's `E + W_pre +
+W_inputs`, and on a runner that does not defer its output through R8, which holds the
+forward's exit for it. There the recurrence's own check (below) charges as the draft the
+forward's read of its own draft ids: its host queued the draft before that read, and
+`W_post` holds the host's time up to it, the draft's preparation included.
 
 **After the return: `E_out`** (owner ruling on
 [#1345](https://github.com/jgong5/ATOM/issues/1345), 2026-10-18). `Scheduler.postprocess`,
@@ -1488,11 +1577,11 @@ after the real put: the records' `t_put_ns` measure that gap.
 
 | rule | applies to | where | waits for | ATOM site |
 |---|---|---|---|---|
-| R1 | output forward, single stage | after launch; before launch with MTP | the previous output forward's `target_end`; with MTP, then `L_mtp` | `tokenIDProcessor.recv_async_output`, from `prepare_sampled_ids`; with MTP, `tokenIDProcessor.recv_spec_status`, from `prepare_input_ids` in `ModelRunner.prepare_model` |
+| R1 | output forward, single stage, on a runner that defers output | after launch; before launch with MTP | the previous output forward's `target_end`; with MTP, then `L_mtp` | `tokenIDProcessor.recv_async_output`, from `prepare_sampled_ids`; with MTP, `tokenIDProcessor.recv_spec_status`, from `prepare_input_ids` in `ModelRunner.prepare_model` |
 | R4 | every forward, single stage | forward entry | `end[n-2]` | `ModelRunner._gate_staging_reuse` |
 | R6 | every forward, PP | forward entry | this stage's `end[n-pp]` | `ModelRunner._advance_forward_vars`, the `forward_vars` ring |
 | R7 | non-first PP stage | device start, host launch | the upstream stage's `end`, and its host send | `GroupCoordinator.recv_tensor_dict`, from `recv_intermediate_tensors` (`atom/distributed/pp_comm.py`) in `ModelRunner.run_model`: the metadata on gloo holds the host, the tensors the device |
-| R8 | last PP stage, output batch | after launch | its own `target_end` | `tokenIDProcessor.prepare_sampled_ids`'s `tolist`, on the stage that does not defer output |
+| R8 | output batch, on the last PP stage or a single stage whose runner does not defer output | after launch; with a drafter, also before the exit | its own `target_end`; with a drafter, then its own `end`: the forward leaves no earlier than it | `tokenIDProcessor.prepare_sampled_ids`'s `tolist`, on a runner that does not defer output ([#3174](https://github.com/jgong5/ATOM/issues/3174)); with a drafter, then `prepare_draft_ids`'s `cpu` ([#3544](https://github.com/jgong5/ATOM/issues/3544)) |
 
 **The MTP status copy, `L_mtp`** (owner ruling on
 [#2080](https://github.com/jgong5/ATOM/issues/2080), 2026-10-25). With MTP, R1 releases
@@ -1536,7 +1625,7 @@ what-if: never graded, and refused by the graders.
 **Measured, not hooked.** The parity recorder, `RecordingModelRunner`
 (`atom/compass/parity/runner.py`), stamps host time around the staging gate, the launch
 and the R1 wait (with MTP also the draft copy wait; on a non-first PP stage also the R7
-receive, and on the last stage its own token read; on a sending stage an idle
+receive, and on the last stage its own token read, which a single stage whose runner does not defer its output stamps too, as `t_read_ns`; with a drafter, either also stamps its own draft read as the draft copy wait, `t_draft_read_ns`; on a sending stage an idle
 `flush_pp_send` that settles a send), and records device events at
 `run_model` entry, with MTP at the target's end, on a non-first PP stage where the
 received tensors are in, and at the forward's exit, drained with `query()`, never `synchronize()`
@@ -1544,7 +1633,12 @@ received tensors are in, and at the forward's exit, drained with `query()`, neve
 recording's engine process stamps the first input pull (`clock.idle`) and output put
 (`clock.relay_queue`'s queue) after each reply, `t_pull_ns` and `t_put_ns`, into
 `dp<rank>.pulls.jsonl` on the same monotonic clock; `parity.read` joins them to the
-steps (#1345).
+steps (#1345). It holds these stamps and its IO-thread handoff lines in memory and
+writes them when the engine leaves its loop or takes its SIGTERM, as a worker holds its
+step lines: a write on the loop is time the loop spends, and on a record kept on NFS the
+pull stamp's write, tens of microseconds after the put stamp's, blocked about 1 ms in
+most forwards, inside the `E` it opens
+([#2726](https://github.com/jgong5/ATOM/issues/2726)).
 
 **The recurrence's own check, provisional.** Fed each real record's measured device
 windows and host segments, and under MTP each forward's `L_mtp` measured as `09` D54
@@ -1872,7 +1966,11 @@ and receives both run on the engine's step loop, and no worker takes part.
   `engine-D->engine-P:kv_write_req`, sent at `t`, arriving at `a = t + request latency`.
   It computes its own ready time `c + notify latency` and reports the request in
   `finished_recving` from `process_completions` as the pipelined funnel would: at the
-  call after the first one whose clock reached it. A local event of engine-D.
+  call after the first one whose clock reached it. A local event of engine-D. A request
+  that finishes before it posts one, aborted while it waits, sends instead, from
+  `request_finished` (called from `Scheduler._cleanup_aborted_load`), the notice that
+  none will come, on the same channel, as Mooncake's consumer sends `MSG_ABORT`
+  (`mooncake_connector.py::MooncakeConnectorScheduler._abort_unwritten`).
 - **Prefill** records the data-ready time `r` in `request_finished` and takes the write
   request in `process_completions`, which the step loop receives inline.
   `Scheduler._mark_finished` calls `request_finished` once per finished request. There
@@ -1886,7 +1984,10 @@ and receives both run on the engine's step loop, and no worker takes part.
   `c`, reported the same way, prefill reports `finished_sending`, and
   `Scheduler._update_from_kv_xfer_finished` retires the claim through `send_finished`
   and frees the parked blocks. `source_blocks_released` does nothing. A local event of
-  engine-P. Scheduler code is unchanged.
+  engine-P. Scheduler code is unchanged. Decode's notice that no write will come retires
+  the claim the same way, done at the notice's arrival, and a later write request for
+  the request is refused, as Mooncake's listener does through
+  `mooncake_connector.py::MooncakeConnector._abort_transfers`.
 - **Write-done is not a message.** Real Mooncake sends `MSG_WRITE_DONE` when the write
   ends (`mooncake_connector.py::MooncakeConnector._send_write_done`). Both ends compute
   that time instead, for two reasons: the router forwards strictly in sequence (D2), so
@@ -1903,18 +2004,28 @@ and receives both run on the engine's step loop, and no worker takes part.
   and no worker ever sends or receives across LPs. A prefill-side local timer would not
   do: when decode posts depends on its own admission, which prefill cannot know, and
   assuming "at once" frees prefill's blocks early exactly when decode is congested.
-- **Ceiling.** FIFO per rank pair is measured on Mooncake TCP only; for RDMA it is an
-  assumption. Under RDMA the real sharing unit is each prefill rank's NIC: its worker
-  writes through the HCA set `_select_ib_devices` resolves for its GPU, and
-  `MooncakeConnector._write_listener` hands every write request, from any decode rank,
-  to one `_send_executor` of `send_worker_count` (`num_worker_threads`) threads. Writes
-  on different rank pairs do not contend here. At decode DP width one a prefill rank's
-  NIC carries only the one decode rank's writes, so both ends still compute the same `c`
-  under any sharing discipline. Above that, `c` depends on other decode ranks' writes,
-  which this decode rank never sees, so a per-prefill-rank model cannot keep both ends
-  computing `c` without a message: decode would need Mooncake's own write-done notice
-  (`MooncakeConnector._send_write_done` to the consumer's `_notification_listener`) as a
-  prefill-to-decode channel (#1179).
+- **Ceiling: per-pair links are a simplification under RDMA.** Each prefill-decode rank
+  pair is one FIFO link, and writes on different pairs never contend. FIFO per rank pair
+  is measured on Mooncake TCP and kept under RDMA through v1 by the owner ruling on
+  #1179. The real sharing unit depends on the fabric:
+  - With matched rails (`ATOM_MOONCAKE_MATCHED_RAILS`, as on the MI355X nodes crs005 and
+    crs013), a producer writes through the rail engine of the consumer's HCA
+    (`RailEnginePool.get`), so writes into one decode rank share its rail across prefill
+    engines and queue within one engine, and one prefill GPU's writes stay under its cap
+    across rails (#3051).
+  - Without matched rails, it is the prefill rank's HCA set, which `_select_ib_devices`
+    resolves for its GPU.
+  - Either way, `MooncakeConnector._write_listener` hands each prefill rank's write
+    requests, from any decode rank, to one `_send_executor` of `send_worker_count`
+    (`num_worker_threads`) threads.
+
+  Effect: fan-in on a rail is priced at a lone writer's rate, so contended writes finish
+  early, and decode admission and prefill's block release come early with them. It grows
+  with concurrency, prefill ranks per decode rank and KV bytes. #3051 has its size on
+  those nodes and #2991 its share of TTFT at #1111's cell. Pricing rail fan-in needs every
+  write into a decode rank, which its prefill ranks do not see, so decode would have to
+  send prefill each write's done time, a message the real deployment never sends; #1179
+  prices it after v1.
 - It must still emit the `kv_transfer_params` blob that Atomesh relays, so
   `AtomAdapter` works unmodified. The router hard-errors if it is absent
   (`http_pd_router.rs::PDRouter::dispatch_atom_relay_internal`). The two backends emit
@@ -1988,9 +2099,10 @@ two differ the code is right.
 
 ### Cons / open issues
 
-- The transfer model is now **unvalidated** — a real RDMA baseline is needed at least
-  once to fit `latency` and `bandwidth`, or the numbers are assumed rather than
-  measured. This is a calibration task, not a simulator task, but it must be named.
+- A link's `latency` and `bandwidth` are as good as its network spec, whose provenance
+  says per value whether it came from a datasheet, was assumed or was probed; a link no
+  probe fills prices every transfer on assumed or datasheet numbers. #3051 probed the
+  MI355X rails between crs005 and crs013 (`atom/compass/networks/crs005-013-ionic.json`).
 - Mooncake requires **all** `(pp_rank, tp_rank)` pairs to report before a request
   completes (`mooncake_connector.py::MooncakeConnector._record_write_done`). The
   simulated write is one event per request, priced on the whole block table, so ranks
@@ -2078,16 +2190,16 @@ lookup read locks, sessions, and the read TTL. A store's chunks become visible a
 store's completion on the server clock. A TTL expiry is a daemon deadline (`t_daemon`,
 #533): it changes later hits but keeps no run alive.
 
-**Channels.** Every one is a real ZMQ path between the real endpoints' identities; the
+**Channels.** Every one is a real ZMQ path to the server's URL; the
 stamp is its own header frame, as on every wrapped socket
-(`clock.py::WrappedSocket`). `N` is the DP rank, `K` the TP rank.
+(`clock.py::WrappedSocket`). `N` is the DP rank.
 
 | Channel | Sender (K-class) | Receiver (mode, K-class) | Lookahead |
 |---|---|---|---|
 | `engine->lmcache:lookup#dpN` | step loop, at `MessageQueueClient.submit_request` (LOOKUP, QUERY_PREFETCH_STATUS, FREE_LOOKUP_LOCKS, END_SESSION); the `ClientPollingLoop` thread sends it as a relay (K4, registered at the put, as the engine output queue is) | stand-in loop (inline, K5) | `lmcache_ipc_s` (below) |
 | `lmcache->engine:lookup#dpN` | stand-in loop, at the job's completion (K4) | the `ClientPollingLoop` thread, which sets the future (thread, K5); TSO delivery resolves it at the reply's arrival | `lmcache_ipc_s` |
-| `engine->lmcache:transfer#dpN.tpK` | STORE or RETRIEVE of TP rank `K`'s connector, one per writer rank (one per group under `lmcache.mp.tp_rank_collapse`) (K4) | stand-in loop (inline, K5) | `lmcache_ipc_s` |
-| `lmcache->engine:transfer#dpN.tpK` | stand-in loop, at the copy's completion (K4) | step loop, in `process_completions` (inline, K5) | `lmcache_ipc_s` |
+| `engine->lmcache:transfer#dpN` | STORE or RETRIEVE of each writer rank's connector in DP rank `N`, in rank order: every TP rank, or one per group under `lmcache.mp.tp_rank_collapse` (K4) | stand-in loop (inline, K5) | `lmcache_ipc_s` |
+| `lmcache->engine:transfer#dpN` | stand-in loop, at the copy's completion (K4) | step loop, in `process_completions` (inline, K5) | `lmcache_ipc_s` |
 
 In a 1P+1D run the engine end is `engine-P`. Every cycle through the server crosses two
 channels, so its lookahead is `2 x lmcache_ipc_s`, positive. `lmcache_ipc_s` is a run-file
@@ -2105,8 +2217,13 @@ CUDA IPC events), and its two contacts with the step loop are a fire-and-forget 
 (`AsyncIOProcManager.call_func_with_aggregation`). Neither lets the owner register the
 worker's send before its next clock call or release a reply at its arrival, so the
 PP pattern (`15` D91: the loop stamps, the worker moves bytes in a call the loop makes)
-would need new ATOM call sites. The shell keeps one DEALER per writer rank, so the
-server sees the clients it sees in a real run.
+would need new ATOM call sites. The shell keeps one DEALER per transfer channel where a
+real run has a client per writer rank: the stand-in keys every object by the worker id
+each request carries and reads the client only to route the reply, and the writer ranks'
+requests of one step leave in rank order at one instant, so the stations still serve
+them in rank order. One channel per DP rank keeps the writer count out of the channel table,
+which every LP and a standalone authority build from the run file before any engine
+exists (`run/__init__.py::channel_table`; amended by #3687).
 
 **A completion is a stamped message.** On the step loop, the Compass shell around the
 scheduler half (below) sends, from `build_connector_meta`, the STORE or RETRIEVE each
@@ -2169,7 +2286,8 @@ time, and rule 3 holds the grant for the peers' send logs, which carry their own
 and stores to `lmcache`. While the peers count as running, the server's LBTS stays at
 the group's `now + lmcache_ipc_s`, below `t_c`, so the reply is never sent.
 
-A *park* request amends rules 1, 2 and 5, at DP width above 1 with `lmcache_mp`:
+A *park* request amends rules 1, 2 and 5, at DP width above 1 with `lmcache_mp` or
+`mooncake_store` (D6.2):
 
 - **The park.** Each member's last CA call before it dispatches a forward (real or the
   DP dummy) is a park, which ships its send log. A parked member stops regulating time
@@ -2209,11 +2327,111 @@ per step per member.
 pricing a LOOKUP by a declared law in prompt chunks and the bookkeeping requests at a
 declared constant; and the copy engine, a stated width, pricing a STORE or RETRIEVE as a
 `TransferModel` (`kv/transfer.py`) over the machine spec's host link, `bytes` the
-chunks moved times the chunk's bytes from the KV geometry. The copy engine applies no
+chunks moved times a chunk's bytes (*Sizing*, below). The copy engine applies no
 derate, unlike `TransferModel.from_spec` on a fabric link: the spec states the host link
 as a copy reaches it, not as a peak (`spec/fields.py`, `interconnect.host_link`;
 `run/__init__.py::_lmcache_stations`). Both stations' laws are declared until measured;
 their accuracy is out of scope here.
+
+**Sizing** (amended by #3687). LP `lmcache` takes a chunk's bytes and the state image from
+the plan of the deployment it serves, the prefill side's in a P/D run, as the simulated
+P/D connector takes its transfer (`run/__init__.py::_planned_transfer`). At
+`get_num_blocks` each member's TP rank 0 runner publishes in its engine's `.kv_block` file
+(`runner/overrides.py::publish_planned_transfer`) its paged KV block's bytes, the block
+that file carries for a P/D transfer, and its state image: the `image_bytes` of its
+PAGE-backed checkpoint spec where native-state saves carry an image
+(`native_state_worker.py::stores_state_images` of `Config.state_replay_tokens`), else 0.
+Under DeepSeek-V4's bounded replay (`ATOM_DSV4_STATE_REPLAY`) saves store the PAGE KV
+alone and `native_state_layout.py::build_native_state_mp_layout` registers no image group,
+so the image is 0 there. A chunk's bytes are the block's times the server's `--chunk-size`
+over the block's tokens, `kv_cache_block_size`, which `Config` fixes before
+`_launch_lmcache` reads it and hands LP `lmcache` at launch. ATOM's workers register their
+PAGE regions per block of those tokens
+(`mp/worker.py::LMCacheMPConnector.register_kv_caches`; for DeepSeek-V4
+`native_state_worker.py::NativeStateLMCacheMPConnector.register_kv_caches` through
+`build_native_state_mp_layout`), and DeepSeek-V4's planned block is exactly those regions
+(`DeepseekV4AttentionMetadataBuilder.get_kv_transfer_tensors` refuses any other sum). A
+pool whose charged entry carries alignment padding is overstated here as in the P/D price.
+The image comes from the spec the scheduler half binds, whose presence makes ATOM's
+scheduler half native-state
+(`mp/connector.py::LMCacheMPConnectorScheduler.bind_block_manager`).
+
+LP `lmcache` reads the plan before it starts its first job, on the first stamped request
+released to it, and builds the copy station's `TransferModel` then. Every member has
+published by that time: an engine plans its pool before it builds its scheduler and the
+lmcache client in it (`engine_core.py::EngineCore.__init__`), and the API server sends no
+request until every DP rank is ready (`CoreManager._wait_for_all_ready_signals`). Until
+then the stand-in answers the unstamped startup frames, which need no bytes, over an
+empty index. It reads every member's file under `_planned_transfer`'s wait and refuses,
+by name, a member that published none within `PLANNED_BLOCK_WAIT_S` and members that plan
+different blocks or images. The publication's P/D refusals
+(`_refuse_kda_regions_across_stages`, `_refuse_fp4_indexer_regions`) stay with a P/D side.
+
+No run file states either value or a writer count (*Channels*). `_launch_lmcache` still
+refuses before the start what needs no plan: a deployment and a run file that disagree on
+whether LP `lmcache` runs, the decode side, an entry without `server`, `lookup_s` or
+`request_s`, a server flag the stand-in does not model, a chunk size that is not a
+multiple of `kv_cache_block_size`, as ATOM's workers refuse it, and an entry that states
+`writers` or `state_bytes`, which nothing reads any more. `compass advice` writes the
+entry it writes today, the server's flags and the request loop's declared laws
+(`advice/check.py::_lmcache`); `scripts/compass/parity_one_node.sh` writes the same entry,
+with no image read from the real run's log.
+
+#3641 builds the sizing: the image published where saves carry one and the block file of
+an `lmcache_mp` deployment, the plan read shared with `_planned_transfer`, LP `lmcache`
+started with the block's tokens and no size, the chunk-size check at launch, and the
+shell's image check dropped (`runner/overrides.py`, `run/__init__.py`,
+`kv/lmcache_server.py`, `kv/lmcache_mp.py`). #3674 builds the channels and the retired
+keys: one transfer channel per DP rank, the writer check dropped and both keys refused
+(`clock/channels.py`, `kv/lmcache_mp.py`, `run/__init__.py`,
+`scripts/compass/parity_one_node.sh`).
+
+**Scenarios** (#3687). #3641's exit, an S5 point of `19` D116 starting under a step stub:
+
+```text
+DeepSeek-V4-Pro, DP attention over 8 ranks, --chunk-size 256 --separate-object-groups
+
+frontend                 engine.dp0 ... engine.dp7          LP lmcache
+_launch_lmcache:
+  flags, laws, no
+  writers/state_bytes;
+  256 % block 256 == 0
+  start LP lmcache(256) ----------------------------------> bind the URL, serve
+                         EngineCore.__init__, each member:
+                           get_num_blocks: rank 0 writes
+                           now-engine.dpN.kv_block
+                           {block_bytes, image_bytes}
+                           Scheduler, shell, client
+                           GET_CHUNK_SIZE, unstamped -----> 256, at once
+                         READY from all 8: API server up
+request                  LOOKUP on lookup#dpN ----------> first job: read the 8
+                                                            files, all alike; chunk
+                                                            = block x 256 / 256;
+                                                            build the copy station
+                         STORE on transfer#dpN ---------> copy: KV chunks and image
+                                                            on host_link, ends at t_c
+                         process_completions <----------- reply at t_c + lmcache_ipc_s
+```
+
+#3674's exit, a `compass advice` point at TP8 without DP attention whose pages are
+sharded, so every TP rank writes (an MLA model collapses to one writer):
+
+```text
+compass advice   entry: server flags, lookup_s, request_s
+compass run      run file: data_parallel_size 1 and the entry as written
+channel table    lookup#dp0, transfer#dp0: no writer count
+_launch_lmcache  no writer check; starts LP lmcache
+
+engine, its shell on the step loop               LP lmcache
+build_connector_meta, one step:
+  rank 0 STORE, worker_id 0 --+
+  rank 1 STORE, worker_id 1 --+  transfer#dp0,
+  ...                         +- 8 seqs, one ---> copy queue in (arrival, channel,
+  rank 7 STORE, worker_id 7 --+  DEALER, one       seq) order: ranks 0 to 7;
+                                 instant           objects keyed by worker_id
+process_completions <---------- 8 replies on ---- each at its copy's end, routed
+  finished_saving once all 8    transfer#dp0      to the DEALER's identity
+```
 
 **Fake-model duties.**
 
@@ -2248,8 +2466,9 @@ PCP, DP across hosts, `engine_driven`, more than one server) stand as they are. 
 stand-in refuses a server flag or request type it does not model, by name, and the shell
 refuses a server URL that `RequestClientFactory` hands to gRPC (`grpc://`,
 `grpc+unix://`), a carrier with no wrapped socket, by its scheme. A `multi`
-connector runs only when each sub-connector is simulated (`compass` and `lmcache_mp`);
-`ATOM_KV_OFFLOAD=lmcache` (in-process, no server) and `mooncake_store` stay refused.
+connector runs only when each sub-connector is simulated (`compass`, `lmcache_mp`, and
+`lmcache_offload`, which `ATOM_KV_OFFLOAD=lmcache` selects, by `03` D13.1);
+`mooncake_store` is D6.2's, on `dsv41/dev`.
 
 **Acceptance**, per #1076's ruling:
 
@@ -2279,6 +2498,461 @@ connector runs only when each sub-connector is simulated (`compass` and `lmcache
 - *The real server under Compass*: README principle 2.
 - *Refusing a blocking lookup above DP width 1* (#1162 option (b)): it refuses the
   recipe, whose prefill runs at DP8.
+- *A `KvGeometry` case per cache layout* (#3641): a second copy of the pool plan's
+  arithmetic, which DeepSeek-V4's compressed and indexer planes would need first.
+- *The run file states the image and the writer count* (#1427, #1281): nothing
+  `compass advice` reads states the image before a start, and the writer count would have
+  every run-file builder resolve ATOM's config to run `_tp_replication_factor`, a value
+  `_launch_lmcache` re-derives to check.
+- *LP `lmcache` takes the writer count `_launch_lmcache` computes* (#3674's plan): the
+  authority and the engines would keep the per-writer table they build from the run file.
+
+---
+
+## D6.2. KV offload to a shared Mooncake Store: the master an LP of its own
+
+Owner rulings on [#3762](https://github.com/jgong5/ATOM/issues/3762), 2026-11-19:
+[option (b)](https://github.com/jgong5/ATOM/issues/3762#issuecomment-7002648960), and
+[the renewal, the master's flags, no six-requester check, the branches and the calibration
+hardware](https://github.com/jgong5/ATOM/issues/3762#issuecomment-7002761844). The text is
+this branch's; the code lands on `dsv41/dev`, the only branch with the Store's asynchronous
+lookup (`kv_transfer/offload/mooncake_store/async_lookup.py`), `offload/tier.py` and
+`model_engine/dp_routing/`. Code below is read there unless it names this branch.
+
+### Problem
+
+ROCm/ATOM's [6P16D C1228 share-cache recipe](https://github.com/ROCm/ATOM/blob/lirzhang/recipe-6p16d-c1228-share-cache-20261117/recipes/DeepSeek-V4.1-6P16D-C1228-Share-Cache.md)
+runs DeepSeek-V4.1-Flash as three prefill instances of two DP ranks
+(`-tp 2 --enable-dp-attention`) and four decode instances behind atomesh `--dp-aware`.
+Each prefill's `kv_transfer_config` is a `multi` of Mooncake's producer and the
+`mooncake_store` offload connector, and all six prefill ranks share one Mooncake Store:
+one master, and owners whose mounted bytes are 1690069630976. Each rank puts and gets one
+object per 256-token chunk straight between HBM and the owners, and its scheduler asks the
+master over tcp which objects exist (`mooncake_store/scheduler.py::_StoreLookup`). A chunk
+any rank saved is a hit for every rank, and `--dp-load-balance share_cache` needs such a
+tier (`engine_core_mgr.py::CoreManager._build_prefix_router` refuses it unless
+`KVConnectorFactory.offload_tier(config).loads`). The master's index, leases and eviction
+decide what every rank is told. `NonAllocatingRunner.allocate_kv_cache` refuses the
+connector on both branches.
+
+### Decision
+
+**One LP, `mooncake_store`, plays the master; each rank's puts and gets are priced on its
+own lanes in its engine; ATOM's scheduler half runs as real code.** The master's state
+decides what every engine sharing it is told, D7's test for an LP, as LP `lmcache`'s does
+(D6.1, #1087). Its requesters reach it through Mooncake's C++ client, which no wrapped
+socket can carry, and its owners copy through the device (README principle 2), so a
+stand-in plays it.
+
+**Real, unchanged.**
+
+- `mooncake_store/scheduler.py::MooncakeStoreOffloadScheduler` on
+  `chunked_scheduler.py::ChunkedOffloadSchedulerBase`: the save frontier, load decisions,
+  `min_load_tokens`, early block release and exact completions; `AsyncStoreLookup`'s
+  bookkeeping and `_StoreLookup`'s hit arithmetic (the shortest present run over ranks,
+  the taint key, a key no pool answered as `None`); the early tier loads
+  (`Scheduler._early_load_tier_prefixes` through `lookup_ready`) and the chunk-floor
+  lowering (`BlockManager.lower_hit_to_chunk`).
+- `offload/tier.py::OffloadTierProfile` and the `share_cache` router.
+  `KVConnectorFactory.offload_tier` reads the registry's `shared_tier`, `chunk_tokens`
+  and `lowers_hbm_hit_to_chunk`, which the substitution leaves alone: it rewrites only an
+  entry's modules and classes, as `kv/lmcache_offload.py::substitute` does.
+- The Store's HBM reserve in the KV budget,
+  `mooncake_store/worker.py::MooncakeStoreOffloadConnector.kv_budget_reserve_bytes`: the
+  save and load pools, 2 MiB to align them and one staging bound per copy and load worker,
+  2434 MiB a rank at the recipe's pools and workers. `ModelRunner.get_num_blocks` reads
+  it from the registry's worker class (`KVConnectorFactory.kv_budget_reserve_bytes`) in
+  the runner process, which substitutes only later, at `allocate_kv_cache` (`03` D13,
+  D14).
+
+**Simulated**, as `03` D13.1 substitutes `lmcache_offload`: the factory builds a Compass
+shell around ATOM's scheduler half, and the worker is `compass`'s null connector. Inside
+the `multi`, the composite's scheduler half is D6.1's (`kv/lmcache_mp.py::MultiShell`).
+The shell builds the scheduler half under `runner/overrides.py::simulated_arch`, so the
+Store's namespace (`mooncake_store/keys.py::kv_storage_formats`, aiter's `get_gfx`)
+names the run's device, not the host's.
+
+**The master.** LP `mooncake_store` holds objects keyed as ATOM keys them
+(`{namespace}/w{rank}of{world}/{digest}`), each in its chunk's group
+(`keys.py::chunk_group_id`), and the used bytes against the owners' mounted capacity.
+An object's bytes come from the plan each prefill member publishes, as LP `lmcache`
+sizes a chunk (D6.1, *Sizing*): the planned block's bytes times `chunk_tokens` over
+`kv_cache_block_size`, which is what each worker puts
+(`_block_gpu_connector.py::BlockGPUConnector.gpu_staging_chunk_bytes` over
+`page_codec.py::pure_page_codec`'s `block_regions`). It follows the master at the Mooncake
+commit ATOM's image pins (`docker/atom_release.dockerfile`,
+[`206d634`](https://github.com/kvcache-ai/Mooncake/tree/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store),
+which keeps v0.3.14's rules below):
+
+- **Leases.** A group's members share one lease, a deadline that only grows. An
+  existence query grants each present key's group `--default_kv_lease_ttl` from the
+  query ([`MasterService::ReadExistence`](https://github.com/kvcache-ai/Mooncake/blob/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store/src/master_service.cpp)),
+  a published object's lease starts at its publication (`PutEnd`'s zero-length grant),
+  and a put of a key the Store holds is a read of it (`PutStart`).
+- **Eviction**, `MasterService::EvictionThreadFunc` every 10 ms
+  (`master_service.h::kEvictionThreadSleepMs`): while used bytes over capacity exceed
+  `--eviction_high_watermark_ratio`, a round evicts
+  `ceil(filed x max(eviction_ratio, used_ratio - mark + eviction_ratio))` objects, `filed`
+  the objects filed when it starts
+  ([`Evictor::Aim::Met`](https://github.com/kvcache-ai/Mooncake/blob/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store/src/eviction/evictor.cpp)).
+  It walks groups as
+  [`LeaseEvictionIndex`](https://github.com/kvcache-ai/Mooncake/blob/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store/include/metadata/lease_eviction_index.h)
+  files them: by the deadline a group's last write saw, in 100 ms buckets, in filing order
+  within one, up to the bucket holding now; a group a read extended is filed again at its
+  deadline when the walk reaches it. A group leaves whole
+  ([`replica.h`](https://github.com/kvcache-ai/Mooncake/blob/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store/include/replica.h),
+  `group_ids`), and one whose lease has not run out is skipped (`Evictor::Pass::Judge`).
+  ATOM puts data with one replica and no soft pin (`client.py::_new_replicate_config`),
+  so the round's second pass, over soft-pinned objects, never runs.
+- **Ticks** are daemon deadlines (`t_daemon`, #533): they change later hits but keep no
+  run alive. While used bytes are above the mark, the next tick is the first 10 ms
+  boundary of the LP clock at or after the earliest deadline among filed groups; a tick
+  that would evict nothing is not run.
+- **Service.** One station `--rpc_thread_num` wide, the master's handler threads
+  ([`master.cpp`](https://github.com/kvcache-ai/Mooncake/blob/206d6340a8b578f44519ccef90bdbfe8483d0231/mooncake-store/src/master.cpp):
+  as many as `--rpc_thread_num` unless `--handler_worker_thread_num` sets them;
+  `pd_server_atom.sh` starts the master with 32; an entry without it is refused, below):
+  a lookup or renewal is busy on it for `lookup_s`'s per-key term. A put takes
+  no station time; its master calls are inside `store_s`. The loop is LP `lmcache`'s,
+  factored out of `kv/lmcache_server.py::LMCacheLP` (settling, release in (arrival,
+  channel, seq) order, jobs on stations of stated widths, NER with `t` the next job end
+  and `t_daemon` the next tick), a server class supplying decoding, pricing, routing and
+  ticks; LP `lmcache` serves on it unchanged.
+
+**Channels.** Mooncake's master is reached over coro_rpc from C++, so the frames are
+Compass's, on a socket the shell opens per channel, as D6.1's transfer DEALERs are.
+`P<i>` is the prefill instance as `clock/channels.py::prefill_decode_table` names it,
+`N` its DP rank.
+
+| Channel | Sender (K-class) | Receiver (mode, K-class) | Lookahead |
+|---|---|---|---|
+| `engine-P<i>->mooncake_store:lookup#dpN` | step loop, at a query's submit or a renewal (K4); an offer from the input thread is stamped by the owner (below) | LP loop (inline, K5) | `store_rpc_s` |
+| `mooncake_store->engine-P<i>:lookup#dpN` | LP loop, at the job's end (K4) | step loop (inline, K5), at its next poll of the query or in the renewal's wait | `store_rpc_s` |
+| `engine-P<i>->mooncake_store:transfer#dpN` | step loop, as the shell queues a save; every rank of DP rank `N` in rank order, one channel per DP rank as #3687 set for LP `lmcache` (K4) | LP loop (inline, K5) | `store_rpc_s` |
+
+`store_rpc_s` is half of `lookup_s`'s fixed term, so a lookup's cycle, two hops and the
+station's per-key time, is the fitted `lookup_s`; the entry refuses a fixed term that is
+not positive. The lookup client is tcp to the master whatever
+`mooncake_store.protocol` says (`mooncake_store/config.py`), and `lookup_s` times that
+call (below). The recipe runs 17 LPs: traffic, router, seven frontends, seven engines and
+`mooncake_store` (`15` D93).
+
+**Lookups.** The shell replaces `AsyncStoreLookup`'s query and renew threads and each
+pool's Store client. A query is sent when `AsyncStoreLookup.submit` or `submit_if` is
+called; `AsyncStoreLookup.lookup` never blocks, so the step loop's next poll of the
+query (`pump`, `is_pending`, `poll`, `answered`, `lookup`) takes a released reply, runs
+`_StoreLookup.lookup` there over a stand-in client whose `exists` returns the reply's
+answer per key, and sets the query's future. The LP answers `batch_is_exist` as the
+master does: present or absent per key, the taint key absent, each present key's group
+leased. It reproduces `async_lookup.py::_BackendSlot`, one call at a time per scheduler:
+a channel's query `k` starts at `max(arrival_k, end_(k-1) + 2 x store_rpc_s)`, when the
+real client would have sent it after the previous reply, plus the hop; a renewal goes
+ahead of the channel's queued queries, behind the one in flight. Each reply carries its
+start and its groups' lease deadline. The query thread's body,
+`AsyncStoreLookup._query`, which stamps `asked_at` on a real run, does not run: the
+shell writes the query's `asked_at`, which `query_started` returns, as the reply's start
+less `store_rpc_s`, when the real client sent it, as it takes the reply.
+
+**Renewal.** `MooncakeStoreOffloadScheduler._ensure_lookup_pin` renews a hit more than
+1 s old (`_LOOKUP_REUSE_S`) right before the load is dispatched, waiting in
+`AsyncStoreLookup.renew` on `future.result(timeout=RENEW_TIMEOUT_S)`, 1 s. That wait is
+a request and reply on the lookup channel and an idle point,
+`next_event(+inf, now + RENEW_TIMEOUT_S)`, its bound a daemon deadline, as D6.1's blocking
+lookup is; a renewal while one is outstanding returns 0 without a send (`_renewing`), as
+real. In a DP group the waiting member asks NER alone and every member parks before its
+forward: D6.1's park, `run/__init__.py::engine` arming it for `mooncake_store` as for
+`lmcache_mp`.
+
+**Saves.** Each rank's save waits on that rank's save lanes, `OFFLOAD_COPY_WORKERS` wide,
+priced `store_s` as `[fixed, per chunk]` seconds: `kv/lmcache_offload.py::OffloadShell`'s
+lanes, shared (`03` D13.1). When the shell queues a rank's save it sends the put,
+carrying the rank's keys, each chunk's group and the lane's priced start and end. The LP
+takes the bytes at the start and publishes the objects at the end, each no earlier than
+the put's arrival, as Mooncake counts used bytes from `PutStart` and makes an object visible at
+`PutEnd`; a save puts its windows tail first, so the prefix from chunk 0 is usable only
+when the last window lands (offload `README.md`, *Data path*). The put gets no reply. At
+the end ATOM's `_do_save_req` runs over stand-ins for the slot pool, the GPU copy and the
+client (`OffloadShell._run_due`), so its windows, source-safe groups and terminal are
+ATOM's. #3505's rule for a copy's overlap with forwards applies to these lanes once
+ruled.
+
+**Loads.** On the rank's load lanes, `OFFLOAD_LOAD_WORKERS` wide, priced `load_s`. At the
+end ATOM's `_do_load_req` runs over stand-ins, all or nothing
+(`MooncakeStoreOffloadConnector._do_load_req` fails a load on any key short of a chunk),
+its client answering each key as the request's last lookup or renewal reply did. A load
+whose lane starts after that reply's lease deadline is refused by name: whether the
+master still held the objects then is what the get would have asked it.
+
+**Interception sites**, classed as D4 names them:
+
+| Site | Class | Under Compass |
+|---|---|---|
+| `EngineCore._offer_tier_lookups` -> `offer_lookups` -> `AsyncStoreLookup.submit_if`, on the engine's input thread, on every arrival (no flag gates the Store's `offer_lookups`) | K4 from a handler | the shell queues the send; the owner stamps it at the message's arrival once the handler is back at its wait point, before releasing the next message: [#3767](https://github.com/jgong5/ATOM/issues/3767)'s send (*Scenarios*); `atom/utils/clock.py::RelayQueue`: "Only the clock owner puts in the run" |
+| `prefetch_lookups`, `detach_lookup`, `_fresh_tier_lookup` through `AsyncStoreLookup.lookup` | K4 | sent at the submit |
+| a query's future: `pump`, `is_pending`, `poll`, `answered`, `lookup` | K5 | released replies taken at the poll |
+| `AsyncStoreLookup.renew`'s `future.result(timeout=RENEW_TIMEOUT_S)` | K3 | idle point; the park in a DP group |
+| `MooncakeStoreOffloadScheduler._fresh_tier_lookup` (`_looked_up_at`), `_ensure_lookup_pin`'s reuse window | K2 | `clock.now(time.monotonic)` |
+| `_may_emit_save`, `_retry_or_retire_failed_save` (the save pause, set only by a failed save) | K2 | `clock.now(time.monotonic)` |
+| `ChunkedOffloadSchedulerBase.activate_block_leases`, `reclaim_stale_leases` (a save source's age, which `_refresh_save_reclaim_clock` already stamps on `clock.now`), shared with `lmcache_mp` and `lmcache_offload` | K2 | `clock.now(time.monotonic)`; `lookup_would_defer` reads it since #3759 |
+| `_StoreLookup`'s pool pauses and reconnects, `_build_save_request`'s `dispatched_at`, perf counters, stats and warnings, and everything in `worker.py`, `client.py`, `pool.py`, `taint.py` | K9 | the worker is replaced; no simulated call fails |
+
+**Calibration.** No new probe, command or store kind. One run-file entry,
+`mooncake_store`, beside `lmcache_offload`'s, by `compass run --mooncake-store FILE`
+(`13` D80): the laws and matched fields `fit_offload` writes, the master's flags and the
+owners' mounted bytes. On the recipe's cards and NICs, one prefill and one decode
+instance on a live master and owners:
+
+1. `compass measure memory` on the prefill side with the Store on: the readings key
+   carries `kv_offload: ["mooncake_store"]` (`run/memory.py::key_fields`), and the worker
+   probes the Store at start (`_probe_store`).
+2. `scripts/compass/deploy.sh OUT record`, then `compass fit steps` and `compass fit
+   host`, at the recipe's flags with the Store on and no profiling: the P and D laws.
+   Packs and unpacks run on the forward's stream (`worker.py::_pin_in_place_stream`), so
+   the P law's records carry them.
+3. Two more prefill records at `OFFLOAD_PROFILE=1 ATOM_LOG_LEVEL=DEBUG`.
+   `step_linear_fit.py::fit_offload` fits `store_s` and `load_s` on their
+   `[OFFLOAD-SAVE-PROF]` and `[OFFLOAD-LOAD-PROF]` lines with `status=ok`, read with the
+   Store worker's start line (`rank=N world=W:`, `chunk_bytes=`), which its
+   `OFFLOAD_WORKER` pattern misses today; and `lookup_s` on `_StoreLookup.lookup`'s
+   `[OFFLOAD-LOOKUP] ... keys= ... elapsed_ms=` lines, logged only at DEBUG: the
+   `[OFFLOAD-PERF]` `lookup_us` that fits `lmcache_offload`'s is
+   `_fresh_tier_lookup`'s, which for the Store times taking an answered query, not the
+   call. Its report keeps `pack_ms`, `put_ms`, `get_ms` and `unpack_ms`
+   apart, for the overlap #3505 is measuring (#3606). The DEBUG lines stay out of item
+   2's records, so the step law's host terms carry no logging.
+
+**Validation.** One of item 3's records replayed simulated at its flags: the Store's hit
+tokens over prompt tokens, loads, saves, and per-request save and load seconds land
+within the two records' spread (`08` D45). Calibration hardware is open (the ruling,
+`12` T136); GPU time is one memory reading and item 2's and item 3's records, not
+estimated here.
+
+**Refusals.** By Compass, by name:
+
+- `mooncake_store` on a decode side, and prefill pipeline parallelism, which
+  `check_engine_compatibility` does not refuse;
+- `mooncake_store.pools` addressing more than one master
+  (`MooncakeStoreOffloadConfig.store_masters()`), under any DP policy: LP
+  `mooncake_store` plays one master, and ATOM refuses several only when
+  `CoreManager._build_prefix_router` asks `KVConnectorFactory.offload_tier`
+  (`share_cache`, `prefix_spread`); every other policy keeps per-NIC pools on distinct
+  masters;
+- a master flag other than those the entry models (`--default_kv_lease_ttl`,
+  `--eviction_high_watermark_ratio`, `--eviction_ratio`, `--rpc_thread_num`) or accepts
+  as changing nothing a requester is told: `--rpc_port`, `--enable_http_metadata_server`,
+  `--http_metadata_server_host`, `--http_metadata_server_port`, `--metrics_port`,
+  `--client_ttl` (no simulated client dies), and `--allocation_strategy` and
+  `--memory_allocator` (one pool of the owners' summed bytes, used counted at the
+  requested size as `OffsetBufferAllocator::allocate` records it). Soft pins, SSD or DFS
+  offloading, NoF and tenants refuse with the rest;
+- master flags that set no positive `--rpc_thread_num`: the master then runs as many
+  handler threads as the smaller of 16 and its host's cores
+  (`master.cpp::LoadConfigFromCmdline`), a width Compass cannot know;
+- a deployment whose `mooncake_store.protocol`, `chunk_tokens`, pool sizes, copy and load
+  workers, world or chunk bytes differ from the entry's: the laws are fitted there, the
+  requester pools and windows not modelled apart;
+- a put the capacity left cannot hold, which Mooncake fails at once
+  (`AllocateReplicas`: `NO_AVAILABLE_HANDLE`) and ATOM answers with its failed-save path;
+- a load whose lane starts after its lease (*Loads*).
+
+ATOM refuses by itself DCP above 1, other layouts and a chunk off the block
+(`mooncake_store/config.py::check_engine_compatibility`).
+
+**Not modelled**: `12` T135 lists it.
+
+### Scenarios
+
+**A prefix one instance saved loads on another** (code task 5's exit). `r` is
+`store_rpc_s`:
+
+```text
+engine-P0.dp1 (step loop)        LP mooncake_store               engine-P2.dp0 (step loop)
+build_connector_meta: save of
+chunks 0-3 on a save lane,
+start s, end e
+put{keys, groups, s, e} -------> transfer#dp1, at t+r
+                                 at s: take 4 objects' bytes
+                                 at e: publish; leases to e
+                                                                 prefetch_lookups:
+                                                                 AsyncStoreLookup.submit
+                                 lookup#dp0, at u+r <----------- query{chunks 0-3}
+                                 slot free; station: 4 keys
+                                 all present; leases to v+ttl
+                                 reply at v --------------------> next poll at v+r:
+                                                                 _StoreLookup.lookup over the
+                                                                 reply: hit 1024 tokens
+                                                                 schedule: load on a load lane,
+                                                                 start l < v+ttl, end m
+                                                                 at m: _do_load_req, all keys
+                                                                 present: finished_loading
+```
+
+**A stale hit renewed inside a DP group:**
+
+```text
+engine-P0: dp0, dp1 (one LP)                             LP mooncake_store
+both pass _sync_dp_state and schedule
+dp0's build_connector_meta dispatches a load whose lookup is 1.4 s old:
+  _ensure_lookup_pin -> renew on lookup#dp0 -----------> ahead of dp0's queued queries,
+  wait: next_event(+inf, now + 1 s), NER alone             behind its call in flight;
+dp1 parks before its forward                               leases to t_c + ttl
+                                                         reply at t_c
+grant reaches t_c + r: reply released <-----------------
+dp0: renew returns; load queued on a load lane; parks
+release: both leave at dp0's now; the forwards run
+```
+
+**An eviction round:**
+
+```text
+LP mooncake_store: mark 0.90, eviction_ratio 0.05, ttl 10 s
+
+a publish takes used/capacity to 0.91
+next tick: first 10 ms boundary >= earliest filed deadline   (daemon deadline)
+tick at t1: target max(0.05, 0.91 - 0.90 + 0.05) = 0.06; goal ceil(0.06 x filed)
+  walk buckets of 100 ms up to t1's:
+    group A, deadline t1 - 30 s, lease out   -> evicted whole
+    group B, a lookup leased it to t1 + 4 s  -> skipped
+    ...                                       until the goal's objects are gone
+used/capacity 0.85: no tick until a publish takes it over the mark
+a later lookup of A's keys: absent; the hit ends before A's chunk
+```
+
+**Calibration and validation:**
+
+```text
+recipe's cards, one P and one D instance, a live master and owners (hardware open)
+(1) compass measure memory, P side, Store on   -> memory_readings, kv_offload [mooncake_store]
+(2) deploy.sh OUT record; compass fit steps;   -> P and D step laws, host laws
+    compass fit host; Store on, no profiling
+(3) two P records, OFFLOAD_PROFILE=1,          -> fit_offload: store_s, load_s, lookup_s,
+    ATOM_LOG_LEVEL=DEBUG                          chunk_tokens, world, chunk_bytes
+                                               -> entry: + master flags, owners' bytes
+compass run --mooncake-store ENTRY ..., record 3a's workload and flags
+    -> Store hit tokens / prompt tokens, loads, saves, per-request save and load
+       seconds, each within records 3a and 3b's spread
+```
+
+**An arrival's lookup offered from the input thread** (#3767's send). `a` is the ADD's
+arrival at `engine-P0`, `r` is `store_rpc_s`:
+
+```text
+engine-P0 input thread          engine-P0 step loop (clock owner)      LP mooncake_store
+                                in a forward's advance_to or at its
+                                idle point, a grant releases ADD at a;
+                                waits for the input thread
+input_queue.put_nowait(reqs)
+_offer_tier_lookups -> offer_lookups
+  -> submit_if: WAITING holds;
+  the shell queues query{seq}
+back at its wait point -------> handled: stamp the queued send at a,
+                                arrival a+r, before the next release
+                                query{chunks 0-3} -------------------> lookup#dp0, at a+r
+                                                                       slot free; station
+                                                                       reply at v, start a+r
+                                next poll at v+r or later: <---------
+                                _StoreLookup.lookup over the reply;
+                                asked_at = a
+```
+
+**The C1228 run** (the named result):
+
+```text
+deploy.sh on dsv41/dev (#3769): three --prefill sides (-tp 2 --enable-dp-attention,
+  multi: mooncake producer + mooncake_store) and four --decode sides
+  (-tp 4 --enable-dp-attention), --mooncake-store ENTRY
+frontend-P0 (compass_instance 0) starts LP mooncake_store; frontend-P1 and -P2 start none
+pd_sim.sh: 17 LPs
+  traffic -> router (--dp-aware cache_aware) -> frontend-P0..P2 -> engine-P0..P2 (dp0, dp1)
+                                             -> frontend-D0..D3 -> engine-D0..D3 (dp0..dp3)
+  engine-P<i> <-> mooncake_store: lookup#dp0, lookup#dp1 both ways; transfer#dp0, #dp1
+every request names its DP rank (--dp-aware), so share_cache only accounts
+-> TTFT p50 and p99, ITL p50, output throughput; the LP's lookups, hit chunks, loads of
+   another instance's saves, evicted objects and renewals
+```
+
+### Simpler alternative
+
+#3762's option (a): an index in each rank's engine process, as `lmcache_offload`'s tier
+(`03` D13.1), about 520 code lines against this design's 830. No rank would load another's
+saves, which `share_cache` and the recipe exist for; the owner ruled (b). Within (b), the
+simplest is a master without eviction that refuses a run once its Store reaches the mark:
+the ruled option holds the master's eviction, and whether the recipe's Store reaches 90%
+at C1228 is what the run would tell, not something known before it.
+
+### Low confidence
+
+None.
+
+### Dependencies
+
+No spike. No sync issue: the code lands on `dsv41/dev`, which carries what the Store
+needs. The code tasks depend on [#3767](https://github.com/jgong5/ATOM/issues/3767) (a
+handler's send stamped by the owner; refusing `lmcache_mp`'s `OFFLOAD_MP_LOOKUP_THREAD`
+would not serve the Store, whose offers no flag gates),
+[#2665](https://github.com/jgong5/ATOM/issues/2665) (xPyD priced end to end),
+[#3417](https://github.com/jgong5/ATOM/issues/3417) (which command writes the offload
+entry), [#3505](https://github.com/jgong5/ATOM/issues/3505) (a copy's overlap with
+forwards, which [#3606](https://github.com/jgong5/ATOM/issues/3606) measures), and the P and
+D step laws of calibration item 2. [#3759](https://github.com/jgong5/ATOM/issues/3759)
+closed with `share_cache` in a simulated DP2 run over `lmcache_mp`, and #3769 runs several
+instances through `deploy.sh`, both on `dsv41/dev`.
+
+### Summary
+
+The deliverable is LP `mooncake_store` and the `mooncake_store` shell on `dsv41/dev`, so
+the recipe's prefill side runs simulated at any DP width and several instances sharing
+one Store. Out of scope: the decode side, PP, several masters, failures, the taint
+marker, contention at the owners, fragmentation. Code tasks, after this text lands:
+
+1. **LP and master index** (`kv/lmcache_server.py`'s loop factored, a new
+   `kv/mooncake_store_server.py`, `clock/channels.py`, `run/__init__.py`,
+   `drive/runfile.py`), about 380 lines. Started from `run/__init__.py::frontend`, as
+   `_launch_lmcache` is, by prefill instance 0's frontend alone (`compass_instance` 0,
+   or the one prefill deployment); every other frontend checks its deployment against the
+   entry and starts none. Its channels from `channel_table`. CPU tests: a lease keeps a
+   group through a round; groups leave whole; the round's count at the mark; no tick
+   below it, and none that would evict nothing; an unplaceable put refused; two queries
+   on one channel serialize and a renewal passes a queued one; each refusal by name; the
+   channel table for three instances at DP2.
+2. **Shell** (a new `kv/mooncake_store.py`, lanes shared with `kv/lmcache_offload.py`,
+   `runner/overrides.py`, the park's condition in `run/__init__.py`, and the K2 lines
+   above in `mooncake_store/scheduler.py`, `async_lookup.py` and `chunked_scheduler.py`),
+   about 330. Built from `NonAllocatingRunner.allocate_kv_cache` and
+   `run/__init__.py::engine`, as `lmcache_offload`'s is.
+3. **The input thread's offers**: #3767, whose brief requires the owner-stamped send.
+4. **`fit_offload` reads the Store's lines**, about 60, recorded lines its test; reached
+   from `step_linear_fit.py::offload_main` until #3417 names its command.
+5. **Scenario under the step stub** [GPU gate]: two prefill instances at DP2 and one
+   decode on one LP `mooncake_store`, `share_cache` on, a small capacity: a prefix one
+   instance saved loads on the other, `check_run` passes, a seed pair gives byte-identical
+   step tables, an eviction round runs, and the simulated KV budget holds the real
+   reserve.
+6. **Calibration and validation** [GPU], then the C1228 run through `deploy.sh`.
+
+Acceptance: the C1228 run's TTFT p50 and p99, ITL p50 and output throughput; the Store's
+lookups, hit chunks, loads across instances, evicted objects and renewals; the
+validation's table.
+
+### Not chosen
+
+- *An index per rank* (#3762 option (a)): no rank loads another's saves.
+- *The LP prices the copies* (option (c)): about 150 more lines, and the lanes leave the
+  engine, where #3505 settles a copy's overlap with forwards.
+- *A one-way renewal charging nothing*: leaves out a master round trip per stale load
+  dispatch on every DP rank.
+- *lmcache's index, parametrized*: its LRU order, read locks and sessions are not the
+  master's leases and eviction order.
+- *One FIFO server for the master, as LP `lmcache`'s request loop*: it serializes lookups
+  the master serves on `--rpc_thread_num` threads.
+- *A tick every 10 ms while above the mark*: the same evictions, and a hundred CA rounds
+  per simulated second with nothing to evict.
+- *A put reply and ATOM's failed-save path*: one more channel for a full Store, refused
+  instead.
+- *A get request to the LP at each load*: a round trip per load to cover only a lane
+  queued past its lease.
+- *One set of records for the step law and the offload laws*: the DEBUG lookup lines
+  would sit in the step law's host terms, unmeasured.
 
 ---
 
@@ -2560,7 +3234,8 @@ Every item is additive at an existing site; no process and no thread is removed 
    grant, and walking pending arrivals in order. **~550**
 2. **Clock-read substitution** at the K2 and K7 sites of D4 and D5, including the
    `_last_refresh` stamp in `AtomMetricsExporter.update`
-   (`atom/metrics/exporter.py`, `11` D72). take2 did four in `scheduler.py`.
+   (`atom/metrics/exporter.py`, `11` D72), and the Store's scheduler half's (D6.2).
+   take2 did four in `scheduler.py`.
    **~30**
 3. **TAR and NER hooks.** `EngineCore._process_engine_step_inner` calls
    `advance_to(now + predicted)` after the forward; take2's `_advance_clock_for` is
@@ -2685,7 +3360,7 @@ Ordered by how much they could cost.
 | D0 | Fresh design; prior branches referenced at the design level only, not as a code-port plan | 2026-09-17 |
 | D1 | Keep ATOM's multi-process / multi-thread topology; additive changes only | 2026-09-17 |
 | D2 | "Two nodes" means true PD disaggregation, realised as two containers on one physical node | 2026-09-17 |
-| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP only after every rank has called; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares | 2026-09-18; revised 2026-09-28, 2026-10-02 and 2026-10-14 (#966) |
+| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP a round only after every rank has asked it or, under local grants below a ceiling, owes it; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares | 2026-09-18; revised 2026-09-28, 2026-10-02, 2026-10-14 (#966), 2026-11-08 (#2820) and 2026-11-09 (#2993) |
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
 | D3.2 | Always-on causality detectors: a straggler check against the receiver's last drain (fails the run); a stall the CA cannot see prints one diagnostic after 30 wall seconds and keeps waiting, never aborting; clock-source CI lint | 2026-09-19; revised 2026-09-28 |
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for multi-container runs (1P+1D in M1 and M2) | 2026-09-19 |
@@ -2694,8 +3369,9 @@ Ordered by how much they could cost.
 | D4 | Every synchronization site maps to one of the PDES mechanisms K1-K9, none undecided; the boundary is the LP, not the process; a DP member's step is one TAR at its own release from the group's device end, the `max` over ranks by an `all_reduce(MAX)` (with no host time, an output rank's at the `max` of the step seconds), exchanged inside the forward by K6 waits with no cost, and the lockstep `all_reduce` is K1 for its own cost; handler threads stay and TSO delivery runs them at their message's timestamp. A forward's K1 charge is one recurrence per runner over the backend's device busy time and host segments (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs` after R1), with wait rules R1, R4 and R6 to R8; after the return the engine LP advances the host's `out_s` (`E_out`) to its input pull, a DP member's pull joining the group rounds; `host.skip` makes a what-if; ATOM's bugs, its sync stalls included, are fixed in ATOM and listed under the `atom-issue` label | 2026-09-18; revised 2026-09-28, 2026-10-01, 2026-10-11 (#815), 2026-10-16 (#829, #1267), 2026-10-18 (#1345), 2026-10-19 (#1409) and 2026-10-21 (#1859) |
 | D5 | Every timer and clock read the CA can reach runs on the LP clock, except the out-of-band control-command reply deadline; only what it cannot reach is configured or left real; metric cadence is virtual time (revising `11` D72); the profiler and RL control commands are refused by the simulated runner with a reply, counted, and make the run a coverage report; a synchronous command from the frontend's clock owner is refused by the frontend | 2026-09-18; revised 2026-09-28, 2026-10-09, 2026-10-14, 2026-10-15 |
 | D5.1 | The simulated run uses stdlib asyncio, not uvloop: only a Python event loop can host virtual time | 2026-09-28 |
-| D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only; a rank pair's writes queue on its link | 2026-09-18; revised 2026-09-28; link sharing 2026-10-16 (#1157); first-write setup 2026-10-16 (#1172) |
-| D6.1 | The lmcache MP server is LP `lmcache`, a Compass stand-in on the real ZMQ channels with a content index and two stations; a store or load completes as a stamped reply that the step loop takes in timestamp order; a blocking lookup is a request and reply whose wait is an idle point; inside a DP group each member parks before its forward, amending member join rules 1, 2 and 5, and the last park releases every member at the group's time | 2026-10-16 (#1087, #1162) |
+| D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only; a rank pair's writes queue on its link | 2026-09-18; revised 2026-09-28; link sharing 2026-10-16 (#1157); first-write setup 2026-10-16 (#1172); per-pair links kept under RDMA 2026-11-09 (#1179) |
+| D6.1 | The lmcache MP server is LP `lmcache`, a Compass stand-in on the real ZMQ channels with a content index and two stations; a store or load completes as a stamped reply that the step loop takes in timestamp order; a blocking lookup is a request and reply whose wait is an idle point; inside a DP group each member parks before its forward, amending member join rules 1, 2 and 5, and the last park releases every member at the group's time; it sizes a chunk and the state image from its deployment's published plan before its first job, and its transfer channels are one per DP rank | 2026-10-16 (#1087, #1162); revised 2026-11-17 (#3687) |
+| D6.2 | A shared Mooncake Store's master is LP `mooncake_store`, a Compass stand-in holding objects, leases and Mooncake's eviction, its loop LP `lmcache`'s factored; each rank's lookups and renewals are requests and replies on its lookup channel, a renewal's wait an idle point with D6.1's park in a DP group; each rank's saves and loads are priced on its own lanes (`03` D13.1), a put sent as the save is queued carrying its priced start and end; ATOM's scheduler half runs as real code; the code is `dsv41/dev`'s | 2026-11-19 (#3762) |
 | D7 | Atomesh gets no virtual clock: mesh-only mode; in 1P1D the router is one segment of a channel, not an LP, and its relay latency is that channel's lookahead; its bounds are configured (health check and circuit breaker off, `--worker-request-timeout-secs` set large); timestamps ride carriers it already relays; under `--dp-aware`, or with several instances per role, the router is LP `router`, handling requests, prefill responses and stream events in timestamp order (#449, #1085) | 2026-09-18; revised 2026-09-30, 2026-10-15, 2026-10-16 |
 | D8 | Arrivals are messages in transit, covered by the send and receive counts for closed and open workloads alike; the arrival timestamp rides the `tracestate` header | 2026-09-18; revised 2026-09-28 |
 | D9 | The ATOM diff is enumerated (~1,980 lines with tests) and completeness enforced by test rather than by review; ATOM's own suite is the gate (`08` D43.1) | 2026-09-18; revised 2026-09-28 |

@@ -29,9 +29,7 @@ FRAMES = ["data: a\n\n", "event: x\ndata: b\n\n", "data: c\n\ndata: [DONE]\n\n"]
 
 
 def _runtime(now, *, in_run=True):
-    table = single_engine_table(
-        admission_path="serving", ipc_s=0.001, stream_s=STREAM_S
-    )
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=STREAM_S)
     rt = LPRuntime(LpId("frontend"), table, conn=None)
     rt.now = now
     if in_run:
@@ -211,7 +209,7 @@ class TestTheStreamWriter:
         self, installed
     ):
         table = prefill_decode_table(
-            admission_path="serving",
+            admission_s=0.54e-3,
             ipc_s=0.001,
             stream_s=STREAM_S,
             router_s=0.004,

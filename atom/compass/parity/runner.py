@@ -9,7 +9,12 @@ import time
 
 import torch
 
-from atom.compass.parity import StepRecording, key_memory_formats_by_name, record_step
+from atom.compass.parity import (
+    StepRecording,
+    blocked,
+    key_memory_formats_by_name,
+    record_step,
+)
 from atom.compass.run import host_key
 from atom.model_engine.model_runner import ModelRunner, RapidServeModelRunner
 
@@ -17,12 +22,14 @@ key_memory_formats_by_name()
 
 
 class _Recording(StepRecording):
-    """`StepRecording` on this worker's clocks, with the host key read at startup."""
+    """`StepRecording` on this worker's clocks, with the host key read at
+    startup, and the blocking-call tool where HIP's initialization loaded it."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Read once at startup, so no forward pays for it.
         self.host_key = host_key(self.config)
+        self._blocked = blocked.loaded()
 
     @staticmethod
     def step_clock_ns() -> int:
@@ -30,9 +37,12 @@ class _Recording(StepRecording):
         return time.monotonic_ns()
 
     @staticmethod
-    def device_event() -> torch.cuda.Event:
-        """A timing event recorded on the current stream: a real step's device stamps."""
-        event = torch.cuda.Event(enable_timing=True)
+    def device_event(event=None) -> torch.cuda.Event:
+        """`event`, or a new timing event, recorded on the current stream: a
+        real step's device stamps. torch creates a new event's device handle at
+        its first record."""
+        if event is None:
+            event = torch.cuda.Event(enable_timing=True)
         event.record()
         return event
 
