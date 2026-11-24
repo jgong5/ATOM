@@ -1171,8 +1171,9 @@ the DP and EP widths when set, the phase, the mode, and whether the step produce
 output. The structure keys no level, by the [ruling on #3052](https://github.com/jgong5/ATOM/issues/3052#issuecomment-6942839264):
 every trace runs eager at level 0 and serves a run at any level (D23). That engine config holds the KV block size and dtype, the quantization's hash,
 the parallel layout, TBO, speculation when it is on, `moe_backend`,
-`moe_all2all_backend`, `eplb_enable` and `enable_decoder_swa_bounded_replay` when
-they are off ATOM's default, the `index_cache_dtype` ATOM resolved where it differs
+`moe_all2all_backend`, `eplb_enable`, `enable_decoder_swa_bounded_replay` and the
+Ulysses `sequence_parallel_size` when they are off ATOM's default, the
+`index_cache_dtype` ATOM resolved where it differs
 from `kv_cache_dtype` (the [ruling on #2981](https://github.com/jgong5/ATOM/issues/2981)),
 whether `mori` imports where it does not, MiniMax-M3's indexer-only context
 parallelism (`dcp_config.indexer_dcp_only`) when it is on, `--hf-overrides` when it
@@ -1182,10 +1183,12 @@ variables and the device selection; ATOM's Triton expert and GEMM switches
 (`ATOM_USE_TRITON_MOE`, `ATOM_USE_TRITON_MOE_A4W4`, `ATOM_USE_TRITON_MOE_DECODE`,
 `ATOM_USE_TRITON_GEMM`) are in it, and ATOM's prefill token buckets
 (`ATOM_TOKEN_GRAPH_SIZES`), vocabulary-embedding replication
-(`ATOM_REPLICATE_VOCAB_EMBED`), `ATOM_FUSE_SHARED_EXPERT`, `ATOM_DISABLE_MORI_EP` and
-`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4` only when ATOM reads them off their default.
-The last three, with the all-to-all backend and `mori`, decide whether a MoE fuses
-its shared expert into aiter's top-k table, which changes its graph ([#3333](https://github.com/jgong5/ATOM/issues/3333)). One store holds V4-Pro graphs of one shape that
+(`ATOM_REPLICATE_VOCAB_EMBED`), `ATOM_FUSE_SHARED_EXPERT`, `ATOM_DISABLE_MORI_EP`,
+`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4` and `ATOM_V4_UNIFIED_MQA` only when ATOM reads
+them off their default. Three of them, with the all-to-all backend and `mori`, decide
+whether a MoE fuses its shared expert into aiter's top-k table, which changes its graph ([#3333](https://github.com/jgong5/ATOM/issues/3333));
+`ATOM_V4_UNIFIED_MQA` picks DeepSeek-V4's and V4.1's FP4 index scorer on gfx950, and with it
+the index cache's layout ATOM hashes (`Config.index_cache_layout`). One store holds V4-Pro graphs of one shape that
 differ only in `kv_cache_dtype`, only in `ATOM_USE_TRITON_MOE`, or only in the index
 cache dtype ATOM resolves for a P/D side and for a plain start at gfx950
 (`atom/config.py::Config.__post_init__`), and each run reads its own.

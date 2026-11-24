@@ -44,6 +44,16 @@ RENDEZVOUS = "where the DP group meets: picks no kernel"
 LEFT_OUT = {
     "max_model_len": BOUND,
     "max_num_seqs": BOUND,
+    "max_num_batched_tokens": BOUND,
+    "index_cache_layout": (
+        "resolved from the index cache's dtype, which `keyed` names, the model's "
+        "config.json, the arch the law's device names, and ATOM_V4_UNIFIED_MQA, "
+        "which `keyed` names off its default"
+    ),
+    "speculative_config.draft_kv_dtype": (
+        "resolved from the KV cache's dtype, the speculative method and the "
+        "draft's config.json, which `keyed` names"
+    ),
     "prefill_context_parallel_size": (
         "a run priced by a step law or grid refuses a width other than 1, the one "
         "both are measured at"
@@ -70,6 +80,7 @@ LEFT_OUT = {
 SWITCHES = [
     ("ATOM_REPLICATE_VOCAB_EMBED", "1", "0"),
     ("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0", "1"),
+    ("ATOM_V4_UNIFIED_MQA", "opus", "flydsl"),
 ]
 #: A value no config holds.
 OTHER = object()
