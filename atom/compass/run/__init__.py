@@ -2824,8 +2824,11 @@ def tokenizer(tok, config) -> None:
     entry, its engine config's among several: a term fitted on another backend
     is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
     ends the run before the server serves (`_end_before_serving`). With no
-    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer,
+    term, `tok` is charged 0 s; ``segment`` wraps the segment tokenizer,
     and its ``chars_per_s`` charges each comparison of its stored-prefix search.
+    Beneath those charges, a segment text any frontend of the deployment has
+    encoded is read back rather than encoded again (`token_ids`), charged the
+    same.
 
     On a real run recording its steps (`parity.ENV`), it records instead
     (`_record_host`); with neither, `tok` is left as it is.
@@ -2856,6 +2859,11 @@ def tokenizer(tok, config) -> None:
         raise
     if isinstance(run.get("host"), list):
         _frontend_host = host
+    from atom.compass.run import token_ids
+
+    backend = getattr(tok, "_tokenizer", None)
+    if isinstance(backend, Tokenizer) and (where := token_ids.directory(run)):
+        token_ids.install(backend, where)
     if term is None:
         return
     if (loaded := _fingerprint(tok)) not in (None, term["fingerprint"]):
