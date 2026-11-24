@@ -72,6 +72,8 @@ read -ra decode_gpus <<<"${DECODE_GPUS:-2,3}"
 
 # serve SIDE K N GPUS KV_ROLE DP: server K of N of a side, recording to
 # OUT/real/record/SIDE, or SIDE<K> above one, as pd_sim.sh names its servers.
+# Its record keeps a step's line until the exit, as `compass record`'s does,
+# whatever the caller exports (parity.WRITE_THROUGH).
 urls=()
 main=(-m atom.entrypoints.openai_server)
 [[ -z ${HTTP_INTAKE:-} ]] || main=("$ROOT/scripts/compass/http_intake.py" serve "$HTTP_INTAKE")
@@ -80,7 +82,8 @@ serve() {
     (($3 == 1)) || name+=$2
     port=$(compass_held_port)
     # shellcheck disable=SC2086 # the server flags are word lists
-    HIP_VISIBLE_DEVICES=$4 ATOM_COMPASS_PARITY_RECORD=$OUT/real/record/$name setsid \
+    HIP_VISIBLE_DEVICES=$4 ATOM_COMPASS_PARITY_RECORD=$OUT/real/record/$name \
+        ATOM_COMPASS_PARITY_WRITE_THROUGH=0 setsid \
         python3 "${main[@]}" --model "$MODEL" --host 127.0.0.1 \
         --server-port "$port" $(dp_args "$6") \
         --data-parallel-master-port "$(compass_held_port)" $SERVER_ARGS --kv-transfer-config \
