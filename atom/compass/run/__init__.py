@@ -2215,6 +2215,30 @@ def _named(inner):
         del os.environ[NOW_ENV]
 
 
+def _stage_span(config) -> tuple[int, int, tuple[float, float] | None]:
+    """This pipeline stage's span of the stack, the one ATOM's `make_layers`
+    builds it from, and its share of the stack's layers, then of its paged
+    layers; the whole stack and None at pipeline width 1."""
+    hf, pp = config.hf_config, getattr(config, "pipeline_parallel_size", 1)
+    depth = hf.num_hidden_layers
+    if pp == 1:
+        return 0, depth, None
+    from atom.compass.backends.geometry import paged_layers
+    from atom.models.utils import get_pp_indices
+
+    pp_rank = config.parallel_config.pipeline_parallel_rank
+    start, end = get_pp_indices(depth, pp_rank, pp)
+    text = getattr(hf, "text_config", hf)
+    paged = paged_layers(text, 0, depth)
+    if not paged:
+        raise ValueError(
+            "a pipeline stage prices its history terms on its share of the "
+            "paged layers, and this stack has no layer that holds a cache "
+            "of every past token"
+        )
+    return start, end, ((end - start) / depth, paged_layers(text, start, end) / paged)
+
+
 def runner(model_runner, tree) -> None:
     """Install the cost backend and the device readings from the run file.
 
@@ -2286,26 +2310,9 @@ def runner(model_runner, tree) -> None:
         dp = config.parallel_config.data_parallel_size if dpa else 1
         backend = StepLinearBackend(StepLinearLaw(run[STEP_LINEAR]), dp)
     elif STEP_STUB in run:
-        # A pipeline stage is priced for its own span of the stack, the span
-        # ATOM's `make_layers` builds it from.
-        hf, pp = config.hf_config, getattr(config, "pipeline_parallel_size", 1)
-        depth, share = hf.num_hidden_layers, None
-        start, end = 0, depth
-        if pp > 1:
-            from atom.compass.backends.geometry import paged_layers
-            from atom.models.utils import get_pp_indices
-
-            pp_rank = config.parallel_config.pipeline_parallel_rank
-            start, end = get_pp_indices(depth, pp_rank, pp)
-            text = getattr(hf, "text_config", hf)
-            paged = paged_layers(text, 0, depth)
-            if not paged:
-                raise ValueError(
-                    "a pipeline stage prices its history terms on its share of the "
-                    "paged layers, and this stack has no layer that holds a cache "
-                    "of every past token"
-                )
-            share = ((end - start) / depth, paged_layers(text, start, end) / paged)
+        # A pipeline stage is priced for its own span of the stack.
+        start, end, share = _stage_span(config)
+        pp = getattr(config, "pipeline_parallel_size", 1)
         backend = StepStubBackend(
             Coefficients(**run[STEP_STUB]),
             Parallelism(tp_size=tp, pp_size=pp),
@@ -2364,7 +2371,16 @@ def runner(model_runner, tree) -> None:
         from atom.compass.run.modules import drafter, walk
 
         modules = walk(tree, drafter(config))
-        roofline = StepRooflineBackend(machine, modules, padded=padding != "none")
+        # A stage's walk holds only its own layers; it states their share.
+        hf = config.hf_config
+        roofline = StepRooflineBackend(
+            machine,
+            modules,
+            padded=padding != "none",
+            stage_share=_stage_span(config)[2],
+            tp=tp,
+            hidden=getattr(hf, "text_config", hf).hidden_size,
+        )
         backend = StepFallbackBackend(backend, roofline) if keys else roofline
     pp = getattr(config, "pipeline_parallel_size", 1)
     if pp > 1 and tp > 1 and not hasattr(backend, "all_gather_s"):

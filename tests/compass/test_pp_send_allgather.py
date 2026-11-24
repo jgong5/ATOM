@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 import test_pp_launch_send as launch
+from test_backend_step_linear import law
 from test_dp_slice import (  # noqa: F401
     MAX_TOKENS,
     device_classes_put_back,
@@ -29,6 +30,7 @@ from test_vertical_slice import NEEDS_A_RUN
 from atom.compass import run as compass_run
 from atom.compass.backends.step_stub import Coefficients, StepStubBackend
 from atom.compass.detect.scenario import check_run
+from atom.compass.run.step_grid import keyed
 from atom.compass.runner import pp_send
 
 #: The step stub's seconds per row of a collective: one all-gather of 8 rows.
@@ -125,9 +127,21 @@ def test_a_backend_that_prices_no_all_gather_is_refused_by_name(tmp_path, monkey
     assert (
         r.compass_backend.all_gather_s(8) == 8 * Coefficients().collective_token_layer
     )
-
+    # The roofline below the stub prices the stage too; the stub its all-gather.
     r = _stub_run(tmp_path, monkeypatch, step_roofline=True)
-    with pytest.raises(ValueError, match="StepFallbackBackend prices no all-gather"):
+    compass_run.runner(r, META_8B)
+    stub, roofline = r.compass_backend.first, r.compass_backend.roofline
+    assert r.compass_backend.stage_share == roofline.stage_share == stub.stage_share
+    assert (
+        r.compass_backend.all_gather_s(8) == 8 * Coefficients().collective_token_layer
+    )
+
+    r = _stub_run(tmp_path, monkeypatch)
+    run = json.loads((tmp_path / "run.json").read_text())
+    run["step_linear"] = law() | {"engine_config": keyed(r.config)}
+    del run["step_stub"]
+    (tmp_path / "run.json").write_text(json.dumps(run))
+    with pytest.raises(ValueError, match="StepLinearBackend prices no all-gather"):
         compass_run.runner(r, META_8B)
     monkeypatch.setenv("ATOM_PP_SEND_ALLGATHER", "0")
     compass_run.runner(r, META_8B)

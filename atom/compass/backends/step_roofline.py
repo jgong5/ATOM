@@ -59,6 +59,14 @@ so a step under a drafter always states its draft; on a step that samples,
 its draft-KV pass prices among the target's terms instead, named
 ``draft_kv roofline.<kind>``.
 
+Pipeline stage. A stage's walk holds only its own layers, a `PPMissingLayer`
+pricing nothing, so the roofline prices the stage it was built on.
+`stage_share` states that share of the stack's layers, then of its paged
+layers, as the step stub's does, for the runner's stage check; it scales
+nothing. `all_gather_s` prices the TP all-gather a stage runs on each sharded
+tensor it receives: one collective of `hidden` bf16 elements a row over the
+`tp` ranks, its link latency and transfer alone.
+
 Refused: a step with image tokens, since nothing here prices the vision
 encoder that fills them; any step, while the walk found a module it could not
 classify; a step whose modules read a spec field the spec does not state; a
@@ -72,7 +80,11 @@ roofline's terms, its draft's too, carry what the first backend declined,
 which shows the fall-through in the record; the step is answered unless the
 roofline refuses it too. Both backends
 are step-level: there is no fallback across granularities, so a first backend
-of another granularity is refused at construction.
+of another granularity is refused at construction. On a pipeline stage it
+states the first backend's `stage_share`, since the roofline prices the stage
+whichever answers, and none where the first prices a whole step; it prices
+the stage's all-gather by the first backend, or by the roofline where the
+first prices none.
 """
 
 from __future__ import annotations
@@ -550,11 +562,27 @@ def _reads(work: Work) -> dict[str, list[str]]:
 
 
 class StepRooflineBackend(CostBackend):
-    """A step as the sum of one roofline per module."""
+    """A step as the sum of one roofline per module.
 
-    def __init__(self, machine, modules, *, padded: bool = True) -> None:
+    `stage_share` is a pipeline stage's (layer, paged layer) share of the
+    stack, None for the whole stack; `tp` and `hidden` the TP group a stage
+    all-gathers each sharded tensor it receives over, and that tensor's
+    elements a row (`all_gather_s`)."""
+
+    def __init__(
+        self,
+        machine,
+        modules,
+        *,
+        padded: bool = True,
+        stage_share: tuple[float, float] | None = None,
+        tp: int = 1,
+        hidden: int = 0,
+    ) -> None:
         self.machine = machine
         self.padded = padded
+        self.stage_share = stage_share
+        self.tp, self.hidden = tp, hidden
         modules = tuple(modules)
         self.unclassified = [m.name for m in modules if m.kind == UNCLASSIFIED]
         classified = [m for m in modules if m.kind != UNCLASSIFIED]
@@ -761,8 +789,20 @@ class StepRooflineBackend(CostBackend):
             )
         return terms
 
+    def all_gather_s(self, rows: int) -> float:
+        """One all-gather over the TP group of a `rows`-row tensor, as a
+        pipeline stage runs on each sharded tensor it receives: its link
+        latency and transfer, no kernel."""
+        work = allgather(self.tp, rows * self.hidden * ELEMENT_BYTES[ACT])
+        return bounds(work, self.machine)["comm"] if work.comm else 0.0
+
     def describe(self) -> str:
-        return f"step roofline; {self.count} modules"
+        share = ""
+        if self.stage_share is not None:
+            share = ", stage share {:g} of layers, {:g} of paged".format(
+                *self.stage_share
+            )
+        return f"step roofline; {self.count} modules{share}"
 
 
 class StepFallbackBackend(CostBackend):
@@ -781,6 +821,17 @@ class StepFallbackBackend(CostBackend):
     @property
     def granularity(self) -> Granularity:
         return self.first.granularity
+
+    @property
+    def stage_share(self) -> tuple[float, float] | None:
+        """A pipeline stage's share of the stack, the first backend's; None
+        where the first prices a whole step."""
+        return getattr(self.first, "stage_share", None)
+
+    def all_gather_s(self, rows: int) -> float:
+        """A pipeline stage's all-gather of a sharded tensor, priced by the
+        first backend, or by the roofline where the first prices none."""
+        return getattr(self.first, "all_gather_s", self.roofline.all_gather_s)(rows)
 
     def price(self, batch_view: BatchView) -> StepCost:
         try:
