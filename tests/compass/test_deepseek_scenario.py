@@ -5,13 +5,14 @@ scenario check: at level 0 under the constant step stub, at level 1 under the
 step roofline alone on `ROOFLINE_MACHINE`, an MI355X's spec document (`08`
 D120).
 
-Both serve at ``-tp 4 --kv-cache-dtype fp8``, as their recipes do on MI355X:
-DeepSeek-V4-Flash's config (`deepseek_v4_flash_config.json`), ATOM's
-`DeepseekV4ForCausalLM`, its attention sparse over a sliding window and the
-compressed KV; and DeepSeek-R1-0528's in MXFP4
-(`deepseek_r1_0528_mxfp4_config.json`, amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4's,
-the checkpoint ATOM's benchmarks serve as DeepSeek-R1-0528-MXFP4), ATOM's
-`DeepseekV2ForCausalLM`, its attention MLA.
+Both serve at ``-tp 4 --kv-cache-dtype fp8``: DeepSeek-V4-Flash's config
+(`deepseek_v4_flash_config.json`), ATOM's `DeepseekV4ForCausalLM`, its
+attention sparse over a sliding window and the compressed KV, at the TP 4
+`.github/benchmark/oot_benchmark_models.json` benchmarks it at and the fp8 KV
+cache of `recipes/DeepSeek-V4.md`; and DeepSeek-R1-0528's in MXFP4
+(`deepseek_r1_0528_mxfp4_config.json`, amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4's),
+ATOM's `DeepseekV2ForCausalLM`, its attention MLA, as
+`.github/benchmark/models.json` serves it as DeepSeek-R1-0528-MXFP4.
 
 The runs need a driver, as in `test_vertical_slice`, and a model directory
 holding a config and a tokenizer: `ATOM_COMPASS_V4_FLASH_MODEL` and
