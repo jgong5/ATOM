@@ -1394,10 +1394,10 @@ def _launch_mooncake_store(config, run: dict, side: str | None) -> None:
     widths differ from those the entry was fitted at."""
     from atom.compass.kv import mooncake_store_server as store
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+    from atom.kv_transfer.offload.kv_store.pool import _SLOT_ALIGN, _round_up
     from atom.kv_transfer.offload.mooncake_store.config import (
         parse_mooncake_store_config,
     )
-    from atom.kv_transfer.offload.mooncake_store.pool import _SLOT_ALIGN, _round_up
     from atom.utils import envs
 
     leaves = KVConnectorFactory.leaf_connectors(config) or ()
@@ -2193,10 +2193,11 @@ def refuse_offload_tier(config, run: dict) -> None:
 def _store_shell(config, run: dict) -> None:
     """Have the connector factory build ``mooncake_store`` as Compass's
     (`atom.compass.kv.mooncake_store`) when this deployment offloads to a
-    Mooncake Store; refuse one whose run file has no ``mooncake_store`` entry.
-    Its frontend checked the rest against the entry
-    (`_launch_mooncake_store`)."""
+    Mooncake Store; refuse one whose run file has no ``mooncake_store`` entry,
+    or under ``ATOM_STORE_ASYNC_RENEW``. Its frontend checked the rest against
+    the entry (`_launch_mooncake_store`)."""
     from atom.compass.kv import mooncake_store
+    from atom.utils import envs
 
     if not _offloads(config.kv_transfer_config, ENTRY_STORE):
         return
@@ -2204,6 +2205,12 @@ def _store_shell(config, run: dict) -> None:
         raise ValueError(
             "this deployment offloads KV to a Mooncake Store and the run file "
             f"has no {ENTRY_STORE} entry"
+        )
+    if envs.ATOM_STORE_ASYNC_RENEW:
+        raise ValueError(
+            "ATOM_STORE_ASYNC_RENEW renews a load's prebuilt keys and polls the "
+            "renewal on the wall clock; the simulated Store renews a sequence's "
+            "range on LP mooncake_store"
         )
     mooncake_store.substitute()
 

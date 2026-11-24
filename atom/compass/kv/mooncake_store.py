@@ -195,9 +195,7 @@ class StandInPool:
         return 0
 
     def window(self, region: str, n_threads: int) -> int:
-        from atom.kv_transfer.offload.mooncake_store.pool import (
-            _MIN_WINDOWS_PER_REGION,
-        )
+        from atom.kv_transfer.offload.kv_store.pool import _MIN_WINDOWS_PER_REGION
 
         return max(1, self.usable(region) // max(_MIN_WINDOWS_PER_REGION, n_threads))
 
