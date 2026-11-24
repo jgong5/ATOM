@@ -44,7 +44,11 @@ calibration's own store, only once it has started, as a publish there before
 would leave its directory holding files, which `calibrate.sh` refuses.
 A readings verdict ``measure`` names the `compass measure memory` command,
 under the instance's variables, a 1P1D side's on the connector a real start of
-it takes.
+it takes; an offloading instance's with the candidate's lmcache server beside
+the engine, reached as a start of its point reaches its own, at the port of
+the first of the candidate's points that runs alike. A point whose offloading
+instance's variables cannot name that server is ``refused``, as its start
+would be.
 
 `states` gives each candidate one state: ``refused``, with each refusal
 verbatim, when any verdict is; else, when a law's verdict is ``calibrate``,
@@ -157,7 +161,7 @@ def check(expansion: dict, out: Path) -> dict:
             }
             judged[candidate["name"]] = {"store": None, "points": verdicts}
             continue
-        holding_law = None
+        holding_law, reached = None, _reached(candidate, points)
         for store in reuse.stores(expansion["store"], out):
             given = (machine["device"], store, machine["ptl"])
             given += (machine.get("stack"), machine.get("network"))
@@ -165,7 +169,7 @@ def check(expansion: dict, out: Path) -> dict:
             made = out / CAL / candidate["name"], expansion["workload"]["traces"]
             made += (expansion["store"],)
             judge = functools.partial(_judged, store, spec, head["atom"], seen, made)
-            verdicts = {p["name"]: _point(p, judge) for p in points}
+            verdicts = {p["name"]: _point(p, judge) for p in reached}
             if isinstance(spec, dict):
                 continue
             if all(v["requirement"] != 1 for v in _each(verdicts)):
@@ -177,7 +181,7 @@ def check(expansion: dict, out: Path) -> dict:
         else:
             store, verdicts = holding_law or (store, verdicts)
         judged[candidate["name"]] = {"store": str(store.root), "points": verdicts}
-        _borrowing(points, judged[candidate["name"]], calibrations)
+        _borrowing(reached, judged[candidate["name"]], calibrations)
     written = {"head": head, "refused": refused, "candidates": judged}
     (out / REUSE).write_text(json.dumps(written, indent=1) + "\n")
     return written
@@ -349,17 +353,26 @@ def serving(machine, candidate, point, verdicts, store, at: Path) -> tuple[list,
 
 def _lmcache(candidate: dict, point: dict, at: Path) -> tuple[Path, dict]:
     """The run file's ``lmcache`` entry of `point` of `candidate`, written
-    beside `at` in ``<at>.lmcache.json``: its lmcache server's flags, at
-    `serve.HOST` and the point's port, and the request loop's declared laws;
-    and the point's instances, each offloading through ``lmcache_mp`` reaching
-    that server through `EXTRA`, which a ValueError refuses when not a JSON
-    object or naming either. ATOM refuses `EXTRA` with no offload, so an
-    instance offloading through none keeps its variables."""
-    port = point["lmcache_port"]
-    server = [*candidate["lmcache_server"], "--host", serve.HOST, "--port", str(port)]
+    beside `at` in ``<at>.lmcache.json``: its lmcache server's flags and the
+    request loop's declared laws; and the point's instances, each reaching
+    that server (`_reaching`)."""
+    server, sides = _reaching(candidate, point)
     entry = at.with_name(at.name + ".lmcache.json")
     entry.parent.mkdir(parents=True, exist_ok=True)
     entry.write_text(json.dumps({"server": server, **DECLARED_LAWS}))
+    return entry, sides
+
+
+def _reaching(candidate: dict, point: dict) -> tuple[list, dict]:
+    """The flags of the lmcache server of `point` of `candidate`, at
+    `serve.HOST` and the point's port; and the point's instances, each
+    offloading through ``lmcache_mp`` reaching that server through `EXTRA`,
+    which a ValueError refuses when not a JSON object or naming either, with
+    the server's command as ``beside``, which a start of it alone runs beside
+    the engine. ATOM refuses `EXTRA` with no offload, so an instance
+    offloading through none keeps its variables."""
+    port = point["lmcache_port"]
+    server = [*candidate["lmcache_server"], "--host", serve.HOST, "--port", str(port)]
     reached = {"lmcache.mp.host": f"tcp://{serve.HOST}", "lmcache.mp.port": port}
     sides = dict(point["instances"])
     for side, one in sides.items():
@@ -374,8 +387,28 @@ def _lmcache(candidate: dict, point: dict, at: Path) -> tuple[Path, dict]:
                 f"{EXTRA} is {one['env'][EXTRA]}: compass advice takes a JSON "
                 f"object naming neither {' nor '.join(reached)}, which it assigns"
             )
-        sides[side] = one | {"env": one["env"] | {EXTRA: json.dumps(extra | reached)}}
-    return entry, sides
+        env = one["env"] | {EXTRA: json.dumps(extra | reached)}
+        sides[side] = one | {"env": env, "beside": ["lmcache", "server", *server]}
+    return server, sides
+
+
+def _reached(candidate: dict, points: list) -> list:
+    """`points`, `candidate`'s, each instance offloading to an lmcache server
+    reaching one as `_reaching` gives it, at the port of the first of `points`
+    that runs alike, as alike points start once (`_searchable`), so one
+    readings command measures them all; or, where `_reaching` refuses a point,
+    each of its instances holding the verdict refusing it as ``refused``."""
+    first, reached = {}, []
+    for point in points:
+        alike = json.dumps(point["instances"], sort_keys=True)
+        if "lmcache_port" in point and alike not in first:
+            try:
+                first[alike] = _reaching(candidate, point)[1]
+            except ValueError as error:
+                why = {"refused": _refused(error)}
+                first[alike] = {s: one | why for s, one in point["instances"].items()}
+        reached.append(point | {"instances": first.get(alike, point["instances"])})
+    return reached
 
 
 def launched(command: list, env: dict, at: Path, until) -> "Command":
@@ -500,9 +533,13 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     `calibrate.sh` command's verdict states, for `_borrowing`, its
     ``calibration``: the ``key`` its law is published at, by model, platform
     and engine config, its directory, ``in``, and the store it publishes
-    ``into``."""
+    ``into``. An instance holding a verdict as ``refused`` takes it for both;
+    the readings command of one holding a command as ``beside`` runs that
+    command beside the engine."""
     if isinstance(machine, dict):
         return machine, machine
+    if "refused" in one:
+        return one["refused"], one["refused"]
     args, env = one["args"], one["env"]
     if side in drive_run.ROLES:
         args = _or_refused(drive_run.side_args, side, args, drive_run.SIMULATED)
@@ -538,8 +575,9 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                     real = args
                     if side in drive_run.ROLES:
                         real = drive_run.side_args(side, one["args"], drive_run.REAL)
+                    beside = one.get("beside")
                     readings["made_by"] = [
-                        lacking.measure_memory(store.root, real, env)
+                        lacking.measure_memory(store.root, real, env, beside)
                     ]
                 verdicts = law, readings
         seen[(store.root, *instance)] = verdicts
@@ -579,12 +617,13 @@ def _borrowing(points: list, held: dict, calibrations: dict) -> None:
 
 def _readings_by(lender: Path, into: str, one: dict) -> str:
     """The command measuring the instance `one`'s readings into `into`, the
-    store the calibration in `lender` publishes into; while that is its own
+    store the calibration in `lender` publishes into, with the command `one`
+    holds as ``beside``, if any, beside the engine; while that is its own
     store and it has not started, `PENDING`: a publish there first leaves the
     calibration's directory holding files, which `calibrate.sh` refuses."""
     if Path(into) == lender / "store" and not (lender / INPUTS).is_file():
         return PENDING.format(into, lender.name)
-    return lacking.measure_memory(into, one["args"], one["env"])
+    return lacking.measure_memory(into, one["args"], one["env"], one.get("beside"))
 
 
 def _publishing(store, made, law: dict, readings: dict) -> str | None:
