@@ -718,7 +718,8 @@ def simulated_arch():
     the meta device. Each probe bound by name in a loaded module is swapped,
     the probes' own module among them, so a module imported inside the block
     binds the swapped one. On the way out every module holding the swapped one
-    gets the probe back, one imported inside the block too: a test process
+    gets its own probe back, and one imported inside the block the probes'
+    module's: a test process
     builds many runners and runs other tests on the host's arch after. Without
     a run file nothing is swapped, nor without aiter loaded, as where there is
     no driver.
@@ -727,18 +728,22 @@ def simulated_arch():
     from atom.compass.spec.machine import MachineSpec
 
     spec = run.spec()
-    real = {}
+    # each swapped module's own probe, and the probe module's, by name
+    own, real = {}, {}
+    chip_info = "aiter.jit.utils.chip_info"
 
     def simulated():
         return arch
 
     if spec is not None:
         arch = MachineSpec.from_mapping(spec["machine"]).value("device.arch")
-        for module in list(sys.modules.values()):
+        for name, module in list(sys.modules.items()):
             for n in ("get_gfx", "get_gfx_runtime"):
                 probe = getattr(module, "__dict__", {}).get(n)
-                if getattr(probe, "__module__", None) == "aiter.jit.utils.chip_info":
-                    real.setdefault(n, probe)
+                if getattr(probe, "__module__", None) == chip_info:
+                    own[(id(module), n)] = probe
+                    if name == chip_info or n not in real:
+                        real[n] = probe
                     setattr(module, n, simulated)
     try:
         yield
@@ -746,7 +751,7 @@ def simulated_arch():
         for module in list(sys.modules.values()):
             for n, probe in real.items():
                 if getattr(module, "__dict__", {}).get(n) is simulated:
-                    setattr(module, n, probe)
+                    setattr(module, n, own.get((id(module), n), probe))
 
 
 def start_on_host(runner: Any, rank: int, config: Any) -> None:
