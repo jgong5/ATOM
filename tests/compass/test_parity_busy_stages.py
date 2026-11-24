@@ -137,16 +137,21 @@ def test_a_trace_run_mixing_stage_names_refuses(tmp_path):
 
 
 def test_a_later_stage_s_drafter_loses_the_floor_from_its_own_traces(tmp_path):
-    """The last of two stages runs the drafter: its drafter parts less the
-    profiler's floor are a one-stage run's of the same forward, read from its
-    own ``pp1_rank_<r>`` traces, not from stage 0's, which run no drafter."""
+    """The last of two stages runs the drafter, its later passes padded to 4
+    rows: its drafter parts less the profiler's floor are a one-stage run's of
+    the same forward, read from its own ``pp1_rank_<r>`` traces and at its own
+    line's shapes, not from stage 0's, which samples nothing and runs no
+    drafter, so a drafter kernel there would take the target's shape."""
     (tmp_path / "one").mkdir()
-    one = _floor_run(tmp_path / "one")
+    one = _floor_run(tmp_path / "one", draft_bs=4)
     two = tmp_path / "two"
     (two / "steps").mkdir(parents=True)
     (two / "run.json").write_text("{}")
-    for name in ("dp0.jsonl", "pp1.dp0.jsonl"):
-        (two / "steps" / name).write_text(one.read_text())
+    first = json.loads(one.read_text()) | {"produces_output": False}
+    for field in ("draft_bs", "d_draft_kv_ns", "d_propose_ns"):
+        del first[field]
+    (two / "steps" / "dp0.jsonl").write_text(json.dumps(first) + "\n")
+    (two / "steps" / "pp1.dp0.jsonl").write_text(one.read_text())
     for k, marks in enumerate(({}, MARKS)):
         for r in (0, 1):
             trace = two / "trace" / f"pp{k}_rank_{r}" / "m_ts_1.pt.trace.json.gz"

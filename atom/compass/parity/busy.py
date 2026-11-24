@@ -391,8 +391,9 @@ def floored(record, floor) -> list[dict]:
     less its kernels' known terms under `floor` (`step_labels.Floor.term`) on
     each rank, at its largest rank, by its busy line field; and under
     ``floor`` why a term is not known, per field. A kernel's shape is its
-    pass's, as `capture.population_steps` places the step: the draft-KV pass
-    at the step's, the rest of the draft at its drafter's."""
+    pass's, as `capture.population_steps` places the step in the record's
+    stage: the draft-KV pass at the step's, the rest of the draft at its
+    drafter's."""
     from atom.compass.capture import population_steps
 
     run = Path(record).parent.parent
@@ -401,11 +402,11 @@ def floored(record, floor) -> list[dict]:
             f"{record} is a trace run's record whose run directory holds no "
             f"{TRACE}/, from which the profiler's floor reads each drafter kernel"
         )
-    shapes = defaultdict(list)
-    for shape, line in population_steps([run], drafters=True):
+    shapes, stage = defaultdict(list), _stage(record)
+    for shape, line in population_steps([run], drafters=True, stage=stage):
         shapes[line["step"]].append(str(shape))
     rows = []
-    for s, ranks in zip(read_jsonl(record), drafter(run, _stage(record))):
+    for s, ranks in zip(read_jsonl(record), drafter(run, stage)):
         at, best, why = shapes[s["step"]], {}, defaultdict(set)
         for parts, kernels in ranks:
             got = dict(parts)
