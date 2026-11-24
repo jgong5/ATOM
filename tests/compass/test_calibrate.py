@@ -12,7 +12,8 @@ memory` and a fit write their readable copy with a token, the law with one
 held-out band, and publish into the store `--store` names an entry keyed by
 the ATOM arguments of the start they measure or of their first record, and
 the variables KEYED names it ran under, refusing one whose key holds one, as
-the store refuses a second publish at a key; FAIL, matched against a command's
+the store refuses a second publish at a key, its file one no store reader
+takes for an entry of its own; FAIL, matched against a command's
 words, makes it refuse. `deploy.sh` logs its arguments and each side's
 variables, and serves as a `record` does, each side's record in its own
 directory, its prefill side's busy lines with `--trace` among that side's own
@@ -74,7 +75,7 @@ def main():
     if at.exists():
         sys.exit(f"refused: {at} holds an entry")
     at.mkdir(parents=True)
-    at.joinpath("entry.json").write_text(json.dumps(entry))
+    at.joinpath("stub_entry.json").write_text(json.dumps(entry))
     law = {"unfitted": {}, "decode": {"1": {"held_out": {"bands": BAND}}}}
     copy = {"token": "tok-" + argv[1], "params": law}
     out.joinpath(COPY[argv[1]] + ".json").write_text(json.dumps(copy))
@@ -475,5 +476,5 @@ def test_two_1p1d_calibrations_sharing_a_prefill_side_publish_each_key_once(
 def _entries(store, kind: str) -> list:
     """The ATOM arguments and keyed variables of each of the stub store's
     `kind` entries."""
-    held = [json.loads(e.read_text()) for e in store.glob(f"{kind}/*/entry.json")]
+    held = [json.loads(e.read_text()) for e in store.glob(f"{kind}/*/stub_entry.json")]
     return sorted(((h["args"], h["env"]) for h in held), key=json.dumps)
