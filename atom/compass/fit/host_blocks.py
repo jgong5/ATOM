@@ -10,28 +10,32 @@ and middle kinds' launch laws, their `PATH_SEGMENTS`, that
 per launch path (`launch_features.path`: a decode's CUDA-graph rung or eager, a
 prefill's or middle chunk's replayed or eager body and tail), the slopes on
 ``tokens`` and ``seqs`` shared, in place of an intercept and the launch columns
-a held-out choice adopts. A path with `PATH_MIN` forwards or more takes a
-constant of its own, under the entry's ``paths``; the kind's commonest path,
-and the rarer ones in the fit, take the law's own,
-``laws[kind][segment][0]``, which a run also prices any path no constant names
-at (`runner.overrides.HostDeviceRecurrence`). Then each path short of its own
-constant is filled: a decode rung of the host key's ladder linearly between
+a held-out choice adopts. Each path with `PATH_MIN` forwards or more takes
+a constant: the kind's commonest the law's own, ``laws[kind][segment][0]``,
+which a run also prices any path no constant names at
+(`runner.overrides.HostDeviceRecurrence`), any other one under the entry's
+``paths``. A path short of `PATH_MIN` forwards is left out of the fit
+(`common`), too few to fit or hold out a constant on, and filled: a decode rung of the host key's ladder linearly between
 the fitted rungs either side (`fill_rungs`), and any other combination of the
 launch features at the price of the law `fit_host` gave, its intercept plus
 the columns it adopted (`fill_flags`); the report names them under
-``filled``. The engine loop's segments keep `fit_host`'s law. Every law is
+``filled``. The path constants are adopted, by the rule #739 section 2.3
+states, only where they lower the error held out in the blocks below against
+the law `fit_host` gave (``choice``; a tie keeps that law, the path fit then
+reported under ``paths_tried``). The engine loop's segments keep `fit_host`'s
+law. Every law is
 validated held out in `BLOCKS` blocks per path kind: each path's forwards, in
 step order, are cut into `BLOCKS` contiguous blocks, and block `b` of every
 path held out together, so every path is held out in every block. The
 report's ``<kind>.<segment>`` gives each path's forwards and, under
 ``held_out``, the error per block and per path of the law fitted on the other
-blocks; a launch law's also the base and pooled paths and the same blocks'
-error of a law with no path constants (``error_pooled``). Its
+blocks; a launch law's also the base path, the paths left out (``short``)
+and the same blocks' error of a law with no path term (``error_pooled``). Its
 ``kind_blocks`` states the checks a calibration record's host fit is held to
 (#739 section 2.2), each with what it read and whether it passed:
 
 - H1: every launch path of every segment has `PATH_MIN` forwards (a launch
-  law pools a path short of them, named under ``pooled``, and fills it);
+  law leaves a path short of them out and fills it);
 - H2: every path appears in every held-out block;
 - H3: each per-token tokenizer term's lone calls span `H3_DECADES` decades of
   tokens, per record;
@@ -90,6 +94,9 @@ BLOCKS = 5
 #: The forwards a launch path needs for a constant of its own (H1): two per
 #: held-out block.
 PATH_MIN = 2 * BLOCKS
+#: The relative difference in held-out error within which two laws tie: a tie
+#: keeps the law `fit_host` gave (#739 section 2.3, the fewer changes).
+TIE = 1e-6
 #: The decades of tokens a per-token tokenizer term's lone calls span (H3).
 H3_DECADES = 1.0
 #: The decades of body bytes the lone requests span (H5).
@@ -159,21 +166,36 @@ def refit(samples, host: dict, report: dict) -> None:
                     report[name] = report.get(name, {}) | _validated(members, cols)
                     _check(checks, name, report[name])
                 continue
-            pooled = laws.get(segment)
-            flags = adopted.pop(segment, {})
+            given = laws.get(segment)
+            flags = adopted.get(segment, {})
             try:
                 law, own, fitted = _path_law(members)
             except (ValueError, QhullError) as e:
-                laws.pop(segment, None)
-                report.pop(name, None)
-                report["unfitted"][name] = str(e).splitlines()[0]
+                if given is None:
+                    continue
+                law, own, fitted = None, {}, {"why": str(e).splitlines()[0]}
+            # Both laws held out on the same forwards: those of a path with a
+            # constant of its own.
+            mine = common(members)
+            theirs = None if given is None else _validated(mine, list(flags))
+            choice = _choice(fitted, theirs)
+            if choice["kept"]:
+                # The law `fit_host` gave holds out no worse: it stays.
+                report[name] = report.get(name, {}) | theirs
+                report[name] |= {"choice": choice, "paths_tried": fitted}
+                report[name]["paths"] = dict(
+                    sorted(Counter(m[2] for m in members).items())
+                )
+                _check(checks, name, report[name])
                 continue
+            fitted["choice"] = choice
+            adopted.pop(segment, None)
             if kind == "decode":
                 ladder = (host["key"].get("engine") or {}).get("ladder") or ()
                 fitted["filled"] = fill_rungs(law[0], fitted["base"], own, ladder)
-            elif pooled is not None:
+            elif given is not None:
                 fitted["filled"] = fill_flags(
-                    pooled[0], flags, launch.features, fitted["base"], own
+                    given[0], flags, launch.features, fitted["base"], own
                 )
             report["unfitted"].pop(name, None)
             host["laws"].setdefault(kind, {})[segment] = law
@@ -192,13 +214,29 @@ def refit(samples, host: dict, report: dict) -> None:
     report["kind_blocks"] = checks
 
 
+def _choice(fitted: dict, theirs: dict | None) -> dict:
+    """Whether the law `fit_host` gave a launch segment stays over its law per
+    launch path, whose report is `fitted` (no ``held_out`` where that law
+    could not be fitted): by the rule #739 section 2.3 states, the path
+    constants are adopted only where they lower the error held out in the same
+    blocks, `theirs` that law's (`_validated`, None with no such law), a tie
+    keeping the change out; and both errors."""
+    own = fitted.get("held_out", {}).get("error")
+    other = None if theirs is None else theirs["held_out"]["error"]
+    lower = own is not None and other is not None and own < other * (1 - TIE)
+    keep = theirs is not None and (own is None or (other is not None and not lower))
+    return {"paths": own, "fit_host": other, "kept": keep}
+
+
 def _check(checks: dict, name: str, fitted: dict) -> None:
     """H1 and H2 of the segment `name` from its report entry `fitted`: its
     paths short of `PATH_MIN` forwards, and those its held-out blocks miss."""
     short = sorted(p for p, n in fitted["paths"].items() if n < PATH_MIN)
     checks["H1"][name] = {"short": short, "pass": not short}
     held = fitted["held_out"]["paths"]
-    missed = sorted(p for p, v in held.items() if v["blocks"] < BLOCKS)
+    missed = sorted(
+        p for p in fitted["paths"] if held.get(p, {}).get("blocks", 0) < BLOCKS
+    )
     checks["H2"][name] = {"short": missed, "pass": not missed}
 
 
@@ -264,22 +302,33 @@ def fill_rungs(base_s: float, base: str, own: dict, ladder) -> dict:
     return filled
 
 
+def common(members: list) -> list:
+    """The `members` (`refit`'s rows) on a path of `PATH_MIN` forwards or
+    more, every one when none has as many: a path short of them has too few
+    to fit or hold out a constant on, and is filled (`fill_rungs`,
+    `fill_flags`)."""
+    counts = Counter(m[2] for m in members)
+    return [m for m in members if counts[m[2]] >= PATH_MIN] or members
+
+
 def _path_law(members: list) -> tuple[list, dict, dict]:
     """The law of `members`, `refit`'s rows ``((1, tokens, seqs), seconds,
-    path, launch)`` in step order, with one constant per path of `PATH_MIN`
-    forwards but its
-    commonest, ``[base, per token, per seq]``; those paths' constants; and its
-    report: `_host_law`'s, each path's forwards, the base and pooled paths,
-    and the held-out figures (`_blocks`)."""
+    path, launch)`` in step order, on a path of `PATH_MIN` forwards or more
+    (`common`), with one constant per path but its commonest, ``[base, per
+    token, per seq]``; those paths' constants; and its report: `_host_law`'s,
+    each path's forwards, the base path, the paths `short` of `PATH_MIN`
+    forwards left out, and the held-out figures (`_blocks`)."""
+    counts = Counter(m[2] for m in members)
+    members = common(members)
     paths = [m[2] for m in members]
-    counts = Counter(paths)
-    if not counts:
+    if not paths:
         raise ValueError("0 forwards for 3 coefficients")
-    base = max(counts, key=lambda p: (counts[p], p))
-    own = sorted(p for p, n in counts.items() if n >= PATH_MIN and p != base)
-    pooled = sorted(p for p, n in counts.items() if n < PATH_MIN and p != base)
+    held_counts = Counter(paths)
+    base = max(held_counts, key=lambda p: (held_counts[p], p))
+    own = sorted(p for p in held_counts if p != base)
+    short = sorted(p for p in counts if p not in held_counts)
     x = np.array([m[0] for m in members], dtype=np.float64).reshape(-1, 3)
-    x[:, 0] = [p not in own for p in paths]
+    x[:, 0] = [p == base for p in paths]
     y = np.array([m[1] for m in members])
     values = [np.array([float(q == p) for q in paths]) for p in own]
     names = [f"path:{p}" for p in own]
@@ -295,7 +344,7 @@ def _path_law(members: list) -> tuple[list, dict, dict]:
     report = fitted | {
         "paths": dict(sorted(counts.items())),
         "base": base,
-        "pooled": pooled,
+        "short": short,
         "held_out": held,
     }
     return coef[:3], dict(zip(own, coef[3:])), report
@@ -309,7 +358,7 @@ def _blocks(design, y, paths, names) -> dict:
     and the blocks it appears in; and ``error``, the mean of each block's and
     path's p50 magnitude weighted by its rows (`_held_out_error`)."""
     block = np.zeros(len(y), dtype=int)
-    for p in set(paths):
+    for p in sorted(set(paths)):
         mine = np.array([i for i, q in enumerate(paths) if q == p])
         block[mine] = np.arange(len(mine)) * BLOCKS // len(mine)
     error = np.full(len(y), math.nan)
@@ -380,7 +429,7 @@ def client_runs(record, exports) -> list[dict]:
             {
                 "span": [a, b],
                 "window": [enter[a], exit_[b]],
-                "prefills": sorted(n for n in prefill if a <= n <= b),
+                "prefills": [n for n in sorted(prefill) if a <= n <= b],
             }
         )
     return out

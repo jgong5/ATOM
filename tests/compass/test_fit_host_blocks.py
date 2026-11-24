@@ -10,6 +10,7 @@ rung 8 unseen. A planted provider's prefill past `BUCKET` tokens runs its body
 eagerly, `EAGER_S` dearer.
 """
 
+import dataclasses
 import json
 
 import numpy as np
@@ -164,7 +165,7 @@ def test_each_rung_takes_its_own_launch_constant_and_a_rare_or_unseen_one_is_fil
 
     law, own = host["laws"]["decode"]["W_launch"], host[PATHS]["decode"]["W_launch"]
     fitted = report["decode.W_launch"]
-    assert fitted["base"] == "rung1" and fitted["pooled"] == ["rung2"]
+    assert fitted["base"] == "rung1" and fitted["short"] == ["rung2"]
     assert law[0] == pytest.approx(RUNG_S[1], rel=0.02)
     for rung in (4, 16):
         assert own[f"rung{rung}"] == pytest.approx(RUNG_S[rung], rel=0.02)
@@ -174,16 +175,21 @@ def test_each_rung_takes_its_own_launch_constant_and_a_rare_or_unseen_one_is_fil
         own["rung4"] + (own["rung16"] - own["rung4"]) / 3
     )
     assert fitted["filled"] == {"rung2": own["rung2"], "rung8": own["rung8"]}
-    # Every path is held out in every block but rung 2, three forwards.
+    # Every path is held out in every block; rung 2's three forwards are left
+    # out of the fit and its blocks alike.
     held = fitted["held_out"]
     assert len(held["blocks"]) == BLOCKS
     assert {p: v["blocks"] for p, v in held["paths"].items()} == {
         "rung1": BLOCKS,
-        "rung2": 3,
         "rung4": BLOCKS,
         "rung16": BLOCKS,
     }
     assert held["error"] < 0.01 < held["error_pooled"]
+    assert fitted["choice"] == {
+        "paths": held["error"],
+        "fit_host": pytest.approx(held["error_pooled"]),
+        "kept": False,
+    }
     checks = report["kind_blocks"]
     assert checks["H1"]["decode.W_launch"] == {"short": ["rung2"], "pass": False}
     assert checks["H2"]["decode.W_launch"] == {"short": ["rung2"], "pass": False}
@@ -202,7 +208,10 @@ def test_each_rung_takes_its_own_launch_constant_and_a_rare_or_unseen_one_is_fil
     )
 
 
-def test_a_prefill_s_eager_path_takes_its_own_constant_in_place_of_a_column():
+def test_a_prefill_s_eager_path_is_priced_its_own_constant_or_its_column():
+    """One feature: a constant per path spans what an intercept and the
+    column do, so both laws price each path alike and hold out alike; the tie
+    keeps the law `fit_host` gave, its column."""
     samples = _prefills()
     host, report = fit_host(samples)
     assert host["columns"]["prefill"]["W_launch"] == {
@@ -210,13 +219,30 @@ def test_a_prefill_s_eager_path_takes_its_own_constant_in_place_of_a_column():
     }
     refit(samples, host, report)
 
-    assert "W_launch" not in host.get("columns", {}).get("prefill", {})
     x = (1, 5000, 1)
-    eager = price(host, "prefill", "W_launch", x, "eager")
-    replay = price(host, "prefill", "W_launch", x, "replay")
+    eager = price(host, "prefill", "W_launch", x, "eager", {"eager": 1.0})
+    replay = price(host, "prefill", "W_launch", x, "replay", {"eager": 0.0})
     assert eager == pytest.approx(2e-3 + 5e-3 + EAGER_S, rel=0.02)
     assert replay == pytest.approx(2e-3 + 5e-3, rel=0.02)
+    choice = report["prefill.W_launch"]["choice"]
+    assert choice["kept"] and choice["paths"] == pytest.approx(choice["fit_host"])
+    assert PATHS not in host and "eager" in host["columns"]["prefill"]["W_launch"]
     assert report["kind_blocks"]["H1"]["prefill.W_launch"]["pass"]
+
+
+def test_a_launch_no_rung_moves_keeps_the_law_fit_host_gave():
+    samples = [
+        dataclasses.replace(s, host=s.host | {"W_launch": s.host["W_pre"] * 20})
+        for s in _decodes()
+    ]
+    host, report = fit_host(samples)
+    law = host["laws"]["decode"]["W_launch"]
+    refit(samples, host, report)
+
+    assert host["laws"]["decode"]["W_launch"] == law and PATHS not in host
+    entry = report["decode.W_launch"]
+    assert entry["choice"]["kept"] and "held_out" in entry["paths_tried"]
+    assert entry["held_out"]["paths"]["rung4"]["blocks"] == BLOCKS
 
 
 def test_a_path_too_rare_for_its_own_constant_keeps_the_additive_price():
