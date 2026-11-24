@@ -2530,20 +2530,9 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     files each read here as they did in its trace (`capture.lookup`), so one
     traced under another torch, or that ran a file since edited, is a miss
     like any other. One the store holds, at a shape or holding G, is
-    loaded through `ArtifactStore.load` under this process's `graph_readings`,
-    its files' reading here (`capture.source_of`),
-    and its engine config as it records it: that cell holds the tracer's own
-    ATOM arguments, which no reader restates, and the key's structure names
-    the engine config in their place."""
-    from atom.compass.artifacts import (
-        ArtifactStore,
-        Axis,
-        Conditions,
-        GateState,
-        Row,
-        Topology,
-    )
-    from atom.compass.capture import graph_key, lookup, peers, source_of
+    loaded under this process's `graph_readings` (`load_graph`)."""
+    from atom.compass.artifacts import ArtifactStore, Topology
+    from atom.compass.capture import graph_key, lookup, peers
     from atom.compass.capture.forward import (
         PerG,
         Shape,
@@ -2585,16 +2574,13 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         return graph_readings(config.model)
 
     def parsed(key) -> dict:
-        """The graph the store holds at `key`, loaded under `here` and the
-        engine config it records, parsed and frozen with the rest of the live
-        heap, a collection first so no garbage is kept, as
-        `gc_utils.freeze_gc_heap` freezes the startup heap and under the same
-        `ATOM_GC_FREEZE`: this lookup's caches keep what it parses alive, and
-        every full collection walked all of it."""
-        cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
-        readings = here() | {"atom_src": source_of(store, key)}
-        conditions = Conditions.of(**readings, engine_config=cells[Axis.ENGINE_CONFIG])
-        entry = store.load(key, conditions=conditions, gates=GateState.of())
+        """The graph the store holds at `key`, loaded under `here`
+        (`load_graph`), parsed and frozen with the rest of the live heap, a
+        collection first so no garbage is kept, as `gc_utils.freeze_gc_heap`
+        freezes the startup heap and under the same `ATOM_GC_FREEZE`: this
+        lookup's caches keep what it parses alive, and every full collection
+        walked all of it."""
+        entry = load_graph(store, key, here())
         graph = json.loads(entry.read_member("graph", rank, "json"))
         if envs.ATOM_GC_FREEZE:
             gc.collect()
@@ -2684,6 +2670,23 @@ def graph_readings(model: str) -> dict:
         **traced_under(),
         "model": _file_digest(model, "config.json"),
     }
+
+
+def load_graph(store, key, readings: dict):
+    """The `op_graph` entry at `key` in `store`, loaded through
+    `ArtifactStore.load` under `readings` (`graph_readings`), its files'
+    reading here (`capture.source_of`), and its engine config as it records
+    it: that cell holds the tracer's own ATOM arguments, which no reader
+    restates, and the key's structure names the engine config in their place.
+    An entry whose row states another torch, ATOM source or model refuses,
+    naming the axis."""
+    from atom.compass.artifacts import Axis, Conditions, GateState, Row
+    from atom.compass.capture import source_of
+
+    cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
+    readings = readings | {"atom_src": source_of(store, key)}
+    conditions = Conditions.of(**readings, engine_config=cells[Axis.ENGINE_CONFIG])
+    return store.load(key, conditions=conditions, gates=GateState.of())
 
 
 def _trace_process():
