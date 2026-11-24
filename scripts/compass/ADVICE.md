@@ -15,12 +15,15 @@ predicts one configuration on a host with no GPU at all.
 
 ## Limits
 
-- **A GPU container.** The search uses no GPU compute, but a simulated server
-  imports aiter, which needs a ROCm driver. Run it in the GPU container of
-  QUICKSTART's [Environment](QUICKSTART.md#environment).
-- **The target machine type.** Host laws are keyed on the host's CPU, so the search
-  runs on a node of the type it predicts, and another CPU is refused by name. A
-  calibration runs there too, on the GPUs the configuration uses.
+- **A GPU only to calibrate.** The search needs no GPU device and runs on any
+  host's CPU: a simulated server starts with no ROCm driver, and host laws fitted
+  on another CPU serve, predicting the host they timed. A search whose candidates
+  the store serves runs in a container with no GPU device, as USER_QUICKSTART's
+  [Environment](USER_QUICKSTART.md#environment) sets one up. Each command a
+  search prints for step 3, a calibration or a readings measurement, takes the
+  target's GPUs, so a search that prints one runs on a node of the type it
+  predicts, in the GPU container of QUICKSTART's
+  [Environment](QUICKSTART.md#environment).
 - **The integration head.** The tree runs at the tip of
   `origin/feature/atomcompass_new` as last fetched, or at the commit the space file
   freezes. A tree whose ATOM digest (`atom/compass/run/__init__.py::atom_digest`)
