@@ -2,6 +2,7 @@
 """`compass fit host`: the host laws, fitted on real runs' records and published.
 
     compass fit host RECORD... --client-run RECORD EXPORT... --store ROOT
+        [--decode-client-run RECORD EXPORT...]
         [--stated-hop NAME=SECONDS...] [--ingress FILE] --out DIR
 
 `host_laws` fits the samples' host labels by `step_linear_fit.fit_host`, under
@@ -41,14 +42,22 @@ entry's ``ingress`` term (`atom.compass.ingress`): FILE's ``ingress``, as
 here holds. The report's ``stated_ingress`` names FILE and the term. Fit such
 an entry on records taken behind that ingress: their server took each prompt's
 token ids, so it rendered and tokenized nothing, and read larger bodies.
+
+`--decode-client-run RECORD EXPORT` names a client run RECORD's server served,
+as `--client-run` does, whose host samples are its decode drains alone
+(`drain_cut`); the report's ``decode_client_runs`` says what each kept and
+left out. Without it, the fit is as it was.
 """
 
+import dataclasses
 import gzip
 import json
 import math
+from collections import Counter
 from pathlib import Path
 
 from atom.compass.artifacts import Key, Kind, keyed_platform
+from atom.compass.backends.step_labels import digest, group_prefills
 from atom.compass.backends.step_linear_fit import (
     fit_hops,
     fit_host,
@@ -59,9 +68,11 @@ from atom.compass.backends.step_linear_fit import (
     streams,
 )
 from atom.compass.fit import publish
+from atom.compass.fit.samples import client_spans
 from atom.compass.ingress import KEY as INGRESS
 from atom.compass.ingress import check as check_ingress
 from atom.compass.parity.client_run import RAW
+from atom.compass.parity.served import served
 from atom.compass.run import INTAKE_RECORD, LOCAL, TOKENIZER_RECORD
 from atom.compass.validate.runs import SIDES
 
@@ -157,6 +168,56 @@ def _client(record, exports) -> dict:
     return {"sent": sent, "acked": acked}
 
 
+def drain_cut(samples, decode) -> tuple[list, list]:
+    """`samples` less, for each client run `decode` names as ``(record,
+    export)``, the steps of its graded span (`fit.samples.client_spans`) in
+    which some rank prefills and the dummy forwards there: a batch admitted at
+    once is decoded down, so its host samples are its drains', the stretches
+    of its span in which its ranks only decode. And the report's
+    ``decode_client_runs``: per run its record, export, span, drains and their
+    steps, and its samples left out and kept. A prefill side refuses."""
+    named: dict = {}
+    for record, export in decode:
+        named.setdefault(Path(record), []).append(export)
+    bursts, report = {}, []
+    for record, exports in named.items():
+        if record.name == SIDES[0] and (record.parent / SIDES[1]).is_dir():
+            raise ValueError(
+                f"--decode-client-run names {record}, a prefill side, which "
+                "decodes nothing"
+            )
+        steps = served(record / "steps", exports)
+        prefills = group_prefills(steps.values())
+        # The run name `fit.samples.load` gives the record's samples.
+        files = sorted(
+            (record / "steps").glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:])
+        )
+        name = ", ".join(map(digest, files))
+        at = Counter(s.step for s in samples if s.provenance["run"] == name)
+        for k, (a, b) in sorted(client_spans(steps).items()):
+            cut = {n for n in prefills if a <= n <= b}
+            bursts.setdefault(name, set()).update(cut)
+            drains = set(range(a, b + 1)) - cut
+            report.append(
+                {
+                    "record": str(record),
+                    "export": exports[k],
+                    "span": [a, b],
+                    "drains": sum(n - 1 not in drains for n in drains),
+                    "drain_steps": len(drains),
+                    "dropped": sum(at[n] for n in cut),
+                    "kept": sum(at[n] for n in drains),
+                }
+            )
+    kept = []
+    for s in samples:
+        cut = bursts.get(s.provenance["run"], ())
+        if s.step not in cut:
+            dummies = tuple(d for d in s.dummy_host if d[0] not in cut)
+            kept.append(dataclasses.replace(s, dummy_host=dummies))
+    return kept, report
+
+
 #: The hops no record times, each stated in a law file until now: the router's
 #: per-request forward (#3009's assumed 1.5 ms) and Mooncake's KV write request
 #: (#2603's p10), which need the router stamped and both sides on one clock.
@@ -210,6 +271,16 @@ def main(argv: list[str]) -> None:
         "into the entry's hops and named under the report's stated_hops",
     )
     parser.add_argument(
+        "--decode-client-run",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("RECORD", "EXPORT"),
+        help="a client run RECORD's server served, by its export, whose decode "
+        "drains alone give host samples: the steps of its span in which no rank "
+        "prefills",
+    )
+    parser.add_argument(
         "--ingress",
         metavar="FILE",
         help="the encoding ingress in front of the deployment, compass fit "
@@ -218,8 +289,13 @@ def main(argv: list[str]) -> None:
     )
     args = parser.parse_args(argv)
     ingress = stated_ingress(args.ingress) if args.ingress else None
+    args.client_run = [*args.client_run, *args.decode_client_run]
     samples, config = publish.inputs(args, ("record",))
+    if args.decode_client_run:
+        samples, drained = drain_cut(samples, args.decode_client_run)
     host, report = host_laws(samples, args.inputs, args.client_run)
+    if args.decode_client_run:
+        report["decode_client_runs"] = drained
     if stated := stated_hops(args.stated_hop, host.get("hops", {})):
         host["hops"] = {**host.get("hops", {}), **stated}
         report["stated_hops"] = stated
