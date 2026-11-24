@@ -1,0 +1,156 @@
+--- a/atom/compass/clock_transport/service.py
++++ b/atom/compass/clock_transport/service.py
+@@ -77,6 +77,66 @@
+ _SERVED: dict[str, "_Server"] = {}
+ 
+ 
++class _WallProfile:
++    """Diagnostic only (COMPASS_CA_PROFILE=path): per address, wall seconds
++    running (between its reply and its next request) and running alone, while
++    every other bound address waits; written every 10 wall seconds."""
++
++    def __init__(self, path, authority):
++        import json as _json
++        import time as _time
++        self._json, self._time, self._path, self._auth = _json, _time, path, authority
++        self.t0 = self.last = self.flushed = _time.monotonic()
++        self.running = set()
++        self.run_s, self.alone_s, self.reqs = {}, {}, {}
++        self.none_s = 0.0
++        self.serve_s = 0.0
++
++    def _tick(self):
++        now = self._time.monotonic()
++        dt, self.last = now - self.last, now
++        for a in self.running:
++            self.run_s[a] = self.run_s.get(a, 0.0) + dt
++        if len(self.running) == 1:
++            (a,) = self.running
++            self.alone_s[a] = self.alone_s.get(a, 0.0) + dt
++        elif not self.running:
++            self.none_s += dt
++        return now
++
++    def request(self, address):
++        self._tick()
++        a = str(address)
++        self.running.discard(a)
++        self.reqs[a] = self.reqs.get(a, 0) + 1
++
++    def reply(self, address):
++        self._tick()
++        self.running.add(str(address))
++
++    def maybe_flush(self, served_s):
++        self.serve_s += served_s
++        now = self._time.monotonic()
++        if now - self.flushed < 10:
++            return
++        self.flushed = now
++        clocks = sorted(v for v in self._auth._now.values() if v < float("inf"))
++        line = {
++            "wall": now - self.t0,
++            "unix": self._time.time(),
++            "virtual_min": clocks[0] if clocks else None,
++            "virtual_max": clocks[-1] if clocks else None,
++            "serve_s": self.serve_s,
++            "none_s": self.none_s,
++            "running_now": sorted(self.running),
++            "alone_s": dict(sorted(self.alone_s.items(), key=lambda kv: -kv[1])),
++            "run_s": dict(sorted(self.run_s.items(), key=lambda kv: -kv[1])),
++            "reqs": dict(sorted(self.reqs.items(), key=lambda kv: -kv[1])),
++        }
++        with open(self._path, "a") as f:
++            f.write(self._json.dumps(line) + "\n")
++
++
+ class _Server:
+     """The serve side of one endpoint. It takes in frames and closes."""
+ 
+@@ -92,6 +152,10 @@
+         self._unasked = set(self._lps)  # LPs yet to send a request
+         self._quiet = True  # no stall diagnostic is due
+         self._served = 0  # requests and closes served, for the watch
++        from .stream import _Trace
++        self._trace = _Trace("CA")
++        _p = os.environ.get("COMPASS_CA_PROFILE")
++        self._prof = _WallProfile(_p, authority) if _p else None
+         self._closed_at = threading.Event()
+         self._watch = threading.Thread(
+             target=self._watching, name=f"clock {endpoint}", daemon=True
+@@ -172,6 +236,11 @@
+                     replies = [(i, self._ended) for i in list(self._slots)]
+             elif self._ended is None:
+                 kind, t, log, t_daemon, *steps_ahead_rounds = request
++                self._trace("Q", f"{address} {kind} {t}")
++                if self._prof is not None:
++                    _t0 = self._prof._time.monotonic()
++                    if kind != REPORT:
++                        self._prof.request(address)
+                 try:
+                     try:
+                         grants = self._authority.on_request(
+@@ -193,6 +262,11 @@
+                     replies = [(i, self._ended) for i in list(self._slots)]
+             for i, frame in replies:
+                 self._slots[i].put(frame)
++                self._trace("A", str(i))
++                if self._prof is not None and request is not None:
++                    self._prof.reply(i)
++            if self._prof is not None and request is not None and self._ended is None:
++                self._prof.maybe_flush(self._prof._time.monotonic() - _t0)
+             for i in resigned:
+                 del self._slots[i]
+ 
+--- a/atom/compass/clock_transport/stream.py
++++ b/atom/compass/clock_transport/stream.py
+@@ -68,6 +68,25 @@
+     sock.close()
+ 
+ 
++class _Trace:
++    """Diagnostic only (COMPASS_TRACE_DIR): one line per frame sent or received,
++    with time.time(), to <dir>/<pid>.trace."""
++
++    def __init__(self, tag):
++        import os as _os
++        import time as _time
++        d = _os.environ.get("COMPASS_TRACE_DIR")
++        self.f = None
++        if d:
++            self.f = open(f"{d}/{_os.getpid()}.trace", "a", buffering=1)
++            self.t = _time.time
++            self.tag = tag
++
++    def __call__(self, ev, extra=""):
++        if self.f is not None:
++            self.f.write(f"{self.t():.6f} {ev} {self.tag} {extra}\n")
++
++
+ class _StreamServer:
+     """A serve side that LPs reach over TCP."""
+ 
+@@ -170,6 +189,9 @@
+         self._stream = self._sock.makefile("rwb")
+ 
+     def bind(self, frame: bytes) -> tuple:
++        from .wire import decode as _decode
++        _, *_who = _decode(frame)
++        self._trace = _Trace("/".join(str(getattr(w, "name", w)) for w in _who if w is not None))
+         _send(self._stream, frame)
+         try:
+             _, *joined = _reply(self.get())
+@@ -179,10 +201,13 @@
+         return None, self, tuple(joined)
+ 
+     def submit(self, _lp, frame: bytes) -> None:
++        self._trace("S")
+         _send(self._stream, frame)
+ 
+     def get(self) -> bytes:
+         frame = _receive(self._stream)
++        if hasattr(self, "_trace"):
++            self._trace("R")
+         if frame is None:
+             raise MalformedMessage("the clock closed the connection with no reply")
+         return frame
