@@ -118,21 +118,23 @@ def test_each_form_meets_every_scenario_check(runs):
 
 
 def test_each_form_runs_as_its_flags_say(runs):
-    """Each DP rank keeps a record. At level 0 every rank serves a request,
-    and under TBO each rank runs a split step. At level 1 which rank serves
-    which request, and what each rank's step holds, follow when requests
-    finish against the steps, and so the step cost; there the roofline prices
-    the routed experts, and under TBO the overlap of a split step's two
-    micro-batches, without which no step of the run is priced as TBO's."""
+    """Each DP rank keeps a record, and under TBO each rank runs a split step:
+    ATOM splits a step for the whole DP group or not at all
+    (`sync_dp_metadata`), so no step cost moves that. At level 0 every rank
+    serves a request; at level 1 which rank serves which request follows when
+    requests finish against the steps, and so the step cost. There every term
+    of every rank's cost lines is the roofline's: the routed experts' among
+    them, and under TBO the overlap of a split step's two micro-batches."""
     form, level, done = runs
     steps = done[0]["parity"]
     assert sorted(steps) == list(range(FORMS[form][2]))
+    if form == "tbo":
+        assert all(any(s.get("tbo_tokens") for s in steps[r]) for r in steps)
     if level == 0:
         assert all(any(s["batch"] for s in steps[rank]) for rank in steps)
-        if form == "tbo":
-            assert all(any(s.get("tbo_tokens") for s in steps[r]) for r in steps)
         return
     terms = _terms(done[0])
+    assert terms and all(t.startswith("roofline.") for t in terms), sorted(terms)
     assert ("roofline.moe" in terms) == (form != "pure_dp"), sorted(terms)
     assert ("roofline.tbo" in terms) == (form == "tbo"), sorted(terms)
 
