@@ -236,10 +236,12 @@ else
     # Its own process group, so a real server's workers stop with it. A held
     # DP master port, as `compass record` gives one: the port keys ATOM's
     # compiled-graph cache, and the first start that loads it autotunes again.
-    # No later start loads it, so the server's stop removes it, as there.
+    # No later start loads it, so the server's stop removes it, as there. Its
+    # record keeps a real step's line until the exit, as `compass record`'s
+    # does, whatever the caller exports (parity.WRITE_THROUGH).
     # shellcheck disable=SC2086 # SERVER_ARGS and on_arch are word lists
-    ATOM_DP_MASTER_PORT=$(compass_held_port) ATOM_COMPASS_PARITY_RECORD=$record setsid \
-        python3 $on_arch "${main[@]}" \
+    ATOM_DP_MASTER_PORT=$(compass_held_port) ATOM_COMPASS_PARITY_RECORD=$record \
+        ATOM_COMPASS_PARITY_WRITE_THROUGH=0 setsid python3 $on_arch "${main[@]}" \
         --model "$MODEL" --host 127.0.0.1 --server-port "$PORT" --timeout-keep-alive 1000000 \
         $SERVER_ARGS "${compass[@]}" >"$OUT/server.log" 2>&1 &
     # Ready once uvicorn listens; the frontend answers /health from then on,
