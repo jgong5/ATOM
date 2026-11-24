@@ -218,6 +218,19 @@ def test_the_switches_read_from_the_environment():
     assert env_options(zero) == {"moe_imbalance": 0.0}
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["COMPASS_FIT_ROW_PADDING", "COMPASS_FIT_GATHER_ROWS", "COMPASS_FIT_MOE_IMBALANCE"],
+)
+def test_a_switch_is_0_or_1_and_any_other_value_is_refused(name):
+    """A switch at ``true`` is refused, not read as off, which would fit the
+    law without its column."""
+    assert env_options({name: "0"}) == env_options({name: ""}) == {}
+    for value in ("true", "yes", "2"):
+        with pytest.raises(ValueError, match=f"{name}={value} is not 0 or 1"):
+            env_options({name: value})
+
+
 RUNG = 8
 ROUTING = (64, 4)
 
@@ -522,6 +535,21 @@ def test_a_gather_column_on_one_rank_or_without_buckets_is_refused(tmp_path):
             fit(one, {"dp": 1, "moe_imbalance": spread})
     with pytest.raises(ValueError, match="run one rank"):
         fit(one, {"dp": 1, "peer_tokens": (4,)})
+
+
+def test_the_shared_form_refuses_peer_tokens(tmp_path):
+    """Only the per-rung decode solves add `peer_tokens`, so the `shared`
+    form, whose one solve shares the base columns over rungs, refuses a
+    target or draft rung list rather than fitting without it."""
+    truth = {k: DECODE[k] for k in ("step", "context", "graph_padding", "peer_tokens")}
+    paths = _decode_records(tmp_path / "run", _decode_groups(7, 60, truth))
+    samples = label_records(paths, DP)[0]
+    shared = {"form": "shared", "dp": DP}
+    for peers in ((RUNG,), "saturated"):
+        with pytest.raises(ValueError, match="shared form fits no peer_tokens"):
+            fit(samples, {**shared, "peer_tokens": peers})
+    with pytest.raises(ValueError, match="shared form fits no peer_tokens"):
+        fit(samples, {**shared, "draft_peer_tokens": "all"}, draft=True)
 
 
 def test_moe_records_still_load_with_peer_rows(tmp_path):

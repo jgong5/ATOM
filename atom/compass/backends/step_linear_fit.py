@@ -233,7 +233,8 @@ adopted `moe_experts` column its median step holds at `SATURATED` of the
 experts (`_peer_rung`, `PEER_TOKENS_ENV`); `draft_peer_tokens` adds it to the
 draft law's decode rungs above `dp` 1, every one as ``all``
 (`DRAFT_PEER_TOKENS_ENV`): a draft's MoE runs on its group's rows too. The draft
-law takes none of the others. A vector carrying one of these columns states,
+law takes none of the others. The `shared` form, whose one decode solve shares
+the base columns over rungs, refuses `row_padding` and `peer_tokens`. A vector carrying one of these columns states,
 under `fit.vif`, each one's variance inflation factor over the rows it was
 fitted on (`_vif`), how far the other columns already hold it.
 
@@ -394,8 +395,9 @@ NO_BUCKETS = "no record states prefill buckets, so the prefill vector adds no pa
 #: stated here, as this package imports nothing from the engine.
 LEVEL = "level"
 DEFAULT_LEVEL = 3
-#: The switches of the opt-in columns (`env_options`), each off unless set to
-#: ``1``: decode `row_padding`, prefill `gather_rows` and `moe_imbalance`.
+#: The switches of the opt-in columns (`env_options`), each on at ``1``, off at
+#: ``0`` or unset, and refused at any other value (`_switch`): decode
+#: `row_padding`, prefill `gather_rows` and `moe_imbalance`.
 ROW_PADDING_ENV = "COMPASS_FIT_ROW_PADDING"
 GATHER_ROWS_ENV = "COMPASS_FIT_GATHER_ROWS"
 MOE_IMBALANCE_ENV = "COMPASS_FIT_MOE_IMBALANCE"
@@ -604,22 +606,32 @@ def _gathered(cols) -> list[str]:
     return [f for f in GATHER_COLUMNS if cols and cols[f] is not None]
 
 
+def _switch(env, name: str) -> bool:
+    """Whether the switch `name` in `env` is on: ``1`` on, ``0`` or unset
+    off, and any other value refused."""
+    value = env.get(name) or "0"
+    if value not in ("0", "1"):
+        raise ValueError(f"{name}={value} is not 0 or 1")
+    return value == "1"
+
+
 def env_options(environ=None) -> dict:
     """The `fit` options the opt-in column switches in `environ`, the process's
     environment by default, set: `ROW_PADDING_ENV`, `GATHER_ROWS_ENV` and
     `MOE_IMBALANCE_ENV` at ``1`` (with `MOE_MIN_SPREAD_ENV`'s share), the
     `MOE_SELECT_ENV` rule and the `PEER_TOKENS_ENV` and `DRAFT_PEER_TOKENS_ENV`
-    rungs; none set, none."""
+    rungs; none set, none. A switch set to anything but ``0`` or ``1`` is
+    refused (`_switch`)."""
     env = os.environ if environ is None else environ
     out = {}
     for key, name in (
         ("row_padding", ROW_PADDING_ENV),
         ("gather_rows", GATHER_ROWS_ENV),
     ):
-        if env.get(name) == "1":
+        if _switch(env, name):
             out[key] = True
     spread = env.get(MOE_MIN_SPREAD_ENV)
-    if env.get(MOE_IMBALANCE_ENV) == "1":
+    if _switch(env, MOE_IMBALANCE_ENV):
         out["moe_imbalance"] = MOE_MIN_SPREAD if spread is None else float(spread)
     elif spread is not None:
         raise ValueError(
@@ -2525,6 +2537,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             "peer_tokens counts a data-parallel group's peers' tokens, and these "
             "records run one rank"
         )
+    if peers and form == "shared":
+        raise ValueError("the shared form fits no peer_tokens column")
     samples = [
         (
             s
