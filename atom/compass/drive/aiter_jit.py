@@ -28,10 +28,12 @@ file, FlyDSL's by its directory. ATOM's compile cache, ``~/.cache/atom``, is
 left out: each start derives a directory of its own there, points Triton and
 Inductor into it, and the stop removes it, so every process pays its compiles.
 
-    python -m atom.compass.drive.aiter_jit RUN_JSON SINCE_NS
+    python -m atom.compass.drive.aiter_jit RUN_JSON WALL_NS MONOTONIC_NS
 
-adds the entries to RUN_JSON for the paths written at or after SINCE_NS, wall
-clock nanoseconds, as `cctraces_sim.sh` does for a real cell.
+adds the entries to RUN_JSON for the paths written at or after WALL_NS, and with
+them ``clock_ns``, the pair: WALL_NS and MONOTONIC_NS are the host's wall clock
+and monotonic nanoseconds read together when the server first answered, as
+`cctraces_sim.sh` reads them for a real cell.
 """
 
 import importlib.util
@@ -46,6 +48,7 @@ from triton import knobs
 
 from atom.compass.backends.step_labels import (  # noqa: F401
     BUILDS,
+    CLOCK,
     COMPILES,
     cut_refusal,
     refusal,
@@ -134,8 +137,12 @@ def builds_since(since_ns: int) -> dict:
 
 
 def main(argv=None) -> None:
-    run_json, since_ns = sys.argv[1:] if argv is None else argv
-    run = json.loads(Path(run_json).read_text()) | builds_since(int(since_ns))
+    run_json, *clock = sys.argv[1:] if argv is None else argv
+    wall, monotonic = map(int, clock)
+    builds = builds_since(wall)
+    if builds:  # the clocks that place its compiles among its steps
+        builds[CLOCK] = [wall, monotonic]
+    run = json.loads(Path(run_json).read_text()) | builds
     _write_whole(Path(run_json), json.dumps(run))
 
 
