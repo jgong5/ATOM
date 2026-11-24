@@ -596,13 +596,11 @@ def _borrowing(points: list, held: dict, calibrations: dict) -> None:
 
 def _measuring(held: dict, new: Path) -> None:
     """Name the command of each readings verdict in `held`, a candidate's in
-    its store, that sends them to measure: into that store; or, where an entry
-    there holds the key of readings a verdict sends to measure, which the store
-    refuses a second publish at, into the new store `new` for every point, as a
-    run reads one store, those at their key in the old store sent to measure
-    too (`MOVED`); `lacking.MEASURED` for those `new` holds. Each verdict sheds
-    what `_judged` gives it as ``measuring``: the readings key, a real start's
-    ATOM arguments and its variables."""
+    its store, that sends them to measure: into that store, or, once one sends
+    readings whose key an entry there holds, which it refuses a second publish
+    at, into `new` for every point, those at their key there too (`MOVED`), as
+    a run reads one store. Each verdict sheds ``measuring``, its key, real ATOM
+    arguments and variables, which `_judged` gives it."""
     taken = []
     for point in held["points"].values():
         for side, readings in point["readings"].items():
