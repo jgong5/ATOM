@@ -654,11 +654,11 @@ def test_the_reading_runner_writes_its_parameter_and_buffer_storages_apart(
         return SimpleNamespace(is_cuda=cuda, untyped_storage=lambda: held)
 
     class ModelRunner:
-        def _build_and_load_model(self, model_class):
+        def _build_and_load_model(self, config, model_class, device):
             # A tied head is the embedding's storage, and so is a buffer
             # that shares it; a host buffer holds no device bytes.
             embedding = storage(1, 100)
-            self.model = SimpleNamespace(
+            return SimpleNamespace(
                 parameters=lambda: [embedding, storage(2, 50), embedding],
                 buffers=lambda: [embedding, storage(3, 7), storage(4, 9, cuda=False)],
             )
@@ -667,7 +667,7 @@ def test_the_reading_runner_writes_its_parameter_and_buffer_storages_apart(
     monkeypatch.setattr(module, "_allocated", {"current": 1_000}.get)
     runner = module.MemoryReadingModelRunner()
     runner.config, runner.rank = tp2(tmp_path).config, 0
-    runner._build_and_load_model(None)
+    runner._build_and_load_model(runner.config, None, None)
     runner._read |= dict.fromkeys(["total", "non_torch", "current", "peak"], 1_000)
     runner._read |= {"warmup_tokens": 0, "num_kvcache_blocks": 1}
     monkeypatch.setenv(measure_memory.OUT_ENV, str(tmp_path))

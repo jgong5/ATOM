@@ -157,7 +157,7 @@ if not mode.startswith("tp"):
 config = Config(model=str(root / "model"), tensor_parallel_size=tp, load_dummy="empty",
                 kv_cache_dtype="fp8", **dpa)
 set_current_atom_config(config)
-from atom.model_engine.model_runner import support_model_arch_dict
+from atom.models.registry import support_model_arch_dict
 from atom.utils import resolve_obj_by_qualname
 from atom.compass.runner.overrides import FactoriesOnMeta, process_weights_after_loading
 from atom.compass.run.modules import walk
