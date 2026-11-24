@@ -26,8 +26,10 @@ the fit labels whose label keeps that kernel's recorded length.
 (`step_linear_fit._keep_peer_tail`), and the opt-in columns and rules
 `step_linear_fit.env_options` reads from the environment, each off unless set:
 `COMPASS_FIT_ROW_PADDING=1` (decode `row_padding`), `COMPASS_FIT_GATHER_ROWS=1`
-(prefill `gather_rows`), `COMPASS_FIT_MOE_IMBALANCE=1` (prefill
+(prefill `gather_rows`; ``pad``, its pad rows alone, `gather_pad_rows`),
+`COMPASS_FIT_MOE_IMBALANCE=1` (prefill
 `moe_imbalance`, over `COMPASS_FIT_MOE_MIN_SPREAD`, 0.2 by default),
+`COMPASS_FIT_UNEVEN_ROWS=1` (prefill `uneven_rows`, over the same spread),
 `COMPASS_FIT_MOE_SELECT=insample` (each decode rung's MoE column by its fit on
 all its steps), `COMPASS_FIT_PEER_TOKENS` (decode `peer_tokens`: ``1`` at
 each rung whose `moe_experts` column is saturated, else the rungs named) and

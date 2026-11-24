@@ -29,21 +29,35 @@ column priced the stretches (the warmup's first turns, c=256's prefill queue)
 about 5% high and the isolated prefills of c=8 to c=128 2-4% low (#3747). A
 vector with the column states its `duty_tau`, which must be `DUTY_TAU`, and a
 step stating no `prefill_duty` is refused.
-After it a prefill vector may add `gather_rows` and `moe_imbalance`, each over
-its data-parallel group's MoE gather and 0 on one rank. `gather_rows`
+After it a prefill vector may add `gather_rows` (or `gather_pad_rows`) and
+`moe_imbalance` (`GATHER_COLUMNS`, `gather_column`), each over its
+data-parallel group's MoE gather and 0 on one rank. `gather_rows`
 (`gather_rows`) is the rows the gather carries: on a step whose group replays a
 prefill token graph every rank runs the bucket (`token_bucket`,
 `ForwardMode._pad_to_token_graph`), so the gather carries `ranks` buckets,
 however few tokens each rank scheduled, its pad rows reaching no expert; on one
 it runs eagerly the variable-length gather carries each rank's own count,
-`moe_rows`. `moe_imbalance` (`moe_imbalance`) is the rows by which a group
+`moe_rows`. `gather_pad_rows` (`gather_pad_rows`) is the pad rows alone,
+`gather_rows` less `moe_rows`: the gather's rows past those its ranks scheduled
+under a token graph, 0 on a step run eagerly. It spans what `gather_rows` adds
+to `moe_rows` without repeating it (#3720: on cell A's e3v2 record
+`gather_rows` held a VIF of 150 against `moe_rows`, its pad rows 2.5), and a
+vector takes one of the two. `moe_imbalance` (`moe_imbalance`) is the rows by which a group
 running that variable-length gather is uneven: `ranks` times its
 `group_max_tokens` less its `moe_rows`, the rows its busiest rank holds past an
 even share, where that is at least `min_spread` of `moe_rows`, else 0, and 0
-on a step that replays a token graph, whose ranks all run the bucket. A vector
-with either states `ranks`, its group's width, and one with `moe_imbalance` its
-`min_spread`; `gather_rows` takes the vector's `buckets`, so it comes with
-`padding`. A data-parallel step stating no `group_max_tokens` is refused.
+on a step that replays a token graph, whose ranks all run the bucket.
+`uneven_rows` (`uneven_rows`), after it, is the `moe_rows` of a step whose
+`moe_imbalance` at that `min_spread` is not 0, else 0: the rows of a gather its
+group runs uneven, each of which waits on the busiest rank at every layer's
+collective. It spans what `moe_imbalance` adds to the base columns without
+repeating `tokens` and `moe_rows` on the busiest rank (#3720: on cell A's e3v2
+record `moe_imbalance` held a VIF of 17.4 and pushed `moe_rows` to 18.8,
+`uneven_rows` 1.7 and 5.7). A vector
+with any of them states `ranks`, its group's width, and one with
+`moe_imbalance` or `uneven_rows` its `min_spread`; `gather_rows` and
+`gather_pad_rows` take the vector's `buckets`, so they come with `padding`. A
+data-parallel step stating no `group_max_tokens` is refused.
 After `seqs` and `out` it may add `peer_small` and `peer_large` (`peer_share`):
 on a data-parallel rank's own prefill forward, output or middle chunk, whose
 peers run real rows (its group's MoE gather, `BatchView.moe_rows`, carrying
@@ -200,8 +214,8 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
               "rowmod": k,    # a decode vector with a `rowmod` coefficient only
               "duty_tau": s,  # a prefill vector with a `cold_peer_rows` coefficient only
               "kda_chunk": c, # a prefill vector with `KDA` coefficients only
-              "ranks": n,     # a prefill vector with `gather_rows` or `moe_imbalance` only
-              "min_spread": f,  # a prefill vector with `moe_imbalance` only
+              "ranks": n,     # a prefill vector with a `GATHER_COLUMNS` column only
+              "min_spread": f,  # a prefill vector with `moe_imbalance` or `uneven_rows` only
               "declared": "<where it was fitted>",  # optional
               "held_out": {"hull": HULL, "bands": {<band>: ERRORS, ...}}}  # optional
 
@@ -261,7 +275,9 @@ PREFILL_EXTRA = (
     "serial_moe_rows",
     "cold_peer_rows",
     "gather_rows",
+    "gather_pad_rows",
     "moe_imbalance",
+    "uneven_rows",
     "seqs",
     "out",
     "peer_small",
@@ -284,7 +300,9 @@ MOE_COLUMNS = ("moe_tokens", "moe_experts")
 DECODE_EXTRA = ("row_padding",) + MOE_COLUMNS + ("peer_tokens", "rowmod")
 #: The prefill vector's columns over its data-parallel group's MoE gather that
 #: state the group's width, `ranks`.
-GATHER_COLUMNS = ("gather_rows", "moe_imbalance")
+GATHER_COLUMNS = ("gather_rows", "gather_pad_rows", "moe_imbalance", "uneven_rows")
+#: The `GATHER_COLUMNS` that state the vector's `min_spread`.
+SPREAD_COLUMNS = ("moe_imbalance", "uneven_rows")
 PROPOSE = ("step", "seqs")
 EAGER = "eager"
 SOURCE = "step-linear"
@@ -354,17 +372,23 @@ class _Vector:
                     f"data-parallel group of {self.ranks!r} ranks; it states its "
                     "group's width, 2 or more, under ranks"
                 )
-        if "gather_rows" in features and not self.buckets:
+        if "gather_rows" in features and "gather_pad_rows" in features:
             raise ValueError(
-                f"the {name} vector carries gather_rows and no padding, whose "
-                "buckets say which steps replay a token graph"
+                f"the {name} vector carries gather_rows and gather_pad_rows, "
+                "the second the first less moe_rows"
             )
-        if "moe_imbalance" in features:
+        for padded in ("gather_rows", "gather_pad_rows"):
+            if padded in features and not self.buckets:
+                raise ValueError(
+                    f"the {name} vector carries {padded} and no padding, whose "
+                    "buckets say which steps replay a token graph"
+                )
+        if spread := [f for f in SPREAD_COLUMNS if f in features]:
             self.min_spread = spec.get("min_spread")
             if not isinstance(self.min_spread, (int, float)) or self.min_spread < 0:
                 raise ValueError(
-                    f"the {name} vector carries moe_imbalance and states its "
-                    f"min_spread as {self.min_spread!r}, not a non-negative share"
+                    f"the {name} vector carries {' and '.join(spread)} and states "
+                    f"its min_spread as {self.min_spread!r}, not a non-negative share"
                 )
 
 
@@ -453,6 +477,57 @@ def gather_rows(view: BatchView, buckets: tuple[int, ...], ranks: int) -> int | 
     if bucket is None:
         return None
     return ranks * bucket if bucket else view.moe_rows
+
+
+def gather_pad_rows(
+    view: BatchView, buckets: tuple[int, ...], ranks: int
+) -> int | None:
+    """The pad rows `view`'s data-parallel group's MoE gather carries on a
+    prefill step of `ranks` ranks, `gather_rows` less `moe_rows`: `ranks`
+    times the `token_bucket` it replays less the rows its ranks scheduled,
+    rows that reach no expert; 0 on a step run eagerly, whose
+    variable-length gather carries no pad, and on one rank. None for a
+    data-parallel view stating no `group_max_tokens`."""
+    rows = gather_rows(view, buckets, ranks)
+    if rows is None:
+        return None
+    return max(rows - (view.moe_rows or 0), 0)
+
+
+def gather_column(
+    feature: str,
+    view: BatchView,
+    buckets: tuple[int, ...],
+    ranks: int,
+    min_spread: float | None = None,
+) -> int | None:
+    """`view`'s count of `feature`, one of `GATHER_COLUMNS`, over a group of
+    `ranks` ranks and the prefill token-graph `buckets`, `moe_imbalance` and
+    `uneven_rows` at `min_spread`: the one function the fit and the backend
+    count each by."""
+    if feature == "gather_rows":
+        return gather_rows(view, buckets, ranks)
+    if feature == "gather_pad_rows":
+        return gather_pad_rows(view, buckets, ranks)
+    if feature == "moe_imbalance":
+        return moe_imbalance(view, buckets, ranks, min_spread)
+    if feature == "uneven_rows":
+        return uneven_rows(view, buckets, ranks, min_spread)
+    raise ValueError(f"{feature!r} is not one of {GATHER_COLUMNS}")
+
+
+def uneven_rows(
+    view: BatchView, buckets: tuple[int, ...], ranks: int, min_spread: float
+) -> int | None:
+    """The rows of `view`'s group's variable-length MoE gather where its
+    group of `ranks` ranks runs it uneven: its `moe_rows` where its
+    `moe_imbalance` at `min_spread` is not 0, else 0 (on a step that replays
+    a token graph and on one rank too). None for a data-parallel view stating
+    no `group_max_tokens`."""
+    idle = moe_imbalance(view, buckets, ranks, min_spread)
+    if idle is None:
+        return None
+    return view.moe_rows if idle else 0
 
 
 def moe_imbalance(
@@ -738,15 +813,13 @@ class StepLinearBackend(CostBackend):
             for feature in GATHER_COLUMNS:
                 if feature not in vector.features:
                     continue
-                if feature == "gather_rows":
-                    got = gather_rows(batch_view, vector.buckets, vector.ranks)
-                else:
-                    got = moe_imbalance(
-                        batch_view,
-                        vector.buckets or (),
-                        vector.ranks,
-                        vector.min_spread,
-                    )
+                got = gather_column(
+                    feature,
+                    batch_view,
+                    vector.buckets or (),
+                    vector.ranks,
+                    vector.min_spread,
+                )
                 if got is None:
                     raise self._refuse(
                         batch_view,
