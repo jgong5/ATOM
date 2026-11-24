@@ -45,10 +45,14 @@ as a publish there before would leave its directory holding files, which
 record a `deploy.sh record` of both sides, fitting each side sent to calibrate
 but one it borrows so: its store is that of a side's lender, where that holds
 nothing the sides it fits would publish, and, when it is the lender's own,
-once the lender has started, each side it fits waiting until then; else a lone
-server's, judged over the sides sent to calibrate; into a store of its own it
-fits both sides, as that store holds neither. A borrowed side whose readings
-key is its lender side's takes no readings command: the lender measures them.
+once the lender has started, each side it fits waiting until then; else, where
+it holds nothing the sides sent to calibrate would publish, the store the
+candidate is looked up in, when a lone server's calibration would take it or a
+side reuses a law there, as from a lender that has ended; else its own, into
+which it fits both sides, as that store holds neither. Once one has started,
+the command takes the store and the sides its `INPUTS` name. A borrowed side
+whose readings key is its lender side's takes no readings command: the lender
+measures them.
 A readings verdict ``measure`` names the `compass measure memory` command,
 under the instance's variables, a 1P1D side's on the connector a real start of
 it takes.
@@ -134,7 +138,8 @@ WAITING = (
     "then prints its command"
 )
 #: The file a calibration writes its inputs to, in its directory: a line
-#: ``store <path>`` names the store it publishes into, when one was named.
+#: ``store <path>`` names the store it publishes into, when one was named, and
+#: on 1P1D a line ``fit <sides>`` the sides it fits.
 INPUTS = "inputs"
 #: What a start runs: a server on one node, a deployment on 1P1D.
 COMPASS, DEPLOY = (
@@ -668,7 +673,11 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
         for side, key in keys.items()
         if calibrations.get(key, {}).get("in", str(directory)) != str(directory)
     }
-    into, fit, waiting = _deployed(directory, shared, held["store"], keys, lent, sides)
+    judged_in = held["store"]
+    reused = [laws[side].get("store") for side in laws if side not in keys]
+    shared_in = Path(judged_in).resolve() == Path(shared).resolve()
+    lookup = judged_in if shared_in or judged_in in reused else None
+    into, fit, waiting = _deployed(directory, lookup, keys, lent, sides)
     for side in (side for side in keys if side not in fit):
         lender, there = Path(lent[side]["in"]), lent[side]["into"]
         laws[side]["made_by"] = [BORROWED.format(lender.name, there)]
@@ -693,31 +702,34 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
         )
 
 
-def _deployed(directory: Path, shared: str, judged_in: str, keys, lent, sides) -> tuple:
+def _deployed(directory: Path, lookup: str | None, keys, lent, sides) -> tuple:
     """The store a 1P1D calibration into `directory` publishes into, None its
     own; the sides it fits; and the calibration it waits on, its ``name`` and
     the store it publishes ``into``, else None. `keys` holds each side sent to
     calibrate, `lent` each of them an earlier candidate's calibration makes at
     its key, and `sides` where each side's calibration publishes (`_keys`).
-    Once one has started in `directory`, the store its `INPUTS` name, if any:
-    a resume takes the store it started with. Before then, the store a side's
-    lender publishes into, where it holds nothing a side the calibration fits
-    there would publish (`_holds`); while that store is the lender's own and
-    the lender has not started, waiting on it, as a publish there would leave
-    the lender's directory holding files, which `calibrate.sh` refuses. Else
-    the shared store, as one server's calibration takes it (`_publishing`),
-    when the candidate is looked up there, `judged_in`, and it holds nothing a
-    side sent to calibrate would publish; else its own. Into a store of its
-    own it fits both sides, as that holds neither; into another, each side
-    sent to calibrate but one whose lender publishes there."""
+    Once one has started in `directory`, the store and the sides its `INPUTS`
+    name, every side where they name none: a resume takes the inputs it
+    started with, though a side it has fitted now holds its key there. Before
+    then, the store a side's lender publishes into, where it holds nothing a
+    side the calibration fits there would publish (`_holds`); while that store
+    is the lender's own and the lender has not started, waiting on it, as a
+    publish there would leave the lender's directory holding files, which
+    `calibrate.sh` refuses. Else `lookup`, the store the candidate is looked
+    up in where it is the shared one, as one server's calibration takes it
+    (`_publishing`), or a side reuses a law there, as from a lender that has
+    ended, when it holds nothing a side sent to calibrate would publish; else
+    its own. Into a store of its own it fits both sides, as that holds
+    neither; into another, each side sent to calibrate but one whose lender
+    publishes there."""
 
     def fitting(into) -> list:
         lenders = {s: Path(lent[s]["into"]).resolve() for s in lent}
         return [s for s in keys if lenders.get(s) != Path(into).resolve()]
 
     if (directory / INPUTS).is_file():
-        into = started_store(directory)
-        return into, fitting(into) if into else list(sides), None
+        fit = _started_input(directory, "fit")
+        return started_store(directory), fit.split() if fit else list(sides), None
     for lender in lent.values():
         into, fits = lender["into"], fitting(lender["into"])
         if any(_holds(into, sides[s]) for s in fits):
@@ -729,10 +741,8 @@ def _deployed(directory: Path, shared: str, judged_in: str, keys, lent, sides) -
         ):
             return into, fits, {"name": own.parent.name, "into": into}
         return into, fits, None
-    if Path(judged_in).resolve() == Path(shared).resolve() and not any(
-        _holds(shared, sides[s]) for s in keys
-    ):
-        return shared, list(keys), None
+    if lookup and not any(_holds(lookup, sides[s]) for s in keys):
+        return lookup, list(keys), None
     return None, list(sides), None
 
 
@@ -769,9 +779,16 @@ def _publishing(store, made, law: dict, readings: dict) -> str | None:
 def started_store(directory: Path) -> str | None:
     """The store the `INPUTS` of the calibration started in `directory` name,
     None when they name none or no calibration started there."""
+    return _started_input(directory, "store")
+
+
+def _started_input(directory: Path, field: str) -> str | None:
+    """What the line of the `INPUTS` of the calibration started in `directory`
+    that `field` opens holds after it, None when they hold none or no
+    calibration started there."""
     inputs = directory / INPUTS
     given = inputs.read_text().splitlines() if inputs.is_file() else []
-    return next((s[len("store ") :] for s in given if s.startswith("store ")), None)
+    return next((s[len(field) + 1 :] for s in given if s.startswith(f"{field} ")), None)
 
 
 def _resolved(args, arch: str):

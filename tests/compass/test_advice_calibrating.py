@@ -14,6 +14,8 @@ Two 1P1D candidates sharing a prefill side, as the development template's A
 and B, take one command each: A's fits both sides, and B's its decode alone
 into the store A's publishes into, naming A's calibration for its prefill side;
 once that store holds A's two sides and B's decode, both are searchable on it.
+A started calibration's command holds once one of its sides has published, and
+B, once A has ended in a store of its own, fits its decode alone there.
 
 The configuration, its stubbed resolution and starts are `test_advice_check`'s:
 the store holds readings of the configuration as the deployment resolves it,
@@ -25,6 +27,7 @@ import shlex
 import shutil
 from types import SimpleNamespace
 
+import platforms
 import pytest
 from test_advice_check import (
     NETWORK,
@@ -36,7 +39,7 @@ from test_advice_check import (
 from test_advice_reuse import stored
 from test_artifact_invalidation import STANZA, moved
 from test_memory_readings import READINGS, publish_readings
-from test_run_step_grid import PLATFORM
+from test_run_step_grid import DOCUMENT, PLATFORM
 
 from atom.compass.advice import check
 from atom.compass.artifacts import (
@@ -298,3 +301,55 @@ def test_both_1p1d_candidates_are_searchable_once_one_store_holds_their_sides(
     held = {name: c["store"] for name, c in reused["candidates"].items()}
     assert held == {"A": str(tmp_path / "store"), "B": str(tmp_path / "store")}
     assert len(starts(tmp_path)) == 2
+
+
+def test_a_started_1p1d_calibration_s_command_holds_once_a_side_has_published(
+    tmp_path, sides
+):
+    store, a = tmp_path / "store", tmp_path / "out" / "cal" / "A"
+    first = advise(tmp_path, PAIR, network=NETWORK)
+    # A started into the shared store, which then holds both sides' readings
+    # and the prefill side's laws: its decode side's fit failed.
+    a.mkdir(parents=True)
+    (a / "inputs").write_text(f"tree c0ffee\nfit prefill decode\nstore {store}\n")
+    for env in ({}, {"GPU_MAX_HW_QUEUES": "2"}):
+        with check._env(env):
+            publish_readings(store, sides)
+            if not env:
+                stored(tmp_path, SimpleNamespace(config=sides))
+
+    found = advise(tmp_path, PAIR, network=NETWORK)
+
+    assert found["A"]["state"] == found["B"]["state"] == "missing a law"
+    # A resumes on the inputs it started with, the trace runs included; B
+    # fits its decode alone into that store, its prefill side now reused.
+    assert _calibrate(found, "A") == _calibrate(first, "A")
+    assert _calibrate(found, "B") == _calibrate(first, "B")
+    assert len(found["B"]["made_by"]) == 1
+
+
+def test_a_1p1d_side_an_ended_calibration_published_leaves_the_other_to_fit_there(
+    tmp_path, sides
+):
+    store, cal = tmp_path / "store", tmp_path / "out" / "cal"
+    own = cal / "A" / "store"
+    # The shared store refuses A's prefill readings, so A has ended in its own
+    # store, which holds its two sides' laws and readings and the platform's.
+    _readings_at_another_digest(store, sides)
+    own.mkdir(parents=True)
+    (cal / "A" / "inputs").write_text("tree c0ffee\nfit prefill decode\n")
+    (cal / "A" / "status").write_text("2026-11-24T00:00:00Z end calibration 0.50\n")
+    platforms.flags(own, DOCUMENT, tmp_path)
+    for env in ({}, {"GPU_MAX_HW_QUEUES": "2"}):
+        with check._env(env):
+            stored(tmp_path, SimpleNamespace(config=sides), store=own)
+            publish_readings(own, sides)
+
+    found = advise(tmp_path, PAIR, network=NETWORK)
+
+    assert (found["A"]["state"], found["B"]["state"]) == ("searchable", "missing a law")
+    # B reuses A's prefill side in A's store, and fits its decode alone there.
+    assert len(found["B"]["made_by"]) == 1
+    env, words = _calibrate(found, "B")
+    assert words == [str(cal / "B"), *[f"{n} {FIRST_TURN}" for n in (1, 2, 4, 8)]]
+    assert (env["FIT"], env["STORE"]) == ("decode", str(own))
