@@ -39,6 +39,7 @@ from atom.compass.backends import (
     StepLinearLaw,
 )
 from atom.compass.backends.step_labels import (
+    PREFILL_LABEL_ENV,
     TABLE_VERSION,
     digest,
     host_kind,
@@ -616,6 +617,35 @@ def test_each_pipeline_stage_s_segments_are_its_own_its_e_from_its_release(
             if s.admitted[0] and not k:
                 del got["E"], planted["E"]
             assert got == pytest.approx(planted, abs=2e-9), s.step
+
+
+def test_under_the_record_label_no_stage_s_prefill_takes_its_window(
+    tmp_path, monkeypatch
+):
+    """`pp2`'s record with a drafter on its last stage, a quarter of each step
+    its draft's, and no busy lines, labelled under `COMPASS_PREFILL_LABEL=record`
+    as its stages: each stage's prefill steps are cut `untraced`, a stage's
+    window holding its receive's wait for the stage before. The last stage's
+    lines as a one-stage record take their windows' labels."""
+    monkeypatch.setenv(PREFILL_LABEL_ENV, "record")
+    _, last = pp2(tmp_path, 19)
+    for s in last:
+        s["d_target_ns"] = s["d_busy_ns"] * 3 // 4
+    text = "".join(json.dumps(s) + "\n" for s in last)
+    (tmp_path / "pp1.dp0.jsonl").write_text(text)
+    (tmp_path / "one").mkdir()
+    (tmp_path / "one" / "dp0.jsonl").write_text(text)
+
+    for k in (0, 1):
+        [(samples, _)] = label_run([tmp_path / f"{'pp1.' * k}dp0.jsonl"], stage=k)
+        assert [s.cut for s in samples] == ["untraced"] * len(last), k
+    [(alone, _)] = label_run([tmp_path / "one" / "dp0.jsonl"])
+    windowed = {s.step: s.device_s for s in alone if s.cut is None}
+    assert windowed and {s.cut for s in alone} <= {None, "paced"}
+    assert windowed == pytest.approx(
+        {s["step"]: s["d_target_ns"] * 1e-9 for s in last if s["step"] in windowed}
+    )
+    assert {s.provenance.get("prefill_label") for s in alone if not s.cut} == {"record"}
 
 
 @pytest.mark.parametrize("stage", [0, 1])

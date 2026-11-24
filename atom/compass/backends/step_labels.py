@@ -89,7 +89,10 @@ their host labels: a stage's decode window holds its wait for the stage before
 and the stream hold of its last send, which the next stage takes when it is
 ready, and no label parts either from the stage's own work. No step of a stage
 is cut as launch-exposed, a cut only a decode takes: a stage before the last
-reads no token, the read that ties its host clock to its device's.
+reads no token, the read that ties its host clock to its device's. A stage's
+prefill step without busy time is cut `untraced` under `PREFILL_LABEL_ENV`
+too: its window holds its receive's wait for the stage before, which the
+handoff prices.
 
 With `PREFILL_LABEL_ENV` set to ``record``, an opt-in for a fit that has one
 plain record and no trace run, a prefill step without busy time that carries
@@ -965,7 +968,8 @@ def _label(
     jit, jit_host = jit_steps(lines, spans), jit_hosts(lines, spans)
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
-    window_prefill = _prefill_label() == "record" and not traced
+    # A stage's window holds its receive's wait for the stage before.
+    window_prefill = _prefill_label() == "record" and not traced and stage is None
     paced = _paced(lines) if window_prefill and mtp else set()
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
