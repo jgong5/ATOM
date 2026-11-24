@@ -191,6 +191,24 @@ def test_a_record_serving_two_sets_of_request_parameters_refuses(tmp_path, monke
         load({a: runs})
 
 
+def test_a_lane_s_pin_to_a_data_parallel_rank_is_no_set_of_request_parameters(
+    tmp_path, monkeypatch
+):
+    # A calibration design pins a lane by `data_parallel_rank`, and leaves the
+    # others to the router: the record serves one sampling, its samples those
+    # of the same record unpinned.
+    a = record(tmp_path, monkeypatch)
+    pinned = [client_run([0, 1], {**SAMPLING, "data_parallel_rank": 0}), RUNS[1]]
+
+    samples, config = load({a: pinned})
+
+    assert config["sampling"] == SAMPLING
+    assert samples == load({a: RUNS})[0]
+    other = client_run([2, 3], {**SAMPLING, "temperature": 0.7})
+    with pytest.raises(ValueError, match="under 2 sets of request parameters"):
+        load({a: [pinned[0], other]})
+
+
 def test_a_record_run_on_a_dirty_tree_refuses_naming_it(tmp_path, monkeypatch):
     a = record(tmp_path, monkeypatch, source={**SOURCE, "dirty": 1})
 

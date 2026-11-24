@@ -61,7 +61,8 @@ level `step_linear_fit.recorded_level` reads, as is each sample's host key's;
 `prefill_buckets`, those `step_linear_fit.stated_buckets` reads, null where it
 states none; `source_root`, its host key's ``atom`` as `source_root` writes
 it; `sampling`, the request parameters, null for a record serving no client
-run's request; its host key
+run's request, less those that only place a request on a data-parallel rank
+(`PLACEMENT`: a calibration lane's pin), which sample nothing; its host key
 less its model and engine; its `stack`, the software versions run.json
 names; and its `ptl`, the cards' PTL state, `unrecorded` for a run.json that
 names none. A measurement reads the same fields but the host key, stack and
@@ -115,6 +116,12 @@ MEMBER = ("measurement", Topology().ranks()[0], "json")
 CARD = ("name", "arch")
 #: The PTL state of a run.json that records none, which no machine spec states.
 UNRECORDED = "unrecorded"
+#: The request parameters that place a request on a data-parallel rank and
+#: sample nothing: a calibration design's pinned lane sends each request with
+#: `data_parallel_rank` set (`atom.compass.calib.design`), its other lanes
+#: without, so a record of the design serves one set of request parameters
+#: less these.
+PLACEMENT = ("data_parallel_rank",)
 
 
 def load(
@@ -217,7 +224,7 @@ def _record(
             )
         if seconds:
             graded_to = graded_to_step(record, min(graded), float(seconds))
-    sampling = sorted({p for s in _steps(record) for p in s["sampling"]})
+    sampling = sorted({_sampled(p) for s in _steps(record) for p in s["sampling"]})
     if len(sampling) > 1:
         raise ValueError(
             f"{directory} served requests under {len(sampling)} sets of request "
@@ -301,6 +308,13 @@ def run_fields(run: dict, record="run.json") -> dict:
         ),
         "source_root": source_root(run["host_key"]["atom"]),
     }
+
+
+def _sampled(params: str) -> str:
+    """The request parameters `params`, sorted JSON as `parity.served` states
+    them, less `PLACEMENT`'s."""
+    kept = {k: v for k, v in json.loads(params).items() if k not in PLACEMENT}
+    return json.dumps(kept, sort_keys=True)
 
 
 def _steps(record: dict) -> list[dict]:
