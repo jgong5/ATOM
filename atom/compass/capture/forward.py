@@ -24,7 +24,9 @@ A raw Triton or FlyDSL launch lifts to the function that issues it
 call entry as the arguments, with whatever else the call ran folded in. An
 argument that is an attribute of the runner is a `ModuleRef` `runner.<attr>`;
 a NamedTuple is held as its class and fields, and any other object as pickle
-reduces it (`ir.nodes.Reduced`), or refused by its type.
+reduces it (`ir.nodes.Reduced`); one pickle cannot reduce that an attribute of
+the runner holds (a drafter's `DraftGraph` pass) is a `ModuleRef`
+`runner.<attr>.<name>`, and anything else is refused by its type.
 
 The engine is ATOM's own `Config` for ATOM's engine arguments, on a declared
 device of one arch. Under DP the capture runs one rank, and its peers the rest of
@@ -45,8 +47,9 @@ the drafter's first pass, which takes the target's tokens unpadded, and the
 step continues at the rung past the cut; only its drafter's graph is kept. A
 shape's `width` is the batch a step that replays no graph pads to past its
 rows, as `ForwardMode.decide` settles it from a ladder of that one width: a
-decode's model runs at it from its inputs, a prefill's LM head and its
-drafter's later passes at it, and each samples its rows. Under a drafter in DP
+decode's model runs at it from its inputs, a prefill's drafter's later passes
+at it (its LM head at its requests' last tokens, as ATOM's since upstream
+b7b5ec3f2), and each samples its rows. Under a drafter in DP
 a middle chunk runs those later passes at it too: only its drafter's graph is
 kept. A decode's drafter is kept from its own shape, at its rows."""
 
@@ -564,9 +567,13 @@ def rebuild_object(cls: str, state):
 
 def referenced(runner, key: str):
     """What a `ModuleRef` key names on `runner`: an attribute of the runner
-    itself, `runner.<attr>`, or a module of its model by path."""
+    itself, `runner.<attr>`, or of one, `runner.<attr>.<name>`, or a module of
+    its model by path."""
     if key.startswith("runner."):
-        return getattr(runner, key.removeprefix("runner."))
+        held = runner
+        for attr in key.split(".")[1:]:
+            held = getattr(held, attr)
+        return held
     return runner.model.get_submodule(key)
 
 
@@ -926,7 +933,24 @@ class _Recorder(TorchDispatchMode):
         held = vars(self.runner).items() if self.runner is not None else ()
         if attr := next((a for a, v in held if v is value), None):
             return ir.ModuleRef(f"runner.{attr}")
-        return self._reduced(value)
+        try:
+            return self._reduced(value)
+        except TypeError:
+            if path := self._held(value):
+                return ir.ModuleRef(path)
+            raise
+
+    def _held(self, value) -> str | None:
+        """`runner.<attr>.<name>` where an attribute of the runner holds
+        `value`: DSpark's `_stage_anchors` takes the drafter's `DraftGraph`
+        pass, which holds its forward, a method. None where none does."""
+        held = vars(self.runner).items() if self.runner is not None else ()
+        for attr, owner in held:
+            if not hasattr(owner, "__dict__"):
+                continue
+            if name := next((n for n, v in vars(owner).items() if v is value), None):
+                return f"runner.{attr}.{name}"
+        return None
 
     def _reduced(self, value):
         """An object as pickle reduces it, its state a dict of attributes each
@@ -1053,6 +1077,7 @@ def _patches(recorder):
     import flydsl
     import triton
     from aiter.ops import topk
+    from aiter.ops.opus import pa_mqa_logits_mxfp4 as mxfp4
     from flydsl.compiler import jit_function as fly
     from torch._subclasses.fake_tensor import unset_fake_temporarily
     from torch.utils import _device
@@ -1219,6 +1244,7 @@ def _patches(recorder):
         (UBatchWrapper, "_run_ubatches", micro_batches),
         (topk, "topk_ob_workspace_size", lambda *a: 0),
         (topk, "topk_mb_workspace_size", lambda *a: 0),
+        (mxfp4, "_instances", driverless.mqa_logits_instances),
         (torch.ops.aiter, "moe_forward", moe_forward),
         (
             torch.ops.aiter,
@@ -1453,7 +1479,9 @@ def _v41(recorder, hf):
     and the model's config `hf`. Its index keys' RoPE (`V41_ROPE`) states
     their indexer's `compress_ratio`; its query's, on the step's positions
     at every ratio, states none. Its top-k (`V41_TOPKS`) states the scorers'
-    `compress_ratio`.
+    `compress_ratio`. A DSpark draft's attention, the same kernels over each
+    row's window and its block (`draft_attention`, two sources since upstream
+    b7b5ec3f2), states the `window_size` and no compression.
     """
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.models.deepseek_v41.attention import Indexer
@@ -1483,6 +1511,18 @@ def _v41(recorder, hf):
         with patch.object(recorder, "stated", recorder.stated | ratio):
             return project_keys(indexer, *args)
 
+    window = ("window_size", hf.sliding_window), ("compress_ratio", 0)
+    drafted = dict.fromkeys(
+        (V41_ATTENTION, V41_FP8_ATTENTION), (*window, ("index_topk", None))
+    )
+
+    def draft(attend):
+        def call(*args, **kwargs):
+            with patch.object(recorder, "stated", recorder.stated | drafted):
+                return attend(*args, **kwargs)
+
+        return call
+
     bodies["v41_attention"] = attention
     recorder.lands = True
     stack = contextlib.ExitStack()
@@ -1492,6 +1532,12 @@ def _v41(recorder, hf):
         patch.object(PagedAttentionCache, "_report_stale_state", lambda *a: None)
     )
     stack.enter_context(patch.object(Indexer, "project_keys", keys))
+    # Loaded where the runner built a DSpark drafter.
+    if (dspark := sys.modules.get("atom.models.deepseek_v41.dspark")) is not None:
+        for name in ("draft_attention", "draft_attention_fp8"):
+            stack.enter_context(
+                patch.object(dspark, name, draft(getattr(dspark, name)))
+            )
     return stack
 
 
@@ -1884,8 +1930,9 @@ class Tracer:
         """The graphs of the DP prefill `shape`, at its tokens, sequences and
         width, that hold G, the rows its MoE gathers, as `trace` yields them,
         each run as one forward: traced with G a symbol at both ends of its
-        range, from a prefilling peer's one row past this rank's tokens to each
-        peer at `max_num_batched_tokens`. The upper end's are kept, with the
+        range, from each peer's one row past this rank's tokens (a rank with no
+        request runs one, `ubatching.sync_dp_metadata`) to each peer at
+        `max_num_batched_tokens`. The upper end's are kept, with the
         guards its trace installed on G (MORI's trim admits G up to its hint),
         once the two agree with G and each exchange's `sizes` put at either end
         (`peers.at`); else `PerG` names where they differ, and each G of the
@@ -1893,7 +1940,7 @@ class Tracer:
         dp = self.config.parallel_config.data_parallel_size
         tokens = shape.tokens
         top = self.config.max_num_batched_tokens
-        lo, hi = hints = tokens + 1, tokens + (dp - 1) * top
+        lo, hi = hints = tokens + dp - 1, tokens + (dp - 1) * top
         text = symbolic_shape(shape)
         if self.runner is None:
             self._build()

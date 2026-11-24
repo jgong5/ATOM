@@ -520,7 +520,7 @@ SHAPES = ["--width", "4", "--prefill", "124", "1"]
 OWN_KERNELS = {
     "atom.model_ops.deepseek_v41.dspark:fused_draft_kv_tail",
     "atom.model_ops.sparse_attn_v4:_sparse_attn_triton",
-    "atom.model_ops.dspark_markov_sample:_launch",
+    "atom.model_ops.dspark_markov_argmax:_launch",
 }
 
 

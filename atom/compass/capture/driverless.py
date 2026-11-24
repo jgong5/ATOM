@@ -53,6 +53,28 @@ REVISIONS = {
 }
 
 
+#: aiter's OPUS MXFP4 MQA-logits instances compiled for each arch, as its
+#: registry lists them (`pa_mqa_logits_mxfp4_<arch>.cu`'s table, gfx950's first
+#: in `REGISTRIES`, so its ids from 0): heads, rows a wave, waves, LDS stages,
+#: scale_tdm, gather, entry_rows_min, entry_rows_max, tile_keys, modes,
+#: flat_out, kv_nt and slot_waves. aiter asks HIP for the rest, how many slots
+#: of each mode a CU holds at once; `mqa_logits_instances` declares those.
+MQA_LOGITS = {
+    "gfx950": (
+        (64, 1, 1, 2, 0, 0, 64, 64, 64, 7, 0, 0, 1),  # h64_r1w1s2L
+        (64, 1, 2, 4, 1, 0, 64, 64, 64, 7, 0, 0, 1),  # h64_r1w2s4T
+        (64, 1, 4, 4, 1, 0, 64, 64, 64, 7, 0, 0, 1),  # h64_r1w4s4T
+        *(
+            (32, rows, 1, stages, 0, 0, 64, 64 << 15, 64, 7, 1, 1, slots)
+            for slots in (1, 4)  # h32_r{rows}w1s{stages}Ln, then its x4
+            for rows, stages in ((1, 3), (2, 3), (3, 3), (4, 2), (6, 3), (8, 3))
+        ),
+        (32, 4, 1, 3, 0, 0, 64, 64 << 15, 64, 7, 1, 0, 1),  # h32_r4w1s3L
+        (32, 1, 1, 2, 0, 1, 8, 8, 64, 7, 1, 0, 1),  # h32g_r1w1s2L
+    ),
+}
+
+
 #: What `card` reads, in a process that sees the one card: the properties
 #: `_props` declares, as HIP reports them.
 _READ = (
@@ -283,6 +305,30 @@ def answer_as(arch: str) -> None:
     for name, value in cuda.items():
         setattr(torch.cuda, name, value)
     torch._C._cuda_getDevice = lambda: 0
+
+
+def mqa_logits_instances(device):
+    """aiter's `pa_mqa_logits_mxfp4._instances` on the declared device: the
+    instances `MQA_LOGITS` lists for its arch, each mode's slots resident at
+    once one a CU (a slot-wave instance's waves each a slot), stated with no
+    source. aiter reads its table off the compiled registry and asks HIP for
+    each kernel's occupancy, which no capture has. What the residency moves
+    in a graph is the Table schedule's slots, `_build_schedule_raw`'s
+    `num_ctas`, a launch op work prices at its floor."""
+    from aiter.ops.opus.pa_mqa_logits_mxfp4 import _Instance
+
+    props = torch.cuda.get_device_properties(device)
+    arch = props.gcnArchName.split(":")[0]
+    if arch not in MQA_LOGITS:
+        raise ValueError(
+            f"no declared MXFP4 MQA-logits instances for {arch}; "
+            f"declared: {sorted(MQA_LOGITS)}"
+        )
+    cus = props.multi_processor_count
+    return tuple(
+        _Instance(id, *row, resident=(cus * row[-1],) * 3)
+        for id, row in enumerate(MQA_LOGITS[arch])
+    )
 
 
 #: The operators outside torch that the fake mode's dispatch cache takes: each

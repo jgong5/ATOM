@@ -45,6 +45,9 @@ GATHERED = (100, DP * T, 3000)
 WIDE = 2
 #: The top of G's range at T: each peer at ATOM's default batch of 16384.
 TOP = T + (DP - 1) * 16384
+#: Its bottom: each peer at one row, which a rank with no request runs since
+#: upstream b7b5ec3f2 (`ubatching.sync_dp_metadata`).
+LOW = T + DP - 1
 HELD = f"prefill T={T} B=1 G=G"
 
 
@@ -240,7 +243,7 @@ def test_a_g_its_guards_refuse_is_traced_and_one_they_admit_is_put(lookup):
     admitted, refused = (graphs("prefill", T, 1, True, g) for g in (100, 3000))
 
     # Both ends traced once with G a symbol, then G=3000 as it is.
-    assert tracer.traced == [(TOP, True), (T + 1, True), (3000, False)]
+    assert tracer.traced == [(TOP, True), (LOW, True), (3000, False)]
     assert admitted == _concrete(tracer, 100) and refused == _concrete(tracer, 3000)
     assert lazy["lazy_traces"] == 2 and "lazy_per_g" not in lazy
 
@@ -250,10 +253,10 @@ def test_ends_that_differ_past_sizes_trace_each_g_and_name_the_shape(lookup):
 
     final = {g: graphs("prefill", T, 1, True, g) for g in (100, 3000)}
 
-    assert tracer.traced == [(TOP, True), (T + 1, True), (100, False), (3000, False)]
+    assert tracer.traced == [(TOP, True), (LOW, True), (100, False), (3000, False)]
     assert final == {g: _concrete(tracer, g) for g in (100, 3000)}
     # The lower end's count against the upper end's put there.
-    why = f"its middle chunk at G={T + 1}: aiter.fused_moe_ at args/n: {T + 1}"
+    why = f"its middle chunk at G={LOW}: aiter.fused_moe_ at args/n: {LOW}"
     assert list(lazy["lazy_per_g"]) == [f"{HELD}, {why} against {TOP}"]
     assert lazy["lazy_traces"] == 3
 
@@ -284,7 +287,7 @@ def test_the_run_summary_counts_the_lookups_a_held_graph_served(
     for g in (100, 200, 3000):
         graphs("prefill", T, 1, True, g)
 
-    assert tracer.traced == [(TOP, True), (T + 1, True), (3000, False)]
+    assert tracer.traced == [(TOP, True), (LOW, True), (3000, False)]
     assert lazy["held_lookups"] == 2
     assert lazy["lookup_wall_seconds"] >= lazy["lazy_trace_wall_seconds"] > 0
     run = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
@@ -334,7 +337,7 @@ def test_a_graph_the_lookup_reads_is_read_once_and_frozen_out_of_the_collector(
     symbolic = forward.symbolic_shape(forward.prefill(T, 1, None).at(DP))
     graphs = {
         concrete: {"region": region},
-        symbolic: {"region": region, "hints": [T + 1, TOP], "guards": [], "slots": []},
+        symbolic: {"region": region, "hints": [LOW, TOP], "guards": [], "slots": []},
     }
     for shape, graph in graphs.items():
         store.publish(

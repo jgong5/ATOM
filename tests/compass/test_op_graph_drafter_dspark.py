@@ -34,9 +34,14 @@ DSPARK = ARGS + EP4 + " --method dspark --num-speculative-tokens 5"
 SHAPES = "--width 16 --prefill 512 1"
 DECODE, PREFILL = "decode B=16", "prefill T=512 B=1"
 #: The draft-KV pass's epilogue, the block's attention and its Markov sampler.
+#: On gfx1250 the block attends its window and itself as two sources, through
+#: the target's sparse attention kernel (`dspark.two_source_draft`, since
+#: upstream b7b5ec3f2): of the attention, only the build of those sources is
+#: the drafter's alone.
 TAIL = "atom.model_ops.deepseek_v41.dspark:fused_draft_kv_tail"
-BLOCK = "atom.model_ops.sparse_attn_v4:_sparse_attn_triton"
-MARKOV = "atom.model_ops.dspark_markov_sample:_launch"
+BLOCK = "atom.model_ops.deepseek_v41.dspark:draft_src_indices"
+ATTENTION = forward.V41_ATTENTION
+MARKOV = "atom.model_ops.dspark_markov_argmax:_launch"
 DRAFTER = {TAIL, BLOCK, MARKOV}
 #: The target's sampler, which runs after the pass.
 SAMPLER = "aiter.mixed_sample_outer_exponential.default"
@@ -100,6 +105,7 @@ def test_a_sampling_step_is_its_target_its_draft_kv_pass_and_its_propose(
     assert SAMPLER in _kinds(target) - _kinds(kv)
     # The propose drafts the block and samples it, and writes no context.
     assert _kinds(propose) & DRAFTER == {BLOCK, MARKOV}
+    assert ATTENTION in _kinds(propose)
 
 
 def test_a_middle_chunk_s_drafter_starts_where_its_draft_kv_pass_starts(captured):
@@ -150,7 +156,7 @@ def test_a_run_prices_the_draft_kv_pass_among_the_target_s_terms(captured, step,
     assert passed == _terms(graphs["draft kv", shape], DRAFT_KV, step)
     drafted = {t.name for t in cost.draft_terms}
     assert all(name.startswith(DRAFT) for name in drafted)
-    assert {f"{DRAFT}op.{BLOCK}", f"{DRAFT}op.{MARKOV}"} <= drafted
+    assert {f"{DRAFT}op.{k}" for k in (BLOCK, ATTENTION, MARKOV)} <= drafted
     assert 0 < cost.draft_seconds < cost.target_seconds
 
 
