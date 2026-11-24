@@ -5,6 +5,7 @@ the link values and write discipline fitted from it and a recorded P/D run.
     rdma_link.py target --ip IP --out TARGETS
     rdma_link.py bench --ip IP --targets TARGETS --out BENCH
     rdma_link.py fit BENCH [RECORD_DIR]
+    rdma_link.py nic RECORD_DIR --network NETWORK [--out NETWORK_OUT]
 
 `target`, on the decode node, holds `BUFFER` bytes of each GPU N registered
 with an engine on N's HCA, as the connector picks it, until it is killed.
@@ -29,6 +30,17 @@ it replays every `_rdma_write` call at its recorded
 start on that link per sharing unit, one at a time on a `Link` (FIFO) or
 splitting the bandwidth evenly among the calls in flight (shared), and prints
 each one's error on every call and on the contended ones.
+
+`nic` fits the NIC bandwidth the writes into one NIC share
+(`interconnect.inter_node.nic_bandwidth_bytes_per_s`, `kv/transfer.py`
+`SharedNic`) from a recorded P/D run's writes, on the link of NETWORK: each
+write from its write request's receipt to its first write-done, its bytes
+its calls', its NIC its `hca` (under matched rails, its decode rank's). It
+replays every write per NIC on a `SharedNic` at each candidate rate, keeps the
+one whose writes come out closest (median relative error, then the mean
+absolute one), and prints it against the pair `Link`s the run prices without
+it, by the writes in flight on the NIC. With --out, NETWORK with the fitted
+field added, probed, its band the per-NIC fits' p10 and p90.
 """
 
 import argparse
@@ -395,6 +407,145 @@ def fit(args) -> None:
                         )
 
 
+def nic_writes(record) -> tuple:
+    """`(pair, hca, receipt s, bytes, seconds to its write-done)` of each write
+    a producer rank of `record` served with an RDMA call, in receipt order, its
+    pair the writes file and the hca; and `sha256:` over the files read."""
+    found, digest = [], hashlib.sha256()
+    for path in sorted(Path(record).rglob("*.writes.jsonl")):
+        data = path.read_bytes()
+        digest.update(data)
+        for line in data.decode().splitlines():
+            w = json.loads(line)
+            rdma, receipt = w.get("rdma"), w.get("t_receipt_ns")
+            if not rdma or receipt is None or not w.get("success", True):
+                continue
+            end = (w.get("t_notify_ns") or [0, rdma[-1][1]])[1]
+            n = sum(c[2] for c in rdma)
+            found.append(
+                ((str(path), w.get("hca")), w.get("hca"), receipt / 1e9, n, (end - receipt) / 1e9)
+            )
+    return sorted(found, key=lambda w: w[2]), f"sha256:{digest.hexdigest()}"
+
+
+def nic_replay(found, latency, bandwidth, nic) -> list:
+    """Each write's replayed seconds: on its pair's `Link` with `nic` 0, else
+    on its NIC's `SharedNic`."""
+    from atom.compass.kv.transfer import TransferModel, shared_completions
+
+    model = TransferModel(latency, bandwidth, 1, nic_bandwidth_bytes_per_s=nic)
+    unit = (lambda w: w[0]) if nic == 0 else (lambda w: w[1])
+    queues = {}
+    for i, w in enumerate(found):
+        queues.setdefault(unit(w), []).append(i)
+    out = [0.0] * len(found)
+    for q in queues.values():
+        jobs = [(found[i][2], found[i][3]) for i in q]
+        done = fifo(jobs, latency, bandwidth) if nic == 0 else shared_completions(model, jobs)
+        for i, d in zip(q, done):
+            out[i] = d - found[i][2]
+    return out
+
+
+def in_flight(found) -> list:
+    """The writes beside each write on its NIC at its midpoint."""
+    by = {}
+    for i, w in enumerate(found):
+        by.setdefault(w[1], []).append(i)
+    out = [0] * len(found)
+    for q in by.values():
+        for i in q:
+            mid = found[i][2] + found[i][4] / 2
+            out[i] = sum(
+                1 for j in q if j != i and found[j][2] <= mid <= found[j][2] + found[j][4]
+            )
+    return out
+
+
+#: A write slower than this waited on a rail's start-up (#3848), not on the
+#: link: replayed, not scored.
+STARTUP_S = 1.0
+
+
+def nic_score(found, predicted) -> tuple:
+    """`(|median relative error|, mean |relative error|)` of `predicted`."""
+    rel = [p / w[4] - 1 for p, w in zip(predicted, found) if 0 < w[4] < STARTUP_S]
+    return abs(statistics.median(rel)), statistics.fmean(abs(x) for x in rel)
+
+
+def nic_fit_rate(found, latency, bandwidth) -> float:
+    """The NIC rate whose `SharedNic` replay of `found` scores best, searched
+    from the link's rate to eight times it."""
+    grid = [bandwidth * (1 + k / 20) for k in range(0, 141)]
+    return min(grid, key=lambda nic: nic_score(found, nic_replay(found, latency, bandwidth, nic)))
+
+
+def nic(args) -> None:
+    from atom.compass.spec.layers import network
+
+    net = network(args.network)
+    link = "interconnect.inter_node"
+    latency = net.values[f"{link}.link_latency_s"]
+    bandwidth = net.values[f"{link}.link_bandwidth_bytes_per_s"] * net.values[f"{link}.derate"]
+    found, digest = nic_writes(args.record)
+    if not found:
+        raise SystemExit(f"{args.record}: no producer write with an RDMA call")
+    rate = nic_fit_rate(found, latency, bandwidth)
+    per = []
+    for h in sorted({w[1] for w in found}):
+        sub = [w for w in found if w[1] == h]
+        per.append(nic_fit_rate(sub, latency, bandwidth))
+    band = spread3(per) if len(per) > 1 else [rate] * 3
+    print(
+        f"{len(found)} writes, {len({w[1] for w in found})} NICs, writes files {digest}; "
+        f"link {latency * 1e3:.3g} ms + bytes / {bandwidth / 1e9:.4g} GB/s"
+    )
+    print(
+        f"NIC rate {rate / 1e9:.4g} GB/s (per NIC p50/p10/p90 "
+        f"{[round(b / 1e9, 3) for b in band]}); scored on the writes under "
+        f"{STARTUP_S:g} s ({sum(w[4] >= STARTUP_S for w in found)} start-ups left out)"
+    )
+    flight = in_flight(found)
+    for name, nic_rate in (("pair Link", 0), ("shared NIC", rate)):
+        got = nic_replay(found, latency, bandwidth, nic_rate)
+        med, mae = nic_score(found, got)
+        err = [g - w[4] for g, w in zip(got, found) if w[4] < STARTUP_S]
+        print(
+            f"{name}: median |rel err| {med:.3g}, mean |rel err| {mae:.3g}, "
+            f"mean err {statistics.fmean(err) * 1e3:+.2f} ms, mean |err| "
+            f"{statistics.fmean(abs(e) for e in err) * 1e3:.2f} ms"
+        )
+        for lo, hi in ((0, 0), (1, 1), (2, 3), (4, 10**9)):
+            sel = [i for i, f in enumerate(flight) if lo <= f <= hi]
+            if len(sel) > 1:
+                print(
+                    f"  {lo}{'+' if hi > 10**6 else '' if lo == hi else f'-{hi}'} beside: "
+                    f"{len(sel)} writes, real p50 {statistics.median(found[i][4] for i in sel) * 1e3:.1f} ms, "
+                    f"replayed p50 {statistics.median(got[i] for i in sel) * 1e3:.1f} ms"
+                )
+    if args.out:
+        path = Path(args.network)
+        if not path.exists():
+            path = Path(__file__).resolve().parents[2] / "atom/compass/networks" / f"{args.network}.json"
+        doc = json.loads(path.read_text())
+        doc["interconnect"]["inter_node"]["nic_bandwidth_bytes_per_s"] = rate
+        prov = doc["provenance"]
+        prov.setdefault("origins", {})[f"{link}.nic_bandwidth_bytes_per_s"] = {
+            "origin": "probed",
+            "record": digest,
+            "p10": band[1],
+            "p90": band[2],
+        }
+        prov["notes"] = (
+            f"{prov.get('notes', '')} nic_bandwidth_bytes_per_s: `rdma_link.py nic` over the "
+            f"{len(found)} writes of {args.record}, the SharedNic replay closest to them "
+            "(median relative error); the band is the per-NIC fits' p10..p90."
+        ).strip()
+        Path(args.out).write_text(json.dumps(doc, indent=2) + "\n")
+        network(args.out)  # the schema reads it back, or refuses
+        print(f"wrote {args.out}")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="verb", required=True)
@@ -407,8 +558,12 @@ def main(argv=None) -> int:
     p = sub.add_parser("fit")
     p.add_argument("bench")
     p.add_argument("record", nargs="?")
+    p = sub.add_parser("nic")
+    p.add_argument("record")
+    p.add_argument("--network", required=True, help="the link the run prices")
+    p.add_argument("--out", help="NETWORK with the fitted NIC rate added")
     args = parser.parse_args(argv)
-    {"target": target, "bench": bench, "fit": fit}[args.verb](args)
+    {"target": target, "bench": bench, "fit": fit, "nic": nic}[args.verb](args)
     return 0
 
 

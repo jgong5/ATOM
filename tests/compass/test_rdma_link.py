@@ -153,3 +153,45 @@ def test_fit_publishes_the_bench_latency_and_the_rate_writes_attained(tmp_path, 
     # Latency 4 or 6 us by round; the uncontended writes moved 20 and 10 GB/s.
     assert found["link_latency_s"] == pytest.approx([5e-6, 4e-6, 6e-6], rel=0.05)
     assert found["derate"][0] == pytest.approx(1.5e10 / 5e10, rel=1e-3)
+
+
+def nic_record(tmp_path, writes):
+    """A record directory of producer write lines (worker, hca, receipt s,
+    write-done s, bytes), each one RDMA call from its receipt to its done."""
+    for i, (worker, hca, a, done, n) in enumerate(writes):
+        line = {
+            "request_id": f"r{i}",
+            "write_nonce": i,
+            "hca": hca,
+            "t_receipt_ns": round(a * 1e9),
+            "rdma": [[round(a * 1e9), round(done * 1e9), n]],
+            "t_notify_ns": [round(done * 1e9), round(done * 1e9)],
+            "success": True,
+        }
+        path = tmp_path / "prefill" / f"{worker}.writes.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(json.dumps(line) + "\n")
+    return tmp_path
+
+
+def test_the_nic_fit_recovers_the_rate_writes_into_one_nic_shared(tmp_path):
+    """Writes of two prefill ranks into one NIC, timed by a `SharedNic` of 1.5
+    links' worth: the fit finds that rate, and its replay matches them where
+    the pair links, which never see the other rank's writes, run fast."""
+    from atom.compass.kv.transfer import TransferModel, shared_completions
+
+    lat, bw = 1e-3, 8e9
+    jobs = [(i * 0.004, (40 + 37 * (i % 7)) * 10**6) for i in range(60)]
+    model = TransferModel(lat, bw, 1, nic_bandwidth_bytes_per_s=1.5 * bw)
+    done = shared_completions(model, jobs)
+    writes = [
+        (f"dp{i % 2}.tp0", "rdma0", a, d, n) for i, ((a, n), d) in enumerate(zip(jobs, done))
+    ]
+    found, digest = rdma.nic_writes(nic_record(tmp_path, writes))
+    assert len(found) == 60 and digest.startswith("sha256:")
+    assert rdma.nic_fit_rate(found, lat, bw) == pytest.approx(1.5 * bw)
+    shared = rdma.nic_replay(found, lat, bw, 1.5 * bw)
+    assert shared == pytest.approx([w[4] for w in found], rel=1e-6)
+    pairs = rdma.nic_replay(found, lat, bw, 0)
+    assert sum(pairs) < sum(shared)
