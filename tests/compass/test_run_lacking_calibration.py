@@ -116,7 +116,7 @@ def test_a_dp_rank_takes_each_rung_s_batch_and_no_trace_run_is_planned(
     assert env["GPU"] == "0,1,2,3,4,5,6,7"
     untraced = (
         "no trace run, which compass record refuses: --trace reduces each TP "
-        "rank's busy time, and ATOM's arguments run DP ranks or pipeline stages; "
+        "rank's busy time per pipeline stage, and ATOM's arguments run DP ranks; "
         "so the law's prefill stays unfitted"
     )
     assert after == [untraced, UNKNOWN]

@@ -84,7 +84,7 @@ priced by `StepLinearBackend`; its ``platform``, the platform fields of its key,
 and its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, a run whose ladder is a prefix of the law's read at the law's, and a
 law missing either refuses; a runner that records prefill token-graph buckets
-refuses a law whose engine config, or else prefill vector, states none or others
+refuses a law whose prefill vector, or else engine config, states none or others
 (`refuse_other_buckets`); a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
@@ -116,7 +116,9 @@ essential work is left, and the last one's end finishes the run),
 ``local_grants`` (optional, ``true``, the default, or ``false``: with ``true``
 the authority gives each grant a ceiling, below which the LP answers its own
 clock calls and reports them with its next one, a DP member at its settle,
-`ClockAuthority`; the step table is the same),
+`ClockAuthority`; the sends are the same, and so is the step table but for an
+own step walking an arrival on an offering channel: one ``TAR`` row where a
+run with ``false`` records ``ARRIVAL`` and ``TAR``),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -447,6 +449,13 @@ COMPASS_ONLY = {
     },
     "utils/zmq_shim.py": {"_Socket", "_ChannelSocket", "_Context"},
 }
+#: A simulated server's tokenizer environment. The segment tokenizer encodes a
+#: long prompt's uncached segments in one ``encode_batch`` call, and while its
+#: station job is open the frontend's clock stands still, so every other LP
+#: waits on its wall time; the C1228 recipe's environment turns the backend's
+#: parallelism off, which jgong5/ATOM#3992 measured. In parallel the ids are
+#: the same.
+_PARALLEL_TOKENIZER = {"TOKENIZERS_PARALLELISM": "true"}
 #: The module `pip install -e .` writes (setuptools_scm) and git ignores: no
 #: commit holds it, so the host-law key leaves it out.
 INSTALL_WRITTEN = Path("_version.py")
@@ -587,11 +596,14 @@ def refuse_unfitted_law(run: dict, config) -> None:
 def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     """Refuse the run file's step linear law on a runner that records the
     prefill token-graph buckets `buckets`, ascending, where the law states none
-    or others: in its engine config, which `refuse_unfitted_law` held to
-    `config`'s, or else in its prefill vector, those its records' runner
-    recorded. An engine config states them only off ATOM's default, which can
-    move between a fit and a run, so one stating none says nothing of them. Host
-    laws refuse where their key's graph sets state others; `run` replaces `spec()`."""
+    or others: in its prefill vector, those its records' runner recorded, or
+    else in its engine config, which `refuse_unfitted_law` held to `config`'s.
+    An engine config states them only off ATOM's default, which can move
+    between a fit and a run, so one stating none says nothing of them; one
+    stating them states ATOM's list, which a runner records only up to
+    `warmup_max_tokens`, a bound no engine config keys, so a prefill vector's
+    are held to `buckets` either way. Host laws refuse where their key's graph
+    sets state others; `run` replaces `spec()`."""
     if not buckets or (run := spec() if run is None else run) is None:
         return
     from atom.compass.backends import launch_features
@@ -610,9 +622,11 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     pick_fitted(run, STEP_LINEAR, config)
     law = run[STEP_LINEAR]
     stated = sorted((law.get("prefill") or {}).get("buckets") or ())
-    if BUCKETS not in law["engine_config"]["env"] and stated != list(buckets):
+    env = law["engine_config"]["env"]
+    if (stated or BUCKETS not in env) and stated != list(buckets):
+        said = f"{BUCKETS}={env[BUCKETS]}" if BUCKETS in env else f"no {BUCKETS}"
         raise ValueError(
-            f"the step linear law states no {BUCKETS} in its engine config and "
+            f"the step linear law states {said} in its engine config and "
             f"{stated or 'none'} as its prefill vector's buckets, and this run's "
             f"runner records the prefill token-graph buckets {list(buckets)}"
         )
@@ -2525,20 +2539,9 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     files each read here as they did in its trace (`capture.lookup`), so one
     traced under another torch, or that ran a file since edited, is a miss
     like any other. One the store holds, at a shape or holding G, is
-    loaded through `ArtifactStore.load` under this process's `graph_readings`,
-    its files' reading here (`capture.source_of`),
-    and its engine config as it records it: that cell holds the tracer's own
-    ATOM arguments, which no reader restates, and the key's structure names
-    the engine config in their place."""
-    from atom.compass.artifacts import (
-        ArtifactStore,
-        Axis,
-        Conditions,
-        GateState,
-        Row,
-        Topology,
-    )
-    from atom.compass.capture import graph_key, lookup, peers, source_of
+    loaded under this process's `graph_readings` (`load_graph`)."""
+    from atom.compass.artifacts import ArtifactStore, Topology
+    from atom.compass.capture import graph_key, lookup, peers
     from atom.compass.capture.forward import (
         PerG,
         Shape,
@@ -2580,16 +2583,13 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         return graph_readings(config.model)
 
     def parsed(key) -> dict:
-        """The graph the store holds at `key`, loaded under `here` and the
-        engine config it records, parsed and frozen with the rest of the live
-        heap, a collection first so no garbage is kept, as
-        `gc_utils.freeze_gc_heap` freezes the startup heap and under the same
-        `ATOM_GC_FREEZE`: this lookup's caches keep what it parses alive, and
-        every full collection walked all of it."""
-        cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
-        readings = here() | {"atom_src": source_of(store, key)}
-        conditions = Conditions.of(**readings, engine_config=cells[Axis.ENGINE_CONFIG])
-        entry = store.load(key, conditions=conditions, gates=GateState.of())
+        """The graph the store holds at `key`, loaded under `here`
+        (`load_graph`), parsed and frozen with the rest of the live heap, a
+        collection first so no garbage is kept, as `gc_utils.freeze_gc_heap`
+        freezes the startup heap and under the same `ATOM_GC_FREEZE`: this
+        lookup's caches keep what it parses alive, and every full collection
+        walked all of it."""
+        entry = load_graph(store, key, here())
         graph = json.loads(entry.read_member("graph", rank, "json"))
         if envs.ATOM_GC_FREEZE:
             gc.collect()
@@ -2679,6 +2679,23 @@ def graph_readings(model: str) -> dict:
         **traced_under(),
         "model": _file_digest(model, "config.json"),
     }
+
+
+def load_graph(store, key, readings: dict):
+    """The `op_graph` entry at `key` in `store`, loaded through
+    `ArtifactStore.load` under `readings` (`graph_readings`), its files'
+    reading here (`capture.source_of`), and its engine config as it records
+    it: that cell holds the tracer's own ATOM arguments, which no reader
+    restates, and the key's structure names the engine config in their place.
+    An entry whose row states another torch, ATOM source or model refuses,
+    naming the axis."""
+    from atom.compass.artifacts import Axis, Conditions, GateState, Row
+    from atom.compass.capture import source_of
+
+    cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
+    readings = readings | {"atom_src": source_of(store, key)}
+    conditions = Conditions.of(**readings, engine_config=cells[Axis.ENGINE_CONFIG])
+    return store.load(key, conditions=conditions, gates=GateState.of())
 
 
 def _trace_process():
@@ -2809,11 +2826,19 @@ def tokenizer(tok, config) -> None:
     entry, its engine config's among several: a term fitted on another backend
     is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
     ends the run before the server serves (`_end_before_serving`). With no
-    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer,
+    term, `tok` is charged 0 s; ``segment`` wraps the segment tokenizer,
     and its ``chars_per_s`` charges each comparison of its stored-prefix search.
+    Beneath those charges, a segment text any frontend of the deployment has
+    encoded is read back rather than encoded again (`token_ids`), charged the
+    same.
 
     On a real run recording its steps (`parity.ENV`), it records instead
-    (`_record_host`); with neither, `tok` is left as it is."""
+    (`_record_host`); with neither, `tok` is left as it is.
+
+    A simulated server's Rust backend encodes a batch's texts in parallel
+    (`_PARALLEL_TOKENIZER`), whatever ``TOKENIZERS_PARALLELISM`` its
+    environment sets: what tokenization costs is the term's charge, never its
+    wall time, and the ids are the same either way."""
     global _frontend_host
     run = spec()
     if run is None:
@@ -2822,6 +2847,8 @@ def tokenizer(tok, config) -> None:
         if record := os.environ.get(parity.ENV):
             _record_host(tok, Path(record))
         return
+    # Read by the tokenizers library at each call, so it holds from here on.
+    os.environ.update(_PARALLEL_TOKENIZER)
     from tokenizers import Tokenizer
 
     from atom.compass.spec.rules import FingerprintMismatch
@@ -2834,6 +2861,11 @@ def tokenizer(tok, config) -> None:
         raise
     if isinstance(run.get("host"), list):
         _frontend_host = host
+    from atom.compass.run import token_ids
+
+    backend = getattr(tok, "_tokenizer", None)
+    if isinstance(backend, Tokenizer) and (where := token_ids.directory(run)):
+        token_ids.install(backend, where)
     if term is None:
         return
     if (loaded := _fingerprint(tok)) not in (None, term["fingerprint"]):

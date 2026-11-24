@@ -15,12 +15,15 @@ predicts one configuration on a host with no GPU at all.
 
 ## Limits
 
-- **A GPU container.** The search uses no GPU compute, but a simulated server
-  imports aiter, which needs a ROCm driver. Run it in the GPU container of
-  QUICKSTART's [Environment](QUICKSTART.md#environment).
-- **The target machine type.** Host laws are keyed on the host's CPU, so the search
-  runs on a node of the type it predicts, and another CPU is refused by name. A
-  calibration runs there too, on the GPUs the configuration uses.
+- **A GPU only to calibrate.** The search needs no GPU device and runs on any
+  host's CPU: a simulated server starts with no ROCm driver, and host laws fitted
+  on another CPU serve, predicting the host they timed. A search whose candidates
+  the store serves runs in a container with no GPU device, as USER_QUICKSTART's
+  [Environment](USER_QUICKSTART.md#environment) sets one up. Each command a
+  search prints for step 3, a calibration or a readings measurement, takes the
+  target's GPUs, so a search that prints one runs on a node of the type it
+  predicts, in the GPU container of QUICKSTART's
+  [Environment](QUICKSTART.md#environment).
 - **The integration head.** The tree runs at the tip of
   `origin/feature/atomcompass_new` as last fetched, or at the commit the space file
   freezes. A tree whose ATOM digest (`atom/compass/run/__init__.py::atom_digest`)
@@ -60,9 +63,16 @@ Set up QUICKSTART's [Environment](QUICKSTART.md#environment) and
   cd /
   ```
 
-The store the space file names must hold the platform readings of the target's
-cards (QUICKSTART's Environment, "The platform"), or every candidate is refused
-with the store's reason.
+A search reads the platform readings of the target's cards (QUICKSTART's
+Environment, "The platform") from the store the space file names. Where that
+store holds none at SPACE's machine, it reads the copy committed for that
+machine under [laws/platform_readings/](laws/platform_readings/), and looks
+every law and readings entry up at the copy's stack, the `software_stack` and
+`torch` of its `key`; with neither, every candidate is refused with the store's
+reason. A calibration publishes at the stack it ran at, so a store holding no
+platform readings serves what it published only when that stack is the copy's:
+unless the target runs that stack, publish the target's readings into the shared
+store, as QUICKSTART's Environment does, before the first calibration.
 
 ## 1. Fill the space file
 
@@ -120,6 +130,13 @@ real-run command. Copy its server command into blocks by these rules.
 - **An LMCache server's command** (`lmcache server ...`) goes into the block's
   `lmcache_server`, each flag written as an argument is, but `--host` and
   `--port`: `compass advice` gives each point its own server address.
+- **A Mooncake Store**, on a configuration whose prefill offloads to one
+  (`ATOM_KV_OFFLOAD=mooncake_store`), is the block's `mooncake_store`: the
+  absolute path of the file holding the `mooncake_store` entry that `compass run
+  --mooncake-store` takes, with the master's flags, the owners' bytes and the
+  laws pricing the Store's lookups and copies. Every point of the candidate runs
+  with that file, each deployment starting its own Store at a port it draws, so
+  the block gives the Store no address.
 - **Every other argument and variable** of the server command is kept as the
   recipe gives it; only the next two sections take any out or change one.
 
@@ -149,11 +166,15 @@ Some things a recipe sets are no instance's and take no departure: the rest of
 the router's command (`deploy.sh` starts it, with `compass advice`'s flags), the
 client's with its `AIPERF_*` variables (`client.sh` runs it from `workload`), a
 variable ATOM does not read that the recipe sets only to build another value, as
-`NODE_IP` builds `ATOM_HOST_IP` and `--kv-transfer-config`, and the Mooncake
-variables the README's 1P1D deployment gives a real side. Keep each other
-variable the recipe gives the server for LMCache, such as `ATOM_KV_OFFLOAD`, as
-it gives it, and any key of `ATOM_KV_OFFLOAD_EXTRA_CONFIG` but
-`lmcache.mp.host` and `lmcache.mp.port`.
+`NODE_IP` builds `ATOM_HOST_IP` and `--kv-transfer-config`, the Mooncake
+variables the README's 1P1D deployment gives a real side, and the commands that
+start a Mooncake Store's master and owners (the entry holds their flags). Keep
+each other variable the recipe gives the server for LMCache, such as
+`ATOM_KV_OFFLOAD`, as it gives it, and any key of `ATOM_KV_OFFLOAD_EXTRA_CONFIG`
+but `lmcache.mp.host` and `lmcache.mp.port`. Keep the variables the recipe gives
+a side for a Mooncake Store, `ATOM_KV_OFFLOAD` and its
+`ATOM_KV_OFFLOAD_EXTRA_CONFIG`, as it gives them: a start refuses a protocol,
+chunk size or pool size there other than the entry's.
 
 ### What the user decides
 
@@ -243,7 +264,7 @@ takes up the rest.
 | State | What it prints | Next |
 |---|---|---|
 | `searchable` | `N of M points searchable`, each other point with its own state | step 3 simulates it |
-| `missing a law` | `made by:` the command that makes the law; `calibration:` the last line of one that stopped or ended | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
+| `missing a law` | `made by:` the command that makes the law, or why none can; `calibration:` the last line of one that stopped | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
 | `calibrating` | `calibration:` its status file, how many steps have ended and its last line; `resumed, once no calibrate.sh runs, by:` its command | run the search again later |
 | `missing readings`, a point of a searchable candidate | `made by:` its `compass measure memory` command | [3. Calibrate what is missing](#3-calibrate-what-is-missing) |
 | `refused` | `refused:` ATOM's or Compass's refusal, verbatim | below |
@@ -296,19 +317,20 @@ calibration beside other work fits that load into its laws.
 
 **Where it publishes.** With `STORE=<the shared store>`, as printed when the
 shared store holds neither readings at the configuration's key nor a law of it
-at the head, it publishes the law and the memory readings there, beside the
-platform readings, and the next `compass advice SPACE OUT` reads them. Without
+at the head, it publishes the law and the memory readings there, and the next
+`compass advice SPACE OUT` reads them. Without
 `STORE`, as printed when the shared store holds one of them, which a second
 publish at its key would meet, it publishes into its own
 `OUT/cal/<candidate>/store`. Once a calibration has started, its printed command
 keeps the store it started with, which its `OUT/cal/<candidate>/inputs` names,
 so a resume publishes where the first run did. A search looks each candidate up
-in those stores, the latest published into first, then in the shared store, but
-passes by a store with no platform readings for SPACE's machine, and a
-calibration's own store starts with none. Once such a calibration has ended,
-take them into its store on two idle cards of the target, as QUICKSTART's
-Environment ("The platform") takes them, `<token>` the one the first command
-prints:
+in those stores, the latest published into first, then in the shared store. A
+store holding no platform readings, as a calibration's own store starts, is read
+with the copy committed for SPACE's machine (Before the first search), and
+passed by where there is none. So once a calibration has ended whose stack is
+not the copy's, or whose machine has no copy, take the platform readings into
+its store on two idle cards of the target, as QUICKSTART's Environment ("The
+platform") takes them, `<token>` the one the first command prints:
 
 ```bash
 compass measure device --gpu <a card>,<another card> --store OUT/cal/S1/store --out OUT/cal/S1.device
@@ -333,11 +355,26 @@ compass fit device <token> --store OUT/cal/S1/store --out OUT/cal/S1.readings
   each step's wall seconds, the node-hours every take of every step held, and
   this run's wall time; the status file's last line is then `end calibration
   <h> node-hours`.
+- **Calibrate again**: once a calibration has ended, a search that still finds
+  the law missing, as after the head has moved or the performance variables
+  have changed, prints the next one into a new directory, `OUT/cal/S1+2`, then
+  `OUT/cal/S1+3`, and reads that one's status; start it as above, its log in
+  `OUT/cal/S1+2.log`. Where the next one would take the ATOM arguments, traces
+  and records the ended one took, and the law that one fitted is at the
+  configuration's key (its model, the machine's platform, the head's ATOM
+  digest, and its engine config with the performance variables), it would refit
+  that law, so `made by:` says so in place of a command and names the store
+  that law is in; the law's verdict line says what it lacks.
 
 **A missing point's readings** take `compass measure memory --gpu G --out D
 --store <store> -- <ATOM's arguments>`, as printed, under the variables it
 names: `G` the cards the configuration uses, `D` a fresh directory. It is one
-engine start on those cards.
+engine start on those cards. Where the store the candidate is looked up in holds
+stale readings at one point's key, which it refuses a second publish at, every
+point's command names a new store, `OUT/cal/readings@<digest>/store`, those
+whose readings that store holds too, as a run reads one store. A search looks
+it up as it does a calibration's own: it starts with no platform readings, so
+take them into it as a calibration's store takes them (above).
 
 **A 1P1D side's law** prints `deploy.sh OUT record of the deployment, then
 compass fit steps --backend step-linear on each OUT/prefill`, and the same for
@@ -418,4 +455,5 @@ An agent that runs this guide for a user keeps these rules:
 | `before it runs, set AIPERF_PYTHON` under a printed command | the shell that ran the search did not set it | set it in the shell that starts the calibration |
 | a candidate `refused` with `ATOM's parser: unrecognized arguments: ...` | a flag ATOM does not have, such as a misspelt one | correct the space file |
 | a candidate `refused` with `--server-port ... is among ATOM's arguments; the driver owns it` | an argument `compass run` assigns, `--host` or a port | leave it out, as What a space file leaves out says |
-| a calibrated candidate still `missing a law` | its calibration failed, or it published into its own store, which holds no platform readings | its `calibration:` line; resume it, or take its store's `measure device` and `fit device` (step 3) |
+| a candidate `refused` with `this deployment offloads KV to a Mooncake Store and the run file has no mooncake_store entry` | its prefill offloads to a Mooncake Store and no block of it names the entry | the entry's path in its block's `mooncake_store` (step 1) |
+| a calibrated candidate still `missing a law` | its calibration failed, or it published into a store holding no platform readings, at another stack than the committed copy's or on a machine with none | its `calibration:` line; resume it, or take its store's `measure device` and `fit device` (step 3), the store `made by: no calibrate.sh command` names when it ended |

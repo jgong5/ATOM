@@ -31,7 +31,10 @@ a pass, from a device event where the drafter points its context at that pass
 and `d_gap_ns`, from the previous forward's
 exit event to this launch's entry event, absent on the first line; summed in
 order they lay every forward on one device timeline. A later pipeline stage's
-receive of its input is `t_pp_recv_ns`, its device part `d_recv_ns`; an idle
+receive of its input is `t_pp_recv_ns`, its device part `d_recv_ns`; a stage
+before the last starts sending its output at `d_send_ns`, an event before it
+settles its previous send, whose wait holds the stream until the next stage
+takes that send; an idle
 `flush_pp_send` since the last forward that settled a pending send is `t_flush_ns`. The events are polled,
 never waited on, so a line is finished once its exit event has completed. A
 real runner's lines are kept in memory and written at its `exit`, so no file
@@ -90,6 +93,7 @@ import contextlib
 import copy
 import functools
 import hashlib
+import importlib
 import json
 import os
 import pathlib
@@ -142,6 +146,7 @@ TIMESTAMPS = (
     "d_gap_ns",
     "d_target_ns",
     "d_recv_ns",
+    "d_send_ns",
     "d_draft_kv_ns",
     "d_propose_ns",
     DRAFT_PASSES,
@@ -150,10 +155,17 @@ TIMESTAMPS = (
     "blocked_ns",
 )
 #: Profiler ranges a trace run (`busy`) splits a forward's kernels at, on every
-#: TP rank: the target ends where `TARGET_DONE` opens, and each drafter pass is
-#: the range named `MARK` and its line field.
+#: TP rank: the target ends where `TARGET_DONE` opens, each drafter pass is the
+#: range named `MARK` and its line field, and a pipeline stage's receive of its
+#: input and send of its output are `PP_RECV` and `PP_SEND`, its handoff.
 MARK = "compass::"
 TARGET_DONE = MARK + "target_done"
+PP_RECV = MARK + "pp_recv"
+PP_SEND = MARK + "pp_send"
+#: ATOM's runner module, and the calls by which its `run_model` sends a stage's
+#: output: the previous send settled, then this one started.
+SENDER = "atom.model_engine.model_runner"
+SENDS = ("commit_pp_send_work", "async_send_intermediate_tensors")
 #: The stamps the blocking-call tool's sums are read at: a line's `blocked_ns`
 #: runs from the launch's entry to its token read's, as `W_launch` does.
 BLOCKED_AT = ("t_launch_ns", "t_recv_ns", "t_read_ns")
@@ -412,6 +424,7 @@ def _record(runner):
             directory = record_dir(directory, runner.config)
             from atom.compass.backends.step_grid_plan import (
                 DEFERS_OUTPUT,
+                MIN_FINAL_ROWS,
                 PREFILL_BUCKETS,
                 UNKEYED,
             )
@@ -431,6 +444,8 @@ def _record(runner):
             for name in CONTEXT_PARALLEL:
                 if (width := getattr(runner.config, name, 1)) > 1:
                     engine[name] = width
+            if (rows := getattr(runner.config, MIN_FINAL_ROWS, 0)) > 0:
+                engine[MIN_FINAL_ROWS] = rows
             engine[PREFILL_BUCKETS] = list(TokenGraph.captured_sizes("prefill"))
             processor = getattr(runner, "tokenID_processor", None)
             engine[DEFERS_OUTPUT] = getattr(processor, "is_deferred_out", True)
@@ -560,6 +575,12 @@ class StepRecording:
     `run_model` entry it also keeps the `ForwardMode` the forward settled,
     which the line's view is built from.
 
+    On a pipeline stage it wraps the PP group's receive of its input and, on a
+    stage before the last, the `SENDS` calls of `SENDER` that send its output:
+    each runs under its profiler range (`PP_RECV`, `PP_SEND`) on every TP
+    rank, and a recorded forward records a device event where the received
+    tensors are in and one where its send starts.
+
     Once `allocate_kv_cache` has built a Mooncake connector, every worker
     records that connector's KV writes (`writes`), written at `exit`. A
     launch provider that declares features is installed once built, and its
@@ -604,6 +625,14 @@ class StepRecording:
             if not group.is_first_rank:
                 recv = group.recv_tensor_dict
                 group.recv_tensor_dict = functools.partial(self._pp_received, recv)
+            last = self.config.pipeline_parallel_size - 1
+            if self.config.parallel_config.pipeline_parallel_rank < last:
+                # `run_model` calls them by name, and no method of the group
+                # or the runner holds them alone.
+                module = importlib.import_module(SENDER)
+                for name in SENDS:
+                    call = functools.partial(self._pp_sending, getattr(module, name))
+                    setattr(module, name, call)
         if processor is not None and hasattr(self, "drafter"):
             for key, name in (
                 ("t_mtp_ns", "recv_spec_status"),
@@ -666,12 +695,27 @@ class StepRecording:
         return reply
 
     def _pp_received(self, call, *args, **kwargs):
-        """The stage before's output, received under `t_pp_recv_ns`, then a
-        device event where the received tensors are in."""
-        reply = self._stamped("t_pp_recv_ns", lambda: call(*args, **kwargs))
+        """The stage before's output, received under `t_pp_recv_ns` inside
+        `PP_RECV`, then a device event where the received tensors are in."""
+        with _traced(PP_RECV):
+            reply = self._stamped("t_pp_recv_ns", lambda: call(*args, **kwargs))
         if getattr(self, "_parity_record", None) is not None:
             self._stamps["recv_event"] = self.device_event()
         return reply
+
+    def _pp_sending(self, call, *args, **kwargs):
+        """`call`, a part of this stage's send of its output, inside `PP_SEND`;
+        in a recorded forward's launch the first part is preceded by a device
+        event, the send's start. An idle `flush_pp_send` settles a send outside
+        any launch and records none."""
+        if (
+            getattr(self, "_parity_record", None) is not None
+            and "launch_event" in self._stamps
+            and "send_event" not in self._stamps
+        ):
+            self._stamps["send_event"] = self.device_event()
+        with _traced(PP_SEND):
+            return call(*args, **kwargs)
 
     def _target_done(self, call, *args, **kwargs):
         """`call(*args, **kwargs)` after a device event where `postprocess` has
@@ -737,7 +781,11 @@ class StepRecording:
             end = (sums["t_recv_ns"] or sums["t_read_ns"] or (end,))[0]
             stamps["blocked_ns"] = self._blocked.between(before, end)
         launch = stamps.pop("launch_event", None)
-        names = {"d_target_ns": "target_event", "d_recv_ns": "recv_event"}
+        names = {
+            "d_target_ns": "target_event",
+            "d_recv_ns": "recv_event",
+            "d_send_ns": "send_event",
+        }
         marks = {k: [stamps.pop(e)] for k, e in names.items() if e in stamps}
         first = stamps.pop("draft_event", None)
         starts = stamps.pop("pass_events", [])

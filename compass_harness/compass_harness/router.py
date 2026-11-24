@@ -29,9 +29,10 @@ def send_rank(credit) -> tuple:
     subagent) and its turn, then its cache-bust marker, digested from the
     benchmark id, which tells two replays of one trace apart where aiperf marks
     them. Not its id: aiperf numbers credits in the order it sends them, the
-    order that varies from run to run; nor its correlation id, a ``uuid4``. Two
-    credits that tie are one trace's turn replayed twice unmarked, the same
-    body either way round.
+    order that varies from run to run; nor its correlation id, which
+    ``session_ids`` draws from the trace and branch ranked here. Two credits
+    that tie are one trace's turn replayed twice unmarked, the same body either
+    way round.
     """
     return (
         -1 if credit.phase_index is None else credit.phase_index,

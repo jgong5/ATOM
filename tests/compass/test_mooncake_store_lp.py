@@ -314,6 +314,24 @@ def test_a_put_publishes_at_its_lane_s_end_and_a_hit_names_who_saved_it():
     }
 
 
+def test_a_put_of_a_key_in_flight_takes_no_bytes_grants_no_lease_publishes_nothing():
+    """Engine P0 puts the keys engine P1's put holds in flight: P0's put ends
+    first and publishes nothing, the keys appear at P1's end as P1's, and
+    their lease starts at that end, not at P0's put."""
+    lp, rt = _loop()
+    keys, groups = _keys(0)
+    first = (1.0, XFER, ("put", keys, groups, 1.0, 3.0))
+    second = (1.5, XFER.replace("P1", "P0"), ("put", keys, groups, 1.5, 2.0))
+    mid = (2.5, LOOK, ("query", "mid", keys))
+    got = _serve(lp, rt, [first, second, mid], until=2.75)
+    assert [p[3] for _, _, p in got] == [{}]
+    assert lp.master.used == 2
+    _serve(lp, rt, [], until=3.25)
+    assert lp.master.groups[_group(0)].deadline == 3.0
+    got = _serve(lp, rt, [(3.5, LOOK, ("query", "after", keys))])
+    assert got[-1][2][3] == dict.fromkeys(keys, "engine-P1")
+
+
 def test_the_loop_runs_a_round_at_its_boundary_and_none_that_would_evict_nothing():
     lp, rt = _loop(_entry(capacity_bytes=6))
     puts = [(1.0, XFER, ("put", *_keys(c), 1.0, 1.003)) for c in range(3)]

@@ -84,9 +84,9 @@ class Runner(Bench):
         self.calls.append("freeze_gc_heap")
         return 0
 
-    def bench_step(self, batch):
-        self.calls.append("bench_step")
-        return super().bench_step(batch)
+    def bench_step(self, batch, repeats):
+        self.calls.append(["bench_step", repeats])
+        return super().bench_step(batch, repeats)
 
     def call_log(self):
         return self.calls
@@ -186,7 +186,7 @@ def test_every_worker_starts_in_engine_cores_order_and_the_slowest_is_charged(
     bench = engine.Bench(config, BLOCKS)
     try:
         assert config.num_kvcache_blocks == BLOCKS
-        result = bench.measure(batch())
+        result = bench.measure(batch(), window.REPEATS)
         log = bench.runner_mgr.call_func("call_log", wait_out=True)
     finally:
         bench.exit()
@@ -194,7 +194,8 @@ def test_every_worker_starts_in_engine_cores_order_and_the_slowest_is_charged(
 
     startup = ["get_num_blocks", ["allocate_kv_cache", BLOCKS]]
     capture = [] if eager else ["capture_cudagraph"]
-    assert log == startup + capture + ["freeze_gc_heap", "bench_step"]
+    bench_step = ["bench_step", window.REPEATS]
+    assert log == startup + capture + ["freeze_gc_heap", bench_step]
     # Rank 0's reply carries rank 1's work, which the closing collective holds
     # every window for, and its preload outlasted rank 1's host: at 3 ms rank
     # 1's entry event had completed, and rank 0's had not.
@@ -212,13 +213,14 @@ def test_under_expert_parallelism_every_worker_routes_uniformly_before_it_starts
     call alone, and the reply is the group's step as the test above reads it."""
     bench = engine.Bench(_config(tp=2, ep=True), BLOCKS)
     try:
-        result = bench.measure(batch())
+        result = bench.measure(batch(), window.REPEATS)
         log = bench.runner_mgr.call_func("call_log", wait_out=True)
     finally:
         bench.exit()
 
     startup = ["get_num_blocks", ["allocate_kv_cache", BLOCKS], "capture_cudagraph"]
-    assert log == ["route_uniformly", *startup, "freeze_gc_heap", "bench_step"]
+    bench_step = ["bench_step", window.REPEATS]
+    assert log == ["route_uniformly", *startup, "freeze_gc_heap", bench_step]
     busy = BUSY + 1_000
     assert result["repeats"] == [[PREPARE + busy, PREPARE, busy]] * window.REPEATS
 
@@ -280,7 +282,7 @@ def test_a_worker_that_dies_in_a_call_stops_the_bench_naming_the_call(
     with pytest.raises(ValueError, match=f"a bench worker died, so {call} got no"):
         bench = engine.Bench(config, BLOCKS)
         try:
-            bench.measure(batch())
+            bench.measure(batch(), window.REPEATS)
         finally:
             bench.exit()
 
@@ -311,7 +313,7 @@ def test_a_sigterm_stops_the_bench_naming_it_and_a_repeat_leaves_the_teardown_wh
     with pytest.raises(engine.Signalled, match="its process was sent SIGTERM$"):
         bench = engine.Bench(config, BLOCKS)
         try:
-            bench.measure(batch())
+            bench.measure(batch(), window.REPEATS)
         finally:
             bench.exit()
     assert not multiprocessing.active_children()

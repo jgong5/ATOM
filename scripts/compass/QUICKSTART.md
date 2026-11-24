@@ -234,9 +234,11 @@ A server builds an aiter, FlyDSL or `compile_hsaco` kernel, or a Triton or Induc
 not prebuild, such as `mha_varlen_fwd`'s for a prefill step of one new token a
 row, about 60 s inside the run, and the container keeps it for every later
 server. A record whose server built one names it in run.json's
-`aiter_jit_builds`, and grading, the fits and `validate.cost` refuse that
-record. Each round sends the server the JIT sweep of this cell for the traces
-every later step serves, the points its records' keys are selected by, and
+`aiter_jit_builds` and times it. The fits and `validate.cost` cut each step
+that overlaps it, refusing the record when they would cut too many; grading
+refuses the run, since the stall delays every later request.
+Each round sends the server the JIT sweep of this cell for the traces every
+later step serves, the points its records' keys are selected by, and
 after the stop keeps what it compiled and the points its record covered in the
 store's JIT cache library (`scripts/compass/README.md`, the full path); nothing
 reads its record. A round sends only the steps still missing, and its last

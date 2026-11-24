@@ -386,8 +386,8 @@ def test_a_borrower_s_readings_command_starts_its_own_server(
 
     found = advise(tmp_path, {"S2": s2, "S5": s5 | {"lmcache_server": SERVER}})
 
-    store = tmp_path / "store"
-    assert found["S5"]["made_by"][0] == check.BORROWED.format("S2", store)
+    store, cal = tmp_path / "store", tmp_path / "out" / check.CAL / "S2"
+    assert found["S5"]["made_by"][0] == check.BORROWED.format("S2", cal, store)
     variables, server, atom_args = read_back(found["S5"]["made_by"][1])
     assert (server[:-4], reached(variables, server)) == (FLAGS, 5555)
     assert atom_args[2:] == ["--max-num-seqs", "12", "--max-model-len", "512"]

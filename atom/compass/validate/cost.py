@@ -123,23 +123,27 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     records differ in length by more than the one step a stopped run leaves on
     some ranks only are refused, and so is a record whose every rank ran only
     dummy forwards.
-    So is a record whose run.json, beside `record`, names `aiter_jit_builds`.
+    So is a record whose run.json, beside `record`, names `aiter_jit_builds`
+    that `step_labels.cut_refusal` refuses; a step overlapping a compile that
+    run.json times is cut.
     On several ranks, the report's ``ranks`` holds per kind and rank number
     the graded steps that rank was priced as (`accuracy._rank`), with its cards' buses.
     """
     run = Path(record).resolve().parent / "run.json"
     identity = read_json(run) if run.is_file() else None
-    if identity is not None and (built := aiter_jit.refusal(identity)):
-        raise ValueError(f"{record} is not costed: {built}")
     ranks = sorted(Path(record).glob("dp*[0-9].jsonl"))
     records = [read_jsonl(r) for r in ranks]
+    if identity is not None and (built := aiter_jit.cut_refusal(identity, records)):
+        raise ValueError(f"{record} is not costed: {built}")
     lines = {r.name: len(x) for r, x in zip(ranks, records)}
     if not ranks or max(lines.values()) - min(lines.values()) > 1:
         raise ValueError(
             f"{record} holds rank records of {lines} lines; one run's ranks "
             "differ by at most the step a stopped run leaves on some"
         )
-    run = [got for got, _ in step_labels.label_run(ranks, split_rule=_split)]
+    spans = step_labels.cut_spans(identity)
+    labelled = step_labels.label_run(ranks, split_rule=_split, spans=spans)
+    run = [got for got, _ in labelled]
     if not any(run):
         raise ValueError(
             f"{record}'s ranks ran only DP's dummy forwards: no step to price"

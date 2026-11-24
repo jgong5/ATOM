@@ -104,6 +104,7 @@ def measured(store, config, sampling=SAMPLING, origin="replay"):
         view="sha256:5e1f",
     )
     member = {**LINE, "seconds": 1.5e-4, "origin": origin, "traces": ["trace-9"]}
+    member["sources"] = ["dp0.jsonl:0a1b2c3d4e5f"]
     ArtifactStore(store).publish(
         key,
         provenance=stanza("compass measure steps"),
@@ -251,6 +252,7 @@ def test_a_measurement_loads_beside_records_of_its_configuration_only(
         "requests": [],
         "config": None,
         "traces": ["trace-9"],
+        "inputs": ["dp0.jsonl:0a1b2c3d4e5f"],
         "profiled": False,
     }
 

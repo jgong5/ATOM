@@ -199,7 +199,7 @@ def test_a_run_file_bundle_prices_the_runs_steps_and_the_summary_names_it(
             "digest": entry.digest,
             "describe": (
                 f"step grid, bundle {entry.key}; replay decode grid, "
-                "timing scope forward; recipe step-grid-residual v3, members "
+                "timing scope forward; recipe step-grid-residual v4, members "
                 "decode: unit; prefill_output: unit; prefill_no_output: unit; "
                 "below it, step roofline; 1 modules"
             ),
