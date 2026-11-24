@@ -668,7 +668,7 @@ def test_a_v41_prefill_past_cached_tokens_scores_on_a_plane_its_rows_blocks_wide
     # the FP4 index plane packs its logits over the whole block table, the
     # candidate pick's block maxima flat, which no context widens
     runner.attn_metadata_builder.geometry = dataclasses.replace(
-        geometry, index_dim=128, index_fp4=True
+        geometry, index_dim=128, index_fp4=True, index_layout="preshuffle"
     )
     maxima = _leaf(
         ops._MAXIMA,
@@ -719,7 +719,11 @@ def _v41_index(monkeypatch, visible, leaves, shape, context, fp4=False):
     geometry = V41PoolGeometry(1, ((0, 1),), 32, 4, 512, 32, layer_ratios=(1,))
     if fp4:  # whole 128-dim K tiles on 8-row pages
         geometry = dataclasses.replace(
-            geometry, index_dim=128, index_block_rows=8, index_fp4=True
+            geometry,
+            index_dim=128,
+            index_block_rows=8,
+            index_fp4=True,
+            index_layout="preshuffle",
         )
     runner.attn_metadata_builder = SimpleNamespace(geometry=geometry)
     runner.forward_vars["logits"] = torch.zeros(128)
@@ -2906,7 +2910,10 @@ def test_a_v41_attention_reads_its_pass_s_indptrs_whatever_was_timed_before_it(
 
         def indptrs(self, step):
             for p, _ in (step.indptr_buffers or self.indptr_buffers).values():
-                p[0], p[1 : step.width + 1] = 0, (step.batch_ids >= 0).cumsum(0) * 2
+                p[0], p[1 : step.running_tokens + 1] = (
+                    0,
+                    (step.batch_ids >= 0).cumsum(0) * 2,
+                )
 
     taken, held = {}, {"cache": Cache()}
 
@@ -3966,8 +3973,8 @@ def _forced(monkeypatch, end=lambda: None):
         "target_logits_indices": torch.arange(10),
         "num_spec_steps": 5,
         "cu_num_draft_tokens": torch.tensor([5, 10], dtype=torch.int32),
-        "draft_probs": None,
-        "target_probs": torch.ones(10, 8),
+        "ratio": None,
+        "target_logits": torch.ones(10, 8),
         "bonus_token_ids": torch.zeros(2, 1, dtype=torch.int32),
         "bonus_logits_indices": torch.tensor([5, 11]),
         "synthetic_acceptance_rates": (1.0, 1.0, 0.0, 0.0, 0.0),

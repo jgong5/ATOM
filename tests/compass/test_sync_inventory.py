@@ -352,6 +352,13 @@ def test_a_worker_call_parks_only_when_it_asks_for_the_reply(src, blocking):
         ("subprocess.Popen(cmd)", "thread_start"),
         ("ThreadPoolExecutor(max_workers=1)", "thread_start"),
         ("ProcessPoolExecutor(2)", "thread_start"),
+        ("subprocess.run(cmd)", "subprocess_wait"),
+        ("subprocess.check_output(cmd, timeout=30)", "subprocess_wait"),
+        ("subprocess.check_call(cmd)", "subprocess_wait"),
+        ("subprocess.call(cmd)", "subprocess_wait"),
+        ("subprocess.getoutput(cmd)", "subprocess_wait"),
+        ("proc.communicate()", "subprocess_wait"),
+        ("async def f(p):\n    return await p.communicate(data)", "subprocess_wait"),
     ],
 )
 def test_a_call_that_parks_or_starts_a_thread_is_reported(src, shape):
@@ -364,6 +371,9 @@ def test_a_call_that_parks_or_starts_a_thread_is_reported(src, shape):
         "if not busy.query():\n    pass",  # one look, not a poll
         "psutil.Process(pid)",  # attaches to a running process
         'db.query("x")\nwhile True:\n    db.query("x")',  # not an event
+        "asyncio.run(main())",  # runs a coroutine, starts no process
+        "self.call(name, *args)",  # a method of the same name
+        "uvicorn.run(app)",
     ],
 )
 def test_a_lookalike_is_not_reported(src):

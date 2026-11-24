@@ -29,7 +29,7 @@ from test_step_linear_token_padding import BUCKETS
 from atom.compass.backends import step_linear_fit
 from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.step_labels import digest
-from atom.compass.fit.samples import load
+from atom.compass.fit.samples import GRADED_ONLY_ENV, load
 from atom.compass.run.step_grid import BOUNDS
 
 #: The engine config the records' server logs state, a field their engine
@@ -116,3 +116,17 @@ def test_a_record_stating_no_buckets_takes_the_file_s_and_one_stating_others_ref
     )
     with pytest.raises(ValueError, match=re.escape(named)):
         load(runs, engine=engine)
+
+
+def test_a_graded_window_loads_under_a_stated_engine(tmp_path, monkeypatch):
+    # Every step sends, so the graded window is the whole record; the record's
+    # own keyed fields, not its graded steps, are what the stated file is held to.
+    a = record(tmp_path / "a", 19)
+    runs = {a: [str(a / "client.json")]}
+    engine = _engine(tmp_path, prefill_buckets=[64, 128])
+    whole = load(runs, engine=engine)
+
+    monkeypatch.setenv(GRADED_ONLY_ENV, "1")
+    graded = load(runs, engine=engine)
+    assert graded[1] == whole[1]
+    assert [s.step for s in graded[0]] == [s.step for s in whole[0]]

@@ -550,7 +550,7 @@ def test_the_reply_answers_every_attribute_atom_reads_off_one(run):
         "logprobs",
         "dspark_ell",
         "get_idx",
-        "structured_errors",
+        "constraint_errors",
     }
     # Answered by building ATOM's own object rather than one shaped like it, so
     # a field this runner never sets still carries the default ATOM gives it.

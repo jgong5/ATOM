@@ -199,6 +199,8 @@ def test_each_cost_line_reproduces_the_charge_of_its_step(
         assert (line["W_launch"], line["skipped"]) == (0.0, ["W_launch"])
         assert line["group_s"] == charge
         assert line["device_s"] == fold_seconds(t["seconds"] for t in line["terms"])
+        # A stub with no draft coefficient: every term is the target's.
+        assert line["target_terms"] == len(line["terms"]) > 0
         provenance = {(t["method"], t["validated"], t["source"]) for t in line["terms"]}
         assert (provenance, line["refused"]) == ({("declared", False, SOURCE)}, None)
     assert all(line["E"] > 0 for line in lines)
@@ -349,3 +351,19 @@ def test_once_one_kind_has_an_E_out_law_a_kind_without_one_is_refused(streak):
         else:
             with pytest.raises(CostRefused, match=rf"no law for {kind}\.E_out"):
                 host.charge(batch, 1e-3, 0.0)
+
+
+def test_a_reply_states_when_its_device_work_ends_which_the_next_output_forward_waits_for(
+    streak,
+):
+    """A forward's reply carries `device_end`, the end of the device work it
+    launched, which a P/D decode's write request waits for. With no host time
+    each output forward returns at the one before's device end, as a deferred
+    output reads the tokens the one before sampled; with no host recurrence
+    the reply states none."""
+    decodes = [b for b in streak if not b.total_seqs_num_prefill][:4]
+    out, exits = replies(decodes, {})
+    ends = [r.device_end for r in out]
+    assert ends == sorted(ends) and ends[0] > exits[0]
+    assert exits[1:] == pytest.approx(ends[:-1], abs=1e-12)
+    assert _Runner(_config()).forward(decodes[0]).device_end is None

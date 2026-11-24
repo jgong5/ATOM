@@ -294,7 +294,8 @@ compass measure ops    --coverage RECORD [--coverage RECORD]... --out D --store 
 compass measure memory [--beside CMD] --out D --store S -- <ATOM args>       [GPU]
 compass measure device --gpu G... [--pp] --out D --store S        [GPU, every card]
 compass fit device     RECORD... --out D --store S
-compass fit device     --assume-from DEVICE --ptl P --device DATASHEET --out D --store S
+compass fit device     --assume-from DEVICE --ptl P [--stack STACK] --device DATASHEET \
+                       --out D --store S
 compass fit steps      --backend step-linear [--form FORM] \
                        [--moe-routing E,K | --model DIR] [--seed SEED] RECORD... \
                        --client-run RECORD EXPORT... [--ops MEASURED...] --out D --store S
@@ -543,6 +544,7 @@ Audited, because an absent flag is a decision and should be a visible one:
 | thread-pool widths | ATOM's, per `05` D24 |
 | the run file's lookaheads and bound | the bound is fixed in code (`atom/compass/drive/runfile.py::FIXED`); the hops come from the `host_laws` entry's `hops`, each a floor where no entry states it (`01`, Lookahead sources); a deployment's `router_s`, the router's hop, is the prefill side's, a host transport cost and no network's, which the law files state at an assumed 1.5 ms (`05` D25), and a router LP's `router_in_s` borrows `ipc_s`, since Atomesh logs no receipt to measure it from; `run` always drives the API server, so there is no admission path to choose |
 | the model's parameter count, the DP width | read from the model directory and from ATOM's arguments |
+| an encoding ingress in front of the router | the `host_laws` entry's `ingress` term, the prefill side's in a prefill-decode run, stated by `compass fit host --ingress FILE` from `compass fit ingress`'s fit of the ingress's stamps, or a law file's `host.ingress`; the run file's `ingress`, which the traffic LP prices on the HTTP channel (`atom/compass/ingress.py`); absent, no hop (#3720) |
 
 ---
 

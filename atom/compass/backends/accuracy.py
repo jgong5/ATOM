@@ -3,6 +3,13 @@
 `validate.cost` gives on a record, whose docstring states its rules, given the
 run's samples rather than read from its directory. The step linear fit grades
 each held-out run with it (`step_linear_fit.fold_figures`).
+
+Beside the graded group, which leaves out every step a declared term prices,
+the report's `PRICED` group holds every step the backend priced, graded and
+declared together, as a simulated run charges them, and under a law its
+``filled`` names, per kind, the steps priced at a rung the fit filled
+(#3796): a filled vector prices the steps no record reached, and the graded
+group alone does not show what they cost.
 """
 
 from __future__ import annotations
@@ -22,16 +29,21 @@ from atom.compass.backends import (
 )
 from atom.compass.backends.cost import GROUPS
 from atom.compass.backends.cost import group as method_group
-from atom.compass.backends.step_linear_fit import WARM_FACTOR, _band
+from atom.compass.backends.step_linear import dummy_view
+from atom.compass.backends.step_linear_fit import PAUSE_S, WARM_FACTOR, _band
 from atom.compass.backends.step_roofline import StepFallbackBackend
 
 WITHIN = 0.10
-#: The report's groups a step enters, by its terms: a declared one only its own.
+#: The report's groups a step enters, by its terms: a declared one only its own
+#: and `PRICED`, which every priced step enters (#3796).
 GRADED = {
-    "validated": ("graded", "validated"),
-    "unvalidated": ("graded", "unvalidated"),
-    "declared": ("declared",),
+    "validated": ("graded", "validated", "priced"),
+    "unvalidated": ("graded", "unvalidated", "priced"),
+    "declared": ("declared", "priced"),
 }
+#: The group of every step the backend priced, graded or declared, warm and
+#: refused steps left out as from every group: what a simulated run charges.
+PRICED = "priced"
 
 
 def _is_grid(backend) -> bool:
@@ -40,10 +52,19 @@ def _is_grid(backend) -> bool:
     return isinstance(first, StepGridBackend)
 
 
-def _leading_slow(priced: list[tuple], law: dict | None) -> set[int]:
+def _leading_slow(
+    priced: list[tuple], law: dict | None, fitted: bool = True
+) -> set[int]:
     """Steps leading their vector's (vector, band, step, seconds, price) rows, each
     slow by the scatter `law` fitted the vector on, or by the scatter here where
-    `law` records none or is None, as for an op graph."""
+    `law` records none or is None, as for an op graph; slow about the centre the
+    law fitted. On rows of a run the law was not `fitted` on, slow about their
+    own median instead where that median is itself slow or fast from the
+    fitted centre by that bound, as a warm step runs slow against the rest of
+    its own record: about the fitted centre a record the law prices off
+    throughout leads slow throughout, and grades none of its steps (#3720's
+    r256: store_bL's rung 32, fitted MAD 0.8%, priced every step 7.5% low, and
+    each one was named warm)."""
     out = set()
     for key in sorted({p[0] for p in priced}):
         mine = [p for p in priced if p[0] == key]
@@ -55,12 +76,12 @@ def _leading_slow(priced: list[tuple], law: dict | None) -> set[int]:
         vector = {}
         if law is not None:
             vector = law["prefill"] if key == "prefill" else law["decode"][key]
-        if "mad" in vector.get("fit", {}):
-            centre, mad = vector["fit"]["centre"], vector["fit"]["mad"]
-        slow = (error < 0) & (
-            np.abs(error - centre)
-            > max(step_linear_fit.MAD_K * mad, step_linear_fit.MAD_FLOOR)
-        )
+        fit = vector.get("fit", {})
+        mad = fit.get("mad", mad)
+        bound = max(step_linear_fit.MAD_K * mad, step_linear_fit.MAD_FLOOR)
+        if "mad" in fit and (fitted or abs(centre - fit["centre"]) <= bound):
+            centre = fit["centre"]
+        slow = (error < 0) & (np.abs(error - centre) > bound)
         for p, s in zip(mine, slow):
             if not s:
                 break
@@ -126,14 +147,18 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
     if law is not None:
         backend = StepLinearBackend(StepLinearLaw(law))
     grid = _is_grid(backend)
-    groups = {g: {} for g in ("graded", "validated", "unvalidated", "declared")}
+    groups = {g: {} for g in ("graded", PRICED, "validated", "unvalidated", "declared")}
     declined: dict[str, dict] = {}
     fell: dict[str, dict] = {}
     warm, priced, extrapolated = [], [], 0
     for group in joined:
         key, _, seconds, step, *_ = next(iter(group.values()))
+        # A rank that ran the prefill step as a dummy forward holds its dummy's
+        # row (`step_linear_fit._groups`), priced at its view as a run prices it.
+        peer = next(views[i][step] for i in group if step in views[i])
+        mine = {i: views[i].get(step) or dummy_view(peer) for i in group}
         try:
-            costs = {i: backend.price(views[i][step]) for i in group}
+            costs = {i: backend.price(mine[i]) for i in group}
         except CostRefused as refused:
             band = _band(key, max((r[1] for r in group.values()), key=lambda c: c[1]))
             _count(declined, band, seconds, refused.declined)
@@ -142,22 +167,33 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
             {i: (c.target_seconds, group[i][1]) for i, c in costs.items()}
         )
         extrapolated += any(t.provenance.extrapolated for t in costs[top].terms)
-        band, price = _band(key, group[top][1]), costs[top].target_seconds
+        # A step a dummy is priced highest on is banded, and its draft priced, at
+        # its busiest forwarding rank: a dummy's draft is none of its labels.
+        busiest = max((i for i in group if step in views[i]), key=lambda i: group[i][1])
+        real = top if step in views[top] else busiest
+        band, price = _band(key, group[real][1]), costs[top].target_seconds
         # Each term of a fallback's answer carries what declined the step.
         if costs[top].refusals:
             _count(fell, band, seconds, dict.fromkeys(costs[top].refusals))
-        labels = [drafts[i][step] for i in group]
+        labels = [drafts[i][step] for i in group if step in drafts[i]]
         draft = None
         if None not in labels:
-            mine = costs[top].draft_terms
-            draft = (min(labels), costs[top].draft_seconds, _group(mine))
+            mine = costs[real].draft_terms
+            draft = (min(labels), costs[real].draft_seconds, _group(mine))
         target = _group(costs[top].terms)
         priced.append((key, band, step, seconds, price, target, draft, costs[top], top))
-    leading = set() if grid else _leading_slow(priced, law)
+    # A run the law was fitted on leads warm where the fit named it warm.
+    names = {s.provenance["run"] for rank in run for s in rank}
+    fitted = law is not None and bool(names & set(law.get("runs", ())))
+    leading = set() if grid else _leading_slow(priced, law, fitted)
     parts: dict[str, list] = {}
     by_rank: dict[str, dict] = {}
     for key, band, step, seconds, price, target, draft, cost, top in priced:
-        if step in leading or seconds > WARM_FACTOR * price:
+        if (
+            step in leading
+            or seconds > WARM_FACTOR * price
+            or seconds - price > PAUSE_S
+        ):
             warm.append(
                 {
                     "step": step,
@@ -182,6 +218,7 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
         report[group] = {
             kind: _summary(rows) for kind, rows in sorted(kinds.items(), reverse=True)
         }
+    report["filled"] = _filled(groups[PRICED], law)
     report["warm"] = warm
     report["fallback"], report["refused"] = fell, declined
     report["extrapolated"] = extrapolated
@@ -214,6 +251,37 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
             for name, s in sorted(terms.items())
         }
     return report
+
+
+def _filled(priced: dict, law: dict | None) -> dict:
+    """Per kind of `priced`, the `PRICED` group's (band, step, real, price)
+    rows, the steps priced at a decode rung `law` filled
+    (`step_linear_fit.filled_rungs`, a draft's at its draft law's): their
+    ``steps``, ``real_s`` and ``priced_s``, their ``share`` of the kind's real
+    seconds and the ``rungs``, ascending. A kind with none, and every kind
+    under a backend that is no law, is left out."""
+    if law is None:
+        return {}
+    named = step_linear_fit.filled_rungs(law)
+    out = {}
+    for kind, rows in priced.items():
+        rungs = set(named["draft" if kind == "draft" else "decode"])
+        on = [r for r in rows if _rung(r[0]) in rungs]
+        if on:
+            out[kind] = {
+                "steps": len(on),
+                "real_s": float(sum(r[2] for r in on)),
+                "priced_s": float(sum(r[3] for r in on)),
+                "share": float(sum(r[2] for r in on) / sum(r[2] for r in rows)),
+                "rungs": sorted({_rung(r[0]) for r in on}),
+            }
+    return out
+
+
+def _rung(band: str) -> int | None:
+    """The rung a ``decode rung <n>`` band names, else None."""
+    head, _, rung = band.rpartition(" ")
+    return int(rung) if head == "decode rung" and rung.isdigit() else None
 
 
 def _count(into: dict, band: str, seconds: float, refusals) -> None:

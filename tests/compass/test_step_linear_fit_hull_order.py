@@ -61,3 +61,72 @@ def test_a_set_qhull_refuses_in_its_order_is_hulled_whole():
     hull = Hull("the fit's hull", NAMES, _hull(POINTS, NAMES))
 
     assert all(hull.contains(tuple(p)) for p in POINTS)
+
+
+def test_a_set_qhull_refuses_in_both_orders_is_hulled_joggled(monkeypatch):
+    """#3720's pooled prefill points failed qhull's precision checks in both
+    orders; a set that spans every free feature is then hulled joggled, and the
+    hull still holds every point."""
+    import scipy.spatial
+
+    real, options = scipy.spatial.ConvexHull, []
+
+    def strict(points, qhull_options=None):
+        options.append(qhull_options)
+        if qhull_options != "QJ":
+            raise QhullError("QH7086 Qhull precision warning: repartition")
+        return real(points, qhull_options=qhull_options)
+
+    monkeypatch.setattr(scipy.spatial, "ConvexHull", strict)
+    hull = Hull("the fit's hull", NAMES, _hull(POINTS, NAMES))
+
+    assert options == [None, None, "QJ"]
+    assert all(hull.contains(tuple(p)) for p in POINTS)
+
+
+def test_a_flat_set_qhull_refuses_is_not_joggled(monkeypatch):
+    """A set that spans fewer features than it varies in still raises: a joggle
+    would hull a flat set as a full one."""
+    import scipy.spatial
+
+    def refuse(points, qhull_options=None):
+        raise QhullError("QH6154 Qhull precision error: initial simplex is flat")
+
+    monkeypatch.setattr(scipy.spatial, "ConvexHull", refuse)
+    rng = np.random.default_rng(0)
+    a, b = rng.uniform(1, 100, 30), rng.uniform(1, 100, 30)
+    flat = np.column_stack([a, b, a + 2 * b])  # the third a sum of the others
+    with pytest.raises(QhullError):
+        _hull(flat, ("x", "y", "z"))
+
+
+def test_a_set_past_the_exact_features_is_hulled_by_pairs(monkeypatch):
+    """#3720: a pooled prefill fit's 8 features hulled to 2.9M facets. Past
+    `HULL_EXACT_FREE` free features the hull is the unit box cut by each pair's
+    2-D hull: qhull sees only pairs, the facets are bounded by the pairs' edges,
+    every point is inside, and a point past every point is not."""
+    import scipy.spatial
+
+    from atom.compass.backends import step_linear_fit
+
+    real, dims = scipy.spatial.ConvexHull, []
+
+    def pairs_only(points, qhull_options=None):
+        dims.append(points.shape[1])
+        return real(points, qhull_options=qhull_options)
+
+    monkeypatch.setattr(scipy.spatial, "ConvexHull", pairs_only)
+    rng = np.random.default_rng(0)
+    free = step_linear_fit.HULL_EXACT_FREE + 2
+    points = rng.uniform(0, 1e6, (2000, free))
+    points[:, 1] = points[:, 0] ** 2  # not affine in the first: still free
+    names = tuple(f"f{i}" for i in range(free))
+
+    raw = _hull(points, names)
+    hull = Hull("the fit's hull", names, raw)
+
+    assert set(dims) == {2}
+    assert len(raw["facets"]) <= 2 * free + len(dims) * len(points)
+    assert len(raw["facets"]) < 5000
+    assert all(hull.contains(tuple(p)) for p in points)
+    assert not hull.contains(tuple(points.max(axis=0) * 1.01))

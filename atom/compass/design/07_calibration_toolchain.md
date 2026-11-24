@@ -588,6 +588,13 @@ a GIL wait
   its send's end less its `wait`, which holds the loop's work for other streams while the
   pool job runs
   ([the exits Ruling](https://github.com/jgong5/ATOM/issues/2751#issuecomment-6686324280)).
+  A request is lone when every request whose body was read before its app call was sent,
+  counted by bodies, not app calls: two intakes that overlap share one app call, and a count
+  of those fell behind the sends for the rest of the record, so no record past c=1 had a
+  lone request and every run charged no intake ([#3748](https://github.com/jgong5/ATOM/issues/3748)). Where the API server renders
+  the template on a pool thread, the loop awaits it and the template job charges only its
+  encode calls, so a lone request's seconds add that render's wall, and only templates
+  rendered on the loop's thread make bursts.
   Its `recv` stretches stay in: the transport parses the request's own body as the read
   awaits it, and on a loaded loop serves other streams there too
   ([#2919](https://github.com/jgong5/ATOM/issues/2919)). `fixed_s` is the mean, over every

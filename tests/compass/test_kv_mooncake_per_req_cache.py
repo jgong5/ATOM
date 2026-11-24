@@ -42,6 +42,7 @@ def test_per_request_cache_forces_the_full_transfer(
         id=0,
         kv_transfer_params={"do_remote_prefill": True, "hash_block_size": own},
         block_table=list(range(8)),
+        state_slot=-1,
         has_per_req_cache=has_per_req_cache,
         num_cached_tokens=4 * own,
     )
@@ -109,6 +110,7 @@ def test_an_unsharded_producer_into_dcp2_is_priced_on_mooncakes_slices(monkeypat
             id=0,
             kv_transfer_params=dict(blob),
             block_table=list(range(8)),
+            state_slot=-1,
             has_per_req_cache=False,
             num_cached_tokens=cached * own * dcp,
         )
@@ -118,7 +120,7 @@ def test_an_unsharded_producer_into_dcp2_is_priced_on_mooncakes_slices(monkeypat
     ref.block_size, ref.dcp_size, ref.hash_block_size = own, dcp, own * dcp
     ref._reqs_need_recv, ref._reqs_need_save = {}, {}
     ref._chunked_waiting, ref._chunked_ready = {}, set()
-    ref._pending_chunked_admissions = {}
+    ref._pending_chunked_admissions, ref._producer_admission_undo = {}, {}
     ref.transfer_id_to_request_id, ref.request_id_to_transfer_id = {}, {}
     ref.update_state_after_alloc(seq())
     sent = []
@@ -136,10 +138,13 @@ def test_an_unsharded_producer_into_dcp2_is_priced_on_mooncakes_slices(monkeypat
     sim._block_size, sim._dcp_size, sim._hash_block_size = own, dcp, own * dcp
     sim._rt, sim._latency_s, sim._wide = SimpleNamespace(now=0.0), 0.0, False
     sim._peers, sim._due = {"P": "engine-P"}, {}
+    sim._queued, sim._device_end = [], 0.0
     writes = []
-    sim._socks = {("engine-P", 0): SimpleNamespace(send=writes.append)}
+    send = lambda message, at=None: writes.append(message)
+    sim._socks = {("engine-P", 0): SimpleNamespace(send=send)}
     sim._written = lambda pair, a, blocks: 0.0
     sim.update_state_after_alloc(seq())
+    sim.device_done(None)  # the queued write request leaves once the device ran
     (write,) = writes
     _, priced, _, _ = pickle.loads(write)
 

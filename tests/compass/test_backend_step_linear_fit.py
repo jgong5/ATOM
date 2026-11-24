@@ -26,9 +26,15 @@ from atom.compass.backends import (
     StepLinearLaw,
 )
 from atom.compass.backends.step_labels import BUILDS, label
+from atom.compass.backends.step_linear import EAGER_DUMMY, EXTRAPOLATED
 from atom.compass.backends.step_linear_fit import (
+    WARM_FACTOR,
     _fit_form,
     _solve,
+    fill_rungs,
+    filled_rungs,
+    filled_share,
+    filled_warning,
     fit,
     fit_host,
     held_out,
@@ -244,6 +250,24 @@ def test_warm_steps_are_not_fitted(tmp_path):
     assert law["prefill"]["coefficients"] == pytest.approx(PREFILL, rel=1e-6)
 
 
+def test_a_step_a_whole_group_pause_held_is_warm_however_long_its_price(tmp_path):
+    # validate.stalls' pauses (#3778) add seconds to a step, not a factor: on
+    # a prefill priced at a second or more, a 4 s pause is under WARM_FACTOR
+    # times its price, and is warm all the same, as on a decode.
+    steps = _steps(2)
+    prefill = next(i for i in range(130, 240, 2) if steps[i][2] >= 1.0)
+    decode = 101
+    pause = {i: (steps[i][2] + 4.0) / steps[i][2] for i in (prefill, decode)}
+    assert pause[prefill] < WARM_FACTOR
+    (tmp_path / "steps").mkdir()
+    law = _fit([_record(tmp_path / "steps" / "dp0.jsonl", steps, pause)])
+
+    assert sorted(law["warm_steps"][0]) == sorted(pause)
+    assert law["prefill"]["coefficients"] == pytest.approx(PREFILL, rel=1e-6)
+    named = [w["step"] for w in cost_accuracy(tmp_path / "steps", law)["warm"]]
+    assert sorted(named) == sorted(pause)
+
+
 def test_three_forms_are_scored_on_a_record_held_out_of_their_fit(tmp_path):
     # Prefill pays a history term the base form cannot see.
     records = [
@@ -363,6 +387,82 @@ def test_a_rung_too_thin_to_fit_is_named_and_its_steps_refused(tmp_path):
     assert "4" not in law["decode"]
     with pytest.raises(CostRefused, match="no decode vector for rung 4"):
         StepLinearBackend(StepLinearLaw(law)).price(_view([(1, 900, True)], 4))
+
+
+def test_a_captured_rung_no_record_reached_is_filled_declared_and_outside_its_hull(
+    tmp_path,
+):
+    # Rungs 2 and 4 fitted, 1, 3 and 8 captured: 3 interpolates them coefficient
+    # by coefficient; 8, past the widest, copies rung 4's vector and 1, past the
+    # narrowest, rung 2's (#3796). Each prices as declared, never inside a hull,
+    # as no step at it was fitted.
+    law = _fit([_record(tmp_path / "dp0.jsonl", _steps(9))])
+    filled = fill_rungs(law, [1, 2, 3, 4, 8])
+
+    assert set(filled) == {"1", "3", "8"} and law["filled"] == filled
+    assert "interpolated in the rung between rungs 2 and 4" in filled["3"]
+    assert filled["8"].endswith("rung 4's vector, the widest fitted rung")
+    assert filled["1"].endswith("rung 2's vector, the narrowest fitted rung")
+    one, two, four = (law["decode"][r]["coefficients"] for r in ("1", "2", "4"))
+    three, eight = (law["decode"][r]["coefficients"] for r in ("3", "8"))
+    for f in three:
+        assert three[f] == pytest.approx((two[f] + four[f]) / 2)
+    assert eight == four and one == two
+    assert law["decode"]["8"]["filled"] == {"from": [4, 4], "weight": 0.0}
+    assert (
+        law["filled_rungs"] == filled_rungs(law) == {"decode": [1, 3, 8], "draft": []}
+    )
+    terms = StepLinearBackend(StepLinearLaw(law)).price(_view([(1, 900, True)], 3))
+    assert {t.provenance.method for t in terms.terms} == {Method.DECLARED}
+    assert {t.provenance.source for t in terms.terms} == {EXTRAPOLATED}
+    assert not any(t.provenance.validated for t in terms.terms)
+    assert fill_rungs(law, [1, 2, 3, 4, 8]) == {} and law["filled"] == filled
+
+
+def test_a_rung_past_the_fitted_ones_is_priced_by_the_widest_fitted_vector(
+    tmp_path,
+):
+    # Rung 4's coefficients three times rung 2's: a line through them, weight 3
+    # on rung 4 at rung 8, prices rung 8 at seven times rung 2's coefficients
+    # (#3796: rung 64 from rungs 24 and 32 priced the real steps there +56%).
+    # The copy prices a rung-8 step by rung 4's vector, its padding to 8 rows
+    # aside.
+    law = _fit([_record(tmp_path / "dp0.jsonl", _steps(9))])
+    law["decode"]["4"]["coefficients"] = {
+        f: 3 * v for f, v in law["decode"]["2"]["coefficients"].items()
+    }
+    line = {f: 7 * v for f, v in law["decode"]["2"]["coefficients"].items()}
+    fill_rungs(law, [2, 4, 8])
+    assert law["decode"]["8"]["coefficients"] == law["decode"]["4"]["coefficients"]
+    backend = StepLinearBackend(StepLinearLaw(law))
+    rows = [(1, 900, True)] * 4
+    at8 = backend.price(_view(rows, 8)).target_seconds
+    at4 = backend.price(_view(rows, 4)).target_seconds
+    old = json.loads(json.dumps(law))
+    old["decode"]["8"]["coefficients"] = line
+    was = StepLinearBackend(StepLinearLaw(old)).price(_view(rows, 8)).target_seconds
+    assert at4 <= at8 < 1.05 * at4 and was > 2 * at8
+
+
+def test_the_filled_rungs_a_target_record_ran_at_are_named_with_their_share():
+    law = {
+        "decode": {},
+        "filled": {
+            "40": "rung 40 filled",
+            "64": "rung 64 filled",
+            "draft 64": "rung 64 filled",
+        },
+    }
+    assert filled_rungs(law) == {"decode": [40, 64], "draft": [64]}
+    share = filled_share(law, {"16": 10, "32": 30, "64": 60})
+    assert share == {"steps": 60, "share": 0.6, "rungs": [64]}
+    assert filled_share(law, {}) == {"steps": 0, "share": 0.0, "rungs": []}
+    assert filled_share({"decode": {}}, {"64": 5})["share"] == 0.0
+    warning = filled_warning(law)
+    assert warning.startswith(
+        "WARNING: no record reached decode rungs 40, 64; draft rungs 64:"
+    )
+    assert filled_warning({"decode": {}}) is None
 
 
 def test_the_outlier_scale_is_read_over_every_step_so_it_does_not_shrink(tmp_path):
@@ -1263,7 +1363,12 @@ def test_a_dp_step_a_peer_ran_as_a_dummy_is_fitted_on_the_ranks_that_ran_it(tmp_
     assert law_["cut"]["ranks"] == 0
     fitted = [law_["prefill"], law_["decode"]["4"]]
     assert sum(v["fit"]["samples"] for v in fitted) == 120
-    assert fitted[0]["coefficients"] == pytest.approx(dp.PREFILL, rel=1e-6)
+    # The dummies ran eagerly (the record states no buckets) and their steps'
+    # times carry nothing of theirs, so the dummy columns come out nil.
+    prefill = dict(fitted[0]["coefficients"])
+    eager = {f: prefill.pop(f) for f in EAGER_DUMMY}
+    assert eager == pytest.approx(dict.fromkeys(EAGER_DUMMY, 0.0), abs=1e-9)
+    assert prefill == pytest.approx(dp.PREFILL, rel=1e-6)
     assert fitted[1]["coefficients"] == pytest.approx(dp.DECODE, rel=1e-6)
 
 

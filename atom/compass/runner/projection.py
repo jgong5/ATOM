@@ -46,6 +46,44 @@ def _rung(mode: ForwardMode) -> int | None:
     return int(mode.running_bs) if mode.use_cudagraph else None
 
 
+def is_dummy(batch: Any) -> bool:
+    """Whether `batch` is an idle DP rank's dummy forward: one flagged
+    `is_dummy_run`, or, as ATOM's `dummy_execution` builds it since ROCm/ATOM
+    main b7b5ec3f2, a batch that schedules no request, every row it runs
+    padding, its phase and width the group's (`ForwardMode.decide`)."""
+    return bool(batch.is_dummy_run) or not batch.total_seqs_num
+
+
+def _tbo_tokens(batch: Any, mode: ForwardMode) -> tuple | None:
+    """The two-batch-overlap split the group runs, per micro-batch each rank's
+    tokens: a prefill's as its exchange agreed it; a decode the group splits,
+    which casts no vote (`ForwardMode.decide` splits its `running_bs`), as
+    ATOM cuts it (`cut_decode_ubatches`), each micro-batch the same running
+    tokens on every rank."""
+    if mode.sync is None:
+        return None
+    if mode.is_prefill or not mode.tbo_collective_active:
+        return mode.sync.ub_tokens_across_dp
+    from atom.utils.tbo.ubatch_splitting import cut_decode_ubatches
+
+    lengths = np.asarray(batch.num_scheduled_tokens[: mode.scheduled_bs])
+    ranks = len(mode.sync.scheduled_tokens_per_dp_rank)
+    cut = cut_decode_ubatches(mode.running_bs, mode.running_tokens, lengths)
+    return tuple((ub.running_tokens,) * ranks for ub in cut)
+
+
+def _dummy_row(batch: Any, mode: ForwardMode) -> RequestShape:
+    """The row an empty dummy is priced and recorded as, as the one fabricated
+    request the dummy ran before: a decode of the step's spec width
+    (``num_spec_step + 1`` tokens over as many) while the group decodes, a
+    one-token prefill row while a peer prefills, the one padding request a
+    group with no request forwards."""
+    if mode.sync is not None and mode.sync.any_rank_has_prefill:
+        return RequestShape(1, 1, False)
+    q = int(getattr(batch, "num_spec_step", 0) or 0) + 1
+    return RequestShape(q, q, True)
+
+
 def dp_group() -> Any:
     """The DP group's CPU group: the one `ModelRunner.prepare_model` hands `decide`."""
     from aiter.dist.parallel_state import get_dp_group
@@ -64,7 +102,7 @@ def dummy_ranks(batch: Any, mode: ForwardMode) -> int:
     """
     if mode.sync is None or len(mode.sync.scheduled_tokens_per_dp_rank) < 2:
         return 0
-    flag = torch.tensor([int(bool(batch.is_dummy_run))], dtype=torch.int32)
+    flag = torch.tensor([int(is_dummy(batch))], dtype=torch.int32)
     torch.distributed.all_reduce(flag, group=dp_group())
     return int(flag.item())
 
@@ -76,15 +114,15 @@ def forward_mode(batch: Any, runner: Any) -> ForwardMode:
     on the DP group, so every rank calls it once per step, as the real forward
     does; the group's rung and token counts come back from it.
 
-    `tbo_on` and `local_tbo` are what `ModelRunner.prepare_model` passes: the
-    config's `enable_tbo` and the runner's own `_local_tbo_eligibility`, which
-    ride the collective, so the group agrees the two-batch-overlap split a real
-    run agrees. The other arguments that do not reach the rung are passed at
-    their inert values: `decide` settles a query length as well, and that is
-    what `is_block_drafter` feeds. The width and the replay decision come from
-    `capture_sizes`, `enforce_eager`, the attention builder's
-    `step_needs_eager`, `tbo_decode_graphs`, the batch and the collective
-    alone; the group's running tokens land in the runner's own
+    `tbo_on`, `tbo_decode` and `local_tbo` are what `ModelRunner.prepare_model`
+    passes: the config's `enable_tbo` and `enable_tbo_decode`, and the runner's
+    own `_local_tbo_eligibility`, which rides the collective, so the group
+    agrees the two-batch-overlap split a real run agrees. The other arguments
+    that do not reach the rung are passed at their inert values: `decide`
+    settles a query length as well, and that is what `is_block_drafter` feeds.
+    The width and the replay decision come from `capture_sizes`,
+    `enforce_eager`, the attention builder's `step_needs_eager`,
+    `tbo_decode_graphs`, the batch and the collective alone; the group's running tokens land in the runner's own
     `running_tokens_per_dp_rank`, as the real forward's do.
     """
     dp_size = _data_parallel_size(runner)
@@ -112,6 +150,7 @@ def forward_mode(batch: Any, runner: Any) -> ForwardMode:
         ),
         max_seqlen_q=batch.num_spec_step + 1,
         running_tokens_per_dp_rank=runner.running_tokens_per_dp_rank,
+        tbo_decode=bool(runner.config.enable_tbo_decode),
         tbo_decode_graphs=runner.tbo_decode_graphs,
     )
 
@@ -204,7 +243,12 @@ def batch_view(
             draft_moe_rows = gathered
             if draft_bs is None and drafter.mtp_k > 1:
                 draft_rows = (
-                    gathered // int(batch.num_scheduled_tokens[0])
+                    gathered
+                    // (
+                        int(batch.num_scheduled_tokens[0])
+                        if len(batch.num_scheduled_tokens)
+                        else _dummy_row(batch, mode).query_tokens
+                    )
                     if mode.running_tokens_are_unified
                     else mode.sync.max_bs_across_dp + _data_parallel_size(runner) - 1
                 )
@@ -215,26 +259,36 @@ def batch_view(
             "segment has no gathered row count to be priced from"
         )
     rows = zip(batch.num_scheduled_tokens, batch.context_lens)
+    shapes = tuple(
+        RequestShape(int(q), int(c), i >= prefill) for i, (q, c) in enumerate(rows)
+    )
+    if not shapes and group_max_tokens is not None:
+        # An empty dummy reports no token to the DP sync, where the fabricated
+        # one counted its row: the group's peak holds that row, as it did.
+        group_max_tokens = max(group_max_tokens, _dummy_row(batch, mode).query_tokens)
     return BatchView(
-        tuple(
-            RequestShape(int(q), int(c), i >= prefill) for i, (q, c) in enumerate(rows)
-        ),
+        shapes or (_dummy_row(batch, mode),),
         capture_rung=_rung(mode),
         moe_rows=moe_rows,
         draft_moe_rows=draft_moe_rows,
         draft_bs=draft_bs,
         target_bs=target_bs,
         produces_output=batch.produces_output(),
-        tbo_tokens=None if mode.sync is None else mode.sync.ub_tokens_across_dp,
+        tbo_tokens=_tbo_tokens(batch, mode),
         image_tokens=image_tokens(batch, runner),
         moe_tokens=moe_tokens,
         dp_rank=dp_rank,
-        dp_dummy=dp_rank is not None and bool(batch.is_dummy_run),
+        dp_dummy=dp_rank is not None and is_dummy(batch),
         group_dummies=dummies if dp_rank is not None else 0,
         draft_rows=draft_rows,
         group_prefills=dp_rank is not None and not mode.running_tokens_are_unified,
         group_max_tokens=group_max_tokens,
         group_needs_eager=mode.sync is not None and mode.sync.any_rank_needs_eager,
+        group_tail=(
+            dp_rank is not None
+            and mode.sync is not None
+            and mode.sync.max_final_requests_across_dp > 0
+        ),
     )
 
 

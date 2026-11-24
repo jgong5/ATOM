@@ -627,11 +627,37 @@ above. A term is `validated` only inside a second hull, the steps `step_linear_f
 priced with a law fitted on the other records, whose errors per band it writes into the
 law beside that hull; a law without one prices every term unvalidated.
 
+**Past six free features the hull is pairwise** (#3720, `step_linear_fit.HULL_EXACT_FREE`).
+qhull's exact hull of a prefill vector's eight features held 430k facets on one c=128
+record; pooled with a c=1 record it failed qhull's precision checks, and hulled joggled
+held 2.9M, a 1.8 GB law whose runs advanced about 3x slower, every prefill step checked
+against every facet. Past six free features the hull is the unit box cut by each pair of
+features' 2-D hull (`_pair_hull`): it holds every point and sees each pair's joint
+distribution, so it still finds a hole like rung 16's above, which two features show, but
+not one only three or more show, where it calls a step inside that the exact hull would
+call outside. Decode, host and propose vectors have at most four free features and keep
+the exact hull. Whether a k-NN distance should replace it is T29's open choice.
+
 A vector fitted on another subject, which the law states under `declared`, prices
 `declared` terms with that note, never validated ([owner ruling on #2660](https://github.com/jgong5/ATOM/issues/2660#issuecomment-6575668068),
 2026-11-02). The prefill side's records, the crs005 prefill law's own and #975's warm pass,
 hold 2 fittable rung-2 decode steps for 3 coefficients, so that law prices rung 2, about
 one step a run, by the crs005 decode law's rung-2 vector: a median 8% high on the 12.
+
+**A captured rung no record reached is filled, declared** (#3720, #3737,
+`step_linear_fit.fill_rungs`). `compass fit steps` gives each rung of the law's capture
+ladder that holds no vector one, in the law and its draft law: coefficient by
+coefficient, linear in the rung between the fitted rungs on either side, past them
+extrapolated from the two nearest on one side and clipped at 0, from one fitted rung its
+vector. It is `declared`, its rule its note, so never validated, and its hull holds no
+point, so every step it prices is also extrapolated; the law and the fit report list
+each under `filled`. A rung's graph pads its batch to the rung, so its step costs
+between its neighbours'. On cell A's per-record laws, rung 40 interpolated from
+c=256's rungs 32 and 64 read +2% against c=128's fitted rung 40, and rung 64
+extrapolated from c=128's rungs 32 and 40 read -8% against c=256's fitted rung 64. No
+record of the six reached rung 48 (a rank at c=256 decodes 64 rows or at most 32), so
+the pooled law's rung 48 is filled between 40 and 64. A step kind with no samples at all,
+a law with no prefill vector or no fitted decode rung, still refuses.
 
 And the dimensions are **workload-dependent** — 0.6B batches ran at raggedness 2.82–3.85,
 27B at 1.11–1.42 — so:
@@ -924,7 +950,7 @@ choice that must be visible.
 | D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61), and, given the model's routing, one MoE column, the step's real MoE tokens `n` or the experts `X` they reach, the step's DP dummy forwards counted in `X` as one token: the form of smallest step-weighted held-out error, no column among them, adopted with no bar. | 2026-09-18; revised 2026-10-14 (#941), 2026-11-01 (MoE column, #2493), 2026-11-03 (no bar, #2735; dummies in `X`, #2536) and 2026-11-06 (each form fitted on its own rows, #2904) |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. MAD rejection drops no host-law sample; the JIT cut keeps it. | 2026-09-18; revised 2026-11-15 (#3383) |
-| D58 | Refuse rather than fall back on a step kind with no samples. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box; an out-of-hull step is priced `estimated` and unvalidated, its source naming the extrapolation, not refused, and graded by cost accuracy as well as reported apart. The step linear law refuses a discrete value it has no vector for, extrapolates outside its fitted hull, and is validated only inside the hull of its held-out steps; a vector it states `declared`, fitted on another subject, prices declared terms. | 2026-09-18; revised 2026-10-11 (#765), 2026-10-14 (#952), 2026-10-23 (#2011) and 2026-11-02 (#2660) |
+| D58 | Refuse rather than fall back on a step kind with no samples. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box; an out-of-hull step is priced `estimated` and unvalidated, its source naming the extrapolation, not refused, and graded by cost accuracy as well as reported apart. The step linear law refuses a discrete value it has no vector for, extrapolates outside its fitted hull, and is validated only inside the hull of its held-out steps; a vector it states `declared`, fitted on another subject, prices declared terms; a captured rung no record reached is filled from the fitted rungs beside it, declared and outside its hull. | 2026-09-18; revised 2026-10-11 (#765), 2026-10-14 (#952), 2026-10-23 (#2011), 2026-11-02 (#2660) and 2026-11-19 (#3737) |
 | D59 | A family is validated on independently gathered data, never by LOO. Rank at least three candidates and report all held-out errors. A law that fits one axis is tested on a second before it ships. | 2026-09-18 |
 | D60 | Laws are piecewise over dispatch bands read from recorded kernel identity. A query with no same-band bracket refuses. At the op level `measure ops` records each point's kernels and `fit ops` interpolates only between same-kernel neighbours, and across neither gap beside a hidden band or a point with a held-out error over 5%, holding out no point whose neighbours are one coordinate away on each side, one row's bytes for a collective whose ranks move the same rows (one byte for `all_gatherv`, `reduce_scatterv` and MORI); MORI at a shape stating G is a family of its own over EP times its largest rank's rows, undensified; a declined leaf falls to its analytical law, counted. An interpolated leaf is validated inside a held-out bracket on each line it interpolates along. | 2026-09-18; op level 2026-10-18 (#1489); declined lines 2026-10-19 (#1493), per gap 2026-10-25 (#2107); adjacent neighbours 2026-10-20 (#1746), a collective's 2026-10-22 (#1908); validated brackets 2026-10-23 (#2011); MORI at G 2026-11-18 (#3688) |
 | D61 | Treatments are stated and the calibration population matched; an assumed treatment is a property of the query, recorded in the run summary. Decode row order, worth 1.77× at a fixed multiset, is a decode feature, `rowmod(k)` in scheduled order, adopted per rung by a four-condition rule. Uniform routing of the MoE segment under DP and EP is an assumed treatment, at every granularity; a decode rung's MoE column counts experts under it, and the skew it cannot see is counted in the error budget, each record's held-out p50 per rung reported, not gated. An eager DP dummy, and a decode that replays no graph while a peer prefills, are priced 0 s under assumed treatments of their own. | 2026-09-18; revised 2026-10-01, 2026-10-14 (#941, #952), 2026-10-22 (#1959), 2026-11-01 (#2493), 2026-11-02 (#2660), 2026-11-03 (#2735) and 2026-11-06 (`rowmod` fitted on its own rows, #2904) |

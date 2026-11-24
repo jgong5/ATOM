@@ -494,6 +494,8 @@ def _engine(blocks):
         "num_kvcache_blocks": blocks,
         "enable_prefix_caching": False,
         "prefill_buckets": [],
+        # A runner with no token processor reads as one that defers.
+        "deferred_output": True,
     }
 
 

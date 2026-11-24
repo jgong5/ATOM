@@ -144,6 +144,9 @@ class Scheduler:
     def shutdown_kv_events(self):
         pass
 
+    def close_kv_connector(self):
+        pass
+
 
 class Engine(EngineCore):
     """ATOM's engine methods over fake workers, scheduler and utility handler."""
@@ -162,7 +165,8 @@ class Engine(EngineCore):
         )
         self.label, self.kv_transfer_enabled = "engine", False
         self._is_rl_weights_offloaded, self._next_idle_kv_drain = False, 0.0
-        self._weight_sync_fenced = False
+        self._weight_sync_fenced = self._generation_paused = False
+        self._ingested_seqs, self._kv_progress_event = 0, threading.Event()
         self.engines_running, self._in_flight = True, []
 
     def _sync_dp_state(self, unfinished, shutdown, offloaded):

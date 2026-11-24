@@ -298,6 +298,7 @@ def dp_view(width, rung, dp, counts=None):
     `rung`, every rank of `dp` alike or at its tokens in `counts`, as
     `batch_view` builds it from the step's mode."""
     batch = SimpleNamespace(
+        total_seqs_num=width,
         total_seqs_num_prefill=0,
         num_scheduled_tokens=[2] * width,
         context_lens=[90] * width,
@@ -313,7 +314,10 @@ def dp_view(width, rung, dp, counts=None):
             scheduled_tokens_per_dp_rank=counts,
             ub_tokens_across_dp=None,
             any_rank_needs_eager=False,
+            max_final_requests_across_dp=0,
         ),
+        is_prefill=False,
+        tbo_collective_active=False,
         running_tokens_are_unified=True,
         running_tokens=2 * rung,
         running_bs=rung,
@@ -471,6 +475,7 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
     assert attended[0] == attended[1]
 
     batch = SimpleNamespace(
+        total_seqs_num=1,
         total_seqs_num_prefill=1,
         num_scheduled_tokens=[64],
         context_lens=[64],
@@ -486,7 +491,10 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
             max_bs_across_dp=1,
             ub_tokens_across_dp=None,
             any_rank_needs_eager=False,
+            max_final_requests_across_dp=0,
         ),
+        is_prefill=True,
+        tbo_collective_active=False,
         running_tokens_are_unified=False,
         running_tokens=64,
         running_bs=1,
@@ -518,6 +526,7 @@ def verify_view(width, rung):
     """One rank's view of a decode of `width` rows, each verifying one draft,
     replaying `rung`, as `batch_view` builds it from the step's mode."""
     batch = SimpleNamespace(
+        total_seqs_num=width,
         total_seqs_num_prefill=0,
         num_scheduled_tokens=[2] * width,
         context_lens=[90] * width,
@@ -545,8 +554,9 @@ def test_a_decode_padded_to_its_rung_prices_its_drafter_at_its_rows(
     assert set(graphs) == {(False, "decode B=4"), (True, "decode B=4")} | {
         (True, "decode T=3 B=4")
     }
-    # Its first pass runs the rows' 6 tokens; the rung's traces 8.
-    for shape, tokens in (("decode T=3 B=4", 6), ("decode B=4", 8)):
+    # Its first pass runs the target's stream at the rung's 8 tokens, as
+    # ATOM's propose does since upstream b7b5ec3f2; so does the rung's.
+    for shape, tokens in (("decode T=3 B=4", 8), ("decode B=4", 8)):
         ops = _ops(graphs[True, shape]["region"])
         assert {op["args"]["q"]["shape"][0] for op in ops if op["op"] == ATTENTION} == {
             tokens

@@ -19,7 +19,6 @@ def tbo(monkeypatch):
     """ATOM's two-batch overlap rule as the server runs it: split at the token
     midpoint once a rank reaches `TBO_MIN`."""
     monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", str(TBO_MIN))
-    monkeypatch.delenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", raising=False)
 
 
 def _engine(**fields):
@@ -105,7 +104,7 @@ def test_b_takes_every_offset_and_parked_count_and_splits_each_tbo_step(tmp_path
 
 
 def test_steps_split_by_atoms_rule_and_a_leaves_a_rank_idle_where_it_would_split(
-    tmp_path, monkeypatch
+    tmp_path,
 ):
     engine = _engine(enable_tbo=True, max_num_batched_tokens=1024)
     steps = {}
@@ -124,12 +123,6 @@ def test_steps_split_by_atoms_rule_and_a_leaves_a_rank_idle_where_it_would_split
         len(t) == 2 and min(t) > 1 and max(t) >= TBO_MIN for t in tokens
     ]
     assert any(s[0].split for s in b if s[0].cached == ("chunk",))
-    # Split on a request boundary, one row cannot split: A keeps every rank, and
-    # only two-row steps split.
-    monkeypatch.setenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "0")
-    points = plan(tmp_path, _workload(3000))
-    assert max(p.step for p in points if p.split is None) == 511
-    assert {len(p.rows) for p in points if p.split} == {2}
 
 
 def test_b_rows_on_a_context_take_each_query_size_over_chunk_cuts_and_prefixes(

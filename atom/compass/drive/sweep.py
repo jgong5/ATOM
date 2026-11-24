@@ -82,7 +82,7 @@ PACING = {
     "ATOM_PREFILL_DELAYER_STALL_TICKS": "16",
 }
 #: The variables ATOM's two-batch overlap splits a prefill step by.
-TBO = ("ATOM_TBO_PREFILL_MIN_TOKENS", "ATOM_TBO_PREFILL_TOKEN_SPLIT")
+TBO = ("ATOM_TBO_PREFILL_MIN_TOKENS",)
 
 
 def pacing(atom_args) -> dict[str, str]:

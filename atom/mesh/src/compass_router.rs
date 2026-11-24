@@ -376,13 +376,19 @@ fn cancel_seq(body: &[u8]) -> Option<u64> {
 }
 
 /// The (arrival, seq) of a stamp written `a:<arrival>;s:<seq>` or
-/// `a=<arrival> s=<seq>`.
+/// `a=<arrival> s=<seq>`. A request a send-order seed jitters carries its
+/// intake jitter after the seq, `a:<arrival>;s:<seq>;j:<bytes>`
+/// (`atom/compass/carriers.py`); the router forwards the header unchanged and
+/// takes no jitter of its own, so the seq ends at the next `;`.
 fn stamp(text: &str) -> (f64, u64) {
     let parsed = text
         .strip_prefix("a")
         .and_then(|t| t.get(1..))
         .and_then(|t| t.split_once([';', ' ']))
-        .and_then(|(a, s)| Some((a.parse().ok()?, s.get(2..)?.parse().ok()?)));
+        .and_then(|(a, s)| {
+            let seq = s.get(2..)?.split(';').next()?;
+            Some((a.parse().ok()?, seq.parse().ok()?))
+        });
     parsed.unwrap_or_else(|| fail(format!("malformed compass stamp {text:?}")))
 }
 
@@ -658,6 +664,16 @@ mod tests {
         assert!(matches!(plain, Ok(Err(_))));
         assert!(lp.is_err());
         held.abort();
+    }
+
+    #[test]
+    fn a_jittered_stamp_parses_to_its_arrival_and_seq() {
+        assert_eq!(stamp("a:7.296000000000001e-06;s:2"), (7.296000000000001e-06, 2));
+        assert_eq!(
+            stamp("a:7.296000000000001e-06;s:2;j:25673.83784298317"),
+            (7.296000000000001e-06, 2)
+        );
+        assert_eq!(stamp("a=0.5 s=7"), (0.5, 7));
     }
 
     #[test]

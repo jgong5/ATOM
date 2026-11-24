@@ -1,11 +1,13 @@
 //! The router LP on the ATOM PD router's own request path, against a scripted
 //! clock authority and two scripted workers: the request is held at ingress,
 //! the prefill response at the relay and each decode event in the stream, and
-//! each goes on restamped at its arrival plus its outbound lookahead.
+//! each goes on restamped at its arrival plus its outbound lookahead. The
+//! request is held at ingress past both of the router's prepare deadlines in
+//! wall time and is not refused: the router takes them once it releases it.
 
 use std::{
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -21,7 +23,10 @@ use mesh::{
     app_context::AppContext,
     compass_clock::ENDPOINT_ENV,
     compass_router::{self, LOOKAHEADS_ENV, SEED_ENV},
-    config::{types::BackendType, RouterConfig, RoutingMode},
+    config::{
+        types::{BackendType, PreparePoolConfig},
+        RouterConfig, RoutingMode,
+    },
     core::{BasicWorkerBuilder, Worker, WorkerType},
     routers::RouterFactory,
     server::{build_app, AppState},
@@ -32,6 +37,11 @@ use tower::ServiceExt;
 
 mod compass_frames;
 use compass_frames::{read_frame, write_frame};
+
+/// The router's prepare deadlines, its wait for a preparation thread and the
+/// preparation's own; the clock holds the request at ingress four times as long.
+const DEADLINE_MS: u64 = 250;
+const HOLD: Duration = Duration::from_millis(4 * DEADLINE_MS);
 
 /// What each worker was sent: (prefill, tracestate, body).
 type Seen = Arc<Mutex<Vec<(bool, Option<String>, Value)>>>;
@@ -69,8 +79,12 @@ async fn a_pd_request_is_held_and_restamped_at_ingress_relay_and_stream() {
     let served = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut read = Vec::new();
-        for reply in replies {
+        for (k, reply) in replies.into_iter().enumerate() {
             read.push(read_frame(&mut sock).await);
+            if k == 1 {
+                // The grant that releases the request, held in wall time.
+                tokio::time::sleep(HOLD).await;
+            }
             write_frame(&mut sock, reply).await;
         }
         read
@@ -92,9 +106,21 @@ async fn a_pd_request_is_held_and_restamped_at_ingress_relay_and_stream() {
             prefill_policy: None,
             decode_policy: None,
         },
+        prepare_pool: PreparePoolConfig {
+            queue_timeout_ms: DEADLINE_MS,
+            prepare_timeout_ms: DEADLINE_MS,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    let context = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime =
+        mesh::core::prepare_pool::PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap())
+            .unwrap();
+    let context = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     let seen = Seen::default();
     let mut workers = Vec::new();
     for prefill in [true, false] {
@@ -139,6 +165,7 @@ async fn a_pd_request_is_held_and_restamped_at_ingress_relay_and_stream() {
             json!({"model": "m", "prompt": "hi", "stream": true}).to_string(),
         ))
         .unwrap();
+    let sent = Instant::now();
     let answered = async {
         let response = app.oneshot(request).await.unwrap();
         response.into_body().collect().await.unwrap().to_bytes()
@@ -146,6 +173,11 @@ async fn a_pd_request_is_held_and_restamped_at_ingress_relay_and_stream() {
     let body = tokio::time::timeout(Duration::from_secs(10), answered)
         .await
         .expect("each hold point is released in turn");
+    let held = sent.elapsed();
+    assert!(
+        held > 2 * Duration::from_millis(DEADLINE_MS),
+        "held {held:?}"
+    );
     assert_eq!(
         String::from_utf8(body.to_vec()).unwrap(),
         ": compass a=2.25 s=0\ndata: x\n\n: compass a=2.75 s=1\ndata: [DONE]\n\n"

@@ -236,6 +236,30 @@ def publish_entry(store, machine, argv, env) -> None:
         publish_readings(store, drive_run._config(argv), document=machine)
 
 
+def publish_entry_on_arch(store, machine, argv, env) -> None:
+    """`publish_entry`, its config resolved in a process whose aiter answers
+    `machine`'s arch, an fp8 quantization's dtype among it: as `on_arch` starts
+    a simulated server, also on a host with no device, where this process's
+    aiter would resolve that dtype to ``uint8`` and the key would miss."""
+    code = (
+        "import json, sys\n"
+        "from atom.compass.capture.driverless import import_aiter_on\n"
+        "import_aiter_on(sys.argv[1])\n"
+        "from test_vertical_slice import publish_entry\n"
+        "publish_entry(*map(json.loads, sys.argv[2:]))\n"
+    )
+    args = [machine["device"]["arch"], str(store), machine, argv, env]
+    path = os.pathsep.join(
+        [str(TREE), str(TREE / "tests/compass"), str(TREE / "tests")]
+    )
+    subprocess.run(
+        [sys.executable, "-c", code, args[0], *map(json.dumps, args[1:])],
+        env=dict(os.environ, PYTHONPATH=path),
+        check=True,
+        timeout=600,
+    )
+
+
 def run_slice(out: Path, seed: str) -> dict:
     """One run in its own process tree; its step table, summary and request times."""
     out.mkdir()

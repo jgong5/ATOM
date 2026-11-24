@@ -50,6 +50,14 @@ FAMILIES = {
         "atom:prefix_cache_cached_tokens": "E",
         "atom:prefix_cache_full_tokens": "E",
         "atom:prefix_cache_offload_tokens": "E",
+        # Its DP router's `share_cache` decisions (`ShareCacheRouter.DECISIONS`),
+        # the requests that named their rank, and each rank's requests.
+        "atom:dp_share_cache_hit": "E",
+        "atom:dp_share_cache_source_rank": "E",
+        "atom:dp_share_cache_cold": "E",
+        "atom:dp_share_cache_stale": "E",
+        "atom:dp_route_explicit": "E",
+        "atom:dp_requests_routed": "E",
         # Its own.
         "atom:time_to_first_token_seconds": "D",
         "atom:inter_token_latency_seconds": "D",
