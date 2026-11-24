@@ -10,6 +10,11 @@ runs, while its status file ends in a step's start or end, and ``missing a
 law`` again, its command resuming it, once that file ends in a failure or the
 calibration's end.
 
+Two 1P1D candidates sharing a prefill side, as the development template's A
+and B, take one command each: A's fits both sides, and B's its decode alone
+into the store A's publishes into, naming A's calibration for its prefill side;
+once that store holds A's two sides and B's decode, both are searchable on it.
+
 The configuration, its stubbed resolution and starts are `test_advice_check`'s:
 the store holds readings of the configuration as the deployment resolves it,
 and no law of it.
@@ -17,18 +22,23 @@ and no law of it.
 
 import json
 import shlex
+import shutil
+from types import SimpleNamespace
 
 import pytest
 from test_advice_check import (
+    NETWORK,
     advise,
     resolved,
     starts,
     stubbed,  # noqa: F401  the fixture
 )
+from test_advice_reuse import stored
 from test_artifact_invalidation import STANZA, moved
 from test_memory_readings import READINGS, publish_readings
 from test_run_step_grid import PLATFORM
 
+from atom.compass.advice import check
 from atom.compass.artifacts import (
     ArtifactStore,
     Axis,
@@ -38,7 +48,8 @@ from atom.compass.artifacts import (
     keyed_platform,
     member_name,
 )
-from atom.compass.drive import reuse
+from atom.compass.backends.step_linear_plan import FIRST_TURN, TRACE_RUNS
+from atom.compass.drive import lacking, reuse
 from atom.compass.run import memory
 
 #: A candidate with no readings at its key in the store, and one with them,
@@ -103,6 +114,17 @@ def test_a_calibration_publishes_into_the_shared_store_unless_it_holds_its_readi
     reused = json.loads((tmp_path / "out" / "reuse.json").read_text())
     held = reused["candidates"]["b"]["points"]["b-c1"]["readings"]["server"]
     assert (held["verdict"], held["held"]) == ("measure", readings != "none")
+
+
+def test_a_calibration_command_runs_under_the_candidate_s_own_variables(
+    tmp_path, stubbed  # noqa: F811
+):
+    # A variable no law key states, as MiniMax-M3's ATOM_M3_INDEXER_CP, which
+    # moves the engine config the law is keyed by.
+    found = advise(tmp_path, {"a": READ, "b": UNREAD | {"env": {"STUB_OWN": "1"}}})
+
+    assert _env(found, "b")["STUB_OWN"] == "1"
+    assert "STUB_OWN" not in _env(found, "a")
 
 
 @pytest.mark.parametrize("started", ["into the shared store", "into its own"])
@@ -175,3 +197,104 @@ def test_a_calibration_s_status_makes_it_calibrating_until_it_fails_or_ends(
     assert starts(tmp_path) == []
     printed = capsys.readouterr().out
     assert f"  state: {state}\n    calibration: {said}\n{shown}" in printed
+
+
+#: Two 1P1D candidates sharing a prefill side, their decode sides keyed apart
+#: by a performance variable.
+PREFILL = {"args": {"--max-num-seqs": 8}, "env": {"STUB_PREFILL": "1"}}
+PAIR = {
+    name: {
+        "deployment": "1p1d",
+        "prefill": PREFILL,
+        "decode": {"args": {"--max-num-seqs": 8}, "env": {"GPU_MAX_HW_QUEUES": q}},
+    }
+    for name, q in (("A", "2"), ("B", "4"))
+}
+
+
+@pytest.fixture
+def sides(tmp_path, monkeypatch, stubbed):  # noqa: F811
+    """The store holding no readings, every side under ``AITER_LOG_LEVEL``
+    WARNING, as deploy.sh starts it, and none under this process's
+    ``GPU_MAX_HW_QUEUES``; the config each side resolves to."""
+    monkeypatch.setenv("AITER_LOG_LEVEL", "WARNING")
+    monkeypatch.delenv("GPU_MAX_HW_QUEUES", raising=False)
+    shutil.rmtree(tmp_path / "store" / Kind.MEMORY_READINGS.value)
+    return resolved(stubbed.config, ["--max-num-seqs", "8"])
+
+
+def _calibrate(found: dict, name: str) -> tuple[dict, list]:
+    """The variables and the arguments of `name`'s one printed calibrate.sh
+    command."""
+    (command,) = [c for c in found[name]["made_by"] if "calibrate.sh " in c]
+    words = shlex.split(command.split("\n")[0])
+    at = words.index(str(lacking.CALIBRATE))
+    return dict(w.split("=", 1) for w in words[:at]), words[at + 1 :]
+
+
+@pytest.mark.parametrize(
+    "held, started",
+    [(False, False), (True, False), (True, True)],
+    ids=["into the shared store", "into A's own, not started", "into A's own"],
+)
+def test_two_1p1d_candidates_sharing_a_prefill_side_fit_it_once(
+    tmp_path, sides, held, started
+):
+    store, cal = tmp_path / "store", tmp_path / "out" / "cal"
+    if held:
+        # The shared store refuses A's prefill readings: A fits into its own.
+        _readings_at_another_digest(store, sides)
+    if started:
+        (cal / "A").mkdir(parents=True)
+        (cal / "A" / "inputs").write_text("tree c0ffee\nrecord 1\n")
+
+    found = advise(tmp_path, PAIR, network=NETWORK)
+
+    assert found["A"]["state"] == found["B"]["state"] == "missing a law"
+    into = str(cal / "A" / "store" if held else store)
+    env, words = _calibrate(found, "A")
+    rungs = [f"{n} {FIRST_TURN}" for n in (1, 2, 4, 8)]
+    assert words == [str(cal / "A"), *rungs, *TRACE_RUNS]
+    assert env.get("STORE") == (None if held else into)
+    assert {k: env.get(k) for k in ("FIT", "PREFILL_GPU", "DECODE_GPU")} == {
+        "FIT": "prefill decode",
+        "PREFILL_GPU": "0",
+        "DECODE_GPU": "1",
+    }
+    assert env["PREFILL_ARGS"] == env["DECODE_ARGS"] == "--max-num-seqs 8"
+    assert (env["AITER_LOG_LEVEL"], env["PREFILL_ENV"]) == ("WARNING", "STUB_PREFILL=1")
+    assert env["DECODE_ENV"] == "GPU_MAX_HW_QUEUES=2"
+    assert env["ROUTER_ARGS"] == " ".join(check.ROUTER)
+    # B names A's calibration for its prefill side, whose readings A measures,
+    # and fits its decode alone into that store once it may publish there.
+    borrowed = check.BORROWED.format("A", into)
+    if held and not started:
+        assert found["B"]["made_by"] == [borrowed, check.WAITING.format(into, "A")]
+        return
+    assert found["B"]["made_by"][0] == borrowed and len(found["B"]["made_by"]) == 2
+    env, words = _calibrate(found, "B")
+    assert words == [str(cal / "B"), *rungs]
+    assert (env["FIT"], env["STORE"], env["DECODE_ENV"]) == (
+        "decode",
+        into,
+        "GPU_MAX_HW_QUEUES=4",
+    )
+
+
+def test_both_1p1d_candidates_are_searchable_once_one_store_holds_their_sides(
+    tmp_path, sides
+):
+    # A's two sides and B's decode side in the shared store, each keyed under
+    # its side's variables; B's prefill side is A's.
+    for env in ({}, {"GPU_MAX_HW_QUEUES": "2"}, {"GPU_MAX_HW_QUEUES": "4"}):
+        with check._env(env):
+            stored(tmp_path, SimpleNamespace(config=sides))
+            publish_readings(tmp_path / "store", sides)
+
+    found = advise(tmp_path, PAIR, network=NETWORK)
+
+    assert found["A"]["state"] == found["B"]["state"] == "searchable"
+    reused = json.loads((tmp_path / "out" / "reuse.json").read_text())
+    held = {name: c["store"] for name, c in reused["candidates"].items()}
+    assert held == {"A": str(tmp_path / "store"), "B": str(tmp_path / "store")}
+    assert len(starts(tmp_path)) == 2

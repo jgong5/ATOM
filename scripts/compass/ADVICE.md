@@ -347,11 +347,28 @@ compass fit device <token> --store OUT/cal/S1/store --out OUT/cal/S1.readings
 names: `G` the cards the configuration uses, `D` a fresh directory. It is one
 engine start on those cards.
 
-**A 1P1D side's law** prints `deploy.sh OUT record of the deployment, then
-compass fit steps --backend step-linear on each OUT/prefill`, and the same for
-host laws and the decode side. It is a real deployment on two nodes, as
-[the 1P1D deployment](README.md#a-1p1d-deployment-across-crsuse2-m2m-v3-005-and--013)
-takes one, not one command; show it to the user as printed.
+**A 1P1D candidate's laws** take one `calibrate.sh` command, as one server's
+do, on one node: each record is a `deploy.sh record` of both sides, the prefill
+side on the first cards and the decode side on the next. In place of `GPU` and
+`SERVER_ARGS` it sets `PREFILL_GPU` and `DECODE_GPU`, `PREFILL_ARGS` and
+`DECODE_ARGS`, each side's own variables as `PREFILL_ENV` and `DECODE_ENV`, the
+router's arguments as `ROUTER_ARGS`, and `FIT`, the sides whose laws it fits:
+
+```
+AITER_LOG_LEVEL=WARNING ... MODEL=... PREFILL_GPU=0,1,2,3 DECODE_GPU=4,5,6,7 PREFILL_ARGS='...' DECODE_ARGS='...' PREFILL_ENV='...' FIT='prefill decode' ROUTER_ARGS='--backend atom ...' STORE=<the shared store> <T>/scripts/compass/calibrate.sh OUT/cal/A '1 --trajectory-start-min-ratio 0 ...' ...
+```
+
+Its records are the decode side's rungs, and the trace runs when it fits the
+prefill side. It fits only the sides its store will lack. A side whose law an
+earlier candidate's calibration publishes into that store, as the development
+template's B shares A's prefill side, is borrowed: the candidate prints that
+calibration for it, as `<A>'s calibration, whose law is at this configuration's
+key, publishing into <store>`, and its own command fits the other side alone,
+`FIT=decode`, into the same store. Where that store is A's own, B's command
+reads `its calibration, into <store>, once A's calibration has started` until
+A has started; run `compass advice SPACE OUT` again then. Its status file,
+resume and end are one server's, above, and its end prints each fitted side's
+tokens and held-out errors. Show the user every command the candidate prints.
 
 Then run `compass advice SPACE OUT` again, now or in a later session, rather than
 waiting on the calibration: a candidate whose law has published is searchable,
