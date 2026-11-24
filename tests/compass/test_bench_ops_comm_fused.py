@@ -207,6 +207,38 @@ def test_one_dp_rank_alone_builds_no_runtime_for_its_target_or_drafter(
         draft._comm_fused_moe.initialize(draft)
 
 
+def test_a_rank_of_the_layout_s_eight_loads_its_drafter_as_atom_does(monkeypatch):
+    # each rank in a process of its own: the drafter's load builds its runtime
+    built = []
+
+    class Backend(_Backend):
+        def initialize(self, layer):
+            built.append(layer)
+
+    comm = SimpleNamespace(CommFusedMoeBackend=Backend)
+    monkeypatch.setitem(sys.modules, "atom.model_ops.fused_moe.comm_fused_moe", comm)
+    draft = torch.nn.Module()
+    draft._comm_fused_moe = Backend()
+
+    class Runner(_AtomRunner):
+        def __init__(self, rank, config):
+            super().__init__(rank, config)
+            self.drafter = SimpleNamespace(model=torch.nn.Sequential(draft))
+            draft._comm_fused_moe.initialize(draft)  # as ATOM's loader
+
+    _atom_runner(monkeypatch)
+    engine = SimpleNamespace(ModelRunner=Runner, RapidServeModelRunner=None)
+    monkeypatch.setitem(sys.modules, "atom.model_engine.model_runner", engine)
+    config = _dpa_config(8)
+    config.speculative_config = SimpleNamespace()
+    ranks.layout(config)
+    config.parallel_config._managed_distributed_store = True
+
+    runner = ops._runner(config, 0)
+
+    assert runner.config.dp_logical_size == 0 and built == [draft]
+
+
 #: The leaf's cold ns at three DP-attention decode widths, eight ranks' rows in.
 COLD_NS = {8: 61000.0, 16: 64000.0, 32: 70000.0}
 
