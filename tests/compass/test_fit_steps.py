@@ -15,7 +15,13 @@ import re
 
 import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
-from test_backend_step_linear_fit import _steps, _timed_record, platform_arg
+from test_backend_step_linear_fit import (
+    PREFILL,
+    _steps,
+    _timed_record,
+    platform_arg,
+    traced,
+)
 from test_fit_samples import DEVICE, SOURCE, edit, idle_rank
 from test_memory_readings import DOCUMENT, STACK
 from test_parity_served import SAMPLING
@@ -609,3 +615,70 @@ def test_a_ladder_run_refuses_off_step_linear_and_naming_no_rungs(
     with pytest.raises(SystemExit, match=re.escape(named)):
         fit(tmp_path, "fit steps", "--backend", backend, a, b, *clients(a), *ladder)
     assert not (tmp_path / "store").exists()
+
+
+#: A two-stage pipeline's engine config, its spans as ATOM splits 28 layers.
+PP2 = {**ENGINE, "pipeline_parallel_size": 2, "pp_layers": [[0, 14], [14, 28]]}
+
+
+def pipeline(directory, seed, trace="trace"):
+    """`directory`, a two-stage pipeline's record of `_steps(seed)`: stage 0's
+    lines as `record` writes them, and stage 1's, the same batches at twice
+    their price, a quarter of each step the drafter's, which only the last
+    stage runs, on stage 0's host stamps, so that each stage enters after its
+    release (`step_labels.released`).
+    Each prefill's busy time, as a trace run's, is its target's and its
+    draft's."""
+    key = {**HOST, "engine": PP2}
+    steps = directory / "steps"
+    steps.mkdir(parents=True)
+    head, _ = _timed_record(steps / "dp0.jsonl", _steps(seed), key=key)
+    doubled = [(rows, rung, 2 * seconds) for rows, rung, seconds in _steps(seed)]
+    last, _ = _timed_record(steps / "pp1.dp0.jsonl", doubled, key=key)
+    lines = [json.loads(x) for x in last.read_text().splitlines()]
+    for s, h in zip(lines, head.read_text().splitlines()):
+        for k in [k for k in s if k[:2] == "b_"]:
+            del s[k]
+        s["d_target_ns"] = s["d_busy_ns"] * 3 // 4
+        s.update((k, v) for k, v in json.loads(h).items() if k[:2] == "t_")
+    last.write_text("".join(json.dumps(traced(s)) + "\n" for s in lines))
+    return as_record(directory, key, trace=trace)
+
+
+def _decodes(directory, stage="") -> int:
+    lines = (directory / f"steps/{stage}dp0.jsonl").read_text().splitlines()
+    return sum(all(r[2] for r in json.loads(x)["rows"]) for x in lines)
+
+
+def test_a_pipeline_fits_one_law_a_part_per_stage_each_on_its_own_steps(tmp_path):
+    """Each stage's prefill vector is its own steps' price, and holds its
+    figures held out on the other run; only the last stage, whose steps carry
+    a draft, holds a draft law, and each stage's decode steps are cut."""
+    a, b = pipeline(tmp_path / "a", 19), pipeline(tmp_path / "b", 20)
+    fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
+
+    law = member(tmp_path / "store", law_key(engine=PP2), "params")
+    report = member(tmp_path / "store", law_key(engine=PP2), "report")
+    assert law["engine_config"] == PP2 and law["platform"] == keyed_platform(
+        Kind.STEP_LINEAR_LAW, PLATFORM
+    )
+    assert law["records_atom"] == HOST["atom"] and "prefill" not in law
+    first, last = law["stages"]
+    for k, part in enumerate(law["stages"]):
+        StepLinearLaw(part)
+        runs = sorted(digest(d / f"steps/{'pp1.' * k}dp0.jsonl") for d in (a, b))
+        assert part["runs"] == runs and sorted(part["figures"]) == runs
+        assert "held_out" in part["prefill"]
+        assert part["decode"] == {}
+        assert part["cut"]["pipelined"] == _decodes(a) + _decodes(b)
+        assert [r["run"] for r in report["stages"][k]["provenance"]] == runs
+    got = [p["prefill"]["coefficients"] for p in law["stages"]]
+    for coefficients, times in zip(got, (1.0, 1.5)):
+        mine = {f: coefficients[f] for f in PREFILL}
+        assert mine == pytest.approx({f: c * times for f, c in PREFILL.items()}, 1e-3)
+    assert "seqs" not in got[0] and "seqs" in got[1]
+    assert "draft" not in first
+    draft = last["draft"]["prefill"]["coefficients"]
+    assert {f: draft[f] for f in PREFILL} == pytest.approx(
+        {f: c / 2 for f, c in PREFILL.items()}, 1e-3
+    )

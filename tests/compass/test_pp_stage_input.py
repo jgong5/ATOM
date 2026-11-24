@@ -497,7 +497,7 @@ def test_the_head_waits_for_the_tokens_its_batch_needs():
         (2, [None, None, 0, 2, 2, None]),
         (4, [None, None, 0, 2, 0, None]),
     ):
-        assert [recurrence._waited(head, n, pp) for n in range(6)] == waits
+        assert [step_labels.waited(head, n, pp) for n in range(6)] == waits
 
 
 class _Group:
