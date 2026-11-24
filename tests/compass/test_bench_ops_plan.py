@@ -1507,3 +1507,30 @@ def test_a_filled_prefill_point_the_bench_refuses_is_asked_once(
 
     refused = [(r["shape"], r["context"]) for r in records if "refused" in r]
     assert refused == [("prefill T=60 B=1", None)] and len(asked) == 1
+
+
+def test_a_plan_fills_prefill_families_at_one_and_four_rows_on_one_skeleton(
+    bench, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ops, "_child", _moving_bench)
+    plan = _records(
+        tmp_path / "plan",
+        ([[1, 1000, True], [1, 3000, True]], 2),
+        ([[1, 1, False]], None),  # B = 1 at T = 1, fewer tokens than B = 4's rows
+        ([[40, 2040, False]], None),
+        ([[150, 150, False]], None),
+        ([[10, 10, False]] * 4, None),  # B = 4 at T = 40
+        ([[50, 50, False]] * 4, None),  # and at T = 200
+    )
+
+    records = _plan(bench, tmp_path, plan)
+
+    attn = {
+        (ops._shape(r["shape"]).seqs, ops._shape(r["shape"]).tokens)
+        for r in records
+        if r["op"] == "aiter.attn" and r["shape"].startswith("prefill")
+    }
+    # Both row counts' attention shares one token axis, which holds B = 1's T = 1:
+    # B = 4 fills T = 150, B = 1's between its own 40 and 200, and nothing under 4.
+    assert {t for b, t in attn if b == 4} == {40, 150, 200}
+    assert {t for b, t in attn if b == 1} == {1, 40, 150}

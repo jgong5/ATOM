@@ -3,7 +3,10 @@
 laws to the prefill token-graph buckets its run records, as the runner does at
 capture: a DeepSeek-V4.1 law stating none or others, or host laws whose key
 states other prefill buckets, is ``refused`` with the runner's refusal, before
-its coverage and figures are judged. A law stating the run's buckets is
+its coverage and figures are judged, where the law's records ran at the head;
+where they ran at another ATOM digest or state none, it is ``calibrate``,
+requirement 1, naming the refusal, since a calibration of the config records
+the run's buckets (the Ruling on #3792). A law stating the run's buckets is
 reused; a model whose attention builder records no token graph keeps its
 verdicts. Buckets the check cannot work out, ATOM's attention builder failing
 to load in the child that reads it or the child dying, refuse by name; a defect
@@ -112,6 +115,38 @@ def test_a_v41_law_its_runner_refuses_at_capture_is_refused_with_its_refusal(
     found = verdicts(advise(tmp_path), "law")
 
     assert judged(found) == [("refused", None, refused)] * 2
+
+
+@pytest.mark.parametrize(
+    "records, named",
+    [
+        ("unstated", "stating no ATOM digest"),
+        ("at another digest", f"from ATOM digest {'0' * 64}"),
+    ],
+)
+@pytest.mark.parametrize(
+    "case, refused",
+    [
+        ("a law file stating no buckets", NO_BUCKETS),
+        ("a host key stating others", OTHER_HOST),
+    ],
+    ids=["law-file-no-buckets", "host-others"],
+)
+def test_a_v41_law_its_runner_refuses_on_records_from_another_tree_is_calibrate(
+    tmp_path, v41, case, refused, records, named
+):
+    if case == "a host key stating others":
+        stated = held(v41, RECORDED, OTHERS)
+    else:
+        stated = held(v41)
+    stated["records_atom"] = "0" * 64 if records == "at another digest" else None
+    where = law_file(tmp_path, stated)
+
+    found = verdicts(advise(tmp_path), "law")
+
+    why = f"{where}: {refused}, on records re-keyed {named}"
+    assert judged(found) == [("calibrate", 1, why)] * 2
+    assert all(v["made_by"] for v in found)
 
 
 @pytest.mark.parametrize(

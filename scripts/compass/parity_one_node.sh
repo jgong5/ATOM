@@ -151,7 +151,8 @@ servers=() authority= lmcache=
 trap 'kill -KILL -- ${servers[*]/#/-} ${authority:+-$authority} ${lmcache:+-$lmcache} 2>/dev/null || true' EXIT
 # serve SIDE [FLAGS...]: an API server per tree recording to OUT/SIDE/record,
 # each in its own process group; returns once rank 0's listens. Tree k above 0
-# logs to server<k>.log.
+# logs to server<k>.log. A record keeps a real step's line until the exit, as
+# `compass record`'s does, whatever the caller exports (parity.WRITE_THROUGH).
 serve() {
     local side=$1 deadline=$((SECONDS + WAIT_S)) master base k log port devices dp pid
     shift
@@ -171,7 +172,8 @@ serve() {
         fi
         # shellcheck disable=SC2086 # SERVER_ARGS and on_arch, the sim side's, are word lists
         env ATOM_DP_MASTER_PORT="$master" ATOM_COMPASS_PARITY_RECORD="$OUT/$side/record" \
-            "${devices[@]}" setsid python3 ${on_arch-} -m atom.entrypoints.openai.api_server \
+            ATOM_COMPASS_PARITY_WRITE_THROUGH=0 "${devices[@]}" \
+            setsid python3 ${on_arch-} -m atom.entrypoints.openai.api_server \
             --model "$MODEL" --host 127.0.0.1 --server-port "$port" \
             --port "$(compass_held_port)" -tp "$TP" $PPA $DPA "${dp[@]}" $SERVER_ARGS "$@" \
             >"$log" 2>&1 &
