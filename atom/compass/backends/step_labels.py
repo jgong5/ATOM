@@ -12,8 +12,11 @@ clock (`CLOCK`): then each rank's steps that overlap a compile are cut whole as
 `JIT`, no device, draft or host label, a forward whose host segments overlap
 one loses its host labels (below), and the record is taken unless the steps
 cut whole are more than `JIT_BOUND` of a rank's forwards. `cut_refusal` says
-why one is not. Grading takes no real run that names `BUILDS` (`refusal`): a
-stall delays every request after it, so its error is no longer the simulator's.
+why one is not. Its caller hands `label_run` the spans of the run.json it
+checked (`cut_spans`), so the steps cut are those the check counted, whatever
+path names the record; given none, nothing is cut. Grading takes no real run
+that names `BUILDS` (`refusal`): a stall delays every request after it, so its
+error is no longer the simulator's.
 
 A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
 `dp_rank`. An older record's lines state neither count: `group_tokens`
@@ -317,13 +320,13 @@ def jit_hosts(lines, spans) -> set[int]:
     return out
 
 
-def _spans(record: Path) -> list[tuple[int, int]]:
-    """`compile_spans` of the run.json in `record`'s run directory, beside its
-    `steps`; none without one, or when `ACCEPT_BUILDS_ENV` takes it whole."""
-    run = record.parent.parent / "run.json"
-    if os.environ.get(ACCEPT_BUILDS_ENV) == "1" or not run.is_file():
+def cut_spans(run: dict | None) -> list[tuple[int, int]]:
+    """The spans `label_run` cuts a record's steps by, given `run`, the
+    run.json `cut_refusal` took the record on: its `compile_spans`; none
+    without one, or when `ACCEPT_BUILDS_ENV` takes the record whole."""
+    if run is None or os.environ.get(ACCEPT_BUILDS_ENV) == "1":
         return []
-    return compile_spans(read_json(run))
+    return compile_spans(run)
 
 
 @dataclass(frozen=True)
@@ -717,28 +720,30 @@ def _pull(step: dict) -> int:
 
 
 def label(
-    record, run: str | None = None, split_rule=None
+    record, run: str | None = None, split_rule=None, spans=()
 ) -> tuple[list[Sample], list[dict]]:
     """The record's samples, in step order, and its table's rows.
 
     `run` names the run in each sample's provenance, the record's `digest` by
-    default; `split_rule` rebuilds an older record's split, as above. A
+    default; `split_rule` rebuilds an older record's split, as above; `spans`
+    are the compiles its steps are cut by (`cut_spans`), none by default. A
     data-parallel record's `group_dummies` and `group_max_tokens` are read from
     the rank records beside it.
     """
     lines = _read(record)
-    return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None, None)
+    starts = [_pull(s) for s in lines]
+    return _label(record, lines, run, starts, split_rule, None, None, spans=spans)
 
 
 def label_run(
-    records, run: str | None = None, split_rule=None, floored=None
+    records, run: str | None = None, split_rule=None, floored=None, spans=()
 ) -> list[tuple[list[Sample], list[dict]]]:
-    """`label` of each of `records`, one run's DP ranks, with each `E` from the
-    latest pull over the ranks before the same forward, a trace run's drafter
-    labels under `floored`, its busy lines less the profiler's floor
-    (`parity.busy.floored`). A rank that ran only DP's dummy forwards gives no
-    sample and no row. Ranks whose line counts differ by more than the forward
-    a stopped server leaves on some refuse."""
+    """`label` of each of `records`, one run's DP ranks, cut by `spans`, with
+    each `E` from the latest pull over the ranks before the same forward, a
+    trace run's drafter labels under `floored`, its busy lines less the
+    profiler's floor (`parity.busy.floored`). A rank that ran only DP's dummy
+    forwards gives no sample and no row. Ranks whose line counts differ by more
+    than the forward a stopped server leaves on some refuse."""
     ranks = [_read(r, floored) for r in records]
     counts = {Path(r).name: len(x) for r, x in zip(records, ranks) if x}
     if counts and max(counts.values()) - min(counts.values()) > 1:
@@ -755,7 +760,16 @@ def label_run(
             ([], [])
             if x and all(s["is_dummy_run"] for s in x)
             else _label(
-                r, x, run, starts, split_rule, dummy_ranks, peaks, tails, prefills
+                r,
+                x,
+                run,
+                starts,
+                split_rule,
+                dummy_ranks,
+                peaks,
+                tails,
+                prefills,
+                spans,
             )
         )
         for r, x in zip(records, ranks)
@@ -831,10 +845,11 @@ def _label(
     peaks,
     tails=None,
     prefills=None,
+    spans=(),
 ) -> tuple[list[Sample], list[dict]]:
     """`label` of `record`'s `lines`, each `E` from `starts` at the line before;
     `prefills` the steps its group prefills at (`group_prefills`), read from
-    the rank records beside it when None."""
+    the rank records beside it when None; `spans` the compiles it is cut by."""
     path = Path(record)
     steps = [s for s in lines if not s["is_dummy_run"]]
     dummies = frozenset(s["step"] for s in lines if s["is_dummy_run"])
@@ -848,7 +863,6 @@ def _label(
             "by its device time"
         )
     (exposed, early), traced = _host_cut(lines), _traced(path)
-    spans = _spans(path)
     jit, jit_host = jit_steps(lines, spans), jit_hosts(lines, spans)
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)

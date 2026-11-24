@@ -10,7 +10,7 @@ lookup by a factor, fitted as relative error on replayed batches, over features
 a recipe computes from the rows in the batch's own order. It is fitted apart
 for each grid a batch is read in, the batch's kind (`kind`): `decode`, and
 `prefill_output` and `prefill_no_output` for prefill chunks that produce output
-and that do not. Recipe v3's features, with k_i the context N_KV (cached plus
+and that do not. Recipe v4's features, with k_i the context N_KV (cached plus
 query) of the i-th row:
 
     tokens         Sum N_Q / 2^10
@@ -25,6 +25,13 @@ query) of the i-th row:
                    row reads one context. Prefill only: a decode batch's
                    longest row is the lookup's, through its rung's alpha
                    (`step_grid.py`).
+    longest_row    Sum N_Q.(max k - k_i) / 2^20, prefill only: the work past
+                   query_context's of a kernel that reads every row to the
+                   longest one's context, as MiniMax-M3's prefill indexer
+                   scores each query token over the longest row's blocks
+                   (`model_ops/minimax_m3/index_topk.py`). 0 when every row
+                   reads one context. raggedness reads the rows' contexts
+                   alone, the same whichever row holds the query tokens.
 
 The divisors are the recipe's normalisers, frozen with it. No feature reads a
 geometry or hardware constant. A recipe is fixed code: its name and version are
@@ -35,7 +42,7 @@ another recipe name, version or digest fails loading.
 
 A residual is a mapping, as a bundle holds it, of one or more kinds:
 
-    {"recipe": {"name": "step-grid-residual", "version": 3, "digest": <hex>},
+    {"recipe": {"name": "step-grid-residual", "version": 4, "digest": <hex>},
      "kinds": {<kind>: KIND, ...}}
 
     KIND = {"hull": {"equal": {<feature>: value, ...},
@@ -80,10 +87,15 @@ their grid (`step_grid.coordinates`: B, T and c in prefill, B and c in decode)
 of the batches its members were held out on. `validated` is true iff a batch
 lies inside its kind's; a kind without one validates nothing.
 
-`fit(triples, seed)` makes that mapping from (batch view, lookup seconds,
-measured seconds) triples; its target is measured over lookup, whatever timed
-the measurement. Each kind the triples hold is fitted on its own triples alone.
-`seed` holds out `HELD_OUT` of them. The members are fitted on the rest, each
+`fit(triples, seed, runs)` makes that mapping from (batch view, lookup seconds,
+measured seconds) triples, `runs` naming the run each came from (None: one
+run); its target is measured over lookup, whatever timed the measurement. Each
+kind the triples hold is fitted on its own triples alone. `seed` holds out
+`HELD_OUT` of them by run where they come from two runs or more (`split`): it
+takes the runs in a seeded order, each that keeps the held-out triples to at
+most half of them, until they reach `HELD_OUT`, so a member is selected on runs
+it was not fitted on. From one run it holds out `HELD_OUT` of the steps, drawn
+at random. The members are fitted on the rest, each
 as relative error: linear over every feature of the kind, `identity` on the
 target and `exp` on its log, and `band`, one factor per band the triples reach.
 A feature constant over them gets coefficient zero and is named. Relative
@@ -94,14 +106,17 @@ lowest median absolute relative error on the held-out triples is selected with
 weight 1, a held-out triple in a band the fit holds no factor for counting as
 an error of 1; the hull is that of its kept views' features, and `held_out`
 that of the held-out views' coordinates, absent when they span none (too few
-or flat in their varying axes). The report gives, per kind, the held-out
-triples' indices, the selected member's dropped ones and, per member, the
+or flat in their varying axes). The report gives, per kind, the split, `run`
+or `step`, the held-out triples' indices and, by run, the runs held out
+(`held_out_runs`), the selected member's dropped ones and, per member, the
 kept and dropped counts, the centre and scaled MAD of the relative residuals
 of those kept and dropped, the condition number of the column-scaled design,
-the zeroed features or bands and the held-out error. A fit holding a triple of
-no kind, or whose lookup or measured time is not positive and finite, is
-refused; so is one where a kind's triples hold out none or leave no more than
-one per coefficient, or its kept views span no hull, naming the kind.
+the zeroed features or bands and the held-out error; by run, also its
+held-out error had the seed held out steps instead (`step_held_out_error`). A
+fit holding a triple of no kind, or whose lookup or measured time is not
+positive and finite, or whose `runs` do not name one run a triple, is refused;
+so is one where a kind's triples hold out none or leave no more than one per
+coefficient, or its kept views span no hull, naming the kind.
 """
 
 from __future__ import annotations
@@ -110,6 +125,7 @@ import hashlib
 import inspect
 import itertools
 import math
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from fractions import Fraction
 
@@ -162,6 +178,12 @@ def raggedness(rows: Sequence[RequestShape]) -> Fraction:
     return Fraction(len(rows) * longest, sum_context(rows))
 
 
+def longest_row(rows: Sequence[RequestShape]) -> Fraction:
+    longest = max(row.context_tokens for row in rows)
+    short = sum(row.query_tokens * (longest - row.context_tokens) for row in rows)
+    return Fraction(short, 2**20)
+
+
 Feature = Callable[[Sequence[RequestShape]], Fraction]
 
 
@@ -186,10 +208,10 @@ class Recipe:
         return tuple(feature(rows) for feature in self.features[kind])
 
 
-PREFILL = (tokens, query_square, query_context, order, raggedness)
+PREFILL = (tokens, query_square, query_context, order, raggedness, longest_row)
 RECIPE = Recipe(
     "step-grid-residual",
-    3,
+    4,
     {
         "decode": (tokens, query_context, order),
         "prefill_output": PREFILL,
@@ -437,30 +459,33 @@ def _solve(x: np.ndarray, y: np.ndarray, transform: str, vary: list[int]) -> dic
     }
 
 
-def _fit(
-    kind: str, triples: Sequence[tuple[BatchView, float, float]], seed: int
-) -> tuple[dict, dict]:
-    """One kind's mapping, fitted on its own triples, and its report."""
-    from scipy.spatial import QhullError
+def _split(runs: Sequence[str] | None, n: int, seed: int) -> tuple[np.ndarray, list]:
+    """The indices of the `n` triples `seed` holds out, as the module says, and
+    the runs they are; none where `runs`, each triple's, name one run or are
+    None, the steps then drawn."""
+    rng = np.random.default_rng(seed)
+    named = list(dict.fromkeys(runs or ()))
+    if len(named) < 2:
+        return np.sort(rng.permutation(n)[: int(n * HELD_OUT)]), []
+    size, held, count = Counter(runs), set(), 0
+    for i in rng.permutation(len(named)):
+        if count >= n * HELD_OUT:
+            break
+        if 2 * (count + size[named[i]]) <= n:
+            held.add(named[i])
+            count += size[named[i]]
+    at = [i for i, run in enumerate(runs) if run in held]
+    return np.array(at, dtype=int), [run for run in named if run in held]
 
+
+def _members(kind: str, triples, x, y, dev, held) -> tuple[dict, dict, dict]:
+    """Each member of `kind` fitted on the triples `dev`: its mapping, its
+    solve, and its report, with its error over the triples `held`."""
     names = RECIPE.names[kind]
-    x = np.array(
-        [[1.0, *map(float, RECIPE(kind, view.requests))] for view, _, _ in triples]
-    )
-    y = np.array([measured / lookup for _, lookup, measured in triples])
-    held = np.sort(
-        np.random.default_rng(seed).permutation(len(y))[: int(len(y) * HELD_OUT)]
-    )
-    dev = np.setdiff1d(np.arange(len(y)), held)
-    if not len(held) or len(dev) <= x.shape[1]:
-        raise ValueError(
-            f"{len(y)} triples hold out {len(held)} and leave {len(dev)} to fit "
-            f"{x.shape[1]} coefficients"
-        )
     bands = sorted({band(triples[i][0]) for i in dev})
     onehot = np.array([[float(band(v) == b) for b in bands] for v, _, _ in triples])
     linear = [0] + [j for j in range(1, x.shape[1]) if np.ptp(x[dev, j]) > 0]
-    members, solved, report = {}, {}, {"held_out": held.tolist(), "members": {}}
+    members, solved, reported = {}, {}, {}
     for name, design, columns, vary in (
         ("identity", x, ("intercept", *names), linear),
         ("exp", x, ("intercept", *names), linear),
@@ -480,12 +505,49 @@ def _fit(
                 "coefficients": dict(zip(names, z[1:])),
             }
         )
-        report["members"][name] = {
+        reported[name] = {
             **{k: v for k, v in s.items() if k not in ("z", "keep", "zero")},
             "zero": [columns[j] for j in s["zero"]],
             "held_out_error": float(np.median(error)),
         }
-    best = min(members, key=lambda t: report["members"][t]["held_out_error"])
+    return members, solved, reported
+
+
+def _fit(
+    kind: str,
+    triples: Sequence[tuple[BatchView, float, float]],
+    seed: int,
+    runs: Sequence[str] | None = None,
+) -> tuple[dict, dict]:
+    """One kind's mapping, fitted on its own triples, and its report."""
+    from scipy.spatial import QhullError
+
+    names = RECIPE.names[kind]
+    x = np.array(
+        [[1.0, *map(float, RECIPE(kind, view.requests))] for view, _, _ in triples]
+    )
+    y = np.array([measured / lookup for _, lookup, measured in triples])
+    everyone = np.arange(len(y))
+    held, runs_held = _split(runs, len(y), seed)
+    dev = np.setdiff1d(everyone, held)
+    if not len(held) or len(dev) <= x.shape[1]:
+        raise ValueError(
+            f"{len(y)} triples hold out {len(held)} and leave {len(dev)} to fit "
+            f"{x.shape[1]} coefficients"
+        )
+    members, solved, reported = _members(kind, triples, x, y, dev, held)
+    report = {"split": "run" if runs_held else "step", "held_out": held.tolist()}
+    if runs_held:
+        report["held_out_runs"] = runs_held
+        steps = _split(None, len(y), seed)[0]
+        if len(steps):
+            by_step = _members(
+                kind, triples, x, y, np.setdiff1d(everyone, steps), steps
+            )
+            for name, member in reported.items():
+                member["step_held_out_error"] = by_step[2][name]["held_out_error"]
+    report["members"] = reported
+    best = min(members, key=lambda t: reported[t]["held_out_error"])
     report["dropped"] = dev[~solved[best]["keep"]].tolist()
     kept = x[dev[solved[best]["keep"]], 1:]
     try:
@@ -512,13 +574,17 @@ def _span(points: np.ndarray, names: tuple[str, ...]) -> dict:
 
 
 def fit(
-    triples: Sequence[tuple[BatchView, float, float]], seed: int
+    triples: Sequence[tuple[BatchView, float, float]],
+    seed: int,
+    runs: Sequence[str] | None = None,
 ) -> tuple[dict, dict]:
     """The residual mapping `Residual` reads, each kind fitted on its own
-    triples, and its report by kind."""
+    triples, held out by the run `runs` names each, and its report by kind."""
     bad = [i for i, (_, *times) in enumerate(triples) if any(map(_bad, times))]
     if bad:
         raise ValueError(f"triples {bad} have a time that is not positive and finite")
+    if runs is not None and len(runs) != len(triples):
+        raise ValueError(f"{len(runs)} runs name {len(triples)} triples")
     indices = {}
     for i, (view, _, _) in enumerate(triples):
         try:
@@ -528,8 +594,9 @@ def fit(
     kinds, report = {}, {}
     for k in [k for k in RECIPE.names if k in indices]:
         own = indices[k]
+        theirs = None if runs is None else [runs[i] for i in own]
         try:
-            kinds[k], report[k] = _fit(k, [triples[i] for i in own], seed)
+            kinds[k], report[k] = _fit(k, [triples[i] for i in own], seed, theirs)
         except ValueError as error:
             raise ValueError(f"the {k} fit: {error}") from error
         for part in ("held_out", "dropped"):

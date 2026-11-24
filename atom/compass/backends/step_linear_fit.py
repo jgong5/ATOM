@@ -22,7 +22,7 @@ states the labels; the command writes each record's per-step table beside it.
 A record refuses, before any table is written, when the run.json beside the
 `steps` directory its path resolves into names JIT compiles its server ran
 that it does not time, or that cut too many of its steps
-(`step_labels.cut_refusal`).
+(`step_labels.cut_refusal`); else the steps they overlap are cut.
 A step whose device label is cut is counted under its reason and not fitted.
 Prefill labels come from trace runs alone (`step_labels`); given none, the
 prefill vector is left out and named under `unfitted`. A trace run gives no
@@ -589,14 +589,18 @@ def records_atom(samples) -> str | None:
     return atoms[0] if atoms else None
 
 
-def label_records(records, dp: int = 1) -> tuple[list, dict]:
+def label_records(records, dp: int = 1, spans=None) -> tuple[list, dict]:
     """`records`, runs of `dp` ranks in rank order, as `step_labels` samples, each
-    run named by its records' digests; and each record's table rows."""
+    run named by its records' digests and cut by the compile spans `spans`
+    holds for its first record (`step_labels.cut_spans`), none where it holds
+    none; and each record's table rows."""
     samples, tables = [], {}
     for i in range(0, len(records), dp):
         run = records[i : i + dp]
         name = ", ".join(map(step_labels.digest, run))
-        for record, (got, table) in zip(run, step_labels.label_run(run, name)):
+        cut = (spans or {}).get(run[0], ())
+        labelled = step_labels.label_run(run, name, spans=cut)
+        for record, (got, table) in zip(run, labelled):
             samples += got
             tables[record] = table
     return samples, tables
@@ -3118,15 +3122,17 @@ def _labelled(args) -> tuple[list, dict, dict, dict]:
     on them and the engine config they ran under. A record whose server built
     an aiter JIT module refuses as `step_labels.cut_refusal` says, and so does
     an engine file that contradicts
-    `--engine` at the records' longest ladder."""
+    `--engine` at the records' longest ladder. A record's steps are cut by the
+    compiles the run.json it was checked on times."""
+    spans = {}
     for record in args.records:
         run = Path(record).resolve().parent.parent / "run.json"
-        if run.is_file() and (
-            built := step_labels.cut_refusal(
-                json.loads(run.read_text()), [json_file.read_jsonl(record)]
-            )
+        identity = json.loads(run.read_text()) if run.is_file() else None
+        if identity is not None and (
+            built := step_labels.cut_refusal(identity, [json_file.read_jsonl(record)])
         ):
             raise ValueError(f"{record} is not fitted: {built}")
+        spans[record] = step_labels.cut_spans(identity)
     owns = {Path(r).with_suffix(".engine.json"): r for r in args.records}
     stated = {r: stated_buckets(r) for r in args.records}
     if args.engine:
@@ -3145,7 +3151,7 @@ def _labelled(args) -> tuple[list, dict, dict, dict]:
     dp = join_width(engine)
     options = {"form": args.form, "dp": dp, "moe_routing": args.moe_routing}
     options["buckets"] = recorded_buckets(stated)
-    samples, tables = label_records(args.records, dp)
+    samples, tables = label_records(args.records, dp, spans)
     return samples, tables, options, engine
 
 

@@ -84,7 +84,7 @@ from pathlib import Path
 from triton import knobs
 
 from atom.compass.backends.step_grid_plan import TARGET
-from atom.compass.backends.step_labels import CLOCK, label_run, write_table
+from atom.compass.backends.step_labels import CLOCK, cut_spans, label_run, write_table
 from atom.compass.cli import OPS
 from atom.compass.drive import aiter_jit, runfile, serve
 from atom.compass.drive.gpu import add_gpu_flag
@@ -190,13 +190,15 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def write_engine_and_costs(out) -> None:
-    """Write each DP rank's cost lines and run.json's ``engine`` entry into
-    `out`, a stopped server's directory."""
+    """Write each DP rank's cost lines, cut by the compiles its run.json times
+    (`step_labels.cut_spans`), and run.json's ``engine`` entry into `out`, a
+    stopped server's directory."""
     out = Path(out)
     records = sorted(
         (out / serve.STEPS).glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:])
     )
-    for record, (_, table) in zip(records, label_run(records)):
+    run = json.loads((out / serve.RUN_JSON).read_text())
+    for record, (_, table) in zip(records, label_run(records, spans=cut_spans(run))):
         write_table(record, table)
     engines = {}
     for record in records:
@@ -214,6 +216,5 @@ def write_engine_and_costs(out) -> None:
             + "\n".join(differ)
         )
     blocks = min(e["num_kvcache_blocks"] for e in engines.values())
-    run = json.loads((out / serve.RUN_JSON).read_text())
     run["engine"] = {**engines[records[0].stem], "num_kvcache_blocks": blocks}
     _write_whole(out / serve.RUN_JSON, json.dumps(run))

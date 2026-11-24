@@ -14,6 +14,7 @@ import re
 from pathlib import Path
 
 import pytest
+import test_backend_step_linear_fit as linear
 from test_fit_steps import (  # noqa: F401  planted_roots: autouse
     LINEAR,
     clients,
@@ -26,7 +27,7 @@ from test_fit_steps import (  # noqa: F401  planted_roots: autouse
 from test_validate_cost import LAW, _record, _steps
 from test_validate_runs import GRADED, _four, _recorded
 
-from atom.compass.backends import step_labels
+from atom.compass.backends import step_labels, step_linear_fit
 from atom.compass.backends.step_labels import (
     ACCEPT_BUILDS_ENV,
     BUILDS,
@@ -71,18 +72,25 @@ def _windowed(record):
     return lines
 
 
+@pytest.mark.parametrize("linked", [False, True], ids=["its path", "by a link"])
 def test_the_step_that_waited_on_a_compile_is_cut_and_the_record_costed(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, linked
 ):
     """Prefill step 4 ran ten times its price, a compile inside it; the rest
     are priced as the law prices them. One step of twenty is past the bound
-    a record of thousands takes."""
+    a record of thousands takes. Named by a link from a directory with no
+    run.json, the record is cut by the run.json its check read."""
     monkeypatch.delenv(ACCEPT_BUILDS_ENV, raising=False)
     monkeypatch.setattr(step_labels, "JIT_BOUND", 0.1)
-    record = _record(tmp_path / "steps", _steps(), stretch={4: 10.0})
+    (tmp_path / "run").mkdir()
+    record = _record(tmp_path / "run/steps", _steps(), stretch={4: 10.0})
     step = _windowed(record)[4]
     start = step["t_enter_ns"] + JIT_SLACK_NS + 1
-    _compiled(tmp_path, (start, start + 80_000_000))
+    _compiled(tmp_path / "run", (start, start + 80_000_000))
+    if linked:
+        (tmp_path / "elsewhere").mkdir()
+        (tmp_path / "elsewhere/steps").symlink_to(record)
+        record = tmp_path / "elsewhere/steps"
 
     report = cost_accuracy(record, LAW)
 
@@ -132,6 +140,34 @@ def test_a_fit_takes_a_record_whose_compiles_are_timed_and_cuts_their_steps(
     fit(tmp_path, "fit steps", *LINEAR, a, *clients(a))
 
     assert member(tmp_path / "store", law_key(), "params")["cut"][JIT] == 1
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["{out}/steps/dp0.jsonl", "dp0.jsonl", "{tmp}/elsewhere/link/dp0.jsonl"],
+    ids=["its path", "from inside it", "by a link"],
+)
+def test_step_linear_fit_cuts_by_the_run_json_its_check_read(
+    tmp_path, monkeypatch, spelling
+):
+    """`step_linear_fit` checks the run.json beside the steps directory a
+    record's path resolves into; a compile at step 100's entry, timed there,
+    cuts that step however the path names the record."""
+    monkeypatch.delenv(ACCEPT_BUILDS_ENV, raising=False)
+    monkeypatch.setattr(step_labels, "JIT_SLACK_NS", 0)
+    steps = tmp_path / "out/steps"
+    steps.mkdir(parents=True)
+    path = linear._record(steps / "dp0.jsonl", linear._steps(6))
+    at = json.loads(path.read_text().splitlines()[100])["t_enter_ns"]
+    _compiled(tmp_path / "out", (at, at))
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "elsewhere/link").symlink_to(steps)
+    monkeypatch.chdir(steps)
+    record = spelling.format(out=tmp_path / "out", tmp=tmp_path)
+
+    step_linear_fit.main([record, "--out", str(tmp_path / "law.json"), *linear.SPEC])
+
+    assert json.loads((tmp_path / "law.json").read_text())["cut"][JIT] == 1
 
 
 def test_builds_since_times_each_compile_by_its_artifact(tmp_path, monkeypatch):
@@ -195,9 +231,9 @@ def test_a_compile_between_two_forwards_leaves_the_later_one_no_host_label(
     record = _record(tmp_path / "steps", _steps()) / "dp0.jsonl"
     lines = [json.loads(x) for x in record.read_text().splitlines()]
     at = (lines[14]["t_exit_ns"] + lines[15]["t_enter_ns"]) // 2
-    _compiled(tmp_path, (at, at))
+    spans = step_labels.cut_spans(_timed((at, at)))
 
-    samples = {s.step: s for s in step_labels.label(record)[0]}
+    samples = {s.step: s for s in step_labels.label(record, spans=spans)[0]}
 
     assert samples[15].cut is None and samples[15].device_s is not None
     assert samples[15].host == {}
@@ -217,9 +253,9 @@ def test_a_dummy_forward_that_overlaps_a_compile_gives_no_dummy_host(
     for i in (3, 7):
         lines[i]["rows"] = [[1, 1, False]]
     record.write_text("".join(json.dumps(s) + "\n" for s in lines))
-    _compiled(tmp_path, (lines[3]["t_enter_ns"], lines[3]["t_enter_ns"]))
+    spans = step_labels.cut_spans(_timed((lines[3]["t_enter_ns"],) * 2))
 
-    samples = step_labels.label(record)[0]
+    samples = step_labels.label(record, spans=spans)[0]
 
     assert [d[0] for d in samples[0].dummy_host] == [7]
 
