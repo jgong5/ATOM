@@ -5,7 +5,7 @@ constant step stub that prices a draft on every forward, and again priced by
 the step roofline alone (`08` D120 point 3), every verify step with a draft
 term. Under the roofline DSpark is priced on an MI355X's spec, whose FP4 peak
 its experts need and MI308X's spec does not state, and MTP on node 18's, its
-tokenizer charged by `QWEN3_5_TOKENIZER`.
+tokenizer charged by `QWEN3_8_TOKENIZER`, assumed.
 
 The acceptance is declared, so the drafts a step accepts are drawn from the
 runner's seeded stream. The runs need a driver, as in `test_vertical_slice`,
@@ -29,6 +29,7 @@ from test_dp_slice import (  # noqa: F401
     device_classes_put_back,
     run_dp_slice,
 )
+from test_served_tokenizer import _LoadedFrom, _model_dir
 from test_vertical_slice import CONSTANT, _run_file
 
 from atom.compass import run as compass_run
@@ -37,6 +38,7 @@ from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_stub import Coefficients, StepStubBackend
 from atom.compass.detect.scenario import check_run, expected_timeline
 from atom.compass.runner.overrides import HostDeviceRecurrence
+from atom.compass.spec.rules import FingerprintMismatch
 
 DRAFT_S = 2.0**-10
 STUB = CONSTANT | {"draft_step": DRAFT_S}
@@ -53,22 +55,26 @@ METHODS = {
 #: The slice's machine.
 MACHINE = copy.deepcopy(DP_MACHINE)
 MACHINES = Path(__file__).parent / "machines"
-#: Qwen3.5-0.8B's tokenizer charge, assumed, since no MI308X node can record
-#: it now: Qwen3.5's own tokenizer.json (the 0.8B and 9B snapshots' on g08),
-#: and the terms of `scripts/compass/laws/qwen3.8-27b-tp1-mi308x-*.json.xz`,
-#: Qwen3.8's tokenizer.json (sha256:0997f410...) on the same fast backend,
-#: fitted by `compass fit host` (36b46d7be8b9) on one record on hjbog-srdc-39,
-#: an MI308X node (tokenizer.jsonl:90140d7c474d, #3932).
-QWEN3_5_TOKENIZER = {
+#: MTP's tokenizer charge, assumed for Qwen3.5-0.8B, since no MI308X node can
+#: record it now: the ``host.tokenizer`` term of
+#: `scripts/compass/laws/qwen3.8-27b-tp1-mi308x-ptl-disabled-661ef7661.json.xz`
+#: as 4c53e5fe2 (#3932) fitted it, by `compass fit host` (36b46d7be8b9) on one
+#: record on hjbog-srdc-39, an MI308X node (tokenizer.jsonl:90140d7c474d); this
+#: branch's copy of that file predates the fit. Its fingerprint stays Qwen3.8's
+#: tokenizer.json, the file the timed calls loaded (`05`), so the MTP run warns
+#: `FingerprintMismatch`, naming it and `QWEN3_5_JSON`.
+QWEN3_8_TOKENIZER = {
     "backend": "fast",
     "fingerprint": "sha256:"
-    "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
     "encode": {"fixed_s": 0.0018664796139258922, "tokens_per_s": 668474.2547418053},
     "decode": {"fixed_s": 1.1371071666609296e-05, "tokens_per_s": 887576.7512085318},
 }
+#: Qwen3.5's tokenizer.json, the 0.8B and 9B snapshots' on g08.
+QWEN3_5_JSON = "sha256:5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
 #: Each method's machine under the step roofline, and its run file's more keys.
 ROOFLINE = {
-    "mtp": ("mi308x-hjbog18.json", {"host": {"tokenizer": QWEN3_5_TOKENIZER}}),
+    "mtp": ("mi308x-hjbog18.json", {"host": {"tokenizer": QWEN3_8_TOKENIZER}}),
     "dspark": ("mi355x-gpu40.json", {}),
 }
 
@@ -156,7 +162,8 @@ def test_a_speculative_run_meets_every_scenario_check_under_the_step_roofline(
     roofline,
 ):
     """Every check but the hand-computed timeline, which only a constant stub's
-    run has; each verify step prices a draft term."""
+    run has; each verify step prices a draft term. A server charging an
+    assumed tokenizer term warns, naming its file and the one it loaded."""
     method, runs = roofline
     summary = runs[0]["summary"]["schedule"]
     print(f"\n{summary['seconds_by_method']}\n{runs[0]['table']}")
@@ -174,19 +181,35 @@ def test_a_speculative_run_meets_every_scenario_check_under_the_step_roofline(
         f"{method}: {len(verify)} verify steps, mean target {target!r} s, "
         f"mean draft {draft!r} s a step"
     )
+    if term := ROOFLINE[method][1].get("host", {}).get("tokenizer"):
+        for run in runs:
+            log = (run["out"] / "server.log").read_text().splitlines()
+            warned = [line for line in log if FingerprintMismatch.__name__ in line]
+            print("\n".join(warned))
+            assert any(
+                term["fingerprint"] in line and QWEN3_5_JSON in line for line in warned
+            ), warned
 
 
 # --- without a driver ---------------------------------------------------------
 
 
-def test_the_mtp_run_files_tokenizer_charge_is_qwen3_5s(monkeypatch, tmp_path):
-    """The MTP run file under the roofline passes the run file's checks and
-    charges Qwen3.5-0.8B's tokenizer.json with no step stub."""
+def test_the_mtp_run_files_tokenizer_term_warns_on_another_tokenizer_json(
+    monkeypatch, tmp_path
+):
+    """The MTP run file under the roofline passes the run file's checks with
+    no step stub, and its tokenizer term, Qwen3.8's, loaded on another
+    tokenizer.json, warns naming both."""
     run = roofline_run_file(tmp_path, ROOFLINE["mtp"][1], step_stub=CONSTANT)
     monkeypatch.setenv(compass_run.ENV, str(run))
     checked = compass_run.spec()
     assert "step_stub" not in checked and checked["step_roofline"] is True
-    assert checked["host"]["tokenizer"] == QWEN3_5_TOKENIZER
+    assert checked["host"]["tokenizer"] == QWEN3_8_TOKENIZER
+    model, loaded = _model_dir(tmp_path)
+    with pytest.warns(FingerprintMismatch) as caught:
+        compass_run.tokenizer(_LoadedFrom(model), None)
+    message = str(caught[0].message)
+    assert QWEN3_8_TOKENIZER["fingerprint"] in message and loaded in message
 
 
 def test_a_stub_with_a_draft_intercept_prices_a_draft_and_stays_constant():
