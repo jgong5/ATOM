@@ -123,9 +123,13 @@ args=(--endpoint-type chat --custom-dataset-type weka_trace
     --no-server-metrics --no-gpu-telemetry --ui none)
 # shellcheck disable=SC2206 # AIPERF_EXTRA_ARGS is a word list
 args+=($AIPERF_EXTRA_ARGS)
+# Where the arm sets aiperf's Dynamo session header, aiperf sends it in place
+# of X-Session-ID, as client.sh's does, and the workload names it.
+DYNAMO=$(compass_dynamo_header)
+[[ -z $DYNAMO ]] || export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=false
 
 read -r MODE CLOCK_PORT PORT DECODE_PORT ROUTER_PORT KV_WRITE_REQ_PORT PROMETHEUS_PORT < <(
-MODEL=$MODEL SERVER_ARGS=$SERVER_ARGS REAL=$REAL python3 - $$ "$RUN_FILE" "$OUT" "$TRACES" "$BENCHMARK_ID" "${args[@]}" <<'EOF'
+MODEL=$MODEL SERVER_ARGS=$SERVER_ARGS REAL=$REAL DYNAMO=$DYNAMO python3 - $$ "$RUN_FILE" "$OUT" "$TRACES" "$BENCHMARK_ID" "${args[@]}" <<'EOF'
 import hashlib, json, os, select, socket, sys
 from pathlib import Path
 
@@ -179,7 +183,7 @@ run["workload"] = {
     "traces_sha256": [sha256(p) for p in sorted((out / "traces").iterdir())],
     "aiperf_args": args,
     "benchmark_id": benchmark_id,
-}
+} | ({"session_header": os.environ["DYNAMO"]} if os.environ["DYNAMO"] else {})
 if int(os.environ["REAL"]):
     run["env"] = {k: os.environ[k] for k in ("TRITON_CACHE_AUTOTUNING", "TRITON_CACHE_DIR")}
 (out / "run.json").write_text(json.dumps(run))
@@ -210,8 +214,11 @@ if [[ $MODE == 1p1d ]]; then
     # An agentic cell, as the real one is launched: under DP attention its
     # router is the --dp-aware router LP, which draws from the cell's seed, and
     # its dp_sticky keys off X-Session-ID, which the real cell's aiperf sends.
+    # Where the arm sets the Dynamo session header, aiperf sends no
+    # X-Session-ID, and dp_sticky, which reads no other header, routes each
+    # request by load.
     export BENCHMARK_KIND=aiperf_agentic SEED=${SEED:-20260707}
-    [[ " $SERVER_ARGS ${PREFILL_ARGS:-} ${DECODE_ARGS:-} " == *" --enable-dp-attention "* ]] && export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
+    [[ -z $DYNAMO && " $SERVER_ARGS ${PREFILL_ARGS:-} ${DECODE_ARGS:-} " == *" --enable-dp-attention "* ]] && export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
     PREFILL_PORT=$PORT bash "$ROOT/scripts/compass/pd_sim.sh" "$OUT/run.json" >"$OUT/pd_sim.log" 2>&1 &
     ready=("pd_sim: ready" "$OUT/pd_sim.log")
     # Behind a router that is no LP, the traffic LP posts each cancel to the

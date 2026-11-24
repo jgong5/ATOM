@@ -229,13 +229,16 @@ args=(--endpoint-type chat --custom-dataset-type weka_trace
     --streaming --use-server-token-count --extra-inputs ignore_eos:true
     "${hashed_scrape[@]}" --no-gpu-telemetry --ui none "${agentx_args[@]}" "${extra[@]}")
 
-# Each request carries X-Session-ID, as the nightly's agentic cell sends it: a
-# dp_sticky router keys off it, and a server alone ignores it. The raw records
+# Each request carries X-Session-ID, as the nightly's agentic cell sends it, or
+# in its place the Dynamo session header where the arm sets it, as ATOM's DP
+# submissions do, which workload.json then names. The raw records
 # leave out each request's payload, its prompt, and are compressed once the
 # export is written. aiperf runs as a job, so that any exit of this script,
 # a SIGTERM's included, stops it.
+dynamo=$(compass_dynamo_header) session=true
+[[ -z $dynamo ]] || session=false
 trap 'set +e; kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
-(cd "$OUT/client" && AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true \
+(cd "$OUT/client" && AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=$session \
     AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true exec "$HARNESS_PYTHON" "${aiperf[@]}" \
     profile --url "${url#http://}" --model "$MODEL" --tokenizer "$MODEL" \
     --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" "${scrape[@]}" \
@@ -254,16 +257,17 @@ wait $! || {
 (cd / && python3 -m atom.compass.parity.client_run "$OUT/artifacts") ||
     fail "export: atom.compass.parity.client_run exited $? on $OUT/artifacts"
 gzip "$OUT/artifacts/profile_export_raw.jsonl" || fail "export: cannot compress $OUT/artifacts/profile_export_raw.jsonl"
-python3 - "$OUT" "$TRACES" "${args[@]}" <<'EOF' || fail "workload: cannot write $OUT/artifacts/workload.json"
+python3 - "$OUT" "$TRACES" "$dynamo" "${args[@]}" <<'EOF' || fail "workload: cannot write $OUT/artifacts/workload.json"
 import hashlib, json, sys
 from pathlib import Path
 
-out, traces, *args = sys.argv[1:]
+out, traces, header, *args = sys.argv[1:]
 sha256 = lambda p: hashlib.file_digest(open(p, "rb"), "sha256").hexdigest()
 export = json.loads(Path(out, "artifacts/profile_export_aiperf.json").read_text())
 given = sorted(Path(out, "client/traces").iterdir())
 workload = {"dataset_sha256": sha256(traces), "traces_sha256": [*map(sha256, given)]}
 workload |= {"aiperf_args": args, "benchmark_id": export["benchmark_id"]}
+workload |= {"session_header": header} if header else {}
 Path(out, "artifacts/workload.json").write_text(json.dumps(workload))
 EOF
 
