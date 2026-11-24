@@ -58,7 +58,8 @@
 # measure its own from; and `router`, the binary that runs it, refused unless built from this tree's
 # atom/mesh (`router_binary` in atom/compass/run). Several servers of a side
 # make it LP `router` too, as it chooses among them. As LP `router` it lists
-# each side's workers in RUN_FILE's `worker_order`, else sorted. Otherwise
+# each side's workers in RUN_FILE's `worker_order`, else by server, then DP
+# rank (`worker_order` in atom/compass/run). Otherwise
 # the router has one worker per side, and ATOM's own DP dispatch picks the rank.
 #
 # It runs its own tree, as the gates do. Logs go beside RUN_FILE. It prints
@@ -169,7 +170,7 @@ if ((${#dp_aware[@]} || PREFILLS > 1 || DECODES > 1)); then
     # The hop into the router takes the run's ipc_s, its declared floor for one
     # hop between two local processes; the rest of each path's lookahead stays
     # on the hop out.
-    # Its lookaheads, then the run file's worker_order as (URL, DP rank) pairs.
+    # Its lookaheads, then `worker_order`'s order as (URL, DP rank) pairs.
     lp=$(python3 - "$RUN_FILE" "$ATOMESH" "$PREFILL_PORT" "$DECODE_PORT" <<'EOF'
 import json, sys
 from pathlib import Path

@@ -75,8 +75,8 @@ D117's development nodes are crsuse2-m2m-v3-005 and -013.
                         -> compass advice again: searchable
    refused ............ ATOM's or Compass's refusal verbatim, never simulated:
                         another tree or a law at the head past the 5% gate
-                        (D112), another host CPU, no ROCm driver (D109), a flag
-                        Compass refuses (--enable-dynamic-chunking)
+                        (D112), a flag Compass refuses
+                        (--enable-dynamic-chunking)
 ```
 
 ### 3. The reuse check's verdicts
@@ -253,11 +253,13 @@ calibration #3355 keeps outside the search.
 
 OUT holds `dashboard.html`, the recommendation, the result table and
 `runs/<config>-c<concurrency>/`, each point's run directory. The search runs at the
-integration head (D112); on the target machine type, since host laws key on the host's
-CPU and another CPU is refused by name until #3122's code task; in a GPU container with
-no GPU compute, since a simulation imports aiter, which needs a ROCm driver (no GPU at
-all is #2893's). It wraps the commands it runs, so no user step needs `python -m` (the
-owner's ruling on #1108, recorded in #1527).
+integration head (D112), on any host's CPU and with no GPU device (the
+[#4006 Ruling](https://github.com/jgong5/ATOM/pull/4006#issuecomment-7130990480)): a
+simulated server starts with no ROCm driver (#3750), and host laws fitted on another CPU
+serve, predicting the host they timed (#3751). Only the commands it prints, a
+calibration or a readings measurement (D113), take the target's GPUs, on a node of its
+type. It wraps the commands it runs, so no user step needs `python -m` (the owner's
+ruling on #1108, recorded in #1527).
 
 **Reason.** A command rerun until every point is searchable leaves the user nothing to
 compute; with no roofline every point is priced by its own law; a later client run meets
@@ -448,7 +450,7 @@ the run's provenance.
    (`atom/compass/run/__init__.py::atom_digest`, the sha256 of ATOM's Python less
    Compass's own code, which every key reads) with the head's: the digest of the `atom/`
    the integration branch's tip holds, or the commit the space file freezes (D110), which
-   must be one of that branch's. It computes that digest where it runs, in the GPU
+   must be one of that branch's. It computes that digest where it runs, in the search's
    container, over the `atom/` that `git archive` ships from the clone the tree belongs
    to, at the integration branch's remote-tracking ref, which the guide fetches on the
    host before a search, or at the frozen commit: git reads the local repository, which
@@ -829,7 +831,7 @@ record 907 s measured
 | ATOM main `a62134f99` and image `nightly_202611240650`: the branch's upstream base, `b7b5ec3f2`, has neither MiniMax's PP-to-TP PAGE staging, nor `pd_admission`'s decode reserve, nor the shared kv_store layer | A, B | #4047, a sync |
 | the upstream tip holding ROCm/ATOM#3563 and ROCm/ATOM#3564, which B waits for. No Compass code: the step linear law prices DP-attention ranks, their experts over the group (`run/__init__.py::runner`), as DeepSeek-V4-Pro's DPA8-EP8 law (`scripts/compass/laws/`) does | B | #4048, a sync to that tip, checking DEP4 |
 | a pipeline with a drafter, refused on a stale reason (`runner/overrides.py::NonAllocatingRunner._build_and_load_model`) | the prefill | #4049 |
-| a step linear law of a pipeline stage: `_group_step_seconds` refuses one, `fit steps` reads stage 0 alone, `record --trace` refuses PP (`07` T129) | the prefill | #4050, a design |
+| a step linear law of a pipeline stage: `_group_step_seconds` refuses one, `fit steps` reads stage 0 alone, `record --trace` refuses PP; designed in `09` D54.1 | the prefill | #4066 to #4071 |
 | the Store under a pipelined prefill, which `01` D6.2 refuses, its entry one chunk size for every writer | the prefill | #4051, a design |
 | a space file naming the Store's entry | A, B | #4052 (D110) |
 | a 1P1D calibration through `calibrate.sh` (D113) | A, B | #4053 |
@@ -982,8 +984,8 @@ of the template offloads through LMCache, so #3712's two points on their own LMC
 have no subject in it. Other issues settle what decisions leave to them: #3256's
 grading, which reopens the showcase's pricing if it fails the step linear law where the
 step grid passes on a cell the showcase runs (D117); #3054 the indexer-CP key MiniMax-M3's move waits on (D117); #2311 who judges a change that
-moves step costs (D112); #3122 readings re-keyed with a law, and trees other than the
-head (D112); #1498 the op-family split's inputs on DeepSeek-V4-Pro (D114).
+moves step costs (D112); `12` T107 trees other than the head, after v1 (D112); #1498 the
+op-family split's inputs on DeepSeek-V4-Pro (D114).
 
 ---
 
@@ -996,10 +998,10 @@ MiniMax-M3.1-Flash's 1P1D recipe on pit2's MI355X, shown on MiniMax-M3.
 
 **Scope and non-goals.** How a user finds the configuration to deploy, what each run
 writes for a person to read, and where the tool is built, on pit2's MI355X, and shown, on
-the development nodes. Out: #3355's *Deferred* list, among it topping a law up in place
-and search from any host; and work the search meets, such as the simulated connector's
-P/D options (#4054) and `inferencex_export` labelling every row single-node, tracked
-apart.
+the development nodes. Out: #3355's *Deferred* list, among it topping a law up in
+place, less search from any host (D109); and work the search meets, such as the
+simulated connector's P/D options (#4054) and `inferencex_export` labelling every row
+single-node, tracked apart.
 
 **Changes.**
 
@@ -1063,7 +1065,7 @@ apart.
 | # | Decision | Date |
 |---|---|---|
 | D108 | Fitting apart from searching: a candidate is simulated once its law exists; the halves meet only through the store and a calibration's `status` file, the search owning no calibration, fitting, reuse judgement or version management. A user guide, `scripts/compass/ADVICE.md`, exact enough that an agent following it fills the development template's space file, and no skill; an agent starts a calibration only on the user's yes. | 2026-11-13 ([#3355](https://github.com/jgong5/ATOM/issues/3355), [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6845852318)) |
-| D109 | `compass advice SPACE OUT` checks each candidate (searchable, missing a law, calibrating, refused) and each point's readings (missing readings, with the `measure memory` command `run --check` prints), simulates each searchable point on a fresh server with no step roofline, and writes the results; it never calibrates, and runs at the integration head, on the target machine type, in a GPU container. Amends `13` D80: it starts the client and takes a workload, and `run --check` resolves a prefill or decode side. | 2026-11-13 (#3355, #3363) |
+| D109 | `compass advice SPACE OUT` checks each candidate (searchable, missing a law, calibrating, refused) and each point's readings (missing readings, with the `measure memory` command `run --check` prints), simulates each searchable point on a fresh server with no step roofline, and writes the results; it never calibrates, and runs at the integration head, on any host's CPU with no GPU device. Amends `13` D80: it starts the client and takes a workload, and `run --check` resolves a prefill or decode side. | 2026-11-13 (#3355, #3363); any host's CPU with no GPU device 2026-11-24 ([#4006 Ruling](https://github.com/jgong5/ATOM/pull/4006#issuecomment-7130990480)) |
 | D110 | The user provides the space file, by hand or through an agent following the guide from what the user asks for, a recipe or real-run arguments; it names the shared store and, for a frozen search, its commit; it expands deterministically into candidates, each naming its ATOM basis and departures; the templates live in `scripts/compass/spaces/`, no default; it is the search's input, not a level of `13` D79's precedence nor the config file it rejects. Its format: one JSON object, the dimensions' product less the exclusions, each candidate `common`'s block and its values', two blocks setting one thing apart refused; a candidate offloading to a Mooncake Store names its run-file entry, which every point takes. | 2026-11-13 (#3355, #3363); D79 settled 2026-11-14 ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927)); the format 2026-11-14 (#3448); the `lmcache_server` field, each offloading point's port and the router's flags 2026-11-15 ([#3477](https://github.com/jgong5/ATOM/issues/3477#issuecomment-6887140315)); the `mooncake_store` field 2026-11-24 ([#3670](https://github.com/jgong5/ATOM/issues/3670)) |
 | D111 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. A 1P1D point's GPUs are its prefill side's plus its decode side's, each from its own engine record. | 2026-11-13 (#3355); the GPU count 2026-11-14 ([#3454](https://github.com/jgong5/ATOM/issues/3454)) |
 | D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage (a decode vector for every scheduled rung before the search, each point's extrapolated share reported after it) and `08` D47's three figures on each leave-one-run-out fold within #627's 5% gate, a law at the head past it refused; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose ATOM digest is not the head's, the remote tip's or a frozen commit's, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363; the head by ATOM's digest, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957); coverage in two parts, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216); the accuracy bar, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6869501859)); requirement 2's readings taken again by `07` D41's rule, 2026-11-17 ([#2899](https://github.com/jgong5/ATOM/issues/2899)) |
