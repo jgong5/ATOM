@@ -538,9 +538,10 @@ def pick_fitted(run: dict, name: str, config) -> None:
 def refuse_unfitted_law(run: dict, config) -> None:
     """Refuse the run file's step linear law where `config` is not what it was
     fitted under: its engine config, at its ladder where this run's is a prefix
-    of it (`at_ladder`), which states its tensor-parallel width,
-    context-parallel width 1, a data-parallel group on one node, and its
-    platform, which the run file's machine spec must state."""
+    of it (`at_ladder`), which states its tensor-parallel and decode
+    context-parallel widths (`keyed`), prefill context-parallel width 1, a
+    data-parallel group on one node, and its platform, which the run file's
+    machine spec must state."""
     from atom.compass.artifacts import Kind, keyed_platform, machine_platform
     from atom.compass.backends.step_grid_plan import at_ladder
     from atom.compass.run.step_grid import differ, keyed
@@ -557,7 +558,7 @@ def refuse_unfitted_law(run: dict, config) -> None:
             "the step linear law was fitted under another engine config: "
             + "; ".join(named)
         )
-    refuse_context_parallel(STEP_LINEAR, config)
+    refuse_context_parallel(STEP_LINEAR, config, PREFILL_CONTEXT_PARALLEL)
     # A node running fewer ranks than the group holds is one of several, and
     # ATOM hands MoRI its ranks times the TP width as the GPUs per node
     # (`moe.py::FusedMoEParallelConfig.make`).
@@ -623,13 +624,19 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
         )
 
 
-def refuse_context_parallel(name: str, config) -> None:
-    """Refuse a context-parallel `config` for the run file's `name`, a law or a
-    bundle: neither's engine config states a context-parallel width."""
+#: The context-parallel widths, each a config field.
+CONTEXT_PARALLEL = ("prefill_context_parallel_size", "decode_context_parallel_size")
+#: Those a step linear law's engine config cannot state: the decode width it
+#: keys (`step_grid.keyed`), so `refuse_unfitted_law` holds it to this run's.
+PREFILL_CONTEXT_PARALLEL = CONTEXT_PARALLEL[:1]
+
+
+def refuse_context_parallel(name: str, config, widths=CONTEXT_PARALLEL) -> None:
+    """Refuse a `config` above width 1 in any of the context-parallel `widths`
+    for the run file's `name`, a law or a bundle, whose engine config states
+    none of them: a bundle states neither, a law no prefill width."""
     cp = {
-        width: getattr(config, width)
-        for width in ("prefill_context_parallel_size", "decode_context_parallel_size")
-        if getattr(config, width) != 1
+        width: getattr(config, width) for width in widths if getattr(config, width) != 1
     }
     if cp:
         raise ValueError(
