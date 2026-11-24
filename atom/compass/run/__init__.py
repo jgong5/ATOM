@@ -448,12 +448,11 @@ COMPASS_ONLY = {
     "utils/zmq_shim.py": {"_Socket", "_ChannelSocket", "_Context"},
 }
 #: A simulated server's tokenizer environment. The segment tokenizer encodes a
-#: long prompt's uncached segments in one ``encode_batch`` call (20 texts a
-#: call, ~110K tokens a prompt, in an 8P16D C1228 run's opening burst), and
-#: while its station job is open the frontend's clock stands still, so every
-#: other LP waits on its wall time: single-threaded, as the C1228 recipe's
-#: environment sets it, a 16-text batch of 1.3M tokens took 2.1 s, in
-#: parallel 0.12 s, the same ids.
+#: long prompt's uncached segments in one ``encode_batch`` call, and while its
+#: station job is open the frontend's clock stands still, so every other LP
+#: waits on its wall time; the C1228 recipe's environment turns the backend's
+#: parallelism off, which jgong5/ATOM#3992 measured. In parallel the ids are
+#: the same.
 _PARALLEL_TOKENIZER = {"TOKENIZERS_PARALLELISM": "true"}
 #: The module `pip install -e .` writes (setuptools_scm) and git ignores: no
 #: commit holds it, so the host-law key leaves it out.

@@ -631,8 +631,8 @@ def _look(alive: set | None) -> tuple[list[str], set, bool]:
 def _tasks_of(loop) -> list:
     """The tasks of `loop`, some perhaps done, in one pass: `asyncio.all_tasks`
     walks a `WeakSet` item by item in Python and checks each task's loop
-    through a Python helper, about 0.4 ms at the 3,000 tasks of a c=1228
-    client, once a clock call. Before 3.14 every task is in
+    through a Python helper, over every open session's task once a clock call
+    (jgong5/ATOM#3992 measured it). Before 3.14 every task is in
     ``asyncio.tasks._scheduled_tasks`` (or ``_eager_tasks`` while it runs
     eagerly), whose weak references are read here directly; 3.14 keeps
     native tasks elsewhere, so there it asks `asyncio.all_tasks`."""
