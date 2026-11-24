@@ -76,7 +76,9 @@ PREFILL = [(b, t, c) for b in (1, 8) for t in (16, 256) for c in (0, 768)]
 GRID = ("--backend", "step-grid", "--grid")
 #: The bench's reply for a batch on `test_bench_window.py`'s planted device,
 #: whose kept repeats a measurement publishes as they are.
-BENCHED = Bench(itertools.repeat(MS), itertools.repeat(BUSY)).bench_step(bench_batch())
+BENCHED = Bench(itertools.repeat(MS), itertools.repeat(BUSY)).bench_step(
+    bench_batch(), window.REPEATS
+)
 
 
 def batch(rows, output=True) -> dict:
