@@ -1237,6 +1237,17 @@ PYTHONPATH=$T python3 $T/scripts/compass/check_v1.py DESIGN OUT --law LAW --host
   segment's step combinations (rung, who holds it, ranks busy; ranks prefilling, tokens,
   rows, history, duty) with the plan's, and repeats the identifiability on the record's own
   GPU-bound steps, with each base form's residuals per segment.
+- `plan_v1.py --target RECORD` (repeatable; a real record, or a simulated one, which writes
+  the same step lines) also reports each vector's error at the target workload's own
+  GPU-bound steps: the mean (target-weighted I criterion), 95th percentile and worst, not
+  gated. G and I are variance under the stated form; form bias shows only in the record's
+  residuals per segment and in held-out grading.
+- A config may `extend` another and `insert` segments into it, and a segment of kind
+  `copy` generates another segment again under its own name (new traces, so it hits no
+  cache the first left): `cellA_v1x.json` is `cellA_v1.json` with D-v1 repeated mid-record
+  and at the end as anchors (a per-record scale factor), and lockstep drains of k = 2, 3, 4
+  ranks at one per-rank size plus a 64/32/16/8 mix, for a lockstep term the law does not
+  price yet: about 30 GPU minutes rehearsed, against cellA_v1's 25.
 
 On pit2-p03-g08, `cellA_v1.json` rehearsed on the e3v2 baseline law p752b0 (LAW
 70714789a2a1, HOST cb0f72ca70f2) in 2 CPU s: 11 segments, about 25 GPU minutes predicted

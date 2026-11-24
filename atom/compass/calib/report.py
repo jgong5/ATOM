@@ -118,6 +118,25 @@ def render_vectors(vectors: list[dict]) -> list[str]:
     return lines
 
 
+def render_target(vectors: list[dict]) -> list[str]:
+    """Each vector's variants' error at the target's steps (`ident.assess`)."""
+    lines = [
+        "| vector | variant | target steps | I (mean) | p95 | worst |",
+        "|---|---|--:|--:|--:|--:|",
+    ]
+    for v in vectors:
+        for i, x in enumerate(v["variants"]):
+            t = x.get("target")
+            if not t:
+                continue
+            off = f" ({t['off_design']} off the design)" if t.get("off_design") else ""
+            lines.append(
+                f"| {v['vector'] if i == 0 else ''} | {x['variant']} | {t['steps']}{off} | "
+                f"{_g(t['i'])} | {_g(t['p95'])} | {_g(t['max'])} |"
+            )
+    return lines
+
+
 def render_vif(vectors: list[dict]) -> list[str]:
     """Each vector's first passing variant's (else first variant's) VIF per column."""
     lines = []

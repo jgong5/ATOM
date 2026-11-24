@@ -345,7 +345,14 @@ GENERATORS = {
 
 def generate(cfg: Config) -> list[Segment]:
     out = []
+    specs = {s["name"]: s for s in cfg.segments}
     for seg in cfg.segments:
+        if seg["kind"] == "copy":  # the same segment again, as an anchor
+            src = specs[seg["of"]]
+            if src["kind"] == "copy":
+                raise ValueError(f"segment {seg['name']}: copies a copy, {seg['of']}")
+            purpose = seg.get("purpose", f"anchor: {seg['of']} again")
+            seg = {**src, "name": seg["name"], "purpose": purpose}
         if seg["kind"] not in GENERATORS:
             raise ValueError(f"segment {seg['name']}: no generator {seg['kind']!r}")
         made = GENERATORS[seg["kind"]](seg, cfg)

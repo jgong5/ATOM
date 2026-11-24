@@ -56,16 +56,26 @@ def _labels(paths) -> dict | None:
     return out or None
 
 
-def record_steps(record: Path, design: dict, cfg, law: Law):
+def steps_dir(record) -> Path:
+    """A record's step files: `cal_v1.sh`'s server --out (``real/steps``), a
+    record directory's ``steps``, or the directory itself."""
+    record = Path(record)
+    for d in (record / "real" / "steps", record / "steps", record):
+        if (d / "dp0.jsonl").exists():
+            return d
+    raise FileNotFoundError(f"no dp0.jsonl under {record}")
+
+
+def record_steps(record: Path, design: dict | None, cfg, law: Law, segment=None):
     """The record's steps as `engine.Step`s, each under its segment, and
-    per step its measured device seconds at the priced rank (None where none)."""
+    per step its measured device seconds at the priced rank (None where none).
+    With `segment`, every step of the record is that segment's and no client
+    run is read: a target workload's record (`ident.vectors`' `target`)."""
     dep = cfg.deployment
-    steps_dir = Path(record) / "real" / "steps"  # cal_v1.sh's server --out
-    if not steps_dir.is_dir():
-        steps_dir = Path(record) / "steps"
-    paths = sorted(steps_dir.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
-    lanes = exports(Path(record), design)
-    owner = served(steps_dir, [p for *_, p in lanes])
+    sdir = steps_dir(record)
+    paths = sorted(sdir.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
+    lanes = [] if segment else exports(Path(record), design)
+    owner = {} if segment else served(sdir, [p for *_, p in lanes])
     seg_of = {k: lanes[k][0] for k in range(len(lanes))}
     ranks = [read_jsonl(p) for p in paths]
     dummies, peaks = step_labels.group_dummies(ranks), step_labels.group_peaks(ranks)
@@ -85,9 +95,9 @@ def record_steps(record: Path, design: dict, cfg, law: Law):
         group = {r: x[n] for r, x in enumerate(at) if n in x}
         real = {r: g for r, g in group.items() if not g[0]["is_dummy_run"]}
         runs = {whose.get((r, n)) for r in real} - {None}
-        if not real or len(runs) != 1:
+        if not real or (len(runs) != 1 and not segment):
             continue
-        seg = seg_of[runs.pop()]
+        seg = segment or seg_of[runs.pop()]
         kinds = {bool(row[2]) for s, _ in real.values() for row in s["rows"]}
         if len(kinds) != 1:
             continue  # mixed rows: a fit cuts it
