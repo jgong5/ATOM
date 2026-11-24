@@ -105,6 +105,7 @@ def decode_vertices(cfg: Config, rung: int) -> list[BatchView]:
                         dp_rank=0 if dp > 1 else None,
                         group_dummies=dummies,
                         prefill_duty=0.0,
+                        kda=dep.kda(rows),
                     )
                 )
     return out
@@ -153,6 +154,7 @@ def prefill_vertices(cfg: Config) -> list[BatchView]:
                                     ),
                                     group_tail=output and dp > 1,
                                     prefill_duty=duty,
+                                    kda=dep.kda(rows),
                                 )
                             )
     return out

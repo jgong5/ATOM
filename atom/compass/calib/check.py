@@ -134,6 +134,7 @@ def record_steps(record: Path, design: dict | None, cfg, law: Law, segment=None)
                 group_tail=dp and n in tails,
                 group_needs_eager=s.get("group_needs_eager") or False,
                 prefill_duty=duty,
+                kda=tuple(s["kda"]) if "kda" in s else None,
             )
             views.append((r, view, *law.price(view)))
         if not views:

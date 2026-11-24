@@ -24,6 +24,8 @@ A config is a JSON document:
                                          # acceptance length (0 and 1: none)
         "prefix_unit": 128,              # tokens a prefix-cache hit comes in
                                          # (the block, or a state checkpoint)
+        "kda_state": false,              # a KDA model: views state its state
+                                         # work (`Deployment.kda`)
         "prefill_buckets": [...],        # prefill token-graph buckets
         "moe_routing": [E, K],           # routed experts and top-k, or null
         "trace_model": "...",            # the traces' model name
@@ -113,6 +115,10 @@ class Deployment:
     trace_block: int = 64
     tp: int = 1
     dcp: int = 1
+    #: A model with KDA layers: each row of a step holds a recurrent state, and a
+    #: view states the step's state work as `BatchView.kda` (`kda`), which the
+    #: law's KDA prefill columns read. Off: views state none, as before.
+    kda_state: bool = False
 
     def __post_init__(self) -> None:
         if self.dp < 1 or not self.rungs or list(self.rungs) != sorted(set(self.rungs)):
@@ -143,6 +149,21 @@ class Deployment:
         """The widest-rank row counts that replay `rung`."""
         i = self.rungs.index(rung)
         return range((self.rungs[i - 1] if i else 0) + 1, rung + 1)
+
+    def kda(self, rows) -> tuple[int, int, int, int] | None:
+        """`BatchView.kda` of a step of `rows` (`RequestShape`s) under
+        `kda_state`, else None: every row holds a state; no midstep save and no
+        fork (a prefix hit resumes through a paged checkpoint restore); one move
+        for each prefill row resuming past its first token (that restore, or the
+        store of the checkpoint its previous chunk ended on). On GLM-5.3-Flash's
+        step A record (TP4, MTP3) this gave a prefill step's real moves exactly
+        on 88% of its 392 prefill steps (correlation 0.85)."""
+        if not self.kda_state:
+            return None
+        resumed = sum(
+            1 for r in rows if not r.decode and r.context_tokens > r.query_tokens
+        )
+        return (len(rows), 0, 0, resumed)
 
     def cached(self, tokens: int) -> int:
         """The prefix-cache hit on `tokens` of history: whole `prefix_unit`s."""
@@ -279,7 +300,7 @@ def from_record(record) -> dict:
     ``dp0.acceptance.json``); and the model's config.json, where it can be
     read, for the routed experts and top-k, and for a model with KDA layers
     (``linear_attn_config``) the state checkpoint interval a prefix hit lands
-    on, refused below one token. `$VAR`s in the path expand. A field the
+    on, refused below one token, and `kda_state`. `$VAR`s in the path expand. A field the
     record does not state is left out."""
     record = Path(os.path.expandvars(str(record)))
     if not (record / "run.json").exists() and (record / "real" / "run.json").exists():
@@ -340,6 +361,7 @@ def from_record(record) -> dict:
                     "prefix hit lands on no fixed unit"
                 )
             out["prefix_unit"] = interval
+            out["kda_state"] = True
     return out
 
 
@@ -377,6 +399,7 @@ def parse(raw: dict, record=None) -> Config:
         trace_block=int(d.get("trace_block", 64)),
         tp=int(d.get("tp", 1)),
         dcp=int(d.get("dcp", 1)),
+        kda_state=bool(d.get("kda_state", False)),
     )
     columns = raw["columns"]
     for kind in ("decode", "prefill"):
