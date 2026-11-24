@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 """The aiter JIT modules a real server built, or began to, while it served,
-which run.json names as ``aiter_jit_builds`` and grading, the fits and
-`validate.cost` refuse (`step_labels.refusal`).
+which run.json names as ``aiter_jit_builds`` and times as ``jit_compiles``, one
+entry per compile with its artifact and its first and last file's mtime. The
+fits and `validate.cost` cut the steps that overlap one, or refuse the record
+(`step_labels.cut_refusal`); grading refuses a run that names one
+(`step_labels.refusal`).
 
 aiter builds a module the first time a process meets a kernel variant its
 image did not prebuild, and keeps it for every later process of that aiter
@@ -27,7 +30,7 @@ Inductor into it, and the stop removes it, so every process pays its compiles.
 
     python -m atom.compass.drive.aiter_jit RUN_JSON SINCE_NS
 
-adds the entry to RUN_JSON for the paths written at or after SINCE_NS, wall
+adds the entries to RUN_JSON for the paths written at or after SINCE_NS, wall
 clock nanoseconds, as `cctraces_sim.sh` does for a real cell.
 """
 
@@ -41,7 +44,12 @@ from pathlib import Path
 from torch._inductor.runtime.cache_dir_utils import default_cache_dir
 from triton import knobs
 
-from atom.compass.backends.step_labels import BUILDS, refusal  # noqa: F401
+from atom.compass.backends.step_labels import (  # noqa: F401
+    BUILDS,
+    COMPILES,
+    cut_refusal,
+    refusal,
+)
 from atom.compass.run import _write_whole
 
 
@@ -71,38 +79,58 @@ def _file(name: str) -> str:
     return name.split(".")[0].removeprefix("__grp__")
 
 
-def _module(parts: tuple[str, ...]) -> str | None:
+def _module(parts: tuple[str, ...]) -> tuple[str, tuple] | None:
     """The module whose build directory holds the path `parts` names under a
-    root: the directory after its first ``build``, when the path is inside it."""
+    root, the directory after its first ``build`` when the path is inside it,
+    and that directory's parts; or `compile_hsaco`'s kernel there, and its
+    files' parts less their suffix."""
     i = parts.index("build") if "build" in parts else len(parts)
     if len(parts) > i + 2 and parts[i + 1].startswith("gfx"):  # compile_hsaco's
-        return _file(parts[i + 2])
-    return parts[i + 1] if len(parts) > i + 2 else None
+        return _file(parts[i + 2]), (*parts[: i + 2], _file(parts[i + 2]))
+    return (parts[i + 1], parts[: i + 2]) if len(parts) > i + 2 else None
+
+
+def _flydsl(parts: tuple[str, ...]) -> tuple[str, tuple] | None:
+    """A FlyDSL kernel, named by its directory, and one build of it: the key
+    its ``<key>.lock`` and ``<key>.pkl`` share, as parts. A directory holds a
+    build per key, each compiled on its own."""
+    return (parts[0], (*parts[:-1], _file(parts[-1]))) if len(parts) > 1 else None
 
 
 #: How each compiler names the compile that wrote a path, given its parts under
-#: the compiler's root.
+#: the compiler's root, with the parts naming its artifact: the directory or
+#: the path less suffix that the compile's files, and no other's, share.
 NAMES = {
     "aiter": _module,
-    "flydsl": lambda parts: parts[0] if len(parts) > 1 else None,
-    "triton": lambda parts: _file(parts[-1]),
-    "inductor": lambda parts: _file(parts[-1]),
+    "flydsl": _flydsl,
+    "triton": lambda parts: (_file(parts[-1]), parts[:-1]),
+    "inductor": lambda parts: (_file(parts[-1]), parts[:-1]),
 }
 
 
 def builds_since(since_ns: int) -> dict:
-    """run.json's entry naming each aiter JIT module or compiled kernel with a
-    file written at or after `since_ns`, wall clock nanoseconds; {} when none
-    was."""
-    built = set()
+    """run.json's entries for each aiter JIT module or compiled kernel with a
+    file written at or after `since_ns`, wall clock nanoseconds: its name in
+    `BUILDS`, and in `COMPILES` each compile, one per artifact (`NAMES`), with
+    its first and last such file's mtime; {} when none was."""
+    spans = {}
     for root, compiler in _roots().items():
         for top, _, files in os.walk(root):
             for path in (Path(top, f) for f in files):
                 with suppress(FileNotFoundError):  # a temporary since renamed
-                    if path.lstat().st_mtime_ns >= since_ns:
-                        built.add(NAMES[compiler](path.relative_to(root).parts))
-    built.discard(None)
-    return {BUILDS: sorted(built)} if built else {}
+                    ns = path.lstat().st_mtime_ns
+                    parts = path.relative_to(root).parts
+                    if ns >= since_ns and (named := NAMES[compiler](parts)):
+                        key = (compiler, named[0], str(Path(root, *named[1])))
+                        first, last = spans.get(key, (ns, ns))
+                        spans[key] = (min(first, ns), max(last, ns))
+    if not spans:
+        return {}
+    compiles = [
+        {"compiler": c, "name": n, "artifact": a, "first_ns": f, "last_ns": t}
+        for (c, n, a), (f, t) in sorted(spans.items(), key=lambda kv: kv[1])
+    ]
+    return {BUILDS: sorted({n for _, n, _ in spans}), COMPILES: compiles}
 
 
 def main(argv=None) -> None:
