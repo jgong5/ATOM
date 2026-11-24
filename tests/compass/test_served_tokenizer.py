@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from atom.compass import run as compass_run
+from atom.compass.backends.json_file import read_json
 from atom.compass.clock import LpId, single_engine_table
 from atom.compass.run import step_grid
 from atom.compass.spec.rules import FingerprintMismatch
@@ -387,10 +388,10 @@ def test_the_summary_names_each_term_the_run_charged_nothing_for(
 
 
 @pytest.mark.parametrize(
-    "law", sorted(p.name for p in (REPO / "scripts/compass/laws").glob("*.json"))
+    "law", sorted(p.name for p in (REPO / "scripts/compass/laws").glob("*.json.xz"))
 )
 def test_every_committed_law_file_charges_both_terms(monkeypatch, tmp_path, law):
-    host = json.loads((REPO / "scripts/compass/laws" / law).read_text())["host"]
+    host = read_json(REPO / "scripts/compass/laws" / law)["host"]
     _run_file(monkeypatch, tmp_path, {"host": host})
     compass_run.spec()
     assert compass_run.http_intake() is not None

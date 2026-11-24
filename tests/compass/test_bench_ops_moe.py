@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """`compass measure ops` on an MoE leaf: the router's top-k expert ids it reads
-are drawn independently and uniformly per copy, and their loads recorded."""
+are drawn independently and uniformly per copy, and their loads recorded; under
+expert parallelism it takes its layer's expert mask, and under MORI every row it
+holds as received."""
 
 import sys
 from types import SimpleNamespace
@@ -11,6 +13,7 @@ import torch
 from test_bench_ops import _Runner
 
 from atom.compass.bench import ops
+from atom.model_ops.fused_moe.expert_layout import determine_expert_map
 from atom.utils import forward_context as fctx
 
 I32, F32 = "torch.int32", "torch.float32"
@@ -292,3 +295,64 @@ def test_a_block_table_as_wide_as_top_k_or_atom_s_ids_buffer_keeps_its_blocks(
     assert stub.placed[0][1]["sig", "block_tables"][0] == "block_tables"
     assert all(c["block_tables"].eq(5).all() for c in copies)
     assert record["routing"] is None
+
+
+class _EpExperts(_Experts):
+    """An MoE layer of rank `rank` of `ep` under expert parallelism, its expert
+    mask as ATOM's layer builds it: ones on the experts ATOM's map gives the
+    rank, none on the sentinel id past them."""
+
+    def __init__(self, experts, top_k, ep, rank):
+        super().__init__(experts, top_k)
+        _, owned = determine_expert_map(ep, rank, experts)
+        owned = torch.cat((owned, torch.tensor([-1], dtype=torch.int32)))
+        self.expert_mask = (owned > -1).to(torch.int32)
+
+
+def _masked(mask):
+    """MOE with an expert mask of `mask` entries and a weight the step holds
+    three of, so copies past the first take weights of their own."""
+    stated = {"expert_mask": _spec([mask], role="weight")}
+    stated["w1"] = _spec([4, 3, 3], F32, "weight")
+    return {"op": MOE["op"], "args": MOE["args"] | stated, "occurrences": 3}
+
+
+def test_under_expert_parallelism_every_copy_takes_the_layer_s_mask_of_the_rank():
+    # Rank 1 of 4 owns experts 4 to 7 of 16. aiter computes a route only where
+    # the mask holds a one: a mask of zeros leaves the leaf nothing to compute.
+    runner = _Runner()
+    runner.model.append(_EpExperts(16, 2, 4, 1))
+    stub = ops.Stub(runner, 10_000)
+    stub.placed = [(fctx.ForwardContext(), {})]
+
+    record, copies = _timed(stub, _masked(17), 1)
+
+    assert len(copies) == 3
+    for copy in copies:
+        mask = copy["expert_mask"]
+        assert mask.dtype == torch.int32 and mask.device == runner.device
+        assert mask.tolist() == [0] * 4 + [1] * 4 + [0] * 9
+    assert len(record["routing"]["activated"]) == 3
+
+
+def test_an_expert_mask_no_moe_layer_holds_refuses_by_name():
+    # A model without expert parallelism holds no mask, and one of 16 experts
+    # under it holds none of 33 entries.
+    for layer in (_Experts(16, 2), _EpExperts(16, 2, 4, 1)):
+        runner = _Runner()
+        runner.model.append(layer)
+        stub = ops.Stub(runner, 10_000)
+        stub.placed = [(fctx.ForwardContext(), {})]
+
+        with pytest.raises(ValueError, match=r"holds an expert mask of \[33\]"):
+            stub._copy(_masked(33), "sig", [{}], 0)
+
+
+def test_mori_s_received_row_count_is_every_row_the_leaf_holds():
+    # Under MORI, aiter's fused MoE sorts only the rows the dispatch counts as
+    # received: a count of zero leaves it no row to compute.
+    moe = {"op": MOE["op"], "args": MOE["args"] | {"num_local_tokens": _spec([1])}}
+
+    _, copies = _timed(_stub((16, 2)), moe, 3)
+
+    assert [c["num_local_tokens"].tolist() for c in copies] == [[4]] * 3

@@ -90,6 +90,11 @@ the host block leaves the spec. The tokenizer rates and the HTTP intake are term
 record` server served (D25, `07` D38); `host.cpu`, `host.ipc`, the class 0 probes and the
 `http-intake` probe go (D26).
 
+**Revised 2026-11-17 by [#3121](https://github.com/jgong5/ATOM/issues/3121):** a shipped
+law that carries memory readings has its platform's readings entry committed, which every
+command reads where its store holds none at that key, so a host with no GPU composes that
+law's platform (D24).
+
 **Scope.** The inputs that tell Compass what machine it is simulating, the layers they
 split into, their schema, and the commands that fill them in. A project requirement is
 that compute, memory size, bandwidth and interconnect are **configured and not read from
@@ -148,7 +153,7 @@ node's value and stated no band across the others.
 | Layer | Varies with | What it is | Written by | Read by |
 |---|---|---|---|---|
 | 1. device datasheet | the SKU | a file, `atom/compass/devices/<sku>.json`, named by SKU or by path | a person, from the vendor's datasheet | `fit device --assume-from` and every command that prices |
-| 2. platform readings | device, stack, PTL and torch, its key | a `platform_readings` store entry, one per key, never replaced | `compass fit device`, from the probe records `compass measure device` publishes per node, or from another device's entry, assumed (D26) | every command that prices |
+| 2. platform readings | device, stack, PTL and torch, its key | a `platform_readings` store entry, one per key, never replaced, or a shipped law's platform's committed copy (below) | `compass fit device`, from the probe records `compass measure device` publishes per node, or from another device's entry, assumed (D26) | every command that prices |
 | 3. network file | the scale-out network | a file, `atom/compass/networks/<name>.json`, named by name or by path | a person, or the class 3 probe (D26) | a run across nodes |
 | 4. host block | the host CPU, ATOM source, model, engine config, device, stack and torch, the host laws' key | the `host_laws` entry's `tokenizer` and `http_intake` terms (D25); the router's hop its `hops`' `router_s` | `compass fit host`, from `compass record`'s records (`07` D38); `router_s` stated, an assumed 1.5 ms ([#3009](https://github.com/jgong5/ATOM/issues/3009)) | `run`'s tokenizer and HTTP intake charges (`06` D33) |
 | 5. keys | — | the platform fields of every artifact key (`07` D41) | every publisher, from what its inputs read | every reader |
@@ -165,12 +170,30 @@ publishes under a new key where a fit to the old one would refuse.
 
 **A run's platform is read from the entries it prices with.** A user names the device and
 its PTL state, `--stack`, which names a stack and a torch, only when the store holds
-readings of several for them and the entries it prices with state none, and `--network`
-for a run across nodes (`13` D80). The run composes the datasheet, the readings entry
-and, across nodes, the network file into one machine spec, with the field paths of D25,
-and echoes it into every run artifact (D25 rule 4). A command whose inputs carry their
-platform, a GPU command from its cards and a fit from its records, names none: it keys
-what it read.
+readings of several for them, or none and the committed copies (below) several, and the
+entries it prices with state none, and `--network` for a run across nodes (`13` D80).
+The run composes the datasheet, the readings entry and, across nodes, the network file
+into one machine spec, with the field paths of D25, and echoes it into every run artifact
+(D25 rule 4). A command whose inputs carry their platform, a GPU command from its cards
+and a fit from its records, names none: it keys what it read.
+
+**A shipped law's platform readings.** A host with no GPU publishes no readings entry, so
+a shipped law that carries memory readings (`07` D41) has its platform's entry committed
+under `scripts/compass/laws/platform_readings/`, as the readable copy `fit device` writes,
+unedited and named by its key's token: one copy per key, the entry `fit device` folds from
+every probe record published at that key, as D26 folds a platform's nodes, kept while
+such a law states its platform. The first is MI355X's at the DeepSeek-V4-Pro DPA8 1P1D
+laws' platform. Every command that reads a readings entry reads the copy where its store holds
+none at the device, PTL state and stack it reads (`atom/compass/fit/device.py::readings`),
+so a user's own entry comes first, and the composed spec names the store or file it
+read. The copy is the entry at the run's own key, which holds no ATOM source (`07` D43):
+it serves every tree, is never re-keyed and keeps its origins, where a law file's memory
+readings, carried across trees, are assumed. Carried in each law file instead, a platform's readings would
+be stated once per law, and two laws of one platform could carry two stores' entries,
+which for MI355X at aiter 41d4d8d7e read bf16 0.6399 and 0.6314
+([#3300](https://github.com/jgong5/ATOM/issues/3300),
+[#2721](https://github.com/jgong5/ATOM/issues/2721)): the per-node values this rule
+replaced.
 
 ### Open issues
 
@@ -350,8 +373,8 @@ it carries Mooncake's KV transfer between the prefill and the decode node (`01` 
 
 ### Schema rules
 
-1. **No default for a memory reading.** A configuration with no `memory_readings` entry
-   **refuses and names it** (`07` D38). These are the terms with no law behind them; a
+1. **No default for a memory reading.** A configuration with no `memory_readings` entry,
+   and no law file's (`07` D41), **refuses and names it** (`07` D38). These are the terms with no law behind them; a
    silent default is the worst kind of wrong.
 2. **`derate` is mandatory wherever a spec-peak number appears**, so nobody can quietly
    use a datasheet FLOP as an achievable one. The peak is the datasheet's, and the
@@ -544,7 +567,7 @@ with them.
 
 - a missing required field, in whichever layer holds it
 - a field in a layer that does not hold it
-- no readings entry for the device and PTL state, or several the run cannot choose between (D24)
+- no readings entry for the device and PTL state, in the store or committed, or several the run cannot choose between (D24)
 - entries that disagree on the platform (D25 rule 3)
 
 The composed spec in `run.json` states each field with its value and origin, one entry per
@@ -573,7 +596,7 @@ single term.
 
 | # | Decision | Date |
 |---|---|---|
-| D24 | The spec describes the machine; ATOM's config describes the deployment. Thread-pool width becomes an ATOM config option, not a Compass one. Revised: a value is stated once, in the layer that names what it varies with: a device datasheet per SKU, platform readings per (device, stack, PTL, torch), a network file per scale-out network that only a run across nodes reads, the host block in host laws (#2309) and the router's hop a host transport cost in the host laws' `hops` (#2714, #3009); each artifact kind keys the device, stack, PTL and torch its invalidation row marks, read from its records, in place of the machine-spec digest; a run's platform is read from the entries it prices with, the user naming device and PTL, the stack only when the store holds several, and the network for a run across nodes. | 2026-09-18; layers 2026-11-03 (#2716, [ruling on #2724](https://github.com/jgong5/ATOM/pull/2724#issuecomment-6596632012)) |
+| D24 | The spec describes the machine; ATOM's config describes the deployment. Thread-pool width becomes an ATOM config option, not a Compass one. Revised: a value is stated once, in the layer that names what it varies with: a device datasheet per SKU, platform readings per (device, stack, PTL, torch), a network file per scale-out network that only a run across nodes reads, the host block in host laws (#2309) and the router's hop a host transport cost in the host laws' `hops` (#2714, #3009); each artifact kind keys the device, stack, PTL and torch its invalidation row marks, read from its records, in place of the machine-spec digest; a run's platform is read from the entries it prices with, the user naming device and PTL, the stack only when the store holds several, or none and the committed copies several, and the network for a run across nodes. Revised: a shipped law that carries memory readings has its platform's readings entry committed, one copy per key, which every command reads where its store holds none at that key, the copy keeping its origins. | 2026-09-18; layers 2026-11-03 (#2716, [ruling on #2724](https://github.com/jgong5/ATOM/pull/2724#issuecomment-6596632012)); a shipped law's platform readings committed 2026-11-17 ([#3121](https://github.com/jgong5/ATOM/issues/3121)) |
 | D25 | Four-section schema: `provenance`, `host`, `device`, `interconnect`. Mandatory derates, no memory readings (`measure memory`'s entries, 2026-10-14), activations included (2026-10-16), `software_pinned_to` checked, torch included, as the target's stack, whole spec echoed into every artifact. Revised for the MI455 projection: an optional dense `fp4_flops`, `intra_node.domain_devices` for a scale-up fabric wider than a node, and every field given an origin, `datasheet`, `probed` or `assumed`, `provenance.origin` and per field `provenance.origins` with a probe's subject, kept across a save. Revised: a `host.http_intake` pair, the event loop's charge per HTTP request taken in, required once every committed spec stated it. An optional `host.http_intake.idle_s`, a lone request's intake. An optional per-link `link_setup_s`, charged once on a rank pair's first KV write. Revised for the attainable-peak roofline: a `derate` is attainable over datasheet, probed, one per compute format; an optional `memory.bandwidth_curve` and an optional `kernel_floor_s`; a device never run carries a probed device's derates, assumed; MI455 has two specs, the A0 samples' probed on their node and the B0 machines' carrying MI355X's derates, assumed, as the frozen projection took them, until a B0 node is probed. A probed number carries its measured p10 and p90 beside its subject, and a spec stating one without them is refused by name before it is written. Revised: three documents, a datasheet, a readings entry and a network file, each holding its own fields and their origins, composed for a run into one spec with the same field paths; `software_pinned_to` and `device.ptl` leave the documents for the readings key; a measured readings entry holds attainable rates and an assumed one the source's ratios, composed into derates with the datasheet as it stands, so no entry names a datasheet, and a peak with no derate is left out of the composition; `router_relay_s` leaves the spec for the host laws' `router_s` hop (#3009); the stack check becomes: entries one run reads must agree. Revised: the host block leaves the spec; the tokenizer rates and the HTTP intake are the `tokenizer` and `http_intake` terms of the `host_laws` entry, keyed by model with the tokenizer's backend and fingerprint checked and no derate, and a missing term charges 0 s, named in the run summary; `host.cpu` and `host.ipc` go with no reader. Revised: the `tokenizer` term prices one-item and several-item encodes as two kinds and a decode with no slope as `fixed_s` alone inside its token hull, each kind optional. Revised: a `segment` kind prices the segment tokenizer call's own work over the ids its `encode_batch` returns. Revised: an optional `segment.chars_per_s` prices its stored-prefix search over the characters it compares. | 2026-09-18; revised 2026-10-10; torch 2026-10-13 (#851); origin 2026-10-14 (#952); intake 2026-10-16 (#1103), required 2026-10-18 (#1230); idle intake 2026-10-20 (#1775); link setup 2026-10-16 (#1172); activations and the transfer origin dropped 2026-10-16 (#1226); attainable peaks 2026-10-17 (#1392); `host.admission_fixed_s` dropped 2026-10-17 (#1000); bands 2026-10-18 (#1482, #1518); MI455 probed 2026-10-25 (#2138), split into A0 and B0 2026-10-28 (#2141); layers 2026-11-03 (#2716, [ruling on #2724](https://github.com/jgong5/ATOM/pull/2724#issuecomment-6596632012)); host block to host laws 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)); tokenizer kinds 2026-11-05 ([#2751](https://github.com/jgong5/ATOM/issues/2751#issuecomment-6655175759)); segment tokenizer 2026-11-09 ([#2618](https://github.com/jgong5/ATOM/issues/2618)); its stored-prefix search 2026-11-09 ([#3083](https://github.com/jgong5/ATOM/issues/3083)) |
 | D26 | Probes emit fragments; `merge` / `validate` / `explain` combine and check them. Four hardware probe classes plus a datasheet path; the transfer path dropped 2026-10-14 (#937). Every hardware probe implements the contamination refusals. All are the `spec` package's functions, run by per-machine scripts, with no `compass` command. Machine specs are developers', one per supported machine, passed by `--machine`; an engine start's memory readings are `measure memory`'s, not the spec's. Revised: class 1 probes the per-format GEMM rate, the bandwidth curve and the kernel floor; class 2 the link latency and bandwidth. Revised: the bandwidth curve is the per-size maximum of a read-only, a write-only and a copy sweep. Revised: `compass measure device` publishes one probe record per node, raw rates with their bands; `compass fit device` folds a platform's records into one readings entry, each field the median over nodes with a band spanning theirs, rates held as rates and naming no datasheet, one entry per key, never replaced; `--assume-from` states another device's ratios, assumed, for a device never run; the fragment merge, `explain` and the per-machine scripts go. Revised: the class 0 probes and the `http-intake` probe are retired; `compass record` times the served tokenizer and stamps the intake, and `compass fit host` fits both. | 2026-09-18; revised 2026-10-13 and 2026-10-14 (#851); 2026-10-17 (#1392); 2026-10-19 (#1575); 2026-11-03 (#2716, [ruling on #2724](https://github.com/jgong5/ATOM/pull/2724#issuecomment-6596632012)); 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)) |
 | D25.1 | Runtime-constant fields renamed to say what they are; ATOM's own term recorded as a mapping column. `host.tokenizer` becomes `host.tokenizers[]`, keyed by tokenizer identity (id + backend + fingerprint) with `applies_to` model architectures. Superseded for the tokenizer: its rates are a `host_laws` term keyed by model, the entry's backend and fingerprint checked. | 2026-09-19; tokenizer superseded 2026-11-03 ([#2309](https://github.com/jgong5/ATOM/issues/2309#issuecomment-6498578963)) |

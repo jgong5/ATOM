@@ -15,6 +15,7 @@ writes, which no runner attribute holds.
 
 import json
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from test_bench_ops_v41_rehearsal import HARNESS, _run
@@ -47,6 +48,16 @@ FILL = "atom.model_ops.v4_kernels.paged_prefill_indices:write_v4_paged_prefill_i
 SWA = "atom.model_ops.v4_kernels.state_writes:swa_write"
 #: Each CSA layer's translate of its indexer's top-k into its index list.
 PACK = "atom.model_ops.v4_kernels.csa_translate_pack:csa_translate_pack"
+#: A prefill of 512 tokens over one row.
+PREFILL = "--prefill 512 1"
+#: Each rehearsal the cases read, by name: its engine arguments and its shape.
+REHEARSALS = {
+    "v4pro_kv": (DPA_TP8, "--width 1"),
+    "v4pro_pd": (DPA_TP8 + CONSUMER, "--width 1"),
+    "v4pro_prefill": (DPA_TP8 + PRODUCER, PREFILL),
+    "v4pro_prefill_tbo": (DPA_TP8 + PRODUCER + " --enable-tbo", PREFILL),
+    "v4pro_bf16_prefill": (" -- --kv_cache_dtype bf16 --enable-dp-attention", PREFILL),
+}
 
 
 def _rehearse(root, tokenizer, args, shape="--width 1"):
@@ -66,16 +77,28 @@ def _rehearse(root, tokenizer, args, shape="--width 1"):
 
 
 @pytest.fixture(scope="module")
-def rehearsed(model_dir, tmp_path_factory):  # noqa: F811
-    """The rehearsal's record of each leaf of a decode of width 1."""
-    return _rehearse(tmp_path_factory.mktemp("v4pro_kv"), model_dir, DPA_TP8)
+def rehearsals(model_dir, tmp_path_factory):  # noqa: F811
+    """Every rehearsal of `REHEARSALS`, all started at once, each its own two
+    processes in turn: by name, the future of its record."""
+    with ThreadPoolExecutor(len(REHEARSALS)) as pool:
+        yield {
+            name: pool.submit(
+                _rehearse, tmp_path_factory.mktemp(name), model_dir, args, shape
+            )
+            for name, (args, shape) in REHEARSALS.items()
+        }
 
 
 @pytest.fixture(scope="module")
-def rehearsed_pd(model_dir, tmp_path_factory):  # noqa: F811
+def rehearsed(rehearsals):
+    """The rehearsal's record of each leaf of a decode of width 1."""
+    return rehearsals["v4pro_kv"].result()
+
+
+@pytest.fixture(scope="module")
+def rehearsed_pd(rehearsals):
     """`rehearsed` under a P/D decode side's transfer config."""
-    root = tmp_path_factory.mktemp("v4pro_pd")
-    return _rehearse(root, model_dir, DPA_TP8 + CONSUMER)
+    return rehearsals["v4pro_pd"].result()
 
 
 def test_the_decode_attention_reads_the_planes_the_runner_bound(rehearsed):
@@ -107,11 +130,10 @@ def test_the_fp8_indexer_compressor_takes_the_scales_its_layer_was_bound(
 
 
 @pytest.fixture(scope="module")
-def rehearsed_prefill(model_dir, tmp_path_factory):  # noqa: F811
+def rehearsed_prefill(rehearsals):
     """The rehearsal's record of each leaf of a prefill of 512 tokens over one
     row, under a P/D prefill side's transfer config."""
-    root = tmp_path_factory.mktemp("v4pro_prefill")
-    return _rehearse(root, model_dir, DPA_TP8 + PRODUCER, "--prefill 512 1")
+    return rehearsals["v4pro_prefill"].result()
 
 
 def test_the_prefill_index_leaves_take_the_buffers_atom_passes(rehearsed_prefill):
@@ -172,12 +194,10 @@ def test_the_prefill_top_k_translate_writes_the_csa_list_atom_passes(
 
 
 @pytest.fixture(scope="module")
-def rehearsed_prefill_tbo(model_dir, tmp_path_factory):  # noqa: F811
+def rehearsed_prefill_tbo(rehearsals):
     """`rehearsed_prefill` under --enable-tbo, whose input preparation builds
     each KV token's batch id."""
-    root = tmp_path_factory.mktemp("v4pro_prefill_tbo")
-    args = DPA_TP8 + PRODUCER + " --enable-tbo"
-    return _rehearse(root, model_dir, args, "--prefill 512 1")
+    return rehearsals["v4pro_prefill_tbo"].result()
 
 
 def test_a_cached_prefill_repeats_gathers_and_writes_on_what_atom_passes(
@@ -202,12 +222,10 @@ def test_a_cached_prefill_repeats_gathers_and_writes_on_what_atom_passes(
 
 
 @pytest.fixture(scope="module")
-def rehearsed_bf16_prefill(model_dir, tmp_path_factory):  # noqa: F811
+def rehearsed_bf16_prefill(rehearsals):
     """The rehearsal's record of each leaf of a prefill of 512 tokens over one
     row under the bf16 KV cache."""
-    root = tmp_path_factory.mktemp("v4pro_bf16_prefill")
-    bf16 = " -- --kv_cache_dtype bf16 --enable-dp-attention"
-    return _rehearse(root, model_dir, bf16, "--prefill 512 1")
+    return rehearsals["v4pro_bf16_prefill"].result()
 
 
 def test_the_bf16_cache_s_prefill_attention_takes_the_lists_of_its_layer_s_class(

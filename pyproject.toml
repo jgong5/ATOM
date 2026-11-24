@@ -16,6 +16,7 @@ dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", 
 compass = "atom.compass.cli:main"
 
 [project.optional-dependencies]
+structured-output = ["llguidance==1.9.1", "jsonschema>=4.25,<5", "google-re2>=1.1"]
 tracing = ["opentelemetry-api>=1.40,<2", "opentelemetry-sdk>=1.40,<2", "opentelemetry-exporter-otlp-proto-http>=1.40,<2"]
 # atom/diffusion only. Kept out of the base install because none of it is
 # reachable from the LLM engine: PyAV muxes the H.264 + AAC MP4, Pillow does

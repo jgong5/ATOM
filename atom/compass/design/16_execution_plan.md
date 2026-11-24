@@ -194,8 +194,10 @@ stage is named for the model; it is not the retired milestone M3 of D95.
   its own arm's and the TP4 indexer-CP LMCache arm's, so each pools records with the tier
   off and on. The LMCache arms reuse those two laws with the offload terms of `03` D13.1.
   A law's key holds the capture ladder (`run/step_grid.py::keyed`), which ATOM clips at
-  `--max-num-seqs`, so how one law serves the other points it covers is
-  [#3275](https://github.com/jgong5/ATOM/issues/3275)'s ruling. An indexer-CP arm's law
+  `--max-num-seqs`; a law, its host laws and a step grid bundle serve each point whose
+  ladder is a prefix of their own ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)), so an arm's entry keyed at its
+  top point serves its lower ones. `fit steps` and `fit host` pool the arm's records at
+  every point into it; a bundle's plan and step measurements stay at one point. An indexer-CP arm's law
   waits on #3054's indexer-CP key, without which its runs would read a law fitted
   without indexer CP.
 
@@ -230,10 +232,11 @@ named for the model and the parallelism of its arms.
 - **Keys.** ATOM serves V4.1 at a KV block of 128 whatever `--block-size` says
   (`atom/config.py`, its `deepseek_v41_text` branch), so the submission's 16 changes no
   key. Every point keeps ATOM's default `--max-num-seqs`; c=64 and c=128 share a capture
-  ladder and c=256 adds 256. Until [#3275](https://github.com/jgong5/ATOM/issues/3275) is
-  ruled, one step linear law and one `host_laws` entry each for DTP2 c=64, DEP2 c=128 and
-  DEP2 c=256, with memory readings per point; a ruling that admits a ladder prefix merges
-  DEP2's two.
+  ladder and c=256 adds 256. One step linear law and one `host_laws` entry each for DTP2
+  c=64 and for DEP2, keyed at c=256's ladder, which serves c=128 at its prefix
+  ([#3275 Ruling](https://github.com/jgong5/ATOM/issues/3275#issuecomment-6890757114)), with memory readings per point. `fit host` compares the graph
+  sets V4.1's host key records exactly, so DEP2's two points pool into one `host_laws`
+  entry only where their decoder's graph keys agree.
 - **Two backends**, the step linear law and the step grid, each graded by `08` D45.1, as
   #3256 rules for M3-Agentic: the submission's inputs reach 525k tokens at p95, past a
   law's hull.
@@ -255,13 +258,13 @@ atom/compass/
   memory/     device-reading substitution, per-term model
   ir/         Cost IR (Seq/Repeat/Par), nested-Repeat detector, opaque leaves
   capture/    FakeTensorMode capture, one concrete graph per shape, leaf contracts
-  spec/       machine-spec schema, probes, merge / validate / explain
+  spec/       machine-spec schema, the reader, layer composition, the cross-rank spread check
   artifacts/  store, keys, digests, invalidation matrix
   drive/      serving ATOM for record, trace steps and run; measure memory; run.json; the GPU checks
   bench/      the step bench: replay by rule, the window, measure; the op bench
   fit/        samples for fit and publishing; each backend owns its fit
   validate/   grading: whether a client run is gradeable, the separable results
-  metrics/    per-step sampling, backfill
+  metrics/    not built: the series is run/metrics.py, its report in report/ (11 D74)
   kv/         simulated KV connector
   cli.py      the `compass` console script, registered in pyproject.toml (13 D80); it parses and dispatches only
 tests/compass/          mirrors the above
@@ -329,8 +332,8 @@ question, not an engineering one.
 P0.2's result, and the reason the agents' original test gate cannot be run as written.
 That gate, `08` D43.1 and ATOM's own `CLAUDE.md` all assert the same thing — that the
 187-file suite under `tests/` runs GPU-free and green — and P0.2 measured both halves
-false. What is GPU-free is the **CPU gate**, run per task; the rest is the GPU gate, a superset, run per
-wave as a delta. Re-derived on 2026-09-20 after review: the first derivation iterated
+false. What is GPU-free is the **CPU gate**, run per landing batch; the rest is the GPU gate, a superset,
+run on a batch that touches a trigger and daily by hand, as a delta. Re-derived on 2026-09-20 after review: the first derivation iterated
 *whole-suite collection* to a fixed point, which measures a property of the collection
 order, not of the files.
 
@@ -358,7 +361,7 @@ both carried, "32 files reach the driver, 28 of them at collection time via `roc
 joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* suite,
 `tests/plugin/` included (25 + 3), and was attached to a non-plugin set of 32.
 
-- **Per task — the CPU gate, re-measured by P0.1 and superseding the counts above.**
+- **The CPU gate, re-measured by P0.1 and superseding the counts above.**
   `tests/` minus `tests/plugin/` (30 files) minus the 29 driver-dependent files in
   `scripts/compass/cpu_gate_exclude.txt`, driven by `scripts/compass/gate_cpu.sh`:
   **130 of the 189 test files at `105ca4197`, 4030 passed, 0 failed, 149 skipped, 3 xfailed,
@@ -386,7 +389,7 @@ joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* sui
   128-file gate whose 149 skips were 68 distinct reasons: 66 skipped tests name a device, 83
   do not. Both carry to `105ca4197`: its `tests/` and code differ from `b963c9411`'s only by
   the two `tests/compass/` files above, which collect tests and skip none.
-- **Per wave — the GPU superset, re-measured by P0.1.** `tests/ --ignore=tests/plugin` in the
+- **The GPU superset, re-measured by P0.1.** `tests/ --ignore=tests/plugin` in the
   GPU container, driven by `scripts/compass/gate_gpu.sh`, judged as a **delta**, never as
   "green". The baseline is **4779 passed / 5 failed**, 0 errors, 105 skipped, 3 xfailed,
   72.6 s, measured 2026-09-20 at `fe9ea043c` on node 18 in `xiaobizh_n18` with
@@ -443,9 +446,11 @@ covered). The rule it applies: an `atom` module named by an excluded test is a b
 **unless a CPU-gate test that actually runs names it too**. A module both gates import is
 covered when the CPU gate runs, so triggering on it would make the gate cry wolf. A trailing
 `/` matches a subtree. `gate_cpu.sh` matches the diff against that file and **exits 98 unless
-`COMPASS_GPU_GATE_DONE` names this tree's own HEAD**; where it can compute neither a diff nor
-a supplied file list — a `git archive` snapshot with no `.git` — it refuses rather than
-reporting "not required", per principle 6.
+`COMPASS_GPU_GATE_DONE` names this tree's own HEAD, or a tree whose diff from this one touches
+no trigger**, read from git or from a snapshot's `.compass-gpu-carry` stamp (the
+[ruling on #3590](https://github.com/jgong5/ATOM/issues/3590#issuecomment-6910498913)); where
+it can compute neither a diff nor a supplied file list — a `git archive` snapshot with no
+`.git` — it refuses rather than reporting "not required", per principle 6.
 
 The rule has three parts. One was forced by a counter-example measured in this tree, one is
 what kept the headline example at `236abfd9a`, and one changed no path there:
@@ -485,17 +490,25 @@ are read as text, not resolved as a graph, so a transitive import, an `importlib
 re-export is invisible. A path *absent* from `gpu_gate_triggers.txt` is not a claim that the
 CPU gate covers it, and a path *present* is not proof that it does not. Of the two mistakes
 this gate prefers the first, because running the GPU gate when in doubt is never the wrong
-one. Judging that a change sits outside the blind spot remains the task's own call.
+one. Judging that a change sits outside the blind spot remains its reviewer's call.
 
-**A task touching EPLB, CUDA-graph capture bounds, block tables, the paged index builders or
-the prefix-cache kernels runs the GPU superset as part of its own gate, not at wave end.**
-That is where the files running nothing here concentrate — 29 excluded plus 22 exercising
+**A change touching a path in `scripts/compass/gpu_gate_triggers.txt` lands in a batch of its
+own, and its lander runs `gate_gpu.sh` on the batch commit.** The overlay
+(`.claude/agent-team.md`, "The GPU gate") states the same rule.
+EPLB, CUDA-graph capture bounds, block tables, the paged index builders and the prefix-cache
+kernels are where the files running nothing here concentrate — 29 excluded plus 22 exercising
 nothing, 51 in all; the silent 22 include `test_pool_index.py`,
 `test_prefill_indices_paged.py`, `test_decode_indices_paged.py`, `test_postprocess_width.py`
 and `test_prefill_prefix_vs_native.py`, the paged-index and prefix-cache areas `03` D13 and
 `01` D6 lean on. `test_dp_metadata` and `test_dp_sync_layout` are **not** among them: they
 are CPU-green, measured above, and booking a GPU for them spends the resource the booking
 queue below exists to ration.
+The paged index builders and the prefix-cache kernels sit under `atom/model_ops/v4_kernels/`,
+a trigger-list entry. The block tables are on the trigger list by name (`NAMED` in
+`regen_gpu_gate_triggers.sh`), because the derivation cannot see them: the CPU gate runs their
+tests, but without a device, and no excluded test imports their files. EPLB and the capture
+bounds are not on it: neither gate runs their device code, so a GPU gate would test nothing of
+a change there.
 
 **Three files are covered by neither gate**, measured in `xiaobizh_n18` at `83daf636d`:
 `test_prefix_cache_accuracy.py` (`no tests ran`), `test_kv_connector_scheduler.py` and
@@ -589,7 +602,7 @@ Depends on Wave 1. The first three are the vertical slice.
 | **W2.3** | Simulated KV connector registered into ATOM's existing factory; `latency + bytes/bandwidth` from the spec | `kv/` | 250–400 | W1.7 |
 | **W2.4** | Artifact store: keys, digests, source-root fingerprints, the invalidation matrix | `artifacts/` | 500–700 | W1.7 |
 | **W2.5** | ~~`FakeTensorMode` capture with the three mandatory disciplines and post-trace assertions; guard-domain evaluation~~ **Superseded by concrete capture** since 2026-10-18 (#1489): one graph per decode width and prefill (T, B), with no disciplines and no guard domain (`04` D18, D19); carried by S3c.8 and S3d.12 | `capture/` | ~~500–800~~ | W1.10, **P0.4** |
-| **W2.6** | Metrics under virtual time: per-step sampling, the class taxonomy, OpenMetrics backfill | `metrics/` | 300–500 | W2.1 |
+| **W2.6** | Metrics under virtual time: ~~per-step sampling~~, the class taxonomy, OpenMetrics backfill. **Revised 2026-11-16** ([#3584](https://github.com/jgong5/ATOM/issues/3584)): each engine and frontend LP samples at ATOM's metrics timer, the class taxonomy as the sampler's class table, the backfill into CI's Prometheus report (`11` D74, D77, *The first build*); carried by #3585 to #3587 | ~~`metrics/`~~ `run/`, `runner/`, `report/` | 300–500 | W2.1 |
 | **W2.7** | Determinism test: byte-diff of two step tables from one configuration, in CI (`01` D3.4) | `tests/compass/` | ~100 | W2.1 |
 | **W2.8** | Model construction under `FakeTensorMode` with `--load_dummy empty` (`02` D10.1), including the buffer audit of T68 | `runner/` | 200–350 | W2.5 |
 
