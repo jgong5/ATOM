@@ -1012,8 +1012,8 @@ def test_a_real_cctraces_sim_cell_whose_server_began_an_aiter_build_is_refused(
     tmp_path, monkeypatch
 ):
     """Its run.json as `cctraces_sim.sh` writes it, then given the entry as
-    that script gives it, from the time its server began serving: a build
-    the stop cut short, with no module written, counts."""
+    that script gives it, from the clock pair it reads when its server began
+    serving: a build the stop cut short, with no module written, counts."""
     jit = _aiter(tmp_path, monkeypatch)
     # Kernel caches of its own too: an earlier `import aiter` points FlyDSL's
     # and Inductor's at the container's, and Triton read its home on import.
@@ -1028,15 +1028,15 @@ def test_a_real_cctraces_sim_cell_whose_server_began_an_aiter_build_is_refused(
         _recorded(cell)
         (cell / "run.json").write_text(json.dumps({"client_runs": 1} | HOST))
     report = grade(real, simulated)
-    since = time.time_ns() - 10**9
+    since = [str(time.time_ns() - 10**9), str(time.monotonic_ns() - 10**9)]
 
-    aiter_jit.main([str(real[0] / "run.json"), str(since)])
+    aiter_jit.main([str(real[0] / "run.json"), *since])
     assert json.loads((real[0] / "run.json").read_text()) == {"client_runs": 1} | HOST
     assert grade(real, simulated) == report
 
     (jit / "build" / "mha" / "blob.staging").mkdir(parents=True)
     (jit / "build" / "mha" / "blob.staging" / "kernel.cpp").write_text("")
-    aiter_jit.main([str(real[2] / "run.json"), str(since)])
+    aiter_jit.main([str(real[2] / "run.json"), *since])
     named = re.escape("its server ran a JIT compile of ['mha'] while it served")
     with pytest.raises(ValueError, match=f"r2 is not graded: {named}, so a step"):
         grade(real, simulated)
