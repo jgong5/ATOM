@@ -31,13 +31,18 @@ STAGING = "atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4"
 
 
 @pytest.fixture
-def moe(monkeypatch):
-    """ATOM's MoE module, imported with the arch declared: no device to probe
-    at import, and nothing here launches a kernel. It refuses any MoE backend
-    but mega's after the fuse, which is not the one checked here."""
+def arch(monkeypatch):
+    """The arch aiter's Triton probe answers, declared: no device to probe at
+    import, and nothing here launches a kernel."""
     from aiter.ops.triton.utils._triton import arch_info
 
     monkeypatch.setattr(arch_info, "_CACHED_ARCH", arch_info._CACHED_ARCH or "gfx950")
+
+
+@pytest.fixture
+def moe(monkeypatch, arch):
+    """ATOM's MoE module. It refuses any MoE backend but mega's after the
+    fuse, which is not the one checked here."""
     moe = importlib.import_module("atom.model_ops.moe")
     monkeypatch.setattr(
         moe, "get_current_atom_config", lambda: SimpleNamespace(moe_backend="aiter")
@@ -124,7 +129,7 @@ def test_a_meta_build_refuses_a_host_staging_left_unloaded_by_name(
         _built(monkeypatch, tmp_path, _holding(lambda: host))
 
 
-def test_minimax_binds_its_drafter_into_the_meta_tree():
+def test_minimax_binds_its_drafter_into_the_meta_tree(arch):
     """ATOM's runner hands its installer the model it holds after the build;
     MiniMax's binds the DSpark drafter into the model's mono router."""
     from atom.models.registry import mono_decode_installers
