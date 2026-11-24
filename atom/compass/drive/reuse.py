@@ -310,11 +310,17 @@ def _keyed(store: ArtifactStore, kind: Kind, engine: dict, **fields) -> list[Key
     keys = []
     for path in sorted((store.root / kind.value).glob(f"*/{ENTRY_FILE}")):
         key = json.loads(path.read_text())["key"]
-        theirs = json.loads(key["engine_config"])
-        theirs.pop(GRAPHS, None)
-        if all(key.get(f) == v for f, v in fields.items()) and _same(theirs, engine):
+        if at_key(key, engine, **fields):
             keys.append(Key.of(kind, **key))
     return keys
+
+
+def at_key(key: dict, engine: dict, **fields) -> bool:
+    """Whether `key`, a key's values, states each of `fields` as given, and
+    `engine` as its engine config, less its graph sets."""
+    theirs = json.loads(key["engine_config"])
+    theirs.pop(GRAPHS, None)
+    return all(key.get(f) == v for f, v in fields.items()) and _same(theirs, engine)
 
 
 def _same(there, here: dict) -> bool:
