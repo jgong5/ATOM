@@ -31,7 +31,7 @@ the fit labels whose label keeps that kernel's recorded length.
 `moe_imbalance`, over `COMPASS_FIT_MOE_MIN_SPREAD`, 0.2 by default),
 `COMPASS_FIT_UNEVEN_ROWS=1` (prefill `uneven_rows`, over the same spread),
 `COMPASS_FIT_MOE_SELECT=insample` (each decode rung's MoE column by its fit on
-all its steps), `COMPASS_FIT_PEER_TOKENS` (decode `peer_tokens`: ``1`` at
+all its steps; ``fallback``, only where its records hold out none), `COMPASS_FIT_PEER_TOKENS` (decode `peer_tokens`: ``1`` at
 each rung whose `moe_experts` column is saturated, else the rungs named) and
 `COMPASS_FIT_DRAFT_PEER_TOKENS` (the draft law's: ``1`` at every rung, else
 the rungs named),
