@@ -709,6 +709,35 @@ def _resident(readings: DeviceReadings, config: Any) -> int:
     return resident + (readings.page_bound.nbytes if fp4 else 0)
 
 
+def _refuse_v4_opus_indexer(config: Any) -> None:
+    """Refuse DeepSeek-V4 under an FP4 indexer layout whose attention builder
+    asks aiter's `mqa_logits_mxfp4_config` about `self.device`, the host here,
+    before the start replaces anything. fp8 and gfx942 leave V4 no such layout
+    (`index_cache_layout` None); DeepSeek-V4.1 builds another builder, whose
+    fp4 plane `_resident` answers for."""
+    from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+        FP4_GFX950_OPUS,
+        FP4_GFX1250_NATURAL,
+    )
+
+    layout = getattr(config, "index_cache_layout", None)
+    if layout not in (FP4_GFX950_OPUS, FP4_GFX1250_NATURAL):
+        return
+    from atom.utils import get_hf_text_config
+    from atom.utils.selector import Family, attn_family
+
+    if attn_family(get_hf_text_config(config.hf_config)) is not Family.V4:
+        return
+    raise RunnerRefusal(
+        f"DeepSeek-V4 under the FP4 indexer ({layout}), which an unset "
+        "--index-cache-dtype resolves to off gfx942, sizes its attention "
+        "builder's block table from aiter's mqa_logits_mxfp4_config, which "
+        "reads the arch off a GPU tensor of the runner's device, and a "
+        "simulated start keeps that device the host; pass --index-cache-dtype "
+        "fp8, whose builder does not ask aiter."
+    )
+
+
 @contextlib.contextmanager
 def simulated_arch():
     """aiter's arch probes answer the run's simulated device's arch.
@@ -767,9 +796,11 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
     after the stages before it -- on gloo and with an empty custom group
     configuration, under which aiter builds no device communicator for any
     group. A simulated TP width is refused: it starts fewer workers than the
-    TP group `apply_simulated_tp` then reports on a device group. In a simulated
-    run the DP group then runs its small collectives over shared memory when
-    its ranks share a host (`shm_collectives`).
+    TP group `apply_simulated_tp` then reports on a device group. So is
+    DeepSeek-V4 under an FP4 indexer whose builder asks aiter about the device
+    (`_refuse_v4_opus_indexer`). In a simulated run the DP group then runs its
+    small collectives over shared memory when its ranks share a host
+    (`shm_collectives`).
     """
     pc = config.parallel_config
     if config.tp_world_size != config.tensor_parallel_size:
@@ -778,6 +809,7 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
             "workers under --fake-eplb, and a runner on the host builds its TP "
             "group from the ranks that start."
         )
+    _refuse_v4_opus_indexer(config)
     from aiter.dist.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,

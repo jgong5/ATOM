@@ -26,10 +26,17 @@ from atom.compass.runner.overrides import (
     start_on_host,
 )
 from atom.compass.spec import MachineSpec
+from atom.config import Config
 from atom.utils import CpuGpuBuffer
 from atom.utils.h2d import PublicationOwner
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
+#: DeepSeek-V4 as ATOM reads it: `_CONFIG_REGISTRY` maps its model type onto
+#: V3's schema, and its architecture tells the two apart.
+V4 = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"], model_type="deepseek_v3")
+V41 = SimpleNamespace(
+    architectures=["DeepseekV41ForCausalLM"], model_type="deepseek_v41_text"
+)
 
 
 def _config(tp=1, dp=1, simulated_tp=None, pp=1):
@@ -219,3 +226,58 @@ def test_a_host_start_refuses_what_it_holds_only_on_the_fp4_index_plane(
     peak = EXPECTED[2]["peak_torch"]
     held = peak["weights"] + peak["buffers"] + peak["load residue"]
     assert torch.cuda.memory_allocated(runner.device) == held
+
+
+def _indexed(monkeypatch, model, index, arch, backend="opus"):
+    """`_config()` for `model` under `--index-cache-dtype index`, its indexer
+    layout resolved as `Config` resolves it on a device of `arch`."""
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.jit.utils.chip_info",
+        SimpleNamespace(get_gfx_runtime=lambda: arch),
+    )
+    monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", backend)
+    config = _config()
+    config.hf_config, config.index_cache_dtype = model, index
+    Config._resolve_index_cache_layout(config)
+    return config
+
+
+@pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
+def test_deepseek_v4_under_the_fp4_indexer_is_refused_by_name_before_anything_is_replaced(
+    started, monkeypatch, arch
+):
+    """An unset `--index-cache-dtype` resolves to fp4 for DeepSeek-V4 off
+    gfx942, and there its attention builder sizes its block table from aiter's
+    `mqa_logits_mxfp4_config` on the runner's device, the host after this
+    start, which aiter refuses on every rank: refused before that, naming the
+    flag that starts."""
+    config = _indexed(monkeypatch, V4, "fp4", arch)
+    stream, event = torch.cuda.Stream, torch.cuda.Event
+    with pytest.raises(RunnerRefusal, match="pass --index-cache-dtype fp8") as e:
+        started(config)
+    assert config.index_cache_layout in str(e.value)
+    assert torch.cuda.Stream is stream
+    assert torch.cuda.Event is event
+
+
+@pytest.mark.parametrize(
+    "model, index, arch, backend",
+    [
+        (V4, "fp8", "gfx950", "opus"),
+        (V4, "fp4", "gfx942", "opus"),
+        (V4, "fp4", "gfx950", "flydsl"),
+        (V41, "fp4", "gfx950", "opus"),
+    ],
+    ids=["v4-fp8", "v4-fp4-on-gfx942", "v4-fp4-flydsl", "v41-fp4"],
+)
+def test_a_start_whose_builder_asks_aiter_nothing_of_the_device_is_not_refused(
+    started, monkeypatch, model, index, arch, backend
+):
+    """fp8, and fp4 on gfx942, where V4 falls back to the fp8 indexer, leave
+    V4 no FP4 layout; the flydsl backend's preshuffled layout sizes its table
+    without aiter; DeepSeek-V4.1 builds another builder, whose fp4 plane
+    `_resident` answers for. Each starts as before."""
+    runner, calls = started(_indexed(monkeypatch, model, index, arch, backend))
+    assert runner.device == torch.device("cpu")
+    assert [k["backend"] for _, k in calls[:1]] == ["gloo"]
