@@ -1073,14 +1073,7 @@ def fit_tokenizer(paths, intakes, windows=None) -> tuple[dict, dict]:
         heads[json.dumps(json.loads(head), sort_keys=True)] = None
         got = [json.loads(line) for line in lines]
         span = windows[i] if windows else None
-        for c in _lone_calls([c for c in got if c["call"] != "segment"], intake):
-            if not within(c["t_start_ns"], span):
-                continue
-            kind = c["call"] if c["items"] > 1 or c["call"] == "decode" else "encode"
-            s = (c["t_end_ns"] - c["t_start_ns"]) * 1e-9
-            rows.append((i, kind, c["tokens"], s))
-        work = _own_work(got, intake, span)
-        rows += [(i, "segment", n, s, chars) for n, chars, s in work]
+        rows += [(i, *row) for row in tokenizer_rows(got, intake, span)]
     if len(heads) != 1:
         raise ValueError(f"the records name {len(heads)} tokenizers: {sorted(heads)}")
     term, report = json.loads(next(iter(heads))), {"unfitted": {}}
@@ -1123,6 +1116,22 @@ def fit_tokenizer(paths, intakes, windows=None) -> tuple[dict, dict]:
         }
         report[kind] = fitted
     return term, report
+
+
+def tokenizer_rows(calls: list[dict], intake, windows=None) -> list[tuple]:
+    """The rows `fit_tokenizer` fits of one record's tokenizer `calls`,
+    beside the intake stamps in `intake`: ``(kind, tokens, seconds)`` per
+    lone call (`_lone_calls`) but a segment call, and ``("segment", ids,
+    seconds, chars)`` per segment call's own work (`_own_work`); with
+    `windows`, host-clock spans, only the calls that start within one
+    (`within`), each still judged lone among all of `calls`."""
+    rows = []
+    for c in _lone_calls([c for c in calls if c["call"] != "segment"], intake):
+        if within(c["t_start_ns"], windows):
+            kind = c["call"] if c["items"] > 1 or c["call"] == "decode" else "encode"
+            rows.append((kind, c["tokens"], (c["t_end_ns"] - c["t_start_ns"]) * 1e-9))
+    work = _own_work(calls, intake, windows)
+    return rows + [("segment", n, s, chars) for n, chars, s in work]
 
 
 def within(ns: int, windows) -> bool:
