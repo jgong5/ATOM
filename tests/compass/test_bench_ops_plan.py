@@ -1318,7 +1318,7 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
             key,
             provenance=stanza("compass trace ops"),
             topology=Topology(),
-            conditions=run_readings(str(model)),
+            conditions=run_readings(str(tmp_path / "model")),
             gates=GateState.of(),
             members={
                 member_name("graph", ops.RANK, "json"): json.dumps(
