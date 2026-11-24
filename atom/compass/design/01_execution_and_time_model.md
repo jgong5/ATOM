@@ -478,11 +478,11 @@ frames. The CA completes each round of the LP only when every member has asked i
    local grants; a lone call only ships its send log.
 
 With `lmcache_mp` above DP width 1, a park request amends rules 1, 2 and 5 (D6.1).
-A message on an offering channel (Grant rule, below) amends rules 1 and 5: only the
-member it is for takes the grant at its arrival and asks its round again, the others
-staying in the round, their replies held for its grant; a member whose call named later
-rounds gets its reply at that grant, a parked member leaves its park there and parks
-again, and no round is granted ahead past such a message (#3767).
+A message on an offering channel (Grant rule, below) amends rules 1 and 5: in a TAR
+round only the member it is for takes the grant at its arrival and asks its round again,
+the others staying in the round, their replies held for its grant; a member whose call
+named later rounds gets its reply at that grant, a parked member leaves its park there
+and parks again, and no round is granted ahead past such a message (#3767).
 
 Every member's step end is a round, and so is every member's input pull (owner ruling
 2026-10-15, #988; revised 2026-10-16, #1267, and 2026-10-18, #1345).
@@ -590,9 +590,10 @@ PDES term: Ayani's distance-between-objects LBTS (Fujimoto, ch. 3). Each part ma
   makes at that message's arrival (I4). So a TAR holding such an arrival before its target
   is granted that arrival first, `G = N[i]` short of `T`, and its owner makes the offered
   sends and asks for `T` again. The step table records that grant as `ARRIVAL`, which
-  `detect/scenario.py::_rows` reads with the TAR it splits as one row. With `now[j]`
-  instead, two LPs in TAR whose targets cross would wait on each other for ever under the
-  strict rule. The channel table marks the offering channels
+  `detect/scenario.py::_rows` reads with the TAR it splits as one row; an own step under
+  local grants makes the same sends with no such grant (*Local grants*, below). With
+  `now[j]` instead, two LPs in TAR whose targets cross would wait on each other for ever
+  under the strict rule. The channel table marks the offering channels
   (`ChannelTable.mark_offering`), alike in the authority's process and each engine's: each
   `mooncake_store` engine's `request#dpN` (D6.2), and with `OFFLOAD_MP_LOOKUP_THREAD` an
   `lmcache_mp` engine's `request#dpN` and lookup replies (`channels.py::add_lmcache`). Not
@@ -690,6 +691,17 @@ counts are those of a run with local grants off, which is why the run-file key i
 NER may ask for its messages ahead: every message registered for it below the ceiling goes
 with the grant, and the owner releases each in the step that reaches it. A step outside
 the LP's clock and ceiling, or past a message registered for it since, aborts the run.
+
+The step table and the grant counts part from a run without local grants in one case
+(#3767). An own TAR step that walks an arrival on an offering channel sent ahead to it
+makes the sends its handler offers at that arrival, as the owner does under the
+`ARRIVAL` grant (Grant rule), but reports one step, which the CA replays as one `TAR`
+grant (`LPRuntime._own_step`, `ClockAuthority._replay`): one row and one grant where the
+run without them has an `ARRIVAL` and a `TAR`. The sends, their stamps and what
+`detect/scenario.py::_rows` reads, as it joins an `ARRIVAL` to the TAR it splits, are
+the same. Not chosen: the own step splitting at the arrival and reporting an `ARRIVAL`
+step, which `_replay` would take short of its target: the step table would match byte
+for byte, for a split `_rows` joins again.
 
 A DP group's LP gets its ceiling at a grant at which some members return while others
 still ask later rounds (#2993): the least of `LBTS(i)`, `G` plus the LP's shortest cycle,
@@ -2342,7 +2354,8 @@ A *park* request amends rules 1, 2 and 5, at DP width above 1 with `lmcache_mp` 
 
 A parked member's call takes no reply until the release, or until a grant releases it a
 message on an offering channel (D3): it then walks what was held for it, makes the sends
-its handlers offered, and parks again. The authority holds what a
+its handlers offered, and parks again (D6.2's *A stale hit renewed inside a DP group*
+walks it). The authority holds what a
 round releases on its channels; at the release the member walks those messages inside
 its park call, its clock at each one's arrival in turn, then leaves at the group's
 time. Its clock therefore moves only inside its own call, and the step table records
@@ -2832,6 +2845,15 @@ dp0's build_connector_meta dispatches a load whose lookup is 1.4 s old:
   wait: next_event(+inf, now + 1 s), NER alone             behind its call in flight;
 dp1 parks before its forward                               leases to t_c + ttl
                                                          reply at t_c
+an ADD for dp1 on request#dp1, an offering channel,
+arrives at a < t_c + r: the round of dp0's NER and
+dp1's park is granted a
+  dp0: no reply yet; asks the same NER again
+  dp1 leaves its park at a, releasing the ADD; its
+  input thread offers query{chunks}; dp1 makes it,
+  stamped at a, ---------------------------------------> lookup#dp1, at a+r; dp1 takes
+  and parks again, the query in its send log               the reply at a poll after
+                                                           the release
 grant reaches t_c + r: reply released <-----------------
 dp0: renew returns; load queued on a load lane; parks
 release: both leave at dp0's now; the forwards run
@@ -2894,7 +2916,8 @@ back at its wait point -------> makes the offer, stamped at a:
 
 At an idle point the grant is `a` itself and no TAR is asked again. In a DP group only
 dp0, the member the ADD is for, takes the grant at `a` and asks again; dp1 stays in the
-round.
+round. A parked member given the ADD leaves its park at `a` and parks again (*A stale hit
+renewed inside a DP group*).
 
 **The C1228 run** (the named result):
 
