@@ -92,6 +92,10 @@ PINNED = {
     "aiperf.timing.trajectory_source:TrajectorySource._snapshot_for": "01c859011e34d7d002c27c8b985f7d247168916b2da2e74bde8f82b514371ed0",
     "aiperf.timing.strategies.agentic_replay:AgenticReplayStrategy._build_handoff_trajectories": "75dc4d46289b7a5667333b3f762705aaeaf88a55aa2b66dfa74545f0e8a73208",
     "aiperf.timing.strategies.agentic_replay:AgenticReplayStrategy._build_session_for_trace": "2f67d9a0e6786baf71409b4423f17d1848884e39450cbd8d32c3ee427a89a871",
+    # A real run's services take that binding by fork (session_ids.bind_by_fork):
+    # the one start-method setting aiperf makes, and the service start.
+    "aiperf.cli_runner._process_setup:_configure_multiprocessing_start_method": "09f9ae3d4d97fec66f7c3559af51b638d51a8330cb9c6f2f2da9e18b9a3c5ceb",
+    "aiperf.controller.multiprocess_service_manager:MultiProcessServiceManager.run_service": "555fbe13a7a51fd7797df905382a8f678752dbb4971bed8092c682d6a1c667ce",
 }
 
 #: Call sites the router relies on being the only ones: every credit leaves

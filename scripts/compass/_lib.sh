@@ -596,13 +596,13 @@ open(out, "w").write(json.dumps(spec.echo()))' \
 # ROOT/compass_harness/compass_harness/session_ids.py profile ...`: as shipped,
 # but for what compass-harness also fixes in a simulated run, so both send the
 # same requests: the benchmark id, which the prompts carry, and each session's
-# id, drawn from its trace and branch (compass_harness/session_ids.py).
-COMPASS_REAL_AIPERF='import importlib, importlib.util as u, sys, uuid, aiperf.cli_runner as r
+# id, drawn from its trace and branch (compass_harness/session_ids.py), which
+# aiperf's services inherit by fork (session_ids.bind_by_fork).
+COMPASS_REAL_AIPERF='import importlib.util as u, sys, uuid, aiperf.cli_runner as r
 r.uuid4 = lambda: uuid.UUID(int=0)
 spec = u.spec_from_file_location("session_ids", sys.argv.pop(1))
-ids = u.module_from_spec(spec)
+ids = sys.modules["session_ids"] = u.module_from_spec(spec)
 spec.loader.exec_module(ids)
-for name in ids.MODULES:
-    importlib.import_module(name).uuid = ids
+ids.bind_by_fork()
 from aiperf.cli import app
 app()'

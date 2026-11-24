@@ -133,20 +133,33 @@ print(json.dumps({name: BaseTransport.build_headers(transport, N(
     for name, s in sessions.items()}))
 """
 #: Runs a real client's aiperf as client.sh does, its arguments after ``-c``
-#: given, with `MINT` as aiperf's CLI, and no compass-harness.
+#: given, under the default start method $START and no compass-harness. Its CLI
+#: sets the start method $SET where given, as aiperf may, then starts a
+#: process as aiperf starts its timing manager, which runs `MINT`.
 REAL_AIPERF = """
-import os, sys, types
+import multiprocessing as mp, os, sys, types
+mp.set_start_method(os.environ["START"])
 sys.modules["compass_harness"] = None
+def app():
+    if "SET" in os.environ:
+        mp.set_start_method(os.environ["SET"], force=True)
+    mint = "import sys\\nsys.modules['compass_harness'] = None\\n" + os.environ["MINT"]
+    service = mp.Process(target=exec, args=(mint, {}))
+    service.start()
+    service.join()
+    sys.exit(service.exitcode)
 cli = sys.modules["aiperf.cli"] = types.ModuleType("aiperf.cli")
-cli.app = lambda: exec(os.environ["MINT"], {})
+cli.app = app
 exec(sys.argv.pop(1), {})
 """
-#: A simulated client's aiperf: compass-harness as aiperf's plugin discovery
-#: imports it, with `MINT` as aiperf's CLI.
+#: A simulated client's aiperf service, started by spawn: compass-harness as
+#: aiperf's plugin discovery imports it in each process, then `MINT`.
 SIMULATED_AIPERF = """
-import os
-from aiperf.plugin import plugins
-exec(os.environ["MINT"], {})
+import multiprocessing as mp, os
+mint = "from aiperf.plugin import plugins\\n" + os.environ["MINT"]
+service = mp.get_context("spawn").Process(target=exec, args=(mint, {}))
+service.start()
+service.join()
 """
 
 
@@ -161,29 +174,35 @@ def test_a_real_and_a_simulated_run_send_one_session_id_per_trace_and_branch(
     out, env = _setup(tmp_path, REAL)
     done = _client(out, *AGENTX, env=env)
     assert done.returncode == 0, done.stdout + done.stderr
-    real = json.loads((tmp_path / "seen.json").read_text())[0][1:3]
+    real = [REAL_AIPERF, *json.loads((tmp_path / "seen.json").read_text())[0][1:3]]
     run = {k: v for k, v in os.environ.items() if not k.startswith("AIPERF_")}
-    sent = {}
-    # Each run spawns the subagents in its own order, as its clock has it.
-    for name, code, order in [
-        ("real", [REAL_AIPERF, *real], "012"),
-        ("simulated", [SIMULATED_AIPERF], "210"),
-    ]:
-        done = subprocess.run(
+
+    def aiperf(code, **more):
+        return subprocess.run(
             [sys.executable, "-c", *code],
-            env=run | {DYNAMO: "1", "MINT": MINT, "ORDER": order},
+            env=run | {DYNAMO: "1", "MINT": MINT} | more,
             capture_output=True,
             text=True,
-            check=True,
+            check=False,
             cwd="/",
         )
-        sent[name] = json.loads(done.stdout.splitlines()[-1])
-    assert sent["real"] == sent["simulated"]
-    ids = {name: h["X-Dynamo-Session-ID"] for name, h in sent["real"].items()}
+
+    # Each run spawns the subagents in its own order, as its clock has it.
+    done = aiperf([SIMULATED_AIPERF], ORDER="210")
+    assert done.returncode == 0, done.stderr
+    sent = json.loads(done.stdout.splitlines()[-1])
+    for start in ("fork", "spawn", "forkserver"):  # forkserver from Python 3.14
+        done = aiperf(real, ORDER="012", START=start)
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout.splitlines()[-1]) == sent, start
+    done = aiperf(real, ORDER="012", START="fork", SET="spawn")
+    assert done.returncode == 1 and not done.stdout
+    assert "aiperf asked for start method spawn" in done.stderr
+    ids = {name: headers["X-Dynamo-Session-ID"] for name, headers in sent.items()}
     assert len(set(ids.values())) == len(ids) == 3 * 3 + 1
     for k, root in enumerate(["t0", "t1", "t0"]):
         for child in (0, 2):
-            headers = sent["real"][f"{k}/{root}::sa:{child}"]
+            headers = sent[f"{k}/{root}::sa:{child}"]
             assert headers["X-Dynamo-Parent-Session-ID"] == ids[f"{k}/{root}"]
 
 

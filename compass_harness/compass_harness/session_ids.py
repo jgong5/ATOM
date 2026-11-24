@@ -11,10 +11,12 @@ its ``uuid4`` digests the conversation and the parent session's id the
 minting function holds (``SITES``) and how many ids that function drew for
 them before, which counts a trace the sampler drew again, in its order.
 
-A simulated run binds it through ``compass_harness.REBIND``. A real run's aiperf
-loads this file by path (``client.sh``, ``cctraces_sim.sh``) and binds it the
-same, since importing ``compass_harness`` would pace aiperf on a simulated
-clock; so it imports neither.
+aiperf mints them in its timing manager, a service process. A simulated run
+binds this module in every aiperf process through ``compass_harness.REBIND``,
+as plugin discovery imports the package. A real run's aiperf, where importing
+``compass_harness`` would pace it on a simulated clock, loads this file by path
+before its CLI (``client.sh``, ``cctraces_sim.sh``) and calls ``bind_by_fork``;
+so it imports neither.
 """
 
 import hashlib
@@ -56,6 +58,29 @@ def uuid4() -> _uuid.UUID:
     _drawn[key] += 1
     digest = hashlib.blake2b(f"{key}/{_drawn[key]}".encode(), digest_size=16)
     return _uuid.UUID(bytes=digest.digest(), version=4)
+
+
+def bind_by_fork() -> None:
+    """Bind this module, loaded as ``session_ids``, as ``uuid`` in each module
+    ``MODULES`` names, and have every process aiperf starts forked from this
+    one, so its services inherit the binding whatever the interpreter's default
+    start method (forkserver from Python 3.14). Exits once aiperf asks for
+    another start method, as its CLI does where configured to."""
+    import importlib
+    import multiprocessing
+
+    for name in MODULES:
+        importlib.import_module(name).uuid = sys.modules[__name__]
+    multiprocessing.set_start_method("fork", force=True)
+
+    def only_fork(method, force=False):
+        if method != "fork":
+            sys.exit(
+                f"{__name__}: aiperf asked for start method {method}, but its "
+                "services take each session's id from this process by fork"
+            )
+
+    multiprocessing.set_start_method = only_fork
 
 
 def __getattr__(name):
