@@ -17,8 +17,6 @@ from unittest.mock import patch
 import pytest
 import torch
 from test_artifact_store import (
-    CONDITIONS,
-    GATES,
     clean_checkout,  # noqa: F401  autouse
     stanza,
 )
@@ -1320,8 +1318,8 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
             key,
             provenance=stanza("compass trace ops"),
             topology=Topology(),
-            conditions=CONDITIONS,
-            gates=GATES,
+            conditions=run_readings(str(model)),
+            gates=GateState.of(),
             members={
                 member_name("graph", ops.RANK, "json"): json.dumps(
                     _graph_at(store, None, at.shape)
