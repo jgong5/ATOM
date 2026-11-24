@@ -942,7 +942,7 @@ claims there are not.
 
 ---
 
-## D107. Every supported form is a gated scenario, at the level a real backend reaches
+## D120. Every supported form is a gated scenario, at the level a real backend reaches
 
 ### Problem
 
@@ -965,23 +965,36 @@ inventory of forms, and each one's level today, is tracked on
    a run with any refusal or a coverage report (D50.1), so level 1 needs no check of its
    own. A form Compass cannot run or price is **refused**: by name, at start or at its
    first step, with a test that asserts the refusal. Level 0 alone shows that the
-   simulation runs, not that the form is supported: a form every real backend refuses, with
-   no task planned to price it, is refused, whatever its level 0. Timeline parity and
-   grading (D44 to D50) are not levels of this decision: they stay with the stage trackers
-   and their graded cells, and no gate runs them.
+   simulation runs, not that the form is supported (point 2). Timeline parity and grading
+   (D44 to D50) are not levels of this decision: they stay with the stage trackers and
+   their graded cells, and no gate runs them.
 2. **The target.** Every supported form reaches level 1. Where the step roofline refuses
    one and a task is planned to price it, the form stays at level 0 until that task lands,
-   and the refusal is an issue, not a target met. A form that is neither supported nor
-   refused is decided one or the other; none stays unclear. Images are refused (the owner's
-   decision of 2026-11-02, confirmed as refused on 2026-11-03, recorded in
-   [#2712](https://github.com/jgong5/ATOM/issues/2712)'s body): every real backend refuses
-   a step with image tokens (`backends/shape.py::IMAGES`), and no task prices a vision
-   encoder. `tests/compass/test_image_scenario.py` tests the frontend's media station under
-   the stub; it is no evidence that images are supported.
+   and the refusal is an issue, not a target met. A form every real backend refuses,
+   whose pricing issue waits until after v1 (its title ends `(after v1)`), is refused by
+   name, whatever its level 0. A form that is neither supported nor refused is decided one
+   or the other; none stays unclear. The owner's
+   [answers on #2712](https://github.com/jgong5/ATOM/issues/2712#issuecomment-6601446125)
+   (2026-11-03) refused Eagle, Kimi-K3, MiniMax-M3 and images, each gap a pricing issue
+   for after v1: Eagle's drafter passes, Kimi-K3's KDA recurrence, MiniMax-M3's sparse
+   attention, windowed attention and a vision encoder
+   ([#3309](https://github.com/jgong5/ATOM/issues/3309)). **Amended 2026-11-12** by `14`
+   D87.1, the owner's ruling on [#3257](https://github.com/jgong5/ATOM/issues/3257):
+   MiniMax-M3 with its EAGLE3 drafter runs at level 0 by scenario
+   (`tests/compass/test_eagle3_m3.py`, [#3313](https://github.com/jgong5/ATOM/pull/3313)),
+   and the step linear law prices it from records, so neither is refused. The step
+   roofline still refuses an Eagle3 step and MiniMax-M3's sparse attention layers by name,
+   so their level 1 waits on those two `(after v1)` issues. Kimi-K3, images and a form
+   with windowed attention, whose issue also waits until after v1, stay refused. Every
+   real backend refuses a step with image tokens (`backends/shape.py::IMAGES`);
+   `tests/compass/test_image_scenario.py` tests the frontend's media station under the
+   stub and is no evidence that images are supported.
 3. **The backend is the step roofline, alone.** It reads no measurement, so it prices any
-   scenario on any host, and a form on MI355X or MI455 is priced on that machine's spec
-   document (`05`) from node 18, with memory readings the test publishes, as the vertical
-   slice does; no such card is needed for level 1. A run file naming
+   scenario on any host. The GPU gate's host is a pit2 MI355X node (gfx950, the target
+   of `scripts/compass/gpu_gate_baselines/gfx950/`); a form on another card, MI308X or
+   MI455, is priced there on that machine's spec document (`05`), a fixture in
+   `tests/compass/machines/`, with memory readings the test publishes, as the vertical
+   slice does, so no such card is needed for level 1. A run file naming
    `step_roofline` and none of `step_stub`, `step_linear`, `step_grid` and `op_graph`
    installs it as the run's only backend (`10` D64, `13` D80; built by
    [#2661](https://github.com/jgong5/ATOM/issues/2661)). Its gaps on a level-1 path are
@@ -1030,7 +1043,7 @@ RapidServe adds, until [#2598](https://github.com/jgong5/ATOM/issues/2598) is ru
 | D50.3 | The op-level empirical backend is graded by this protocol as the step-level backends are, on the same real runs: Qwen3.8-27B TP1 on MI308X on #974's runs, then M2's cells with the ranking gate. Faster than real is gated; 5× is reported. Reported, not gated: the analytical fallback's share of priced seconds, the per-step composed-over-measured gap per phase and op kind, the step-level backend's table beside it, and warm-over-cold. | 2026-10-18 (#1489) |
 | D51 | Measure a saturated cell early. Account cold costs once; report the simulator's own per-step CPU cost alongside the ratio. | 2026-09-18 |
 | D52 | Fail-closed invalidation conditions; any refusal is one, an answered step is not, whatever its method or share (D50.1). Scheduling claims require slack; throughput claims at saturation are fine. | 2026-09-18; revised 2026-10-11 twice |
-| D107 | Every supported form is a gated scenario. Level 0: its scenario passes `check_run` under the step stub; level 1: the same run passes priced by the step roofline alone, on the machine's spec document; otherwise refused by name, at start or at its first step, with a refusal test; a form every real backend refuses, with no task planned to price it, is refused whatever its level 0. Every supported form targets level 1, a roofline refusal with a planned task leaving it at level 0 with an issue; none stays unclear. Images are refused. The capability matrix is printed from marks on the tests, checked against a vocabulary by a CPU test, never against prose; engine scenarios run in the GPU gate per wave, and D43.1's trigger list is unchanged. Timeline parity and grading are not levels and run in no gate. | 2026-11-03 ([#2712](https://github.com/jgong5/ATOM/issues/2712)) |
+| D120 | Every supported form is a gated scenario. Level 0: its scenario passes `check_run` under the step stub; level 1: the same run passes priced by the step roofline alone, on the machine's spec document, on a pit2 MI355X host; otherwise refused by name, at start or at its first step, with a refusal test; a form every real backend refuses, whose pricing issue waits until after v1, is refused by name whatever its level 0. Every supported form targets level 1, a roofline refusal with a planned task leaving it at level 0 with an issue; none stays unclear. The 2026-11-03 answers, as `14` D87.1 amended them on 2026-11-12: Kimi-K3, windowed attention and images are refused, each gap a pricing issue for after v1; MiniMax-M3 with its EAGLE3 drafter runs at level 0, its roofline gaps after v1. The capability matrix is printed from marks on the tests, checked against a vocabulary by a CPU test, never against prose; engine scenarios run in the GPU gate per wave, and D43.1's trigger list is unchanged. Timeline parity and grading are not levels and run in no gate. | 2026-11-03 ([#2712](https://github.com/jgong5/ATOM/issues/2712)); amended 2026-11-12 (`14` D87.1) |
 
 ---
 
@@ -1047,4 +1060,4 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T26 | Assert simulator bit-reproducibility as a test | depends on the Clock Authority existing |
 | T27 | Decide the construction of the cells the corpus cannot fill without reusing sessions: 256 clients with fan-out in every root, and the recipe's largest DPA concurrency | doc 06 T14, surfaces again here |
 | ~~T28~~ | ~~Establish whether ranking/regret becomes an explicit acceptance gate~~ — **done**: M2's ranking gate, D50 | — |
-| T106 | Decide whether a change to a path a level-1 scenario imports runs the capability matrix on a GPU before it lands (D107) | needs the matrix's wall time on one card, measured by [#2664](https://github.com/jgong5/ATOM/issues/2664); amends D43.1 rule 4, and `16`'s per-task gate with it, if adopted |
+| T106 | Decide whether a change to a path a level-1 scenario imports runs the capability matrix on a GPU before it lands (D120) | needs the matrix's wall time on one card, measured by [#2664](https://github.com/jgong5/ATOM/issues/2664); amends D43.1 rule 4, and `16`'s per-task gate with it, if adopted |

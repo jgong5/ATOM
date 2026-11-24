@@ -171,7 +171,7 @@ projection. A run reaches it as the step-level fallback its run file composes
 (`StepFallbackBackend`, `07` D36), turned on by the run-file key `step_roofline`, and
 always on under `step_grid` (`17` D102). A run file naming `step_roofline` and none of
 `step_stub`, `step_linear`, `step_grid` and `op_graph` installs it as the run's only
-backend, every step priced by it: the level-1 backend of `08` D107
+backend, every step priced by it: the level-1 backend of `08` D120
 ([#2661](https://github.com/jgong5/ATOM/issues/2661)). Its method counts the inputs it reads (owner ruling on
 [#1011](https://github.com/jgong5/ATOM/issues/1011), 2026-10-15): spec fields by their
 origin, analytical from a datasheet or a probe, declared if assumed; the run file's stated
@@ -435,7 +435,7 @@ extractors at op level (`16` *Wave 5*).
 
 An op-level backend answers a leaf no measurement prices by its analytical law, always
 (#952); at step level the step roofline is the fallback a run file composes, or the run's only
-backend (D64, `08` D107). As the
+backend (D64, `08` D120). As the
 fallback of an empirical backend, the analytical method answers its own price, reported
 apart (#1392), with the method its inputs give it, declared while it reads an assumed
 parameter, and its share of seconds is always reported (`08` D50.1). A law never moves
