@@ -1107,6 +1107,15 @@ SLICE_RECORDS = (
         "_checkpoint_shards",
         {0, 1, 2, 3},
     ),
+    # The fused KDA input projection of GLM-5.3-Flash's linear-attention
+    # layers: its q, k and v shards come from the checkpoint, its g shard is
+    # folded after load from the low-rank output gate.
+    (
+        "atom.models.glm5_next",
+        "Glm5NextKDAAttention",
+        "_loaded_input_shards",
+        {0, 1, 2},
+    ),
 )
 
 
