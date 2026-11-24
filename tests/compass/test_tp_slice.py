@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from capabilities import ROOFLINE, ROOFLINE_MACHINE, capability
 from test_dp_slice import (  # noqa: F401
     MAX_TOKENS,
     device_classes_put_back,
@@ -38,6 +39,7 @@ def tp2(tmp_path_factory):
 
 
 @NEEDS_A_RUN
+@capability("tp_above_1")
 def test_a_tp2_engine_meets_every_scenario_check(tp2):
     print(f"\n{tp2[0]['table']}")
     failed = check_run(
@@ -49,15 +51,76 @@ def test_a_tp2_engine_meets_every_scenario_check(tp2):
     assert not failed, "\n".join(failed)
 
 
+#: Each context-parallel width, and the form it runs.
+CONTEXT_PARALLEL = {"pcp": ["-pcp", "2"], "dcp": ["-tp", "2", "-dcp", "2"]}
+
+
 @NEEDS_A_RUN
-@pytest.mark.parametrize("width", [["-pcp", "2"], ["-tp", "2", "-dcp", "2"]])
+@pytest.mark.parametrize(
+    "width",
+    [pytest.param(w, marks=capability(form)) for form, w in CONTEXT_PARALLEL.items()],
+)
 def test_a_context_parallel_engine_meets_the_run_properties(tmp_path, width):
     runs = [run_dp_slice(tmp_path / s, s, width, dp=1) for s in ("1", "2")]
     failed = check_run([r["out"] for r in runs])
     assert not failed, "\n".join(failed)
 
 
+@pytest.fixture(scope="module")
+def tp2_roofline(tmp_path_factory):
+    root = tmp_path_factory.mktemp("tp2_roofline")
+    return [
+        run_dp_slice(
+            root / s, s, ["-tp", "2"], dp=1, machine=ROOFLINE_MACHINE, backend=ROOFLINE
+        )
+        for s in ("1", "2")
+    ]
+
+
+@NEEDS_A_RUN
+@capability("tp_above_1", 1)
+def test_a_tp2_engine_meets_every_scenario_check_under_the_step_roofline(
+    tp2_roofline,
+):
+    """The level-0 case's checks but one: the engine's hand-computed
+    timeline, `check_run`'s records, which it computes only for a constant
+    step stub, from that stub's prefill and decode costs."""
+    run = tp2_roofline[0]
+    print(f"\n{run['summary']['schedule']['seconds_by_method']}\n{run['table']}")
+    failed = check_run(
+        [r["out"] for r in tp2_roofline],
+        MAX_TOKENS,
+        [line for _, line in run["events"]],
+    )
+    assert not failed, "\n".join(failed)
+
+
+@NEEDS_A_RUN
+@pytest.mark.parametrize(
+    "width",
+    [
+        pytest.param(w, marks=capability(form, 1), id=form)
+        for form, w in CONTEXT_PARALLEL.items()
+    ],
+)
+def test_a_context_parallel_engine_meets_the_run_properties_under_the_step_roofline(
+    tmp_path, width
+):
+    """The level-0 case's checks, none of them on step timing."""
+    runs = [
+        run_dp_slice(
+            tmp_path / s, s, width, dp=1, machine=ROOFLINE_MACHINE, backend=ROOFLINE
+        )
+        for s in ("1", "2")
+    ]
+    print(f"\n{runs[0]['summary']['schedule']['seconds_by_method']}")
+    failed = check_run([r["out"] for r in runs])
+    assert not failed, "\n".join(failed)
+
+
 @NEEDS_A_PD_RUN
+@capability("tp_above_1")
+@capability("pd_1p1d")
 def test_a_tp2_prefill_and_decode_meet_every_scenario_check(tmp_path, monkeypatch):
     monkeypatch.setenv("SERVER_ARGS", "-tp 2 --enforce-eager --max-model-len 2048")
     runs = [run_pd(tmp_path / s, s) for s in ("1", "2")]

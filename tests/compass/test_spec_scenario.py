@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import test_dp_slice
 import torch
+from capabilities import capability
 from test_dp_slice import (  # noqa: F401
     DP_MACHINE,
     MAX_TOKENS,
@@ -46,7 +47,10 @@ METHODS = {
 MACHINE = copy.deepcopy(DP_MACHINE)
 
 
-@pytest.fixture(scope="module", params=sorted(METHODS))
+@pytest.fixture(
+    scope="module",
+    params=[pytest.param(m, marks=capability(m)) for m in sorted(METHODS)],
+)
 def runs(request, tmp_path_factory):
     name, flags, drafts = METHODS[request.param]
     model = os.environ.get(name)
@@ -56,9 +60,10 @@ def runs(request, tmp_path_factory):
     root = tmp_path_factory.mktemp(request.param)
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(test_dp_slice, "MODEL", model)
-        mp.setattr(test_dp_slice, "CONSTANT", STUB)
         return [
-            run_dp_slice(root / f"seed{s}", s, flags, dp=1, machine=MACHINE)
+            run_dp_slice(
+                root / f"seed{s}", s, flags, dp=1, machine=MACHINE, backend=STUB
+            )
             for s in ("1", "2")
         ]
 

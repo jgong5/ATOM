@@ -19,6 +19,7 @@ from collections import Counter
 from types import SimpleNamespace
 
 import pytest
+from capabilities import capability
 from test_dp_slice import MAX_TOKENS, _deployment
 from test_kv_remote_prefill import Script, connector
 from test_kv_simulated_connector import PEAKS, geometry, model_for  # noqa: F401
@@ -173,6 +174,7 @@ def runs(request, tmp_path_factory):
 
 
 @NEEDS_A_PD_RUN
+@capability("pd_widths")
 def test_two_widths_meet_every_scenario_check_with_a_transfer_per_request(runs):
     (p, d), runs = runs
     run = runs[0]
