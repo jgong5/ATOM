@@ -163,7 +163,9 @@ part of v1, added after that
 ## D95.1. The M3-Agentic stage: MiniMax-M3's AgentX submission on MI355X
 
 Owner rulings of 2026-11-12, on [#3256](https://github.com/jgong5/ATOM/issues/3256) for
-the stage and on [#3257](https://github.com/jgong5/ATOM/issues/3257) for its design. The
+the stage and on [#3257](https://github.com/jgong5/ATOM/issues/3257) for its design, and
+of 2026-11-24 on #3256 ([Ruling](https://github.com/jgong5/ATOM/issues/3256#issuecomment-7121059622)),
+which moves the stage from mi355-gpu-40 to the pit2 MI355X pool. The
 stage is named for the model; it is not the retired milestone M3 of D95.
 
 - **Target.** Compass reproduces every point of ATOM's MiniMax-M3 AgentX submission to
@@ -172,14 +174,19 @@ stage is named for the model; it is not the retired milestone M3 of D95.
   ran it. #3256 holds its arms, their arguments and concurrencies, and InferenceX's values;
   this document does not copy them. The 8k/1k and disaggregated MiniMax-M3 entries are out
   of scope, and MiniMax-M3.1 until ATOM's InferenceX entry for it lands.
-- **The real curve is this branch's ATOM** serving the submission's arguments on
-  mi355-gpu-40, three spaced rounds per point (`08` D45). The submission's own image is
+- **The real curve is this branch's ATOM** serving the submission's arguments on the
+  pit2 MI355X pool, three spaced rounds per point (`08` D45). The submission's own image is
   not run again and InferenceX's published points are not drawn: Compass grades a
   simulated run against real runs of its own tree.
-- **Platform.** gpu-40 on the nightly 20261026 stack, not InferenceX's nightly 20261007;
-  each registration states it.
-- **One frozen commit.** Calibration and every graded run use the commit frozen at
-  #3266's first registration. A later ATOM change re-keys the laws
+- **Platform.** pit2-p03 MI355X nodes, GPUs leased through the team pool, on the image
+  the frozen commit's gates run (`rocm/atom-dev:nightly_202611151511` once
+  [#3936](https://github.com/jgong5/ATOM/pull/3936) lands), not InferenceX's nightly
+  20261007; each registration states the node, its platform entry and the image's
+  digest. Nothing measured on gpu-40 is reused: its stores, laws, records and graded
+  rounds cannot be reached from the pool.
+- **One frozen commit.** Calibration and every graded run use one commit of this branch,
+  taken after #3936 lands and frozen at #3266's first registration on the pool. A later
+  ATOM change re-keys the laws
   ([#2350](https://github.com/jgong5/ATOM/issues/2350)), so moving needs a new
   registration.
 - **What Compass adds for it:** EAGLE3 (`14` D87.1), ATOM's `lmcache_offload` connector
