@@ -646,8 +646,20 @@ def _rank_departures(seg, lane, dep) -> list[int]:
 
 @pytest.mark.parametrize(
     "deployment",
-    [{}, {"rungs": [1, 2, 4, 8, 16], "max_num_seqs": 12}, {"max_num_seqs": 10}],
-    ids=["max-num-seqs-a-rung", "widest-rung-past-max-num-seqs", "eager-rows"],
+    [
+        {},
+        {"rungs": [1, 2, 4, 8, 16], "max_num_seqs": 12},
+        {"max_num_seqs": 10},
+        # rung 16's eight row counts take 60 / 8 = 7.5 steps each: whole steps
+        # rounded down would leave it 56.
+        {"rungs": [1, 2, 4, 8, 16], "max_num_seqs": 16},
+    ],
+    ids=[
+        "max-num-seqs-a-rung",
+        "widest-rung-past-max-num-seqs",
+        "eager-rows",
+        "a-rung-s-steps-past-a-whole-share",
+    ],
 )
 def test_every_drain_holds_each_rung_it_passes_for_60_steps_on_one_shared_schedule(
     deployment,
@@ -865,3 +877,42 @@ def test_a_segment_the_deployment_cannot_run_is_refused_by_name():
     refused({"name": "X", "kind": "fill"}, "no generator")
     refused({"name": "X", "kind": "copy", "of": "A-a"}, "copies a copy")
     refused({"name": "X", "kind": "copy", "of": "no-such"}, "copies no segment")
+
+
+def test_an_unpinned_lane_drains_a_one_rank_deployment_as_a_pinned_one():
+    """At `dp` 1 an unpinned lane is on the one rank: it drains as a lane
+    pinned there does, its traces carrying no pin."""
+
+    def lane(pin):
+        raw = _design_config(dp=1)
+        seg = {"name": "X", "kind": "drain"}
+        seg["lanes"] = [{"pin": pin, "groups": [{"rows": 8, "prompt": 1024}]}]
+        raw["segments"] = [seg]
+        (made,) = design.generate(deploy.parse(raw))
+        return made
+
+    free, pinned = lane(None), lane(0)
+    assert free.lanes[0].pin is None and pinned.lanes[0].pin == 0
+    turns = [[(t.prompt, t.out) for t in s.turns] for s in free.lanes[0].sessions]
+    assert turns == [
+        [(t.prompt, t.out) for t in s.turns] for s in pinned.lanes[0].sessions
+    ]
+    assert free.plan["lanes"]["l0"] == {**pinned.plan["lanes"]["l0"], "pin": None}
+
+
+def test_lanes_sharing_a_rank_are_refused_by_name():
+    """A rank holds one lane of a segment, so `max_num_seqs` bounds its rows:
+    two 6-row lanes pinned to rank 0 of a `max_num_seqs` 8 deployment would
+    put 12 rows there. An unpinned lane is on every rank."""
+
+    def refused(lanes, match):
+        raw = _design_config()
+        raw["segments"] = [{"name": "X", "kind": "drain", "lanes": lanes}]
+        with pytest.raises(ValueError, match=match):
+            design.generate(deploy.parse(raw))
+
+    six = {"groups": [{"rows": 6, "prompt": 1024}]}
+    pinned = [{**six, "name": "a", "pin": 0}, {**six, "name": "b", "pin": 0}]
+    refused(pinned, "X: lanes a and b share rank 0")
+    free = [{**six, "name": "a", "pin": 1}, {**six, "name": "b", "pin": None}]
+    refused(free, "X: lanes a and b share rank 1")

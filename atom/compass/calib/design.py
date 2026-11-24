@@ -35,7 +35,9 @@ Kinds (`GENERATORS`):
   `last` leave last (an anchor stays to the end); a lane with `hold` keeps
   every row until the segment's longest drain ends (a peer that holds the rung
   or the group's tokens while another rank drains). An unpinned lane drains
-  `rows / dp` rows a rank, `dp` rows leaving at each departure. A group with
+  `rows / dp` rows a rank, `dp` rows leaving at each departure. A rank holds
+  one lane of a segment, an unpinned lane every rank, so `max_num_seqs` bounds
+  its rows; lanes sharing a rank are refused by name. A group with
   `then` sends each prompt with one output token, then a `then`-token turn on
   it that carries the drain's output: the second turns queue behind every
   first turn's chunks, so they prefill together, a step of many rows on deep
@@ -237,12 +239,24 @@ def drain(seg: dict, cfg: Config) -> Segment:
     if len(set(names)) != len(names):
         raise ValueError(f"{seg['name']}: lane names repeat: {names}")
     load = [0.0] * dep.dp  # prompt tokens each rank prefills before its drain
-    for k, lane in enumerate(specs):
+    held: dict[int, str] = {}  # the lane on each rank
+    for k, (lane, name) in enumerate(zip(specs, names)):
         pin = lane.get("pin")
         if pin is not None and not 0 <= pin < dep.dp:
             raise ValueError(f"{seg['name']} lane {k}: pin {pin} past dp {dep.dp}")
+        # An unpinned lane is on every rank, even the one of a one-rank
+        # deployment; a rank holds one lane, so `max_num_seqs` bounds its rows
+        # and its rows leave on the one schedule.
+        ranks = [pin] if pin is not None else list(range(dep.dp))
+        for r in ranks:
+            if r in held:
+                raise ValueError(
+                    f"{seg['name']}: lanes {held[r]} and {name} share rank {r} "
+                    "(an unpinned lane is on every rank); a rank holds one lane"
+                )
+            held[r] = name
         rows = sum(g["rows"] for g in lane["groups"])
-        width = 1 if pin is not None else dep.dp
+        width = len(ranks)
         if rows % width:
             raise ValueError(f"{seg['name']} lane {k}: {rows} rows over {width} ranks")
         if rows // width > dep.max_num_seqs:
@@ -251,7 +265,7 @@ def drain(seg: dict, cfg: Config) -> Segment:
             sum(_prompts(g, g["rows"], dep)) + g["rows"] * g.get("then", 0)
             for g in lane["groups"]
         )
-        for r in [pin] if width == 1 else range(dep.dp):
+        for r in ranks:
             load[r] += prefill / width
         if not lane.get("hold"):
             ends.append(departures(rows // width, dep, steps_per_rung)[-1])
@@ -264,7 +278,7 @@ def drain(seg: dict, cfg: Config) -> Segment:
     for lane, name in zip(specs, names):
         pin = lane.get("pin")
         width = 1 if pin is not None else dep.dp
-        lag = max(chunks) - (chunks[pin] if width == 1 else min(chunks))
+        lag = max(chunks) - (chunks[pin] if pin is not None else min(chunks))
         # leaving order: groups as listed, `last` ones after the rest
         order = [g for g in lane["groups"] if not g.get("last")]
         order += [g for g in lane["groups"] if g.get("last")]
