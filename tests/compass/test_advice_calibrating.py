@@ -447,13 +447,18 @@ def test_an_ended_calibration_s_candidate_calibrates_anew_unless_that_refits_its
     its status read for b's state, or why none serves where it would take what
     the ended one took and that law is at b's key at the head's ATOM digest."""
     monkeypatch.setenv("AIPERF_PYTHON", "/real/python")
+    # The stub keys its store entries by the variable, as a law's key does.
+    monkeypatch.setenv("KEYED", "ATOM_USE_TRITON_MOE")
     cal, b = tmp_path / "out" / "cal", UNREAD
     (first,) = advise(tmp_path, {"b": b})["b"]["made_by"]
     assert _calibrated(tmp_path, first)[0] == 0
+    config = resolved(stubbed.config, ["--max-num-seqs", "4"])
+    # The readings it published into the shared store, which the stub's entries
+    # stand for and no store reader takes.
+    publish_readings(tmp_path / "store", config)
     atom = "0" * 64 if since == "the tree moved" else None
     # The law a calibration of b on another card fits, OUT then taken here.
     elsewhere = {"device": "MI300X gfx942"} if since.endswith("device") else {}
-    config = resolved(stubbed.config, ["--max-num-seqs", "4"])
     _fitted(cal / "b", config, atom, PLATFORM | elsewhere)
     if since == "the tree moved":
         (tmp_path / "ATOM" / ".compass-commit").write_text("beef\n")
