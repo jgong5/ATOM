@@ -105,8 +105,11 @@ shard, and the Markov sampler on that shard, once a position.
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
 first of each class comes back as an `unclassified` module named by class
-and path, which the backend refuses. Each module carries the index of the
-decoder layer it sits in, read off its path.
+and path, which the backend refuses. Kimi-K3's `KimiKDAAttention` is refused
+by name and not gone into: its KDA recurrence runs inside its forward, in no
+module the walk reads, so the first one comes back as such a module whose
+name also says what it runs and the issue that would price it. Each module
+carries the index of the decoder layer it sits in, read off its path.
 """
 
 import dataclasses
@@ -171,6 +174,9 @@ V41_SILENT = (
 )
 #: What the routed experts' kernel reads once for each expert it runs.
 HELD = tuple(f"w{w}_{p}" for w in (13, 2) for p in ("weight", "weight_scale", "bias"))
+#: Kimi-K3's KDA attention, and why the walk refuses it.
+KDA = "atom.models.kimi_k3.model.KimiKDAAttention"
+KDA_REFUSED = "Kimi-K3's KDA recurrence; no roofline class prices it before #3963"
 LAYER = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
@@ -198,10 +204,10 @@ def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
             for child, sub in module.named_children():
                 inner = CONTEXT if _drafts_kv(sub, module) else draft
                 visit(sub, f"{name}.{child}" if name else child, module, inner)
-        elif then is None and type(module) not in seen:
+        elif (then is None or isinstance(then, str)) and type(module) not in seen:
             seen.add(type(module))
             where = f"{type(module).__name__} at {name or 'the root'}"
-            found.append(Module(where, UNCLASSIFIED))
+            found.append(Module(f"{where} ({then})" if then else where, UNCLASSIFIED))
 
     visit(tree, "", None, 0)
     if drafted is not None:
@@ -323,9 +329,12 @@ def _is(module, *names: str) -> bool:
 
 
 def _classify(module, name, parent):
-    """`module`'s `Module`, `NOTHING`, `DESCEND`, or None if unclassified."""
+    """`module`'s `Module`, `NOTHING`, `DESCEND`, None if unclassified, or why
+    it is refused."""
     if parent is not None and _inside(module, parent):
         return NOTHING
+    if _is(module, KDA):
+        return KDA_REFUSED
     weight = getattr(module, "weight", None)
     fmt = FORMATS.get(getattr(weight, "dtype", None))
     if _is(module, V4 + "Block"):
