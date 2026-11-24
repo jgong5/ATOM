@@ -91,7 +91,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from atom.compass.artifacts import ArtifactStore, Topology
-from atom.compass.backends.json_file import read_jsonl
 from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, pooled
@@ -201,14 +200,7 @@ def _record(
             f"{steps} holds {ARRIVALS}, so its steps are not numbered as its lines"
         )
     record = served(steps, client_runs)
-    own, buckets = steps / "dp0.engine.json", stated_buckets(steps / "dp0.jsonl")
-    level = recorded_level(steps / "dp0.jsonl")
-    engine = level | keyed_of(json.loads(own.read_text()))
-    if stated is not None:
-        engine, buckets = _stated(own, level | held, buckets, stated)
-    stages = _stages(steps, engine)
-    later = [read_jsonl(f) for files in stages[1:] for f in files]
-    if built := aiter_jit.cut_refusal(run, [*record.values(), *later]):
+    if built := aiter_jit.cut_refusal(run, record.values()):
         raise ValueError(f"{directory} is not fitted: {built}")
     spans = client_spans(record)
     # Each step within a calibration ladder's span, to the rungs it calibrates.
@@ -240,7 +232,12 @@ def _record(
             f"parameters: {' and '.join(sampling)}"
         )
     traces = {(s["dp_rank"], s["step"]): s["traces"] for s in _steps(record)}
-    heads, samples = {}, []
+    own, buckets = steps / "dp0.engine.json", stated_buckets(steps / "dp0.jsonl")
+    level = recorded_level(steps / "dp0.jsonl")
+    engine = level | keyed_of(json.loads(own.read_text()))
+    if stated is not None:
+        engine, buckets = _stated(own, level | held, buckets, stated)
+    stages, heads, samples = _stages(steps, engine), {}, []
     for k, files in enumerate(stages):
         stage = k if len(stages) > 1 else None
         name = ", ".join(map(digest, files))
