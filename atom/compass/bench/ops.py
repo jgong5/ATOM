@@ -4857,9 +4857,6 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
         head, rows, _ = json.loads(base)
         tokens = [t for t, _ in at]
         for t in sorted(axis[skeletons[base]]):
-            shape = prefill(t, rows) if head == "prefill" else own.get((base, t))
-            if shape is None:
-                continue
             for c in sorted({c for u, c in at if ((base, u), c) not in tried}):
                 fam = json.dumps([*json.loads(base), c], sort_keys=True)
                 fam = base if c is None else fam
@@ -4869,6 +4866,11 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
                     or (fam, t) in tried
                     or (c or 0) > max_model_len - -(-t // rows)
                 ):
+                    continue
+                # the axis holds other row counts' token counts, some fewer
+                # than these rows: a shape is built only inside this range
+                shape = prefill(t, rows) if head == "prefill" else own.get((base, t))
+                if shape is None:
                     continue
                 tried.add((fam, t))
                 want[shape, c or None].add(fam)
