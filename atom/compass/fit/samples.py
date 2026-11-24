@@ -86,7 +86,7 @@ from atom.compass.artifacts import ArtifactStore, Topology
 from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, pooled
-from atom.compass.backends.step_labels import Sample, digest, label_run
+from atom.compass.backends.step_labels import Sample, cut_spans, digest, label_run
 from atom.compass.backends.step_linear_fit import (
     recorded_buckets,
     recorded_level,
@@ -231,7 +231,7 @@ def _record(
         engine, buckets = _stated(own, level | held, buckets, stated)
     files = sorted(steps.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
     name, samples = ", ".join(map(digest, files)), []
-    for got, _ in label_run(files, name, _split, floored):
+    for got, _ in label_run(files, name, _split, floored, cut_spans(run)):
         dummies = None
         for s in got:
             if graded is not None and s.step not in graded:

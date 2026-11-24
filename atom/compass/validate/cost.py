@@ -124,7 +124,8 @@ def cost_accuracy(record, backend, steps=None) -> dict:
     some ranks only are refused, and so is a record whose every rank ran only
     dummy forwards.
     So is a record whose run.json, beside `record`, names `aiter_jit_builds`
-    that `step_labels.cut_refusal` refuses; a step overlapping a timed compile is cut.
+    that `step_labels.cut_refusal` refuses; a step overlapping a compile that
+    run.json times is cut.
     On several ranks, the report's ``ranks`` holds per kind and rank number
     the graded steps that rank was priced as (`accuracy._rank`), with its cards' buses.
     """
@@ -140,7 +141,9 @@ def cost_accuracy(record, backend, steps=None) -> dict:
             f"{record} holds rank records of {lines} lines; one run's ranks "
             "differ by at most the step a stopped run leaves on some"
         )
-    run = [got for got, _ in step_labels.label_run(ranks, split_rule=_split)]
+    spans = step_labels.cut_spans(identity)
+    labelled = step_labels.label_run(ranks, split_rule=_split, spans=spans)
+    run = [got for got, _ in labelled]
     if not any(run):
         raise ValueError(
             f"{record}'s ranks ran only DP's dummy forwards: no step to price"
