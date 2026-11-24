@@ -24,7 +24,9 @@ dummy run, holds a prefill row (`group_prefills`).
 A view also takes its line's `target_bs`, `draft_bs`, `draft_moe_rows` and
 `draft_rows`, the widths and rows its target and drafter ran at, which an op
 graph reads, and its `group_needs_eager`, which a line states only where it is
-true, so a record written before the field reads false throughout.
+true, so a record written before the field reads false throughout, and its
+`kda`, which a KDA model's lines state (`runner.projection.kda_counts`), None
+where a line states none.
 
 A decode step's device label is its device busy time, `d_busy_ns`, plus the
 device work queued since the previous forward's exit, `d_gap_ns`. A decode step
@@ -811,6 +813,7 @@ def _label(
             group_needs_eager=s.get("group_needs_eager", False),
             group_tail=dp and s["step"] in (tails or ()),
             prefill_duty=duties[i],
+            kda=tuple(s["kda"]) if "kda" in s else None,
         )
         cut = None
         # An untraced prefill labelled from its own window (`PREFILL_LABEL_ENV`).
