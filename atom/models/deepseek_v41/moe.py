@@ -41,6 +41,7 @@ from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
 
+
 #: Whether this process compiled the router's widths
 #: (`MoE.process_weights_after_loading`).
 _ROUTER_WARM = False

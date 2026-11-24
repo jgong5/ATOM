@@ -6,9 +6,9 @@ table's values and, when quantized, its block scales) and returns them as
 page-locked tensors -- copied into `hipHostMalloc` memory of exactly their
 size, or the checkpoint mapping registered in place (`ATOM_ENGRAM_UVA_COPY=0`,
 no HIP runtime, or -- unless `ATOM_ENGRAM_UVA_COPY` is set -- a shard that
-every DP-attention rank of the node holds whole, see `pin_rows`).
-`to_device` copies them into HBM instead (`ATOM_ENGRAM_UVA_HBM`); nothing
-below about page-locking or releasing applies to that.
+every DP-attention rank of the node holds whole, see `pin_rows`). `to_device`
+copies them into HBM instead (`ATOM_ENGRAM_UVA_HBM`); nothing below about
+registering or releasing applies to that.
 
 In-place registrations go through a process-wide, reference-counted set of
 page runs (`_PageRuns`): ranges are widened to page boundaries, so ranges
@@ -140,40 +140,20 @@ def _hip_runtime():
     Not `CDLL("libamdhip64.so")`: that is the system's unversioned dev link,
     which a wheel-only install lacks (the copy would quietly turn into an
     in-place registration) and which can name a second, different runtime
-    than torch's, with its own allocations and last error: memory it
-    page-locks is pageable to torch, whose copies from it faulted on MI455.
-    So a runtime the process maps is bound as it is (`RTLD_NOLOAD`, nothing
-    new mapped), and with several mapped none is, since which is torch's
-    cannot be told: the shard is then registered in place through torch.
+    than torch's, with its own allocations and last error.
     """
     if not torch.version.hip:
         return None
-    mapped = []
+    candidates = []
     try:
         with open("/proc/self/maps") as maps:
             for line in maps:
                 path = line.split(maxsplit=5)[-1].strip()
                 name = os.path.basename(path)
-                if name.startswith("libamdhip64.so") and path not in mapped:
-                    mapped.append(path)
+                if name.startswith("libamdhip64.so") and path not in candidates:
+                    candidates.append(path)
     except OSError:
         pass
-    if len(mapped) > 1:
-        logger.warning(
-            "engram: several HIP runtimes mapped (%s); a UVA shard is "
-            "registered in place instead of copied",
-            ", ".join(mapped),
-        )
-        return None
-    if mapped:
-        try:
-            hip = ctypes.CDLL(mapped[0], mode=os.RTLD_NOLOAD)
-        except OSError:
-            logger.warning("engram: HIP runtime %s not bound", mapped[0], exc_info=True)
-            return None
-        logger.info("engram: HIP runtime for page-locking: %s", mapped[0])
-        return hip
-    candidates = []
     torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
     try:
         candidates += sorted(
@@ -643,20 +623,6 @@ def _copy(allocator, sources, leases):
             pool.shutdown()
 
 
-def _read_only(lo: int, hi: int) -> bool:
-    """Whether some mapping of `[lo, hi)` is not writable (`/proc/self/maps`)."""
-    try:
-        with open("/proc/self/maps") as maps:
-            for line in maps:
-                fields = line.split(maxsplit=2)
-                a, b = (int(x, 16) for x in fields[0].split("-"))
-                if b > lo and a < hi and "w" not in fields[1]:
-                    return True
-    except (OSError, ValueError, IndexError):
-        pass
-    return False
-
-
 def to_device(sources: list[torch.Tensor], device) -> tuple[torch.Tensor, ...] | None:
     """`sources` (contiguous row ranges) copied into HBM on `device`, as
     tensors of the same dtype and shape; all-or-nothing, None on any failure
@@ -678,7 +644,9 @@ _HBM_BOUNCE_BYTES = 1 << 30
 
 
 def _bounce(nbytes: int) -> torch.Tensor:
-    """`nbytes` page-locked by torch's own allocator.
+    """`nbytes` page-locked by torch's own allocator, not `_HipHostAllocator`:
+    that loads HIP by name, which can be a second HIP runtime beside torch's,
+    to which its memory is pageable -- an H2D copy from it faulted on MI455.
     `device="cpu"`: under the CUDA default device the model is built with, a
     bare `pin_memory=True` asks for a CUDA tensor and raises.
     """
@@ -715,6 +683,20 @@ def _to_device(sources, device):
         del bounce
         # Free the bounce chunk now, not cache it page-locked for the process.
         torch._C._host_emptyCache()
+
+
+def _read_only(lo: int, hi: int) -> bool:
+    """Whether some mapping of `[lo, hi)` is not writable (`/proc/self/maps`)."""
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                fields = line.split(maxsplit=2)
+                a, b = (int(x, 16) for x in fields[0].split("-"))
+                if b > lo and a < hi and "w" not in fields[1]:
+                    return True
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
 
 
 def _reg_chunk_bytes() -> int:

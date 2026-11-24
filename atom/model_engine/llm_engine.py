@@ -122,9 +122,9 @@ class LLMEngine:
 
     def close(self):
         """Shut down engine and release all GPU resources."""
+        clock.finish()
         if getattr(self, "_structured_preflight", None) is not None:
             self._structured_preflight.close()
-        clock.finish()
         if hasattr(self, "core_mgr"):
             self.core_mgr.close()
 

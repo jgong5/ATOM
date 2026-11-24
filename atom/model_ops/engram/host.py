@@ -398,9 +398,10 @@ class EngramHost:
         default, registered in place with ATOM_ENGRAM_UVA_COPY=0;
         `host_memory.to_device` under ATOM_ENGRAM_UVA_HBM): the full table on
         every rank is what a TP job cannot afford. Under DP attention every
-        rank does hold the full table; page-locked, unless
-        ATOM_ENGRAM_UVA_COPY is set it is then registered in place, so the
-        node pins the checkpoint's page cache once instead of one copy per rank.
+        rank does hold the full table; unless ATOM_ENGRAM_UVA_COPY is set (or
+        ATOM_ENGRAM_UVA_HBM puts each rank's copy in its own HBM) it is then
+        registered in place, so the node pins the checkpoint's page cache once
+        instead of one copy per rank.
 
         The answer is the GROUP's. An empty shard and a refused page-lock are
         both per-rank outcomes, and the device lookup ends in an all-gather: a

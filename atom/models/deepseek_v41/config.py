@@ -388,11 +388,9 @@ def validate_runtime_config(config):
             # P/D with CPU offload composes one Mooncake leg and one offload tier.
             # Compass's simulated connector stands in for the Mooncake P/D leg
             # and prices the same PAGE units and STATE slot, moving no bytes.
-            # It is admitted as Mooncake is, unnamed here, so a run without
-            # Compass refuses in upstream's words.
             (
-                "KV transfer other than lmcache_mp, mooncake_store or mooncake "
-                "(multi: mooncake plus one offload tier)"
+                "KV transfer other than lmcache_mp, mooncake_store, mooncake or "
+                "compass (multi: mooncake or compass plus one offload tier)"
             ),
             names is None
             or any(

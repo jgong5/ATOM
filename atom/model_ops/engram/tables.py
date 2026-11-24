@@ -130,7 +130,8 @@ class HostEmbeddingTable:
 
         `shared`: every DP-attention rank of the node page-locks this same
         whole table, so it is registered in place rather than copied unless
-        `ATOM_ENGRAM_UVA_COPY` is set (`host_memory.copies`).
+        `ATOM_ENGRAM_UVA_COPY` is set (`host_memory.copies`). It has no effect
+        with `device`: each rank's HBM copy is its own.
 
         A table holds one range: enabling a different one while a range is
         held raises -- `disable_uva()` first.

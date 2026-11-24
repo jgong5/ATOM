@@ -634,9 +634,9 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        constraint_errors: dict[int, str] | None = None,
         predicted_s: float | None = None,
         group_targets: tuple[float, ...] | None = None,
-        constraint_errors: dict[int, str] | None = None,
     ):
         self.req_ids = req_ids
         self.constraint_errors = constraint_errors or {}
@@ -3346,9 +3346,9 @@ class Scheduler:
         seq = self._deferred_sequence(req_id)
         if seq is None:
             return False
-        abort_parked_send = getattr(self.kv_connector, "abort_parked_send", None)
-        if callable(abort_parked_send):
-            abort_parked_send(seq.id)
+        abort_send = getattr(self.kv_connector, "abort_send", None)
+        if callable(abort_send):
+            abort_send(seq.id)
             # An idle scheduler builds no metadata, so `_schedule` builds an
             # empty batch to carry the abort to the workers.
             self._abort_awaits_meta = True

@@ -16,11 +16,10 @@ from atom.config import Config, KVCacheTensor, ParallelConfig
 
 # A module, not its names: `region_graph` reads this one back at call time.
 from atom.utils import region_graph
-
+from atom.utils.tbo.ubatch_splitting import UBatchSlice, decode_bucket_splits
 # Called through the module, so a caller that replaces
 # `ubatching.sync_dp_metadata` (Compass's driverless capture) reaches the call.
 from atom.utils.tbo import ubatching
-from atom.utils.tbo.ubatch_splitting import UBatchSlice, decode_bucket_splits
 
 if TYPE_CHECKING:
     from atom.distributed.pcp_utils import PcpBalGroup

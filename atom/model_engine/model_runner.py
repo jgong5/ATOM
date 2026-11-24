@@ -1476,7 +1476,9 @@ class ModelRunner:
             draft = getattr(getattr(self, "drafter", None), "model", None)
             if isinstance(draft, torch.nn.Module):
                 models.append(draft)
-            calls = sum(prewarm_native_a8(m, self.warmup_max_tokens()) for m in models)
+            calls = sum(
+                prewarm_native_a8(m, self.warmup_max_tokens()) for m in models
+            )
             if calls:  # none off a GPU, as in a simulated run
                 torch.cuda.synchronize()
             logger.info(
