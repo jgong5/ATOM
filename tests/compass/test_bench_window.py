@@ -113,7 +113,7 @@ def test_the_preload_doubles_until_it_outlasts_the_host_and_each_kept_repeat_is_
     bench = Bench(issue, iter(busy))
 
     handed = batch()
-    result = bench.bench_step(handed)
+    result = bench.bench_step(handed, window.REPEATS)
 
     assert bench.preloads == [MS, 2 * MS] + [4 * MS] * window.REPEATS
     # Every forward ran the batch as handed in, its rows as new requests.
@@ -130,10 +130,88 @@ def test_the_preload_doubles_until_it_outlasts_the_host_and_each_kept_repeat_is_
     assert bench._parity_record is None
 
 
+def test_a_burst_keeps_the_repeats_it_is_asked_for_after_its_own_warm_ups():
+    """Each warm-up takes the host 1 ms to issue, sizing a preload that
+    outlasts each repeat's 0.5 ms, so none is discarded."""
+    issue = itertools.chain([MS] * window.WARMUPS, itertools.repeat(MS // 2))
+    busy = [BUSY + 1_000 * n for n in range(window.WARMUPS + window.BURST)]
+    bench = Bench(issue, iter(busy))
+
+    result = bench.bench_step(batch(), window.BURST)
+
+    assert bench.forwards == window.WARMUPS + window.BURST
+    kept = busy[window.WARMUPS :]
+    assert result["repeats"] == [[PREPARE + b, PREPARE, b] for b in kept]
+    assert result["median_ns"] == PREPARE + kept[window.BURST // 2]
+
+
+def burst(*busy, draft=None, discarded=0, preload=MS, eager=False) -> dict:
+    """A burst's reply whose repeats' model work lasts `busy` ns each, the
+    drafter's part `draft` ns of it under a drafter."""
+    tail = [] if draft is None else [draft]
+    repeats = [[PREPARE + b, PREPARE, b, *tail] for b in busy]
+    return {
+        "protocol": window.PROTOCOL,
+        "repeats": repeats,
+        "discarded": discarded,
+        "preload_ns": preload,
+        "group_needs_eager": eager,
+    }
+
+
+def test_two_bursts_whose_medians_agree_within_the_tolerance_are_kept():
+    """`17` D98: within 0.23% of the first burst's median, the point keeps its
+    ten repeats; past it, it runs on to 45 at once."""
+    first = burst(*[BUSY] * window.BURST)
+    step = PREPARE + BUSY
+    within = int(step * window.AGREE)
+    assert window.AGREE == 0.0023 and (window.BURST, window.REPEATS) == (5, 45)
+    for shift in (within, -within):
+        assert window.more([first, burst(*[BUSY + shift] * window.BURST)]) == 0
+    for shift in (within + 1, -within - 1):
+        second = burst(*[BUSY + shift] * window.BURST)
+        assert window.more([first, second]) == window.REPEATS - 2 * window.BURST
+        rest = burst(*[BUSY] * (window.REPEATS - 2 * window.BURST))
+        assert window.more([first, second, rest]) == 0
+
+
+def test_under_a_drafter_the_drafters_medians_must_agree_too():
+    draft = MS
+    first = burst(*[BUSY] * window.BURST, draft=draft)
+    same = burst(*[BUSY] * window.BURST, draft=draft)
+    moved = burst(*[BUSY + draft // 100] * window.BURST, draft=draft + draft // 100)
+    assert window.more([first, same]) == 0
+    # The target's part, F to B less the drafter's, is unmoved; the drafter's is not.
+    assert window._medians(moved["repeats"])["median_ns"] == PREPARE + BUSY - draft
+    assert window.more([first, moved]) == window.REPEATS - 2 * window.BURST
+
+
+def test_a_points_measurement_is_the_median_of_every_repeat_its_bursts_kept():
+    bursts = [
+        burst(*range(BUSY, BUSY + 5), discarded=1, preload=2 * MS),
+        burst(*range(BUSY + 5, BUSY + 10), preload=MS, eager=True),
+        burst(*range(BUSY + 10, BUSY + 45), discarded=2, preload=MS),
+    ]
+
+    got = window.joined(bursts)
+
+    assert got["repeats"] == [t for b in bursts for t in b["repeats"]]
+    assert got["median_ns"] == PREPARE + BUSY + 22
+    assert got["bursts"] == [5, 5, 35]
+    assert (got["discarded"], got["preload_ns"]) == (3, 2 * MS)
+    assert got["group_needs_eager"] is True and "draft_median_ns" not in got
+    assert got["protocol"] == window.PROTOCOL == 2
+    drafted = window.joined([burst(BUSY, BUSY + 2, draft=7), burst(BUSY + 4, draft=9)])
+    assert (drafted["median_ns"], drafted["draft_median_ns"]) == (
+        PREPARE + BUSY + 2 - 7,
+        7,
+    )
+
+
 def test_a_forward_that_waits_for_the_device_never_counts_and_its_point_refuses():
     bench = Bench(itertools.repeat(MS), itertools.repeat(BUSY), sync=True)
 
-    result = bench.bench_step(batch())
+    result = bench.bench_step(batch(), window.BURST)
 
     # The warm-ups' host waited for the device, so the first preload is that long.
     first = MS + BUSY
@@ -151,7 +229,7 @@ def test_a_host_that_stalls_every_other_forward_is_measured_between_the_stalls()
         itertools.chain([MS] * window.WARMUPS, repeats), itertools.repeat(BUSY)
     )
 
-    result = bench.bench_step(batch())
+    result = bench.bench_step(batch(), window.REPEATS)
 
     assert result["discarded"] == window.REPEATS - 1
     assert result["preload_ns"] == MS * 2**window.DOUBLINGS
@@ -225,7 +303,7 @@ def test_above_one_rank_each_kept_repeat_is_the_last_opened_ranks_window(pair, s
         issue = itertools.repeat(MS + rank * MS // 2)
         spin = spins[rank]
         bench = Rank(issue, iter(busy), rank=rank, group=group, spin=spin, link=link)
-        return bench.bench_step(batch()), bench.preloads
+        return bench.bench_step(batch(), window.REPEATS), bench.preloads
 
     (result, preloads), other = pair(step)
 

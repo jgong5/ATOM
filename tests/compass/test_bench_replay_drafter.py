@@ -192,7 +192,7 @@ def test_each_repeat_splits_where_a_real_steps_labels_split(output):
     bench = Bench(issue, iter(busy))
     batch = SimpleNamespace(req_ids=[7, 8], rows=[], produces_output=lambda: output)
 
-    result = bench.bench_step(batch)
+    result = bench.bench_step(batch, window.REPEATS)
 
     draft = PROPOSE if output else KV
     kept = busy[window.WARMUPS :]
@@ -210,8 +210,13 @@ def test_a_measurement_holds_the_drafters_value_and_fit_reads_it_as_a_draft_labe
     batch's token count in microseconds, the drafter's at half that."""
     reply = FakeBench.measure
 
-    def drafted(self, batch):
-        return reply(self, batch) | {"draft_median_ns": 500 * batch.total_tokens_num}
+    def drafted(self, batch, repeats):
+        got, draft = reply(self, batch, repeats), 500 * batch.total_tokens_num
+        whole = got["median_ns"] + draft
+        return got | {
+            "repeats": [[whole, 0, whole, draft]] * repeats,
+            "draft_median_ns": draft,
+        }
 
     monkeypatch.setattr(FakeBench, "measure", drafted)
     rec = str(run.record)

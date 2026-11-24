@@ -4645,11 +4645,11 @@
    "mechanism_why": "startup, before any batch; the bench measures real forwards on a real runner for a measuring command, and no simulated run starts one"
   },
   {
-   "id": "atom/compass/bench/engine.py::Bench.measure::self.runner_mgr.call_func(\"bench_step\", batch, wait_out=True)::worker_rpc#0",
+   "id": "atom/compass/bench/engine.py::Bench.measure::self.runner_mgr.call_func( \"bench_step\", batch, repeats, wait_out=True )::worker_rpc#0",
    "file": "atom/compass/bench/engine.py",
    "symbol": "Bench.measure",
    "call": "self.runner_mgr.call_func",
-   "expr": "self.runner_mgr.call_func(\"bench_step\", batch, wait_out=True)",
+   "expr": "self.runner_mgr.call_func( \"bench_step\", batch, repeats, wait_out=True )",
    "shape": "worker_rpc",
    "peer": "process",
    "why": "the bench asks every worker to measure one batch's forward and waits for rank 0's reply, the step charged to the slowest rank",
@@ -4681,11 +4681,11 @@
    "mechanism_why": "a startup calibration inside the bench's real runner; the bench measures real forwards on a real runner for a measuring command, and no simulated run starts one"
   },
   {
-   "id": "atom/compass/bench/window.py::BenchWindow.bench_step::while len(kept) < REPEATS::spin_loop#0",
+   "id": "atom/compass/bench/window.py::BenchWindow.bench_step::while len(kept) < repeats::spin_loop#0",
    "file": "atom/compass/bench/window.py",
    "symbol": "BenchWindow.bench_step",
-   "call": "while len(kept) < REPEATS",
-   "expr": "while len(kept) < REPEATS",
+   "call": "while len(kept) < repeats",
+   "expr": "while len(kept) < repeats",
    "shape": "spin_loop",
    "peer": "none",
    "why": "repeats one batch's forward until the bench keeps its repeats or the point refuses; each turn runs a forward, whose waits are the forward's own and the workers' agreement in _repeat",
