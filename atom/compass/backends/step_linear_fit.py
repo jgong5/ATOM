@@ -430,6 +430,11 @@ PEER_TOKENS_ENV = "COMPASS_FIT_PEER_TOKENS"
 #: The draft law's decode rungs that add `peer_tokens` above `dp` 1: ``1`` for
 #: every rung, else the rungs, comma separated.
 DRAFT_PEER_TOKENS_ENV = "COMPASS_FIT_DRAFT_PEER_TOKENS"
+#: The KDA prefill columns to leave out of a KDA model's prefill vector, comma
+#: separated (`_kda`): ``kda_pad_blocks`` folds the chunk padding, about a
+#: constant share of a chunk on each finishing row of whole-block prompts, into
+#: the per-row `kda_seqs` (LOCAL, #752 Kimi K-merge; not on 752/dev).
+KDA_DROP_ENV = "COMPASS_FIT_KDA_DROP"
 #: The share of the routed experts past which a rung's median step's
 #: `moe_experts` count is saturated: past it the column barely moves with the
 #: group's tokens.
@@ -502,7 +507,8 @@ def _prefill_counts(
                 f"{where} states no kda counts, which a KDA model's law prices "
                 "prefill from; its record predates them"
             )
-        counts += columns
+        kept = _kda_kept(kda)
+        counts += tuple(c for f, c in zip(KDA, columns) if f in kept)
     if buckets:
         if (padding := token_padding(view, buckets)) is None:
             raise ValueError(
@@ -567,12 +573,22 @@ def _keep_peer_tail(options) -> bool:
     return True
 
 
-def _kda(options) -> bool:
-    """Whether the prefill vector adds `KDA`'s columns: as `options`' `kda`
-    states, False by default; `compass fit steps --model` sets it for a model
-    with KDA layers (`step_linear.kda_layers`). A fitted prefill step whose
-    view states no `kda` counts refuses (`_prefill_counts`)."""
-    return bool((options or {}).get("kda"))
+def _kda(options):
+    """The `KDA` columns the prefill vector adds, False for none: as `options`'
+    `kda` states, False by default (`compass fit steps --model` sets it for a
+    model with KDA layers, `step_linear.kda_layers`), True for all of them or
+    the columns themselves, less `kda_drop`'s (`KDA_DROP_ENV`). A fitted
+    prefill step whose view states no `kda` counts refuses (`_prefill_counts`)."""
+    kda = (options or {}).get("kda")
+    if not kda:
+        return False
+    drop = set((options or {}).get("kda_drop") or ())
+    return tuple(f for f in _kda_kept(kda) if f not in drop) or False
+
+
+def _kda_kept(kda) -> tuple:
+    """The `KDA` columns `kda`, `_kda`'s answer or True, keeps."""
+    return KDA if kda is True else tuple(f for f in KDA if f in kda)
 
 
 def _min_spread(cols) -> float | None:
@@ -711,6 +727,11 @@ def env_options(environ=None) -> dict:
         out["draft_peer_tokens"] = (
             "all" if peers == "1" else tuple(int(r) for r in peers.split(","))
         )
+    if drop := env.get(KDA_DROP_ENV):
+        names = tuple(d for d in drop.split(",") if d)
+        if unknown := [d for d in names if d not in KDA]:
+            raise ValueError(f"{KDA_DROP_ENV}: {unknown} are not KDA columns {KDA}")
+        out["kda_drop"] = names
     return out
 
 
@@ -2680,7 +2701,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     prefill += gathered
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
     prefill += list(PEER_SHARE) * share
-    prefill += list(KDA) * kda
+    prefill += list(_kda_kept(kda)) if kda else []
     prefill += ["padding"] * bool(buckets)
     prefill += [f for f in GRAPH_COLUMNS if cols[f]]
     prefill += list(EAGER_DUMMY) * eager
@@ -3771,7 +3792,7 @@ def figures_main(argv) -> None:
     samples, _, options, _ = _labelled(args)
     options["draft_moe_routing"] = _law_routing(law.get("draft", {}))
     fitted_with = (law.get("prefill") or {}).get("coefficients", {})
-    options["kda"] = any(f in fitted_with for f in KDA)
+    options["kda"] = tuple(f for f in KDA if f in fitted_with) or False
     given = {s.provenance["run"] for s in samples}
     if differ := sorted(given ^ set(runs)):
         raise ValueError(
