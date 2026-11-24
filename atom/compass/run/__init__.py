@@ -447,6 +447,13 @@ COMPASS_ONLY = {
     },
     "utils/zmq_shim.py": {"_Socket", "_ChannelSocket", "_Context"},
 }
+#: A simulated server's tokenizer environment. The segment tokenizer encodes a
+#: long prompt's uncached segments in one ``encode_batch`` call, and while its
+#: station job is open the frontend's clock stands still, so every other LP
+#: waits on its wall time; the C1228 recipe's environment turns the backend's
+#: parallelism off, which jgong5/ATOM#3992 measured. In parallel the ids are
+#: the same.
+_PARALLEL_TOKENIZER = {"TOKENIZERS_PARALLELISM": "true"}
 #: The module `pip install -e .` writes (setuptools_scm) and git ignores: no
 #: commit holds it, so the host-law key leaves it out.
 INSTALL_WRITTEN = Path("_version.py")
@@ -2821,7 +2828,12 @@ def tokenizer(tok, config) -> None:
     and its ``chars_per_s`` charges each comparison of its stored-prefix search.
 
     On a real run recording its steps (`parity.ENV`), it records instead
-    (`_record_host`); with neither, `tok` is left as it is."""
+    (`_record_host`); with neither, `tok` is left as it is.
+
+    A simulated server's Rust backend encodes a batch's texts in parallel
+    (`_PARALLEL_TOKENIZER`), whatever ``TOKENIZERS_PARALLELISM`` its
+    environment sets: what tokenization costs is the term's charge, never its
+    wall time, and the ids are the same either way."""
     global _frontend_host
     run = spec()
     if run is None:
@@ -2830,6 +2842,8 @@ def tokenizer(tok, config) -> None:
         if record := os.environ.get(parity.ENV):
             _record_host(tok, Path(record))
         return
+    # Read by the tokenizers library at each call, so it holds from here on.
+    os.environ.update(_PARALLEL_TOKENIZER)
     from tokenizers import Tokenizer
 
     from atom.compass.spec.rules import FingerprintMismatch
