@@ -83,6 +83,12 @@ without busy time is cut as `untraced`. A trace run, a record with its busy
 lines beside it or whose run directory holds `TRACE`, ran under a profiler: its
 decode steps are cut as `traced` and its steps carry no host labels.
 
+A pipeline stage's ranks, labelled with their stage (`label_run`'s `stage`),
+give samples naming it, and their decode steps are cut as `PIPELINED`, keeping
+their host labels: a stage's decode window holds its wait for the stage before
+and the stream hold of its last send, which the next stage takes when it is
+ready, and no label parts either from the stage's own work.
+
 With `PREFILL_LABEL_ENV` set to ``record``, an opt-in for a fit that has one
 plain record and no trace run, a prefill step without busy time that carries
 its MTP target end is labelled from its own device window instead, as an MTP
@@ -209,6 +215,9 @@ COMPILES = "jit_compiles"
 CLOCK = "clock_ns"
 #: Why a whole step is cut: its window, entry to exit, overlaps a compile's span.
 JIT = "jit"
+#: Why a pipeline stage's decode step's device label is cut (module docstring);
+#: counted, as `JIT` is, only where it cuts a step.
+PIPELINED = "pipelined"
 #: How long before a compile's first file the span starts: a Triton kernel's
 #: front end builds its IR before it writes any file.
 JIT_SLACK_NS = 200_000_000
@@ -334,7 +343,7 @@ class Sample:
     """One real forward, labelled.
 
     `device_s` is its device label, None when cut, and `cut` names why (`CUTS`,
-    or `JIT` for a step cut whole).
+    `PIPELINED`, or `JIT` for a step cut whole).
     `draft_s` is its draft label, None when cut, on a step with no draft, or
     on a decode whose device reached its `propose` pass before the host's
     draft copy wait.
@@ -368,6 +377,7 @@ class Sample:
     `ladder` holds the decode rungs a calibration ladder's client run calibrates,
     on a step within that client run's graded span (`fit.samples.load`); None on
     any other step, and wherever a record is labelled without its client runs.
+    `stage` is the pipeline stage its record ran at, 0 off a pipeline.
     """
 
     step: int
@@ -389,6 +399,7 @@ class Sample:
     passes_s: tuple | None = None
     dummy_host: tuple = ()
     ladder: tuple | None = None
+    stage: int = 0
 
 
 class Floor:
@@ -736,14 +747,21 @@ def label(
 
 
 def label_run(
-    records, run: str | None = None, split_rule=None, floored=None, spans=()
+    records,
+    run: str | None = None,
+    split_rule=None,
+    floored=None,
+    spans=(),
+    stage: int | None = None,
 ) -> list[tuple[list[Sample], list[dict]]]:
     """`label` of each of `records`, one run's DP ranks, cut by `spans`, with
     each `E` from the latest pull over the ranks before the same forward, a
     trace run's drafter labels under `floored`, its busy lines less the
     profiler's floor (`parity.busy.floored`). A rank that ran only DP's dummy
     forwards gives no sample and no row. Ranks whose line counts differ by more
-    than the forward a stopped server leaves on some refuse."""
+    than the forward a stopped server leaves on some refuse. `stage` is the
+    pipeline stage the ranks ran at, None off a pipeline: its samples name it
+    and its decode steps are cut as `PIPELINED`."""
     ranks = [_read(r, floored) for r in records]
     counts = {Path(r).name: len(x) for r, x in zip(records, ranks) if x}
     if counts and max(counts.values()) - min(counts.values()) > 1:
@@ -770,6 +788,7 @@ def label_run(
                 tails,
                 prefills,
                 spans,
+                stage,
             )
         )
         for r, x in zip(records, ranks)
@@ -846,10 +865,12 @@ def _label(
     tails=None,
     prefills=None,
     spans=(),
+    stage=None,
 ) -> tuple[list[Sample], list[dict]]:
     """`label` of `record`'s `lines`, each `E` from `starts` at the line before;
     `prefills` the steps its group prefills at (`group_prefills`), read from
-    the rank records beside it when None; `spans` the compiles it is cut by."""
+    the rank records beside it when None; `spans` the compiles it is cut by;
+    `stage` the pipeline stage it ran at, None off a pipeline."""
     path = Path(record)
     steps = [s for s in lines if not s["is_dummy_run"]]
     dummies = frozenset(s["step"] for s in lines if s["is_dummy_run"])
@@ -939,6 +960,8 @@ def _label(
             cut = JIT
         elif view.prefill and view.decode:
             cut = "mixed"
+        elif not view.prefill and stage is not None:
+            cut = PIPELINED
         elif not view.prefill and s["step"] in exposed:
             cut = "exposed"
         elif not view.prefill and traced:
@@ -1008,6 +1031,7 @@ def _label(
                 {} if cut else s.get("floor", {}),
                 passes,
                 dummy_host,
+                stage=stage or 0,
             )
         )
         gap_ns = s.get("d_gap_ns")

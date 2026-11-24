@@ -6,7 +6,8 @@
 
 `host_laws` fits the samples' host labels by `step_linear_fit.fit_host`, under
 the host key the real runner writes beside each record, and its report names
-each run with every trace its steps served. From the tokenizer calls and HTTP
+each run with every trace its steps served; on a pipeline's records, those of
+its stage 0's samples alone (`Sample.stage`). From the tokenizer calls and HTTP
 intake stamps the recorded server wrote beside its steps
 (`atom.compass.run.TOKENIZER_RECORD`, `INTAKE_RECORD`) it fits the entry's
 ``tokenizer`` term (`step_linear_fit.fit_tokenizer`) and ``http_intake`` term
@@ -219,6 +220,8 @@ def main(argv: list[str]) -> None:
     args = parser.parse_args(argv)
     ingress = stated_ingress(args.ingress) if args.ingress else None
     samples, config = publish.inputs(args, ("record",))
+    # A pipeline's host laws are its stage 0's.
+    samples = [s for s in samples if s.stage == 0]
     host, report = host_laws(samples, args.inputs, args.client_run)
     if stated := stated_hops(args.stated_hop, host.get("hops", {})):
         host["hops"] = {**host.get("hops", {}), **stated}

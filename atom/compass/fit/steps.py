@@ -45,6 +45,16 @@ warns on stderr naming them (`step_linear_fit.filled_warning`). The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
 
+Above one pipeline stage, as the records' engine config states
+(`pipeline_parallel_size`), `step-linear` fits each stage's samples
+(`Sample.stage`) apart, as it fits one stage's: held out, filled and named
+alike. The law holds each stage's under `stages`, in stage order, with its
+own `provenance`, and states `platform`, `engine_config` and `records_atom`
+once, at its top, beside a `provenance` naming the stages; the report holds
+each stage's under `stages`. Only the last stage runs the drafter, so only
+its part holds a draft law, and every stage's decode steps are cut
+(`step_labels.PIPELINED`), so no part holds a decode vector.
+
 `--ladder-run RECORD EXPORT RUNGS` names one more client run RECORD's server
 served, a calibration ladder that calibrates the decode rungs RUNGS (comma
 separated): it is served and graded as a `--client-run` is, and its decode
@@ -142,17 +152,19 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
         options["draft_moe_routing"] = drafter
     options["buckets"] = config.get("prefill_buckets")
     options["cold"] = bool(args.cold_peer_rows)
-    law, report = step_linear_fit.fit(samples, options, args.seed)
-    if options["buckets"] is None:
-        law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
-    if len({s.provenance["run"] for s in samples}) > 1:
-        step_linear_fit.mark_held_out(law, report, samples, options, args.seed)
-    report["filled"] = step_linear_fit.fill_rungs(
-        law, config["engine_config"].get("ladder")
-    )
-    if warning := step_linear_fit.filled_warning(law):
-        print(warning, file=sys.stderr)
-    report["provenance"] = publish.runs(samples)
+    engine = config["engine_config"]
+    parts = [
+        _part([s for s in samples if s.stage == k], options, args.seed, engine)
+        for k in range(engine.get("pipeline_parallel_size", 1))
+    ]
+    law, report = parts[0]
+    if len(parts) > 1:
+        law = {
+            "provenance": f"step_linear_fit {form} on {len(parts)} pipeline "
+            "stages, each part on its own stage's records",
+            "stages": [p[0] for p in parts],
+        }
+        report = {"stages": [p[1] for p in parts]}
     if args.ladder_run:
         report["ladder"] = {
             "runs": [[r, e, list(rungs)] for r, e, rungs in args.ladder_run],
@@ -163,6 +175,22 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     if atom := step_linear_fit.records_atom(samples):
         law["records_atom"] = atom
     return {"form": form, **law["platform"]}, law, report
+
+
+def _part(samples, options, seed: int, engine: dict) -> tuple[dict, dict]:
+    """The law fitted on `samples`, one pipeline stage's, under `options` and
+    `seed`, held out when they hold two runs or more, its rungs filled at
+    `engine`'s ladder; and its report, naming each run it was fitted on."""
+    law, report = step_linear_fit.fit(samples, options, seed)
+    if options["buckets"] is None:
+        law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
+    if len({s.provenance["run"] for s in samples}) > 1:
+        step_linear_fit.mark_held_out(law, report, samples, options, seed)
+    report["filled"] = step_linear_fit.fill_rungs(law, engine.get("ladder"))
+    if warning := step_linear_fit.filled_warning(law):
+        print(warning, file=sys.stderr)
+    report["provenance"] = publish.runs(samples)
+    return law, report
 
 
 def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:

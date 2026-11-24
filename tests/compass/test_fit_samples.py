@@ -459,3 +459,68 @@ def test_each_client_run_s_span_runs_from_its_first_step_to_its_last():
         1: [line(0, None), line(1, None), line(2, None), line(3, None), line(4, 1)],
     }
     assert client_spans(record) == {0: (1, 3), 1: (4, 4)}
+
+
+#: A two-stage pipeline's fields of `keyed`.
+PIPELINE = {"pipeline_parallel_size": 2, "pp_layers": [[0, 14], [14, 28]]}
+
+
+def staged(directory, engine=PIPELINE):
+    """`directory`, a record, as a pipeline's whose stage 1 ran stage 0's lines:
+    each file of rank 0 copied as stage 1's, and `engine` in its engine file."""
+    steps = directory / "steps"
+    for path in steps.glob("dp0.*"):
+        (steps / f"pp1.{path.name}").write_bytes(path.read_bytes())
+    edit(steps / "dp0.engine.json", lambda e: e.update(engine))
+    return directory
+
+
+def test_each_stage_s_samples_name_it_a_run_of_its_own_rank_files_its_decodes_cut(
+    tmp_path, monkeypatch
+):
+    a = record(tmp_path, monkeypatch)
+    alone, one = load({a: RUNS})
+    samples, config = load({staged(a): RUNS})
+
+    assert config == {**one, "engine_config": {**one["engine_config"], **PIPELINE}}
+    assert len(samples) == 2 * len(alone)
+    for stage, name in enumerate(("dp0.jsonl", "pp1.dp0.jsonl")):
+        mine = [s for s in samples if s.stage == stage]
+        assert [s.step for s in mine] == [s.step for s in alone]
+        run = digest(a / "steps" / name)
+        for s, plain in zip(mine, alone):
+            assert s.provenance == {**plain.provenance, "run": run}
+            assert s.host == plain.host
+            assert s.cut == (plain.cut if s.view.prefill else "pipelined")
+
+
+@pytest.mark.parametrize(
+    "engine, stages, stated",
+    [({}, "[0, 1]", "None"), ({**PIPELINE, "pipeline_parallel_size": 3}, "[0, 1]", 3)],
+    ids=["predating", "missing"],
+)
+def test_a_record_holding_other_stages_than_its_engine_file_states_refuses(
+    tmp_path, monkeypatch, engine, stages, stated
+):
+    a = staged(record(tmp_path, monkeypatch), engine)
+
+    named = (
+        f"{a / 'steps'} holds the rank records of pipeline stages {stages}, and "
+        f"its engine file states pipeline_parallel_size {stated}"
+    )
+    with pytest.raises(ValueError, match=re.escape(named)):
+        load({a: RUNS})
+
+
+def test_a_later_stage_s_step_holding_other_requests_than_stage_0_s_refuses(
+    tmp_path, monkeypatch
+):
+    a = staged(record(tmp_path, monkeypatch))
+    path = a / "steps/pp1.dp0.jsonl"
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    lines[1]["batch"][0][0] = 999
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+
+    named = f"{a} pipeline stage 1, DP rank 0, step {lines[1]['step']} holds requests"
+    with pytest.raises(ValueError, match=re.escape(named) + r" \[999"):
+        load({a: RUNS})
