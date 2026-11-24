@@ -1082,8 +1082,11 @@ def _patches(recorder):
     def jit_call(jit, *args, **kwargs):
         recorder.launch(f"flydsl.{jit.func.__name__}", jit)
 
-    def compile_impl(jit, *args):
-        jit(*args)  # flyc.compile launches the kernel as it compiles it
+    def compile_impl(jit, *args, compile_only=False, **kwargs):
+        # flyc.compile launches the kernel as it compiles it, unless asked
+        # to compile only; a call of what it returns launches it then.
+        if not compile_only:
+            jit(*args, **kwargs)
         return fly.CompiledFunction(None, jit)
 
     def compiled_call(compiled, *args):
