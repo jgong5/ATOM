@@ -92,8 +92,9 @@ def expected_timeline(
     stream before it returns does. Without `defer`, an engine whose token
     processor reads each step's ids at once (`scheduler.defers_output`), an
     output forward returns at its own device end, the group's, as it reads them,
-    and a dummy forward, which reads none, returns at its entry and marks no
-    output end, as the runner's `HostDeviceRecurrence` charges it.
+    and a dummy forward beside a peer's prefill, which reads none, returns at
+    its entry and marks no output end, as the runner's `HostDeviceRecurrence`
+    charges it.
 
     With `draft_s`, a speculative engine's: each forward's device work runs
     `draft_s` of draft after its target, and an output forward enters no
@@ -447,9 +448,15 @@ def _outputs(sent, taken) -> list[str]:
 
 def _waits_for_output(step: dict, defer: bool) -> bool:
     """Whether the recorded `step` waits for output: one that produces it,
-    unless it is a dummy forward of an engine that does not defer its output,
-    which reads no token."""
-    return step["produces_output"] and (defer or not step.get("is_dummy_run"))
+    unless it is a dummy forward beside a peer's prefill on an engine that does
+    not defer its output, which reads no token. Such a dummy schedules no
+    request and is recorded as a one-token prefill row
+    (`projection._dummy_row`); one while its group decodes, or idles, runs a
+    decode row and reads its output as a decode does, as the runner's
+    `compass_dummy` tells them apart."""
+    empty_dummy = step.get("is_dummy_run") and not step.get("batch")
+    beside_prefill = empty_dummy and not all(r[-1] for r in step["rows"])
+    return step["produces_output"] and (defer or not beside_prefill)
 
 
 def _defers_output(directory) -> bool:

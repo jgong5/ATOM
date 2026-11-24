@@ -247,6 +247,17 @@ def test_a_dummy_of_an_engine_that_reads_its_ids_at_once_returns_at_its_entry():
     assert expected_timeline(record, P, D, tars, defer=False) == tars
 
 
+def test_a_dummy_of_an_engine_that_reads_its_ids_at_once_while_its_group_idles_reads_its_output():
+    # With no peer prefilling, each rank's dummy runs a decode row, which the
+    # runner charges as an output forward: the idle group's step returns at
+    # its device end D, the next decode at 2 D.
+    record = _record([(DECODE, True)] * 2, [(DECODE, True)] * 2)
+    for steps in record.values():
+        steps[0]["is_dummy_run"] = True
+    tars = [(0.0, D), (D, 2 * D)]
+    assert expected_timeline(record, P, D, tars, defer=False) == tars
+
+
 def test_an_engine_file_states_whether_its_engine_deferred(tmp_path):
     from atom.compass.backends.step_grid_plan import DEFERS_OUTPUT, keyed_of
     from atom.compass.detect.scenario import _defers_output
