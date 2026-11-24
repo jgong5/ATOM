@@ -1,6 +1,6 @@
 {
  "name": "cellA_k31",
- "about": "Kimi-K3.1-Pro on 8 MI355X: TP8 + DCP8, ONE DP rank, bf16 KV, block 128, max-num-seqs 64, max len 1048576, no speculative decode, KDA recurrent state with a checkpoint every 8192 tokens: a prefix hit lands on a checkpoint boundary only (prefix_unit 8192) (#752; ~/agent_scratch/752/kimi/env_k31.sh). Rungs: ATOM's default capture sizes up to 64; max-num-batched-tokens and the prefill chunk at ATOM's 16384. One DP rank: rule 2.4.6 as for M3.1. kv_tokens is a PLACEHOLDER (#752: the pool holds about three 940k-token requests) until the smoke record's run.json replaces it. The prefill's KDA state columns (752-kimi: kda_seqs, kda_saves, kda_forks, kda_moves, kda_pad_blocks) are a variant this tree's backend does not count: they report an error until that tree lands and the rehearsal's views carry KDA counts. Dry run: waits for a law fitted on the smoke record.",
+ "about": "Kimi-K3.1-Pro on 8 MI355X: TP8 + DCP8, ONE DP rank, bf16 KV, block 128, max-num-seqs 64, max len 1048576, no speculative decode, KDA recurrent state with a checkpoint every 8192 tokens: a prefix hit lands on a checkpoint boundary only (prefix_unit 8192) (#752; ~/agent_scratch/752/kimi/env_k31.sh). Rungs: ATOM's default capture sizes up to 64; max-num-batched-tokens and the prefill chunk at ATOM's 16384. One DP rank: rule 2.4.6 as for M3.1. kv_tokens is a PLACEHOLDER (#752: the pool holds about three 940k-token requests) until the smoke record's run.json replaces it. The prefill's KDA state columns (752-kimi: kda_seqs, kda_saves, kda_forks, kda_moves, kda_pad_blocks) are a variant this tree's backend does not count: they report an error until that tree lands and the rehearsal's views carry KDA counts. Decode variant `rows`: the per-sequence, context-independent cost DCP's exchange adds at each full-attention layer (provisional column). The KDA layers carry no context term; `context` stands for the 24 full-attention layers. Dry run: waits for a law fitted on the smoke record.",
  "deployment": {
   "dp": 1,
   "rungs": [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64],
@@ -20,8 +20,8 @@
  },
  "columns": {
   "decode": ["step", "context", "graph_padding", "row_padding"],
-  "decode_variants": [[], ["moe_tokens"], ["moe_experts"]],
-  "prefill": ["step", "tokens", "query_square", "query_cached", "history"],
+  "decode_variants": [[], ["moe_tokens"], ["moe_experts"], ["rows"]],
+  "prefill": ["step", "tokens", "query_square", "query_cached", "history", "seqs", "out"],
   "prefill_variants": [[], ["kda_seqs", "kda_saves", "kda_forks", "kda_moves", "kda_pad_blocks"]],
   "min_spread": 0.2
  },

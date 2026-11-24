@@ -42,8 +42,11 @@ its own (`ident.variants`); `min_spread` the fit's `moe_imbalance` floor. A
 column this tree's step linear backend prices is counted by it (`columns`);
 a newer opt-in column plugs in by name.
 
-A segment's kind is one `design.GENERATORS` names; its other entries are that
-generator's parameters.
+A segment's kind is one `design.GENERATORS` names, its other entries that
+generator's parameters; or ``copy``, ``{"name": ..., "kind": "copy", "of":
+NAME}``, the segment NAME generated again under its own name (an anchor
+repeated through a record: its traces are new, so it hits no cache the first
+left). A config may `extend` another (`resolve`), inserting segments into it.
 """
 
 from __future__ import annotations
@@ -188,5 +191,25 @@ def parse(raw: dict) -> Config:
     )
 
 
+def resolve(raw: dict, here: Path) -> dict:
+    """`raw` over the config it `extends` (a path beside it): its own entries
+    replace the base's, and each of its `insert` entries, ``{"after": NAME or
+    null, "segments": [...]}``, puts segments after the base's segment NAME
+    (null: first)."""
+    if "extends" not in raw:
+        return raw
+    base = resolve(json.loads((here / raw["extends"]).read_text()), here)
+    own = {k: v for k, v in raw.items() if k not in ("extends", "insert")}
+    out = {**base, **own}
+    segments = list(out["segments"])
+    for ins in raw.get("insert", ()):
+        names = [s["name"] for s in segments]
+        at = 0 if ins.get("after") is None else names.index(ins["after"]) + 1
+        segments[at:at] = ins["segments"]
+    out["segments"] = segments
+    return out
+
+
 def load(path) -> Config:
-    return parse(json.loads(Path(path).read_text()))
+    path = Path(path)
+    return parse(resolve(json.loads(path.read_text()), path.parent))

@@ -26,7 +26,15 @@ is no design point: a fit cuts it (rule 2.4.2). For each:
   vertex whose device time its host launch would pace is left out (its price
   is the host's), and so counted apart;
 - levels: the distinct values each column takes, at two significant digits
-  (I5, at least `levels`).
+  (I5, at least `levels`);
+- given a target workload's steps (a real or simulated record), the same
+  relative error at each of its GPU-bound steps of the vector, reported, not
+  gated: its mean (the target-weighted I criterion), 95th percentile and worst
+  (infinite for a step moving a column the design holds constant).
+
+All of it is variance under the stated form: a design passes G with any form
+the columns fit, so form bias is what the record's residuals per segment
+(`check.residuals`) and held-out grading show, not this.
 
 The reachable range comes from the deployment alone (rule 2.1.2): a decode
 rung's widest-rank rows (and, above one rank, a priced rank below the rung
@@ -182,9 +190,11 @@ def vif(X: np.ndarray, w: np.ndarray | None = None) -> list[float]:
     return out
 
 
-def assess(names, X, y, V, vy, sigma: float, z: float) -> dict:
+def assess(names, X, y, V, vy, sigma: float, z: float, T=None, ty=None) -> dict:
     """Rank, VIF, G and levels of design `X` (rows priced `y`) over vertices
-    `V` priced `vy`; see the module docstring."""
+    `V` priced `vy`; see the module docstring. Given target steps `T` priced
+    `ty`, also the same relative error at each of them (`target`: their mean,
+    the target-weighted I criterion, its 95th percentile and its worst)."""
     X, y = np.asarray(X, dtype=float), np.asarray(y, dtype=float)
     n, p = X.shape if X.size else (0, len(names))
     out = {"columns": list(names), "steps": n}
@@ -214,6 +224,20 @@ def assess(names, X, y, V, vy, sigma: float, z: float) -> dict:
         out["not_estimable"] = int(lost.sum())
         if lost.any():
             return out | {"g": math.inf, "g_vertex": None}
+    if T is not None and len(T):
+        Ts = np.asarray(T, dtype=float) / scale
+        st = np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", Ts, inv, Ts), 0.0))
+        st = z * sigma * st / np.asarray(ty, dtype=float)
+        if rank < p:
+            off = Ts - Ts @ (np.linalg.pinv(Xw) @ Xw)
+            far = np.linalg.norm(off, axis=1) > 1e-6 * np.linalg.norm(Ts, axis=1)
+            st[far] = math.inf
+        out["target"] = {
+            "steps": len(st),
+            "i": float(np.mean(st)),
+            "p95": float(np.percentile(st, 95)),
+            "max": float(np.max(st)),
+        }
     se = np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", Vs, inv, Vs), 0.0)) / np.asarray(
         vy, dtype=float
     )
@@ -256,17 +280,21 @@ def _verdict(cfg: Config, kind: str, got: dict) -> dict:
     rule6 = None
     if waived:
         bad = {c: got["vif"].get(c, math.inf) for c in waived}
-        rule6 = "failed (one DP rank, rule 2.4.6, judged by G): " + ", ".join(
-            f"{c} VIF {v:.3g}" for c, v in bad.items()
+        rule6 = (
+            "aliased (one DP rank, rule 2.4.6; estimability checked, judged by G): "
+            + ", ".join(f"{c} VIF {v:.3g}" for c, v in bad.items())
         )
         if got["rank"] < p:
             rule6 += f"; rank {got['rank']} < {p}"
     return {"pass": not fails, "fails": fails, "rule6": rule6}
 
 
-def vectors(cfg: Config, steps, law: Law) -> list[dict]:
+def vectors(cfg: Config, steps, law: Law, target=()) -> list[dict]:
     """Every vector's assessment on `steps` (`engine.Step`s, or the same shape
-    from a record): per variant of its columns, with its verdict."""
+    from a record): per variant of its columns, with its verdict; given
+    `target`, the steps of a target workload (a real or simulated record's,
+    `check.record_steps`), each variant's error at its GPU-bound ones
+    (`assess`'s `target`), reported beside the verdict, not gating it."""
     dep, acc = cfg.deployment, cfg.acceptance
     z = acc["g_z"]
     out = []
@@ -274,6 +302,11 @@ def vectors(cfg: Config, steps, law: Law) -> list[dict]:
     for r in dep.rungs:
         groups[("decode", r)] = []
     counted = {k: [0, 0] for k in groups}
+    aimed = {k: [] for k in groups}
+    for s in target:
+        key = (s.kind, s.rung if s.kind == "decode" else None)
+        if key in aimed and s.gpu_bound:
+            aimed[key].append(s)
     for s in steps:
         key = (s.kind, s.rung if s.kind == "decode" else None)
         if key not in groups:
@@ -309,14 +342,19 @@ def vectors(cfg: Config, steps, law: Law) -> list[dict]:
                 V = np.array(
                     [cols.values(v, kind, names, dep, spread) for v, _ in priced]
                 )
-                X, V = X.reshape(-1, len(names)), V.reshape(-1, len(names))
+                aim = aimed[(kind, rung)]
+                T = np.array(
+                    [cols.values(s.view, kind, names, dep, spread) for s in aim]
+                )
+                X, V, T = (a.reshape(-1, len(names)) for a in (X, V, T))
             except ValueError as e:
                 results.append({"variant": label, "columns": names, "error": str(e)})
                 continue
             # a column the whole reachable range holds at one value (and the
             # design with it) is no column at this vector: the fit names it and
             # gives it zero (`step_linear_fit`); one the range holds at 0 and 1
-            # alone is an indicator, which takes no third level
+            # alone is an indicator, which takes no third level. A target step
+            # that moves such a column lies off the design: its error is infinite
             both = np.vstack([V, X]) if len(X) else V
             keep, structural, indicator = [0], [], []
             for j in range(1, len(names)):
@@ -327,6 +365,11 @@ def vectors(cfg: Config, steps, law: Law) -> list[dict]:
                 if len(V) and set(np.unique(V[:, j])) <= {0.0, 1.0}:
                     indicator.append(names[j])
             used = [names[j] for j in keep]
+            gone = [j for j in range(1, len(names)) if j not in keep]
+            if len(T) and gone and len(both):
+                off = np.any(T[:, gone] != both[0, gone], axis=1)
+            else:
+                off = np.zeros(len(T), dtype=bool)
             y = [s.ranks[s.priced][2] for s in got]
             res = assess(
                 used,
@@ -336,7 +379,12 @@ def vectors(cfg: Config, steps, law: Law) -> list[dict]:
                 [p for _, p in priced],
                 cfg.noise[kind],
                 z,
+                T[:, keep] if len(T) else None,
+                [s.ranks[s.priced][2] for s in aim],
             )
+            if "target" in res and off.any():
+                res["target"]["off_design"] = int(off.sum())
+                res["target"]["max"] = math.inf
             res["variant"] = label
             res["structural"] = structural
             res["indicator"] = indicator
