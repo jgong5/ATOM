@@ -173,7 +173,8 @@ def test_a_tp2_pipeline_meets_the_run_properties_under_the_step_roofline(
     tmp_path, monkeypatch
 ):
     """Every check but the stages' timeline, which only a constant stub's run
-    has computed; each stage prices its own layers."""
+    has computed; stage 0's sends reach stage 1 on ``pp_data``, and each stage
+    prices its own layers."""
     monkeypatch.setenv("ATOM_PP_SEND_ALLGATHER", "1")
     monkeypatch.setattr(test_dp_slice, "_run_file", roofline_run_file)
     width = ["-pp", "2", "-tp", "2"]
@@ -186,5 +187,8 @@ def test_a_tp2_pipeline_meets_the_run_properties_under_the_step_roofline(
     taken = [line for _, line in runs[0]["events"]]
     failed = check_run([r["out"] for r in runs], MAX_TOKENS, taken)
     assert not failed, "\n".join(failed)
+    rows = [line.split() for line in runs[0]["table"].splitlines()[1:]]
+    released = {r[4] for r in rows if r[3] == "release"}
+    assert "engine-pp0->engine-pp1:pp_data#dp0" in released
     stages = each_stage_prices_its_own_layers(runs[0]["out"] / "parity")
     print(f"mean decode price: PP2 TP2 stages {stages!r} s")

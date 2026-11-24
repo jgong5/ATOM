@@ -192,16 +192,53 @@ def test_a_pipeline_meets_every_scenario_check_under_the_step_roofline(roofline)
 @NEEDS_A_RUN
 def test_each_stage_prices_its_own_layers_not_the_whole_stacks(roofline):
     """Each stage's mean decode price, beside the PP1 run's: the whole stack's,
-    whose steps price both the embedding and the LM head."""
+    whose steps price both the embedding and the LM head. A stage of half the
+    layers prices under three quarters of it; one of every layer would not."""
     runs, pp1 = roofline
     whole, mean = stage_prices(pp1["out"] / "parity")
     stages = each_stage_prices_its_own_layers(runs[0]["out"] / "parity")
     print(f"\nmean decode price: PP1 {mean!r} s; PP2 stages {stages!r} s")
     assert {EMBEDDING, LM_HEAD} <= whole
-    assert max(stages) < mean
+    assert max(stages) < 0.75 * mean
 
 
 # --- without a driver ---------------------------------------------------------
+
+
+def _record(directory: Path, name: str, steps, costs) -> None:
+    """Write `name`'s step lines and its cost lines, after their version line,
+    as `parity.StepRecord` and `overrides._group_step_seconds` write them."""
+    for suffix, docs in ((".jsonl", steps), (".cost.jsonl", [{"version": 1}, *costs])):
+        lines = "".join(json.dumps(d) + "\n" for d in docs)
+        (directory / f"{name}{suffix}").write_text(lines)
+
+
+def _cost(step: int, device_s: float, *names: str) -> dict:
+    """A cost line of `step`, its terms `names` at `device_s` in all."""
+    terms = [{"name": n, "seconds": device_s / len(names)} for n in names]
+    return {"step": step, "device_s": device_s, "draft_s": 0.0, "terms": terms}
+
+
+def test_a_stages_prices_are_read_from_its_step_record(tmp_path):
+    """A prefill and two decodes on each of two stages: a stage's terms are
+    every cost line's, its mean decode price the decodes' alone; a head that
+    prices the LM head too charges the whole model."""
+    rows = [[[8, 8, False]], [[1, 9, True], [1, 10, True]], [[1, 11, True]]]
+    steps = [{"step": n, "dp_rank": 0, "rows": r} for n, r in enumerate(rows)]
+    seconds = (3e-3, 1e-3, 2e-3)
+    last = [_cost(n, t, "roofline.gemm", LM_HEAD) for n, t in enumerate(seconds)]
+    _record(tmp_path, "pp1.dp0", steps, last)
+    head = [_cost(n, t, "roofline.gemm", EMBEDDING) for n, t in enumerate(seconds)]
+    _record(tmp_path, "dp0", steps[:1], head[:1])
+
+    mean = pytest.approx(1.5e-3)
+    assert stage_prices(tmp_path, 1) == ({"roofline.gemm", LM_HEAD}, mean)
+    assert stage_prices(tmp_path) == ({"roofline.gemm", EMBEDDING}, None)
+    assert each_stage_prices_its_own_layers(tmp_path) == [None, mean]
+    head[0]["terms"].append({"name": LM_HEAD, "seconds": 0.0})
+    _record(tmp_path, "dp0", steps[:1], head[:1])
+    with pytest.raises(AssertionError, match=LM_HEAD):
+        each_stage_prices_its_own_layers(tmp_path)
 
 
 def test_the_stages_join_the_head_with_a_positive_lookahead_each_way():
