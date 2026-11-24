@@ -6,8 +6,10 @@ engine LP ``engine-P-pp<k>``. Decode sends its write request to the head,
 which prices every stage's write: decode is ready at ``max_k c_k + L`` and
 the head is done at ``max_k c_k + 2L``, after Mooncake's release.
 
-The run tests start `pd_sim.sh` at prefill ``-pp 2`` and at ``-pp 1`` and
-skip as `test_pd_slice`'s do; the rest run anywhere.
+The run tests start `pd_sim.sh` at prefill ``-pp 2`` and at ``-pp 1`` under a
+constant step stub, and at ``-pp 2`` priced by the step roofline alone on node
+18's spec (`08` D120 point 3), where each prefill stage prices only its own
+layers. They skip as `test_pd_slice`'s do; the rest run anywhere.
 """
 
 import dataclasses
@@ -38,7 +40,17 @@ from test_kv_remote_prefill import (
 from test_kv_simulated_connector import PEAKS, TICK, geometry, model_for  # noqa: F401
 from test_pd_slice import NEEDS_A_PD_RUN, PD, PORTS, PdTraffic, publish_pd_entries
 from test_pp_kv_status import _head
-from test_vertical_slice import CONSTANT, MAX_TOKENS, MODEL, TREE, WALL_S, _run_file
+from test_pp_stages import NODE18, each_stage_prices_its_own_layers, roofline_run_file
+from test_vertical_slice import (
+    CONSTANT,
+    MAX_TOKENS,
+    MODEL,
+    TREE,
+    WALL_S,
+    _run_file,
+    publish_entry,
+    publish_entry_on_arch,
+)
 
 from atom.compass import run as compass_run
 from atom.compass.backends import KvGeometry
@@ -226,17 +238,23 @@ def test_a_request_prefilled_at_another_pipeline_width_is_refused_by_name(
 # --- with a driver ------------------------------------------------------------
 
 
-def run_pd_pp(out: Path, seed: str, pp: int) -> dict:
-    """One run under `pd_sim.sh` with a prefill side of `pp` stages."""
+def run_pd_pp(out: Path, seed: str, pp: int, roofline: bool = False) -> dict:
+    """One run under `pd_sim.sh` with a prefill side of `pp` stages, under a
+    constant stub or, with `roofline`, the step roofline alone on node 18's
+    spec, each side's step record on; its readings published as its servers
+    start, on the spec's arch."""
     out.mkdir()
+    machine, publish = (
+        (NODE18, publish_entry_on_arch) if roofline else (DP_MACHINE, publish_entry)
+    )
     with held_ports(len(PORTS)) as drawn:
         ports = dict(zip(PORTS, drawn))
         more = {compass_run.PREFILL_PP: pp} if pp > 1 else {}
-        run_file = _run_file(
+        run_file = (roofline_run_file if roofline else _run_file)(
             out,
             clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
             step_stub=CONSTANT,
-            machine=DP_MACHINE,
+            machine=machine,
             **PD,
             **more,
         )
@@ -249,7 +267,9 @@ def run_pd_pp(out: Path, seed: str, pp: int) -> dict:
             PREFILL_ARGS=f"-pp {pp}" if pp > 1 else "",
             **{name: str(port) for name, port in ports.items()},
         )
-        publish_pd_entries(out / "store", DP_MACHINE, env)
+        if roofline:
+            env["ATOM_COMPASS_PARITY_RECORD"] = str(out / "parity")
+        publish_pd_entries(out / "store", machine, env, publish)
         log = out / "pd_sim.log"
         with open(log, "w") as f:
             sim = subprocess.Popen(
@@ -301,6 +321,27 @@ def test_a_prefill_pipeline_meets_every_scenario_check(pipeline):
     taken = [line for _, line in runs[0]["events"]]
     failed = check_run([r["out"] for r in runs], [MAX_TOKENS], taken)
     assert not failed, "\n".join(failed)
+
+
+@pytest.fixture(scope="module")
+def roofline(tmp_path_factory):
+    """A prefill side of two stages under two seeds, priced by the step
+    roofline alone."""
+    root = tmp_path_factory.mktemp("roofline")
+    return [run_pd_pp(root / f"seed{s}", s, 2, roofline=True) for s in ("1", "2")]
+
+
+@NEEDS_A_PD_RUN
+def test_a_prefill_pipeline_meets_every_scenario_check_under_the_step_roofline(
+    roofline,
+):
+    """Every check, and each prefill stage prices its own layers."""
+    summary = json.loads((roofline[0]["out"] / compass_run.SUMMARY_FILE).read_text())
+    print(f"\n{summary['schedule']['seconds_by_method']}\n{roofline[0]['table']}")
+    taken = [line for _, line in roofline[0]["events"]]
+    failed = check_run([r["out"] for r in roofline], [MAX_TOKENS], taken)
+    assert not failed, "\n".join(failed)
+    each_stage_prices_its_own_layers(roofline[0]["out"] / "parity" / "prefill")
 
 
 def _write_end(ran: dict, a: float, prompt_tokens: int, pp: int) -> list[float]:

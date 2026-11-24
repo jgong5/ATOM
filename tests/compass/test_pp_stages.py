@@ -8,8 +8,10 @@ each stage's worker starts on the host with its groups, the PP group among
 them, on gloo. Each stage hands the next its forward's output on ``pp_data``,
 and the next returns a rendezvous send's completion on ``pp_ack``.
 
-The run test needs a driver and `ATOM_COMPASS_SLICE_MODEL`, as in
-`test_vertical_slice`; the rest run anywhere.
+The run test runs under a constant step stub, and PP2 again priced by the
+step roofline alone on node 18's spec (`08` D120 point 3), beside a PP1 run:
+each stage prices only its own layers. The run tests need a driver and
+`ATOM_COMPASS_SLICE_MODEL`, as in `test_vertical_slice`; the rest run anywhere.
 """
 
 import copy
@@ -18,9 +20,11 @@ import json
 import math
 import pickle
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import test_dp_slice
 import torch
 from test_dp_slice import (  # noqa: F401
     DP_MACHINE,
@@ -32,6 +36,7 @@ from test_dp_slice import (  # noqa: F401
 from test_vertical_slice import CONSTANT, MODEL, NEEDS_A_RUN, _run_file
 
 from atom.compass import run as compass_run
+from atom.compass.backends.json_file import read_jsonl
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.clock import LpId, single_engine_table
 from atom.compass.detect.determinism import StepTable
@@ -49,6 +54,48 @@ L_DATA, L_ACK = pp_send.lookaheads(
 )
 META = "engine-pp0->engine-pp1:meta#pp1"
 DATA, ACK = "engine-pp0->engine-pp1:pp_data#dp0", "engine-pp1->engine-pp0:pp_ack#dp0"
+#: Node 18's spec, a pipeline's machine under the step roofline: it states the
+#: carriers a stage's sends price by, and every field the roofline reads.
+NODE18 = json.loads(
+    (Path(__file__).parent / "machines" / "mi308x-hjbog18.json").read_text()
+)
+#: The roofline's terms for the first stage's embedding and the last's LM head.
+EMBEDDING, LM_HEAD = "roofline.embedding", "roofline.lm_head"
+
+
+def roofline_run_file(out: Path, **keys) -> Path:
+    """`_run_file`, its step stub left out: the step roofline alone prices
+    every step (`08` D120 point 3). A run helper writing a constant stub's run
+    file writes this one where it is patched in."""
+    path = _run_file(out, **keys)
+    run = json.loads(path.read_text())
+    del run["step_stub"]
+    path.write_text(json.dumps(run | {"step_roofline": True}))
+    return path
+
+
+def stage_prices(record: Path, stage: int = 0) -> tuple[set[str], float | None]:
+    """Stage `stage` of DP rank 0 in the step record `record`: the terms its
+    cost lines hold (`overrides._group_step_seconds`), and its mean decode
+    price, the device seconds of a step whose every row decodes, None with
+    no such step."""
+    name = f"pp{stage}.dp0" if stage else "dp0"
+    steps = {s["step"]: s for s in read_jsonl(record / f"{name}.jsonl")}
+    _, *costs = read_jsonl(record / f"{name}.cost.jsonl")
+    terms = {t["name"] for c in costs for t in c["terms"]}
+    rows = [steps[c["step"]]["rows"] for c in costs]
+    decode = [c["device_s"] for c, r in zip(costs, rows) if r and all(d for *_, d in r)]
+    return terms, sum(decode) / len(decode) if decode else None
+
+
+def each_stage_prices_its_own_layers(record: Path, pp: int = 2) -> list:
+    """Assert that the first of `pp` stages in `record` prices the embedding
+    and no LM head, and the last the LM head and no embedding, so no stage
+    charges the whole model; each stage's mean decode price (`stage_prices`)."""
+    terms, means = zip(*(stage_prices(record, k) for k in range(pp)))
+    assert EMBEDDING in terms[0] and LM_HEAD not in terms[0], terms[0]
+    assert LM_HEAD in terms[-1] and EMBEDDING not in terms[-1], terms[-1]
+    return list(means)
 
 
 @pytest.fixture(scope="module", params=[2, 4])
@@ -115,7 +162,83 @@ def test_a_pipeline_meets_the_run_properties_and_uses_every_stage_channel(pipeli
     assert len(sends) == len(data) and least >= L_ACK
 
 
+@pytest.fixture(scope="module")
+def roofline(tmp_path_factory):
+    """PP2 at TP1 under two seeds, and PP1 under one, each priced by the step
+    roofline alone on node 18's spec."""
+    root = tmp_path_factory.mktemp("roofline")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(test_dp_slice, "_run_file", roofline_run_file)
+        pp2 = [
+            run_dp_slice(root / s, s, ["-pp", "2"], dp=1, pp=2, machine=NODE18)
+            for s in ("1", "2")
+        ]
+        pp1 = run_dp_slice(root / "pp1", "1", [], dp=1, machine=NODE18)
+    return pp2, pp1
+
+
+@NEEDS_A_RUN
+def test_a_pipeline_meets_every_scenario_check_under_the_step_roofline(roofline):
+    """Every check but the stages' timeline, which only a constant stub's run
+    has computed."""
+    runs, _ = roofline
+    print(f"\n{runs[0]['summary']['schedule']['seconds_by_method']}")
+    print(runs[0]["table"])
+    taken = [line for _, line in runs[0]["events"]]
+    failed = check_run([r["out"] for r in runs], MAX_TOKENS, taken)
+    assert not failed, "\n".join(failed)
+
+
+@NEEDS_A_RUN
+def test_each_stage_prices_its_own_layers_not_the_whole_stacks(roofline):
+    """Each stage's mean decode price, beside the PP1 run's: the whole stack's,
+    whose steps price both the embedding and the LM head. A stage of half the
+    layers prices under three quarters of it; one of every layer would not."""
+    runs, pp1 = roofline
+    whole, mean = stage_prices(pp1["out"] / "parity")
+    stages = each_stage_prices_its_own_layers(runs[0]["out"] / "parity")
+    print(f"\nmean decode price: PP1 {mean!r} s; PP2 stages {stages!r} s")
+    assert {EMBEDDING, LM_HEAD} <= whole
+    assert max(stages) < 0.75 * mean
+
+
 # --- without a driver ---------------------------------------------------------
+
+
+def _record(directory: Path, name: str, steps, costs) -> None:
+    """Write `name`'s step lines and its cost lines, after their version line,
+    as `parity.StepRecord` and `overrides._group_step_seconds` write them."""
+    for suffix, docs in ((".jsonl", steps), (".cost.jsonl", [{"version": 1}, *costs])):
+        lines = "".join(json.dumps(d) + "\n" for d in docs)
+        (directory / f"{name}{suffix}").write_text(lines)
+
+
+def _cost(step: int, device_s: float, *names: str) -> dict:
+    """A cost line of `step`, its terms `names` at `device_s` in all."""
+    terms = [{"name": n, "seconds": device_s / len(names)} for n in names]
+    return {"step": step, "device_s": device_s, "draft_s": 0.0, "terms": terms}
+
+
+def test_a_stages_prices_are_read_from_its_step_record(tmp_path):
+    """A prefill and two decodes on each of two stages: a stage's terms are
+    every cost line's, its mean decode price the decodes' alone; a head that
+    prices the LM head too charges the whole model."""
+    rows = [[[8, 8, False]], [[1, 9, True], [1, 10, True]], [[1, 11, True]]]
+    steps = [{"step": n, "dp_rank": 0, "rows": r} for n, r in enumerate(rows)]
+    seconds = (3e-3, 1e-3, 2e-3)
+    last = [_cost(n, t, "roofline.gemm", LM_HEAD) for n, t in enumerate(seconds)]
+    _record(tmp_path, "pp1.dp0", steps, last)
+    head = [_cost(n, t, "roofline.gemm", EMBEDDING) for n, t in enumerate(seconds)]
+    _record(tmp_path, "dp0", steps[:1], head[:1])
+
+    mean = pytest.approx(1.5e-3)
+    assert stage_prices(tmp_path, 1) == ({"roofline.gemm", LM_HEAD}, mean)
+    assert stage_prices(tmp_path) == ({"roofline.gemm", EMBEDDING}, None)
+    assert each_stage_prices_its_own_layers(tmp_path) == [None, mean]
+    head[0]["terms"].append({"name": LM_HEAD, "seconds": 0.0})
+    _record(tmp_path, "dp0", steps[:1], head[:1])
+    with pytest.raises(AssertionError, match=LM_HEAD):
+        each_stage_prices_its_own_layers(tmp_path)
 
 
 def test_the_stages_join_the_head_with_a_positive_lookahead_each_way():
