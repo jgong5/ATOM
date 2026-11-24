@@ -24,7 +24,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 from conftest import MockConfig, _MockHFConfig
-from test_backend_step_linear_fit import DECODE, _engine_file, _record, _view
+from test_backend_step_linear_fit import (
+    DECODE,
+    _engine_file,
+    _record,
+    _timed_record,
+    _view,
+)
 from test_parity_record import _drive
 
 from atom.compass.backends import (
@@ -36,7 +42,13 @@ from atom.compass.backends import (
 )
 from atom.compass.backends.step_labels import digest
 from atom.compass.backends.step_linear import KDA, KDA_CHUNK, kda_layers
-from atom.compass.backends.step_linear_fit import _features, fit, label_records
+from atom.compass.backends.step_linear_fit import (
+    _features,
+    fit,
+    label_records,
+    main,
+    mark_held_out,
+)
 from atom.compass.parity import read
 from atom.compass.runner.projection import kda_counts
 
@@ -109,14 +121,20 @@ def _steps(seed, n=240):
     return out
 
 
+def _state(path, steps) -> None:
+    """Give each line of the record `path`, one per step of `steps`, its step's
+    `kda` counts."""
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    for line, step in zip(lines, steps, strict=True):
+        line["kda"] = list(step[3])
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
 def _kda_record(path, steps, kda=True):
     """`steps` as a real record, each line stating its `kda` counts with `kda`."""
     _record(path, [s[:3] for s in steps])
-    lines = [json.loads(line) for line in path.read_text().splitlines()]
     if kda:
-        for line, step in zip(lines, steps):
-            line["kda"] = list(step[3])
-    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+        _state(path, steps)
     _engine_file(path)
     return path
 
@@ -237,11 +255,13 @@ def test_kda_counts_reads_the_scheduled_batchs_state_work():
         state_save_all=[[(5, 8192)], [], []],
         state_fork_srcs=[7, -1, -1],
         state_maintenance_ops=StateMaintenanceOps(
-            relocations=((1, 2),), checkpoint_stores=("store",)
+            relocations=((1, 2),),
+            checkpoint_stores=("store",),
+            checkpoint_restores=("restore", "restore"),
         ),
     )
     counted = kda_counts(batch, MockConfig(config=runner))
-    assert counted == (3, 1, 1, 2)
+    assert counted == (3, 1, 1, 4)
     assert kda_counts(batch, MockConfig(config=MockConfig())) is None
 
 
@@ -287,3 +307,77 @@ def test_a_data_parallel_dummy_runs_no_state_work_beside_a_kda_peer():
     assert dummy_view(peer).kda == (0, 0, 0, 0)
     assert kda_columns(dummy_view(peer)) == (0, 0, 0, 0, 0.0)
     assert dummy_view(BatchView((RequestShape(300, 300, False),))).kda is None
+
+
+@pytest.mark.parametrize(
+    "kda", [(1, 0, 0), (1, 0, 0, 0, 0), (1, 0, -1, 0), (1.0, 0, 0, 0), (True, 0, 0, 0)]
+)
+def test_a_view_refuses_kda_that_is_not_four_counts(kda):
+    with pytest.raises(ValueError, match="is not four counts"):
+        BatchView((RequestShape(100, 100, False),), kda=kda)
+    view = BatchView((RequestShape(100, 100, False),), kda=[1, 0, 0, 2])
+    assert view.kda == (1, 0, 0, 2)
+
+
+def test_each_held_out_run_is_priced_by_the_kda_columns_of_the_others_law(tmp_path):
+    """Exact records of three runs: each run's prefills, held out of a fit on
+    the other two, are priced by that fit's KDA columns as the records were
+    written, in the law's held-out bands and its figures alike; the figures
+    command, which reads the columns off the law, restates those figures."""
+    records = []
+    for seed in (5, 6, 7):
+        (tmp_path / f"r{seed}").mkdir()
+        records.append(_kda_record(tmp_path / f"r{seed}" / "dp0.jsonl", _steps(seed)))
+    samples = label_records(records)[0]
+    options = {"form": "history", "kda": True}
+    law, report = fit(samples, options)
+    mark_held_out(law, report, samples, options)
+
+    bands = law["prefill"]["held_out"]["bands"]
+    errors = [b[p] for b in bands.values() for p in ("p10", "p50", "p90")]
+    assert bands and max(map(abs, errors)) < 1e-4
+    for figures in law["figures"].values():
+        assert abs(figures["prefill"]["median"]) < 1e-4
+    file = tmp_path / "law.json"
+    file.write_text(json.dumps({**law, "figures": {}}))
+    main(["figures", *map(str, records), "--law", str(file)])
+    assert json.loads(file.read_text())["figures"] == json.loads(
+        json.dumps(law["figures"])
+    )
+
+
+def test_compass_fit_steps_model_fits_a_kda_model_s_columns_and_states_their_chunk(
+    tmp_path, monkeypatch
+):
+    """`compass fit steps --model` on the timed record of a Kimi model directory
+    adds the prefill vector's KDA columns and states `kda_chunk`; on a model
+    directory with no KDA layer, over the same lines, neither."""
+    import test_fit_steps as command
+    from test_artifact_store import AITER_ROOT, ATOM_ROOT
+
+    from atom.compass.fit import publish
+
+    monkeypatch.setattr(publish, "roots_for", lambda modules: (ATOM_ROOT, AITER_ROOT))
+    steps = _steps(8)
+    kimi = command.kimi(linear_attn_config={"kda_layers": [1, 2, 3]})
+    for name, config, kda in (("kimi", kimi, True), ("moe", command.MOE, False)):
+        model, key = command.model(tmp_path / f"{name}.model", config)
+        run = tmp_path / name / "record"
+        (run / "steps").mkdir(parents=True)
+        _timed_record(run / "steps" / "dp0.jsonl", [s[:3] for s in steps], key=key)
+        _state(run / "steps" / "dp0.jsonl", steps)
+        command.as_record(run, key)
+        command.fit(
+            tmp_path / name,
+            "fit steps",
+            *command.LINEAR,
+            "--model",
+            model,
+            run,
+            *command.clients(run),
+        )
+        out = tmp_path / name / "out" / "step_linear_law.json"
+        prefill = json.loads(out.read_text())["params"]["prefill"]
+        columns = [f for f in prefill["coefficients"] if f in KDA]
+        assert columns == list(KDA if kda else ())
+        assert prefill.get("kda_chunk") == (KDA_CHUNK if kda else None)
