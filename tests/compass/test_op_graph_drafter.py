@@ -41,7 +41,7 @@ from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import gemm, price
-from atom.compass.capture import graph_key, population_shapes
+from atom.compass.capture import graph_key, lookup, population_shapes
 from atom.compass.capture.forward import structure
 from atom.compass.run import _op_graphs
 from atom.compass.runner import projection
@@ -57,33 +57,40 @@ MOE = "aiter.rocm_aiter_fused_moe.default"
 #: Two rows, each verifying one draft and its bonus token.
 VERIFY = view((2, 90, True), (2, 9, True), rung=2)
 #: A prefill of 64 tokens in one sequence, and a middle chunk of it.
-PREFILL = ("--prefill", "64", "1")
+PREFILL, PREFILL_AT = ("--prefill", "64", "1"), "prefill T=64 B=1"
 CHUNK = BatchView((RequestShape(64, 64, False),), produces_output=False)
+#: A record's step of 3 rows, each verifying one draft, padded to rung 4.
+PADDED = {"rows": [[2, 90, True]] * 3, "rung": 4}
 
-_CAPTURES: dict = {}
+_TRACES: dict = {}
 
 
-def capture(drafts, tmp_path_factory, shape=("--width", "2"), dp=1):
-    """`compass trace ops` at `shape` under an MTP drafter of `drafts` tokens,
-    or at DP `dp` (`shape` naming `--tp`) or its `--population` of a record whose
-    every rank verifies 2 rows at rung 2, then beside a peer prefilling 16 tokens: the capture's directory
-    and its graphs by structure, the first shape's."""
-    if (drafts, shape, dp) in _CAPTURES:
-        return _CAPTURES[drafts, shape, dp]
+def _trace(drafts, dp, tmp_path_factory):
+    """`compass trace ops` under an MTP drafter of `drafts` tokens at DP `dp`,
+    of every shape this file reads there, in one process, whose runner, built
+    once, takes most of its seconds: without DP a decode of width 2; under
+    MTP1 a prefill of 64 tokens in one sequence too, and the `--population` of
+    a record whose step is `PADDED`, or under DP one whose every rank verifies
+    2 rows at rung 2, then beside a peer prefilling 16 tokens. The capture's
+    directory and its graphs."""
+    if (drafts, dp) in _TRACES:
+        return _TRACES[drafts, dp]
     root = tmp_path_factory.mktemp(f"mtp{drafts}")
     (root / "model").mkdir()
     (root / "model" / "config.json").write_bytes(CONFIG.read_bytes())
-    argv = ["trace", "ops", "--model", str(root / "model"), *shape]
-    if dp > 1 and "--tp" not in shape:
+    argv = ["trace", "ops", "--model", str(root / "model")]
+    argv += ["--width", "2"] if dp == 1 else ["--tp", str(dp)]
+    if drafts == 1:
         (root / "record").mkdir()
         line = {"rows": [[drafts + 1, 90, True]] * 2, "rung": 2}
         local = 2 * (drafts + 1)
         beside = line | {"rung": None, "moe_rows": local + 16}
-        record = _record(root / "record", [line | {"moe_rows": dp * local}, beside])
+        lines = [line | {"moe_rows": dp * local}, beside] if dp > 1 else [PADDED]
+        record = _record(root / "record", lines)
         steps = root / "record" / "steps"
         for r in range(1, dp):
             (steps / f"dp{r}.jsonl").write_bytes((steps / "dp0.jsonl").read_bytes())
-        argv[-len(shape) :] = ["--tp", str(dp), "--population", record]
+        argv += [*PREFILL, "--population", record]
     argv += ["--store", str(root / "store"), "--", "--method", "mtp"]
     argv += ["--enable-dp-attention"] * (dp > 1)
     argv += ["--num-speculative-tokens", str(drafts)]
@@ -104,13 +111,19 @@ def capture(drafts, tmp_path_factory, shape=("--width", "2"), dp=1):
     tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
     assert tokens, f"rc {done.returncode}\n{done.stderr[-4000:]}"
     store, rank = ArtifactStore(str(root / "store")), Topology().ranks()[0]
-    graphs = {}
+    graphs = []
     for token in tokens:
         entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
-        graph = json.loads(entry.read_member("graph", rank, "json"))
-        graphs.setdefault(graph["structure"], graph)
-    _CAPTURES[drafts, shape, dp] = root, graphs
+        graphs.append(json.loads(entry.read_member("graph", rank, "json")))
+    _TRACES[drafts, dp] = root, graphs
     return root, graphs
+
+
+def capture(drafts, tmp_path_factory, at="decode B=2", dp=1):
+    """The directory of the capture under an MTP drafter of `drafts` tokens at
+    DP `dp` (`_trace`) and its graphs of shape `at`, by structure."""
+    root, graphs = _trace(drafts, dp, tmp_path_factory)
+    return root, {g["structure"]: g for g in graphs if g["shape"] == at}
 
 
 @pytest.mark.parametrize("drafts", [1, 2])
@@ -181,7 +194,7 @@ def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(ep, tmp_path_fa
 
 
 def test_a_middle_chunk_is_cut_where_its_draft_kv_pass_starts(tmp_path_factory):
-    _, graphs = capture(1, tmp_path_factory, PREFILL)
+    _, graphs = capture(1, tmp_path_factory, PREFILL_AT)
     [middle] = [key for key in graphs if key.endswith(" no output")]
     final = middle.removesuffix(" no output")
     assert set(graphs) == {middle, f"{middle} draft", final, f"{final} draft"}
@@ -202,7 +215,7 @@ def test_a_middle_chunk_is_cut_where_its_draft_kv_pass_starts(tmp_path_factory):
 def test_a_run_prices_a_middle_chunk_s_draft_kv_pass_from_its_own_graph(
     tmp_path_factory,
 ):
-    root, graphs = capture(1, tmp_path_factory, PREFILL)
+    root, graphs = capture(1, tmp_path_factory, PREFILL_AT)
     [drafter] = [
         graph for key, graph in graphs.items() if key.endswith(" no output draft")
     ]
@@ -285,6 +298,7 @@ def dp_view(width, rung, dp, counts=None):
     `rung`, every rank of `dp` alike or at its tokens in `counts`, as
     `batch_view` builds it from the step's mode."""
     batch = SimpleNamespace(
+        total_seqs_num=width,
         total_seqs_num_prefill=0,
         num_scheduled_tokens=[2] * width,
         context_lens=[90] * width,
@@ -300,7 +314,10 @@ def dp_view(width, rung, dp, counts=None):
             scheduled_tokens_per_dp_rank=counts,
             ub_tokens_across_dp=None,
             any_rank_needs_eager=False,
+            max_final_requests_across_dp=0,
         ),
+        is_prefill=False,
+        tbo_collective_active=False,
         running_tokens_are_unified=True,
         running_tokens=2 * rung,
         running_bs=rung,
@@ -344,7 +361,7 @@ def test_a_dp_drafter_beside_a_prefilling_peer_gathers_the_step_s_rows(
     root, graphs = capture(1, tmp_path_factory, dp=2)
     [target] = [key for key in graphs if not key.endswith(" draft")]
     store, rank = ArtifactStore(str(root / "store")), Topology().ranks()[0]
-    key = graph_key(f"{target} draft", "decode B=2 G=20")
+    key = lookup(store, f"{target} draft", "decode B=2 G=20")
     drafter = json.loads(store.read(key).read_member("graph", rank, "json"))
 
     # Its first pass gathers this rank's 4 verified tokens and the peer's 16.
@@ -441,7 +458,7 @@ def test_a_dp_prefill_under_a_drafter_reads_its_graphs_at_their_default(tmp_path
 def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
     tmp_path_factory,
 ):
-    root, graphs = capture(1, tmp_path_factory, (*PREFILL, "--tp", "2"), dp=2)
+    root, graphs = capture(1, tmp_path_factory, PREFILL_AT, dp=2)
     [middle] = [key for key in graphs if key.endswith(" no output")]
     final = middle.removesuffix(" no output")
     assert set(graphs) == {middle, f"{middle} draft", final, f"{final} draft"}
@@ -458,6 +475,7 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
     assert attended[0] == attended[1]
 
     batch = SimpleNamespace(
+        total_seqs_num=1,
         total_seqs_num_prefill=1,
         num_scheduled_tokens=[64],
         context_lens=[64],
@@ -473,7 +491,10 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
             max_bs_across_dp=1,
             ub_tokens_across_dp=None,
             any_rank_needs_eager=False,
+            max_final_requests_across_dp=0,
         ),
+        is_prefill=True,
+        tbo_collective_active=False,
         running_tokens_are_unified=False,
         running_tokens=64,
         running_bs=1,
@@ -501,46 +522,11 @@ def test_a_population_names_a_padded_decode_s_drafter_at_its_rows(tmp_path):
     assert list(map(str, population_shapes([record]))) == shapes
 
 
-def _population(tmp_path_factory, line, drafts):
-    """`compass trace ops --population` of a record of one step, `line`, under
-    an MTP drafter of `drafts` tokens: the capture's directory and its graphs
-    by whether each is the drafter's and its shape."""
-    root = tmp_path_factory.mktemp(f"padded{drafts}")
-    (root / "model").mkdir()
-    (root / "model" / "config.json").write_bytes(CONFIG.read_bytes())
-    (root / "record").mkdir()
-    argv = ["trace", "ops", "--model", str(root / "model"), "--population"]
-    argv += [_record(root / "record", [line]), "--store", str(root / "store")]
-    argv += ["--", "--method", "mtp", "--num-speculative-tokens", str(drafts)]
-    done = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            MAIN,
-            *argv,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=1800,
-        cwd=TREE,
-        env={**os.environ, "PYTHONPATH": str(TREE)},
-    )
-    tokens = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
-    assert tokens, f"rc {done.returncode}\n{done.stderr[-4000:]}"
-    store, rank = ArtifactStore(str(root / "store")), Topology().ranks()[0]
-    graphs = {}
-    for token in tokens:
-        entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
-        graph = json.loads(entry.read_member("graph", rank, "json"))
-        graphs[graph["structure"].endswith(" draft"), graph["shape"]] = graph
-    return root, graphs
-
-
 def verify_view(width, rung):
     """One rank's view of a decode of `width` rows, each verifying one draft,
     replaying `rung`, as `batch_view` builds it from the step's mode."""
     batch = SimpleNamespace(
+        total_seqs_num=width,
         total_seqs_num_prefill=0,
         num_scheduled_tokens=[2] * width,
         context_lens=[90] * width,
@@ -558,14 +544,19 @@ def verify_view(width, rung):
 def test_a_decode_padded_to_its_rung_prices_its_drafter_at_its_rows(
     tmp_path_factory,
 ):
-    line = {"rows": [[2, 90, True]] * 3, "rung": 4}
-    root, graphs = _population(tmp_path_factory, line, 1)
+    root, traced = _trace(1, 1, tmp_path_factory)
+    graphs = {
+        (graph["structure"].endswith(" draft"), graph["shape"]): graph
+        for graph in traced
+        if graph["shape"].endswith(" B=4")
+    }
     # The padded step's target ran at its rung: only its drafter is read at its rows.
     assert set(graphs) == {(False, "decode B=4"), (True, "decode B=4")} | {
         (True, "decode T=3 B=4")
     }
-    # Its first pass runs the rows' 6 tokens; the rung's traces 8.
-    for shape, tokens in (("decode T=3 B=4", 6), ("decode B=4", 8)):
+    # Its first pass runs the target's stream at the rung's 8 tokens, as
+    # ATOM's propose does since upstream b7b5ec3f2; so does the rung's.
+    for shape, tokens in (("decode T=3 B=4", 8), ("decode B=4", 8)):
         ops = _ops(graphs[True, shape]["region"])
         assert {op["args"]["q"]["shape"][0] for op in ops if op["op"] == ATTENTION} == {
             tokens

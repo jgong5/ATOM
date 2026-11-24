@@ -8,6 +8,7 @@ thread, so its intake is read between its return and the collective that
 settles it; dp0 and the frontend run on threads of their own.
 """
 
+import dataclasses
 import math
 import queue
 import threading
@@ -167,16 +168,21 @@ def test_after_settling_a_pass_that_ran_nothing_waits_at_its_idle_point(monkeypa
 def test_an_idle_ranks_dummy_returns_at_its_own_seconds_a_busy_rank_at_the_max(
     dp2,  # noqa: F811
 ):
-    # Prefill dearer than decode, so the busy rank sets the group's max.
-    coefficients = Coefficients.constant(prefill_seconds=0.005, decode_seconds=0.001)
+    # The busy rank's 40-token prefill dearer than the idle rank's dummy, a
+    # one-token prefill in the group's phase, so the busy rank sets the max.
+    coefficients = dataclasses.replace(
+        Coefficients.constant(prefill_seconds=0.001, decode_seconds=0.001),
+        prefill_token=1e-4,
+    )
     ranks = [
         runner(StepStubBackend(coefficients), dp_size=2, dp_rank=r) for r in (0, 1)
     ]
 
     busy, idle = dp2(lambda: ranks[0].forward(prefill(40)), ranks[1].dummy_execution)
 
-    assert [busy.predicted_s, idle.predicted_s] == [0.005, 0.001]
-    assert busy.group_targets == idle.group_targets == (0.005, 0.001)
+    assert [busy.predicted_s, idle.predicted_s] == pytest.approx([0.005, 0.0011])
+    assert busy.group_targets == idle.group_targets
+    assert busy.group_targets == pytest.approx((0.005, 0.0011))
 
 
 def test_every_collective_the_inventory_lists_on_torch_distributed_settles_first(

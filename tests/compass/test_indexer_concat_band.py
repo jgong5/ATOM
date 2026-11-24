@@ -4,20 +4,30 @@
 """A prefill indexer band stays under 2 GiB as aiter's `fp8_mqa_logits`
 allocates it: the step's keys rounded up to 256 columns."""
 
-import importlib.util
+import importlib
 import pathlib
+import sys
+import types
 
 import pytest
 import torch
 
 from atom.model_ops.sparse_indexer_chunk import logits_rows
 
-# By path: the `atom.model_ops.indexer` package imports Triton kernels that
-# need a GPU driver to load, and `rows.py` alone does not.
-_PATH = pathlib.Path(__file__).resolve().parents[2] / "atom/model_ops/indexer/rows.py"
-_spec = importlib.util.spec_from_file_location("_indexer_rows_under_test", _PATH)
-rows_module = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(rows_module)
+# Without the package's own `__init__`: the `atom.model_ops.indexer` package
+# imports Triton kernels that need a GPU driver to load, and `rows.py` and the
+# siblings it imports relatively do not. The package stands in by its path.
+_PACKAGE = "atom.model_ops.indexer"
+_DIR = pathlib.Path(__file__).resolve().parents[2] / "atom/model_ops/indexer"
+_held = sys.modules.get(_PACKAGE)
+if _held is None:
+    sys.modules[_PACKAGE] = types.ModuleType(_PACKAGE)
+    sys.modules[_PACKAGE].__path__ = [str(_DIR)]
+try:
+    rows_module = importlib.import_module(f"{_PACKAGE}.rows")
+finally:
+    if _held is None:
+        del sys.modules[_PACKAGE]
 
 
 @pytest.fixture(autouse=True)

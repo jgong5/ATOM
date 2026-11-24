@@ -9,14 +9,23 @@ import pytest
 import torch
 from test_pp_launch_send import _runner, pp_comm
 
+from atom.compass.runner.overrides import RunnerRefusal
+
 N, TOPK = 8, 4
 
 
-def _stage(monkeypatch, extra=None):
+def _stage(monkeypatch, extra=None, aux=()):
     """Stage 0 of 2, TP rank 1 (no host recurrence charge), carrying the
-    sparse indices; `extra` is added to its output under the key ``extra``."""
+    sparse indices and, for each tap in `aux`, a drafter's aux hidden states
+    ATOM's relay sends on; `extra` is added to its output under the key
+    ``extra``."""
     stage = _runner(monkeypatch, 0, lambda: 0.0)
     stage.rank, stage._pp_send_needs_sparse, stage._pp_index_topk = 1, True, TOPK
+    stage.pp_aux_relay = (
+        SimpleNamespace(outgoing_ids=aux, spec=SimpleNamespace(hidden_size=8))
+        if aux
+        else None
+    )
     if extra is not None:
         output = stage._pp_output
         stage._pp_output = lambda n: {**output(n), "extra": extra}
@@ -28,17 +37,18 @@ def _parts(stage):
 
 
 def test_a_send_carries_every_key_atom_sends_split_as_atom_splits_it(monkeypatch):
-    """With every optional key carried, the send splits exactly ATOM's keys,
-    in ATOM's order: the size, the metadata's pickle, then each tensor."""
+    """With every optional key Compass sizes carried, the send splits exactly
+    ATOM's keys but Kimi-K3's block window, in ATOM's order: the size, the
+    metadata's pickle, then each tensor."""
     comm, split = pp_comm(monkeypatch), []
-    stage = _stage(monkeypatch)
+    stage = _stage(monkeypatch, aux=(-1, 3))
     real = comm._split_tensor_dict
     monkeypatch.setattr(
         comm, "_split_tensor_dict", lambda d: split.append(d) or real(d)
     )
     parts = _parts(stage)
     [sent] = split
-    assert tuple(sent) == tuple(comm._PP_PROXY_KEYS)
+    assert tuple(sent) == tuple(k for k in comm._PP_PROXY_KEYS if k != "block_residual")
     meta = real(sent)[0]
     assert parts == [
         ("gloo", 8),
@@ -46,7 +56,19 @@ def test_a_send_carries_every_key_atom_sends_split_as_atom_splits_it(monkeypatch
         ("rccl", N * 8 * 2),
         ("rccl", N * 8 * 2),
         ("rccl", N * TOPK * 4),
+        ("rccl", N * 2 * 8 * 2),
     ]
+
+
+def test_a_stage_whose_model_sends_a_block_window_is_refused(monkeypatch):
+    stage = _stage(monkeypatch)
+    stage.model = SimpleNamespace(
+        make_empty_intermediate_tensors=lambda n, dtype, device: SimpleNamespace(
+            tensors={"hidden_states": None, "block_residual": None}
+        )
+    )
+    with pytest.raises(RunnerRefusal, match="block_residual"):
+        _parts(stage)
 
 
 def test_a_key_in_the_output_and_in_atoms_keys_is_priced(monkeypatch):

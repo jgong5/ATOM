@@ -47,6 +47,10 @@ from typing import Any
 EVICTION_INTERVAL_S = 1.0
 SESSION_TTL_S = 600.0  # lmcache's SessionManager.DEFAULT_SESSION_TTL
 SESSION_SWEEP_INTERVAL_S = 60.0
+#: The request loop's laws as a run file's ``lmcache`` entry states them,
+#: declared, not measured: a LOOKUP 2^-13 s plus 2^-17 s a prompt chunk, any
+#: other request 2^-14 s.
+DECLARED_LAWS = {"lookup_s": [2.0**-13, 2.0**-17], "request_s": 2.0**-14}
 
 
 class LMCacheRefusal(Exception):
@@ -400,43 +404,35 @@ def reply_channel(ch: str) -> str:
     return f"{dst}->{src}:{kind}"
 
 
-class LMCacheLP:
-    """LP ``lmcache``: the stand-in's one loop, the clock owner of its process.
+class StationLP:
+    """The loop of an LP that plays a server its engines share, the clock owner
+    of its process.
 
-    Each request released to it joins a station's queue in ``(arrival,
-    channel, seq)`` order: the copy engine, `copy_width` servers pricing a
-    STORE or RETRIEVE as `copy` over the chunks it copies, or the request
-    loop, one server pricing a LOOKUP at ``lookup_s[0] + lookup_s[1]`` per
-    prompt chunk and any other request at `request_s`. A job is served
-    (`LMCacheServer.handle`) at its start and, at its end, applies its effect
-    and sends its reply. The loop asks only NER: `t` its next job end, its
-    daemon deadline the server's next tick: the eviction loop's
-    (`LMCacheServer.evict`), first a second after the server starts, or the
-    session sweep's (`LMCacheServer.expire_sessions`), first at its start.
-    While it waits it answers at once the frames sent outside the run, which
-    carry no stamp: lmcache's startup and teardown requests.
+    Each stamped request released to it is taken (`_take`) in ``(arrival,
+    channel, seq)`` order. A job runs on a station of a stated width: it starts
+    (`_start`) when one of the station's servers is free and the server picks it
+    (`_next_job`, its queue's head by default), and at its end it finishes and
+    sends its reply, if it has one, on its request's channel with the ends
+    swapped. The server's own timed events run between job ends and starts
+    (`_tick`). The loop asks only NER, `_deadlines`: `t` its next job end, and
+    its daemon deadline the server's next tick. While it waits it answers at
+    once the frames sent outside the run, which carry no stamp (`_answer`).
 
-    A frame is ``[identity, header, request id, operation, payloads...]``, the
-    header ``(channel, arrival, seq)`` as every wrapped socket sends it.
+    A frame is ``[identity, header, payloads...]``, the header ``(channel,
+    arrival, seq)`` as every wrapped socket sends it.
     """
 
-    def __init__(self, rt, sock, server, *, lookup_s, request_s, copy, copy_width=1):
+    def __init__(self, rt, sock, width: dict[str, int]):
         import zmq
-        from lmcache.v1.multiprocess.transport.zmq_impl import wire
 
-        self.zmq, self.rt, self.sock, self.server = zmq, rt, sock, server
-        self._wire = wire
-        self.lookup_s, self.request_s, self.copy = lookup_s, request_s, copy
-        # ponytail: each copy server moves at the link's whole rate; share it
-        # between them if a measured copy engine says they contend.
-        self.width = {"copy": copy_width, "request": 1}
-        self.queued = {"copy": deque(), "request": deque()}
-        self.busy = dict.fromkeys(self.width, 0)
-        # A heap of (end, start order, station, channel, reply, effect).
+        self.zmq, self.rt, self.sock = zmq, rt, sock
+        self.width = width
+        self.queued = {station: deque() for station in width}
+        self.busy = dict.fromkeys(width, 0)
+        # A heap of (end, start order, station, channel, finish).
         self.jobs: list = []
         self.started = 0
         self.inbox: dict = {}  # (channel, seq) -> (arrival, frames), read, not taken
-        self.due = {"evict": rt.now + EVICTION_INTERVAL_S, "expire_sessions": rt.now}
 
     def serve(self) -> None:
         """Serve until the ``+inf`` grant."""
@@ -446,13 +442,15 @@ class LMCacheLP:
         while True:
             self._settle()
             self._at(rt.now)
-            rt.ask_next_event(
-                self.jobs[0][0] if self.jobs else math.inf, min(self.due.values())
-            )
+            rt.ask_next_event(*self._deadlines())
             while rt.conn.fileno() not in dict(poller.poll()):
                 self._pull()
             if rt.take_grant() == math.inf:
                 return
+
+    def _deadlines(self) -> tuple[float, float]:
+        """NER's `t` and daemon deadline."""
+        return (self.jobs[0][0] if self.jobs else math.inf), math.inf
 
     def _at(self, now: float) -> None:
         """Everything due at `now`: job ends, the server's ticks, the requests
@@ -462,39 +460,47 @@ class LMCacheLP:
             for (ch, seq), (a, _) in self.inbox.items()
             if seq in self.rt.released[ch]
         )
-        for _, ch, seq in released:
-            frames = self.inbox.pop((ch, seq))[1]
-            op = self._wire.decode_operation(frames[2])
-            self.queued["copy" if op in COPIES else "request"].append((ch, op, frames))
+        for arrival, ch, seq in released:
+            self._take(ch, arrival, self.inbox.pop((ch, seq))[1])
         while True:
             while self.jobs and self.jobs[0][0] <= now:
-                _, _, station, ch, reply, effect = heapq.heappop(self.jobs)
-                effect(now)
+                _, _, station, ch, finish = heapq.heappop(self.jobs)
                 self.busy[station] -= 1
-                back = reply_channel(ch)
-                self._send(back, reply, self.rt.stamp_send(back))
-            for tick, due in self.due.items():
-                if now >= due:
-                    getattr(self.server, tick)(now)
-                    self.due[tick] += TICKS[tick]
-            for station, queue in self.queued.items():
-                while queue and self.busy[station] < self.width[station]:
-                    ch, op, frames = queue.popleft()
-                    reply, effect, chunks = self.server.handle(frames, now)
-                    end = now + self._price(op, chunks)
-                    job = (end, self.started, station, ch, reply, effect)
-                    heapq.heappush(self.jobs, job)
+                if (reply := finish(now)) is not None:
+                    back = reply_channel(ch)
+                    self._send(back, reply, self.rt.stamp_send(back))
+            self._tick(now)
+            for station, width in self.width.items():
+                while self.busy[station] < width:
+                    if (job := self._next_job(station, now)) is None:
+                        break
+                    ch, end, finish = self._start(station, job, now)
+                    heapq.heappush(self.jobs, (end, self.started, station, ch, finish))
                     self.started += 1
                     self.busy[station] += 1
             if not (self.jobs and self.jobs[0][0] <= now):
                 return
 
-    def _price(self, op: str, chunks: int) -> float:
-        if op == "lookup":
-            return self.lookup_s[0] + self.lookup_s[1] * chunks
-        if op in COPIES:
-            return self.copy.duration_s(chunks)
-        return self.request_s
+    def _take(self, ch: str, arrival: float, frames: list[bytes]) -> None:
+        """Queue the request `frames` released on `ch` at `arrival`."""
+        raise NotImplementedError
+
+    def _next_job(self, station: str, now: float):
+        """The next job `station` starts at `now`, or None."""
+        queue = self.queued[station]
+        return queue.popleft() if queue else None
+
+    def _start(self, station: str, job, now: float) -> tuple:
+        """Start `job` at `now`: its request's channel, its end, and a callable
+        that finishes it at its end and returns its reply frames or None."""
+        raise NotImplementedError
+
+    def _tick(self, now: float) -> None:
+        """The server's own events due at `now`."""
+
+    def _answer(self, identity: bytes, ch: str, frames: list[bytes]) -> None:
+        """Answer a request sent on `ch` outside the run."""
+        raise NotImplementedError
 
     def _pull(self) -> None:
         """Read every frame already here without blocking: answer one sent
@@ -506,9 +512,7 @@ class LMCacheLP:
                 return
             ch, arrival, seq = pickle.loads(hdr)
             if arrival is None:
-                reply, effect, _ = self.server.handle([identity, *rest], self.rt.now)
-                effect(self.rt.now)
-                self._send(reply_channel(ch), reply, (None, None))
+                self._answer(identity, ch, rest)
             else:
                 self.rt.check_arrival(ch, arrival, seq)
                 self.inbox[ch, seq] = (arrival, [identity, *rest])
@@ -523,3 +527,76 @@ class LMCacheLP:
     def _send(self, ch: str, reply: list[bytes], stamp: tuple) -> None:
         identity, *rest = reply
         self.sock.send_multipart([identity, pickle.dumps((ch, *stamp)), *rest])
+
+
+class LMCacheLP(StationLP):
+    """LP ``lmcache``: the stand-in's one loop, the clock owner of its process.
+
+    Each request released to it joins a station's queue in ``(arrival,
+    channel, seq)`` order: the copy engine, `copy_width` servers pricing a
+    STORE or RETRIEVE over the chunks it copies as the `TransferModel` that
+    `size_copy()` returns at the first stamped request released, after it has
+    sized the server's chunk and state image from what the engines it serves
+    planned, or the request
+    loop, one server pricing a LOOKUP at ``lookup_s[0] + lookup_s[1]`` per
+    prompt chunk and any other request at `request_s`. A job is served
+    (`LMCacheServer.handle`) at its start and, at its end, applies its effect
+    and sends its reply. The loop asks only NER: `t` its next job end, its
+    daemon deadline the server's next tick: the eviction loop's
+    (`LMCacheServer.evict`), first a second after the server starts, or the
+    session sweep's (`LMCacheServer.expire_sessions`), first at its start.
+    While it waits it answers at once the frames sent outside the run, which
+    carry no stamp: lmcache's startup and teardown requests.
+
+    A frame is ``[identity, header, request id, operation, payloads...]``.
+    """
+
+    def __init__(
+        self, rt, sock, server, *, lookup_s, request_s, size_copy, copy_width=1
+    ):
+        from lmcache.v1.multiprocess.transport.zmq_impl import wire
+
+        # ponytail: each copy server moves at the link's whole rate; share it
+        # between them if a measured copy engine says they contend.
+        super().__init__(rt, sock, {"copy": copy_width, "request": 1})
+        self.server, self._wire = server, wire
+        self.lookup_s, self.request_s, self._size_copy = lookup_s, request_s, size_copy
+        self.copy = None  # the copy engine's model, from the first stamped request
+        self.due = {"evict": rt.now + EVICTION_INTERVAL_S, "expire_sessions": rt.now}
+
+    def _deadlines(self) -> tuple[float, float]:
+        return super()._deadlines()[0], min(self.due.values())
+
+    def _take(self, ch: str, arrival: float, frames: list[bytes]) -> None:
+        if self.copy is None:
+            self.copy = self._size_copy()
+        op = self._wire.decode_operation(frames[2])
+        self.queued["copy" if op in COPIES else "request"].append((ch, op, frames))
+
+    def _tick(self, now: float) -> None:
+        for tick, due in self.due.items():
+            if now >= due:
+                getattr(self.server, tick)(now)
+                self.due[tick] += TICKS[tick]
+
+    def _start(self, station: str, job, now: float) -> tuple:
+        ch, op, frames = job
+        reply, effect, chunks = self.server.handle(frames, now)
+
+        def finish(end: float) -> list[bytes]:
+            effect(end)
+            return reply
+
+        return ch, now + self._price(op, chunks), finish
+
+    def _price(self, op: str, chunks: int) -> float:
+        if op == "lookup":
+            return self.lookup_s[0] + self.lookup_s[1] * chunks
+        if op in COPIES:
+            return self.copy.duration_s(chunks)
+        return self.request_s
+
+    def _answer(self, identity: bytes, ch: str, frames: list[bytes]) -> None:
+        reply, effect, _ = self.server.handle([identity, *frames], self.rt.now)
+        effect(self.rt.now)
+        self._send(reply_channel(ch), reply, (None, None))

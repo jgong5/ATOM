@@ -137,13 +137,17 @@ def test_every_channel_row_maps_to_an_address_its_wiring_names(monkeypatch):
     # channel from each frame's header, and a pipeline stage's `pp_data`
     # rides the PP CPU group; no address names any of them. An lmcache_mp
     # LOOKUP leaves on lmcache's own client socket, which no ATOM address names,
-    # and the lmcache_mp shell names each channel it stamps.
+    # and the lmcache_mp shell names each channel it stamps. A Mooncake Store
+    # query or renewal leaves through the Store shell's sends in place of
+    # AsyncStoreLookup's workers, and the shell names each channel it stamps.
     own_files = (
         "atom/compass/kv/connector.py",
         "atom/compass/kv/lmcache_mp.py",
         "atom/compass/kv/lmcache_server.py",
+        "atom/compass/kv/mooncake_store.py",
         "atom/compass/runner/pp_send.py",
         "atom/kv_transfer/offload/chunked_scheduler.py",
+        "atom/kv_transfer/offload/mooncake_store/async_lookup.py",
     )
     own = [r for r in rows if r["file"] in own_files]
     rows = [r for r in rows if r not in acks + own]
@@ -349,6 +353,7 @@ def test_the_engine_input_thread_takes_a_request_sent_by_the_frontend(
     clock.name_endpoints(0, *addrs, "")
     engine = EngineCore.__new__(EngineCore)
     engine.label, engine.input_queue = "engine", queue.Queue()
+    engine._kv_progress_event = threading.Event()
     thread = threading.Thread(
         target=engine.process_input_sockets, args=addrs, daemon=True
     )

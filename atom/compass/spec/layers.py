@@ -164,11 +164,15 @@ def stack_of(fields: Mapping) -> str:
 
 
 def composed(
-    sheet: Layer, key: Any, document: Mapping, net: Layer | None = None
+    sheet: Layer,
+    key: Any,
+    document: Mapping,
+    net: Layer | None = None,
+    source: str | None = None,
 ) -> MachineSpec:
     """The machine spec of the datasheet `sheet`, the readings entry at `key`,
-    an artifact store's `Key`, whose document is `document`, and the network
-    file `net`."""
+    an artifact store's `Key`, whose document is `document`, read from
+    `source`, a store or a file, when named, and the network file `net`."""
     stated = document["provenance"]["origins"]
     values, origins = dict(sheet.values), dict(sheet.origins)
     for path, value in document.items():
@@ -205,6 +209,8 @@ def composed(
     notes = (
         f"composed from the device datasheet {sheet.name} and {key} as {key.token()}"
     )
+    if source is not None:
+        notes += f" in {source}"
     if net is not None:
         values |= net.values
         origins |= net.origins

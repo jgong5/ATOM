@@ -8,7 +8,10 @@ ATOM adds to the hash fails here until it is placed.
 
 A run whose data-parallel group spans nodes, or that runs MiniMax-M3's
 indexer-only context parallelism, `--hf-overrides`, or an ATOM switch `keyed`
-names off its default, refuses a step linear law fitted without it, naming it.
+names off its default, refuses a step linear law fitted without it, naming it;
+so does a run at another compilation level than its law's, which `keyed` names
+off the default of ATOM's ``--level``. An op graph, traced eager at level 0,
+keys no level.
 
 No device: aiter's arch probe answers a declared arch.
 """
@@ -20,11 +23,13 @@ from types import SimpleNamespace
 
 import pytest
 from test_drive_runfile import build, install, step_linear
-from test_key_index_cache_dtype import V41, V41_SERVER, served
-from test_run_step_grid import deployment
+from test_key_index_cache_dtype import QWEN, V41, V41_SERVER, served
+from test_run_step_grid import LADDER, deployment
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
-from atom.compass.run.step_grid import keyed
+from atom.compass.capture.forward import structure
+from atom.compass.run.step_grid import LEVEL, keyed
+from atom.model_engine.arg_utils import EngineArgs
 from atom.quant_spec import LayerQuantConfig
 from atom.utils import envs
 
@@ -43,7 +48,6 @@ LEFT_OUT = {
         "a run priced by a step law or grid refuses a width other than 1, the one "
         "both are measured at"
     ),
-    "compilation_config.level": "picks torch.compile's kernels: #3052",
     "compilation_config.use_cudagraph": (
         "picks no kernel: ATOM reads it only to refuse a compiled buffer write"
     ),
@@ -233,3 +237,44 @@ def test_an_atom_switch_off_its_default_refuses_a_law_fitted_at_it_naming_it(
     monkeypatch.setenv(name, off)
     named = refusal(tmp_path, monkeypatch, run, r)
     assert f"env {name} None in the law and {off!r} here" in named
+
+
+@pytest.fixture
+def levels(tmp_path, monkeypatch):
+    """A Qwen3 server's config at ATOM's default level, and at ``--level 0``."""
+    return [
+        served(tmp_path, monkeypatch, "gfx950", QWEN, *args)
+        for args in ([], ["--level", "0"])
+    ]
+
+
+def test_a_server_keys_its_level_only_off_atoms_default(levels):
+    default, eager = levels
+
+    assert keyed(eager) == keyed(default) | {LEVEL: 0}
+
+
+def test_an_op_graph_traced_at_level_0_serves_a_run_at_any_level(levels):
+    graphs = {structure(c, "decode", device="gfx950") for c in levels}
+
+    assert len(graphs) == 1
+
+
+@pytest.mark.parametrize(
+    "fitted, here, named",
+    [
+        (0, EngineArgs.level, "level 0 in the law and None here"),
+        (EngineArgs.level, 0, "level None in the law and 0 here"),
+    ],
+    ids=["law-at-0", "run-at-0"],
+)
+def test_a_run_at_another_level_refuses_a_law_fitted_at_one_naming_it(
+    tmp_path, monkeypatch, fitted, here, named
+):
+    def at(level):
+        compiled = SimpleNamespace(cudagraph_capture_sizes=list(LADDER), level=level)
+        return deployment(tmp_path, compilation_config=compiled)
+
+    run = fitted_on(tmp_path, at(fitted))
+
+    assert named in refusal(tmp_path, monkeypatch, run, at(here))

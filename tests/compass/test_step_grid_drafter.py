@@ -255,7 +255,9 @@ def test_each_kv_limit_is_the_largest_context_the_replay_rule_fits_in_the_pool(
     planned = step_grid_plan.plan(DEFINITION, steps, engines)
 
     nodes = planned["decode"]["nodes"]
-    lookahead = width - 2 if width > 2 else 0
+    # DSpark, a block drafter, writes its K positions past a row; MTP K - 1.
+    block = SPECULATIVE[drafter][0] == "dspark"
+    lookahead = width - 1 if block else max(0, width - 2)
     for rung, bs in nodes["B"].items():
         for b in bs:
             limit = 16 * (30 // b) - width - lookahead
@@ -438,17 +440,18 @@ def test_a_v41_flash_dspark5_verify_step_is_priced_from_a_fitted_bundle(
         assert f" x {member} " in term.provenance.detail.split("; residual ")[1]
 
 
-@pytest.mark.parametrize("c, fits", [(60, True), (61, False)])
+@pytest.mark.parametrize("c, fits", [(59, True), (60, False)])
 def test_a_point_is_planned_only_where_the_replay_rule_fits_the_draft_rounds_positions(
     model_dir, c, fits  # noqa: F811
 ):
-    """At an 8-block pool one prefill row of 64 tokens on 61 cached fills 8
-    blocks of 16, and its draft round's 4 positions past it a ninth."""
+    """At an 8-block pool one prefill row of 64 tokens on 60 cached fills 8
+    blocks of 16 but 4 tokens, and its draft round's 5 positions past it, a
+    block drafter's K, a ninth."""
     target = {
         **recorded(model_dir, "dspark5")[1]["dspark5 dp0"],
         "num_kvcache_blocks": 8,
         "draft_width": K,
-        "lookahead": K - 1,
+        "lookahead": K,
     }
     built = config(model_dir, "dspark5")
     built.num_kvcache_blocks = 8

@@ -248,3 +248,32 @@ def test_a_source_that_returns_a_bare_number_is_a_bug_not_a_cost():
 
     with pytest.raises(TypeError, match="not a cost term"):
         Resolver([ReturnsSeconds()]).resolve("attention")
+
+
+def test_an_answer_given_again_resolves_as_before_and_after_a_refusal_names_it():
+    # One term object: the top source's answer, then the next source's once
+    # the top declines.
+    term = CostTerm("x", 1.0, Provenance(Method.MEASURED))
+
+    class Top(CostSource):
+        name = "top"
+
+        def price(self, request):
+            return term if request == "first" else self.refuse("not this one")
+
+    class Next(CostSource):
+        name = "next"
+
+        def price(self, request):
+            return term
+
+    resolver = Resolver([Top(), Next()])
+    first, again, after = map(resolver.resolve, ("first", "first", "second"))
+
+    assert again == first and first.term.provenance.source == "top"
+    assert after.source == "next" and after.term.provenance.source == "next"
+    assert (
+        after.declined
+        == after.term.provenance.refusals
+        == (Refusal("top", "not this one"),)
+    )

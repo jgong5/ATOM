@@ -28,8 +28,10 @@ from atom.compass import run as compass_run
 from atom.compass.artifacts import Key, Kind, keyed_platform
 from atom.compass.backends.step_labels import digest
 from atom.compass.backends.step_linear_fit import (
+    _intakes,
     fit_host,
     fit_intake,
+    fit_relay,
     fit_tokenizer,
     label_records,
 )
@@ -82,6 +84,84 @@ def test_the_host_laws_published_are_fit_hosts_and_a_run_file_carrying_them_runs
     )
     compass_run.runner(r, META_8B)
     assert r.compass_host.laws == host["laws"]
+
+
+def test_a_stated_hop_is_written_into_the_entry_s_hops_and_named_in_its_report(
+    tmp_path,
+):
+    """`--stated-hop`: a hop no record times, such as the router's forward a
+    `--dp-aware` deployment's router LP needs above the IPC hop it borrows."""
+    r = deployment(tmp_path)
+    publish(tmp_path, r)
+    key = compass_run.host_key(r.config)
+    a = record(tmp_path / "a", 19, key=key, trace="trace-a")
+    stated = ["--stated-hop", "router_s=0.0015", "--stated-hop", "kv_write_req_s=1e-4"]
+    fit(tmp_path, "fit host", a, *clients(a), *stated)
+
+    host = member(tmp_path / "store", host_laws_key(key), "params")
+    assert host["hops"] == {"router_s": 0.0015, "kv_write_req_s": 1e-4}
+    report = member(tmp_path / "store", host_laws_key(key), "report")
+    assert report["stated_hops"] == host["hops"]
+
+
+def test_a_stated_ingress_is_written_as_the_entry_s_term_and_named_in_its_report(
+    tmp_path,
+):
+    """`--ingress FILE`: the encoding ingress in front of the deployment, as
+    `compass fit ingress` wrote it from the ingress's stamps, which no record
+    holds; an entry stated with one goes to a run file as its ingress."""
+    r = deployment(tmp_path)
+    publish(tmp_path, r)
+    key = compass_run.host_key(r.config)
+    a = record(tmp_path / "a", 19, key=key, trace="trace-a")
+    term = {"fixed_s": 0.0, "per_byte_s": 4.4e-7, "workers": 64}
+    term |= {"router_per_byte_s": 1.2e-8, "bytes": [875, 3620123]}
+    (tmp_path / "ingress.json").write_text(json.dumps({"ingress": term}))
+    fit(
+        tmp_path,
+        "fit host",
+        a,
+        *clients(a),
+        "--ingress",
+        str(tmp_path / "ingress.json"),
+    )
+
+    host = member(tmp_path / "store", host_laws_key(key), "params")
+    assert host["ingress"] == term
+    report = member(tmp_path / "store", host_laws_key(key), "report")
+    assert report["stated_ingress"] == {
+        "file": str(tmp_path / "ingress.json"),
+        "ingress": term,
+    }
+    (tmp_path / "bad.json").write_text(json.dumps({"ingress": {**term, "workers": 0}}))
+    with pytest.raises(SystemExit, match="bad.json: its ingress is"):
+        fit(
+            tmp_path,
+            "fit host",
+            a,
+            *clients(a),
+            "--ingress",
+            str(tmp_path / "bad.json"),
+        )
+
+
+@pytest.mark.parametrize(
+    "words, refusal",
+    [
+        (["ipc_s=0.0001"], "only router_s, kv_write_req_s"),
+        (["router_s=0.001", "router_s=0.002"], "state router_s already"),
+        (["router_s=-1"], "not a positive number of seconds"),
+        (["router_s=fast"], "not a positive number of seconds"),
+    ],
+    ids=["fitted-hop", "twice", "negative", "no-number"],
+)
+def test_a_stated_hop_refuses_a_fitted_hop_a_repeat_or_no_positive_seconds(
+    words, refusal
+):
+    from atom.compass.fit.host import stated_hops
+
+    with pytest.raises(ValueError, match=refusal):
+        stated_hops(words, {"ipc_s": 1e-4})
 
 
 def test_a_record_without_its_host_key_refuses(tmp_path):
@@ -373,6 +453,93 @@ def test_the_intake_hull_spans_bodies_past_the_lone_requests_both_ways(tmp_path)
     assert term["bytes"] == [9000, 600_000] and report["samples"] == 8
 
 
+def test_requests_lone_after_two_that_overlap_fit_with_their_pool_rendered_template(
+    tmp_path,
+):
+    # Two requests whose app calls both come before either body (one app call
+    # then names both), a metrics scrape's app call with no body, then lone
+    # requests whose template a pool thread renders: each lone request's
+    # seconds are its loop CPU time plus that render's wall.
+    t, cpu, lines, expect = 10**12, 0, [], []
+    lines += [_stamp("app", t, t), _stamp("app", t + 10, t + 10)]
+    for k in range(2):
+        s = t + 1000 * (k + 1)
+        lines += [_stamp("body", s, s + 100, 5000)]
+        lines += [_stamp("tmpl", s + 200, s + 300, 5000)]
+        lines += [_stamp("prep", s + 400, s + 500, thread=2)]
+        lines += [_stamp("send", s + 600, s + 700)]
+    for k, size in enumerate(np.linspace(30_000, 400_000, 8).astype(int).tolist()):
+        t += 10**9
+        loop, render = round((IDLE + PER_BYTE * size) * 1e9), 300_000 + 2 * size
+        w, p, e = t + 9000 + render, t + 10_000 + render, t + 60_000 + render
+        lines += [_stamp("app", t - 5000, t - 5000)]  # a scrape
+        lines += [
+            _stamp("app", t, t, cpu=(cpu, cpu)),
+            _stamp("body", t + 1000, t + 2000, size, (cpu + 1000, cpu + 2000)),
+            _stamp("tmpl", t + 3000, t + 3000 + render, size, thread=POOL[0]),
+            _stamp("wait", w, w + 41_000, 0, (cpu + 5000,) * 2),
+            _stamp("prep", p, p + 30_000, thread=POOL[1]),
+            _stamp("send", e, e + 10_000, 0, (cpu, cpu + loop)),
+        ]
+        expect.append((size, (loop + render) * 1e-9))
+        cpu += loop + 10**6
+    path = tmp_path / compass_run.INTAKE_RECORD
+    path.write_text("\n".join(lines) + "\n")
+    lone, bursts, sizes = _intakes(path)
+    assert lone == pytest.approx(expect) and not bursts and len(sizes) == 10
+
+
+def test_a_server_that_renders_no_template_fits_its_intake_on_its_pool_jobs(
+    tmp_path,
+):
+    # A prefill-decode deployment's decode side renders no chat template: each
+    # request reads its body, submits its pool job and is sent. The same requests
+    # stamped so fit the same term, each request of a burst marked by its pool
+    # job's submit, stamped where its template began. Each pool job encodes, as
+    # its record's tokenizer record says, so no job's wall joins its intake.
+    rendered, bare = tmp_path / "rendered", tmp_path / "bare"
+    for d in (rendered, bare):
+        (d / "steps").mkdir(parents=True)
+        stamped(d, burst=(40_000, 60_000, 50_000, 45_000))
+    stamps = bare / "steps" / compass_run.INTAKE_RECORD
+    rows = [line.split() for line in stamps.read_text().splitlines()]
+    kept = [row for row in rows if row[2] != "tmpl"]
+    for k, row in enumerate(rows):
+        later = [r[2] for r in rows[k + 1 :] if r[2] in ("app", "wait")]
+        if row[2] == "tmpl" and later[:1] != ["wait"]:
+            # `stamped` gives only the lone requests a pool job's wait.
+            kept.append([row[3], row[1], "wait", row[3], "0", row[6], row[6]])
+    stamps.write_text("".join(" ".join(row) + "\n" for row in kept))
+    record = bare / "steps" / compass_run.TOKENIZER_RECORD
+    jobs = [
+        {"call": "encode", "tokens": 1, "items": 1, "thread": int(row[1])}
+        | {"t_start_ns": int(row[3]), "t_end_ns": int(row[0])}
+        for row in kept
+        if row[2] == "prep"
+    ]
+    record.write_text(record.read_text() + "".join(json.dumps(j) + "\n" for j in jobs))
+
+    got = [
+        fit_intake(
+            [d / "steps" / compass_run.INTAKE_RECORD],
+            [d / "steps" / compass_run.TOKENIZER_RECORD],
+        )
+        for d in (rendered, bare)
+    ]
+    assert got[1] == got[0]
+    term, report = got[1]
+    assert term == pytest.approx(
+        {
+            "fixed_s": FIXED,
+            "per_byte_s": PER_BYTE,
+            "idle_s": IDLE,
+            "bytes": [9000, 400_000],
+        },
+        rel=1e-6,
+    )
+    assert report["samples"] == 8 and report["burst"]["requests"] == 4
+
+
 @pytest.mark.parametrize(
     "lone, burst, encodes, unfitted",
     [
@@ -427,7 +594,7 @@ def test_a_term_the_records_cannot_give_is_left_out_and_listed_unfitted(
             (900_000, 1_000_000, 1_100_000),
             -3e-3,
             (
-                "the longest burst's 2 later requests take 0.00624 s of the loop's "
+                "the bursts' 2 later requests take 0.00624 s of the loop's "
                 "CPU each, less than per_byte_s 8.8e-09 times their mean body of "
                 "1050000 B, so fixed_s would be -0.003 s"
             ),
@@ -463,6 +630,30 @@ def test_with_no_burst_or_a_negative_one_fixed_s_is_idle_s_and_a_run_charges_it(
     # and the frontend charges a queued request's intake as a lone one's.
     run_file(tmp_path, monkeypatch, host=host)
     assert compass_run.http_intake() == pytest.approx((IDLE, PER_BYTE, IDLE), rel=1e-6)
+
+
+def test_fixed_s_is_the_mean_over_every_burst_of_every_record(tmp_path):
+    # Record a's burst of 3 runs its later requests 2 ms past per_byte_s apart,
+    # b's longer burst of 5 runs them 1 ms apart: fixed_s weighs each later
+    # request once, not the longest burst alone.
+    a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
+    stamped(a, burst=(40_000, 60_000, 50_000), fixed=2e-3)
+    stamped(b, burst=(45_000, 55_000, 65_000, 35_000, 50_000), fixed=1e-3)
+    fit(tmp_path, "fit host", a, b, *clients(a, b))
+
+    host = member(tmp_path / "store", host_laws_key(HOST), "params")
+    report = member(tmp_path / "store", host_laws_key(HOST), "report")
+    values = [2e-3] * 2 + [1e-3] * 4
+    assert host["http_intake"]["fixed_s"] == pytest.approx(np.mean(values), rel=1e-6)
+    assert report["http_intake"]["burst"] == pytest.approx(
+        {
+            "bursts": 2,
+            "requests": 8,
+            "p10_s": np.percentile(values, 10),
+            "p90_s": np.percentile(values, 90),
+        },
+        rel=1e-6,
+    )
 
 
 def _unfitted(report) -> dict:
@@ -558,3 +749,81 @@ def test_the_segment_term_takes_what_its_stored_prefix_search_compared(tmp_path)
     term, why = segment(zero)
     assert set(term) == {"fixed_s", "tokens_per_s"}
     assert why == "the records give no time per compared character"
+
+
+def test_a_request_given_its_token_ids_takes_its_pool_job_in_with_its_intake(tmp_path):
+    # A prefill-decode decode side's requests: no template, and a pool job
+    # that builds the sequence and calls no tokenizer, which no tokenizer law
+    # prices, so its wall joins the loop's CPU time. One whose job encodes
+    # (a text prompt) leaves its job to the tokenizer laws.
+    t, cpu, lines, expect, calls = 10**12, 0, [], [], [TOKENIZER]
+    for k, size in enumerate(np.linspace(30_000, 900_000, 6).astype(int).tolist()):
+        t += 10**9
+        loop, job = round((IDLE + PER_BYTE * size) * 1e9), 100_000 + 3 * size
+        p, e = t + 10_000, t + 20_000 + job
+        lines += [
+            _stamp("app", t, t, cpu=(cpu, cpu)),
+            _stamp("body", t + 1000, t + 2000, size, (cpu + 1000, cpu + 2000)),
+            _stamp("wait", p - 1000, p + job + 1000, 0, (cpu + 5000,) * 2),
+            _stamp("prep", p, p + job, thread=POOL[k % 2]),
+            _stamp("send", e, e + 10_000, 0, (cpu, cpu + loop)),
+        ]
+        encodes = k == 5
+        if encodes:
+            calls.append(
+                {"call": "encode", "tokens": 9, "items": 1, "thread": POOL[k % 2]}
+                | {"t_start_ns": p + 10, "t_end_ns": p + 20}
+            )
+        expect.append((size, (loop + (0 if encodes else job)) * 1e-9))
+        cpu += loop + 10**6
+    path = tmp_path / compass_run.INTAKE_RECORD
+    path.write_text("\n".join(lines) + "\n")
+    record = tmp_path / compass_run.TOKENIZER_RECORD
+    record.write_text("".join(json.dumps(c) + "\n" for c in calls))
+    lone, bursts, sizes = _intakes(path, record)
+    assert lone == pytest.approx(expect) and not bursts and len(sizes) == 6
+    # With no tokenizer record, no job is known to have called one.
+    assert _intakes(path)[0][-1] == pytest.approx(
+        (sizes[-1], expect[-1][1] + 3e-9 * sizes[-1] + 1e-4)
+    )
+
+
+def _relayed(directory, sizes, fixed, per_byte, rows=3, others=()):
+    """A prefill-decode deployment's two sides' intake stamps: each request's
+    `rows` output rows on prefill, one per 100 us, then decode's app call for
+    it `fixed + per_byte x bytes` after the last row's return, and its body;
+    `others`, app calls on decode with no output on prefill before them."""
+    pre, dec = [], [_stamp("app", t, t) for t in others]
+    t = 10**12
+    for k, size in enumerate(sizes):
+        t += 10**9
+        for r in range(rows):
+            pre.append(_stamp("out", t + r * 100_000, t + r * 100_000 + 1000, thread=7))
+        back = t + (rows - 1) * 100_000 + 1000
+        app = back + round((fixed + per_byte * size) * 1e9)
+        dec += [_stamp("app", app, app), _stamp("body", app + 100, app + 500, size)]
+        dec += [_stamp("send", app + 900, app + 1000)]
+    for side, lines in (("prefill", pre), ("decode", dec)):
+        (directory / side / "steps").mkdir(parents=True)
+        path = directory / side / "steps" / compass_run.INTAKE_RECORD
+        path.write_text("".join(line + "\n" for line in lines))
+    return [tuple(directory / s / "steps" / compass_run.INTAKE_RECORD for s in SIDES)]
+
+
+SIDES = ("prefill", "decode")
+
+
+def test_the_relay_term_is_fitted_from_prefill_s_last_output_row_to_decode_s_app_call(
+    tmp_path,
+):
+    sizes = np.linspace(20_000, 3_000_000, 12).astype(int).tolist()
+    pairs = _relayed(tmp_path, sizes, 1.5e-3, 11e-9, others=(10**11,))
+    term, report = fit_relay(pairs)
+    assert term["fixed_s"] == pytest.approx(1.5e-3, rel=1e-3)
+    assert term["per_byte_s"] == pytest.approx(11e-9, rel=1e-3)
+    assert term["bytes"] == [sizes[0], sizes[-1]] and report["samples"] == 12
+
+
+def test_a_relay_with_no_request_alone_on_it_is_left_unfitted(tmp_path):
+    with pytest.raises(ValueError, match="0 forwards for 2 coefficients"):
+        fit_relay(_relayed(tmp_path, [], 1.5e-3, 11e-9))

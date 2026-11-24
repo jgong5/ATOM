@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from types import SimpleNamespace
@@ -92,17 +93,13 @@ def _rank(config, todo, rank):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize(
-    "config",
-    [_config(2, dp_attention=True), _config(2)],
-    ids=["dp_attention", "tp"],
-)
+@pytest.mark.parametrize("layout", ["dp_attention", "tp"])
 def test_two_ranks_naming_different_points_each_measure_their_union_in_one_order(
-    config,
+    layout, launched
 ):
-    ranks.layout(config)
+    got, (config, _) = launched[layout]
 
-    by_rank = ranks.launch(_rank, config, TODO)
+    by_rank = got.result()
 
     union = [
         (str(decode(2)), 20, ["a", "b", "c"]),
@@ -158,7 +155,16 @@ def _measuring_rank(config, todo, refuse, rank):
     pc = config.parallel_config
     me = pc.data_parallel_rank * config.tensor_parallel_size + rank
     store = dist.TCPStore(pc.data_parallel_master_ip, pc.data_parallel_base_port)
-    # a rank left waiting fails, not hangs
+    # Both ranks up before the group, on the store's own timeout: a loaded
+    # host can start one spawned rank more than the group's timeout after
+    # the other, and the group's connect waits on that timeout.
+    store.set(f"up/{me}", "1")
+    store.wait(["up/0", "up/1"])
+    # Gloo binds the address the hostname resolves to, one DNS lookup per rank
+    # inside the group's timeout; loopback needs no lookup. The rank's process
+    # ends with its launch, so the variable dies with it.
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    # a rank left waiting in a call fails, not hangs
     wait = datetime.timedelta(seconds=RUNNER_WAIT if refuse == "runner" else 10)
     dist.init_process_group("gloo", store=store, rank=me, world_size=2, timeout=wait)
     runner, captures = _Runner(), []
@@ -220,27 +226,74 @@ def _leaves(records):
     return [(r["op"], r.get("refused")) for r in records]
 
 
-def test_ranks_measuring_different_points_each_measure_their_union_in_one_order():
-    config = _config(2)
-    ranks.layout(config)
-    todo = [[(decode(2), 20, _found(ABS))], [(decode(2), 20, _found(NEG, ABS))]]
+def _journaled_rank(config, todo, refuse, journal, rank):
+    """`_measuring_rank`, journaling each rank's records at `journal`."""
+    os.environ[ops.JOURNAL] = str(journal)  # dies with the rank's process
+    return _measuring_rank(config, todo, refuse, rank)
 
-    by_rank = ranks.launch(_measuring_rank, config, todo, None)
+
+def _raising(fn, *args):
+    """What `ranks.launch(fn, *args)` raised, or returned, and its seconds."""
+    start = time.monotonic()
+    try:
+        got = ranks.launch(fn, *args)
+    except RuntimeError as e:  # the case asserts what it says
+        got = e
+    return got, time.monotonic() - start
+
+
+@pytest.fixture(scope="module")
+def launched(tmp_path_factory):
+    """Each case's `ranks.launch`, by the case, all started at once, each in a
+    thread of its own: a future of what it returned (`_raising`'s pair for
+    the rank that raises), and the arguments it took after its function."""
+    two = [[(decode(2), 20, _found(NEG, ABS))]] * 2
+    one = [[(decode(2), 20, _found(NEG))]] * 2
+    jobs = {
+        "dp_attention": (_rank, _config(2, dp_attention=True), TODO),
+        "tp": (_rank, _config(2), TODO),
+        "union": (
+            _measuring_rank,
+            _config(2),
+            [[(decode(2), 20, _found(ABS))], [(decode(2), 20, _found(NEG, ABS))]],
+            None,
+        ),
+        "profile": (_measuring_rank, _config(2), two, "profile"),
+        "missing": (_missing_rank, _config(2), one, None),
+        "runner": (_measuring_rank, _config(2), one, "runner"),
+        "c10d": (_layout_rank, _config(2, dp_attention=True), [[], []]),
+        "gatherv": (_gatherv_rank, _config(2, dp_attention=True), [[], []]),
+    }
+    for refuse in ("copy", "later_copy", "call", "capture"):
+        journal = tmp_path_factory.mktemp(refuse) / "points.jsonl"
+        jobs[refuse] = (_journaled_rank, _config(2), two, refuse, journal)
+    for _, config, *_ in jobs.values():
+        ranks.layout(config)
+    with ThreadPoolExecutor(len(jobs)) as pool:
+        return {
+            case: (
+                pool.submit(_raising if case == "runner" else ranks.launch, *job),
+                job[1:],
+            )
+            for case, job in jobs.items()
+        }
+
+
+def test_ranks_measuring_different_points_each_measure_their_union_in_one_order(
+    launched,
+):
+    by_rank = launched["union"][0].result()
 
     assert [_leaves(r) for r in by_rank] == [[(ABS, None), (NEG, None)]] * 2
 
 
 @pytest.mark.parametrize("refuse", ["copy", "later_copy", "call", "capture"])
 def test_a_leaf_one_rank_refuses_every_rank_refuses_and_the_next_is_measured(
-    refuse, tmp_path, monkeypatch
+    refuse, launched
 ):
-    config = _config(2)
-    ranks.layout(config)
-    todo = [[(decode(2), 20, _found(NEG, ABS))]] * 2
-    journal = tmp_path / "points.jsonl"
-    monkeypatch.setenv(ops.JOURNAL, str(journal))
+    got, (*_, journal) = launched[refuse]
 
-    by_rank = ranks.launch(_measuring_rank, config, todo, refuse)
+    by_rank = got.result()
 
     own = "ValueError: rank 1 refuses"
     assert [_leaves(r) for r in by_rank] == [
@@ -254,12 +307,10 @@ def test_a_leaf_one_rank_refuses_every_rank_refuses_and_the_next_is_measured(
     assert not journal.exists()
 
 
-def test_a_rank_whose_first_profile_names_no_kernel_profiles_as_often_as_the_others():
-    config = _config(2)
-    ranks.layout(config)
-    todo = [[(decode(2), 20, _found(NEG, ABS))]] * 2
-
-    by_rank = ranks.launch(_measuring_rank, config, todo, "profile")
+def test_a_rank_whose_first_profile_names_no_kernel_profiles_as_often_as_the_others(
+    launched,
+):
+    by_rank = launched["profile"][0].result()
 
     got = [
         ([(r["op"], r.get("refused"), r.get("kernels")) for r in rs], n)
@@ -290,27 +341,22 @@ def _missing_rank(config, todo, refuse, rank):
     return _measuring_rank(config, todo, refuse, rank), len(profiles)
 
 
-def test_every_rank_profiles_a_call_again_when_one_rank_s_two_profiles_missed_it():
-    config = _config(2)
-    ranks.layout(config)
-    todo = [[(decode(2), 20, _found(NEG))]] * 2
-
-    by_rank = ranks.launch(_missing_rank, config, todo, None)
+def test_every_rank_profiles_a_call_again_when_one_rank_s_two_profiles_missed_it(
+    launched,
+):
+    by_rank = launched["missing"][0].result()
 
     got = [([(r["op"], r.get("kernels")) for r in rs], n) for rs, n in by_rank]
     assert got == [([(NEG, ["k"])], 2 + 2)] * 2
 
 
-def test_a_rank_raising_before_its_first_cross_rank_call_ends_the_others():
-    config = _config(2)
-    ranks.layout(config)
-    todo = [[(decode(2), 20, _found(NEG))]] * 2
+def test_a_rank_raising_before_its_first_cross_rank_call_ends_the_others(launched):
+    raised, seconds = launched["runner"][0].result()
 
-    start = time.monotonic()
     with pytest.raises(RuntimeError, match="rank 1 has no runner"):
-        ranks.launch(_measuring_rank, config, todo, "runner")
+        raise raised
 
-    assert time.monotonic() - start < RUNNER_WAIT  # not rank 0's gloo timeout
+    assert seconds < RUNNER_WAIT  # not rank 0's gloo timeout
 
 
 def test_a_rank_that_dies_costs_only_the_point_the_ranks_were_measuring(
@@ -438,11 +484,10 @@ def _layout_rank(config, todo, rank):
     return _measuring_rank(config, todo, None, rank)
 
 
-def test_a_c10d_leaf_runs_on_its_coordinator_s_group_whatever_torch_named_it():
-    config = _config(2, dp_attention=True)
-    ranks.layout(config)
-
-    by_rank = ranks.launch(_layout_rank, config, [[], []])
+def test_a_c10d_leaf_runs_on_its_coordinator_s_group_whatever_torch_named_it(
+    launched,
+):
+    by_rank = launched["c10d"][0].result()
 
     merged = {
         json.loads(r["leaf"])["args"]["group_name"]: r for r in ranks.merge(by_rank)
@@ -487,11 +532,10 @@ def _gatherv_rank(config, todo, rank):
     return _measuring_rank(config, todo, None, rank), shapes
 
 
-def test_each_rank_s_dp_all_gather_sends_its_own_rows_of_the_captured_sizes():
-    config = _config(2, dp_attention=True)
-    ranks.layout(config)
-
-    by_rank = ranks.launch(_gatherv_rank, config, [[], []])
+def test_each_rank_s_dp_all_gather_sends_its_own_rows_of_the_captured_sizes(
+    launched,
+):
+    by_rank = launched["gatherv"][0].result()
 
     assert [_leaves(records) for records, _ in by_rank] == [[(GATHERV, None)]] * 2
     assert [shapes for _, shapes in by_rank] == [

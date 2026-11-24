@@ -187,7 +187,7 @@ def test_measuring_one_record_twice_publishes_each_view_once_and_then_nothing(ru
         assert member["seconds"] == 1e-6 * sum(q for q, *_ in member["rows"])
         assert member["repeats"] and member["statistic"] == "median"
         assert member["protocol"] == window.PROTOCOL
-        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 3}
+        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 4}
         assert member["origin"] == "replay"
         assert member["sources"] == [
             measure.file_digest(run.record / "steps/dp0.jsonl")
@@ -714,7 +714,9 @@ def test_ragged_composes_across_the_rungs_of_the_ladder_the_record_states(
     ladder = json.loads((run.record / "steps/dp0.engine.json").read_text())["ladder"]
     given, compose = [], measure.ragged.compose
     monkeypatch.setattr(
-        measure.ragged, "compose", lambda *a: given.append(a[-1]) or compose(*a)
+        measure.ragged,
+        "compose",
+        lambda *a, **k: given.append(a[-1]) or compose(*a, **k),
     )
 
     run(rec, "--sample", "2", "--seed", "3", "--ragged", *run.named(rec))
@@ -732,7 +734,7 @@ def test_ragged_under_grid_also_plans_the_cells_of_the_views_it_composes(
     monkeypatch.setattr(
         measure.ragged,
         "compose",
-        lambda seed, *_: [{**seed, "rows": [[1, 1000, True], *seed["rows"][1:]]}],
+        lambda seed, *_, **__: [{**seed, "rows": [[1, 1000, True], *seed["rows"][1:]]}],
     )
     rec = str(run.record)
     definition = run.tmp / "definition.json"
@@ -938,6 +940,33 @@ def test_run_and_measure_steps_lay_out_dp_attention_alike(
         assert (config.tensor_parallel_size, pc.data_parallel_size) == (1, 2)
     with pytest.raises(SystemExit):
         measure.atom_config([*atom_args, "--compass-run", "run.json"])
+
+
+@pytest.mark.parametrize("node", [0, 1])
+def test_run_lays_out_one_node_of_a_dp_attention_group_across_nodes_as_its_engines(
+    monkeypatch, model_dir, node  # noqa: F811
+):
+    # Each node of a TP 2 group of two DP ranks on two nodes starts two of its
+    # four engines; a check that read the whole group would pass a step law
+    # the runner refuses. The benches run the whole group on one host.
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    atom_args = ["--model", str(model_dir), "-tp", "2", "--enable-dp-attention"]
+    atom_args += ["--data-parallel-size", "2", "--data-parallel-size-local", "1"]
+    atom_args += ["--data-parallel-rank", str(node)]
+    served = drive_run._config(atom_args)
+    pc = served.parallel_config
+    fields = ("data_parallel_size", "data_parallel_size_local", "data_parallel_rank")
+    got = {"tensor_parallel_size": served.tensor_parallel_size}
+    got |= {name: getattr(pc, name) for name in fields}
+    print(f"\nnode {node}: {got}")
+
+    assert list(got.values()) == [1, 4, 2, 2 * node]
+    measured = measure.atom_config(atom_args).parallel_config
+    assert (measured.data_parallel_size, measured.data_parallel_size_local) == (4, 4)
 
 
 #: The API server's flags `compass record` passes it, as MiniMax-M3's

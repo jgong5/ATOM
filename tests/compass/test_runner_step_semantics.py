@@ -365,7 +365,7 @@ def test_a_single_stage_defers_exactly_when_atoms_token_processor_does(
     producer of such a model reports the decode it ran, not the one before."""
     from atom.model_engine import llm_engine
 
-    monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *_: None)
+    monkeypatch.setattr(llm_engine, "load_tokenizer", lambda *_: None)
     monkeypatch.setattr(overrides, "filler_token_ids", lambda *_: [0])
     config = MockConfig(pipeline_parallel_size=1, model="m", trust_remote_code=False)
     runner = _Runner(config)
@@ -490,7 +490,8 @@ def _reply_attribute_reads():
 
     A read is `fwd_out.x` or `fwd_output.x`. The reply may also be handed on
     whole -- passed positionally to one of `HANDED_TO`, returned, or tested
-    against `None` either way. Any other use of it, a `getattr`, an alias, a hand-off to
+    against `None` either way. A `getattr(fwd_output, "x", default)` reads `x`.
+    Any other use of it, a `getattr` of a computed name, an alias, a hand-off to
     any other function or method, is refused by file and line: it
     could read an attribute this set would never contain.
     """
@@ -515,8 +516,19 @@ def _reply_attribute_reads():
                     and node in up.args
                 )
             )
+            named = (
+                isinstance(up, ast.Call)
+                and isinstance(up.func, ast.Name)
+                and up.func.id == "getattr"
+                and up.args[:1] == [node]
+                and len(up.args) > 1
+                and isinstance(up.args[1], ast.Constant)
+                and isinstance(up.args[1].value, str)
+            )
             if isinstance(up, ast.Attribute):
                 names.add(up.attr)
+            elif named:
+                names.add(up.args[1].value)
             elif not handed_on:
                 unread.append(f"{path.name}:{node.lineno}: {ast.unparse(up)}")
     assert not unread, f"the forward reply is used in a form not read here: {unread}"
@@ -538,6 +550,7 @@ def test_the_reply_answers_every_attribute_atom_reads_off_one(run):
         "logprobs",
         "dspark_ell",
         "get_idx",
+        "constraint_errors",
     }
     # Answered by building ATOM's own object rather than one shaped like it, so
     # a field this runner never sets still carries the default ATOM gives it.

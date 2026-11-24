@@ -11,9 +11,10 @@ its scheduler half is `MultiShell`.
 native-state as its `bind_block_manager` picks) with the workers' transfers
 moved onto the step loop. It keeps one ATOM worker connector per TP rank, with
 no device: `build_connector_meta` hands each rank the metadata, and the rank's
-adapter sends each STORE or RETRIEVE it submits to LP ``lmcache`` on its
-writer's ``transfer`` channel, stamped now. A native-state rank takes its
-checkpoint units as named and restores a load at no cost.
+adapter sends each STORE or RETRIEVE it submits to LP ``lmcache`` on its DP
+rank's ``transfer`` channel, stamped now and carrying its worker id, so every
+writer rank's request leaves in rank order on one DEALER. A native-state rank
+takes its checkpoint units as named and restores a load at no cost.
 `process_completions` takes, inline, every reply released so far and reports
 what the ranks' `get_finished`, aggregated over the TP group, gave at the
 previous call, since the engine's aggregation answers one poll behind.
@@ -24,6 +25,11 @@ as it puts it on the client's queue; lmcache's polling thread sends it, takes
 each reply once a grant releases it and sets its future. A wait on that future
 on the step loop is an idle point until the reply or the wait's bound. Frames
 outside the run go unstamped.
+
+With ``OFFLOAD_MP_LOOKUP_THREAD``, the shell replaces the lookup driver's thread
+with `_OwnedDriver`, whose passes the clock owner makes (`LPRuntime.offer`):
+one when the input thread offers an arrival's lookup, at that arrival, and one
+when lmcache's polling thread takes a reply, at the reply's arrival (#3767).
 
 A server URL lmcache reaches over gRPC is refused by its scheme. Importing this
 module loads no third-party package; using it loads lmcache, zmq and torch.
@@ -37,6 +43,7 @@ import logging
 import math
 import pickle
 import threading
+from functools import partial
 from types import SimpleNamespace
 
 from atom.compass.kv.connector import SimulatedKVConnectorScheduler
@@ -91,10 +98,18 @@ class MultiShell(MultiConnectorScheduler):
 def _units_as_named(config) -> SimpleNamespace:
     """A native-state rank's checkpoint layout: the units it is given, as
     named, and an image group exactly when ATOM's worker registers one."""
-    from atom.kv_transfer.offload.mp.native_state_worker import stores_state_images
+    from atom.kv_transfer.offload.mp.native_state_layout import (
+        NativeStateMPLayout,
+        stores_state_images,
+    )
 
     replay = int(getattr(config, "state_replay_tokens", 0) or 0)
-    return SimpleNamespace(validate_unit_ids=tuple, images=stores_state_images(replay))
+    return SimpleNamespace(
+        validate_unit_ids=tuple,
+        images=stores_state_images(replay),
+        # ATOM's own block ids per group, which read nothing of the layout.
+        transfer_block_ids=partial(NativeStateMPLayout.transfer_block_ids, None),
+    )
 
 
 def _restored(pending) -> bool:
@@ -109,6 +124,7 @@ class LMCacheMPShell:
 
     def __init__(self, config) -> None:
         from atom.kv_transfer.offload.mp import connector, deployment
+        from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
         from atom.utils import clock
 
         url = deployment._server_urls(config)[0]
@@ -121,11 +137,14 @@ class LMCacheMPShell:
         self._inner = connector.LMCacheMPConnectorScheduler(config)
         self._config, self._url, self._rt = config, url, clock.installed()
         self._ranks: list = []
-        self._socks: dict = {}  # reply channel -> its DEALER, one per writer
+        self._socks: dict = {}  # reply channel -> its DEALER
         self._futures: dict = {}  # (reply channel, request id) -> its future
         self._read: dict = {}  # (reply channel, seq) -> (arrival, frames), untaken
         self._ids = itertools.count()
         self._held = None  # what the ranks reported at the previous call
+        # Each request's prefix, rebuilt from the tokens the scheduler ships,
+        # as each real worker rebuilds its own; every rank's copy is this one.
+        self._tokens = WorkerTokens()
 
     def __getattr__(self, name: str):
         inner = self.__dict__.get("_inner")
@@ -134,7 +153,6 @@ class LMCacheMPShell:
         return getattr(inner, name)
 
     def bind_block_manager(self, block_manager) -> None:
-        from atom.compass.run import spec
         from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
         from atom.kv_transfer.offload.mp.deployment import _tp_replication_factor
         from atom.kv_transfer.offload.mp.native_state_scheduler import (
@@ -148,15 +166,14 @@ class LMCacheMPShell:
         self._inner.bind_block_manager(block_manager)
         if self._ranks:
             return
+        client = getattr(self._inner._impl, "_lookup_client", None)
+        driver = getattr(client, "_driver", None)
+        if driver is not None:
+            driver.stop()
+            client._driver = _OwnedDriver(self._rt, client, driver.window)
+            client._adapter.compass_replied.append(client._driver.notify)
         impl, config = self._inner._impl, self._config
         native = isinstance(impl, NativeStateLMCacheMPConnectorScheduler)
-        checkpoints = block_manager.paged_state_checkpoints
-        image = checkpoints.store.spec.image_bytes if native else 0
-        if (declared := spec()["lmcache"].get("state_bytes", 0)) != image:
-            raise ValueError(
-                f"the run file's lmcache state_bytes is {declared}; this deployment "
-                f"offloads a recurrent-state image of {image} bytes a rank"
-            )
         tp, group = config.tensor_parallel_size, _tp_replication_factor(config)
         dp = config.parallel_config.data_parallel_rank
         for k in range(tp):
@@ -164,7 +181,7 @@ class LMCacheMPShell:
                 config
             )
             rank.chunk_size, rank._is_kv_writer = impl.chunk_size, k % group == 0
-            rank._adapter = _Rank(self, f"transfer#dp{dp}.tp{k // group}", k // group)
+            rank._adapter = _Rank(self, f"transfer#dp{dp}", k // group)
             if native:
                 rank._native_layout = _units_as_named(config)
                 rank._begin_restore = _restored
@@ -174,6 +191,8 @@ class LMCacheMPShell:
     def build_connector_meta(self):
         """ATOM's metadata, after each rank has submitted its share of it."""
         meta = self._inner.build_connector_meta()
+        # As a worker's `start_load_kv` does before it submits.
+        self._tokens.resolve(meta)
         for rank in self._ranks:
             for req in getattr(meta, "requests", ()):
                 if req.load_spec is not None and rank._do_load:
@@ -288,9 +307,39 @@ class LMCacheMPShell:
             )
 
 
+class _OwnedDriver:
+    """`mp/lookup_driver.py::_LookupDriver` with no thread of its own: each pass
+    is offered to the clock owner, which makes it at the arrival whose handler
+    woke it, or at its own next clock call. The real driver also wakes every
+    `_DRIVER_IDLE_S` to release stale answers; this one does so only at a pass."""
+
+    def __init__(self, rt, client, window: int) -> None:
+        self.rt, self.client, self.window = rt, client, window
+        self.queued = False
+
+    def start(self) -> None:
+        pass
+
+    def stop(self, timeout: float = 5.0) -> None:
+        pass
+
+    def notify(self) -> None:
+        if not self.queued:
+            self.queued = True
+            self.rt.offer(self._pass)
+
+    def _pass(self) -> None:
+        self.queued = False
+        try:
+            self.client._drive(self.window)
+        except Exception:
+            logger.warning("LMCache MP lookup driver pass failed", exc_info=True)
+
+
 class _Rank:
     """One TP rank's lmcache worker adapter: each STORE and RETRIEVE it is given
-    goes to LP ``lmcache`` on its writer's channel, as its worker would send it."""
+    goes to LP ``lmcache`` on its DP rank's channel, under its writer's worker
+    id, as its worker would send it."""
 
     def __init__(self, shell: LMCacheMPShell, kind: str, worker_id: int) -> None:
         self.shell, self.kind, self.worker_id = shell, kind, worker_id
@@ -385,6 +434,7 @@ def clocked_adapter(cls, config, **kwargs):
             return self.query()
 
     adapter = cls(context=Context(), **kwargs)
+    adapter.compass_replied = []  # called as a stamped reply is taken
     client = adapter._client._message_queue_client
     sock, receive, submit = client.socket, client.process_inbound, client.submit_request
     client.input_queue = clock.RelayQueue(rt, sock)
@@ -405,6 +455,8 @@ def clocked_adapter(cls, config, **kwargs):
             rt.handed_over(back, seq)
             try:
                 receive()
+                for replied in adapter.compass_replied:
+                    replied()
             finally:
                 rt.back_at_wait_point()
 

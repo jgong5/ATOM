@@ -8,17 +8,24 @@ response is ATOM's own `stream_chat_response`.
 """
 
 import asyncio
+import json
 import re
 
 import pytest
 from starlette.responses import StreamingResponse
 
-from atom.compass.carriers import sse_stamp, tracestate_stamp, tracestate_with
+from atom.compass import run as compass_run
+from atom.compass.carriers import (
+    sse_stamp,
+    tracestate_jitter,
+    tracestate_stamp,
+    tracestate_with,
+)
 from atom.compass.clock import LpId, prefill_decode_table, single_engine_table
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.serving_chat import stream_chat_response
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
-from atom.utils import clock
+from atom.utils import clock, compass_loop
 from atom.utils.clock import LPRuntime
 from atom.utils.compass_loop import HttpChannel
 
@@ -139,6 +146,34 @@ class TestTracestate:
         with pytest.raises(ValueError, match="already has a compass entry"):
             tracestate_with("rojo=1,compass=a:1.0;s:1", 2.0, 2)
 
+    @pytest.mark.parametrize("jitter", [0.0, 1.0, 48000.0, 0.1 + 0.2, 3.5e-07, 2e20])
+    def test_an_intake_jitter_round_trips_beside_the_stamp(self, jitter):
+        header = tracestate_with(VENDORS, 1.5, 3, jitter)
+        assert header.startswith(f"compass=a:1.5;s:3;j:{jitter!r},rojo=")
+        assert tracestate_stamp(header) == (1.5, 3)
+        assert tracestate_jitter(header) == jitter
+
+    @pytest.mark.parametrize("header", [None, "", VENDORS, "compass=a:1.5;s:3"])
+    def test_no_intake_jitter_reads_as_zero(self, header):
+        assert tracestate_jitter(header) == 0.0
+
+    def test_a_stamp_with_no_jitter_names_none(self):
+        assert tracestate_with(None, 1.5, 3) == "compass=a:1.5;s:3"
+        assert tracestate_with(None, 1.5, 3, None) == "compass=a:1.5;s:3"
+
+    @pytest.mark.parametrize(
+        "value", ["a:1.0;s:1;j:", "a:1.0;s:1;j:x", "a:1.0;s:1;j:-1.0", "a:1.0;s:1;x:2"]
+    )
+    def test_a_malformed_jitter_is_refused_by_name(self, value):
+        for read in (tracestate_stamp, tracestate_jitter):
+            with pytest.raises(ValueError, match="^malformed compass tracestate entry"):
+                read(f"{VENDORS},compass={value}")
+
+    @pytest.mark.parametrize("jitter", [-1.0, float("nan"), float("inf")])
+    def test_writing_a_jitter_that_is_no_count_of_bytes_is_refused(self, jitter):
+        with pytest.raises(ValueError, match="no finite count of bytes"):
+            tracestate_with(None, 1.5, 3, jitter)
+
 
 class TestSseComment:
     @pytest.mark.parametrize(
@@ -204,6 +239,38 @@ class TestTheStreamWriter:
         assert rt.send_log == [(STREAM, s, 2.0 + STREAM_S) for s in range(len(events))]
         assert len(events) > len(sent) and events[-1].endswith("data: [DONE]")
         assert re.sub(r"(?m)^: compass .*\n", "", text) == "".join(sent)
+
+    @pytest.mark.parametrize("per_event", [None, 1e-3], ids=["unstated", "stated"])
+    def test_each_event_but_done_is_charged_its_http_stream_term_before_its_stamp(
+        self, installed, tmp_path, monkeypatch, per_event
+    ):
+        """The loop sends each event after its own work on it: a decode
+        server's ~50 us at c=256 (#3720). The [DONE] after the last event
+        costs nothing of its own."""
+        run = {"bound_s": 1.0}
+        if per_event is not None:
+            run["host"] = {"http_stream": {"per_event_s": per_event}}
+        (tmp_path / "run.json").write_text(json.dumps(run))
+        monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+        rt = installed(_runtime(2.0))
+        charged = []
+
+        def charge(d):
+            charged.append((d, len(rt.send_log)))
+            rt.now += d
+
+        monkeypatch.setattr(compass_loop, "charge", charge)
+        text = "".join(_client_text(_replay(FRAMES)))
+        assert re.sub(r"(?m)^: compass .*\n", "", text) == "".join(FRAMES)
+        d = per_event or 0.0
+        if per_event is None:
+            assert charged == []
+        else:
+            # One charge per frame, before its stamps: a, b, then c beside [DONE].
+            assert charged == [(d, 0), (d, 1), (d, 2)]
+        at = [2.0 + d + STREAM_S, 2.0 + 2 * d + STREAM_S, *[2.0 + 3 * d + STREAM_S] * 2]
+        assert [(ch, s) for ch, s, _ in rt.send_log] == [(STREAM, s) for s in range(4)]
+        assert [a for _, _, a in rt.send_log] == pytest.approx(at)
 
     def test_behind_the_router_lp_frontend_d_stamps_its_stream_to_the_router(
         self, installed

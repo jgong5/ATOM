@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import importlib.util
 import itertools
 import logging
 from collections import Counter
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import Any
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
@@ -14,17 +13,22 @@ from atom.compass import run as compass_run
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
-from atom.model_engine.segment_tokenizer import SegmentTokenizer
+from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
-from atom.sampling_params import SamplingParams
+from atom.sampling_params import RequiredChannel, SamplingParams
+from atom.structured_output import is_structured
+from atom.structured_output.validation import (
+    WorkerGrammarPreflight,
+    validate_execution_options,
+)
 from atom.utils import clock, envs
 from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
 
-def _load_tokenizer(model: str, trust_remote_code: bool = False):
+def load_tokenizer(model: str, trust_remote_code: bool = False):
     tokenizer = AutoTokenizer.from_pretrained(
         model, use_fast=True, trust_remote_code=trust_remote_code
     )
@@ -46,7 +50,7 @@ class LLMEngine:
         data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
         self.config = config
-        self.tokenizer = tokenizer or _load_tokenizer(
+        self.tokenizer = tokenizer or load_tokenizer(
             config.model, config.trust_remote_code
         )
         config.bos_token_id = self.tokenizer.bos_token_id
@@ -66,30 +70,9 @@ class LLMEngine:
                     data_parallel_master_port
                 )
         self.data_parallel_size = config.parallel_config.data_parallel_size
-        # TBO's two concurrent ubatches are supported by the mori EP
-        # dispatch/combine path. The EP collective fallback instead issues
-        # full DP all-gather/reduce-scatter operations from both ubatch streams;
-        # those streams can enter the collectives in opposite order and hang.
-        # Keep the fallback usable by serializing it until it has dedicated
-        # per-ubatch communicators, analogous to the PCP/TP guard below.
-        mori_ep_enabled = (
-            getattr(config, "moe_all2all_backend", "auto") in {"auto", "mori"}
-            and not envs.ATOM_DISABLE_MORI_EP
-            and importlib.util.find_spec("mori") is not None
-        )
-        if (
-            config.enable_dp_attention
-            and config.enable_expert_parallel
-            and config.enable_tbo
-            and not mori_ep_enabled
-        ):
-            logger.warning(
-                "Disabling TBO for the DP-attention + EP collective fallback: "
-                "concurrent all-gather/reduce-scatter ubatches can deadlock. "
-                "Use mori EP or run the fallback without --enable-tbo."
-            )
-            config.enable_tbo = False
-            config.enable_tbo_decode = False
+        # Config validated SP before the legacy DP kwargs above landed.
+        if config.sequence_parallel_size > 1 and self.data_parallel_size != 1:
+            raise ValueError("Ulysses SP currently requires data_parallel_size=1")
         # PCP and DP-attention together are unverified. The refusal's original
         # cause, a DP all-gather of the hash-routing input ids sized for the
         # un-split token count, is gone: the MoE now routes before its DP
@@ -107,58 +90,6 @@ class LLMEngine:
                 "now, disable one of them (use -tp N -pcp M without "
                 "DP-attention, or -dp N --enable-dp-attention without -pcp)."
             )
-        # PCP + TBO prefill: supported via coordinated splitting.
-        # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under
-        # per-request ubatch split are unverified).
-        if config.prefill_context_parallel_size > 1 and config.enable_tbo:
-            # TBO overlaps compute with the attn<->MoE PCP collectives, which
-            # only exist in MoE merge mode (ATOM_PCP_MOE_MERGE=1). With
-            # ATOM_PCP_MOE_MERGE=0, MoE runs on each rank's 1/W token shard
-            # with NO extra comm between attn and MoE, so TBO has nothing
-            # to overlap and only adds ubatch-splitting overhead. Force it off.
-            if not envs.ATOM_PCP_MOE_MERGE:
-                logger.warning(
-                    "Disabling TBO because ATOM_PCP_MOE_MERGE=0: in this "
-                    "situation it runs MoE on each rank's 1/W token shard with "
-                    "no extra attn<->MoE communication, so TBO has nothing to "
-                    "overlap and only adds overhead."
-                )
-                config.enable_tbo = False
-                config.enable_tbo_decode = False
-            elif config.tensor_parallel_size > 1:
-                # Cross-communicator (PCP x TP) RCCL deadlock:
-                # under TBO the PCP collectives (comm_stream) run concurrently
-                # and UNORDERED with the TP-group all_reduces (compute_stream,
-                # from attention wo_b / MoE RowParallelLinear). On the TPxPCP
-                # rank grid with large collectives this forms a cross-rank
-                # circular wait -> hang (reproduced MI355 TP4PCP2/TP2PCP4 merge
-                # +TBO, 64k/c32). Serialized (non-TBO single stream) is fine, and
-                # TP=1 has no TP communicator so it cannot form the cycle. Only
-                # TP=1 + PCP keeps TBO; TP>1 falls back to non-TBO.
-                logger.warning(
-                    "Disabling TBO: prefill_context_parallel_size > 1 (-pcp) "
-                    "with tensor_parallel_size > 1 (-tp) hangs under TBO due to "
-                    "a PCP<->TP cross-communicator RCCL deadlock (concurrent "
-                    "unordered collectives on comm/compute streams; see "
-                    "PCP_TBO.md 14.4). TBO with PCP is only supported at -tp 1 "
-                    "(e.g. -tp 1 -pcp 8)."
-                )
-                config.enable_tbo = False
-                config.enable_tbo_decode = False
-            elif config.enable_tbo_decode:
-                raise ValueError(
-                    "prefill_context_parallel_size > 1 (-pcp) combined with "
-                    "--enable-tbo all (decode TBO) is not supported yet. "
-                    "Use --enable-tbo (prefill only) with -pcp."
-                )
-            # Under PCP, TBO prefill uses a request-boundary split (the
-            # non-default TBO split mode; never token-midpoint split), so
-            # ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored.
-            if config.enable_tbo and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
-                logger.warning(
-                    "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
-                    "prefill uses request-boundary balanced grouping."
-                )
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
@@ -167,6 +98,11 @@ class LLMEngine:
                 self.core_mgr = DisaggCoreManager(config)
             else:
                 self.core_mgr = CoreManager(config)
+        self._structured_preflight = WorkerGrammarPreflight(
+            self, self.tokenizer, config
+        )
+        self.io_processor.structured_admission = self.prepare_structured_request
+        self.core_mgr.structured_request_prepare = self.bind_structured_requests
         self._step_lock = None
         self._pending_results = {}
         import json
@@ -186,9 +122,43 @@ class LLMEngine:
 
     def close(self):
         """Shut down engine and release all GPU resources."""
+        if getattr(self, "_structured_preflight", None) is not None:
+            self._structured_preflight.close()
         clock.finish()
         if hasattr(self, "core_mgr"):
             self.core_mgr.close()
+
+    def prepare_structured_request(self, params, kv_transfer=None, multimodal=False):
+        if not is_structured(params):
+            return
+        validate_execution_options(
+            self.config,
+            params,
+            kv_transfer=kv_transfer,
+            multimodal=multimodal,
+            relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+        )
+        preflight = self._structured_preflight
+        key = (
+            params.json_schema,
+            params.structured_tool_format,
+            params.structured_reasoning_end,
+        )
+        preflight.submit(*key).result()
+
+    def bind_structured_requests(self, seqs):
+        # Called by CoreManager only after frontend context validation, at the
+        # actual submission boundary. No worker matcher belongs to preprocessing.
+        groups = {}
+        for seq in seqs:
+            key = (
+                seq.json_schema,
+                seq.structured_tool_format,
+                seq.structured_reasoning_end,
+            )
+            groups.setdefault(key, []).append(seq.id)
+        for key, request_ids in groups.items():
+            self._structured_preflight.prepare_requests(key, tuple(request_ids))
 
     def add_request(
         self,
@@ -277,6 +247,7 @@ class LLMEngine:
                 parent_request_id=request_id,
             )
             reqs.extend(fanout)
+        self.core_mgr.keep_finished_outputs = True
         self.core_mgr.add_request(reqs)
 
     def step(self) -> list[Sequence]:
@@ -304,7 +275,10 @@ class LLMEngine:
         # fresh batch gets deterministic DP assignment and no leaked counts.
         self.core_mgr.reset_dp_router()
 
-        self.add_request(prompts, sampling_params, request_ids=request_ids)
+        # Backpressure admission is offline-only. The flag covers this add,
+        # not the collect loop; refills of the pool do not consult it.
+        with self.core_mgr.offline_backpressure_batch():
+            self.add_request(prompts, sampling_params, request_ids=request_ids)
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -324,11 +298,12 @@ class LLMEngine:
     ) -> list[dict]:
         """Generate completions for multimodal inputs (token IDs + vision data)."""
         self.core_mgr.reset_dp_router()
-        self.add_request(
-            token_ids_list,
-            sampling_params,
-            multimodal_data_list=multimodal_data_list,
-        )
+        with self.core_mgr.offline_backpressure_batch():
+            self.add_request(
+                token_ids_list,
+                sampling_params,
+                multimodal_data_list=multimodal_data_list,
+            )
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -623,6 +598,8 @@ class LLMEngine:
             "prompt_tokens": summed("prompt_tokens"),
             "generation_tokens": summed("generation_tokens"),
             "preemptions": summed("preemptions"),
+            "requests_deferred_free": summed("requests_deferred_free"),
+            "kv_blocks_deferred_free": summed("kv_blocks_deferred_free"),
             "kv_blocks_used": kv_used,
             "kv_blocks_free": summed("kv_blocks_free"),
             "kv_blocks_total": kv_total,
@@ -694,7 +671,13 @@ class InputOutputProcessor:
         self.config = config
         self.tokenizer = tokenizer
         self.block_size = block_size
+        self.structured_admission = None
         self.requests = {}
+        # The one channel `tool_choice="required"` holds this engine's requests
+        # to (`_engine_channel`): as the server's format named it, and as built
+        # from that once with every id this engine stops on held back.
+        self._format_channel: RequiredChannel | None = None
+        self._required_channel: RequiredChannel | None = None
         self.segment_tokenizer = SegmentTokenizer.maybe_create(
             tokenizer, envs.ATOM_TOKENIZE_CACHE_MB << 20
         )
@@ -750,7 +733,7 @@ class InputOutputProcessor:
 
     def preprocess(
         self,
-        prompt_or_tokens: str | list[int],
+        prompt_or_tokens: str | list[int] | PrefixEncoding,
         sampling_params: SamplingParams,
         stream_callback=None,
         kv_transfer_params=None,
@@ -786,9 +769,54 @@ class InputOutputProcessor:
         )
         return seqs[0]
 
+    def _engine_channel(self, channel: RequiredChannel) -> RequiredChannel:
+        """The channel a required request is held to on this engine.
+
+        Hold its opening against every single id this engine ends a sequence
+        on (`Scheduler.postprocess` stops on EOS and on `stop_token_ids`), not
+        just the ones the tool-call format named. The third way a sequence
+        ends, the request's own `stop` strings, is left to end it: the client
+        asked for that stop, and a multi-token match is not one logits row's
+        mask.
+
+        Built once, from the first required request, and shared by every
+        later one. A request naming a different channel is refused here, at
+        admission, where it fails alone; the engine loop batches every
+        request together and holds one channel.
+        """
+        if self._required_channel is None:
+            held = channel.ending_on(self.config.end_token_ids)
+            self._format_channel, self._required_channel = channel, held
+        elif channel != self._format_channel and channel != self._required_channel:
+            raise ValueError(
+                'this engine already holds tool_choice="required" requests to '
+                "another channel; a server resolves one tool-call format"
+            )
+        return self._required_channel
+
+    def encode_prompt(
+        self, prompt: str, *, multimodal: bool = False
+    ) -> PrefixEncoding | list[int]:
+        """Tokenize ``prompt`` the way ``preprocess`` does (segment cache and,
+        when enabled, the prompt's block-hash chain). ``preprocess`` takes the
+        result in place of the text without tokenizing again."""
+        segment_tokenizer = getattr(self, "segment_tokenizer", None)
+        if segment_tokenizer is None:
+            return self.tokenizer.encode(prompt)
+        if (
+            getattr(self, "_reuse_block_hashes", False)
+            and self.prefix_hash_block_size
+            and envs.ATOM_FRONTEND_PREFIX_HASH
+            and not multimodal
+        ):
+            return segment_tokenizer.encode_with_prefix(
+                prompt, self.prefix_hash_block_size
+            )
+        return segment_tokenizer.encode(prompt)
+
     def preprocess_fanout(
         self,
-        prompt_or_tokens: str | list[int],
+        prompt_or_tokens: str | list[int] | PrefixEncoding,
         sampling_params: SamplingParams,
         stream_callback=None,
         stream_callbacks: list | None = None,
@@ -815,6 +843,22 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
+        sampling_params.validate_logprob_options(
+            self.config,
+            kv_transfer=kv_transfer_params,
+            multimodal=multimodal_data is not None,
+        )
+        if is_structured(sampling_params):
+            if sampling_params.required_channel is not None:
+                raise ValueError(
+                    "A request cannot carry both a structured-output grammar "
+                    "(json_schema or structured_tool_format) and a required_channel"
+                )
+            if self.structured_admission is None:
+                raise ValueError("Structured output requires engine admission")
+            self.structured_admission(
+                sampling_params, kv_transfer_params, multimodal_data is not None
+            )
         request_validator = getattr(self.config.hf_config, "validate_request", None)
         if request_validator is not None:
             request_validator(
@@ -824,25 +868,16 @@ class InputOutputProcessor:
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
-        prefix_encoding = None
-        segment_tokenizer = getattr(self, "segment_tokenizer", None)
-        if not isinstance(prompt_or_tokens, str):
-            tokens = prompt_or_tokens
-        elif segment_tokenizer is not None:
-            if (
-                getattr(self, "_reuse_block_hashes", False)
-                and self.prefix_hash_block_size
-                and envs.ATOM_FRONTEND_PREFIX_HASH
-                and multimodal_data is None
-            ):
-                prefix_encoding = segment_tokenizer.encode_with_prefix(
-                    prompt_or_tokens, self.prefix_hash_block_size
-                )
-                tokens = prefix_encoding.token_ids
-            else:
-                tokens = segment_tokenizer.encode(prompt_or_tokens)
+        if isinstance(prompt_or_tokens, str):
+            prompt_or_tokens = self.encode_prompt(
+                prompt_or_tokens, multimodal=multimodal_data is not None
+            )
+        if isinstance(prompt_or_tokens, PrefixEncoding):
+            prefix_encoding = prompt_or_tokens
+            tokens = prefix_encoding.token_ids
         else:
-            tokens = self.tokenizer.encode(prompt_or_tokens)
+            prefix_encoding = None
+            tokens = prompt_or_tokens
         mrope_positions = None
         mrope_position_delta = 0
         if multimodal_data is not None:
@@ -863,6 +898,12 @@ class InputOutputProcessor:
                 stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
+
+        if sampling_params.required_channel is not None:
+            sampling_params = replace(
+                sampling_params,
+                required_channel=self._engine_channel(sampling_params.required_channel),
+            )
 
         if stream_callbacks is not None and len(stream_callbacks) != n:
             raise ValueError(
@@ -895,11 +936,13 @@ class InputOutputProcessor:
                 dp_parent_session_id=dp_parent_session_id,
             )
             seq.arrive_time = time.time()
+            seqs.append(seq)
+
+        for seq in seqs:
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
                 self._internal_to_external[seq.id] = seq.external_request_id
-            seqs.append(seq)
 
         # Runs in an executor or submit thread, not the event loop. Siblings
         # share a prompt and seed, so one chain serves them all.

@@ -39,8 +39,9 @@ from itertools import zip_longest
 from pathlib import Path
 from types import SimpleNamespace
 
+from atom.compass.backends.step_grid_plan import DEFERS_OUTPUT
 from atom.compass.backends.step_stub import Coefficients
-from atom.compass.clock import TAR
+from atom.compass.clock import ARRIVAL, TAR
 from atom.compass.detect.determinism import CONFIGURATION_PREFIX, compare_step_tables
 from atom.compass.parity import read
 from atom.compass.parity.recurrence import _waited
@@ -71,6 +72,7 @@ def expected_timeline(
     tars,
     sync: bool = False,
     draft_s: float = 0.0,
+    defer: bool = True,
 ) -> list:
     """One engine LP's TAR rows, ``(from, to)``, under a constant step stub.
 
@@ -87,7 +89,12 @@ def expected_timeline(
     as its output end on an output forward; each rank returns at its own exit,
     and the step is one TAR per distinct return, ascending. With `sync`, every
     forward returns at the group's device end, as one that synchronizes its
-    stream before it returns does.
+    stream before it returns does. Without `defer`, an engine whose token
+    processor reads each step's ids at once (`scheduler.defers_output`), an
+    output forward returns at its own device end, the group's, as it reads them,
+    and a dummy forward beside a peer's prefill, which reads none, returns at
+    its entry and marks no output end, as the runner's `HostDeviceRecurrence`
+    charges it.
 
     With `draft_s`, a speculative engine's: each forward's device work runs
     `draft_s` of draft after its target, and an output forward enters no
@@ -109,7 +116,7 @@ def expected_timeline(
         if i >= len(tars):
             raise ValueError(f"record step {k} has no TAR row")
         now = tars[i][0]
-        returns, ends, targets = set(), {}, {}
+        returns, ends, targets, reads = set(), {}, {}, False
         for r in ranks:
             step = record[r][k]
             rows = [row[-1] for row in step["rows"]]
@@ -120,14 +127,24 @@ def expected_timeline(
                 host = max(host, output)
             targets[r] = max(last, host) + busy
             ends[r] = targets[r] + draft_s
-            returns.add((max(host, output) if step["produces_output"] else host) - now)
+            if _waits_for_output(step, defer) and not defer:
+                reads = True
+            else:
+                back = max(host, output) if _waits_for_output(step, defer) else host
+                returns.add(back - now)
         end = max(ends.values())
         mark = max(targets.values()) if draft_s else end
+        if reads:
+            returns.add(mark - now)
         if sync:
             returns = {end - now}
         for r in ranks:
             _, last, output = device[r]
-            device[r] = (last, end, mark if record[r][k]["produces_output"] else output)
+            device[r] = (
+                last,
+                end,
+                mark if _waits_for_output(record[r][k], defer) else output,
+            )
         start = now
         for t in sorted(returns):
             want.append((start, now + t))
@@ -169,13 +186,16 @@ def _run_properties(table: str, summary: dict) -> list[str]:
 
 def _rows(table: str):
     """A step table's run file, its TAR rows by LP, its release ends by channel
-    and seq."""
+    and seq. A TAR granted an offering arrival first is one row, from where it
+    was asked."""
     lines = table.splitlines()
     run = json.loads(lines[0].removeprefix(CONFIGURATION_PREFIX))
-    tars, arrived = defaultdict(list), defaultdict(dict)
+    tars, arrived, asked = defaultdict(list), defaultdict(dict), {}
     for lp, t0, t1, event, ch, seq, _ in map(str.split, lines[1:]):
-        if event == TAR:
-            tars[lp].append((float(t0), float(t1)))
+        if event == ARRIVAL:
+            asked.setdefault(lp, float(t0))
+        elif event == TAR:
+            tars[lp].append((asked.pop(lp, float(t0)), float(t1)))
         elif event == "release":
             arrived[ch][int(seq)] = float(t1)
     return run, tars, arrived
@@ -426,7 +446,28 @@ def _outputs(sent, taken) -> list[str]:
     return [f"the traffic sent requests for {sorted(sent)} tokens and {took}"]
 
 
-def _timeline(table: str, lp: str, record) -> list[str]:
+def _waits_for_output(step: dict, defer: bool) -> bool:
+    """Whether the recorded `step` waits for output: one that produces it,
+    unless it is a dummy forward beside a peer's prefill on an engine that does
+    not defer its output, which reads no token. Such a dummy schedules no
+    request and is recorded as a one-token prefill row
+    (`projection._dummy_row`); one while its group decodes, or idles, runs a
+    decode row and reads its output as a decode does, as the runner's
+    `compass_dummy` tells them apart."""
+    empty_dummy = step.get("is_dummy_run") and not step.get("batch")
+    beside_prefill = empty_dummy and not all(r[-1] for r in step["rows"])
+    return step["produces_output"] and (defer or not beside_prefill)
+
+
+def _defers_output(directory) -> bool:
+    """Whether the engine whose record is in `directory` deferred its output,
+    as each rank's engine file states (`DEFERS_OUTPUT`); a file stating none
+    was written before engines stated it, all of which deferred."""
+    engines = Path(directory).glob("*.engine.json")
+    return all(json.loads(p.read_text()).get(DEFERS_OUTPUT, True) for p in engines)
+
+
+def _timeline(table: str, lp: str, record, defer: bool = True) -> list[str]:
     run, tars, _ = _rows(table)
     stub, tars = Coefficients(**run.get("step_stub", {})), tars[lp]
     if not stub.shape_blind or any(h.get("laws") for h in entries(run, "host")):
@@ -437,7 +478,13 @@ def _timeline(table: str, lp: str, record) -> list[str]:
     sync = run.get(RAPIDSERVE, False) and lp == "engine-P"
     try:
         want = expected_timeline(
-            record, stub.prefill_step, stub.decode_step, tars, sync, stub.draft_step
+            record,
+            stub.prefill_step,
+            stub.decode_step,
+            tars,
+            sync,
+            stub.draft_step,
+            defer,
         )
     except ValueError as e:
         return [f"{lp}: {e}"]
@@ -466,7 +513,7 @@ def check_run(out_dirs, sent=None, taken=(), records=None, pipeline=None) -> lis
         while more := read(directory, len(stages)):
             stages.append(more)
         if len(stages) == 1:
-            failed += _timeline(tables[0], lp, stages[0])
+            failed += _timeline(tables[0], lp, stages[0], _defers_output(directory))
         elif pipeline is None or any(len(s) > 1 for s in stages):
             failed.append(
                 f"{lp}: a pipeline's timeline is computed at DP width 1, from its "

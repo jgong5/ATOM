@@ -110,11 +110,11 @@ def test_capture_states_the_buckets_atom_records(
 def test_an_idle_rank_dummy_prefills_beside_a_peer_s_prefill(
     dp2, monkeypatch, eager  # noqa: F811
 ):
-    """The scheduler of a rank with nothing to prefill takes the runner's
-    answer: with buckets stated it gives the tick to the group's dummy
-    prefill, the smallest bucket's tokens, which `decide` pads to the bucket
-    of the group's 300 tokens; an eager deployment, whose engine never asks
-    for a capture, keeps the one-token dummy decode."""
+    """A rank with nothing to schedule runs ATOM's dummy, which `decide` runs
+    in the group's phase since upstream b7b5ec3f2: a one-token prefill beside
+    the peer's, padded with buckets stated to the bucket of the group's 300
+    tokens; an eager deployment, whose engine never asks for a capture,
+    leaves it its one token."""
     monkeypatch.setenv("ATOM_TOKEN_GRAPH_SIZES", "256,512,1024")
     ranks = [runner(r) for r in (0, 1)]
     for r in ranks:
@@ -145,7 +145,7 @@ def test_an_idle_rank_dummy_prefills_beside_a_peer_s_prefill(
             scheduled = scheduler.schedule()
             if scheduled is not None:
                 return ranks[rank].forward(scheduled[0])
-            return ranks[rank].dummy_execution(scheduler.dummy_prefill)
+            return ranks[rank].dummy_execution()
 
         return run
 
@@ -154,8 +154,6 @@ def test_an_idle_rank_dummy_prefills_beside_a_peer_s_prefill(
     views = [r.compass_backend.views[0] for r in ranks]
     assert views[0].requests == (RequestShape(300, 300, False),)
     assert views[1].dp_dummy and views[1].group_prefills
-    dummy = RequestShape(1, 1, True) if eager else RequestShape(256, 256, False)
-    assert views[1].requests == (dummy,)
-    assert schedulers[1].dummy_prefill is not eager
+    assert views[1].requests == (RequestShape(1, 1, False),)
     padded = [300, 1] if eager else [512, 512]
     assert [r.running_tokens_per_dp_rank.tolist() for r in ranks] == [padded] * 2

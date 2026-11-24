@@ -4,7 +4,7 @@ records, or assumed from another device's for a device never run.
 
     compass fit device RECORD... --store S --out D
     compass fit device --device DATASHEET --assume-from DEVICE --ptl P
-        --store S --out D
+        [--stack STACK] --store S --out D
 
 Each RECORD is a `probe_record` in S, named by the token its key prints. The
 `platform_readings` entry published in S, keyed by the records' device, stack,
@@ -18,16 +18,18 @@ torches refuse, naming each record's value, and so does a key S already holds.
 
 With `--assume-from`, DEVICE is a device name a datasheet under
 `atom/compass/devices/` states. The one measured `platform_readings` entry S
-holds for it at `--ptl` is taken by `assumed`, and published for the device
-`--device` names, a datasheet by SKU or path, keyed by the source's stack and
-torch, every field assumed. None, or several, refuse, listing them.
+holds for it at `--ptl`, and at `--stack` when given (`stack_of`), is taken by
+`assumed`, and published for the device `--device` names, a datasheet by SKU
+or path, keyed by the source's stack and torch, every field assumed. None, or
+several, refuse, listing them.
 
 `--out` gets a readable copy of the entry, ``platform_readings.json``, with
 its key and token.
 
 A command that prices reads its platform through `compose`: the datasheet
-it names, the one entry S holds for that device (`readings`), and, across
-nodes, a network file, composed by `layers.composed`.
+it names, the one entry S holds for that device (`readings`), else the one
+committed for a shipped law's platform (`COPIES`), and, across nodes, a
+network file, composed by `layers.composed`.
 """
 
 import argparse
@@ -67,6 +69,9 @@ PROG = "compass fit device"
 #: The rank a readings entry's one member is written at.
 RANK = Topology().ranks()[0]
 PP = "interconnect.intra_node.pp"
+#: A shipped law's platform's readings entry, as the readable copy `--out`
+#: gets, one per key and named by its token, read where a store holds none.
+COPIES = ROOT.parents[1] / "scripts/compass/laws/platform_readings"
 
 
 def fold(records: Mapping[str, dict]) -> tuple[dict, dict]:
@@ -143,23 +148,23 @@ def _records(store: ArtifactStore, tokens: list[str]) -> tuple[dict, dict]:
 
 def readings(
     store: ArtifactStore, device: str, ptl: str, stack: str | None = None
-) -> tuple[Key, dict]:
+) -> tuple[Key, dict, str]:
     """The one `platform_readings` entry `store` holds for `device`, `<name>
-    <arch>`, at PTL state `ptl` and, when given, at `stack` (`stack_of`), and
-    its document; none or several refuse, listing each."""
+    <arch>`, at PTL state `ptl` and, when given, at `stack` (`stack_of`), its
+    document and where it was read; with none in `store`, the one copy
+    `COPIES` holds at them. None or several refuse, listing each."""
     folder = store.root / Kind.PLATFORM_READINGS.value
     keys = [
         Key.of(Kind.PLATFORM_READINGS, **json.loads(p.read_text())["key"])
         for p in sorted(folder.glob("[!.]*/entry.json"))
     ]
-    found = [
-        k
-        for k in keys
-        if (k.values["device"], k.values["ptl"]) == (device, ptl)
-        and stack in (None, stack_of(k.values))
-    ]
+    found = [k for k in keys if _at(k, device, ptl, stack)]
+    held, copies = len(found), {} if found else _copies()
+    if not held:
+        found = [k for k in copies if _at(k, device, ptl, stack)]
     if len(found) != 1:
         at = f" at {stack}" if stack else ""
+        committed = "" if held else f", and {COPIES} {len(found)} committed copies"
         listed = "".join(f"; {stack_of(k.values)} as {k.token()}" for k in found)
         remedy = (
             "--stack names one"
@@ -168,11 +173,32 @@ def readings(
             "publish one"
         )
         raise ValueError(
-            f"{store.root} holds {len(found)} platform_readings entries for "
-            f"{device} at PTL {ptl}{at}{listed}; {remedy}"
+            f"{store.root} holds {held} platform_readings entries for {device} at "
+            f"PTL {ptl}{at}{committed}{listed}; {remedy}"
         )
+    if not held:
+        path, document = copies[found[0]]
+        return found[0], document, str(path)
     body = store.read(found[0]).read_member("readings", RANK, "json")
-    return found[0], json.loads(body)
+    return found[0], json.loads(body), str(store.root)
+
+
+def _copies() -> dict:
+    """Each copy `COPIES` holds, by its key: its path and its entry's document."""
+    copies = {}
+    for path in sorted(COPIES.glob("*.json")):
+        copy = json.loads(path.read_text())
+        key = Key.of(Kind.PLATFORM_READINGS, **copy.pop("key"))
+        del copy["token"]
+        copies[key] = (path, copy)
+    return copies
+
+
+def _at(key: Key, device: str, ptl: str, stack: str | None) -> bool:
+    return (key.values["device"], key.values["ptl"]) == (device, ptl) and stack in (
+        None,
+        stack_of(key.values),
+    )
 
 
 def compose(
@@ -183,23 +209,24 @@ def compose(
     network_file: str | Path | None = None,
 ) -> MachineSpec:
     """The machine spec of the datasheet `device` names, by SKU or path, the
-    one readings entry `store` holds for it at `ptl` and `stack` (`readings`),
-    and the network file `network_file` names, when it names one."""
+    one readings entry `store` holds for it at `ptl` and `stack`, else the one
+    committed (`readings`), and the network file `network_file` names, when it
+    names one."""
     sheet = datasheet(device)
-    key, document = readings(store, _device(sheet), ptl, stack)
+    key, document, source = readings(store, _device(sheet), ptl, stack)
     net = None if network_file is None else network(network_file)
-    return composed(sheet, key, document, net)
+    return composed(sheet, key, document, net, source)
 
 
 def assumed_entry(
     store: ArtifactStore, device: str, ptl: str, stack: str | None = None
-) -> tuple[Key, dict, object]:
+) -> tuple[Key, dict, object, str]:
     """The one measured `platform_readings` entry `store` holds for the device
-    named `device` at `ptl` and `stack` (`readings`), its document as a
-    device never run takes it, `assumed`'s readings every one assumed, and the
-    datasheet stating `device`."""
+    named `device` at `ptl` and `stack`, else the one committed (`readings`),
+    its document as a device never run takes it, `assumed`'s readings every
+    one assumed, the datasheet stating `device`, and where it was read."""
     source = _named(device)
-    found, document = readings(store, _device(source), ptl, stack)
+    found, document, where = readings(store, _device(source), ptl, stack)
     if document["provenance"]["origin"] != "probed":
         raise ValueError(
             f"{found} as {found.token()} is assumed itself; assume from a "
@@ -212,7 +239,7 @@ def assumed_entry(
         "origins": {p: {"origin": "assumed"} for p in values},
     }
     header = {k: document[k] for k in READINGS_HEADER}
-    return found, header | values | {"provenance": provenance}, source
+    return found, header | values | {"provenance": provenance}, source, where
 
 
 def _named(device: str):
@@ -238,7 +265,9 @@ def main(argv: list[str]) -> None:
     if args.assume_from:
         if args.records or not (args.device and args.ptl):
             raise ValueError("--assume-from takes --device and --ptl and no RECORD")
-        found, document, source = assumed_entry(store, args.assume_from, args.ptl)
+        found, document, source, _ = assumed_entry(
+            store, args.assume_from, args.ptl, args.stack
+        )
         values = {k: v for k, v in document.items() if k not in READINGS_HEADER}
         target = datasheet(args.device)
         platform = found.values | {"device": _device(target)}
@@ -248,7 +277,7 @@ def main(argv: list[str]) -> None:
             f"the {source.name} datasheet; the stack and torch are that entry's"
         )
     else:
-        if not args.records or args.device or args.ptl:
+        if not args.records or args.device or args.ptl or args.stack:
             raise ValueError("name the probe records, or --assume-from a device")
         records, platform = _records(store, args.records)
         values, origins = fold(records)
@@ -302,6 +331,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--device", help="with --assume-from: the datasheet, SKU or path")
     p.add_argument("--assume-from", help="the device name whose readings to assume")
     p.add_argument("--ptl", help="with --assume-from: the PTL state to take")
+    p.add_argument(
+        "--stack", help="with --assume-from: the stack and torch to take, of several"
+    )
     p.add_argument("--store", required=True, help="the artifact store's root")
     p.add_argument("--out", required=True, help="a directory for the readable copy")
     return p

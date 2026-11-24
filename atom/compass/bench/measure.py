@@ -86,7 +86,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.step_grid_plan import plan
 from atom.compass.backends.step_labels import digest as file_digest
-from atom.compass.backends.step_linear_fit import token_band
+from atom.compass.backends.step_linear_fit import recorded_level, token_band
 from atom.compass.bench import ragged
 from atom.compass.drive.gpu import add_gpu_flag, hip_visible, kfd_pid, quiet
 from atom.compass.drive.identity import identity, phase
@@ -300,7 +300,9 @@ def _sampling(text: str) -> dict:
 
 def atom_config(atom_args, server: bool = False):
     """ATOM's `Config` for its arguments, as `LLMEngine` resolves one and
-    `CoreManager` rewrites it under DP attention, each TP rank a DP rank of TP 1.
+    `CoreManager` rewrites it under DP attention, each TP rank a DP rank of TP 1:
+    a server's node runs the DP ranks `CoreManager` starts there, and the
+    benches run the whole group on one host.
     With `server`, `atom_args` are a server's, whose own flags pass unread, and
     no tokenizer loads; otherwise the server's flags `compass record` passes it
     (`measure_memory.FRONTEND`) are taken and dropped, any other flag the engine
@@ -313,7 +315,8 @@ def atom_config(atom_args, server: bool = False):
     from atom.compass.drive.runfile import _engine_args
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
-    from atom.model_engine.llm_engine import _load_tokenizer
+    from atom.model_engine.engine_core_mgr import iter_dp_rank_assignments
+    from atom.model_engine.llm_engine import load_tokenizer
 
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog=f"{PROG} --"))
     for flag, kind in FRONTEND.items():
@@ -324,10 +327,16 @@ def atom_config(atom_args, server: bool = False):
     kwargs = engine_args._get_engine_kwargs().items()
     config = Config(engine_args.model, **{k: v for k, v in kwargs if k in names})
     if config.enable_dp_attention:
+        # The engines `CoreManager` starts on this node, each its (global,
+        # local) DP rank, the first the node's lowest.
+        node = iter_dp_rank_assignments(config)
         layout(config)
+        if server:
+            config.parallel_config.data_parallel_size_local = len(node)
+            config.parallel_config.data_parallel_rank = node[0][0]
     if server:
         return config
-    tokenizer = _load_tokenizer(config.model, config.trust_remote_code)
+    tokenizer = load_tokenizer(config.model, config.trust_remote_code)
     config.bos_token_id = tokenizer.bos_token_id
     config.eos_token_id = tokenizer.eos_token_id
     config.stop_token_ids = sorted(set(config.stop_token_ids) - {config.eos_token_id})
@@ -381,13 +390,21 @@ def _ragged(points: dict, read: list, seed) -> dict:
     engine = read[0][2]
     blocks = max(stated["num_kvcache_blocks"] for *_, stated in read)
     size, top = engine["kv_cache_block_size"], engine["max_model_len"]
+    block_drafter = (engine.get("speculative") or (None,))[0] == "dspark"
     sources, traces = [s for s, *_ in read], {t for x in lines for t in x["traces"]}
     out = {}
     for digest, point in sorted(points.items()):
         if _kind(point["view"]).startswith("decode"):
             rng = random.Random(f"{seed} {digest}")
             for view in ragged.compose(
-                point["view"], contexts, rng, blocks, size, top, engine["ladder"]
+                point["view"],
+                contexts,
+                rng,
+                blocks,
+                size,
+                top,
+                engine["ladder"],
+                block_drafter=block_drafter,
             ):
                 _add(out, view, "ragged", sources, traces)
     return out
@@ -425,8 +442,9 @@ def grid_plan(args, read: dict, views=()) -> dict:
 
 def _read(name: str, store, client_runs, sessions, engine, sampling, against=AGAINST):
     """The input `name`: what names it as a source, its kept lines, and the
-    engine its rank states. One whose engine or sampling is not `engine` or
-    `sampling` refuses, naming what states those as `against` does."""
+    engine its rank states. One whose engine, a record's over its level
+    (`recorded_level`), or sampling is not `engine` or `sampling` refuses,
+    naming what states those as `against` does."""
     path = Path(name)
     with tempfile.TemporaryDirectory() as unpacked:
         if (path / "run.json").is_file():
@@ -449,7 +467,7 @@ def _read(name: str, store, client_runs, sessions, engine, sampling, against=AGA
             )
         ((rank, lines),) = record.items()
         stated = json.loads((steps / f"dp{rank}.engine.json").read_text())
-    ran = keyed_of(stated)
+    ran = recorded_level(path / "steps" / "dp0.jsonl") | keyed_of(stated)
     differ = [
         k for k in sorted(ran.keys() | engine.keys()) if ran.get(k) != engine.get(k)
     ]

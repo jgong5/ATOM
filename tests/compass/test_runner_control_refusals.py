@@ -30,15 +30,26 @@ from atom.model_engine.sequence import SequenceStatus
 NAME_ARG = {"call_func": 0, "_update_on_every_rank": 1, "_utility_on_every_rank": 1}
 
 
+def _waits(call):
+    """Whether the handler waits for the worker's reply to `call`. A
+    `call_func` without `wait_out=True` waits for none, and the worker must
+    send none: a reply would answer the next caller that waits."""
+    return call.func.attr != "call_func" or any(
+        k.arg == "wait_out" and getattr(k.value, "value", None) is True
+        for k in call.keywords
+    )
+
+
 def _worker_method(cmd):
-    """The name a command's handler broadcasts to the worker, or None."""
+    """The name a command's handler broadcasts to the worker and waits on, or
+    None."""
     handler = getattr(EngineUtilityHandler, EngineUtilityHandler._UTILITY_HANDLERS[cmd])
     tree = ast.parse(textwrap.dedent(inspect.getsource(handler)))
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
     names = [
         n.args[NAME_ARG[n.func.attr]].value
         for n in calls
-        if getattr(n.func, "attr", None) in NAME_ARG
+        if getattr(n.func, "attr", None) in NAME_ARG and _waits(n)
     ]
     # The discard helper sends its one method by constant rather than literal.
     names += [
@@ -55,7 +66,7 @@ REFUSED = {cmd: method for cmd, method in REACHES.items() if method}
 
 
 class Worker:
-    """`call_func(..., wait_out=True)` over `busy_loop`'s dispatch, one runner."""
+    """`call_func` over `busy_loop`'s dispatch, one runner."""
 
     def __init__(self, runner):
         self.runner = runner
@@ -64,6 +75,10 @@ class Worker:
     def call_func(self, name, *args, wait_out=False):
         func = getattr(self.runner, name, None)
         out = None if func is None else func(*args)
+        if not wait_out:
+            # `busy_loop` would hand a reply to the next caller that waits.
+            assert out is None, f"{name} answers {out!r}, which no caller waits for"
+            return None
         if out is None:
             raise AssertionError(f"{name} forwards nothing; its caller waits forever")
         self.calls.append((name, out))
@@ -97,9 +112,18 @@ def _send(runner, *cmds, scheduler=None):
     """Run *cmds* through ATOM's handler; the worker calls and the responses."""
     pending, out = queue.Queue(), queue.Queue()
     for cmd in cmds:
-        pending.put((cmd, {"req_id": "r0"}))  # read by abort_request alone
+        # Read by abort_request and release_constraints alone.
+        pending.put((cmd, {"req_id": "r0", "request_ids": ["r0"]}))
     handler = EngineUtilityHandler(Worker(runner), out, scheduler=scheduler)
-    engine = SimpleNamespace(_has_pending_utility=True, _is_rl_weights_offloaded=False)
+    engine = SimpleNamespace(
+        _has_pending_utility=True,
+        _is_rl_weights_offloaded=False,
+        # A single idle stage: ATOM's own has nothing to wait for or preempt.
+        prepare_weight_sync=lambda deadline: None,
+        prepare_kv_change=lambda weights, deadline: None,
+        pause_generation=lambda deadline: None,
+        resume_generation=lambda: None,
+    )
     handler.process_queue(pending, engine)
     return handler.runner_mgr.calls, [out.get_nowait() for _ in range(out.qsize())]
 
@@ -114,6 +138,11 @@ def test_which_commands_reach_a_worker_is_read_off_atoms_handler():
         "finish_weight_sync",
         "get_weight_sync_status",
         "collective_rpc",
+        # Sent without a wait: ATOM's own method answers it, with nothing.
+        "release_constraints",
+        # The engine's own: it schedules nothing, or again.
+        "pause_generation",
+        "resume_generation",
     }
     assert {REFUSED["update_weights_shm"], REFUSED["update_weights_ipc"]} == {
         "update_weights_from_shm",
@@ -177,6 +206,8 @@ def test_the_commands_that_reach_no_worker_run_as_in_atom():
             "error": "collective_rpc needs a method name and a request id, both "
             "non-empty strings",
         },
+        {"cmd": "pause_generation"},
+        {"cmd": "resume_generation"},
     ]
     # Nothing refused is still an answer, so the reader is never parked.
     assert Worker(runner).call_func("refused_commands", wait_out=True) == ()

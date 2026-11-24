@@ -10,7 +10,6 @@ keys the engine config both of its laws state.
 No device: aiter's arch probe answers a declared arch.
 """
 
-import json
 import pathlib
 
 import pytest
@@ -20,6 +19,7 @@ from test_drive_runfile import build, install, step_linear
 from test_run_step_grid import deployment
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
+from atom.compass.backends.json_file import read_json
 from atom.compass.capture.forward import structure
 from atom.compass.drive.run import _config
 from atom.compass.run.step_grid import BUCKETS, keyed
@@ -54,6 +54,8 @@ def served(tmp_path, monkeypatch, gfx, config_json, *args):
     """ATOM's config of a server of the model `config_json` describes, under
     ATOM's arguments `args`, on a `gfx` device, as `compass run` builds it."""
     monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx", lambda: gfx)
+    # The index cache's layout reads the device's own arch (upstream b7b5ec3f2).
+    monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx_runtime", lambda: gfx)
     model = tmp_path / config_json.stem
     model.mkdir(exist_ok=True)
     (model / "config.json").write_bytes(config_json.read_bytes())
@@ -103,26 +105,30 @@ def test_a_step_law_fitted_on_one_side_refuses_the_other_naming_it(
     assert named in str(e.value)
 
 
-@pytest.mark.parametrize(
-    "gfx, config_json, args",
-    [("gfx942", V4_PRO, DPA_TP8), ("gfx950", QWEN, [])],
-    ids=["v4-pro-gfx942", "qwen3"],
-)
-def test_an_index_cache_that_follows_the_kv_cache_keys_as_before(
-    tmp_path, monkeypatch, gfx, config_json, args
-):
-    config = served(tmp_path, monkeypatch, gfx, config_json, *args)
+def test_an_index_cache_that_follows_the_kv_cache_keys_as_before(tmp_path, monkeypatch):
+    config = served(tmp_path, monkeypatch, "gfx950", QWEN)
 
     assert config.index_cache_dtype == config.kv_cache_dtype
     assert "index_cache_dtype" not in keyed(config)
+
+
+def test_v4_pro_at_gfx942_keys_its_fp8_index_apart_from_the_kv_it_falls_back_to(
+    tmp_path, monkeypatch
+):
+    # Since upstream b7b5ec3f2 V4's FP8 KV falls back to BF16 off gfx950 and
+    # gfx1250, and its index cache stays FP8 there.
+    config = served(tmp_path, monkeypatch, "gfx942", V4_PRO, *DPA_TP8)
+
+    assert (config.kv_cache_dtype, config.index_cache_dtype) == ("bf16", "fp8")
+    assert keyed(config)["index_cache_dtype"] == "fp8"
 
 
 @pytest.mark.parametrize("ep", [[], ["--enable-expert-parallel"]], ids=["tp4", "ep4"])
 def test_a_v41_flash_mi455_server_keys_the_engine_config_its_law_states(
     tmp_path, monkeypatch, ep
 ):
-    law = f"deepseek-v4.1-flash-tp4-{'ep4-' * bool(ep)}dspark5-mi455-a0.json"
-    stated = json.loads((TREE / "scripts/compass/laws" / law).read_text())
+    law = f"deepseek-v4.1-flash-tp4-{'ep4-' * bool(ep)}dspark5-mi455-a0.json.xz"
+    stated = read_json(TREE / "scripts/compass/laws" / law)
     for name, value in V41_ENV.items():
         monkeypatch.setenv(name, value)
     config = served(tmp_path, monkeypatch, "gfx1250", V41, *V41_SERVER.split(), *ep)

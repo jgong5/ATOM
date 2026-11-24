@@ -4,10 +4,15 @@
 `lacking` resolves the run's inputs as `runfile.build`, the runner and the
 server do, calling per input the function whose refusal the run would meet,
 so one lacking input hides no other: the platform, its datasheet and readings
-(`runfile.spec`); each store key or law
-file a flag names (`runfile.resolve`); a step linear law and host laws held
-against this run's engine config, widths, platform and host key
+(`runfile.spec`); a step stub's file, read as `runfile.build` reads it, and its
+`Coefficients` as the runner builds them; an ``lmcache_offload`` entry's file,
+read as `runfile.build` reads it, or its absence, held to this deployment as
+the engine holds it (`run.refuse_offload_tier`, `lmcache_offload.tier_config`);
+each store key or law file a flag
+names (`runfile.resolve`); a step linear law and host laws held against this
+run's engine config, widths, platform and host key
 (`run.pick_fitted`, `run.refuse_unfitted_law`, `run.refuse_unfitted_host`),
+and to the prefill token-graph buckets it records (`run.refuse_other_buckets`),
 and the step linear law's decode vectors against the rungs this configuration
 schedules (`uncovered_rungs`); the host laws' tokenizer term against the
 backend of the tokenizer ATOM's server loads (`run.tokenizer_term`); a step
@@ -26,8 +31,8 @@ Each lacking input is printed with the command that makes it. A step linear
 law's is the `calibrate.sh` command that records and fits one for this
 configuration (`calibration`), into `--out`, or `cal` in the current directory
 without one, naming each client variable it requires that this environment
-does not set, with its expected time, unknown while no calibration records its
-time.
+does not set, with its expected time, unknown, as no earlier calibration's
+status is read for it.
 
 A prefill or decode instance's run reads a network file across nodes, as
 `deploy.sh run` hands it one, and its readings command takes the ATOM
@@ -40,14 +45,18 @@ Printed apart, outside the exit status: the gaps `--coverage`'s check counts;
 an op graph's absent price list, which prices every leaf by its analytical
 law, unless `--coverage` asks for its check, which then refuses; and the
 modules the step roofline leaves unclassified on the model built on the meta
-device, when it prices the steps the backend refuses. No `compass run`
-backend is the step roofline itself.
+device, when it prices the steps the backend refuses; and why the prefill
+token-graph buckets cannot be worked out, so no law is held to them. No
+`compass run` backend is the step roofline itself.
 """
 
+import functools
 import json
+import multiprocessing
 import os
 import re
 import shlex
+import tempfile
 from pathlib import Path
 
 from atom.compass import run as compass_run
@@ -58,9 +67,12 @@ from atom.compass.artifacts import (
     machine_platform,
 )
 from atom.compass.backends.step_linear_plan import records, scheduled_rungs
+from atom.compass.backends.step_stub import Coefficients
 from atom.compass.drive import runfile, serve
+from atom.compass.kv.lmcache_offload import ENTRY as OFFLOAD
+from atom.compass.kv.lmcache_offload import tier_config
 from atom.compass.memory.readings import PAGE_BOUND
-from atom.compass.run import OP_GRAPH, PRICE_LIST, STEP_GRID, STEP_LINEAR
+from atom.compass.run import OP_GRAPH, PRICE_LIST, STEP_GRID, STEP_LINEAR, STEP_STUB
 from atom.compass.runner.overrides import schedulable_bound, schedulable_ladder
 from atom.compass.spec import SpecRefusal
 
@@ -74,6 +86,9 @@ NAMES = {
 #: The commands that make each input.
 MADE_BY = {
     "platform": "compass measure device on each node, then compass fit device",
+    STEP_STUB: "a JSON file of the stated fields of backends.step_stub.Coefficients",
+    OFFLOAD: "python -m atom.compass.backends.step_linear_fit offload LOG... --out "
+    "ENTRY, on real runs' server logs at OFFLOAD_PROFILE=1",
     STEP_GRID: "compass trace steps, compass measure steps --grid, then compass "
     "fit steps --backend step-grid",
     "host": "compass record, then compass fit host",
@@ -106,6 +121,9 @@ SIDE_LAW = (
 FITS = {STEP_LINEAR: "steps --backend step-linear", "host": "host"}
 #: Each side by the letter `runfile.pd_side` gives it.
 SIDES = {"P": "prefill", "D": "decode"}
+#: How long the child reading ATOM's attention builder may take, in seconds, far
+#: past the few it takes on a CPU host; past it, the child is ended.
+PROBE_SECONDS = 300
 
 
 def report(args, atom_args, real=None, env=None) -> int:
@@ -128,7 +146,7 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     and runs under `env`, the variables the check set, where given."""
     from atom.compass.drive import run as drive_run
     from atom.compass.run import memory, step_grid
-    from atom.model_engine.llm_engine import _load_tokenizer
+    from atom.model_engine.llm_engine import load_tokenizer
 
     lacks, apart = [], []
 
@@ -160,6 +178,24 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     elif STEP_LINEAR in flags:
         out = args.out or CALIBRATION_OUT
         made_by[STEP_LINEAR] = calibration(out, atom_args, config)
+    if stub := getattr(args, STEP_STUB):
+        try:
+            Coefficients(**json.loads(Path(stub).read_text()))
+        except (OSError, TypeError, ValueError) as unread:
+            lacks.append(
+                (f"step stub {stub}", "missing", str(unread), made_by[STEP_STUB])
+            )
+    entry, path = {}, args.lmcache_offload
+    try:
+        if path:
+            entry[OFFLOAD] = json.loads(Path(path).read_text())
+        compass_run.refuse_offload_tier(config, entry)
+        if OFFLOAD in entry:
+            tier_config(entry[OFFLOAD], config)
+    except (OSError, TypeError, ValueError) as refused:
+        name = f"{OFFLOAD} entry" + (f" {path}" if path else "")
+        state = "stale" if entry else "missing"
+        lacks.append((name, state, str(refused), made_by[OFFLOAD]))
     for name, tokens in (flags | {"host": args.host_laws or []}).items():
         tokens, held = [tokens] if isinstance(tokens, str) else tokens, []
         for token in tokens:
@@ -170,10 +206,18 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
         if held and len(held) == len(tokens):
             run[name] = held if len(held) > 1 else held[0]
     law, host = NAMES[STEP_LINEAR], NAMES["host"]
+    try:
+        buckets = {STEP_LINEAR, "host"} & run.keys() and recorded_buckets(config, arch)
+    except ValueError as unworked:
+        buckets = ()
+        apart.append(f"{unworked}, so no law is held to them")
     if STEP_LINEAR in run and met(
         law, made_by[STEP_LINEAR], compass_run.pick_fitted, run, STEP_LINEAR, config
     ):
-        met(law, made_by[STEP_LINEAR], compass_run.refuse_unfitted_law, run, config)
+        made = made_by[STEP_LINEAR]
+        if met(law, made, compass_run.refuse_unfitted_law, run, config):
+            given = config, buckets, {STEP_LINEAR: run[STEP_LINEAR]}
+            met(law, made, compass_run.refuse_other_buckets, *given)
         if rungs := uncovered_rungs(run[STEP_LINEAR], config):
             whose = (
                 " in the law or its draft law" if "draft" in run[STEP_LINEAR] else ""
@@ -189,20 +233,20 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     ):
         given = run["host"], config, machine_platform(machine)
         met(host, made_by["host"], compass_run.refuse_unfitted_host, *given)
-        tok = _load_tokenizer(engine.model, engine.trust_remote_code)
+        given = config, buckets, {"host": run["host"]}
+        met(host, made_by["host"], compass_run.refuse_other_buckets, *given)
+        tok = load_tokenizer(engine.model, engine.trust_remote_code)
         met(host, made_by["host"], compass_run.tokenizer_term, run, tok, config)
     grid, made = NAMES[STEP_GRID], MADE_BY[STEP_GRID]
     checked = STEP_GRID in run and (
         met(grid, made, compass_run.refuse_context_parallel, STEP_GRID, config)
         and met(grid, made, step_grid.load, run[STEP_GRID], config, machine)
     )
-    made = MADE_BY["memory readings"].format(
-        store=args.store, atom=shlex.join(real or atom_args)
-    )
-    made = " ".join([*(f"{k}={shlex.quote(v)}" for k, v in (env or {}).items()), made])
-    read = met("memory readings", made, memory.load, run["store"], config, machine, 0)
-    if read and PAGE_BOUND not in read.values and _reads_page_bound(config):
-        why = f"{read.source} states no {PAGE_BOUND}, which an fp4 V4.1 start reads"
+    made = measure_memory(args.store, real or atom_args, env)
+    carried = runfile.carried(runfile.priced_by(args))
+    given = run["store"], config, machine, 0, carried
+    read = met("memory readings", made, memory.load, *given)
+    if read and (why := stale_page_bound(read, config)):
         lacks.append(("memory readings", "stale", why, made))
 
     if getattr(args, OP_GRAPH):
@@ -241,6 +285,22 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
     return lacks, apart
 
 
+def measure_memory(store, atom_args, env=None) -> str:
+    """The command that measures the memory readings of a start under ATOM's
+    arguments `atom_args` into `store`, run under the variables `env`."""
+    made = MADE_BY["memory readings"].format(store=store, atom=shlex.join(atom_args))
+    return " ".join([*(f"{k}={shlex.quote(v)}" for k, v in (env or {}).items()), made])
+
+
+def stale_page_bound(read, config) -> str | None:
+    """Why the memory readings `read` are stale for a start of `config`: it
+    reads the PAGE bound (`_reads_page_bound`), and they state none; else
+    None."""
+    if PAGE_BOUND in read.values or not _reads_page_bound(config):
+        return None
+    return f"{read.source} states no {PAGE_BOUND}, which an fp4 V4.1 start reads"
+
+
 def _reads_page_bound(config) -> bool:
     """Whether a start of `config` sizes by what `memory_allocated` answers on
     its device: DeepSeek-V4.1's builder under --index-cache-dtype fp4."""
@@ -250,6 +310,68 @@ def _reads_page_bound(config) -> bool:
     if getattr(config, "index_cache_dtype", None) != "fp4":
         return False
     return attn_family(get_hf_text_config(config.hf_config)) is Family.CSA2
+
+
+def recorded_buckets(config, arch: str) -> tuple[int, ...]:
+    """The prefill token-graph buckets a run of `config` on a device of `arch`
+    records at capture (`state_prefill_buckets`): `ATOM_TOKEN_GRAPH_SIZES` up to
+    `ModelRunner.warmup_max_tokens` where ATOM's attention builder for its model
+    records token graphs; none if eager or under RapidServe, whose prefill is eager.
+    Where the builder cannot be read (`_token_graphs`), a value error says why."""
+    from atom.utils import envs, get_hf_text_config
+    from atom.utils.selector import attn_family
+
+    if config.enforce_eager or getattr(config, "enable_rapidserve", False):
+        return ()
+    dp = 1 if config.enable_dp_attention else config.parallel_config.data_parallel_size
+    limit = config.max_num_batched_tokens // dp // config.prefill_context_parallel_size
+    sizes = sorted({n for n in envs.ATOM_TOKEN_GRAPH_SIZES if 0 < n <= limit})
+    family = attn_family(get_hf_text_config(config.hf_config))
+    records = bool(sizes) and _token_graphs(family, arch)
+    if isinstance(records, str):
+        raise ValueError(records)  # noqa: TRY004 - why, not a wrong type
+    return tuple(sizes) if records else ()
+
+
+@functools.cache
+def _token_graphs(family, arch: str) -> bool | str:
+    """Whether ATOM's attention builder for `family` records token graphs, in a
+    process declaring a device of `arch`: its module imports aiter, which needs one.
+    Compass's own defect there raises as a runtime error (`check._resolving`).
+    Anything else it raises, the child dying, or the child outliving
+    `PROBE_SECONDS`, which ends it, gives why the buckets cannot be worked out,
+    cached as an answer is, so a child that hangs is waited for once."""
+    from concurrent.futures.process import BrokenProcessPool, ProcessPoolExecutor
+
+    from atom.compass.advice.check import _resolving
+
+    of, spawn = "attention builder", multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(1, mp_context=spawn) as child:
+        try:
+            read = child.submit(_resolving, _builder_records, family, arch, of)
+            records, raised, said = read.result(PROBE_SECONDS)
+        except BrokenProcessPool as died:
+            raised, said = "refused", f"the child reading ATOM's {of} died: {died}"
+        except TimeoutError:
+            for process in list(child._processes.values()):  # 3.14: kill_workers
+                process.kill()
+            raised = "refused"
+            said = f"the child reading ATOM's {of} outlived {PROBE_SECONDS} s"
+    if raised == "defect":
+        raise RuntimeError(f"Compass's own code raised reading ATOM's {of}:\n{said}")
+    if raised:
+        why = "the prefill token-graph buckets this run records cannot be worked out"
+        return f"{why}: {said}"
+    return records
+
+
+def _builder_records(family, arch: str) -> bool:
+    from atom.compass.capture import driverless
+    from atom.utils.selector import get_attn_backend
+
+    with tempfile.TemporaryDirectory(prefix="compass-check-") as tmpdir:
+        driverless.install(tmpdir, arch)
+        return get_attn_backend(family).get_builder_cls().supports_token_graph
 
 
 def _state(refused) -> str:
@@ -268,12 +390,37 @@ def uncovered_rungs(law: dict, config) -> list:
     ladder, `schedulable_ladder`, and the scheduler's bound) that the step
     linear `law` has no vector for, or its draft law, whose decode vectors
     price a decode's draft unless it states a `forward` vector. A step outside
-    a vector's hull is priced, not refused, so no context counts."""
+    a vector's hull is priced, not refused, so no context counts.
+
+    A prefill-decode producer (`_producer`) schedules none: its requests leave
+    after their prefill, and the one decode-phase step it takes, the dummy a
+    DP group runs with every rank idle, is priced without a vector
+    (`cost.idle_group_dummy`)."""
+    if _producer(config):
+        return []
     rungs = scheduled_rungs(_ladder(config), schedulable_bound(config))
     draft = law.get("draft")
     laws = [law] + ([draft] if draft and "forward" not in draft else [])
     vectors = [{str(rung) for rung in each.get("decode", {})} for each in laws]
     return [r for r in rungs if any(str(r) not in v for v in vectors)]
+
+
+def _producer(config) -> bool:
+    """Whether `config` is a prefill-decode producer: every prefill-decode
+    transport it runs (`KVConnectorFactory.leaf_connectors`, a `multi`
+    expanded, offload tiers left out) states ``kv_role`` ``kv_producer``, as
+    the recipe's prefill's Mooncake ``kv_producer`` beside its
+    ``mooncake_store`` offload does. A consumer, ``kv_both``, a transport
+    stating no role, or none at all decodes."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    leaves = KVConnectorFactory.leaf_connectors(config) or ()
+    roles = {
+        (getattr(sub, "kv_transfer_config", None) or {}).get("kv_role")
+        for name, sub in leaves
+        if not KVConnectorFactory.is_offload_backend(name)
+    }
+    return roles == {"kv_producer"}
 
 
 def _ladder(config) -> list[int]:
@@ -282,15 +429,16 @@ def _ladder(config) -> list[int]:
     return [] if config.enforce_eager else schedulable_ladder(config)
 
 
-def calibration(out, atom_args, config) -> str:
+def calibration(out, atom_args, config, store=None) -> str:
     """The `calibrate.sh` command that records and fits a step linear law for
-    `config`, ATOM's arguments `atom_args` resolved, into `out`, then its
-    expected time: the records `step_linear_plan.records` plans, the trace
-    runs only where `compass record --trace` takes one; on as many GPUs as
-    ATOM's ranks use; under this process's environment as a law's key states
-    it (`keyed_env`), and each of `CLIENT_ENV` it sets, then a line naming each
-    it does not, which `calibrate.sh` refuses to run without. Where
-    `calibrate.sh` cannot take ATOM's arguments, why."""
+    `config`, ATOM's arguments `atom_args` resolved, into `out`, publishing
+    into `store` when given, else into its own, then its expected time: the
+    records `step_linear_plan.records` plans, the trace runs only where
+    `compass record --trace` takes one; on as many GPUs as ATOM's ranks use;
+    under this process's environment as a law's key states it (`keyed_env`),
+    and each of `CLIENT_ENV` it sets, then a line naming each it does not,
+    which `calibrate.sh` refuses to run without. Where `calibrate.sh` cannot
+    take ATOM's arguments, why."""
     from atom.compass.drive.record import refuse_trace
     from atom.compass.run.step_grid import keyed_env
 
@@ -326,13 +474,15 @@ def calibration(out, atom_args, config) -> str:
         "GPU": ",".join(map(str, range(gpus))),
         "SERVER_ARGS": " ".join(server),
     }
+    if store is not None:
+        env["STORE"] = str(store)
     words = [f"{k}={shlex.quote(v)}" for k, v in env.items()]
     words += map(shlex.quote, [str(CALIBRATE), str(Path(out).resolve()), *planned])
     return (
         " ".join(words)
         + unheld
         + untraced
-        + "\n  expected time: unknown, as calibrate.sh records no calibration's time"
+        + "\n  expected time: unknown, as no earlier calibration's status is read for it"
     )
 
 

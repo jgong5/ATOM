@@ -127,7 +127,7 @@ def test_a_replayed_step_is_the_batch_atoms_scheduler_built_under_a_drafter(
             past |= tables != own
     assert kinds == {(False, False), (False, True), (True, True)}
     assert past == (drafter == "dspark5")
-    assert rebuilt.replay_rule == {"name": "fresh-contiguous", "version": 3}
+    assert rebuilt.replay_rule == {"name": "fresh-contiguous", "version": 4}
 
 
 def line_tokens(line):
@@ -244,7 +244,8 @@ def test_each_ragged_verify_view_keeps_its_width_and_replays_in_the_pool(
         "rung": 4,
         "produces_output": True,
     }
-    blocks = sum(-(-(c + K + 1 + K - 1) // BLOCK) for c in cached)
+    # DSpark, a block drafter, writes its K draft positions past each row.
+    blocks = sum(-(-(c + K + 1 + K) // BLOCK) for c in cached)
     engine = {
         "kv_cache_block_size": BLOCK,
         "max_model_len": 2048,

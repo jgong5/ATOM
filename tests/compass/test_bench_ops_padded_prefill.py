@@ -96,6 +96,7 @@ def test_a_padded_prefill_s_window_write_takes_the_slots_and_offsets_atom_pads(
             total_seqs_num_prefill=len(tokens),
             total_tokens_num=sum(tokens),
             total_tokens_num_prefill=sum(tokens),
+            has_prefill=True,
             num_scheduled_tokens=tokens,
             num_cached_tokens=[0] * len(tokens),
             final_prefill_requests=lambda: len(tokens),

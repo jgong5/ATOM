@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from atom.compass import run as compass_run
+from atom.compass.backends.json_file import read_json
 from atom.compass.clock import LpId, single_engine_table
 from atom.compass.run import step_grid
 from atom.compass.spec.rules import FingerprintMismatch
@@ -387,10 +388,10 @@ def test_the_summary_names_each_term_the_run_charged_nothing_for(
 
 
 @pytest.mark.parametrize(
-    "law", sorted(p.name for p in (REPO / "scripts/compass/laws").glob("*.json"))
+    "law", sorted(p.name for p in (REPO / "scripts/compass/laws").glob("*.json.xz"))
 )
 def test_every_committed_law_file_charges_both_terms(monkeypatch, tmp_path, law):
-    host = json.loads((REPO / "scripts/compass/laws" / law).read_text())["host"]
+    host = read_json(REPO / "scripts/compass/laws" / law)["host"]
     _run_file(monkeypatch, tmp_path, {"host": host})
     compass_run.spec()
     assert compass_run.http_intake() is not None
@@ -401,12 +402,16 @@ def test_the_server_wraps_its_tokenizer_after_the_delta_reuse_probe():
     """The probe decodes at startup, before the run has traffic; a charged
     decode there waits on a clock that no request will advance."""
     tree = ast.parse((REPO / "atom/entrypoints/openai/api_server.py").read_text())
-    main = next(
-        f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "main"
-    )
-    body = [ast.unparse(s) for s in main.body]
 
-    def first(text):
-        return next(i for i, s in enumerate(body) if text in s)
+    def body(name):
+        f = next(
+            f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == name
+        )
+        return [ast.unparse(s) for s in f.body]
 
-    assert first("enable_delta_reuse(") < first("compass_run.tokenizer(")
+    def first(text, name="main"):
+        return next(i for i, s in enumerate(body(name)) if text in s)
+
+    # The probe runs where the stream dispatcher is set up.
+    assert first("enable_delta_reuse(", "_setup_stream_dispatch") >= 0
+    assert first("_setup_stream_dispatch(") < first("compass_run.tokenizer(")

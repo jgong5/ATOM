@@ -123,7 +123,9 @@ def test_the_fit_prices_serial_moe_rows_on_an_unsplit_step_only(tmp_path):
     records = _old_dp2(tmp_path, steps)
     samples = [s for got, _ in label_run(records, "run", _split) for s in got]
     law = fit(samples, {"form": "base", "dp": 2})[0]
-    assert law["prefill"]["coefficients"] == pytest.approx(LAW, rel=1e-6)
+    # Rank 1's dummy forwards are rows of the fit too, which LAW prices at nothing.
+    dummies = {"eager_dummy": 0.0, "eager_dummy_tail": 0.0}
+    assert law["prefill"]["coefficients"] == pytest.approx(LAW | dummies, rel=1e-6)
     graded = cost_accuracy(tmp_path, law)["graded"]["prefill"]
     assert graded["on_totals"] == pytest.approx(0.0, abs=1e-6)
 

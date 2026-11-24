@@ -15,7 +15,12 @@
 #                     answer the blind-spot question without .git
 #
 # Both are written from the same rev-parse that selects the archived tree, so
-# neither can name a different commit than the one inside.
+# neither can name a different commit than the one inside. The third,
+# .compass-gpu-carry, lets gate_cpu.sh carry the GPU gate of COMPASS_GPU_GATE_DONE=G
+# here: G, HEAD and the diff from G, or empty, so it replaces a stale extraction's.
+# The fourth, .compass-select, lets gate_cpu.sh select with the map
+# COMPASS_GATE_SELECT names: the map's commit, HEAD, whether the first is an
+# ancestor of the second, and the diff between them; or empty.
 #
 # Usage: snapshot.sh [<output-dir>]   (default: the current directory)
 #
@@ -74,15 +79,35 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/ATOM"
 printf '%s\n' "$SHA" >"$STAGE/ATOM/.compass-commit"
-git -C "$ROOT" diff --name-only "$BASE" HEAD >"$STAGE/ATOM/.compass-changed"
+# Both sides of a rename, unquoted, in both stamps as in gate_cpu.sh: else a
+# renamed trigger file or a non-ASCII path under a trigger matches nothing.
+git -C "$ROOT" -c core.quotePath=false diff --no-renames --name-only "$BASE" HEAD >"$STAGE/ATOM/.compass-changed"
+: >"$STAGE/ATOM/.compass-gpu-carry"
+if [ -n "${COMPASS_GPU_GATE_DONE:-}" ]; then
+    G=$(git -C "$ROOT" rev-parse --verify --quiet "$COMPASS_GPU_GATE_DONE^{commit}") && [ "$G" = "$COMPASS_GPU_GATE_DONE" ] || {
+        printf 'REFUSED: COMPASS_GPU_GATE_DONE=%s is not the full sha of a commit here.\n' "$COMPASS_GPU_GATE_DONE" >&2
+        exit 93
+    }
+    [ "$G" = "$SHA" ] || { printf '%s\n%s\n' "$G" "$SHA"; git -C "$ROOT" -c core.quotePath=false diff --no-renames --name-only "$G" HEAD; } >"$STAGE/ATOM/.compass-gpu-carry"
+fi
+: >"$STAGE/ATOM/.compass-select"
+if [ -n "${COMPASS_GATE_SELECT:-}" ]; then
+    python3 "$ROOT/scripts/compass/gate_select.py" stamp "$COMPASS_GATE_SELECT" "$ROOT" >"$STAGE/ATOM/.compass-select" || {
+        printf 'REFUSED: COMPASS_GATE_SELECT=%s is not a map gate_map.sh wrote.\n' "$COMPASS_GATE_SELECT" >&2
+        exit 93
+    }
+fi
 
 git -C "$ROOT" archive --format=tar --prefix=ATOM/ HEAD >"$TAR"
 tar -rf "$TAR" -C "$STAGE" ATOM/.compass-commit ATOM/.compass-changed
+tar -rf "$TAR" -C "$STAGE" ATOM/.compass-gpu-carry
+tar -rf "$TAR" -C "$STAGE" ATOM/.compass-select
 
 printf 'wrote %s\n' "$TAR"
 printf '  commit:  %s\n' "$SHA"
 printf '  base:    %s (%s)\n' "${BASE:0:9}" "$REF"
 printf '  changed: %s file(s)\n' "$(grep -c . "$STAGE/ATOM/.compass-changed")"
+[ ! -s "$STAGE/ATOM/.compass-gpu-carry" ] || printf '  carry:   %s\n' "$(head -1 "$STAGE/ATOM/.compass-gpu-carry")"
 printf '\nExtract with:\n'
 printf '  mkdir -p <dir> && tar -x -C <dir> -f %s\n' "$(basename "$TAR")"
 printf 'then run <dir>/ATOM/scripts/compass/gate_cpu.sh\n'
