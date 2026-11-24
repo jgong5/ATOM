@@ -341,6 +341,27 @@ def test_a_rung_of_one_record_and_one_composition_has_no_held_out_error_and_adop
     assert list(vector["coefficients"]) == list(BASE)
 
 
+def test_the_fallback_rule_picks_in_sample_only_where_no_record_is_held_out(cells):
+    """Under `moe_select` ``fallback`` a rung of one record and one
+    composition adopts the column its fit on all its steps prices nearest, its
+    figures naming the fallback; a rung its records hold out picks as the
+    held-out rule does, its law unchanged."""
+    full, sparse = cells
+    samples = label_records(full, DP)[0]
+    options = {"form": "base", "dp": DP, "moe_routing": ROUTING}
+    vector = fit(samples, {**options, "moe_select": "fallback"})[0]["decode"][str(RUNG)]
+    figures = vector["fit"]["moe_column"]
+    assert figures["adopted"] == "moe_experts" and figures["selected_by"] == "insample"
+    assert figures["fallback"] == "group_dummies"
+    assert vector["coefficients"] == pytest.approx(EXPERTS, rel=1e-6)
+    both = label_records(full + sparse, DP)[0]
+    held = fit(both, options)[0]
+    fell = fit(both, {**options, "moe_select": "fallback"})[0]
+    assert json.dumps(fell["decode"]) == json.dumps(held["decode"])
+    with pytest.raises(ValueError, match="not one of"):
+        fit(samples, {**options, "moe_select": "median"})
+
+
 def test_a_routed_rung_fits_each_fold_of_the_form_it_adopts_once(cells, monkeypatch):
     """Both records hold enough steps at the rung for `rowmod` to hold each
     out without its column: it takes the experts column's folds the column

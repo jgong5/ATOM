@@ -227,7 +227,8 @@ column `gather_pad_rows` in its place, the gather's pad rows alone, and
 (`GATHER_ROWS_ENV` at ``1`` or ``pad``,
 `MOE_IMBALANCE_ENV`, `UNEVEN_ROWS_ENV`, `MOE_MIN_SPREAD_ENV`); `moe_select` ``insample`` makes each
 target decode rung adopt the MoE column its fit on all its steps prices nearest
-(`_moe_column`, `MOE_SELECT_ENV`); `peer_tokens` adds that decode column, after
+(`_moe_column`, `MOE_SELECT_ENV`), and ``fallback`` only each rung its records
+cannot hold out, which adopts none under the default rule; `peer_tokens` adds that decode column, after
 the MoE column, to the rungs it names or, as ``saturated``, to each rung whose
 adopted `moe_experts` column its median step holds at `SATURATED` of the
 experts (`_peer_rung`, `PEER_TOKENS_ENV`); `draft_peer_tokens` adds it to the
@@ -398,7 +399,7 @@ MOE_MIN_SPREAD = 0.2
 #: How a decode rung picks its MoE column (`_moe_column`), one of `MOE_SELECTS`,
 #: the first when unset.
 MOE_SELECT_ENV = "COMPASS_FIT_MOE_SELECT"
-MOE_SELECTS = ("held_out", "insample")
+MOE_SELECTS = ("held_out", "insample", "fallback")
 #: The decode rungs that add `peer_tokens` (`_peer_rung`): ``1`` for each
 #: rung whose `moe_experts` column is `SATURATED`, else the rungs, comma separated.
 PEER_TOKENS_ENV = "COMPASS_FIT_PEER_TOKENS"
@@ -2154,29 +2155,39 @@ def _moe_column(steps, routing, base=DECODE, select: str = "held_out") -> tuple:
     Under `select` ``insample`` (`MOE_SELECT_ENV`) the rung adopts one of
     `MOE_COLUMNS` whatever its records: the one whose fit on all its steps has
     the smaller scaled MAD of its relative residuals, the first on a tie, the
-    figures stating each under `in_sample`.
+    figures stating each under `in_sample`. Under ``fallback`` a rung picks by
+    its held-out error where it has one, and where it has none, one record of
+    one composition, as under ``insample``, its figures stating `fallback`:
+    without a MoE column such a rung's context slope takes up its group's MoE
+    work, which grows with the rows it decodes (#3720 cell A's e3v2 record:
+    rung 16 fitted context at 3x rung 8's and 24's slope, its MAD 1.99% against
+    `moe_tokens`' 1.22%, and priced as the max over its ranks it charged a
+    target's step its busiest rank's context at that slope, its c=64 steps
+    3.7% high).
     """
     forms = {"none": {"coefficients": list(base)}}
     forms |= {f: {"coefficients": [*base, f]} for f in MOE_COLUMNS}
-    if select == "insample":
+    if select not in MOE_SELECTS:
+        raise ValueError(f"MoE column rule {select!r} is not one of {MOE_SELECTS}")
+    cell, by = np.array([s[0][0] for s in steps]), "record"
+    if len(set(cell.tolist())) == 1:
+        cell, by = np.array([s[0][7] for s in steps]), "group_dummies"
+    fallback = select == "fallback" and len(set(cell.tolist())) == 1
+    if select == "insample" or fallback:
         fits = {f: _fit_vector(steps, forms[f], routing) for f in MOE_COLUMNS}
         error = {f: fits[f]["mad"] for f in MOE_COLUMNS}
         picked = min(error, key=error.get)
         figures = {
             "picked": picked,
             "adopted": picked,
-            "selected_by": select,
+            "selected_by": "insample",
+            **({"fallback": by} if fallback else {}),
             "in_sample": {
                 f: {"mad": fits[f]["mad"], "F": fits[f]["passes"]["F"]}
                 for f in MOE_COLUMNS
             },
         }
         return forms[picked], figures, None
-    if select != "held_out":
-        raise ValueError(f"MoE column rule {select!r} is not one of {MOE_SELECTS}")
-    cell, by = np.array([s[0][0] for s in steps]), "record"
-    if len(set(cell.tolist())) == 1:
-        cell, by = np.array([s[0][7] for s in steps]), "group_dummies"
     band, edges = _token_bands(steps)
     held, banded, error = {}, {}, {}
     for form, vector in forms.items():
