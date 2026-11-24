@@ -74,10 +74,12 @@ def test_two_candidates_at_one_law_key_print_one_calibration(
     assert _env(found, "S2").get("STORE", str(cal / "store")) == into
     measure = f"compass measure memory --gpu G --out D --store {into} -- --model "
     measure += " ".join([str(tmp_path), *ARGS5])
-    made = [check.BORROWED.format("S2", into)]
+    made = [check.BORROWED.format("S2", cal, into)]
     if held or not at_key:
         # A measure into S2's own store before it starts makes it refuse.
-        made += [check.PENDING.format(into, "S2") if held and not started else measure]
+        made += [
+            check.PENDING.format(into, "S2", cal) if held and not started else measure
+        ]
     assert found["S5"]["made_by"] == made
     printed = capsys.readouterr().out
     # Once in S2's state, once in its rows of the results.
@@ -102,3 +104,27 @@ def test_a_candidate_refused_at_a_point_leaves_the_calibration_to_the_next(
     assert found["R"]["state"] == "refused"
     (calibration,) = _calibrations(found)
     assert f"calibrate.sh {tmp_path / 'out' / 'cal' / 'S2'} " in calibration
+
+
+def test_a_calibration_taken_again_is_named_by_its_candidate_and_its_directory(
+    tmp_path, stubbed  # noqa: F811
+):
+    """S2's calibration in ``cal/S2`` has ended, and the store refuses its
+    readings again, so its next goes into ``cal/S2+2``, publishing into its own
+    store: S5 names S2's calibration there, and its readings once it starts."""
+    store, cal = tmp_path / "store", tmp_path / "out" / "cal"
+    _readings_at_another_digest(store, resolved(stubbed.config, ARGS2))
+    (cal / "S2").mkdir(parents=True)
+    ended = "2026-11-24T07:00:00Z end calibration 0.20 node-hours\n"
+    (cal / "S2" / "status").write_text(ended)
+
+    found = advise(tmp_path, {"S2": S2, "S5": S5})
+
+    again = cal / "S2+2"
+    (calibration,) = _calibrations(found)
+    assert f"calibrate.sh {again} " in calibration
+    into = str(again / "store")
+    assert found["S5"]["made_by"] == [
+        check.BORROWED.format("S2", again, into),
+        check.PENDING.format(into, "S2", again),
+    ]

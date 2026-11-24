@@ -113,15 +113,17 @@ CAL, STARTS = "cal", "starts"
 #: directory, and ``end calibration`` once it has fitted both laws.
 STATUS = "status"
 #: What makes a law an earlier candidate's calibration makes at its key: that
-#: calibration, named by its candidate, and the store it publishes into.
+#: calibration, named by its candidate and its directory, and the store it
+#: publishes into.
 BORROWED = (
-    "{}'s calibration, whose law is at this configuration's key, publishing into {}"
+    "{}'s calibration in {}, whose law is at this configuration's key, "
+    "publishing into {}"
 )
 #: What stands for a borrower's readings command into the calibration's own
 #: store until that calibration starts.
 PENDING = (
-    "its readings, into {}, once {}'s calibration has started: compass advice "
-    "then prints their command"
+    "its readings, into {}, once {}'s calibration in {} has started: compass "
+    "advice then prints their command"
 )
 #: The file a calibration writes its inputs to, in its directory: a line
 #: ``store <path>`` names the store it publishes into, when one was named.
@@ -289,6 +291,12 @@ def _ended(directory: Path) -> bool:
     status = directory / STATUS
     said = status.read_text().splitlines() if status.is_file() else []
     return bool(said) and said[-1].split()[1:3] == ["end", "calibration"]
+
+
+def _candidate(directory: Path) -> str:
+    """The candidate whose calibration runs in `directory`, ``<name>`` or one
+    `AGAIN` names after it."""
+    return directory.name.partition("+")[0]
 
 
 def _calibration(at: Path, calibrate: list) -> dict:
@@ -622,7 +630,7 @@ def _borrowing(points: list, held: dict, calibrations: dict) -> None:
                 calibrations[key] = mine
             elif made["in"] != mine["in"]:
                 lender, into = Path(made["in"]), made["into"]
-                law["made_by"] = [BORROWED.format(lender.name, into)]
+                law["made_by"] = [BORROWED.format(_candidate(lender), lender, into)]
                 there = Path(into) == Path(held["store"])
                 if verdicts["readings"][side]["verdict"] != "reuse" or not there:
                     one = point["instances"][side]
@@ -636,7 +644,7 @@ def _readings_by(lender: Path, into: str, one: dict) -> str:
     store and it has not started, `PENDING`: a publish there first leaves the
     calibration's directory holding files, which `calibrate.sh` refuses."""
     if Path(into) == lender / "store" and not (lender / INPUTS).is_file():
-        return PENDING.format(into, lender.name)
+        return PENDING.format(into, _candidate(lender), lender)
     return lacking.measure_memory(into, one["args"], one["env"])
 
 
