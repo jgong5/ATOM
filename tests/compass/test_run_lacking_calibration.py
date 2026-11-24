@@ -252,7 +252,10 @@ def test_a_deployment_side_lacking_its_laws_prints_deploy_sh_record_and_a_fit(
     law = r"^lacking (step linear law|host laws): .*\n  refused: .*\n  made by: (.*)$"
     record = "deploy.sh OUT record of the deployment, then compass fit {} on each "
     record += f"OUT/{side}"
+    # The prefill side, a producer, schedules no decode rung its law could
+    # lack (`lacking.uncovered_rungs`).
+    steps = [("step linear law", record.format("steps --backend step-linear"))]
     assert re.findall(law, out, re.MULTILINE) == [
-        ("step linear law", record.format("steps --backend step-linear")),
+        *(steps if side == "decode" else []),
         ("host laws", record.format("host")),
     ]

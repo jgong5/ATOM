@@ -72,6 +72,7 @@ def runner(ladder=LADDER, enforce_eager=False, dp_size=1):
         attn_metadata_builder=GRAPHABLE,
         config=SimpleNamespace(
             enable_tbo=False,
+            enable_tbo_decode=False,
             parallel_config=SimpleNamespace(data_parallel_size=dp_size),
         ),
     )

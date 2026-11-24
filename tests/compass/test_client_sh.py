@@ -200,6 +200,25 @@ def test_a_deploy_sh_out_names_its_prefill_instance_to_aiperf(tmp_path, deployed
     assert named == ("http://10.0.0.5:8010" if deployed else None)
 
 
+@pytest.mark.parametrize("simulated", [True, False])
+def test_a_simulated_run_s_export_names_its_send_order_seed_and_its_workload_not(
+    tmp_path, simulated
+):
+    """The seed reaches aiperf, whose traffic LP orders a simulated server's
+    sends at one instant by it; a real run has no such order, so the workload
+    a cell's runs share leaves it out."""
+    server = SIM if simulated else {k: SIM[k] for k in ("url", "pid")}
+    out, env = _setup(tmp_path, server)
+    done = _client(out, *GOOD, env=env | {"COMPASS_HARNESS_SEND_ORDER_SEED": "7"})
+    assert done.returncode == 0, done.stdout + done.stderr
+
+    _, aiperf_env, _ = json.loads((tmp_path / "seen.json").read_text())
+    assert aiperf_env["COMPASS_HARNESS_SEND_ORDER_SEED"] == "7"
+    export = json.loads((out / "artifacts" / NAME).read_text())
+    assert export.get("send_order_seed") == ("7" if simulated else None)
+    assert "send_order_seed" not in json.loads((out / WORKLOAD).read_text())
+
+
 #: The nightly's client arguments and aiperf timeouts client.sh has no default for.
 NIGHTLY = (
     "--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75"
@@ -314,6 +333,21 @@ def test_stop_stops_the_command_once_the_export_is_written(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert command.wait(timeout=10) == 0
     assert (out / "run.json").exists() and (out / "artifacts" / NAME).exists()
+
+
+def test_a_failed_aiperf_still_stops_the_command_and_names_its_own_failure(tmp_path):
+    out, env = _setup(tmp_path)
+    env["BREAK"] = "aiperf"
+    (tmp_path / "compass_command.py").write_text(COMMAND)
+    command = subprocess.Popen([sys.executable, tmp_path / "compass_command.py", out])
+    while not (out / "server.json").exists():
+        assert command.poll() is None
+        time.sleep(0.1)
+    done = _client(out, *GOOD, "--stop", env=env)
+    assert done.returncode == 1, done.stdout + done.stderr
+    last = done.stderr.splitlines()[-1]
+    assert fnmatchcase(last, "client: aiperf: exited 3; see */client/aiperf.log")
+    assert command.wait(timeout=10) == 0 and (out / "run.json").exists()
 
 
 @pytest.mark.parametrize("writes_run", [True, False])
@@ -533,3 +567,80 @@ def test_sigterm_during_aiperf_leaves_it_not_running(tmp_path):
     alive and os.kill(pid, signal.SIGKILL)
     assert p.returncode == -signal.SIGTERM, err
     assert not alive
+
+
+#: The variable an arm sets for the Dynamo session header, as ATOM's DP
+#: submissions to InferenceX set it, and the header aiperf then sends.
+DYNAMO, HEADER = (
+    "AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID",
+    "X-Dynamo-Session-ID",
+)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "Yes", "0", "false", None])
+@pytest.mark.parametrize("server", [SIM, REAL], ids=["simulated", "real"])
+def test_an_arm_s_dynamo_header_replaces_x_session_id_and_the_workload_names_it(
+    tmp_path, value, server
+):
+    out, env = _setup(tmp_path, server)
+    env.pop(DYNAMO, None)
+    done = _client(out, *AGENTX, env=env | ({} if value is None else {DYNAMO: value}))
+    assert done.returncode == 0, done.stdout + done.stderr
+
+    aiperf_env = json.loads((tmp_path / "seen.json").read_text())[1]
+    dynamo = value in ("1", "true", "Yes")
+    assert aiperf_env.get(DYNAMO) == value
+    assert aiperf_env["AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID"] == (
+        "false" if dynamo else "true"
+    )
+    workload = json.loads((out / "artifacts/workload.json").read_text())
+    assert workload.get("session_header") == (HEADER if dynamo else None)
+
+
+def test_a_cell_whose_runs_sent_different_session_headers_names_the_field(tmp_path):
+    cell, runs = tmp_path / "cell", {"real1": REAL, "step_linear": SIM}
+    cell.mkdir()
+    for name, server in runs.items():
+        (tmp_path / name).mkdir()
+        out, env = _setup(tmp_path / name, server)
+        env = {k: v for k, v in env.items() if k != DYNAMO}
+        done = _client(
+            out, *AGENTX, env=env | ({DYNAMO: "1"} if server is REAL else {})
+        )
+        assert done.returncode == 0, done.stdout + done.stderr
+        (cell / name).symlink_to(out)
+    odd = _odd_workloads(cell, {n: {} for n in runs})
+    assert odd == {"session_header": {"real1": HEADER, "step_linear": None}}
+
+
+@pytest.mark.parametrize("value", ["1", None])
+def test_cctraces_sim_sends_the_arm_s_dynamo_header_as_client_sh_does(tmp_path, value):
+    out, env = _setup(tmp_path, SIM)
+    env = {k: v for k, v in env.items() if k != DYNAMO} | (
+        {DYNAMO: value} if value else {}
+    )
+    done = _client(out, *GOOD, env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    seen = [json.loads((tmp_path / "seen.json").read_text())[1]]
+    workload = json.loads((out / "artifacts" / "workload.json").read_text())
+
+    (tmp_path / "bin" / "python3").write_text(PYTHON3)
+    (tmp_path / "bin" / "python3").chmod(0o755)
+    (tmp_path / "run_file.json").write_text("{}")
+    cell = {"FIRST_SESSION": "1", "SESSIONS": "2", "CONCURRENCY": "3", "WAIT_S": "5"}
+    # About 9 s alone; a CPU gate beside another has taken over 120 s.
+    subprocess.run(
+        ["bash", TREE / "scripts/compass/cctraces_sim.sh", "run_file.json", "cell"],
+        cwd=tmp_path,
+        env=env | cell,
+        capture_output=True,
+        timeout=600,
+        check=False,
+    )
+    seen.append(json.loads((tmp_path / "seen.json").read_text())[1])
+    run = json.loads((tmp_path / "cell" / "run.json").read_text())
+    assert workload == run["workload"]
+    assert workload.get("session_header") == (HEADER if value else None)
+    # cctraces_sim.sh adds no X-Session-ID to a single server's requests.
+    session = [e.get("AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID") for e in seen]
+    assert session == (["false", "false"] if value else ["true", None])

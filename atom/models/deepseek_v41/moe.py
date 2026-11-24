@@ -33,12 +33,17 @@ from atom.model_ops.deepseek_v41.router import (
     router_logits as fixed_order_router_logits,
 )
 from atom.model_ops.deepseek_v41.router import router_supported
+from atom.model_ops.deepseek_v41.router import warm as warm_router
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import mm_topk
 from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
+
+#: Whether this process compiled the router's widths
+#: (`MoE.process_weights_after_loading`).
+_ROUTER_WARM = False
 
 
 @torch_compile_guard(mutates_args=["output"], gen_fake=lambda output: None)
@@ -69,6 +74,19 @@ class MoE(V4MoE):
         )
 
         self.experts.custom_routing_function = self._topk
+
+    def process_weights_after_loading(self):
+        """Compile the fixed-order router's widths in this process, once, on
+        the first layer's gate: a width an eager forward first met while
+        serving stalled that forward, and under DP every rank's, by its
+        compile (#3743)."""
+        parent = getattr(super(), "process_weights_after_loading", None)
+        if parent is not None:
+            parent()
+        global _ROUTER_WARM
+        if not _ROUTER_WARM:
+            warm_router(self.gate.weight)
+            _ROUTER_WARM = True
 
     def _topk(self, hidden_states, gating_output, topk, renormalize):
         image_mask = getattr(get_forward_context().attn_metadata, "image_mask", None)
@@ -118,6 +136,7 @@ class MoE(V4MoE):
         before_stage2_for_rows=None,
         before_shared_add=None,
         stage2_stream: torch.cuda.Stream | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> tuple[torch.Tensor, bool]:
         routed, is_complete = self.experts.forward_maybe_comm_fused(
             x,
@@ -126,6 +145,7 @@ class MoE(V4MoE):
             before_stage2_for_rows=before_stage2_for_rows,
             before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
+            shared_ready=shared_ready,
         )
         # create_comm_fused_moe_backend excludes TBO (and DP > 1), so TBO
         # returns the fallback routed output before shared combine/mHC.

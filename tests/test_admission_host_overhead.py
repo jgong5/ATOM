@@ -9,6 +9,7 @@ import pickle
 import queue
 import random
 import sys
+import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -546,6 +547,7 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
     # and a setattr's undo would leave pyzmq's class there for later tests.
     monkeypatch.setitem(vars(core.zmq), "Poller", lambda: poller)
     engine = object.__new__(core.EngineCore)
+    engine._kv_progress_event = threading.Event()
     engine.label, engine.input_queue = "test", queue.Queue()
     engine.process_input_sockets("input", "control")
     want = reference_chain(tokens, BLOCK, -1, 10)

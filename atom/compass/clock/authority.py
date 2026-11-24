@@ -16,9 +16,10 @@ Each request carries the requester's send log since its previous request, as
 changes, so every message an LP produced is known before its clock moves.
 
 ``N[j]`` is the earliest time LP *j* could still produce a message: its clock
-while it runs, its target while it waits in TAR (its owner is inside this call
-and sends nothing), and the least of its target, its daemon deadline and its
-earliest unreleased message while it waits in NER. A waiting LP *i* is granted
+while it runs; while it waits in TAR, its target (its owner is inside this
+call and sends nothing) or the earliest unreleased message on one of its
+offering channels, whichever is first; and while it waits in NER, the least of
+its target, its daemon deadline and its earliest unreleased message. A waiting LP *i* is granted
 exactly ``N[i]``, and only when ``N[i] < min over j != i of (N[j] + D(j->i))``.
 ``D`` is the channel table's least summed lookahead over every channel path, so
 an idle LP between two others does not hide the first from the third. The comparison is strict: a
@@ -108,6 +109,16 @@ which gets no reply, or in its call for the rounds left. Until it has, the LP's
 has yet to log. A request from such a member that does not report exactly
 those rounds, each with its own target, aborts the run.
 
+A channel the table marks offering carries messages whose handler may offer a
+send, which the LP's owner makes at the message's arrival (#3767). An LP
+waiting in TAR past such a message is granted that arrival first, releasing
+what arrives up to it, and asks again; the step table records that grant as
+``ARRIVAL``. In an LP with members, only the member the message is for gets
+that grant and asks again, the rest staying in the round; no grant holds such
+a message for its member: one whose call named later rounds gets its reply at
+that grant, and a parked member leaves its park there and parks again. No round
+is granted ahead past such a message.
+
 Nothing here reads a clock, opens a socket or starts a thread. The caller
 carries requests in and replies out.
 """
@@ -119,6 +130,9 @@ from .channels import ChannelTable
 from .identity import LpId
 
 TAR, NER, PARK, REPORT = "TAR", "NER", "PARK", "REPORT"
+#: The step-table event of a TAR's grant short of its target, at an arrival on
+#: an offering channel.
+ARRIVAL = "ARRIVAL"
 RUNNING = "running"
 _STANDING = (PARK, math.inf, math.inf)  # a parked member's place in each round
 
@@ -228,6 +242,10 @@ class ClockAuthority:
         self._horizon = -math.inf  # H: the latest essential time seen
         self._into = {
             i: tuple(c.name for c in channels.channels_into(i)) for i in self._ids
+        }
+        self._offering = {
+            i: tuple(name for name in self._into[i] if channels.offering(name))
+            for i in self._ids
         }
         # Per channel, seq -> arrival of every registered message not yet
         # released, in registration order.
@@ -445,7 +463,7 @@ class ClockAuthority:
         if t < math.inf:
             self._horizon = max(self._horizon, t)
         self._state[lp], self._target[lp], self._daemon[lp] = kind, t, daemon
-        self._nv[lp] = t if kind == TAR else self._n(lp)
+        self._nv[lp] = self._n(lp)
 
     def _join_queued(self, lp: LpId) -> None:
         """After a round of `lp` is granted, each member's next queued round
@@ -500,10 +518,12 @@ class ClockAuthority:
                     out.append((i, g, released, *ended))
                     continue
                 mine = {c: r for c, r in released.items() if self._owner[i][c] == m}
+                # A message for its handler to offer on goes at once.
+                woken = any(r for c, r in mine.items() if c in self._offering[i])
                 held, at = self._parked[i].get(m), g
                 if held is not None:
                     self._hold(held, mine)
-                    if g < math.inf and not ended:
+                    if g < math.inf and not ended and not woken:
                         continue
                     del self._parked[i][m]
                     self._round[i].pop(m, None)
@@ -511,7 +531,7 @@ class ClockAuthority:
                 elif m in self._held[i]:
                     last, held, back = self._held[i][m]
                     self._hold(held, mine)
-                    if g < last and not ended:
+                    if g < last and not ended and not (woken and g < back):
                         continue
                     del self._held[i][m]
                     mine, at = held, back if g == last and not ended else g
@@ -588,7 +608,8 @@ class ClockAuthority:
             self._undelivered[name][seq] = a
             self._horizon = max(self._horizon, a)
             self._next_seq[name] = seq + 1
-            if self._state[channel.target] == NER:
+            state = self._state[channel.target]
+            if state == NER or state == TAR and self._channels.offering(name):
                 self._nv[channel.target] = self._n(channel.target)
             return
         raise BackdatedEvent(refusal, self.lp_table())
@@ -610,12 +631,20 @@ class ClockAuthority:
         if self._state[j] == RUNNING:  # no later than a member yet to report
             return min([self._now[j], *(c for c, _ in self._owing.get(j, {}).values())])
         if self._state[j] == TAR:
-            return self._target[j]
+            return min(self._target[j], self._offered(j))
         n = min(self._target[j], self._daemon[j])
         for name in self._into[j]:
             for a in self._undelivered[name].values():
                 n = min(n, a)
         return n
+
+    def _offered(self, j: LpId) -> float:
+        """The earliest unreleased message on an offering channel into `j`."""
+        pending = self._undelivered
+        return min(
+            (a for n in self._offering[j] for a in pending[n].values()),
+            default=math.inf,
+        )
 
     def _row(self, i: LpId) -> tuple[tuple[LpId, float], ...]:
         nv = self._nv
@@ -637,8 +666,9 @@ class ClockAuthority:
             grantable = [(n, i) for n, i in waiting if n <= self._horizon]
             due = next(((i, n) for n, i in grantable if n < self._lbts(i)), None)
             if due is not None:
+                short = state[due[0]] == TAR and due[1] < self._target[due[0]]
                 replies.append(self._grant(*due))
-                replies += self._grant_ahead(due[0])
+                replies += [] if short else self._grant_ahead(due[0])
             elif len(waiting) < len(self._ids):
                 return replies
             elif not grantable:
@@ -657,6 +687,8 @@ class ClockAuthority:
             return []
         ceiling, replies = self._ceiling_of(i, self._now[i]), []
         while joined and (t := next(iter(joined.values()))[1]) < ceiling:
+            if self._offered(i) <= t:  # its member gets that arrival's grant
+                break
             for m in self._members[i]:
                 if m not in joined:
                     self._owing[i].setdefault(m, [self._now[i], []])[1].append(t)
@@ -705,14 +737,40 @@ class ClockAuthority:
         self._ceiling.pop(i, None)
         if self._ceilings and not recovered and g < math.inf and i not in self._members:
             released.ceiling = self._ceiling[i] = self._ceiling_of(i, g, released)
+        target = self._target[i]
+        short = self._state[i] == TAR and g < target
         if self.timeline is not None:
-            self._record(i, g, self._state[i], recovered, tuple(got))
+            kind = ARRIVAL if short else self._state[i]
+            self._record(i, g, kind, recovered, tuple(got))
         self.grants[i.name] += 1
         # g is N[i], so N[i] is unchanged: a running LP's N is its clock.
         self._now[i], self._state[i], self._target[i] = g, RUNNING, None
-        if self._queued.get(i):
-            self._join_queued(i)
+        if i in self._members:
+            self._wake(i, released, target if short else None)
         return (i, g, released)
+
+    def _wake(self, i: LpId, released: dict, short: float | None) -> None:
+        """After a grant of `i`, which has members: each member a message on an
+        offering channel is released to asks again, its later rounds dropped;
+        under a grant `short` of the round's target, the rest stay in that
+        round, their replies held for its grant. Otherwise each member's next
+        queued round joins the next one."""
+        woken = dict.fromkeys(
+            self._owner[i][c]
+            for c, r in released.items()
+            if r and c in self._offering[i]
+        )
+        for m in woken:
+            self._queued[i].pop(m, None)
+        if short is None:
+            if self._queued[i]:
+                self._join_queued(i)
+            return
+        for m in self._members[i]:
+            if m not in woken:
+                self._round[i][m] = (TAR, short, math.inf)
+                own = (short, self._own_into(i, m), short)
+                self._held[i].setdefault(m, own)
 
     def _ceiling_of(self, i: LpId, g: float, released: Released | None = None) -> float:
         """The ceiling of `i`'s grant to `g`: `released` takes every message

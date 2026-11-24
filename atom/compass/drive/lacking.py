@@ -382,12 +382,37 @@ def uncovered_rungs(law: dict, config) -> list:
     ladder, `schedulable_ladder`, and the scheduler's bound) that the step
     linear `law` has no vector for, or its draft law, whose decode vectors
     price a decode's draft unless it states a `forward` vector. A step outside
-    a vector's hull is priced, not refused, so no context counts."""
+    a vector's hull is priced, not refused, so no context counts.
+
+    A prefill-decode producer (`_producer`) schedules none: its requests leave
+    after their prefill, and the one decode-phase step it takes, the dummy a
+    DP group runs with every rank idle, is priced without a vector
+    (`cost.idle_group_dummy`)."""
+    if _producer(config):
+        return []
     rungs = scheduled_rungs(_ladder(config), schedulable_bound(config))
     draft = law.get("draft")
     laws = [law] + ([draft] if draft and "forward" not in draft else [])
     vectors = [{str(rung) for rung in each.get("decode", {})} for each in laws]
     return [r for r in rungs if any(str(r) not in v for v in vectors)]
+
+
+def _producer(config) -> bool:
+    """Whether `config` is a prefill-decode producer: every prefill-decode
+    transport it runs (`KVConnectorFactory.leaf_connectors`, a `multi`
+    expanded, offload tiers left out) states ``kv_role`` ``kv_producer``, as
+    the recipe's prefill's Mooncake ``kv_producer`` beside its
+    ``mooncake_store`` offload does. A consumer, ``kv_both``, a transport
+    stating no role, or none at all decodes."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    leaves = KVConnectorFactory.leaf_connectors(config) or ()
+    roles = {
+        (getattr(sub, "kv_transfer_config", None) or {}).get("kv_role")
+        for name, sub in leaves
+        if not KVConnectorFactory.is_offload_backend(name)
+    }
+    return roles == {"kv_producer"}
 
 
 def _ladder(config) -> list[int]:

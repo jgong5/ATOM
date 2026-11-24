@@ -525,6 +525,9 @@ _TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
 # aiter's other decode top-ks: FlyDSL's multi-CTA one (gfx950's) and HIP's
 _MULTI = "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode"
 _PICK = "aiter._top_k_per_row_decode.default"
+# aiter's decode top-k as its routed operator, which picks its kernel itself:
+# what DeepSeek-V4.1's scorer calls since upstream b7b5ec3f2
+_ROUTED = "aiter_routed.top_k_per_row_decode.default"
 _INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
 _SCAN = f"{_INDPTRS}:_launch_indptr_scan"
 _INDICES = f"{_INDPTRS}:_launch_indices"
@@ -554,6 +557,7 @@ V41_NAMES = {
     (_MULTI, "row_starts", "packed"): _OFFSETS,
     (_MULTI, "seq_lens"): "step.visible.{ratio}",
     (_PICK, "seqLens"): "step.visible.{ratio}",
+    (_ROUTED, "seqLens"): "step.visible.{ratio}",
     (_FUSED, "plan_gpu"): _PLAN,
     ("atom.model_ops.deepseek_v41.index_write:write_index_rows", "plan"): _PLAN,
     (_INDICES, "pptr"): f"{_CACHE}.0",
@@ -631,6 +635,7 @@ PAGE_WIDE = {
     _TOPK: ("row_ends", "logits", "stride0"),
     _MULTI: ("seq_lens", "logits", "stride0"),
     _PICK: ("seqLens", "logits", "stride0"),
+    _ROUTED: ("seqLens", "logits", "stride0"),
     _MAXIMA: ("visible", "logits", "maxima", "blocks"),
     f"{_V41}.unit_table:unit_table": ("block_tables", "block_tables"),
 }
@@ -680,6 +685,7 @@ _WRITTEN = {
     (_MULTI, "row_starts"): "context",
     (_MULTI, "seq_lens"): "context",
     (_PICK, "seqLens"): "context",
+    (_ROUTED, "seqLens"): "context",
     (_MAXIMA, "packed.0"): "offsets",
     (_MAXIMA, "packed.1"): "block_offsets",
     **{
@@ -1386,7 +1392,7 @@ class Stub:
         for rows, (step, _) in passes.items():
             if hasattr(step, "request_floors"):
                 split = np.maximum(step.request_positions, step.request_cached_until)
-                self.reach[rows or step.width] = split - step.request_floors
+                self.reach[rows or step.running_tokens] = split - step.request_floors
         # DeepSeek-V4's persistent HCA decode workspace, one per device: a slot
         # of `HCA_DECODE` named as one of its fields is a view of that field
         hca = sys.modules.get("atom.model_ops.v4_kernels.hca_persist")
@@ -1475,7 +1481,8 @@ class Stub:
                                 "cannot tell which ratio's compress plan holds its "
                                 f"{spec['shape'][-1]} rows: trace its shape again"
                             )
-                        top_k = op["op"] in (_TOPK, _MULTI, _PICK) and not index
+                        top_k = op["op"] in (_TOPK, _MULTI, _PICK, _ROUTED)
+                        top_k = top_k and not index
                         bound = V41_NAMES.get(key) == "step.visible.{ratio}"
                         if top_k and ratio is None and untold and bound:
                             raise ValueError(  # a row bound ATOM stages, its ratio's
@@ -2203,7 +2210,10 @@ class Stub:
                 got = rebuild_object(value["object"], build(path, value["state"], None))
                 cache = getattr(snap.attn_metadata, "cache", None)
                 geometry = getattr(cache, "geometry", None)
-                if value["object"] == RING and hasattr(geometry, "window_bytes"):
+                # A V4.1 pool places its BF16 window rings after its pages; an
+                # FP8 window's ring is on planes of its own, whatever the pages.
+                placed = hasattr(geometry, "window") and not geometry.window_fp8
+                if value["object"] == RING and placed:
                     at = _captured(geometry, op.get("rings", ()))
                     return _ring(geometry, cache.num_pages, got, at)
                 return got
@@ -3079,12 +3089,12 @@ def _widest(shape, stride) -> int:
 def _layers(geometry, captured) -> dict:
     """By page count, the layer of DeepSeek-V4.1's pool `geometry` whose window
     ring a pool of that many pages starts where `captured` (`RING`) does, and
-    its build (`V41PoolGeometry.window`, or `window_bytes` in bytes)."""
+    its build (`V41PoolGeometry.window`)."""
     found = {}
-    for build in (geometry.window, geometry.window_bytes)[: 1 + geometry.window_fp8]:
+    for build in (geometry.window,):
         first = build(0, 0)
         if dataclasses.replace(first, ring_start=captured.ring_start) != captured:
-            continue  # counted in the other unit
+            continue  # not this pool's ring
         # a layer's ring starts this far past the last's, on any pool
         step = build(min(1, geometry.layers - 1), 0).ring_start - first.ring_start
         for layer in range(geometry.layers):
@@ -5026,5 +5036,16 @@ def _child(fn, *args):
     """`fn(*args)` in a spawned process of its own: the device is free again
     at its end, and a capture's process-wide patches end with it."""
     spawn = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(1, mp_context=spawn) as child:
-        return child.submit(fn, *args).result()
+    # A script read on stdin (`python3 -`, as deploy.sh builds its run file) names itself `<stdin>`, a file spawn
+    # cannot re-import in the child (BrokenProcessPool); `fn` is imported by name, so the child needs no main module.
+    main = sys.modules["__main__"]
+    path = getattr(main, "__file__", None)
+    hidden = path is not None and not os.path.exists(path)
+    if hidden:
+        del main.__file__
+    try:
+        with ProcessPoolExecutor(1, mp_context=spawn) as child:
+            return child.submit(fn, *args).result()
+    finally:
+        if hidden:
+            main.__file__ = path

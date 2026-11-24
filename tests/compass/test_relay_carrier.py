@@ -14,7 +14,12 @@ import math
 import pytest
 from starlette.responses import JSONResponse
 
-from atom.compass.carriers import relay_stamp, with_relay_stamp
+from atom.compass.carriers import (
+    RELAY_SERVICE,
+    relay_service,
+    relay_stamp,
+    with_relay_stamp,
+)
 from atom.compass.clock import LpId, prefill_decode_table
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
@@ -164,3 +169,47 @@ class TestDecodeRequest:
     def test_a_malformed_entry_is_refused_by_name(self):
         with pytest.raises(ValueError, match="malformed compass kv_transfer_params"):
             relay_stamp(_decode_request(compass="a:1.5"))
+
+
+class TestRelayService:
+    """The seconds the relay serves a response on decode's API server loop:
+    prefill writes them beside its stamp, the router copies them with the rest
+    of ``kv_transfer_params`` and restamps only ``compass``."""
+
+    @pytest.mark.parametrize("service", [0.0, 1e-3, 0.1 + 0.2])
+    def test_the_service_written_beside_the_stamp_reads_back_exactly(self, service):
+        body = json.dumps(_response()).encode()
+        out = with_relay_stamp(body, lambda: (2.5, 3), service)
+        params = json.loads(out)["kv_transfer_params"]
+        assert params[RELAY_SERVICE] == service and relay_stamp(out) == (2.5, 3)
+        assert relay_service(out) == service
+        # The router restamps `compass` and keeps the field.
+        params["compass"] = "a:3.0;s:9"
+        decode = _decode_request(**params)
+        assert relay_service(decode) == service and relay_stamp(decode) == (3.0, 9)
+
+    def test_no_service_writes_no_field_and_reads_as_none_charged(self):
+        body = json.dumps(_response()).encode()
+        out = with_relay_stamp(body, lambda: (2.5, 3))
+        assert RELAY_SERVICE not in json.loads(out)["kv_transfer_params"]
+        assert relay_service(out) == 0.0
+        assert relay_service(_decode_request()) == 0.0
+        assert relay_service(b"not json") == 0.0
+
+    @pytest.mark.parametrize("value", ["1e-3", True, -1e-3, None])
+    def test_a_malformed_service_is_refused_by_name(self, value):
+        if value is None:  # null: no service stated
+            assert relay_service(_decode_request(compass_relay_s=None)) == 0.0
+            return
+        with pytest.raises(ValueError, match=RELAY_SERVICE):
+            relay_service(_decode_request(compass_relay_s=value))
+
+    @pytest.mark.parametrize("service", [-1e-3, math.inf, math.nan])
+    def test_a_service_that_is_no_seconds_is_refused_before_anything_is_stamped(
+        self, service
+    ):
+        def stamp():
+            raise AssertionError("stamped")
+
+        with pytest.raises(ValueError, match="relay service"):
+            with_relay_stamp(json.dumps(_response()).encode(), stamp, service)

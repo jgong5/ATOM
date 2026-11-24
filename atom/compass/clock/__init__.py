@@ -21,6 +21,7 @@ package, not inside it.
 """
 
 from .authority import (
+    ARRIVAL,
     NER,
     PARK,
     REPORT,
@@ -51,6 +52,7 @@ from .observability import (
 from .registry import LpRegistry
 
 __all__ = [
+    "ARRIVAL",
     "NER",
     "PARK",
     "REPORT",

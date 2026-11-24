@@ -26,6 +26,7 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int64, T
 
@@ -181,12 +182,33 @@ def _router_logits_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 @torch_compile_guard(gen_fake=_router_logits_fake, mutates_args=[])
 def router_logits(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """[T, 384] bf16 logits of ``x`` (``router_supported``)."""
+    """[T, 384] bf16 logits of ``x`` (``router_supported``).
+
+    Through the launcher's `CompiledFunction` (`_run_compiled`), as the mono
+    runner calls its own: called as a ``flyc.jit`` function, the launcher
+    traces the whole kernel again on every call before it looks for an
+    artifact: about 17 ms a call on MI355X, 0.7 s an eager forward of V4.1's
+    40 MoE layers (#3743). A width's first call still traces it, once a
+    process; `warm` makes all 16 at load."""
     out = torch.empty((x.shape[0], EXPERTS), dtype=torch.bfloat16, device=x.device)
-    _build(x.shape[0])(
+    _run_compiled(
+        _build(x.shape[0]),
         x.data_ptr(),
         weight.data_ptr(),
         out.data_ptr(),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return out
+
+
+def warm(weight: torch.Tensor) -> None:
+    """Compile every width's launcher (1 to `MAX_TOKENS` tokens) in this
+    process, on `weight`, the gate's [384, 5120] bf16 weight: a width first
+    met while serving would otherwise stall its forward, and under DP every
+    rank's with it, for its first-call trace. Nothing off a GPU."""
+    if weight.device.type != "cuda":
+        return
+    x = torch.zeros((MAX_TOKENS, HIDDEN), dtype=torch.bfloat16, device=weight.device)
+    for tokens in range(1, MAX_TOKENS + 1):
+        if router_supported(x[:tokens], weight):
+            router_logits(x[:tokens], weight)

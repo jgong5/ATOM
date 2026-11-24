@@ -26,7 +26,7 @@ from atom.compass.runner import projection
 from atom.compass.runner.overrides import NonAllocatingRunner
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils.forward_context import ForwardMode
-from atom.utils.tbo.ubatching import local_tbo_precompute
+from atom.utils.tbo.ubatching import prefill_tbo_vote
 
 #: The `ModelRunner` methods `prepare_model` runs up to and including `decide`.
 REAL = {
@@ -59,7 +59,7 @@ def _runner_classes():
         "logger": logging.getLogger("atom"),
         "ScheduledBatch": ScheduledBatch,
         "ForwardMode": StopAtDecide,
-        "local_tbo_precompute": local_tbo_precompute,
+        "prefill_tbo_vote": prefill_tbo_vote,
         "get_dp_group": lambda: sys.modules["aiter.dist.parallel_state"].get_dp_group(),
         "_profile_runner_stage": lambda method: method,
         "NonAllocatingRunner": NonAllocatingRunner,

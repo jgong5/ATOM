@@ -390,13 +390,21 @@ def _ragged(points: dict, read: list, seed) -> dict:
     engine = read[0][2]
     blocks = max(stated["num_kvcache_blocks"] for *_, stated in read)
     size, top = engine["kv_cache_block_size"], engine["max_model_len"]
+    block_drafter = (engine.get("speculative") or (None,))[0] == "dspark"
     sources, traces = [s for s, *_ in read], {t for x in lines for t in x["traces"]}
     out = {}
     for digest, point in sorted(points.items()):
         if _kind(point["view"]).startswith("decode"):
             rng = random.Random(f"{seed} {digest}")
             for view in ragged.compose(
-                point["view"], contexts, rng, blocks, size, top, engine["ladder"]
+                point["view"],
+                contexts,
+                rng,
+                blocks,
+                size,
+                top,
+                engine["ladder"],
+                block_drafter=block_drafter,
             ):
                 _add(out, view, "ragged", sources, traces)
     return out

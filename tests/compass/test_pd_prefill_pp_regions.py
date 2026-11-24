@@ -7,8 +7,9 @@ as `test_qwen3_pp_stages` builds a stage, on the simulated connector's config,
 and plans its pool with ATOM's `get_num_blocks`, as a simulated run does. Its
 runner then publishes what its connector prices, or refuses; its fake KV cache
 is allocated and ATOM's own `get_kv_transfer_tensors` is asked for the regions
-on Mooncake's config. Kimi-K3's regions refuse the stage; DeepSeek-V4-Pro's
-pool plan refuses it first; DeepSeek-R1-0528's MLA regions take it.
+on Mooncake's config. DeepSeek-V4-Pro's pool plan refuses the stage;
+DeepSeek-R1-0528's MLA regions take it, and so, since upstream b7b5ec3f2
+places a stage's MLA rows and KDA slots by layer, do Kimi-K3's.
 """
 
 import json
@@ -26,7 +27,7 @@ CONFIGS = {
 #: By model, what refuses its stage: ATOM's pool plan (``plan``), its
 #: builder's regions (``atom``), the simulated runner (``compass``).
 REFUSED = {
-    "kimi-k3": ["atom", "compass"],
+    "kimi-k3": [],
     "deepseek-v4-pro": ["plan"],
     "deepseek-r1-0528": [],
 }
@@ -76,15 +77,22 @@ recorder = forward._Recorder(config.compilation_config.static_forward_context, f
 driverless.on_wait = recorder.wait
 with forward._patches(recorder):
     runner = forward._build_runner(config, fake)
-    # This stage stands for every stage: its block count is their least, and
-    # there is no other stage to wait for.
-    dist.is_initialized = lambda: False
+    # This stage stands for every stage: its block count is their least, its
+    # state checkpoints' layout theirs, and there is no other stage to wait
+    # for. Its plan still runs under PP's initialized groups, as ATOM's
+    # PAGE-backed checkpoints require.
+    from atom.model_engine import model_runner as mr
+    agree = mr.agree_kv_budget
+    mr.agree_kv_budget = lambda free, budget, kept, groups: agree(free, budget, kept, ())
+    mr.kv_blocks_differ_across_ranks = lambda config: False
+    runner._agree_pipeline_checkpoint_spec = lambda spec: spec
     try:
         with fake, torch.inference_mode():
             runner.get_num_blocks()
     except RuntimeError as e:
         print(json.dumps({"plan": str(e)}))
         sys.exit()
+    dist.is_initialized = lambda: False
 refused = {}
 runner.compass_block_file = pathlib.Path(out)
 try:

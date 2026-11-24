@@ -3,13 +3,20 @@
 
 A request carries its ``(arrival, seq)`` as a ``compass`` entry of the W3C
 ``tracestate`` header, ``compass=a:<arrival>;s:<seq>``, written before any
-entries already there, as W3C Trace Context adds a new entry. A streamed response carries one comment line before
+entries already there, as W3C Trace Context adds a new entry. A request the
+traffic LP sends with a send-order seed adds its intake jitter, the bytes its
+body is read as if it were longer, ``compass=a:<arrival>;s:<seq>;j:<bytes>``
+(`compass_harness.traffic_lp`). A streamed response carries one comment line before
 each SSE event, ``: compass a=<arrival> s=<seq>``; SSE clients skip lines that
 start with a colon. Both pass a router that forwards headers and the stream
 unchanged. A prefill response the router relays to decode carries its stamp as
 the ``compass`` field of its ``kv_transfer_params``, ``a:<arrival>;s:<seq>``,
 which the router copies onto the decode request. The arrival is written as
-``repr(float)``, so it parses back exactly.
+``repr(float)``, so it parses back exactly. Beside it, ``compass_relay_s``
+holds the seconds the relay serves the response on decode's API server loop
+(`RELAY_SERVICE`, `atom.utils.compass_loop.HttpChannel`), where prefill's host
+entry prices a relay; the router restamps only ``compass`` and copies the rest
+of the object, so the seconds reach decode as prefill wrote them.
 
 A client's cancel of a request is itself a stamped request to the same URL,
 whose body names the cancelled request's seq: ``{"compass_cancel": <seq>}``.
@@ -21,13 +28,18 @@ A client's own records carry simulated time as aiperf's ns stamps, each the
 simulated seconds in ns plus `EPOCH_NS`.
 """
 
+import math
 import re
 from typing import Any
 
 import msgspec
 
 _NUM = r"(inf|\d[\d.e+-]*)"
+#: The ``kv_transfer_params`` field of a relayed response holding the seconds
+#: its relay serves it on decode's API server loop.
+RELAY_SERVICE = "compass_relay_s"
 _ENTRY = re.compile(rf"a:{_NUM};s:(\d+)")
+_TRACE_ENTRY = re.compile(rf"a:{_NUM};s:(\d+)(?:;j:{_NUM})?")
 _COMMENT = re.compile(rf": compass a={_NUM} s=(\d+)")
 _MAX_ENTRIES = 32
 #: Added to every simulated ns stamp a client records. Simulated time starts at
@@ -45,8 +57,8 @@ def _parse(pattern: re.Pattern, text: str, what: str) -> tuple[float, int]:
         ) from None
 
 
-def tracestate_stamp(header: str | None) -> tuple[float, int] | None:
-    """The ``(arrival, seq)`` of the ``compass`` entry in `header`; None without one."""
+def _tracestate_entry(header: str | None) -> str | None:
+    """The value of the ``compass`` entry in `header`; None without one."""
     found = [
         value
         for key, _, value in (
@@ -58,19 +70,44 @@ def tracestate_stamp(header: str | None) -> tuple[float, int] | None:
         return None
     if len(found) > 1:
         raise ValueError(f"tracestate {header!r} has more than one compass entry")
-    return _parse(_ENTRY, found[0], "tracestate entry")
+    return found[0]
 
 
-def tracestate_with(header: str | None, arrival: float, seq: int) -> str:
-    """`header` with the ``compass`` entry for ``(arrival, seq)`` first.
+def tracestate_stamp(header: str | None) -> tuple[float, int] | None:
+    """The ``(arrival, seq)`` of the ``compass`` entry in `header`; None without one."""
+    entry = _tracestate_entry(header)
+    return None if entry is None else _parse(_TRACE_ENTRY, entry, "tracestate entry")
+
+
+def tracestate_jitter(header: str | None) -> float:
+    """The intake jitter, in bytes, of the ``compass`` entry in `header`; 0.0
+    without one, or with an entry that names none."""
+    entry = _tracestate_entry(header)
+    if entry is None:
+        return 0.0
+    _parse(_TRACE_ENTRY, entry, "tracestate entry")
+    jitter = _TRACE_ENTRY.fullmatch(entry)[3]
+    return 0.0 if jitter is None else float(jitter)
+
+
+def tracestate_with(
+    header: str | None, arrival: float, seq: int, jitter: float | None = None
+) -> str:
+    """`header` with the ``compass`` entry for ``(arrival, seq)`` first, and
+    `jitter`, the request's intake jitter in bytes, in it when given.
 
     The other entries keep their order; empty ones are dropped, and so are
     entries from the end past W3C Trace Context's limit of 32.
     """
     if tracestate_stamp(header) is not None:
         raise ValueError(f"tracestate {header!r} already has a compass entry")
+    if jitter is not None and not (math.isfinite(jitter) and jitter >= 0):
+        raise ValueError(f"intake jitter {jitter!r} is no finite count of bytes >= 0")
+    entry = f"compass=a:{arrival!r};s:{seq}"
+    if jitter is not None:
+        entry += f";j:{float(jitter)!r}"
     others = [e.strip() for e in (header or "").split(",") if e.strip()]
-    return ",".join([f"compass=a:{arrival!r};s:{seq}", *others][:_MAX_ENTRIES])
+    return ",".join([entry, *others][:_MAX_ENTRIES])
 
 
 def stamp_events(text: str, rt) -> str:
@@ -106,6 +143,7 @@ def sse_stamp(line: str) -> tuple[float, int] | None:
 
 class _Params(msgspec.Struct):
     compass: Any = None
+    compass_relay_s: Any = None
 
 
 class _Relayed(msgspec.Struct):
@@ -131,10 +169,32 @@ def relay_stamp(body: bytes) -> tuple[float, int] | None:
     return None if value is None else _parse(_ENTRY, value, "kv_transfer_params entry")
 
 
-def with_relay_stamp(body: bytes, stamp) -> bytes:
-    """`body` with ``stamp()``'s ``(arrival, seq)`` in its ``kv_transfer_params``;
-    `body` itself, and `stamp` not called, when it has no such object. Every
-    other value keeps its JSON text."""
+def relay_service(body: bytes) -> float:
+    """The seconds a JSON request body's ``kv_transfer_params`` says its relay
+    serves it on the receiving loop (`RELAY_SERVICE`); 0.0 without one."""
+    try:
+        params = _STAMP.decode(body).kv_transfer_params
+    except msgspec.DecodeError:
+        return 0.0
+    value = None if params is None else params.compass_relay_s
+    if value is None:
+        return 0.0
+    # A JSON number, not a bool or a string of one.
+    seconds = value if type(value) in (int, float) else math.nan
+    if not (math.isfinite(seconds) and seconds >= 0):
+        raise ValueError(
+            f"malformed {RELAY_SERVICE} {value!r}; expected finite seconds >= 0"
+        )
+    return float(seconds)
+
+
+def with_relay_stamp(body: bytes, stamp, service_s: float | None = None) -> bytes:
+    """`body` with ``stamp()``'s ``(arrival, seq)`` in its ``kv_transfer_params``,
+    and with `service_s` there under `RELAY_SERVICE` when given; `body`
+    itself, and `stamp` not called, when it has no such object. Every other
+    value keeps its JSON text."""
+    if service_s is not None and not (math.isfinite(service_s) and service_s >= 0):
+        raise ValueError(f"relay service {service_s!r} is no finite seconds >= 0")
     try:
         doc = _MEMBERS.decode(body)
         params = _MEMBERS.decode(doc["kv_transfer_params"])
@@ -142,6 +202,8 @@ def with_relay_stamp(body: bytes, stamp) -> bytes:
         return body
     arrival, seq = stamp()
     params["compass"] = f"a:{arrival!r};s:{seq}"
+    if service_s is not None:
+        params[RELAY_SERVICE] = float(service_s)
     doc["kv_transfer_params"] = msgspec.Raw(_ENCODE.encode(params))
     return _ENCODE.encode(doc)
 

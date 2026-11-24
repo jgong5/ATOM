@@ -80,6 +80,7 @@ def _unwritten(blob):
         id=5,
         kv_transfer_params={**blob, "do_remote_prefill": True},
         block_table=[],
+        state_slot=-1,
         output_tokens=[],
         spec_token_ids=None,
         prefix_cache_hit_tokens=0,

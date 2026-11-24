@@ -29,10 +29,12 @@ from types import SimpleNamespace
 
 import pytest
 from test_dp_slice import _deployment
+from test_report_extrapolation import DP2, plant
 
 from atom.compass import run as compass_run
 from atom.compass.clock import ClientRun
 from atom.compass.clock_transport import connect
+from atom.compass.report import extrapolation
 from atom.model_engine.engine_stats import EngineStats
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
@@ -67,13 +69,17 @@ CLIENT_RUNS = (
 )
 
 
-def _serve(monkeypatch, out: Path, client_runs, served, stop=None) -> Path:
+def _serve(monkeypatch, out: Path, client_runs, served, stop=None, record=None) -> Path:
     """Serve one client run per entry of `served` on one server whose run file
     declares `client_runs`, None for ``null``; each client run sends one
     request, answered on the stream. With `stop`, a SIGTERM then stops the
     server: ``resigned``, once the last client run has ended, or ``bound``,
-    with its client still bound after its answer. Returns the out_dir."""
+    with its client still bound after its answer. `record`, given, first
+    writes in the out_dir what the run's engines would, their step record.
+    Returns the out_dir."""
     out.mkdir()
+    if record is not None:
+        record(out)
     run = {
         "admission_s": 0.54e-3,
         "ipc_s": 2.0**-10,
@@ -210,6 +216,42 @@ def test_a_later_client_run_s_summary_is_a_fresh_server_s(
         assert later[key] == fresh[key], key
     span = later["client_run"]["end"] - later["client_run"]["start"]
     assert span == pytest.approx(fresh["cost"]["simulated_seconds"], rel=0, abs=1e-12)
+
+
+def test_each_client_run_s_summary_reads_the_extrapolation_of_its_own_span(
+    monkeypatch, tmp_path
+):
+    """The record's group steps enter from the server's start to past every
+    client run's end, so each client run's summary counts those entering in
+    its span, the first holding the one at 0, and the run summary all of
+    them."""
+    times = [0.0, 2.0**-12, 2.0**-9, 2.0**-6, 2.0**-3, 1.0, 8.0, 64.0, 1e4]
+    steps = tuple(DP2[k % len(DP2)] for k in range(len(times)))
+    steps = tuple(
+        tuple(rank[:1] + (t,) + rank[2:] for rank in group)
+        for group, t in zip(steps, times)
+    )
+    out = _serve(
+        monkeypatch,
+        tmp_path / "server",
+        2,
+        CLIENT_RUNS,
+        record=lambda out: plant(out / "steps", steps),
+    )
+
+    whole = _read(out / compass_run.SUMMARY_FILE)["schedule"][extrapolation.FIELD]
+    assert whole == extrapolation.of_run(out)
+    counted = []
+    for k in (0, 1):
+        summary = _read(out / f"client-{k}" / compass_run.SUMMARY_FILE)
+        span = summary["client_run"]["start"], summary["client_run"]["end"]
+        print(f"\nclient run {k}: {span}")
+        mine = summary["schedule"][extrapolation.FIELD]
+        assert mine == extrapolation.of_run(out, span)
+        assert summary["schedule"][extrapolation.REFUSED] is None
+        counted.append(mine["critical_rank"]["steps"])
+    assert counted[0] >= 1
+    assert sum(counted) < whole["critical_rank"]["steps"] == len(times)
 
 
 def test_client_runs_is_a_positive_count_or_null(monkeypatch, tmp_path):

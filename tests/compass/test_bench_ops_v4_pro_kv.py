@@ -195,20 +195,20 @@ def test_the_prefill_top_k_translate_writes_the_csa_list_atom_passes(
 
 @pytest.fixture(scope="module")
 def rehearsed_prefill_tbo(rehearsals):
-    """`rehearsed_prefill` under --enable-tbo, whose input preparation builds
-    each KV token's batch id."""
+    """`rehearsed_prefill` under --enable-tbo."""
     return rehearsals["v4pro_prefill_tbo"].result()
 
 
-def test_a_cached_prefill_repeats_gathers_and_writes_on_what_atom_passes(
+def test_a_cached_prefill_gathers_and_writes_on_what_atom_passes(
     rehearsed_prefill_tbo,
 ):
-    """Past cached tokens, the batch-id build repeats ATOM's context lengths,
-    widened as it widens them, and the FP8 indexer's row starts gather at
-    ATOM's batch ids, each reaching its launch; each window write takes ATOM's
-    state slots, plane rows past the slot count the harness bounds them by."""
+    """Past cached tokens, the FP8 indexer's row starts gather at ATOM's batch
+    ids, reaching its launch; each window write takes ATOM's state slots,
+    plane rows past the slot count the harness bounds them by. The capture
+    caches nothing, and since upstream b7b5ec3f2 ATOM builds each KV token's
+    batch id only past cached tokens, under TBO too: its graph holds no
+    batch-id build."""
     taken = {
-        "aten.repeat_interleave.self_Tensor": ("bound", "repeats", "context_lens.long"),
         "aten.index.Tensor": ("identity", "indices.0", "md.batch_id_per_q_token+0"),
         SWA: ("identity", "state_slot_per_seq", "md.state_slot_out+0"),
     }
