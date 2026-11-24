@@ -970,7 +970,7 @@ th:first-child, td:first-child { text-align: left; }
 td.lbl { text-align: left; }
 tr.sel td:not(.err) { background: var(--hover); font-weight: 650; }
 #matrix th { white-space: normal; vertical-align: bottom; line-height: 1.2; min-width: 62px; max-width: 96px; }
-#matrix th:nth-child(-n+2) { max-width: none; }
+#matrix th.key { max-width: none; }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover td:not(.err) { background: var(--hover); }
 tr.clickable:hover td.err { box-shadow: inset 0 1px 0 var(--ink2), inset 0 -1px 0 var(--ink2); }
@@ -1268,7 +1268,9 @@ function drawMatrix() {
       STAT_LABEL[st.stat] + " (switch above). Running, waiting and KV are sampled state and ignore the statistic. Hover a cell for both values."
     : "Each cell: one_real.py's per-request metric over each run's graded requests (the issues' figures). The statistic switch does not apply.";
   $("mTitle").textContent = "Error by concurrency and metric, (sim − real) / real · " + groupName(groupOf(st.ci));
-  let h = "<thead><tr><th>c</th><th>simulated run</th>";
+  // The run column names a row's simulated run; with one per cell it says nothing.
+  const runCol = groupCells.some((c) => c.runs.length > 2);
+  let h = '<thead><tr><th class="key">c</th>' + (runCol ? '<th class="key">simulated run</th>' : "");
   for (const col of cols) h += "<th>" + esc(col.label) + (panelMode && !col.sub ? ' <span class="tag">' + STAT_LABEL[st.stat] + "</span>" : "") + "</th>";
   h += "</tr></thead><tbody>";
   groupOf(st.ci).cells.forEach((ci) => {
@@ -1277,7 +1279,7 @@ function drawMatrix() {
     sims.forEach((run, si) => {
       h += '<tr class="clickable' + (ci === st.ci ? " sel" : "") + '" data-ci="' + ci + '">';
       if (si === 0) h += '<td rowspan="' + sims.length + '"><b>' + cell.c + "</b></td>";
-      h += '<td class="lbl">' + lineSample(si + 1, true) + " " + esc(run.label) + "</td>";
+      if (runCol) h += '<td class="lbl">' + lineSample(si + 1, true) + " " + esc(run.label) + "</td>";
       for (const col of cols) {
         let e = null, title = "", tag = "";
         if (panelMode) {
