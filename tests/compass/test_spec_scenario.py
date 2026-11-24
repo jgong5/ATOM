@@ -15,6 +15,7 @@ DSpark; no weight is read. The rest run anywhere.
 """
 
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -62,7 +63,8 @@ MACHINES = Path(__file__).parent / "machines"
 #: record on hjbog-srdc-39, an MI308X node (tokenizer.jsonl:90140d7c474d); this
 #: branch's copy of that file predates the fit. Its fingerprint stays Qwen3.8's
 #: tokenizer.json, the file the timed calls loaded (`05`), so the MTP run warns
-#: `FingerprintMismatch`, naming it and `QWEN3_5_JSON`.
+#: `FingerprintMismatch`, naming it and the served model's tokenizer.json
+#: (`served_fingerprint`; sha256:5f9e4d49... in the 0.8B snapshot on g08).
 QWEN3_8_TOKENIZER = {
     "backend": "fast",
     "fingerprint": "sha256:"
@@ -70,8 +72,6 @@ QWEN3_8_TOKENIZER = {
     "encode": {"fixed_s": 0.0018664796139258922, "tokens_per_s": 668474.2547418053},
     "decode": {"fixed_s": 1.1371071666609296e-05, "tokens_per_s": 887576.7512085318},
 }
-#: Qwen3.5's tokenizer.json, the 0.8B and 9B snapshots' on g08.
-QWEN3_5_JSON = "sha256:5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
 #: Each method's machine under the step roofline, and its run file's more keys.
 ROOFLINE = {
     "mtp": ("mi308x-hjbog18.json", {"host": {"tokenizer": QWEN3_8_TOKENIZER}}),
@@ -141,6 +141,13 @@ def roofline(request, tmp_path_factory):
         ]
 
 
+def served_fingerprint(method: str) -> str:
+    """``sha256:<hex>`` of the tokenizer.json in `method`'s served model
+    directory, as `run._fingerprint` hashes the one the server loads."""
+    served = Path(os.environ[METHODS[method][0]]) / "tokenizer.json"
+    return "sha256:" + hashlib.sha256(served.read_bytes()).hexdigest()
+
+
 def verify_prices(record: Path) -> list[tuple[float, float, list[str]]]:
     """Each verify step's target and draft price and draft terms, from DP rank
     0's cost lines in the step record `record` (`_group_step_seconds`): a
@@ -182,12 +189,13 @@ def test_a_speculative_run_meets_every_scenario_check_under_the_step_roofline(
         f"mean draft {draft!r} s a step"
     )
     if term := ROOFLINE[method][1].get("host", {}).get("tokenizer"):
+        loaded = served_fingerprint(method)
         for run in runs:
             log = (run["out"] / "server.log").read_text().splitlines()
             warned = [line for line in log if FingerprintMismatch.__name__ in line]
             print("\n".join(warned))
             assert any(
-                term["fingerprint"] in line and QWEN3_5_JSON in line for line in warned
+                term["fingerprint"] in line and loaded in line for line in warned
             ), warned
 
 
