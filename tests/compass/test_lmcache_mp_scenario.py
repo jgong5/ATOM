@@ -37,6 +37,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import pytest
+from capabilities import capability
 from test_lmcache_lp import lmcache_port  # noqa: F401  the lmcache_port fixture
 from test_lmcache_mp_engine import on_cards
 from test_parity_record import _config as _parity_config
@@ -390,6 +391,7 @@ def _meet_every_check_and_load_the_prefix_back(seeds: list, dp: int) -> None:
 
 
 @NEEDS_A_RUN
+@capability("lmcache_mp")
 def test_each_run_meets_every_scenario_check_and_loads_the_prefix_back(runs):
     _meet_every_check_and_load_the_prefix_back(runs[1], runs[0])
 
@@ -415,6 +417,7 @@ def _decisions(run: dict) -> dict[str, float]:
     return {key: _last(run["out"], family)[""] for key, family in families.items()}
 
 
+@capability("lmcache_mp")
 def test_share_cache_runs_meet_every_scenario_check_and_place_a_hit(
     share_cache_runs,
 ):
@@ -428,6 +431,7 @@ def test_share_cache_runs_meet_every_scenario_check_and_place_a_hit(
         assert decisions["share_cache_hit_total"] > 0, decisions
 
 
+@capability("lmcache_mp")
 def test_named_runs_meet_every_scenario_check_and_keep_each_request_on_its_rank(
     named_runs,
 ):
