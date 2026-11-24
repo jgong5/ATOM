@@ -127,6 +127,13 @@ real-run command. Copy its server command into blocks by these rules.
 - **An LMCache server's command** (`lmcache server ...`) goes into the block's
   `lmcache_server`, each flag written as an argument is, but `--host` and
   `--port`: `compass advice` gives each point its own server address.
+- **A Mooncake Store**, on a configuration whose prefill offloads to one
+  (`ATOM_KV_OFFLOAD=mooncake_store`), is the block's `mooncake_store`: the
+  absolute path of the file holding the `mooncake_store` entry that `compass run
+  --mooncake-store` takes, with the master's flags, the owners' bytes and the
+  laws pricing the Store's lookups and copies. Every point of the candidate runs
+  with that file, each deployment starting its own Store at a port it draws, so
+  the block gives the Store no address.
 - **Every other argument and variable** of the server command is kept as the
   recipe gives it; only the next two sections take any out or change one.
 
@@ -156,11 +163,15 @@ Some things a recipe sets are no instance's and take no departure: the rest of
 the router's command (`deploy.sh` starts it, with `compass advice`'s flags), the
 client's with its `AIPERF_*` variables (`client.sh` runs it from `workload`), a
 variable ATOM does not read that the recipe sets only to build another value, as
-`NODE_IP` builds `ATOM_HOST_IP` and `--kv-transfer-config`, and the Mooncake
-variables the README's 1P1D deployment gives a real side. Keep each other
-variable the recipe gives the server for LMCache, such as `ATOM_KV_OFFLOAD`, as
-it gives it, and any key of `ATOM_KV_OFFLOAD_EXTRA_CONFIG` but
-`lmcache.mp.host` and `lmcache.mp.port`.
+`NODE_IP` builds `ATOM_HOST_IP` and `--kv-transfer-config`, the Mooncake
+variables the README's 1P1D deployment gives a real side, and the commands that
+start a Mooncake Store's master and owners (the entry holds their flags). Keep
+each other variable the recipe gives the server for LMCache, such as
+`ATOM_KV_OFFLOAD`, as it gives it, and any key of `ATOM_KV_OFFLOAD_EXTRA_CONFIG`
+but `lmcache.mp.host` and `lmcache.mp.port`. Keep the variables the recipe gives
+a side for a Mooncake Store, `ATOM_KV_OFFLOAD` and its
+`ATOM_KV_OFFLOAD_EXTRA_CONFIG`, as it gives them: a start refuses a protocol,
+chunk size or pool size there other than the entry's.
 
 ### What the user decides
 
@@ -443,4 +454,5 @@ An agent that runs this guide for a user keeps these rules:
 | `before it runs, set AIPERF_PYTHON` under a printed command | the shell that ran the search did not set it | set it in the shell that starts the calibration |
 | a candidate `refused` with `ATOM's parser: unrecognized arguments: ...` | a flag ATOM does not have, such as a misspelt one | correct the space file |
 | a candidate `refused` with `--server-port ... is among ATOM's arguments; the driver owns it` | an argument `compass run` assigns, `--host` or a port | leave it out, as What a space file leaves out says |
+| a candidate `refused` with `this deployment offloads KV to a Mooncake Store and the run file has no mooncake_store entry` | its prefill offloads to a Mooncake Store and no block of it names the entry | the entry's path in its block's `mooncake_store` (step 1) |
 | a calibrated candidate still `missing a law` | its calibration failed, or it published into a store holding no platform readings, at another stack than the committed copy's or on a machine with none | its `calibration:` line; resume it, or take its store's `measure device` and `fit device` (step 3) |

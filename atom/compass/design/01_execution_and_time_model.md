@@ -24,6 +24,10 @@ publish, and its transfer channels are one per DP rank, so no run file states ei
 master LP `mooncake_store`, each rank's copies priced on its own lanes, on `dsv41/dev`;
 its renewal waits as D6.1's blocking lookup does, with D6.1's park in a DP group.
 
+**Revised 2026-11-20 by [#3767](https://github.com/jgong5/ATOM/issues/3767)'s landed variant
+(b), as the owner's ruling on [#3804](https://github.com/jgong5/ATOM/issues/3804) directs:**
+D3 grants a TAR an arrival on an offering channel first, and I4 lets a handler offer a send.
+
 **Revised 2026-11-24 by [#3799](https://github.com/jgong5/ATOM/issues/3799):** D6.2's LP
 answers a put of a key in flight as Mooncake does; the allocator flags are accepted, not
 modelled.
@@ -478,6 +482,11 @@ frames. The CA completes each round of the LP only when every member has asked i
    local grants; a lone call only ships its send log.
 
 With `lmcache_mp` above DP width 1, a park request amends rules 1, 2 and 5 (D6.1).
+A message on an offering channel (Grant rule, below) amends rules 1 and 5: in a TAR
+round only the member it is for takes the grant at its arrival and asks its round again,
+the others staying in the round, their replies held for its grant; a member whose call
+named later rounds gets its reply at that grant, a parked member leaves its park there
+and parks again, and no round is granted ahead past such a message (#3767).
 
 Every member's step end is a round, and so is every member's input pull (owner ruling
 2026-10-15, #988; revised 2026-10-16, #1267, and 2026-10-18, #1345).
@@ -544,7 +553,7 @@ services:
 
 | LP call | PDES term | Meaning |
 |---|---|---|
-| `advance_to(T)` | TAR (time advance request) | the owner prices an event of duration `d` (a forward) and asks for `T = now + d`; the grant is exactly `T` |
+| `advance_to(T)` | TAR (time advance request) | the owner prices an event of duration `d` (a forward) and asks for `T = now + d`; the grant is `T`, or first an earlier arrival on one of its offering channels (Grant rule) |
 | `next_event(t, t_daemon)` | NER (next event request) | the owner is idle; `t` is its next essential event and `t_daemon` its next daemon deadline, each or `+inf`; the grant is `min(t, t_daemon, earliest undelivered arrival)`, a daemon deadline held until it is at most the essential horizon `H` (Invariants, below); a one-argument `next_event(t)` means `t_daemon = +inf` |
 | grant reply | TAG (time advance grant) | carries `G` and the `(channel, seq)` set it releases |
 
@@ -563,7 +572,8 @@ over any channel path from *j* to *i*.
 
 ```
 N[j] = now[j]                                                     j running
-     = T_j                                                        j waiting in TAR(T_j)
+     = min(T_j, earliest undelivered arrival into j on an         j waiting in TAR(T_j)
+           offering channel)
      = min(t_j, t_daemon_j, earliest undelivered arrival into j)  j waiting in NER(t_j, t_daemon_j)
 
 LBTS(i) = min over j != i of ( N[j] + D(j->i) )
@@ -577,10 +587,26 @@ PDES term: Ayani's distance-between-objects LBTS (Fujimoto, ch. 3). Each part ma
   any moment from `now[j]` on. With `next[j]`, LP A can be behind LP B (A had the minimum,
   B ran ahead earlier), and an event A generates at `A.now + 0` lands in `[A.now, B.now)`
   — B's past.
-- **An LP waiting in TAR contributes its target.** Its owner is inside the CA call and
-  produces nothing (I1, below); messages released to it meanwhile are handled by receiver
-  and handler threads, which send nothing across LPs (I4). With `now[j]` instead, two LPs
-  in TAR whose targets cross would wait on each other for ever under the strict rule.
+- **An LP waiting in TAR contributes its target, or an earlier arrival on an offering
+  channel.** Its owner is inside the CA call and produces nothing (I1, below). A message
+  released to it meanwhile is handled by a receiver or handler thread, which sends nothing
+  across LPs itself; on an *offering* channel the handler may offer a send, which the owner
+  makes at that message's arrival (I4). So a TAR holding such an arrival before its target
+  is granted that arrival first, `G = N[i]` short of `T`, and its owner makes the offered
+  sends and asks for `T` again. The step table records that grant as `ARRIVAL`, which
+  `detect/scenario.py::_rows` reads with the TAR it splits as one row; an own step under
+  local grants makes the same sends with no such grant (*Local grants*, below). With
+  `now[j]` instead, two LPs in TAR whose targets cross would wait on each other for ever
+  under the strict rule. The channel table marks the offering channels
+  (`ChannelTable.mark_offering`), alike in the authority's process and each engine's: each
+  `mooncake_store` engine's `request#dpN` (D6.2), and with `OFFLOAD_MP_LOOKUP_THREAD` an
+  `lmcache_mp` engine's `request#dpN` and lookup replies (`channels.py::add_lmcache`). Not
+  chosen ([#3767](https://github.com/jgong5/ATOM/issues/3767#issuecomment-7037825830)):
+  holding the LP's output bound at the arrival until its owner's next call reports, which
+  refuses as a cyclic wait a lookup reply held for a parked DP member while another member
+  waits on the server; and stamping at the releasing grant's clock, a send up to one
+  forward late, which [the ruling](https://github.com/jgong5/ATOM/issues/3767#issuecomment-7027191204)
+  rejected.
 - **Distance, not direct neighbours.** In a 1P+1D run, with illustrative lookaheads
   `L(traffic->frontend-P:http) = 0.1` and `L(frontend-P->frontend-D:relay) = 0.5`:
   traffic is running at 9.0, and frontend-P, engine-P and engine-D are idle with `t = inf`
@@ -670,6 +696,17 @@ NER may ask for its messages ahead: every message registered for it below the ce
 with the grant, and the owner releases each in the step that reaches it. A step outside
 the LP's clock and ceiling, or past a message registered for it since, aborts the run.
 
+The step table and the grant counts part from a run without local grants in one case
+(#3767). An own TAR step that walks an arrival on an offering channel sent ahead to it
+makes the sends its handler offers at that arrival, as the owner does under the
+`ARRIVAL` grant (Grant rule), but reports one step, which the CA replays as one `TAR`
+grant (`LPRuntime._own_step`, `ClockAuthority._replay`): one row and one grant where the
+run without them has an `ARRIVAL` and a `TAR`. The sends, their stamps and what
+`detect/scenario.py::_rows` reads, as it joins an `ARRIVAL` to the TAR it splits, are
+the same. Not chosen: the own step splitting at the arrival and reporting an `ARRIVAL`
+step, which `_replay` would take short of its target: the step table would match byte
+for byte, for a split `_rows` joins again.
+
 A DP group's LP gets its ceiling at a grant at which some members return while others
 still ask later rounds (#2993): the least of `LBTS(i)`, `G` plus the LP's shortest cycle,
 and the bound. The CA grants each later round below it at once, each its own grant, the
@@ -733,9 +770,16 @@ The grant rule relies on these invariants inside each LP:
   lexically inside a `with ...lock` block.
 - **I3** One sending thread per channel (a ZMQ socket is not thread-safe either).
 - **I4** Receiver and handler threads produce no cross-LP message; only the clock owner
-  does, directly or by registering on a `RelayQueue`. Checked: the engine input thread,
-  the frontend output thread, `_recv_prefill_done` and `_recv_block_assignments` send
-  nothing inside the simulation window, and the simulated KV connector sends only from
+  does, directly or by registering on a `RelayQueue`. A handler, or a thread it wakes,
+  that would send *offers* the send instead (`atom/utils/clock.py::LPRuntime.offer`): the
+  owner makes it once that handler is back at its wait point, stamped at the arrival of
+  the message it was given, before it releases the next; any other offer, at the owner's
+  next clock call. Checked: the frontend output thread, `_recv_prefill_done` and
+  `_recv_block_assignments` send nothing inside the simulation window; the engine input
+  thread sends nothing, and offers an arrival's tier lookup
+  (`EngineCore._offer_tier_lookups`: D6.2, and `lmcache_mp` under
+  `OFFLOAD_MP_LOOKUP_THREAD`, whose lookup driver's passes are offers too,
+  `kv/lmcache_mp.py::_OwnedDriver`); and the simulated KV connector sends only from
   scheduler-side hooks on the step loop (D6).
 
 #### Client runs: termination in a federation open to clients
@@ -2295,7 +2339,8 @@ A *park* request amends rules 1, 2 and 5, at DP width above 1 with `lmcache_mp` 
 
 - **The park.** Each member's last CA call before it dispatches a forward (real or the
   DP dummy) is a park, which ships its send log. A parked member stops regulating time
-  until the group's collective completes, since it sends nothing before then: until
+  until the group's collective completes, since it sends nothing before then but what a
+  message on an offering channel brings (below): until
   every member is parked, its park stands in every round as NER with `t` and
   `t_daemon` at `+inf`.
 - **Rule 1.** A park is one call however many rounds it stands in, so the NER calls a
@@ -2311,7 +2356,10 @@ A *park* request amends rules 1, 2 and 5, at DP width above 1 with `lmcache_mp` 
   the waiting member's `now` after the reply, so its forward starts when the late
   member dispatches, and #988's step-end rounds keep one base (rule 2's equal `T`).
 
-A parked member's call takes no reply until the release. The authority holds what a
+A parked member's call takes no reply until the release, or until a grant releases it a
+message on an offering channel (D3): it then walks what was held for it, makes the sends
+its handlers offered, and parks again (D6.2's *A stale hit renewed inside a DP group*
+walks it). The authority holds what a
 round releases on its channels; at the release the member walks those messages inside
 its park call, its clock at each one's arrival in turn, then leaves at the group's
 time. Its clock therefore moves only inside its own call, and the step table records
@@ -2704,7 +2752,7 @@ master still held the objects then is what the get would have asked it.
 
 | Site | Class | Under Compass |
 |---|---|---|
-| `EngineCore._offer_tier_lookups` -> `offer_lookups` -> `AsyncStoreLookup.submit_if`, on the engine's input thread, on every arrival (no flag gates the Store's `offer_lookups`) | K4 from a handler | the shell queues the send; the owner stamps it at the message's arrival once the handler is back at its wait point, before releasing the next message: [#3767](https://github.com/jgong5/ATOM/issues/3767)'s send (*Scenarios*); `atom/utils/clock.py::RelayQueue`: "Only the clock owner puts in the run" |
+| `EngineCore._offer_tier_lookups` -> `offer_lookups` -> `AsyncStoreLookup.submit_if`, on the engine's input thread, on every arrival (no flag gates the Store's `offer_lookups`) | K4 from a handler | the shell offers the send (`StoreShell._send_lookup`); the owner makes it at the ADD's arrival once the input thread is back at its wait point, before releasing the next message (D3, I4); the engine's request channels are offering (`clock/channels.py::add_mooncake_store`), so inside a forward's TAR that arrival is granted first: [#3767](https://github.com/jgong5/ATOM/issues/3767)'s (b) (*Scenarios*) |
 | `prefetch_lookups`, `detach_lookup`, `_fresh_tier_lookup` through `AsyncStoreLookup.lookup` | K4 | sent at the submit |
 | a query's future: `pump`, `is_pending`, `poll`, `answered`, `lookup` | K5 | released replies taken at the poll |
 | `AsyncStoreLookup.renew`'s `future.result(timeout=RENEW_TIMEOUT_S)` | K3 | idle point; the park in a DP group |
@@ -2839,6 +2887,15 @@ dp0's build_connector_meta dispatches a load whose lookup is 1.4 s old:
   wait: next_event(+inf, now + 1 s), NER alone             behind its call in flight;
 dp1 parks before its forward                               leases to t_c + ttl
                                                          reply at t_c
+an ADD for dp1 on request#dp1, an offering channel,
+arrives at a < t_c + r: the round of dp0's NER and
+dp1's park is granted a
+  dp0: no reply yet; asks the same NER again
+  dp1 leaves its park at a, releasing the ADD; its
+  input thread offers query{chunks}; dp1 makes it,
+  stamped at a, ---------------------------------------> lookup#dp1, at a+r; dp1 takes
+  and parks again, the query in its send log               the reply at a poll after
+                                                           the release
 grant reaches t_c + r: reply released <-----------------
 dp0: renew returns; load queued on a load lane; parks
 release: both leave at dp0's now; the forwards run
@@ -2875,27 +2932,34 @@ compass run --mooncake-store ENTRY ..., record 3a's workload and flags
        seconds, each within records 3a and 3b's spread
 ```
 
-**An arrival's lookup offered from the input thread** (#3767's send). `a` is the ADD's
-arrival at `engine-P0`, `r` is `store_rpc_s`:
+**An arrival's lookup offered from the input thread** (#3767's (b)). `a` is the ADD's
+arrival at `engine-P0`, inside a forward's TAR to `T`; `r` is `store_rpc_s`:
 
 ```text
 engine-P0 input thread          engine-P0 step loop (clock owner)      LP mooncake_store
-                                in a forward's advance_to or at its
-                                idle point, a grant releases ADD at a;
+                                advance_to(T), a forward; the ADD on
+                                request#dp0, an offering channel,
+                                arrives at a < T: the CA grants a
+                                (ARRIVAL), releasing the ADD;
                                 waits for the input thread
 input_queue.put_nowait(reqs)
 _offer_tier_lookups -> offer_lookups
   -> submit_if: WAITING holds;
-  the shell queues query{seq}
-back at its wait point -------> handled: stamp the queued send at a,
+  the shell offers query{seq}
+back at its wait point -------> makes the offer, stamped at a:
                                 arrival a+r, before the next release
                                 query{chunks 0-3} -------------------> lookup#dp0, at a+r
-                                                                       slot free; station
+                                asks TAR(T) again, the send logged     slot free; station
                                                                        reply at v, start a+r
                                 next poll at v+r or later: <---------
                                 _StoreLookup.lookup over the reply;
                                 asked_at = a
 ```
+
+At an idle point the grant is `a` itself and no TAR is asked again. In a DP group only
+dp0, the member the ADD is for, takes the grant at `a` and asks again; dp1 stays in the
+round. A parked member given the ADD leaves its park at `a` and parks again (*A stale hit
+renewed inside a DP group*).
 
 **The C1228 run** (the named result):
 
@@ -2929,16 +2993,18 @@ None.
 ### Dependencies
 
 No spike. No sync issue: the code lands on `dsv41/dev`, which carries what the Store
-needs. The code tasks depend on [#3767](https://github.com/jgong5/ATOM/issues/3767) (a
-handler's send stamped by the owner; refusing `lmcache_mp`'s `OFFLOAD_MP_LOOKUP_THREAD`
-would not serve the Store, whose offers no flag gates),
-[#2665](https://github.com/jgong5/ATOM/issues/2665) (xPyD priced end to end),
-[#3417](https://github.com/jgong5/ATOM/issues/3417) (which command writes the offload
-entry), [#3505](https://github.com/jgong5/ATOM/issues/3505) (a copy's overlap with
-forwards, which [#3606](https://github.com/jgong5/ATOM/issues/3606) measures), and the P and
-D step laws of calibration item 2. [#3759](https://github.com/jgong5/ATOM/issues/3759)
-closed with `share_cache` in a simulated DP2 run over `lmcache_mp`, and #3769 runs several
-instances through `deploy.sh`, both on `dsv41/dev`.
+needs. [The plan](https://github.com/jgong5/ATOM/issues/3762#issuecomment-7017567733) cuts
+the code into #3800 to #3809. [#3767](https://github.com/jgong5/ATOM/issues/3767), landed
+as (b) (D3's grant rule and I4), gates the shell, #3805, and the P and D step laws of
+calibration item 2 (#3807) gate the validation and the C1228 run.
+[#2665](https://github.com/jgong5/ATOM/issues/2665),
+[#3417](https://github.com/jgong5/ATOM/issues/3417) and
+[#3505](https://github.com/jgong5/ATOM/issues/3505) gate no code task: the C1228 run goes
+through `deploy.sh`, which #3769 made run several instances, not through #2665's xPyD
+pricing; `fit_offload` needs no command #3417 names (code task 4); and the lanes take
+#3505's overlap rule only once it is ruled (*Saves*).
+[#3759](https://github.com/jgong5/ATOM/issues/3759) closed with `share_cache` in a
+simulated DP2 run over `lmcache_mp`, on `dsv41/dev`.
 
 ### Summary
 
@@ -2962,7 +3028,8 @@ marker, contention at the owners, fragmentation. Code tasks, after this text lan
    above in `mooncake_store/scheduler.py`, `async_lookup.py` and `chunked_scheduler.py`),
    about 330. Built from `NonAllocatingRunner.allocate_kv_cache` and
    `run/__init__.py::engine`, as `lmcache_offload`'s is.
-3. **The input thread's offers**: #3767, whose brief requires the owner-stamped send.
+3. **The input thread's offers**: #3767, landed as (b): the owner-stamped send and the
+   TAR granted an offering arrival first (D3).
 4. **`fit_offload` reads the Store's lines**, about 60, recorded lines its test; reached
    from `step_linear_fit.py::offload_main` until #3417 names its command.
 5. **Scenario under the step stub** [GPU gate]: two prefill instances at DP2 and one
@@ -3408,7 +3475,7 @@ Ordered by how much they could cost.
 | D0 | Fresh design; prior branches referenced at the design level only, not as a code-port plan | 2026-09-17 |
 | D1 | Keep ATOM's multi-process / multi-thread topology; additive changes only | 2026-09-17 |
 | D2 | "Two nodes" means true PD disaggregation, realised as two containers on one physical node | 2026-09-17 |
-| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP a round only after every rank has asked it or, under local grants below a ceiling, owes it; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares | 2026-09-18; revised 2026-09-28, 2026-10-02, 2026-10-14 (#966), 2026-11-08 (#2820) and 2026-11-09 (#2993) |
+| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP a round only after every rank has asked it or, under local grants below a ceiling, owes it; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a TAR holding an arrival on an offering channel is granted that arrival first, so the clock owner makes the send a handler offered at its message's arrival; a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares | 2026-09-18; revised 2026-09-28, 2026-10-02, 2026-10-14 (#966), 2026-11-08 (#2820), 2026-11-09 (#2993) and 2026-11-20 (#3767) |
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
 | D3.2 | Always-on causality detectors: a straggler check against the receiver's last drain (fails the run); a stall the CA cannot see prints one diagnostic after 30 wall seconds and keeps waiting, never aborting; clock-source CI lint | 2026-09-19; revised 2026-09-28 |
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for multi-container runs (1P+1D in M1 and M2) | 2026-09-19 |

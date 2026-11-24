@@ -116,7 +116,9 @@ essential work is left, and the last one's end finishes the run),
 ``local_grants`` (optional, ``true``, the default, or ``false``: with ``true``
 the authority gives each grant a ceiling, below which the LP answers its own
 clock calls and reports them with its next one, a DP member at its settle,
-`ClockAuthority`; the step table is the same),
+`ClockAuthority`; the sends are the same, and so is the step table but for an
+own step walking an arrival on an offering channel: one ``TAR`` row where a
+run with ``false`` records ``ARRIVAL`` and ``TAR``),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
