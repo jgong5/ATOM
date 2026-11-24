@@ -46,10 +46,12 @@ def _worker_method(cmd):
     handler = getattr(EngineUtilityHandler, EngineUtilityHandler._UTILITY_HANDLERS[cmd])
     tree = ast.parse(textwrap.dedent(inspect.getsource(handler)))
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    # A name is a literal, or a module constant (`RECEIVE_WEIGHTS_RDMA_CMD`).
     names = [
-        n.args[NAME_ARG[n.func.attr]].value
+        getattr(arg, "value", None) or handler.__globals__[arg.id]
         for n in calls
         if getattr(n.func, "attr", None) in NAME_ARG and _waits(n)
+        for arg in [n.args[NAME_ARG[n.func.attr]]]
     ]
     # The discard helper sends its one method by constant rather than literal.
     names += [
@@ -89,7 +91,7 @@ class Worker:
         func = getattr(self.runner, name, None)
         if func is None:
             return [RpcResult(payload.request_id, 0, error=f"no method {name!r}")]
-        out = func(*payload.args)
+        out = func(*payload.args, **(payload.kwargs or {}))
         self.calls.append((name, out))
         return [RpcResult(payload.request_id, 0, value=out)]
 
@@ -112,12 +114,16 @@ def _send(runner, *cmds, scheduler=None):
     """Run *cmds* through ATOM's handler; the worker calls and the responses."""
     pending, out = queue.Queue(), queue.Queue()
     for cmd in cmds:
-        # Read by abort_request and release_constraints alone.
-        pending.put((cmd, {"req_id": "r0", "request_ids": ["r0"]}))
+        # Read by abort_request and release_constraints, and the stream's
+        # group and version by receive_weights_rdma.
+        args = {"req_id": "r0", "request_ids": ["r0"], "group_name": "g", "version": 1}
+        pending.put((cmd, args))
     handler = EngineUtilityHandler(Worker(runner), out, scheduler=scheduler)
     engine = SimpleNamespace(
         _has_pending_utility=True,
         _is_rl_weights_offloaded=False,
+        _weight_sync_fenced=False,
+        _rl_weights_inconsistent=False,
         # A single idle stage: ATOM's own has nothing to wait for or preempt.
         prepare_weight_sync=lambda deadline: None,
         prepare_kv_change=lambda weights, deadline: None,
@@ -196,7 +202,12 @@ def test_the_commands_that_reach_no_worker_run_as_in_atom():
         },
         {
             "cmd": "get_weight_sync_status",
-            "result": {"fenced": False, "in_progress": False, "failure": None},
+            "result": {
+                "fenced": False,
+                "in_progress": False,
+                "failure": None,
+                "whole": True,
+            },
         },
         {"cmd": "get_mtp_statistics", "result": {"enabled": False}},
         {"cmd": "get_cache_statistics", "result": {"enabled": False}},

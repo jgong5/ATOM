@@ -54,14 +54,14 @@ class MemoryReadingModelRunner(ModelRunner):
     `check.STORAGE`, the bytes of the parameter storages and of the buffer
     storages no parameter holds."""
 
-    def _build_and_load_model(self, model_class):
-        super()._build_and_load_model(model_class)
-        model = self.model
+    def _build_and_load_model(self, config, model_class, device):
+        model = super()._build_and_load_model(config, model_class, device)
         self._read = {
             "loaded": _allocated("current"),
             "weights": _storage_bytes([*model.parameters(), *model.buffers()]),
             "parameters": _storage_bytes(model.parameters()),
         }
+        return model
 
     def allocate_forward_vars(self):
         super().allocate_forward_vars()
