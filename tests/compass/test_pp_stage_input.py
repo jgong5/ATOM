@@ -477,7 +477,8 @@ def test_each_stage_waits_for_the_other_stages_predicted_times(pp):
 def test_the_head_waits_for_the_tokens_its_batch_needs():
     """Rows are (request, decode): a request's next chunk waits for nothing,
     its first decode, or any request of a batch that decoded, for that batch,
-    and every forward for the one `pp` back if that one produced output."""
+    and every forward for the one `pp` back, whose ack it waits for whether or
+    not that one produced output."""
     head = [
         {
             "produces_output": out,
@@ -494,8 +495,8 @@ def test_the_head_waits_for_the_tokens_its_batch_needs():
         )
     ]
     for pp, waits in (
-        (2, [None, None, 0, 2, 2, None]),
-        (4, [None, None, 0, 2, 0, None]),
+        (2, [None, None, 0, 2, 2, 3]),
+        (4, [None, None, 0, 2, 0, 1]),
     ):
         assert [step_labels.waited(head, n, pp) for n in range(6)] == waits
 
