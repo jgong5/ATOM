@@ -998,10 +998,10 @@ MiniMax-M3.1-Flash's 1P1D recipe on pit2's MI355X, shown on MiniMax-M3.
 
 **Scope and non-goals.** How a user finds the configuration to deploy, what each run
 writes for a person to read, and where the tool is built, on pit2's MI355X, and shown, on
-the development nodes. Out: #3355's *Deferred* list but search from any host (D109),
-among it topping a law up in place; and work the search meets, such as the simulated
-connector's P/D options (#4054) and `inferencex_export` labelling every row single-node,
-tracked apart.
+the development nodes. Out: #3355's *Deferred* list, among it topping a law up in
+place, less search from any host (D109); and work the search meets, such as the
+simulated connector's P/D options (#4054) and `inferencex_export` labelling every row
+single-node, tracked apart.
 
 **Changes.**
 
