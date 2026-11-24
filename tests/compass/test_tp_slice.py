@@ -82,8 +82,9 @@ def tp2_roofline(tmp_path_factory):
 def test_a_tp2_engine_meets_every_scenario_check_under_the_step_roofline(
     tp2_roofline,
 ):
-    """Every check but the hand-computed timeline, which only a constant
-    stub's run has."""
+    """The level-0 case's checks but one: the engine's hand-computed
+    timeline, `check_run`'s records, which it computes only for a constant
+    step stub, from that stub's prefill and decode costs."""
     run = tp2_roofline[0]
     print(f"\n{run['summary']['schedule']['seconds_by_method']}\n{run['table']}")
     failed = check_run(
@@ -105,6 +106,7 @@ def test_a_tp2_engine_meets_every_scenario_check_under_the_step_roofline(
 def test_a_context_parallel_engine_meets_the_run_properties_under_the_step_roofline(
     tmp_path, width
 ):
+    """The level-0 case's checks, none of them on step timing."""
     runs = [
         run_dp_slice(
             tmp_path / s, s, width, dp=1, machine=ROOFLINE_MACHINE, backend=ROOFLINE

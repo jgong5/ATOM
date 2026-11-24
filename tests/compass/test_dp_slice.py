@@ -219,8 +219,13 @@ def roofline_runs(tmp_path_factory):
 def test_four_requests_meet_every_scenario_check_under_the_step_roofline(
     roofline_runs,
 ):
-    """Every check but the hand-computed timeline, which only a constant
-    stub's run has."""
+    """The level-0 case's checks but those on step timing. The engine's
+    hand-computed timeline, `check_run`'s records, which it computes only for
+    a constant step stub, from that stub's prefill and decode costs. And the
+    first step's batch of two on each rank, both ranks serving, and a step
+    where one rank runs a request beside the other's dummy batch: which rank a
+    request lands on, and what each rank's step holds, follow when requests
+    arrive and finish against the steps, and so the step cost."""
     run = roofline_runs[0]
     print(f"\n{run['summary']['schedule']['seconds_by_method']}\n{run['table']}")
     failed = check_run(
