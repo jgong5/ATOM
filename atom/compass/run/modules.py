@@ -261,7 +261,7 @@ def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
     replay = _replay(tree)
 
     def visit(module, name, parent, draft, passes=0):
-        m = _classify(module, name, parent)
+        m = _eagle3(module, name, parent) or _classify(module, name, parent)
         *priced, then = m if isinstance(m, tuple) else (m,)
         if isinstance(then, Module):
             priced, then = [then], NOTHING
@@ -444,8 +444,7 @@ def _inside(module, parent) -> bool:
     """Whether `module` runs inside a kernel its V4.1 parent is priced as: a
     block's norms in its mixes, an attention's Q and KV norms in their one
     launch, a compressor's norm in its pooling, an indexer's key projection
-    and norm in its index keys; or an Eagle3 layer's two input norms, in
-    theirs (`_eagle3`)."""
+    and norm in its index keys."""
     held = ()
     if _is(parent, V41_BLOCK):
         held = ("attn_norm", "ffn_norm")
@@ -455,8 +454,6 @@ def _inside(module, parent) -> bool:
         held = ("norm",)
     elif _is(parent, V41_INDEXER):
         held = ("wk", "k_norm")
-    elif _is(parent, EAGLE3_LAYER):
-        held = ("input_layernorm", "hidden_norm")
     return any(module is getattr(parent, h, None) for h in held)
 
 
@@ -501,8 +498,6 @@ def _classify(module, name, parent):
         return NOTHING
     if _is(module, KDA):
         return KDA_REFUSED
-    if eagle3 := _eagle3(module, name, parent):
-        return eagle3
     weight = getattr(module, "weight", None)
     fmt = FORMATS.get(getattr(weight, "dtype", None))
     if _is(module, V4 + "Block"):
@@ -624,13 +619,17 @@ def _classify(module, name, parent):
 
 def _eagle3(module, name, parent):
     """An Eagle3 drafter's norms that run as one launch or on its head's rows
-    alone, or None: its layer's input norms, over the embedding and the
-    carried hidden state (`fused_dual_rmsnorm_cat`); its aux chunks' norms
-    (`fused_group_rmsnorm`); and its final norm where `compute_draft_ids`
-    runs it, on the rows the LM head samples."""
+    alone, as `_classify` reads a module, or None for any other: its layer's
+    input norms, over the embedding and the carried hidden state
+    (`fused_dual_rmsnorm_cat`); its aux chunks' norms (`fused_group_rmsnorm`);
+    and its final norm where `compute_draft_ids` runs it, on the rows the LM
+    head samples."""
     if _is(module, EAGLE3_LAYER):
         both = (module.input_layernorm, module.hidden_norm)
         return Module(f"{name}.dual_norm", "norm", (_widths(both),)), DESCEND
+    if _is(parent, EAGLE3_LAYER):
+        held = (parent.input_layernorm, parent.hidden_norm)
+        return NOTHING if any(module is n for n in held) else None
     if not _is(parent, EAGLE3):
         return None
     if module is parent.fc_norm:
