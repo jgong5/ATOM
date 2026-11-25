@@ -101,8 +101,8 @@ def test_each_stage_plans_the_chunk_its_ranks_state():
 
 
 def test_a_pp4_prefill_launches_against_an_entry_of_world_4(
-    tmp_path, started
-):  # noqa: F811
+    tmp_path, started  # noqa: F811
+):
     run = _run(tmp_path)
     run[store.ENTRY] = _pp_entry()
     config = _config(STORE, pipeline_parallel_size=4)
@@ -111,8 +111,8 @@ def test_a_pp4_prefill_launches_against_an_entry_of_world_4(
 
 
 def test_a_pp4_prefill_names_the_rank_whose_slots_differ(
-    tmp_path, started
-):  # noqa: F811
+    tmp_path, started  # noqa: F811
+):
     run = _run(tmp_path)
     run[store.ENTRY] = _pp_entry(save_slots=[ENTRY["save_slots"]] * 3 + [7])
     config = _config(STORE, pipeline_parallel_size=4)
@@ -150,14 +150,15 @@ def test_a_pp4_prefill_s_store_logs_give_its_per_rank_fields_and_laws(
     bytes and slots, and its copies (`rank=`) take its own seconds a chunk."""
     import json
 
-    from test_mooncake_store_fit import CAPACITY, FLAGS, START, copy, lookups, started
+    from test_mooncake_store_fit import CAPACITY, FLAGS, START, copy, lookups
+    from test_mooncake_store_fit import started as started_line
 
     from atom.compass.backends.step_linear_fit import offload_main
 
     chunk = [3 << 20, 3 << 20, 3 << 20, 5 << 20]
     slots = [26, 26, 26, 15]
     lines = [
-        started(
+        started_line(
             START
             | {"rank": r, "world": 4, "chunk_bytes": chunk[r], "save_slots": slots[r]}
         )

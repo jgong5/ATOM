@@ -29,8 +29,8 @@ def _kv(d, name):
 
 @pytest.mark.parametrize("cmd", ["run", "record"])
 def test_each_side_s_kv_settings_reach_its_kv_config(
-    tmp_path, planted, cmd
-):  # noqa: F811
+    tmp_path, planted, cmd  # noqa: F811
+):
     env, flags = planted
     env |= {
         "PREFILL_KV_EXTRA": json.dumps(CHUNKED),
@@ -69,8 +69,8 @@ def test_each_side_s_kv_settings_reach_its_kv_config(
 
 
 def test_a_side_s_kv_settings_that_are_no_json_object_exit_2(
-    tmp_path, planted
-):  # noqa: F811
+    tmp_path, planted  # noqa: F811
+):
     env, flags = planted
     env["DECODE_KV_EXTRA"] = "[1]"
     done = subprocess.run(
