@@ -174,13 +174,28 @@ def test_a_worker_order_lists_each_deployment_rank_once_and_names_no_configurati
     run = XPYD | {"prefill_data_parallel_size": 2, "clock_endpoint": "tcp://x"}
     order = {"P": [[1, 0], [0, 0], [1, 1], [0, 1]], "D": [[1, 0], [0, 0]]}
     assert compass_run.worker_order(run | {"worker_order": order}) == order
-    assert compass_run.worker_order(run) == {}
+    assert compass_run.worker_order(run) == {
+        "P": [[0, 0], [0, 1], [1, 0], [1, 1]],
+        "D": [[0, 0], [1, 0]],
+    }
     assert compass_run.configuration(run | {"worker_order": order}) == XPYD | {
         "prefill_data_parallel_size": 2
     }
     for bad in ({"P": order["P"][:3]}, {"D": [[0, 0], [0, 0]]}, {"X": [[0, 0]]}):
         with pytest.raises(ValueError, match="list each of its deployments"):
             compass_run.worker_order(run | {"worker_order": bad})
+
+
+def test_a_side_the_run_file_does_not_order_is_listed_by_instance_then_rank():
+    """The router LP lists the side a recorded order leaves out by instance and
+    DP rank, not by its workers' URLs, whose ports deploy.sh draws afresh in
+    each run: two runs of one deployment place alike."""
+    run = XPYD | {"prefill_data_parallel_size": 2, "decode_data_parallel_size": 4}
+    prefill = [[1, 0], [0, 0], [1, 1], [0, 1]]
+    assert compass_run.worker_order(run | {"worker_order": {"P": prefill}}) == {
+        "P": prefill,
+        "D": [[0, 0], [0, 1], [0, 2], [0, 3], [1, 0], [1, 1], [1, 2], [1, 3]],
+    }
 
 
 # --- the connector -----------------------------------------------------------

@@ -122,7 +122,9 @@ that takes it, as its loader builds it before the runner's KV pool is sized,
 its runners' peer memory with it (`_comm_fused`), with the leaf's arguments,
 its stated group width and reduction aside, and, where it holds no shared
 expert's output, as under ATOM's dual-stream MoE, zeros at the rows its
-stage 2 asks for, built once (`Stub._comm_fused`).
+stage 2 asks for, built once (`Stub._comm_fused`). One DP rank alone builds
+no runtime, a drafter's load included, its layers keeping their backend with
+none (`_unbuilt_comm_fused`), and the leaf refuses as a collective does.
 MORI's dispatch and combine are methods of a handle no graph holds: each is
 called at MORI's entry point on the handle ATOM builds for the model's MoE,
 with the leaf's arguments, and, since neither runs twice in a row, timed
@@ -917,7 +919,9 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     runs its target's leaves less the LM head and the sampler, so the
     target's points at output cover both. A graph traced under this ATOM
     source and torch answers (`capture.graph_key`), else one whose files read
-    here as in its trace (`capture.lookup_by_files`). A miss where the store
+    here as in its trace (`capture.lookup_by_files`), loaded as a run loads it
+    (`run.load_graph`): one whose row states another torch, ATOM source or
+    model refuses, naming the axis. A miss where the store
     holds the shape under another engine config or torch, or of a file that
     reads otherwise, refuses naming what differs. A
     two-batch-overlap micro-batch's `shape` reads its own graph, and a shape
@@ -925,6 +929,7 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture import graph_key, lookup_by_files
     from atom.compass.capture.forward import missed, structure
+    from atom.compass.run import graph_readings, load_graph
 
     shape = shape._replace(real=None)
     at = structure(
@@ -948,7 +953,8 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
             f"source and torch{why}",
             "compass trace ops captures one under this process's environment",
         )
-    return json.loads(store.read(key).read_member("graph", RANK, "json"))
+    entry = load_graph(store, key, graph_readings(config.model))
+    return json.loads(entry.read_member("graph", RANK, "json"))
 
 
 def leaves_at(
@@ -961,8 +967,9 @@ def leaves_at(
     step's (`parts`), where a capture keeps a decode's drafter's graph alone:
     the leaves of the drafter's graphs there at each output (`graph`'s
     `output`) `own` holds, as its steps read them. With `drafter`, only the
-    leaves some graph of the drafter's holds, each as the whole shape has it."""
-    from atom.compass.artifacts import ArtifactRefusal
+    leaves some graph of the drafter's holds, each as the whole shape has it.
+    A drafter's graph the store holds that refuses here (`graph`) refuses."""
+    from atom.compass.artifacts import ArtifactRefusal, Rule
 
     if own:
         found, target = {}, set()
@@ -976,7 +983,9 @@ def leaves_at(
         for output, draft in DRAFTED if spec else ():
             try:
                 region = graph(store, config, shape, arch, output, draft)["region"]
-            except ArtifactRefusal:
+            except ArtifactRefusal as refused:
+                if refused.rule is not Rule.RESOLUTION:
+                    raise
                 continue
             held |= leaves(region).keys()
             leaves(region, None, found)
@@ -1112,7 +1121,8 @@ def _runner(config, rank: int):
     on the device and then freed for the weights each leaf builds, and with
     the MORI exchange ATOM's loader builds before it, MORI's heap with it, in
     its `mori` (`_prepare_finalize`) where its MoE exchanges through MORI, and
-    the runtime of aiter's comm-fused MoE in its `comm_fused` (`_comm_fused`);
+    the runtime of aiter's comm-fused MoE in its `comm_fused` (`_comm_fused`),
+    but for one DP rank run alone (`_unbuilt_comm_fused`);
     the runner attributes the allocation set are in its `kv_held`, and by path each
     tensor it bound on a metadata builder (`BUILDERS`, `_bound`) but a view the
     builder cut from one of the runner's (`_cut_from`); and, when
@@ -1150,7 +1160,9 @@ def _runner(config, rank: int):
             wait_for_workers=False,
         )
         pc.data_parallel_base_port, pc._managed_distributed_store = store.port, True
-    runner = MetaRunner(rank, config)
+    alone = getattr(config, "dp_logical_size", 0)
+    with _unbuilt_comm_fused(config) if alone else contextlib.nullcontext():
+        runner = MetaRunner(rank, config)
     runner.store = store
     nbytes = sum(p.nbytes for p in runner.model.parameters())
     held = torch.empty(nbytes, dtype=torch.uint8, device=runner.device)
@@ -1158,7 +1170,8 @@ def _runner(config, rank: int):
     # leaf instead, the heap took room the pool left the leaves' weights
     modules = dict(runner.model.named_modules())
     runner.mori = _prepare_finalize(modules, mori_only=True)
-    runner.comm_fused = _comm_fused(modules)
+    # one rank alone has no group to build it on, and `Stub` refuses its leaf
+    runner.comm_fused = None if alone else _comm_fused(modules)
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     del held
     _release()  # the pool takes the room the hold had
@@ -1226,6 +1239,20 @@ def _comm_fused(modules: dict):
         return None
     layer._comm_fused_moe.initialize(layer)
     return layer._comm_fused_moe.runtime
+
+
+def _unbuilt_comm_fused(config):
+    """A context in which ATOM's runner for one DP rank alone loads its
+    drafter's weights with no runtime built for aiter's comm-fused MoE: ATOM's
+    loader builds one there (`init_prepare_finalize`), on a group of the
+    layout's ranks, which a rank alone holds none of, and refuses a group of
+    one. Each layer keeps the backend the layout gives it, with no runtime, as
+    the target's layers do, whose parameters on the meta device load nothing."""
+    if not getattr(config, "speculative_config", None):
+        return contextlib.nullcontext()
+    from atom.model_ops.fused_moe.comm_fused_moe import CommFusedMoeBackend
+
+    return patch.object(CommFusedMoeBackend, "initialize", lambda self, layer: None)
 
 
 class Stub:
@@ -4923,14 +4950,17 @@ def _load(
     """Each of `shapes`' leaves (`leaves_at`, a drafter's own at a shape `own`
     maps to its outputs) into `graphs`, its op_graph captured first when the
     store has none (`_capture`, naming the record directories `records` the
-    shapes are of)."""
-    from atom.compass.artifacts import ArtifactRefusal
+    shapes are of). One the store holds that refuses here (`graph`) refuses:
+    a capture of its shape would be keyed as it is."""
+    from atom.compass.artifacts import ArtifactRefusal, Rule
 
     own, missing = own or {}, []
     for shape in sorted(shapes - graphs.keys(), key=str):  # G and W: None or a count
         try:
             graphs[shape] = leaves_at(store, config, shape, arch, own.get(shape, ()))
-        except ArtifactRefusal:
+        except ArtifactRefusal as refused:
+            if refused.rule is not Rule.RESOLUTION:
+                raise
             missing.append(shape)
     if missing:
         _capture(config, missing, root, arch, atom_args, records)

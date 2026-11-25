@@ -6,8 +6,17 @@ A record is a real run's step record (`steps/dp<r>.jsonl`, written with
 that is not a dummy run a `Sample`: its batch view, its device label, its host
 labels and its provenance. `step_linear_fit` fits samples and `validate.cost`
 prices them; neither reads a step's stamps. Neither takes a record whose
-run.json names `BUILDS`, the JIT compiles its server ran while it served;
-`refusal` says why.
+run.json names `BUILDS`, the JIT compiles its server ran while it served, unless
+run.json also times each (`COMPILES`) and places them on the step record's
+clock (`CLOCK`): then each rank's steps that overlap a compile are cut whole as
+`JIT`, no device, draft or host label, a forward whose host segments overlap
+one loses its host labels (below), and the record is taken unless the steps
+cut whole are more than `JIT_BOUND` of a rank's forwards. `cut_refusal` says
+why one is not. Its caller hands `label_run` the spans of the run.json it
+checked (`cut_spans`), so the steps cut are those the check counted, whatever
+path names the record; given none, nothing is cut. Grading takes no real run
+that names `BUILDS` (`refusal`): a stall delays every request after it, so its
+error is no longer the simulator's.
 
 A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
 `dp_rank`. An older record's lines state neither count: `group_tokens`
@@ -74,6 +83,17 @@ without busy time is cut as `untraced`. A trace run, a record with its busy
 lines beside it or whose run directory holds `TRACE`, ran under a profiler: its
 decode steps are cut as `traced` and its steps carry no host labels.
 
+A pipeline stage's ranks, labelled with their stage (`label_run`'s `stage`),
+give samples naming it, and their decode steps are cut as `PIPELINED`, keeping
+their host labels: a stage's decode window holds its wait for the stage before
+and the stream hold of its last send, which the next stage takes when it is
+ready, and no label parts either from the stage's own work. No step of a stage
+is cut as launch-exposed, a cut only a decode takes: a stage before the last
+reads no token, the read that ties its host clock to its device's. A stage's
+prefill step without busy time is cut `untraced` under `PREFILL_LABEL_ENV`
+too: its window holds its receive's wait for the stage before, which the
+handoff prices.
+
 With `PREFILL_LABEL_ENV` set to ``record``, an opt-in for a fit that has one
 plain record and no trace run, a prefill step without busy time that carries
 its MTP target end is labelled from its own device window instead, as an MTP
@@ -123,14 +143,21 @@ spent in HIP's blocking calls, there waiting on the device; a line without
 `blocked_ns` gives its wall time; `W_post` from that wait's end to the exit,
 less the draft copy wait, and a middle chunk has none. With an MTP status wait,
 `W_pre` ends at it and `W_inputs` runs from it to the launch. On a later
-pipeline stage, `W_recv` runs from the launch to the receive of its input.
+pipeline stage, `W_recv` runs from the launch to the receive of its input, and
+`W_launch` leaves out that receive, a wait for the stage before's send.
 Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
 pull after the previous exit, and `E_out` from the exit to the pull after it.
 `L_mtp` is `mtp_copy`'s time on a forward whose MTP status wait began before
-the event it waits for.
+the event it waits for. A forward has no host label when a timed compile
+overlaps its segments, from the previous line's exit to its own pull
+(`jit_hosts`): one between two forwards would sit in the later one's `E`.
 `label_run` labels a run's DP ranks together: there `E` runs from the latest
 pull, else exit, over the ranks before the same forward, where the group's
-`_sync_dp_state` releases each of them.
+`_sync_dp_state` releases each of them. On a pipeline stage it runs from no
+earlier than the forward's release (`released`), read with the pipeline's
+other stages: the head's at the last stage's exit of the forward whose ack it
+waits for, its tokens or a middle chunk's bare ack, a later stage's at the
+head's call, so neither holds a wait for another stage.
 
 A DP rank's dummy forward at a step some rank of its group prefills, its line
 holding the one prefill row `ModelRunner.dummy_execution` runs, gives no
@@ -140,7 +167,7 @@ group's launch path, eagerly past the largest prefill token graph, for as long
 as a prefill's own body, after waiting for the step before it at its MTP status
 wait, and the group's next forward enters only once it has left. Each holds its
 view (`step_linear.dummy_view` of the group's fields) and the launch features its
-line states.
+line states. A dummy forward whose segments overlap a timed compile gives none.
 
 A step's `admitted` is what its `E` spent admitting requests (`admissions`):
 the scheduler allocates a request's whole prompt the first time it schedules
@@ -188,6 +215,24 @@ TABLE_VERSION = 1
 #: run.json's entry naming the JIT modules and kernels its server compiled while
 #: it served (`atom.compass.drive.aiter_jit`); a server that compiled none has none.
 BUILDS = "aiter_jit_builds"
+#: run.json's entry timing each of those compiles: its ``compiler``, ``name``,
+#: ``artifact`` (the path its files share) and the wall clock mtimes of its
+#: first and last file written, ``first_ns`` and ``last_ns``.
+COMPILES = "jit_compiles"
+#: run.json's pair of wall clock and monotonic nanoseconds read together on the
+#: server's host when serving began, which places those mtimes on the step
+#: record's monotonic clock.
+CLOCK = "clock_ns"
+#: Why a whole step is cut: its window, entry to exit, overlaps a compile's span.
+JIT = "jit"
+#: Why a pipeline stage's decode step's device label is cut (module docstring);
+#: counted, as `JIT` is, only where it cuts a step.
+PIPELINED = "pipelined"
+#: How long before a compile's first file the span starts: a Triton kernel's
+#: front end builds its IR before it writes any file.
+JIT_SLACK_NS = 200_000_000
+#: The most of a rank's forwards the compiles may cut before the record refuses.
+JIT_BOUND = 0.01
 #: The variable that, set to ``record``, labels an untraced prefill step from its
 #: own device window (module docstring); unset, such a step is cut `untraced`.
 PREFILL_LABEL_ENV = "COMPASS_PREFILL_LABEL"
@@ -213,9 +258,9 @@ ACCEPT_BUILDS_ENV = "COMPASS_ACCEPT_JIT_BUILDS"
 
 
 def refusal(run: dict) -> str | None:
-    """Why grading, a fit or `validate.cost` refuses a record whose run.json is
-    `run`, naming the modules of its `BUILDS`; None when it names none, or
-    when `ACCEPT_BUILDS_ENV` is ``1`` (then a warning names them)."""
+    """Why grading refuses a real run whose run.json is `run`, naming the
+    modules of its `BUILDS`; None when it names none, or when
+    `ACCEPT_BUILDS_ENV` is ``1`` (then a warning names them)."""
     if builds := run.get(BUILDS):
         if os.environ.get(ACCEPT_BUILDS_ENV) == "1":
             print(
@@ -232,11 +277,83 @@ def refusal(run: dict) -> str | None:
     return None
 
 
+def cut_refusal(run: dict, ranks: Iterable[list[dict]]) -> str | None:
+    """Why a fit or `validate.cost` refuses a record whose run.json is `run`
+    and whose rank records' lines are `ranks`, as `refusal` does, unless
+    run.json times its `BUILDS` and the steps they cut (`jit_steps`) are at
+    most `JIT_BOUND` of each rank's forwards."""
+    if (why := refusal(run)) is None:
+        return None
+    if COMPILES not in run or CLOCK not in run:
+        return (
+            f"{why}, and its run.json has no {COMPILES} and {CLOCK} to place "
+            "them among its steps"
+        )
+    spans = compile_spans(run)
+    for lines in ranks:
+        forwards = [s for s in lines if not s["is_dummy_run"]]
+        if (n := len(jit_steps(forwards, spans))) > JIT_BOUND * len(forwards):
+            return (
+                f"its server's JIT compiles of {run[BUILDS]} overlap {n} of DP "
+                f"rank {forwards[0]['dp_rank']}'s {len(forwards)} forwards, more "
+                f"than {JIT_BOUND:.0%}"
+            )
+    return None
+
+
+def compile_spans(run: dict) -> list[tuple[int, int]]:
+    """Each compile run.json `run` times, as its span on the step record's
+    clock: from `JIT_SLACK_NS` before its first file to its last; none
+    without `CLOCK`."""
+    if CLOCK not in run:
+        return []
+    wall, monotonic = run[CLOCK]
+    return [
+        (
+            c["first_ns"] - wall + monotonic - JIT_SLACK_NS,
+            c["last_ns"] - wall + monotonic,
+        )
+        for c in run.get(COMPILES, ())
+    ]
+
+
+def jit_steps(lines, spans) -> set[int]:
+    """The steps of `lines`, one rank's record, whose window, from entry to
+    exit, overlaps one of `spans`."""
+    return {
+        s["step"]
+        for s in lines
+        if any(lo <= s["t_exit_ns"] and s["t_enter_ns"] <= hi for lo, hi in spans)
+    }
+
+
+def jit_hosts(lines, spans) -> set[int]:
+    """The steps of `lines`, one rank's record, whose host segments overlap one
+    of `spans`: from the previous line's exit, where its `E` may start, or the
+    first line's entry, to the step's own pull, where its `E_out` ends."""
+    out, start = set(), lines[0]["t_enter_ns"] if lines else None
+    for s in lines:
+        if any(lo <= _pull(s) and start <= hi for lo, hi in spans):
+            out.add(s["step"])
+        start = s["t_exit_ns"]
+    return out
+
+
+def cut_spans(run: dict | None) -> list[tuple[int, int]]:
+    """The spans `label_run` cuts a record's steps by, given `run`, the
+    run.json `cut_refusal` took the record on: its `compile_spans`; none
+    without one, or when `ACCEPT_BUILDS_ENV` takes the record whole."""
+    if run is None or os.environ.get(ACCEPT_BUILDS_ENV) == "1":
+        return []
+    return compile_spans(run)
+
+
 @dataclass(frozen=True)
 class Sample:
     """One real forward, labelled.
 
-    `device_s` is its device label, None when cut, and `cut` names why (`CUTS`).
+    `device_s` is its device label, None when cut, and `cut` names why (`CUTS`,
+    `PIPELINED`, or `JIT` for a step cut whole).
     `draft_s` is its draft label, None when cut, on a step with no draft, or
     on a decode whose device reached its `propose` pass before the host's
     draft copy wait.
@@ -245,7 +362,8 @@ class Sample:
     `draft_kv_s` is its draft-KV label, the part of `device_s` that is the
     drafter's draft-KV pass, on a step that produces output; None elsewhere.
     `host` holds the segments it has, in seconds: no `W_post` on a middle chunk,
-    no `E` on the record's first forward or after an idle engine (`idle`).
+    no `E` on the record's first forward or after an idle engine (`idle`), none
+    on a step cut `JIT` or whose segments overlap a compile (`jit_hosts`).
     `provenance` holds `source`, `run` (the run's digest), `requests` (the
     request ids the step served) and `config` (the host key the record states,
     or None).
@@ -269,6 +387,7 @@ class Sample:
     `ladder` holds the decode rungs a calibration ladder's client run calibrates,
     on a step within that client run's graded span (`fit.samples.load`); None on
     any other step, and wherever a record is labelled without its client runs.
+    `stage` is the pipeline stage its record ran at, 0 off a pipeline.
     """
 
     step: int
@@ -290,6 +409,7 @@ class Sample:
     passes_s: tuple | None = None
     dummy_host: tuple = ()
     ladder: tuple | None = None
+    stage: int = 0
 
 
 class Floor:
@@ -620,29 +740,71 @@ def _pull(step: dict) -> int:
     return step.get("t_pull_ns", step["t_exit_ns"])
 
 
+def waited(steps: list[dict], n: int, pp: int) -> int | None:
+    """The head's last forward before `n` whose ack `n` is scheduled after, or
+    None, in a pipeline of `pp` stages whose head ran `steps`: `n - pp`, which
+    leaves the in-flight queue only at the last stage's ack, its tokens or a
+    middle chunk's bare ack, or a later one producing output and holding a
+    request of `n`'s, every request of a batch with a decode in it, else the
+    requests `n` decodes."""
+    mine = {k: d for (k, *_), (*_, d) in zip(steps[n]["batch"], steps[n]["rows"])}
+    for m in range(n - 1, max(n - pp, 0) - 1, -1):
+        s, decode = steps[m], any(d for *_, d in steps[m]["rows"])
+        held = any(k in mine and (decode or mine[k]) for k, *_ in s["batch"])
+        if m == n - pp or (s["produces_output"] and held):
+            return m
+    return None
+
+
+def released(head: list[dict], n: int, pp: int, exit_of) -> tuple:
+    """Forward `n`'s releases in a pipeline of `pp` stages whose head ran
+    `head`: the head's, at the last stage's exit of the forward whose ack it
+    waits for (`waited`), and every later stage's, at the head's call, the later
+    of the head's previous exit and that release; each None where nothing holds
+    it. `exit_of(k, m)` is stage `k`'s exit of forward `m`, measured or
+    predicted, in ns."""
+    w = waited(head, n, pp)
+    tokens = None if w is None else exit_of(pp - 1, w)
+    if not n:
+        return tokens, None
+    call = exit_of(0, n - 1)
+    return tokens, call if tokens is None else max(call, tokens)
+
+
 def label(
-    record, run: str | None = None, split_rule=None
+    record, run: str | None = None, split_rule=None, spans=()
 ) -> tuple[list[Sample], list[dict]]:
     """The record's samples, in step order, and its table's rows.
 
     `run` names the run in each sample's provenance, the record's `digest` by
-    default; `split_rule` rebuilds an older record's split, as above. A
+    default; `split_rule` rebuilds an older record's split, as above; `spans`
+    are the compiles its steps are cut by (`cut_spans`), none by default. A
     data-parallel record's `group_dummies` and `group_max_tokens` are read from
     the rank records beside it.
     """
     lines = _read(record)
-    return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None, None)
+    starts = [_pull(s) for s in lines]
+    return _label(record, lines, run, starts, split_rule, None, None, spans=spans)
 
 
 def label_run(
-    records, run: str | None = None, split_rule=None, floored=None
+    records,
+    run: str | None = None,
+    split_rule=None,
+    floored=None,
+    spans=(),
+    stage: int | None = None,
 ) -> list[tuple[list[Sample], list[dict]]]:
-    """`label` of each of `records`, one run's DP ranks, with each `E` from the
-    latest pull over the ranks before the same forward, a trace run's drafter
-    labels under `floored`, its busy lines less the profiler's floor
-    (`parity.busy.floored`). A rank that ran only DP's dummy forwards gives no
-    sample and no row. Ranks whose line counts differ by more than the forward
-    a stopped server leaves on some refuse."""
+    """`label` of each of `records`, one run's DP ranks, cut by `spans`, with
+    each `E` from the latest pull over the ranks before the same forward, a
+    trace run's drafter labels under `floored`, its busy lines less the
+    profiler's floor (`parity.busy.floored`). A rank that ran only DP's dummy
+    forwards gives no sample and no row. Ranks whose line counts differ by more
+    than the forward a stopped server leaves on some refuse. `stage` is the
+    pipeline stage the ranks ran at, None off a pipeline: its samples name it,
+    its decode steps are cut as `PIPELINED`, and each `E` runs from no earlier
+    than the forward's release, read with the pipeline's other stages
+    (`_from_release`)."""
     ranks = [_read(r, floored) for r in records]
     counts = {Path(r).name: len(x) for r, x in zip(records, ranks) if x}
     if counts and max(counts.values()) - min(counts.values()) > 1:
@@ -659,11 +821,57 @@ def label_run(
             ([], [])
             if x and all(s["is_dummy_run"] for s in x)
             else _label(
-                r, x, run, starts, split_rule, dummy_ranks, peaks, tails, prefills
+                r,
+                x,
+                run,
+                starts if stage is None else _from_release(r, stage, starts),
+                split_rule,
+                dummy_ranks,
+                peaks,
+                tails,
+                prefills,
+                spans,
+                stage,
             )
         )
         for r, x in zip(records, ranks)
     ]
+
+
+def _from_release(record, stage: int, starts: list) -> list:
+    """`starts`, the times each line's next `E` runs from, each moved to that
+    next line's release where later (`released`), on `record`, pipeline stage
+    `stage`'s rank record, read with its pipeline's other rank records of its
+    DP rank beside it: stage 0's `dp<r>.jsonl`, stage k's `pp<k>.dp<r>.jsonl`.
+    Stages whose line counts differ refuse, as does a line entered before its
+    release."""
+    path = Path(record)
+    rank = "dp" + path.name.split("dp", 1)[1]
+    paths = [path.with_name(rank)]
+    while (more := path.with_name(f"pp{len(paths)}.{rank}")).exists():
+        paths.append(more)
+    stages = [read_jsonl(p) for p in paths]
+    if len({len(s) for s in stages}) > 1:
+        raise ValueError(
+            f"{record}'s pipeline stages hold {[len(s) for s in stages]} lines, "
+            "and each runs every forward"
+        )
+
+    def exit_of(k: int, m: int) -> int:
+        return stages[k][m]["t_exit_ns"]
+
+    out = list(starts)
+    for n, s in enumerate(stages[stage][1:], 1):
+        tokens, call = released(stages[0], n, len(stages), exit_of)
+        if (release := call if stage else tokens) is None:
+            continue
+        if (early := release - s["t_enter_ns"]) > 0:
+            raise ValueError(
+                f"{record} step {s['step']} enters {early * 1e-6:.3f} ms before "
+                "the release it waits for"
+            )
+        out[n - 1] = max(out[n - 1], release)
+    return out
 
 
 def _segments(s: dict, output: bool) -> dict:
@@ -679,8 +887,9 @@ def _segments(s: dict, output: bool) -> dict:
     host["W_launch"] = r0 - l0 - sum((blocked or {}).values())
     if "t_mtp_ns" in s:
         host["W_inputs"] = l0 - m1
-    if "t_pp_recv_ns" in s:
-        host["W_recv"] = s["t_pp_recv_ns"][0] - l0
+    if "t_pp_recv_ns" in s:  # the receive waits for the stage before's send
+        p0, p1 = s["t_pp_recv_ns"]
+        host["W_recv"], host["W_launch"] = p0 - l0, host["W_launch"] - (p1 - p0)
     if output:
         d0, d1 = s.get("t_draft_recv_ns", s.get("t_draft_read_ns", (0, 0)))
         host["W_post"] = s["t_exit_ns"] - r1 - (d1 - d0)
@@ -693,17 +902,20 @@ def _segments(s: dict, output: bool) -> dict:
 DUMMY_SEGMENTS = ("W_pre", "W_inputs", "W_launch", "W_post")
 
 
-def _dummy_hosts(lines, peaks, tails) -> tuple:
+def _dummy_hosts(lines, peaks, tails, dropped) -> tuple:
     """`Sample.dummy_host` of a rank's `lines`: each dummy forward at a step
     its group prefills, its line holding a prefill row, with its view, the
     group's fields from `peaks` and `tails` (`group_peaks`, `group_tails`), its
-    `DUMMY_SEGMENTS` in seconds and its line's launch features."""
+    `DUMMY_SEGMENTS` in seconds and its line's launch features; none at a step
+    of `dropped`, whose host segments overlap a compile (`jit_hosts`)."""
     from atom.compass.backends.step_linear import dummy_view
 
     out = []
     for s in lines:
         rows = s.get("rows") or ()
         if not (s["is_dummy_run"] and "t_launch_ns" in s and rows) or rows[0][2]:
+            continue
+        if s["step"] in dropped:
             continue
         view = dummy_view(
             BatchView(
@@ -732,10 +944,13 @@ def _label(
     peaks,
     tails=None,
     prefills=None,
+    spans=(),
+    stage=None,
 ) -> tuple[list[Sample], list[dict]]:
     """`label` of `record`'s `lines`, each `E` from `starts` at the line before;
     `prefills` the steps its group prefills at (`group_prefills`), read from
-    the rank records beside it when None."""
+    the rank records beside it when None; `spans` the compiles it is cut by;
+    `stage` the pipeline stage it ran at, None off a pipeline."""
     path = Path(record)
     steps = [s for s in lines if not s["is_dummy_run"]]
     dummies = frozenset(s["step"] for s in lines if s["is_dummy_run"])
@@ -748,10 +963,14 @@ def _label(
             f"{record} has no device windows (`d_busy_ns`); a fit labels a step "
             "by its device time"
         )
-    (exposed, early), traced = _host_cut(lines), _traced(path)
+    # A stage's decodes are cut whole, and a stage before the last reads no token.
+    exposed, early = _host_cut(lines) if stage is None else (set(), set())
+    traced = _traced(path)
+    jit, jit_host = jit_steps(lines, spans), jit_hosts(lines, spans)
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
-    window_prefill = _prefill_label() == "record" and not traced
+    # A stage's window holds its receive's wait for the stage before.
+    window_prefill = _prefill_label() == "record" and not traced and stage is None
     paced = _paced(lines) if window_prefill and mtp else set()
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
@@ -770,7 +989,7 @@ def _label(
             peers = [read_jsonl(p) for p in _peers(path)]
             dummy_ranks, peaks = group_dummies(peers), group_peaks(peers)
             tails = group_tails(peers)
-        dummy_host = _dummy_hosts(lines, peaks, tails or frozenset())
+        dummy_host = _dummy_hosts(lines, peaks, tails or frozenset(), jit_host)
     for i, s in enumerate(lines):
         if s["is_dummy_run"]:
             prev = s
@@ -820,8 +1039,12 @@ def _label(
             and "d_target_ns" in s
             and window_prefill
         )
-        if view.prefill and view.decode:
+        if s["step"] in jit:
+            cut = JIT
+        elif view.prefill and view.decode:
             cut = "mixed"
+        elif not view.prefill and stage is not None:
+            cut = PIPELINED
         elif not view.prefill and s["step"] in exposed:
             cut = "exposed"
         elif not view.prefill and traced:
@@ -860,7 +1083,9 @@ def _label(
         idle = prev is not None and not busy[i]
         if prev is not None and not idle:
             host["E"] = enter - starts[i - 1]
-        host = {} if traced else {k: v * 1e-9 for k, v in host.items()}
+        if traced or s["step"] in jit_host:
+            host = {}
+        host = {k: v * 1e-9 for k, v in host.items()}
         provenance = {
             "source": "record",
             "run": run,
@@ -889,6 +1114,7 @@ def _label(
                 {} if cut else s.get("floor", {}),
                 passes,
                 dummy_host,
+                stage=stage or 0,
             )
         )
         gap_ns = s.get("d_gap_ns")

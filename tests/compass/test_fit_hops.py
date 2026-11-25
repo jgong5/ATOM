@@ -171,6 +171,30 @@ def test_a_deployment_side_fits_its_engine_hops_and_not_its_client_s(tmp_path):
     }
 
 
+@pytest.mark.parametrize("name", ["prefill1", "decode0"])
+def test_an_instance_of_a_deployment_s_side_fits_no_hop_of_its_client(tmp_path, name):
+    """Above one instance of a side, `deploy.sh` names each by its index, and
+    its run.json states each prefill instance's handshake port: each is behind
+    the router as a side's only instance is."""
+    d = record(tmp_path / name, 19)
+    for other in {"prefill0", "prefill1", "decode0", "decode1"} - {name}:
+        (tmp_path / other).mkdir()
+    ports = [{"name": f"prefill{k}", "handshake_port": 11 * (k + 1)} for k in (0, 1)]
+    (tmp_path / "run.json").write_text(json.dumps({"instances": ports}))
+    hopped(d)
+    fit(tmp_path, "fit host", d, *clients(d))
+
+    key = host_laws_key(HOST)
+    host = member(tmp_path / "store", key, "params")
+    report = member(tmp_path / "store", key, "report")
+    assert set(host["hops"]) == {"ipc_s", "ipc_out_s"}
+    behind = f"{d / 'steps' / compass_run.INTAKE_RECORD}: {d} is a side of a deployment, behind its router"
+    assert {k: v for k, v in report["unfitted"].items() if k.startswith("hops")} == {
+        "hops.admission_s": behind,
+        "hops.stream_s": behind,
+    }
+
+
 def test_rows_taken_in_and_heads_sent_leave_the_intake_fit_as_it_was(tmp_path):
     a = record(tmp_path / "a", 19)
     stamped(a, burst=(40_000, 60_000, 50_000, 45_000))
