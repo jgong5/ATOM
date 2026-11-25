@@ -15,7 +15,8 @@ recurrence, which composes it with this price. Nothing is fitted.
 Rows. A module that runs per token runs at the rows the step's replayed graph
 pads to, `capture_rung` rows of the decode rows' query length, or at the real
 rows when built with `padded=False` (the run file's ``padding: none``).
-Attention runs over the real rows, a pad row holding no context. The LM head
+Attention and a recurrence run over the real rows, a pad row holding no
+context and no state. The LM head
 runs on each prefill row's last token (`ParallelLMHead.forward` cuts to
 them) and on every row of a decode, a graph's pad rows too, which the runner
 hands it (`running_tokens`); on none of a step that produces no output. A
@@ -168,6 +169,9 @@ UNCLASSIFIED = "unclassified"
 CONTEXT = -1
 DRAFT = "draft "
 DRAFT_KV = "draft_kv "
+#: KDA's prefill chunk: aiter's FlashKDA chunk (`flash_kda.FLASH_KDA_CHUNK`),
+#: a lower bound on its default pipeline's 64.
+KDA_CHUNK = 32
 
 
 @dataclasses.dataclass(frozen=True)
@@ -182,8 +186,10 @@ class Module:
     logits a row its exchange holds),
     `hc_head` (residual copies, width), a pass (elements a token; a `norm`'s
     second, those of them it writes in fp8), `act` (output
-    elements a token), `attention` (heads, KV heads, head dim),
-    `linear_attention` (value heads, key heads, key dim, value dim), `mhc`
+    elements a token), `gated_norm` (elements a token), `attention` (heads,
+    KV heads, head dim), `linear_attention` (value heads, key heads, key dim,
+    value dim), `kda` (heads, head dim, 1 where its decode rows run
+    ReplaySSM), `mhc`
     (residual copies, width), `sparse_attention` (heads, head dim, window,
     compression ratio, top k, indexer heads and head dim, then optionally the
     most compressed entries the indexer scores), `mla_attention`
@@ -307,7 +313,12 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
         return Work({}, moved) + allreduce(m.ranks, width * act)
     if m.kind == "act":
         return elementwise(tokens * d[0], reads=2)
+    if m.kind == "gated_norm":
+        # Its input and its gate in, the output at `fmt`.
+        return Work({}, tokens * d[0] * (2 * act + ELEMENT_BYTES[m.fmt]))
     rows = view.requests
+    if m.kind == "kda":
+        return _kda(m, view)
     if m.kind == "attention":
         q, kv = [r.query_tokens for r in rows], [r.context_tokens for r in rows]
         return attention(q, kv, d[0], d[2], d[1], kv_fmt=m.fmt)
@@ -322,6 +333,54 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
     # ponytail: the state is priced at the bf16 rate, a lower bound on an
     # fp32 accumulation the spec states no rate for.
     return Work({ACT: 4 * real * vh * dk * dv}, moved)
+
+
+def _kda(m: Module, view: BatchView) -> Work:
+    """Kimi-K3's KDA recurrence over the step's real rows, as
+    `KimiKDAAttention._forward_impl` runs it.
+
+    A step with a prefill row runs aiter's chunked kernel over every row
+    (`chunk_kimi_delta_attn`), one of decode rows alone the fused recurrent
+    kernel (`fused_sigmoid_gating_delta_rule_update`), or under ReplaySSM its
+    replay kernel (`replayssm_sigmoid_gating_delta_rule`). Each reads q, k,
+    the forget gate (a channel) and v, and beta (a head), and writes its
+    output, once a token in bf16; reads the gate's `A_log` and `dt_bias`, in
+    fp32, once; and reads a row's state where the row has history. The
+    chunked kernel writes each row's last state; the fused kernel the state
+    after each token, a snapshot a verified position; the replay kernel each
+    token's (k, u, g) record, k and u in bf16 and g in fp32, and no state.
+
+    Each token and head runs three products with its state: k against it, its
+    rank-1 update, and q against it. The chunked kernel also runs, in each
+    chunk of `n` tokens, a head, Q and K against K, the inverse's products
+    with K and V, and its intra-chunk output: `2 n^2 (3 K + 2 V)`.
+
+    Kimi-K3 Mono (`ATOM_MONO_ENABLE=1`, its default) runs a decode of at most
+    64 rows at TP8 in its own kernels (`atom/models/kimi_k3/mono/`), this
+    recurrence inside K1; the roofline still prices it module by module.
+    """
+    heads, dim, records = m.dims
+    rows, act, fp32 = view.requests, ELEMENT_BYTES[ACT], ELEMENT_BYTES["fp32"]
+    real = sum_tokens(rows)
+    state = heads * dim * dim * ELEMENT_BYTES[m.fmt]
+    moved = real * heads * (5 * dim + 1) * act + heads * (dim + 1) * fp32
+    moved += sum(1 for r in rows if r.cached_tokens) * state
+    flops = 6 * real * heads * dim * dim
+    if view.prefill:
+        moved += len(rows) * state
+        chunks = [divmod(r.query_tokens, KDA_CHUNK) for r in rows]
+        squares = sum(n * KDA_CHUNK**2 + tail**2 for n, tail in chunks)
+        flops += 10 * heads * dim * squares
+    elif records:
+        moved += real * heads * dim * (2 * act + fp32)
+    else:
+        moved += real * state
+    # ponytail: a record replayed from the buffer, the checkpoint rewritten
+    # when the buffer fills, the triangular inverse, and a prefill's midstep
+    # checkpoints (`ScheduledBatch.state_save_all`) are left out of this lower
+    # bound: the view states none of them. The state is priced at the bf16
+    # rate, a lower bound on an fp32 accumulation the spec states no rate for.
+    return Work({ACT: flops}, moved)
 
 
 def _pairs(rows) -> int:
