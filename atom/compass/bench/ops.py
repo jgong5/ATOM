@@ -4215,14 +4215,15 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             want[at[tokens][0], None].add(fam)
     for point, fams in cached_ladder(top_only=True).items():
         want[point] |= fams
-    n = 1
+    n, spec = 1, config.speculative_config
+    drafts = spec.num_speculative_tokens if spec else 0
     while want:
         measure_round(want, n)
         n += 1
         want = cached_ladder(top_only=False) if n == 2 else {}
         dependent = _dependent(done.values())
         families = _families(done.values(), dependent)
-        want = want or _densify(families, tried, step_tokens, dependent)
+        want = want or _densify(families, tried, step_tokens, dependent, drafts)
         want = want or _filled(families, tried, config.max_model_len)
     kinds = Counter(r["op"] for r in done.values() if "refused" not in r)
     print(json.dumps({"points per leaf kind": dict(kinds.most_common())}, indent=1))
@@ -4352,7 +4353,8 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
                     bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
-                    bound += (None if part else _real(line), *tail[1:])
+                    rows = frozenset((q, c) for q, c, _ in line["rows"])
+                    bound += (None if part else _real(line), peak, rows)
                 elif asked:  # a prefill's drafter's leaf at each bound a run asks
                     each = [(*b, mean, top) for b, _ in asked]
                     bound = each if each[1:] else each[0]
@@ -4733,7 +4735,9 @@ def _band(ats, lo, hi) -> slice | None:
     return None if i < 0 or j == len(ats) else slice(min(i, j), max(i, j) + 1)
 
 
-def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
+def _densify(
+    families, tried: set, step_tokens=None, dependent=None, drafts: int = 0
+) -> dict:
     """The point halfway between each two neighbours of a family, or of a
     prefill leaf's token count over cached tokens (`_cut`), more than one
     apart, unless `tried`, that launched different kernels or, in a decode
@@ -4756,8 +4760,15 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
     state G (`exchange_at`): `trace ops` traces such a shape only at a record's
     step. Any other is `_bent` on its line as `fit ops` reads it, taking
     in a gap beside a bend each count of a step (`step_tokens`) at its rows, or
-    at any for a family stating none."""
+    at any for a family stating none. A compressor's decode family
+    (`_compressor`) is two lines, as `fit ops` reads it: its points whose rows
+    complete a compressed entry (`fit.ops.completes`) and the rest, each
+    halved at the context nearest halfway at which a point's rows
+    (`point_rows`, a drafter of `drafts` verifying past each) hold its line,
+    and each reaching its family's least and most context at the nearest
+    context inside them that holds it."""
     from atom.compass.capture.forward import decode, prefill
+    from atom.compass.fit.ops import completes
 
     steps = {
         p[2]["op"]
@@ -4794,8 +4805,36 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
         if json.loads(fam)[0] == "prefill":
             lines[line(fam, points)] += points
 
-    want = defaultdict(set)
-    for fam, points in [*families.items(), *across.items()]:
+    # a compressor's decode family as two lines, each reaching its family's ends
+    want, lined, lines_of = defaultdict(set), [], {}
+    for fam, points in families.items():
+        if not (ratio := _compressor(points, moved)):
+            lined.append((fam, points))
+            continue
+        shape, ragged = _marked(points[0][2]), json.loads(fam)[2:]
+
+        def completing(m, shape=shape, ragged=ragged, ratio=ratio) -> int:
+            at = (m, *ragged) if ragged else m
+            return completes(
+                point_rows(shape, at, sys.maxsize, 1, False, drafts), ratio
+            )
+
+        lines_of[fam] = completing, ratio
+        least, most = min(p[0] for p in points), max(p[0] for p in points)
+        for done in (0, 1):
+            on = [p for p in points if completes(p[2]["rows"], ratio) == done]
+            lined += [(fam, on)] if on else []
+            low = min((p[0] for p in on), default=most + 1)
+            high = max((p[0] for p in on), default=least - 1)
+            for end, lo, hi in ((least, least, low - 1), (most, high + 1, most)):
+                if lo > hi or (fam, done, end) in tried:
+                    continue
+                tried.add((fam, done, end))
+                m = _nearest(end, lo, hi, completing, done)
+                if m is not None and (fam, m) not in tried:
+                    tried.add((fam, m))
+                    want[shape, (m, *ragged) if ragged else m].add(fam)
+    for fam, points in [*lined, *across.items()]:
         if isinstance(fam, str) and json.loads(fam)[0] == "exchange G":
             continue
         points = sorted(points, key=lambda p: p[0])
@@ -4825,8 +4864,14 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
                             tried.add((fam, t, r))
                             want[prefill(t, r), cut and cut[1] or None].add(fam)
                 continue
+            if ka == kb and a not in bent or b - a < 2:
+                continue
             mid = (a + b) // 2
-            if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
+            if fam in lines_of:  # a compressor's: the nearest halfway on its line
+                completing, ratio = lines_of[fam]
+                done = completes(record["rows"], ratio)
+                mid = _nearest(mid, a + 1, b - 1, completing, done)
+            if mid is None or (fam, mid) in tried:
                 continue
             if cut and moves(*cut, a, b):
                 continue
@@ -4926,6 +4971,28 @@ def _bent(points, steps=()) -> set:
         if p[1] == q[1] == r[1] and abs(line - y[1]) > BENDS * y[1]:
             ends |= {p[0], q[0]}
     return ends
+
+
+def _compressor(points, dependent: dict) -> int:
+    """The compress ratio the leaf of a decode family's `points` takes, a
+    compressor's, of a kind that depends on context (`_dependent`), where its
+    points state their rows; else 0."""
+    record = points[0][2]
+    if not record["shape"].startswith("decode") or "rows" not in record:
+        return 0
+    if not dependent.get(record["op"], True):
+        return 0
+    return json.loads(record["leaf"])["args"].get("ratio") or 0
+
+
+def _nearest(around: int, lo: int, hi: int, of, value) -> int | None:
+    """The number nearest `around`, from `lo` to `hi`, the lower first, at
+    which `of` gives `value`; None where none is."""
+    for d in range(max(around - lo, hi - around) + 1):
+        for m in (around - d, around + d):
+            if lo <= m <= hi and of(m) == value:
+                return m
+    return None
 
 
 def _apart(p, q) -> bool:

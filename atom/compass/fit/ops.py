@@ -47,7 +47,11 @@ row's, after its rows' mean context in `PERMILLE` of it (``mean``) where some
 point of the family has ragged rows, leaving out each uniform point whose rows
 the KV pool cut, or a prefill point's rows' mean cached
 tokens (`band`); and a prefill's B for a kind its rows move (``("rows",
-op)``). A collective's
+op)``). A decode leaf of such a kind that takes a compress ``ratio``, a
+compressor, is read before its context at ``completes``, whether its point's
+rows complete a compressed entry (`completes`): the entry's attention runs
+only then, so its cost alternates with every row's context against the ratio,
+and each answer is read from points alike. A collective's
 points name their family themselves, `measure ops`'s `exchange`, and its one
 dimension is their message bytes; one apart along it is one row's bytes
 (``row_bytes``, a decode's B or a prefill's T being its rows), when every point
@@ -111,8 +115,10 @@ LIMIT = 0.05
 #: The leaves a `PriceList` keeps the signatures of; past it, it forgets them.
 SIGNED = 1 << 14
 #: The dimensions a bound states by place, as `op_graph.OpGraphBackend._bound`
-#: lays them out: (phase, T, B, G, context, last, real[, largest]).
+#: lays them out: (phase, T, B, G, context, last, real, largest, rows).
 BOUND = (None, "T", "B", "G", "context")
+#: Where a bound states its rows, each its query and context tokens.
+ROWS = 8
 
 
 class Declined(ValueError):
@@ -308,6 +314,13 @@ def _context(p) -> int:
     return band(p["rows"], False)[0] if "rows" in p else p["context"] or 0
 
 
+def completes(rows, ratio: int) -> int:
+    """1 when some row of `rows`, each its query and context tokens, completes
+    a compressed entry at `ratio`: its query tokens cross a multiple of it;
+    else 0."""
+    return int(any(c // ratio > (c - q) // ratio for q, c, *_ in rows))
+
+
 def fit(points) -> dict:
     """The price list's params: per skeleton, the integer positions that follow
     the shape, and per family, its dimensions and its points, each its
@@ -400,7 +413,7 @@ def fit(points) -> dict:
             for p in members
             if "R" in shape_counts(p["shape"])
         }
-        for p, ns in zip(members, ran):
+        for p, sig, ns in zip(members, sigs, ran):
             name = family(p["shape"], p["leaf"], free_of[skel], tokens)
             at_p = ns[0] | {"context": _context(p)}
             if p["shape"].startswith("decode") and "T" in at_p:
@@ -428,6 +441,9 @@ def fit(points) -> dict:
                     continue
                 dims.append("mean")
                 at_p["mean"] = mean or PERMILLE
+                if ratio := sig["args"].get("ratio"):  # a compressor
+                    dims.append("completes")
+                    at_p["completes"] = completes(p["rows"], ratio)
             dims += ["context"] if moves else []
             if len({tuple(n.get(d) for d in dims) for n in ns}) > 1:
                 left_out.append(
@@ -578,8 +594,9 @@ class PriceList(CostSource):
     a decode step's rows' max, a prefill's rows' mean cached tokens; ``mean``
     a decode step's rows' mean context over its B in `PERMILLE` of their max,
     where the family was measured on ragged rows; ``pad`` the rows a decode's
-    MoE leaf routes less the real ones the bound states last, 0 where it
-    states none; a collective's family
+    MoE leaf routes less the real ones the bound states, 0 where it
+    states none; ``completes`` whether the rows the bound states last complete
+    a compressed entry at the leaf's ratio (`completes`); a collective's family
     (`bench.ops.exchange`) at its message bytes, MORI's at a step stating G
     its family apart, over EP times the rows its largest rank sends: the most
     tokens a rank of its DP group scheduled, where the bound states them after
@@ -620,7 +637,7 @@ class PriceList(CostSource):
                 return got[0]
             ran = _either(dict(zip("TBG", b[1:4])) for b in bounds)
             return self.refuse(f"{leaf['op']}: {ran}")
-        leaf, bound, _ = request  # (phase, T, B, G, context, last, real[, largest])
+        leaf, bound, _ = request  # as `BOUND` lays it out
         kind, phase = leaf["op"], bound[0]
         ex, sig = self._sign(leaf)
         if ex and kind.startswith(MORI) and bound[3] is not None:
@@ -644,6 +661,8 @@ class PriceList(CostSource):
             real = bound[6:7]
             stated = real[0] if real else None
             at["pad"] = 0 if stated is None else routed_rows(leaf) - stated
+        if "completes" in dims:  # a compressor, at whether the step's rows complete
+            at["completes"] = completes(bound[ROWS], leaf["args"]["ratio"])
         if phase == "decode":
             if "mean" in dims:
                 at["mean"] = PERMILLE * bound[5] / bound[4]

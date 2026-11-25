@@ -236,7 +236,7 @@ def test_a_step_is_asked_at_the_real_rows_its_moe_runs(view, dp, real):
 
     backend.price(view)
 
-    assert [b[-1] for b in asked.bounds] == [real]
+    assert [b[6] for b in asked.bounds] == [real]
 
 
 def _moe(dp, shape):

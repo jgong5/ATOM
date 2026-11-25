@@ -703,7 +703,10 @@ class OpGraphBackend(CostBackend):
         states the real rows its MoE runs (`real_rows`), and any other None;
         a target at a step stating G then the most tokens a rank of its DP
         group scheduled (`group_max_tokens`), where its view states them,
-        which MORI's exchange there is priced by."""
+        which MORI's exchange there is priced by, and any other None; and
+        every bound its rows, each its query and context tokens, as a set
+        whose hash is kept: a compressor's price reads whether they complete
+        a compressed entry (`fit.ops.completes`)."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
@@ -725,8 +728,8 @@ class OpGraphBackend(CostBackend):
         own = sum(r.query_tokens for r in view.requests)
         real = real_rows(own, view.moe_rows, view.moe_tokens, view.group_dummies)
         bound += (real if phase == "decode" and not draft else None,)
-        if g is not None and not draft and view.group_max_tokens is not None:
-            bound += (view.group_max_tokens,)
+        stated = g is not None and not draft
+        bound += (view.group_max_tokens if stated else None, frozenset(rows))
         if not width:
             return bound
         if ran == t:
