@@ -2,7 +2,7 @@
 # The decode engine step's hop split (#4151), on #4029's 8P16D C1228 short cell.
 #   host:          run.sh prep DIR    DIR/ATOM: #4029's measured tree with hopstamps.py and hooks.patch
 #   CPU container: run.sh sim DIR/ATOM OUT [DURATION] [WARMUP_PER_LANE]: #4029's run.sh sim, stamps into OUT.frames
-#   host:          python3 rank.py OUT 60; python3 split.py OUT
+#   host:          python3 $TOOLS/rank.py OUT 60; python3 split.py OUT 60
 # BASE (#4029's run 2 tree: a5691dd27 + #3996 + #3997 + #4004 + frames.patch) holds the c307 laws' `atom_digest`;
 # hopstamps.py and both hooks live under atom/compass/, which the digest leaves out. Each stamping process writes
 # <pid>.hop and <pid>.hop.json beside the frames (COMPASS_TRACE_DIR).
