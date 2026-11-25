@@ -34,8 +34,10 @@ the `INPUTS` of a calibration started there name, or its own when they name
 none, as a resume must take the store it started with; before one starts, into
 the shared store when the verdicts were judged there and it holds neither a
 step linear law of the configuration at the head's ATOM digest nor readings at
-their key, since it refuses a second publish at a key, else into the
-calibration's own. Where an earlier candidate none of whose verdicts is refused
+their key, nor a stale entry at the readings key of a later candidate looked up
+there, none of whose verdicts is refused, that names that calibration (below),
+since it refuses a second publish at a key, else into the calibration's own.
+Where an earlier candidate none of whose verdicts is refused
 calibrates a law at the same key, by model, platform and engine config, a
 candidate names that calibration in place of its own command, which the store
 would refuse as a second law at the key, with the command measuring its
@@ -226,14 +228,34 @@ def check(expansion: dict, out: Path) -> dict:
     """`expansion`'s verdicts, written into `out`: the ``head``, the reason
     the tree is ``refused``, if it is, and per candidate the ``store`` it is
     looked up in and each point's ``law`` and ``readings`` verdicts per
-    instance."""
+    instance; judged again where a calibration not yet started would publish
+    into a store holding a stale entry at a borrower's readings key, that
+    calibration then publishing into its own."""
     try:
         head = reuse.head(expansion["commit"])
         reuse.refuse_another_tree(head)
         refused = None
     except ValueError as error:
         head, refused = None, _refused(error, 1)
-    judged, seen, machine, calibrations = {}, {}, expansion["machine"], {}
+    seen = {}
+    judged, alone = _judging(expansion, out, head, refused, seen, set())
+    if alone:
+        # A calibration into its own store meets no entry there: once is enough.
+        judged, _ = _judging(expansion, out, head, refused, seen, alone)
+    written = {"head": head, "refused": refused, "candidates": judged}
+    (out / REUSE).write_text(json.dumps(written, indent=1) + "\n")
+    return written
+
+
+def _judging(
+    expansion: dict, out: Path, head, refused, seen: dict, alone: set
+) -> tuple:
+    """Each candidate's verdicts as `check` gives them, each instance's config
+    and verdicts kept in `seen` (`_judged`), the calibration in each directory
+    in `alone` publishing into its own store; and the directory of each
+    calibration a borrower's readings meet a stale entry in the store of
+    (`_borrowing`)."""
+    judged, machine, calibrations, moving = {}, expansion["machine"], {}, set()
     for candidate in expansion["candidates"]:
         points = [p for p in expansion["points"] if p["candidate"] == candidate["name"]]
         if refused:
@@ -245,7 +267,7 @@ def check(expansion: dict, out: Path) -> dict:
         holding_law, reached = None, _reached(candidate, points)
         directory, ended = calibrating(out, candidate["name"])
         made = directory, expansion["workload"]["traces"]
-        made += (expansion["store"], ended)
+        made += (None if directory in alone else expansion["store"], ended)
         for store in reuse.stores(expansion["store"], out):
             given = (machine["device"], store, machine["ptl"])
             given += (machine.get("stack"), machine.get("network"))
@@ -263,12 +285,12 @@ def check(expansion: dict, out: Path) -> dict:
         else:
             store, verdicts = holding_law or (store, verdicts)
         judged[candidate["name"]] = {"store": str(store.root), "points": verdicts}
-        _borrowing(candidate, reached, judged[candidate["name"]], calibrations, made)
+        _borrowing(
+            candidate, reached, judged[candidate["name"]], calibrations, made, moving
+        )
         new = lacking.readings_store(out / CAL / READINGS, head["atom"])
         _measuring(judged[candidate["name"]], new)
-    written = {"head": head, "refused": refused, "candidates": judged}
-    (out / REUSE).write_text(json.dumps(written, indent=1) + "\n")
-    return written
+    return judged, moving
 
 
 def lines(judged: dict) -> list[str]:
@@ -643,7 +665,8 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     each instance's config resolved once, under its variables, and judged once
     a store, both kept in `seen`. A 1P1D `side` runs as `_side` gives it, on
     the simulated connector. `made` is the calibration's directory, traces and
-    the shared store a ``calibrate`` verdict's command takes, and the directory
+    the shared store a ``calibrate`` verdict's command may take, or None,
+    which `seen` keeps a verdict apart for, and the directory
     of one that ended before it, or None, whose law a command refitting it
     (`_refits`) gives way to `REFITS`; a ``calibrate`` verdict states, for
     `_borrowing`, its ``calibration``: the ``key`` its law is published at, by
@@ -666,7 +689,7 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     if isinstance(args, dict):
         return args, args
     instance = (tuple(args), tuple(env.items()))
-    if (store.root, *instance) not in seen:
+    if (at := (store.root, made[2], *instance)) not in seen:
         with _env(env):
             if instance not in seen:
                 arch = machine.value("device.arch")
@@ -707,8 +730,8 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                         one.get("beside"),
                     )
                 verdicts = law, readings
-        seen[(store.root, *instance)] = verdicts
-    return seen[(store.root, *instance)]
+        seen[at] = verdicts
+    return seen[at]
 
 
 def _side(side: str, one: dict, connector: str) -> tuple:
@@ -752,7 +775,9 @@ def _holds(root, keys: dict) -> bool:
     return bool(reuse._keyed(store, Kind.STEP_LINEAR_LAW, engine, **keys["law"]))
 
 
-def _borrowing(candidate: dict, points: list, held: dict, calibrations: dict, made):
+def _borrowing(
+    candidate: dict, points: list, held: dict, calibrations: dict, made, alone: set
+) -> None:
     """Take each ``calibration`` `_judged` states out of the law verdicts in
     `held`, `candidate`'s at its `points`, and name, in place of a verdict's own
     `calibrate.sh` command, the calibration an earlier candidate's in
@@ -763,7 +788,10 @@ def _borrowing(candidate: dict, points: list, held: dict, calibrations: dict, ma
     (`_readings_by`), unless they are at their key there. Each other
     calibration joins `calibrations`, unless a verdict of the candidate is
     refused, whose state prints no command. A 1P1D point's sides take one
-    command into `made`'s calibration directory (`_deploying`)."""
+    command into `made`'s calibration directory (`_deploying`). A calibration
+    that has not started joins `alone` where this candidate's readings, unless
+    refused, meet a stale entry at their key in the store it publishes into,
+    which refuses them."""
     refused = any(v["verdict"] == "refused" for v in _each(held["points"]))
     for point in points:
         verdicts = held["points"][point["name"]]
@@ -782,9 +810,13 @@ def _borrowing(candidate: dict, points: list, held: dict, calibrations: dict, ma
                 lender, into = Path(lending["in"]), lending["into"]
                 law["made_by"] = [_lent(lending)]
                 there = Path(into) == Path(held["store"])
-                if verdicts["readings"][side]["verdict"] != "reuse" or not there:
+                readings = verdicts["readings"][side]
+                if readings["verdict"] != "reuse" or not there:
                     one = point["instances"][side]
                     law["made_by"].append(_readings_by(lender, into, one))
+                stale = there and readings.get("held") and not refused
+                if stale and not (lender / INPUTS).is_file():
+                    alone.add(lender)
             verdicts["law"][side] = law
 
 
@@ -829,7 +861,7 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
     }
     judged_in = held["store"]
     reused = [laws[side].get("store") for side in laws if side not in keys]
-    shared_in = Path(judged_in).resolve() == Path(shared).resolve()
+    shared_in = shared and Path(judged_in).resolve() == Path(shared).resolve()
     lookup = judged_in if shared_in or judged_in in reused else None
     into, fit, waiting = _deployed(directory, lookup, keys, lent, sides)
     for side in (side for side in keys if side not in fit):
@@ -965,7 +997,7 @@ def _publishing(store, made, law: dict, readings: dict) -> str | None:
     if (directory / INPUTS).is_file():
         return started_store(directory)
     held = "store" in law or readings["verdict"] == "reuse" or readings.get("held")
-    return shared if store.root == Path(shared) and not held else None
+    return shared if shared and store.root == Path(shared) and not held else None
 
 
 def started_store(directory: Path) -> str | None:
