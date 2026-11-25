@@ -1315,11 +1315,13 @@ not built.
 A conservative protocol overlaps LPs' wall work only as far as their ceilings and LBTS
 let them run apart in simulated time. [#4029](https://github.com/jgong5/ATOM/issues/4029)'s
 run 2 of the 8P16D C1228 recipe (4 P instances at DP2, 4 D instances at DP4, LP `router`,
-LP `mooncake_store`; tree a5691dd27 with #3996, #3997 and #4004) spends 6.07 wall seconds
-per simulated second in its profiling window: 3,713 critical-path hops at 1.64 ms each,
-while the LPs' own work averages 1.6 cores
+LP `mooncake_store`; tree a5691dd27 with #3996, #3997 and #4004) spends 6.03 wall seconds
+per simulated second in its profiling window
 ([#4029's table](https://github.com/jgong5/ATOM/issues/4029#issuecomment-7151883313)).
-The decode frontends hold 2,846 of the hops. Their ceiling is the local-grant rule's
+#4029's walk of that window, cut into 300 s slices, counts 3,713 critical-path hops per
+simulated second at 1.64 ms each, while the LPs' own work averages 1.6 cores, and puts
+2,846 of the hops on the decode frontends
+([the breakdown](https://github.com/wuhuikx/LLM-Booster/issues/596#issuecomment-7153595726)). Their ceiling is the local-grant rule's
 `G + cycle` (D3, *Local grants*), and their shortest cycle runs through their engine,
 `request` 9.57 us plus `output` 61 us. [#3968](https://github.com/jgong5/ATOM/issues/3968)
 drops that cycle while the engine waits in TAR, which leaves the cycle through LP `router`:
@@ -1413,8 +1415,9 @@ LBTS, which a ceiling never passes.
    from LP names, a second source for one fact.
 5. **LBTS keeps one term per LP that reacts on every channel, and splits a declaring LP's
    by reaction class.** For `j` without a declaration the term stays `N[j] + D(j->i)`, its
-   undelivered messages each provoking what `j` itself can. For the router it is the least
-   of its own events' term, `min(t, t_daemon) + D(router->i)`, and, per class, the
+   undelivered messages each provoking what `j` itself can. While the router runs or waits
+   in TAR, its term stays `N[router] + D(router->i)`. While it waits in NER, it is the
+   least of its own events' term, `min(t, t_daemon) + D(router->i)`, and, per class, the
    earliest undelivered arrival on the class's channels plus that class's `reach`. Basis: code,
    `ClockAuthority._row` and `_n` keep `N[j]` per LP; for an LP without a declaration
    every class has the same distance. Rejected: per-channel terms for every LP: the same
