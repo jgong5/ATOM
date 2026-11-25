@@ -11,7 +11,8 @@
 #   RUN_FILE        a run file; its out_dir and clock_endpoint are replaced,
 #                   and its client_runs set to 1
 #   MODEL           model directory: config.json and the tokenizer (required;
-#                   with REAL=1, the weights too)
+#                   with REAL=1, the weights too), whose tokenizer aiperf reads
+#                   with HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE unset
 #   TRACES          a cc-traces traces.jsonl (required)
 #   HARNESS_PYTHON  the Python that has agentx-harness and compass-harness
 #                   installed; with REAL=1, agentx-harness without
@@ -268,8 +269,12 @@ aiperf=(-m aiperf)
 # same requests.
 ((REAL)) && aiperf=(-c "$COMPASS_REAL_AIPERF" "$ROOT/compass_harness/compass_harness/session_ids.py")
 # Its own process group, so stopping it stops its workers too. Its raw records
-# leave out each request's payload, its prompt.
-(cd "$OUT" && ATOM_COMPASS_RUN=$OUT/run.json AIPERF_DATASET_MMAP_BASE_PATH=$OUT AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true \
+# leave out each request's payload, its prompt. Its tokenizer is MODEL's
+# directory, read with no network; offline, aiperf looks the name up in the
+# Hugging Face cache alone and refuses a directory, so it runs with the offline
+# switches unset.
+(cd "$OUT" && unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE &&
+    ATOM_COMPASS_RUN=$OUT/run.json AIPERF_DATASET_MMAP_BASE_PATH=$OUT AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true \
     exec setsid "$HARNESS_PYTHON" "${aiperf[@]}" profile --url "127.0.0.1:$PORT" --model "$MODEL" \
     --tokenizer "$MODEL" --input-file "$OUT/traces" --artifact-dir "$OUT/artifacts" \
     --export-level raw "${args[@]}") >"$OUT/aiperf.log" 2>&1 &
