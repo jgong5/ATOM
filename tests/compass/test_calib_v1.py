@@ -6,6 +6,7 @@ segments generated from the deployment (`design`), on synthetic configs,
 records and laws."""
 
 import copy
+import dataclasses
 import json
 import math
 import os
@@ -20,7 +21,9 @@ from atom.compass.backends.step_grid_plan import TARGET
 from atom.compass.backends.step_linear import (
     StepLinearBackend,
     StepLinearLaw,
+    dummy_view,
     gather_rows,
+    hull_axes,
 )
 from atom.compass.calib import columns, deploy, design
 
@@ -577,6 +580,63 @@ def test_a_provisional_gather_counts_no_rows_on_one_rank_as_the_backend_does():
             dp_rank=0,
         )
         assert gather(group, 2, buckets) == gather_rows(group, tuple(buckets), 2)
+
+
+INDICATORS = ("peer_small", "peer_large", "eager_dummy", "eager_dummy_tail")
+
+
+def test_the_peer_share_and_eager_dummy_indicators_are_counted_as_the_backend_prices_them():
+    """Cell B P's prefill law (DeepSeek-V4.1 DP2 EP2, fitted with `--peer-share`)
+    carries `peer_small`, `peer_large`, `eager_dummy` and `eager_dummy_tail`,
+    indicators a vector's hull leaves out (`step_linear.hull_axes`). The backend
+    prices each, so a design counts each as the backend does, on a rank's own
+    prefill beside a small and beside a large peer and on a dummy forward of an
+    eager step, and a variant carrying them is checked like any other (#752
+    DEPA2, the aggregated config split from cell B's P)."""
+    for name in INDICATORS:
+        assert columns.backend_prices("prefill", name), name
+    names = ["step", "tokens", "query_square", "query_cached", "seqs", "out"]
+    names += [*INDICATORS[:2], "padding", *INDICATORS[2:]]
+    assert columns.provisional("prefill", names) == []
+    values = (0.02, 1e-5, 5e-11, 2e-11, 3e-3, 5e-3, 7e-3, 4e-3, 5e-6, 0.08, 0.01)
+    coefficients = dict(zip(names, values))
+    law = {
+        "provenance": "synthetic",
+        "prefill": _vector(coefficients, buckets=[256, 512, 1024]),
+        "decode": {},
+    }
+    # the hull holds the backend's axes alone, which a law over all of them refuses
+    axes = [names[i] for i in hull_axes(tuple(names))]
+    law["prefill"]["hull"]["equal"] = dict.fromkeys(axes, 0.0)
+    backend = StepLinearBackend(StepLinearLaw(law), dp=2)
+    dep = _dep()
+
+    def own(peers, tokens=2000):
+        return BatchView(
+            (RequestShape(tokens, tokens, False),),
+            moe_rows=tokens + peers,
+            group_max_tokens=tokens,  # past the largest bucket: the step runs eagerly
+            produces_output=True,
+            group_tail=True,
+            group_prefills=True,
+            dp_rank=0,
+        )
+
+    small, large = own(100), own(1500)
+    dummy = dataclasses.replace(dummy_view(large), dp_rank=1)
+    expect = {
+        "small": (small, {"peer_small": 1.0, "peer_large": 0.0}),
+        "large": (large, {"peer_small": 0.0, "peer_large": 1.0}),
+        "dummy": (dummy, {"eager_dummy": 1.0, "eager_dummy_tail": 1.0}),
+    }
+    for label, (view, ones) in expect.items():
+        got = dict(zip(names, columns.values(view, "prefill", names, dep)))
+        for name in INDICATORS:
+            assert got[name] == ones.get(name, 0.0), (label, name)
+        priced = {t.name: t.seconds for t in backend.price(view).terms}
+        for name in names:
+            term = priced.get(f"prefill.{name}", 0.0)
+            assert term == pytest.approx(coefficients[name] * got[name]), (label, name)
 
 
 def test_a_step_the_backend_refuses_is_refused_by_name():

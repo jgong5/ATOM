@@ -25,6 +25,7 @@ from atom.compass.backends.step_linear import (
     PREFILL,
     StepLinearBackend,
     StepLinearLaw,
+    hull_axes,
 )
 
 
@@ -93,7 +94,11 @@ PROVISIONAL = {
 
 
 def _vector(features, extra=None) -> dict:
-    axes = [f for f in features if f != "step"]
+    # The hull spans the backend's own axes (`hull_axes`): not the intercept,
+    # nor the indicators `EAGER_DUMMY` and `PEER_SHARE`, which a vector whose
+    # hull names them refuses, so no variant could carry them.
+    features = tuple(features)
+    axes = [features[i] for i in hull_axes(features)]
     return {
         "coefficients": dict.fromkeys(features, 1.0),
         "hull": {"equal": dict.fromkeys(axes, 0.0), "facets": []},
