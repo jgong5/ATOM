@@ -34,9 +34,9 @@ the `INPUTS` of a calibration started there name, or its own when they name
 none, as a resume must take the store it started with; before one starts, into
 the shared store when the verdicts were judged there and it holds neither a
 step linear law of the configuration at the head's ATOM digest nor readings at
-their key, nor a stale entry at the readings key of a later candidate naming
-that calibration (below), since it refuses a second publish at a key, else into
-the calibration's own.
+their key, nor a stale entry at the readings key of a later candidate looked up
+there, none of whose verdicts is refused, that names that calibration (below),
+since it refuses a second publish at a key, else into the calibration's own.
 Where an earlier candidate none of whose verdicts is refused calibrates a law
 at the same key, by model, platform and engine config, a candidate names that
 calibration in place of its own command, which the store would refuse as a
