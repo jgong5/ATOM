@@ -501,8 +501,10 @@ record, fit and simulated run.
 [#2712](https://github.com/jgong5/ATOM/issues/2712) defines: a MiniMax-M3 scenario with its
 EAGLE3 drafter built on the meta device runs under the step stub and passes `check_run`.
 That closes the Eagle case of [#2672](https://github.com/jgong5/ATOM/issues/2672), which
-asked each such form to run or be refused. The step roofline lays out no Eagle3 pass, so an
-Eagle3 step it prices is refused by name (`cost:<backend>: prices no draft`, D83).
+asked each such form to run or be refused. The step roofline prices each Eagle3 pass, one a
+draft token over the draft model's own layer, its `fc` once before them
+([#3962](https://github.com/jgong5/ATOM/issues/3962)); a MiniMax-M3 step it prices is still
+refused by its sparse attention layers ([#3964](https://github.com/jgong5/ATOM/issues/3964)).
 
 A law and a readings entry name the draft by method and `K`
 (`run/step_grid.py::keyed`'s `speculative`) beside the target's `config.json` digest, and

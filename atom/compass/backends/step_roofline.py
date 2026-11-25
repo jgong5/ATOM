@@ -51,8 +51,9 @@ KV, and replays as the target's modules do. On a step that samples, a decode
 step or a prefill that produces output, that pass runs before
 `forward_done_event`, inside the target's time.
 
-A module with `passes` is a serial drafter's (MTP), which runs once for each
-draft token. Its first pass runs the step's own rows, unpadded, its MoE
+A module with `passes` is a serial drafter's (MTP or Eagle3), which runs once
+for each draft token, or with `passes` 1, once before them (Eagle3's `fc`,
+in its first pass). Its first pass runs the step's own rows, unpadded, its MoE
 gathering `draft_moe_rows`; on a step that samples nothing that pass alone
 runs, writing the drafter's KV. On a step that drafts, one that samples or,
 under a data-parallel group, a middle chunk, whose propose runs for the
@@ -205,7 +206,8 @@ class Module:
     module on the target's rows, 0 for the target's; `kv` the format of the
     cache an `mla_up` gathers a prefill's context from, and `chunk` the
     cached tokens past which it gathers only those, 0 for none; `passes` a
-    serial drafter's passes, one a draft token, 0 for any other module;
+    serial drafter's passes, one a draft token, 1 for one of its modules that
+    runs once before them, 0 for any other module;
     `gathers` that a `gemm`'s collective all-gathers its output shards over
     `ranks` rather than all-reducing its output; `head` that it runs on the
     rows the LM head samples, before it, none where that samples none;

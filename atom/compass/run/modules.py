@@ -132,9 +132,25 @@ window, priced over it as the target's windowed layers are. Where a
 data-parallel group shards a draft's argmax (`ATOM_DP_DRAFT_ARGMAX`, a head
 at TP 1, its vocabulary split evenly), its LM head carries the group's width
 and the most rows it shards (`ParallelLMHead._can_use_dp_sharded_argmax`).
-An Eagle3 drafter is not built, and a step under one prices no draft
-(#3962), nor are GLM-5-Next's and Qwen4-Exp's MTP drafters, whose sparse
-attention no roofline class prices (#3984).
+
+It reads an Eagle3 drafter as a serial one too (`EAGLE3`: one Llama decoder
+layer, MiniMax-M3's and Kimi-K2.5's), built from its own config as
+`EagleProposer._build_draft_model` builds it. Its `fc`, which projects the
+target's aux hidden states, and their norms (`fc_norm`, in one launch) run
+once a step, before the first pass (`EagleProposer._propose`'s
+`combine_hidden_states`): their passes are 1. Its layer norms the embedding
+and the carried hidden state in one launch (`_dual_norm_cat`); its own
+embedding, whole on every rank (`ReplicatedEmbedding`), joins no collective;
+and where it carries its hidden state unnormed (`norm_output` off), its final
+norm runs in `compute_draft_ids`, on the rows its LM head samples alone. The
+target's aux capture, the concatenation `fc` reads and, with `norm_output`
+off, the plain residual add that ends its forward are left out of this lower
+bound. The `ReplicatedEmbedding` reading also classifies GLM-5.2's target and
+MTP embeddings (`use_replicated_vocab_embed`) and GLM-5.3-Flash's MTP one; no
+step of theirs prices for it, as their DSA layers stay unclassified (#4186).
+Kimi-K2.6's EAGLE 3.1 MLA drafter is not built, and a step under it prices no
+draft (#4190), nor are GLM-5-Next's and Qwen4-Exp's MTP drafters, whose sparse
+attention no roofline class prices (#4186, #4187).
 
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
@@ -207,6 +223,9 @@ SERIAL = (
     "atom.models.qwen3_next_mtp.Qwen3NextMTP",
     "atom.models.mimo_v2_mtp.MiMoV2MTP",
 )
+#: The Eagle3 drafter whose passes it lays out, serially, and its layer.
+EAGLE3 = "atom.models.eagle3_llama.Eagle3LlamaModel"
+EAGLE3_LAYER = "atom.models.eagle3_llama.Eagle3LlamaDecoderLayer"
 #: V4's MTP block, read apart (`walk`), and the MTP layers that all-gather
 #: their `fc`'s output: Qwen3.5's and Qwen3-Next's.
 V4_MTP_BLOCK = "atom.models.deepseek_v4_mtp.MTPBlock"
@@ -243,7 +262,7 @@ def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
     replay = _replay(tree)
 
     def visit(module, name, parent, draft, passes=0):
-        m = _classify(module, name, parent)
+        m = _eagle3(module, name, parent) or _classify(module, name, parent)
         *priced, then = m if isinstance(m, tuple) else (m,)
         if isinstance(then, Module):
             priced, then = [then], NOTHING
@@ -259,12 +278,14 @@ def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
             found.append(dataclasses.replace(p, replay=rows))
         if then is DESCEND:
             children = list(module.named_children())
-            if passes and parent is drafted.model and isinstance(module, LISTS):
+            mtp = getattr(drafted, "model", None)
+            if passes and parent is mtp and isinstance(module, LISTS):
                 children = children[:1]  # its MTP layers: the first runs
             for child, sub in children:
                 inner = CONTEXT if _drafts_kv(sub, module) else draft
                 at = f"{name}.{child}" if name else child
-                visit(sub, at, module, inner, passes)
+                once = passes and _before_passes(sub, module)
+                visit(sub, at, module, inner, 1 if once else passes)
         elif (then is None or isinstance(then, str)) and type(module) not in seen:
             seen.add(type(module))
             where = f"{type(module).__name__} at {name or 'the root'}"
@@ -274,7 +295,7 @@ def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
     found[:] = [_dp_head(m) if m.kind == "lm_head" else m for m in found]
     if drafted is None:
         return found
-    if not _is(drafted, *SERIAL):
+    if not _is(drafted, *SERIAL, EAGLE3):
         visit(drafted, "drafter", None, drafted.block_size)
         return found
     from atom.config import get_current_atom_config
@@ -342,8 +363,9 @@ def drafter(config):
     """The model `config`'s drafter runs, built on the meta device as a
     simulated run builds its target, its post-load hooks run; None without a
     drafter, or for one whose passes the step roofline does not lay out: any
-    but DeepSeek-V4.1's DSpark, whose weights ship with the target's, and the
-    serial drafters of `SERIAL`, which ATOM builds from the target's config.
+    but DeepSeek-V4.1's DSpark, whose weights ship with the target's, the
+    serial drafters of `SERIAL`, which ATOM builds from the target's config,
+    and the Eagle3 drafter of `EAGLE3`, which it builds from its own.
 
     It registers its layers in a copy of ATOM's forward context: ATOM's own
     drafter build registers the same names, and refuses one twice."""
@@ -354,7 +376,7 @@ def drafter(config):
 
     arch = spec.draft_model_hf_config.architectures[0]
     built = support_draft_model_arch_dict.get(arch)
-    if built not in (DSPARK, *SERIAL):
+    if built not in (DSPARK, *SERIAL, EAGLE3):
         return None
     import copy
 
@@ -369,8 +391,18 @@ def drafter(config):
     own = copy.copy(config)
     own.compilation_config = copy.copy(config.compilation_config)
     own.compilation_config.static_forward_context = {}
+    after = {}
+    if built == EAGLE3:
+        # As `EagleProposer._build_draft_model`: its own config, uncompiled,
+        # its KV at the draft's dtype, its layer after the target's.
+        from atom.config import CompilationLevel
+
+        own.hf_config = spec.draft_model_hf_config
+        own.compilation_config.level = CompilationLevel.NO_COMPILATION
+        own.kv_cache_dtype = spec.draft_kv_dtype
+        after = {"layer_offset": config.hf_config.num_hidden_layers}
     with use_custom_atom_config(own), FactoriesOnMeta(), simulated_arch():
-        model = resolve_obj_by_qualname(built)(own)
+        model = resolve_obj_by_qualname(built)(own, **after)
         process_weights_after_loading(model)
     return model
 
@@ -399,6 +431,13 @@ def _replayed(replay, layer: int, name: str, kind: str) -> int:
 def _drafts_kv(module, parent) -> bool:
     """Whether `module` runs in its drafter's pass over the target's rows."""
     held = ("main_proj", "main_norm") if _is(parent, DRAFT_BLOCK) else ()
+    return any(module is getattr(parent, h, None) for h in held)
+
+
+def _before_passes(module, parent) -> bool:
+    """Whether `module` runs once a step, before its Eagle3 drafter's first
+    pass: the drafter's `fc` and its aux chunks' norms (`fc_norm`)."""
+    held = ("fc", "fc_norm") if _is(parent, EAGLE3) else ()
     return any(module is getattr(parent, h, None) for h in held)
 
 
@@ -497,6 +536,8 @@ def _classify(module, name, parent):
         return _moe(module, name, parent)
     if _is(module, OPS + "embed_head.ParallelLMHead"):
         return fmt and Module(name, "lm_head", tuple(weight.shape), fmt, module.tp_size)
+    if _is(module, OPS + "embed_head.ReplicatedEmbedding"):
+        return Module(name, "embedding", (weight.shape[1],))  # whole: no collective
     if _is(module, OPS + "embed_head.VocabParallelEmbedding"):
         if not _first_stage():
             return NOTHING
@@ -581,6 +622,33 @@ def _classify(module, name, parent):
     if type(module).__module__.startswith(SILENT):
         return NOTHING
     return DESCEND if next(module.children(), None) is not None else None
+
+
+def _eagle3(module, name, parent):
+    """An Eagle3 drafter's norms that run as one launch or on its head's rows
+    alone, as `_classify` reads a module, or None for any other: its layer's
+    input norms, over the embedding and the carried hidden state
+    (`fused_dual_rmsnorm_cat`); its aux chunks' norms (`fused_group_rmsnorm`);
+    and its final norm where `compute_draft_ids` runs it, on the rows the LM
+    head samples."""
+    if _is(module, EAGLE3_LAYER):
+        both = (module.input_layernorm, module.hidden_norm)
+        return Module(f"{name}.dual_norm", "norm", (_widths(both),)), DESCEND
+    if _is(parent, EAGLE3_LAYER):
+        held = (parent.input_layernorm, parent.hidden_norm)
+        return NOTHING if any(module is n for n in held) else None
+    if not _is(parent, EAGLE3):
+        return None
+    if module is parent.fc_norm:
+        return Module(name, "norm", (_widths(module),))
+    if module is parent.norm and not parent.norm_output:
+        return Module(name, "norm", (module.weight.shape[0],), head=True)
+    return None
+
+
+def _widths(norms) -> int:
+    """The widths of `norms` together."""
+    return sum(n.weight.shape[0] for n in norms)
 
 
 def _in_width(linear) -> int:
