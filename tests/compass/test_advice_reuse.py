@@ -418,15 +418,15 @@ def test_a_figure_past_5_percent_names_requirement_4(
 PRODUCER = {"kv_role": "kv_producer", "kv_connector": "compass"}
 
 
-def staged(tmp_path, r, *medians) -> dict:
-    """`r`'s config on as many pipeline stages as `medians`, an eager producer
-    as the template's prefill side, with its readings in the store; and `law`
-    re-keyed to it with a part per stage, as `fit steps` and `fit host` write
-    one: each stage's decode cut, its figures on prefill within the gate but
-    one run's median, `medians[k]` on stage k."""
+def staged(tmp_path, r, *medians, eager=True) -> dict:
+    """`r`'s config on as many pipeline stages as `medians`, a producer as the
+    template's prefill side, eager unless `eager` is false, with its readings
+    in the store; and `law` re-keyed to it with a part per stage, as `fit
+    steps` and `fit host` write one: each stage's decode cut, its figures on
+    prefill within the gate but one run's median, `medians[k]` on stage k."""
     stages = len(medians)
     vars(r.config).update(
-        pipeline_parallel_size=stages, enforce_eager=True, kv_transfer_config=PRODUCER
+        pipeline_parallel_size=stages, enforce_eager=eager, kv_transfer_config=PRODUCER
     )
     publish_readings(tmp_path / "store", r.config)
     held = law(r)
@@ -469,6 +469,25 @@ def test_a_pipeline_s_law_holds_each_stage_s_figures_to_5_percent_the_stage_name
     assert found[0]["reason"] == (
         f"{where}: {figure} of pipeline stage {stage}, past 5%, on records run at "
         "the head, which a calibration refits alike"
+    )
+
+
+@pytest.mark.parametrize("parts", ["laws", "stages"])
+def test_a_pipeline_s_host_laws_under_another_key_are_refused_as_one_stage_s_are(
+    tmp_path, searched, parts
+):
+    held = staged(tmp_path, searched, -0.02, -0.02)
+    if parts == "laws":
+        held["host"] = {"key": held["host"]["key"], **held["host"]["stages"][0]}
+    held["host"]["key"]["engine"]["tensor_parallel_size"] = 2
+    law_file(tmp_path, held)
+
+    found = verdicts(advise(tmp_path), "law")
+
+    assert [(v["verdict"], v["requirement"]) for v in found] == [("refused", None)] * 2
+    assert found[0]["reason"].startswith(
+        "the run file's host laws were fitted under another "
+        "['engine.tensor_parallel_size']; this run's key is "
     )
 
 
