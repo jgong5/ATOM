@@ -1106,6 +1106,13 @@ class UnbuiltModel(torch.nn.Module):
             "to call."
         )
 
+    def bind_mono_drafter(self, drafter: Any) -> None:
+        """Bind `drafter` to the tree's mono decode, as MiniMax-M3's installer
+        (`minimax_m3.mono.dispatch.install_mono_decode`) does to the model the
+        runner hands it whenever there is a drafter, mono on or off. No forward
+        runs here, so nothing reads the binding."""
+        self.tree.bind_mono_drafter(drafter)
+
 
 def publish_planned_transfer(runner: Any) -> None:
     """Publish one entry of the paged class `get_num_blocks` planned, the state
