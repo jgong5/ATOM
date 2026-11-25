@@ -1,0 +1,128 @@
+{
+ "model": "/share_nfs/models/amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+ "machine": {
+  "device": "mi355x",
+  "ptl": "disabled",
+  "network": "/share_nfs/xingjche/m31pd/net/pit2-link.json"
+ },
+ "store": "/share_nfs/xingjche/m31pd/store",
+ "workload": {
+  "traces": "/share_nfs/xingjche/m31pd/inputs/traces.jsonl",
+  "select": "agentx",
+  "concurrency": [
+   8,
+   16,
+   32,
+   64,
+   140,
+   256
+  ],
+  "duration_s": 900
+ },
+ "slo": {},
+ "common": {
+  "deployment": "1p1d",
+  "args": {
+   "--trust-remote-code": true,
+   "--kv_cache_dtype": "nvfp4",
+   "--index-cache-dtype": "nvfp4",
+   "--block-size": 128,
+   "--max-model-len": 1048576,
+   "--gpu-memory-utilization": 0.9,
+   "--method": "dspark",
+   "--draft-model": "/share_nfs/models/amd/MiniMax-M3.1-Flash-Quark-MXFP4/dspark",
+   "--num-speculative-tokens": 7,
+   "--spec-decode-acceptance-length": 4.04,
+   "--timeout-keep-alive": 900
+  },
+  "env": {
+   "PYTHONHASHSEED": "0",
+   "HF_HUB_OFFLINE": "1",
+   "MC_NUM_QP_PER_EP": "1",
+   "MC_DISABLE_HIP": "1",
+   "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4": "0",
+   "NCCL_IB_DISABLE": "1",
+   "RCCL_IB_DISABLE": "1",
+   "NCCL_NET_PLUGIN": "none",
+   "GLOO_SOCKET_IFNAME": "eno0",
+   "MORI_SOCKET_IFNAME": "eno0",
+   "NCCL_SOCKET_IFNAME": "eno0",
+   "PREFILL_KV_EXTRA": "{\"handshake_port\":6301,\"protocol\":\"rdma\",\"enable_chunked_transfer\":true,\"chunked_admission_timeout_s\":1500}",
+   "DECODE_KV_EXTRA": "{\"handshake_port\":6301,\"protocol\":\"rdma\",\"ib_device\":\"rdma4,rdma5,rdma6,rdma7\",\"pd_admission\":{\"enabled\":true,\"max_pending_kv_fraction\":0.15,\"num_reserved_decode_tokens\":512}}"
+  },
+  "prefill": {
+   "args": {
+    "--tensor-parallel-size": 1,
+    "--pipeline-parallel-size": 4,
+    "--enforce-eager": true,
+    "--max-num-seqs": 128,
+    "--max-num-batched-tokens": 8192
+   },
+   "env": {
+    "VLLM_PP_LAYER_PARTITION": "16,16,16,12",
+    "ATOM_KV_OFFLOAD": "mooncake_store",
+    "ATOM_KV_OFFLOAD_EXTRA_CONFIG": "{\"mooncake_store.master\":\"10.19.0.127:26051\",\"mooncake_store.metadata\":\"http://10.19.0.127:26080/metadata\",\"mooncake_store.owner_rdma_devices\":\"rdma4,rdma5,rdma6,rdma7\",\"mooncake_store.local_hostname\":\"10.19.0.127\",\"mooncake_store.protocol\":\"rdma\"}",
+    "OFFLOAD_LOAD_WORKERS": "1",
+    "OFFLOAD_MIN_LOAD_TOKENS": "0",
+    "OFFLOAD_PROFILE": "1",
+    "MC_MAX_MR_SIZE": "1073741824"
+   }
+  },
+  "departures": {
+   "--host": "unset: compass run and compass record assign it and refuse it among ATOM's arguments",
+   "--server-port": "unset: compass run and compass record assign it and refuse it among ATOM's arguments",
+   "--port": "unset: compass run and compass record assign it and refuse it among ATOM's arguments",
+   "--kv-transfer-config": "unset: deploy.sh adds each side's; the recipe's other keys are PREFILL_KV_EXTRA's and DECODE_KV_EXTRA's, which deploy.sh merges into that side's",
+   "HIP_VISIBLE_DEVICES": "unset: a real side's cards are deploy.sh's --gpu, and a simulated side uses none",
+   "ATOM_HOST_IP": "unset: a node's own address, which a real side takes from the node it runs on",
+   "MC_TCP_BIND_ADDRESS": "unset: a node's own address, which a real side takes from the node it runs on",
+   "ATOM_DP_MASTER_PORT": "unset: compass run assigns each instance its ports",
+   "ATOM_DP_BASE_PORT": "unset: compass run assigns each instance its ports",
+   "AITER_LOG_LEVEL": "unset: deploy.sh sets WARNING itself",
+   "PYTHONUNBUFFERED": "unset: it orders log lines, not the engine's work",
+   "AITER_QUICK_REDUCE_QUANTIZATION": "unset, as env.sh unsets it: bf16 all-reduce",
+   "ATOM_KV_OFFLOAD_EXTRA_CONFIG": "the recipe's, its node address the node every real run of this search runs on (store.sh's master and metadata ports, owners on rdma4-7); a simulated point runs a Store of its own"
+  }
+ },
+ "dimensions": {
+  "decode": {
+   "A": {
+    "basis": "recipes/mesh/MiniMax-M3.1-PD-PP4-MooncakeStore.md at ROCm/ATOM 0368ec741 (minimax_m31_pd_store/), decode.sh MODE=tp4",
+    "decode": {
+     "args": {
+      "--tensor-parallel-size": 4,
+      "--max-num-seqs": 256,
+      "--max-num-batched-tokens": 16384,
+      "--cudagraph-capture-sizes": "[1,2,4,8,16,32,64,128,256]"
+     },
+     "env": {
+      "ATOM_M3_INDEXER_CP": "1"
+     }
+    },
+    "departures": {
+     "--cudagraph-capture-sizes": "thinned to powers of two up to 256, against the recipe's 32 sizes: one calibration record a decode rung"
+    }
+   },
+   "B": {
+    "basis": "recipes/mesh/MiniMax-M3.1-PD-PP4-MooncakeStore.md at ROCm/ATOM 0368ec741 (minimax_m31_pd_store/), decode.sh MODE=dep4",
+    "decode": {
+     "args": {
+      "--tensor-parallel-size": 4,
+      "--enable-dp-attention": true,
+      "--enable-expert-parallel": true,
+      "--dp-load-balance": "least_requests",
+      "--max-num-seqs": 64,
+      "--max-num-batched-tokens": 4096,
+      "--cudagraph-capture-sizes": "[1,2,4,8,16,32,64]"
+     },
+     "env": {
+      "MORI_SHMEM_HEAP_SIZE": "8G"
+     }
+    },
+    "departures": {
+     "--cudagraph-capture-sizes": "thinned to powers of two up to 64 a rank, against the recipe's 20 sizes: one calibration record a decode rung"
+    }
+   }
+  }
+ }
+}
