@@ -10,8 +10,10 @@ Y0/Y1 a settle of owed rounds, A0/A1 `advance_group`, D0/D1 `_sync_dp_state`, X0
 exchange, P0/P1 `_process_engine_step`, H0/H1 `Scheduler.schedule`, C0/C1 `call_func`, Q0/Q1 the ring's enqueue
 and Qw its write done (before the doorbell rings), O1 the output thread's put of a worker reply, G1 the owner's
 get of it, K0/K1 `call_func_with_aggregation`, Z0/Z1 `_postprocess`.
-Worker: W0 woken by its doorbell, W1 a call dequeued, F0/F1 the forward stand-in, c0/c1 a torch.distributed
-collective, wget the output thread's get of a reply and wsent its next get (the reply sent).
+Worker: W0 woken by its doorbell, W1 a call dequeued, F0/F1 the forward stand-in and inside it r0/r1 its step
+record (`parity.record_step`), t0/t1 its token ids (`DeferredTokenStream.step`), g0/g1 its pricing and DP group
+target (`_group_step_seconds`), m0/m1 its forward metrics (`_time_target`), X0/X1 a shared-memory exchange and
+c0/c1 a torch.distributed call; wget the output thread's get of a reply and wsent its next get (the reply sent).
 """
 
 import array
@@ -24,7 +26,7 @@ import threading
 import time
 
 NAMES = ("S R R1 Y0 Y1 A0 A1 D0 D1 X0 X1 P0 P1 H0 H1 C0 C1 Q0 Qw Q1 O1 G1 K0 K1 Z0 Z1 "
-         "W0 W1 F0 F1 c0 c1 wget wsent").split()
+         "W0 W1 F0 F1 c0 c1 wget wsent r0 r1 g0 g1 t0 t1 m0 m1").split()
 EV = {n: i for i, n in enumerate(NAMES)}
 DETAIL = {"TAR": 1, "NER": 2, "PARK": 3, "REPORT": 4, "forward": 11, "dummy_execution": 12,
           "async_proc_aggregation": 13, "all_reduce": 21, "all_gather": 22, "all_gather_into_tensor": 23,
@@ -155,7 +157,8 @@ def install_worker(runner_class):
         return
     import torch.distributed as dist
 
-    from atom.compass.runner import doorbell
+    from atom.compass import parity
+    from atom.compass.runner import doorbell, overrides, shm_collectives, step_output
     from atom.model_engine import async_proc
 
     _st = _Stamps(name[4:-4].replace(".", "/"), "worker")
@@ -180,5 +183,10 @@ def install_worker(runner_class):
 
     proc.busy_loop = looping
     _wrap(runner_class, "forward", "F0", "F1")
+    _wrap(parity, "record_step", "r0", "r1")
+    _wrap(step_output.DeferredTokenStream, "step", "t0", "t1")
+    _wrap(overrides, "_group_step_seconds", "g0", "g1")
+    _wrap(overrides, "_time_target", "m0", "m1")
+    _wrap(shm_collectives._Segment, "exchange", "X0", "X1")
     for c in ("all_reduce", "all_gather", "all_gather_into_tensor", "broadcast", "barrier"):
         _wrap(dist, c, "c0", "c1", detail=lambda a, d=DETAIL[c]: d)

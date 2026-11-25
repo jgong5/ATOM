@@ -1,11 +1,12 @@
 """split.py OUT [SLICE_S]: split each simulated decode engine member's hop in OUT's profiling window, from its clock
 grant to its next clock request, into its hand-offs (#4151), from the stamps hopstamps.py wrote into OUT.frames.
 
-A hop runs from a grant (R) to the member's next request that waits for one (S, a REPORT does not). Its time between
-consecutive stamps goes to one part each, so the parts sum to the hop: the member's own stamps, except that from the
-ring's write (Qw) to the reply's put (O1) the forward's round trip runs on its worker's stamps. The interval of a
-DP collective, the engine's shared-memory exchange (X0-X1) or a worker's gloo call (c0-c1), splits at the latest
-entry of the same call across the group's ranks (matched by call count): before it, waiting for the slowest rank.
+A hop runs from a grant (R) to the member's next request that waits for one (S; a REPORT does not). The time between
+two consecutive stamps goes to one part, so the parts sum to the hop. The stamps are the member's own, except that
+from the ring's write (Qw) to the reply's put (O1) the forward's round trip runs on its worker's. A part is named by
+the point stamp that opens it (POINT), else by the innermost open call (REGION), else it is the busy loop. A
+shared-memory exchange (X0-X1), the DP group's collectives in the engine and in the worker, splits at the latest
+entry of the same call across the group's ranks, matched by count: before it, waiting for the slowest rank.
 
 Hops are ranked twice: every engine-D hop, and the engine-D hops on the critical path, which rank.py's walk takes
 from OUT.slices (run `rank.py OUT SLICE_S` first, SLICE_S default 60) and which match a stamped hop by its request.
@@ -21,24 +22,34 @@ import re
 import sys
 
 out, slice_s = sys.argv[1], float(sys.argv[2]) if len(sys.argv) > 2 else 60.0
-AFTER = {  # the part an interval goes to, by the stamp that opens it; any other is the engine core's own work
-    "R": "grant: release walk (LPRuntime._grant)",
-    "H0": "scheduling (Scheduler.schedule)",
-    "Z0": "postprocess (EngineCore._postprocess)",
-    "K0": "KV transfer poll round trip (call_func_with_aggregation)",
-    "C0": "dispatch: RPC encode (call_func, encode_rpc)",
+POINT = {  # the part from this stamp to the next
+    "C0": "dispatch: RPC encode (AsyncIOProcManager.call_func)",
     "Q0": "dispatch: pickle and ring write (MessageQueue.enqueue)",
     "Qw": "dispatch: doorbell ring and worker wake-up (RingingQueue.enqueue, Doorbell.spin)",
     "W0": "dispatch: dequeue and unpickle (AsyncIOProc.get_func)",
     "W1": "worker: dispatch to forward (AsyncIOProc.busy_loop)",
-    "F0": "forward stand-in: pricing (NonAllocatingRunner.forward)",
-    "c1": "forward stand-in: pricing (NonAllocatingRunner.forward)",
     "F1": "reply: worker output thread wake-up (send_output_to_socket)",
     "wget": "reply: pickle, zmq, engine output thread (process_output_sockets)",
     "O1": "reply: engine owner wake-up (outputs_queue.get)",
 }
-COLLECTIVE = {"X0": ("DP state sync", "shared-memory exchange (_Segment.exchange)"),
-              "c0": ("forward stand-in", "gloo collective (torch.distributed)")}
+REGION = {  # opener: (closer, the part inside it); an exchange inside it is named by it too
+    "R": ("R1", "engine core: grant's release walk (LPRuntime._grant)"),
+    "D0": ("D1", "engine core: DP state sync (DPEngineCoreProc._sync_dp_state)"),
+    "Y0": ("Y1", "engine core: settle of owed rounds (LPRuntime.settle)"),
+    "P0": ("P1", "engine core: engine step (EngineCore._process_engine_step)"),
+    "H0": ("H1", "engine core: scheduling (Scheduler.schedule)"),
+    "C0": ("C1", "engine core: call_func"),
+    "K0": ("K1", "engine core: KV transfer poll round trip (call_func_with_aggregation)"),
+    "Z0": ("Z1", "engine core: postprocess (EngineCore._postprocess)"),
+    "A0": ("A1", "engine core: clock charge (LPRuntime.advance_group)"),
+    "F0": ("F1", "forward stand-in: rest of NonAllocatingRunner.forward"),
+    "r0": ("r1", "forward stand-in: step record (parity.record_step)"),
+    "t0": ("t1", "forward stand-in: token ids (DeferredTokenStream.step)"),
+    "g0": ("g1", "forward stand-in: pricing and group target (_group_step_seconds)"),
+    "m0": ("m1", "forward stand-in: forward metrics (_time_target)"),
+    "X0": ("X1", None),
+}
+CLOSES = {c: o for o, (c, _) in REGION.items()}
 GROUPS = [  # the brief's hand-offs, each part in the first that takes it; the rest is the engine core's own work
     ("DP group's wait for its slowest rank", lambda p: "waiting for the slowest rank" in p),
     ("engine core to worker", lambda p: p.startswith(("dispatch", "worker:"))),
@@ -53,8 +64,8 @@ def load(path):
     a = array.array("d")
     a.frombytes(data[: len(data) // 16 * 16])  # a torn last pair is dropped
     head = json.load(open(path + ".json"))
-    ev = sorted((a[i], head["events"][int(a[i + 1]) // 100], int(a[i + 1]) % 100) for i in range(0, len(a), 2))
-    return head, ev
+    names, role = head["events"], head["role"]
+    return head, sorted((a[i], names[int(a[i + 1]) // 100], int(a[i + 1]) % 100, role) for i in range(0, len(a), 2))
 
 
 # the profiling window, as rank.py reads it
@@ -68,81 +79,89 @@ t0, t1 = marks["started"], marks["sending complete"]
 members, workers = {}, {}
 for p in glob.glob(f"{out}.frames/*.hop"):
     head, ev = load(p)
-    (members if head["role"] == "engine" else workers)[head["tag"]] = (head, ev)
-worker_of = {tag: workers.get(tag) for tag in members}
+    (members if head["role"] == "engine" else workers)[head["tag"]] = ev  # a worker carries its member's tag
 
 
-def last_entries(series, opener, closer):
-    """Per LP group, the k-th call's latest entry across its ranks; and how many calls' exits spread over 2 ms."""
-    by_group, last, bad = collections.defaultdict(dict), {}, collections.Counter()
-    for tag, (_, ev) in series.items():
-        by_group[tag.split("/")[0]][tag] = ([t for t, e, _ in ev if e == opener], [t for t, e, _ in ev if e == closer])
-    for g, ranks in by_group.items():
-        n = min(len(o) for o, _ in ranks.values())
-        last[g] = [max(o[k] for o, _ in ranks.values()) for k in range(n)]
-        bad[g] = sum(max(c[k] for _, c in ranks.values()) - min(c[k] for _, c in ranks.values()) > 2e-3
-                     for k in range(min(n, *(len(c) for _, c in ranks.values()))))
-        bad[g, "calls"] = (n, max(len(o) for o, _ in ranks.values()))
-    return last, {tag: o for g in by_group.values() for tag, (o, _) in g.items()}, bad
+def exchanges(series):
+    """Per rank, its exchanges' entries; per LP group, the k-th exchange's latest entry across its ranks, how many
+    exchanges each rank made (the fewest, the most), and how many matched ones' exits spread over 2 ms."""
+    by_group, entries, last, check = collections.defaultdict(dict), {}, {}, {}
+    for tag, ev in series.items():
+        entries[tag] = [t for t, e, _, _ in ev if e == "X0"]
+        by_group[tag.split("/")[0]][tag] = [t for t, e, _, _ in ev if e == "X1"]
+    for g, exits in by_group.items():
+        ins = [entries[tag] for tag in exits]
+        n = min(map(len, ins))
+        last[g] = [max(x[k] for x in ins) for k in range(n)]
+        m = min(n, *map(len, exits.values()))
+        spread = sum(max(x[k] for x in exits.values()) - min(x[k] for x in exits.values()) > 2e-3 for k in range(m))
+        check[g] = (n, max(map(len, ins)), spread)
+    return entries, last, check
 
 
-LAST = {"X0": last_entries(members, "X0", "X1"), "c0": last_entries(workers, "c0", "c1")}
+XCH = {"engine": exchanges(members), "worker": exchanges(workers)}
 
 
-def split(tag, ev, i, j):
-    """The parts of member `tag`'s hop from its grant ev[i] to its request ev[j]."""
+def track(stack, e):
+    """`stack`, the calls open, after stamp `e`."""
+    if e in CLOSES and CLOSES[e] in stack:
+        del stack[len(stack) - 1 - stack[::-1].index(CLOSES[e]) :]
+    elif e in REGION:
+        stack.append(e)
+
+
+def split(tag, ev, i, j, stack):
+    """The parts of member `tag`'s hop from its grant ev[i] to its request ev[j], `stack` open at the grant."""
     chain = ev[i : j + 1]
-    fwd = [k for k, (_, e, d) in enumerate(chain) if e == "C0" and d in (11, 12)]
-    if fwd and worker_of[tag]:
-        k = fwd[-1]
-        qw = next((n for n in range(k, len(chain)) if chain[n][1] == "Qw"), None)
-        o1 = next((n for n in range(k, len(chain)) if chain[n][1] == "O1"), None)
+    fwd = [k for k, x in enumerate(chain) if x[1] == "C0" and x[2] in (11, 12)]
+    if fwd and tag in workers:
+        qw = next((n for n in range(fwd[-1], len(chain)) if chain[n][1] == "Qw"), None)
+        o1 = next((n for n in range(fwd[-1], len(chain)) if chain[n][1] == "O1"), None)
         if qw is not None and o1 is not None:
-            wev = worker_of[tag][1]
+            wev = workers[tag]
             lo, hi = bisect.bisect_right(wev, (chain[qw][0], "~")), bisect.bisect_left(wev, (chain[o1][0], ""))
-            inner = [x for x in wev[lo:hi] if x[1] != "wsent"]
-            chain = chain[: qw + 1] + inner + chain[o1:]
-    parts, lock = collections.Counter(), None
-    for (ta, a, _), (tb, b, _) in zip(chain, chain[1:]):
-        if lock:
-            parts[lock] += tb - ta
-            lock = None if b == "K1" else lock
+            chain = chain[: qw + 1] + [x for x in wev[lo:hi] if x[1] != "wsent"] + chain[o1:]
+    parts, stack = collections.Counter(), list(stack)
+    for (ta, a, _, src), (tb, b, _, _) in zip(chain, chain[1:]):
+        track(stack, a)
+        if "K0" in stack:  # its round trip's own stamps are not split
+            parts[REGION["K0"][1]] += tb - ta
             continue
-        if a in COLLECTIVE:
-            who, what = COLLECTIVE[a]
-            last, entries, _ = LAST[a]
-            ks = entries.get(tag, [])  # a worker's stamps carry its engine member's tag
+        inside = next((REGION[o][1] for o in reversed(stack) if REGION[o][1]), "engine core: busy loop")
+        if a == "X0":
+            entries, last, _ = XCH[src]
+            ks, lg = entries.get(tag, []), last.get(tag.split("/")[0], [])
             k = bisect.bisect_left(ks, ta)
-            lg = last.get(tag.split("/")[0], [])
-            wait = min(max(lg[k] - ta, 0.0), tb - ta) if k < len(lg) and k < len(ks) and ks[k] == ta else 0.0
+            wait = min(max(lg[k] - ta, 0.0), tb - ta) if k < len(lg) and ks[k] == ta else 0.0
+            who = inside.split(" (")[0]
             parts[f"{who}: waiting for the slowest rank"] += wait
-            parts[f"{who}: {what}"] += tb - ta - wait
+            parts[f"{who}: shared-memory exchange (_Segment.exchange)"] += tb - ta - wait
             continue
-        label = AFTER.get(a) or f"engine core: {a} -> {b}"
-        lock = label if a == "K0" else None
-        parts[label] += tb - ta
+        parts[POINT.get(a) or inside] += tb - ta
     return parts
 
 
 def hops_of(ev):
-    """(grant index, request index, what the grant answered) for each hop whose request falls in the window."""
-    out_, r, y, adv, kind = [], None, False, False, None
-    for n, (t, e, d) in enumerate(ev):
-        y, adv = (e == "Y0") or (y and e != "Y1"), (e == "A0") or (adv and e != "A1")
+    """(grant index, request index, what the grant answered, the calls open at the grant) for each hop whose request
+    falls in the window."""
+    out_, r, kind, stack = [], None, None, []
+    for n, (t, e, d, _) in enumerate(ev):
         if e == "S" and d != 4:
             if r is not None and t0 <= t < t1:
-                out_.append((r, n, kind))
-            r, kind = None, "settle" if y else "advance" if adv else {1: "TAR", 2: "NER", 3: "PARK"}.get(d, "?")
+                out_.append((r, n, kind, at_r))
+            r = None
+            kind = "settle" if "Y0" in stack else "advance" if "A0" in stack else {2: "NER", 3: "PARK"}.get(d, "TAR")
         elif e == "R":
-            r = n
+            r, at_r = n, list(stack)
+        track(stack, e)
     return out_
 
 
 everything, by_kind, stamped = collections.Counter(), collections.defaultdict(list), {}
-for tag, (_, ev) in sorted(members.items()):
+for tag, ev in sorted(members.items()):
     stamped[tag] = []
-    for i, j, kind in hops_of(ev):
-        p = split(tag, ev, i, j)
+    for i, j, kind, stack in hops_of(ev):
+        p = split(tag, ev, i, j, stack)
         everything.update(p)
         by_kind[kind].append(ev[j][0] - ev[i][0])
         stamped[tag].append((ev[j][0], ev[i][0], p))
@@ -243,7 +262,7 @@ def report(parts, n, title, per_slice=()):
 
 
 print(f"# Decode engine hop split of {out}\n\nProfiling window {t1 - t0:.0f} s wall; {len(members)} engine-D members "
-      f"stamped, {sum(w is not None for w in worker_of.values())} of them with their worker.\n")
+      f"stamped, {sum(tag in workers for tag in members)} of them with their worker.\n")
 print("| hop opened by the grant of | hops | mean ms | median ms |\n|---|---|---|---|")
 for kind, v in sorted(by_kind.items(), key=lambda kv: -len(kv[1])):
     v.sort()
@@ -253,8 +272,8 @@ print(f"\nThose hops' wall: {match['stamps s']:.2f} s by the stamps, {match['fra
       f"({100 * (match['stamps s'] / max(match['frames s'], 1e-9) - 1):+.2f}%); {match['unmatched hops']:.0f} hops "
       f"({match['unmatched s']:.2f} s) on the path matched no stamped hop.")
 report(everything, sum(len(v) for v in by_kind.values()), "Every engine-D hop")
-print("\n## Collective matching\n\n| call | LP group | calls matched / most by one rank | matched calls whose exits "
+print("\n## Exchange matching\n\n| ranks | LP group | exchanges matched / most by one rank | matched ones whose exits "
       "spread over 2 ms |\n|---|---|---|---|")
-for c, (_, _, bad) in LAST.items():
-    for g in sorted(k for k in bad if isinstance(k, str)):
-        print(f"| {c} | {g} | {bad[g, 'calls'][0]} / {bad[g, 'calls'][1]} | {bad[g]} |")
+for role, (_, _, check) in XCH.items():
+    for g, (n, most, spread) in sorted(check.items()):
+        print(f"| {role} | {g} | {n} / {most} | {spread} |")
