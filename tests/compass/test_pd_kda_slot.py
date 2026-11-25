@@ -8,9 +8,9 @@ writes the blocks, then one unit of each slot region. Kimi-K3 (`kimi_k3_config.j
 for byte at revision f831ab66814297da540d832a5235f8e904f29d06) is built
 driverless at TP8 in a process of its own as `compass trace ops` builds one,
 with ReplaySSM off, as by default, and on, which adds a cursor region the
-planned state entry does not count. Its fake KV cache is allocated so ATOM's
-own `get_kv_transfer_tensors` states the regions on Mooncake's config, and the
-runner publishes what its connector prices.
+planned state entry does not count. The runner publishes what its connector
+prices, then its fake KV cache is allocated on Mooncake's config, where ATOM's
+own `get_kv_transfer_tensors` states the regions.
 """
 
 import json
@@ -56,8 +56,8 @@ runner.compass_block_file = pathlib.Path(out)
 publish_planned_transfer(runner)
 with forward._patches(recorder), fake, torch.inference_mode():
     runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
-    runner.allocate_kv_cache(runner.pool_plan.paged_entries)
     config.kv_transfer_config = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    runner.allocate_kv_cache(runner.pool_plan.paged_entries)
     regions = runner.attn_metadata_builder.get_kv_transfer_tensors()
 print(json.dumps({
     "page_units": sum(r.unit_bytes for r in regions.block_regions),
