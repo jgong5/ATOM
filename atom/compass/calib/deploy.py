@@ -304,6 +304,7 @@ def from_record(record) -> dict:
     checkpoint interval below one token (`resume_unit`: the interval, finer
     where the record's requests resume off it), and `kda_state`. `$VAR`s in the
     path expand. A field the record does not state is left out."""
+    from atom.compass.backends.step_linear import gdn_state_layers
     record = Path(os.path.expandvars(str(record)))
     if not (record / "run.json").exists() and (record / "real" / "run.json").exists():
         record = record / "real"  # a calibration run's: its server's record
@@ -354,7 +355,9 @@ def from_record(record) -> dict:
         top_k = next((hf[k] for k in TOP_K if k in hf), None)
         if experts and top_k:
             out["moe_routing"] = [int(experts), int(top_k)]
-        if (hf.get("linear_attn_config") or {}).get("kda_layers"):
+        if (hf.get("linear_attn_config") or {}).get("kda_layers") or (
+            gdn_state_layers(hf.get("model_type"), hf.get("layer_types"))
+        ):
             interval = int(args.state_checkpoint_interval_tokens)
             if interval < 1:
                 raise ValueError(
