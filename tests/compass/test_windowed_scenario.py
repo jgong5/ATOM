@@ -7,12 +7,16 @@ The model is the slice model, `ATOM_COMPASS_SLICE_MODEL`, built as a Llama of
 its own widths whose odd layers attend a sliding window (`llama.py` reads it
 off `layer_types`) narrower than the request's prompt; its tokenizer is the
 slice model's, and no weight is read. The runs need a driver, as the slice's do.
+The model's walk does not: built on the meta device from the slice model's
+config as checked in (`qwen3_0_6b_config.json`), its odd layers carry the
+window, so neither run can pass priced as a dense model.
 """
 
 import json
 from pathlib import Path
 
 import pytest
+import test_backend_step_roofline_mla as mla
 import test_vertical_slice as vertical
 from capabilities import ROOFLINE, ROOFLINE_MACHINE, capability
 from test_vertical_slice import MAX_TOKENS, NEEDS_A_RUN, run_slice
@@ -24,24 +28,41 @@ from atom.compass.detect.scenario import check_run
 WINDOW = 4
 
 
+def windowed(config: dict) -> dict:
+    """`config`, the slice model's, as a Llama of its widths whose odd layers
+    attend `WINDOW` keys."""
+    kinds = ("full_attention", "sliding_attention")
+    return config | {
+        "architectures": ["LlamaForCausalLM"],
+        "model_type": "llama",
+        "sliding_window": WINDOW,
+        "layer_types": [kinds[i % 2] for i in range(config["num_hidden_layers"])],
+    }
+
+
 def _windowed(root: Path) -> Path:
-    """The slice model's directory but its weights, its config a Llama of its
-    widths whose odd layers attend `WINDOW` keys."""
+    """The slice model's directory but its weights, its config `windowed`."""
     slice_model, model = Path(vertical.MODEL), root / "model"
     model.mkdir()
     for f in slice_model.iterdir():
         if f.name != "config.json" and f.suffix not in (".safetensors", ".bin"):
             (model / f.name).symlink_to(f.resolve())
     config = json.loads((slice_model / "config.json").read_text())
-    kinds = ("full_attention", "sliding_attention")
-    config.update(
-        architectures=["LlamaForCausalLM"],
-        model_type="llama",
-        sliding_window=WINDOW,
-        layer_types=[kinds[i % 2] for i in range(config["num_hidden_layers"])],
-    )
-    (model / "config.json").write_text(json.dumps(config))
+    (model / "config.json").write_text(json.dumps(windowed(config)))
     return model
+
+
+def test_the_scenario_model_carries_its_window_on_its_odd_layers(monkeypatch):
+    monkeypatch.delenv("ATOM_USE_UNIFIED_ATTN", raising=False)
+    config = Path(__file__).with_name("qwen3_0_6b_config.json").read_text()
+    walked = mla._build("tp1", windowed(json.loads(config)))
+    attention = [(m.layer, m.dims) for m in walked if m.kind == "attention"]
+
+    assert not [m.name for m in walked if m.kind == "unclassified"]
+    # 16 heads over 8 KV heads of 128: a full layer, then a windowed one.
+    assert attention == [
+        (n, (16, 8, 128) + ((WINDOW, 1) if n % 2 else ())) for n in range(28)
+    ]
 
 
 def _runs(root: Path, *pricing) -> list[dict]:
