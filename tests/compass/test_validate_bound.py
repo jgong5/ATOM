@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import platforms
 import pytest
-from test_backend_step_roofline import MACHINE, ROOFLINE, STACK
+from test_backend_step_roofline import MACHINE, ROOFLINE, STACK, _module
 from test_op_graph import g
 from test_op_work import leaf, t
 from test_op_work_v4_attention import decode as v4_decode
@@ -28,7 +28,7 @@ from atom.compass.backends.cost import CostTerm, StepCost
 from atom.compass.backends.op_graph import DRAFT_KV, OpGraphBackend
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.step_roofline import CONTEXT, Module, StepRooflineBackend
-from atom.compass.backends.work import Work, price
+from atom.compass.backends.work import Work, allgather, gemm, price
 from atom.compass.bench.ops import signature
 from atom.compass.run.step_grid import BUCKETS
 from atom.compass.validate import bound
@@ -192,6 +192,36 @@ def test_a_dp_step_joins_every_ranks_line_by_atoms_rules(tmp_path):
     # A step one rank's record lacks.
     assert views["dp0 step 4"] == Refusal(bound.SOURCE, bound.PARTIAL)
     assert next(bound.steps(tmp_path))[1].tbo_tokens is None
+
+
+def test_a_dp_step_states_whether_a_rank_of_its_group_prefills(tmp_path):
+    """`group_prefills`, as `step_labels.group_prefills` reads it: some
+    rank's line at the step, not a dummy run, holds a prefill row. Beside a
+    prefilling peer a decode runs a TP-1 LM head its group of 2 shards on
+    the whole vocabulary, its own 2 rows; else on the group's 4 rows."""
+    decode = _line([[1, 50, True]] * 2)
+    dummy = _line([[1, 1, True]], is_dummy_run=True)
+    record(tmp_path, [decode] * 3, rank=0)
+    record(tmp_path, [_line([[2048, 2048, False]]), decode, dummy], rank=1)
+
+    views = {name.split(" ", 1)[1]: v for name, v, _ in bound.steps(tmp_path)}
+    beside, alike, idle = (views[f"dp0 step {i}"] for i in range(3))
+    head = StepRooflineBackend(
+        MACHINE, [Module("lm_head", "lm_head", (1000, 64, 2, 500))]
+    )
+    priced = [head.price(v).seconds for v in (beside, alike)]
+
+    assert (beside.group_prefills, alike.group_prefills, idle.group_prefills) == (
+        True,
+        False,
+        False,
+    )
+    assert views["dp1 step 0"].group_prefills
+    assert priced[0] == pytest.approx(price(gemm(2, 1000, 64), MACHINE), rel=1e-12)
+    # The 4 rows of 64 gathered, half the vocabulary over them, each rank's
+    # 4 x 500 logits spread over the group, in bf16.
+    sharded = gemm(4, 500, 64) + allgather(2, 4 * 64 * 2) + allgather(2, 4 * 500 * 2)
+    assert priced[1] == pytest.approx(_module(sharded), rel=1e-12)
 
 
 def test_an_mtp_record_is_measured_by_its_target(tmp_path):

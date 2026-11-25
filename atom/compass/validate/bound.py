@@ -30,9 +30,10 @@ the error of projecting it from the other.
 
 A data-parallel step (one with `moe_rows`) is read off every rank's line at
 that step: its `moe_tokens` is the group's scheduled tokens, a dummy rank's
-one. Under `--enable-tbo` a step's two-batch-overlap split, one rank's
-included, is the one ATOM's prefill rule agrees over its ranks' lines
-(`_split`).
+one, and its `group_prefills` says some rank's line there, not a dummy run,
+holds a prefill row (`step_labels.group_prefills`). Under `--enable-tbo` a
+step's two-batch-overlap split, one rank's included, is the one ATOM's
+prefill rule agrees over its ranks' lines (`_split`).
 
 Gate: a step priced above its measured time is a violation, named by its
 costliest term, an op kind (`op.<kind>`) or a module kind (`roofline.<kind>`).
@@ -79,7 +80,7 @@ from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.cost import fold_parts
 from atom.compass.backends.provenance import Refusal
 from atom.compass.backends.shape import sum_tokens
-from atom.compass.backends.step_labels import group_tokens
+from atom.compass.backends.step_labels import group_prefills, group_tokens
 from atom.compass.backends.work import COMM, KERNEL
 
 PROG = "python -m atom.compass.validate.bound"
@@ -111,6 +112,7 @@ def steps(record, tbo=False, mtp=False):
         for p in paths
     ]
     mtp = mtp or any("d_target_ns" in s for r in ranks for s in r.values())
+    prefills = group_prefills(r.values() for r in ranks)
     for step in sorted(set().union(*ranks)):
         lines = [r.get(step) for r in ranks]
         whole = None not in lines
@@ -141,6 +143,7 @@ def steps(record, tbo=False, mtp=False):
                 produces_output=s["produces_output"],
                 tbo_tokens=split,
                 moe_tokens=group if dp else None,
+                group_prefills=dp and step in prefills,
             )
             measured = s.get("d_target_ns", s["d_busy_ns"])
             if "d_target_ns" in s and s["produces_output"]:

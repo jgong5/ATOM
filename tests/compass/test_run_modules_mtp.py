@@ -571,41 +571,23 @@ def test_a_dp_group_shards_its_targets_lm_head_at_tp1_by_its_mode(monkeypatch):
     assert _dp_head(head) == head
 
 
-def test_a_v4_dp8_target_shards_its_lm_head_on_a_decode_and_its_drafts_do_not(
-    built, monkeypatch
-):
+def test_a_v4_dp8_target_shards_its_lm_head_and_its_drafts_do_not(built, monkeypatch):
     """V4-Pro MTP2 under `--enable-dp-attention -tp 8`, DP8 at TP 1, on
     MI355X. The target's LM head carries the group and an eighth of the
     vocabulary; its drafts', the same head, the group and their argmax's cap
-    alone. A verify of 3 rows of 3 tokens while every rank decodes, as
-    `ForwardMode.decide` settles it, replays a rung-4 graph and gathers the
-    group's 96 rows; beside a prefilling peer it replays none and runs the
-    whole vocabulary on its own 9."""
+    alone. `ForwardMode.decide` settles a verify while every rank decodes
+    into a rung-4 graph of no prefilling group, which the head shards on, and
+    one beside a prefilling peer into no graph of a prefilling group."""
     hf = json.loads(V4_PRO.read_text())
     vocab, d = hf["vocab_size"], hf["hidden_size"]
     found = built["v4-dp8-mtp2"]["modules"]
     heads = [(m.passes, m.dims) for m in found if m.kind == "lm_head"]
     assert heads == [(0, (vocab, d, 8, vocab // 8)), (2, (vocab, d, 8, 256))]
-    installed = built["v4-dp8-mtp2"]["installed"]
     rows = [(3, 600 + i, True) for i in range(3)]
     alike = settled(monkeypatch, rows, [(3, 9, False)] * 7)
     beside = settled(monkeypatch, rows, [(3, 9, False)] * 6 + [(1, 16, True)])
     assert (alike.capture_rung, alike.group_prefills) == (4, False)
     assert (beside.capture_rung, beside.group_prefills) == (None, True)
-
-    def head(step):
-        terms = installed.price(step).terms
-        return {t.name: t.seconds for t in terms}["roofline.lm_head"]
-
-    # The group's 8 x 12 rows of 7168 gathered, an eighth of the vocabulary
-    # over them, and each rank's logits sent all-to-all, all in bf16.
-    shard = vocab // 8
-    sharded = gemm(96, shard, d) + allgather(8, 96 * d * 2)
-    sharded += allgather(8, 96 * shard * 2)
-    assert head(alike) == pytest.approx(serial(sharded, installed.machine), rel=1e-12)
-    assert head(beside) == pytest.approx(
-        serial(gemm(9, vocab, d), installed.machine), rel=1e-12
-    )
 
 
 class _Refuses(CostBackend):
