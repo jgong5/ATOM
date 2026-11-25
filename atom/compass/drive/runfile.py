@@ -282,8 +282,10 @@ def prefill_decode(args, prefill_args, decode_args, kv_link, decode_env=None) ->
     and the decode side's in the environment its instance starts in, which
     `decode_env()`, when given, returns (`_hops`), else in this process's too.
     A price list the prefill side names that is not the decode side's
-    refuses."""
-    from atom.compass.drive.run import SIMULATED, side_args
+    refuses. With ``args.acceptance_record``, a decode record, it names the
+    record as ``compass run`` does, refusing what either instance would refuse
+    as it joins (`drive.run.joined_atom_args`)."""
+    from atom.compass.drive.run import SIMULATED, joined_atom_args, side_args
 
     prefill_args = side_args("prefill", prefill_args, SIMULATED)
     decode_args = side_args("decode", decode_args, SIMULATED)
@@ -301,6 +303,10 @@ def prefill_decode(args, prefill_args, decode_args, kv_link, decode_env=None) ->
     if hosts := run.entries(out, "host"):
         arch = run._machine(out).value("device.arch")
         out[run.DECODE_HOPS] = _hops(hosts, decode_args, arch, decode_env)
+    if record := getattr(args, "acceptance_record", None):
+        out[run.ACCEPTANCE_RECORD] = str(Path(record).resolve())
+        for side, atom_args in (("D", decode_args), ("P", prefill_args)):
+            joined_atom_args(out, atom_args, side)
     return out | {
         "router_s": _hops(hosts, prefill_args, arch).get("router_s") if hosts else None,
         "kv_link": kv_link,

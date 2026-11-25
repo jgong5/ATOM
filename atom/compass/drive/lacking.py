@@ -17,7 +17,8 @@ and the step linear law's decode vectors against the rungs this configuration
 schedules (`uncovered_rungs`); the host laws' tokenizer term against the
 backend of the tokenizer ATOM's server loads (`run.tokenizer_term`); a step
 grid bundle's load; the configuration's memory readings; an op graph's price
-list; and an `--acceptance-record`. An input is missing when nothing resolves
+list; and an `--acceptance-record`, a deployment side's as it joins
+(`drive.run.joined_atom_args`). An input is missing when nothing resolves
 for it, and stale when the run refuses the entry it holds, naming each artifact
 axis that moved, or refuses steps it would price, as a step linear law's
 coverage is where a rung the run schedules has no vector. A memory readings
@@ -290,10 +291,17 @@ def lacking(args, atom_args, real=None, env=None) -> tuple[list, list]:
             )
     if record := args.acceptance_record:
         steps = Path(record) / serve.STEPS
-        drawn = any(steps.glob(compass_run.ACCEPTANCE_FILE.format("*")))
-        given = record, atom_args, runfile._dp_width(atom_args)
+        drawn = list(steps.glob(compass_run.ACCEPTANCE_FILE.format("*")))
+        ranks = runfile._dp_width(atom_args)
+        check, given = drive_run.measured, (record, atom_args, ranks)
+        if side:
+            # A side reads the decode's record as it joins, over the decode's
+            # ranks, which a prefill's check cannot see: every rank it holds.
+            joined = {compass_run.ACCEPTANCE_RECORD: record}
+            joined[compass_run.DP_WIDTHS["D"]] = len(drawn) if side == "P" else ranks
+            check, given = drive_run.joined_atom_args, (joined, atom_args, side)
         made, state = MADE_BY["acceptance record"], None if drawn else "missing"
-        met("acceptance record", made, drive_run.measured, *given, state=state)
+        met("acceptance record", made, check, *given, state=state)
     if args.coverage and checked:
         made, given = MADE_BY["coverage input"], (args.coverage, run, atom_args)
         if found := met("coverage input", made, drive_run.check, *given):
