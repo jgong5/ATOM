@@ -1075,7 +1075,9 @@ def _refits(ended: Path, command: str, keys: dict) -> bool:
         if not law.is_file():
             return False
         fitted, held = json.loads(law.read_text())["key"], keys[side]
-        if not reuse.at_key(fitted, held["engine"], **held["law"]):
+        if not reuse.at_key(
+            Kind.STEP_LINEAR_LAW, fitted, held["engine"], **held["law"]
+        ):
             return False
     return True
 

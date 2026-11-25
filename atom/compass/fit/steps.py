@@ -37,7 +37,9 @@ names no routed experts gives none. It reads a block drafter's own routing too
 may adopt a MoE column. The law states,
 as `platform`, the platform fields of its key,
 and `engine_config`, as that command's does, and the key holds them, and
-`records_atom` as that command's states it. Each rung of the capture ladder
+`records_atom` as that command's states it; the key holds ``fit_src`` too, the
+law's own digest (`step_linear_fit.fit_src`), so a refit whose law differs,
+on other records or by other code, is another entry. Each rung of the capture ladder
 no record reached gets a declared vector, filled from the fitted rungs beside
 it (`step_linear_fit.fill_rungs`), and the law and the report name each under
 `filled`; the law also lists them by law under `filled_rungs`, and the command
@@ -174,7 +176,8 @@ def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     law["engine_config"] = config["engine_config"]
     if atom := step_linear_fit.records_atom(samples):
         law["records_atom"] = atom
-    return {"form": form, **law["platform"]}, law, report
+    fit_src = step_linear_fit.fit_src(law)
+    return {"form": form, **law["platform"], "fit_src": fit_src}, law, report
 
 
 def _part(samples, options, seed: int, engine: dict) -> tuple[dict, dict]:

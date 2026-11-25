@@ -237,8 +237,8 @@ def test_two_keys_never_share_a_directory(tmp_path):
         (
             Kind.STEP_LINEAR_LAW,
             (
-                "(model, engine_config, source_root, form, device, software_stack, "
-                "ptl, torch)"
+                "(model, engine_config, source_root, form, fit_src, device, "
+                "software_stack, ptl, torch)"
             ),
         ),
         (

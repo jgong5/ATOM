@@ -17,8 +17,12 @@ outside ATOM's Python passes.
 verdict, `reuse`, `calibrate` or `refused`, from each law file under `LAWS` and
 each step linear law in a store whose key states the config's model, engine
 config and platform, at any ATOM digest and form, the engine config at any
-ladder the config's is a prefix of; of several, reuse comes
-first, then refused, then calibrate. The requirement a verdict names:
+ladder the config's is a prefix of, and of those at one key but their law's
+digest (``fit_src``), the newest (``produced_at``): a refit whose law differs
+is another entry; of several, reuse comes
+first, then refused, then calibrate. A store entry whose key lacks a field its
+kind is keyed by, published before the kind gained it, is passed by. The
+requirement a verdict names:
 
 1. the same key: none there, a store law, or host laws beside it, at another
    ATOM digest than the head's, or a law file whose host key states another,
@@ -183,7 +187,8 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
         if at == (stated, model) and _same(held.get("engine_config"), engine):
             found.append(_law_file(str(path), held, config, machine, atom))
             found[-1]["run"] = [str(path)] * 2
-    for key in _keyed(store, Kind.STEP_LINEAR_LAW, engine, model=model, **stated):
+    laws = _keyed(store, Kind.STEP_LINEAR_LAW, engine, model=model, **stated)
+    for key in _newest(store, laws):
         where = f"{key.kind} {key.token()} in {store.root}"
         if (ran := key.values["source_root"]) != compass_run.source_root(atom):
             why = f"ran at {ran}, and a store entry is never re-keyed"
@@ -215,7 +220,8 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
     if not found:
         why = (
             f"no step linear law at its key, model {model}, this engine config and "
-            f"platform {stated}, in {store.root} or {LAWS}"
+            f"platform {stated}, in {store.root}, keyed by fit_src, its law's own "
+            f"digest, or in {LAWS}"
         )
         return _verdict("calibrate", 1, why)
     return min(found, key=lambda v: PREFERRED.index(v["verdict"]))
@@ -323,16 +329,23 @@ def _folded(law: dict) -> list[tuple[str, dict]]:
 
 
 def _keyed(store: ArtifactStore, kind: Kind, engine: dict, **fields) -> list[Key]:
-    """The keys of `store`'s `kind` entries that state each of `fields` as
-    given, and `engine` as their engine config, less its graph sets; an entry
-    whose key lacks a field `kind` is keyed by, published before the kind
-    gained it, is skipped."""
+    """The keys of `store`'s `kind` entries at `fields` and `engine`
+    (`at_key`)."""
     keys = []
     for path in sorted((store.root / kind.value).glob(f"*/{ENTRY_FILE}")):
         key = json.loads(path.read_text())["key"]
-        if set(KEY_FIELDS[kind]) <= key.keys() and at_key(key, engine, **fields):
+        if at_key(kind, key, engine, **fields):
             keys.append(Key.of(kind, **key))
     return keys
+
+
+def _newest(store: ArtifactStore, keys: list[Key]) -> list[Key]:
+    """Of `keys`, `store`'s, in their order, the newest (`_produced`) of those
+    at one key but ``fit_src``, the digest of what was fitted."""
+    newest = {}
+    for key in sorted(keys, key=lambda k: _produced(store, k)):
+        newest[tuple(f for f in key.fields if f[0] != "fit_src")] = key
+    return [key for key in keys if key in newest.values()]
 
 
 def _produced(store: ArtifactStore, key: Key) -> float:
@@ -343,9 +356,12 @@ def _produced(store: ArtifactStore, key: Key) -> float:
     return datetime.datetime.fromisoformat(when).timestamp()
 
 
-def at_key(key: dict, engine: dict, **fields) -> bool:
-    """Whether `key`, a key's values, states each of `fields` as given, and
-    `engine` as its engine config, less its graph sets."""
+def at_key(kind: Kind, key: dict, engine: dict, **fields) -> bool:
+    """Whether `key`, a `kind` key's values, states each of `fields` as given,
+    and `engine` as its engine config, less its graph sets; a key lacking a
+    field `kind` is keyed by, published before the kind gained it, is not."""
+    if not set(KEY_FIELDS[kind]) <= key.keys():
+        return False
     theirs = json.loads(key["engine_config"])
     theirs.pop(GRAPHS, None)
     return all(key.get(f) == v for f, v in fields.items()) and _same(theirs, engine)
