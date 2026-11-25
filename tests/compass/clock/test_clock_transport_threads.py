@@ -4,8 +4,8 @@
 A simulated step makes several clock calls, and every thread a call crosses on
 the serve side is a wake and a GIL hand-off on the run's critical path. So a
 request is served on the thread that brings it -- the sender's own for the
-in-process carrier, the connection's reader for ``tcp`` -- and the reply is
-written from there: no other thread stands in between.
+in-process carrier, the one thread that reads every ``tcp`` connection -- and
+the reply is written from there: no other thread stands in between.
 """
 
 import math
@@ -48,29 +48,29 @@ def test_an_in_process_request_is_served_on_its_senders_thread_before_send_retur
     assert len(replies) == 2
 
 
-def test_each_tcp_connection_is_served_on_its_own_reader_and_needs_no_other_thread():
+def test_every_tcp_connection_is_served_on_the_servers_one_reader_and_needs_no_other_thread():
+    before = set(threading.enumerate())
     ca = _Threads(_table())
     server = serve(ca, LOCAL)
     try:
-        before = set(threading.enumerate())
+        started = set(threading.enumerate()) - before
         a = _result(_later(connect, A, server.endpoint))
         b = _result(_later(connect, B, server.endpoint))
-        added = set(threading.enumerate()) - before
+        added = set(threading.enumerate()) - before - started
         _result(_later(b.send, (NER, INF, [], INF)))
         held = _later(b.recv)
         _result(_later(a.send, (TAR, 1.0, [(AB, 0, 0.7)], INF)))
         assert _result(_later(a.recv)) == (1.0, {})
-        # b's held reply, released by a's request, is written by a's reader.
+        # b's held reply, released by a's request, is written by the reader.
         assert _result(held) == (0.7, {AB: [(0, 0.7)]})
         for conn in (a, b):
             conn.close()
     finally:
         server.close()
-    readers = {t.ident for t in added}
-    assert len(added) == 2  # one reader per connection, nothing else
-    assert len(ca.served_on) == 2
-    assert ca.served_on["a"] != ca.served_on["b"]
-    assert ca.served_on["a"] | ca.served_on["b"] <= readers
+    assert not added  # a connection starts no thread
+    reader = {t.ident for t in started if t.name != f"clock {server.endpoint}"}
+    assert len(reader) == 1  # the selector thread, beside the stall watch
+    assert ca.served_on == {"a": reader, "b": reader}
 
 
 def test_an_lp_in_the_serving_process_reaches_a_tcp_clock_with_no_socket_and_can_poll():

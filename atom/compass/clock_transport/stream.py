@@ -23,6 +23,7 @@ here and at ``send`` in-process, with the same reason, and reaches no authority.
 """
 
 import contextlib
+import selectors
 import socket
 import threading
 
@@ -69,7 +70,11 @@ def _end(sock: socket.socket) -> None:
 
 
 class _StreamServer:
-    """A serve side that LPs reach over TCP."""
+    """A serve side that LPs reach over TCP.
+
+    One thread reads the listener and every connection through a selector:
+    it accepts, reads what each readable connection holds, and serves each
+    whole frame in the order read, as `_read` does for one connection."""
 
     def __init__(self, authority, host: str, port: int) -> None:
         self._listener = socket.create_server((host, port))
@@ -77,12 +82,104 @@ class _StreamServer:
         self.endpoint = f"{STREAM_SCHEME}://{host}:{port}"
         self._server = _Server(authority, self.endpoint)
         self._open = []
-        threading.Thread(target=self._admit, daemon=True).start()
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(self._listener, selectors.EVENT_READ, None)
+        self._closing = False
+        threading.Thread(target=self._select, daemon=True).start()
+
+    def _select(self) -> None:
+        """Accept and read every connection on this one thread."""
+        conns = {}  # socket -> [buffer, slot, address]
+        while not self._closing:
+            try:
+                events = self._selector.select()
+            except (OSError, ValueError):
+                return
+            for key, _ in events:
+                sock = key.fileobj
+                if sock is self._listener:
+                    try:
+                        conn, _ = self._listener.accept()
+                    except OSError:
+                        if self._closing:
+                            return
+                        continue
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    self._open.append(conn)
+                    conns[conn] = [bytearray(), None, None]
+                    self._selector.register(conn, selectors.EVENT_READ, None)
+                    continue
+                state = conns.get(sock)
+                if state is None:
+                    continue
+                try:
+                    data = sock.recv(1 << 16)
+                except OSError:
+                    data = b""
+                if data:
+                    state[0] += data
+                    try:
+                        self._frames(sock, state)
+                        continue
+                    except (MalformedMessage, OSError):
+                        pass
+                # the peer closed, or spoke out of protocol
+                with contextlib.suppress(KeyError, ValueError):
+                    self._selector.unregister(sock)
+                del conns[sock]
+                self._ended(sock, state[1], state[2])
+
+    def _frames(self, sock, state) -> None:
+        """Serve every whole frame `state`'s buffer holds."""
+        buf = state[0]
+        at = 0
+        while len(buf) - at >= 4:
+            size = int.from_bytes(buf[at : at + 4], "big")
+            if size > LARGEST_FRAME:
+                raise MalformedMessage(f"a {size}-byte frame is over {LARGEST_FRAME}")
+            if len(buf) - at - 4 < size:
+                break
+            frame = bytes(buf[at + 4 : at + 4 + size])
+            at += 4 + size
+            state[1], state[2] = self._one(sock, frame, state[1], state[2])
+        del buf[:at]
+
+    def _one(self, sock, frame: bytes, slot, address):
+        """Serve one frame of `sock`'s connection, as `_read` does; returns
+        the connection's slot and address, bound by its first frame."""
+        try:
+            if slot is None:
+                with self._server._lock:
+                    address, slot, joined = self._server.bind(frame, _SocketSlot(sock))
+                    try:
+                        reply = encode((JOINED, *joined))
+                    except MalformedMessage as refused:
+                        reply = encode(_refusal(refused))
+                    slot.put(reply)
+            else:
+                self._server.submit(address, frame)
+        except (KeyError, ValueError) as refused:
+            reply = encode(_refusal(refused))
+            if slot is None:
+                sock.sendall(_framed(reply))
+            else:
+                slot.put(reply)
+        return slot, address
+
+    def _ended(self, sock, slot, address) -> None:
+        if slot is None:
+            _end(sock)
+        else:
+            # Ended first: the peer has gone, so the end of the run its
+            # close makes is for every other LP.
+            slot.put(None)
+            self._server._closed(address, slot)
 
     def close(self) -> None:
         """Stop listening, end every connection and stop serving."""
         for name in [k for k, v in _SERVED.items() if v is self]:
             del _SERVED[name]
+        self._closing = True
         for sock in [self._listener, *self._open]:
             _end(sock)
         self._server.close()
