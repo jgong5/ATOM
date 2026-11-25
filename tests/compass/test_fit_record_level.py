@@ -64,7 +64,7 @@ def test_every_fit_keys_its_law_at_the_level_the_records_ran(tmp_path, level, ke
     assert written["engine_config"] == written["host"]["key"]["engine"] == engine
     law = member(tmp_path / "store", law_key(engine=engine), "params")
     assert law["engine_config"] == engine
-    host_key = host_laws_key({**HOST, "engine": engine})
+    host_key = host_laws_key({**HOST, "engine": engine}, tmp_path)
     assert member(tmp_path / "store", host_key, "params")["key"]["engine"] == engine
 
 

@@ -662,9 +662,10 @@ def refuse_context_parallel(name: str, config) -> None:
 
 def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     """Refuse the run file's host laws `host` when fitted under another host
-    key than this run's, on `platform` (`machine_platform`), the host CPU and
-    graph sets their key states taken as this run's, which records none, and
-    its engine config read at their ladder where this run's is a prefix of it."""
+    key than this run's, on `platform` (`machine_platform`), the host CPU,
+    graph sets and digest of what was fitted (``fit_src``) their key states
+    taken as this run's, which records none, and its engine config read at
+    their ladder where this run's is a prefix of it."""
     from atom.compass.artifacts import Kind, keyed_platform
     from atom.compass.backends.launch_features import GRAPHS, stated
     from atom.compass.backends.step_grid_plan import at_ladder
@@ -678,6 +679,9 @@ def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     if ours and "host_cpu" in theirs:
         # The host they timed is the host the run predicts, from any CPU.
         ours["host_cpu"] = theirs["host_cpu"]
+    if ours and "fit_src" in theirs:
+        # The digest of the laws themselves, which says nothing of the run.
+        ours["fit_src"] = theirs["fit_src"]
     if ours:
         ours["engine"] = at_ladder(ours["engine"], theirs.get("engine"))
     if ours and launch[1] is not None:

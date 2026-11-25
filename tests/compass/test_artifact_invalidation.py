@@ -246,6 +246,7 @@ def test_host_laws_published_on_one_host_cpu_refuse_another_naming_it(tmp_path):
         atom_src="0f1e2d3c",
         model="sha256:191e0af2",
         engine_config="{}",
+        fit_src="5eed",
         **keyed_platform(Kind.HOST_LAWS, STATED),
     )
     publish(store, key)

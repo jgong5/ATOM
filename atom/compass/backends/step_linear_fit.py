@@ -95,7 +95,9 @@ each row computes its drafts too) gets zero. Two keys refuse, ladders pooled
 first. The law, as
 `platform`, and the host key state the platform fields `--platform` gives for
 their kinds, `step_linear_law` and `host_laws`, which a run's spec must match,
-and the host key's `engine` is the law's `engine_config`. A segment outside `HOST_SEGMENTS` is
+and the host key's `engine` is the law's `engine_config`; the host key's
+``fit_src`` is the laws' own digest (`fit_src`), as `compass fit host` keys
+them. A segment outside `HOST_SEGMENTS` is
 fitted for a kind whose samples carry it: `W_inputs` and `L_mtp`, on an MTP
 record, and `W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
 solve drops above the law paid a first-use JIT compile (`_jit`): it and the
@@ -245,6 +247,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import itertools
 import json
 import math
@@ -615,6 +618,13 @@ def _runs(samples, dp: int) -> dict[str, list[list]]:
         n = sum(map(len, runs.values()))
         raise ValueError(f"{n} records are not runs of {dp} ranks")
     return {run: [ranks[r] for r in sorted(ranks)] for run, ranks in runs.items()}
+
+
+def fit_src(host: dict) -> str:
+    """The sha256 of the host laws `host`, a run file's `host` entry, without
+    its ``key``: of what was fitted, so it moves exactly when the laws do."""
+    fitted = {term: value for term, value in host.items() if term != "key"}
+    return hashlib.sha256(json.dumps(fitted, sort_keys=True).encode()).hexdigest()
 
 
 def fit_host(samples) -> tuple[dict, dict]:
@@ -3325,6 +3335,7 @@ def main(argv=None) -> None:
             **args.platform["host_laws"],
             "engine": engine | graphs,
         }
+        law["host"]["key"]["fit_src"] = fit_src(law["host"])
     if len(args.records) > dp:
         mark_held_out(law, report, samples, options)
     fill_rungs(law, engine.get("ladder"))

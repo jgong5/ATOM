@@ -67,7 +67,7 @@ def test_both_fits_key_their_entries_by_the_stated_engine_as_step_linear_fit_doe
     graphs = json.loads((a / "steps/dp0.key.json").read_text())["engine"][GRAPHS]
     keyed = {**STATED, GRAPHS: graphs}
     assert written["host"]["key"]["engine"] == keyed
-    host_key = host_laws_key({**HOST, "engine": keyed})
+    host_key = host_laws_key({**HOST, "engine": keyed}, tmp_path)
     assert member(tmp_path / "store", host_key, "params")["key"]["engine"] == keyed
     report = member(tmp_path / "store", host_key, "report")
     assert report["stated_engine"] == json.loads(engine.read_text())
