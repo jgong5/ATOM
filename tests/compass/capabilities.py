@@ -75,9 +75,9 @@ FORMS = {
     "deepseek_v4": Form("DeepSeek-V4 sparse attention", issue="#2671"),
     "mla": Form("MLA (DeepSeek-R1)", issue="#2671"),
     "router_cache_aware": Form(
-        "the router LP's cache_aware, with and without timed eviction", issue="#2673"
+        "the router LP's cache_aware, with and without timed eviction"
     ),
-    "router_prefix_hash": Form("the router LP's prefix_hash", issue="#2673"),
+    "router_prefix_hash": Form("the router LP's prefix_hash"),
     "images": refused(
         "a step with image tokens: no real backend prices a vision encoder",
         HERE + "test_image_preprocess.py::"

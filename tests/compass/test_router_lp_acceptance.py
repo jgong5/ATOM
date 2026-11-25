@@ -502,6 +502,8 @@ def shared(atomesh, tmp_path_factory):
     }
 
 
+@capability("router_cache_aware")
+@capability("router_prefix_hash")
 def test_each_policy_meets_every_scenario_check_and_one_seed_picks_its_ranks(shared):
     failed = {name: check_run(list(pair)) for name, pair in shared.items()}
     print("\nrun: level, evictions, (prefill, decode) rank per request")
