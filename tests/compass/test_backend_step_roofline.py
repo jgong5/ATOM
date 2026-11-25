@@ -239,13 +239,14 @@ def test_linear_attention_and_act_on_a_padded_two_token_decode_step_by_hand(bf16
 
 
 #: 4 heads over 2 KV heads of 8, a window of 16: a fresh 40-token prefill, an
-#: 8-token chunk at context 100, and decodes at contexts 50 and 10.
-WINDOW_ROWS = [(40, 40, False), (8, 100, False), (1, 50, True), (1, 10, True)]
+#: 8-token chunk at context 100, a 2-token verify at context 50 and a decode
+#: at context 10.
+WINDOW_ROWS = [(40, 40, False), (8, 100, False), (2, 50, True), (1, 10, True)]
 
 
 @pytest.mark.parametrize("bf16", [2.5e15, 1e9], ids=["memory-bound", "compute-bound"])
 @pytest.mark.parametrize(
-    "whole,keys", [(1, 40 + 100 + 16 + 10), (0, 40 + 23 + 16 + 10)]
+    "whole,keys", [(1, 40 + 100 + 16 + 10), (0, 40 + 23 + 17 + 10)]
 )
 def test_a_windowed_attention_layer_prices_its_window_by_hand(bf16, whole, keys):
     document = copy.deepcopy(ROOFLINE)
@@ -256,15 +257,16 @@ def test_a_windowed_attention_layer_prices_its_window_by_hand(bf16, whole, keys)
     windowed = Module("swa", "attention", (4, 2, 8, 16, whole))
     terms = StepRooflineBackend(machine, [windowed]).price(view(*WINDOW_ROWS)).terms
     # Each query scores min(position, 16) keys: 1 + .. + 16 and 24 more 16s,
-    # 8 queries past 16, and the two decodes' 16 and 10.
-    pairs = (16 * 17 // 2 + 24 * 16) + 8 * 16 + 16 + 10
+    # 8 queries past 16, the verify's two 16s and the decode's 10.
+    pairs = (16 * 17 // 2 + 24 * 16) + 8 * 16 + 2 * 16 + 10
     flops = 4 * 4 * 8 * pairs
-    # 50 queries read and written at 4 heads of 8; the keys and values each
-    # request reads: a decode's last 16, and a prefill's whole context, or
-    # the 8 + 16 - 1 the chunk's window opens at context 100.
-    moved = 50 * 2 * 4 * 8 * 2 + keys * 2 * 2 * 8 * 2
+    # 51 queries read and written at 4 heads of 8; the keys and values each
+    # request reads: a prefill's whole context and a decode's last 16, or,
+    # under unified attention, the span its first query's window opens: the
+    # chunk's 8 + 16 - 1 and the verify's 2 + 16 - 1.
+    moved = 51 * 2 * 4 * 8 * 2 + keys * 2 * 2 * 8 * 2
 
-    assert pairs == 674
+    assert pairs == 690
     assert [t.seconds for t in terms] == [
         pytest.approx(max(moved / 1e12, flops / (bf16 * 0.70)))
     ]
