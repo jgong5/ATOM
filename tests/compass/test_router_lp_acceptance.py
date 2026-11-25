@@ -15,6 +15,14 @@ same pair of runs under ``--policy random`` (as `pd_sim.sh` runs a cell that
 maps ranks outside aiperf_agentic) must pick the same ranks, and
 ``--policy power_of_two`` must be refused by name.
 
+cache_aware, as `pd_sim.sh` runs it, and prefix_hash make the same pair of
+runs over requests that share prefixes, the frontends on the same ports in
+both, as one deployment's are; cache_aware evicts every 300 s, `pd_sim.sh`'s
+interval, past the run's end (atomesh refuses 0), and every 1 s, inside it.
+Each pair meets the scenario checks and picks the same ranks under either
+delay; the eviction inside the run moves a pick; prefix_hash sends each prefix
+to one rank of each side.
+
 Skips where cargo cannot resolve atomesh's dependencies, as
 ``test_mesh_clock_client.py`` does.
 """
@@ -58,8 +66,9 @@ MESH = TREE / "atom" / "mesh"
 WALL_S = 120.0
 U = 2.0**-6
 PREFILL_S, DECODE_S = 4 * U, U
-# Each request's send time on the traffic clock, and its max_tokens.
-WORKLOAD = [(0.0, 6), (5.5 * U, 8), (6 * U, 1), (11.5 * U, 2)]
+# Each request's send time on the traffic clock, its max_tokens, and what its
+# prompt starts with before `request <i>`.
+WORKLOAD = [(0.0, 6, ""), (5.5 * U, 8, ""), (6 * U, 1, ""), (11.5 * U, 2, "")]
 # Least load, ties to rank 0. Prefill load is held from placement until the
 # relay is handled, 4.12U after the send; decode load until the stream's last
 # event is, 0.02U plus U per token later.
@@ -71,6 +80,20 @@ WORKLOAD = [(0.0, 6), (5.5 * U, 8), (6 * U, 1), (11.5 * U, 2)]
 # A missed prefill drop sends 1 to p1, a missed decode drop 3 to d1, and a
 # decode drop at the stream's first event 1 to d0.
 RANKS = [(0, 0), (0, 1), (1, 0), (0, 0)]
+
+# Two prefixes of 16 words each, which a prompt starts with before
+# `request <i>`. cache_aware's eviction, at 1 s when on, falls between
+# requests 2 and 3.
+A, B = (" ".join(f"{f}{k}" for k in range(16)) + " " for f in "ab")
+SHARED = [(0.0, 4, A), (U, 4, B), (1 - 2 * U, 4, A), (1 + U, 4, A), (1 + 16 * U, 4, B)]
+# cache_aware, on each side: 0 matches nothing with both ranks idle, so it
+# draws rank a; 1 matches nothing while a holds 0, so the other rank; 2 matches
+# 0, so a. 3 matches 0 and 2, so a, unless the eviction emptied the tree: then
+# the rank 2 does not hold. The arguments are `pd_sim.sh`'s, but the tree's
+# size, in characters, below one prompt's.
+CACHE_AWARE = ["--prefill-policy", "cache_aware", "--decode-policy", "cache_aware"]
+CACHE_AWARE += ["--cache-threshold", "0.8", "--balance-abs-threshold", "20"]
+CACHE_AWARE += ["--balance-rel-threshold", "2.0", "--max-tree-size", "16"]
 
 
 @pytest.fixture(scope="module")
@@ -118,15 +141,15 @@ class Frontend:
     """Frontend LP ``frontend-<side>``: an HTTP server the router posts to, and
     the LP's clock owner, which replies to each request once it is released."""
 
-    def __init__(self, run: dict, side: str, delay) -> None:
-        self.run, self.side, self.delay = run, side, delay
+    def __init__(self, run: dict, side: str, delay, model: str, port: int) -> None:
+        self.run, self.side, self.delay, self.model = run, side, delay, model
         self.lp = LpId(f"frontend-{side}")
         self.cv = threading.Condition()
         self.bodies: dict[int, dict] = {}  # inbound seq -> its request body
         self.replies: dict[int, list] = {}  # inbound seq -> its reply's parts
         self.ranks: dict[int, int] = {}  # request -> the DP rank it was sent to
         self.errors: list[BaseException] = []
-        self.http = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
+        self.http = ThreadingHTTPServer(("127.0.0.1", port), self._handler())
         self.url = f"http://127.0.0.1:{self.http.server_port}"
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.owner = threading.Thread(target=self._own, daemon=True)
@@ -142,7 +165,7 @@ class Frontend:
             def do_GET(self) -> None:  # the router's worker discovery
                 role = "kv_producer" if fe.side == "P" else "kv_consumer"
                 info = {"dp_size": 2, "tp_size": 1, "kv_role": role}
-                info |= {"model_id": "m", "data": [{"id": "m"}]}
+                info |= {"model_id": fe.model, "data": [{"id": fe.model}]}
                 self._send(json.dumps(info).encode(), "application/json")
 
             def do_POST(self) -> None:
@@ -156,7 +179,7 @@ class Frontend:
                 )
                 seq = stamp[1]
                 with fe.cv:
-                    request = int(re.match(r"request (\d+)", body["prompt"])[1])
+                    request = int(re.search(r"request (\d+)$", body["prompt"])[1])
                     fe.ranks[request] = body["data_parallel_rank"]
                     fe.bodies[seq] = body
                     fe.cv.notify_all()
@@ -265,9 +288,19 @@ def _launch(out: Path, name: str, args: list, **env) -> subprocess.Popen:
 
 
 def run_router_lp(
-    atomesh: Path, out: Path, hash_seed: str, delay, policy: str = "dp_sticky"
+    atomesh: Path,
+    out: Path,
+    hash_seed: str,
+    delay,
+    policy: str = "dp_sticky",
+    args: list = (),
+    workload: list = WORKLOAD,
+    model: str = "m",
+    ports: tuple = (0, 0),
 ) -> list:
-    """One run in `out`; each request's (prefill, decode) rank, in order."""
+    """One run in `out`; each request's (prefill, decode) rank, in order.
+    `args` are more router arguments; the frontends serve `model` on `ports`
+    (prefill, decode), 0 for any."""
     out.mkdir()
     with held_ports(3) as (clock_port, router_port, metrics_port):
         run_file = _run_file(
@@ -302,7 +335,9 @@ def run_router_lp(
                 authority,
                 lambda: socket.create_connection((host, port)).close(),
             )
-            frontends = {s: Frontend(run, s, delay) for s in "PD"}
+            frontends = {
+                s: Frontend(run, s, delay, model, port) for s, port in zip("PD", ports)
+            }
             idle = [
                 threading.Thread(
                     target=_idle,
@@ -323,10 +358,13 @@ def run_router_lp(
                 + ["--decode", frontends["D"].url, "--policy", policy, "--dp-aware"]
                 + ["--backend", "atom", "--disable-health-check"]
                 + ["--disable-circuit-breaker", "--disable-retries"]
-                + ["--prometheus-port", str(metrics_port), "--log-level", "info"],
+                + ["--prometheus-port", str(metrics_port), "--log-level", "info"]
+                + list(args),
                 ATOM_COMPASS_CLOCK_ENDPOINT=endpoint,
                 ATOM_COMPASS_SEED="20260707",
                 ATOM_COMPASS_ROUTER_LOOKAHEADS=json.dumps(lookaheads),
+                # Each eviction pass's tenant sizes, which `evictions` reads.
+                RUST_LOG="mesh=info,mesh::policies::tree=debug",
             )
             procs.append(router)
             deadline = time.monotonic() + WALL_S
@@ -340,14 +378,14 @@ def run_router_lp(
                     time.sleep(0.5)
             bodies = [
                 {
-                    "model": "m",
-                    "prompt": f"request {i}",
+                    "model": model,
+                    "prompt": f"{prefix}request {i}",
                     "max_tokens": n,
                     "stream": True,
                 }
-                for i, (_, n) in enumerate(WORKLOAD)
+                for i, (_, n, prefix) in enumerate(workload)
             ]
-            offsets = [t for t, _ in WORKLOAD]
+            offsets = [t for t, _, _ in workload]
             DelayedTraffic(run, router_port, bodies, offsets, delay=delay).run()
             for t in [*idle, *(f.owner for f in frontends.values())]:
                 t.join(WALL_S)
@@ -358,11 +396,12 @@ def run_router_lp(
                     p.kill()
             for f in frontends.values():
                 f.http.shutdown()
+                f.http.server_close()
     errors += [e for f in frontends.values() for e in f.errors]
     if errors:
         raise errors[0]
     p, d = (frontends[s].ranks for s in "PD")
-    return [(p[i], d[i]) for i in range(len(WORKLOAD))]
+    return [(p[i], d[i]) for i in range(len(workload))]
 
 
 @pytest.fixture(scope="module")
@@ -397,6 +436,106 @@ def test_random_picks_the_same_ranks_from_one_seed_under_any_host_delay(
     )
     print("\nrandom: (prefill, decode) rank per request, per run:", [first, second])
     assert first == second
+
+
+def evictions(log: str) -> int:
+    """The router's eviction passes that shrank a tree: each logs every
+    tenant's size before it and after it (`atom/mesh/src/policies/tree.rs`)."""
+    totals = []
+    for line in log.splitlines():
+        if "eviction - Used size per tenant" in line:
+            totals.append(0)
+        elif size := re.search(r"Tenant: \S+, Size: (\d+)", line):
+            totals[-1] += int(size[1])
+    return sum(after < before for before, after in zip(totals[::2], totals[1::2]))
+
+
+def _model(directory: Path) -> str:
+    """A model directory whose tokenizer, word-level over the prefixes' words,
+    the router loads to give prefix_hash the tokens it hashes; its path is the
+    model's name, as ATOM names a model by its path."""
+    words = ["<unk>", *A.split(), *B.split()]
+    vocab = {w: i for i, w in enumerate(words)}
+    spec = {"version": "1.0", "truncation": None, "padding": None}
+    spec |= {"added_tokens": [], "normalizer": None, "post_processor": None}
+    spec |= {"pre_tokenizer": {"type": "WhitespaceSplit"}, "decoder": None}
+    spec["model"] = {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}
+    directory.mkdir()
+    (directory / "tokenizer.json").write_text(json.dumps(spec))
+    return str(directory)
+
+
+def _pair(atomesh: Path, root: Path, model: str, policy: str, args: list) -> dict:
+    """`policy`'s runs over `SHARED` from both seeds, the second under a random
+    host delay, the frontends on the same ports in both: {out dir: ranks}."""
+    root.mkdir()
+    wall = random.Random(3)
+    delays = {"1": lambda: 0.0, "2": lambda: wall.uniform(0.0, 0.02)}
+    runs = {}
+    with held_ports(2) as ports:
+        for s, delay in delays.items():
+            out = root / f"seed{s}"
+            runs[out] = run_router_lp(
+                atomesh, out, s, delay, policy, args, SHARED, model, ports
+            )
+    return runs
+
+
+@pytest.fixture(scope="module")
+def shared(atomesh, tmp_path_factory):
+    root = tmp_path_factory.mktemp("router_lp_shared")
+    model = _model(root / "model")
+    runs = {
+        "cache_aware": ("cache_aware", [*CACHE_AWARE, "--eviction-interval", "300"]),
+        "cache_aware_evicting": (
+            "cache_aware",
+            [*CACHE_AWARE, "--eviction-interval", "1"],
+        ),
+        "prefix_hash": (
+            "prefix_hash",
+            ["--tokenizer-path", model, "--prefix-token-count", "16"],
+        ),
+    }
+    return {
+        name: _pair(atomesh, root / name, model, policy, args)
+        for name, (policy, args) in runs.items()
+    }
+
+
+@capability("router_cache_aware")
+@capability("router_prefix_hash")
+def test_each_policy_meets_every_scenario_check_and_one_seed_picks_its_ranks(shared):
+    failed = {name: check_run(list(pair)) for name, pair in shared.items()}
+    print("\nrun: level, evictions, (prefill, decode) rank per request")
+    for name, pair in shared.items():
+        for out, ranks in pair.items():
+            level = "failed" if failed[name] else "level 0"
+            count = evictions((out / "router.log").read_text())
+            print(f"{name}/{out.name}: {level}, {count} evictions, {ranks}")
+    assert not any(failed.values()), "\n".join(f for fs in failed.values() for f in fs)
+    for name, pair in shared.items():
+        first, second = pair.values()
+        assert first == second, f"{name} picks other ranks under a host delay"
+
+
+def test_the_eviction_fires_inside_the_run_and_moves_a_pick(shared):
+    kept, evicting = shared["cache_aware"], shared["cache_aware_evicting"]
+    counts = [evictions((out / "router.log").read_text()) for out in [*kept, *evicting]]
+    # One pass a side's tree at 1 s; none at 300 s.
+    assert counts[:2] == [0, 0] and counts[2] == counts[3] > 0, counts
+    (kept, _), (evicted, _) = kept.values(), evicting.values()
+    a = kept[0]
+    other = tuple(1 - r for r in a)
+    assert kept == [a, other, a, a, other]
+    assert evicted[:4] == [a, other, a, other], "the eviction must move request 3"
+
+
+def test_prefix_hash_sends_each_prefix_to_one_rank_of_each_side(shared):
+    # Its 16 words hash a prefix to one rank of each side, and no request finds
+    # that rank above 1.25 times the mean load, which would send it elsewhere.
+    ranks, _ = shared["prefix_hash"].values()
+    taken = {p: {r for r, (_, _, q) in zip(ranks, SHARED) if q == p} for p in (A, B)}
+    assert all(len(r) == 1 for r in taken.values()), taken
 
 
 def test_power_of_two_is_refused_by_name(atomesh, tmp_path):
