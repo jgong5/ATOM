@@ -705,8 +705,8 @@ class OpGraphBackend(CostBackend):
         group scheduled (`group_max_tokens`), where its view states them,
         which MORI's exchange there is priced by, and any other None; and
         every bound its rows, each its query and context tokens, as a set
-        whose hash is kept: a compressor's price reads whether they complete
-        a compressed entry (`fit.ops.completes`)."""
+        whose hash is kept: a compressor's price reads how they complete a
+        compressed entry (`fit.ops.completion`)."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)

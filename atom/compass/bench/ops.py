@@ -4761,14 +4761,14 @@ def _densify(
     step. Any other is `_bent` on its line as `fit ops` reads it, taking
     in a gap beside a bend each count of a step (`step_tokens`) at its rows, or
     at any for a family stating none. A compressor's decode family
-    (`_compressor`) is two lines, as `fit ops` reads it: its points whose rows
-    complete a compressed entry (`fit.ops.completes`) and the rest, each
+    (`_compressor`) is a line for each way its points' rows complete a
+    compressed entry, as `fit ops` reads it (`fit.ops.completion`), each
     halved at the context nearest halfway at which a point's rows
-    (`point_rows`, a drafter of `drafts` verifying past each) hold its line,
+    (`point_rows`, a drafter of `drafts` verifying past each) complete one so,
     and each reaching its family's least and most context at the nearest
-    context inside them that holds it."""
+    context inside them that does."""
     from atom.compass.capture.forward import decode, prefill
-    from atom.compass.fit.ops import completes
+    from atom.compass.fit.ops import completion
 
     steps = {
         p[2]["op"]
@@ -4805,7 +4805,7 @@ def _densify(
         if json.loads(fam)[0] == "prefill":
             lines[line(fam, points)] += points
 
-    # a compressor's decode family as two lines, each reaching its family's ends
+    # a compressor's decode family as its lines, each reaching its family's ends
     want, lined, lines_of = defaultdict(set), [], {}
     for fam, points in families.items():
         if not (ratio := _compressor(points, moved)):
@@ -4813,19 +4813,18 @@ def _densify(
             continue
         shape, ragged = _marked(points[0][2]), json.loads(fam)[2:]
 
-        def completing(m, shape=shape, ragged=ragged, ratio=ratio) -> int:
+        def completing(m, shape=shape, ragged=ragged, ratio=ratio) -> tuple:
             at = (m, *ragged) if ragged else m
-            return completes(
+            return completion(
                 point_rows(shape, at, sys.maxsize, 1, False, drafts), ratio
             )
 
         lines_of[fam] = completing, ratio
         least, most = min(p[0] for p in points), max(p[0] for p in points)
-        for done in (0, 1):
-            on = [p for p in points if completes(p[2]["rows"], ratio) == done]
-            lined += [(fam, on)] if on else []
-            low = min((p[0] for p in on), default=most + 1)
-            high = max((p[0] for p in on), default=least - 1)
+        for done in sorted({completion(p[2]["rows"], ratio) for p in points}):
+            on = [p for p in points if completion(p[2]["rows"], ratio) == done]
+            lined.append((fam, on))
+            low, high = min(p[0] for p in on), max(p[0] for p in on)
             for end, lo, hi in ((least, least, low - 1), (most, high + 1, most)):
                 if lo > hi or (fam, done, end) in tried:
                     continue
@@ -4869,7 +4868,7 @@ def _densify(
             mid = (a + b) // 2
             if fam in lines_of:  # a compressor's: the nearest halfway on its line
                 completing, ratio = lines_of[fam]
-                done = completes(record["rows"], ratio)
+                done = completion(record["rows"], ratio)
                 mid = _nearest(mid, a + 1, b - 1, completing, done)
             if mid is None or (fam, mid) in tried:
                 continue
