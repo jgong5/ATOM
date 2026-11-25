@@ -56,7 +56,8 @@
 #                    there replaces client.sh's; aiperf appends a --url, --model
 #                    or --extra-inputs there to client.sh's, and refuses any
 #                    other option given twice. aiperf reads its AIPERF_* settings,
-#                    its timeouts among them, from client.sh's environment
+#                    its timeouts among them, from client.sh's environment, and
+#                    runs with HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE unset
 #   COMPASS_HARNESS_SEND_ORDER_SEED  against a simulated server, the order its
 #                    traffic LP numbers the requests aiperf sends at one
 #                    instant in, which its router places them in: unset, by
@@ -243,11 +244,14 @@ args=(--endpoint-type chat --custom-dataset-type weka_trace
 # submissions do, which workload.json then names. The raw records
 # leave out each request's payload, its prompt, and are compressed once the
 # export is written. aiperf runs as a job, so that any exit of this script,
-# a SIGTERM's included, stops it.
+# a SIGTERM's included, stops it. Its tokenizer is MODEL's directory, read with
+# no network; offline, aiperf looks the name up in the Hugging Face cache alone
+# and refuses a directory, so it runs with the offline switches unset.
 dynamo=$(compass_dynamo_header) session=true
 [[ -z $dynamo ]] || session=false
 trap 'set +e; kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
-(cd "$OUT/client" && AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=$session \
+(cd "$OUT/client" && unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE &&
+    AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=$session \
     AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true exec "$HARNESS_PYTHON" "${aiperf[@]}" \
     profile --url "${url#http://}" --model "$MODEL" --tokenizer "$MODEL" \
     --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" "${scrape[@]}" \
