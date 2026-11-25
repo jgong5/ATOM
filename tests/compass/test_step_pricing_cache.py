@@ -271,3 +271,14 @@ def test_a_float_max_off_the_segment_is_redone_on_gloo_where_gloo_s_order_decide
     rows, maxed
 ):
     assert shm_collectives.maxed(np.array(rows)) == maxed
+
+
+def test_a_host_whose_laws_are_assigned_anew_prices_its_segments_by_them():
+    """A record's grading assigns an idle forward's measured `E` as new laws
+    (`parity.recurrence.priced`); the segments kept under the old ones go."""
+    host = HostDeviceRecurrence(HOST, (), lambda: 0.0)
+    before = host.prepare_end(0.0, "decode", (1, 4, 4))[1]["E"]
+    host.laws = {**HOST, "decode": {**HOST["decode"], "E": [0.5, 0, 0]}}
+    after = host.prepare_end(0.0, "decode", (1, 4, 4))[1]["E"]
+
+    assert (before, after) == (pytest.approx(1e-4 + 8e-7 + 1.2e-5), 0.5)

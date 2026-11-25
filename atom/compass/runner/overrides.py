@@ -412,7 +412,9 @@ class HostDeviceRecurrence:
         self.output_end = -math.inf  # target end of the last output forward
         self.mtp = mtp
         self.own_draft = not defer
-        self._kept = {}  # `prepare_end`'s segment seconds, by what they are priced from
+        # `prepare_end`'s segment seconds, by what they are priced from, and
+        # the laws, columns and skip they were priced under.
+        self._kept, self._kept_for = {}, (None, None, None)
 
     def charge(
         self, batch: Any, device_s: float, draft_s: float, refuse: bool = True
@@ -526,8 +528,19 @@ class HostDeviceRecurrence:
         `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, and each column a segment
         adopts prices `features`' value of its feature, 0 where absent. The
         seconds are those an earlier forward of the same kind, `x`, `admit_s`
-        and `features` got, kept for `KEPT` of them; the dict is shared, so no
-        caller changes it."""
+        and `features` got, kept for `KEPT` of them while `laws`, `columns`
+        and `skip` stay the same objects: one assigned anew, as a record's
+        grading assigns an idle forward's measured `E`, starts them again,
+        and none is changed in place. The dict is shared, so no caller
+        changes it."""
+        laws, columns, skip = self._kept_for
+        if (
+            laws is not self.laws
+            or columns is not self.columns
+            or skip is not self.skip
+        ):
+            self._kept.clear()
+            self._kept_for = self.laws, self.columns, self.skip
         features = features or {}
         key = (kind, x, admit_s, tuple(features.items()))
         seg = self._kept.get(key)
