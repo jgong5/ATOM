@@ -422,6 +422,9 @@ ROW_PADDING_ENV = "COMPASS_FIT_ROW_PADDING"
 GATHER_ROWS_ENV = "COMPASS_FIT_GATHER_ROWS"
 MOE_IMBALANCE_ENV = "COMPASS_FIT_MOE_IMBALANCE"
 UNEVEN_ROWS_ENV = "COMPASS_FIT_UNEVEN_ROWS"
+#: Prefill `tail_peers` (`step_linear.tail_peers`): a rank's real-row peers at a
+#: step its group runs a finishing prompt's tail at.
+TAIL_PEERS_ENV = "COMPASS_FIT_TAIL_PEERS"
 #: Prefill `GRAPH_COLUMNS`: `tokens` and `query_cached` on a step replaying a
 #: prefill token graph.
 GRAPH_TOKENS_ENV = "COMPASS_FIT_GRAPH_TOKENS"
@@ -642,6 +645,7 @@ def _columns(options, draft: bool = False) -> dict:
         "gather_pad_rows": True if gather == "pad" else None,
         "moe_imbalance": options.get("moe_imbalance"),
         "uneven_rows": options.get("uneven_rows"),
+        "tail_peers": True if options.get("tail_peers") else None,
         **{f: bool(options.get(f)) for f in GRAPH_COLUMNS},
     }
     if draft:
@@ -732,6 +736,8 @@ def env_options(environ=None) -> dict:
     ):
         if _switch(env, name):
             out[key] = MOE_MIN_SPREAD if spread is None else float(spread)
+    if _switch(env, TAIL_PEERS_ENV):
+        out["tail_peers"] = True
     if spread is not None and not {"moe_imbalance", "uneven_rows"} & set(out):
         raise ValueError(
             f"{MOE_MIN_SPREAD_ENV} is moe_imbalance's and uneven_rows'; set "

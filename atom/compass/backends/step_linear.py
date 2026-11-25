@@ -58,6 +58,18 @@ with any of them states `ranks`, its group's width, and one with
 `moe_imbalance` or `uneven_rows` its `min_spread`; `gather_rows` and
 `gather_pad_rows` take the vector's `buckets`, so they come with `padding`. A
 data-parallel step stating no `group_max_tokens` is refused.
+After the gather columns it may add `tail_peers` (`tail_peers`), stating its
+group's width `ranks` as they do: on a data-parallel rank's own prefill forward
+at a step whose group runs a finishing prompt's tail (`BatchView.group_tail`),
+the group's other ranks running real rows, `ranks` less one less its
+`group_dummies`; else 0, on one rank and on a dummy forward, whose tail
+`eager_dummy_tail` prices. The tail runs the decoder on every rank of the
+group, its MoE collectives being the group's (DeepSeek-V4.1), and each peer
+running a real prefill beside it holds the group past the max of its ranks'
+prices: on #752's cell A v2 (DPA4, MoE over TP) the prefill vector fitted
+without the column on its calibration record and three addenda priced the
+output prefill steps of 2-4 real ranks 3-6% low in-sample (about 8 ms a real
+peer) and on the c=64-512 targets alike, their middle chunks within 2%.
 After `seqs` and `out` it may add `peer_small` and `peer_large` (`peer_share`):
 on a data-parallel rank's own prefill forward, output or middle chunk, whose
 peers run real rows (its group's MoE gather, `BatchView.moe_rows`, carrying
@@ -292,6 +304,7 @@ PREFILL_EXTRA = (
     "gather_pad_rows",
     "moe_imbalance",
     "uneven_rows",
+    "tail_peers",
     "seqs",
     "out",
     "peer_small",
@@ -319,7 +332,13 @@ MOE_COLUMNS = ("moe_tokens", "moe_experts")
 DECODE_EXTRA = ("row_padding",) + MOE_COLUMNS + ("peer_tokens", "rowmod")
 #: The prefill vector's columns over its data-parallel group's MoE gather that
 #: state the group's width, `ranks`.
-GATHER_COLUMNS = ("gather_rows", "gather_pad_rows", "moe_imbalance", "uneven_rows")
+GATHER_COLUMNS = (
+    "gather_rows",
+    "gather_pad_rows",
+    "moe_imbalance",
+    "uneven_rows",
+    "tail_peers",
+)
 #: The `GATHER_COLUMNS` that state the vector's `min_spread`.
 SPREAD_COLUMNS = ("moe_imbalance", "uneven_rows")
 PROPOSE = ("step", "seqs")
@@ -551,7 +570,22 @@ def gather_column(
         return moe_imbalance(view, buckets, ranks, min_spread)
     if feature == "uneven_rows":
         return uneven_rows(view, buckets, ranks, min_spread)
+    if feature == "tail_peers":
+        return tail_peers(view, ranks)
     raise ValueError(f"{feature!r} is not one of {GATHER_COLUMNS}")
+
+
+def tail_peers(view: BatchView, ranks: int) -> int:
+    """`view`'s `tail_peers` in a data-parallel group of `ranks` ranks: on a
+    rank's own prefill forward at a step its group runs a finishing prompt's
+    tail at (`BatchView.group_tail`), the group's other ranks that run real
+    rows, `ranks` less one less `group_dummies`; else 0, on one rank (no
+    `moe_rows`), on a dummy forward, on a decode and at a step with no tail."""
+    if view.moe_rows is None or view.dp_dummy or not view.prefill:
+        return 0
+    if not view.group_tail:
+        return 0
+    return max(ranks - 1 - view.group_dummies, 0)
 
 
 def uneven_rows(
@@ -609,13 +643,14 @@ def peer_tokens(view: BatchView) -> int | None:
 
 def hull_axes(features) -> tuple[int, ...]:
     """The positions in `features` of a vector's hull coordinates: all but the
-    intercept, first, and the `EAGER_DUMMY` and `PEER_SHARE` indicators, which
+    intercept, first, the `EAGER_DUMMY` and `PEER_SHARE` indicators and the
+    `tail_peers` count of 0 to `ranks` less 1, which
     a hull in their extra dimensions would only split into its 0 and 1 faces,
     at a cost qhull's facet count grows by."""
     return tuple(
         i
         for i, f in enumerate(features)
-        if i and f not in EAGER_DUMMY and f not in PEER_SHARE
+        if i and f not in EAGER_DUMMY and f not in PEER_SHARE and f != "tail_peers"
     )
 
 
