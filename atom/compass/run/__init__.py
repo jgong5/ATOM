@@ -3754,7 +3754,8 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     An engine whose ``lmcache_offload`` or ``mooncake_store`` is simulated
     hands in ``offload``: `OffloadShell.offload_statistics` or
     `StoreShell.offload_statistics`, and under ``cache`` its prefix cache's
-    counters (`EngineStats.cache_statistics`)."""
+    counters (`EngineStats.cache_statistics`); a later pipeline stage's Store
+    shell states none, and its engine hands in no ``offload``."""
     said = _workers_say(engine_core)
     rt = clock.installed()
     lp = rt.me.name if _member is None else f"{rt.me.name}.{_member}"
@@ -3772,9 +3773,12 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     if getattr(getattr(scheduler, "engine_stats", None), "spec_enabled", False):
         sections = sections | {"speculative": _acceptance(scheduler, run)}
     for half in getattr(kv, "_connectors", None) or [kv]:
-        if callable(tier := getattr(half, "offload_statistics", None)):
+        tier = getattr(half, "offload_statistics", None)
+        # A later pipeline stage's Store shell is inert and states nothing:
+        # the head's keeps the ranks and their counters.
+        if callable(tier) and (stated := tier()):
             cache = scheduler.engine_stats.cache_statistics()
-            sections = sections | {"offload": tier() | {"cache": cache}}
+            sections = sections | {"offload": stated | {"cache": cache}}
     _hand_in(run, lp, reasons, client_run, **said, **sections)
 
 
