@@ -55,6 +55,15 @@ reaches the head stage only, which reports at ``c + 2 x notify``: decode is
 ready at ``c + notify`` and sends Mooncake's release, which both ends time
 as they time write-done. Stages above the head build an inert connector.
 
+Under a link that states a NIC's bandwidth (`nic_bandwidth_bytes_per_s`,
+opt-in; `SharedNic`), the writes into one decode rank share its NIC rather
+than queue on their rank pair's `Link`: decode, which posts every write into
+it, both P ranks' alike, times them on one `SharedNic` and learns a write's
+write-done once it has advanced that NIC past it; prefill times its own writes
+into that rank on one of its own, so it frees its blocks no later than decode
+learns of the write, and earlier by what another prefill rank's writes into
+the same NIC cost. One prefill stage only.
+
 The worker half reports nothing. The engine still builds and polls it.
 """
 
@@ -65,9 +74,10 @@ import logging
 import math
 import pickle
 import weakref
+from typing import ClassVar
 
 from atom.compass.kv.handoff import SIMULATED_ENGINE_ID, transfer_params, whole_number
-from atom.compass.kv.transfer import Link, TransferModel
+from atom.compass.kv.transfer import Link, SharedNic, TransferModel
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
@@ -163,6 +173,13 @@ class SimulatedKVConnector(KVConnectorBase):
 class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler side: Mooncake's write request, and both ends' completion times."""
 
+    # The opt-in switches' state, off: what `__init__` replaces when one is on,
+    # and what a connector built without it reads (no shared NIC, nothing in
+    # flight on a NIC).
+    _shared = False
+    _nics: ClassVar[dict] = {}
+    _extra: ClassVar[dict] = {}
+
     def __init__(self, config) -> None:
         import zmq
 
@@ -192,6 +209,17 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         self._due: dict = {}  # request -> when its transfer is done
         # Each pair's links, one per prefill stage, by the rank at the other end.
         self._links = collections.defaultdict(lambda: [Link(m) for m in self._transfer])
+        # Opt-in: the writes into one decode rank's NIC share it (`SharedNic`).
+        # Decode times every write into its rank on one NIC, prefill its own
+        # writes into each decode rank on one NIC per pair.
+        self._shared = self._transfer[0].nic_bandwidth_bytes_per_s > 0
+        if self._shared and len(self._transfer) > 1:
+            raise ValueError(
+                "a shared NIC prices one prefill stage's writes; this deployment "
+                f"prices {len(self._transfer)}"
+            )
+        self._nics = collections.defaultdict(lambda: SharedNic(self._transfer[0]))
+        self._extra: dict = {}  # request -> what its due adds to its write-done
         self._snapshot: list = []  # done at the last poll, reported at the next
         # Mooncake's send claim: a producer keeps a request's blocks from the
         # pool from `request_finished` until its write is reported done.
@@ -258,6 +286,29 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         """When the last prefill stage's write of `blocks`, arriving at `a` on
         rank pair `pair`, is done."""
         return max(link.start(a, blocks) for link in self._links[pair])
+
+    def _write(self, pair, req_id, a: float, blocks: int, extra: float) -> None:
+        """Time `req_id`'s write of `blocks`, arriving at `a` on rank pair
+        `pair`: due `extra` after its write-done, at once on the pair's link,
+        or under a shared NIC once `_settle` has advanced the NIC past it. A
+        `req_id` of None is timed and reported to no one."""
+        if not self._shared:
+            done = self._written(pair, a, blocks)
+            if req_id is not None:
+                self._due[req_id] = done + extra
+            return
+        # Decode's writes all share its own NIC; prefill's, its pair's.
+        self._nics[None if not self.is_producer else pair].add(req_id, a, blocks)
+        if req_id is not None:
+            self._extra[req_id] = extra
+
+    def _settle(self, now: float) -> None:
+        """Under a shared NIC: each write whose bytes have moved by `now`
+        is due at its write-done."""
+        for nic in self._nics.values():
+            for req_id, done in nic.advance(now):
+                if req_id is not None:
+                    self._due[req_id] = done + self._extra.pop(req_id)
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
         """Claim a remote-filled prompt whole, so the engine parks it."""
@@ -337,7 +388,7 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         a = max(t, self._rt.now) + self._latency_s
         for req_id, params, blocks in self._queued:
             key, _ = self._send(params, blocks, a)
-            self._due[req_id] = self._written(key, a, blocks) + self._latency_s
+            self._write(key, req_id, a, blocks, self._latency_s)
         self._queued.clear()
 
     def _send(self, params, blocks, a=None) -> tuple[tuple[str, int], float]:
@@ -401,7 +452,9 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
     def _drop_claim(self, req_id, t: float) -> None:
         """A claimed request no write request is taken for is done at `t`, and
         a later write request for it is refused."""
-        pending = req_id in self._due or req_id in self._snapshot
+        pending = (
+            req_id in self._due or req_id in self._snapshot or req_id in self._extra
+        )
         if str(req_id) not in self._awaiting_send or pending:
             return
         self._ready.pop(req_id, None)
@@ -432,7 +485,7 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             if req_id in self._aborted:
                 # Mooncake refuses it. Decode, which cannot learn that, timed
                 # the write on its end of the link, and this end keeps in step.
-                self._written(other, a, blocks)
+                self._write(other, None, a, blocks, 0.0)
                 logger.info("compass: a write request for aborted %s", req_id)
                 continue
             r = self._ready.pop(req_id, None)
@@ -444,13 +497,13 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                 )
             # Above one stage, decode's write-done notice and its release back.
             release = 2 * self._latency_s if len(self._transfer) > 1 else 0.0
-            self._due[req_id] = self._written(other, a, blocks) + release
+            self._write(other, req_id, a, blocks, release)
             logger.info(
                 "compass: KV transfer %s, %d blocks, from %r to %r simulated s",
                 req_id,
                 blocks,
                 a,
-                self._due[req_id],
+                self._due.get(req_id, "a shared NIC's write-done"),
             )
 
     def process_completions(self, output):
@@ -467,6 +520,8 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         # The engine's aggregation keeps one poll in flight, so a poll returns
         # the snapshot the workers took at the previous poll: report that one.
         now = self._rt.read_clock()
+        if self._shared:
+            self._settle(now)
         done, self._snapshot = self._snapshot, [
             req_id for req_id, t in self._due.items() if t <= now
         ]
@@ -480,4 +535,9 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
 
     def has_pending_work(self) -> bool:
         """Keeps an idle decode engine polling until its parked requests are ready."""
-        return bool(self._due or self._snapshot or self._queued)
+        return bool(
+            self._due
+            or self._snapshot
+            or self._queued
+            or any(nic.busy() for nic in self._nics.values())
+        )

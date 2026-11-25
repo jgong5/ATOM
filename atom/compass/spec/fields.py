@@ -19,7 +19,8 @@ curve is `[bytes, bytes per second]` points, both rising with the bytes.
 
 Every field is required except the optional provenance fields,
 `fp4_flops` and its derate, the bandwidth curve, the kernel and profiler
-floors, the pipeline send terms, a link's `link_setup_s` (zero when absent), the
+floors, the pipeline send terms, a link's `link_setup_s` (zero when absent) and
+`nic_bandwidth_bytes_per_s` (no NIC shared when absent), the
 `inter_node` link, which only a run across nodes reads, the
 `host_link` pair and `device.ptl`, the cards' PTL state (`disabled` when
 absent). An engine start's memory readings are no field here: `compass measure
@@ -150,6 +151,13 @@ FIELDS = (
     ),
     Field("interconnect.intra_node.link_latency_s", Kind.QUANTITY),
     Field("interconnect.intra_node.link_setup_s", Kind.QUANTITY, required=False),
+    # What the KV writes into one NIC reach together (attained, not a peak):
+    # stated, they share it (kv/transfer.py `SharedNic`); absent, they do not.
+    Field(
+        "interconnect.intra_node.nic_bandwidth_bytes_per_s",
+        Kind.QUANTITY,
+        required=False,
+    ),
     # A pipeline stage's send, per carrier; a pipeline run requires them.
     *(
         Field(f"interconnect.intra_node.pp.{carrier}.{name}", kind, required=False)
@@ -173,6 +181,11 @@ FIELDS = (
     ),
     Field("interconnect.inter_node.link_latency_s", Kind.QUANTITY, required=False),
     Field("interconnect.inter_node.link_setup_s", Kind.QUANTITY, required=False),
+    Field(
+        "interconnect.inter_node.nic_bandwidth_bytes_per_s",
+        Kind.QUANTITY,
+        required=False,
+    ),
     # The device-to-host copy an lmcache server's stores and loads ride, as a
     # copy reaches it (not a peak); a run with an lmcache server requires it.
     Field(

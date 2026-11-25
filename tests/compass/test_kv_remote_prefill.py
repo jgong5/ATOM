@@ -16,6 +16,7 @@ requests it names.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import ipaddress
 import itertools
 import json
@@ -493,6 +494,93 @@ def test_writes_posted_together_queue_on_the_link_on_both_ends(pd, seq_factory):
         pd.d.schedule()
         waiting = [y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS for y in ys]
         assert waiting == want, t
+
+
+@pytest.fixture
+def pd_shared(geometry, monkeypatch):
+    """`pd` on a link whose NIC moves 1.5 links' worth (`SharedNic`)."""
+    base = model_for(geometry, PEAKS[0])
+    model = dataclasses.replace(
+        base, nic_bandwidth_bytes_per_s=1.5 * base.bandwidth_bytes_per_s
+    )
+    address = f"inproc://kv-write-req-{next(_PAIRS)}"
+    rt_p, rt_d = runtime("engine-P"), runtime("engine-D")
+    p = connector(rt_p, monkeypatch, model, kv_role="kv_producer", address=address)
+    d = connector(rt_d, monkeypatch, model, kv_role="kv_consumer", address=address)
+    return SimpleNamespace(
+        model=model,
+        address=address,
+        rt_p=rt_p,
+        rt_d=rt_d,
+        p=scheduler_with(p),
+        d=scheduler_with(d),
+    )
+
+
+def test_writes_posted_together_share_a_nic_on_both_ends(pd_shared, seq_factory):
+    """Under a NIC's rate, two writes posted at once move together at 0.75 of
+    the link's rate each until the smaller is done, then the larger alone at
+    the link's: each end reports both at those times, a poll late as ever."""
+    pd = pd_shared
+    prompts = [PROMPT[:24], PROMPT]
+    xs = [
+        Sequence(
+            p,
+            4,
+            sampling_params=SamplingParams(max_tokens=1),
+            kv_transfer_params=dict(TO_PREFILL),
+        )
+        for p in prompts
+    ]
+    for x in xs:
+        pd.p.add(x)
+    engine_step(pd.p, pd.rt_p, R)
+    at(pd.rt_d, SEND)
+    ys = [
+        seq_factory(p, kv_transfer_params=dict(x.kv_transfer_params_output))
+        for p, x in zip(prompts, xs)
+    ]
+    for y in ys:
+        pd.d.add(y)
+    admit(pd.d)
+
+    a = SEND + L
+    small, large = (len(y.block_table) * pd.model.bytes_per_block for y in ys)
+    assert small < large
+    bw = pd.model.bandwidth_bytes_per_s
+    together = small / (0.75 * bw)
+    first = a + together + pd.model.latency_s
+    last = a + together + (large - small) / bw + pd.model.latency_s
+    d = (last - first) / 4
+    engine_step(pd.p, pd.rt_p, a, (0, a), (1, a))
+    polls = [first + d, first + 2 * d, last + d, last + 2 * d]
+    held = [[True, True], [False, True], [False, True], [False, False]]
+    for t, want in zip(polls, held):
+        engine_step(pd.p, pd.rt_p, t)
+        assert [x.id in pd.p.deferred_free_blocks for x in xs] == want, t
+    for t, want in zip(polls, held):
+        engine_step(pd.d, pd.rt_d, t + L)
+        pd.d.schedule()
+        waiting = [y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS for y in ys]
+        assert waiting == want, t
+
+
+def test_a_shared_nic_prices_one_prefill_stage(geometry, monkeypatch):
+    """Two stages' links would each need a NIC of their own: refused by name."""
+    base = model_for(geometry, PEAKS[0])
+    model = dataclasses.replace(base, nic_bandwidth_bytes_per_s=1e12)
+    rt = runtime("engine-D")
+    monkeypatch.setattr(clock, "_installed", rt)
+    kv = {
+        "kv_connector": "compass",
+        "kv_role": "kv_consumer",
+        TRANSFER_KEY: (model, model),
+        WRITE_REQ_KEY: "inproc://unused",
+    }
+    with pytest.raises(ValueError, match="one prefill stage"):
+        KVConnectorFactory.create_connector(
+            atom_config_double(kv_transfer_config=kv), role="scheduler"
+        )
 
 
 def test_a_prefill_the_router_does_not_send_on_is_freed_at_once(pd):
