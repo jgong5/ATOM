@@ -12,6 +12,7 @@ keys.
 """
 
 import copy
+import dataclasses
 
 import pytest
 import torch
@@ -235,6 +236,46 @@ def test_linear_attention_and_act_on_a_padded_two_token_decode_step_by_hand(bf16
         max(moved / 1e12, flops / (bf16 * 0.70))
     )
     assert by_name["roofline.act"] == pytest.approx(act / 1e12)
+
+
+#: 4 heads over 2 KV heads of 8, a window of 16: a fresh 40-token prefill, an
+#: 8-token chunk at context 100, and decodes at contexts 50 and 10.
+WINDOW_ROWS = [(40, 40, False), (8, 100, False), (1, 50, True), (1, 10, True)]
+
+
+@pytest.mark.parametrize("bf16", [2.5e15, 1e9], ids=["memory-bound", "compute-bound"])
+@pytest.mark.parametrize(
+    "whole,keys", [(1, 40 + 100 + 16 + 10), (0, 40 + 23 + 16 + 10)]
+)
+def test_a_windowed_attention_layer_prices_its_window_by_hand(bf16, whole, keys):
+    document = copy.deepcopy(ROOFLINE)
+    document["device"]["kernel_floor_s"] = 1e-12
+    document["device"]["memory"]["bandwidth_curve"] = [[1, 1e12], [2**40, 1e12]]
+    document["device"]["compute"]["bf16_flops"] = bf16
+    machine = MachineSpec.from_mapping(document)
+    windowed = Module("swa", "attention", (4, 2, 8, 16, whole))
+    terms = StepRooflineBackend(machine, [windowed]).price(view(*WINDOW_ROWS)).terms
+    # Each query scores min(position, 16) keys: 1 + .. + 16 and 24 more 16s,
+    # 8 queries past 16, and the two decodes' 16 and 10.
+    pairs = (16 * 17 // 2 + 24 * 16) + 8 * 16 + 16 + 10
+    flops = 4 * 4 * 8 * pairs
+    # 50 queries read and written at 4 heads of 8; the keys and values each
+    # request reads: a decode's last 16, and a prefill's whole context, or
+    # the 8 + 16 - 1 the chunk's window opens at context 100.
+    moved = 50 * 2 * 4 * 8 * 2 + keys * 2 * 2 * 8 * 2
+
+    assert pairs == 674
+    assert [t.seconds for t in terms] == [
+        pytest.approx(max(moved / 1e12, flops / (bf16 * 0.70)))
+    ]
+    # A window no context outgrows prices as the layer without one.
+    wide = dataclasses.replace(windowed, dims=(4, 2, 8, 100, whole))
+    dense = Module("full", "attention", (4, 2, 8))
+    priced = [
+        StepRooflineBackend(machine, [m]).price(view(*WINDOW_ROWS)).seconds
+        for m in (wide, dense)
+    ]
+    assert priced[0] == pytest.approx(priced[1], rel=1e-12)
 
 
 def test_an_unclassified_module_refuses_every_step_by_name():
