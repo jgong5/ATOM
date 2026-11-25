@@ -236,13 +236,17 @@ target decode rung adopt the MoE column its fit on all its steps prices nearest
 (`_moe_column`, `MOE_SELECT_ENV`), and ``fallback`` only each rung its records
 cannot hold out, which adopts none under the default rule; `moe_both` adds to
 the forms each target decode rung picks among the one carrying both
-`MOE_COLUMNS`, `MOE_BOTH` (`_moe_column`, `MOE_BOTH_ENV`); `peer_tokens` adds that decode column, after
+`MOE_COLUMNS`, `MOE_BOTH` (`_moe_column`, `MOE_BOTH_ENV`); `moe_folds`
+``covered`` makes a decode rung of several records, the draft law's too, hold
+out each record's group compositions and grade each form only on the held-out
+steps inside the hull of the others' steps, adopting by in-sample MAD where
+none is (`_moe_column`, `MOE_FOLDS_ENV`); `peer_tokens` adds that decode column, after
 the MoE column, to the rungs it names or, as ``saturated``, to each rung whose
 adopted `moe_experts` column its median step holds at `SATURATED` of the
 experts (`_peer_rung`, `PEER_TOKENS_ENV`); `draft_peer_tokens` adds it to the
 draft law's decode rungs above `dp` 1, every one as ``all``
 (`DRAFT_PEER_TOKENS_ENV`): a draft's MoE runs on its group's rows too. The draft
-law takes none of the others. The `shared` form, whose one decode solve shares
+law takes none of the others but `moe_folds`. The `shared` form, whose one decode solve shares
 the base columns over rungs, refuses `row_padding` and `peer_tokens`. A vector carrying one of these columns states,
 under `fit.vif`, each one's variance inflation factor over the rows it was
 fitted on (`_vif`), how far the other columns already hold it.
@@ -448,6 +452,15 @@ ROWMOD_VIF_ENV = "COMPASS_FIT_ROWMOD_VIF"
 #: together: rung 32 adopted `rowmod(16)` at VIF 57, `graph_padding` then 49,
 #: for a 24% MAD cut that moved neither record's held-out p50 by 0.05 points).
 ROWMOD_VIF = MOE_BOTH_VIF
+#: How a decode rung of several records holds them out to pick its MoE column
+#: (`_moe_column`), one of `MOE_FOLDS`, the first when unset: each record
+#: whole, or each record's group compositions, graded only on the steps the
+#: other cells' steps cover (`_covered`).
+MOE_FOLDS_ENV = "COMPASS_FIT_MOE_FOLDS"
+MOE_FOLDS = ("record", "covered")
+#: The quantities over whose convex hull the other cells' steps must hold a
+#: held-out step for a MoE form's fold fit to grade it (`_covered`).
+COVER_AXES = ("context", "moe_tokens", "group_dummies")
 #: The decode rungs that add `peer_tokens` (`_peer_rung`): ``1`` for each
 #: rung whose `moe_experts` column is `SATURATED`, else the rungs, comma separated.
 PEER_TOKENS_ENV = "COMPASS_FIT_PEER_TOKENS"
@@ -692,8 +705,9 @@ def env_options(environ=None) -> dict:
     ``pad``), `MOE_IMBALANCE_ENV` and `UNEVEN_ROWS_ENV` at ``1`` (the last two
     with `MOE_MIN_SPREAD_ENV`'s share), `GRAPH_TOKENS_ENV` and
     `GRAPH_QUERY_CACHED_ENV` at ``1``, the
-    `MOE_SELECT_ENV` rule, `MOE_BOTH_ENV` and `ROWMOD_VIF_ENV` at ``1``, and
-    the `PEER_TOKENS_ENV` and `DRAFT_PEER_TOKENS_ENV` rungs; none set, none.
+    `MOE_SELECT_ENV` rule, `MOE_BOTH_ENV` and `ROWMOD_VIF_ENV` at ``1``, the
+    `MOE_FOLDS_ENV` cells, and the `PEER_TOKENS_ENV` and
+    `DRAFT_PEER_TOKENS_ENV` rungs; none set, none.
     A switch set to anything but ``0`` or ``1`` is refused (`_switch`)."""
     env = os.environ if environ is None else environ
     out = {}
@@ -731,6 +745,10 @@ def env_options(environ=None) -> dict:
         out["moe_both"] = True
     if _switch(env, ROWMOD_VIF_ENV):
         out["rowmod_vif"] = True
+    if folds := env.get(MOE_FOLDS_ENV):
+        if folds not in MOE_FOLDS:
+            raise ValueError(f"{MOE_FOLDS_ENV}={folds} is not one of {MOE_FOLDS}")
+        out["moe_folds"] = folds
     if peers := env.get(PEER_TOKENS_ENV):
         out["peer_tokens"] = (
             "saturated" if peers == "1" else tuple(int(r) for r in peers.split(","))
@@ -2266,8 +2284,43 @@ def _held_out_error(folds: dict) -> float | None:
     return sum(n * abs(p) for n, p in folds.values()) / rows if rows else None
 
 
+def _covered(steps, cell) -> np.ndarray:
+    """Whether each of `steps`, each its ranks' `fit` rows, lies inside the
+    convex hull (`_hull`, as a law's vector bounds the steps it validates) of
+    the steps of every other `cell` over `COVER_AXES`: the largest context any
+    of its ranks holds (Sum N_KV, which a context slope multiplies), its
+    group's real MoE tokens and its group's dummy forwards (which, with the
+    tokens, set the experts a `moe_experts` column counts). Every candidate
+    form prices a step by these and the rung's constants, so a fold's fit
+    interpolates at a step inside that hull. Other cells no qhull hull holds
+    cover no step."""
+    from scipy.spatial import QhullError
+
+    from atom.compass.backends.hull import Hull
+
+    point = np.array(
+        [(max(int(r[2][1]) for r in s), int(s[0][6]), int(s[0][7])) for s in steps]
+    )
+    out = np.zeros(len(steps), dtype=bool)
+    for c in set(cell.tolist()):
+        mine, other = cell == c, cell != c
+        if not other.any():
+            continue
+        try:
+            hull = Hull("fold", COVER_AXES, _hull(point[other], COVER_AXES))
+        except (QhullError, ValueError):
+            continue
+        out[mine] = [hull.contains(tuple(p)) for p in point[mine]]
+    return out
+
+
 def _moe_column(
-    steps, routing, base=DECODE, select: str = "held_out", both: bool = False
+    steps,
+    routing,
+    base=DECODE,
+    select: str = "held_out",
+    both: bool = False,
+    folds: str = MOE_FOLDS[0],
 ) -> tuple:
     """The vector decode rung `steps` adopts with a MoE column, or None, the
     figures the rule read, as the vector records them under `fit.moe_column`,
@@ -2313,6 +2366,43 @@ def _moe_column(
     `_counts` reads. A rung of one record and one composition has no held-out
     error and adopts none.
 
+    Under `folds` ``covered`` (`MOE_FOLDS_ENV`) a rung of several records
+    holds out each record's compositions, a cell keyed "record:dummies", each
+    priced by a fit on every other cell, its own record's other compositions
+    too, and grades each form only on the held-out steps the other cells'
+    steps cover (`_covered`): inside their convex hull over `COVER_AXES`, the
+    largest rank context, the group's MoE tokens and its dummies. A fold's
+    fit says how a column prices steps like the ones it was fitted on; graded
+    on steps past them it says how far the fit extrapolates, and weighted by
+    steps the largest cell beyond the others' reach decides the rung. Held out
+    whole, a record whose MoE tokens the others do not reach grades each form
+    on that extrapolation (#752 cell A v2, its calibration record and addendum
+    fitted together: at rung 48 the calibration's long-row steps at ~520 group
+    tokens and the addendum's at 264 and 693; `moe_experts` won, 4.42% against
+    `MOE_BOTH`'s 4.63%, though its MAD was 5.1% against 1.9%, and priced the
+    c=128 target's rung-48 steps 4.7% low; held out by composition `MOE_BOTH`
+    won and priced them 0.7% high), and so does one whose context the others
+    do not reach (#752 cell B's D, cal and hi records: rung 24's cal steps at
+    0.1-0.27M tokens of context on the fullest rank, hi's at 3.5-5.5M, every
+    step of both with all four ranks busy, one composition each; the fold
+    fitted on cal's 793 steps priced hi's 11013 with the two MoE columns 115%
+    high, with `moe_experts` 13% low, so the rule adopted `moe_experts` with a
+    zero intercept at an in-sample MAD of 2.0%, against 0.63% for both
+    columns, whose fold fitted on hi priced cal 0.4% high, `moe_experts`' 5.7%
+    low). Each held-out cell weighs its covered steps alone, the p50 per band
+    over them, and one with none drops out; where no cell has one the rung
+    adopts as under ``insample``, its figures stating ``fallback:
+    uncovered``. The vector states, per held-out cell, its steps and how many
+    are covered under `fold_cover`. A hull, not the box of the ranges: a
+    record whose steps lie along a line in these quantities spans a box it
+    does not cover (cell A v2's calibration record and addendum, rung 8: 299
+    of the calibration record's 475 steps inside the addendum's box, 53 inside
+    its hull; graded on the 299, the addendum's fit with `moe_tokens` priced
+    them 73% high). Its folds are no record's, and none is returned for
+    `_rowmod`. A rung of one record is held out by composition, uncovered
+    steps graded too, either way: how a column carries a step across
+    compositions is what that hold-out tests.
+
     Under `select` ``insample`` (`MOE_SELECT_ENV`) the rung adopts one of
     `MOE_COLUMNS` whatever its records: the one whose fit on all its steps has
     the smaller scaled MAD of its relative residuals, the first on a tie, the
@@ -2338,9 +2428,14 @@ def _moe_column(
     columns = [f for f in forms if f != "none"]
     if select not in MOE_SELECTS:
         raise ValueError(f"MoE column rule {select!r} is not one of {MOE_SELECTS}")
+    if folds not in MOE_FOLDS:
+        raise ValueError(f"MoE folds {folds!r} are not one of {MOE_FOLDS}")
     cell, by = np.array([s[0][0] for s in steps]), "record"
     if len(set(cell.tolist())) == 1:
         cell, by = np.array([s[0][7] for s in steps]), "group_dummies"
+    elif folds == "covered":
+        cell = np.array([f"{s[0][0]}:{s[0][7]}" for s in steps])
+        by = "record:group_dummies"
     fallback = select == "fallback" and len(set(cell.tolist())) == 1
     if select == "insample" or fallback:
         fits = {f: _fit_vector(steps, forms[f], routing) for f in columns}
@@ -2357,18 +2452,52 @@ def _moe_column(
             },
         }
         return forms[picked], figures, None
+    covered = cover = None
+    if by == "record:group_dummies":
+        covered = _covered(steps, cell)
+        cover = {
+            str(c): [int((cell == c).sum()), int((covered & (cell == c)).sum())]
+            for c in sorted(set(cell.tolist()))
+        }
+        if not covered.any():
+            fits = {f: _fit_vector(steps, forms[f], routing) for f in columns}
+            error = {f: fits[f]["mad"] for f in columns}
+            picked = min(error, key=error.get)
+            figures = {
+                "picked": picked,
+                "adopted": picked,
+                "selected_by": "insample",
+                "fallback": "uncovered",
+                "fold_cover": cover,
+                **({"both_vif": vif} if vif is not None else {}),
+                "in_sample": {
+                    f: {"mad": fits[f]["mad"], "F": fits[f]["passes"]["F"]}
+                    for f in columns
+                },
+            }
+            return forms[picked], figures, None
     band, edges = _token_bands(steps)
-    held, banded, error = {}, {}, {}
+    held, banded, error, graded = {}, {}, {}, {}
     for form, vector in forms.items():
         errors = _max_affine_errors(steps, vector, routing, cell)
         held[form], banded[form] = _p50s(errors), _p50s(errors, band)
-        error[form] = _held_out_error(banded[form])
+        if covered is None:
+            error[form] = _held_out_error(banded[form])
+            continue
+        kept = {
+            c: (at[covered[at]], e[covered[at]])
+            for c, (at, e) in errors.items()
+            if covered[at].any()
+        }
+        graded[form] = _p50s(kept, band)
+        error[form] = _held_out_error(graded[form])
     picked = min(error, key=error.get) if held["none"] else None
     adopted = None if picked in (None, "none") else picked
     figures = {
         "picked": picked,
         "adopted": adopted,
         "held_out_by": by,
+        **({"fold_cover": cover} if cover is not None else {}),
         **({"both_vif": vif} if vif is not None else {}),
         "token_bands": edges,
         "held_out": {
@@ -2376,12 +2505,21 @@ def _moe_column(
                 "error": error[form],
                 "folds": {str(c): list(f) for c, f in held[form].items()},
                 "bands": {f"{c}:{b}": list(f) for (c, b), f in banded[form].items()},
+                **(
+                    {
+                        "covered_bands": {
+                            f"{c}:{b}": list(f) for (c, b), f in graded[form].items()
+                        }
+                    }
+                    if cover is not None
+                    else {}
+                ),
             }
             for form in forms
         },
     }
     vector = None if adopted is None else forms[adopted]
-    return vector, figures, held[adopted or "none"]
+    return vector, figures, held[adopted or "none"] if by == "record" else None
 
 
 def _rowmod(
@@ -2691,7 +2829,9 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     which above `dp` 1 it adds `cold_peer_rows` (`_cold`), and `kda`, under
     which it adds `KDA`'s columns and states `kda_chunk` (`_kda`); `seed` fixes the
     `rowmod` shuffles, and `rowmod_vif` gates each `rowmod` choice on the
-    column's variance inflation factor (`_rowmod`); `draft`, or a sample with
+    column's variance inflation factor (`_rowmod`), and `moe_folds`, one of
+    `MOE_FOLDS`, sets how each decode rung of several records, the draft
+    law's too, holds them out to pick its MoE column (`_moe_column`); `draft`, or a sample with
     a draft label, adds `seqs` and `out` to the prefill vector. `peer_share`,
     false by default, adds `PEER_SHARE` to it above `dp` 1 (`_share`), and
     `keep_peer_tail`, false by default and only with `peer_share`, keeps in
@@ -2714,6 +2854,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     select = (not draft and (options or {}).get("moe_select")) or MOE_SELECTS[0]
     both = not draft and bool((options or {}).get("moe_both"))
     gated = bool((options or {}).get("rowmod_vif"))
+    moe_folds = (options or {}).get("moe_folds") or MOE_FOLDS[0]
     peers = (options or {}).get("draft_peer_tokens" if draft else "peer_tokens")
     if peers and dp == 1:
         raise ValueError(
@@ -2822,7 +2963,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             vector = {"coefficients": names}
             if routing:
                 chosen, figures, folds = _moe_column(
-                    steps, routing, names, select, both
+                    steps, routing, names, select, both, moe_folds
                 )
                 if chosen:
                     vector, solved = chosen, _fit_vector(steps, chosen, routing)
