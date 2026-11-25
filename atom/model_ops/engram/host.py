@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from atom.distributed.group_agreement import group_agree
+from atom.model_ops.engram import host_memory
 from atom.model_ops.engram.tables import HostEmbeddingTable
 from atom.utils import CpuGpuBuffer, envs
 
@@ -229,14 +230,18 @@ class EngramPrefetcher:
         self._pool.shutdown(wait=False, cancel_futures=True)
 
 
-def _dp_world_size() -> int:
-    """Ranks in this rank's DP group (1 without DP, or with no group)."""
+def _node_share():
+    """The DP group's ranks as one `host_memory.NodeShare` (DP attention:
+    every rank holds the whole tables), or None without DP."""
     try:
         from aiter.dist.parallel_state import get_dp_group
 
-        return int(get_dp_group().world_size)
+        group = get_dp_group()
     except Exception:  # noqa: BLE001 - no aiter, no DP group: not DP
-        return 1
+        return None
+    if group.world_size <= 1:
+        return None
+    return host_memory.NodeShare(group.cpu_group, group.rank_in_group)
 
 
 class EngramHost:
@@ -270,7 +275,8 @@ class EngramHost:
         # no UVA -- which is also what a CPU-only test wants to say.
         self.uva = False
         self._tp_group = None
-        self._shared_tables = False
+        # DP attention: the DP group's ranks, one copy of the whole tables a node
+        self._node_share = None
         # Every table this rank holds a shard of, for the fallback and the shutdown.
         self._pinned_tables = []
         self.device = device
@@ -394,13 +400,12 @@ class EngramHost:
         Sharding is by hash HEAD. Each head owns a disjoint, contiguous row range
         (the mapping's head offsets are their running sum), so a whole number of
         heads is a contiguous row -- and byte -- range. A rank holds only that
-        range (`host_memory.pin_rows`: copied into page-locked memory by
-        default, registered in place with ATOM_ENGRAM_UVA_COPY=0;
+        range (`host_memory.pin_rows`: copied into page-locked memory;
         `host_memory.to_device` under ATOM_ENGRAM_UVA_HBM): the full table on
         every rank is what a TP job cannot afford. Under DP attention every
-        rank does hold the full table; page-locked, unless
-        ATOM_ENGRAM_UVA_COPY is set it is then registered in place, so the
-        node pins the checkpoint's page cache once instead of one copy per rank.
+        rank does hold the full table: page-locked, the node copies it once
+        into memory its ranks share (`host_memory.NodeShare`), and a failure to
+        raises on every rank (`host_memory.SharedTablesError`).
 
         The answer is the GROUP's. An empty shard and a refused page-lock are
         both per-rank outcomes, and the device lookup ends in an all-gather: a
@@ -424,10 +429,9 @@ class EngramHost:
         self.local_heads = min(per, max(0, num_hash_heads - self.head_start))
         self.total_heads = num_hash_heads
         # DP attention: a one-GPU TP group per DP rank, each holding every
-        # head. The tables are then the same on every rank of the node, and
-        # registering the shared checkpoint mapping in place pins them once
-        # where a copy per rank would pin them once per rank.
-        self._shared_tables = shards == 1 and _dp_world_size() > 1
+        # head -- the same tables on every rank of the node; in HBM each
+        # rank holds its own copy
+        self._node_share = _node_share() if shards == 1 and not self._in_hbm else None
         pinned = self._register_shard(prefetcher)
         # Gloo, once, at load: one refusal is the group's answer.
         if shards > 1 and not group_agree(bool(pinned), group.cpu_group):
@@ -447,8 +451,8 @@ class EngramHost:
             pinned / 1024**3,
             "in HBM" if self._in_hbm else "page-locked",
             (
-                " (whole tables, shared by the DP ranks)"
-                if self._shared_tables and not self._in_hbm
+                " (whole tables, one copy shared by the DP ranks)"
+                if self._node_share is not None
                 else ""
             ),
         )
@@ -474,8 +478,11 @@ class EngramHost:
             row_end = int(offsets[last]) + int(mapping.head_vocab_sizes[layer_id][last])
             try:
                 ok = table.enable_uva(
-                    row_start, row_end, shared=self._shared_tables, device=device
+                    row_start, row_end, share=self._node_share, device=device
                 )
+            except host_memory.SharedTablesError:
+                # raised on every DP rank alike: no rank is left in a vote
+                raise
             except Exception:
                 # Answered as a refusal, not raised: the TP group votes next,
                 # and a rank that left before the vote would leave its peers
@@ -499,8 +506,8 @@ class EngramHost:
         """Drop every shard this rank holds; page-locked pages are unswappable.
 
         Each table gives up its shard tensors (`disable_uva`). The memory -- a
-        `hipHostMalloc` copy by default, the checkpoint mapping registered in
-        place, or HBM -- goes with the last tensor over it, after the device
+        `hipHostMalloc` copy, the node's shared copy, or HBM -- goes with the
+        last tensor over it, after the device
         has finished with it (`host_memory`), so a lookup still holding one
         keeps it until then."""
         for table in self._pinned_tables:
