@@ -2089,6 +2089,14 @@ and receives both run on the engine's step loop, and no worker takes part.
   state behave identically. It also clears the flag in `update_state_after_alloc`, as
   Mooncake does (`MooncakeConnectorScheduler.update_state_after_alloc`), so every call
   that posts a write request is followed by that park.
+- **A side's P/D options** (`19` D110) reach this connector's config as they reach
+  Mooncake's on a real side. It takes those its simulation carries, and `protocol` and
+  `ib_device`, transport choices the run file's `kv_link` prices in their place, and
+  refuses any other by name, as it refuses the keys `deploy.sh` sets. Mooncake's chunked
+  transfer (`enable_chunked_transfer`, `chunked_admission_timeout_s`) and the consumer's
+  `pd_admission` are not carried yet: #4054 designs them, since under chunked transfer
+  the router sends a request to both sides at once and the write request no longer
+  follows the prefill's return (`19` D116).
 
 ### The blob, per backend
 
@@ -2197,6 +2205,38 @@ Simulated:
   `Scheduler._update_from_kv_xfer_finished` on every poll, empty included, as
   `EngineCore._poll_kv_transfer_progress` does: this connector's workers report nothing,
   so a head that passed only non-empty output never called `process_completions`.
+
+### Sides of different TP widths (#4146)
+
+MiniMax-M3.1-Flash's recipe writes from TP1 prefill stages into a TP4 decode (`19` D116).
+Real Mooncake, at upstream `a62134f99`, cuts heads there: each decode rank's write request
+names its page layout, and the producer's `MooncakeConnector._unit_plan` pairs its page
+units with that rank's, moving of each unit with head-major runs only the rank's heads
+(`sharded_transfer.py::consumer_head_slices`, `kv_heads_of_rank`) and a unit with no head
+axis, such as MiniMax-M3.1's index page, whole to every rank. It refuses a cut unless the
+producer runs TP1 and neither side runs DCP (ROCm/ATOM#3471, `9d0691096`, after #2846,
+`c0573d462`). Every decode rank's write goes through the stage rank's one send executor
+(`MooncakeConnector._write_listener`) and its one HCA set.
+
+Simulated:
+
+- Each runner publishes, with its planned block, the head runs of each of its page units,
+  as ATOM states them for the cut (`runner/overrides.py::publish_planned_transfer`).
+- `run/__init__.py::_planned_transfer` holds a decode rank's block to the prefill's
+  stages cut to that rank's heads by ATOM's rule, not to their sum; at equal widths the
+  cut is the sum, as before. Sides of different widths are refused, naming both, unless
+  the prefill runs TP1 and neither side runs DCP, as ATOM refuses them.
+- A stage's write is priced on its FIFO link at what the stage sends: each decode TP
+  rank's cut, summed over them, so a head-major unit's heads once each where the decode's
+  TP width is no wider than the model's KV heads, and a unit with no head axis once per
+  decode rank. The decode's receive is done when every stage's write is, as above. The
+  per-pair link and its ceiling are unchanged (#1179).
+
+**Rejected:** pricing the write at the decode rank's own block, as a DCP consumer's blocks
+are priced (*The blob, per backend*): one rank's share, a quarter of what each of the
+recipe's TP1 stages sends through its one NIC. #4166 builds this; before it,
+`_planned_transfer` refused such sides
+(`tests/compass/test_pd_planned_block.py::test_sides_that_plan_different_blocks_refuse_naming_both`).
 
 ---
 
@@ -2772,7 +2812,9 @@ instance on a live master and owners:
    carries `kv_offload: ["mooncake_store"]` (`run/memory.py::key_fields`), and the worker
    probes the Store at start (`_probe_store`).
 2. `scripts/compass/deploy.sh OUT record`, then `compass fit steps` and `compass fit
-   host`, at the recipe's flags with the Store on and no profiling: the P and D laws.
+   host`, at the recipe's flags with the Store on and no profiling the recipe does not
+   set: the P and D laws. A recipe that sets `OFFLOAD_PROFILE=1`, as MiniMax-M3.1-Flash's
+   `prefill.sh` does (`19` D116), keeps it in these records, as in its real runs.
    Packs and unpacks run on the forward's stream (`worker.py::_pin_in_place_stream`), so
    the P law's records carry them.
 3. Two more prefill records at `OFFLOAD_PROFILE=1 ATOM_LOG_LEVEL=DEBUG`.
@@ -2784,8 +2826,9 @@ instance on a live master and owners:
    `[OFFLOAD-PERF]` `lookup_us` that fits `lmcache_offload`'s is
    `_fresh_tier_lookup`'s, which for the Store times taking an answered query, not the
    call. Its report keeps `pack_ms`, `put_ms`, `get_ms` and `unpack_ms`
-   apart, for the overlap #3505 is measuring (#3606). The DEBUG lines stay out of item
-   2's records, so the step law's host terms carry no logging.
+   apart, for the overlap #3505 is measuring (#3606). Item 3's records add to item 2's
+   flags only what they lack of these two. The DEBUG lines stay out of item 2's records,
+   so the step law's host terms carry no DEBUG logging.
 
 **Validation.** One of item 3's records replayed simulated at its flags: the Store's hit
 tokens over prompt tokens, loads, saves, and per-request save and load seconds land
@@ -3485,7 +3528,7 @@ Ordered by how much they could cost.
 | D4 | Every synchronization site maps to one of the PDES mechanisms K1-K9, none undecided; the boundary is the LP, not the process; a DP member's step is one TAR at its own release from the group's device end, the `max` over ranks by an `all_reduce(MAX)` (with no host time, an output rank's at the `max` of the step seconds), exchanged inside the forward by K6 waits with no cost, and the lockstep `all_reduce` is K1 for its own cost; handler threads stay and TSO delivery runs them at their message's timestamp. A forward's K1 charge is one recurrence per runner over the backend's device busy time and host segments (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs` after R1), with wait rules R1, R4 and R6 to R8; after the return the engine LP advances the host's `out_s` (`E_out`) to its input pull, a DP member's pull joining the group rounds; `host.skip` makes a what-if; ATOM's bugs, its sync stalls included, are fixed in ATOM and listed under the `atom-issue` label | 2026-09-18; revised 2026-09-28, 2026-10-01, 2026-10-11 (#815), 2026-10-16 (#829, #1267), 2026-10-18 (#1345), 2026-10-19 (#1409) and 2026-10-21 (#1859) |
 | D5 | Every timer and clock read the CA can reach runs on the LP clock, except the out-of-band control-command reply deadline; only what it cannot reach is configured or left real; metric cadence is virtual time (revising `11` D72); the profiler and RL control commands are refused by the simulated runner with a reply, counted, and make the run a coverage report; a synchronous command from the frontend's clock owner is refused by the frontend | 2026-09-18; revised 2026-09-28, 2026-10-09, 2026-10-14, 2026-10-15 |
 | D5.1 | The simulated run uses stdlib asyncio, not uvloop: only a Python event loop can host virtual time | 2026-09-28 |
-| D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only; a rank pair's writes queue on its link | 2026-09-18; revised 2026-09-28; link sharing 2026-10-16 (#1157); first-write setup 2026-10-16 (#1172); per-pair links kept under RDMA 2026-11-09 (#1179) |
+| D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only; a rank pair's writes queue on its link; a TP1 prefill stage writes into a wider decode as Mooncake cuts its heads, priced at what the stage sends; a side's P/D options reach the connector, one it does not carry refused by name | 2026-09-18; revised 2026-09-28; link sharing 2026-10-16 (#1157); first-write setup 2026-10-16 (#1172); per-pair links kept under RDMA 2026-11-09 (#1179); sides of different TP widths and a side's options 2026-11-25 ([#4146](https://github.com/jgong5/ATOM/issues/4146)) |
 | D6.1 | The lmcache MP server is LP `lmcache`, a Compass stand-in on the real ZMQ channels with a content index and two stations; a store or load completes as a stamped reply that the step loop takes in timestamp order; a blocking lookup is a request and reply whose wait is an idle point; inside a DP group each member parks before its forward, amending member join rules 1, 2 and 5, and the last park releases every member at the group's time; it sizes a chunk and the state image from its deployment's published plan before its first job, and its transfer channels are one per DP rank | 2026-10-16 (#1087, #1162); revised 2026-11-17 (#3687) |
 | D6.2 | A shared Mooncake Store's master is LP `mooncake_store`, a Compass stand-in holding objects, leases and Mooncake's eviction, its loop LP `lmcache`'s factored; each rank's lookups and renewals are requests and replies on its lookup channel, a renewal's wait an idle point with D6.1's park in a DP group; each rank's saves and loads are priced on its own lanes (`03` D13.1), a put sent as the save is queued carrying its priced start and end; ATOM's scheduler half runs as real code; the code is `dsv41/dev`'s | 2026-11-19 (#3762); revised 2026-11-24 (#3799) |
 | D7 | Atomesh gets no virtual clock: mesh-only mode; in 1P1D the router is one segment of a channel, not an LP, and its relay latency is that channel's lookahead; its bounds are configured (health check and circuit breaker off, `--worker-request-timeout-secs` set large); timestamps ride carriers it already relays; under `--dp-aware`, or with several instances per role, the router is LP `router`, handling requests, prefill responses and stream events in timestamp order (#449, #1085) | 2026-09-18; revised 2026-09-30, 2026-10-15, 2026-10-16 |

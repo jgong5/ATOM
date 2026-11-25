@@ -11,7 +11,7 @@ to 2026-11-13, and the owner's rulings on its design PR #3363
 [sixth](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927)). Its code tasks are cut from *Summary* by
 [#3355's plan](https://github.com/jgong5/ATOM/issues/3355#issuecomment-6878189760).
 
-**Depends on:** `01` (D6.2), `07` (the store, D37), `08` (D44, D45, D45.1, D50, D50.1),
+**Depends on:** `01` (D6, D6.2), `07` (the store, D37), `08` (D44, D45, D45.1, D50, D50.1),
 `13` (D79, D80), `16` (D95.1), and the M3-Agentic stage's `03` D13.1, `06` D35.1 and `14`
 D87.1.
 
@@ -24,14 +24,15 @@ D87.1.
 | `13` D80: what `run --check` lists | a step linear law's scheduled decode rungs with no vector, too | D112 |
 | `13` D80: what `run`, `record` and `deploy.sh` leave | each run's per-request split and `report.html`, and a simulated run's `prometheus.html`, written as it ends by `client.sh --stop` for an instance and by `deploy.sh` for a deployment | D114, D115 |
 | `08` D50: the cell matrix | a MiniMax-M3 showcase set: the recommended configuration and the runner-up | D117 |
+| `01` D6: both sides of a write plan one block, each summed over its stages | a TP1 prefill stage writes into a wider decode as Mooncake cuts its heads; an option the connector does not carry is refused by name | D110, D116 |
 
 ---
 
 ## Scenarios
 
-Each walks one use #3355 names through the decisions to its outcome; *Summary* lists the
-outcomes as acceptance items. A and B are D116's configurations, on pit2's MI355X nodes;
-D117's development nodes are crsuse2-m2m-v3-005 and -013.
+Each walks one use #3355 or #4145 names through the decisions to its outcome; *Summary*
+lists the outcomes as acceptance items. A and B are D116's configurations, on pit2's MI355X
+nodes; D117's development nodes are crsuse2-m2m-v3-005 and -013.
 
 ### 1. A search, from the space file to the recommendation
 
@@ -127,19 +128,24 @@ D117's development nodes are crsuse2-m2m-v3-005 and -013.
 ### 5. A 1P1D candidate
 
 ```
- A, then B: one PP4 prefill beside a Mooncake Store; A's decode TP4, B's DEP4 (D116)
+ A, then B: one PP4 x TP1 prefill beside a Mooncake Store, writing chunked into its
+ decode; A's decode TP4, B's DEP4, each admitting by pd_admission (D116)
    check      each side by compass run --check, resolved as deploy.sh resolves it,
-              with --kv-transfer-config, each under its own variables (D109); a
-              law and readings per side, B's prefill side at A's keys (D112)
+              with --kv-transfer-config and the side's own P/D options, each under
+              its own variables (D109, D110); a law and readings per side, B's
+              prefill side at A's keys (D112)
    calibrate  A: one calibrate.sh, each record a deploy.sh record of both sides,
               fitting both sides into one store S (D113)
               B: its prefill side named as A's calibration, which publishes its
               law and readings into S; one calibrate.sh fitting B's decode alone
               into S, its records the decode's rungs, no second law at a key
    both done  S holds A's two sides and B's decode: both searchable on S
-   simulate   deploy.sh run with the Store's entry (D110): both sides, LP
-              mooncake_store, the router, one client.sh run
-   results    both sides' GPUs counted, each from its own engine record (D111)
+   simulate   deploy.sh run with the Store's entry (D110): both sides, each side's
+              P/D options in its connector, LP mooncake_store, the router, one
+              client.sh run; on A each TP1 stage writes every decode rank its
+              heads (01 D6)
+   results    both sides' GPUs counted, TP x PP x DP each, from its own engine
+              record (D111)
    the run    its per-request split joins both sides on each request (D114)
 ```
 
@@ -189,6 +195,42 @@ D117's development nodes are crsuse2-m2m-v3-005 and -013.
      -> each cell graded by 08 D44; the real order against the simulated one
      -> beside each grade, not gated: its 08 D45.1 verdict, and the
         M3-Agentic stage's verdict on gpu-40, as another platform
+```
+
+### 9. The development template, checked against held-out real runs
+
+```
+ SPACE: D116's template, frozen at commit C, the first holding every piece
+ D116's table lists; every step below runs on pit2 at C, in C's image, but the
+ platform readings and the network file, which may come before
+   |
+   v
+ the template's inputs (#3468), whole-node gpool leases:
+   platform readings, a network file of pit2's NICs, the Store's entry
+   environment check: each decode served by the recipe's scripts;
+     gsm8k.sh <label> 32 200 through the router exits 0 with an accuracy  A3
+   calibrate.sh for A, then B, as compass advice prints them; each
+     status file holds every step's node-hours                          A6
+   compass advice SPACE OUT: every point searchable and finished,
+     results.json opening "Recommended:", its CPU seconds              A1, A6
+   |
+   v
+ the grading (D116, Validation), whole-node gpool leases:
+   for each decode, at c = 16, 32, 64, 140, and at advice's pick when 8 or 256:
+     store.sh stop, start; deploy.sh record at candidates.json's arguments;
+     client.sh --agentx --concurrency c --duration 900, aiperf scraping the
+       router and the prefill's /metrics
+     one_real.py REAL SIM: each metric, SIM's error, REAL's own 95%
+       interval over its 60 s blocks, in or out                          A2
+   A at C140: the decode's /metrics before the stop, real, and simulated by
+     simulated.json's ran again; the atom:pd_admission families side by side A4
+   at advice's pick: the recommendation and the runner-up in REAL's order by
+     throughput per GPU, or the gap within REAL's intervals              A5
+   |
+   v
+ the report on #4145: the tables, A4's values, A5's statement, each step's
+ node-hours and the search's CPU seconds; the dashboard reads every point
+ ungraded (D115), no 08 D44 cell holding two real runs
 ```
 
 ---
@@ -241,10 +283,12 @@ calibration #3355 keeps outside the search.
    `--enable-dynamic-chunking`. It never calibrates.
 2. **Simulate.** Each searchable point, a fresh server per point (`13` D80): `compass
    run`, or `deploy.sh run` on 1P1D, driven by one `client.sh` run, points in parallel
-   over the host's cores and ports, a failed one retried and then listed with its
-   reason, a finished one skipped. A 1P1D point's router takes Compass's own flags, the
-   same for every candidate: `--backend atom`, and the health check, circuit breaker and
-   retries off, as `scripts/compass/pd_sim.sh` starts it; the space file states none
+   over the host's cores and ports, as many at once as its cores give each rank one
+   (tensor times pipeline times data parallel over a point's instances), a failed one
+   retried and then listed with its reason, a finished one skipped. A 1P1D point's
+   router takes Compass's own flags, the same for every candidate: `--backend atom`, and
+   the health check, circuit breaker and retries off, as `scripts/compass/pd_sim.sh`
+   starts it; the space file states none
    (the [#3477 Ruling](https://github.com/jgong5/ATOM/issues/3477#issuecomment-6887140315)).
    An offloading point's lmcache server runs at its own port (D110). No
    `--step-roofline`: a refusal means a calibration is missing, and the law is completed,
@@ -321,9 +365,15 @@ candidate offloading to an lmcache server (`lmcache_mp`), each `lmcache server` 
 to its value as `args` takes one, `--host` and `--port` refused by name;
 `mooncake_store`, on a candidate offloading to a Mooncake Store (`mooncake_store`), the
 absolute path of the run file's `mooncake_store` entry (`01` D6.2); and, on a 1P1D
-candidate, `prefill` and `decode`, each holding one side's `args`, `env` and
-`per_concurrency`. Router arguments are no block's: a 1P1D point's router takes
-Compass's own (D109).
+candidate, `prefill` and `decode`, each holding one side's `args`, `env`,
+`per_concurrency` and `kv_transfer`. A side's `kv_transfer` is an object of its P/D
+connector's options, which `deploy.sh` merges into that side's `--kv-transfer-config`: a
+real side's into Mooncake's config, a simulated side's into the `compass` connector's,
+which takes the options its simulation carries and the transport choices a network file
+prices in their place, `protocol` and `ib_device`, and refuses any other by name (`01`
+D6). The keys `deploy.sh` sets itself, `kv_connector`, `kv_role`, `handshake_port`,
+`compass_kv_write_req` and `compass_instance`, are refused in it by name. Router arguments
+are no block's: a 1P1D point's router takes Compass's own (D109).
 
 **The expansion.** Each combination of the dimensions' values that no exclusion names is a
 candidate, named by its values joined with `-`, the first dimension varying slowest and each
@@ -332,8 +382,8 @@ values' blocks in the dimensions' order; an instance's arguments are `--model`, 
 block's, a side's after its own block's. It is refused, naming both blocks, when two of
 them set one thing apart: an argument, which ATOM's parser reads with `--a_b` as `--a-b`
 and `--no-x` as `--x`'s negation, a variable, an lmcache server flag, which lmcache's
-parser reads with `--no-x` as `--x`'s negation, a departure's reason, the basis, the
-deployment or the Store's entry; or an argument both fixed and varying with the
+parser reads with `--no-x` as `--x`'s negation, a P/D option, a departure's reason, the
+basis, the deployment or the Store's entry; or an argument both fixed and varying with the
 concurrency. It is refused when
 no block names its basis, and when a block gives a single-node candidate a side. An
 excluded combination is never judged. A point is a candidate at one concurrency, in the
@@ -356,9 +406,9 @@ once need no port assigned.
 `compass advice` writes the expansion
 into OUT's `candidates.json`: the space file's path, its model, machine, store, commit,
 workload and SLO; each candidate with its values, deployment, basis, departures, each
-instance's arguments, variables and per-concurrency factors, and an offloading one's
-`lmcache_server` flags or Store's entry; and each point with each instance's arguments
-and variables, and an offloading one's `lmcache_port`.
+instance's arguments, variables, P/D options and per-concurrency factors, and an
+offloading one's `lmcache_server` flags or Store's entry; and each point with each
+instance's arguments, variables and P/D options, and an offloading one's `lmcache_port`.
 
 **Reason.** The user, not Compass, knows what they would deploy; a template shows the
 shape, and an agent saves the user copying arguments by hand; the frozen commit has to be
@@ -367,7 +417,9 @@ is refused rather than one overriding the other, so what a candidate runs is wha
 blocks say. An lmcache server's flags set its hit rate, so a candidate states them, as it
 states ATOM's arguments; its address is the search's, since points run at once on one host.
 A Store's entry holds the master's flags, the owners' bytes and the laws its copies and
-lookups are priced by, so a candidate names it as it names an lmcache server's flags.
+lookups are priced by, so a candidate names it as it names an lmcache server's flags. A
+side's P/D options are its own: ATOM refuses `pd_admission` on a producer, so one object
+for both sides cannot carry a recipe that admits on its decode.
 **Basis.** The owner
 on #3355 and #3363, the [sixth ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927) settling that the file is no config file;
 the [#3477 Ruling](https://github.com/jgong5/ATOM/issues/3477#issuecomment-6887140315) on
@@ -376,8 +428,12 @@ the lmcache server's flags and the router's;
 `--traces`, `--agentx` and `--duration`; `atom/utils/arg_parser.py::FlexibleArgumentParser`,
 which reads both spellings of a long flag;
 `atom/compass/run/__init__.py::_launch_mooncake_store`, which refuses a deployment
-offloading to a Store whose run file has no entry; and #3417, which decides what command
-writes an offload entry.
+offloading to a Store whose run file has no entry; #3417, which decides what command
+writes an offload entry; `scripts/compass/deploy.sh`, which refuses `--kv-transfer-config`
+among a side's ATOM arguments and merges `KV_EXTRA` into every real instance alike; and,
+at upstream `a62134f99`,
+`kv_transfer/disaggregation/pd_admission.py::PdAdmissionController.from_config`, which
+raises "pd_admission requires a Mooncake consumer" on a producer.
 
 **Rejected.** A shipped default space, the development template, that the command falls
 back on: a default is the silent answer `13` D79 refuses, and it would search a space the
@@ -386,7 +442,10 @@ templates are JSON, which the standard library parses. A block keyed by a combin
 value of one dimension already holds a whole configuration, and a setting then has one
 source to trace it to. A Store port per point, as an lmcache server takes one: LP
 `mooncake_store` binds a random port of its own and writes it to its run's endpoint file,
-so no point needs one assigned.
+so no point needs one assigned. A side's P/D options as two `deploy.sh` variables,
+`PREFILL_KV_EXTRA` and `DECODE_KV_EXTRA`, with no field: `compass advice` and
+`calibrate.sh` start every run from the space file, as each side's `args` and `env`
+reach them.
 
 ---
 
@@ -400,9 +459,10 @@ and the normalised one, one over the P90 of each request's end-to-end latency pe
 token; P90 TTFT. The search adds two of its own from the same export: throughput per GPU
 of the tokens the engine computed, the input and output tokens less
 `usage_prompt_cache_read_tokens`; P90 end-to-end latency, from `request_latency`. A
-point's GPUs are those its engine records state, each tensor parallel times data
-parallel: a 1P1D point's are its prefill side's plus its decode side's, each read from
-that side's own record, in the `prefill/` and `decode/` that `deploy.sh` writes.
+point's GPUs are those its engine records state, each tensor parallel times pipeline
+parallel times data parallel, a record that states no pipeline width counting one: a 1P1D
+point's are its prefill side's plus its decode side's, each read from that side's own
+record, in the `prefill/` and `decode/` that `deploy.sh` writes.
 
 - **Frontier**: throughput per GPU, InferenceX's, against P90 interactivity; the points
   no other dominates on both.
@@ -426,8 +486,11 @@ code that grades the M3-Agentic stage, so a search and a grade share them; the s
 own add the engine's work net of prefix-cache hits and a request's whole wait; a refused
 step charges less than it ran by an amount nothing measured (`08` D50.1). Both sides of a
 1P1D point hold their cards for the whole run, and their widths may differ, so each side
-counts its own. **Basis.** The owner on #3355; #3264, landed by #3325; the GPU count,
-#3454; `08` D45.1, D50.1.
+counts its own; each pipeline stage holds its own cards, as D116's PP4 x TP1 prefill holds
+four. **Basis.** The owner on #3355; #3264, landed by #3325; the GPU count,
+#3454; `08` D45.1, D50.1; `atom/compass/run/step_grid.py::keyed`, which states
+`pipeline_parallel_size` in the engine record above one stage, and
+`atom/compass/drive/lacking.py::calibrate_inputs`, whose GPU count already multiplies it.
 
 **Rejected.** Ranking by the computed-token throughput: the tokens a user is served,
 cache hits included, are what InferenceX ranks and the M3-Agentic stage grades, so the
@@ -763,55 +826,104 @@ once (#3611).
 
 ---
 
-## D116. The development template: MiniMax-M3.1-Flash's 1P1D recipe on pit2's MI355X, ungraded
+## D116. The development template: MiniMax-M3.1-Flash's 1P1D recipe on pit2's MI355X, checked against held-out real runs
 
-**Rule.** The search, profiling and views are developed on MiniMax-M3.1-Flash's one-node
-1P1D recipe,
-[ROCm/ATOM `b32dca87` `recipes/mesh/MiniMax-M3.1-PD-PP4-MooncakeStore.md`](https://github.com/ROCm/ATOM/blob/b32dca87380cd1ed8dcbd975516a3f603c4bc8bc/recipes/mesh/MiniMax-M3.1-PD-PP4-MooncakeStore.md),
-in its two decodes, under the `agentx` workload (`06` D35.1) at 1, 2, 4, ..., 256 clients,
-256 the most either decode admits, on pit2's MI355X nodes (pit2-p03-gXX). The template is a
-vehicle, not evidence: none of its configurations is graded or entered in `08` D50, and
-every point reads ungraded. Its space file writes the decodes as the values of one
-dimension and the prefill in `common` (D110).
+**Rule.** The search, profiling and views are developed, and `compass advice`'s answer is
+checked, on MiniMax-M3.1-Flash's one-node 1P1D recipe,
+[ROCm/ATOM `0368ec741` `recipes/mesh/MiniMax-M3.1-PD-PP4-MooncakeStore.md`](https://github.com/ROCm/ATOM/blob/0368ec7410ccbda844d743e474d36d4403092a83/recipes/mesh/MiniMax-M3.1-PD-PP4-MooncakeStore.md),
+in its two decodes, under the `agentx` workload (`06` D35.1) for 900 s at c = 8, 16, 32,
+64, 140 and 256, 140 the recipe's benchmark point and 256 the most either decode admits,
+with no SLO, on pit2's MI355X nodes (pit2-p03-gXX). Its points are checked against
+held-out real runs (*Validation*, below), reported and not gated: none of its
+configurations enters `08` D50, and the dashboard marks every point ungraded, since a cell
+`08` D44 grades holds two real runs (`atom/compass/validate/curves.py::point`). Its space
+file writes the decodes as the values of one dimension and the prefill in `common` (D110).
 
 | # | Prefill, GPUs 0-3 | Decode, GPUs 4-7 | Recipe | Law |
 |---|---|---|---|---|
-| A | PP4 x TP1 (`VLLM_PP_LAYER_PARTITION=16,16,16,12`), DSpark k=7, eager; a Mooncake Store its prefix tier (`ATOM_KV_OFFLOAD=mooncake_store`) | TP4 with indexer CP (`ATOM_M3_INDEXER_CP=1`), DSpark k=7 | `minimax_m31_pd_store/`: `store.sh`, `prefill.sh`, `decode.sh` at `MODE=tp4`, `router.sh` | calibrated anew, both sides |
-| B | A's | DEP4: DP attention, MoE EP4 over MoRI, `--dp-load-balance least_requests` | `decode.sh` at `MODE=dep4`, with ROCm/ATOM#3563 and ROCm/ATOM#3564 | the decode calibrated anew; the prefill's law and readings A's, at the same keys (D112), which B's calibration borrows and publishes beside (D113) |
+| A | PP4 x TP1 (`VLLM_PP_LAYER_PARTITION=16,16,16,12`), DSpark k=7, eager; a Mooncake Store its prefix tier (`ATOM_KV_OFFLOAD=mooncake_store`); chunked P->D transfer, its admission deadline 1500 s | TP4 with indexer CP (`ATOM_M3_INDEXER_CP=1`), DSpark k=7; `pd_admission` at 0.15 of the KV pool and 512 reserved tokens | `minimax_m31_pd_store/`: `store.sh`, `prefill.sh`, `decode.sh` at `MODE=tp4`, `router.sh` | calibrated anew, both sides |
+| B | A's | DEP4: DP attention, MoE EP4 over MoRI, `--dp-load-balance least_requests`; A's admission, per DP rank | `decode.sh` at `MODE=dep4`, its tree with ROCm/ATOM PRs 3563 and 3564 merged | the decode calibrated anew; the prefill's law and readings A's, at the same keys (D112), which B's calibration borrows and publishes beside (D113) |
 
-Each takes the recipe's arguments and variables, with `FORCE_AL=4.04` on both sides as its
-benchmarks set it, since a simulated step draws its drafts from a declared acceptance; a
-fractional stated length has the gaps #3355's template lists, ungraded here. The
-departures:
+Each takes the recipe's arguments, variables and P/D options, NVFP4 KV and index cache on
+both sides (`KV_DTYPE=nvfp4`) among them, and a side's options in its `kv_transfer` (D110):
+the prefill's `enable_chunked_transfer` and `chunked_admission_timeout_s`, the decode's
+`ib_device` and `pd_admission`, and each side's `protocol`. Both sides take
+`FORCE_AL=4.04` as its benchmarks set it, since a simulated step draws its drafts from a
+declared acceptance; a fractional stated length has the gaps #3355's template lists.
+
+**Chunked transfer and `pd_admission` simulated**, as #4054 designs them before their
+code, amending `01` D6 and D7. Under chunked transfer the router sends a request to both
+sides at once ("Chunked mode establishes D before P finishes",
+`atom/mesh/src/core/placement/backend/atom.rs::inject_decode_fields` at upstream
+`a62134f99`): the decode admits and posts its write requests before the prefill
+allocates, the prefill admits once every stage has reported the decode ready
+(`MooncakeConnectorScheduler.admission_ready`, `pd_admission_ready`), each stage writes
+its pages after each of its forwards, and the admission deadline runs on
+`time.monotonic()`. That breaks `01` D6's premise that a write request exists only once
+the prefill has returned (`r <= a`) and `01` D7's relay timestamp on the
+prefill-to-decode forward. Under `pd_admission` ATOM's `PdAdmissionController` runs as
+it is, once the connector states `supports_pd_admission` and answers
+`pd_receive_block_offset`, so ATOM's exporter renders its three `atom:pd_admission_*`
+families on the simulated decode too. A connector protocol is `01`'s, as the Store under
+a pipelined prefill is (#4051), so this section states only that the template carries
+both. **Rejected:** designing them here: `01` owns the connector, and this section's
+table already sends the Store under a pipelined prefill to a design of its own.
+
+**One tree for both decodes.** ATOM is the integration branch once it holds upstream main
+`a62134f99` (#4047) and the two PR heads the recipe merges for B, each one commit on
+`9f98bffc8`, which `a62134f99` holds: `1551211d0` (PR 3563, on upstream main since as
+`7d2f16afe`) and `59e0a20ad` (PR 3564, open), merged by sha and labelled
+`agent-team/land-as-merge` (#4048). A runs them too, since one frozen commit holds both
+decodes (#4145's A1): PR 3564 changes only `atom/models/minimax_m3/dspark.py`, whose
+refusal of more draft KV heads than a rank's TP width (`M3DSparkAttention.__init__`)
+A's TP4 ranks, one draft head each, never meet. **Rejected:** B on the first upstream tip
+holding both PRs, as #4048's brief had it: B idles on an upstream review, and that tip
+brings commits neither recipe runs, five between `a62134f99` and `7d2f16afe` alone, the
+DP state sync `49e3aee9a` among them.
+
+**The departures**, those #4145's Goal 3 allows:
 
 - **Capture sizes** thinned to powers of two, A's to 256 and B's to 64 a rank, against the
-  recipe's 32 and 20 sizes: each decode rung is one record (D113), so the calibration
-  takes about a third of the node-hours, as the
+  recipe's 32 and 20 sizes, in calibration, search and validation alike: each decode rung
+  is one record (D113), so the calibration takes about a third of the node-hours, as the
   [#3468 Ruling](https://github.com/jgong5/ATOM/issues/3468#issuecomment-6944202685)
   thinned the earlier template's.
-- **The P/D options.** `deploy.sh` fills each side's `--kv-transfer-config`, so the
-  prefill's chunked transfer and the decode's `pd_admission` and `ib_device` are unset, in
-  real records and simulated runs alike: the simulated connector carries neither (#4054).
-- **`OFFLOAD_PROFILE=1`** only in the Store's two profiled records (`01` D6.2's
-  calibration).
-- **The router** takes Compass's flags (D109), without `--dp-aware`: ATOM's
-  `least_requests` places B's requests, as the recipe's default `POLICY=random` does;
-  `dp_sticky` waits on #3496.
+- **The router** takes Compass's flags (D109), with no `--policy`, so atomesh's
+  `cache_aware` (`atom/mesh/src/cliargs.rs`), and no `--dp-aware`: with one worker a side
+  every policy picks that worker (`01` D7), as the recipe's `POLICY=random` does, and
+  ATOM's `least_requests` places B's requests on its ranks; `dp_sticky` waits on #3496,
+  which the template does not need.
+- **What Compass assigns itself**: the ports, the servers', the handshake's and
+  `ATOM_DP_MASTER_PORT`, and the `--kv-transfer-config` keys `deploy.sh` sets (D110).
+
+Every record and run takes the prefill's `OFFLOAD_PROFILE=1`, as `prefill.sh` sets it;
+the Store's two profiled records add `ATOM_LOG_LEVEL=DEBUG` alone (`01` D6.2's
+calibration). **Rejected:** keeping `OFFLOAD_PROFILE` out of the step law's records:
+Goal 3 does not list it, and the validation runs, which take it, would run a flag their
+law's records never did.
 
 The space file's machine names a network file of pit2's NICs, so `compass advice` starts
 the decode apart under its own variables and prices the KV on that link (D109), as the
 recipe moves it through the NICs (`MC_DISABLE_HIP=1`); every point takes the Store's
 `mooncake_store` entry (D110).
 
-**Calibration**, on pit2 under a gpool lease of a whole node, at the integration head once
-it holds the recipe's ATOM (below):
+**The frozen commit**, D110's `commit` in the space file: the first integration commit
+holding every task the table below lists. Every calibration, readings measure,
+environment check, simulated run and real run of the template is taken there, in the
+image #4047 gates on, `rocm/atom-dev:nightly_202611240650`, named by digest; pit2's
+platform readings and its network file, which key no ATOM digest, may come before
+(#4145's A1, A3; D112 keys a law by its records' digest). **Rejected:** A at an earlier
+commit, its law re-keyed onto B's (D112, requirement 2): A's real runs and its law's
+records would run different trees, and a re-keyed law is not re-validated.
+
+**Calibration**, on pit2 under a gpool lease of a whole node, at the frozen commit:
 
 1. pit2's platform readings (`compass fit device`) and a network file of its NICs, probed
    as `atom/compass/networks/crs005-013-ionic.json` was; the Store's master and owners as
    `store.sh` starts them.
-2. An environment check: each configuration served once by the recipe's scripts and its
-   200-question GSM8K check run; one that does not serve leaves the template until it
-   does.
+2. An environment check: each decode served once by the recipe's scripts, and the
+   recipe's `gsm8k.sh <label> 32 200` through the router, which exits 0 and prints an
+   accuracy; a decode that does not serve leaves the template until it does.
 3. A: the warm record; both sides' readings, the prefill's with the Store on; D113's
    records at A's rungs and the prefill's trace runs; `01` D6.2's two profiled prefill
    records for the Store's entry. The fits run on CPU, after the lease.
@@ -826,20 +938,86 @@ record 907 s measured
 0.1 h and a trace run 0.15 h estimated; `calibrate.sh`'s `status` records the real hours
 (D113).
 
+**Validation**, after the search, at the frozen commit and image, each run under a
+whole-node gpool lease:
+
+- **Points.** Each decode at c = 16, 32, 64 and 140, none a calibration input, and, when
+  `compass advice` recommends c = 8 or 256, each decode there too
+  ([#4146 Ruling](https://github.com/jgong5/ATOM/issues/4146#issuecomment-7156425733)):
+  one real run a point.
+- **A real run** is `deploy.sh record` at the point's arguments, variables and P/D
+  options as `candidates.json` states them, driven by `client.sh --agentx --concurrency c --duration
+  900`, the Store's master and owners started afresh before it (`store.sh stop`, then
+  `start`), since a simulated point's LP `mooncake_store` starts empty (`01` D6.2).
+  `one_real.py` reads a `deploy.sh` OUT's engine records and client export, and refuses a
+  REAL and SIM given other client arguments. **Rejected:** the recipe's own scripts: they
+  write no engine record or client export.
+- **Each point's table** is `one_real.py REAL SIM`, SIM the search's run of that point:
+  every metric #4145's A2 names, TTFT p50 and p99, TPOT p50 and p90, throughput per GPU
+  and both hit rates, with SIM's error and REAL's own 95% interval over resamples of its
+  60 s blocks of sends, each error marked in or out, as `one_real.py::tails` resamples
+  a tail's, since a burst's requests move together. A hit rate's block is the change of
+  the prefill's counters over 60 s of its scrape series, each draw the ratio of its sums.
+  **Rejected:** resampling requests for the medians, as `one_real.py::paired` does for
+  E2E p50: two methods in one table, and a burst moves a median's neighbours as it moves
+  a tail.
+- **A 1P1D point's hit rates are its prefill side's**, real and simulated: the HBM hits
+  and the Store's loads, each over the prefill's prompt tokens. A real run's aiperf also
+  scrapes the prefill's `/metrics`, named by `prefill/server.json`, and keeps the scrape
+  as a series (aiperf's `jsonl`), since the run's own endpoint, the router, renders
+  `mesh_self_metrics` (`atom/mesh/src/observability/metrics/routes.rs`), with no engine
+  counter. A simulated run sums its prefill engines' `hit_counters` alone. **Rejected:**
+  both sides' counters summed: a P/D decode counts its own local reuse over every prompt
+  again (`Scheduler._record_cache_reuse` at upstream `a62134f99`), adding its received
+  prompts to the denominator and the blocks it skips receiving to the hits.
+- **Admission** (#4145's A4): at C140 on A, the decode's `/metrics`, read once the client
+  run ends and before the stop, in the real run, driven by `client.sh` without `--stop`,
+  and in a simulated run repeating the search's (`simulated.json`'s `ran`), which the
+  same inputs repeat (*Summary*, item 6): the three `atom:pd_admission_*` families, the
+  simulated values beside the real. A simulated frontend passes an unstamped `GET`
+  straight through (`atom/utils/compass_loop.py::HttpChannel`). **Rejected:** the
+  families added to the series a simulated run samples (`atom/compass/run/metrics.py::FAMILIES`)
+  and to the real run's scrape, to report them over the run: more than A4's check reads.
+- **The order** (#4145's A5): at the recommended point's concurrency, whether it and the
+  runner-up (D111) keep their order by throughput per GPU in the real runs, or the gap
+  lies within REAL's intervals.
+- **The report**, on #4145: the tables, A4's values, A5's statement, each calibration
+  step's node-hours from its `status` and the search's CPU seconds from
+  `simulated.json`.
+
+A real run takes about 0.6 h, a 900 s client beside both sides' start and a fresh Store,
+estimated: about 4.8 node-hours for the eight, 1.2 more for the Ruling's pair.
+
+**Who takes what.** #3468, re-briefed to `0368ec741`, takes the inputs and the answer:
+calibration steps 1 to 4 and the Store's entry, then `compass advice` on the template
+(#4145's A1, A3, A6). #4170, after it, takes the validation (A2, A4, A5) and the report.
+#3469 keeps the guide's walk-through. **Rejected:** the validation folded into #3468: one
+issue would hold two GPU campaigns and a report, and the validation reads advice's answer
+first.
+
 **What Compass lacks**, read at the integration head, each with its task:
 
 | Lacks | For | Task |
 |---|---|---|
-| ATOM main `a62134f99` and image `nightly_202611240650`: the branch's upstream base, `b7b5ec3f2`, has neither MiniMax's PP-to-TP PAGE staging, nor `pd_admission`'s decode reserve, nor the shared kv_store layer | A, B | #4047, a sync |
-| the upstream tip holding ROCm/ATOM#3563 and ROCm/ATOM#3564, which B waits for. No Compass code: the step linear law prices DP-attention ranks, their experts over the group (`run/__init__.py::runner`), as DeepSeek-V4-Pro's DPA8-EP8 law (`scripts/compass/laws/`) does | B | #4048, a sync to that tip, checking DEP4 |
+| ATOM main `a62134f99` and image `nightly_202611240650`: the branch's upstream base, `b7b5ec3f2`, has neither MiniMax's PP-to-TP PAGE staging and head cut, nor NVFP4 over Mooncake P/D and the Store, nor `pd_admission`, its metrics and chunked admission, nor the shared kv_store layer | A, B | #4047, a sync |
+| ROCm/ATOM PR heads `1551211d0` and `59e0a20ad`, which the recipe merges for B: without PR 3564, `M3DSparkAttention.__init__` refuses B's TP1 attention ranks | A, B | #4048, a sync of both heads, checking DEP4 |
+| MiniMax-M3.1-Flash with its DSpark draft built and served on meta | A, B | #4015 |
+| the simulated P/D connector at an NVFP4 KV beside a DSpark draft, which ATOM refuses | A, B | #4152 |
 | a pipeline with a drafter, refused on a stale reason (`runner/overrides.py::NonAllocatingRunner._build_and_load_model`) | the prefill | #4049 |
-| a step linear law of a pipeline stage: `_group_step_seconds` refuses one, `fit steps` reads stage 0 alone, `record --trace` refuses PP; designed in `09` D54.1 | the prefill | #4066 to #4071 |
+| a simulated pipeline stage priced by its own part of the step linear law and host laws, and the stage labels checked on pit2 (`09` D54.1) | the prefill | #4069, #4071 |
 | the Store under a pipelined prefill, which `01` D6.2 refuses, its entry one chunk size for every writer | the prefill | #4051, a design |
-| a space file naming the Store's entry | A, B | #4052 (D110) |
-| a 1P1D calibration through `calibrate.sh` (D113) | A, B | #4053 |
+| each side's P/D options: `deploy.sh` fills each side's `--kv-transfer-config` and merges `KV_EXTRA` into both alike (D110) | A, B | #4165 |
+| chunked transfer and `pd_admission` in the simulated connector (above) | A, B | #4054, a design of `01` D6 and D7, then its code |
+| a TP1 prefill stage's write into A's TP4 decode, which `run/__init__.py::_planned_transfer` refuses (`01` D6) | A | #4166 |
+| a point's GPUs and ranks counting pipeline stages: `validate/curves.py::gpus` and `advice/simulate.py` count TP x DP, so A's eight cards read as five (D109, D111) | A, B | #4167 |
+| a real 1P1D run's hit rates, which aiperf's scrape of the router lacks, and a simulated one's from the prefill side alone | the validation | #4168 |
+| REAL's interval for every metric A2 names: `one_real.py::tails` gives TTFT p99, p90 TTFT and TPOT p90 alone | the validation | #4169 |
 
 `compass advice`'s check starts every point (D109), and whatever MiniMax-M3.1 forces to
-change there is filed as a defect, as for MiniMax-M3 (D117). A does not wait on #4048.
+change there is filed as a defect, as for MiniMax-M3 (D117). #3624 does not block: a
+producer schedules no decode rung (`atom/compass/drive/lacking.py::uncovered_rungs`), and
+the prefill runs eager. The template needs no `03` change: NVFP4 KV sizing is ATOM's
+arithmetic over measured readings (`03` D13, D14).
 
 The configurations cut from it can come back: DeepSeek-V4-Pro's S1 (TP8, MTP3), S2 (DPA8,
 MTP3, TBO), S5 (S2 with LMCache), P1 (1P1D TP8) and P3 (1P1D DPA8), with S3, S4, P2 and P4
@@ -851,18 +1029,22 @@ team's GPU pool, crsuse2-m2m-v3-005 staying reserved for stage 3d/3e
 ([first](https://github.com/jgong5/ATOM/issues/3670#issuecomment-7127634115)), and to
 this recipe in its two decodes
 ([second](https://github.com/jgong5/ATOM/issues/3670#issuecomment-7130535680)),
-superseding #3468's move to DeepSeek-V4.1-Flash; nothing more runs on DeepSeek-V4-Pro,
-whose calibration the owner stopped on #3468. Both decodes share one prefill, so B's
-calibration borrows A's prefill law and B's points reuse it: the template runs a new law
-and a borrowed one, and A against B puts the
-recipe's own comparison, TP4 against DEP4 on one AgentX workload, on its frontier.
-**Basis.** The Rulings; the recipe and its scripts at `b32dca87`; D112's keys
-(`atom/compass/drive/reuse.py`, `atom/compass/drive/lacking.py::_producer`); D113 and
-`atom/compass/backends/step_linear_plan.py::records`; `01` D6.2.
+superseding #3468's move to DeepSeek-V4.1-Flash; #4145's requirement takes it to
+`0368ec741` as written and checks advice's answer against held-out real runs. Both decodes
+share one prefill, so B's calibration borrows A's prefill law and B's points reuse it: the
+template runs a new law and a borrowed one, and A against B puts the recipe's own
+comparison, TP4 against DEP4 on one AgentX workload, on its frontier, where the real runs
+check it. **Basis.** The Rulings; #4145's requirement and the
+[#4146 Ruling](https://github.com/jgong5/ATOM/issues/4146#issuecomment-7156425733); the
+recipe and its scripts at `0368ec741`; D112's keys (`atom/compass/drive/reuse.py`,
+`atom/compass/drive/lacking.py::_producer`); D113 and
+`atom/compass/backends/step_linear_plan.py::records`; `01` D6, D6.2;
+`scripts/compass/one_real.py`.
 
-**Rejected.** Departing from the recipe where Compass lacks a feature, a TP prefill or one
-without the Store, to calibrate sooner: the second Ruling names the PP4 x TP1 prefill and
-its Store tier among the configurations' parts.
+**Rejected.** Departing from the recipe where Compass lacks a feature, a TP prefill, one
+without the Store or the P/D options left unset, to calibrate sooner: the second Ruling
+names the PP4 x TP1 prefill and its Store tier among the configurations' parts, and
+#4145's Goal 3 the recipe as written.
 
 ---
 
@@ -954,23 +1136,34 @@ bar, so reuse requirements 3 and 4 go unjudged; `--check` refuses a prefill or d
 side's arguments (`13` D80), so no 1P1D candidate is checked; and a user step needs
 `python -m`, which the owner's ruling on #1108, recorded in #1527, rules out.
 
+For D116's template, the simplest is the one #3670 left: the P/D options unset, the real
+runs taken by the recipe's own scripts and `one_real.py` as it is. It fails #4145: Goal 3,
+the recipe as written, its chunked transfer and `pd_admission` among it; A4, with no
+simulated admission to export; and A2, a real 1P1D run having no hit rate, no engine
+record or client export for `one_real.py` to read, and three intervals of the seven
+metrics A2 names.
+
 ---
 
 ## Low confidence
 
-Each entry is a departure of D116's template from its recipe, the owner's trade, which no
-measurement settles. The earlier last entry, D110's space file against the config file
-`13` D79 rejects, is settled by the
-[sixth ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927).
+Each entry is a choice for D116's template that no measurement settles, the owner's to
+overturn. The earlier entry for D110's space file against the config file `13` D79 rejects
+is settled by the
+[sixth ruling](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927), and the
+one for the P/D options left unset by #4145's Goal 3, which carries them.
 
 - **Thinned capture sizes.** The decodes calibrate at powers of two, about 11 node-hours
   for both, against about 32 at the recipe's sizes; the template then departs from the
   recipe in the batches its graphs pad to. It rests on the #3468 Ruling that thinned the
   earlier template's, a Ruling on another template.
-- **The P/D options left unset.** Chunked transfer and `pd_admission` stay off in real
-  records and simulated runs alike until the simulated connector carries them (#4054).
-  The recipe notes its decodes are bound by KV capacity near 100 clients, where
-  `pd_admission` acts, so the template's upper points depart there most.
+- **A 1P1D point's hit rates are its prefill side's.** Which counters a 1P1D hit rate
+  reads is a definition, and none published settles it: InferenceX's ATOM adapter sums
+  the counters of every endpoint aiperf scrapes, with no role filter
+  ([`backends/atom.py`](https://github.com/SemiAnalysisAI/InferenceX/blob/4b94f096b74191b8af6b7c89e50e0b6bc69f7aba/inferencex-e2e/infx/results/agentic/backends/atom.py)),
+  and publishes no 1P1D hit rate. The template counts the side that computes the prompt;
+  another definition changes no simulation, only `client.sh`'s scrape and the sum in
+  `validate/curves.py`.
 
 ---
 
@@ -978,10 +1171,12 @@ measurement settles. The earlier last entry, D110's space file against the confi
 
 No spike: no decision waits on a measurement. D116's template waits on two syncs with
 ROCm/ATOM, each labelled `agent-team/land-as-merge`: #4047 takes upstream main `a62134f99`
-and the image `nightly_202611240650`, and #4048, after it, the tip holding ROCm/ATOM#3563
-and ROCm/ATOM#3564, which decode B needs. Its other tasks are in
-[D116's table](#d116-the-development-template-minimax-m31-flashs-1p1d-recipe-on-pit2s-mi355x-ungraded)
-of what Compass lacks, and #3468 takes the template's inputs. No configuration
+and the image `nightly_202611240650`, and #4048, after it, the PR heads `1551211d0` and
+`59e0a20ad`, which decode B needs and A runs too. Two designs settle what D116 leaves to
+them, each amending `01`: #4051 the Store under a pipelined prefill, #4054 chunked
+transfer and `pd_admission` in the simulated connector. Its other tasks are in
+[D116's table](#d116-the-development-template-minimax-m31-flashs-1p1d-recipe-on-pit2s-mi355x-checked-against-held-out-real-runs)
+of what Compass lacks; #3468 takes the template's inputs and answer, #4170 its validation. No configuration
 of the template offloads through LMCache, so #3712's two points on their own LMCache ports
 have no subject in it. Other issues settle what decisions leave to them: #3256's
 grading, which reopens the showcase's pricing if it fails the step linear law where the
@@ -996,13 +1191,15 @@ op-family split's inputs on DeepSeek-V4-Pro (D114).
 **Deliverable.** `compass advice`, which searches a space the user provides and recommends
 a configuration; the reuse check it calls and the calibration it prints; each run's
 per-request split, op-family split and report; the dashboard; the guide. Built on
-MiniMax-M3.1-Flash's 1P1D recipe on pit2's MI355X, shown on MiniMax-M3.
+MiniMax-M3.1-Flash's 1P1D recipe on pit2's MI355X, its answer there checked against
+held-out real runs, and shown on MiniMax-M3.
 
 **Scope and non-goals.** How a user finds the configuration to deploy, what each run
 writes for a person to read, and where the tool is built, on pit2's MI355X, and shown, on
 the development nodes. Out: #3355's *Deferred* list, among it topping a law up in
-place, less search from any host (D109); and work the search meets, such as the
-simulated connector's P/D options (#4054) and `inferencex_export` labelling every row
+place, less search from any host (D109); for D116's template, `MODE=mega`, other models
+and nodes, an accuracy threshold on its real runs and any `08` D50 entry; and work the
+search meets, such as `inferencex_export` labelling every row
 single-node, tracked apart.
 
 **Changes.**
@@ -1019,6 +1216,11 @@ single-node, tracked apart.
 | `atom/compass/validate/__main__.py`, `validate/curves.py` | `grades.json` in each graded cell, its runs' `report.html` rendered again; a 1P1D point's GPUs over both sides | D115, D111 |
 | `scripts/compass/spaces/` (new) | the development template, MiniMax-M3.1-Flash's 1P1D, and MiniMax-M3's | D110, D116, D117 |
 | `scripts/compass/ADVICE.md` (new), `QUICKSTART.md` | the guide, linked both ways | D108 |
+| `atom/compass/advice/space.py`, `advice/check.py`, `advice/simulate.py`, `drive/run.py`, `scripts/compass/deploy.sh`, `atom/compass/kv/connector.py` | a side's `kv_transfer`, merged into its `--kv-transfer-config`, real and simulated, `run --check` included; the `compass` connector refusing an option it does not carry | D110 |
+| `atom/compass/run/__init__.py::_planned_transfer`, `runner/overrides.py::publish_planned_transfer` | a TP1 prefill stage's write into a wider decode, cut to each decode rank's heads (`01` D6) | D116 |
+| `atom/compass/validate/curves.py::gpus`, `advice/simulate.py` | a point's GPUs and ranks counting pipeline stages | D109, D111 |
+| `scripts/compass/client.sh`, `validate/curves.py` | a 1P1D point's hit rates from its prefill side, real and simulated, the real scrape kept as a series | D116 |
+| `scripts/compass/one_real.py` | REAL's interval for every metric #4145's A2 names | D116 |
 
 **Acceptance items**, each walked by the scenario named:
 
@@ -1059,6 +1261,11 @@ single-node, tracked apart.
 12. Every simulated run's end writes `prometheus.html` beside `report.html`, CI's panels
     over its series on the simulated clock, or `prometheus.txt` with why, its stop not
     failing; `report.html` links or quotes it (7; `11`, *The first build*).
+13. D116's template meets #4145's A1 to A6 at its frozen commit and image: advice answers
+    both decodes; a `one_real.py` table per held-out point gives every A2 metric with
+    SIM's error and REAL's interval; the recipe serves; C140's `/metrics` export the
+    admission families, simulated beside real; the real order at advice's pick; each
+    step's cost (9).
 
 ---
 
@@ -1068,13 +1275,13 @@ single-node, tracked apart.
 |---|---|---|
 | D108 | Fitting apart from searching: a candidate is simulated once its law exists; the halves meet only through the store and a calibration's `status` file, the search owning no calibration, fitting, reuse judgement or version management. A user guide, `scripts/compass/ADVICE.md`, exact enough that an agent following it fills the development template's space file, and no skill; an agent starts a calibration only on the user's yes. | 2026-11-13 ([#3355](https://github.com/jgong5/ATOM/issues/3355), [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6845852318)) |
 | D109 | `compass advice SPACE OUT` checks each candidate (searchable, missing a law, calibrating, refused) and each point's readings (missing readings, with the `measure memory` command `run --check` prints), simulates each searchable point on a fresh server with no step roofline, and writes the results; it never calibrates, and runs at the integration head, on any host's CPU with no GPU device. Amends `13` D80: it starts the client and takes a workload, and `run --check` resolves a prefill or decode side. | 2026-11-13 (#3355, #3363); any host's CPU with no GPU device 2026-11-24 ([#4006 Ruling](https://github.com/jgong5/ATOM/pull/4006#issuecomment-7130990480)) |
-| D110 | The user provides the space file, by hand or through an agent following the guide from what the user asks for, a recipe or real-run arguments; it names the shared store and, for a frozen search, its commit; it expands deterministically into candidates, each naming its ATOM basis and departures; the templates live in `scripts/compass/spaces/`, no default; it is the search's input, not a level of `13` D79's precedence nor the config file it rejects. Its format: one JSON object, the dimensions' product less the exclusions, each candidate `common`'s block and its values', two blocks setting one thing apart refused; a candidate offloading to a Mooncake Store names its run-file entry, which every point takes. | 2026-11-13 (#3355, #3363); D79 settled 2026-11-14 ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927)); the format 2026-11-14 (#3448); the `lmcache_server` field, each offloading point's port and the router's flags 2026-11-15 ([#3477](https://github.com/jgong5/ATOM/issues/3477#issuecomment-6887140315)); the `mooncake_store` field 2026-11-24 ([#3670](https://github.com/jgong5/ATOM/issues/3670)) |
-| D111 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. A 1P1D point's GPUs are its prefill side's plus its decode side's, each from its own engine record. | 2026-11-13 (#3355); the GPU count 2026-11-14 ([#3454](https://github.com/jgong5/ATOM/issues/3454)) |
+| D110 | The user provides the space file, by hand or through an agent following the guide from what the user asks for, a recipe or real-run arguments; it names the shared store and, for a frozen search, its commit; it expands deterministically into candidates, each naming its ATOM basis and departures; the templates live in `scripts/compass/spaces/`, no default; it is the search's input, not a level of `13` D79's precedence nor the config file it rejects. Its format: one JSON object, the dimensions' product less the exclusions, each candidate `common`'s block and its values', two blocks setting one thing apart refused; a candidate offloading to a Mooncake Store names its run-file entry, which every point takes; a 1P1D side states its P/D options, `kv_transfer`, merged into that side's `--kv-transfer-config`. | 2026-11-13 (#3355, #3363); D79 settled 2026-11-14 ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6871001927)); the format 2026-11-14 (#3448); the `lmcache_server` field, each offloading point's port and the router's flags 2026-11-15 ([#3477](https://github.com/jgong5/ATOM/issues/3477#issuecomment-6887140315)); the `mooncake_store` field 2026-11-24 ([#3670](https://github.com/jgong5/ATOM/issues/3670)); a side's `kv_transfer` 2026-11-25 ([#4146](https://github.com/jgong5/ATOM/issues/4146)) |
+| D111 | InferenceX's metrics by #3264's code, and the search's computed-token throughput and P90 end-to-end latency from the same export; the frontier of throughput per GPU against P90 interactivity; the recommendation, the most throughput per GPU meeting the SLO, which bounds P90 interactivity, with no refusal; the runner-up, another configuration's best at its concurrency; the result table and the recommendation's text. A 1P1D point's GPUs are its prefill side's plus its decode side's, each from its own engine record, tensor times pipeline times data parallel. | 2026-11-13 (#3355); the GPU count 2026-11-14 ([#3454](https://github.com/jgong5/ATOM/issues/3454)); pipeline stages counted 2026-11-25 ([#4146](https://github.com/jgong5/ATOM/issues/4146)) |
 | D112 | Calibrated data serves a candidate only with the same key, not invalidated, enough coverage (a decode vector for every scheduled rung before the search, each point's extrapolated share reported after it) and `08` D47's three figures on each leave-one-run-out fold within #627's 5% gate, a law at the head past it refused; a law's verdict is reuse or calibrate, a point's readings' reuse or measure, and a tree whose ATOM digest is not the head's, the remote tip's or a frozen commit's, is refused naming both. A store law reaches a later head only checked in re-keyed. A search may mix laws fitted at different commits, each point's provenance naming its law's commit; the showcase's are all fitted at its one frozen commit. | 2026-11-13 (#3355, #3363; the head by ATOM's digest, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6854911957); coverage in two parts, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216); the accuracy bar, [#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6869501859)); requirement 2's readings taken again by `07` D41's rule, 2026-11-17 ([#2899](https://github.com/jgong5/ATOM/issues/2899)) |
 | D113 | The step linear backend lists a configuration's missing records, for a missing law or decode rung, as one `calibrate.sh` command, which takes a GPU list, publishes into `STORE` and reports each step in `status`; a readings gap is measured alone; with no top-up in place, a configuration lacking coverage is calibrated again into a new store, the readings of every configuration borrowing its law with it, as is a publish meeting a readings key an older tree's entry holds, and each candidate runs on the latest store holding its store inputs; each calibration is timed per step; a 1P1D configuration takes one command, its records `deploy.sh record`s, publishing into one store and fitting only the sides that store will lack, a side an earlier candidate's calibration publishes there borrowed. | 2026-11-13 (#3355, #3363); the 1P1D calibration due 2026-11-24 ([#3670](https://github.com/jgong5/ATOM/issues/3670)) |
 | D114 | Every run writes its per-request split when it ends, apart from `summary.json`; an op-level run's op-family split sums pricing's prices per step phase. Amends `13` D80's outputs of `run`, `record` and `deploy.sh`. | 2026-11-13 (#3355); the format 2026-11-14 ([#3458](https://github.com/jgong5/ATOM/issues/3458)); a `resource_bound` `Par` shown whole 2026-11-18 ([#3707](https://github.com/jgong5/ATOM/pull/3707#issuecomment-6968684379)), host time named beside the DP group's slowest rank the same day ([#3707](https://github.com/jgong5/ATOM/pull/3707#discussion_r4609386973)) |
 | D115 | Two static views reading files only: the search's dashboard, a page of Compass's own, each point marked by grading state and method shares, with a reference layer from the file `--reference` names; and every run's `report.html`, a graded cell's grades read from the `grades.json` grading writes into the cell, which renders the cell's reports again. Beside `report.html`, every simulated run's `prometheus.html`: CI's report, `export_report.py` unchanged, over the run's series (`11` D74), marked simulated, the GPU panels predicted, the router's TTFT empty; or `prometheus.txt` with why, the stop not failing. | 2026-11-13 (#3355, #3363); the page Compass's own 2026-11-15 ([#3465](https://github.com/jgong5/ATOM/issues/3465)); the Prometheus report 2026-11-16 ([#3584](https://github.com/jgong5/ATOM/issues/3584)); its query's end and the tools written whole 2026-11-17 ([#3611](https://github.com/jgong5/ATOM/issues/3611)); no reference layer on the development template 2026-11-24 ([#3670](https://github.com/jgong5/ATOM/issues/3670)) |
-| D116 | Developed on MiniMax-M3.1-Flash's one-node 1P1D recipe (ROCm/ATOM `b32dca87`) on pit2's MI355X, ungraded and outside `08` D50: one PP4 x TP1 prefill with DSpark and a Mooncake Store tier; decode A, TP4 with indexer CP, and decode B, DEP4; each calibrated anew under a gpool lease, B's calibration borrowing A's prefill law, at 1 to 256 clients, each departure from the recipe stated; DeepSeek-V4-Pro's S1, S2, S5, P1 and P3 cut. | 2026-11-13 (#3355); P1 calibrated anew 2026-11-16 ([#3493](https://github.com/jgong5/ATOM/pull/3493#issuecomment-6906479025)); moved to pit2's MI355X and to the MiniMax-M3.1-Flash recipe 2026-11-24 ([#3670](https://github.com/jgong5/ATOM/issues/3670#issuecomment-7127634115), [Ruling](https://github.com/jgong5/ATOM/issues/3670#issuecomment-7130535680)) |
+| D116 | Developed on MiniMax-M3.1-Flash's one-node 1P1D recipe (ROCm/ATOM `0368ec741`) on pit2's MI355X: one PP4 x TP1 prefill with DSpark, NVFP4 and a Mooncake Store tier, writing chunked into its decode; decode A, TP4 with indexer CP, and decode B, DEP4, each admitting by `pd_admission`; both at one frozen commit holding the PR heads B needs; each calibrated anew under a gpool lease, B's calibration borrowing A's prefill law; searched at c = 8 to 256 for 900 s with no SLO; checked by `one_real.py` against one held-out real run a point at c = 16 to 140, and at advice's pick when it is 8 or 256, a 1P1D hit rate the prefill side's, reported and outside `08` D50; each departure from the recipe stated; DeepSeek-V4-Pro's S1, S2, S5, P1 and P3 cut. | 2026-11-13 (#3355); P1 calibrated anew 2026-11-16 ([#3493](https://github.com/jgong5/ATOM/pull/3493#issuecomment-6906479025)); moved to pit2's MI355X and to the MiniMax-M3.1-Flash recipe 2026-11-24 ([#3670](https://github.com/jgong5/ATOM/issues/3670#issuecomment-7127634115), [Ruling](https://github.com/jgong5/ATOM/issues/3670#issuecomment-7130535680)); moved to `0368ec741` and checked against held-out real runs 2026-11-25 ([#4145](https://github.com/jgong5/ATOM/issues/4145), [#4146 Ruling](https://github.com/jgong5/ATOM/issues/4146#issuecomment-7156425733)) |
 | D117 | Moved to MiniMax-M3 once its Compass features land and #3265 passes, calibrated on the development nodes from #3256's arms at one frozen commit, where its simulations and validation runs run too, every point priced by the step linear law alone, a step past its records extrapolated and reported, and the pricing reopened if #3256's grading fails the law where the step grid passes ([#3363](https://github.com/jgong5/ATOM/pull/3363#issuecomment-6857982216)); the showcase validation runs the recommended configuration and the runner-up real, graded by `08` D44, their real order compared with the simulated one, each point's `08` D45.1 verdict beside its grade, not gated. Amends `08` D50. | 2026-11-13 (#3355, #3363) |
 
 ---
