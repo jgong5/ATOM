@@ -1656,8 +1656,8 @@ class NonAllocatingRunner(
         load it from the checkpoint; `drafts_on_meta` makes that build meta and
         skips the load. A predicted step's accepted drafts are drawn from the
         config's forced acceptance (`DeferredTokenStream`), so a config that
-        declares none is refused, as is one over more than one pipeline stage,
-        on which ATOM's `prepare_input_ids` raises `NotImplementedError`.
+        declares none is refused, as is one over more than one pipeline stage
+        that is not a P/D producer, which never speculates.
 
         What stands in for the model is installed here instead, on a simulated
         run: the cost backend and the device readings its run file declares.
@@ -1675,16 +1675,35 @@ class NonAllocatingRunner(
                     "acceptance, and this speculative config declares none; pass "
                     "--spec-decode-acceptance-length, -rate or -rates"
                 )
-            if int(_config_field(self, "pipeline_parallel_size") or 1) > 1:
+            from atom.kv_transfer.disaggregation import kv_config_has_producer
+
+            # A P/D producer never speculates: its drafter writes context K/V
+            # alone (`Drafter.context_kv_only`), stage by stage as ATOM serves
+            # it (`Config._check_pp_support`).
+            producer = kv_config_has_producer(_config_field(self, "kv_transfer_config"))
+            if int(_config_field(self, "pipeline_parallel_size") or 1) > 1 and (
+                not producer
+            ):
                 raise RunnerRefusal(
-                    "ATOM's prepare_input_ids raises NotImplementedError for "
-                    "pipeline parallel + speculative decode"
+                    "a predicted step under pipeline parallel + speculative decode "
+                    "is simulated for a P/D producer alone, whose drafter only "
+                    "writes context K/V"
                 )
             drafts_on_meta()
         engram_tables_unread()
         with FactoriesOnMeta(), simulated_arch():
             model.tree = model_class(config)
             process_weights_after_loading(model.tree)
+        if int(_config_field(self, "pipeline_parallel_size") or 1) > 1:
+            # A pipeline stage's aux relay finds the target's decoder layers
+            # under `language_model` (`PPAuxRelay`, `_resolve_decoder_layers`):
+            # the tree's, held as an attribute, not a submodule. Its hooks arm
+            # on the meta tree, which runs no forward.
+            object.__setattr__(
+                model,
+                "language_model",
+                getattr(model.tree, "language_model", model.tree),
+            )
         from atom.compass import run
 
         run.runner(self, model.tree)

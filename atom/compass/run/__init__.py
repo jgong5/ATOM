@@ -1474,7 +1474,7 @@ def mooncake_store(block_tokens: int) -> None:
     rt = _runtime(MOONCAKE_STORE, run)
     served = {c.source.name for c in rt.table.channels_into(MOONCAKE_STORE)}
     # A pipeline's head stage is served; every stage's members plan a chunk.
-    heads = {re.sub(r"-pp0$", "", n) for n in served}
+    heads = {re.sub(r"-pp0$", "", n) for n in sorted(served)}
     members = [
         n
         for n in _hand_ins(run)

@@ -1745,7 +1745,7 @@ def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
             by_rank.setdefault(fields.pop("rank"), set()).add(
                 tuple(sorted(fields.items()))
             )
-    shared = {f for f in {f for fs in by_rank.values() for line in fs for f, _ in line}}
+    shared = sorted({f for fs in by_rank.values() for line in fs for f, _ in line})
     common = {
         f: {dict(line)[f] for fs in by_rank.values() for line in fs} for f in shared
     }
