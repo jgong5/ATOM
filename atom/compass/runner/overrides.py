@@ -358,7 +358,10 @@ class HostDeviceRecurrence:
     launch path (`launch_features.path`), a batch's `compass_path`, which its
     caller sets from `path`, to the constant that segment takes on it in
     place of its law's own; a path it does not name keeps the law's. A
-    pipeline stage refuses them, as it does columns.
+    pipeline stage refuses them, as it does columns. `stalls`, a host entry's
+    `step_labels.STALLS`, maps a launch path to ``first_s``, what a rank's
+    first launch of a shape on it costs (`launch_stall`); `path` then names a
+    forward's path for them too.
     With `own_draft`, true unless it defers, an output forward that waits for its own
     target leaves no earlier than its device end, as one that reads its own draft ids does.
     A batch whose `compass_dummy` is true, a DP rank's dummy forward at a step
@@ -391,10 +394,11 @@ class HostDeviceRecurrence:
         launch=(None, None),
         defer=True,
         paths=None,
+        stalls=None,
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
         self.admit, self.columns, self.launch = admit, columns or {}, launch
-        self.paths = paths or {}
+        self.paths, self.stalls = paths or {}, stalls or {}
         if self.paths and stage is not None:
             raise ValueError(
                 "the host laws state launch-path constants, and a pipeline stage "
@@ -529,10 +533,11 @@ class HostDeviceRecurrence:
     def path(self, view: Any) -> str | None:
         """A step's launch path (`launch_features.path`) from its `BatchView`
         `view` and the features `launch`'s provider predicts for it, which a
-        batch's `compass_path` holds; None where no law states `paths`."""
+        batch's `compass_path` holds; None where the laws state neither
+        `paths` nor `stalls`."""
         from atom.compass.backends.launch_features import path
 
-        if not self.paths:
+        if not self.paths and not self.stalls:
             return None
         provider, graphs = self.launch
         features = provider.predict(view, graphs) if graphs is not None else {}
@@ -2161,6 +2166,34 @@ def replayed_stall(runner: Any, view: Any, host: Any) -> float:
     return seconds
 
 
+def launch_stall(runner: Any, view: Any, host: Any) -> float:
+    """The launch stall this rank's step `view` charges from its host laws'
+    `step_labels.STALLS` (`HostDeviceRecurrence.stalls`): a forward holding a
+    prefill row, not a DP dummy, on a launch path (`HostDeviceRecurrence.path`)
+    the stalls name, the first of its `step_labels.first_launch_key` on that
+    path on this runner (one process, so its set starts empty at each
+    deployment), costs the path's ``first_s``; any other forward, none.
+    Added to the step's device time where `replayed_stall` adds a replayed
+    one, it holds the DP group's `all_reduce(MAX)`, as a real group's MoE
+    collectives wait on a rank whose host was late issuing its kernels. It
+    draws nothing at random: a run's charges follow from its own forwards."""
+    from atom.compass.backends.step_labels import first_launch_key
+
+    stalls = getattr(host, "stalls", None)
+    if not stalls or view is None or view.dp_dummy or not view.prefill:
+        return 0.0
+    path = host.path(view)
+    got = stalls.get(path)
+    if got is None:
+        return 0.0
+    seen = vars(runner).setdefault("_launched_shapes", set())
+    key = (path, first_launch_key(view.requests))
+    if key in seen:
+        return 0.0
+    seen.add(key)
+    return got["first_s"]
+
+
 def _group_step_seconds(
     runner: Any,
     batch: Any,
@@ -2236,7 +2269,8 @@ def _group_step_seconds(
     later stage's receive, in seconds, each 0.0 where the law has none, and `skipped`,
     those its `skip` charged as 0; `device_s` and `draft_s`, the backend's
     target and draft price, the target's with any `replayed_stall`, which
-    ``replayed_stall_s`` then states; `charge_s`, those composed with host
+    ``replayed_stall_s`` then states, and with any `launch_stall`, which
+    ``launch_stall_s`` states; `charge_s`, those composed with host
     time (their sum with no host);
     `group_s`, its DP group target; `terms`, each one's `name`, `seconds`
     and its provenance's `method`, `validated` and `source`, the target's
@@ -2324,7 +2358,8 @@ def _group_step_seconds(
         device_s, draft_s = cost.target_seconds, cost.draft_seconds
         terms, target_terms = (*cost.terms, *cost.draft_terms), len(cost.terms)
     stall_s = 0.0 if refused else replayed_stall(runner, view, host)
-    device_s += stall_s
+    first_s = 0.0 if refused else launch_stall(runner, view, host)
+    device_s += stall_s + first_s
     lookup_s, price_s = (lazy.get(k, 0) - w for k, w in zip(WALLS, walls))
     pricing_s = price_s - lookup_s
     # `decide` returns the collective's rows for a group of one too.
@@ -2412,6 +2447,7 @@ def _group_step_seconds(
         "device_s": device_s,
         "draft_s": draft_s,
         **({"replayed_stall_s": stall_s} if stall_s else {}),
+        **({"launch_stall_s": first_s} if first_s else {}),
         "charge_s": charge_s,
         "group_s": group_s,
         "terms": [
