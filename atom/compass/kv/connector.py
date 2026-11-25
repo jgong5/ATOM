@@ -64,6 +64,14 @@ into that rank on one of its own, so it frees its blocks no later than decode
 learns of the write, and earlier by what another prefill rank's writes into
 the same NIC cost. One prefill stage only.
 
+Opt-in (``COMPASS_KV_WRITE_REQ_LATE=1``): decode's write request leaves one
+forward later, at the return of the forward after the one it waited for, and
+no earlier than that one's device work ends. On cell B's c=256 record the
+worker takes an admission step's metadata only once that step's forward has
+returned, and its write-request thread, past its device synchronize, sends
+when the next forward has returned (p50 1.9 ms after it): with the rule above
+the request reaches prefill about 0.6 D step after the simulated one (#3720).
+
 The worker half reports nothing. The engine still builds and polls it.
 """
 
@@ -72,6 +80,7 @@ from __future__ import annotations
 import collections
 import logging
 import math
+import os
 import pickle
 import weakref
 
@@ -91,6 +100,9 @@ TRANSFER_KEY = "compass_transfer"
 
 #: The zmq address the write requests travel over.
 WRITE_REQ_KEY = "compass_kv_write_req"
+
+#: Opt-in: decode's write requests leave one forward later (`device_done`).
+WRITE_REQ_LATE_ENV = "COMPASS_KV_WRITE_REQ_LATE"
 
 
 def engine_id(lp: str) -> str:
@@ -173,9 +185,11 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler side: Mooncake's write request, and both ends' completion times."""
 
     # The opt-in switches' state, off: what `__init__` replaces when one is on,
-    # and what a connector built without it reads (no shared NIC, nothing in
-    # flight on a NIC).
+    # and what a connector built without it reads (no shared NIC, no late
+    # write request, nothing armed or in flight on a NIC).
     _shared = False
+    _late = False
+    _armed: tuple = ()
     _nics: dict = {}
     _extra: dict = {}
 
@@ -229,6 +243,11 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         # the device, and when the last forward's device work ends.
         self._queued: list = []
         self._device_end = -math.inf
+        # Opt-in: requests a forward's return armed, and that forward's device
+        # end; they leave at the next forward's return.
+        self._late = os.environ.get(WRITE_REQ_LATE_ENV, "0") not in ("", "0")
+        self._armed: list = []
+        self._armed_end = -math.inf
         # Above DP width one an admission step with nothing to run is followed
         # by the group's dummy forward.
         self._dummies = getattr(parallel, "data_parallel_size", 1) > 1
@@ -379,6 +398,13 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         forward, which the engine launched first, before it posts them."""
         now = self._rt.now
         self._device_end = max(self._device_end, now if end is None else end)
+        if self._late:
+            # Those armed by the forward before leave now, no earlier than its
+            # device end; those queued since wait for the next return.
+            queued, self._queued = self._queued, self._armed
+            self._post(self._armed_end)
+            self._armed, self._armed_end = queued, self._device_end
+            return
         self._post(self._device_end)
 
     def _post(self, t: float) -> None:
@@ -538,5 +564,6 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             self._due
             or self._snapshot
             or self._queued
+            or self._armed
             or any(nic.busy() for nic in self._nics.values())
         )

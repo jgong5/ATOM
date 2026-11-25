@@ -284,6 +284,43 @@ def test_a_write_request_leaves_once_the_forward_after_its_admission_ends_on_the
     assert y.status is SequenceStatus.RUNNING
 
 
+@pytest.fixture
+def pd_late(geometry, monkeypatch):
+    """`pd` with decode's write requests one forward later (opt-in)."""
+    monkeypatch.setenv(connector_module.WRITE_REQ_LATE_ENV, "1")
+    model = model_for(geometry, PEAKS[0])
+    address = f"inproc://kv-write-req-{next(_PAIRS)}"
+    rt_p, rt_d = runtime("engine-P"), runtime("engine-D")
+    p = connector(rt_p, monkeypatch, model, kv_role="kv_producer", address=address)
+    d = connector(rt_d, monkeypatch, model, kv_role="kv_consumer", address=address)
+    return SimpleNamespace(
+        model=model, address=address, rt_p=rt_p, rt_d=rt_d,
+        p=scheduler_with(p), d=scheduler_with(d),
+    )
+
+
+def test_a_late_write_request_leaves_at_the_next_forwards_return(pd_late, seq_factory):
+    """Opt-in: the request queued by the admission step waits past the first
+    forward's return for the next one, and leaves there, no earlier than the
+    first one's device end; a forward with nothing armed posts nothing."""
+    pd = pd_late
+    xs = prefilled(pd, 2, R)
+    queued(pd, xs[:1], seq_factory, SEND)
+    end = SEND + 5 * TICK  # the first forward returns at SEND + TICK
+    returned(pd, SEND + TICK, end)
+    assert pd.rt_d.send_log == [], "left at the first forward's return"
+    assert pd.d.kv_connector.has_pending_work() is True
+    returned(pd, SEND + 2 * TICK, SEND + 9 * TICK)
+    assert pd.rt_d.send_log == [(KV, 0, end + L)], "not before the device end"
+    queued(pd, xs[1:], seq_factory, SEND + 10 * TICK)
+    returned(pd, SEND + 11 * TICK, SEND + 12 * TICK)
+    assert pd.rt_d.send_log == []
+    returned(pd, SEND + 20 * TICK, SEND + 21 * TICK)
+    assert pd.rt_d.send_log == [(KV, 1, SEND + 20 * TICK + L)], "at the return"
+    returned(pd, SEND + 30 * TICK, None)
+    assert pd.rt_d.send_log == []
+
+
 def test_a_device_already_done_posts_at_the_return_and_a_later_forward_posts_nothing(
     pd, seq_factory
 ):
