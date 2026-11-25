@@ -417,12 +417,32 @@ class _Vector:
                 )
 
 
+#: Text model types whose gated delta-net layers (`layer_types`
+#: "linear_attention") keep their recurrent state in ATOM's state slots and
+#: checkpoints (`GDNStateMixin`), which the scheduler saves, forks and moves as
+#: it does Kimi-K3's KDA states: Qwen3.8-Flash-Next's. Their state work is
+#: stated and fitted as KDA layers'. Other GDN models (Qwen3.5, Qwen3.8 dense)
+#: keep stating none, so their records and laws are unchanged.
+GDN_STATE_MODELS = ("qwen4_exp_text",)
+
+
 def kda_layers(hf_config) -> int:
     """How many KDA layers the model config `hf_config` states, in its text
-    config's `linear_attn_config` (Kimi-K3's, Kimi-Linear's); 0 for none."""
+    config's `linear_attn_config` (Kimi-K3's, Kimi-Linear's), or, for a model
+    of `GDN_STATE_MODELS`, its gated delta-net layers; 0 for none."""
     text = getattr(hf_config, "text_config", None) or hf_config
     linear = getattr(text, "linear_attn_config", None) or {}
-    return len(linear.get("kda_layers") or ()) if isinstance(linear, Mapping) else 0
+    if isinstance(linear, Mapping) and linear.get("kda_layers"):
+        return len(linear["kda_layers"])
+    return gdn_state_layers(getattr(text, "model_type", None), getattr(text, "layer_types", None))
+
+
+def gdn_state_layers(model_type, layer_types) -> int:
+    """The gated delta-net layers of a `GDN_STATE_MODELS` text config of
+    `model_type` and `layer_types`; 0 for any other model."""
+    if model_type not in GDN_STATE_MODELS:
+        return 0
+    return sum(t == "linear_attention" for t in layer_types or ())
 
 
 def kda_columns(view: BatchView) -> tuple | None:
