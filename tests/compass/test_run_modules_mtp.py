@@ -20,8 +20,8 @@ sharding their argmax. Under V4-Pro's DP8 at TP 1 the target's LM head,
 which its drafts share, is sharded over the group on a decode every rank
 runs, a draft's never. A speculative step then answers
 `_group_step_seconds`' "prices no draft" check, the roofline alone or below a
-backend that refuses the step; a run with no drafter laid out, Eagle3's
-(#3962), is still refused.
+backend that refuses the step; a run with no drafter laid out, GLM-5-Next's
+(#3984), is still refused.
 
 Each model is built in a process of its own, as
 `test_backend_step_roofline_v41` builds V4.1's. Qwen3.5-0.8B's config is its
@@ -623,8 +623,8 @@ def test_a_speculative_step_under_the_roofline_states_its_draft(built):
 
 
 def test_a_run_whose_drafter_is_not_laid_out_is_still_refused(built):
-    """As an Eagle3 run is (#3962): its drafter is not built, and the roofline
-    over the target alone prices no draft."""
+    """As a GLM-5-Next MTP run is (#3984): its drafter is not built, and the
+    roofline over the target alone prices no draft."""
     target = [m for m in built["qwen3.5-mtp1"]["modules"] if not m.passes]
     r = speculative(StepRooflineBackend(MACHINE, target))
     assert r.forward(prefill(8)).predicted_s == 0
