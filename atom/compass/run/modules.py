@@ -114,7 +114,8 @@ window before it; the block's LM head, the target's, runs on its vocabulary
 shard, and the Markov sampler on that shard, once a position.
 
 It reads a serial drafter's model too, the MTP layer `EagleProposer` runs once
-for each draft token: Qwen3.5's, DeepSeek-V3's and DeepSeek-V4's (`SERIAL`).
+for each draft token: Qwen3.5's, DeepSeek-V3's, DeepSeek-V4's, Qwen3-Next's
+and MiMo-V2's (`SERIAL`).
 Its modules carry its passes, the config's `num_speculative_tokens`
 (`Module.passes`). Each pass runs the first of its MTP layers, since
 `EagleProposer` passes no `spec_step_idx`. A drafter that holds no LM head of
@@ -125,13 +126,15 @@ block norms its two inputs itself, as a V4 block does not, its hidden-state
 norm and `h_proj` on each residual copy of a token; before the LM head it
 reduces its residual copies (`hc_head`, by its own mixing weights) and
 norms the result, on the rows the head samples alone (`Module.head`,
-`DeepseekV4MTPModel._head_input`). Qwen3.5's all-gathers its `fc`'s output
-over the TP group. Where a data-parallel group shards a draft's argmax
-(`ATOM_DP_DRAFT_ARGMAX`, a head at TP 1, its vocabulary split evenly), its LM
-head carries the group's width and the most rows it shards
-(`ParallelLMHead._can_use_dp_sharded_argmax`). An Eagle3 drafter is not
-built, and a step under one prices no draft (#3962), nor are the other
-serial drafters ATOM maps (#3984).
+`DeepseekV4MTPModel._head_input`). Qwen3.5's and Qwen3-Next's all-gather
+their `fc`'s output over the TP group. MiMo-V2's MTP block attends a sliding
+window, priced over it as the target's windowed layers are. Where a
+data-parallel group shards a draft's argmax (`ATOM_DP_DRAFT_ARGMAX`, a head
+at TP 1, its vocabulary split evenly), its LM head carries the group's width
+and the most rows it shards (`ParallelLMHead._can_use_dp_sharded_argmax`).
+An Eagle3 drafter is not built, and a step under one prices no draft
+(#3962), nor are GLM-5-Next's and Qwen4-Exp's MTP drafters, whose sparse
+attention no roofline class prices (#3984).
 
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
@@ -201,10 +204,16 @@ SERIAL = (
     "atom.models.qwen3_5_mtp.Qwen3_5MTP",
     "atom.models.deepseek_mtp.DeepSeekMTP",
     "atom.models.deepseek_v4_mtp.DeepseekV4MTP",
+    "atom.models.qwen3_next_mtp.Qwen3NextMTP",
+    "atom.models.mimo_v2_mtp.MiMoV2MTP",
 )
-#: V4's MTP block and Qwen3.5's MTP layer, read apart (`walk`).
+#: V4's MTP block, read apart (`walk`), and the MTP layers that all-gather
+#: their `fc`'s output: Qwen3.5's and Qwen3-Next's.
 V4_MTP_BLOCK = "atom.models.deepseek_v4_mtp.MTPBlock"
-QWEN35_MTP = "atom.models.qwen3_5_mtp.Qwen3_5MultiTokenPredictor"
+GATHERED_FC = (
+    "atom.models.qwen3_5_mtp.Qwen3_5MultiTokenPredictor",
+    "atom.models.qwen3_next_mtp.Qwen3NextMultiTokenPredictor",
+)
 #: V4.1's rotary tables, read inside its attention and index kernels, its
 #: vision tower, the runtime's compiled stages, and DSpark's Markov tables,
 #: priced at the drafter's root.
@@ -521,7 +530,7 @@ def _classify(module, name, parent):
         dims = (weight.shape[0], _in_width(module))
         if _is(parent, V4_MTP_BLOCK) and module is parent.h_proj:
             dims += (parent.hc_mult,)  # each residual copy of each token
-        if gathers := _is(parent, QWEN35_MTP) and module is parent.fc:
+        if gathers := _is(parent, *GATHERED_FC) and module is parent.fc:
             ranks = module.tp_size
         return Module(name, "gemm", dims, fmt, ranks, act=act, gathers=gathers)
     if _is(module, *NORMS):
