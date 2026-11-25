@@ -651,7 +651,7 @@ class _Listed(CostSource):
         self.method = method
 
     def price(self, request):
-        context = request[1][-2]
+        context = request[1][4]
         how = self.method(context)
         said = Provenance(how, note="stated" if how is Method.DECLARED else "")
         return CostTerm(f"op.{request[0]['op']}", 0.02 + 1e-7 * context, said)
