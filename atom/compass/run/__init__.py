@@ -84,8 +84,8 @@ priced by `StepLinearBackend`; its ``platform``, the platform fields of its key,
 and its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, a run whose ladder is a prefix of the law's read at the law's, and a
 law missing either refuses; a runner that records prefill token-graph buckets
-refuses a law whose prefill vector, or else engine config, states none or others
-(`refuse_other_buckets`); a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
+refuses a law whose prefill vector, or else engine config, states none or others, and keeps
+one with no prefill vector, which prices no prefill step (`refuse_other_buckets`); a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
 holds at its shape and output, traced under this process's torch, each file it
@@ -595,8 +595,13 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     between a fit and a run, so one stating none says nothing of them; one
     stating them states ATOM's list, which a runner records only up to
     `warmup_max_tokens`, a bound no engine config keys, so a prefill vector's
-    are held to `buckets` either way. Host laws refuse where their key's graph
-    sets state others; `run` replaces `spec()`."""
+    are held to `buckets` either way. A law with no prefill vector is kept:
+    the buckets pad prefill steps alone, and it prices none (`StepLinearBackend`
+    refuses each where it meets one), so no bucket set misprices a step of
+    it. A prefill-decode deployment's decode side fits one: its records run no
+    prefill step a client run times, yet its runner records ATOM's buckets up
+    to its batch budget (#3720 cell B, 1P1D: [256, 512, 1024] on D). Host laws
+    refuse where their key's graph sets state others; `run` replaces `spec()`."""
     if not buckets or (run := spec() if run is None else run) is None:
         return
     from atom.compass.backends import launch_features
@@ -614,7 +619,9 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
         return
     pick_fitted(run, STEP_LINEAR, config)
     law = run[STEP_LINEAR]
-    stated = sorted((law.get("prefill") or {}).get("buckets") or ())
+    if not law.get("prefill"):
+        return
+    stated = sorted(law["prefill"].get("buckets") or ())
     env = law["engine_config"]["env"]
     if (stated or BUCKETS not in env) and stated != list(buckets):
         said = f"{BUCKETS}={env[BUCKETS]}" if BUCKETS in env else f"no {BUCKETS}"

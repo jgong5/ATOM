@@ -5,7 +5,9 @@ law to them as it states them at capture. A law's engine config states
 former default and held in a store keys as a run at today's does; it states the
 buckets in neither its engine config nor its prefill vector, installs, and is
 refused at capture. A law whose prefill vector states the buckets this runner
-records runs, one stating others is refused, those its records' runner
+records runs, one stating others is refused, and one with no prefill vector, a
+prefill-decode deployment's decode side's, runs whatever this runner records,
+pricing no prefill step; those its records' runner
 recorded at another batch budget too, which caps them and keys no law; an
 engine config stating them is held to the run's at install, a prefill vector
 beside it still to this runner's at capture, and a runner that records none
@@ -25,7 +27,8 @@ from test_run_step_grid import deployment
 from test_step_linear_token_padding import PADDED
 
 from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
-from atom.compass.backends import StepLinearBackend
+from atom.compass.backends import CostRefused, StepLinearBackend
+from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.run.step_grid import keyed
 from atom.utils.graph_holders import release_registered_graphs
 
@@ -58,11 +61,14 @@ def recording(tmp_path, token_graphs=True, decode_only=False, **config):
     return r
 
 
-def law_file(tmp_path, r, buckets=None):
+def law_file(tmp_path, r, buckets=None, prefill=True):
     """A law file fitted under `r`'s engine config, its prefill vector padded
-    to `buckets` when given, else with no padding and no buckets."""
+    to `buckets` when given, else with no padding and no buckets; with no
+    prefill vector unless `prefill`."""
     stated = law()
-    if buckets is not None:
+    if not prefill:
+        del stated["prefill"]
+    elif buckets is not None:
         hull = {"equal": dict.fromkeys(list(PADDED)[1:], 0), "facets": []}
         stated["prefill"] = {"coefficients": PADDED, "hull": hull, "buckets": buckets}
     path = tmp_path / "law.json"
@@ -122,6 +128,46 @@ def test_an_engine_config_stating_the_buckets_holds_the_law_to_them(
 
     assert r.capture_cudagraph() == (0.0, [], 0)
     assert run["step_linear"]["engine_config"]["env"] == {BUCKETS: FORMER}
+
+
+@pytest.mark.parametrize(
+    "prefill, buckets, budget",
+    [
+        (False, None, 8192),
+        (False, None, 1024),
+        (True, None, 8192),
+        (True, RECORDED[:3], 8192),
+    ],
+    ids=[
+        "no-prefill-vector",
+        "no-prefill-vector-1024",
+        "prefill-states-none",
+        "prefill-states-others",
+    ],
+)
+def test_a_law_with_no_prefill_vector_runs_where_a_prefill_law_stating_none_or_others_is_refused(
+    monkeypatch, tmp_path, prefill, buckets, budget
+):
+    """A prefill-decode deployment's decode-side law has no prefill vector: its
+    records run no prefill step a client run times, yet their runner records
+    ATOM's buckets up to its batch budget (#3720 cell B, D at 1024: [256, 512,
+    1024]). It prices no prefill step, refusing each where it meets one, so a
+    runner keeps it whatever it records, and still refuses a law whose prefill
+    vector states none or others."""
+    r = recording(tmp_path, max_num_batched_tokens=budget)
+    run = build(tmp_path, "--step-linear", law_file(tmp_path, r, buckets, prefill))
+    install(tmp_path, monkeypatch, run, r)
+
+    if prefill:
+        with pytest.raises(ValueError, match=REFUSED) as e:
+            r.capture_cudagraph()
+        assert f"and {buckets or 'none'} as its prefill vector's buckets" in str(
+            e.value
+        )
+        return
+    assert r.capture_cudagraph() == (0.0, [], 0)
+    with pytest.raises(CostRefused):
+        r.compass_backend.price(BatchView((RequestShape(40, 40, False),)))
 
 
 @pytest.mark.parametrize(
