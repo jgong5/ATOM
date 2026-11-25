@@ -121,6 +121,10 @@ clock calls and reports them with its next one, a DP member at its settle,
 `ClockAuthority`; the sends are the same, and so is the step table but for an
 own step walking an arrival on an offering channel: one ``TAR`` row where a
 run with ``false`` records ``ARRIVAL`` and ``TAR``),
+``wide_local_grants`` (optional, ``false``, the default, or ``true``, which
+needs local grants: a ceiling's cycle term counts only the LPs that can react
+to the LP's sends before their own next grant, and a TAR's grant sends the
+messages below its ceiling ahead, `ClockAuthority`'s ``wide_ceilings``),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -377,6 +381,8 @@ INSTANCE_KEY = "compass_instance"
 WORKER_ORDER = "worker_order"
 #: The run-file key that gives grants their ceilings.
 LOCAL_GRANTS = "local_grants"
+#: The run-file key that widens those ceilings.
+WIDE_LOCAL_GRANTS = "wide_local_grants"
 ATOM_RUNNER = "atom.model_engine.model_runner.ModelRunner"
 RAPIDSERVE_RUNNER = "atom.model_engine.model_runner.RapidServeModelRunner"
 #: The run-file key that says the deployment runs RapidServe.
@@ -393,6 +399,7 @@ PER_RUN = (
     "store",
     WORKER_ORDER,
     LOCAL_GRANTS,
+    WIDE_LOCAL_GRANTS,
 )
 LP_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
     "lp-{}.json",  # by LP name, or <lp>.<member> for a member
@@ -1603,11 +1610,12 @@ class _RecordingAuthority(ClockAuthority):
         table = channel_table(run)
         count = run.get("client_runs", 1)
         local = run.get(LOCAL_GRANTS, True)
-        if not isinstance(local, bool):
-            raise TypeError(
-                f"the run file's {LOCAL_GRANTS} is {local!r}; it is true, which "
-                "gives grants their ceilings, or false"
-            )
+        wide = run.get(WIDE_LOCAL_GRANTS, False)
+        for key, value in ((LOCAL_GRANTS, local), (WIDE_LOCAL_GRANTS, wide)):
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"the run file's {key} is {value!r}; it is true or false"
+                )
         super().__init__(
             table,
             timeline=self,
@@ -1616,6 +1624,7 @@ class _RecordingAuthority(ClockAuthority):
             client=TRAFFIC,
             client_runs=math.inf if count is None else count,
             ceilings=local,
+            wide_ceilings=wide,
         )
 
     def record(self, lp, time_from, time_to, kind, recovered, released=(), *_):

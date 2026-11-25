@@ -32,6 +32,10 @@ D3 grants a TAR an arrival on an offering channel first, and I4 lets a handler o
 answers a put of a key in flight as Mooncake does; the allocator flags are accepted, not
 modelled.
 
+**Revised 2026-11-25 by [#3968](https://github.com/jgong5/ATOM/issues/3968):** D3's wide
+local grants, behind a flag, count in a ceiling's cycle only the LPs that can react before
+their own next grant, and send a TAR's messages below its ceiling ahead.
+
 **Revised 2026-11-25 by [#4135](https://github.com/jgong5/ATOM/issues/4135):** D3.6 lets an
 LP declare which outbound channels a message can provoke, so LBTS and the local-grant
 cycle follow the router's declared reactions; not built.
@@ -723,6 +727,41 @@ waits for no reply. Until it has, the LP's `N` is no later than that member's cl
 its sends are stamped there and not yet logged. No step is replayed, since each round was
 granted, and a request from such a member that does not report exactly those rounds
 aborts the run.
+
+**Wide local grants** (off by default, `compass run --wide-local-grants` turns them on,
+with local grants;
+[#3968](https://github.com/jgong5/ATOM/issues/3968)). Two changes raise a ceiling:
+
+- **The cycle term counts only the LPs that can react.** It is the least, over each
+  channel `c` out of `i` to an LP `j` that is running, waits in NER, or is reached on an
+  offering channel, of `L(c) + D(j->i)`; with every LP able to react, it is the static
+  cycle. A message `i` sends on a channel that is not offering to `j` waiting in
+  `TAR(T_j)` provokes nothing from `j` before `j`'s next grant: `j`'s owner is inside its
+  call (I1), and its handlers send nothing (I4). That grant is at `N[j]` or later, and
+  what `j` then sends reaches `i` at or past `N[j] + D(j->i)`, at least `LBTS(i)`, unless
+  an arrival on an offering channel lowers `N[j]` first. Such an arrival ends a chain of
+  sends. A chain starting at another LP's own event, or at a message already registered,
+  lands at or past `LBTS(i)`. A chain starting at a send of `i`'s after its grant `G`, over
+  a channel `c` to an LP `k`, lands back at `i` at or past `G + L(c) + D(k->i)` when `k`
+  can react, a term the cycle counts, `j` reached on an offering channel included; when
+  `k` waits in TAR on a channel that is not offering, this argument bounds it by
+  `LBTS(i)` in turn. Every return through `j` therefore lands at or past the ceiling. An
+  LP with members counts as unable to react only while it waits in TAR as a whole, every
+  member in the round. The decode frontends of the 8P16D C1228 cell are the case: the
+  static cycle runs through each one's engine and caps each grant near one SSE event's
+  charge ([#3968](https://github.com/jgong5/ATOM/issues/3968), from
+  [#4029](https://github.com/jgong5/ATOM/issues/4029)'s ranking).
+- **A grant answering a TAR sends every message below its ceiling ahead**, as one
+  answering an NER that asks for them does, so the next message to arrive no longer caps
+  a TAR's ceiling. The owner releases each in the own step that reaches it
+  (`LPRuntime._own_step`), and a frontend's event loop, which asks its NER without
+  waiting on the reply, walks messages sent ahead by its own NER step instead
+  (`compass_loop.py::CompassSelector.select`). A grant that sends messages ahead has its
+  ceiling at or below the LP's earliest unreleased arrival on an offering channel, so no
+  such message goes ahead: a TAR past a message sent ahead is granted its target, and an
+  arrival there would have its offered sends registered only at the LP's next call,
+  after other LPs may have moved past them. The TAR is granted that arrival first, as
+  without a ceiling, and the step table is that of a run without local grants.
 
 #### Invariants
 
@@ -3700,7 +3739,7 @@ Ordered by how much they could cost.
 | D0 | Fresh design; prior branches referenced at the design level only, not as a code-port plan | 2026-09-17 |
 | D1 | Keep ATOM's multi-process / multi-thread topology; additive changes only | 2026-09-17 |
 | D2 | "Two nodes" means true PD disaggregation, realised as two containers on one physical node | 2026-09-17 |
-| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP a round only after every rank has asked it or, under local grants below a ceiling, owes it; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a TAR holding an arrival on an offering channel is granted that arrival first, so the clock owner makes the send a handler offered at its message's arrival; a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares | 2026-09-18; revised 2026-09-28, 2026-10-02, 2026-10-14 (#966), 2026-11-08 (#2820), 2026-11-09 (#2993) and 2026-11-20 (#3767) |
+| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP a round only after every rank has asked it or, under local grants below a ceiling, owes it; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a TAR holding an arrival on an offering channel is granted that arrival first, so the clock owner makes the send a handler offered at its message's arrival; a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares; under wide local grants a ceiling's cycle counts only the LPs that can react, and a TAR's grant sends its messages below the ceiling ahead | 2026-09-18; revised 2026-09-28, 2026-10-02, 2026-10-14 (#966), 2026-11-08 (#2820), 2026-11-09 (#2993), 2026-11-20 (#3767) and 2026-11-25 (#3968) |
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
 | D3.2 | Always-on causality detectors: a straggler check against the receiver's last drain (fails the run); a stall the CA cannot see prints one diagnostic after 30 wall seconds and keeps waiting, never aborting; clock-source CI lint | 2026-09-19; revised 2026-09-28 |
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for multi-container runs (1P+1D in M1 and M2) | 2026-09-19 |
