@@ -139,6 +139,15 @@ def _every(cost: StepCost) -> tuple[CostTerm, ...]:
     return _checked((*cost.terms, *cost.draft_terms))
 
 
+def _by_method(every: Sequence[CostTerm]) -> dict[tuple[Method, bool], float]:
+    """`every`'s seconds by (method, validated), each group folded in order."""
+    grouped: dict[tuple[Method, bool], list[float]] = {}
+    for term in every:
+        key = (term.provenance.method, term.provenance.validated)
+        grouped.setdefault(key, []).append(term.seconds)
+    return {key: fold_seconds(vals) for key, vals in grouped.items()}
+
+
 @dataclass(frozen=True)
 class StepCost:
     """What one step costs, and what that cost is made of.
@@ -243,11 +252,7 @@ class StepCost:
         reporting how the time was obtained. `rows()` is the view that
         re-folds to the total, and is what a reader checks a total against.
         """
-        grouped: dict[tuple[Method, bool], list[float]] = {}
-        for term in _every(self):
-            key = (term.provenance.method, term.provenance.validated)
-            grouped.setdefault(key, []).append(term.seconds)
-        return {key: fold_seconds(vals) for key, vals in grouped.items()}
+        return _by_method(_every(self))
 
     def rows(self) -> tuple[tuple[str, float, str], ...]:
         """The breakdown as an artifact writes it: name, seconds, provenance."""
@@ -347,21 +352,26 @@ class ProvenanceMix:
         self.treatments: Counter[str] = Counter()
 
     def record(self, step: StepCost) -> None:
+        # One check of the breakdown; each reading below is the one `step`'s
+        # reader of that name folds from it.
+        every = _every(step)
         self.steps += 1
         self.treatments.update(step.treatments)
-        self.seconds = fold_step(self.seconds, step.seconds)
-        self.extrapolated_steps += any(t.provenance.extrapolated for t in _every(step))
-        if step.fell_back:
+        self.seconds = fold_step(self.seconds, fold_seconds(t.seconds for t in every))
+        self.extrapolated_steps += any(t.provenance.extrapolated for t in every)
+        fell = [t for t in every if t.provenance.fell_through]
+        if fell:
             self.fallback_steps += 1
             self.fallback_seconds = fold_step(
-                self.fallback_seconds, step.fallback_seconds
+                self.fallback_seconds, fold_seconds(t.seconds for t in fell)
             )
-        for key, seconds in step.seconds_by_method().items():
+        for key, seconds in _by_method(every).items():
             self._method_seconds[key] = fold_step(
                 self._method_seconds.get(key, 0.0), seconds
             )
             self._method_steps[key] = self._method_steps.get(key, 0) + 1
-        for key in dict.fromkeys((r.source, r.reason) for r in step.refusals):
+        refusals = (r for term in every for r in term.refusals)
+        for key in dict.fromkeys((r.source, r.reason) for r in refusals):
             self._reasons[key] = self._reasons.get(key, 0) + 1
 
     @property
