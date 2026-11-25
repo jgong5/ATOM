@@ -22,7 +22,7 @@ import pytest
 import torch
 from test_backend_step_roofline_v4 import BOUND, EP_OFF, LINK, _module, _price, view
 
-from atom.compass.backends import BatchView, CostRefused, RequestShape
+from atom.compass.backends import BatchView, RequestShape
 from atom.compass.backends.step_roofline import Module, StepRooflineBackend
 from atom.compass.backends.work import (
     Work,
@@ -336,12 +336,18 @@ WINDOWED = {
 }
 
 
-def test_a_windowed_attention_layer_refuses_every_step_naming_it():
+@pytest.mark.parametrize("unified,whole", [("0", 1), ("1", 0)])
+def test_a_windowed_attention_layer_carries_its_window_and_prices_every_step(
+    monkeypatch, unified, whole
+):
+    # Its prefill reads only its window's keys through unified attention.
+    monkeypatch.setenv("ATOM_USE_UNIFIED_ATTN", unified)
     modules = _build("tp1", WINDOWED)
-    attention = [m.layer for m in modules if m.kind == "attention"]
+    attention = [(m.layer, m.dims) for m in modules if m.kind == "attention"]
 
-    assert attention == [0]
-    with pytest.raises(CostRefused, match=r"Attention at model\.layers\.1\.self_attn"):
-        StepRooflineBackend(
-            MachineSpec.from_mapping(json.loads(MI355X.read_text())), modules
-        ).price(view((1, 64, True)))
+    assert attention == [(0, (4, 2, 64)), (1, (4, 2, 64, 128, whole))]
+    assert not [m for m in modules if m.kind == "unclassified"]
+    cost = StepRooflineBackend(
+        MachineSpec.from_mapping(json.loads(MI355X.read_text())), modules
+    ).price(view((1, 64, True)))
+    assert cost.seconds > 0
