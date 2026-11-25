@@ -403,6 +403,7 @@ def prefill_decode_table(
     decode: int = 1,
     prefill_pp: int = 1,
     pp_links=(),
+    chunked: bool = False,
 ) -> ChannelTable:
     """`prefill` prefill and `decode` decode deployments behind the router,
     each with the channels of its data-parallel ranks: `dp` of them on each
@@ -430,6 +431,11 @@ def prefill_decode_table(
     Above `prefill_pp` one, each prefill deployment ``P`` is the pipeline
     ``engine-P-pp<k>`` (`_pipeline`, with `pp_links`), and decode writes to its
     head, ``engine-P-pp0``. A pipeline runs at DP width one.
+
+    With `chunked`, Mooncake's chunked transfer: prefill tells decode its write
+    is done on ``kv_write_done`` (prefill engine to decode engine, a channel per
+    rank pair as ``kv_write_req``, ``#dp<prefill rank>.dp<decode rank>``, at
+    the write request's lookahead), as no relay carries prefill's finish there.
 
     A prefill deployment's ZMQ messages each take `ipc_s`, but an engine's
     output to its frontend, which takes `ipc_out_s` (`ipc_s` when None); a
@@ -490,6 +496,8 @@ def prefill_decode_table(
         )
     pairs = [f"#dp{d}.dp{p}" for d in range(dp_d) for p in range(dp_p)]
     pairs = [""] if pairs == ["#dp0.dp0"] else pairs
+    done = [f"#dp{p}.dp{d}" for p in range(dp_p) for d in range(dp_d)]
+    done = [""] if done == ["#dp0.dp0"] else done
     return _table(
         lps,
         [*hops]
@@ -504,6 +512,18 @@ def prefill_decode_table(
             for d in ds
             for p in ps
             for pair in pairs
+        ]
+        + [
+            (
+                engines[p][0],
+                f"engine-{d}",
+                "kv_write_done" + pair,
+                kv_write_req_s,
+                "inline",
+            )
+            for p in ps
+            for d in ds
+            for pair in (done if chunked else ())
         ]
         + rows,
     )
