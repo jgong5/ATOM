@@ -1322,8 +1322,9 @@ def publish_planned_transfer(runner: Any) -> None:
     """Publish one entry of the paged class `get_num_blocks` planned, the state
     slot a transfer moves beside a request's blocks (`_transferred_slot`),
     the staging row a second write moves after them (`_staging_row_bytes`),
-    the state image an lmcache save carries (`_saved_image_bytes`) and the
-    runner's TP width, at the file `compass_block_file` names, which
+    the state image an lmcache save carries (`_saved_image_bytes`), the
+    runner's TP width and the width its attention splits KV heads over, at
+    the file `compass_block_file` names, which
     `run.runner` gives TP rank 0 of a prefill-decode deployment and of one that
     offloads to an lmcache server: its connector prices a transfer at them, and
     LP lmcache sizes a chunk and an image. A prefill-decode deployment is
@@ -1344,7 +1345,10 @@ def publish_planned_transfer(runner: Any) -> None:
         staging = _staging_row_bytes(runner)
         block = plan.entry_bytes[plan.paged_class]
         image = _saved_image_bytes(runner)
-        run.publish_transfer(path, block, tp, slot, staging, after_blocks, image)
+        heads = 1 if runner.config.enable_dp_attention else tp
+        run.publish_transfer(
+            path, block, tp, slot, staging, after_blocks, image, heads_tp=heads
+        )
 
 
 def _saved_image_bytes(runner: Any) -> int:

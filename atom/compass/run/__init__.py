@@ -1212,14 +1212,18 @@ def publish_transfer(
     staging_bytes: int = 0,
     slot_after_blocks: bool = False,
     image_bytes: int = 0,
+    heads_tp: int | None = None,
 ) -> None:
     """Write one paged KV block's bytes, the state slot a transfer moves beside
     a request's blocks, or after them, the staging row it moves in a second
     write, and the state image an lmcache save carries, as a runner at TP `tp`
-    planned them, where `_planned_transfer` and `_lmcache_plan` read them."""
+    planned them, where `_planned_transfer` and `_lmcache_plan` read them.
+    `heads_tp`, `tp` when None, is the width its attention splits KV heads
+    over: 1 under DP attention."""
     planned = {
         "block_bytes": int(block_bytes),
         "tp": tp,
+        "heads_tp": tp if heads_tp is None else int(heads_tp),
         "slot_bytes": int(slot_bytes),
         "staging_bytes": int(staging_bytes),
         "slot_after_blocks": bool(slot_after_blocks),
@@ -1245,6 +1249,33 @@ def _published_plans(run: dict, names: list[str]) -> dict:
     return {n: json.loads(f.read_text()) for n, f in files.items()}
 
 
+def _head_cut(planned: dict, prefill: list[str]) -> dict:
+    """By decode deployment member whose KV heads Mooncake cuts out of a TP1
+    prefill's (`MooncakeConnectorWorker._unit_plan`), what its ``h`` heads-TP
+    ranks receive a block between them: each its own planned block, its heads
+    of each region split by head and the whole of every other. So its block
+    is at least the prefill's ``1/h`` (every region split) and short of all
+    of it (none split), and it moves no state slot or staging row, which no
+    head cut carries."""
+    sides = [s for u in prefill for s in planned[u].values()]
+    whole = sum(s["block_bytes"] for s in planned[prefill[0]].values())
+    if any(s.get("heads_tp", s["tp"]) != 1 for s in sides) or any(
+        s["slot_bytes"] or s["staging_bytes"] for s in sides
+    ):
+        return {}
+    out = {}
+    for u, stages in planned.items():
+        if u in prefill or len(stages) != 1:
+            continue
+        (s,) = stages.values()
+        heads = s.get("heads_tp", s["tp"])
+        block = s["block_bytes"]
+        moves_state = s["slot_bytes"] or s["staging_bytes"]
+        if heads > 1 and whole <= heads * block < heads * whole and not moves_state:
+            out[u] = heads * block
+    return out
+
+
 def _planned_transfer() -> tuple:
     """One transfer model per prefill stage, each pricing the block, the state
     slot and the staging row that stage's runner planned, once every engine of
@@ -1253,7 +1284,12 @@ def _planned_transfer() -> tuple:
 
     Refused unless every deployment plans one block, one slot and one row,
     each summed over its stages, and every prefill deployment splits them
-    alike: both ends of a write price it, each from its own copy."""
+    alike: both ends of a write price it, each from its own copy. The one
+    exception is Mooncake's head cut (`_head_cut`): a TP1 prefill writes each
+    decode TP rank its own KV heads and a whole copy of every region not split
+    by head, so a decode at heads TP ``h`` plans a block between the prefill's
+    ``1/h`` and all of it, and the ``h`` ranks receive ``h`` of its blocks,
+    which the stages' writes carry in proportion to their blocks."""
     from atom.compass.kv import Scope, TransferModel
 
     run = spec()
@@ -1269,6 +1305,7 @@ def _planned_transfer() -> tuple:
         stages = planned.setdefault(deployment + dot + member, {})
         stages[int(stage or 0)] = published
     prefill = [u for u in planned if u.startswith(f"{ENGINE.name}-P")]
+    received = _head_cut(planned, prefill)
     for key, what in (
         ("block_bytes", "KV block"),
         ("slot_bytes", "state slot"),
@@ -1277,6 +1314,8 @@ def _planned_transfer() -> tuple:
         sizes = {u: [s[k][key] for k in sorted(s)] for u, s in planned.items()}
         first = sizes[prefill[0]]
         for u, b in sizes.items():
+            if key == "block_bytes" and u in received:
+                continue
             if b != first if u in prefill else sum(b) != sum(first):
                 (a, x), (c, y) = (
                     (f"{v} at TP {planned[v][0]['tp']}", " + ".join(map(str, sizes[v])))
@@ -1289,10 +1328,22 @@ def _planned_transfer() -> tuple:
                 )
     machine, scope = _machine(run), Scope(run["kv_link"])
     stages = planned[prefill[0]]
+    whole = sum(s["block_bytes"] for s in stages.values())
+    wire = {received.get(u, whole) for u in planned if u not in prefill}
+    if len(wire) > 1:
+        raise ValueError(
+            f"the decode deployments receive {' and '.join(map(str, sorted(wire)))} "
+            "B a block between their ranks: one prefill write prices one"
+        )
+    wire = wire.pop()
     return tuple(
         TransferModel.from_spec(
             machine,
-            s["block_bytes"],
+            # Under a head cut each stage's write carries its block's share of
+            # what the decode ranks receive (`_head_cut`): a stage whose split
+            # and whole regions stand in another ratio than the others' is
+            # priced at the mean. Its whole block otherwise.
+            s["block_bytes"] * wire // whole,
             scope,
             s["slot_bytes"],
             s["staging_bytes"],
