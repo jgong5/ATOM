@@ -125,18 +125,20 @@ OUTBOUND = {"engine-P: request -> output": OUT, "frontend-P: http -> request": I
 E2D, FWD, OR, FD, HR = (min(d[n]) for n in ("E2D: prefill pull -> decode request", "engine-P: request -> output",
                                             "frontend-P: output -> relay", "frontend-D: relay -> request",
                                             "frontend-P: http -> request"))
-STORE_RPC = run["mooncake_store"]["lookup_s"][0] / 2  # each Store hop's lookahead (mooncake_store_server.store_rpc_s)
 FIN = min(e - b for m in steps for b, e, fin in m if fin)  # the least step that outputs a finished prefill
 NEW = IPC_P + FWD - OUT + E2D  # a new request, sent by a frontend-P at p, to engine-D
 TRAFFIC = R_IN + HTTP_OUT + HR + FWD - OUT + E2D  # traffic's own event at p, or a stream it answers, to engine-D
-VARIANTS = [("1. each LP's least delay per inbound and outbound channel", math.inf, False),
-            ("2. as 1, and each prefill step declares whether its pull outputs a finished prefill", math.inf, True),
-            ("as 1 (a rejection leaves at any schedule), and a rejected prefill may output at its arrival",
-             R_IN + HTTP_OUT + HR + E2D, False),
-            ("as 2, but engine-P declares one delay, which its offered Store lookup makes 0", STORE_RPC + E2D, True),
-            ("as 2, but a stream may provoke a cancel", R_S + IPC_D, True),
-            ("as 2, but frontend-D's relayed handlers never report", IPC_D, True),
-            ("any lead: every round covered", None, True)]
+AT_ONCE = IPC_P + E2D  # a request a frontend-P sends at p, were engine-P to output at its arrival
+VARIANTS = [  # (declarations, cap on the lead, per-step outcome; or None and the LPs whose every grant wait is freed)
+    ("1. each LP's least delay per inbound and outbound channel", math.inf, False),
+    ("2. as 1, and each prefill step declares whether its pull outputs a finished prefill", math.inf, True),
+    ("as 1 (a rejection leaves at any schedule), and a rejected prefill may output at its arrival", AT_ONCE, False),
+    ("as 2, but engine-P declares one delay, which its offered Store lookup makes 0", AT_ONCE, True),
+    ("as 2, but a stream may provoke a cancel", R_S + IPC_D, True),
+    ("as 2, but frontend-D's relayed handlers never report", IPC_D, True),
+    ("any lead: every engine-D round freed", None, ("engine-D",)),
+    ("every engine-D and engine-P round freed", None, ("engine-D", "engine-P")),
+    ("every LP's grant waits freed", None, ("",))]
 
 # 2. the lead of engine-D<k> at p
 phases = []  # (start, end, decode k or None for every k, term at p, in the handler) of each relay
@@ -145,7 +147,8 @@ for x, ra, k, a in chain:
     phases += [(x, s, None, lambda p, x=x: max(p, x + OUT + OR - R_IN) + R_S + FD, False),  # at frontend-P
                (s, ra, None, lambda p, rd=rd: rd + FD, False),  # to the router, which picks frontend-D<k>
                (ra, rd, k, lambda p, rd=rd: rd + FD, False),  # to frontend-D<k>
-               (rd, a - IPC_D, k, lambda p, rd=rd: max(p, rd + FD - IPC_D) + IPC_D, True)]  # in its handler
+               (rd, a - IPC_D, k, lambda p, rd=rd: max(p, rd + FD - IPC_D) + IPC_D, True),  # in its handler
+               (a - IPC_D, a, k, lambda p, a=a: a, False)]  # the decode request, to engine-D<k>
 phases.sort(key=lambda ph: ph[0])
 pstart, longest = [ph[0] for ph in phases], max(ph[1] - ph[0] for ph in phases)
 starts = [[b for b, _, _ in m] for m in steps]
@@ -203,9 +206,10 @@ ev.sort(key=lambda v: (v[0], v[1]))
 
 
 def replay(cap, outcome):
-    """The window's replayed wall per simulated s, and the engine-D rounds per simulated s freed by their own
-    request instead of another LP's: every round when `cap` is None, else each round the lead covers from the
-    member's last round that waited, where the other LPs stood, so a member never leads further than the lead."""
+    """The window's replayed wall per simulated s, and the rounds per simulated s freed by their own request instead
+    of another LP's: when `cap` is None, every TAR of the LPs `outcome` names; else each engine-D round the lead
+    covers from the member's last round that waited, where the other LPs stood, so a member never leads further
+    than the lead."""
     last_a, pend, synced, trig, end, freed = {}, {}, {}, (t0, t0, ""), t0, 0
     for t, is_a, name, kind, target in ev:
         g = name.split("/")[0]
@@ -213,11 +217,13 @@ def replay(cap, outcome):
             oa, na = last_a.get(name, (t, t))
             nq = na + t - oa
             own = False
-            if g.startswith("engine-D") and kind != "REPORT":
+            if cap is None:
+                own = t >= t0 and kind == "TAR" and g.startswith(outcome)
+            elif g.startswith("engine-D") and kind != "REPORT":
                 at = synced.get(name)
                 if kind != "TAR":  # idle or parked: where the others stand is not known
                     synced[name] = None
-                elif t >= t0 and (cap is None or at is not None and target - at <= lead(at, int(g[8:]), cap, outcome)):
+                elif t >= t0 and at is not None and target - at <= lead(at, int(g[8:]), cap, outcome):
                     own = True
                 else:
                     synced[name] = target
@@ -255,7 +261,7 @@ for label, v in (("frontend-D's relayed handler, until it sends", IPC_D), ("a re
                  ("a relay at the router", RELAY_OUT + FD), ("a prefill output at frontend-P", OR + RELAY_OUT + FD),
                  ("a prefill engine's pull (E2D)", E2D), ("a new request at a prefill engine", FWD - OUT + E2D),
                  ("traffic's next request", TRAFFIC), ("traffic's cancel, at its own timed event", R_S + IPC_D),
-                 ("a Store reply, were engine-P to output at once", STORE_RPC + E2D)):
+                 ("a request from frontend-P, were engine-P to output at its arrival", AT_ONCE)):
     print(f"| {label} | {1e3 * v:.3f} |")
 print("\n| declarations | engine-D rounds covered | forward rounds (over 5 ms) covered | lead at a forward round's "
       "start, p10 / median, ms | rounds freed from another LP in the replay, per simulated s | replayed wall s per "
@@ -275,6 +281,14 @@ for label, cap, outcome in VARIANTS:
     lq = " / ".join("-" if math.isinf(v) else f"{1e3 * v:.2f}" for v in q)
     wall, freed = replay(cap, outcome)
     print(f"| {label} | {100 * n[1] / n[0]:.1f}% | {100 * n[3] / max(n[2], 1):.1f}% | {lq} | {freed:,.0f} | {wall:.2f} |")
+traffic, last = 0.0, None  # traffic's own work and transport: from each reply to its next request
+for t, is_a, name, kind, _ in ev:
+    if name == "traffic":
+        if not is_a and last is not None and t > t0:
+            traffic += t - max(last, t0)
+        last = t if is_a or kind == "REPORT" else None
+print(f"\nTraffic's own work and transport alone, which no grant rule frees: {traffic / duration:.2f} wall s per "
+      "simulated s.")
 forward = [(b, k) for k, v in rounds.items() for b, e in v if w0 <= b < w1 and e - b > 5e-3]
 print(f"\nForward rounds that start while frontend-D<k> holds a relay in its handler: "
       f"{100 * sum(any(ph[4] for ph in relays(b, k)) for b, k in forward) / len(forward):.1f}%.")
