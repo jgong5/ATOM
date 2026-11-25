@@ -234,7 +234,9 @@ column `gather_pad_rows` in its place, the gather's pad rows alone, and
 (`GRAPH_TOKENS_ENV`, `GRAPH_QUERY_CACHED_ENV`); `moe_select` ``insample`` makes each
 target decode rung adopt the MoE column its fit on all its steps prices nearest
 (`_moe_column`, `MOE_SELECT_ENV`), and ``fallback`` only each rung its records
-cannot hold out, which adopts none under the default rule; `peer_tokens` adds that decode column, after
+cannot hold out, which adopts none under the default rule; `moe_both` adds to
+the forms each target decode rung picks among the one carrying both
+`MOE_COLUMNS`, `MOE_BOTH` (`_moe_column`, `MOE_BOTH_ENV`); `peer_tokens` adds that decode column, after
 the MoE column, to the rungs it names or, as ``saturated``, to each rung whose
 adopted `moe_experts` column its median step holds at `SATURATED` of the
 experts (`_peer_rung`, `PEER_TOKENS_ENV`); `draft_peer_tokens` adds it to the
@@ -424,6 +426,15 @@ MOE_MIN_SPREAD = 0.2
 #: the first when unset.
 MOE_SELECT_ENV = "COMPASS_FIT_MOE_SELECT"
 MOE_SELECTS = ("held_out", "insample", "fallback")
+#: Whether a target decode rung may also pick the form carrying both
+#: `MOE_COLUMNS`, named `MOE_BOTH` (`_moe_column`): ``1`` on.
+MOE_BOTH_ENV = "COMPASS_FIT_MOE_BOTH"
+MOE_BOTH = "moe_tokens+moe_experts"
+#: The largest variance inflation factor `MOE_BOTH`'s two columns may take over
+#: a rung's fitted steps for the rung to pick among it: a calibration design's
+#: acceptance bound (`calib.deploy`'s default). Past it, at a rung whose steps
+#: all reach nearly every expert, `moe_experts` is the intercept again.
+MOE_BOTH_VIF = 10.0
 #: The decode rungs that add `peer_tokens` (`_peer_rung`): ``1`` for each
 #: rung whose `moe_experts` column is `SATURATED`, else the rungs, comma separated.
 PEER_TOKENS_ENV = "COMPASS_FIT_PEER_TOKENS"
@@ -703,6 +714,8 @@ def env_options(environ=None) -> dict:
         if select not in MOE_SELECTS:
             raise ValueError(f"{MOE_SELECT_ENV}={select} is not one of {MOE_SELECTS}")
         out["moe_select"] = select
+    if _switch(env, MOE_BOTH_ENV):
+        out["moe_both"] = True
     if peers := env.get(PEER_TOKENS_ENV):
         out["peer_tokens"] = (
             "saturated" if peers == "1" else tuple(int(r) for r in peers.split(","))
@@ -2227,7 +2240,9 @@ def _held_out_error(folds: dict) -> float | None:
     return sum(n * abs(p) for n, p in folds.values()) / rows if rows else None
 
 
-def _moe_column(steps, routing, base=DECODE, select: str = "held_out") -> tuple:
+def _moe_column(
+    steps, routing, base=DECODE, select: str = "held_out", both: bool = False
+) -> tuple:
     """The vector decode rung `steps` adopts with a MoE column, or None, the
     figures the rule read, as the vector records them under `fit.moe_column`,
     and the held-out folds of the form adopted, a column or none (None under
@@ -2247,7 +2262,19 @@ def _moe_column(steps, routing, base=DECODE, select: str = "held_out") -> tuple:
     tokens holds flat, held out nearest by record, 0.25% against
     `moe_tokens`' 0.35%, yet priced the rung's fullest steps 2-5% low out of
     sample, the load the requests making TPOT p90 decode at, where
-    `moe_tokens`' error stays level across the rows). Each record's own p50
+    `moe_tokens`' error stays level across the rows). With `both` the forms
+    add `MOE_BOTH`, the rung's columns with both `MOE_COLUMNS`: the experts'
+    weights each step reads, which `moe_experts` counts and which stop growing
+    once nearly every expert is reached, and the rows the gather and the
+    experts' GEMMs carry, which `moe_tokens` counts and which keep growing
+    (#752 cell A v2, 384 experts top-6 over 4 data-parallel ranks: rung 24
+    adopted `moe_experts`, whose fit dropped as outliers all 21 calibration
+    steps of 400 group tokens or more, 10% slower than it, and priced the c=128
+    target's rung-24 steps, all four ranks busy at 300-560 tokens, 8.6% low;
+    both columns, VIF 3, kept those steps and priced them 0.2% low). The form
+    is a candidate only where both its MoE columns' variance inflation factor
+    over the steps its fit on all of them keeps is `MOE_BOTH_VIF` or less,
+    stated under `both_vif` either way. Each record's own p50
     stays under `folds`, the p50s graded under `bands`, keyed "record:band",
     and the bands' edges under `token_bands`.
     A rung of one record holds out each group composition instead, the steps
@@ -2275,6 +2302,19 @@ def _moe_column(steps, routing, base=DECODE, select: str = "held_out") -> tuple:
     """
     forms = {"none": {"coefficients": list(base)}}
     forms |= {f: {"coefficients": [*base, f]} for f in MOE_COLUMNS}
+    vif = None
+    if both:
+        wide = {"coefficients": [*base, *MOE_COLUMNS]}
+        solved = _fit_vector(steps, wide, routing)
+        points = [
+            _counts(wide, routing, r[2], *r[5:])
+            for r, keep in zip(solved["rows"], solved["keep"])
+            if keep
+        ]
+        vif = _vif(points, wide["coefficients"], list(MOE_COLUMNS))
+        if len(vif) == len(MOE_COLUMNS) and max(vif.values()) <= MOE_BOTH_VIF:
+            forms[MOE_BOTH] = wide
+    columns = [f for f in forms if f != "none"]
     if select not in MOE_SELECTS:
         raise ValueError(f"MoE column rule {select!r} is not one of {MOE_SELECTS}")
     cell, by = np.array([s[0][0] for s in steps]), "record"
@@ -2282,17 +2322,17 @@ def _moe_column(steps, routing, base=DECODE, select: str = "held_out") -> tuple:
         cell, by = np.array([s[0][7] for s in steps]), "group_dummies"
     fallback = select == "fallback" and len(set(cell.tolist())) == 1
     if select == "insample" or fallback:
-        fits = {f: _fit_vector(steps, forms[f], routing) for f in MOE_COLUMNS}
-        error = {f: fits[f]["mad"] for f in MOE_COLUMNS}
+        fits = {f: _fit_vector(steps, forms[f], routing) for f in columns}
+        error = {f: fits[f]["mad"] for f in columns}
         picked = min(error, key=error.get)
         figures = {
             "picked": picked,
             "adopted": picked,
             "selected_by": "insample",
             **({"fallback": by} if fallback else {}),
+            **({"both_vif": vif} if vif is not None else {}),
             "in_sample": {
-                f: {"mad": fits[f]["mad"], "F": fits[f]["passes"]["F"]}
-                for f in MOE_COLUMNS
+                f: {"mad": fits[f]["mad"], "F": fits[f]["passes"]["F"]} for f in columns
             },
         }
         return forms[picked], figures, None
@@ -2308,6 +2348,7 @@ def _moe_column(steps, routing, base=DECODE, select: str = "held_out") -> tuple:
         "picked": picked,
         "adopted": adopted,
         "held_out_by": by,
+        **({"both_vif": vif} if vif is not None else {}),
         "token_bands": edges,
         "held_out": {
             form: {
@@ -2637,6 +2678,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     kda = not draft and _kda(options)
     cols = _columns(options, draft)
     select = (not draft and (options or {}).get("moe_select")) or MOE_SELECTS[0]
+    both = not draft and bool((options or {}).get("moe_both"))
     peers = (options or {}).get("draft_peer_tokens" if draft else "peer_tokens")
     if peers and dp == 1:
         raise ValueError(
@@ -2743,7 +2785,9 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         if key and key.isdigit():
             vector = {"coefficients": names}
             if routing:
-                chosen, figures, folds = _moe_column(steps, routing, names, select)
+                chosen, figures, folds = _moe_column(
+                    steps, routing, names, select, both
+                )
                 if chosen:
                     vector, solved = chosen, _fit_vector(steps, chosen, routing)
             if _peer_rung(steps, int(key), vector, routing, peers):
@@ -2817,7 +2861,9 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                 vector["fit"]["passes"] = solved["passes"]
             if figures:
                 vector["fit"]["moe_column"] = figures
-            if carried := [f for f in OPT_IN if f in features]:
+            carried = [f for f in OPT_IN if f in features]
+            carried += list(MOE_COLUMNS) * set(MOE_COLUMNS).issubset(features)
+            if carried:
                 vector["fit"]["vif"] = _vif(points, list(features), carried)
             if rowmod_k:
                 vector["rowmod"] = rowmod_k
