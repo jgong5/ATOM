@@ -1,0 +1,610 @@
+# SPDX-License-Identifier: MIT
+"""The analytical bound gate: a real run's steps priced at step and op level,
+none above its measured device time.
+
+A step priced above measured fails the gate, named by its costliest term; a
+law seeded to price one op kind above its measured time fails it naming that
+kind. Refusals are counted by reason and make the result a coverage report;
+measured over analytical is reported per phase, and the records are ranked
+by tokens a second. A record or `measure ops` run whose engine file states
+other performance variables than the grading process's is refused, each named.
+"""
+
+import json
+import math
+from types import SimpleNamespace
+
+import platforms
+import pytest
+from test_backend_step_roofline import MACHINE, ROOFLINE, STACK
+from test_op_graph import g
+from test_op_work import leaf, t
+from test_op_work_v4_attention import decode as v4_decode
+from test_work import SPEC
+
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
+from atom.compass.backends import BatchView, RequestShape, op_work
+from atom.compass.backends.cost import CostTerm, StepCost
+from atom.compass.backends.op_graph import DRAFT_KV, OpGraphBackend
+from atom.compass.backends.provenance import Method, Provenance, Refusal
+from atom.compass.backends.step_roofline import CONTEXT, Module, StepRooflineBackend
+from atom.compass.backends.work import Work, price
+from atom.compass.bench.ops import signature
+from atom.compass.run.step_grid import BUCKETS
+from atom.compass.validate import bound
+
+SILU = "aiter.silu_and_mul.default"
+# A decode step at rung 2, a prefill, a mixed step, a DP dummy run, and a
+# DP step of a one-rank group; one second of device time each.
+LINES = [
+    {"rows": [[1, 900, True], [1, 300, True]], "rung": 2},
+    {"rows": [[4096, 4096, False]], "rung": None},
+    {"rows": [[100, 100, False], [1, 50, True]], "rung": None},
+    {"rows": [[1, 9, True]], "rung": None, "is_dummy_run": True},
+    {"rows": [[1, 9, True]], "rung": None, "moe_rows": 8},
+]
+
+
+def record(path, lines=LINES, busy_ns=10**9, rank=0):
+    (path / "steps").mkdir(parents=True, exist_ok=True)
+    body = [
+        {
+            "step": i,
+            "is_dummy_run": False,
+            "produces_output": True,
+            "d_busy_ns": busy_ns,
+            **s,
+        }
+        for i, s in enumerate(lines)
+    ]
+    (path / "steps" / f"dp{rank}.jsonl").write_text(
+        "".join(json.dumps(s) + "\n" for s in body)
+    )
+    return path
+
+
+def graph(*shape):
+    return {
+        "seq": [
+            g(shape[1], 4096, 4096),
+            leaf(SILU, [[shape[1], 4096]], input=t([shape[1], 8192])),
+        ]
+    }
+
+
+BACKENDS = {
+    "step": StepRooflineBackend(MACHINE, STACK),
+    "op": OpGraphBackend(SPEC, graph, kv="bf16"),
+}
+
+
+def test_every_step_under_its_measured_time_passes_with_its_reports(tmp_path):
+    report = bound.gate([record(tmp_path)], BACKENDS)
+
+    for level in ("step", "op"):
+        r = report[level]
+        assert (r["verdict"], r["steps"], r["violations"]) == ("pass", 4, [])
+        assert (r["refused"], r["steps_refused"]) == ({}, 0)
+        assert set(r["measured_over_analytical"]) == {"decode", "prefill", "mixed"}
+        assert all(q["min"] > 1 for q in r["measured_over_analytical"].values())
+    prefill = (RequestShape(4096, 4096, False),)
+    one = BACKENDS["op"].price(BatchView(prefill, produces_output=True))
+    assert report["op"]["measured_over_analytical"]["prefill"][
+        "median"
+    ] == pytest.approx(1 / one.seconds)
+
+
+def test_a_law_pricing_one_op_kind_above_its_measured_time_fails_naming_it(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setitem(op_work.EXTRACTORS, SILU, lambda *a: Work({"bf16": 1e18}))
+
+    r = bound.gate([record(tmp_path)], {"op": BACKENDS["op"]})["op"]
+
+    assert r["verdict"] == "fail"
+    assert [v["named"] for v in r["violations"]] == [f"op.{SILU}"] * 4
+    assert {v["phase"] for v in r["violations"]} == {"decode", "prefill", "mixed"}
+
+
+def test_a_step_level_violation_names_its_module_kind(tmp_path):
+    norm = Module("layers.0.norm", "norm", (10**12,))
+    seeded = StepRooflineBackend(MACHINE, [*STACK, norm])
+
+    r = bound.gate([record(tmp_path)], {"step": seeded})["step"]
+
+    assert r["verdict"] == "fail"
+    assert {v["named"] for v in r["violations"]} == {"roofline.norm"}
+
+
+def test_a_shape_with_no_graph_is_counted_by_its_reason(tmp_path):
+    backend = OpGraphBackend(
+        SPEC, lambda *shape: None if shape[0] == "decode" else graph(*shape), kv="bf16"
+    )
+
+    r = bound.gate([record(tmp_path)], {"op": backend})["op"]
+
+    assert (r["verdict"], r["steps"]) == ("coverage report", 2)
+    assert sum(r["refused"].values()) == 2
+    assert any("no op_graph holds a decode step of 2 tokens" in k for k in r["refused"])
+
+
+def test_records_are_ranked_by_tokens_a_second(tmp_path):
+    slow = record(tmp_path / "slow", LINES[:3], busy_ns=2 * 10**9)
+    fast = record(tmp_path / "fast", LINES[:3], busy_ns=10**9)
+
+    k = bound.gate([slow, fast], {"op": BACKENDS["op"]})["op"]["ranking"]
+
+    # Both price alike, so analytical's order is the records' order.
+    assert k["analytical_order"] == [str(slow), str(fast)]
+    assert (k["measured_fastest"], k["top_1"], k["top_3"]) == (str(fast), False, True)
+
+
+class OneSecond:
+    """Every step at exactly one second."""
+
+    def price(self, view):
+        term = CostTerm("one", 1.0, Provenance(Method.ANALYTICAL, "", "test"))
+        return StepCost((term,))
+
+
+@pytest.mark.parametrize("busy_ns,verdict", [(10**9 - 1, "fail"), (10**9, "pass")])
+def test_the_gate_is_at_most_measured(tmp_path, busy_ns, verdict):
+    r = bound.gate([record(tmp_path, LINES[1:2], busy_ns)], {"op": OneSecond()})["op"]
+
+    assert r["verdict"] == verdict
+
+
+def test_records_rank_by_tokens_not_by_rows(tmp_path):
+    # One 4096-token row a second against two one-token rows a second.
+    long = record(tmp_path / "long", LINES[1:2])
+    wide = record(tmp_path / "wide", [{"rows": [[1, 9, True]] * 2, "rung": None}])
+
+    k = bound.gate([wide, long], {"op": OneSecond()})["op"]["ranking"]
+
+    assert (k["measured_fastest"], k["analytical_order"][0]) == (str(long), str(long))
+
+
+def _line(rows, moe_rows=8, **more):
+    return {"rows": rows, "rung": None, "moe_rows": moe_rows, **more}
+
+
+def test_a_dp_step_joins_every_ranks_line_by_atoms_rules(tmp_path):
+    prefill, short, decode = [[9000, 9000, False]], [[100, 100, False]], [[1, 50, True]]
+    dummy = _line([[1, 1, True]], is_dummy_run=True)
+    rank0 = [_line(prefill)] * 2 + [_line(short)] + [_line(prefill)] * 2
+    rank1 = [_line(short), dummy, _line([[200, 200, False]]), _line(decode)]
+    record(tmp_path, rank0, rank=0)
+    record(tmp_path, rank1, rank=1)
+
+    got = list(bound.steps(tmp_path, tbo=True))
+    views = {name.split(" ", 1)[1]: v for name, v, _ in got}
+
+    # 9000 clears the 8192-token bar and both ranks split at their midpoints.
+    assert views["dp0 step 0"].tbo_tokens == ((4500, 50), (4500, 50))
+    assert views["dp1 step 0"].moe_tokens == 9100
+    # A dummy rank counts one token and cannot split; nor can a decoding one.
+    assert views["dp0 step 1"].moe_tokens == 9001
+    assert views["dp0 step 1"].tbo_tokens is None
+    assert "dp1 step 1" not in views
+    assert views["dp0 step 3"].tbo_tokens is None
+    # No rank clears the bar.
+    assert views["dp0 step 2"].tbo_tokens is None
+    # A step one rank's record lacks.
+    assert views["dp0 step 4"] == Refusal(bound.SOURCE, bound.PARTIAL)
+    assert next(bound.steps(tmp_path))[1].tbo_tokens is None
+
+
+def test_an_mtp_record_is_measured_by_its_target(tmp_path):
+    lines = [
+        {**LINES[0], "d_target_ns": 4 * 10**8},
+        {**LINES[1]},
+    ]
+    record(tmp_path, lines)
+
+    (_, view, measured), (_, refused, _) = bound.steps(tmp_path)
+
+    assert (view.decode != (), measured) == (True, pytest.approx(0.4))
+    assert refused == Refusal(bound.SOURCE, bound.UNSPLIT)
+
+
+def _main(monkeypatch, tmp_path, records, tp=1, more=(), ep=1, document=ROOFLINE):
+    config = SimpleNamespace(
+        tensor_parallel_size=tp,
+        kv_cache_dtype="bf16",
+        enable_tbo=False,
+        enable_tbo_decode=False,
+        enable_expert_parallel=False,
+        speculative_config=None,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+    moe = SimpleNamespace(moe_parallel_config=SimpleNamespace(ep_size=ep))
+    tree = SimpleNamespace(modules=lambda: [SimpleNamespace(), moe])
+    monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
+    monkeypatch.setattr("atom.compass.run.modules.walk", lambda tree, d=None: STACK)
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: graph)
+    store = tmp_path / "store"
+    platform = platforms.flags(store, document, tmp_path)
+    argv = ["--model", "m", *platform, "--store", str(store), *more]
+    argv += map(str, records)
+    bound.main(argv)
+
+
+def test_main_exits_1_on_a_step_above_its_measured_time(monkeypatch, tmp_path, capsys):
+    fast = record(tmp_path / "fast", LINES[:3], busy_ns=1)
+    engine = {"tensor_parallel_size": 1, "kv_cache_dtype": "bf16"}
+    (fast / "steps" / "dp0.engine.json").write_text(json.dumps(engine))
+
+    with pytest.raises(SystemExit) as exit:
+        _main(monkeypatch, tmp_path, [fast])
+
+    assert exit.value.code == 1
+    assert "step level: fail" in capsys.readouterr().out
+
+
+def test_main_refuses_a_record_its_key_states_another_tp_for(monkeypatch, tmp_path):
+    slow = record(tmp_path / "slow", LINES[:3])
+    engine = {"engine": {"tensor_parallel_size": 2, "kv_cache_dtype": "bf16"}}
+    (slow / "steps" / "dp0.key.json").write_text(json.dumps(engine))
+
+    with pytest.raises(ValueError, match="tensor_parallel_size 2 there, 1 here"):
+        _main(monkeypatch, tmp_path, [slow])
+
+
+def plan(path, points):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "plan.jsonl").write_text("".join(json.dumps(p) + "\n" for p in points))
+    return path
+
+
+def point(op, shape, rows, cold_ns, **more):
+    record = {"shape": shape, "context": None, "op": op["op"], "rows": rows}
+    return record | {"leaf": json.dumps(op), "cold_ns": cold_ns, **more}
+
+
+ATTN = "aiter.unified_attention_with_output_base.default"
+
+
+def test_each_measured_point_is_its_cold_time_over_its_leafs_price(tmp_path):
+    short, long = [[1, 900, True], [1, 300, True]], [[1, 200000, True]] * 2
+    silu = leaf(SILU, [[2, 4096]], input=t([2, 8192]))
+    attn = leaf(ATTN, [[2, 6144]], q=t([2, 6144]), k=t([2, 1024]), v=t([2, 1024]))
+    attn["args"] |= {"layer_name": {"context": None}, "use_mla": False}
+
+    def priced(op, rows):
+        view = BatchView(tuple(RequestShape(*r) for r in rows), produces_output=True)
+        return price(op_work.work(op, view, 1, "bf16"), SPEC) * 1e9
+
+    decode, empty = "decode T=2 B=2", leaf("aten.empty.memory_format", [[2, 4096]])
+    out = plan(
+        tmp_path,
+        [
+            point(silu, decode, short, 3 * priced(silu, short)),
+            point(silu, decode, short, 0.5 * priced(silu, short)),
+            point(silu, decode, short, 0.8 * priced(silu, short)),
+            point(silu, "prefill T=2 B=1", [[2, 2, False]], 2 * priced(silu, short)),
+            point(attn, decode, long, 1.5 * priced(attn, long)),
+            point(silu, decode, short, 0, refused="ValueError: no room"),
+            point(empty, decode, short, 0),
+            point(empty, decode, short, 1000),
+            point(leaf("x.unknown.default"), decode, short, 1000),
+        ],
+    )
+
+    r = bound.ops(out, SPEC, 1, "bf16")
+
+    assert r["points"] == 9
+    assert r["counts"] == {"unmeasured": 1, "no kernel": 1, "no kernel, timed": 1}
+    assert r["refused"] == {
+        "refused(op-work: no extractor for the op kind x.unknown.default)": 1
+    }
+    q = r["measured_over_analytical"]
+    assert list(q) == [f"{SILU} decode", f"{SILU} prefill", f"{ATTN} decode"]
+    # Attention reads the KV of the point's rows, not of its shape alone.
+    assert priced(attn, long) > 10 * priced(attn, short)
+    assert q[f"{ATTN} decode"]["median"] == pytest.approx(1.5)
+    assert (q[f"{SILU} decode"]["points"], q[f"{SILU} decode"]["above"]) == (3, 2)
+    assert (q[f"{SILU} decode"]["min"], q[f"{SILU} decode"]["max"]) == pytest.approx(
+        (0.5, 3)
+    )
+    assert q[f"{SILU} prefill"]["median"] == pytest.approx(2)
+    assert "2 of a leaf priced as launching no kernel (1 of them timed" in (
+        text := bound.ops_text(r)
+    )
+    assert "2 priced above their measured time" in text
+
+
+FILL = "aten.index_fill_.int_Scalar"
+
+
+def test_a_point_keyed_by_its_signature_prices_as_its_leaf(tmp_path):
+    """A point's leaf is the `signature` `measure ops` keys it by, which sizes
+    no KV view of a kernel's along its pool: a kernel's work reads none, and
+    an aten operator over KV state, whose work reads the whole operand, keeps
+    it whole."""
+    rows = [[1, 300, True], [1, 9, True]]
+    attn = v4_decode(window_size=4, compress_ratio=4, index_topk=16)
+    state, index = t([10, 6], "torch.float32", role="kv"), t([2], "torch.int64")
+    fill = leaf(FILL, [[10, 6]], self=state, dim=0, index=index, value=0)
+
+    def priced(op):
+        view = BatchView(tuple(RequestShape(*r) for r in rows), produces_output=True)
+        return price(op_work.work(op, view, 1, "fp8"), SPEC) * 1e9
+
+    out = plan(
+        tmp_path,
+        [
+            point(op, "decode B=2", rows, 2 * priced(op)) | {"leaf": signature(op)}
+            for op in (attn, fill)
+        ],
+    )
+
+    r = bound.ops(out, SPEC, 1, "fp8")
+
+    assert r["refused"] == {}
+    assert {k: q["median"] for k, q in r["measured_over_analytical"].items()} == {
+        f"{attn['op']} decode": pytest.approx(2),
+        f"{FILL} decode": pytest.approx(2),
+    }
+
+
+def test_main_reports_an_ops_run_and_refuses_one_of_another_engine(
+    monkeypatch, tmp_path, capsys
+):
+    slow = record(tmp_path / "slow", LINES[:3])
+    engine = {"tensor_parallel_size": 1, "kv_cache_dtype": "bf16"}
+    (slow / "steps" / "dp0.engine.json").write_text(json.dumps(engine))
+    out = plan(tmp_path / "plan", [])
+    (out / "engine.json").write_text(json.dumps(engine))
+
+    _main(monkeypatch, tmp_path, [slow], more=["--ops", str(out)])
+    assert "op points: 0 planned" in capsys.readouterr().out
+
+    (out / "engine.json").write_text(json.dumps(engine | {"kv_cache_dtype": "fp8"}))
+    with pytest.raises(ValueError, match="kv_cache_dtype 'fp8' there, 'bf16' here"):
+        _main(monkeypatch, tmp_path, [slow], more=["--ops", str(out)])
+
+
+def test_main_prices_ops_and_points_at_the_model_s_ep_width(monkeypatch, tmp_path):
+    slow = record(tmp_path / "slow", LINES[:3])
+    engine = {"tensor_parallel_size": 1, "kv_cache_dtype": "bf16"}
+    (slow / "steps" / "dp0.engine.json").write_text(json.dumps(engine))
+    out = plan(tmp_path / "plan", [])
+    (out / "engine.json").write_text(json.dumps(engine))
+    seen = {}
+    monkeypatch.setattr(
+        bound, "gate", lambda _, b, *a: seen.update(op=b["op"].ep) or {}
+    )
+    monkeypatch.setattr(bound, "ops", lambda *a: seen.update(points=a[-1]))
+    monkeypatch.setattr(bound, "text", lambda r: "")
+    monkeypatch.setattr(bound, "ops_text", lambda r: "")
+
+    _main(monkeypatch, tmp_path, [slow], more=["--ops", str(out)], ep=8)
+
+    assert seen == {"op": 8, "points": 8}
+
+
+ENGINE = {"tensor_parallel_size": 1, "kv_cache_dtype": "bf16"}
+# The performance variables a run's engine file states, sorted as `keyed` writes them.
+RAN = {"ATOM_NUMA_BIND": "1", "GPU_MAX_HW_QUEUES": "5"}
+
+
+def _performance_env(monkeypatch, **env):
+    """This process's performance environment set to `env` alone."""
+    for name in PERFORMANCE_KEYS | {BUCKETS}:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+
+@pytest.mark.parametrize("ops", [False, True])
+def test_a_run_under_other_performance_variables_refuses_naming_each(
+    monkeypatch, tmp_path, ops
+):
+    here = {"ATOM_USE_TRITON_MOE": "1", "GPU_MAX_HW_QUEUES": "5"}
+    _performance_env(monkeypatch, **here)
+    slow = record(tmp_path / "slow", LINES[:3])
+    out = plan(tmp_path / "plan", [])
+    stated = {"env": here if ops else RAN}
+    (slow / "steps" / "dp0.engine.json").write_text(json.dumps(ENGINE | stated))
+    (out / "engine.json").write_text(json.dumps(ENGINE | {"env": RAN if ops else here}))
+
+    with pytest.raises(ValueError) as refused:
+        _main(monkeypatch, tmp_path, [slow], more=["--ops", str(out)])
+
+    assert str(refused.value) == (
+        f"{out if ops else slow / 'steps'} ran under other performance variables "
+        "than this process's, which builds the model and keys the op graphs under "
+        "its own: env ATOM_NUMA_BIND '1' in its engine file and None here; "
+        "env ATOM_USE_TRITON_MOE None in its engine file and '1' here"
+    )
+
+
+def test_a_run_under_this_process_s_performance_variables_prices_as_before(
+    monkeypatch, tmp_path, capsys
+):
+    _performance_env(monkeypatch, **RAN)
+    slow = record(tmp_path / "slow", LINES[:3])
+    out = plan(tmp_path / "plan", [])
+    engines = (slow / "steps" / "dp0.engine.json", out / "engine.json")
+    reports = []
+    for engine in (ENGINE, ENGINE | {"env": RAN}):
+        for path in engines:
+            path.write_text(json.dumps(engine))
+        _main(monkeypatch, tmp_path, [slow], more=["--ops", str(out)])
+        reports.append(capsys.readouterr().out)
+
+    assert reports[1] == reports[0]
+    assert "op level: pass, 3 steps priced, 0 refused" in reports[1]
+
+
+def test_a_measured_point_prices_at_the_ep_width(tmp_path):
+    op = leaf(
+        "mori.ops.dispatch_combine:EpDispatchCombineOp.combine",
+        [[16384, 7168]],
+        input=t([16384, 7168]),
+        weights=None,
+        indices=t([2048, 6], "torch.int32"),
+    )
+    rows = [[2048, 2048, False]]
+    view = BatchView(tuple(RequestShape(*r) for r in rows), produces_output=True)
+    cold = price(op_work.work(op, view, 1, "bf16", 8), SPEC) * 1e9
+    out = plan(tmp_path, [point(op, "prefill T=2048 B=1", rows, cold)])
+
+    [q] = bound.ops(out, SPEC, 1, "bf16", 8)["measured_over_analytical"].values()
+
+    assert q["median"] == pytest.approx(1)
+
+
+def _config(drafts=0, dp=1, tbo=False, low_latency=False, block=False):
+    drafter = SimpleNamespace(num_speculative_tokens=drafts, use_dspark=lambda: block)
+    return SimpleNamespace(
+        tensor_parallel_size=1,
+        kv_cache_dtype="bf16",
+        enable_tbo=tbo,
+        enable_tbo_decode=False,
+        enable_expert_parallel=low_latency,
+        enable_low_latency=low_latency,
+        speculative_config=drafts and drafter,
+        parallel_config=SimpleNamespace(data_parallel_size=dp),
+    )
+
+
+#: A block drafter's modules: its block's, and its KV pass over the target's rows.
+DRAFTER = [
+    Module("drafter.head", "gemm", (4096, 4096), draft=6),
+    Module("drafter.kv", "gemm", (4096, 4096), draft=CONTEXT),
+]
+
+
+def _backends(monkeypatch, tmp_path, config, modules=STACK, lookup=graph, ep=1):
+    """`bound.backends` for `config` at EP width `ep`, its build, walk and
+    store stubbed, a block drafter's modules `DRAFTER`."""
+    moe = SimpleNamespace(moe_parallel_config=SimpleNamespace(ep_size=ep))
+    tree = SimpleNamespace(modules=lambda: [moe])
+    spec = config.speculative_config
+    monkeypatch.setattr(bound, "_build", lambda *a: (config, tree))
+    monkeypatch.setattr("atom.compass.run.modules.drafter", lambda c: spec)
+    monkeypatch.setattr(
+        "atom.compass.run.modules.walk",
+        lambda t, d=None: modules + DRAFTER * bool(d and d.use_dspark()),
+    )
+    monkeypatch.setattr("atom.compass.run._op_graphs", lambda *a, **kw: lookup)
+    return bound.backends("m", 1, [], MACHINE, str(tmp_path), [])[2]
+
+
+def drafted(*shape, draft=False):
+    """A target's graph, and a drafter's that costs far more."""
+    return {"seq": [g(shape[1], 8192, 8192)]} if draft else graph(*shape)
+
+
+@pytest.mark.parametrize("drafts,block", [(1, False), (3, False), (5, True)])
+def test_an_mtp_step_prices_at_op_level_its_target_against_d_target_ns(
+    monkeypatch, tmp_path, drafts, block
+):
+    decode = {"rows": [[drafts + 1, 900, True], [drafts + 1, 300, True]], "rung": 2}
+    lines = [decode, LINES[1]]
+    config = _config(drafts, block=block)
+    priced = _backends(monkeypatch, tmp_path, config, lookup=drafted)
+    views = [
+        BatchView(
+            tuple(RequestShape(*r) for r in s["rows"]),
+            capture_rung=s["rung"],
+            produces_output=True,
+        )
+        for s in lines
+    ]
+    costs = [priced["op"].price(v) for v in views]
+    # Measured: the target's price to the next nanosecond, under the step's;
+    # a block drafter's draft-KV pass, which that price holds, stamped apart.
+    kv = [sum(t.seconds for t in c.terms if t.name.startswith(DRAFT_KV)) for c in costs]
+    lines = [
+        {
+            **s,
+            "d_target_ns": math.ceil((c.target_seconds - k) * 1e9),
+            "d_draft_kv_ns": math.ceil(k * 1e9),
+        }
+        for s, c, k in zip(lines, costs, kv)
+    ]
+    rec = record(tmp_path / "mtp", lines)
+
+    report = bound.gate([rec], priced, mtp=True)
+    r = report["op"]
+
+    assert all(c.draft_terms and c.seconds > c.target_seconds * 1.5 for c in costs)
+    assert all((k > c.target_seconds / 2) == block for c, k in zip(costs, kv))
+    assert (r["verdict"], r["steps"], r["refused"]) == ("pass", 2, {})
+    assert r["draft_s"] == {
+        "decode": pytest.approx(costs[0].draft_seconds),
+        "prefill": pytest.approx(costs[1].draft_seconds),
+    }
+    assert r["analytical_s"]["decode"]["total"] == pytest.approx(
+        costs[0].target_seconds
+    )
+    assert report["step"]["steps"] == 2
+    assert bool(report["step"]["draft_s"]) == block
+
+
+def test_a_draft_kv_pass_is_measured_with_its_target_on_a_step_that_samples(tmp_path):
+    stamps = {"d_target_ns": 4 * 10**8, "d_draft_kv_ns": 10**8}
+    middle = {**LINES[1], **stamps, "produces_output": False}
+    record(tmp_path, [{**LINES[0], **stamps}, middle])
+
+    measured = [m for _, _, m in bound.steps(tmp_path)]
+
+    # A middle chunk's pass runs after its target's end, in the drafter's time.
+    assert measured == [pytest.approx(0.5), pytest.approx(0.4)]
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_walked_walks_a_block_drafter_with_its_target(monkeypatch, block):
+    config = _config(5, block=block)
+    monkeypatch.setattr(bound, "_build", lambda *a: (config, SimpleNamespace()))
+    monkeypatch.setattr(
+        "atom.compass.run.modules.drafter", lambda c: c.speculative_config
+    )
+    monkeypatch.setattr(
+        "atom.compass.run.modules.walk",
+        lambda t, d=None: STACK + DRAFTER * bool(d and d.use_dspark()),
+    )
+
+    walked = bound.walked(["--model", "m", "-tp", "4"], "gfx1250")
+
+    assert walked == STACK + DRAFTER * block
+
+
+def test_ep_low_latency_split_under_tbo_refuses_at_both_levels(monkeypatch, tmp_path):
+    split = (8, 1, 2, 32, 32, 8, 8, 1, 1632)
+    experts = Module("experts", "moe", split, "fp4", ranks=8, layer=0)
+    rows = [[9000, 9000, False]]
+    for rank in range(8):
+        record(tmp_path, [_line(rows, moe_rows=72000)], rank=rank)
+    config = _config(dp=8, tbo=True, low_latency=True)
+    priced = _backends(monkeypatch, tmp_path, config, [experts], ep=8)
+
+    report = bound.gate([tmp_path], priced, tbo=True)
+
+    for level in ("step", "op"):
+        r = report[level]
+        assert (r["steps"], r["steps_refused"]) == (0, 8), level
+        assert all("split send and receive" in k for k in r["refused"]), level
+
+
+def test_one_rank_under_tbo_prices_a_split_prefill_as_two_micro_batches(
+    monkeypatch, tmp_path
+):
+    # 9000 tokens on one rank clear the 8192-token bar; no peer vetoes it.
+    record(tmp_path, [{"rows": [[9000, 9000, False]], "rung": None}])
+    asked = []
+
+    def lookup(*shape, micro_batch=False):
+        asked.append((shape[1], micro_batch))
+        return graph(*shape)
+
+    priced = _backends(monkeypatch, tmp_path, _config(tbo=True), lookup=lookup)
+
+    report = bound.gate([tmp_path], priced, tbo=True)
+
+    [(_, view, _)] = bound.steps(tmp_path, tbo=True)
+    assert view.tbo_tokens == ((4500,), (4500,))
+    assert set(asked) == {(4500, True)}
+    assert [report[k]["steps_refused"] for k in ("step", "op")] == [0, 0]

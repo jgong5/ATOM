@@ -231,6 +231,7 @@ class TestEngineArgsSpeculativeValidation:
             kv_cache_dtype=None,
             synthetic_acceptance_rate=None,
             synthetic_acceptance_length=None,
+            synthetic_acceptance_rates=None,
         )
         assert kwargs["speculative_config"] is fake_spec_config
 

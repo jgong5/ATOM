@@ -36,7 +36,7 @@ impl LoadBalancingPolicy for RandomPolicy {
             return (None, RouteDecision::branch(NO_HEALTHY_WORKERS));
         }
 
-        let mut rng = rand::rng();
+        let mut rng = crate::determinism::rng();
         let random_idx = rng.random_range(0..healthy_indices.len());
 
         (

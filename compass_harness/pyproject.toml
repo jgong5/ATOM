@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compass-harness"
+version = "0.1.0"
+description = "Runs agentx-harness (aiperf) against a Compass simulated ATOM, paced on the Compass clock."
+requires-python = ">=3.11"
+# agentx-harness at 56a0cf70f4c0359454ee4bd15a17770b541a3e3e, installed beside
+# this package; its distribution is named aiperf.
+dependencies = ["aiperf"]
+
+# The value names a sub-package of compass_harness, so aiperf's plugin
+# discovery imports compass_harness (and runs its __init__) while it resolves
+# the manifest, before any phase runner exists.
+[project.entry-points."aiperf.plugins"]
+compass = "compass_harness.plugin:plugins.yaml"
+
+[tool.setuptools]
+packages = ["compass_harness"]
+
+[tool.setuptools.package-data]
+compass_harness = ["plugin/plugins.yaml"]

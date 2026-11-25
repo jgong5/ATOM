@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,6 +32,7 @@ from atom.kv_transfer.offload.mp.transfer import (
 from atom.kv_transfer.offload.mp.worker import LMCacheMPConnector
 from atom.model_engine.page_unit_checkpoint import CheckpointRestoreOp
 from atom.utils import envs
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"

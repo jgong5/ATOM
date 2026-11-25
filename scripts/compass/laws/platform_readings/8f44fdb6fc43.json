@@ -1,0 +1,256 @@
+{
+ "key": {
+  "device": "MI355X gfx950",
+  "software_stack": "rocm 7.2.4 / aiter 41d4d8d7e / rccl 2.27.7",
+  "ptl": "disabled",
+  "torch": "2.10.0+rocm7.2.4.git3d3aa833"
+ },
+ "token": "8f44fdb6fc43",
+ "schema_version": 1,
+ "name": "MI355X gfx950 readings",
+ "provenance": {
+  "authored_by": "compass fit device",
+  "date": "2026-11-19",
+  "origin": "probed",
+  "origins": {
+   "device.compute.attainable_flops.bf16": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 1554126330363429.0,
+    "p90": 1637450305008140.0
+   },
+   "device.compute.attainable_flops.fp4": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 5360902235590339.0,
+    "p90": 5654713641770838.0
+   },
+   "device.compute.attainable_flops.fp8": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 3237106696155260.5,
+    "p90": 3393551808525333.0
+   },
+   "device.kernel_floor_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 1.4583749771118162e-06,
+    "p90": 1.569049000740051e-06
+   },
+   "device.memory.bandwidth_curve": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2"
+   },
+   "device.profiler_floor_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 3.679000000000087e-06,
+    "p90": 4.159000000000559e-06
+   },
+   "interconnect.host_link.bandwidth_bytes_per_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 56254772058.75675,
+    "p90": 57089208999.89596
+   },
+   "interconnect.host_link.latency_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 8.3600003272295e-06,
+    "p90": 9.163999930024147e-06
+   },
+   "interconnect.intra_node.attainable_bandwidth_bytes_per_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 60794886311.239174,
+    "p90": 61277492792.04989
+   },
+   "interconnect.intra_node.link_latency_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 7.625665724277497e-07,
+    "p90": 9.342550158500672e-07
+   },
+   "interconnect.intra_node.pp.gloo.eager_threshold_bytes": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 0,
+    "p90": 0
+   },
+   "interconnect.intra_node.pp.gloo.latency_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 4.323164466768503e-05,
+    "p90": 4.7474284656345844e-05
+   },
+   "interconnect.intra_node.pp.gloo.overhead_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 1.644689719463162e-05,
+    "p90": 3.063485407627924e-05
+   },
+   "interconnect.intra_node.pp.gloo.per_byte_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 5.826884066599996e-11,
+    "p90": 1.8898195186467505e-10
+   },
+   "interconnect.intra_node.pp.gloo.rendezvous_fixed_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 6.0731718905301525e-05,
+    "p90": 6.989088832293417e-05
+   },
+   "interconnect.intra_node.pp.gloo.wake_rise_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 1.5218225698321848,
+    "p90": 1.5505354665777167
+   },
+   "interconnect.intra_node.pp.gloo.wake_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 8.198243294505482e-05,
+    "p90": 0.00012580511719739008
+   },
+   "interconnect.intra_node.pp.rccl.eager_threshold_bytes": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 33554432,
+    "p90": 33554432
+   },
+   "interconnect.intra_node.pp.rccl.latency_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 9.906943887472153e-07,
+    "p90": 1.2095551937818527e-06
+   },
+   "interconnect.intra_node.pp.rccl.overhead_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 3.5543167501001596e-05,
+    "p90": 3.5910200603083746e-05
+   },
+   "interconnect.intra_node.pp.rccl.per_byte_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 1.6287354938951206e-11,
+    "p90": 1.7431446415714182e-11
+   },
+   "interconnect.intra_node.pp.rccl.rendezvous_fixed_s": {
+    "origin": "probed",
+    "record": "fc8520e4b8e5, aa205c8060b2",
+    "p10": 4.632741976384374e-05,
+    "p90": 4.8811719701413954e-05
+   }
+  },
+  "notes": "folded from the probe records of crsuse2-m2m-v3-005 as fc8520e4b8e5, mi355-gpu-40 as aa205c8060b2"
+ },
+ "device.compute.attainable_flops.bf16": 1599694369898335.0,
+ "device.compute.attainable_flops.fp4": 5532301448702806.0,
+ "device.compute.attainable_flops.fp8": 3320669321980422.0,
+ "device.kernel_floor_s": 1.5126747488975523e-06,
+ "device.memory.bandwidth_curve": [
+  [
+   4096,
+   2526390669.496118
+  ],
+  [
+   8192,
+   5045845632.164309
+  ],
+  [
+   16384,
+   10088095914.210644
+  ],
+  [
+   32768,
+   19416881576.098328
+  ],
+  [
+   65536,
+   37548426140.26517
+  ],
+  [
+   131072,
+   75078240869.08975
+  ],
+  [
+   262144,
+   149982935740.10315
+  ],
+  [
+   524288,
+   289887858439.96655
+  ],
+  [
+   1048576,
+   570244447745.4481
+  ],
+  [
+   2097152,
+   1080401741109.513
+  ],
+  [
+   4194304,
+   1946077420966.1753
+  ],
+  [
+   8388608,
+   3053654975878.928
+  ],
+  [
+   16777216,
+   4093843542004.0283
+  ],
+  [
+   33554432,
+   5139969720995.387
+  ],
+  [
+   67108864,
+   5849688390767.099
+  ],
+  [
+   134217728,
+   6045603690490.422
+  ],
+  [
+   268435456,
+   6132988099651.387
+  ],
+  [
+   536870912,
+   6329671989535.548
+  ],
+  [
+   1073741824,
+   6443331721300.874
+  ],
+  [
+   2147483648,
+   6494629334733.344
+  ],
+  [
+   4294967296,
+   6523178810207.16
+  ]
+ ],
+ "device.profiler_floor_s": 3.958999999999833e-06,
+ "interconnect.host_link.bandwidth_bytes_per_s": 57078157619.043594,
+ "interconnect.host_link.latency_s": 8.580000139772892e-06,
+ "interconnect.intra_node.attainable_bandwidth_bytes_per_s": 61062588309.49176,
+ "interconnect.intra_node.link_latency_s": 8.487428724765778e-07,
+ "interconnect.intra_node.pp.gloo.eager_threshold_bytes": 0,
+ "interconnect.intra_node.pp.gloo.latency_s": 4.535296466201544e-05,
+ "interconnect.intra_node.pp.gloo.overhead_s": 2.354087563545543e-05,
+ "interconnect.intra_node.pp.gloo.per_byte_s": 1.236253962653375e-10,
+ "interconnect.intra_node.pp.gloo.rendezvous_fixed_s": 6.531130361411784e-05,
+ "interconnect.intra_node.pp.gloo.wake_rise_s": 1.5361790182049506,
+ "interconnect.intra_node.pp.gloo.wake_s": 0.00010389377507122246,
+ "interconnect.intra_node.pp.rccl.eager_threshold_bytes": 33554432,
+ "interconnect.intra_node.pp.rccl.latency_s": 1.100124791264534e-06,
+ "interconnect.intra_node.pp.rccl.overhead_s": 3.5726684052042674e-05,
+ "interconnect.intra_node.pp.rccl.per_byte_s": 1.6859400677332692e-11,
+ "interconnect.intra_node.pp.rccl.rendezvous_fixed_s": 4.756956973262885e-05
+}

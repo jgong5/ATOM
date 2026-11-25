@@ -4,9 +4,10 @@
 """Text completion handler for the OpenAI-compatible API."""
 
 import logging
-import time
 from collections.abc import AsyncGenerator
 from typing import Any
+
+from atom.utils import time_shim as time
 
 from .protocol import (
     STREAM_DONE_MESSAGE,

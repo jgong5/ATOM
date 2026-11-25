@@ -1,0 +1,743 @@
+# SPDX-License-Identifier: MIT
+"""The step grid's lookup: a batch's equivalent homogeneous shape, read in a grid of
+measured whole forwards, answered only inside a cell whose every corner was
+measured.
+
+Decode steps come from ATOM's `Scheduler` and are priced through the runner's
+own `forward`, `_group_step_seconds` and `projection.batch_view`, on a ladder
+where ATOM's `ForwardMode.decide` picks the rung. Prefill chunks come from the
+same scheduler, chunking one prompt into pure middle chunks and a final one.
+
+Decode times are `f(B, c)` microseconds, plus `100 * rung` in a replay bundle.
+A cell's interpolation reproduces any `a + x.B + y.c + z.B.c` exactly, so the
+expected values below are `f` evaluated by hand. Each backend's residual is a
+factor of 1 over a hull no step here leaves, so a price is the lookup's.
+"""
+
+import copy
+from fractions import Fraction
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+from conftest import MockConfig
+from test_backend_step_roofline import roofline
+from test_dp_step_max import BLOCK, runner
+
+from atom.compass.backends import (
+    BatchView,
+    CostRefused,
+    Granularity,
+    Method,
+    ProvenanceMix,
+    Refusal,
+    RequestShape,
+    StepGrid,
+    StepGridBackend,
+)
+from atom.compass.backends.step_grid import equivalent_shape
+from atom.compass.backends.step_grid_residual import RECIPE, Residual
+from atom.compass.backends.step_roofline import StepFallbackBackend
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.sequence import Sequence
+from atom.sampling_params import SamplingParams
+
+LADDER = [1, 2, 4, 8, 16, 32, 48]
+C_NODES = [512, 1024]
+REPLAY_B = {"32": [17, 32], "48": [33, 48]}
+EAGER_B = [32, 40, 48]
+PREFILL_NODES = {"B": [1, 2], "T": [8, 64], "c": [0, 64, 128, 192]}
+
+
+def f(b, c):
+    return 1000 + 30 * b + c + b * c / 16
+
+
+def point(*at, time):
+    return {"at": list(at), "time": time, "statistic": "median", "repeats": 20}
+
+
+REPLAY = [
+    point(int(r), b, c, time=f(b, c) + 100 * int(r))
+    for r, nodes in REPLAY_B.items()
+    for b in nodes
+    for c in C_NODES
+]
+EAGER = [point(b, c, time=f(b, c)) for b in EAGER_B for c in C_NODES]
+
+
+def bundle(mode, points, output=(), no_output=(), unit="us"):
+    return {
+        "graph_mode": mode,
+        "scope": "forward",
+        "unit": unit,
+        "prefill": {
+            "nodes": PREFILL_NODES,
+            "output": list(output),
+            "no_output": list(no_output),
+        },
+        "decode": {
+            "nodes": (
+                {"B": REPLAY_B, "c": dict.fromkeys(REPLAY_B, C_NODES)}
+                if mode == "replay"
+                else {"B": EAGER_B, "c": C_NODES}
+            ),
+            "points": list(points),
+        },
+    }
+
+
+def linear(intercept=1.0, transform="identity", **coefficients):
+    """A linear member over prefill's features, which `fitted` cuts to each kind's."""
+    return {
+        "form": "linear",
+        "transform": transform,
+        "intercept": intercept,
+        "coefficients": {
+            **dict.fromkeys(RECIPE.names["prefill_output"], 0.0),
+            **coefficients,
+        },
+    }
+
+
+def _cut(member, names):
+    if member.get("form") != "linear":
+        return member
+    cut = {f: z for f, z in member["coefficients"].items() if f in names}
+    return {**member, "coefficients": cut}
+
+
+def fitted(members, selected, hulls=None):
+    """A residual mapping under this code's recipe, every kind holding `members`,
+    a linear one's coefficients cut to the kind's features; a kind's hull is
+    `hulls`' or, by default, a box."""
+    kinds = {}
+    for kind, names in RECIPE.names.items():
+        box = [
+            [s * (i == j) for j in range(len(names))] + [-1e6 * (s > 0)]
+            for i in range(len(names))
+            for s in (1, -1)
+        ]
+        kinds[kind] = {
+            "hull": (hulls or {}).get(kind, {"facets": box}),
+            "members": {name: _cut(m, names) for name, m in members.items()},
+            "selected": dict(selected),
+        }
+    recipe = {"name": RECIPE.name, "version": RECIPE.version, "digest": RECIPE.digest}
+    return {"recipe": recipe, "kinds": kinds}
+
+
+UNIT = Residual(fitted({"unit": linear()}, {"unit": 1.0}))
+
+
+def replay(points=REPLAY, residual=UNIT):
+    return StepGridBackend(StepGrid(bundle("replay", points)), residual, "replay")
+
+
+def eager(points=EAGER, residual=UNIT, **prefill):
+    grid = StepGrid(bundle("eager", points, **prefill))
+    return StepGridBackend(grid, residual, "eager")
+
+
+def view(*rows, rung=None, produces_output=None):
+    return BatchView(
+        tuple(RequestShape(*r) for r in rows),
+        capture_rung=rung,
+        produces_output=produces_output,
+    )
+
+
+def scheduler_of(prompts):
+    """ATOM's scheduler holding one prompt of each length."""
+    built = Scheduler(
+        MockConfig(
+            num_kvcache_blocks=2048,
+            kv_cache_block_size=BLOCK,
+            max_model_len=1024,
+            max_num_seqs=64,
+            max_num_batched_tokens=32768,
+            parallel_config=SimpleNamespace(data_parallel_rank=0),
+        )
+    )
+    for n in prompts:
+        built.add(
+            Sequence(list(range(5, 5 + n)), BLOCK, sampling_params=SamplingParams())
+        )
+    return built
+
+
+def decode(prompts):
+    """The first decode batch ATOM's scheduler builds after one prompt of each length."""
+    scheduler = scheduler_of(prompts)
+    while True:
+        batch, seqs = scheduler.schedule()
+        if batch.total_seqs_num_decode:
+            return batch
+        scheduler.postprocess(
+            list(seqs.values()),
+            ScheduledBatchOutput(
+                req_ids=list(batch.req_ids),
+                token_ids=[(7,) for _ in batch.req_ids],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch,
+        )
+
+
+# 37 decode rows whose cached context averages 600: each row caches its prompt.
+B37 = [500] * 18 + [700] * 18 + [600]
+
+
+def graphed(backend, ladder=LADDER):
+    r = runner(backend)
+    r.capture_sizes_np, r.enforce_eager = np.asarray(ladder, dtype=np.int32), False
+    return r
+
+
+def test_a_decode_step_is_priced_from_its_rungs_cell_or_at_its_width():
+    batch = decode(B37)
+
+    # decide replays rung 48: f(37, 600) = 1000 + 1110 + 600 + 1387.5 = 4097.5,
+    # read between rung 48's B nodes 33 and 48, plus 100 * 48.
+    assert graphed(replay()).forward(batch).predicted_s == 8897.5e-6
+    # The eager bundle ignores the rung and reads B = 37 between 32 and 40.
+    assert graphed(eager()).forward(batch).predicted_s == 4097.5e-6
+
+
+@pytest.mark.parametrize(
+    "make,points,gone,named",
+    [
+        (replay, REPLAY, [48, 48, 1024], "decode rung 48 cell"),
+        (eager, EAGER, [40, 1024], "decode cell"),
+    ],
+    ids=["replay", "eager"],
+)
+def test_with_one_corner_removed_the_step_refuses_naming_it(make, points, gone, named):
+    r = graphed(make([p for p in points if p["at"] != gone]))
+
+    assert r.forward(decode(B37)).predicted_s == 0.0
+    b, c = gone[-2:]
+    assert r.refused_commands() == (
+        f"cost:step-grid: the {named} has no measurement at B={b}, c={c}",
+    )
+
+
+def test_a_hole_refuses_only_the_steps_that_need_it():
+    holed = replay([p for p in REPLAY if p["at"] != [48, 48, 1024]])
+    rows = [(1, 601, True)] * 20
+
+    # Rung 32 is complete: f(20, 600) + 3200 = 1000 + 600 + 600 + 750 + 3200.
+    assert holed.price(view(*rows, rung=32)).seconds == 6150e-6
+    with pytest.raises(CostRefused, match="no measurement at B=48, c=1024"):
+        holed.price(view(*[(1, 601, True)] * 37, rung=48))
+
+
+def test_a_hole_under_a_roofline_floor_is_priced_by_the_roofline():
+    holed = replay([p for p in REPLAY if p["at"] != [48, 48, 1024]])
+    r = graphed(StepFallbackBackend(holed, roofline()))
+    rows = [(1, 501, True)] * 18 + [(1, 701, True)] * 18 + [(1, 601, True)]
+
+    assert r.forward(decode(B37)).predicted_s == (
+        roofline().price(view(*rows, rung=48)).seconds
+    )
+    assert r.refused_commands() == ()
+    assert r.priced_steps()["declared_steps"] == 1
+    reason = "the decode rung 48 cell has no measurement at B=48, c=1024"
+    assert r._priced.reasons() == {("step-grid", reason): 1}
+
+
+def test_steps_missing_the_same_corner_share_one_reason():
+    """With (40, 1024) unmeasured, steps anywhere in the two cells beside it,
+    or on the B=40 node between them, are declined for that corner alone."""
+    holed = eager([p for p in EAGER if p["at"] != [40, 1024]])
+    mix = ProvenanceMix()
+    for b, c in ((36, 600), (34, 900), (40, 800), (44, 700)):
+        rows = [(1, c + 1, True)] * b
+        mix.record(StepFallbackBackend(holed, roofline()).price(view(*rows)))
+
+    reason = "the decode cell has no measurement at B=40, c=1024"
+    assert mix.reasons() == {("step-grid", reason): 4}
+
+
+@pytest.mark.parametrize(
+    "steps,reason",
+    [
+        (
+            [[(8, 8, False), (1, 10, True)], [(8, 8, False)] * 2 + [(1, 10, True)]],
+            (
+                "a step mixing prefill and decode rows; the grid prices a step "
+                "of one kind"
+            ),
+        ),
+        (
+            [[(2, 10, True)], [(3, 10, True)] * 2],
+            (
+                "a decode row computes more than one token; the decode grid has "
+                "no N_Q axis"
+            ),
+        ),
+        (
+            [[(1, 601, True)] * 37, [(1, 601, True)] * 40],
+            "a decode step replays no graph, and a replay bundle has no eager decode",
+        ),
+    ],
+    ids=["mixed", "speculative", "eager"],
+)
+def test_steps_declined_for_one_cause_share_one_reason(steps, reason):
+    """Steps of one kind the grid declines, whatever their row and token counts,
+    are counted under one reason."""
+    mix = ProvenanceMix()
+    for rows in steps:
+        mix.record(StepFallbackBackend(replay(), roofline()).price(view(*rows)))
+
+    assert mix.reasons() == {("step-grid", reason): 2}
+
+
+def test_steps_with_image_tokens_are_refused_for_one_reason():
+    reasons = set()
+    for tokens in (3, 10):
+        with pytest.raises(CostRefused) as refused:
+            replay().price(BatchView(view(*INSIDE).requests, image_tokens=tokens))
+        reasons.update(refused.value.declined)
+
+    assert reasons == {
+        Refusal(
+            "step-grid",
+            "a step with image tokens, and no vision encoder in what this prices "
+            "from",
+        )
+    }
+
+
+def test_a_decode_step_wider_than_the_widest_rung_refuses_under_a_replay_bundle():
+    r = graphed(replay(), ladder=LADDER[:-1])
+
+    assert r.forward(decode(B37)).predicted_s == 0.0
+    assert r.refused_commands() == (
+        (
+            "cost:step-grid: a decode step replays no graph, and a replay bundle "
+            "has no eager decode"
+        ),
+    )
+
+
+def chunks(backend):
+    """One 200-token prompt at a 64-token budget, each prefill step priced by the runner."""
+    scheduler = Scheduler(
+        MockConfig(
+            num_kvcache_blocks=64,
+            kv_cache_block_size=BLOCK,
+            max_model_len=256,
+            parallel_config=SimpleNamespace(data_parallel_rank=0),
+        )
+    )
+    scheduler.add(
+        Sequence(list(range(5, 205)), BLOCK, sampling_params=SamplingParams())
+    )
+    r, steps = runner(backend), []
+    while not steps or not steps[-1][0]:
+        batch, seqs = scheduler.schedule()
+        reply = r.forward(batch)
+        steps.append((batch.produces_output(), reply.predicted_s))
+        scheduler.postprocess(list(seqs.values()), reply, batch=batch)
+    return steps, r.refused_commands()
+
+
+# The three middle chunks, and the final chunk's shape, in the no-output grid.
+MIDDLE = [point(1, 64, c, time=1) for c in (0, 64, 128)] + [point(1, 8, 192, time=1)]
+
+
+def test_a_middle_chunk_is_priced_from_the_no_output_grid_and_a_final_one_never_is():
+    steps, refused = chunks(eager(no_output=MIDDLE, unit="ms"))
+
+    assert steps == [(False, 1e-3)] * 3 + [(True, 0.0)]
+    assert refused == (
+        (
+            "cost:step-grid: the prefill output cell has no measurement at "
+            "B=1, T=8, c=192"
+        ),
+    )
+    final = [point(1, 8, 192, time=3)]
+    steps, refused = chunks(eager(output=final, no_output=MIDDLE, unit="ms"))
+    assert steps == [(False, 1e-3)] * 3 + [(True, 3e-3)]
+    assert refused == ()
+
+
+def test_a_prefill_step_is_read_at_its_token_count():
+    """Prompts of 20 and 10 tokens open in one step: B = 2 and T = 30, and work
+    210 + 55 = 265, 132.5 a row, so c = (132.5 - 15 * 16 / 2) / 15 = 5/6."""
+    grid = [
+        point(b, t, c, time=1000 + t) for b in (1, 2) for t in (8, 64) for c in (0, 64)
+    ]
+    batch, _ = scheduler_of([20, 10]).schedule()
+    r = runner(eager(output=grid))
+
+    # 1000 + T, read between the T nodes 8 and 64.
+    assert r.forward(batch).predicted_s == 1030e-6
+    assert r.refused_commands() == ()
+
+
+def test_the_equivalent_shape_keeps_the_token_count_and_the_attention_work():
+    # Rows (N_Q, c) of (3, 0) and (5, 10): 8 tokens over 2 rows is N_Q = 4.
+    # Work 3*0 + 3*4/2 + 5*10 + 5*6/2 = 71, 35.5 a row; 4c + 4*5/2 = 35.5.
+    rows = (RequestShape(3, 3, False), RequestShape(5, 15, False))
+    shape = equivalent_shape(rows)
+
+    assert shape == (2, 4, Fraction(51, 8))
+    assert all(type(x) is Fraction for x in shape)
+    # A decode row is N_Q = 1, so c is the mean cached context.
+    decoding = (RequestShape(1, 501, True), RequestShape(1, 701, True))
+    assert equivalent_shape(decoding) == (2, 1, 600)
+
+
+ON_NODE = [(1, 513, True)] * 32
+RAGGED = [(1, 257, True)] * 16 + [(1, 769, True)] * 16
+INSIDE = [(1, 601, True)] * 32
+
+
+# f(32, 512) = 1000 + 960 + 512 + 1024; f(32, 600) = 1000 + 960 + 600 + 1200.
+@pytest.mark.parametrize(
+    "rows,lookup,seconds",
+    [
+        (ON_NODE, "measured", 3496e-6),
+        (RAGGED, "interpolated", 3496e-6),
+        (INSIDE, "interpolated", 3760e-6),
+    ],
+    ids=["homogeneous-on-a-node", "ragged-on-a-node", "inside-a-cell"],
+)
+def test_only_a_homogeneous_batch_on_a_node_is_a_measured_lookup(rows, lookup, seconds):
+    cost = eager().price(view(*rows, rung=32))
+
+    (term,) = cost.terms
+    assert term.name == "forward"
+    assert term.provenance.method is Method.ESTIMATED
+    assert not term.provenance.validated
+    assert term.seconds == seconds
+    assert term.provenance.detail.startswith(f"lookup {term.seconds!r} s, {lookup};")
+    assert eager().price(view(*rows, rung=32)) == cost
+
+
+@pytest.mark.parametrize(
+    "batch,reason",
+    [
+        (view(*[(1, 2001, True)] * 32), "c is above the decode grid's nodes 512..1024"),
+        (view(*[(1, 601, True)] * 20), "B is below the decode grid's nodes 32..48"),
+        (view((8, 8, False), (1, 10, True)), "mixing prefill and decode rows"),
+        (view((2, 10, True)), "a decode row computes more than one token"),
+        (view((64.0, 64, False), produces_output=True), "a count is a float"),
+        (view(*ON_NODE, rung=48.0), "a count is a float, not an int"),
+        (view((64, 64, False)), "does not say whether it produces output"),
+    ],
+    ids=["past-c", "below-B", "mixed", "speculative", "float", "rung", "output"],
+)
+def test_a_step_the_grid_cannot_answer_is_refused_by_name(batch, reason):
+    with pytest.raises(CostRefused, match=reason):
+        eager().price(batch)
+
+
+def test_a_replay_bundle_refuses_a_rung_it_has_no_grid_for():
+    with pytest.raises(CostRefused, match="no decode rung 16"):
+        replay().price(view(*[(1, 601, True)] * 10, rung=16))
+    with pytest.raises(CostRefused, match="replays no graph"):
+        replay().price(view(*INSIDE))
+
+
+# A pool of 2304 16-token blocks holds 48 rows to c = 767, 40 to 911 and 32 to
+# 1151; each B is measured at every c node it fits, so (40, 1024), (48, 911)
+# and (48, 1024) are past the pool. f is linear in c, so a B side read along c
+# from its two highest nodes inside the pool extends to f exactly.
+POOL = {"block_size": 16, "blocks": 2304}
+POOLED = {
+    (b, c) for b in EAGER_B for c in (512, 767, 911, 1024) if c <= 16 * (2304 // b) - 1
+}
+
+
+def pooled(pool=POOL, gone=(), times=None):
+    times = times or {}
+    grid = bundle(
+        "eager",
+        [point(*at, time=times.get(at, f(*at))) for at in sorted(POOLED - set(gone))],
+    )
+    grid["decode"]["nodes"]["c"] = [512, 767, 911, 1024]
+    if pool:
+        grid["decode"]["pool"] = pool
+    return StepGridBackend(StepGrid(grid), UNIT, "pooled")
+
+
+@pytest.mark.parametrize(
+    "b,c,past",
+    [
+        (48, 800, "c 33 past 767, the pool's edge at B=48"),
+        (44, 850, "c 83 past 767, the pool's edge at B=48"),
+        (40, 1000, "c 89 past 911, the pool's edge at B=40"),
+    ],
+)
+def test_a_decode_cell_past_the_kv_pool_is_extended_from_its_edge_naming_how_far(
+    b, c, past
+):
+    (term,) = pooled().price(view(*[(1, c + 1, True)] * b)).terms
+
+    assert term.seconds == pytest.approx(f(b, c) * 1e-6, rel=1e-12)
+    assert term.provenance.source == f"step-grid-extrapolated: {past}"
+    assert (term.provenance.validated, term.provenance.extrapolated) == (False, True)
+    assert ", extrapolated;" in term.provenance.detail
+
+
+@pytest.mark.parametrize(
+    "backend,missing",
+    [
+        (pooled(gone=[(40, 767)]), "B=40, c=767"),
+        (pooled(pool=None), "B=48, c=911"),
+    ],
+    ids=["hole-inside-the-pool", "no-pool"],
+)
+def test_a_cell_missing_a_corner_inside_the_pool_or_with_no_pool_still_refuses(
+    backend, missing
+):
+    with pytest.raises(CostRefused, match=f"has no measurement at .*{missing}"):
+        backend.price(view(*[(1, 851, True)] * 44))
+
+
+# B=48's edge read along c from 512 and 767 and extended: falling 60% it reaches
+# -908.16 at c = 1023 and -665.28 at c = 1000, where B=44's other side, B=40,
+# reads 5700; from 5110 to 2560 it reaches exactly 0 at c = 1023.
+@pytest.mark.parametrize(
+    "b,c,at_512,at_767",
+    [
+        (48, 1023, f(48, 512), 0.4 * f(48, 512)),
+        (48, 1023, 5110.0, 2560.0),
+        (44, 1000, f(48, 512), 0.4 * f(48, 512)),
+    ],
+    ids=["negative", "zero", "one-b-side"],
+)
+def test_a_falling_in_pool_edge_prices_the_past_pool_step_by_the_roofline(
+    b, c, at_512, at_767
+):
+    falling = pooled(times={(48, 512): at_512, (48, 767): at_767})
+    rows = [(1, c + 1, True)] * b
+
+    (term,) = StepFallbackBackend(falling, roofline()).price(view(*rows)).terms
+    (floor,) = roofline().price(view(*rows)).terms
+    assert (term.name, term.seconds) == (floor.name, floor.seconds)
+    assert term.provenance.refusals == (
+        Refusal(
+            "step-grid",
+            "the decode cell is past the KV pool, and B=48's in-pool edge falls "
+            "from c=512 to 767, reaching no positive time at the step's c",
+        ),
+    )
+
+
+def test_a_negative_count_never_reaches_the_backend():
+    with pytest.raises(ValueError, match="at least one token"):
+        view((-1, 3, False))
+
+
+def test_it_is_one_step_granularity_line():
+    assert replay().granularity is Granularity.STEP
+    assert replay().describe() == (
+        "step grid, bundle replay; replay decode grid, timing scope forward; "
+        "recipe step-grid-residual v4, members decode: unit; prefill_output: unit; "
+        "prefill_no_output: unit"
+    )
+
+
+def _edited(edit, mode="eager"):
+    mapping = copy.deepcopy(bundle(mode, REPLAY if mode == "replay" else EAGER))
+    edit(mapping)
+    return mapping
+
+
+@pytest.mark.parametrize(
+    "mapping,match",
+    [
+        (_edited(lambda m: m.update(graph_mode="lazy")), "neither replay nor eager"),
+        (_edited(lambda m: m.update(unit="min")), "unit 'min' is not one of"),
+        (
+            _edited(
+                lambda m: m["prefill"].update(nodes={**PREFILL_NODES, "B": [2, 1]})
+            ),
+            "prefill output grid's B nodes \\[2, 1\\] are not strictly ascending",
+        ),
+        (
+            _edited(lambda m: m["decode"]["points"].append(point(36, 512, time=1))),
+            "point at \\[36, 512\\] is not on the grid's B/c nodes",
+        ),
+        (
+            _edited(lambda m: m["decode"]["points"].append(point(32, 512, time=1))),
+            "measures \\[32, 512\\] twice",
+        ),
+        (
+            _edited(lambda m: m["decode"]["points"][0].update(time=0)),
+            "takes 0.0, which is not a positive duration",
+        ),
+        (
+            _edited(lambda m: m["decode"]["points"][0].update(time=float("nan"))),
+            "takes nan, which is not a positive duration",
+        ),
+        (
+            _edited(lambda m: m["decode"]["points"][0].update(repeats=0)),
+            "records no statistic and repeat count",
+        ),
+        (
+            _edited(lambda m: m["decode"]["points"][0].update(statistic="")),
+            "records no statistic and repeat count",
+        ),
+        (
+            _edited(
+                lambda m: m["decode"]["points"].append(point(16, 9, 512, time=1)),
+                mode="replay",
+            ),
+            "is on rung 16, which has no B nodes",
+        ),
+        (
+            _edited(lambda m: m["decode"]["nodes"].update(B=EAGER_B), mode="replay"),
+            "under graph mode replay the decode B nodes are one list per rung, not a list",
+        ),
+        (
+            _edited(lambda m: m["decode"]["nodes"].update(B=REPLAY_B)),
+            "under graph mode eager the decode B nodes are one list, not a dict",
+        ),
+        (
+            _edited(lambda m: m["decode"]["nodes"].update(c=C_NODES), mode="replay"),
+            "under graph mode replay the decode c nodes are one list per rung, not a list",
+        ),
+    ],
+    ids=[
+        "mode",
+        "unit",
+        "descending",
+        "off-node",
+        "twice",
+        "zero",
+        "nan",
+        "repeats",
+        "statistic",
+        "rung",
+        "replay-b-list",
+        "eager-b-per-rung",
+        "replay-c-list",
+    ],
+)
+def test_a_bundle_that_cannot_be_read_fails_loading(mapping, match):
+    with pytest.raises(ValueError, match=match):
+        StepGrid(mapping)
+
+
+# Rung 32 holds alpha; 20 rows: 18 at c 560, one at 600 and one at 1000, so the
+# mean is 584 and the longest row 1000, both inside the cell B 17..32, c 512..1024.
+RAGGED = [(1, 561, True)] * 18 + [(1, 601, True), (1, 1001, True)]
+LONGEST, MEAN = 1000, 584
+
+
+def alpha_replay(**alpha):
+    grid = bundle("replay", REPLAY)
+    grid["decode"]["alpha"] = {"32": {"ratio": 0.0, "spread": 0.0, **alpha}}
+    return StepGridBackend(StepGrid(grid), UNIT, "alpha")
+
+
+@pytest.mark.parametrize(
+    "alpha, expected",
+    [
+        ({"intercept": 0.1, "ratio": 0.5}, 0.1 + 0.5 * (LONGEST / MEAN - 1)),
+        ({"intercept": 0.9, "ratio": 0.5}, 1.0),
+        ({"intercept": -0.5}, 0.0),
+    ],
+    ids=["between", "clipped-to-the-longest-row", "clipped-to-the-mean"],
+)
+def test_a_ragged_decode_batch_is_read_between_its_mean_and_longest_row(
+    alpha, expected
+):
+    def g(c):
+        return f(20, c) + 3200
+
+    (term,) = alpha_replay(**alpha).price(view(*RAGGED, rung=32)).terms
+
+    looked_up = g(MEAN) + expected * (g(LONGEST) - g(MEAN))
+    assert term.seconds == pytest.approx(looked_up * 1e-6, rel=1e-12)
+    assert ("longest row's cell" in term.provenance.detail) == bool(expected)
+
+
+def test_a_batch_of_one_context_or_on_a_rung_without_alpha_is_read_at_its_mean():
+    backend = alpha_replay(intercept=1.0)
+    even = view(*[(1, 585, True)] * 20, rung=32)
+    other = view(*[(1, c + 1, True) for _, c, _ in RAGGED] * 2, rung=48)
+
+    assert backend.price(even).seconds == replay().price(even).seconds
+    assert backend.price(other).seconds == replay().price(other).seconds
+    assert (
+        backend.price(view(*RAGGED, rung=32)).seconds
+        > replay().price(view(*RAGGED, rung=32)).seconds
+    )
+
+
+# A pool of 2304 16-token blocks holds 32 rows to c = 1151, so (32, 2047) is
+# past it: a longest row at c 1500 is read along c from (32, 767) and (32, 1024).
+def past_pool_alpha(gone=()):
+    at = [(32, 32, c) for c in (512, 767, 1024)]
+    points = [point(*p, time=f(*p[1:]) + 3200) for p in at if p not in gone]
+    grid = bundle("replay", points)
+    grid["decode"]["nodes"] = {"B": {"32": [32]}, "c": {"32": [512, 767, 1024, 2047]}}
+    grid["decode"]["pool"] = POOL
+    grid["decode"]["alpha"] = {"32": {"intercept": 0.5, "ratio": 0.0, "spread": 0.0}}
+    return StepGridBackend(StepGrid(grid), UNIT, "past-pool")
+
+
+def test_a_longest_row_past_the_kv_pool_is_extended_and_named_as_extrapolated():
+    rows = [(1, 601, True)] * 31 + [(1, 1501, True)]
+    mean = (600 * 31 + 1500) / 32
+
+    (term,) = past_pool_alpha().price(view(*rows, rung=32)).terms
+
+    assert term.seconds * 1e6 == pytest.approx(
+        f(32, mean + 0.5 * (1500 - mean)) + 3200, rel=1e-12
+    )
+    assert term.provenance.source == (
+        "step-grid-extrapolated: c 476 past 1024, the pool's edge at B=32"
+    )
+    assert (term.provenance.validated, term.provenance.extrapolated) == (False, True)
+
+
+def test_a_longest_row_whose_cell_misses_a_corner_inside_the_pool_refuses():
+    backend = past_pool_alpha(gone=[(32, 32, 1024)])
+    rows = [(1, 601, True)] * 31 + [(1, 1501, True)]
+
+    with pytest.raises(CostRefused, match="has no measurement at B=32, c=1024"):
+        backend.price(view(*rows, rung=32))
+    even = view(*[(1, 601, True)] * 32, rung=32)
+    assert backend.price(even).seconds == pytest.approx((f(32, 600) + 3200) * 1e-6)
+
+
+@pytest.mark.parametrize(
+    "mode, alpha, match",
+    [
+        ("replay", {"16": {"intercept": 0, "ratio": 0, "spread": 0}}, "rung 16"),
+        ("replay", {"32": {"intercept": "nan", "ratio": 0, "spread": 0}}, "finite"),
+        ("replay", {"32": {"intercept": 0, "ratio": 0}}, "spread"),
+        ("eager", {"32": {"intercept": 0, "ratio": 0, "spread": 0}}, "no rung"),
+    ],
+    ids=["no-such-rung", "nan", "missing-term", "eager"],
+)
+def test_an_alpha_the_grid_cannot_read_fails_loading(mode, alpha, match):
+    mapping = _edited(lambda m: m["decode"].update(alpha=alpha), mode)
+    with pytest.raises((ValueError, KeyError), match=match):
+        StepGrid(mapping)
+
+
+def test_alpha_reads_the_mean_cached_context_and_a_grid_without_that_term_reads_0():
+    def g(c):
+        return f(20, c) + 3200
+
+    def priced(**alpha):
+        (term,) = alpha_replay(**alpha).price(view(*RAGGED, rung=32)).terms
+        return term.seconds * 1e6
+
+    alpha = 0.1 + 20 * MEAN / 2**16
+    assert priced(intercept=0.1, mean=20.0) == pytest.approx(
+        g(MEAN) + alpha * (g(LONGEST) - g(MEAN)), rel=1e-12
+    )
+    assert priced(intercept=0.1) == pytest.approx(
+        g(MEAN) + 0.1 * (g(LONGEST) - g(MEAN)), rel=1e-12
+    )

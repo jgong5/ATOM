@@ -1,0 +1,17 @@
+{
+ "name": "cellA_v1x",
+ "extends": "cellA_v1.json",
+ "about": "cellA_v1 plus the orchestrator's cheap additions (#752 research, SUMMARY sections 4 and 8): lockstep decode with k = 2, 3, 4 DP ranks decoding at the same per-rank size (k = 1 is D-v1) and one uneven mix, for a lockstep / straggler term; and D-v1 repeated in the middle (A-mid) and at the end (A-end) of the record as anchors, so a per-record scale factor can be fitted and records pooled. Not in cellA_v1 itself: the law prices no lockstep term yet, so these segments add GPU time without moving the base gates.",
+ "insert": [
+  {"after": "D-multi", "segments": [
+   {"name": "A-mid", "kind": "copy", "of": "D-v1"},
+   {"name": "D-k2", "kind": "drain", "purpose": "lockstep: two ranks decode at the same per-rank size", "lanes": [{"name": "r0", "pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}, {"name": "r1", "pin": 1, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}], "min_dp": 2},
+   {"name": "D-k3", "kind": "drain", "purpose": "lockstep: three ranks decode at the same per-rank size", "lanes": [{"name": "r0", "pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}, {"name": "r1", "pin": 1, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}, {"name": "r2", "pin": 2, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}], "min_dp": 3},
+   {"name": "D-k4", "kind": "drain", "purpose": "lockstep: four ranks decode at the same per-rank size", "lanes": [{"name": "r0", "pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}, {"name": "r1", "pin": 1, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}, {"name": "r2", "pin": 2, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}, {"name": "r3", "pin": 3, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}], "min_dp": 4},
+   {"name": "D-uneven", "kind": "drain", "purpose": "lockstep: four ranks at a full rank's rows, a half, a quarter and an eighth", "lanes": [{"name": "r0", "pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}, {"name": "r1", "pin": 1, "groups": [{"rows": {"seqs_share": 0.5}, "prompt": 4096}]}, {"name": "r2", "pin": 2, "groups": [{"rows": {"seqs_share": 0.25}, "prompt": 4096}]}, {"name": "r3", "pin": 3, "groups": [{"rows": {"seqs_share": 0.125}, "prompt": 4096}]}], "min_dp": 4}
+  ]},
+  {"after": "P-rows-b", "segments": [
+   {"name": "A-end", "kind": "copy", "of": "D-v1"}
+  ]}
+ ]
+}

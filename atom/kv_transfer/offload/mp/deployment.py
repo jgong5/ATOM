@@ -18,7 +18,7 @@ from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
 from atom.model_engine.dp_routing.topology import shared_prefix_routing_enabled
-from atom.utils import envs
+from atom.utils import clock, envs
 
 logger = logging.getLogger("atom")
 
@@ -407,16 +407,21 @@ def _make_scheduler_adapter(
             super().end_session(request_id)
 
     extra = _extra_config(config)
-    return _SaltedSchedulerAdapter(
-        server_url=_server_urls(config)[0],
-        context=zmq.Context.instance(),
-        model_name=_model_namespace(
+    kwargs = {
+        "server_url": _server_urls(config)[0],
+        "model_name": _model_namespace(
             config, checkpoint_spec=checkpoint_spec, images=images
         ),
-        block_size=_logical_block_size(config),
-        parallel_config=_parallel_strategy(config, 0),
-        mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
-    )
+        "block_size": _logical_block_size(config),
+        "parallel_config": _parallel_strategy(config, 0),
+        "mq_timeout": float(extra.get("lmcache.mp.mq_timeout", 300.0)),
+    }
+    if clock.installed() is not None:
+        # A simulated run: the client's requests and replies ride the LP clock.
+        from atom.compass.kv.lmcache_mp import clocked_adapter
+
+        return clocked_adapter(_SaltedSchedulerAdapter, config, **kwargs)
+    return _SaltedSchedulerAdapter(context=zmq.Context.instance(), **kwargs)
 
 
 def _make_worker_adapter(

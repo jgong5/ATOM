@@ -153,7 +153,7 @@ fn least_loaded(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> Optio
         .copied()
         .filter(|&(_, load)| Some(load) == min_load)
         .map(|(idx, _)| idx)
-        .choose(&mut rand::rng())
+        .choose(&mut crate::determinism::rng())
 }
 
 impl CacheAwarePolicy {
@@ -499,7 +499,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 );
             }
             // Return a random healthy worker
-            let mut rng = rand::rng();
+            let mut rng = crate::determinism::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
             (
                 Some(healthy_indices[random_idx]),

@@ -1,0 +1,29 @@
+schema_version: "1.0"
+
+timing_strategy:
+  agentic_replay:
+    class: compass_harness.strategy:CompassAgenticReplay
+    description: |
+      agentic_replay paced on the Compass clock. Refuses a phase runner whose
+      scheduler is not ClockPacedLoopScheduler, and the options the clock does
+      not pace yet.
+
+transport:
+  http:
+    class: compass_harness.transport:CompassTransport
+    description: |
+      aiperf's HTTP transport with each request's tracestate stamped by the
+      traffic LP, and record times read from the SSE events' compass stamps.
+    metadata:
+      transport_type: http
+      url_schemes: [http, https]
+
+service:
+  system_controller:
+    class: compass_harness.controller:CompassSystemController
+    description: |
+      aiperf's system controller, whose shutdown also waits for the traffic
+      LP's +inf grant, so it never kills the timing manager before it.
+    metadata:
+      required: true
+      auto_start: false

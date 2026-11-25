@@ -1,0 +1,568 @@
+# SPDX-License-Identifier: MIT
+"""`python -m atom.compass.validate.bound`: the analytical price, at most the
+measured device time on every measured step, at step and at op level.
+
+    python -m atom.compass.validate.bound --model M [--tp N] --device DEV
+        --ptl PTL [--stack STACK] [--ratios-from DEVICE] --store S [--ops DIR]
+        RECORD... [-- ATOM args]
+
+The spec is DEV's datasheet with the readings S holds for it at PTL
+(`fit.device.compose`). A RECORD is a real run's directory, its step record in
+`steps/`. Each forward
+there that is not a DP dummy run is priced at step level by the step roofline,
+over the modules `run.modules.walk` reads off the meta build ATOM's arguments
+configure and its block drafter's (`run.modules.drafter`), as a simulated run
+walks them, and at op level by `OpGraphBackend`, over the `op_graph`s `compass
+trace ops` published in S for the spec's arch; both price the rows a replayed
+graph pads to, and the op level a target and drafter at the widths and rows a
+line states they ran at (`target_bs`, `draft_bs`, `draft_moe_rows`,
+`draft_rows`).
+Each price is compared with the step's device busy time,
+`d_busy_ns`, or on an MTP record the target's, `d_target_ns`, plus on a step
+that samples a block drafter's draft-KV pass, `d_draft_kv_ns`, which runs
+before `forward_done_event`. On an MTP record only the target's price is
+compared, that pass's included; the drafter's is reported apart.
+With `--ratios-from`, the prices are DEV's datasheet peaks at the ratios of
+the readings S holds for DEVICE, a device name a datasheet states, else its
+committed copy, as `compass fit device --assume-from` takes them
+(`fit.device.assumed_entry`): run on a device's own records, the report is
+the error of projecting it from the other.
+
+A data-parallel step (one with `moe_rows`) is read off every rank's line at
+that step: its `moe_tokens` is the group's scheduled tokens, a dummy rank's
+one. Under `--enable-tbo` a step's two-batch-overlap split, one rank's
+included, is the one ATOM's prefill rule agrees over its ranks' lines
+(`_split`).
+
+Gate: a step priced above its measured time is a violation, named by its
+costliest term, an op kind (`op.<kind>`) or a module kind (`roofline.<kind>`).
+Any violation fails the gate and exits with status 1. With none, any refusal
+makes the result a coverage report, its reasons counted by step.
+
+Reported, not gated: per granularity and phase (decode, prefill, mixed), the
+distribution of measured over analytical; the analytical seconds by the
+roofline part that set them (`CostTerm.by_bound`), and those of a term no part
+set, an overlapped step's, `unattributed`; and the records ranked by tokens a
+second over the steps priced at that granularity, analytical against
+measured: whether measured's fastest is analytical's fastest (top-1), or
+among its first three (top-3); and per phase the drafter's analytical seconds.
+
+Per op kind (`--ops`, a `measure ops --plan` run's `--out`): each point its
+plan.jsonl holds measured, its cold time over the analytical price of the same
+leaf at the point's shape and rows (`op_work.work`, `work.price`), as a
+distribution per op kind and phase, with the points priced above their
+measured time counted. Not gated: the bound holds per step, not per leaf. A
+point whose leaf the analytical price refuses is counted by its reason; one
+the plan refused to measure is counted apart.
+
+Refused: a record whose engine block (`dp<r>.engine.json`, else the `engine`
+of `dp<r>.key.json`) states another TP width or KV cache format than ATOM's
+arguments resolve; two-batch overlap of decode steps, whose split no step
+line states; a data-parallel step some rank's record lacks; a
+step of an MTP record without `d_target_ns`, whose `d_busy_ns` holds the
+draft, which the gate does not compare. Refused too: a record, or an `--ops`
+run, whose engine block states another performance environment (`env`) than
+this process's, each variable named: this process builds the model and keys
+the op graphs under its own.
+"""
+
+import argparse
+import json
+import re
+import tempfile
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import numpy as np
+
+from atom.compass.backends import BatchView, CostRefused, RequestShape
+from atom.compass.backends.cost import fold_parts
+from atom.compass.backends.provenance import Refusal
+from atom.compass.backends.shape import sum_tokens
+from atom.compass.backends.step_labels import group_tokens
+from atom.compass.backends.work import COMM, KERNEL
+
+PROG = "python -m atom.compass.validate.bound"
+SOURCE = "validate-bound"
+PHASES = ("decode", "prefill", "mixed")
+#: Priced seconds by the roofline part that set them, and those no part set.
+UNATTRIBUTED = "unattributed"
+BY_BOUND = (*KERNEL, *COMM, UNATTRIBUTED)
+#: The engine fields a record must state as ATOM's arguments resolve them.
+PRICED = ("tensor_parallel_size", "kv_cache_dtype")
+PARTIAL = (
+    "a data-parallel step some rank's record lacks: the group's token count "
+    "and two-batch-overlap split, which its price reads, are unknown"
+)
+UNSPLIT = (
+    "a step of an MTP record without `d_target_ns`: its `d_busy_ns` holds the "
+    "draft, which the gate does not compare"
+)
+
+
+def steps(record, tbo=False, mtp=False):
+    """Each forward of `record`'s ranks but DP dummy runs, as its name, its
+    batch view or the `Refusal` it is counted by, and its measured device
+    seconds. `tbo` is ATOM's `enable_tbo`; `mtp` says the run drafts, which
+    any line with `d_target_ns` also says."""
+    paths = sorted(Path(record, "steps").glob("dp*[0-9].jsonl"))
+    ranks = [
+        {s["step"]: s for s in map(json.loads, p.read_text().splitlines())}
+        for p in paths
+    ]
+    mtp = mtp or any("d_target_ns" in s for r in ranks for s in r.values())
+    for step in sorted(set().union(*ranks)):
+        lines = [r.get(step) for r in ranks]
+        whole = None not in lines
+        # num_tokens_across_dp: every rank's scheduled tokens, a dummy's one.
+        group = group_tokens(lines)
+        split = _split(lines) if tbo and whole else None
+        for path, s in zip(paths, lines):
+            if s is None or s["is_dummy_run"]:
+                continue
+            if "d_busy_ns" not in s:
+                raise ValueError(f"{path} has no device windows (`d_busy_ns`)")
+            name = f"{record} {path.stem} step {step}"
+            dp = s.get("moe_rows") is not None
+            if dp and not whole:
+                yield name, Refusal(SOURCE, PARTIAL), None
+                continue
+            if mtp and "d_target_ns" not in s:
+                yield name, Refusal(SOURCE, UNSPLIT), None
+                continue
+            view = BatchView(
+                tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
+                capture_rung=s["rung"],
+                moe_rows=s.get("moe_rows"),
+                draft_moe_rows=s.get("draft_moe_rows"),
+                draft_bs=s.get("draft_bs"),
+                draft_rows=s.get("draft_rows"),
+                target_bs=s.get("target_bs"),
+                produces_output=s["produces_output"],
+                tbo_tokens=split,
+                moe_tokens=group if dp else None,
+            )
+            measured = s.get("d_target_ns", s["d_busy_ns"])
+            if "d_target_ns" in s and s["produces_output"]:
+                # A block drafter's draft-KV pass precedes forward_done_event.
+                measured += s.get("d_draft_kv_ns", 0)
+            yield name, view, measured * 1e-9
+
+
+def _split(lines):
+    """The two-batch-overlap split ATOM agrees over a DP group's step `lines`,
+    per micro-batch each rank's tokens, or None: each rank's vote on its
+    prefill tokens, cut at their midpoint (`prefill_tbo_vote`), then
+    `sync_dp_metadata`'s OR of the min-token bar, AND of can-split and uniform
+    prefill. A decoding rank, a dummy run among them, casts no prefill vote,
+    so the step does not split."""
+    from atom.utils.tbo import ubatching
+
+    local = []
+    for s in lines:
+        prefill = [q for q, _, d in s["rows"] if not d]
+        if not prefill:
+            return None
+        local.append(ubatching.prefill_tbo_vote(sum(prefill)))
+    meets, can, first, second = zip(*local)
+    return (first, second) if any(meets) and all(can) else None
+
+
+def _phase(view: BatchView) -> str:
+    if view.prefill and view.decode:
+        return "mixed"
+    return "prefill" if view.prefill else "decode"
+
+
+def gate(records, backends: dict, tbo=False, mtp=False) -> dict:
+    """The gate and its reports for `records`, every step priced by each of
+    `backends`, a granularity's name to its `CostBackend`; `tbo` and `mtp` as
+    `steps` reads them."""
+    report = {}
+    for level, backend in backends.items():
+        violations, refused, rates, unpriced = [], Counter(), {}, 0
+        seconds = {p: [] for p in PHASES}  # (measured, priced) per step
+        parts = {p: [] for p in PHASES}  # each term's seconds by bound
+        drafts = Counter()  # the drafter's seconds by phase
+        for record in records:
+            tokens = measured_s = priced_s = 0.0
+            for name, view, measured in steps(record, tbo, mtp):
+                try:
+                    if isinstance(view, Refusal):
+                        raise CostRefused(None, [view])
+                    cost = backend.price(view)
+                except CostRefused as e:
+                    refused.update(str(r) for r in dict.fromkeys(e.declined))
+                    unpriced += 1
+                    continue
+                priced = cost.target_seconds
+                seconds[_phase(view)].append((measured, priced))
+                if cost.draft_terms:
+                    drafts[_phase(view)] += cost.draft_seconds
+                parts[_phase(view)] += [
+                    t.by_bound or {UNATTRIBUTED: t.seconds} for t in cost.terms
+                ]
+                tokens += sum_tokens(view.requests)
+                measured_s, priced_s = measured_s + measured, priced_s + priced
+                if priced > measured:
+                    top = max(cost.terms, key=lambda t: t.seconds)
+                    violations.append(
+                        {
+                            "step": name,
+                            "phase": _phase(view),
+                            "measured_s": measured,
+                            "priced_s": priced,
+                            "named": top.name,
+                            "named_s": top.seconds,
+                        }
+                    )
+            if priced_s:
+                rates[str(record)] = (tokens / measured_s, tokens / priced_s)
+        steps_priced = sum(map(len, seconds.values()))
+        verdict = "fail" if violations else "coverage report" if refused else "pass"
+        report[level] = {
+            "verdict": verdict,
+            "steps": steps_priced,
+            "steps_refused": unpriced,
+            "violations": violations,
+            "refused": dict(refused.most_common()),
+            "measured_over_analytical": {
+                p: _spread([m / a for m, a in s]) for p, s in seconds.items() if s
+            },
+            "analytical_s": {
+                p: {"total": sum(a for _, a in s), **_spread([a for _, a in s])}
+                for p, s in seconds.items()
+                if s
+            },
+            "by_bound": {
+                p: dict.fromkeys(BY_BOUND, 0.0) | fold_parts(s)
+                for p, s in parts.items()
+                if s
+            },
+            "ranking": _ranking(rates),
+            "draft_s": dict(drafts),
+        }
+    return report
+
+
+def _spread(values) -> dict:
+    """The min, p10, median, p90 and max of `values`."""
+    points = np.percentile(values, (0, 10, 50, 90, 100))
+    return dict(zip(("min", "p10", "median", "p90", "max"), points))
+
+
+def _ranking(rates: dict) -> dict | None:
+    """Records by analytical tokens a second, and where measured's fastest sits."""
+    if not rates:
+        return None
+    order = sorted(rates, key=lambda r: -rates[r][1])
+    fastest = max(rates, key=lambda r: rates[r][0])
+    rank = order.index(fastest) + 1
+    return {
+        "analytical_order": order,
+        "measured_fastest": fastest,
+        "top_1": rank == 1,
+        "top_3": rank <= 3,
+        "tokens_per_s": {
+            r: {"measured": m, "analytical": a} for r, (m, a) in rates.items()
+        },
+    }
+
+
+def ops(out, machine, tp: int, kv: str, ep: int = 1) -> dict:
+    """The points a `measure ops --plan` run at `out` measured, each its cold
+    time over the analytical price of its leaf at its shape and rows on
+    `machine`, in a TP group of `tp` and an EP group of `ep` with a `kv` KV cache,
+    by op kind and phase.
+    A leaf the analytical price says launches no kernel is counted apart, by
+    whether its point timed any kernel."""
+    from atom.compass.backends.op_work import work
+    from atom.compass.backends.work import price
+    from atom.compass.spec.rules import SpecRefusal
+
+    lines = Path(out, "plan.jsonl").read_text().splitlines()
+    ratios, refused, count = defaultdict(list), Counter(), Counter()
+    for p in map(json.loads, lines):
+        if "refused" in p:
+            count["unmeasured"] += 1
+            continue
+        rows = tuple(RequestShape(q, c, bool(d)) for q, c, d in p["rows"])
+        view = BatchView(rows, produces_output=True)
+        try:
+            w = work(json.loads(p["leaf"]), view, tp, kv, ep)
+            priced = None if w is None else price(w, machine)
+        except CostRefused as e:
+            refused.update(str(r) for r in e.declined)
+            continue
+        except (SpecRefusal, ValueError) as e:
+            refused[f"{p['op']}: {e}"] += 1
+            continue
+        if priced is None:
+            count["no kernel, timed" if p["cold_ns"] else "no kernel"] += 1
+            continue
+        ratios[p["op"], p["shape"].split()[0]].append(p["cold_ns"] * 1e-9 / priced)
+    return {
+        "points": len(lines),
+        "counts": dict(count),
+        "refused": dict(refused.most_common()),
+        "measured_over_analytical": {
+            f"{kind} {phase}": {
+                "points": len(r),
+                "above": sum(x < 1 for x in r),
+                **_spread(r),
+            }
+            for (kind, phase), r in sorted(ratios.items())
+        },
+    }
+
+
+def ops_text(r: dict) -> str:
+    rows, n = r["measured_over_analytical"], Counter(r["counts"])
+    priced = sum(q["points"] for q in rows.values())
+    above = sum(q["above"] for q in rows.values())
+    out = [
+        (
+            f"op points: {r['points']} planned, {n['unmeasured']} unmeasured, "
+            f"{n['no kernel'] + n['no kernel, timed']} of a leaf priced as launching "
+            f"no kernel ({n['no kernel, timed']} of them timed a kernel), {priced} "
+            f"priced, {sum(r['refused'].values())} refused; {above} priced above "
+            "their measured time, reported, not gated: the bound holds per step"
+        )
+    ]
+    out += [f"  refused {k} points: {reason}" for reason, k in r["refused"].items()]
+    out.append(
+        "  measured over analytical: kind phase | points | above | min | p10 | median | p90 | max"
+    )
+    for name, q in rows.items():
+        out.append(
+            f"  {name} | {q['points']} | {q['above']} | "
+            + " | ".join(f"{q[k]:.3f}" for k in ("min", "p10", "median", "p90", "max"))
+        )
+    return "\n".join(out)
+
+
+def text(report: dict) -> str:
+    out = []
+    for level, r in report.items():
+        out.append(
+            f"{level} level: {r['verdict']}, {r['steps']} steps priced, {r['steps_refused']} refused, {len(r['violations'])} above measured"
+        )
+        if r["violations"]:
+            named = Counter(v["named"] for v in r["violations"])
+            out.append(
+                f"  above measured, by costliest term: {json.dumps(dict(named.most_common()))}"
+            )
+        for v in r["violations"]:
+            out.append(
+                f"  above: {v['step']} ({v['phase']}) measured {v['measured_s'] * 1e3:.3f} ms,"
+                f" priced {v['priced_s'] * 1e3:.3f} ms; costliest {v['named']} {v['named_s'] * 1e3:.3f} ms"
+            )
+        # Reasons that differ only in their numbers, a shape or a row count, share a line.
+        census, values = Counter(), Counter()
+        for reason, n in r["refused"].items():
+            census[key := re.sub(r"\b\d+\b", "N", reason)] += n
+            values[key] += 1
+        for reason, n in census.most_common():
+            many = f" ({values[reason]} values of N)" if values[reason] > 1 else ""
+            out.append(f"  refused {n} steps: {reason}{many}")
+        out.append("  measured over analytical: phase | min | p10 | median | p90 | max")
+        for phase, q in r["measured_over_analytical"].items():
+            out.append(f"  {phase} | " + " | ".join(f"{x:.3f}" for x in q.values()))
+        for phase, s in r["draft_s"].items():
+            out.append(f"  drafter, not compared: {phase} {s * 1e3:.3f} ms analytical")
+        if (k := r["ranking"]) is not None:
+            out.append(
+                f"  ranking: top-1 {k['top_1']}, top-3 {k['top_3']}; measured fastest {k['measured_fastest']}"
+            )
+            for record in k["analytical_order"]:
+                t = k["tokens_per_s"][record]
+                out.append(
+                    f"  {record}: analytical {t['analytical']:.0f}, measured {t['measured']:.0f} tokens/s"
+                )
+    return "\n".join(out)
+
+
+def _build(model: str, tp: int, atom_args, arch: str, tmpdir: str):
+    """ATOM's config for its arguments, and the model it builds on the meta
+    device with no driver, `arch` declared, its post-load hooks run as a
+    simulated run's are."""
+    import torch
+
+    from atom.compass.capture import driverless
+    from atom.compass.capture.forward import _config
+    from atom.compass.runner.overrides import (
+        FactoriesOnMeta,
+        process_weights_after_loading,
+    )
+    from atom.config import set_current_atom_config
+    from atom.utils import resolve_obj_by_qualname
+
+    driverless.install(tmpdir, arch)
+    config = _config(model, tp, atom_args)
+    driverless.group(
+        config.tensor_parallel_size, config.parallel_config.data_parallel_size
+    )
+    set_current_atom_config(config)
+    from atom.model_engine.model_runner import (
+        support_model_arch_dict,
+    )  # needs the declared arch
+
+    model_class = support_model_arch_dict[config.hf_config.architectures[0]]
+    torch.set_default_dtype(config.torch_dtype)
+    with FactoriesOnMeta():
+        tree = resolve_obj_by_qualname(model_class)(config)
+        process_weights_after_loading(tree)
+    return config, tree
+
+
+def walked(atom_args, arch: str) -> list:
+    """The modules `run.modules.walk` reads off the model a server's ATOM
+    arguments `atom_args` build, `arch` declared, and off its block drafter
+    (`run.modules.drafter`), as a simulated run walks them. It declares a device
+    process-wide, so it runs in a process of its own."""
+    from atom.compass.drive import runfile
+    from atom.compass.run.modules import drafter, walk
+
+    engine, kept = runfile._engine_args(atom_args), runfile.engine_only(atom_args)
+    with tempfile.TemporaryDirectory(prefix="compass-walk-") as tmpdir:
+        config, tree = _build(
+            engine.model, engine.tensor_parallel_size, kept, arch, tmpdir
+        )
+        drafted = drafter(config)
+    return walk(tree, drafted)
+
+
+def backends(model: str, tp: int, atom_args, machine, store: str, records, ops=None):
+    """ATOM's config for its arguments, the EP width its MoE resolves and the
+    step- and op-level backends pricing `records` on `machine`, the op level
+    as a simulated run's (`run.op_graph`) over the op_graphs `store` holds for
+    its arch. Refused: a record, or the `measure ops` run
+    `ops`, that ran under another engine or other performance variables than
+    this process's; two-batch overlap of decode steps."""
+    from atom.compass.backends.step_roofline import StepRooflineBackend
+    from atom.compass.run import ep_width, op_graph, step_grid
+    from atom.compass.run.modules import drafter, walk
+
+    arch = machine.value("device.arch")
+    with tempfile.TemporaryDirectory(prefix="compass-bound-") as tmpdir:
+        config, tree = _build(model, tp, atom_args, arch, tmpdir)
+        drafted = drafter(config)
+    if config.enable_tbo_decode:
+        raise ValueError(
+            "two-batch overlap of decode steps: no step line states its split, "
+            "and only a prefill split is rebuilt from the step's lines"
+        )
+    engines = []
+    for record in records:
+        for path in sorted(Path(record, "steps").glob("dp*[0-9].jsonl")):
+            engine = path.with_suffix(".engine.json")
+            if engine.exists():
+                ran = json.loads(engine.read_text())
+            else:
+                ran = json.loads(path.with_suffix(".key.json").read_text())["engine"]
+            engines.append((path.parent, ran))
+    if ops:
+        engines.append((ops, json.loads(Path(ops, "engine.json").read_text())))
+    here = {"env": step_grid.keyed_env()}
+    for where, ran in engines:
+        if differ := [k for k in PRICED if ran.get(k) != getattr(config, k)]:
+            raise ValueError(
+                f"{where} ran under another engine than ATOM's arguments resolve: "
+                + "; ".join(
+                    f"{k} {ran.get(k)!r} there, {getattr(config, k)!r} here"
+                    for k in differ
+                )
+            )
+        stated = {"env": ran.get("env", here["env"])}
+        if named := step_grid.differ(stated, here, "its engine file"):
+            raise ValueError(
+                f"{where} ran under other performance variables than this "
+                "process's, which builds the model and keys the op graphs under "
+                "its own: " + "; ".join(named)
+            )
+    ep = ep_width(tree)
+    return (
+        config,
+        ep,
+        {
+            "step": StepRooflineBackend(machine, walk(tree, drafted)),
+            "op": op_graph({"store": store}, config, machine, ep),
+        },
+    )
+
+
+def main(argv: list[str]) -> None:
+    cut = argv.index("--") if "--" in argv else len(argv)
+    p = argparse.ArgumentParser(prog=PROG, description=__doc__)
+    p.add_argument(
+        "records", nargs="+", metavar="RECORD", help="a real run's directory"
+    )
+    p.add_argument("--model", required=True, help="a model name or directory")
+    p.add_argument("--tp", type=int, default=1, help="tensor-parallel width")
+    p.add_argument("--device", required=True, help="the datasheet, SKU or path")
+    p.add_argument("--ptl", required=True, choices=("enabled", "disabled"))
+    p.add_argument("--stack", help="the readings' stack and torch, of several")
+    p.add_argument(
+        "--ratios-from",
+        metavar="DEVICE",
+        help="price on --device's datasheet peaks at this device's probed ratios",
+    )
+    p.add_argument(
+        "--store",
+        required=True,
+        help="the artifact store holding the op_graphs and the readings",
+    )
+    p.add_argument(
+        "--ops",
+        metavar="DIR",
+        help="a `measure ops --plan` run's --out, whose points are each priced "
+        "at their leaf, shape and rows",
+    )
+    args = p.parse_args(argv[:cut])
+
+    from atom.compass.artifacts import ArtifactStore
+    from atom.compass.fit.device import assumed_entry, compose
+    from atom.compass.spec.layers import composed, datasheet
+
+    store = ArtifactStore(args.store)
+    if args.ratios_from:
+        key, entry, _, where = assumed_entry(
+            store, args.ratios_from, args.ptl, args.stack
+        )
+        machine = composed(datasheet(args.device), key, entry, source=where)
+    else:
+        machine = compose(args.device, store, args.ptl, args.stack)
+    config, ep, priced = backends(
+        args.model,
+        args.tp,
+        argv[cut + 1 :],
+        machine,
+        args.store,
+        args.records,
+        args.ops,
+    )
+    mtp = config.speculative_config is not None
+    report = gate(args.records, priced, config.enable_tbo, mtp)
+    print(text(report))
+    if args.ops:
+        print(
+            ops_text(
+                ops(
+                    args.ops,
+                    machine,
+                    config.tensor_parallel_size,
+                    config.kv_cache_dtype,
+                    ep,
+                )
+            )
+        )
+    if any(r["violations"] for r in report.values()):
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    import sys
+
+    from atom.compass.cli import refusing
+
+    refusing(PROG, main, sys.argv[1:])

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import math
-import time
 from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -28,6 +27,7 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
 )
 from atom.kv_transfer.offload.mp.deployment import _extra_config
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 

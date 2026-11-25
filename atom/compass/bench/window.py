@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: MIT
+"""The bench's window: a step's device time, read off the step recording's events.
+
+`BenchWindow.bench_step` runs one batch through the runner's `forward` again
+and again, each time a copy whose rows are new requests, so every forward runs
+the batch as it was handed in, and with the bench standing where
+`StepRecording`'s record would. Before
+each forward it queues a preload on the worker's stream, device work meant to
+outlast the host's issue of the whole forward, and records event F at the
+forward's entry; `StepRecording` records A at `run_model` entry and B at the
+forward's exit. A repeat's value is device time from F to B; F to A, the device
+work input preparation queues, and A to B, the record's `d_busy_ns`, are kept
+beside it.
+
+A repeat counts only if F is still pending once the forward has returned and B
+is recorded: the device was still in the preload, so nothing the host did shows
+between F and B. Otherwise it is discarded and the preload doubles, at most
+`DOUBLINGS` times in a point. A forward with a host synchronisation inside never
+qualifies, and its point refuses after more than `DOUBLINGS` misses in a row; a
+host that stalls now and then only discards the repeats it stalls.
+
+`WARMUPS` forwards run first, with no preload, and size the first preload: the
+longest the host took to issue one of them. Then the burst asked for is kept,
+and the statistic is its median. Every worker runs each forward, and the
+workers agree on it: a repeat counts only where it counts on every worker, the
+host time sizing the preload is the slowest worker's, and the repeat's times
+are the last-opened worker's, the one whose F to B is shortest. Each worker's
+preload spins a clock it calibrated once, so the preloads end apart, and every
+worker waits at the forward's first collective for the last to open: the
+window of a worker that opened earlier also holds that wait. The last-opened
+worker's holds none, and every collective holds it for the slowest worker, so
+the reply of rank 0, the only one the runner manager returns, carries the
+group's step, charged to its slowest rank.
+
+Under a drafter a repeat is split where `step_labels` splits a real step: the
+target's part runs from F to the record's target end, `d_target_ns`, with the
+draft-KV pass before `forward_done_event` on a forward that produces output,
+and the drafter's part is the rest of A to B, kept as the repeat's fourth
+time. The statistic is then the median of the target's parts, F to B less the
+drafter's, and `draft_median_ns` the median of the drafter's.
+
+The reply also states `group_needs_eager`: the `any_rank_needs_eager` of the
+`ForwardMode` the forwards settled, which `StepRecording` keeps at `run_model`
+entry, so whether an attention backend refused the batch a graph and it ran
+eagerly. Each forward runs the same batch, so each settles alike; a forward
+that settled no mode states false.
+
+A point's repeats come in bursts (`17` D98): `measure steps` asks each point
+for a burst of `BURST`, and for a second once every point has had its first.
+Where the two medians agree within `AGREE` of the first's, the drafter's parts'
+too under a drafter, the point keeps those ten; otherwise it runs on to
+`REPEATS` at once (`more`). The point's statistic is the median of every repeat
+it kept (`joined`).
+"""
+
+import copy
+import itertools
+import statistics
+
+import torch
+import torch.distributed as dist
+
+#: The measuring protocol's version; it changes whenever a count below does.
+PROTOCOL = 2
+WARMUPS = 3
+#: A burst's repeats; a point's first two bursts run a pass of the bench apart.
+BURST = 5
+#: How near the two bursts' medians are kept, relative to the first's: 0.23%,
+#: the median difference between two of #1233's cards (`17` D98).
+AGREE = 0.0023
+#: The repeats a point whose two bursts disagree runs on to.
+REPEATS = 45
+DOUBLINGS = 5
+
+#: Request ids no scheduler hands out, one per row of each forward the bench runs.
+_FRESH = itertools.count(1 << 48)
+
+
+class BenchWindow:
+    """Put before `StepRecording` in the bases.
+
+    The class it is composed into supplies, beside `StepRecording`'s
+    `step_clock_ns` and `device_event`, `preload(ns)`, which queues about `ns`
+    of device work on the current stream, and `bench_group()`, the process
+    group the workers agree over, or None for one worker.
+    """
+
+    def bench_step(self, batch, repeats: int) -> dict:
+        """`batch` measured, a burst of `repeats` kept repeats and their median,
+        or a refusal."""
+        preload = max(self._repeat(batch, 0)[-1] for _ in range(WARMUPS))
+        longest = preload << DOUBLINGS
+        kept, discarded, in_a_row = [], 0, 0
+        while len(kept) < repeats:
+            missed, *times, _host = self._repeat(batch, preload)
+            if not missed:
+                kept.append(times)
+                in_a_row = 0
+                continue
+            discarded += 1
+            in_a_row += 1
+            if in_a_row > DOUBLINGS:
+                return {
+                    "protocol": PROTOCOL,
+                    "refused": (
+                        f"the forward's entry event completed before the forward "
+                        f"returned behind every preload up to {preload} ns: a host "
+                        "synchronisation inside the forward"
+                    ),
+                }
+            preload = min(2 * preload, longest)
+        return {
+            "protocol": PROTOCOL,
+            **_medians(kept),
+            # each [F to B, F to A, A to B] in ns, and the drafter's part
+            "repeats": kept,
+            "discarded": discarded,
+            "preload_ns": preload,
+            "group_needs_eager": self._needs_eager,
+        }
+
+    def _repeat(self, batch, preload: int) -> list[int]:
+        """One forward behind `preload` ns, agreed by every worker:
+        [missed, F to B, F to A, A to B, the drafter's part under a drafter,
+        host ns]."""
+        # A real forward may rewrite batch fields in place, and a decode row
+        # under a request id the runner has seen takes the token it sampled
+        # last, not the batch's own: each forward runs a copy, as new requests.
+        batch = copy.deepcopy(batch)
+        batch.req_ids = [next(_FRESH) for _ in batch.req_ids]
+        forward = self._parity_record = _Forward(preload)
+        try:
+            self.forward(batch)
+        finally:
+            self._parity_record = None
+        self._needs_eager = forward.needs_eager
+        group = self.bench_group()
+        if group is None:
+            return forward.values
+        mine = torch.tensor(forward.values, dtype=torch.int64)
+        ranks = [torch.empty_like(mine) for _ in range(dist.get_world_size(group))]
+        dist.all_gather(ranks, mine, group=group)
+        ranks = torch.stack(ranks)
+        missed, *_, host = ranks.max(0).values.tolist()
+        _, *times, _ = ranks[ranks[:, 1].argmin()].tolist()
+        return [missed, *times, host]
+
+
+def more(bursts: list[dict]) -> int:
+    """How many more repeats a point runs after `bursts`, `bench_step`'s
+    results, at least two: none once its first two agree or it holds
+    `REPEATS`, else the rest of `REPEATS`."""
+    first, second = (_medians(b["repeats"]) for b in bursts[:2])
+    agree = all(abs(second[v] - first[v]) <= AGREE * first[v] for v in first)
+    held = sum(len(b["repeats"]) for b in bursts)
+    return 0 if agree or held >= REPEATS else REPEATS - held
+
+
+def joined(bursts: list[dict]) -> dict:
+    """A point's measurement from its `bursts`: every kept repeat and their
+    median, under a drafter their drafter parts' too; how many each burst
+    kept; the repeats discarded and the longest preload; and whether any
+    burst ran the batch eagerly."""
+    kept = [t for b in bursts for t in b["repeats"]]
+    return {
+        "protocol": PROTOCOL,
+        **_medians(kept),
+        "repeats": kept,
+        "bursts": [len(b["repeats"]) for b in bursts],
+        "discarded": sum(b["discarded"] for b in bursts),
+        "preload_ns": max(b["preload_ns"] for b in bursts),
+        "group_needs_eager": any(b["group_needs_eager"] for b in bursts),
+    }
+
+
+def _medians(kept: list) -> dict:
+    """The median of `kept` repeats' target parts, F to B less the drafter's
+    part, and under a drafter that of the drafter's parts."""
+    medians = {"median_ns": statistics.median(t[0] - sum(t[3:]) for t in kept)}
+    if len(kept[0]) > 3:
+        medians["draft_median_ns"] = statistics.median(t[3] for t in kept)
+    return medians
+
+
+class _Forward:
+    """What `record_step` hands a bench forward to, in place of a `StepRecord`."""
+
+    def __init__(self, preload: int) -> None:
+        self.preload = preload
+
+    def add(self, batch, runner, forward):
+        # A real forward may rewrite batch fields in place.
+        output = hasattr(runner, "drafter") and batch.produces_output()
+        start = runner.step_clock_ns()
+        if self.preload:
+            runner.preload(self.preload)
+        entry = runner.device_event()
+        # F stands where the previous forward's exit would, so the record's
+        # device gap is F to A.
+        runner._last_exit = entry
+        reply = forward(batch)
+        stamps, window = runner.step_stamps()  # records B
+        host = runner.step_clock_ns() - start
+        mode = stamps.get("forward_mode")
+        self.needs_eager = bool(mode and mode.sync and mode.sync.any_rank_needs_eager)
+        missed = entry.query()
+        fields = window(True)
+        values = [
+            int(missed),
+            round(entry.elapsed_time(runner._last_exit) * 1e6),
+            fields["d_gap_ns"],
+            fields["d_busy_ns"],
+        ]
+        if "d_target_ns" in fields:
+            target = fields["d_target_ns"] + output * fields.get("d_draft_kv_ns", 0)
+            values.append(fields["d_busy_ns"] - target)
+        self.values = [*values, host]
+        return reply

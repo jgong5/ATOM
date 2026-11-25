@@ -2166,6 +2166,18 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             )
         return super().build_kv_cache_tensor(module)
 
+    def finish_prefill(self, batch, attn_metadata, running_bs, running_tokens):
+        super().finish_prefill(batch, attn_metadata, running_bs, running_tokens)
+        gdn_metadata = attn_metadata.gdn_metadata
+        if gdn_metadata is None:
+            return
+        # `prepare_chunk_indices` reads the lengths from this host copy, so the
+        # chunk kernels' launch does not wait for the device.
+        cu = gdn_metadata.non_spec_query_start_loc
+        cu.host_copy = (
+            self.model_runner.forward_vars["cu_seqlens_q"].cpu[: cu.numel()].clone()
+        )
+
     def prepare_mtp_decode(
         self,
         bs: int,

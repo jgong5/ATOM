@@ -8,7 +8,6 @@ from __future__ import annotations
 import functools
 import logging
 import threading
-import time
 from typing import Any
 
 from atom.kv_transfer.disaggregation.types import (
@@ -42,6 +41,7 @@ from atom.kv_transfer.offload.mp.transfer import (
 )
 from atom.model_engine.sequence import SequenceStatus
 from atom.utils import envs
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 

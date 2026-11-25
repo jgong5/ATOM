@@ -34,7 +34,7 @@ from atom.kv_transfer.offload.metadata import (
     SaveSpec,
 )
 from atom.model_engine.sequence import SequenceStatus, resumes_offload_prefill
-from atom.utils import envs
+from atom.utils import clock, envs
 
 _PIN_PENDING = LookupPinStatus.PENDING
 logger = logging.getLogger("atom")
@@ -475,7 +475,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if not self._lookup_in_flight(seq):
             return False
         first = self._lookup_defer_since.get(str(seq.id))
-        return first is None or time.monotonic() - first <= envs.OFFLOAD_LOOKUP_DEFER_S
+        # The clock `lookup_pending` stamped `first` with.
+        now = clock.now(time.monotonic)
+        return first is None or now - first <= envs.OFFLOAD_LOOKUP_DEFER_S
 
     def lookup_pending(self, seq) -> bool:
         """True while admission should pass over `seq`: its lookup is in flight.
@@ -491,7 +493,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if not self._lookup_in_flight(seq):
             self._lookup_defer_since.pop(sid, None)
             return False
-        now = time.monotonic()
+        now = clock.now(time.monotonic)
         first = self._lookup_defer_since.setdefault(sid, now)
         if now - first > envs.OFFLOAD_LOOKUP_DEFER_S:
             self._perf_bump("lookup_defer_expired")
@@ -1219,7 +1221,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         added = set(block_ids) - leased
         leased.update(added)
         if added:
-            self._save_lease_at.setdefault(lease_key, time.monotonic())
+            self._save_lease_at.setdefault(lease_key, clock.now(time.monotonic))
             self.total_leased_source_blocks += len(added)
 
     def take_source_safe_releases(self) -> list[frozenset]:
@@ -1232,7 +1234,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Force-release leases whose save never reported, past ``timeout_s``."""
         if timeout_s <= 0 or not self._save_lease_at:
             return []
-        now = time.monotonic()
+        now = clock.now(time.monotonic)
         stale_keys = [
             lease_key
             for lease_key, at in self._save_lease_at.items()

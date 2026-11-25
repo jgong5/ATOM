@@ -805,7 +805,11 @@ impl PDRouter {
             .plan(&descriptor)
             .await
             .map_err(|error| placement_err_to_response(error, context.model_id))?;
-        self.reserve_pair(plan, context.headers.as_deref())
+        let pair = self.reserve_pair(plan, context.headers.as_deref());
+        if let Ok(pair) = &pair {
+            crate::compass_router::placed(pair.prefill.base_url(), pair.decode.base_url());
+        }
+        pair
     }
 
     async fn execute_reserved(
@@ -1084,7 +1088,7 @@ impl PDRouter {
         let prefill = placement.prefill.clone();
         let decode = placement.decode.clone();
         let [prefill_guard, decode_guard] = match placement.take_load() {
-            Ok(guards) => guards,
+            Ok(guards) => crate::compass_router::cancellable(guards),
             Err(response) => return response,
         };
 
@@ -1155,7 +1159,7 @@ impl PDRouter {
             );
         }
 
-        let prefill_body: Value = match prefill_resp.json().await {
+        let mut prefill_body: Value = match prefill_resp.json().await {
             Ok(v) => v,
             Err(e) => {
                 error!(
@@ -1171,8 +1175,14 @@ impl PDRouter {
             }
         };
 
+        let relayed = crate::compass_router::relay(&mut prefill_body).await;
         // P has completed its work; D's output stream must not keep P loaded.
         drop(prefill_guard);
+        if relayed.as_ref().is_some_and(|turn| turn.cancelled) {
+            drop(decode_guard);
+            return error::bad_request("cancelled", "Cancelled before its relay");
+        }
+        drop(relayed);
 
         let mut kv_params = match prefill_body.get("kv_transfer_params").cloned() {
             Some(v) => v,
@@ -1367,7 +1377,7 @@ impl PDRouter {
         res: WorkerResponse,
         context: PDRequestContext<'_>,
         decode: Arc<dyn Worker>,
-        decode_guard: WorkerLoadGuard,
+        decode_guard: impl Send + Unpin + 'static,
     ) -> Response {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1415,7 +1425,7 @@ impl PDRouter {
         &self,
         res: WorkerResponse,
         context: &PDRequestContext<'_>,
-        decode_guard: WorkerLoadGuard,
+        decode_guard: impl Send + Unpin + 'static,
         decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
@@ -1656,8 +1666,9 @@ impl PDRouter {
         return_logprob: bool,
         decode_url: Option<String>,
         headers: Option<HeaderMap>,
-        decode_guard: WorkerLoadGuard,
+        decode_guard: impl Send + Unpin + 'static,
     ) -> Response {
+        let (stream, decode_guard) = crate::compass_router::stream(stream, decode_guard);
         // Poll the upstream only when the downstream asks for data. Dropping the
         // response also drops the upstream, including while it is idle.
         let stream = futures_util::stream::unfold(
@@ -1909,7 +1920,7 @@ impl PDRouter {
         })?;
 
         // Resolve credentials for each PD worker with the same rules as regular ingress.
-        let headers = header_utils::inference_request_headers(
+        let mut headers = header_utils::inference_request_headers(
             headers.unwrap_or(&HeaderMap::new()),
             route,
             worker.api_key().as_deref(),
@@ -1919,6 +1930,20 @@ impl PDRouter {
             worker.record_outcome(false);
             error.response(route)
         })?;
+        // Under Compass a `tracestate` carries the request's stamp, restamped
+        // for the prefill it was placed on; otherwise it goes on unchanged.
+        if let http::header::Entry::Occupied(mut tracestate) = headers.entry("tracestate") {
+            for value in tracestate.iter_mut() {
+                let stamped = value
+                    .to_str()
+                    .ok()
+                    .map(|v| crate::compass_router::header("tracestate", v))
+                    .and_then(|v| HeaderValue::from_str(&v).ok());
+                if let Some(stamped) = stamped {
+                    *value = stamped;
+                }
+            }
+        }
         let mut request = client
             .post(worker.endpoint_url(route))
             .headers(headers)

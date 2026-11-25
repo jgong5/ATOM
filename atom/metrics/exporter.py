@@ -10,7 +10,6 @@ import asyncio
 import copy
 import gc
 import threading
-import time
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from typing import Any
@@ -20,6 +19,7 @@ from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
 from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
+from atom.utils import time_shim as time
 
 Snapshot = dict[str, Any]
 SnapshotState = tuple[Snapshot, int, float]

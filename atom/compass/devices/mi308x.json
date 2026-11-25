@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "name": "mi308x",
+  "provenance": {
+    "authored_by": "compass agent for jgong5",
+    "date": "2026-11-03",
+    "origin": "mixed",
+    "origins": {
+      "device.name": {"origin": "probed"},
+      "device.arch": {"origin": "probed"},
+      "device.count_per_node": {"origin": "probed"},
+      "device.memory.capacity_bytes": {"origin": "probed"},
+      "device.memory.bandwidth_bytes_per_s": {"origin": "assumed"},
+      "device.compute.bf16_flops": {"origin": "assumed"},
+      "device.compute.fp8_flops": {"origin": "assumed"},
+      "interconnect.intra_node.topology": {"origin": "assumed"},
+      "interconnect.intra_node.domain_devices": {"origin": "assumed"},
+      "interconnect.intra_node.link_bandwidth_bytes_per_s": {"origin": "assumed"}
+    },
+    "notes": "name, arch, count and capacity read at one Qwen/Qwen3.8-27B TP1 engine start on each node, equal on both: card 7 of hjbog-srdc-18 at 0f045543d (server log sha256:213874c331d63384299d21d68bdffd1cda1aecf72ba4a9eab80beb63a7243bd7) and card 5 of hjbog-srdc-39 at ce625ddd9 (sha256:e7c309168326a052460eb20e1cec1f0744415b69161e80856069339158600c52) | no probe fills the rest: the compute peaks are MI300X's datasheet scaled by 80 of its 304 compute units, the bandwidth and link rate MI300X's unscaled, the topology and domain the schema's example values"
+  },
+  "device": {
+    "name": "MI308X",
+    "arch": "gfx942",
+    "count_per_node": 8,
+    "memory": {
+      "capacity_bytes": 206141652992,
+      "bandwidth_bytes_per_s": 5.3e12
+    },
+    "compute": {
+      "bf16_flops": 3.44e14,
+      "fp8_flops": 6.88e14
+    }
+  },
+  "interconnect": {
+    "intra_node": {
+      "topology": "fully_connected",
+      "domain_devices": 8,
+      "link_bandwidth_bytes_per_s": 6.4e10
+    }
+  }
+}

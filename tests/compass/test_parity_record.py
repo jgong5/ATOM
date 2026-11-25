@@ -1,0 +1,922 @@
+# SPDX-License-Identifier: MIT
+"""The per-step record, taken off ATOM's own scheduler, and the first-divergence compare.
+
+Each run drives the real `Scheduler` and the simulated runner's `forward` in the
+engine's order -- schedule, forward, postprocess -- one scheduler per DP rank,
+with every prompt distinct unless a test says otherwise.
+"""
+
+import gc
+import hashlib
+import json
+import pathlib
+import queue
+import runpy
+import shutil
+import sys
+import threading
+import time
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+from conftest import MockConfig
+from test_backend_step_linear_fit import platform_arg
+from test_dp_step_max import dp2  # noqa: F401  the dp2 fixture
+from test_memory_readings import DOCUMENT
+
+from atom.benchmarks.results.metadata import PERFORMANCE_KEYS
+from atom.compass import run
+from atom.compass.backends import step_linear_fit
+from atom.compass.backends.shape import BatchView, RequestShape
+from atom.compass.backends.step_stub import StepStubBackend
+from atom.compass.parity import (
+    ENV,
+    RUNNER,
+    TIMESTAMPS,
+    StepRecord,
+    StepRecording,
+    _record,
+    compare,
+    read,
+)
+from atom.compass.run.step_grid import keyed_of
+from atom.compass.runner import overrides, projection
+from atom.compass.runner.overrides import NonAllocatingRunner, install_cost_backend
+from atom.compass.runner.step_output import DeferredTokenStream
+from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.prefill_delayer import PrefillDelayer
+from atom.model_engine.scheduler import ScheduledBatch, Scheduler
+from atom.model_engine.sequence import Sequence, SequenceType
+from atom.sampling_params import SamplingParams
+from atom.utils import clock, forward_context
+from atom.utils.tbo import ubatching
+
+PROMPT, BUDGET, BLOCK = 200, 64, 16
+#: The capture ladder every runner here replays decode steps from.
+LADDER = [1, 2, 4, 8]
+#: An attention builder that runs every decode from a graph, as ATOM's base does.
+GRAPHABLE = SimpleNamespace(
+    step_needs_eager=lambda batch: False, supports_token_graph=False
+)
+
+
+def _prompt(i):
+    return list(range(5 + 1000 * i, 5 + 1000 * i + PROMPT))
+
+
+def _key(tokens):
+    data = np.asarray(tokens, dtype=np.int32).tobytes()
+    return hashlib.blake2b(data, digest_size=8).hexdigest()
+
+
+def _config(dp_rank=0, pipeline_parallel_size=1, budget=BUDGET, blocks=4096, **extra):
+    return MockConfig(
+        **extra,
+        max_num_seqs=8,
+        num_kvcache_blocks=blocks,
+        kv_cache_block_size=BLOCK,
+        max_model_len=2048,
+        max_num_batched_tokens=budget,
+        pipeline_parallel_size=pipeline_parallel_size,
+        parallel_config=SimpleNamespace(
+            data_parallel_rank=dp_rank, data_parallel_size=1
+        ),
+        # The engine fields a record states, which a real Config always has.
+        enforce_eager=False,
+        capture_sizes=list(LADDER),
+        kv_cache_dtype="bf16",
+        quant_config=SimpleNamespace(compute_hash=lambda: "q"),
+        tensor_parallel_size=1,
+        kv_transfer_config={},
+    )
+
+
+class _Runner(NonAllocatingRunner):
+    """The simulated runner's `forward`, with the attributes it reads."""
+
+    def __init__(self, config, rank=0):
+        self.config, self.rank = config, rank
+        install_cost_backend(self, StepStubBackend())
+        self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+        self.running_tokens_per_dp_rank = np.zeros(
+            self.config.parallel_config.data_parallel_size, dtype=np.int32
+        )
+        self.tbo_decode_graphs = False
+        self.attn_metadata_builder = GRAPHABLE
+        self._token_stream = DeferredTokenStream([0])
+
+
+#: The pricing step, kept before `unpriced` stubs it for the module.
+GROUP_STEP_SECONDS = overrides._group_step_seconds
+
+# Reporting is under test here, not the price: `test_dp_step_max.py` prices.
+pytestmark = pytest.mark.usefixtures("unpriced")
+
+
+def _drive(
+    directory,
+    monkeypatch,
+    ranks,
+    prompt=_prompt,
+    budget=BUDGET,
+    blocks=4096,
+    delayer=False,
+    per_req_cache=False,
+    **extra,
+):
+    """Run each DP rank's requests to completion; return its batches and sequences.
+
+    `delayer` installs ATOM's `PrefillDelayer` at its defaults, as its DP engine does;
+    `per_req_cache` gives each sequence per-request state, as V4.1's attention does,
+    and `extra` sets the scheduler's config.
+    """
+    monkeypatch.setenv(ENV, str(directory))
+    built = {}
+    for dp_rank, requests in ranks.items():
+        config = _config(dp_rank, budget=budget, blocks=blocks, **extra)
+        scheduler, runner = Scheduler(config), _Runner(config)
+        if delayer:
+            scheduler.set_prefill_delayer(PrefillDelayer(1, None, budget))
+        sequences = [
+            Sequence(
+                prompt(i),
+                BLOCK,
+                sampling_params=SamplingParams(max_tokens=3, ignore_eos=True),
+                has_per_req_cache=per_req_cache,
+            )
+            for i in requests
+        ]
+        for sequence in sequences:
+            scheduler.add(sequence)
+        batches = []
+        while scheduler.has_unfinished_requests():
+            assert len(batches) < 100, "the driven sequence does not terminate"
+            scheduled = scheduler.schedule()
+            if scheduled is None or scheduled[0] is None or not scheduled[0].req_ids:
+                continue
+            batch, seqs = scheduled
+            batches.append(batch)
+            reply = runner.forward(batch)
+            if delayer and batch.total_seqs_num_prefill:
+                scheduler.prefill_delayer.notify_prefill_executed()
+            scheduler.postprocess(
+                list(seqs.values()),
+                reply,
+                stream_output_queue=queue.Queue(),
+                batch=batch,
+            )
+        built[dp_rank] = (batches, {s.id: s for s in sequences}, runner)
+    return built
+
+
+@pytest.mark.parametrize(
+    "length, first_rows",
+    # At 20 tokens both prompts open in one batch, the second at row 1, and no
+    # chunk is a middle one.
+    [(PROMPT, [0, 0]), (20, [0, 1])],
+)
+def test_the_record_is_the_batches_the_scheduler_built(
+    tmp_path, monkeypatch, length, first_rows
+):
+    # An earlier run's file in the same directory is replaced, not appended to.
+    _drive(tmp_path, monkeypatch, {0: [2]})
+    built = _drive(tmp_path, monkeypatch, {0: [0, 1]}, lambda i: _prompt(i)[:length])
+    batches, sequences, runner = built[0]
+    keys, expected, opened_at = {}, [], []
+    for step, batch in enumerate(batches):
+        rows, shapes = [], []
+        for i, req_id in enumerate(batch.req_ids):
+            if req_id not in keys:
+                opened_at.append(i)
+            key = keys.setdefault(req_id, _key(sequences[req_id].prompt_token_ids))
+            num, context = int(batch.num_scheduled_tokens[i]), int(
+                batch.context_lens[i]
+            )
+            rows.append([key, num, context])
+            # Every prefill chunk here is 8 tokens or more; a decode is 1.
+            shapes.append([num, context, num == 1])
+        decoding = all(decode for *_, decode in shapes)
+        expected.append(
+            {
+                "step": step,
+                "dp_rank": 0,
+                "is_dummy_run": False,
+                "produces_output": batch.produces_output(),
+                "batch": rows,
+                "rows": shapes,
+                # A decode step replays the narrowest graph that holds it.
+                "rung": min(w for w in LADDER if w >= len(rows)) if decoding else None,
+            }
+        )
+    assert len(set(keys.values())) == 2 and opened_at == first_rows
+    assert any(not step["produces_output"] for step in expected) == (length == PROMPT)
+    assert {step["rung"] for step in expected} == {None, 2}
+    assert read(tmp_path) == {0: expected}
+
+    # The dummy batch `ModelRunner.dummy_execution` builds for DP synchronisation.
+    seq = Sequence([0], block_size=BLOCK, id=-1)
+    seq.type = SequenceType.DECODE
+    runner.forward(
+        ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=np.array([1], dtype=np.int32),
+            total_tokens_num=1,
+            total_tokens_num_decode=1,
+            total_seqs_num=1,
+            total_seqs_num_decode=1,
+            is_dummy_run=True,
+        )
+    )
+    assert read(tmp_path)[0][-1] == {
+        "step": len(batches),
+        "dp_rank": 0,
+        "is_dummy_run": True,
+        "produces_output": True,
+        "batch": [],
+        "rows": [[1, 1, True]],
+        "rung": 1,
+    }
+
+
+def test_two_records_of_one_sequence_compare_equal(tmp_path, monkeypatch):
+    _drive(tmp_path / "real", monkeypatch, {0: [0, 1], 1: [2, 3]})
+    _drive(tmp_path / "simulated", monkeypatch, {0: [0, 1], 1: [2, 3]})
+    report = compare(tmp_path / "real", tmp_path / "simulated")
+    assert report["first_divergence"] == {0: None, 1: None}
+    ranks = report["request_dp_rank"]
+    assert ranks["real"] == ranks["simulated"]
+    assert sorted(ranks["real"].values()) == [0, 0, 1, 1]
+
+
+@pytest.mark.parametrize(
+    "budget, length",
+    # At a 128-token budget requests 1, 2 and 3 open with a different first
+    # chunk in each run, 64 tokens in one and 128 in the other.
+    [(BUDGET, PROMPT), (128, 150)],
+)
+def test_a_request_moved_to_the_other_rank_names_its_first_step(
+    tmp_path, monkeypatch, budget, length
+):
+    def prompt(i):
+        return _prompt(i)[:length]
+
+    real = _drive(
+        tmp_path / "real", monkeypatch, {0: [0, 1], 1: [2, 3]}, prompt, budget
+    )
+    _drive(tmp_path / "simulated", monkeypatch, {0: [0], 1: [1, 2, 3]}, prompt, budget)
+    report = compare(tmp_path / "real", tmp_path / "simulated")
+    real_record = read(tmp_path / "real")
+    first = report["first_divergence"]
+    # Rank 0 parts where request 1 is first scheduled on the real side.
+    moved = next(
+        step for step, b in enumerate(real[0][0]) if any(r == 1 for r in b.req_ids)
+    )
+    assert first[0]["step"] == moved
+    assert first[0]["real"] == real_record[0][moved]
+    assert first[1]["step"] == 0
+    ranks = report["request_dp_rank"]
+    assert ranks["real"].keys() == ranks["simulated"].keys()
+    assert [
+        (ranks["real"][key], ranks["simulated"][key])
+        for key in ranks["real"]
+        if ranks["real"][key] != ranks["simulated"][key]
+    ] == [(0, 1)]
+
+
+def test_a_shifted_chunk_boundary_names_its_first_step(tmp_path, monkeypatch):
+    _drive(tmp_path / "real", monkeypatch, {0: [0, 1], 1: [2, 3]})
+    shutil.copytree(tmp_path / "real", tmp_path / "simulated")
+    path = tmp_path / "simulated" / "dp0.jsonl"
+    steps = [json.loads(line) for line in path.read_text().splitlines()]
+    # Request 0's first two chunks, 64 and 64, become 60 and 68.
+    assert [s["batch"][0][1:] for s in steps[:2]] == [[64, 64], [64, 128]]
+    steps[0]["batch"][0][1:] = [60, 60]
+    steps[1]["batch"][0][1:] = [68, 128]
+    path.write_text("".join(json.dumps(s) + "\n" for s in steps))
+    report = compare(tmp_path / "real", tmp_path / "simulated")
+    assert report["first_divergence"][1] is None
+    first = report["first_divergence"][0]
+    assert first["step"] == 0
+    assert first["real"]["batch"][0][1:] == [64, 64]
+    assert first["simulated"]["batch"][0][1:] == [60, 60]
+
+
+def test_a_record_that_stops_early_or_has_no_rank_parts_where_it_ends(
+    tmp_path, monkeypatch
+):
+    _drive(tmp_path / "real", monkeypatch, {0: [0, 1], 1: [2, 3]})
+    shutil.copytree(tmp_path / "real", tmp_path / "simulated")
+    real = read(tmp_path / "real")
+    (tmp_path / "simulated" / "dp0.jsonl").unlink()
+    cut = tmp_path / "simulated" / "dp1.jsonl"
+    lines = cut.read_text().splitlines(keepends=True)
+    # Cut after the line naming rank 1's last request, so every row is keyed.
+    end = max(n for n, line in enumerate(lines) if json.loads(line)["named"]) + 1
+    assert end < len(lines)
+    cut.write_text("".join(lines[:end]))
+    first = compare(tmp_path / "real", tmp_path / "simulated")["first_divergence"]
+    assert first == {
+        0: {"step": 0, "real": real[0][0], "simulated": None},
+        1: {"step": end, "real": real[1][end], "simulated": None},
+    }
+
+
+def test_requests_behind_one_system_prompt_keep_their_keys_at_every_budget(
+    tmp_path, monkeypatch
+):
+    # A 192-token system prompt, then a distinct 36-token tail; the first
+    # chunks differ with the budget.
+    def prompt(i):
+        return _prompt(9)[:192] + _prompt(i)[:36]
+
+    keys = []
+    for budget in (64, 128, 512):
+        _drive(tmp_path / str(budget), monkeypatch, {0: [0, 1, 2, 3]}, prompt, budget)
+        steps = read(tmp_path / str(budget))[0]
+        keys.append({row[0] for step in steps for row in step["batch"]})
+    assert keys[0] == keys[1] == keys[2] == {_key(prompt(i)) for i in range(4)}
+
+
+def test_two_requests_with_one_prompt_are_named_in_final_chunk_order(
+    tmp_path, monkeypatch
+):
+    for side in ("real", "simulated"):
+        built = _drive(tmp_path / side, monkeypatch, {0: [0, 1]}, lambda i: _prompt(0))
+    batches, sequences, _ = built[0]
+    finals = list(
+        dict.fromkeys(
+            req_id
+            for b in batches
+            for i, req_id in enumerate(b.req_ids)
+            if b.is_final_chunk is not None and b.is_final_chunk[i]
+        )
+    )
+    key = _key(_prompt(0))
+    lines = (tmp_path / "simulated" / "dp0.jsonl").read_text().splitlines()
+    named = [pair for line in lines for pair in json.loads(line)["named"]]
+    assert named == [[finals[0], key], [finals[1], f"{key}.1"]]
+    assert sorted(finals) == sorted(sequences)
+    steps = read(tmp_path / "simulated")[0]
+    assert {row[0] for step in steps for row in step["batch"]} == {key, f"{key}.1"}
+    report = compare(tmp_path / "real", tmp_path / "simulated")
+    assert report["first_divergence"] == {0: None}
+
+
+def test_a_window_that_does_not_continue_the_last_is_refused(tmp_path, monkeypatch):
+    batches = _drive(tmp_path / "source", monkeypatch, {0: [0]})[0][0]
+    runner = _Runner(_config())
+    runner.forward(batches[0])
+    with pytest.raises(ValueError, match="starts at token 128, not at 64"):
+        runner.forward(batches[2])
+
+
+@pytest.mark.parametrize(
+    "threshold, starts",
+    # 8 rows are left after the last full chunk, under the 16 a final forward
+    # needs, so it starts on the block grid at 176, below where the last ended.
+    [(0, [0, 64, 128, 176]), (48, [0, 48, 96, 144, 176])],
+)
+def test_a_final_chunk_backed_off_below_the_last_end_keeps_its_whole_prompt_key(
+    tmp_path, monkeypatch, threshold, starts
+):
+    built = _drive(
+        tmp_path,
+        monkeypatch,
+        {0: [0]},
+        per_req_cache=True,
+        pool_entries={"state": 8},
+        min_final_prefill_rows=16,
+        long_prefill_token_threshold=threshold,
+    )
+    batches = [b for b in built[0][0] if b.num_scheduled_tokens[0] > 1]
+    assert [int(b.num_cached_tokens[0]) for b in batches] == starts
+    steps = read(tmp_path)[0]
+    assert {row[0] for step in steps for row in step["batch"]} == {_key(_prompt(0))}
+    # The back-off continues the chunk it follows, not any earlier one.
+    runner = _Runner(_config())
+    runner.forward(batches[0])
+    with pytest.raises(ValueError, match="starts at token 176, not at"):
+        runner.forward(batches[-1])
+
+
+@pytest.mark.parametrize(
+    "blocks, starts",
+    # Four 16-token requests decode beside request 4's 200-token prompt, and
+    # the pool is too small for all of them, so request 4 is preempted.
+    [
+        # Mid-prefill, held by the delayer: it restarts at token 0.
+        (19, [0, 64, 128, 0, 64, 128, 192]),
+        # After its final chunk: it re-prefills, already named.
+        (17, [0, 64, 128, 192, 0, 64, 128, 192]),
+    ],
+)
+def test_a_preempted_request_keeps_its_whole_prompt_key(
+    tmp_path, monkeypatch, blocks, starts
+):
+    def prompt(i):
+        return _prompt(i)[: 16 if i < 4 else PROMPT]
+
+    built = _drive(
+        tmp_path, monkeypatch, {0: range(5)}, prompt, blocks=blocks, delayer=True
+    )
+    batches, sequences, _ = built[0]
+    last = list(sequences)[-1]
+    assert [
+        int(b.num_cached_tokens[i])
+        for b in batches
+        for i, req_id in enumerate(b.req_ids)
+        if req_id == last and b.num_scheduled_tokens[i] > 1
+    ] == starts
+    steps = read(tmp_path)[0]
+    assert {row[0] for step in steps for row in step["batch"]} == {
+        _key(prompt(i)) for i in range(5)
+    }
+
+
+def test_one_key_on_two_ranks_is_refused(tmp_path, monkeypatch):
+    _drive(tmp_path / "real", monkeypatch, {0: [0], 1: [0]})
+    _drive(tmp_path / "simulated", monkeypatch, {0: [0]})
+    with pytest.raises(ValueError, match="the real record schedules request"):
+        compare(tmp_path / "real", tmp_path / "simulated")
+
+
+def test_an_empty_record_is_refused(tmp_path, monkeypatch):
+    _drive(tmp_path / "real", monkeypatch, {0: [0]})
+    (tmp_path / "simulated").mkdir()
+    with pytest.raises(ValueError, match="the simulated record has no steps"):
+        compare(tmp_path / "real", tmp_path / "simulated")
+
+
+@pytest.mark.parametrize("env, rank", [(None, 0), ("out", 1)])
+def test_only_tp_rank_0_records_and_only_when_asked(tmp_path, monkeypatch, env, rank):
+    batches = _drive(tmp_path / "source", monkeypatch, {0: [0]})[0][0]
+    if env is None:
+        monkeypatch.delenv(ENV)
+    else:
+        monkeypatch.setenv(ENV, str(tmp_path / env))
+    _Runner(_config(), rank).forward(batches[0])
+
+    class _Base:
+        def __init__(self, config, rank):
+            self.config, self.rank, self.ran = config, rank, []
+
+        def forward(self, batch):
+            self.ran.append(batch)
+            return "ran"
+
+    class _Recorded(StepRecording, _Base):
+        step_clock_ns = staticmethod(time.monotonic_ns)
+
+    # A real runner that does not record still runs its forward.
+    recorded = _Recorded(_config(), rank)
+    assert recorded.forward(batches[0]) == "ran"
+    assert recorded.ran == [batches[0]]
+    assert not (tmp_path / "out").exists()
+
+
+def _engine(blocks):
+    """The engine `_config` resolves at `max_num_seqs` 4 with `blocks` KV blocks."""
+    return {
+        "ladder": [1, 2, 4],
+        "kv_cache_block_size": BLOCK,
+        "kv_cache_dtype": "bf16",
+        "quantization": "q",
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 1,
+        "enable_dp_attention": False,
+        "enable_expert_parallel": False,
+        "enable_tbo": False,
+        "enable_tbo_decode": False,
+        "env": {},
+        "max_num_seqs": 4,
+        "max_num_batched_tokens": BUDGET,
+        "max_model_len": 2048,
+        "num_kvcache_blocks": blocks,
+        "enable_prefix_caching": False,
+        "prefill_buckets": [],
+        # A runner with no token processor reads as one that defers.
+        "deferred_output": True,
+    }
+
+
+def test_a_simulated_record_states_the_engine_its_runner_resolved(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(ENV, str(tmp_path))
+    for name in PERFORMANCE_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    path = tmp_path / "dp1.engine.json"
+    path.write_text("an earlier run's")
+    config = _config(dp_rank=1)
+    config.max_num_seqs = 4
+    runner = _Runner(config)
+    # As `EngineCore.__init__` does: size the pool, capture, then schedule.
+    runner.allocate_kv_cache(300)
+    runner.capture_cudagraph()
+    scheduler = Scheduler(config)
+    params = SamplingParams(max_tokens=3, ignore_eos=True)
+    for i in range(6):
+        scheduler.add(Sequence(_prompt(i)[:20], BLOCK, sampling_params=params))
+
+    def step():
+        batch, seqs = scheduler.schedule()
+        reply = runner.forward(batch)
+        scheduler.postprocess(
+            list(seqs.values()), reply, stream_output_queue=queue.Queue(), batch=batch
+        )
+
+    step()
+    assert json.loads(path.read_text()) == _engine(300)
+    # Written once, by the first step.
+    path.unlink()
+    step()
+    assert not path.exists()
+
+
+def test_a_real_record_states_the_engine_its_runner_resolved(tmp_path, monkeypatch):
+    batches = _drive(tmp_path / "simulated", monkeypatch, {0: [0]})[0][0]
+
+    class _Base:
+        """ATOM's runner: `allocate_kv_cache` sets the count on its own config."""
+
+        def __init__(self, rank, config):
+            self.rank, self.config = rank, config
+            self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
+            self.attn_metadata_builder = GRAPHABLE
+
+        def allocate_kv_cache(self, num_kvcache_blocks):
+            self.config.num_kvcache_blocks = num_kvcache_blocks
+            return True
+
+        def forward(self, batch):
+            return "ran"
+
+    class _Recorded(StepRecording, _Base):
+        step_clock_ns = staticmethod(time.monotonic_ns)
+
+    monkeypatch.setenv(ENV, str(tmp_path / "real"))
+    for name in PERFORMANCE_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    config = _config()
+    config.max_num_seqs = 4
+    runner = _Recorded(0, config)
+    runner.allocate_kv_cache(300)
+    assert runner.forward(batches[0]) == "ran"
+    path = tmp_path / "real" / "dp0.engine.json"
+    assert json.loads(path.read_text()) == _engine(300)
+
+
+def test_a_context_parallel_record_states_its_width_and_the_step_linear_fit_refuses_it(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(ENV, str(tmp_path / "steps"))
+    runner = SimpleNamespace(rank=0, config=_config(prefill_context_parallel_size=2))
+    record = _record(runner).path
+    engine = json.loads(record.with_suffix(".engine.json").read_text())
+    assert engine["prefill_context_parallel_size"] == 2
+    assert "decode_context_parallel_size" not in engine
+    with pytest.raises(ValueError) as refused:
+        step_linear_fit.main(
+            [str(record), "--out", str(tmp_path / "law.json")]
+            + [*platform_arg(DOCUMENT)]
+        )
+    assert str(refused.value) == (
+        "the records' engine config states prefill_context_parallel_size 2, and "
+        "a step linear law states no prefill context-parallel width, so a run at "
+        "width 1 would price with it"
+    )
+    assert not (tmp_path / "law.json").exists()
+
+
+@pytest.mark.parametrize("rows", [0, 128])
+def test_a_record_states_the_last_forwards_fewest_rows_only_above_0_and_keys_none(
+    tmp_path, monkeypatch, rows
+):
+    monkeypatch.setenv(ENV, str(tmp_path))
+    runner = SimpleNamespace(rank=0, config=_config(min_final_prefill_rows=rows))
+    engine = json.loads(_record(runner).path.with_suffix(".engine.json").read_text())
+    assert engine.get("min_final_prefill_rows") == (rows or None)
+    assert "min_final_prefill_rows" not in keyed_of(engine)
+
+
+def test_the_mixin_records_from_the_first_forward_after_construction(
+    tmp_path, monkeypatch
+):
+    batches = _drive(tmp_path / "source", monkeypatch, {0: [0]})[0][0]
+
+    class _Base:
+        """`ModelRunner`'s shape: construction runs a warmup forward."""
+
+        def __init__(self, rank, config):
+            self.rank, self.config = rank, config
+            self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
+            self.attn_metadata_builder = GRAPHABLE
+            self.forward(batches[1])
+
+        def forward(self, batch):
+            return "ran"
+
+        def exit(self):
+            pass
+
+    class _Recorded(StepRecording, _Base):
+        step_clock_ns = staticmethod(time.monotonic_ns)
+
+    monkeypatch.setenv(ENV, str(tmp_path / "out"))
+    runner = _Recorded(0, _config())
+    assert not (tmp_path / "out").exists()
+    assert runner.forward(batches[0]) == "ran"
+    runner.exit()
+    assert [s["step"] for s in read(tmp_path / "out")[0]] == [0]
+
+
+def test_a_real_runner_records_the_batch_it_was_handed_and_times_its_forward(
+    tmp_path, monkeypatch, capsys
+):
+    batches = _drive(tmp_path / "simulated", monkeypatch, {0: [0, 1]})[0][0]
+    record = tmp_path / "real" / "dp0.jsonl"
+
+    class _Base:
+        """A forward that rewrites the batch it runs, as ATOM's does."""
+
+        def __init__(self, rank, config):
+            self.rank, self.config = rank, config
+            self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
+            self.attn_metadata_builder = GRAPHABLE
+            self.inside = []
+
+        def forward(self, batch):
+            # Nothing is written before the runner exits.
+            assert record.read_text() == ""
+            self.inside.append(time.monotonic_ns())
+            batch.num_scheduled_tokens[:] = 0
+            batch.context_lens[:] = 0
+            return "ran"
+
+        def exit(self):
+            pass
+
+    class _Recorded(StepRecording, _Base):
+        step_clock_ns = staticmethod(time.monotonic_ns)
+
+    monkeypatch.setenv(ENV, str(tmp_path / "real"))
+    runner = _Recorded(0, _config())
+    assert [runner.forward(b) for b in batches] == ["ran"] * len(batches)
+    # Held lines cost later full collections nothing: one untracks a line's
+    # innermost tuples, the next the rest of it.
+    gc.collect()
+    gc.collect()
+    held = runner._parity_record.lines
+    assert len(held) == len(batches) and not any(map(gc.is_tracked, held))
+    runner.exit()
+    real, simulated = read(tmp_path / "real")[0], read(tmp_path / "simulated")[0]
+    for step, inside in zip(real, runner.inside, strict=True):
+        assert step.pop("t_enter_ns") <= inside <= step.pop("t_exit_ns")
+    assert real == simulated
+    report = compare(tmp_path / "real", tmp_path / "simulated")
+    assert report["first_divergence"] == {0: None}
+
+    # The documented invocation prints the same report.
+    argv = ["python -m atom.compass.parity", str(tmp_path / "real")]
+    monkeypatch.setattr(sys, "argv", [*argv, str(tmp_path / "simulated")])
+    runpy.run_module("atom.compass.parity", run_name="__main__")
+    assert json.loads(capsys.readouterr().out) == json.loads(json.dumps(report))
+
+
+def test_a_dp2_real_runner_records_moe_rows_from_its_forwards_one_collective(
+    tmp_path, monkeypatch, dp2  # noqa: F811
+):
+    built = _drive(tmp_path / "simulated", monkeypatch, {0: [0], 1: [1]})
+    simulated = read(tmp_path / "simulated")
+    batches = [built[rank][0] for rank in (0, 1)]
+    calls = {}  # thread -> sync_dp_metadata calls
+    sync = ubatching.sync_dp_metadata
+
+    def counted(**kwargs):
+        calls[threading.get_ident()] = calls.get(threading.get_ident(), 0) + 1
+        return sync(**kwargs)
+
+    monkeypatch.setattr(ubatching, "sync_dp_metadata", counted)
+
+    class _Base:
+        """ATOM's forward: settle the step's mode once, then run the model under it."""
+
+        def __init__(self, dp_rank):
+            self.rank, self.config = 0, _config(dp_rank)
+            self.config.parallel_config.data_parallel_size = 2
+            self.capture_sizes_np, self.enforce_eager = np.array(LADDER), False
+            self.running_tokens_per_dp_rank = np.zeros(
+                self.config.parallel_config.data_parallel_size, dtype=np.int32
+            )
+            self.tbo_decode_graphs = False
+            self.attn_metadata_builder = GRAPHABLE
+
+        def forward(self, batch):
+            mode = projection.forward_mode(batch, self)
+            context = SimpleNamespace(forward_mode=mode)
+            forward_context._forward_context_local.ctx = SimpleNamespace(
+                context=context
+            )
+            return self.run_model()
+
+        def run_model(self):
+            return "ran"
+
+        def exit(self):
+            pass
+
+    class _Recorded(StepRecording, _Base):
+        step_clock_ns = staticmethod(time.monotonic_ns)
+
+        @staticmethod
+        def device_event(event=None):
+            return event or SimpleNamespace(
+                query=lambda: True, elapsed_time=lambda _: 1.0
+            )
+
+    monkeypatch.setenv(ENV, str(tmp_path / "real"))
+    runners = [_Recorded(rank) for rank in (0, 1)]
+    dp2(
+        *(
+            lambda r=r, bs=bs: [r.forward(b) for b in bs]
+            for r, bs in zip(runners, batches)
+        )
+    )
+    for runner in runners:
+        runner.exit()
+
+    real = read(tmp_path / "real")
+    assert len(batches[0]) == len(batches[1])
+    assert list(calls.values()) == [len(batches[0])] * 2
+    for rank in (0, 1):
+        moe_rows, moe_tokens = [], []
+        for step in real[rank]:
+            moe_rows.append(step.pop("moe_rows"))
+            moe_tokens.append(step.pop("moe_tokens"))
+            for key in TIMESTAMPS:
+                step.pop(key, None)
+        assert real[rank] == simulated[rank]
+        # A prefilling rank sends its own rows through the gather; a decoding
+        # group pads every rank to the rung.
+        assert moe_rows == [
+            2 * step["rung"] if step["rung"] else sum(b.total_tokens_num for b in pair)
+            for step, pair in zip(simulated[rank], zip(*batches))
+        ]
+        # The real tokens among them: the group's scheduled tokens.
+        assert moe_tokens == [
+            sum(b.total_tokens_num for b in pair) for pair in zip(*batches)
+        ]
+
+
+def test_a_dp2_simulated_runner_records_and_prices_from_one_collective(
+    tmp_path, monkeypatch, dp2  # noqa: F811
+):
+    built = _drive(tmp_path / "source", monkeypatch, {0: [0], 1: [1]})
+    batches = [built[rank][0] for rank in (0, 1)]
+    calls = {}  # thread -> sync_dp_metadata calls
+    sync = ubatching.sync_dp_metadata
+
+    def counted(**kwargs):
+        calls[threading.get_ident()] = calls.get(threading.get_ident(), 0) + 1
+        return sync(**kwargs)
+
+    monkeypatch.setattr(ubatching, "sync_dp_metadata", counted)
+    monkeypatch.setattr(overrides, "_group_step_seconds", GROUP_STEP_SECONDS)
+    monkeypatch.setenv(ENV, str(tmp_path / "simulated"))
+    runners = []
+    for rank in (0, 1):
+        config = _config(rank)
+        config.parallel_config.data_parallel_size = 2
+        runners.append(_Runner(config))
+    replies = dp2(
+        *(
+            lambda r=r, bs=bs: [r.forward(b).predicted_s for b in bs]
+            for r, bs in zip(runners, batches)
+        )
+    )
+
+    assert len(batches[0]) == len(batches[1])
+    assert list(calls.values()) == [len(batches[0])] * 2
+    record = read(tmp_path / "simulated")
+    assert [len(record[rank]) for rank in (0, 1)] == [len(batches[0])] * 2
+    assert replies[0] == replies[1]
+
+
+def _keep_add_request(monkeypatch):
+    """A recording frontend wraps both core managers' `add_request` for the
+    process; put ATOM's back after the test."""
+    for cls in (CoreManager, DisaggCoreManager):
+        monkeypatch.setattr(cls, "add_request", cls.add_request)
+
+
+@pytest.mark.parametrize(
+    "record, named, runs",
+    [
+        (None, run.ATOM_RUNNER, run.ATOM_RUNNER),
+        (None, "x.RapidServeModelRunner", "x.RapidServeModelRunner"),
+        ("record", run.ATOM_RUNNER, RUNNER),
+    ],
+)
+def test_a_real_run_records_through_the_recording_runner_only_when_asked(
+    tmp_path, monkeypatch, record, named, runs
+):
+    monkeypatch.delenv(run.ENV, raising=False)
+    monkeypatch.delenv(ENV, raising=False)
+    if record:
+        monkeypatch.setenv(ENV, str(tmp_path / record))
+    _keep_add_request(monkeypatch)
+    config = SimpleNamespace(runner_qualname=named)
+    with run.frontend(config):
+        pass
+    assert config.runner_qualname == runs
+    assert clock.installed() is None
+
+
+def test_a_real_run_asked_to_record_refuses_a_runner_that_cannot(tmp_path, monkeypatch):
+    monkeypatch.delenv(run.ENV, raising=False)
+    monkeypatch.setenv(ENV, str(tmp_path))
+    _keep_add_request(monkeypatch)
+    with pytest.raises(ValueError, match="only .* has a recording runner"):
+        run.frontend(SimpleNamespace(runner_qualname="x.RapidServeModelRunner"))
+
+
+def test_no_file_call_or_json_encoding_runs_between_two_forwards(tmp_path, monkeypatch):
+    """`E` is all of the worker's time between forwards, so the lines are
+    encoded and written at `write`, the runner's exit: on an NFS home an open
+    costs about 0.25 ms and a close that flushes about 0.73. The file holds the
+    step order and bytes it had."""
+    calls, path_open, dumps = [], pathlib.Path.open, json.dumps
+    monkeypatch.setattr(
+        json, "dumps", lambda *a, **k: calls.append("dumps") or dumps(*a, **k)
+    )
+
+    class _File:
+        def __init__(self, f):
+            self.f = f
+            calls.append("open")
+
+        def write(self, text):
+            calls.append("write")
+            return self.f.write(text)
+
+        def flush(self):
+            calls.append("flush")
+            self.f.flush()
+
+        def close(self):
+            calls.append("close")
+            self.f.close()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+
+    monkeypatch.setattr(
+        pathlib.Path, "open", lambda p, *a, **k: _File(path_open(p, *a, **k))
+    )
+    view = BatchView((RequestShape(1, 9, True),))
+    monkeypatch.setattr(projection, "batch_view", lambda batch, mode, run: view)
+    runner = SimpleNamespace(
+        step_clock_ns=lambda: calls.append("stamp") or len(calls),
+        step_stamps=lambda: ({"forward_mode": "m"}, lambda wait: {"d_busy_ns": 5}),
+    )
+    batch = SimpleNamespace(
+        is_dummy_run=True,
+        num_scheduled_tokens=np.array([1]),
+        context_lens=np.array([9]),
+        produces_output=lambda: True,
+    )
+    record = StepRecord(tmp_path, 0)
+    for _ in range(3):
+        record.add(batch, runner, lambda batch: None)
+    record.write()
+
+    # Opened, emptied, at the start; then only the forwards' stamps until the
+    # exit, which writes through the file opened at the start.
+    start = ["open"]
+    end = ["dumps"] * 3 + ["write", "flush"]
+    assert calls == start + ["stamp", "stamp"] * 3 + end
+    monkeypatch.undo()
+    line = '"is_dummy_run": true, "produces_output": true, "batch": [], "named": []'
+    # A stamp is the count of calls up to it, the one at the start included.
+    assert record.path.read_text() == "".join(
+        f'{{"step": {n}, "dp_rank": 0, {line}, "t_enter_ns": {2 * n + 2}, '
+        f'"t_exit_ns": {2 * n + 3}, "rows": [[1, 9, true]], "rung": null, '
+        '"d_busy_ns": 5}\n'
+        for n in range(3)
+    )

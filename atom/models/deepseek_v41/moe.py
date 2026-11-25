@@ -32,6 +32,7 @@ from atom.model_ops.deepseek_v41.router import (
     router_logits as fixed_order_router_logits,
 )
 from atom.model_ops.deepseek_v41.router import router_supported
+from atom.model_ops.deepseek_v41.router import warm as warm_router
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import mm_topk, topk_meta_rows
 from atom.model_ops.utils import atom_parameter
@@ -39,6 +40,10 @@ from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
 from atom.models.deepseek_v41.config import FP4PTPC_RECIPE
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
+
+#: Whether this process compiled the router's widths
+#: (`MoE.process_weights_after_loading`).
+_ROUTER_WARM = False
 
 
 @torch_compile_guard(mutates_args=["output"], gen_fake=lambda output: None)
@@ -72,6 +77,19 @@ class MoE(V4MoE):
         )
 
         self.experts.custom_routing_function = self._topk
+
+    def process_weights_after_loading(self):
+        """Compile the fixed-order router's widths in this process, once, on
+        the first layer's gate: a width an eager forward first met while
+        serving stalled that forward, and under DP every rank's, by its
+        compile (#3743)."""
+        parent = getattr(super(), "process_weights_after_loading", None)
+        if parent is not None:
+            parent()
+        global _ROUTER_WARM
+        if not _ROUTER_WARM:
+            warm_router(self.gate.weight)
+            _ROUTER_WARM = True
 
     def _topk(self, hidden_states, gating_output, topk, renormalize):
         image_mask = getattr(get_forward_context().attn_metadata, "image_mask", None)

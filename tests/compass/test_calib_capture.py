@@ -1,0 +1,244 @@
+# SPDX-License-Identifier: MIT
+"""`calib_capture.sh`: one cell at a time, stopped STEPS_S after aiperf's
+profiling phase starts or in a warmup that outlasts STEPS_S, never on a GPU
+that holds a process.
+
+`cctraces_sim.sh` and `rocm-smi` are stubbed, so these run with no GPU: the stub
+cell runs a process named as aiperf's controller is, which writes no step, as a
+server writes its record only at its exit. Into aiperf.log, each line led by
+its time, it logs its warmup's start and, WARMUP_S seconds later, its profiling
+phase's, and ends DURATION_S (default 60) seconds after that with status 0 and
+its export. As aiperf does, SIGINT ends it with status 0 and its export, or in
+its warmup with status 1 and none, and it logs the signal; SIGTERM ends it
+with 143. With IN_WARMUP set it exits 1 in
+its warmup, with no export. With IN_GRACE set its duration has passed: it logs
+so, and ends 5 s after the cell's log reads that its duration ended, with
+status 0 and its export, or on SIGINT with status 1; with no such line within
+40 s it exits 2. The cell exits with its status, as cctraces_sim.sh exits with
+aiperf's.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from test_drive_gpu import GPU45, SHOWHW
+
+COMPASS = Path(__file__).resolve().parents[2] / "scripts" / "compass"
+BASH = shutil.which("bash")
+FREE = "No KFD PIDs currently running\n"
+BUSY = "PID 1 is using 1 DRM device(s):\n6\n"
+AIPERF = """import os, signal, sys, time
+cell = sys.argv[1]
+def export():
+    os.mkdir(cell + "/artifacts")
+    open(cell + "/artifacts/client_run.json", "w").write("{}")
+in_warmup = True
+def stop(*_):
+    print(time.time(), "SIGINT", flush=True)
+    in_warmup or export()
+    sys.exit(1 if in_warmup or os.environ.get("IN_GRACE") else 0)
+signal.signal(signal.SIGINT, stop)
+print(time.time(), "Phase warmup (warmup) started", flush=True)
+time.sleep(float(os.environ.get("WARMUP_S", 0)))
+os.environ.get("IN_WARMUP") and sys.exit(1)
+in_warmup = False
+print(time.time(), "Phase profiling (profiling) started", flush=True)
+if os.environ.get("IN_GRACE"):
+    print(time.time(), "Phase profiling (profiling) sending complete", flush=True)
+    for _ in range(400):
+        time.sleep(0.1)
+        if "aiperf duration ended" in open(cell + ".log").read():
+            time.sleep(5)
+            export()
+            sys.exit(0)
+    sys.exit(2)
+time.sleep(float(os.environ.get("DURATION_S", 60)))
+export()"""
+CELL = f"""#!/bin/bash
+mkdir -p "$2/steps" && echo '{{"workload": 1}}' > "$2/run.json"
+(exec -a "aiperf system_controller" {sys.executable} -c '{AIPERF}' "$2") >"$2/aiperf.log"
+rc=$?
+echo "c=$CONCURRENCY done" >> "$2/../order"
+exit $rc
+"""
+#: `identity` as a stub returns what it was given, and raises for a cell named in
+#: NO_IDENTITY.
+IDENTITY = """import os
+def identity(engine_file, model, argv, gpus):
+    if engine_file.parent.parent.name in os.environ.get("NO_IDENTITY", "").split():
+        raise ValueError("no engine file")
+    return {"format_version": 2, "engine": str(engine_file), "model": model,
+            "argv": argv, "gpus": list(gpus)}
+"""
+
+
+def _capture(tmp_path, smi, cells, gpus="6", showhw=SHOWHW, **env):
+    tree = tmp_path / "ATOM"
+    (tree / "scripts" / "compass").mkdir(parents=True)
+    drive = tree / "atom" / "compass" / "drive"
+    drive.mkdir(parents=True)
+    for d in (drive, drive.parent, drive.parent.parent):
+        (d / "__init__.py").write_text("")
+    (drive / "identity.py").write_text(IDENTITY)
+    for name in ("calib_capture.sh", "_lib.sh"):
+        shutil.copy(COMPASS / name, tree / "scripts" / "compass" / name)
+    (tree / "scripts" / "compass" / "cctraces_sim.sh").write_text(CELL)
+    (tree / ".compass-commit").write_text("cafe\n")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "showhw").write_text(showhw)
+    (bindir / "rocm-smi").write_text(
+        f'#!/bin/sh\ncase "$*" in *--showhw*) cat {bindir}/showhw;;\n'
+        f"*) printf '{smi}';;\nesac\n"
+    )
+    (bindir / "rocm-smi").chmod(0o755)
+    (tmp_path / "run.json").write_text("{}")
+    env = dict(
+        os.environ,
+        PATH=f"{bindir}:{os.environ['PATH']}",
+        CELLS=cells,
+        HIP_VISIBLE_DEVICES=gpus,
+        **{"STEPS_S": "0", **env},
+    )
+    script = "scripts/compass/calib_capture.sh"
+    r = subprocess.run(
+        [BASH, script, str(tmp_path / "run.json"), "cap"],
+        cwd=tree,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=50,
+        check=False,
+    )
+    return r, tree / "cap"
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_each_cell_is_stopped_and_logged_in_turn(tmp_path):
+    r, cap = _capture(tmp_path, FREE, "4 1")
+    assert r.returncode == 0, r.stderr
+    assert (cap / "order").read_text() == "c=4 done\nc=1 done\n"
+    for c in (4, 1):
+        log = (cap / f"c{c}.log").read_text()
+        assert log.startswith(f"cafe\nCONCURRENCY={c} GPU=6 ")
+        assert "stopped aiperf" in log and "CELL_RC=0" in log
+        assert log.count("uptime:") == 2
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_cell_is_stopped_steps_s_after_its_profiling_phase_starts(tmp_path):
+    r, cap = _capture(tmp_path, FREE, "1", STEPS_S="10", WARMUP_S="3", DURATION_S="30")
+    assert r.returncode == 0, r.stderr
+    log = (cap / "c1.log").read_text()
+    assert "aiperf profiling started" in log and "stopped aiperf" in log, log
+    aiperf = (cap / "c1" / "aiperf.log").read_text().splitlines()
+    at = {event: float(t) for t, event in (line.split(" ", 1) for line in aiperf)}
+    assert at["SIGINT"] - at["Phase profiling (profiling) started"] >= 10, at
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_cell_whose_warmup_outlasts_steps_s_is_stopped_in_it(tmp_path):
+    r, cap = _capture(tmp_path, FREE, "1", STEPS_S="3", WARMUP_S="30")
+    assert r.returncode == 1
+    assert "no client-run export: c1" in r.stderr
+    log = (cap / "c1.log").read_text()
+    assert "aiperf warmup started" in log and "stopped aiperf" in log, log
+    assert "aiperf profiling started" not in log and "CELL_RC=1" in log, log
+    aiperf = (cap / "c1" / "aiperf.log").read_text().splitlines()
+    at = {event: float(t) for t, event in (line.split(" ", 1) for line in aiperf)}
+    assert at.keys() == {"Phase warmup (warmup) started", "SIGINT"}, at
+    assert at["SIGINT"] - at["Phase warmup (warmup) started"] >= 3, at
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_cell_whose_aiperf_duration_has_passed_ends_on_its_own(tmp_path):
+    r, cap = _capture(tmp_path, FREE, "1", IN_GRACE="1")
+    assert r.returncode == 0, r.stderr
+    log = (cap / "c1.log").read_text()
+    assert "aiperf duration ended" in log and "stopped aiperf" not in log, log
+    assert "CELL_RC=0" in log, log
+    assert (cap / "c1" / "artifacts" / "client_run.json").exists()
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_the_capture_fails_naming_each_cell_left_without_its_export(tmp_path):
+    r, cap = _capture(tmp_path, FREE, "4 1", IN_WARMUP="1")
+    assert r.returncode == 1
+    assert "no client-run export: c4 c1" in r.stderr
+    assert (cap / "order").read_text() == "c=4 done\nc=1 done\n"
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_the_capture_fails_naming_each_cell_left_without_its_identity(tmp_path):
+    r, cap = _capture(tmp_path, FREE, "4 1", NO_IDENTITY="c4")
+    assert r.returncode == 1
+    assert "no record identity: c4\n" in r.stderr
+    assert "no client-run export" not in r.stderr
+    assert (cap / "order").read_text() == "c=4 done\nc=1 done\n"
+    assert "no identity" in (cap / "c4.log").read_text()
+    assert "gpus" in json.loads((cap / "c1" / "run.json").read_text())
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_gpu_holding_a_process_runs_no_cell(tmp_path):
+    r, cap = _capture(tmp_path, BUSY, "1")
+    assert r.returncode == 3
+    assert "GPU 6 is in use" in (cap / "c1.log").read_text()
+    assert not (cap / "c1").exists()
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+@pytest.mark.parametrize("gpu", ["3", "7"])
+def test_a_process_on_any_named_gpu_runs_no_cell(tmp_path, gpu):
+    smi = f"PID 1 is using 1 DRM device(s):\n{gpu}\n"
+    r, cap = _capture(tmp_path, smi, "1", "0,1,2,3,4,5,6,7")
+    assert r.returncode == 3
+    assert f"GPU {gpu} is in use" in (cap / "c1.log").read_text()
+    assert not (cap / "c1").exists()
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_process_on_an_unnamed_gpu_leaves_the_cell_running(tmp_path):
+    r, cap = _capture(tmp_path, "PID 1 is using 2 DRM device(s):\n6 7\n", "1", "0,1")
+    assert r.returncode == 0, r.stderr
+    assert (cap / "c1.log").read_text().startswith("cafe\nCONCURRENCY=1 GPU=0,1 ")
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+@pytest.mark.parametrize("gpu, rc", [("1", 0), ("3", 3)])
+def test_the_guard_reads_hip_devices_0_and_1_as_rocm_smi_gpus_3_and_0(
+    tmp_path, gpu, rc
+):
+    smi = f"PID 1 is using 1 DRM device(s):\n{gpu}\n"
+    r, cap = _capture(tmp_path, smi, "1", "0,1", GPU45)
+    assert r.returncode == rc, r.stderr
+    log = (cap / "c1.log").read_text()
+    assert log.startswith("cafe\nCONCURRENCY=1 GPU=0,1 ROCM_SMI_GPU=3,0 ")
+    assert ("rocm-smi GPU 3 is in use" in log) == (rc == 3)
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH")
+def test_a_stopped_cell_ends_with_aiperf_s_exit_and_a_record_s_identity(tmp_path):
+    r, cap = _capture(tmp_path, FREE, "1", "0,1", GPU45, MODEL="/models/m")
+    assert r.returncode == 0, r.stderr
+    log = (cap / "c1.log").read_text()
+    assert "stopped aiperf" in log and "CELL_RC=0" in log, log
+    run = json.loads((cap / "c1" / "run.json").read_text())
+    tree = tmp_path / "ATOM"
+    assert run == {
+        "workload": 1,
+        "format_version": 2,
+        "engine": f"{cap}/c1/steps/dp0.engine.json",
+        "model": "/models/m",
+        "argv": [
+            f"{tree}/scripts/compass/cctraces_sim.sh",
+            str(tmp_path / "run.json"),
+            f"{cap}/c1",
+        ],
+        "gpus": [3, 0],
+    }

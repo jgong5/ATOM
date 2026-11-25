@@ -1008,6 +1008,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if hasattr(c, "send_finished"):
                 c.send_finished(req_id)
 
+    def abort_parked_send(self, req_id: Any) -> None:
+        # Fanned out like `send_finished`: only the sub holding the claim acts.
+        for fn in self._sub_methods("abort_parked_send"):
+            fn(req_id)
+
     def load_failed(self, req_id: Any) -> None:
         for c in self._connectors:
             if hasattr(c, "load_failed"):

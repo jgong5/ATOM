@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: MIT
+"""The bench: `EngineCore` without its scheduler.
+
+`Bench(config, num_blocks)` publishes the workers' rendezvous store as
+`CoreManager` does for an engine, then starts `RUNNER` on every worker through
+ATOM's runner manager, in `EngineCore`'s order: `get_num_blocks`, which sizes
+the per-request state, `allocate_kv_cache` with `num_blocks`, which then
+becomes `config.num_kvcache_blocks`, `capture_cudagraph` unless the engine
+runs eagerly, and `freeze_gc_heap`. The pool is the one the batches ran on,
+not the count `get_num_blocks` reports: that count reads the device's memory
+outside torch, which moves from one start to the next, so a pool sized by it
+can be smaller than the one a batch filled. A worker that dies stops the
+bench, naming the call that got no reply; a device that cannot hold the pool
+stops it naming both counts. The per-request entries `get_num_blocks` replies
+become `config.pool_entries_per_req`, as `EngineCore` carries them to its block
+manager: the state slots a request holds, which the replay rule reads.
+`measure(batch, repeats)` runs `bench_step` on every worker for a burst of
+`repeats` and returns rank 0's reply, the window's result (`window.py`).
+`exit()` stops the workers and returns once they and every process they had
+started have exited, or after `serve.STOP_GRACE_S`, so a GPU check after it
+does not find the bench's own processes still exiting. Data parallelism above
+one and pipeline parallelism refuse.
+
+Under expert parallelism at data-parallel width 1 the workers start as
+without it, every rank runs a point's whole batch, and before the first call
+above each worker routes its MoE layers by a uniform draw, `route_uniformly`
+(`routing.py`): a replayed batch's filler tokens route neither as the
+workload's do nor uniformly.
+
+The manager leaves SIGINT ignored in the process that starts it, as an engine
+core's process wants; the bench's is the command's, so the bench restores
+Python's handler there, and a stop from the keyboard stops the bench, while
+the workers keep ignoring it. The manager's SIGTERM handler there stops the
+workers as a dead worker does; the bench's raises `Signalled` instead, naming
+the signal, so a command sent one fails as stopped, not as a worker's death.
+"""
+
+import contextlib
+import signal
+import time
+
+import psutil
+from torch.distributed import TCPStore
+
+from atom.compass.drive import serve
+from atom.model_engine.async_proc import AsyncIOProcManager
+
+RUNNER = "atom.compass.bench.runner.BenchModelRunner"
+
+
+class Signalled(SystemExit):
+    """A signal the bench's process was sent: a SystemExit, so nothing on the
+    command's way out takes it for a refusal, and the command fails printing
+    it. The manager's own stop, a bare SystemExit, is a worker's death."""
+
+
+def _signalled(signum, frame):
+    # GNU timeout signals the command, then its process group: a repeat must
+    # not cut the teardown short. Not SIG_IGN, which the processes the command
+    # starts after would inherit.
+    signal.signal(signum, lambda *_: None)
+    name = signal.Signals(signum).name
+    raise Signalled(f"the bench stopped: its process was sent {name}")
+
+
+@contextlib.contextmanager
+def _refuse_a_stop(call: str):
+    """The manager stops, with a bare SystemExit, when a worker dies."""
+    try:
+        yield
+    except Signalled:
+        raise
+    except SystemExit as stop:
+        raise ValueError(f"a bench worker died, so {call} got no reply") from stop
+
+
+class Bench:
+    def __init__(self, config, num_blocks: int) -> None:
+        # Under DP attention every TP rank becomes a DP rank.
+        dp = config.parallel_config.data_parallel_size * (
+            config.tensor_parallel_size if config.enable_dp_attention else 1
+        )
+        for refused, what in (
+            (dp > 1, f"{dp} data-parallel ranks"),
+            (config.pipeline_parallel_size > 1, "pipeline parallelism"),
+        ):
+            if refused:
+                raise ValueError(f"the bench does not measure under {what}")
+        pc = config.parallel_config
+        self.store = TCPStore(
+            pc.data_parallel_master_ip,
+            pc.data_parallel_base_port,
+            is_master=True,
+            wait_for_workers=False,
+        )
+        pc.data_parallel_base_port = self.store.port
+        pc._managed_distributed_store = True
+        self.still_running = True
+        self.tree: list[psutil.Process] = []
+        self.runner_mgr = AsyncIOProcManager(
+            # Not `exit`: from the monitor thread, it would race the command's
+            # own call, which then skips the wait the after-check needs.
+            lambda: None,
+            config.tp_world_size * config.prefill_context_parallel_size,
+            RUNNER,
+            config,
+        )
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, _signalled)
+        try:
+            if config.enable_expert_parallel:
+                with _refuse_a_stop("route_uniformly"):
+                    self.runner_mgr.call_func("route_uniformly", wait_out=True)
+            with _refuse_a_stop("get_num_blocks"):
+                budget = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
+            config.pool_entries_per_req = budget.get("pool_entries_per_req", {})
+            try:
+                allocated = self.runner_mgr.call_func(
+                    "allocate_kv_cache", num_blocks, wait_out=True
+                )
+            except Signalled:
+                raise
+            except SystemExit as stop:
+                # The manager stops, with a bare SystemExit, when a worker dies.
+                raise ValueError(
+                    f"the bench stopped allocating a pool of {num_blocks} KV "
+                    "blocks, and this device's budget gives "
+                    f"{budget['num_kvcache_blocks']}"
+                ) from stop
+            assert allocated, "Failed to allocate kv cache"
+            config.num_kvcache_blocks = num_blocks
+            if not config.enforce_eager:
+                with _refuse_a_stop("capture_cudagraph"):
+                    self.runner_mgr.call_func("capture_cudagraph", wait_out=True)
+            # Unfrozen, a worker's collections walk its startup heap, and their
+            # pauses would discard repeats.
+            with _refuse_a_stop("freeze_gc_heap"):
+                self.runner_mgr.call_func("freeze_gc_heap", wait_out=True)
+            # A dead worker's descendants are no longer its children, and the
+            # manager forgets its workers before the bench learns of the death.
+            # ponytail: one started after this, or by a worker that dies in
+            # the startup calls, is not waited for.
+            self._record()
+        except BaseException:
+            self.exit()
+            raise
+
+    def measure(self, batch, repeats: int) -> dict:
+        """`batch`'s step, measured on every worker: a burst of `repeats`."""
+        with _refuse_a_stop("bench_step"):
+            return self.runner_mgr.call_func(
+                "bench_step", batch, repeats, wait_out=True
+            )
+
+    def exit(self) -> None:
+        """Stop every worker, then wait at most `serve.STOP_GRACE_S` for the
+        workers and every process they started to exit."""
+        if not self.still_running:
+            return
+        self.still_running = False
+        # The manager SIGKILLs a worker that outlasts its grace and joins it,
+        # not the descendants it killed with it (inductor's compile workers),
+        # which can still hold the GPU when the command's after-check reads it.
+        self._record()
+        if self.runner_mgr.still_running:
+            self.runner_mgr.keep_monitoring = False
+            self.runner_mgr.call_func("exit")
+            self.runner_mgr.exit()
+        # Left to the garbage collector at interpreter exit, the broadcast
+        # queue's ZMQ context never terminates and the process never exits.
+        self.runner_mgr.rpc_broadcast_mq.close()
+        for _ in range(int(serve.STOP_GRACE_S / serve.POLL_S)):
+            if not any(map(_running, self.tree)):
+                return
+            time.sleep(serve.POLL_S)
+
+    def _record(self) -> None:
+        """Add every live worker and its descendants to `tree`."""
+        for worker in self.runner_mgr.procs:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                process = psutil.Process(worker.pid)
+                self.tree += [process, *process.children(recursive=True)]
+
+
+def _running(process: psutil.Process) -> bool:
+    """Whether `process` has not exited; a zombie has."""
+    try:
+        return process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False

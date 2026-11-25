@@ -104,6 +104,7 @@ from atom.kv_transfer.disaggregation.types import (
     pair_units,
     produced_no_handoff,
 )
+from atom.kv_transfer.rdma_nic import gpu_pci_bdf, rail_rdma_device
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.models.utils import get_pp_indices
 from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
@@ -156,6 +157,9 @@ KV_CACHE_READY_EVENT_TTL_S = 600.0
 # Requests whose ready event aged out are remembered up to this many, oldest
 # dropped first, so a late transfer still finds that its prefill is complete.
 KV_CACHE_READY_EXPIRED_MAX = 1 << 16
+# Aborted requests a producer rank remembers, oldest dropped first, so a write
+# request that comes for one after its blocks went back to the pool is refused.
+ABORTED_TRANSFERS_MAX = 1 << 16
 _IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
 
@@ -252,8 +256,11 @@ def _ib_device_exists(device_name: str) -> bool:
 
 
 def _auto_select_ib_device(phys_idx: int) -> str:
-    # Older environments expose paired HCAs as rdmaN. Spur MI350 fabric exposes
-    # them as ionic_N, so try ionic_N only when rdmaN is not present.
+    """The HCA numbered like a physical GPU index, by name alone.
+
+    Older environments expose paired HCAs as rdmaN. Spur MI350 fabric exposes
+    them as ionic_N, so try ionic_N only when rdmaN is not present.
+    """
     rdma_device = f"rdma{phys_idx}"
     if _ib_device_exists(rdma_device):
         return rdma_device
@@ -261,6 +268,47 @@ def _auto_select_ib_device(phys_idx: int) -> str:
     if _ib_device_exists(ionic_device):
         return ionic_device
     return rdma_device
+
+
+def _primary_ib_device(phys_idx: int, gpu_ordinal: int | None) -> str:
+    """This rank's own HCA: the one on its GPU's PCIe switch, else by name.
+
+    HIP numbers GPUs in KFD order, which need not follow the HCA numbering: on
+    pit2-p03-g08 HIP GPU 0 shares its switch with rdma3, not rdma0 (#3833).
+    The ACTIVE HCA sharing the deepest sysfs PCI path with the GPU of torch
+    ordinal ``gpu_ordinal`` is the one the Mooncake Store client uses too
+    (``rail_rdma_device``). Where sysfs cannot tell -- no GPU or HCA in it, no
+    ACTIVE HCA under the GPU's host bridge, a tie -- or no ordinal is given,
+    the HCA is ``_auto_select_ib_device(phys_idx)``'s, as before.
+    """
+    if gpu_ordinal is None:
+        return _auto_select_ib_device(phys_idx)
+    try:
+        bdf = gpu_pci_bdf(gpu_ordinal)
+        device = rail_rdma_device(bdf, ib_root=_IB_SYSFS_ROOT)
+    except Exception as exc:  # noqa: BLE001 - the name serves as before
+        # The PCI tree only improves on the name: whatever stops the lookup
+        # (no sysfs in a container, a torch without PCI properties) must not
+        # stop a rank that starts on the name.
+        device = _auto_select_ib_device(phys_idx)
+        logger.info(
+            "Mooncake HCA for physical GPU %d: %s by name; the PCI tree of "
+            "GPU ordinal %d did not name one (%s)",
+            phys_idx,
+            device,
+            gpu_ordinal,
+            exc,
+        )
+        return device
+    logger.info(
+        "Mooncake HCA for physical GPU %d: %s, the ACTIVE HCA closest to its "
+        "PCI address %s (GPU ordinal %d)",
+        phys_idx,
+        device,
+        bdf,
+        gpu_ordinal,
+    )
+    return device
 
 
 def _parse_ib_devices(configured_devices: str) -> list[str]:
@@ -277,10 +325,16 @@ def _select_ib_devices(
     configured_devices: str,
     phys_idx: int | None,
     *,
+    gpu_ordinal: int | None = None,
     enable_alternate_hca: bool = False,
     hca_count: int = 8,
 ) -> list[str]:
-    """Resolve the HCAs on which Mooncake registers this rank's GPU memory."""
+    """Resolve the HCAs on which Mooncake registers this rank's GPU memory.
+
+    Configured devices win. Otherwise the first is the GPU's own HCA
+    (``_primary_ib_device``; ``gpu_ordinal`` is its torch ordinal, for the PCI
+    lookup), and alternate HCAs follow by name.
+    """
     if protocol.strip().lower() == "tcp":
         return []
     if configured_devices:
@@ -288,7 +342,7 @@ def _select_ib_devices(
     if phys_idx is None:
         raise ValueError("physical GPU index is required for RDMA device selection")
 
-    primary = _auto_select_ib_device(phys_idx)
+    primary = _primary_ib_device(phys_idx, gpu_ordinal)
     devices = [primary]
     if enable_alternate_hca:
         if hca_count <= 0:
@@ -421,6 +475,9 @@ PD_META_TIMEOUT_MS = 10_000
 # PP-prefill only: consumer tells stage-0 a request's KV is fully received from
 # every stage, so stage-0 may reuse the shared page table (see _record_release).
 MSG_RELEASE = b"release"
+# Consumer scheduler -> producer: a request finished on the consumer before it
+# asked for its write, so none will come (see _abort_unwritten).
+MSG_ABORT = b"abort"
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +529,10 @@ def _receive_block_offset(
 
 
 class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
+    # Claimed requests aborted since the last metadata, for the workers.
+    # Class-level so a scheduler built without __init__ sends none.
+    _aborted_sends: frozenset[ReqId] = frozenset()
+
     def __init__(self, config: Config) -> None:
         kv_transfer_config = config.kv_transfer_config
         self.is_producer = (
@@ -518,6 +579,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # for legacy relay. Chunked mode claims at allocation because the peer
         # can read after the first forward; it must not be preempted meanwhile.
         self._awaiting_send: set[str] = set()
+        # Consumer: each producer rank's side channel, once an abort was sent
+        # on it (`_abort_unwritten`).
+        self._abort_sockets: dict[str, zmq.Socket] = {}
         # Producer state each undispatched allocation replaced, by request id:
         # what `cancel_preadmission` restores.
         self._producer_admission_undo: dict[ReqId, tuple] = {}
@@ -667,6 +731,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # Those allocations are now dispatched. Cancellation must drain the
         # worker's source claim, never apply preadmission rollback to them.
         self._producer_admission_undo.clear()
+        meta.reqs_not_processed = set(self._aborted_sends)
+        self._aborted_sends = frozenset()
         return meta
 
     def cancel_preadmission(self, seq: Sequence) -> None:
@@ -897,6 +963,46 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             transfer_id = self.request_id_to_transfer_id.pop(seq.id, None)
             if transfer_id is not None:
                 self.transfer_id_to_request_id.pop(transfer_id, None)
+            params = getattr(seq, "kv_transfer_params", None) or {}
+            if params.get("do_remote_prefill"):
+                # Finished before `update_state_after_alloc` asked for its
+                # write: aborted while it waited.
+                params["do_remote_prefill"] = False
+                self._abort_unwritten(params)
+
+    def _abort_unwritten(self, params: dict[str, Any]) -> None:
+        """Tell each producer rank that holds a request's KV that this consumer
+        will not ask for its write, on the side channel a write request takes.
+
+        The producer's leg of the request is over, so no abort reaches it, and
+        without this it keeps its send claim for ever. Sent here, on the step
+        loop, rather than by a worker: a DP rank whose last request is gone
+        stops building the metadata that would carry it there.
+        """
+        meta = ConnectorMetadata._build_req_meta(None, [], params)
+        notice = msgpack.dumps({"transfer_id": meta.transfer_id})
+        stages = max(1, meta.remote_pp_size)
+        for stage in range(stages):
+            for rank in range(meta.tp_size):
+                port = meta.remote_handshake_port + _port_offset(
+                    meta.remote_dp_rank,
+                    rank,
+                    meta.tp_size,
+                    stage,
+                    stages,
+                    meta.remote_dp_size,
+                )
+                addr = make_zmq_path("tcp", meta.remote_host, port)
+                sock = self._abort_sockets.get(addr)
+                if sock is None:
+                    sock = zmq.Context.instance().socket(zmq.DEALER)
+                    sock.setsockopt(zmq.LINGER, 0)
+                    # Queued, never blocking the step loop, while a producer
+                    # rank is unreachable.
+                    sock.setsockopt(zmq.SNDHWM, 0)
+                    sock.connect(addr)
+                    self._abort_sockets[addr] = sock
+                sock.send_multipart([MSG_ABORT, notice])
 
     def should_defer_free(self, seq: Sequence) -> bool:
         return str(seq.id) in self._awaiting_send
@@ -950,6 +1056,13 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.request_finished(seq)
         self._pending_chunked_admissions.pop(seq.id, None)
         return True
+
+    def abort_parked_send(self, req_id) -> None:
+        """Ask the workers to report an aborted request's send once none of its
+        writes runs. Not under PP prefill: each stage writes its own layers
+        and sees only its own, so the claim waits for the decode's release."""
+        if self.pp_size == 1 and str(req_id) in self._awaiting_send:
+            self._aborted_sends |= {req_id}
 
     def source_blocks_released(self, seq: Sequence) -> None:
         """No block-lifetime state remains after the send claim is retired."""
@@ -1156,11 +1269,12 @@ class MooncakeConnector(KVConnectorBase):
         # Determine which RDMA device this TP rank should use. TCP is
         # intentionally initialized with an empty device filter so Mooncake
         # cannot activate an available HCA as an alternate path.
-        # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
-        # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
-        # By default, register only with the local NIC. Alternate-HCA mode
-        # registers a single engine on multiple NICs. On rail-isolated fabrics,
-        # matched-rail mode instead selects a single-HCA engine per request.
+        # The local NIC is the one on the GPU's PCIe switch in sysfs; failing
+        # that, NIC N for physical GPU N, named ionic_N on Spur MI350 and rdmaN
+        # on older setups (_primary_ib_device). By default, register only with
+        # the local NIC. Alternate-HCA mode registers a single engine on
+        # multiple NICs. On rail-isolated fabrics, matched-rail mode instead
+        # selects a single-HCA engine per request.
         _configure_mooncake_transport(self.protocol)
         configured_ib_device = kv_transfer_config.get(
             "ib_device", ""
@@ -1170,6 +1284,7 @@ class MooncakeConnector(KVConnectorBase):
         )
         hca_count = int(kv_transfer_config.get("ib_hca_count", 8))
         phys_idx: int | None = None
+        visible_idx: int | None = None
         if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
             visible_idx = torch.cuda.current_device()
             # ROCR first, for the reason in numa_utils._physical_index: it
@@ -1189,6 +1304,7 @@ class MooncakeConnector(KVConnectorBase):
             self.protocol,
             configured_ib_device,
             phys_idx,
+            gpu_ordinal=visible_idx,
             enable_alternate_hca=enable_alternate_hca,
             hca_count=hca_count,
         )
@@ -1338,6 +1454,10 @@ class MooncakeConnector(KVConnectorBase):
         self._admission_results: set[ConnectorCompletion] = set()
         self._transfer_refcount: dict[ReqId, int] = {}
         self._transfer_refcount_lock = threading.Lock()
+        # Under _completion_lock: write requests taken and not yet served, per
+        # transfer, and the transfers whose request was aborted, oldest first.
+        self._writes_in_flight: dict[TransferId, int] = {}
+        self._aborted_transfers: dict[TransferId, None] = {}
 
         # --- Consumer: pending receive tracking ---
         self._pending_recv: set[ReqId] = set()
@@ -2012,6 +2132,8 @@ class MooncakeConnector(KVConnectorBase):
                     meta.local_slot_index,
                     req_id,
                 )
+            if metadata.reqs_not_processed:
+                self._abort_transfers(metadata.reqs_not_processed)
             self._dispatch_ready_chunked_requests()
             return
 
@@ -2579,6 +2701,11 @@ class MooncakeConnector(KVConnectorBase):
                             data["transfer_id"], data.get("consumer_tp_size", 1)
                         )
 
+                    elif msg_type == MSG_ABORT:
+                        # No write request will come, so none is in flight.
+                        data = msgpack.loads(parts[2])
+                        self._abort_transfers([data["transfer_id"]])
+
                     else:
                         logger.error("Unknown message type: %s", msg_type)
         except BaseException as exc:
@@ -2611,6 +2738,55 @@ class MooncakeConnector(KVConnectorBase):
                 "[PRODUCER] acknowledging write request %s failed",
                 request_data["request_id"],
             )
+
+    def _serve_write(self, request_data: dict) -> None:
+        """Serve a write request on a send worker, unless its request was
+        aborted; the last one in flight for an aborted request reports its send."""
+        transfer_id = request_data.get("transfer_id", request_data["request_id"])
+        with self._completion_lock:
+            aborted = transfer_id in self._aborted_transfers
+            if not aborted:
+                in_flight = self._writes_in_flight.get(transfer_id, 0)
+                self._writes_in_flight[transfer_id] = in_flight + 1
+        if aborted:
+            logger.warning(
+                "[PRODUCER] refusing a write request for transfer_id=%s: its "
+                "request was aborted and its blocks may be another's now",
+                transfer_id,
+            )
+            self._notify_transfer_result(request_data, success=False)
+            return
+        try:
+            self._execute_transfer(request_data)
+        finally:
+            with self._completion_lock:
+                left = self._writes_in_flight.pop(transfer_id) - 1
+                if left:
+                    self._writes_in_flight[transfer_id] = left
+                elif transfer_id in self._aborted_transfers:
+                    self._release_aborted(transfer_id)
+
+    def _abort_transfers(self, transfer_ids) -> None:
+        """Refuse every later write request for these aborted requests, and
+        report each one's send now unless a write of it is in flight."""
+        with self._completion_lock:
+            for transfer_id in transfer_ids:
+                self._aborted_transfers[transfer_id] = None
+                if len(self._aborted_transfers) > ABORTED_TRANSFERS_MAX:
+                    del self._aborted_transfers[next(iter(self._aborted_transfers))]
+                if transfer_id not in self._writes_in_flight:
+                    self._release_aborted(transfer_id)
+
+    def _release_aborted(self, transfer_id: TransferId) -> None:
+        """Report an aborted request's send, unless this rank already did.
+        Caller holds ``_completion_lock``."""
+        with self._completed_prefills_lock:
+            held = self._completed_prefills.pop(transfer_id, None) is not None
+            self._kv_cache_ready_events.pop(transfer_id, None)
+        with self._transfer_refcount_lock:
+            self._transfer_refcount.pop(transfer_id, None)
+        if held:
+            self.done_sending.add(transfer_id)
 
     def _record_release(self, transfer_id: TransferId, consumer_tp_size: int) -> None:
         """Count a consumer-rank release; free the shared page after all ranks.

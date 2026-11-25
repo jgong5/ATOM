@@ -1,0 +1,606 @@
+# SPDX-License-Identifier: MIT
+"""Two prefill and two decode deployments behind the router LP (2P2D).
+
+Each deployment is its own frontend and engine LP pair, the router chooses
+among them on its own clock, and decode sends each write request to the
+prefill deployment the relayed engine id names.
+
+Without a driver: the channel table and the refusals; the connector's choice
+of deployment; atomesh, built from this tree, between scripted frontends as in
+`test_router_lp_acceptance`, twice, under two hash seeds and random host delays.
+With one, `pd_sim.sh` runs 2P2D at TP1 under a constant stub, twice, and
+`check_run` holds the runs to the scenario checks and each engine LP's rows to
+the timeline the stub implies. With `ATOM_COMPASS_DSPARK_MODEL` and atomesh,
+and no driver, it runs DeepSeek-V4.1-Flash's 2P2D at DP 2 behind the 6P16D
+share-cache recipe's router (`RECIPE`, --dp-aware) the same way.
+"""
+
+import json
+import os
+import random
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import uuid
+from collections import Counter
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import test_dp_slice
+from test_dp_slice import DP_MACHINE, MAX_TOKENS
+from test_kv_remote_prefill import Script, connector
+from test_kv_simulated_connector import PEAKS, geometry, model_for  # noqa: F401
+from test_pd_dp import RouterLpRequests
+from test_pd_sim_router_args import RECIPE
+from test_pd_slice import NEEDS_A_PD_RUN, PD, publish_pd_entries
+from test_router_lp_acceptance import (
+    WALL_S,
+    DelayedTraffic,
+    Frontend,
+    _idle,
+    _launch,
+    atomesh,  # noqa: F401
+)
+from test_vertical_slice import (
+    CONSTANT,
+    DOCUMENT,
+    MODEL,
+    TREE,
+    _retry,
+    _run_file,
+    publish_entry,
+    publish_entry_on_arch,
+)
+
+from atom.compass import run as compass_run
+from atom.compass.clock import LpId, prefill_decode_table
+from atom.compass.detect.scenario import check_run
+from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+from atom.utils.clock import LPRuntime
+from tests.compass.held_ports import held_ports
+
+XPYD = {"prefill_instances": 2, "decode_instances": 2}
+ROUTER_IN_S = 2.0**-14
+
+
+def _table(prefill=2, decode=2, **kw):
+    return prefill_decode_table(
+        admission_s=0.54e-3,
+        ipc_s=ROUTER_IN_S,
+        stream_s=PD["router_s"],
+        router_s=PD["router_s"],
+        kv_write_req_s=PD["kv_write_req_s"],
+        prefill=prefill,
+        decode=decode,
+        **kw,
+    )
+
+
+def test_each_deployment_is_a_frontend_and_engine_lp_with_its_own_channels():
+    table = _table(router_in_s=ROUTER_IN_S)
+    names = {c.name for lp in table.registry.ids() for c in table.channels_from(lp)}
+    assert sorted(lp.name for lp in table.registry.ids()) == sorted(
+        ["traffic", "router"]
+        + [f"{r}-{s}{k}" for r in ("frontend", "engine") for s in "PD" for k in (0, 1)]
+    )
+    assert {"traffic->router:http", "router->traffic:stream"} <= names
+    for k in (0, 1):
+        assert {
+            f"router->frontend-P{k}:http",
+            f"frontend-P{k}->router:relay",
+            f"router->frontend-D{k}:relay",
+            f"frontend-D{k}->router:stream",
+        } <= names
+    assert sorted(n for n in names if ":kv_write_req" in n) == [
+        f"engine-D{d}->engine-P{p}:kv_write_req" for d in (0, 1) for p in (0, 1)
+    ]
+
+
+def test_one_deployment_per_side_keeps_its_names():
+    table = _table(1, 1, router_in_s=ROUTER_IN_S)
+    assert {lp.name for lp in table.registry.ids()} == {
+        "traffic",
+        "router",
+        "frontend-P",
+        "engine-P",
+        "frontend-D",
+        "engine-D",
+    }
+
+
+def test_several_deployments_without_the_router_lp_are_refused_by_name():
+    with pytest.raises(ValueError, match="2 prefill and 1 decode .* set router_in_s"):
+        _table(2, 1)
+
+
+def _server(run: dict, role: str, **kv):
+    kv = {"kv_connector": "compass", "kv_role": role} | kv
+    return SimpleNamespace(kv_transfer_config=kv)
+
+
+def test_a_server_runs_as_the_deployment_its_index_names():
+    name = compass_run._pd_name
+    assert name(_server(XPYD, "kv_producer", compass_instance=1), XPYD) == "P1"
+    assert name(_server(XPYD, "kv_consumer", compass_instance=0), XPYD) == "D0"
+    assert name(_server({}, "kv_producer"), {}) == "P"
+    for kv in ({}, {"compass_instance": 2}, {"compass_instance": "1"}):
+        with pytest.raises(ValueError, match="compass_instance is .* declares 2"):
+            name(_server(XPYD, "kv_producer", **kv), XPYD)
+
+
+@pytest.mark.parametrize(
+    "instances, role, index, record",
+    [
+        (XPYD, "kv_producer", 1, "prefill1"),
+        (XPYD, "kv_consumer", 0, "decode0"),
+        ({"prefill_instances": 2}, "kv_consumer", None, "decode"),
+        ({}, "kv_producer", None, "prefill"),
+    ],
+)
+def test_a_replay_reads_the_record_of_its_own_deployment(
+    tmp_path, monkeypatch, instances, role, index, record
+):
+    path = _run_file(tmp_path, replay=str(tmp_path), **instances)
+    monkeypatch.setenv(compass_run.ENV, str(path))
+
+    class Read(Exception):
+        pass
+
+    def host(directory, dp_rank, stage):
+        raise Read(directory, dp_rank)
+
+    monkeypatch.setattr("atom.compass.parity.replay.ReplayHost", host)
+    kv = {"kv_connector": "compass", "kv_role": role}
+    if index is not None:
+        kv["compass_instance"] = index
+    config = SimpleNamespace(
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_rank=1, pipeline_parallel_rank=0),
+        kv_transfer_config=kv,
+    )
+    with pytest.raises(Read) as read:
+        compass_run.runner(SimpleNamespace(config=config), None)
+    assert read.value.args == (tmp_path / record, 1)
+
+
+def test_a_worker_order_lists_each_deployment_rank_once_and_names_no_configuration():
+    run = XPYD | {"prefill_data_parallel_size": 2, "clock_endpoint": "tcp://x"}
+    order = {"P": [[1, 0], [0, 0], [1, 1], [0, 1]], "D": [[1, 0], [0, 0]]}
+    assert compass_run.worker_order(run | {"worker_order": order}) == order
+    assert compass_run.worker_order(run) == {}
+    assert compass_run.configuration(run | {"worker_order": order}) == XPYD | {
+        "prefill_data_parallel_size": 2
+    }
+    for bad in ({"P": order["P"][:3]}, {"D": [[0, 0], [0, 0]]}, {"X": [[0, 0]]}):
+        with pytest.raises(ValueError, match="list each of its deployments"):
+            compass_run.worker_order(run | {"worker_order": bad})
+
+
+# --- the connector -----------------------------------------------------------
+
+
+def test_decode_sends_the_write_request_to_the_prefill_deployment_that_served_it(
+    geometry, monkeypatch  # noqa: F811
+):
+    """Prefill deployment 1 finishes a request; its relayed blob reaches decode
+    deployment 0, whose write request goes to deployment 1 only."""
+    table = _table(router_in_s=ROUTER_IN_S)
+    model = model_for(geometry, PEAKS[0])
+    address = f"inproc://kv-write-req-{uuid.uuid4().hex}:5000"
+
+    def half(lp, role):
+        rt = LPRuntime(LpId(lp), table, Script())
+        rt.start_run()
+        return rt, connector(rt, monkeypatch, model, kv_role=role, address=address)
+
+    (_, p0), (rt_p1, p1) = half("engine-P0", "kv_producer"), half(
+        "engine-P1", "kv_producer"
+    )
+    rt_d, d = half("engine-D0", "kv_consumer")
+    seq = SimpleNamespace(
+        id=9,
+        kv_transfer_params={"do_remote_decode": True},
+        block_table=[0, 1],
+        output_tokens=[7],
+    )
+    p1.request_finished(seq)
+    blob = seq.kv_transfer_params_output
+    assert blob["remote_engine_id"] == "compass-simulated-p1"
+    assert blob["remote_host"] == "compass-simulated-p1.invalid"
+    d.update_state_after_alloc(
+        SimpleNamespace(
+            id=9,
+            kv_transfer_params=blob,
+            block_table=[0, 1],
+            has_per_req_cache=False,
+            num_cached_tokens=0,
+        )
+    )
+    d.device_done(None)  # the admission step's forward returns, its device done
+    channel, seq_no, arrival = rt_d.send_log[-1]
+    assert channel == "engine-D0->engine-P1:kv_write_req"
+    rt_p1.conn.grants.append((1.0, {channel: [(seq_no, arrival)]}))
+    rt_p1.advance_to(1.0)
+    p1.process_completions(KVConnectorOutput())
+    assert p1.process_completions(KVConnectorOutput()).finished_sending == {9}
+    assert not p0._socks[("engine-D0", 0)].raw.poll(0)
+
+
+# --- atomesh between scripted frontends ---------------------------------------
+
+#: Eight requests at one arrival, two tokens each, placed one at a time: all
+#: are in prefill at once, so each side's least-load choice walks its workers
+#: in the order the router sorts them, base URL then DP rank, and starts again.
+#: Both deployments of a side then send the router messages of one seq at one
+#: arrival, which it holds at once.
+WORKLOAD = [(0.0, 2)] * 8
+#: Request k's (deployment, DP rank) on each side.
+PLACED = [((k % 4) // 2, k % 2) for k in range(8)]
+
+
+class InstanceFrontend(Frontend):
+    """`Frontend` as LP `lp`, serving on `http`, which nothing serves yet."""
+
+    def __init__(self, run: dict, side: str, delay, lp: str, http) -> None:
+        self.run, self.side, self.delay, self.lp = run, side, delay, LpId(lp)
+        self.cv = threading.Condition()
+        self.bodies, self.replies, self.ranks, self.errors = {}, {}, {}, []
+        self.http, self.url = http, f"http://127.0.0.1:{http.server_port}"
+        http.RequestHandlerClass = self._handler()
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.owner = threading.Thread(target=self._own, daemon=True)
+        self.owner.start()
+
+
+def run_scripted_xpyd(binary: Path, out: Path, hash_seed: str, delay) -> list:
+    """One run in `out`; each request's (prefill, decode) (deployment, rank)."""
+    out.mkdir()
+    with held_ports(3) as (clock_port, router_port, metrics_port):
+        run_file = _run_file(
+            out,
+            clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
+            data_parallel_size=2,
+            step_stub=CONSTANT,
+            router_in_s=ROUTER_IN_S,
+            **XPYD,
+            **PD,
+        )
+        run = json.loads(run_file.read_text())
+        table = compass_run.channel_table(run)
+        lookaheads = {
+            c.name: table.lookahead(c.name)
+            for c in table.channels_from(compass_run.ROUTER)
+        }
+        endpoint = run["clock_endpoint"]
+        errors, procs, frontends = [], [], {}
+        try:
+            procs.append(
+                authority := _launch(
+                    out,
+                    "authority",
+                    [sys.executable, "-m", "atom.compass.run", "--compass-run"]
+                    + [str(run_file), "--compass-clock-endpoint", endpoint],
+                    PYTHONHASHSEED=hash_seed,
+                    PYTHONPATH=str(TREE),
+                )
+            )
+            host, port = endpoint.removeprefix("tcp://").rsplit(":", 1)
+            _retry(
+                "clock",
+                authority,
+                lambda: socket.create_connection((host, port)).close(),
+            )
+            # Deployment k of a side serves on that side's k-th URL in sorted order,
+            # the order the router takes its workers in.
+            for side in "PD":
+                servers = sorted(
+                    (ThreadingHTTPServer(("127.0.0.1", 0), None) for _ in range(2)),
+                    key=lambda s: f"http://127.0.0.1:{s.server_port}",
+                )
+                for k, http in enumerate(servers):
+                    lp = f"frontend-{side}{k}"
+                    frontends[lp] = InstanceFrontend(run, side, delay, lp, http)
+            idle = [
+                threading.Thread(
+                    target=_idle, args=(run, f"engine-{s}{k}", f"dp{r}", errors)
+                )
+                for s in "PD"
+                for k in range(2)
+                for r in range(2)
+            ]
+            for t in idle:
+                t.daemon = True
+                t.start()
+            urls = [
+                arg
+                for lp, f in frontends.items()
+                for arg in ("--prefill" if "-P" in lp else "--decode", f.url)
+            ]
+            procs.append(
+                router := _launch(
+                    out,
+                    "router",
+                    [str(binary), "launch", "--host", "127.0.0.1", "--port"]
+                    + [str(router_port), "--pd-disaggregation", *urls]
+                    + ["--policy", "dp_sticky", "--dp-aware", "--backend", "atom"]
+                    + ["--disable-health-check", "--disable-circuit-breaker"]
+                    + ["--disable-retries", "--prometheus-port", str(metrics_port)]
+                    + ["--log-level", "info"],
+                    ATOM_COMPASS_CLOCK_ENDPOINT=endpoint,
+                    ATOM_COMPASS_SEED="20260707",
+                    ATOM_COMPASS_ROUTER_LOOKAHEADS=json.dumps(lookaheads),
+                    ATOM_COMPASS_ROUTER_WORKERS=json.dumps(
+                        {f.url: lp for lp, f in frontends.items()}
+                    ),
+                )
+            )
+            deadline = time.monotonic() + WALL_S
+            while True:
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{router_port}/v1/models")
+                    break
+                except OSError:
+                    assert router.poll() is None, (out / "router.log").read_text()
+                    assert time.monotonic() < deadline, f"no router in {WALL_S} s"
+                    time.sleep(0.5)
+            bodies = [
+                {
+                    "model": "m",
+                    "prompt": f"request {i}",
+                    "max_tokens": n,
+                    "stream": True,
+                }
+                for i, (_, n) in enumerate(WORKLOAD)
+            ]
+            offsets = [t for t, _ in WORKLOAD]
+
+            def drive() -> None:
+                try:
+                    DelayedTraffic(run, router_port, bodies, offsets, delay=delay).run()
+                except BaseException as e:  # noqa: BLE001 - the test raises it
+                    errors.append(e)
+
+            # A message the router sends to the wrong frontend never arrives, and
+            # the LPs wait for it: one wall deadline bounds them all.
+            lps = [threading.Thread(target=drive, daemon=True)]
+            lps[0].start()
+            lps += [*idle, *(f.owner for f in frontends.values())]
+            deadline = time.monotonic() + WALL_S
+            for t in lps:
+                t.join(max(0.0, deadline - time.monotonic()))
+            stuck = [t.name for t in lps if t.is_alive()]
+            assert not stuck, f"still running after {WALL_S} s: {stuck}"
+            assert authority.wait(WALL_S) == 0, (out / "authority.log").read_text()
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+            for f in frontends.values():
+                f.http.shutdown()
+    errors += [e for f in frontends.values() for e in f.errors]
+    if errors:
+        raise errors[0]
+    placed = {}
+    for lp, f in frontends.items():
+        for request, rank in f.ranks.items():
+            placed.setdefault(request, {})[lp[len("frontend-")]] = (int(lp[-1]), rank)
+    return [(placed[i]["P"], placed[i]["D"]) for i in range(len(WORKLOAD))]
+
+
+@pytest.fixture(scope="module")
+def scripted_runs(atomesh, tmp_path_factory):  # noqa: F811
+    root = tmp_path_factory.mktemp("xpyd_scripted")
+    wall = random.Random(2)
+    delays = {"1": lambda: 0.0, "2": lambda: wall.uniform(0.0, 0.02)}
+    return {
+        root / f"seed{s}": run_scripted_xpyd(atomesh, root / f"seed{s}", s, delay)
+        for s, delay in delays.items()
+    }
+
+
+def test_2p2d_through_atomesh_meets_every_scenario_check(scripted_runs):
+    failed = check_run(list(scripted_runs))
+    assert not failed, "\n".join(failed)
+
+
+def test_each_request_takes_the_least_load_deployment_and_rank_under_any_delay(
+    scripted_runs,
+):
+    want = [(p, p) for p in PLACED]
+    print("\n(prefill, decode) (deployment, rank) per request:", scripted_runs)
+    assert list(scripted_runs.values()) == [want, want]
+
+
+# --- with a driver: pd_sim.sh at 2P2D ------------------------------------------
+
+#: Each port name pd_sim.sh reads, by its offset in a block of held ports; a
+#: server k of a side takes its port plus k and its DP port plus 16k.
+OFFSETS = {
+    "CLOCK_PORT": 0,
+    "ROUTER_PORT": 1,
+    "PROMETHEUS_PORT": 2,
+    "PREFILL_PORT": 3,
+    "DECODE_PORT": 5,
+    "KV_WRITE_REQ_PORT": 7,
+    "PREFILL_DP_PORT": 11,
+    "DECODE_DP_PORT": 12,
+}
+#: At DP 2 the write requests take 2 * 2 * 2 * 2 = 16 ports from
+#: KV_WRITE_REQ_PORT, and each server's DP port leaves its ranks room.
+DP2_OFFSETS = OFFSETS | {"PREFILL_DP_PORT": 32, "DECODE_DP_PORT": 40}
+
+
+def run_xpyd(
+    out: Path,
+    seed: str,
+    offsets=OFFSETS,
+    run: dict | None = None,
+    cell=None,
+    publish=publish_entry,
+) -> dict:
+    """One 2P2D run under `pd_sim.sh`, round robin on each side, or with the
+    run file keys `run` and the environment `cell` over those, its readings
+    published by `publish`."""
+    out.mkdir()
+    run, cell = run or {}, cell or {}
+    with held_ports(1, lambda q: range(q[0] + 1, q[0] + 72)) as [base]:
+        ports = {name: base + k for name, k in offsets.items()}
+        run_file = _run_file(
+            out,
+            clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
+            step_stub=CONSTANT,
+            **XPYD,
+            **PD,
+            **run,
+        )
+        env = (
+            dict(
+                os.environ,
+                PYTHONHASHSEED=seed,
+                PYTHONPATH=str(TREE),
+                AITER_LOG_LEVEL="WARNING",
+                ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
+                MODEL=MODEL,
+                ROUTER_POLICY="round_robin",
+                **{name: str(port) for name, port in ports.items()},
+            )
+            | cell
+        )
+        publish_pd_entries(out / "store", run.get("machine", DOCUMENT), env, publish)
+        log = out / "pd_sim.log"
+        with open(log, "w") as f:
+            sim = subprocess.Popen(
+                ["bash", str(TREE / "scripts/compass/pd_sim.sh"), str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        watchdog = threading.Timer(WALL_S * 2, os.killpg, (sim.pid, signal.SIGKILL))
+        watchdog.start()
+        try:
+            deadline = time.monotonic() + WALL_S * 2
+            while "pd_sim: ready" not in log.read_text():
+                assert sim.poll() is None, f"pd_sim.sh exited:\n{log.read_text()}"
+                assert time.monotonic() < deadline, "no router in time"
+                time.sleep(0.5)
+            run = json.loads(run_file.read_text())
+            traffic = RouterLpRequests(run, ports["ROUTER_PORT"], sim)
+            traffic.run()
+            code = sim.wait(timeout=120)
+        finally:
+            watchdog.cancel()
+            if sim.poll() is None:
+                os.killpg(sim.pid, signal.SIGKILL)
+    assert code == 0, f"pd_sim.sh exited {code}:\n{log.read_text()[-4000:]}"
+    return {
+        "out": out,
+        "table": (out / compass_run.STEP_TABLE_FILE).read_text(),
+        "events": traffic.events,
+    }
+
+
+@pytest.fixture(scope="module")
+def xpyd_runs(tmp_path_factory):
+    root = tmp_path_factory.mktemp("xpyd")
+    return [run_xpyd(root / f"seed{s}", s) for s in ("1", "2")]
+
+
+def _every_check_with_requests_on_every_deployment(runs) -> list[str]:
+    """Both seeds' `runs` meet every scenario check, each request's KV moving
+    once, every deployment of each side taking one; the transfers' channels."""
+    run = runs[0]
+    rows = [r.split() for r in run["table"].splitlines()[1:]]
+    channels = [r[4] for r in rows if r[3] == "release" and ":kv_write_req" in r[4]]
+    pairs = Counter(c.partition(":")[0] for c in channels)
+    print(
+        "\nKV transfers per decode->prefill engine pair:", dict(sorted(pairs.items()))
+    )
+    parity = run["out"] / "parity"
+    records = {
+        f"engine-{s}{k}": parity / f"{n}{k}"
+        for s, n in (("P", "prefill"), ("D", "decode"))
+        for k in (0, 1)
+    }
+    failed = check_run(
+        [r["out"] for r in runs],
+        MAX_TOKENS,
+        [line for _, line in run["events"]],
+        records,
+    )
+    assert not failed, "\n".join(failed)
+    assert sum(pairs.values()) == len(MAX_TOKENS)
+    ends = [p.split("->") for p in pairs]
+    assert {d for d, _ in ends} == {"engine-D0", "engine-D1"}
+    assert {p for _, p in ends} == {"engine-P0", "engine-P1"}
+    return channels
+
+
+@NEEDS_A_PD_RUN
+def test_2p2d_meets_every_scenario_check_with_requests_on_every_deployment(
+    xpyd_runs,
+):
+    _every_check_with_requests_on_every_deployment(xpyd_runs)
+
+
+# --- the share-cache recipe's router, at DP 2, with no driver ------------------
+
+#: DeepSeek-V4.1-Flash's config and tokenizer, as `test_spec_scenario` takes it.
+DSV41 = os.environ.get("ATOM_COMPASS_DSPARK_MODEL")
+#: Each server at DP 2, eager, on the recipe's KV and index dtypes, block size
+#: and MoE path. No side here has a tier every DP rank shares, which
+#: `share_cache` needs, so the prefill side keeps its default policy: under the
+#: recipe's --dp-aware router, which names each request's rank, it chooses none.
+DSV41_ARGS = "--trust-remote-code -tp 2 --enable-dp-attention --enforce-eager"
+DSV41_ARGS += " --max-model-len 2048 --kv_cache_dtype bf16 --index-cache-dtype fp8"
+DSV41_ARGS += " --block-size 128 --moe-backend standard --all2all-backend none"
+NEEDS_A_RECIPE_RUN = pytest.mark.skipif(
+    not (DSV41 and shutil.which("atomesh")),
+    reason="a run needs ATOM_COMPASS_DSPARK_MODEL and atomesh on PATH",
+)
+
+
+@pytest.fixture(scope="module")
+def recipe_runs(tmp_path_factory):
+    """2P2D at DP 2 behind the recipe's router, on a gfx950 machine, so each
+    server starts under on_arch and needs no driver."""
+    root = tmp_path_factory.mktemp("xpyd_recipe")
+    run = {"data_parallel_size": 2, "machine": DP_MACHINE}
+    router = f"{RECIPE} --dp-aware --model-path {DSV41}"
+    cell = {"MODEL": DSV41, "SERVER_ARGS": DSV41_ARGS, "ROUTER_ARGS": router}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(test_dp_slice, "MODEL", DSV41)  # the traffic's model
+        return [
+            run_xpyd(
+                root / f"seed{s}", s, DP2_OFFSETS, run, cell, publish_entry_on_arch
+            )
+            for s in ("1", "2")
+        ]
+
+
+@NEEDS_A_RECIPE_RUN
+def test_2p2d_at_dp2_behind_the_recipe_s_router_meets_every_scenario_check(
+    recipe_runs,
+):
+    """The recipe's router chooses each request's deployment and DP rank on
+    the run's clock: both seeds' runs meet every scenario check with requests
+    on every deployment and both ranks of each side, and the router ran on
+    the recipe's flags, its wall-clock bounds a year, refusing no request."""
+    channels = _every_check_with_requests_on_every_deployment(recipe_runs)
+    ranks = [c.rpartition("#")[2].split(".") for c in channels]
+    assert {d for d, _ in ranks} == {p for _, p in ranks} == {"dp0", "dp1"}
+    for run in recipe_runs:
+        log = (run["out"] / "pd_sim.log").read_text()
+        [said] = [x for x in log.splitlines() if x.startswith("pd_sim: router ")]
+        print(f"\n{run['out'].name}: {said}")
+        assert all(word in said.split() for word in [*RECIPE.split(), "--dp-aware"])
+        router = (run["out"] / "router.log").read_text()
+        assert "prepare_timeout" not in router and "prepare_queue_timeout" not in router

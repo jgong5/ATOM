@@ -1,0 +1,665 @@
+# SPDX-License-Identifier: MIT
+"""The step roofline over DeepSeek-V4-Pro's modules: hyper-connection mixes,
+sparse attention with its indexer, the routed experts and their exchange, and
+a two-batch-overlap step laid on the compute and comm streams.
+
+Each is checked against a count by hand, on a machine with no kernel floor,
+once memory-bound and once compute-bound. The published model's meta build at
+DPA-TP8, expert parallelism off and at EP8, classifies every module; the build
+owns its process because the driverless declarations are process-global.
+"""
+
+import collections
+import copy
+import dataclasses
+import functools
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+from math import comb
+from types import SimpleNamespace
+
+import pytest
+import torch
+from test_backend_step_roofline import ROOFLINE
+from test_dp_step_max import prefill, runner
+from test_moe_gather_rows import decode
+
+from atom.compass.backends import BatchView, CostRefused, RequestShape
+from atom.compass.backends.step_roofline import (
+    Module,
+    StepRooflineBackend,
+    micro_batches,
+    overlap,
+)
+from atom.compass.backends.work import (
+    Work,
+    activated_experts,
+    allgather,
+    allreduce,
+    attention,
+    bounds,
+    gemm,
+    max_rank_load,
+)
+from atom.compass.run.modules import walk
+from atom.compass.runner import projection
+from atom.compass.spec import MachineSpec
+
+TREE = pathlib.Path(__file__).resolve().parents[2]
+CONFIG = pathlib.Path(__file__).with_name("deepseek_v4_pro_config.json")
+#: Experts, local experts, top k, intermediate, hidden, group, DP width, split,
+#: and the bytes an expert holds: its fp4 weights and a byte per 32 of them.
+EP_OFF = (8, 8, 2, 16, 32, 2, 2, 0, 816)
+EP2 = (8, 4, 2, 32, 32, 2, 2, 0, 1632)
+#: The link: one hop of 2 us, 1e12 B/s derated by 0.8, one lane at two ranks.
+LINK = 1.0e12 * 0.80
+
+
+def machine(bf16):
+    document = copy.deepcopy(ROOFLINE)
+    document["device"]["kernel_floor_s"] = 1e-15
+    document["device"]["memory"]["bandwidth_curve"] = [[1, 1e9], [2**40, 1e9]]
+    document["device"]["compute"].update(bf16_flops=bf16, fp8_flops=2 * bf16)
+    document["device"]["compute"].update(fp4_flops=4 * bf16)
+    document["device"]["compute"]["derate"]["fp4"] = 0.7
+    return MachineSpec.from_mapping(document)
+
+
+BOUND = pytest.mark.parametrize(
+    "spec", [machine(1e18), machine(1e6)], ids=["memory-bound", "compute-bound"]
+)
+
+
+def view(*rows, moe_rows=None, tbo=None):
+    return BatchView(
+        tuple(RequestShape(*r) for r in rows), moe_rows=moe_rows, tbo_tokens=tbo
+    )
+
+
+def _module(work, spec):
+    b = bounds(work, spec)
+    return max(b["floor"], b["compute"], b["memory"]) + b["comm"]
+
+
+def _price(modules, step, spec):
+    cost = StepRooflineBackend(spec, modules).price(step)
+    return {t.name: t.seconds for t in cost.terms}
+
+
+def test_two_micro_batches_overlap_as_atoms_streams_order_them():
+    # Three layers of compute 3, exchange in 2, experts 4, exchange out 2 for
+    # each micro-batch: the timeline ATOM's own TBO ring ran, finishing at 44
+    # against 66 run one after the other.
+    layer = [[3, 3], [2, 2], [4, 4], [2, 2]]
+    assert overlap([layer] * 3) == 44
+    # One micro-batch's slow compute holds the other's experts behind it.
+    assert overlap([[[5, 1], [1, 1], [1, 1], [1, 1]]]) == 9
+
+
+@BOUND
+def test_the_routed_experts_and_their_exchange_by_hand(spec):
+    tokens, rows = 3, 10
+    ep_off = Module("experts", "moe", EP_OFF, "fp4", ranks=2)
+    ep2 = Module("experts", "moe", EP2, "fp4", ranks=2, act="fp8", wire=("fp4", "fp8"))
+    one_rank = Module("experts", "moe", EP_OFF[:6] + (1, 0, 816), "fp4", ranks=2)
+    step = view((tokens, tokens, False), moe_rows=rows)
+    # EP off: every expert a row reaches, at a sixteenth of the intermediate,
+    # read once by one kernel, with each row's bf16 input and output and its
+    # two top-k ids and weights; the gate-up output stays inside. The gathered
+    # hidden states and router logits, the output scattered back.
+    hit = 8 * (1 - (6 / 8) ** rows)
+    experts = Work({"bf16": 2 * 20 * (32 + 16) * 32}, hit * 816 + rows * (128 + 16))
+    gather = 2e-6 + rows * (32 + 8) * 2 / 2 / LINK
+    scatter = 2e-6 + rows * 32 * 2 / 2 / LINK
+    assert _price([ep_off], step, spec)["roofline.moe"] == pytest.approx(
+        _module(experts, spec) + gather + scatter
+    )
+    # Activations the method quantizes to the weights' fp4: the products run
+    # at the fp4 rate, the kernel's boundary unchanged.
+    fp4 = dataclasses.replace(ep_off, act="fp4")
+    experts = Work({"fp4": 2 * 20 * (32 + 16) * 32}, experts.bytes)
+    assert _price([fp4], step, spec)["roofline.moe"] == pytest.approx(
+        _module(experts, spec) + gather + scatter
+    )
+    # A gather's pad rows route to no expert: its 6 real tokens reach the
+    # experts, the exchanges still moving every row.
+    padded = BatchView(step.requests, moe_rows=rows, moe_tokens=6)
+    hit6 = activated_experts(8, 2, 6)
+    experts = Work({"bf16": 2 * 12 * (32 + 16) * 32}, hit6 * 816 + 6 * 144)
+    assert _price([ep_off], padded, spec)["roofline.moe"] == pytest.approx(
+        _module(experts, spec) + gather + scatter
+    )
+    # EP2: the busiest rank's share at the full intermediate, half the experts
+    # read, and its routes' share of the rows, which arrive at fp4; each token
+    # sent once to each rank holding one of its two experts, at fp4 and back
+    # at fp8.
+    load = max_rank_load(rows, 2, 8, 2)
+    row = 32 * (0.5 + 2) + 16
+    experts = Work({"fp8": 2 * load * (64 + 32) * 32}, hit / 2 * 1632 + load / 2 * row)
+    sent = tokens * 32 * 2 * (1 - comb(4, 2) / comb(8, 2))
+    dispatch = 2e-6 + sent * 0.5 / 2 / LINK
+    combine = 2e-6 + sent / 2 / LINK
+    assert _price([ep2], step, spec)["roofline.moe"] == pytest.approx(
+        _module(experts, spec) + dispatch + combine
+    )
+    # One data-parallel rank: its graph's 8 rows, the output all-reduced; its
+    # 3 decode tokens alone reach the experts, a pad row routing to none.
+    hit = activated_experts(8, 2, 3)
+    experts = Work({"bf16": 2 * 6 * (32 + 16) * 32}, hit * 816 + 3 * 144)
+    experts += allreduce(2, 8 * 32 * 2)
+    one = BatchView((RequestShape(1, 4, True),) * 3, capture_rung=8)
+    assert _price([one_rank], one, spec)["roofline.moe"] == pytest.approx(
+        _module(experts, spec)
+    )
+
+
+def test_a_padded_decode_exchanges_only_its_real_rows():
+    # EP2 at rung 4: this rank's 3 decode rows and a pad row, which routes to
+    # no expert, so MoRI sends it nowhere: the exchange moves what the 3 rows
+    # move unpadded, at fp4 out and fp8 back.
+    ep2 = Module("experts", "moe", EP2, "fp4", ranks=2, act="fp8", wire=("fp4", "fp8"))
+    rows = (RequestShape(1, 9, True),) * 3
+    padded = BatchView(rows, capture_rung=4, moe_rows=8, moe_tokens=6)
+    unpadded = BatchView(rows, moe_rows=6, moe_tokens=6)
+
+    def transfer(step):
+        (term,) = StepRooflineBackend(machine(1e18), [ep2]).price(step).terms
+        return term.by_bound["comm.transfer"]
+
+    sent = 3 * 32 * 2 * (1 - comb(4, 2) / comb(8, 2))
+    assert transfer(padded) == pytest.approx(sent * (0.5 + 1) / 2 / LINK)
+    assert transfer(padded) == pytest.approx(transfer(unpadded))
+
+
+@BOUND
+def test_sparse_attention_and_the_hyper_connection_mix_by_hand(spec):
+    # Window 4, every 3 tokens compressed, the indexer keeping the top 2.
+    attn = Module("attn", "sparse_attention", (2, 8, 4, 3, 2, 3, 4), "fp8")
+    mix = Module("mix", "mhc", (4, 16))
+    rows = [(3, 10, False), (1, 7, True)]
+    keys = scored = 0
+    for q, kv, _ in rows:
+        for p in range(kv - q + 1, kv + 1):
+            keys += min(p, 4) + min(p // 3, 2)
+            scored += p // 3
+    # Each row reads its window and its top 2 compressed entries once, and
+    # every compressed index key once.
+    read = (4 + 2) + (4 + 2)
+    work = Work({"bf16": 4 * 2 * 8 * keys}, 2 * 4 * 2 * 8 * 2 + read * 8)
+    work += Work({"fp8": 2 * 3 * 4 * scored}, (3 + 2) * 4)
+    # Read the residual's four copies and the output, write both back; the
+    # 24 mixing weights' fp32 projection of the four copies.
+    moved = 2 * 4 * 5 * 16 * 2 + 24 * 4 * 16 * 4
+    flops = 2 * 4 * 24 * 4 * 16
+    by_name = _price([attn, mix], view(*rows), spec)
+
+    assert by_name["roofline.sparse_attention"] == pytest.approx(_module(work, spec))
+    assert by_name["roofline.mhc"] == pytest.approx(
+        _module(Work({"bf16": flops}, moved), spec)
+    )
+
+
+@BOUND
+def test_sparse_attention_over_an_fp8_q_and_without_an_indexer_by_hand(spec):
+    # Window 4, every 3 tokens compressed; Q in fp8 as the KV is.
+    csa = Module("attn", "sparse_attention", (2, 8, 4, 3, 2, 3, 4), "fp8", act="fp8")
+    hca = dataclasses.replace(csa, dims=(2, 8, 4, 3, 0, 0, 0))
+    rows = [(3, 10, False), (1, 7, True)]
+    top = every = scored = 0
+    for q, kv, _ in rows:
+        for p in range(kv - q + 1, kv + 1):
+            top += min(p, 4) + min(p // 3, 2)
+            every += min(p, 4) + p // 3
+            scored += p // 3
+    # The products run at fp8 and Q is read at a byte, O written in bf16. A
+    # layer with no indexer reads every compressed entry: 3 and 2.
+    q = 4 * 2 * 8 * (1 + 2)
+    work = Work({"fp8": 4 * 2 * 8 * top + 2 * 3 * 4 * scored}, q + 12 * 8 + 5 * 4)
+    hca_work = Work({"fp8": 4 * 2 * 8 * every}, q + (7 + 6) * 8)
+
+    assert _price([csa], view(*rows), spec)["roofline.sparse_attention"] == (
+        pytest.approx(_module(work, spec))
+    )
+    assert _price([hca], view(*rows), spec)["roofline.sparse_attention"] == (
+        pytest.approx(_module(hca_work, spec))
+    )
+
+
+@BOUND
+def test_the_fp4_indexer_scores_at_fp4_by_hand(spec):
+    # Window 4, every 3 tokens compressed, the indexer keeping the top 2; Q and
+    # the KV in fp8, the indexer's queries and keys in fp4.
+    attn = Module(
+        "attn", "sparse_attention", (2, 8, 4, 3, 2, 3, 4), "fp8", act="fp8", index="fp4"
+    )
+    rows = [(3, 10, False), (1, 7, True)]
+    keys = scored = 0
+    for q, kv, _ in rows:
+        for p in range(kv - q + 1, kv + 1):
+            keys += min(p, 4) + min(p // 3, 2)
+            scored += p // 3
+    # Q read at a byte, O written in bf16, the window and the top 2 at a byte;
+    # the 3 and 2 index keys at half a byte.
+    work = Work({"fp8": 4 * 2 * 8 * keys}, 4 * 2 * 8 * (1 + 2) + 12 * 8)
+    work += Work({"fp4": 2 * 3 * 4 * scored}, (3 + 2) * 4 / 2)
+
+    assert _price([attn], view(*rows), spec)["roofline.sparse_attention"] == (
+        pytest.approx(_module(work, spec))
+    )
+
+
+@BOUND
+def test_a_split_step_lays_each_layers_micro_batches_on_two_streams(spec):
+    layers = []
+    for i in range(2):
+        layers += [
+            Module(f"layers.{i}.attn", "attention", (4, 1, 8), layer=i),
+            Module(f"layers.{i}.proj", "gemm", (32, 32), layer=i),
+            Module(f"layers.{i}.experts", "moe", EP_OFF, "fp4", ranks=2, layer=i),
+        ]
+    head = Module("head", "lm_head", (64, 32))
+    # This rank's 7 tokens split 3 then 4, the shorter half first, cutting the
+    # first request: its last token attends the first three as history. The
+    # peer splits 5 and 5, so the halves gather 8 and 9 rows.
+    step = view((4, 4, False), (3, 10, False), tbo=((3, 5), (4, 5)))
+    halves = [([3], [3], 8), ([1, 3], [4, 10], 9)]
+    segments = []
+    for q, kv, rows in halves:
+        hit = activated_experts(8, 2, rows)
+        experts = Work({"bf16": 2 * 2 * rows * (32 + 16) * 32}, hit * 816 + rows * 144)
+        compute = _module(attention(q, kv, 4, 8, 1), spec)
+        compute += _module(gemm(sum(q), 32, 32), spec)
+        gather = bounds(allgather(2, rows * 40 * 2), spec)["comm"]
+        scatter = bounds(allgather(2, rows * 32 * 2), spec)["comm"]
+        segments.append([compute, gather, _module(experts, spec), scatter])
+    layer = [list(pair) for pair in zip(*segments)]
+    by_name = _price(layers + [head], step, spec)
+
+    assert by_name["roofline.tbo"] == pytest.approx(overlap([layer, layer]))
+    assert by_name["roofline.lm_head"] == _module(gemm(2, 64, 32), spec)
+    assert set(by_name) == {"roofline.tbo", "roofline.lm_head"}
+
+
+@pytest.mark.parametrize(
+    "modules,step,refusal",
+    [
+        (
+            [Module("experts", "moe", EP2[:7] + (1, 1632), "fp4", ranks=2, layer=0)],
+            view((4, 4, False), tbo=((2, 2), (2, 2))),
+            "split send and receive",
+        ),
+        (
+            [Module("proj", "gemm", (32, 32), layer=0)],
+            view((4, 4, False), tbo=((1, 3), (3, 1))),
+            r"names no single pair of micro-batches for this rank's 4 tokens",
+        ),
+        (
+            [Module("experts", "moe", EP_OFF, "fp4", ranks=2)],
+            view((4, 4, False)),
+            "a MoE over 2 data-parallel ranks, and no moe_rows",
+        ),
+    ],
+    ids=["split-path", "ambiguous-split", "no-moe-rows"],
+)
+def test_a_step_with_no_price_is_refused_by_name(modules, step, refusal):
+    with pytest.raises(CostRefused, match=refusal):
+        StepRooflineBackend(machine(1e18), modules).price(step)
+
+
+def test_the_batch_view_states_the_real_tokens_among_the_gathered_rows():
+    # Two ranks decode 3 and 2 tokens in a graph of 4 rows each.
+    r = runner(None, dp_size=2)
+    r.drafter = None
+    sync = SimpleNamespace(
+        scheduled_tokens_per_dp_rank=torch.tensor([3, 2]),
+        ub_tokens_across_dp=None,
+        any_rank_needs_eager=False,
+        max_final_requests_across_dp=0,
+    )
+    mode = SimpleNamespace(
+        sync=sync,
+        is_prefill=False,
+        tbo_collective_active=False,
+        running_tokens_are_unified=True,
+        running_tokens=4,
+        use_cudagraph=True,
+        running_bs=4,
+    )
+    view = projection.batch_view(decode(3), mode, r)
+
+    assert (view.moe_rows, view.moe_tokens) == (8, 5)
+
+
+def test_a_rank_s_view_names_its_own_slot_of_the_split():
+    # Both ranks prefill 7 tokens; rank 1 splits 3 then 4, rank 0 4 then 3.
+    r = runner(None, dp_size=2, dp_rank=1)
+    r.drafter = None
+    sync = SimpleNamespace(
+        scheduled_tokens_per_dp_rank=torch.tensor([7, 7]),
+        ub_tokens_across_dp=((4, 3), (3, 4)),
+        any_rank_needs_eager=False,
+        max_final_requests_across_dp=0,
+    )
+    mode = SimpleNamespace(
+        sync=sync,
+        is_prefill=True,
+        tbo_collective_active=True,
+        running_tokens_are_unified=False,
+        use_cudagraph=False,
+        running_bs=1,
+    )
+    view = projection.batch_view(prefill(7), mode, r)
+
+    assert [h.requests for h in micro_batches(view)] == [
+        (RequestShape(3, 3, False),),
+        (RequestShape(4, 7, False),),
+    ]
+    with pytest.raises(ValueError, match="names no single pair"):
+        micro_batches(dataclasses.replace(view, dp_rank=None))
+
+
+WALK = """
+import json, os, sys, torch
+from types import SimpleNamespace
+from atom.compass.capture import driverless
+driverless.install(sys.argv[1], "gfx950")
+driverless.group(1, 1)
+from atom.model_ops.fused_moe.routed_rows import resolve_routed_rows_wire
+from atom.compass.run.modules import walk
+
+class Mxfp4MoEMethod:
+    act_quant = SimpleNamespace(value="bf16")
+
+class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
+    pass
+
+class FusedMoE(torch.nn.Module):
+    pass
+
+# The walk matches ATOM's classes by name.
+for cls in Mxfp4MoEMethod, MegaMxfp4MoEMethod, FusedMoE:
+    cls.__module__ = "atom.model_ops.moe"
+
+walked = {}
+for case, (method, backend, off, combine, fp4, v2) in json.loads(sys.argv[2]).items():
+    os.environ.update(
+        ATOM_DISABLE_MORI_EP=off, ATOM_MORI_COMBINE_QUANT=combine, ATOM_MORI_V2=v2
+    )
+    # EP2 over two data-parallel ranks of TP1 attention.
+    moe = FusedMoE()
+    moe.quant_method, moe._comm_fused_moe = globals()[method](), None
+    # The method's routed-rows wire, as ATOM_MORI_FP4_DISPATCH sets it.
+    moe.quant_method.routed_rows_wire = (
+        resolve_routed_rows_wire(torch.bfloat16, 32, fp4=True) if fp4 else None
+    )
+    moe.w13_weight = torch.empty(4, 64, 32, dtype=torch.bfloat16, device="meta")
+    moe.global_num_experts, moe.top_k, moe.hidden_size = 8, 2, 32
+    moe.moe_config = SimpleNamespace(in_dtype=torch.bfloat16)
+    moe.moe_parallel_config = SimpleNamespace(
+        use_ep=True, ep_size=2, tp_size=1, low_latency=False,
+        requested_all2all_backend=backend,
+    )
+    block = torch.nn.Module()
+    block.tp_size, block.experts = 1, moe
+    walked[case] = [[m.kind, m.name, *m.wire] for m in walk(block)]
+print(json.dumps(walked))
+"""
+#: Method, all-to-all backend, ATOM_DISABLE_MORI_EP, ATOM_MORI_COMBINE_QUANT,
+#: ATOM_MORI_FP4_DISPATCH, ATOM_MORI_V2.
+WALKS = {
+    "mori": ("Mxfp4MoEMethod", "auto", "0", "none", False, "0"),
+    "mori-quantized": ("Mxfp4MoEMethod", "mori", "0", "fp8_blockwise", True, "0"),
+    "rccl": ("Mxfp4MoEMethod", "rccl", "0", "none", False, "0"),
+    "none": ("Mxfp4MoEMethod", "none", "0", "none", False, "0"),
+    "mori-disabled": ("Mxfp4MoEMethod", "auto", "1", "none", False, "0"),
+    "mega": ("MegaMxfp4MoEMethod", "mori", "0", "none", False, "0"),
+    "mori-fp4-combine": ("Mxfp4MoEMethod", "auto", "0", "fp4_blockwise", False, "0"),
+    "unknown-combine": ("Mxfp4MoEMethod", "auto", "0", "int8", False, "0"),
+    "mori-v2": ("Mxfp4MoEMethod", "auto", "0", "none", False, "1"),
+}
+
+
+@functools.cache
+def _walked():
+    """Each case of `WALKS` walked in one process of its own: resolving MoRI's
+    wire format imports aiter, which reads the arch the driverless
+    declarations supply."""
+    with tempfile.TemporaryDirectory() as root:
+        done = subprocess.run(
+            [sys.executable, "-c", WALK, root, json.dumps(WALKS)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=600,
+            cwd=TREE,
+            env={**os.environ, "PYTHONPATH": str(TREE)},
+        )
+    assert done.returncode == 0, done.stderr[-4000:]
+    return json.loads(done.stdout.splitlines()[-1])
+
+
+def test_mori_sends_at_the_formats_atom_resolves():
+    assert _walked()["mori"] == [["moe", "experts", "bf16", "bf16"]]
+    assert _walked()["mori-quantized"] == [["moe", "experts", "fp4", "fp8"]]
+    assert _walked()["mori-fp4-combine"] == [["moe", "experts", "bf16", "fp4"]]
+
+
+@pytest.mark.parametrize(
+    "case", ["rccl", "none", "mori-disabled", "mega", "unknown-combine", "mori-v2"]
+)
+def test_an_ep_moe_off_moris_exchange_is_unclassified(case):
+    refused = ["unclassified", "FusedMoE at experts", "bf16", "bf16"]
+
+    assert _walked()[case] == [refused]
+
+
+BUILD = """
+import json, pathlib, sys, torch
+ep, root = sys.argv[1] == "1", pathlib.Path(sys.argv[2])
+from atom.compass.capture import driverless
+driverless.install(str(root), "gfx950")
+driverless.group(1, 1)
+from atom.config import Config, set_current_atom_config
+config = Config(model=str(root / "model"), tensor_parallel_size=1, load_dummy="empty",
+                enable_dp_attention=True, dp_logical_size=8, enable_expert_parallel=ep,
+                kv_cache_dtype="fp8")
+set_current_atom_config(config)
+from atom.model_engine.model_runner import support_model_arch_dict
+from atom.utils import resolve_obj_by_qualname
+from atom.compass.runner.overrides import FactoriesOnMeta, process_weights_after_loading
+from atom.compass.run.modules import walk
+model = support_model_arch_dict[config.hf_config.architectures[0]]
+torch.set_default_dtype(config.torch_dtype)
+with FactoriesOnMeta():
+    tree = resolve_obj_by_qualname(model)(config)
+    process_weights_after_loading(tree)
+found = [[m.kind, list(m.dims), m.fmt, m.act, m.layer] for m in walk(tree)]
+print(json.dumps(found))
+"""
+
+
+@pytest.mark.parametrize("ep", [False, True], ids=["ep-off", "ep8"])
+def test_the_v4_pro_dpa_tp8_build_classifies_every_module(ep, tmp_path):
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_bytes(CONFIG.read_bytes())
+    # The declared device is the MI355X the cells run on, so ATOM takes its
+    # own gfx950 MoE default, aiter's, which the meta build can lay out.
+    env = {**os.environ, "PYTHONPATH": str(TREE)}
+    done = subprocess.run(
+        [sys.executable, "-c", BUILD, str(int(ep)), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=900,
+        cwd=TREE,
+        env=env,
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    walked = json.loads(done.stdout.splitlines()[-1])
+    found = collections.Counter(
+        (kind, tuple(dims), fmt, act) for kind, dims, fmt, act, _ in walked
+    )
+    ratios = json.loads(CONFIG.read_text())["compress_ratios"][:61]
+
+    assert not [m for m in found if m[0] == "unclassified"]
+    assert {layer for *_, layer in walked} == set(range(61)) | {-1}
+    assert found[("mhc", (4, 7168), "bf16", "bf16")] == 2 * 61
+    # The fp8 KV cache's kernels take Q in fp8.
+    for ratio, top in ((128, (0, 0, 0)), (4, (1024, 64, 128))):
+        dims = (128, 512, 128, ratio) + top
+        assert found[("sparse_attention", dims, "fp8", "fp8")] == ratios.count(ratio)
+    moe = (384, 48, 6, 3072) if ep else (384, 384, 6, 384)
+    # The experts read fp4 activations, aiter quantizing them in the kernel.
+    # An expert holds its fp4 weights and a one-byte scale per 32 of them,
+    # each of w2's rows padded to 16 scales at EP off.
+    weights = 3 * moe[3] * 7168 // 2
+    held = weights + 2 * moe[3] * 224 + 7168 * (96 if ep else 16)
+    assert found[("moe", moe + (7168, 8, 8, 0, held), "fp4", "fp4")] == 61
+    # The fp8 linears read fp8 activations; the block's norms run in its mixes.
+    assert found[("gemm", (65536, 1536), "fp8", "fp8")] == 61
+    # So does wo_a, which gfx950 runs as an fp8 batched GEMM.
+    assert found[("gemm", (16384, 4096), "fp8", "fp8")] == 61
+    assert found[("act", (3072,), "bf16", "bf16")] == 61
+    assert found[("norm", (7168,), "bf16", "bf16")] == 1
+
+
+#: The build at the indexer cache format the third argument names, ATOM's
+#: default when it is empty, each module's indexer format in place of its layer.
+INDEX_BUILD = BUILD.replace(
+    'kv_cache_dtype="fp8")',
+    'kv_cache_dtype="fp8", index_cache_dtype=sys.argv[3] or None)',
+).replace("m.act, m.layer]", "m.act, m.index]")
+
+
+@pytest.mark.parametrize(
+    "cache, index", [("", "fp4"), ("fp8", "fp8")], ids=["default", "fp8-cache"]
+)
+def test_the_v4_pro_indexer_scores_at_the_format_atom_runs_it(cache, index, tmp_path):
+    # gfx950 runs the fp4 indexer by default; asked for an fp8 indexer cache,
+    # the fp8 one. A layer without an indexer scores nothing.
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_bytes(CONFIG.read_bytes())
+    done = subprocess.run(
+        [sys.executable, "-c", INDEX_BUILD, "0", str(tmp_path), cache],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=900,
+        cwd=TREE,
+        env={**os.environ, "PYTHONPATH": str(TREE)},
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    found = collections.Counter(
+        (tuple(dims[3:5]), ix)
+        for kind, dims, _, _, ix in json.loads(done.stdout.splitlines()[-1])
+        if kind == "sparse_attention"
+    )
+    ratios = json.loads(CONFIG.read_text())["compress_ratios"][:61]
+
+    assert found == {
+        ((128, 0), "fp8"): ratios.count(128),
+        ((4, 1024), index): ratios.count(4),
+    }
+
+
+#: The build on a declared arch, the third argument.
+ARCH_BUILD = BUILD.replace('"gfx950"', "sys.argv[3]")
+
+
+@pytest.mark.parametrize(
+    "ep, arch, env, act",
+    [
+        (False, "gfx950", {}, "bf16"),
+        (True, "gfx950", {}, "fp8"),
+        (True, "gfx950", {"ATOM_USE_TRITON_MOE_A4W4": "1"}, "fp4"),
+        (False, "gfx942", {}, "bf16"),
+        (False, "gfx942", {"ATOM_USE_TRITON_MOE_A4W4": "1"}, "bf16"),
+    ],
+    ids=["ep-off", "ep8", "ep8-a4w4", "mi308x-ep-off", "mi308x-ep-off-a4w4"],
+)
+def test_the_v4_pro_triton_experts_read_the_activations_their_kernel_runs(
+    ep, arch, env, act, tmp_path
+):
+    # ATOM's Triton experts: bf16 activations into `moe_gemm_a16w4` without
+    # expert parallelism, whatever A4W4 says; fp8 into the fused SiLU a8w4
+    # kernel under it, or fp4 into a4w4.
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_bytes(CONFIG.read_bytes())
+    done = subprocess.run(
+        [sys.executable, "-c", ARCH_BUILD, str(int(ep)), str(tmp_path), arch],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=900,
+        cwd=TREE,
+        env={**os.environ, "PYTHONPATH": str(TREE), "ATOM_USE_TRITON_MOE": "1", **env},
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    walked = json.loads(done.stdout.splitlines()[-1])
+    found = collections.Counter(
+        (kind, tuple(dims), fmt, act) for kind, dims, fmt, act, _ in walked
+    )
+
+    assert not [m for m in found if m[0] == "unclassified"]
+    moe = (384, 48, 6, 3072) if ep else (384, 384, 6, 384)
+    # The Triton prep holds the fp4 weights and their scales unpadded.
+    held = 3 * moe[3] * 7168 // 2 + 2 * moe[3] * 224 + 7168 * moe[3] // 32
+    assert found[("moe", moe + (7168, 8, 8, 0, held), "fp4", act)] == 61
+
+
+class FusedMoE(torch.nn.Module):
+    pass
+
+
+FusedMoE.__module__ = "atom.model_ops.moe"
+
+
+def _fused_silu(**method):
+    """A TP1 block whose experts run the Triton fused SiLU kernel, gfx1250's."""
+    moe = FusedMoE()
+    moe.quant_method = SimpleNamespace(
+        **{
+            "act_quant": SimpleNamespace(value="bf16"),
+            "use_triton": True,
+            "use_triton_ep": False,
+            "use_triton_decode": False,
+            "quant_dtype": torch.float4_e2m1fn_x2,
+            "intermediate_size": 16,
+            **method,
+        }
+    )
+    moe.w13_weight = torch.empty(4, 16, 32, dtype=torch.uint8, device="meta")
+    moe.use_fused_silu_gugu, moe._comm_fused_moe = True, None
+    moe.global_num_experts, moe.top_k, moe.hidden_size = 4, 2, 32
+    moe.moe_parallel_config = SimpleNamespace(
+        use_ep=False, ep_size=1, tp_size=1, low_latency=False
+    )
+    block = torch.nn.Module()
+    block.tp_size, block.experts = 1, moe
+    return [(m.kind, m.name, m.fmt, m.act) for m in walk(block)]
+
+
+@pytest.mark.parametrize(
+    "a4w4, method, act",
+    [
+        ("0", {}, "fp8"),
+        ("1", {}, "fp4"),
+        ("0", {"act_quant": SimpleNamespace(value="fp4")}, "fp4"),
+    ],
+)
+def test_the_fused_silu_triton_experts_run_a8w4_unless_a4w4_is_asked(
+    a4w4, method, act, monkeypatch
+):
+    monkeypatch.setenv("ATOM_USE_TRITON_MOE_A4W4", a4w4)
+
+    assert _fused_silu(**method) == [("moe", "experts", "fp4", act)]
+
+
+def test_experts_picked_by_phase_are_unclassified():
+    refused = ("unclassified", "FusedMoE at experts", "bf16", "bf16")
+
+    assert _fused_silu(use_triton_decode=True) == [refused]

@@ -37,7 +37,7 @@ from atom.kv_transfer.offload.load_math import (
     loadable_hit,
     tier_load_tokens,
 )
-from atom.utils import envs
+from atom.utils import clock, envs
 
 logger = logging.getLogger("atom")
 _VALID_KV_ROLES = {"offload", "kv_both", "kv_producer", "kv_consumer"}
@@ -677,7 +677,7 @@ class OffloadSchedulerMixin(ABC):
         `_reconcile_stalled_deferred_saves` mid-copy. Restart it per dispatch;
         holding older work longer is the safe direction.
         """
-        now = time.monotonic()
+        now = clock.now(time.monotonic)
         if getattr(seq, "_deferred_save_at", None) is not None:
             seq._deferred_save_at = now
         lease_times = getattr(self, "_save_lease_at", {})

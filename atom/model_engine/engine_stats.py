@@ -17,9 +17,10 @@ keys, because the decode process owns the blocks.
 """
 
 import logging
-import time
 from collections import deque
 from collections.abc import Callable
+
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 

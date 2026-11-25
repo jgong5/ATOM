@@ -183,6 +183,7 @@ class EngineArgs:
     spec_decode_acceptance_rate: float | None = None
     spec_decode_acceptance_length: float | None = None
     spec_decode_kv_cache_dtype: str | None = None
+    spec_decode_acceptance_rates: list[float] | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
     disagg_prefill_max_num_seqs: int | None = None
@@ -552,6 +553,16 @@ class EngineArgs:
             "a mean acceptance rate in [0, 1] (accepted_draft/total_draft), i.e. "
             "(length - 1) / num_speculative_tokens. Mutually exclusive with "
             "--spec-decode-acceptance-length.",
+        )
+        parser.add_argument(
+            "--spec-decode-acceptance-rates",
+            type=lambda s: [float(x) for x in s.split(",")],
+            default=None,
+            help="The same knob as a per-position curve: comma-separated rates, "
+            "one per speculative position, entry i the probability that the "
+            "first i+1 draft tokens are all accepted (e.g. 0.92,0.71,0.48,0.19). "
+            "Each in [0, 1] and non-increasing. Mutually exclusive with "
+            "--spec-decode-acceptance-length and --spec-decode-acceptance-rate.",
         )
         parser.add_argument(
             "--max-num-batched-tokens",
@@ -984,6 +995,7 @@ class EngineArgs:
             draft_model = kwargs.pop("draft_model")
             synthetic_acceptance_rate = kwargs.pop("spec_decode_acceptance_rate")
             synthetic_acceptance_length = kwargs.pop("spec_decode_acceptance_length")
+            synthetic_acceptance_rates = kwargs.pop("spec_decode_acceptance_rates")
             if method == "eagle3" and not draft_model:
                 raise ValueError("--draft-model is required when --method eagle3.")
             if draft_model and method == "mtp":
@@ -998,6 +1010,7 @@ class EngineArgs:
                 kv_cache_dtype=kwargs.pop("spec_decode_kv_cache_dtype"),
                 synthetic_acceptance_rate=synthetic_acceptance_rate,
                 synthetic_acceptance_length=synthetic_acceptance_length,
+                synthetic_acceptance_rates=synthetic_acceptance_rates,
             )
         else:
             kwargs.pop("method")
@@ -1010,6 +1023,7 @@ class EngineArgs:
                     "--spec-decode-kv-cache-dtype needs --method and "
                     "--num-speculative-tokens > 0."
                 )
+            kwargs.pop("spec_decode_acceptance_rates")
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode

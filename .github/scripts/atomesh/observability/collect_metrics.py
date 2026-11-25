@@ -116,48 +116,62 @@ def scrape_config(
     }
 
 
-def ensure_prometheus(directory: Path) -> str:
-    override = os.environ.get("ATOMESH_PROMETHEUS_BIN")
+def ensure_prometheus(directory: Path, tool: str = "prometheus") -> str:
+    """The executable of `tool`, ``prometheus`` or ``promtool``: the one
+    ATOMESH_PROMETHEUS_BIN or ATOMESH_PROMTOOL_BIN names, else the one on PATH,
+    else the one in `directory`, extracted there, with the release archive it
+    came from, by an earlier call. Each lands under its own name only once
+    whole, the archive once its checksum holds, so calls in parallel never
+    run or read another's part-written file."""
+    variable = f"ATOMESH_{tool.upper()}_BIN"
+    override = os.environ.get(variable)
     if override:
         binary = shutil.which(override)
         if not binary:
-            raise FileNotFoundError(f"Prometheus executable not found: {override}")
+            raise FileNotFoundError(f"{tool} executable not found: {override}")
         return binary
-    installed = shutil.which("prometheus")
+    installed = shutil.which(tool)
     if installed:
         return installed
+    binary = directory / tool
+    if binary.is_file():
+        return str(binary)
     arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
     if platform.system() != "Linux" or arch is None:
-        raise RuntimeError("Set ATOMESH_PROMETHEUS_BIN on this platform")
+        raise RuntimeError(f"Set {variable} on this platform")
     stem = f"prometheus-{PROMETHEUS_VERSION}.linux-{arch}"
     filename = stem + ".tar.gz"
-    base = f"https://github.com/prometheus/prometheus/releases/download/v{PROMETHEUS_VERSION}/"
-    with urlopen(base + "sha256sums.txt", timeout=30) as response:
-        checksums = response.read().decode()
-    expected = next(
-        line.split()[0]
-        for line in checksums.splitlines()
-        if line.split()[-1].lstrip("*") == filename
-    )
     archive_path = directory / filename
-    digest = hashlib.sha256()
-    with (
-        urlopen(base + filename, timeout=60) as response,
-        archive_path.open("wb") as output,
-    ):
-        while chunk := response.read(1024 * 1024):
-            digest.update(chunk)
-            output.write(chunk)
-    if digest.hexdigest() != expected:
-        raise RuntimeError("Prometheus archive checksum mismatch")
-    binary = directory / "prometheus"
+    if not archive_path.is_file():
+        base = f"https://github.com/prometheus/prometheus/releases/download/v{PROMETHEUS_VERSION}/"
+        with urlopen(base + "sha256sums.txt", timeout=30) as response:
+            checksums = response.read().decode()
+        expected = next(
+            line.split()[0]
+            for line in checksums.splitlines()
+            if line.split()[-1].lstrip("*") == filename
+        )
+        part = archive_path.with_name(f"{filename}.{os.getpid()}.part")
+        digest = hashlib.sha256()
+        with (
+            urlopen(base + filename, timeout=60) as response,
+            part.open("wb") as output,
+        ):
+            while chunk := response.read(1024 * 1024):
+                digest.update(chunk)
+                output.write(chunk)
+        if digest.hexdigest() != expected:
+            raise RuntimeError("Prometheus archive checksum mismatch")
+        part.replace(archive_path)
+    part = binary.with_name(f"{tool}.{os.getpid()}.part")
     with tarfile.open(archive_path) as archive:
-        member = archive.getmember(stem + "/prometheus")
+        member = archive.getmember(f"{stem}/{tool}")
         if not member.isfile():
-            raise RuntimeError("Prometheus binary is not a regular file")
-        with archive.extractfile(member) as source, binary.open("wb") as output:
+            raise RuntimeError(f"{tool} binary is not a regular file")
+        with archive.extractfile(member) as source, part.open("wb") as output:
             shutil.copyfileobj(source, output)
-    binary.chmod(0o755)
+    part.chmod(0o755)
+    part.replace(binary)
     return str(binary)
 
 

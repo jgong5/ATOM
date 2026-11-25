@@ -8,7 +8,6 @@ from __future__ import annotations
 import functools
 import logging
 import threading
-import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -18,6 +17,8 @@ from atom.kv_transfer.offload._offload_common import CACHE_SALT_TAG
 from atom.kv_transfer.offload.lookup_client import LookupClient
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
 from atom.kv_transfer.offload.mp.lookup_driver import _DRIVER_POLL_S, _LookupDriver
+from atom.utils import clock
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
@@ -577,7 +578,7 @@ class _MPLookupClient(LookupClient):
                         )
                         self._orphans.add(lookup_id)
                         return None
-                time.sleep(self._wait_interval())
+                clock.sleep(self._wait_interval(), time.sleep)
         with self._lock:
             self._async_tokens.pop(lookup_id, None)
             self._answered_at.pop(lookup_id, None)
@@ -611,7 +612,7 @@ class _MPLookupClient(LookupClient):
                 # which is what tells clear_lookup_status() the job is still
                 # outstanding.
                 return None
-            time.sleep(self._poll_interval)
+            clock.sleep(self._poll_interval, time.sleep)
 
     def _wait_interval(self) -> float:
         """Sleep between checks of an in-flight async lookup."""

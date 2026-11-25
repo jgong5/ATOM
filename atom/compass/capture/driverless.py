@@ -1,0 +1,529 @@
+# SPDX-License-Identifier: MIT
+"""What a capture declares in place of a device, so ATOM builds and steps on none.
+
+Every substitution is process-global, and the `torch.cuda` ones must precede
+aiter's import (its Triton configs read device properties at import), so a
+capture owns its process.
+"""
+
+import contextlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+import types
+
+import torch
+
+from atom.mono.runtime import peer_memory
+
+#: The devices a capture can declare, by arch: compute units, capability and
+#: memory. ATOM and aiter branch on the arch and size grids by the CU count.
+#: Nothing here reads a device; `card` reads one in their place.
+DEVICES = {
+    "gfx942": (80, (9, 4), 192 << 30),  # MI308X
+    "gfx950": (256, (9, 5), 288 << 30),  # MI355X
+    # MI455X, assumed: AMD counts 256 work-group processors and 432 GB of HBM4.
+    # Its capability is card 0's of the MI455 A0 node.
+    "gfx1250": (256, (12, 5), 432 << 30),
+}
+#: The card's product name, by arch, as rocm-smi's series and the datasheet
+#: in `compass/devices` name it: aiter reads the model it keys its comm-fused
+#: MoE's winners on off the name. An arch without one is named by its arch.
+NAMES = {
+    "gfx942": "AMD Instinct MI308X",
+    "gfx950": "AMD Instinct MI355X",
+}
+#: The rest of a declared device, by arch, where a source states it: warp size,
+#: threads per CU, L2 bytes, registers per CU and shared memory per block.
+PROPERTIES = {
+    # Card 0 of the MI455 A0 node as `card` read it on 2026-11-04; gfx1250 runs
+    # wave32 on every stepping.
+    "gfx1250": (32, 2048, 4 << 20, 131072, 320 << 10),
+}
+#: What an arch with no `PROPERTIES` entry declares, stated with no source.
+UNSOURCED = (64, 2048, 8 << 20, 65536, 65536)
+#: The stepping `rocminfo` states, where not the first: aiter runs no shipped
+#: asm kernel on gfx1250 A0, revision 0.
+REVISIONS = {
+    "gfx1250": 1,
+}
+
+
+#: What `card` reads, in a process that sees the one card: the properties
+#: `_props` declares, as HIP reports them.
+_READ = (
+    "import json, torch; p = torch.cuda.get_device_properties(0); print(json.dumps("
+    "{f: getattr(p, f) for f in ('multi_processor_count', 'gcnArchName', 'name', "
+    "'major', 'minor', 'total_memory', 'warp_size', 'max_threads_per_multi_processor', "
+    "'L2_cache_size', 'regs_per_multiprocessor', 'shared_memory_per_block')}))"
+)
+
+
+def card(index: int) -> dict:
+    """Card `index` as a capture declares it in place of `DEVICES`: its
+    properties as HIP reports them (``props``), its arch and the stepping
+    rocminfo states for it (``revision``), each read in a child that sees that
+    card alone, so this process holds nothing on it."""
+    env = {**os.environ, "ROCR_VISIBLE_DEVICES": str(index)}
+    for name in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        env.pop(name, None)
+    run = dict(env=env, capture_output=True, text=True, timeout=300, check=False)
+    read = subprocess.run([sys.executable, "-c", _READ], **run)
+    if read.returncode:
+        raise ValueError(f"card {index} reads no device: {read.stderr[-2000:]}")
+    props = json.loads(read.stdout.splitlines()[-1])
+    arch = props["gcnArchName"].split(":")[0]
+    # rocminfo's agents, each with its header fields: aiter reads its stepping
+    # off the GPU agent of its arch.
+    states = []
+    info = subprocess.run(["rocminfo"], **run).stdout
+    for agent in re.split(r"^\s*Agent\s+\d+\s*$", info, flags=re.M):
+        gpu = re.search(r"^  Device Type:\s*GPU\s*$", agent, re.M)
+        named = re.search(rf"^  Name:\s*{arch}\b", agent, re.M)
+        stepping = re.search(r"^  ASIC Revision:\s*(\d+)", agent, re.M)
+        if gpu and named and stepping:
+            states.append(int(stepping[1]))
+    if len(states) != 1:
+        raise ValueError(f"rocminfo states {len(states)} steppings for card {index}")
+    return {"index": index, "arch": arch, "revision": states[0], "props": props}
+
+
+def _props(arch, read=None):
+    if read:
+        return types.SimpleNamespace(**read["props"])
+    cus, (major, minor), memory = DEVICES[arch]
+    warp, threads, l2, regs, shared = PROPERTIES.get(arch, UNSOURCED)
+    return types.SimpleNamespace(
+        multi_processor_count=cus,
+        gcnArchName=arch,
+        name=NAMES.get(arch, arch),
+        major=major,
+        minor=minor,
+        total_memory=memory,
+        warp_size=warp,
+        max_threads_per_multi_processor=threads,
+        L2_cache_size=l2,
+        regs_per_multiprocessor=regs,
+        shared_memory_per_block=shared,
+    )
+
+
+def on_wait(waiter, waited):
+    """Told of each wait one stream makes on another; the recorder replaces it."""
+
+
+class Stream:
+    """A stream with an identity and no device."""
+
+    created = 0
+
+    def __init__(self, *args, **kwargs):
+        self.stream_id = self.cuda_stream = Stream.created
+        Stream.created += 1
+
+    def wait_stream(self, other):
+        on_wait(self, other)
+
+    def wait_event(self, event):
+        on_wait(self, event.stream)
+
+    def record_event(self, event=None):
+        event = event or Event()
+        event.record(self)
+        return event
+
+    def synchronize(self):
+        return None
+
+    def query(self):
+        return True
+
+
+class Event:
+    """An event remembers the stream it was recorded on, so a wait names it."""
+
+    def __init__(self, *args, **kwargs):
+        self.stream = None
+
+    def record(self, stream=None):
+        self.stream = stream or current[0]
+
+    def wait(self, stream=None):
+        on_wait(stream or current[0], self.stream)
+
+    def synchronize(self):
+        return None
+
+    def query(self):
+        return True
+
+    def elapsed_time(self, other):
+        raise RuntimeError("a capture runs no kernel and has no elapsed time")
+
+
+main_stream = Stream()
+current = [main_stream]
+#: True while a stand-in collective runs: its functional collective is ATOM's
+#: work, and the copy back into ATOM's tensor is the stand-in's own.
+standing_in = [False]
+
+
+@contextlib.contextmanager
+def _stand_in():
+    standing_in[0] = True
+    try:
+        yield
+    finally:
+        standing_in[0] = False
+
+
+@contextlib.contextmanager
+def _stream(stream):
+    previous, current[0] = current[0], stream or current[0]
+    try:
+        yield
+    finally:
+        current[0] = previous
+
+
+def _cuda(props) -> dict:
+    """`torch.cuda`'s answers as the one device `props` declares."""
+    return {
+        # True: on False ATOM takes paths no deployment runs. The fake mode is
+        # told otherwise by `driverless_mode`.
+        "is_available": lambda: True,
+        "device_count": lambda: 1,
+        "_lazy_init": lambda *a, **k: None,
+        "get_rng_state": lambda *a, **k: torch.zeros(16, dtype=torch.uint8),
+        "set_rng_state": lambda *a, **k: None,
+        "get_device_properties": lambda *a, **k: props,
+        "current_device": lambda: 0,
+        "get_device_capability": lambda *a, **k: (props.major, props.minor),
+        "Stream": Stream,
+        "Event": Event,
+        "current_stream": lambda *a, **k: current[0],
+        "default_stream": lambda *a, **k: main_stream,
+        "stream": _stream,
+        "set_device": lambda *a, **k: None,
+        # `torch.cuda.device(i)` swaps the current device: there is one.
+        "_exchange_device": lambda device: 0,
+        "_maybe_exchange_device": lambda device: 0,
+        "synchronize": lambda *a, **k: None,
+        "memory_stats": lambda *a, **k: {
+            "allocated_bytes.all.current": 0,
+            "allocated_bytes.all.peak": 0,
+            "reserved_bytes.all.current": 0,
+        },
+        "memory_allocated": lambda *a, **k: 0,
+        # Free and total: nothing is allocated on the declared device.
+        "mem_get_info": lambda *a, **k: (props.total_memory,) * 2,
+        "reset_peak_memory_stats": lambda *a, **k: None,
+        "empty_cache": lambda *a, **k: None,
+        "is_current_stream_capturing": lambda: False,
+        # A memory pool of no device; allocating from it allocates as before.
+        "MemPool": lambda *a, **k: None,
+        "use_mem_pool": lambda *a, **k: contextlib.nullcontext(),
+    }
+
+
+def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
+    """Declare the device of `arch`, or the card `read` (`card`); say what."""
+    if read is None and arch not in DEVICES:
+        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
+    props = _props(arch, read)
+    cuda = _cuda(props)
+    for name, value in cuda.items():
+        setattr(torch.cuda, name, value)
+    # ATOM's H2D publication reads the current stream's id off `torch._C`, and
+    # aiter's top-k the current device and the raw stream.
+    torch._C._cuda_getCurrentStream = lambda *a: (current[0].stream_id, 0, 1)
+    torch._C._cuda_getDevice = lambda: 0
+    torch._C._cuda_getCurrentRawStream = lambda *a: current[0].cuda_stream
+    # No checkpoint is read, so a parameter's fill is arbitrary either way, and
+    # the in-place RNG fills ask the device for a generator.
+    torch.Tensor.uniform_ = torch.Tensor.normal_ = lambda self, *a, **k: self
+    # The allocator's note that another stream uses a block: none is allocated.
+    torch.Tensor.record_stream = lambda self, stream: None
+
+    from torch._subclasses import fake_tensor
+
+    # A device-tagged fake primes a real CUDA context; nothing here runs backward.
+    fake_tensor.init_gpu_context = lambda device: None
+    flags = {
+        # The default custom vocab gather needs the device communicator.
+        "ATOM_USE_CUSTOM_ALL_GATHER": "0",
+        # aiter's CU count, which it would otherwise ask rocminfo for.
+        "CU_NUM": str(props.multi_processor_count),
+        # aiter's check that every rank sets it all-reduces over a group whose
+        # collectives reduce nothing; what it shares, the device
+        # communicators, a capture declines.
+        "AITER_REUSE_IDENTICAL_COMM_GROUPS": "0",
+        # `group` names GPUs to HIP, which then holds memory on the first at
+        # its first device query; ROCm's own mask, below HIP's, hides them all.
+        "ROCR_VISIBLE_DEVICES": "",
+    }
+    os.environ.update(flags)
+    revision = read["revision"] if read else REVISIONS.get(arch, 0)
+    _declare_arch(tmpdir, arch, props.multi_processor_count, revision, props.warp_size)
+    return {"cuda": sorted(cuda), "arch": arch, "flags": flags} | (
+        {"card": read} if read else {}
+    )
+
+
+def answer_as(arch: str) -> None:
+    """`install`'s `torch.cuda` answers for a device of `arch`, and `torch._C`'s
+    device query, for the life of this process. `is_available` keeps this
+    host's answer, and nothing else `install` declares is declared. aiter's
+    MLA planner's arch probe answers `arch` too (`_mla_arch_as`)."""
+    cuda = _cuda(_props(arch))
+    del cuda["is_available"]
+    for name, value in cuda.items():
+        setattr(torch.cuda, name, value)
+    torch._C._cuda_getDevice = lambda: 0
+    _mla_arch_as(arch)
+
+
+def _mla_arch_as(arch: str) -> None:
+    """aiter's MLA planner's device arch, `ops.attention._mla_cpp_gpu_arch`,
+    answering `arch`. Asked with no arch, the planner reads the device's in
+    C++ (`get_gpu_arch`), and with no driver its `hipGetDeviceCount` aborts
+    the process: a decode context-parallel MLA layer asks it as it builds
+    (`atom.distributed.dcp_utils.dcp_persistent_supported`), so a simulated
+    Kimi-K3.1 at DCP8 lost every rank there. An aiter without the probe is
+    left as it is."""
+    from aiter.ops import attention
+
+    if hasattr(attention, "_mla_cpp_gpu_arch"):
+        attention._mla_cpp_gpu_arch = lambda device_index: arch
+
+
+#: The operators outside torch that the fake mode's dispatch cache takes: each
+#: fake builds its outputs from its arguments' shapes, dtypes and devices and
+#: nothing else, so equal arguments give equal outputs. Torch caches no other
+#: operator outside its own namespaces (`non-builtin`).
+CACHED = frozenset(
+    {
+        "aiter.batched_gemm_a8w8_mxscale.default",
+        "aiter.gemm_a8w8_blockscale_preshuffle_impl.default",
+        "aiter.indexer_score_topk.default",
+        "aiter.linear_attention_with_output_base.default",
+        "aiter.mhc_fused_post_pre.default",
+        "aiter.mhc_pre.default",
+        "aiter.mhc_res_repeat.default",
+        "aiter.per_1x128_e8m0_quant.default",
+        "aiter.rmsnorm2d_fwd.default",
+    }
+)
+
+
+def driverless_mode(shape_env):
+    """A fake mode told the device is absent, while ATOM is told it is there.
+
+    `avoid_device_init` keeps `torch.tensor` on the host, makes the device guard
+    a no-op and skips constant propagation across a device move, each of which
+    would otherwise reach a driver. Its dispatch cache also takes the operators
+    of `CACHED` whose schema mutates no argument.
+    """
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    to, host = torch.ops.aten.to.dtype_layout, torch.device("cpu")
+
+    class _DriverlessFakeTensorMode(FakeTensorMode):
+        avoid_device_init = property(lambda self: True)
+
+        def _dispatch_impl(self, func, types, args, kwargs):
+            # Under inference mode no autograd kernel decomposes `aten.to`
+            # first, so `torch.tensor` under a device default hands the mode
+            # its host constant's move whole, which the mode would run on the
+            # device as constant propagation. Its decomposition is the
+            # `_to_copy` the mode keeps off the device.
+            if func is to and kwargs.get("device", host).type != "cpu":
+                with self:
+                    return func.decompose(*args, **kwargs)
+            return super()._dispatch_impl(func, types, args, kwargs)
+
+        def _validate_cache_key(self, func, args, kwargs):
+            if str(func) in CACHED and not func._schema.is_mutable:
+                return
+            super()._validate_cache_key(func, args, kwargs)
+
+    return _DriverlessFakeTensorMode(shape_env=shape_env, allow_non_fake_inputs=True)
+
+
+def _declare_arch(tmpdir: str, arch: str, cus=None, revision=None, warp=None) -> None:
+    """Answer aiter's `rocminfo` shell-out and Triton's target query with `arch`,
+    its `cus`, stepping `revision` and `warp` size, those `DEVICES`, `REVISIONS`
+    and `_props` declare unless given."""
+    cus = DEVICES[arch][0] if cus is None else cus
+    revision = REVISIONS.get(arch, 0) if revision is None else revision
+    warp = _props(arch).warp_size if warp is None else warp
+    import triton
+    from triton.backends.compiler import GPUTarget
+
+    rocminfo = pathlib.Path(tmpdir) / "declared-bin" / "rocminfo"
+    rocminfo.parent.mkdir(parents=True, exist_ok=True)
+    rocminfo.write_text(
+        f"#!/bin/sh\necho 'Agent 1\n  Name: {arch}\n  Device Type: GPU\n"
+        f"  Compute Unit: {cus}\n  ASIC Revision: {revision}'\n"
+    )
+    rocminfo.chmod(0o755)
+    os.environ["PATH"] = f"{rocminfo.parent}:{os.environ.get('PATH', '')}"
+    os.environ["GPU_ARCHS"] = arch
+
+    class _DeclaredTarget:
+        def get_current_target(self):
+            return GPUTarget("hip", arch, warp)
+
+        def __getattr__(self, name):
+            raise RuntimeError(f"a device-free capture has no Triton driver: {name}")
+
+    triton.runtime.driver.set_active(_DeclaredTarget())
+
+
+def import_aiter_on(arch: str) -> None:
+    """Import aiter in this process as on a device of `arch`, whatever device
+    this host has. aiter resolves its fp8 dtype at import, ``uint8`` where no
+    device is available, and caches each arch probe's first answer; those
+    answers stay, as does Triton's target (`_declare_arch`). The device query
+    and the environment are put back, so a process this one starts finds this
+    host's own."""
+    if arch not in DEVICES:
+        raise ValueError(f"no declared device for {arch}; declared: {sorted(DEVICES)}")
+    if "aiter" in sys.modules:
+        raise RuntimeError("aiter is loaded already, its fp8 dtype resolved")
+    environ = {name: os.environ.get(name) for name in ("PATH", "GPU_ARCHS")}
+    available, torch.cuda.is_available = torch.cuda.is_available, lambda: True
+    try:
+        with tempfile.TemporaryDirectory(prefix="compass-arch-") as tmpdir:
+            _declare_arch(tmpdir, arch)
+            from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+            from aiter.utility import dtypes  # noqa: F401  its fp8 resolves here
+
+            get_gfx(), get_gfx_runtime()
+    finally:
+        torch.cuda.is_available = available
+        for name, value in environ.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def group(tp: int, dp: int) -> dict:
+    """A TP x DP process group in one process, its transport declined.
+
+    Every shard is the one a `tp`-way deployment holds and every collective ATOM
+    issues is dispatched; aiter's `all_reduce_` and fused all-reduce norms
+    answer from their fakes. The
+    legacy `c10d` collectives ATOM reaches have no fake kernel, so they go
+    through their functional forms, which give the same shapes, and copy the
+    result back under `standing_in`, since the legacy ones write in place.
+    """
+    import torch.distributed as dist
+    from torch.distributed import _functional_collectives as functional
+    from torch.testing._internal.distributed.fake_pg import FakeStore
+
+    world = tp * dp
+    os.environ.update(RANK="0", LOCAL_RANK="0", WORLD_SIZE=str(world))
+    os.environ["HIP_VISIBLE_DEVICES"] = ",".join(map(str, range(world)))
+    dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=world)
+
+    from aiter.dist import parallel_state
+
+    group, new_group = parallel_state.init_model_parallel_group, dist.new_group
+
+    def no_transport(*args, **kwargs):
+        kwargs.update(
+            use_device_communicator=False, use_message_queue_broadcaster=False
+        )
+        return group(*args, **kwargs)
+
+    def fake_backend(ranks=None, **kwargs):
+        kwargs.pop("pg_options", None)
+        return new_group(ranks, **{**kwargs, "backend": "fake"})
+
+    parallel_state.init_model_parallel_group, dist.new_group = (
+        no_transport,
+        fake_backend,
+    )
+    try:
+        parallel_state.init_distributed_environment(
+            world_size=tp, rank=0, backend="fake", local_rank=0, data_parallel_size=dp
+        )
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=tp, data_parallel_size=dp, backend="fake"
+        )
+    finally:
+        parallel_state.init_model_parallel_group, dist.new_group = group, new_group
+
+    coordinator = parallel_state.GroupCoordinator
+    per_group = coordinator.fused_allreduce_rmsnorm_quant_per_group
+
+    def fused_allreduce_rmsnorm_quant_per_group(self, *args, **kwargs):
+        # aiter asks for a communicator before it dispatches its registered op,
+        # whose fake answers; the op itself never reaches this stand-in.
+        declined, self.device_communicator = self.device_communicator, object()
+        try:
+            return per_group(self, *args, **kwargs)
+        finally:
+            self.device_communicator = declined
+
+    coordinator.fused_allreduce_rmsnorm_quant_per_group = (
+        fused_allreduce_rmsnorm_quant_per_group
+    )
+
+    def all_gather_into_tensor(output, input, group=None, async_op=False):
+        with _stand_in():
+            gathered = functional.all_gather_tensor(input, 0, group or dist.group.WORLD)
+            output.copy_(gathered.reshape(output.shape))
+
+    def broadcast(tensor, src=0, group=None, async_op=False):
+        with _stand_in():
+            tensor.copy_(functional.broadcast(tensor, src, group or dist.group.WORLD))
+
+    def all_to_all_single(output, input, *args, group=None, async_op=False):
+        with _stand_in():
+            sent = functional.all_to_all_single(input, None, None, group)
+            output.copy_(sent)
+
+    dist.all_gather_into_tensor, dist.broadcast = all_gather_into_tensor, broadcast
+    dist.all_to_all_single = all_to_all_single
+    dist.barrier = lambda *args, **kwargs: None  # no shape, nobody to wait for
+    # A rank-local verdict every rank of a CPU group takes alike (the agreed KV
+    # budget among them): every rank of a capture is this one, so the group's
+    # most is this rank's own value, with no all-reduce on a fake tensor.
+    from atom.distributed import group_agreement
+
+    group_agreement.group_max = lambda value, group: value
+    return {
+        "world_size": parallel_state.get_tp_group().world_size,
+        "dp": parallel_state.get_dp_group().world_size,
+        "declined": ["device_communicator", "message_queue_broadcaster", "barrier"],
+        "functional": ["all_gather_into_tensor", "broadcast", "all_to_all_single"],
+        "communicator_checked_only": ["fused_allreduce_rmsnorm_quant_per_group"],
+        "own_verdict": ["group_max"],
+    }
+
+
+def uncached_bytes(nbytes, device):
+    """A mono runner's uncached scratch, of the size it asks for, on the
+    declared device: a plain tensor, since a capture reads no value through
+    it and every rank of a capture is this one."""
+    return torch.empty(nbytes, dtype=torch.uint8, device=device)
+
+
+class PeerBuffer(peer_memory.PeerBuffer):
+    """A mono runner's peer buffer of the sizes it asks for, on the declared
+    device: no IPC heap and no handle exchange, since every rank of a capture
+    is this one. Its data and never-zeroed regions are tensors of their own,
+    and every peer's address is this rank's. Closing it frees nothing."""
+
+    def __init__(self, nbytes, group, rank, npes, device, plain_bytes=0):
+        self.local, self.rank, self._opened = 0, rank, []
+        self.bytes = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        self.plain = torch.empty(plain_bytes, dtype=torch.uint8, device=device)
+        self.addresses = torch.zeros(npes, dtype=torch.int64, device=device)

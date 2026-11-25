@@ -4,7 +4,6 @@
 """Pydantic request/response models for the OpenAI-compatible API."""
 
 import json
-import time
 from typing import Annotated, Any
 
 from pydantic import (
@@ -16,6 +15,8 @@ from pydantic import (
     TypeAdapter,
     ValidationError,
 )
+
+from atom.utils import time_shim as time
 
 # ============================================================================
 # Constants

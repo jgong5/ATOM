@@ -144,6 +144,10 @@ def init_nccl_process_group(
     )
     _world.pg_group_ranks[pg] = {i: i for i in range(group_size)}
     return pg
+#: Each rank's logical process while Compass runs, or None on a real run. The run
+#: bootstrap sets it, numbering ranks as the group being created numbers them:
+#: for the data-parallel group, by DP rank.
+LP_OF_RANK: dict | None = None
 
 
 def stateless_init_torch_distributed_process_group(
@@ -192,6 +196,21 @@ def stateless_init_torch_distributed_process_group(
     under that name, where a trainer building its end the same way puts them.
     *timeout* covers the rendezvous and the group's collectives alike.
     """
+    if LP_OF_RANK is not None:
+        # A collective across logical processes is a wait the clock authority
+        # cannot see, so refuse before any rank blocks in the rendezvous.
+        missing = [r for r in range(world_size) if r not in LP_OF_RANK]
+        if missing:
+            raise RuntimeError(
+                f"a process group of {world_size} ranks has ranks with no logical "
+                f"process: {', '.join(map(str, missing))}"
+            )
+        lps = sorted({LP_OF_RANK[r] for r in range(world_size)})
+        if len(lps) > 1:
+            raise RuntimeError(
+                f"a process group of {world_size} ranks spans logical processes "
+                f"{', '.join(map(str, lps))}; its ranks must all belong to one"
+            )
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
     if timeout is None:

@@ -1,0 +1,405 @@
+# SPDX-License-Identifier: MIT
+"""A simulated run at pipeline width above one: each stage is an engine LP.
+
+ATOM's API server at ``-pp 2`` or ``-pp 4`` runs one engine-core process per
+stage. The head schedules, sends each downstream stage its batch on
+``meta#pp<k>``, and the last stage sends the head its output on ``tokens``;
+each stage's worker starts on the host with its groups, the PP group among
+them, on gloo. Each stage hands the next its forward's output on ``pp_data``,
+and the next returns a rendezvous send's completion on ``pp_ack``.
+
+The run test needs a driver and `ATOM_COMPASS_SLICE_MODEL`, as in
+`test_vertical_slice`; the rest run anywhere.
+"""
+
+import copy
+import dataclasses
+import json
+import math
+import pickle
+import sys
+from types import SimpleNamespace
+
+import pytest
+import torch
+from test_dp_slice import (  # noqa: F401
+    DP_MACHINE,
+    MAX_TOKENS,
+    _deployment,
+    device_classes_put_back,
+    run_dp_slice,
+)
+from test_vertical_slice import CONSTANT, MODEL, NEEDS_A_RUN, _run_file
+
+from atom.compass import run as compass_run
+from atom.compass.backends.step_stub import Coefficients
+from atom.compass.clock import LpId, single_engine_table
+from atom.compass.detect.determinism import StepTable
+from atom.compass.detect.scenario import check_run, pipeline_timeline, stage_timelines
+from atom.compass.runner import pp_send
+from atom.compass.runner.overrides import start_on_host
+from atom.compass.spec import MachineSpec, SpecRefusal
+from atom.utils import clock
+from atom.utils.clock import LPRuntime
+from atom.utils.distributed import utils
+
+IPC = 2.0**-14
+L_DATA, L_ACK = pp_send.lookaheads(
+    pp_send.carrier_models(MachineSpec.from_mapping(DP_MACHINE))
+)
+META = "engine-pp0->engine-pp1:meta#pp1"
+DATA, ACK = "engine-pp0->engine-pp1:pp_data#dp0", "engine-pp1->engine-pp0:pp_ack#dp0"
+
+
+@pytest.fixture(scope="module", params=[2, 4])
+def pipeline(request, tmp_path_factory):
+    pp = request.param
+    root = tmp_path_factory.mktemp(f"pp{pp}")
+    return pp, [
+        run_dp_slice(root / s, s, ["-pp", str(pp)], dp=1, pp=pp) for s in ("1", "2")
+    ]
+
+
+def _model_sends():
+    """The slice model's layer count, and a stage's send of a `tokens`-row
+    forward as the runner sizes it: the size and the pickled metadata on gloo,
+    `hidden_states` and `residual` on RCCL."""
+    from atom.config import get_hf_config
+    from atom.distributed import pp_comm
+
+    hf = get_hf_config(MODEL)
+    dtype = getattr(hf, "dtype", None) or torch.bfloat16
+
+    def parts(tokens):
+        x = torch.empty(tokens, hf.hidden_size, dtype=dtype, device="meta")
+        meta, tensors = pp_comm._split_tensor_dict({"hidden_states": x, "residual": x})
+        rccl = [("rccl", t.nbytes) for t in tensors]
+        return [("gloo", 8), ("gloo", len(pickle.dumps(meta))), *rccl]
+
+    return hf.num_hidden_layers, parts
+
+
+@NEEDS_A_RUN
+def test_a_pipeline_meets_the_run_properties_and_uses_every_stage_channel(pipeline):
+    pp, runs = pipeline
+    print(f"\n{runs[0]['table']}")
+    sends, out = _model_sends(), [r["out"] for r in runs]
+    taken = [line for _, line in runs[0]["events"]]
+    failed = check_run(out, MAX_TOKENS, taken, {"engine": out[0] / "parity"}, sends)
+    # Each seed's stages against its own record.
+    failed += check_run(out[1:], records={"engine": out[1] / "parity"}, pipeline=sends)
+    assert not failed, "\n".join(failed)
+    rows = [line.split() for line in runs[0]["table"].splitlines()[1:]]
+    released = {r[4] for r in rows if r[3] == "release"}
+    last = f"engine-pp{pp - 1}"
+    assert f"{last}->engine-pp0:tokens" in released
+    assert {f"engine-pp0->engine-pp{k}:meta#pp{k}" for k in range(1, pp)} <= released
+    # Every stage priced its forwards.
+    assert {r[0] for r in rows if r[3] == "TAR"} >= {f"engine-pp{k}" for k in range(pp)}
+    # The head keeps up to pp batches in flight, so it starts forward n + pp
+    # only once forward n's tokens are back: after every stage's compute of
+    # forward n, the whole model's step, and the tokens' IPC to the head.
+    starts = sorted(float(r[2]) - IPC for r in rows if r[4].endswith(":meta#pp1"))
+    gaps = [b - a for a, b in zip(starts, starts[pp:])]
+    print(f"pp{pp} head forward n to n + pp: {gaps}")
+    assert min(gaps) >= CONSTANT["decode_step"] + IPC
+    # Each rendezvous send from the head: t_send, t_recv_posted, now_r, done.
+    data, ack = ({int(r[5]): r for r in rows if r[4] == ch} for ch in (DATA, ACK))
+    sends = []
+    for n in sorted(ack):
+        posted, arrival = float(data[n][1]), float(data[n][2])
+        sends.append((arrival - L_DATA, posted, max(posted, arrival), float(ack[n][2])))
+        print("t_send {!r} t_recv_posted {!r} now_r {!r} done {!r}".format(*sends[-1]))
+    least = min(done - now_r for *_, now_r, done in sends)
+    print(f"least done - now_r {least!r}, L_ack {L_ACK!r}")
+    assert len(sends) == len(data) and least >= L_ACK
+
+
+# --- without a driver ---------------------------------------------------------
+
+
+def test_the_stages_join_the_head_with_a_positive_lookahead_each_way():
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=IPC, stream_s=IPC, pp=4)
+    head, *rest = [LpId(f"engine-pp{k}") for k in range(4)]
+    assert set(table.registry.ids()) == {
+        LpId("traffic"),
+        LpId("frontend"),
+        head,
+        *rest,
+    }
+    for stage in rest:
+        assert table.distance(head, stage) == table.distance(stage, head) == IPC
+    # Two downstream stages hear of each other only through the head.
+    assert table.distance(rest[0], rest[1]) == 2 * IPC
+    with pytest.raises(ValueError, match="ipc_s is 0.0"):
+        single_engine_table(admission_s=0.54e-3, ipc_s=0.0, stream_s=IPC, pp=2)
+
+
+def test_a_stage_names_its_channels_by_the_index_its_frontend_gives_it(monkeypatch):
+    table = single_engine_table(admission_s=0.54e-3, ipc_s=IPC, stream_s=IPC, pp=2)
+    rt = LPRuntime(LpId("engine-pp1"), table, None)
+    monkeypatch.setattr(clock, "_installed", rt)
+    pc = SimpleNamespace(
+        pipeline_parallel_rank=1,
+        pp_meta_addrs=["m0", "m1"],
+        pp_token_addr="t",
+        pp_kv_status_addr="k",
+    )
+    config = SimpleNamespace(
+        parallel_config=pc,
+        pipeline_parallel_size=2,
+        disagg_p2d_addr="",
+        disagg_d2p_addr="",
+    )
+    relay = clock.relay_queue(SimpleNamespace(data_parallel_rank=0))
+    clock.name_endpoints(0, "in", "ctl", "out", config)
+    assert relay.wsock.ch == "engine-pp1->frontend:output#dp1"
+    assert [rt.endpoints[a] for a in ("in", "ctl", "out", "m1")] == [
+        "request#dp1",
+        "control#dp1",
+        "output#dp1",
+        "meta#pp1",
+    ]
+
+
+def _stage(rank, pp=2):
+    deployment = _deployment()
+    deployment.pipeline_parallel_size = pp
+    deployment.parallel_config.pipeline_parallel_rank = rank
+    return deployment
+
+
+def test_a_pipeline_whose_machine_states_no_send_carrier_is_refused_by_name(
+    monkeypatch, tmp_path
+):
+    run = _run_file(tmp_path, pipeline_parallel_size=2)
+    monkeypatch.setenv(compass_run.ENV, str(run))
+    with pytest.raises(SpecRefusal, match="interconnect.intra_node.pp.rccl"):
+        compass_run.frontend(_stage(0))
+    assert clock.installed() is None
+
+
+def _two_stage_table(*rows) -> str:
+    """A PP2 step table: the head's forward 0 starts at 1.0, and `rows`."""
+    run = {
+        "admission_s": 0.54e-3,
+        "ipc_s": IPC,
+        "stream_s": IPC,
+        "pipeline_parallel_size": 2,
+        "machine": DP_MACHINE,
+    }
+    table = StepTable(json.dumps(run))
+    table.record("engine-pp0", 1.0, 1.0, "TAR")
+    table.record("engine-pp1", 0.5, 1.0 + IPC, "release", META, 0)
+    for row in rows:
+        table.record(*row)
+    return table.text()
+
+
+#: Forward 0's output leaves the head at 1.5 and is released to the next stage
+#: at `IN`; its rendezvous completes at 1.6.
+IN = 1.5 + L_DATA
+SENT = ("engine-pp1", 1.0 + IPC, IN, "release", DATA, 0)
+ACKED = ("engine-pp0", 1.0, 1.6, "release", ACK, 0)
+
+
+def test_the_pipeline_check_holds_a_stage_to_the_release_of_its_input():
+    # The forward starts at the release; the rendezvous completes inside it.
+    computes = ("engine-pp1", IN, 1.8, "TAR")
+    assert pipeline_timeline(_two_stage_table(SENT, ACKED, computes)) == []
+    # A stage busy at the release starts the forward when it frees.
+    busy, late = ("engine-pp1", 1.4, 1.7, "TAR"), ("engine-pp1", 1.7, 1.9, "TAR")
+    assert pipeline_timeline(_two_stage_table(SENT, ACKED, busy, late)) == []
+    # A stage that forwards as its batch arrives, as before the stage sends,
+    # fails whether the send was rendezvous or eager.
+    early = ("engine-pp1", 1.0 + IPC, 1.2, "TAR")
+    for rows in ((SENT, ACKED, early), (SENT, early)):
+        assert pipeline_timeline(_two_stage_table(*rows)) == [
+            f"engine-pp1 starts no forward 0 at {IN}"
+        ]
+    assert pipeline_timeline(_two_stage_table(early)) == [
+        f"engine-pp0 never sent forward 0's output on {DATA}"
+    ]
+    # Input released before the batch: the forward starts at the batch.
+    sent_early = ("engine-pp1", 0.5, 0.9 + L_DATA, "release", DATA, 0)
+    at_input = ("engine-pp1", 0.9 + L_DATA, 0.95, "TAR")
+    sent_before = "engine-pp0 sent forward 0 at 0.9, before 1.0"
+    failed = pipeline_timeline(_two_stage_table(sent_early, ACKED, at_input))
+    assert failed == [sent_before, f"engine-pp1 starts no forward 0 at {1.0 + IPC}"]
+    at_batch = ("engine-pp1", 1.0 + IPC, 1.8, "TAR")
+    failed = pipeline_timeline(_two_stage_table(sent_early, ACKED, at_batch))
+    assert failed == [sent_before]
+
+
+#: A machine whose every PP part is rendezvous, `T` for 8 bytes once its
+#: receive is posted, `L` ahead on ``pp_data``. A host blocked on an ack goes on
+#: `WAKE` x (1 - exp(-idle / `RISE`)) after it, idle the pair's since the last.
+L, T = 2.0**-10, 2.0**-8 + 2.0**-17
+WAKE, RISE = 2.0**-12, 2.0**-6
+ROUND = copy.deepcopy(DP_MACHINE)
+ROUND["interconnect"]["intra_node"]["pp"] = {
+    c: {
+        "eager_threshold_bytes": 0,
+        "latency_s": L,
+        "overhead_s": 2.0**-20,
+        "per_byte_s": 2.0**-20,
+        "rendezvous_fixed_s": 2.0**-8,
+    }
+    for c in ("rccl", "gloo")
+}
+ROUND["interconnect"]["intra_node"]["pp"]["gloo"] |= {
+    "wake_s": WAKE,
+    "wake_rise_s": RISE,
+}
+#: One request's prefill, then its decode: half the stub's 2**-3 s and 2**-4 s
+#: on each stage, with ``meta`` and ``tokens`` 2**-6 s ahead.
+STEPS = [
+    {"batch": [["r", 4, 4]], "rows": [[4, 4, False]], "produces_output": True},
+    {"batch": [["r", 1, 5]], "rows": [[1, 5, True]], "produces_output": True},
+]
+P, D, IPC6 = 2.0**-4, 2.0**-5, 2.0**-6
+META1, TOKENS = "engine-pp0->engine-pp1:meta#pp1", "engine-pp1->engine-pp0:tokens"
+#: The last stage posts each receive at its batch's ``meta``; its tensors leave
+#: at the head's device end; it ends its device work and sends the tokens. The
+#: head flushes its send on the ack, wakes, and starts forward 1 on the tokens;
+#: its first wake is the whole `WAKE`, no send having completed before.
+TOK0 = 1 + P + T + P + IPC6
+TOK1 = TOK0 + D + T + D + IPC6
+ACK1 = TOK0 + IPC6 + T
+
+
+def _woken(idle):
+    return WAKE * -math.expm1(-idle / RISE)
+
+
+ROWS = [
+    ("engine-pp0", 1.0, 1.0, "TAR"),
+    ("engine-pp1", 0.0, 1 + L, "release", DATA, 0),
+    ("engine-pp1", 1 + L, 1 + IPC6, "release", META1, 0),
+    ("engine-pp0", 1.0, 1 + IPC6 + T, "release", ACK, 0),
+    ("engine-pp0", 1 + IPC6 + T, 1 + IPC6 + T + WAKE, "TAR"),
+    ("engine-pp1", 1 + IPC6, 1 + P + T + P, "TAR"),
+    ("engine-pp0", 1 + IPC6 + T, TOK0, "release", TOKENS, 0),
+    ("engine-pp0", TOK0, TOK0, "TAR"),
+    ("engine-pp1", 1 + P + T + P, TOK0 + L, "release", DATA, 1),
+    ("engine-pp1", TOK0 + L, TOK0 + IPC6, "release", META1, 1),
+    ("engine-pp0", TOK0, ACK1, "release", ACK, 1),
+    ("engine-pp0", ACK1, ACK1 + _woken(ACK1 - (1 + IPC6 + T)), "TAR"),
+    ("engine-pp1", TOK0 + IPC6, TOK1 - IPC6, "TAR"),
+    ("engine-pp0", ACK1, TOK1, "release", TOKENS, 1),
+]
+
+
+def _computed(i=None, row=None) -> list[str]:
+    """`stage_timelines` on `ROWS`, with `row` in place of row `i`; each stage
+    runs one layer of two."""
+    run = {
+        "admission_s": 0.54e-3,
+        "ipc_s": IPC6,
+        "stream_s": IPC6,
+        "pipeline_parallel_size": 2,
+        "machine": ROUND,
+        "step_stub": dataclasses.asdict(Coefficients.constant(2 * P, 2 * D)),
+    }
+    table = StepTable(json.dumps(run))
+    for k, r in enumerate(ROWS):
+        table.record(*(row if k == i else r))
+    return stage_timelines(
+        table.text(), "engine", [STEPS, STEPS], 2, lambda _: [("gloo", 8), ("rccl", 8)]
+    )
+
+
+def test_each_stages_rows_are_computed_from_its_forwards_and_the_carriers():
+    assert _computed() == []
+    implied = f"the pipeline implies {ROWS[5][1:3]}"
+    # The send priced 0 s: the last stage's prefill ends at the head's device end.
+    free = ("engine-pp1", 1 + IPC6, 1 + P + P, "TAR")
+    assert _computed(5, free) == [f"engine-pp1: TAR row 0 is {free[1:3]}; {implied}"]
+    # The last stage running the whole model's prefill.
+    whole = ("engine-pp1", 1 + IPC6, 1 + P + T + 2 * P, "TAR")
+    assert _computed(5, whole) == [f"engine-pp1: TAR row 0 is {whole[1:3]}; {implied}"]
+    # The head's forward 1 launched with forward 0's tokens still in flight.
+    early = ("engine-pp0", TOK0 - D, TOK0 - D, "TAR")
+    assert _computed(7, early) == [
+        f"engine-pp0: TAR row 2 is {early[1:3]}; the pipeline implies {(TOK0, TOK0)}"
+    ]
+    # Forward 1's tokens a decode stub late.
+    late = ("engine-pp0", ACK1, TOK1 + 2 * D, "release", TOKENS, 1)
+    assert _computed(13, late) == [
+        f"{TOKENS} seq 1 is {(TOK1 + 2 * D,)}; the pipeline implies {(TOK1,)}"
+    ]
+    # The head's second wake over its block on ack 1, not the pair's idle
+    # since ack 0.
+    block = ("engine-pp0", ACK1, ACK1 + _woken(ACK1 - TOK0), "TAR")
+    assert _computed(11, block) == [
+        f"engine-pp0: TAR row 3 is {block[1:3]}; the pipeline implies {ROWS[11][1:3]}"
+    ]
+
+
+def test_a_run_file_stating_a_pipeline_the_deployment_does_not_run_is_refused(
+    monkeypatch, tmp_path
+):
+    run = _run_file(tmp_path, pipeline_parallel_size=2)
+    monkeypatch.setenv(compass_run.ENV, str(run))
+    with pytest.raises(ValueError, match="pipeline_parallel_size is 2"):
+        compass_run.frontend(_stage(0, pp=1))
+    assert clock.installed() is None
+
+
+def test_each_stage_is_an_engine_lp_of_its_own(monkeypatch, tmp_path):
+    run = _run_file(tmp_path, pipeline_parallel_size=2, machine=DP_MACHINE)
+    monkeypatch.setenv(compass_run.ENV, str(run))
+    monkeypatch.setattr(clock, "_installed", None)
+    monkeypatch.setattr(utils, "LP_OF_RANK", None, raising=False)
+    monkeypatch.setattr(compass_run, "_member", None)
+    joined = []
+    monkeypatch.setattr(
+        compass_run, "connect", lambda lp, endpoint, member: joined.append((lp, member))
+    )
+    with compass_run.engine(_stage(1)):
+        pass
+    assert joined == [(LpId("engine-pp1"), None)]
+    assert utils.LP_OF_RANK == {0: LpId("engine-pp1")}
+
+
+def test_a_stage_starts_on_the_host_after_the_stages_before_it(monkeypatch):
+    calls = {}
+
+    def record(name):
+        return lambda *a, **k: calls.setdefault(name, (a, k))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.dist.parallel_state",
+        SimpleNamespace(
+            init_distributed_environment=record("world"),
+            initialize_model_parallel=record("groups"),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.dist.utils",
+        SimpleNamespace(get_distributed_init_method=lambda ip, p: f"tcp://{ip}:{p}"),
+    )
+    config = SimpleNamespace(
+        tensor_parallel_size=2,
+        tp_world_size=2,
+        decode_context_parallel_size=1,
+        prefill_context_parallel_size=1,
+        pipeline_parallel_size=4,
+        master_addr="127.0.0.1",
+        port=29500,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_rank=0,
+            pipeline_parallel_rank=2,
+            data_parallel_master_ip="127.0.0.1",
+            data_parallel_base_port=29501,
+            _managed_distributed_store=False,
+        ),
+    )
+    start_on_host(SimpleNamespace(), 1, config)
+    world = calls["world"][1]
+    assert (world["world_size"], world["rank"], world["backend"]) == (8, 5, "gloo")
+    assert calls["groups"][0] == (2, 4)
+    assert calls["groups"][1]["custom_group_config"] == {}

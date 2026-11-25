@@ -1,0 +1,434 @@
+# SPDX-License-Identifier: MIT
+"""One request end to end through ATOM's real serving stack on the simulated clock.
+
+A run is ATOM's API server started with ``--compass-run``: its engine core and
+TP1 worker processes, the Compass runner priced by `StepStubBackend`, and
+the Clock Authority co-hosted in the API server. The traffic LP is `Traffic`
+below, in this process. The run is made twice, in two process trees with
+different `PYTHONHASHSEED`, under a constant stub with the step record on, and
+`atom.compass.detect.scenario.check_run` holds the two to the scenario checks.
+
+The engine core and the worker import aiter, and the worker's construction
+still touches the device, so those tests skip where there is no driver. They
+also skip without `ATOM_COMPASS_SLICE_MODEL`, a model directory holding a
+config and a tokenizer; no weight is read.
+"""
+
+import dataclasses
+import http.client
+import json
+import math
+import os
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+import pytest
+import torch
+from test_memory_readings import DOCUMENT, META_8B, publish_readings
+
+from atom.compass import run as compass_run
+from atom.compass.backends.step_stub import Coefficients
+from atom.compass.carriers import sse_stamp, tracestate_with
+from atom.compass.clock import LpId
+from atom.compass.clock_transport import connect
+from atom.compass.detect.determinism import CONFIGURATION_PREFIX
+from atom.compass.detect.scenario import check_run
+from atom.compass.drive import run as drive_run
+from atom.utils import clock
+from atom.utils.clock import LPRuntime
+from tests.compass.held_ports import held_ports
+
+MODEL = os.environ.get("ATOM_COMPASS_SLICE_MODEL")
+NEEDS_A_RUN = pytest.mark.skipif(
+    not (torch.cuda.is_available() and MODEL),
+    reason="a run needs a driver, since the engine core and the TP1 worker import "
+    "aiter, and ATOM_COMPASS_SLICE_MODEL naming a model directory",
+)
+
+TREE = Path(__file__).resolve().parents[2]
+TRAFFIC = LpId("traffic")
+HTTP, STREAM = "traffic->frontend:http", "frontend->traffic:stream"
+#: The served tokenizer's charge, as the slice's `host` entry states it.
+TOKENIZER = {
+    "backend": "fast",
+    "fingerprint": "sha256:" + "a" * 64,
+    "encode": {"fixed_s": 3.0e-4, "tokens_per_s": 2.0e6},
+    "decode": {"fixed_s": 1.5e-4, "tokens_per_s": 3.0e6},
+}
+SCRAPE_S = 16.0
+WALL_S = 600.0
+MAX_TOKENS = 4
+#: The step stub the slices run under: constant, so `check_run` can compute
+#: each engine step's end by hand.
+CONSTANT = dataclasses.asdict(Coefficients.constant(2.0**-9, 2.0**-11))
+
+
+class UnansweredRequests(AssertionError):
+    """The run finished with requests that never had their final response."""
+
+
+def _retry(what, server, attempt):
+    deadline = time.monotonic() + WALL_S
+    while True:
+        try:
+            return attempt()
+        except ConnectionRefusedError:
+            assert server.poll() is None, f"the server exited before {what}"
+            assert time.monotonic() < deadline, f"no {what} in {WALL_S} wall seconds"
+            time.sleep(0.05)
+
+
+class Traffic:
+    """The traffic LP: one streamed completion at 0, then one scrape once it is
+    answered, and a periodic scrape on a daemon deadline.
+
+    The owner stamps every send and takes each stream event the authority
+    releases; threads only carry bytes. An event is checked against the clock
+    as it is read, and taken once released. Requests go to `port` and scrapes
+    to `scrape_port`, by default the same.
+    """
+
+    http, stream = HTTP, STREAM
+
+    def __init__(self, run: dict, port: int, server, scrape_port=None) -> None:
+        bound = run["bound_s"]
+        if not math.isfinite(bound):
+            raise ValueError(
+                f"the run file's bound_s is {bound}; a run needs a finite one"
+            )
+        self.bound = (bound, "run file bound_s")
+        self.port, self.server = port, server
+        self.scrape_port = scrape_port or port
+        endpoint = run["clock_endpoint"]
+        conn = _retry("clock", server, lambda: connect(TRAFFIC, endpoint))
+        self.rt = LPRuntime(TRAFFIC, compass_run.channel_table(run), conn)
+        self.cv = threading.Condition()
+        self.frames: dict[int, tuple[float, str]] = {}  # read, not yet taken
+        self.events: list[tuple[float, str]] = []  # taken, in order
+        self.errors: list[BaseException] = []
+        self.open: set[int] = set()
+
+    def run(self) -> None:
+        rt = self.rt
+        rt.start_run()
+        self.sent, seq = rt.stamp_send(self.http)
+        self.open.add(0)
+        body = {
+            "model": MODEL,
+            "prompt": "one request through the slice",
+            "max_tokens": MAX_TOKENS,
+            "stream": True,
+        }
+        self._carry(
+            "POST",
+            "/v1/completions",
+            body,
+            tracestate_with(None, self.sent, seq),
+            self.port,
+        )
+        next_scrape, scraped = SCRAPE_S, False
+        while rt.next_event(math.inf, next_scrape) != math.inf:
+            self._take()
+            if rt.now >= next_scrape:
+                next_scrape += SCRAPE_S
+                self._scrape()
+            if not self.open and not scraped:
+                scraped = True
+                self._scrape()
+        rt.close()
+        if self.open:
+            raise UnansweredRequests(
+                f"requests {sorted(self.open)} were sent and never given their final "
+                "response"
+            )
+
+    def _scrape(self) -> None:
+        arrival, seq = self.rt.stamp_send(self.http)
+        self._carry(
+            "GET",
+            "/metrics",
+            None,
+            tracestate_with(None, arrival, seq),
+            self.scrape_port,
+        )
+
+    def _carry(self, method, path, body, tracestate, port) -> None:
+        threading.Thread(
+            target=self._read,
+            args=(method, path, body, tracestate, port),
+            daemon=True,
+        ).start()
+
+    def _read(self, method, path, body, tracestate, port) -> None:
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=WALL_S)
+            _retry("HTTP listener", self.server, conn.connect)
+            headers = {"tracestate": tracestate, "content-type": "application/json"}
+            conn.request(method, path, body and json.dumps(body), headers)
+            stamp = None
+            for raw in conn.getresponse():
+                line = raw.decode().rstrip("\r\n")
+                stamp = sse_stamp(line) or stamp
+                if line.startswith("data:") and stamp is not None:
+                    arrival, seq = stamp
+                    self.rt.check_arrival(self.stream, arrival, seq)
+                    with self.cv:
+                        self.frames[seq] = (arrival, line)
+                        self.cv.notify_all()
+                    stamp = None
+        except BaseException as e:  # noqa: BLE001 - the owner raises it
+            with self.cv:
+                self.errors.append(e)
+                self.cv.notify_all()
+
+    def _take(self) -> None:
+        """Take every released stream event, waiting for any not read yet."""
+        with self.rt.lock:
+            due = sorted(self.rt.released[self.stream] - self.rt.handled[self.stream])
+        for seq in due:
+            with self.cv:
+                arrived = self.cv.wait_for(
+                    lambda seq=seq: seq in self.frames or self.errors, WALL_S
+                )
+                if self.errors:
+                    raise self.errors[0]
+                assert arrived, f"stream seq {seq} released and not read"
+                self.events.append(self.frames.pop(seq))
+            if self.events[-1][1] == "data: [DONE]":
+                self.open.discard(0)
+            with self.rt.lock:
+                self.rt.count_done_locked(self.stream, seq)
+
+
+def _run_file(out: Path, **overrides) -> Path:
+    """`out`'s run file with `overrides`. Its default clock endpoint is
+    in-process and takes no port; a run whose authority another process serves
+    names one on a held port."""
+    run = {
+        "clock_endpoint": f"inproc:{uuid.uuid4().hex}",
+        "bound_s": 600.0,
+        "admission_s": 0.54e-3,
+        "ipc_s": 2.0**-14,
+        "stream_s": 2.0**-12,
+        "step_stub": dataclasses.asdict(Coefficients()),
+        "machine": DOCUMENT,
+        "store": str(out / "store"),
+        "out_dir": str(out),
+    } | overrides
+    (out / "run.json").write_text(json.dumps(run))
+    return out / "run.json"
+
+
+def publish_entry(store, machine, argv, env) -> None:
+    """Publish in `store` the `memory_readings` entry of the configuration
+    ATOM's server resolves from its flags `argv` in the environment `env` on
+    `machine`, as `compass measure memory` leaves it, so that a run reading
+    `store` starts."""
+    # The key holds the config as the server resolves it, and its performance
+    # environment.
+    with mock.patch.dict(os.environ, env, clear=True):
+        publish_readings(store, drive_run._config(argv), document=machine)
+
+
+def publish_entry_on_arch(store, machine, argv, env) -> None:
+    """`publish_entry`, its config resolved in a process whose aiter answers
+    `machine`'s arch, an fp8 quantization's dtype among it: as `on_arch` starts
+    a simulated server, also on a host with no device, where this process's
+    aiter would resolve that dtype to ``uint8`` and the key would miss."""
+    code = (
+        "import json, sys\n"
+        "from atom.compass.capture.driverless import import_aiter_on\n"
+        "import_aiter_on(sys.argv[1])\n"
+        "from test_vertical_slice import publish_entry\n"
+        "publish_entry(*map(json.loads, sys.argv[2:]))\n"
+    )
+    args = [machine["device"]["arch"], str(store), machine, argv, env]
+    path = os.pathsep.join(
+        [str(TREE), str(TREE / "tests/compass"), str(TREE / "tests")]
+    )
+    subprocess.run(
+        [sys.executable, "-c", code, args[0], *map(json.dumps, args[1:])],
+        env=dict(os.environ, PYTHONPATH=path),
+        check=True,
+        timeout=600,
+    )
+
+
+def run_slice(out: Path, seed: str) -> dict:
+    """One run in its own process tree; its step table, summary and request times."""
+    out.mkdir()
+    with held_ports(2) as (clock_port, port):
+        endpoint = f"tcp://127.0.0.1:{clock_port}"
+        run_file = _run_file(
+            out,
+            clock_endpoint=endpoint,
+            step_stub=CONSTANT,
+            host={"tokenizer": TOKENIZER},
+        )
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            PYTHONPATH=str(TREE),
+            AITER_LOG_LEVEL="WARNING",
+            ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
+        )
+        args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
+        args += ["--enforce-eager", "--max-model-len", "2048"]
+        publish_entry(out / "store", DOCUMENT, args, env)
+        with open(out / "server.log", "w") as log:
+            server = subprocess.Popen(
+                [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
+                + ["--compass-run", str(run_file)],
+                cwd=TREE,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            # A run that hangs ends here: the clock's socket closes with the server.
+            watchdog = threading.Timer(WALL_S, server.kill)
+            watchdog.start()
+            try:
+                traffic = Traffic(json.loads(run_file.read_text()), port, server)
+                traffic.run()
+                code = server.wait(timeout=120)
+            finally:
+                watchdog.cancel()
+                if server.poll() is None:
+                    server.kill()
+    tail = (out / "server.log").read_text()[-4000:]
+    assert code == 0, f"the server exited {code} after the finish:\n{tail}"
+    return {
+        "out": out,
+        "table": (out / compass_run.STEP_TABLE_FILE).read_text(),
+        "summary": json.loads((out / compass_run.SUMMARY_FILE).read_text()),
+        "request": (traffic.sent, traffic.events[0][0], traffic.events[-1][0]),
+        "events": traffic.events,
+        "bound": traffic.bound,
+    }
+
+
+@pytest.fixture(scope="module")
+def runs(tmp_path_factory):
+    root = tmp_path_factory.mktemp("slice")
+    return [run_slice(root / f"seed{seed}", seed) for seed in ("1", "2")]
+
+
+@NEEDS_A_RUN
+def test_one_request_meets_every_scenario_check(runs):
+    run = runs[0]
+    arrive, first_token, leave = run["request"]
+    print(f"\nrequest 0: arrive {arrive!r} first token {first_token!r} leave {leave!r}")
+    print(run["table"])
+    failed = check_run(
+        [r["out"] for r in runs],
+        [MAX_TOKENS],
+        [line for _, line in run["events"]],
+        {"engine": run["out"] / "parity"},
+    )
+    assert not failed, "\n".join(failed)
+    assert 0 < arrive < first_token <= leave
+    assert 0 < run["summary"]["cost"]["wall_seconds"]
+    assert run["bound"] == (600.0, "run file bound_s")
+
+
+def _release(table: str, lp: str, channel: str, seq: int) -> float:
+    """The time `lp` released message `seq` on `channel`, from a step table."""
+    for row in table.splitlines()[1:]:
+        f = row.split()
+        if f[0] == lp and f[3] == "release" and f[4] == channel and f[5] == str(seq):
+            return float(f[2])
+    raise AssertionError(f"{lp} released no {channel} {seq}")
+
+
+@NEEDS_A_RUN
+def test_the_served_tokenizer_charges_the_request_its_encode_and_decode(runs):
+    table = runs[0]["table"]
+    run = json.loads(table.splitlines()[0].removeprefix(CONFIGURATION_PREFIX))
+    # The request leaves for the engine once its prompt is encoded.
+    received = _release(table, "frontend", HTTP, 0)
+    sent = _release(table, "engine", "frontend->engine:request#dp0", 0)
+    encode = sent - received - run["ipc_s"]
+    # The first token leaves for the traffic LP once the frame carrying it is decoded.
+    output = _release(table, "frontend", "engine->frontend:output#dp0", 1)
+    decode = _release(table, "traffic", STREAM, 0) - output - run["stream_s"]
+    print(f"\nrequest 0: encode {encode!r} s, first frame's decode {decode!r} s")
+    assert encode >= TOKENIZER["encode"]["fixed_s"]
+    assert decode >= TOKENIZER["decode"]["fixed_s"]
+
+
+# --- without a driver: the bootstrap off, and its refusals -------------------
+
+
+def _config(dp=1, pp=1, runner=compass_run.ATOM_RUNNER):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=dp),
+        pipeline_parallel_size=pp,
+        enable_rapidserve=False,
+        runner_qualname=runner,
+    )
+
+
+def test_with_no_run_file_nothing_is_installed(monkeypatch):
+    monkeypatch.delenv(compass_run.ENV, raising=False)
+    config, model_runner = _config(), SimpleNamespace()
+    with compass_run.frontend(config), compass_run.engine(config):
+        compass_run.runner(model_runner, META_8B)
+    assert clock.installed() is None
+    assert config.runner_qualname == compass_run.ATOM_RUNNER
+    assert vars(model_runner) == {}
+
+
+def test_a_run_with_no_finite_bound_is_refused(monkeypatch, tmp_path):
+    monkeypatch.setenv(compass_run.ENV, str(_run_file(tmp_path, bound_s=None)))
+    with pytest.raises(ValueError, match="bound_s is None; a run needs a finite"):
+        compass_run.frontend(_config())
+
+
+@pytest.mark.parametrize(
+    "config, refusal",
+    [
+        (_config(pp=2), "pipeline_parallel_size is 1"),
+        (_config(runner="my.Runner"), "runner 'my.Runner' is named"),
+    ],
+)
+def test_a_deployment_the_slice_does_not_run_is_refused(
+    monkeypatch, tmp_path, config, refusal
+):
+    monkeypatch.setenv(compass_run.ENV, str(_run_file(tmp_path)))
+    with pytest.raises(ValueError, match=refusal):
+        compass_run.frontend(config)
+    assert clock.installed() is None
+
+
+def test_an_entry_is_published_for_the_config_the_server_resolves(
+    monkeypatch, tmp_path
+):
+    """The server reads either spelling of a flag and lays out a DP-attention
+    deployment as `CoreManager` does; the entry `publish_entry` publishes for
+    it is keyed alike."""
+    from atom.config import Config
+
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    published = []
+    monkeypatch.setitem(
+        publish_entry.__globals__,
+        "publish_readings",
+        lambda store, config, document: published.append(config),
+    )
+    argv = ["--model", "m", "--max_model_len", "2048", "-tp", "2"]
+    publish_entry(tmp_path, DOCUMENT, [*argv, "--enable-dp-attention"], {})
+    [config] = published
+    pc = config.parallel_config
+    assert config.max_model_len == 2048
+    assert (config.tensor_parallel_size, pc.data_parallel_size) == (1, 2)
+    assert pc.data_parallel_size_local == 2

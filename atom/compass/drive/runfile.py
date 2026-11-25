@@ -1,0 +1,472 @@
+# SPDX-License-Identifier: MIT
+"""The run file a simulated run hands ATOM, built from its command's flags.
+
+`add_arguments` adds the flags `trace steps` and `run` share, and `build`
+resolves them, store keys included, into the run file's mapping; the command
+then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
+
+- The backend, exactly one, each flag named by its `run` run-file key:
+  ``--step-stub FILE``, the stated `Coefficients`; ``--step-linear KEY``, a
+  `step_linear_law` entry's params with its key's ``engine_config``, the entry
+  loaded through `ArtifactStore.load` under `law_readings`;
+  ``--step-grid KEY``, the store's root and a `step_grid_bundle` entry's key;
+  ``--op-graph``, ``true``, and as ``price_list`` the fields of the
+  `price_list` key this run's model, parallel layout, platform and ATOM
+  source name, when ``--store`` holds one there.
+  A KEY is the token `Key.token` prints, resolved under ``--store``; for
+  ``--step-linear`` and ``--host-laws`` a law file `step_linear_fit` writes
+  may stand in: its law less ``host``, ``host_fit`` and ``memory_readings``,
+  or its ``host``, each at the keys it states, and its ``backend`` stated as a
+  stub's is. The ``memory_readings`` the law files named carry go into the run
+  file as `memory.CARRIED` (`carried`), which a run reads where ``--store``
+  holds none.
+  ``backend`` holds the backend's ``digest`` and, for a store entry, its
+  ``provenance``, with its report's as ``inputs``; a stub's, and an op graph's
+  with no price list, is None, its digest over what the run file states.
+- ``--host-laws KEY``, a `host_laws` entry's params, as ``host``, and its
+  ``hops``, each at the run-file key of its name, ``router_s`` only in a
+  prefill-decode run's; without it the run charges no host time and each hop
+  its floor (`run.HOP_FLOOR_S`). The entry's ``ingress`` term, the encoding
+  ingress in front of the deployment (`atom.compass.ingress`), goes to the run
+  file's ``ingress``, a prefill-decode run's from its prefill side's entry.
+- ``--step-linear`` and ``--host-laws`` repeat, one entry per engine config:
+  the key then holds a list, each process installing its own config's entry,
+  and where their hops differ, the hops are those of the entry fitted under the
+  config ATOM's arguments resolve, as `drive.run.check` resolves one,
+  and ``backend``'s digest is over every law's in any order, their provenance
+  ``entries``; so is the ``ingress`` term.
+- ``--lmcache-offload FILE``, the ``lmcache_offload`` entry
+  `step_linear_fit`'s offload form writes, at that key; ``--lmcache FILE``,
+  the ``lmcache`` entry of a deployment offloading to an lmcache server, as
+  `compass advice` writes it, at that key; and ``--mooncake-store FILE``, a
+  shared Mooncake Store's ``mooncake_store`` entry, at that key.
+- ``--device``, ``--ptl``, ``--stack`` and ``--network``, the platform
+  flags, whose spec `spec` composes, as ``machine``; ``--store``'s root as
+  ``store``; ``--on-refusal``;
+  ``--step-roofline``; ``--padding none``, which prices a replayed graph's
+  real rows; ``--local-grants``, on unless ``--no-local-grants``, which gives
+  grants their ceilings.
+- Not flags: `FIXED`, and ``data_parallel_size``, read from ATOM's arguments.
+  The server serves client runs until it is stopped.
+
+`prefill_decode` builds the one run file of a prefill and a decode instance,
+which `scripts/compass/deploy.sh` hands its clock authority and both instances.
+"""
+
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from atom.compass import run
+from atom.compass.artifacts import (
+    ArtifactRefusal,
+    ArtifactStore,
+    GateState,
+    Key,
+    Kind,
+    keyed_platform,
+    machine_platform,
+    member_name,
+)
+from atom.compass.backends.json_file import read_json
+from atom.compass.fit.device import compose
+from atom.compass.fit.publish import RANK
+from atom.compass.run import memory
+from atom.compass.run.step_grid import readings
+from atom.compass.spec.layers import stack_of
+
+#: Each backend flag's store kind; the step stub's coefficients are a file.
+KINDS = {run.STEP_LINEAR: Kind.STEP_LINEAR_LAW, run.STEP_GRID: Kind.STEP_GRID_BUNDLE}
+#: A simulated-time bound past any run's.
+FIXED = {"bound_s": 1e7}
+#: A law file's members that are not its step law: its host laws, their fit
+#: report and the memory readings it carries.
+NOT_STEP_LAW = ("host", "host_fit", memory.LAW_MEMBER)
+
+
+def add_arguments(parser) -> None:
+    """Add the run file's flags to `parser`."""
+    backend = parser.add_mutually_exclusive_group(required=True)
+    for key in (run.STEP_STUB, *KINDS):
+        flag, stub = "--" + key.replace("_", "-"), key == run.STEP_STUB
+        many = {"action": "append"} if key == run.STEP_LINEAR else {}
+        backend.add_argument(flag, dest=key, metavar="FILE" if stub else "KEY", **many)
+    backend.add_argument("--op-graph", dest=run.OP_GRAPH, action="store_true")
+    parser.add_argument(
+        "--host-laws", metavar="KEY", action="append", help="a token or law file"
+    )
+    parser.add_argument("--lmcache", metavar="FILE", help="the lmcache entry")
+    for entry in ("lmcache_offload", "mooncake_store"):
+        flag = "--" + entry.replace("_", "-")
+        parser.add_argument(flag, metavar="FILE", help=f"the {entry} entry")
+    parser.add_argument("--device", required=True, help="the datasheet, SKU or path")
+    parser.add_argument("--ptl", required=True, choices=("enabled", "disabled"))
+    parser.add_argument("--stack", help="the readings' stack and torch, of several")
+    parser.add_argument("--network", help="a run across nodes' network file")
+    parser.add_argument("--store", required=True, help="the artifact store's root")
+    parser.add_argument("--on-refusal", choices=("mark", "abort"), default="mark")
+    parser.add_argument("--step-roofline", action="store_true")
+    parser.add_argument("--padding", choices=("none",))
+    parser.add_argument(
+        "--local-grants", action=argparse.BooleanOptionalAction, default=True
+    )
+
+
+def spec(args, store: ArtifactStore, across: bool = False):
+    """The machine spec `args`' platform flags compose (`fit.device.compose`), at
+    the stack and torch the entries the run prices with state, else at
+    `--stack`; entries and `--stack` that state two refuse, naming each.
+    `--network` is for a run across nodes (`across`), which refuses without
+    one."""
+    if bool(args.network) != across:
+        raise ValueError(
+            "a run across nodes reads a network file and names none"
+            if across
+            else f"--network {args.network}: a run on one node reads no network"
+        )
+    stacks = _stacks(args, store) | ({"--stack": args.stack} if args.stack else {})
+    if len(set(stacks.values())) > 1:
+        each = "; ".join(f"{name}: {stack}" for name, stack in stacks.items())
+        raise ValueError(
+            f"the entries the run prices with state {len(set(stacks.values()))} "
+            f"stacks, and one run reads one platform: {each}"
+        )
+    stack = next(iter(stacks.values()), None)
+    return compose(args.device, store, args.ptl, stack, args.network)
+
+
+def _stacks(args, store) -> dict:
+    """The stack and torch, as `--stack` names them, of each store entry and
+    law file the backend and `--host-laws` name that states them, by token; a
+    token that names no entry states none, and `resolve` refuses it."""
+    stated = {}
+    for name, kind in (*KINDS.items(), ("host_laws", Kind.HOST_LAWS)):
+        tokens = getattr(args, name) or []
+        for token in [tokens] if isinstance(tokens, str) else tokens:
+            if (law := _law_file(token)) is None:
+                try:
+                    fields = store.key_from_token(kind, token).values
+                except ArtifactRefusal:
+                    continue
+            elif kind is Kind.HOST_LAWS:
+                fields = law.get("host", {}).get("key", {})
+            else:
+                fields = law.get("platform", {})
+            if {"software_stack", "torch"} <= fields.keys():
+                stated[token] = stack_of(fields)
+    return stated
+
+
+def build(args, atom_args, across: bool = False) -> dict:
+    """The run file of `args`, parsed with `add_arguments`, for a server
+    started with ATOM's arguments `atom_args`, across nodes when `across`."""
+    store = ArtifactStore(Path(args.store).resolve())
+    out = {
+        **FIXED,
+        "client_runs": None,
+        "data_parallel_size": _dp_width(atom_args),
+        "machine": spec(args, store, across).echo(),
+        "store": str(store.root),
+        "on_refusal": args.on_refusal,
+        "step_roofline": args.step_roofline,
+        run.LOCAL_GRANTS: args.local_grants,
+    }
+    # Read back as the runner reads it, so a spec it would refuse refuses
+    # before a server starts.
+    machine = run._machine(out)
+    if stub := getattr(args, run.STEP_STUB):
+        out[run.STEP_STUB] = json.loads(Path(stub).read_text())
+        out["backend"] = _stated(out[run.STEP_STUB])
+    elif getattr(args, run.OP_GRAPH):
+        out[run.OP_GRAPH] = True
+        key = _price_list_key(atom_args, machine)
+        if store.directory_for(key).exists():
+            out[run.PRICE_LIST] = key.values
+            out["backend"] = _backend(store.read(key))
+        else:
+            out["backend"] = _stated({run.OP_GRAPH: True})
+    else:
+        name = next(k for k in KINDS if getattr(args, k))
+        tokens = getattr(args, name)
+        tokens = [tokens] if isinstance(tokens, str) else tokens
+        resolved = [resolve(store, name, t, machine, atom_args) for t in tokens]
+        laws = [law for law, _ in resolved]
+        backends = [backend for _, backend in resolved]
+        out[name], out["backend"] = laws[0], backends[0]
+        if len(laws) > 1:
+            digests = " ".join(sorted(b["digest"] for b in backends)).encode()
+            out[name], out["backend"] = laws, {
+                "digest": "sha256:" + hashlib.sha256(digests).hexdigest(),
+                "provenance": {
+                    "entries": [b["provenance"] for b in backends],
+                    "inputs": [
+                        i
+                        for b in backends
+                        for i in (b["provenance"] or {}).get("inputs") or ()
+                    ],
+                },
+            }
+    if args.host_laws:
+        hosts = [
+            resolve(store, "host", k, machine, atom_args)[0] for k in args.host_laws
+        ]
+        out["host"] = hosts if len(hosts) > 1 else hosts[0]
+        picked = _picked(hosts, atom_args, machine.value("device.arch"))
+        # A run file's router_s makes it prefill-decode: `prefill_decode` writes it.
+        out |= {k: v for k, v in picked.get("hops", {}).items() if k != "router_s"}
+        if run.INGRESS in picked:
+            out[run.INGRESS] = picked[run.INGRESS]
+    if held := carried(priced_by(args)):
+        out[memory.CARRIED] = held
+    if args.padding:
+        out["padding"] = args.padding
+    for name in ("lmcache", "lmcache_offload", "mooncake_store"):
+        if entry := getattr(args, name, None):
+            out[name] = json.loads(Path(entry).read_text())
+    return out
+
+
+def priced_by(args) -> list[str]:
+    """The ``--step-linear`` and ``--host-laws`` values of `args`."""
+    return [*(getattr(args, run.STEP_LINEAR, None) or ()), *(args.host_laws or ())]
+
+
+def carried(named) -> list:
+    """The memory readings the law files among `named`, values of
+    ``--step-linear`` and ``--host-laws``, carry, as the run file holds them
+    (`memory.CARRIED`); a token names no law file."""
+    laws = {t: law for t in named if (law := _law_file(t)) is not None}
+    return [c for t, law in laws.items() if (c := memory.carried_by(law, t))]
+
+
+def resolve(store, name: str, token: str, machine, atom_args) -> tuple:
+    """The run file's `name` value for `token`, with its ``backend``, as
+    `build` takes each: a step linear law from a law file, else the params of
+    the entry `token` names, loaded under `law_readings`, with its key's
+    engine config; a bundle's key; host laws as `_host` reads them, which have
+    no backend."""
+    if name == "host":
+        return _host(store, token), None
+    if name == run.STEP_LINEAR and (law := _law_file(token)) is not None:
+        law = {k: v for k, v in law.items() if k not in NOT_STEP_LAW}
+        return law, _stated(law)
+    key = store.key_from_token(KINDS[name], token)
+    if name == run.STEP_GRID:
+        return {"store": str(store.root), **key.values}, _backend(store.read(key))
+    conditions = law_readings(key, machine, atom_args)
+    entry = store.load(key, conditions=conditions, gates=GateState.of())
+    engine_config = json.loads(key.values["engine_config"])
+    law = {**_member(entry, "params"), "engine_config": engine_config}
+    return law, _backend(entry)
+
+
+def prefill_decode(args, prefill_args, decode_args, kv_link, decode_env=None) -> dict:
+    """The run file `build` builds from `args` for one prefill and one decode
+    instance, started with ATOM's arguments `prefill_args` and `decode_args`:
+    each side's DP width read from its own, the router's per-request forward
+    cost the prefill side's host entry's ``router_s`` hop, None for the floor
+    where it states none, and the KV transfers priced on the spec's
+    `kv_link`, ``intra_node`` for two instances on one node whose KV moves
+    over the GPUs' own links and ``inter_node`` across two, or on one node
+    whose KV crosses the network (`deploy.sh --kv-over-network`: Mooncake's
+    RDMA through the NICs, or TCP), which alone reads ``--network``. Its hops are
+    the prefill side's host entry's, its ``decode_hops`` the decode side's,
+    each side's config resolved from its arguments as deploy.sh starts its
+    instance, with its KV role on the simulated connector
+    (`drive.run.side_args`), the prefill side's in this process's environment
+    and the decode side's in the environment its instance starts in, which
+    `decode_env()`, when given, returns (`_hops`), else in this process's too.
+    A price list the prefill side names that is not the decode side's
+    refuses."""
+    from atom.compass.drive.run import SIMULATED, side_args
+
+    prefill_args = side_args("prefill", prefill_args, SIMULATED)
+    decode_args = side_args("decode", decode_args, SIMULATED)
+    out = build(args, prefill_args, across=kv_link == "inter_node")
+    if run.PRICE_LIST in out:
+        decode = _price_list_key(decode_args, run._machine(out)).values
+        if decode != out[run.PRICE_LIST]:
+            raise ValueError(
+                f"--op-graph: the prefill side's price list is {out[run.PRICE_LIST]} "
+                f"and the decode side's {decode}; one run file names one"
+            )
+    del out["data_parallel_size"]
+    out[run.DP_WIDTHS["P"]] = _dp_width(prefill_args)
+    out[run.DP_WIDTHS["D"]] = _dp_width(decode_args)
+    if hosts := run.entries(out, "host"):
+        arch = run._machine(out).value("device.arch")
+        out[run.DECODE_HOPS] = _hops(hosts, decode_args, arch, decode_env)
+    return out | {
+        "router_s": _hops(hosts, prefill_args, arch).get("router_s") if hosts else None,
+        "kv_link": kv_link,
+    }
+
+
+def law_readings(key: Key, machine, atom_args):
+    """The readings a run on `machine` from this ATOM source, serving the model
+    ATOM's arguments `atom_args` name, loads the `step_linear_law` at `key`
+    under: its engine config as `key` states it, the one the runner then holds
+    the resolved config to."""
+    return readings(
+        machine_platform(machine),
+        atom_src=run.atom_source(),
+        model=_model_digest(_engine_args(atom_args).model),
+        engine_config=key.values["engine_config"],
+    )
+
+
+def _model_digest(model: str) -> str:
+    """`run._file_digest` of the config.json of the model `model` names, found
+    or fetched as ATOM's loader finds it, so a hub id with no local copy reads
+    the one its server will load; one it cannot find or fetch refuses."""
+    from transformers.utils import cached_file
+
+    try:
+        why = cached_file(model, "config.json") is None and "there is none"
+    except OSError as error:
+        why = error
+    if why:
+        raise ValueError(
+            f"--model {model}: its config.json is neither local nor fetchable: {why}"
+        )
+    return run._file_digest(model, "config.json")
+
+
+def _hops(hosts: list, atom_args, arch: str, env=None) -> dict:
+    """The ``hops`` of the entry of `hosts` `_picked` picks."""
+    return _picked(hosts, atom_args, arch, env).get("hops", {})
+
+
+def _picked(hosts: list, atom_args, arch: str, env=None) -> dict:
+    """The entry of `hosts` fitted under the config ATOM's arguments
+    `atom_args` resolve on a device of `arch`, in the environment `env()`
+    gives, else this process's, picked as the runner picks its own
+    (`run.pick_fitted`); the first where every entry states its ``hops`` and
+    ``ingress`` alike, with no config resolved and `env` not called."""
+    host = hosts[0]
+    if any(h.get(k) != host.get(k) for h in hosts for k in ("hops", run.INGRESS)):
+        from atom.compass.drive.run import _config
+
+        picked, here = {"host": hosts}, contextlib.nullcontext()
+        with patch.dict(os.environ, env(), clear=True) if env else here:
+            run.pick_fitted(picked, "host", _config(atom_args, arch))
+        host = picked["host"]
+    return host
+
+
+def _dp_width(atom_args) -> int:
+    """The DP ranks ATOM's arguments run: under DP-attention every TP rank is
+    one, as `run.frontend` counts."""
+    engine = _engine_args(atom_args)
+    ranks = engine.tensor_parallel_size if engine.enable_dp_attention else 1
+    return engine.data_parallel_size * ranks
+
+
+def _stated(value) -> dict:
+    """The ``backend`` of a backend the run file states whole as `value`."""
+    stated = json.dumps(value, sort_keys=True).encode()
+    return {
+        "digest": "sha256:" + hashlib.sha256(stated).hexdigest(),
+        "provenance": None,
+    }
+
+
+def _backend(entry) -> dict:
+    """The ``backend`` of the store entry `entry`: its digest and provenance,
+    with its report's provenance as ``inputs``."""
+    reported = member_name("report", RANK, "json") in entry.members
+    inputs = _member(entry, "report").get("provenance") if reported else None
+    provenance = {**entry.provenance.as_json(), "inputs": inputs}
+    return {"digest": entry.digest, "provenance": provenance}
+
+
+def _price_list_key(atom_args, machine) -> Key:
+    """The `price_list` key of the model and parallel layout ATOM's arguments
+    serve, as `CoreManager` lays it out under DP attention, each TP rank a DP
+    rank of TP 1, on `machine`, from this ATOM source."""
+    engine = _engine_args(atom_args)
+    return Key.of(
+        Kind.PRICE_LIST,
+        model=_model_digest(engine.model),
+        dp=_dp_width(atom_args),
+        pp=engine.pipeline_parallel_size,
+        pcp=engine.prefill_context_parallel_size,
+        tp=1 if engine.enable_dp_attention else engine.tensor_parallel_size,
+        enable_expert_parallel=engine.enable_expert_parallel,
+        enable_dp_attention=engine.enable_dp_attention,
+        decode_context_parallel_size=engine.decode_context_parallel_size,
+        **keyed_platform(Kind.PRICE_LIST, machine_platform(machine)),
+        source_root=run.source_root(),
+    )
+
+
+def _member(entry, stem: str):
+    """`entry`'s `stem` member, as `fit` publishes one, read as JSON."""
+    return json.loads(entry.read_member(stem, RANK, "json"))
+
+
+def _law_file(value: str) -> dict | None:
+    """The law file `value` names, read as `read_json` reads it; None when it
+    names no file, as a token does not."""
+    path = Path(value)
+    return read_json(path) if path.is_file() else None
+
+
+def _host(store, value: str) -> dict:
+    """The run file's ``host`` entry `--host-laws value` names: a law file's
+    ``host``, else the params of the `host_laws` entry its token names."""
+    if (law := _law_file(value)) is None:
+        key = store.key_from_token(Kind.HOST_LAWS, value)
+        return _member(store.read(key), "params")
+    if "host" not in law:
+        raise ValueError(
+            f"--host-laws {value} states no host laws; a law file fitted on "
+            "records with host labels holds them as host"
+        )
+    return law["host"]
+
+
+def _engine_args(atom_args, parser_class=None):
+    """ATOM's arguments as its own parser reads them, or as `parser_class`, a
+    subclass of it, does."""
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    parser = (parser_class or FlexibleArgumentParser)(add_help=False)
+    EngineArgs.add_cli_args(parser)
+    return parser.parse_known_args(atom_args)[0]
+
+
+def pd_side(atom_args, refuse: bool = False) -> str | None:
+    """``P`` or ``D`` for a prefill or a decode instance, else None; `refuse` raises."""
+    transfer = _engine_args(atom_args).kv_transfer_config
+    side = run._pd_side(SimpleNamespace(kv_transfer_config=json.loads(transfer)))
+    if refuse and side is not None:
+        raise ValueError(
+            f"--kv-transfer-config {transfer} makes this a "
+            f"{'prefill' if side == 'P' else 'decode'} instance, which shares a clock "
+            "with its peer: start it with compass run --join, as deploy.sh does"
+        )
+    return side
+
+
+def engine_only(atom_args) -> list[str]:
+    """ATOM's arguments `atom_args` less the server's, which a build that
+    parses ATOM's engine arguments alone refuses."""
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(add_help=False))
+    left, kept = iter(parser.parse_known_args(atom_args)[1]), []
+    drop = next(left, None)
+    for arg in atom_args:
+        if arg == drop:
+            drop = next(left, None)
+        else:
+            kept.append(arg)
+    return kept

@@ -7,13 +7,13 @@ needed, and scrapes never consume observations.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
 import numpy as np
 from prometheus_client import Gauge, Histogram
 
 from atom.metrics.histogram import LATENCY_BUCKETS
+from atom.utils import time_shim as time
 
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TOKEN_BUCKETS = (

@@ -1,0 +1,61 @@
+{
+ "name": "cellA_m31",
+ "about": "MiniMax-M3.1-Flash on 4 MI355X: TP4, ONE DP rank, fp8 KV, block 128, max len 1048576, prefix caching, DSpark 7 drafts at acceptance 3.13 (#752; ~/agent_scratch/752/m31/env_m31.sh). Capture rungs are ATOM's default up to max-num-seqs 128. One DP rank: graph_padding and row_padding are collinear inside a rung (identical at rungs 1-8), which no design separates (#739 2.4 rule 6): both kept, the check reported failed, the rungs judged by G. The deployment is the step-A smoke record's (pit2-p03-g08 /var/tmp/perzhang_compass/p752/m31/smoke_c8, memory readings 06105bf48e92; `gen_v1.py --record` on it gives the same fields): kv_tokens 56860 blocks x 128 (num_kvcache_blocks of its run.json), the prefill chunk ATOM's default 16384 (its serve line sets none), and no prefill token-graph buckets (M3.1 captures none), so the prefill vector takes no padding. Dry run: waits for a law fitted on the smoke record.",
+ "deployment": {
+  "dp": 1,
+  "tp": 4,
+  "dcp": 1,
+  "rungs": [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64, 128],
+  "max_num_seqs": 128,
+  "max_num_batched_tokens": 32768,
+  "chunk": 16384,
+  "block_size": 128,
+  "max_model_len": 1048576,
+  "kv_tokens": 7278080,
+  "drafts": 7,
+  "acceptance": 3.13,
+  "prefix_unit": 128,
+  "prefill_buckets": [],
+  "moe_routing": [128, 4],
+  "trace_model": "minimax-m3.1-flash",
+  "trace_block": 64
+ },
+ "columns": {
+  "decode": ["step", "context", "graph_padding", "row_padding"],
+  "decode_variants": [[], ["moe_tokens"], ["moe_experts"]],
+  "prefill": ["step", "tokens", "query_square", "query_cached", "history", "seqs", "out"],
+  "prefill_variants": [[]],
+  "min_spread": 0.2
+ },
+ "noise": {
+  "decode": 0.0063,
+  "prefill": 0.0037
+ },
+ "acceptance": {
+  "vif": 10,
+  "g": {"decode": 0.01, "prefill": 0.02},
+  "g_z": 2.0,
+  "rung_steps": 60,
+  "levels": 3
+ },
+ "range": {
+  "min_context": 1024,
+  "min_prompt": 512,
+  "min_seq_tokens": 128
+ },
+ "timing": {
+  "server_start_s": 450,
+  "segment_overhead_s": 35
+ },
+ "segments": [
+  {"name": "D-v1", "kind": "drain", "purpose": "each rung's fixed cost at small context", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}]},
+  {"name": "D-v2", "kind": "drain", "purpose": "row padding at low context: one long anchor among short rows", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0, "minus": 1}, "prompt": 4096, "then": 512}, {"rows": 1, "prompt": {"len_share": 0.8583}, "last": true, "then": 512}]}]},
+  {"name": "D-v3", "kind": "drain", "purpose": "long context at the high rungs: half the KV pool over 128 rows", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": {"kv_share": 0.5}, "then": 512}]}]},
+  {"name": "D-v3low", "kind": "drain", "purpose": "long context at the low rungs: nine anchors leave last", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0, "minus": 9}, "prompt": 7168, "then": 512}, {"rows": 9, "prompt": {"kv_share": 0.5, "over": 9}, "last": true, "then": 512}]}]},
+  {"name": "P-quads", "kind": "quads", "purpose": "prefill scale x density; graph and eager", "scales": [1024, 2048, 4096, 7168, {"budget_share": 0.375}, {"budget_share": 0.5}, {"budget_share": 0.75}, {"budget_share": 1.0}], "shares": [1.0], "sparse_steps": [0, 150, 0, 0, 300, 0]},
+  {"name": "P-backlog", "kind": "backlog", "purpose": "long chunks sharing the step budget with short prompts", "long": [{"len_share": 0.28613}, {"len_share": 0.5625}, {"len_share": 0.8496}], "short": [512, {"budget_share": 0.75}], "short_turns": 40, "short_sessions": 3},
+  {"name": "P-trickle", "kind": "trickle", "purpose": "short prefills and middle chunks on long histories", "firsts": [{"len_share": 0.1914}, {"len_share": 0.38184}, {"len_share": 0.57227}, {"len_share": 0.76294}], "deltas": [4096, 8192, 16384, 32768, 2048], "outs": [16, 64, 1], "gaps": [0.5, 1.0, 2.0], "turns": 11},
+  {"name": "P-rows-a", "kind": "rows", "purpose": "prefill steps of many rows", "requests": 2742, "prompt": [64, 4096], "out1": 0.8, "outs": [1, 4, 16], "concurrency": {"seqs_share": 1.0, "dp": true}},
+  {"name": "P-rows-b", "kind": "rows", "purpose": "single-row prompts of 16-32k: query_square apart from tokens at output steps", "requests": 160, "prompt": [{"budget_share": 0.5}, {"budget_share": 1.0}], "out1": 0.8, "outs": [1, 8, 32], "concurrency": {"per_rank": 1, "dp": true}}
+ ]
+}

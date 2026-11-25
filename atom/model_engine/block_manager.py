@@ -8,7 +8,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from itertools import islice
 from math import inf, isinf
-from time import monotonic
 from weakref import WeakKeyDictionary
 
 import numpy as np
@@ -48,6 +47,7 @@ from atom.model_engine.state_runtime import (
 )
 from atom.spec_decode.draft_window_geometry import draft_read_window
 from atom.utils import envs
+from atom.utils.time_shim import read_monotonic as monotonic
 
 logger = logging.getLogger("atom")
 

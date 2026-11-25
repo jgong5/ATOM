@@ -1,0 +1,1115 @@
+# SPDX-License-Identifier: MIT
+"""A real run's recorded steps, labelled one way for every reader.
+
+A record is a real run's step record (`steps/dp<r>.jsonl`, written with
+`ATOM_COMPASS_PARITY_RECORD`), read as JSON lines. `label` makes each forward
+that is not a dummy run a `Sample`: its batch view, its device label, its host
+labels and its provenance. `step_linear_fit` fits samples and `validate.cost`
+prices them; neither reads a step's stamps. Neither takes a record whose
+run.json names `BUILDS`, the JIT compiles its server ran while it served;
+`refusal` says why.
+
+A data-parallel step's view takes its line's `moe_tokens`, `tbo_tokens` and
+`dp_rank`. An older record's lines state neither count: `group_tokens`
+rebuilds `moe_tokens` from every rank's line, and, when its host key's engine
+states `enable_tbo`, the caller's `split_rule`, ATOM's two-batch-overlap split
+over those lines, rebuilds `tbo_tokens`; with no rule such a line refuses.
+No line states its group's dummy forwards: a view's `group_dummies` counts the
+run's rank records whose line at its step is a dummy run (`group_dummies`), and
+its `group_max_tokens` is the most tokens their lines at its step run
+(`group_peaks`). Its `prefill_duty` is its rank's `shape.PrefillDuty` at its
+line's `t_enter_ns`, over the rank's earlier lines from `t_enter_ns` to
+`t_exit_ns`, each a prefill forward when some rank's line at its step, not a
+dummy run, holds a prefill row (`group_prefills`).
+A view also takes its line's `target_bs`, `draft_bs`, `draft_moe_rows` and
+`draft_rows`, the widths and rows its target and drafter ran at, which an op
+graph reads, and its `group_needs_eager`, which a line states only where it is
+true, so a record written before the field reads false throughout, and its
+`kda`, which a KDA model's lines state (`runner.projection.kda_counts`), None
+where a line states none.
+
+A decode step's device label is its device busy time, `d_busy_ns`, plus the
+device work queued since the previous forward's exit, `d_gap_ns`. A decode step
+whose device start precedes its host launch end is launch-exposed and cut. The
+exit of each wait for the previous output's token copy (`t_recv_ns`)
+bounds the host clock's lead over the device's (that forward had finished by
+then), as does the exit of a forward's read of its own tokens (`t_read_ns`)
+over its device start, its target's end under MTP; the tightest of the last
+`ANCHORS` bounds is the lead. The copy itself
+lands on its own stream after the exit event the bound reads, by 14 to 29 us
+measured on one host (median 17 us), so each bound carries that much more lead
+than the clocks actually have; on the step linear law's records the gap never
+moves a decode step across the launch-exposed cut, so it is left in the bound
+rather than corrected by a host-specific number with no record or law of its
+own to carry it. On an MTP record, one with `d_target_ns`, the device label is
+the target's, `d_target_ns` with no gap, and the draft label is the rest of
+`d_busy_ns`. A decode's draft-KV pass, `d_draft_kv_ns`, runs before
+`forward_done_event`: its device label holds it, as its draft-KV label too,
+and its draft label does not. A device event runs no earlier than the host
+records it, so the host clock read just before a launch's entry event is
+recorded (`t_launch_event_ns`) less the event's device start bounds the host
+clock's lead from below, and an MTP status wait's return less the
+`forward_done_event` it waits for bounds it from above. A record without that
+read takes the launch's entry stamp, read after the event, so a host stall
+between the two lifts its bound. The clocks drift apart over a record, and the
+tightest of the last `ANCHORS` status-wait bounds (of the first, before as
+many) follows them: a step's lead is the largest launch bound moved by how far
+that tightest bound moved since, leaving out any above it at its own launch,
+which only a stalled entry stamp or drift faster than the anchors follow
+reaches; with no status wait, the largest launch
+bound over the record. A decode's draft label, its `propose`
+pass, is cut where the device reached the pass, placed by that lead, before
+the host's draft copy wait (`t_draft_recv_ns`, or reading its own, `t_draft_read_ns`) began: the host queues the pass
+just before that wait, so the window may hold the device's wait for it.
+Under an EAGLE3 drafter a decode's line also times each draft forward of that
+pass (`DRAFT_PASSES`), which stand and are cut with its draft label.
+
+A prefill step's labels are a trace run's busy time per pass (`parity.busy`),
+which a trace run's record joins from `dp<r>.busy.jsonl` beside it: the device
+label `b_target_ns`, the draft label `b_draft_ns`, and on a step that produces
+output the propose label, the draft's `propose` pass, `b_propose_ns`. An output
+prefill's draft-KV pass, `b_draft_kv_ns`, runs before `forward_done_event`, as
+a decode's does: its device label holds it, as its draft-KV label too, and its
+draft label does not; a middle chunk's stays in its draft label. A window
+holds the device's idle between launches the host paced, so a prefill step
+without busy time is cut as `untraced`. A trace run, a record with its busy
+lines beside it or whose run directory holds `TRACE`, ran under a profiler: its
+decode steps are cut as `traced` and its steps carry no host labels.
+
+With `PREFILL_LABEL_ENV` set to ``record``, an opt-in for a fit that has one
+plain record and no trace run, a prefill step without busy time that carries
+its MTP target end is labelled from its own device window instead, as an MTP
+decode is: the device label `d_target_ns` (plus the draft-KV pass on a step
+that produces output), the draft label the rest of `d_busy_ns`, and the
+propose label `d_propose_ns`. On a record with no speculative decode (no line
+carries `d_target_ns`: Kimi-K3.1 at #752's deployment) the whole window is the
+target's, so such a step's device label is its `d_busy_ns`. Such a label holds whatever idle the host paced
+inside the window, so it reads the step's device span, not its busy time; its
+sample's provenance says so (`prefill_label`), and a step with busy time keeps
+the trace run's labels. One whose labelled device work, placed on the host
+clock by the lead (below), ends within `PACED_S` of its host launch's end ran
+at its launch's pace: the device waited for each kernel the host launched, so
+its span is the launch's, which the host laws' `W_launch` prices, not device
+work. It is cut as `paced` (`_paced`) and keeps its host labels. On #3720's
+cell B (DeepSeek-V4.1 1P1D, P at DP2 EP2, eager) an output prefill's launch
+takes 55-56 ms up to 8k tokens, and 96% of those of 1024 or fewer tokens end
+their device span 0.5-1.5 ms after it, its spike (b3_B3 and r256: 1,987 of
+the output prefills within 2 ms, about 40 per 0.5 ms bin past it); the same
+tokens after a middle chunk, whose device the host keeps busy, run 24-27 ms.
+Fitted on the paced spans, the prefill vector's intercept held the launch
+(42 ms) and priced such a tail at 50 ms, and with the launch priced again by
+the host's recurrence a lone prefill of 1-2k tokens 13-18% over the real one.
+
+Given `floored`, a trace run's drafter labels, the draft's and its passes',
+lose what the profiler added to each drafter kernel shorter than the profiler's
+floor (`parity.busy.floored` under a `Floor`): queued behind another, such a
+kernel records the floor, so its term is its recorded length, up to the floor,
+less its own (`Floor.term`). A kernel's own
+length is the median `warm_ns` of the `compass measure ops` points that launch
+it alone, at its grid on any shape, or, replayed from a graph, which states no
+grid, at its pass's shape, as `capture.population_steps` places the step: the
+draft-KV pass at the step's shape, the rest of the draft at its drafter's. The
+profiler adds less than the floor to any kernel, so one recorded at twice the
+floor or more is past it. A kernel no point gives its own length, or only a
+point launching it among other kernels, keeps its recorded length, and its
+sample names it under `floor` for each label holding it.
+
+With `STALL_ENV` set to ``1``, an opt-in, a step at which some DP rank's host
+stalled issuing a prefill forward is cut as `stalled` on every rank
+(`launch_stalls`): a line not a dummy run, holding a prefill row, whose launch
+window (`t_launch_ns`, the host issuing the forward's kernels) lasted
+`STALL_FACTOR` times or more its launch path's median (`launch_features.path`)
+over that rank's such lines of the run. That host was then off issuing the
+forward at least as long as on it, and every peer's device waited on its
+devices at each MoE collective, so each rank's device span holds the stall: the
+paced cut above, read off the launch alone and across the group, where a rank
+whose device runs on after a stalled launch ends escapes `_paced`. Each such
+line keeps its host labels. On #3720's cell B (DeepSeek-V4.1 1P1D, P at DP2,
+eager) a prefill's launch stays within 10-25% of its path's median at p90,
+and 0.5-4% of the lines take twice it or more, up to 80 times (4.2 s); with
+the peer columns' slower tail kept (`--keep-peer-tail`), the stalled ones among
+the 75 steps whose peer prefilled under a quarter of the rows carried
+`peer_small` from B final's 7 ms to 353 ms. Under the same switch a host fit
+(`fit.host.host_laws`) prices the stalls its records hold (`stall_prices`) as
+the first launch of a shape on a rank: on #752's cell A v2 (DeepSeek-V4.1, DPA4,
+MoE over TP) 95-100% of the stalled prefill lines are their rank's first of
+their exact token count, and no exact shape stalls twice, but only 1-3% of such
+first lines stall; most are a warm-up that dies out 15 minutes after the first
+forward (1-1.7 stalls a rank-minute, then 0.05-0.15). Per launch path, the host
+entry's `STALLS` states the stalls' excess past the path's median over the
+records' first launches of a `first_launch_key` on a rank, and the key, which a
+run charges on each such first launch (`runner.overrides.launch_stall`), with
+no randomness. Unset or ``0``, no step is cut so, no host entry states stalls,
+and every label is as before.
+
+A record without device windows is refused. A step mixing prefill and decode
+rows is cut. A step of an MTP record without `d_target_ns` is cut as
+`unsplit`: its device label would hold a draft the law prices again.
+
+A step's host labels are its segments: `E` from the previous forward's exit,
+cut as idle after an idle engine (`busy_gaps`); `W_pre` to the launch, less
+the staging gate's wait; `W_launch` from the launch to the token read,
+the sampler's launch included, or to the launch's end on a forward with no
+such wait, less the time its line's `blocked_ns` states the launch thread
+spent in HIP's blocking calls, there waiting on the device; a line without
+`blocked_ns` gives its wall time; `W_post` from that wait's end to the exit,
+less the draft copy wait, and a middle chunk has none. With an MTP status wait,
+`W_pre` ends at it and `W_inputs` runs from it to the launch. On a later
+pipeline stage, `W_recv` runs from the launch to the receive of its input.
+Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
+pull after the previous exit, and `E_out` from the exit to the pull after it.
+`L_mtp` is `mtp_copy`'s time on a forward whose MTP status wait began before
+the event it waits for.
+`label_run` labels a run's DP ranks together: there `E` runs from the latest
+pull, else exit, over the ranks before the same forward, where the group's
+`_sync_dp_state` releases each of them.
+
+A DP rank's dummy forward at a step some rank of its group prefills, its line
+holding the one prefill row `ModelRunner.dummy_execution` runs, gives no
+sample, but its segments, `W_pre`, `W_inputs`, `W_launch` and `W_post` as
+above, are its rank's samples' `dummy_host` (`_dummy_hosts`): it runs the
+group's launch path, eagerly past the largest prefill token graph, for as long
+as a prefill's own body, after waiting for the step before it at its MTP status
+wait, and the group's next forward enters only once it has left. Each holds its
+view (`step_linear.dummy_view` of the group's fields) and the launch features its
+line states.
+
+A step's `admitted` is what its `E` spent admitting requests (`admissions`):
+the scheduler allocates a request's whole prompt the first time it schedules
+it, walking its prefix-cache hit and taking a fresh block for each one past it.
+
+`write_table` writes a record's labels beside it, `dp<r>.cost.jsonl`, for
+people: a first line `{"version": TABLE_VERSION}`, then per step `step`,
+`d_busy_s`, `d_gap_s`, `launch_exposed`, `idle`, the segments, `label_s`,
+`draft_s` and `cut`, the reason its device label was cut; seconds throughout, null where
+the step has none.
+"""
+
+from __future__ import annotations
+
+import bisect
+import dataclasses
+import hashlib
+import itertools
+import json
+import os
+import statistics
+import sys
+from collections import Counter, defaultdict, deque
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from atom.compass.backends.json_file import read_json, read_jsonl
+from atom.compass.backends.shape import BatchView, PrefillDuty, RequestShape
+
+#: The recent bounds whose tightest places a step on the host clock, of either
+#: window: token copy wait exits for the launch-exposed cut, MTP status-wait
+#: returns for the lead.
+ANCHORS = 32
+#: Why a device label is cut: a launch-exposed decode, mixed rows, no MTP target
+#: end, a prefill with no traced busy time, a trace run's decode, a windowed
+#: prefill its launch paced.
+CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced", "paced")
+#: The directory beside a trace run's `steps` its traces are in (`parity.busy`).
+TRACE = "trace"
+HOST_SEGMENTS = ("E", "W_pre", "W_launch", "W_post")
+#: The line key timing each pass of an EAGLE3 drafter's `propose`.
+DRAFT_PASSES = "d_draft_passes_ns"
+TABLE_VERSION = 1
+#: run.json's entry naming the JIT modules and kernels its server compiled while
+#: it served (`atom.compass.drive.aiter_jit`); a server that compiled none has none.
+BUILDS = "aiter_jit_builds"
+#: The variable that, set to ``record``, labels an untraced prefill step from its
+#: own device window (module docstring); unset, such a step is cut `untraced`.
+PREFILL_LABEL_ENV = "COMPASS_PREFILL_LABEL"
+#: How near its host launch's end a windowed prefill's device work ends, either
+#: side, to have run at the launch's pace (`_paced`), in seconds.
+PACED_S = 2e-3
+#: The variable that, set to ``1``, cuts as `STALLED` each rank's line of a step
+#: some rank's host stalled issuing a prefill forward at (`launch_stalls`);
+#: unset or ``0``, no step is, and a fit is as before.
+STALL_ENV = "COMPASS_FIT_LAUNCH_STALL"
+#: How many times its launch path's median over its rank's prefill lines a
+#: line's launch window lasts to be a stall: its host was then off issuing the
+#: forward at least as long as on it. The same on every record and rank.
+STALL_FACTOR = 2.0
+#: The cut a stalled step's lines take under `STALL_ENV`; not one of `CUTS`,
+#: which every fit counts, since no step is cut so without the switch.
+STALLED = "stalled"
+#: A host entry's launch stalls under `STALL_ENV` (`stall_prices`): by launch
+#: path, ``first_s``, what a rank's first launch of a `first_launch_key` costs,
+#: and ``key``, `FIRST_LAUNCH_KEY`, which a run refuses any other of.
+STALLS = "stalls"
+#: The shape `first_launch_key` reads: a forward's prefill tokens, up to the
+#: next power of 2.
+FIRST_LAUNCH_KEY = "pow2_prefill_tokens"
+
+
+def _prefill_label() -> str:
+    """``trace``, the default, or ``record``, as `PREFILL_LABEL_ENV` names it."""
+    value = os.environ.get(PREFILL_LABEL_ENV, "trace")
+    if value not in ("trace", "record"):
+        raise ValueError(f"{PREFILL_LABEL_ENV}={value!r}: name trace or record")
+    return value
+
+
+def launch_stall_on() -> bool:
+    """Whether `STALL_ENV` is on: ``1`` on, ``0`` or unset off, any other refused."""
+    value = os.environ.get(STALL_ENV) or "0"
+    if value not in ("0", "1"):
+        raise ValueError(f"{STALL_ENV}={value!r} is not 0 or 1")
+    return value == "1"
+
+
+def launch_stalls(
+    ranks: Iterable[list[dict]], factor: float = STALL_FACTOR
+) -> frozenset[int]:
+    """The steps of one run's DP ranks, each rank's `lines`, at which some rank's
+    host stalled issuing a prefill forward: its line, not a dummy run and
+    holding a prefill row, whose launch window (`t_launch_ns`) lasted `factor`
+    times or more the median of its launch path's (`launch_features.path` of
+    its view and recorded features) over that rank's such lines. The fit's
+    `STALL_ENV` cut, `stall_prices` and any record check read the same set."""
+    stalled = set()
+    for lines in ranks:
+        for got in _launch_windows(lines).values():
+            median = statistics.median(w for w, _, _ in got)
+            stalled.update(step for w, step, _ in got if w >= factor * median)
+    return frozenset(stalled)
+
+
+def _launch_windows(lines: list[dict]) -> dict[str, list[tuple]]:
+    """One rank's prefill launch windows by launch path, `launch_stalls`'
+    lines: per line not a dummy run, holding a prefill row and stamping its
+    launch, in order, ``(window_ns, step, first_launch_key)`` under
+    `launch_features.path` of its view and recorded features."""
+    from atom.compass.backends.launch_features import path as launch_path
+
+    windows = defaultdict(list)
+    for s in lines:
+        rows = s.get("rows") or ()
+        if s["is_dummy_run"] or "t_launch_ns" not in s or all(r[2] for r in rows):
+            continue
+        shapes = tuple(RequestShape(q, c, bool(d)) for q, c, d in rows)
+        view = BatchView(
+            shapes, capture_rung=s.get("rung"), produces_output=s["produces_output"]
+        )
+        start, end = s["t_launch_ns"][:2]
+        key = first_launch_key(shapes)
+        path = launch_path(view, s.get("launch", {}))
+        windows[path].append((end - start, s["step"], key))
+    return windows
+
+
+def first_launch_key(requests: Iterable[RequestShape]) -> int:
+    """The shape, `FIRST_LAUNCH_KEY`, whose first launch on a rank `STALLS`
+    prices, of a forward holding the requests `requests`: its prefill tokens
+    up to the next power of 2. On #752's cell A v2 it is the key a rule fixed
+    before the numbers chose on the calibration records alone, from 14
+    candidates (exact, multiple-of-16/64/256 and power-of-2 buckets of tokens,
+    MoE tokens, context, rows): the least summed error predicting the stall
+    excess of each held-out segment of the calibration record and its
+    addendum, and of each record from the other, the coarsest within 10%."""
+    tokens = sum(r.query_tokens for r in requests if not r.decode)
+    return 1 << max(tokens - 1, 0).bit_length()
+
+
+def stall_prices(
+    runs: Iterable[Iterable[list[dict]]], factor: float = STALL_FACTOR
+) -> dict[str, dict]:
+    """The launch stalls of `runs`, each a run's DP ranks' `lines`, per launch
+    path a line `launch_stalls` names stalled on: ``forwards``, that path's
+    prefill lines it weighs; ``stalled``, those it finds stalled (`factor`
+    times or more their rank's median of the path); ``excess_s``, their
+    summed launch window past that median; ``first``, the path's lines that
+    are their rank's first of their `first_launch_key` on it; and
+    ``first_s``, the excess over those, what a host entry's `STALLS` charges
+    each first launch (`stall_entry`)."""
+    count, stalled, first = Counter(), Counter(), Counter()
+    past = defaultdict(float)
+    for ranks in runs:
+        for lines in ranks:
+            for path, got in _launch_windows(lines).items():
+                median = statistics.median(w for w, _, _ in got)
+                seen = set()
+                for w, _, key in got:
+                    count[path] += 1
+                    first[path] += key not in seen
+                    seen.add(key)
+                    if w >= factor * median:
+                        stalled[path] += 1
+                        past[path] += (w - median) / 1e9
+    return {
+        path: {
+            "forwards": count[path],
+            "stalled": stalled[path],
+            "excess_s": past[path],
+            "first": first[path],
+            "first_s": past[path] / first[path],
+        }
+        for path in sorted(stalled)
+    }
+
+
+def stall_entry(prices: dict[str, dict]) -> dict[str, dict]:
+    """A host entry's `STALLS` from `stall_prices`: each path's ``first_s``,
+    and the `FIRST_LAUNCH_KEY` it was counted on."""
+    return {
+        p: {"first_s": v["first_s"], "key": FIRST_LAUNCH_KEY} for p, v in prices.items()
+    }
+
+
+def record_ranks(record) -> list[list[dict]]:
+    """The lines of each DP rank record of the run in the directory `record`,
+    its ``steps/dp<r>.jsonl`` (`_peers`)."""
+    return [read_jsonl(p) for p in _peers(Path(record) / "steps" / "dp0.jsonl")]
+
+
+#: The variable that, set to ``1``, takes a record whose run.json names
+#: `BUILDS` anyway, with a warning naming them: for a one-real-run fit whose
+#: server met kernel shapes no sweep had compiled (Triton specializes per
+#: shape), where the few steps that waited on a compile are a known residual
+#: rather than a reason to discard the run. Unset, such a record refuses.
+ACCEPT_BUILDS_ENV = "COMPASS_ACCEPT_JIT_BUILDS"
+
+
+def refusal(run: dict) -> str | None:
+    """Why grading, a fit or `validate.cost` refuses a record whose run.json is
+    `run`, naming the modules of its `BUILDS`; None when it names none, or
+    when `ACCEPT_BUILDS_ENV` is ``1`` (then a warning names them)."""
+    if builds := run.get(BUILDS):
+        if os.environ.get(ACCEPT_BUILDS_ENV) == "1":
+            print(
+                f"WARNING: {ACCEPT_BUILDS_ENV}=1 takes a record whose server ran "
+                f"a JIT compile of {builds} while it served; a step may have "
+                "waited on it",
+                file=sys.stderr,
+            )
+            return None
+        return (
+            f"its server ran a JIT compile of {builds} while it served, "
+            "so a step may have waited on it"
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class Sample:
+    """One real forward, labelled.
+
+    `device_s` is its device label, None when cut, and `cut` names why (`CUTS`).
+    `draft_s` is its draft label, None when cut, on a step with no draft, or
+    on a decode whose device reached its `propose` pass before the host's
+    draft copy wait.
+    `propose_s` is its propose label, the part of `draft_s` that is the
+    `propose` pass, on a prefill step that produces output; None elsewhere.
+    `draft_kv_s` is its draft-KV label, the part of `device_s` that is the
+    drafter's draft-KV pass, on a step that produces output; None elsewhere.
+    `host` holds the segments it has, in seconds: no `W_post` on a middle chunk,
+    no `E` on the record's first forward or after an idle engine (`idle`).
+    `provenance` holds `source`, `run` (the run's digest), `requests` (the
+    request ids the step served) and `config` (the host key the record states,
+    or None).
+    `dummies` holds the steps its rank ran as a DP dummy forward, which give no
+    sample: the same set on each of the rank's samples.
+    `admitted` is `(requests, uncached, cached)` of the requests it admits
+    (`admissions`). `launch` is its line's, what its launch ran per launch
+    feature (`launch_features`), empty on a line that states none.
+    `blocked` is the seconds its `W_launch` left out per blocking HIP call
+    that blocked, from its line's `blocked_ns`; None on a line without it.
+    `passes_s` holds the seconds of each pass an EAGLE3 drafter's `propose`
+    ran, from its line's `d_draft_passes_ns`, on a decode whose draft label
+    stands; None elsewhere.
+    `floor` names, per busy line field of a drafter part, why the profiler's
+    floor left a kernel of it at its recorded length (`Floor.term`); empty on
+    a cut step, without `floored` or with every term known.
+    `dummy_host` holds, per dummy forward its rank ran at a step its group
+    prefills, ``(step, view, host, launch)``: its view, its host segments in
+    seconds and its line's launch features (`_dummy_hosts`); the same tuple on
+    each of the rank's samples, empty on a trace run.
+    `ladder` holds the decode rungs a calibration ladder's client run calibrates,
+    on a step within that client run's graded span (`fit.samples.load`); None on
+    any other step, and wherever a record is labelled without its client runs.
+    """
+
+    step: int
+    rank: int
+    view: BatchView
+    device_s: float | None
+    cut: str | None
+    host: dict
+    idle: bool
+    provenance: dict
+    draft_s: float | None = None
+    propose_s: float | None = None
+    dummies: frozenset = frozenset()
+    draft_kv_s: float | None = None
+    admitted: tuple = (0, 0, 0)
+    launch: dict = field(default_factory=dict)
+    blocked: dict | None = None
+    floor: dict = field(default_factory=dict)
+    passes_s: tuple | None = None
+    dummy_host: tuple = ()
+    ladder: tuple | None = None
+
+
+class Floor:
+    """What a trace run's profiler adds to a drafter kernel shorter than its
+    floor: the floor, `seconds`, a machine spec's `device.profiler_floor_s`,
+    and the measured points of `compass measure ops`, each a kernel's own
+    length, held by kernel and grid and by kernel and shape."""
+
+    def __init__(self, seconds: float, points) -> None:
+        self.seconds = seconds
+        self._at, self._known = defaultdict(list), {}
+        for p in points:
+            grids = p.get("grids") or [None] * len(p["kernels"])
+            keys = [(k, json.dumps(g)) for k, g in zip(p["kernels"], grids) if g]
+            for key in dict.fromkeys(keys + [(k, p["shape"]) for k in p["kernels"]]):
+                self._at[key].append(p)
+
+    def term(self, name: str, grid, ns: float, shape: str) -> float | str:
+        """The ns the profiler added to one kernel recorded `ns` long: its
+        recorded length, up to the floor, less its own (`own`), none at or
+        past the floor; or why its own length is not known."""
+        floor = self.seconds * 1e9
+        if ns >= 2 * floor:
+            return 0.0
+        own = self.own(name, grid, shape)
+        return own if isinstance(own, str) else max(0.0, min(ns, floor) - own)
+
+    def own(self, name: str, grid, shape: str) -> float | str:
+        """A kernel's own length in ns: the median `warm_ns` of the points
+        that launch it alone, at `grid`, or with none at `shape`; or why
+        there is none, naming the points that launch it among others."""
+        at = shape if grid is None else json.dumps(grid)
+        if (name, at) not in self._known:
+            where = shape if grid is None else f"grid {grid}"
+            self._known[name, at] = self._own(self._at.get((name, at), []), name, where)
+        return self._known[name, at]
+
+    @staticmethod
+    def _own(found: list, name: str, where: str) -> float | str:
+        alone = [p["warm_ns"] for p in found if p["kernels"] == [name]]
+        if timed := [ns for ns in alone if ns is not None]:
+            return statistics.median(timed)
+        if alone:
+            return f"{name} at {where}: its points timed no warm replay"
+        if found:
+            ops = ", ".join(sorted({p["op"] for p in found}))
+            return f"{name} at {where} launches beside other kernels in {ops}"
+        return f"no measured point launches {name} alone at {where}"
+
+
+def admissions(lines: list[dict]) -> list[tuple[int, int, int]]:
+    """Per line, `(requests, uncached, cached)` of the requests it admits: those
+    a prefill row schedules for the first time, with their prompt tokens past
+    the prefix-cache hit and within it. A request's prompt is its last prefill
+    row's context; its hit, the context its first row starts from."""
+    rows = [list(zip(s["batch"], (r[2] for r in s["rows"]))) for s in lines]
+    prompt = {r: c for line in rows for (r, _, c), decode in line if not decode}
+    seen, out = set(), []
+    for line in rows:
+        new = [(r, q, c) for (r, q, c), decode in line if r not in seen and not decode]
+        seen.update(r for (r, _, _), _ in line)
+        hits = [c - q for _, q, c in new]
+        out.append((len(new), sum(prompt[r] for r, *_ in new) - sum(hits), sum(hits)))
+    return out
+
+
+def admit_x(admitted: tuple) -> tuple[int, int, int]:
+    """The `admit` law's features of a forward's `admitted`: 1 if it admits a
+    request, then the prompt tokens past the hits and within them, summed over
+    every request it admits."""
+    requests, uncached, cached = admitted
+    return min(requests, 1), uncached, cached
+
+
+def group_tokens(lines) -> int | None:
+    """The real tokens among a data-parallel step's `moe_rows`: ATOM's
+    `num_tokens_across_dp` summed over every rank's line at that step, a dummy
+    rank's one row. None when a rank's line is missing."""
+    return None if None in lines else sum(q for s in lines for q, _, _ in s["rows"])
+
+
+def group_dummies(ranks: Iterable[list[dict]]) -> Counter:
+    """Per step, how many of `ranks`, one run's rank records as their lines,
+    ran it as a DP dummy forward; a record that lacks the step counts none."""
+    return Counter(s["step"] for lines in ranks for s in lines if s["is_dummy_run"])
+
+
+def group_tails(ranks: Iterable[list[dict]]) -> frozenset[int]:
+    """The steps at which some rank of `ranks`, one run's rank records as their
+    lines, finishes a prompt's prefill: its line names a request (`named`
+    holds a request whose prompt was digested whole at its final chunk)."""
+    return frozenset(
+        s["step"]
+        for lines in ranks
+        for s in lines
+        if s.get("named") and not s["is_dummy_run"]
+    )
+
+
+def group_prefills(ranks: Iterable[list[dict]]) -> frozenset[int]:
+    """The steps at which some rank of `ranks`, one run's rank records as their
+    lines, prefills: its line, not a dummy run, holds a prefill row."""
+    return frozenset(
+        s["step"]
+        for lines in ranks
+        for s in lines
+        if not s["is_dummy_run"] and any(not d for _, _, d in s["rows"])
+    )
+
+
+def prefill_duties(lines: list[dict], prefills) -> list[float | None]:
+    """Per line of one rank's `lines`, in order, its `shape.PrefillDuty` at
+    its `t_enter_ns` over the lines before it, each from `t_enter_ns` to
+    `t_exit_ns` and a prefill forward when its step is in `prefills`; None for
+    each when some line lacks either stamp."""
+    if any("t_enter_ns" not in s or "t_exit_ns" not in s for s in lines):
+        return [None] * len(lines)
+    duty, out = PrefillDuty(), []
+    for s in lines:
+        enter, exit_ = s["t_enter_ns"] * 1e-9, s["t_exit_ns"] * 1e-9
+        out.append(duty.at(enter))
+        duty.add(enter, exit_, s["step"] in prefills)
+    return out
+
+
+def group_peaks(ranks: Iterable[list[dict]]) -> dict[int, int]:
+    """Per step, the most tokens any of `ranks`, one run's rank records as their
+    lines, runs at it, a dummy rank's its rows': ATOM's largest
+    `num_tokens_across_dp`."""
+    peaks: dict[int, int] = {}
+    for lines in ranks:
+        for s in lines:
+            tokens = sum(q for q, _, _ in s["rows"])
+            peaks[s["step"]] = max(tokens, peaks.get(s["step"], 0))
+    return peaks
+
+
+def _peers(path: Path) -> list[Path]:
+    """The rank records of `path`'s run, itself among them: those beside it."""
+    return sorted(path.parent.glob(path.name.split("dp")[0] + "dp*[0-9].jsonl"))
+
+
+def digest(record) -> str:
+    """The record's file name and the head of its bytes' SHA-256."""
+    path = Path(record)
+    return f"{path.name}:{hashlib.sha256(path.read_bytes()).hexdigest()[:12]}"
+
+
+def host_kind(view: BatchView) -> str:
+    """`decode`, `prefill`, or `middle` for a step that produces no output."""
+    if not view.produces_output:
+        return "middle"
+    return "prefill" if view.prefill else "decode"
+
+
+def _timed(lines) -> list[tuple[dict, int, int, int | None]]:
+    """Each line with a device window, its device start, gaps and busy times
+    summed, the host clock's lead over that device clock there, and the
+    `forward_done_event` of the output forward before it, or None."""
+    device, timed, done = 0, [], None
+    for s in lines:
+        if "d_busy_ns" in s:
+            start = device + s.get("d_gap_ns", 0)
+            device = start + s["d_busy_ns"]
+            timed.append((s, start, done))
+            if s["produces_output"]:
+                done = None
+                if "d_target_ns" in s:
+                    done = start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0)
+    bounds = [
+        s["t_mtp_ns"][1] - d if "t_mtp_ns" in s and d is not None else None
+        for s, _, d in timed
+    ]
+    waits = [b for b in bounds if b is not None]
+    first, recent, tight = min(waits[:ANCHORS], default=0), deque(maxlen=ANCHORS), []
+    for b in bounds:
+        if b is not None:
+            recent.append(b)
+        tight.append(min(recent) if len(recent) == ANCHORS else first)
+    lows = [
+        s.get("t_launch_event_ns", s["t_launch_ns"][0]) - start for s, start, _ in timed
+    ]
+    margins = [t - low for t, low in zip(tight, lows) if low <= t or not waits]
+    if not margins:
+        raise ValueError("every launch bound exceeds the MTP status waits' bound")
+    gap = min(margins)
+    return [(s, start, t - gap, d) for (s, start, d), t in zip(timed, tight)]
+
+
+def mtp_copy(lines) -> dict[int, tuple[int, bool]]:
+    """Per forward with an MTP status wait after an output forward that marks
+    its target: the nanoseconds from that forward's `forward_done_event`, after
+    its target and draft-KV pass, to the wait's return, and whether the wait
+    began before the event. The lead places the event no later than it ran
+    while the fastest recent status copy holds still, so the time is an upper
+    bound."""
+    copy = {}
+    for s, _, lead, done in _timed(lines):
+        if "t_mtp_ns" in s and done is not None:
+            m0, m1 = s["t_mtp_ns"]
+            copy[s["step"]] = (m1 - done - lead, m0 < done + lead)
+    return copy
+
+
+def host_paced_drafts(lines) -> set[int]:
+    """The steps whose device reached their `propose` pass, after their target
+    and draft-KV pass and placed by the lead, before their host's draft copy
+    wait began: the host queues the pass just before that wait, so the device
+    waited for it there."""
+    return {
+        s["step"]
+        for s, start, lead, _ in _timed(lines)
+        if ("t_draft_recv_ns" in s or "t_draft_read_ns" in s)
+        and "d_target_ns" in s
+        and start + s["d_target_ns"] + s.get("d_draft_kv_ns", 0) + lead
+        < s.get("t_draft_recv_ns", s.get("t_draft_read_ns"))[0]
+    }
+
+
+def _paced(lines, mtp: bool = True) -> set[int]:
+    """The prefill steps of `lines` whose labelled device work, the target's
+    and on a step that produces output its draft-KV pass, ends within
+    `PACED_S` of their host launch's end, either side, placed on the host
+    clock by the lead `_timed` gives: their device ran at the launch's pace.
+    On a record with no speculative decode (`mtp` false) the target's work is
+    the whole window, `d_busy_ns`."""
+    paced = set()
+    target = "d_target_ns" if mtp else "d_busy_ns"
+    for s, start, lead, _ in _timed(lines):
+        if s["is_dummy_run"] or target not in s or "t_launch_ns" not in s:
+            continue
+        if not any(not decode for _, _, decode in s["rows"]):
+            continue
+        work = s[target] + s.get("d_draft_kv_ns", 0) * s["produces_output"]
+        if abs(start + work + lead - s["t_launch_ns"][1]) <= PACED_S * 1e9:
+            paced.add(s["step"])
+    return paced
+
+
+def _host_cut(lines) -> tuple[set[int], set[int]]:
+    """The steps whose device start precedes their host launch end, and the
+    MTP decodes whose device reached the propose pass before the host's draft
+    copy wait."""
+    output_end, timed = None, []
+    for s, start, _, _ in _timed(lines):
+        bound = None
+        if "t_recv_ns" in s and output_end is not None:
+            bound = s["t_recv_ns"][1] - output_end
+        if "t_read_ns" in s:  # its own tokens: read after its target ran
+            bound = s["t_read_ns"][1] - start - s.get("d_target_ns", 0)
+        if s["produces_output"]:
+            output_end = start + s["d_busy_ns"]
+        timed.append((s, start, bound))
+    bounds = [b for _, _, b in timed if b is not None]
+    if not bounds:
+        raise ValueError(
+            "no token read exit (`t_recv_ns` or `t_read_ns`) ties the record's "
+            "host and device clocks"
+        )
+    # Steps before the first anchor read the first ones.
+    first, recent, exposed = min(bounds[:ANCHORS]), deque(maxlen=ANCHORS), set()
+    for s, start, bound in timed:
+        if bound is not None:
+            recent.append(bound)
+        if start + min(recent, default=first) < s["t_launch_ns"][1]:
+            exposed.add(s["step"])
+    decodes = {s["step"] for s, _, _ in timed if all(r[2] for r in s["rows"])}
+    return exposed, decodes & host_paced_drafts(lines)
+
+
+def join_stamps(steps: list[dict], path) -> None:
+    """Put into each step the first stamp of each key in `path` at or after
+    its exit and before the next step's entry."""
+    times = defaultdict(list)
+    for stamps in read_jsonl(path):
+        for key, ns in stamps.items():
+            times[key].append(ns)
+    ends = [s["t_enter_ns"] for s in steps[1:]] + [float("inf")]
+    for step, end in zip(steps, ends):
+        for key, ts in times.items():
+            i = bisect.bisect_left(ts, step["t_exit_ns"])
+            if i < len(ts) and ts[i] < end:
+                step[key] = ts[i]
+
+
+def busy_gaps(lines: list[dict]) -> list[bool]:
+    """Per line, whether the engine was busy in the gap before it, holding a
+    request an earlier line scheduled and this line or a later one schedules
+    again. A busy loop steps on at its next pull; an idle one waits there for an
+    arrival, which the gap then holds."""
+    spans: dict = {}
+    for i, s in enumerate(lines):
+        for r in s["batch"]:
+            spans[r[0]] = (spans.get(r[0], (i,))[0], i)
+    opened = [0] * (len(lines) + 1)
+    for first, last in spans.values():
+        opened[first + 1] += 1
+        opened[last + 1] -= 1
+    return [n > 0 for n in itertools.accumulate(opened[:-1])]
+
+
+def _read(record, floored=None) -> list[dict]:
+    path = Path(record)
+    lines = read_jsonl(path)
+    if (pulls := path.with_suffix(".pulls.jsonl")).exists():
+        join_stamps(lines, pulls)
+    if (busy := path.with_suffix(".busy.jsonl")).exists():
+        got = {b.pop("step"): b for b in read_jsonl(busy)}
+        for s in lines:
+            s.update(got.get(s["step"], {}))
+        if floored is not None:
+            for s, row in zip(lines, floored(path)):
+                s.update(row)
+    elif _traced(path):
+        raise ValueError(
+            f"{record} is a trace run's record with no {busy.name}; its own "
+            "`compass record --trace` writes it"
+        )
+    return lines
+
+
+def _traced(record: Path) -> bool:
+    """Whether `record` is a trace run's: its busy lines are beside it, so its
+    `steps` directory copied alone still says so, or its run directory holds
+    `TRACE`."""
+    busy = record.with_suffix(".busy.jsonl")
+    return busy.exists() or (record.parent.parent / TRACE).is_dir()
+
+
+def _pull(step: dict) -> int:
+    return step.get("t_pull_ns", step["t_exit_ns"])
+
+
+def label(
+    record, run: str | None = None, split_rule=None
+) -> tuple[list[Sample], list[dict]]:
+    """The record's samples, in step order, and its table's rows.
+
+    `run` names the run in each sample's provenance, the record's `digest` by
+    default; `split_rule` rebuilds an older record's split, as above. A
+    data-parallel record's `group_dummies` and `group_max_tokens` are read from
+    the rank records beside it.
+    """
+    lines = _read(record)
+    stalled = None
+    if launch_stall_on():
+        peers = (
+            [read_jsonl(p) for p in _peers(Path(record))]
+            if lines and "moe_rows" in lines[0]
+            else [lines]
+        )
+        stalled = launch_stalls(peers)
+    return _label(
+        record,
+        lines,
+        run,
+        [_pull(s) for s in lines],
+        split_rule,
+        None,
+        None,
+        stalled=stalled,
+    )
+
+
+def label_run(
+    records, run: str | None = None, split_rule=None, floored=None
+) -> list[tuple[list[Sample], list[dict]]]:
+    """`label` of each of `records`, one run's DP ranks, with each `E` from the
+    latest pull over the ranks before the same forward, a trace run's drafter
+    labels under `floored`, its busy lines less the profiler's floor
+    (`parity.busy.floored`). A rank that ran only DP's dummy forwards gives no
+    sample and no row. Ranks whose line counts differ by more than the forward
+    a stopped server leaves on some refuse."""
+    ranks = [_read(r, floored) for r in records]
+    counts = {Path(r).name: len(x) for r, x in zip(records, ranks) if x}
+    if counts and max(counts.values()) - min(counts.values()) > 1:
+        raise ValueError(
+            f"the run's rank records hold {counts} lines, so their forwards "
+            "do not pair up"
+        )
+    n = max(map(len, ranks), default=0)
+    starts = [max(_pull(x[i]) for x in ranks if i < len(x)) for i in range(n)]
+    dummy_ranks, peaks = group_dummies(ranks), group_peaks(ranks)
+    tails, prefills = group_tails(ranks), group_prefills(ranks)
+    stalled = launch_stalls(ranks) if launch_stall_on() else None
+    return [
+        (
+            ([], [])
+            if x and all(s["is_dummy_run"] for s in x)
+            else _label(
+                r,
+                x,
+                run,
+                starts,
+                split_rule,
+                dummy_ranks,
+                peaks,
+                tails,
+                prefills,
+                stalled=stalled,
+            )
+        )
+        for r, x in zip(records, ranks)
+    ]
+
+
+def _segments(s: dict, output: bool) -> dict:
+    """A line's host segments within its forward, in ns, as the module says:
+    `W_pre`, `W_launch`, and where it stamps them `W_inputs`, `W_recv`,
+    `W_post` (on a forward with `output`) and `E_out`."""
+    enter, (l0, l1) = s["t_enter_ns"], s["t_launch_ns"]
+    g0, g1 = s.get("t_gate_ns", (l0, l0))
+    r0, r1 = s.get("t_recv_ns", s.get("t_read_ns", (l1, l1)))
+    m0, m1 = s.get("t_mtp_ns", (l0, l0))
+    blocked = s.get("blocked_ns")
+    host = {"W_pre": g0 - enter + m0 - g1}
+    host["W_launch"] = r0 - l0 - sum((blocked or {}).values())
+    if "t_mtp_ns" in s:
+        host["W_inputs"] = l0 - m1
+    if "t_pp_recv_ns" in s:
+        host["W_recv"] = s["t_pp_recv_ns"][0] - l0
+    if output:
+        d0, d1 = s.get("t_draft_recv_ns", s.get("t_draft_read_ns", (0, 0)))
+        host["W_post"] = s["t_exit_ns"] - r1 - (d1 - d0)
+    if "t_pull_ns" in s:
+        host["E_out"] = s["t_pull_ns"] - s["t_exit_ns"]
+    return host
+
+
+#: The segments a dummy forward's `dummy_host` holds: those within its forward.
+DUMMY_SEGMENTS = ("W_pre", "W_inputs", "W_launch", "W_post")
+
+
+def _dummy_hosts(lines, peaks, tails) -> tuple:
+    """`Sample.dummy_host` of a rank's `lines`: each dummy forward at a step
+    its group prefills, its line holding a prefill row, with its view, the
+    group's fields from `peaks` and `tails` (`group_peaks`, `group_tails`), its
+    `DUMMY_SEGMENTS` in seconds and its line's launch features."""
+    from atom.compass.backends.step_linear import dummy_view
+
+    out = []
+    for s in lines:
+        rows = s.get("rows") or ()
+        if not (s["is_dummy_run"] and "t_launch_ns" in s and rows) or rows[0][2]:
+            continue
+        view = dummy_view(
+            BatchView(
+                (RequestShape(1, 1, False),),
+                moe_rows=s.get("moe_rows"),
+                moe_tokens=s.get("moe_tokens"),
+                dp_rank=s["dp_rank"],
+                group_max_tokens=peaks.get(s["step"]),
+                group_tail=s["step"] in tails,
+            )
+        )
+        view = dataclasses.replace(view, produces_output=s["produces_output"])
+        host = _segments(s, s["produces_output"])
+        host = {k: host[k] * 1e-9 for k in DUMMY_SEGMENTS if k in host}
+        out.append((s["step"], view, host, s.get("launch", {})))
+    return tuple(out)
+
+
+def _label(
+    record,
+    lines,
+    run,
+    starts,
+    split_rule,
+    dummy_ranks,
+    peaks,
+    tails=None,
+    prefills=None,
+    stalled=None,
+) -> tuple[list[Sample], list[dict]]:
+    """`label` of `record`'s `lines`, each `E` from `starts` at the line before;
+    `prefills` the steps its group prefills at (`group_prefills`), read from
+    the rank records beside it when None; `stalled` the steps cut as `STALLED`
+    (`launch_stalls`), none when None."""
+    path = Path(record)
+    steps = [s for s in lines if not s["is_dummy_run"]]
+    dummies = frozenset(s["step"] for s in lines if s["is_dummy_run"])
+    if not steps or "t_enter_ns" not in steps[0]:
+        raise ValueError(
+            f"{record} has no timed steps; a fit needs a real run's record"
+        )
+    if "d_busy_ns" not in steps[0]:
+        raise ValueError(
+            f"{record} has no device windows (`d_busy_ns`); a fit labels a step "
+            "by its device time"
+        )
+    (exposed, early), traced = _host_cut(lines), _traced(path)
+    copy = mtp_copy(lines)
+    mtp = any("d_target_ns" in s for s in steps)
+    window_prefill = _prefill_label() == "record" and not traced
+    paced = _paced(lines, mtp) if window_prefill else set()
+    key = path.with_suffix(".key.json")
+    config = read_json(key) if key.exists() else None
+    tbo = (config or {}).get("engine", {}).get("enable_tbo")
+    run = run or digest(record)
+    samples, table, prev, ranks = [], [], None, None
+    busy, admits = busy_gaps(lines), admissions(lines)
+    if prefills is None:
+        prefills = group_prefills(
+            [read_jsonl(p) for p in _peers(path)] if "moe_rows" in steps[0] else [lines]
+        )
+    duties = prefill_duties(lines, prefills)
+    dummy_host = ()
+    if dummies and not traced and "moe_rows" in steps[0]:
+        if dummy_ranks is None:
+            peers = [read_jsonl(p) for p in _peers(path)]
+            dummy_ranks, peaks = group_dummies(peers), group_peaks(peers)
+            tails = group_tails(peers)
+        dummy_host = _dummy_hosts(lines, peaks, tails or frozenset())
+    for i, s in enumerate(lines):
+        if s["is_dummy_run"]:
+            prev = s
+            continue
+        dp, tokens = "moe_rows" in s, s.get("moe_tokens")
+        split = s.get("tbo_tokens")
+        if dp and dummy_ranks is None:
+            peers = [read_jsonl(p) for p in _peers(path)]
+            dummy_ranks, peaks = group_dummies(peers), group_peaks(peers)
+            tails = group_tails(peers)
+        if dp and tokens is None:
+            if ranks is None:
+                ranks = [{t["step"]: t for t in read_jsonl(p)} for p in _peers(path)]
+            group = [r.get(s["step"]) for r in ranks]
+            tokens = group_tokens(group)
+            if tokens is not None and tbo:
+                if split_rule is None:
+                    raise ValueError(
+                        f"{record} step {s['step']} states no two-batch-overlap "
+                        "split under enable_tbo, and no split rule was given to "
+                        "rebuild it"
+                    )
+                split = split_rule(group)
+        view = BatchView(
+            tuple(RequestShape(q, c, bool(d)) for q, c, d in s["rows"]),
+            capture_rung=s["rung"],
+            moe_rows=s.get("moe_rows"),
+            draft_moe_rows=s.get("draft_moe_rows"),
+            draft_bs=s.get("draft_bs"),
+            draft_rows=s.get("draft_rows"),
+            target_bs=s.get("target_bs"),
+            produces_output=s["produces_output"],
+            tbo_tokens=None if split is None else tuple(map(tuple, split)),
+            moe_tokens=tokens,
+            dp_rank=s["dp_rank"] if dp else None,
+            group_dummies=dummy_ranks.get(s["step"], 0) if dp else 0,
+            group_max_tokens=peaks.get(s["step"]) if dp else None,
+            group_needs_eager=s.get("group_needs_eager", False),
+            group_tail=dp and s["step"] in (tails or ()),
+            prefill_duty=duties[i],
+            kda=tuple(s["kda"]) if "kda" in s else None,
+        )
+        cut = None
+        # An untraced prefill labelled from its own window (`PREFILL_LABEL_ENV`):
+        # its MTP target's, or with no speculative decode the whole window.
+        windowed = (
+            view.prefill
+            and "b_target_ns" not in s
+            and ("d_target_ns" in s or not mtp)
+            and window_prefill
+        )
+        if view.prefill and view.decode:
+            cut = "mixed"
+        elif not view.prefill and s["step"] in exposed:
+            cut = "exposed"
+        elif not view.prefill and traced:
+            cut = "traced"
+        elif view.prefill and "b_target_ns" not in s and not windowed:
+            cut = "untraced"
+        elif windowed and s["step"] in paced:
+            cut = "paced"
+        elif stalled and s["step"] in stalled:
+            cut = STALLED
+        elif mtp and "d_target_ns" not in s:
+            cut = "unsplit"
+        gap = 0 if view.prefill else s.get("d_gap_ns", 0)
+        device = None if cut else (gap + s["d_busy_ns"]) * 1e-9
+        draft = propose = draft_kv = passes = None
+        if not (cut or view.prefill or s["step"] in early or DRAFT_PASSES not in s):
+            passes = tuple(p * 1e-9 for p in s[DRAFT_PASSES])
+        if "d_target_ns" in s:  # an MTP record: the target alone, no gap
+            target = s["d_target_ns"]
+            if view.produces_output:  # the pass precedes forward_done_event
+                draft_kv = s.get("d_draft_kv_ns")
+                target += draft_kv or 0
+            device = None if cut else target * 1e-9
+            draft = (s["d_busy_ns"] - target) * 1e-9
+        if windowed and not cut:  # its own window, as an MTP decode's above
+            propose = s.get("d_propose_ns") if view.produces_output else None
+        elif view.prefill and not cut:  # a trace run's busy time
+            target, draft = s["b_target_ns"], s.get("b_draft_ns")
+            draft_kv = s.get("b_draft_kv_ns") if view.produces_output else None
+            target += draft_kv or 0
+            device = target * 1e-9
+            draft = None if draft is None else (draft - (draft_kv or 0)) * 1e-9
+            propose = s.get("b_propose_ns") if view.produces_output else None
+        enter, blocked = s["t_enter_ns"], s.get("blocked_ns")
+        host = _segments(s, host_kind(view) != "middle")
+        if copy.get(s["step"], (0, False))[1]:
+            host["L_mtp"] = copy[s["step"]][0]
+        idle = prev is not None and not busy[i]
+        if prev is not None and not idle:
+            host["E"] = enter - starts[i - 1]
+        host = {} if traced else {k: v * 1e-9 for k, v in host.items()}
+        provenance = {
+            "source": "record",
+            "run": run,
+            "requests": [r[0] for r in s["batch"]],
+            "config": config,
+        }
+        if windowed and not cut:
+            provenance["prefill_label"] = "record"
+        samples.append(
+            Sample(
+                s["step"],
+                s["dp_rank"],
+                view,
+                device,
+                cut,
+                host,
+                idle,
+                provenance,
+                None if cut or s["step"] in early else draft,
+                None if cut or propose is None else propose * 1e-9,
+                dummies,
+                None if cut or draft_kv is None else draft_kv * 1e-9,
+                admits[i],
+                s.get("launch", {}),
+                None if blocked is None else {k: v * 1e-9 for k, v in blocked.items()},
+                {} if cut else s.get("floor", {}),
+                passes,
+                dummy_host,
+            )
+        )
+        gap_ns = s.get("d_gap_ns")
+        table.append(
+            {
+                "step": s["step"],
+                "d_busy_s": s["d_busy_ns"] * 1e-9,
+                "d_gap_s": None if gap_ns is None else gap_ns * 1e-9,
+                "launch_exposed": s["step"] in exposed,
+                "idle": idle,
+                **{k: host.get(k) for k in (*HOST_SEGMENTS, "W_inputs", "E_out")},
+                "label_s": device,
+                "draft_s": draft,
+                "cut": cut,
+            }
+        )
+        prev = s
+    return samples, table
+
+
+def write_table(record, table: list[dict]) -> Path:
+    """Write `table`, `label`'s rows for `record`, beside it; return its path."""
+    path = Path(record).with_suffix(".cost.jsonl")
+    lines = [{"version": TABLE_VERSION}, *table]
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    return path

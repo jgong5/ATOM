@@ -1,0 +1,354 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+"""The projection a cost backend is priced from: one row per scheduled request.
+
+`BatchView` and `RequestShape` live in `atom.compass.backends` because the scan
+that forbids engine imports reads that package and nothing else. This module is
+their other half and does the opposite: it reads a scheduled batch and the
+runner's graph-capture ladder, and turns them into those two types. Keeping the
+builder here is what lets it read the engine at all.
+
+**The row count.** `BatchView` cannot tie its row count to the number of
+requests a scheduler scheduled, so `batch_view` builds one row per entry of
+`ScheduledBatch.num_scheduled_tokens`, each with the `N_KV` ATOM computed when
+it built the batch, `ScheduledBatch.context_lens`.
+
+**The rung.** The type refuses a `capture_rung` with no decode rows and one
+narrower than the decode row count. It cannot refuse one that is far too wide,
+because rows cannot contradict a width -- only a ladder of captured widths can
+-- so a width supplied by a caller is charged at face value, and one decode row
+at `capture_rung=10**9` prices 99.9999999 s of graph padding. Nothing here
+takes a width from a caller. `ForwardMode.decide` is the rule ATOM dispatches a
+real step by, and its answer is taken whole: `running_bs` where it says a graph
+replays, `None` where it says one does not. A prefill step, an eager runner and
+a batch wider than the widest captured size therefore all come back `None` from
+that one call rather than from three conditions restated here. `decide` finds
+the width by binary search and so has a precondition -- an ascending ladder --
+which is checked here rather than assumed, because an unsorted ladder answers a
+width that is not the smallest captured one holding the batch, and too wide is
+the direction the type cannot refuse.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import torch
+
+from atom.compass.backends.shape import BatchView, RequestShape
+from atom.compass.runner.overrides import RunnerRefusal
+from atom.utils.forward_context import ForwardMode
+
+
+def _rung(mode: ForwardMode) -> int | None:
+    return int(mode.running_bs) if mode.use_cudagraph else None
+
+
+def is_dummy(batch: Any) -> bool:
+    """Whether `batch` is an idle DP rank's dummy forward: one flagged
+    `is_dummy_run`, or, as ATOM's `dummy_execution` builds it since ROCm/ATOM
+    main b7b5ec3f2, a batch that schedules no request, every row it runs
+    padding, its phase and width the group's (`ForwardMode.decide`)."""
+    return bool(batch.is_dummy_run) or not batch.total_seqs_num
+
+
+def _tbo_tokens(batch: Any, mode: ForwardMode) -> tuple | None:
+    """The two-batch-overlap split the group runs, per micro-batch each rank's
+    tokens: a prefill's as its exchange agreed it; a decode the group splits,
+    which casts no vote (`ForwardMode.decide` splits its `running_bs`), as
+    ATOM cuts it (`cut_decode_ubatches`), each micro-batch the same running
+    tokens on every rank."""
+    if mode.sync is None:
+        return None
+    if mode.is_prefill or not mode.tbo_collective_active:
+        return mode.sync.ub_tokens_across_dp
+    from atom.utils.tbo.ubatch_splitting import cut_decode_ubatches
+
+    lengths = np.asarray(batch.num_scheduled_tokens[: mode.scheduled_bs])
+    ranks = len(mode.sync.scheduled_tokens_per_dp_rank)
+    cut = cut_decode_ubatches(mode.running_bs, mode.running_tokens, lengths)
+    return tuple((ub.running_tokens,) * ranks for ub in cut)
+
+
+def _dummy_row(batch: Any, mode: ForwardMode) -> RequestShape:
+    """The row an empty dummy is priced and recorded as, as the one fabricated
+    request the dummy ran before: a decode of the step's spec width
+    (``num_spec_step + 1`` tokens over as many) while the group decodes, a
+    one-token prefill row while a peer prefills, the one padding request a
+    group with no request forwards."""
+    if mode.sync is not None and mode.sync.any_rank_has_prefill:
+        return RequestShape(1, 1, False)
+    q = int(getattr(batch, "num_spec_step", 0) or 0) + 1
+    return RequestShape(q, q, True)
+
+
+def dp_group() -> Any:
+    """The DP group's CPU group: the one `ModelRunner.prepare_model` hands `decide`."""
+    from aiter.dist.parallel_state import get_dp_group
+
+    return get_dp_group().cpu_group
+
+
+def dummy_ranks(batch: Any, mode: ForwardMode) -> int:
+    """How many ranks of the step's data-parallel group run a dummy forward,
+    this one among them when `batch` is its dummy; 0 on one rank.
+
+    ATOM's DP sync carries no dummy flag: a dummy reports one token, as a rank
+    decoding one request does. So the group sums each rank's `is_dummy_run`
+    over its CPU group, a collective of the simulated step's own that every
+    rank of the group runs once before pricing, as it runs `decide`'s.
+    """
+    if mode.sync is None or len(mode.sync.scheduled_tokens_per_dp_rank) < 2:
+        return 0
+    flag = torch.tensor([int(is_dummy(batch))], dtype=torch.int32)
+    torch.distributed.all_reduce(flag, group=dp_group())
+    return int(flag.item())
+
+
+def forward_mode(batch: Any, runner: Any) -> ForwardMode:
+    """The step's shape, settled by `ForwardMode.decide` as the real runner settles it.
+
+    Under data parallelism this runs the step's collective, `sync_dp_metadata`,
+    on the DP group, so every rank calls it once per step, as the real forward
+    does; the group's rung and token counts come back from it.
+
+    `tbo_on`, `tbo_decode` and `local_tbo` are what `ModelRunner.prepare_model`
+    passes: the config's `enable_tbo` and `enable_tbo_decode`, and the runner's
+    own `_local_tbo_eligibility`, which rides the collective, so the group
+    agrees the two-batch-overlap split a real run agrees. The other arguments
+    that do not reach the rung are passed at their inert values: `decide`
+    settles a query length as well, and that is what `is_block_drafter` feeds.
+    The width and the replay decision come from `capture_sizes`,
+    `enforce_eager`, the attention builder's `step_needs_eager`,
+    `tbo_decode_graphs`, the batch and the collective alone; the group's running tokens land in the runner's own
+    `running_tokens_per_dp_rank`, as the real forward's do.
+    """
+    dp_size = _data_parallel_size(runner)
+    tbo_on = runner.config.enable_tbo
+    ladder = np.asarray(runner.capture_sizes_np, dtype=np.int32)
+    if bool(np.any(ladder[1:] < ladder[:-1])):
+        raise RunnerRefusal(
+            f"the capture ladder {ladder.tolist()} is not ascending, which is "
+            "the precondition of the binary search `decide` resolves the rung "
+            "with; out of order it answers a width that is not the narrowest "
+            "captured one holding this batch, and a rung too wide is the one "
+            "direction the rows cannot contradict"
+        )
+    return ForwardMode.decide(
+        batch=batch,
+        dp_size=dp_size,
+        dp_group=dp_group() if dp_size > 1 else None,
+        enforce_eager=bool(runner.enforce_eager),
+        step_needs_eager=runner.attn_metadata_builder.step_needs_eager(batch),
+        capture_sizes=ladder,
+        is_block_drafter=False,
+        tbo_on=tbo_on,
+        local_tbo=(
+            runner._local_tbo_eligibility(batch) if tbo_on else (False, False, 0, 0)
+        ),
+        max_seqlen_q=batch.num_spec_step + 1,
+        running_tokens_per_dp_rank=runner.running_tokens_per_dp_rank,
+        tbo_decode=bool(runner.config.enable_tbo_decode),
+        tbo_decode_graphs=runner.tbo_decode_graphs,
+    )
+
+
+def _data_parallel_size(runner: Any) -> int:
+    """How many ranks `decide` would settle a rung across, or a refusal.
+
+    Absent, zero, negative or `False` is refused rather than read as one,
+    the set ATOM's `ParallelConfig` refuses too. A runner shaped differently
+    from the engine's own would otherwise be priced as a single rank on a
+    default nothing checked; zero or a negative width would pass the `> 1`
+    test in `forward_mode` as the single-rank case.
+    """
+    parallel = getattr(getattr(runner, "config", None), "parallel_config", None)
+    size = getattr(parallel, "data_parallel_size", None)
+    if size is None or size < 1:
+        raise RunnerRefusal(
+            "this runner states no width in "
+            f"`config.parallel_config.data_parallel_size` (it reads {size!r}), "
+            "and a rung is one rank's answer or a group's depending on it; "
+            "reading that as 1 is the guess this would have to make to carry on"
+        )
+    return int(size)
+
+
+def batch_view(
+    batch: Any, mode: ForwardMode, runner: Any, dummies: int = 0
+) -> BatchView:
+    """The projection a worker builds: it holds the batch and not the sequences.
+
+    A row's kind is the convention `ModelRunner.prepare_inputs` reads: the
+    first `total_seqs_num_prefill` rows are prefill. The rung and the MoE
+    gather's rows come from `mode`, the step's one `forward_mode`; a
+    data-parallel runner handed a mode with no group counts is refused.
+    Whether the step produces output is `ScheduledBatch.produces_output`, and
+    the TBO split is the collective's `ub_tokens_across_dp`, a group of one's
+    too, since ATOM splits one rank's step by the same rule; a data-parallel
+    rank's slot in it is the config's `data_parallel_rank`. A data-parallel rank's
+    `is_dummy_run` batch is its `dp_dummy`, a step some rank prefills its
+    `group_prefills`, and `dummies`, the group's dummy forwards as
+    `dummy_ranks` sums them, its `group_dummies`: a caller that does not run
+    that collective, as a recording real run does not, passes none. The most
+    tokens any rank scheduled is its `group_max_tokens`. A single
+    rank reads none of the collective's other counts, though `decide` returns
+    them for a group of one. Every rank, a lone one too, reads the
+    collective's `any_rank_needs_eager`, whether an attention backend refused
+    the step a graph, as its `group_needs_eager`.
+
+    The MoE gather's rows follow `running_tokens_are_unified`, as
+    `FusedMoE.forward_impl_graph` does. Every rank decoding, the padded
+    `all_gather` carries `running_tokens` rows from each rank, the group's
+    agreed height, under `enforce_eager` too. Otherwise (a rank prefilling) the
+    variable-length gather carries each rank's own count. An MTP drafter's
+    first pass runs each rank's target token stream unpadded, so its gather is
+    always the variable-length one (`EagleProposer.propose`); a block drafter
+    pads its passes to the group and is left out. Its later passes run at
+    `running_bs`, on any step, when it declares a draft graph, else at the
+    rows (`draft_bs`), where the gather carries each rank's rows (`draft_rows`):
+    every rank decoding, its tokens over a row's query, every row's alike; else
+    at least the widest rank's rows and one each peer, an idle one's dummy. A
+    drafter of one draft (`mtp_k`) has no later passes.
+
+    A target that replays no graph pads to it too (`target_bs`): an eager
+    decode every rank decodes in, its inputs; a sampling prefill, its LM head.
+
+    A model with KDA layers states its step's state work (`kda`, `kda_counts`).
+    """
+    draft_moe_rows = moe_tokens = dp_rank = draft_bs = target_bs = draft_rows = None
+    group_max_tokens = None
+    drafter = getattr(runner, "drafter", None)
+    if getattr(drafter, "step", None) is not None:  # `EagleProposer`'s pass
+        draft_bs = int(mode.running_bs)
+    prefill = batch.total_seqs_num_prefill
+    if not mode.use_cudagraph and (
+        batch.produces_output() if prefill else mode.running_tokens_are_unified
+    ):
+        wider = mode.running_bs > len(batch.num_scheduled_tokens)
+        target_bs = mode.running_bs if wider else None
+    if _data_parallel_size(runner) == 1:
+        moe_rows = None
+    elif mode.sync is not None and len(
+        mode.sync.scheduled_tokens_per_dp_rank
+    ) == _data_parallel_size(runner):
+        dp_rank = runner.config.parallel_config.data_parallel_rank
+        gathered = moe_tokens = int(mode.sync.scheduled_tokens_per_dp_rank.sum())
+        group_max_tokens = int(mode.sync.scheduled_tokens_per_dp_rank.max())
+        if mode.running_tokens_are_unified:
+            moe_rows = _data_parallel_size(runner) * mode.running_tokens
+        else:
+            moe_rows = gathered
+        if drafter is not None and not drafter.is_block_drafter:
+            draft_moe_rows = gathered
+            if draft_bs is None and drafter.mtp_k > 1:
+                draft_rows = (
+                    gathered
+                    // (
+                        int(batch.num_scheduled_tokens[0])
+                        if len(batch.num_scheduled_tokens)
+                        else _dummy_row(batch, mode).query_tokens
+                    )
+                    if mode.running_tokens_are_unified
+                    else mode.sync.max_bs_across_dp + _data_parallel_size(runner) - 1
+                )
+    else:
+        raise RunnerRefusal(
+            "this rank is one of a data-parallel group and its forward mode "
+            "states no scheduled_tokens_per_dp_rank for that group, so the MoE "
+            "segment has no gathered row count to be priced from"
+        )
+    rows = zip(batch.num_scheduled_tokens, batch.context_lens)
+    shapes = tuple(
+        RequestShape(int(q), int(c), i >= prefill) for i, (q, c) in enumerate(rows)
+    )
+    if not shapes and group_max_tokens is not None:
+        # An empty dummy reports no token to the DP sync, where the fabricated
+        # one counted its row: the group's peak holds that row, as it did.
+        group_max_tokens = max(group_max_tokens, _dummy_row(batch, mode).query_tokens)
+    return BatchView(
+        shapes or (_dummy_row(batch, mode),),
+        capture_rung=_rung(mode),
+        moe_rows=moe_rows,
+        draft_moe_rows=draft_moe_rows,
+        draft_bs=draft_bs,
+        target_bs=target_bs,
+        produces_output=batch.produces_output(),
+        tbo_tokens=_tbo_tokens(batch, mode),
+        image_tokens=image_tokens(batch, runner),
+        moe_tokens=moe_tokens,
+        dp_rank=dp_rank,
+        dp_dummy=dp_rank is not None and is_dummy(batch),
+        group_dummies=dummies if dp_rank is not None else 0,
+        draft_rows=draft_rows,
+        group_prefills=dp_rank is not None and not mode.running_tokens_are_unified,
+        group_max_tokens=group_max_tokens,
+        group_needs_eager=mode.sync is not None and mode.sync.any_rank_needs_eager,
+        group_tail=(
+            dp_rank is not None
+            and mode.sync is not None
+            and mode.sync.max_final_requests_across_dp > 0
+        ),
+        kda=kda_counts(batch, runner),
+    )
+
+
+def kda_counts(batch: Any, runner: Any) -> tuple[int, ...] | None:
+    """`BatchView.kda` of `batch`, for a runner whose model has KDA layers
+    (`step_linear.kda_layers`), else None: the one count a real record and a
+    simulated run both read off the scheduled batch.
+
+    The rows holding a state are `ScheduledBatch.state_rows`; the midstep
+    checkpoints its forward writes, each of `state_save_all`'s positions; the
+    forks, the rows whose `state_fork_srcs` names a slot to read from; and the
+    moves, its `state_maintenance_ops`' relocations, checkpoint stores and
+    restores, which the attention builder runs before the forward. The
+    recurrence's chunk padding is the rows' (`step_linear.kda_columns`).
+    """
+    from atom.compass.backends.step_linear import kda_layers
+
+    if not kda_layers(getattr(getattr(runner, "config", None), "hf_config", None)):
+        return None
+    ops = getattr(batch, "state_maintenance_ops", None)
+    moves = sum(
+        len(getattr(ops, name, ()))
+        for name in ("relocations", "checkpoint_stores", "checkpoint_restores")
+    )
+    return (
+        len(getattr(batch, "state_rows", ())),
+        sum(len(saves) for saves in getattr(batch, "state_save_all", ())),
+        sum(1 for src in getattr(batch, "state_fork_srcs", ()) if src >= 0),
+        moves,
+    )
+
+
+def image_tokens(batch: Any, runner: Any) -> int:
+    """The image rows a step's forward handles, as `ModelRunner.run_model`
+    handles them. With embedding spans, a payload still carrying pixel values
+    encodes every span on this chunk, even one that fills none; a later chunk
+    fills the spans it overlaps. Without spans, the image's embeddings sit at
+    the model's image token; a batch with no multimodal data has none."""
+    media = getattr(batch, "multimodal_data", None)
+    if not media:
+        return 0
+    from atom.model_engine.multimodal_runtime import embedding_indices
+
+    count, offset = 0, 0
+    for req, length, end in zip(
+        batch.req_ids, batch.num_scheduled_tokens, batch.context_lens
+    ):
+        length, data = int(length), media.get(req)
+        if data is not None and "embedding_spans" in data:
+            spans = data["embedding_spans"]
+            if "pixel_values" in data:
+                count += sum(rows for _, rows in spans)
+            else:
+                count += len(embedding_indices(spans, int(end) - length, length)[0])
+        elif data is not None:
+            image = runner.config.multimodal_config.image_token_id
+            mine = batch.scheduled_tokens[offset : offset + length]
+            count += int(np.count_nonzero(mine == image))
+        offset += length
+    return count

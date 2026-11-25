@@ -1,0 +1,1654 @@
+# ATOM Compass — Design Topic 4: Model Capture and the Cost IR
+
+**Status:** reviewed and approved, 2026-09-20. Drafted by an AI assistant during a design
+interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
+written against it yet; implementation follows the execution plan in `16`.
+
+**Revised 2026-10-14 by the naming record in
+[#952](https://github.com/jgong5/ATOM/issues/952):** the cost model has two granularities,
+step-level and op-level, and no fallback crosses them (D17); a stated node's terms
+carry the `declared` method (D21).
+
+**Revised 2026-10-18 by the owner's
+[ruling on #531](https://github.com/jgong5/ATOM/issues/531#issuecomment-6244543796):** MORI
+dispatch and combine overlap the other micro-batch's compute under TBO, and `JoinPolicy`
+has no `exclusive` value (D19).
+
+**Revised 2026-10-18 by the owner's
+[bench, band and capture ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252):**
+capture is concrete, one graph per decode width and prefill (T, B) that `trace ops` is
+given or that a record directory's steps hold (D17, D18, D19); each leaf carries a contract, its arguments by schema
+slot with each tensor's stride, role, preshuffled, host and pageable marks, and a raw Triton or FlyDSL launch lifts to its
+innermost ATOM function (D20).
+
+**Revised 2026-10-19 by #1401's capture of DeepSeek-V4-Pro:** capture runs ATOM's two MoE
+wrappers, and the DP gathers and MORI dispatch and combine are declared nodes (D20, D21).
+
+**Revised 2026-10-20 by the owner's [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811),
+as #1812 and #1813 built it:** a raw Triton or FlyDSL launch lifts to the function that
+issues it, its arguments taken at call entry, objects kept in pickle's reduce shape,
+nested launching calls folded into the outermost; an `op_graph` is keyed by the step
+law's engine config less its ladder (D20).
+
+**Revised 2026-10-21 by the owner's
+[ruling on #1812](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6304727730):**
+each traced step follows two untraced steps of its shape (D20).
+
+**Revised 2026-10-21 by [#1270](https://github.com/jgong5/ATOM/issues/1270):** under a
+drafter, a step that samples is captured as two graphs, its target's and its drafter's, cut
+where ATOM records `forward_done_event`, and the op-level backend tags the drafter's terms
+`draft` (D18).
+
+**Revised 2026-10-30 by [#2345](https://github.com/jgong5/ATOM/issues/2345):** a block
+drafter's draft-KV pass on a step that samples is a third graph, priced among the target's
+terms (D18).
+
+**Revised 2026-10-31 by [#2560](https://github.com/jgong5/ATOM/issues/2560):** a mono
+runner binds and builds its widths under capture as its deployment does; a refusal the
+deployment makes too traces the original path and is declared, and any other bind or build
+failure is refused by name (D18).
+
+**Depends on:** `02_model_runner_and_cost_backend.md` (the backend plug point this fills),
+`03_memory_and_kv_model.md` (the activation term this supplies).
+
+**Scope.** What a model looks like to Compass: how it is captured without a device, what
+intermediate representation the cost is computed over, and which parts of a step that
+representation cannot see. Covers both granularities of the cost model.
+
+---
+
+## D17. Two granularities, and how they compose
+
+### Problem
+
+A single cost model cannot be both cheap enough to run per step over a 300-second
+workload and detailed enough to explain a tile cliff. The project needs both: quick
+simulation for exploring a configuration space, and operator-level accuracy for the
+acceptance gates.
+
+### Decision
+
+**Two granularities behind one `CostBackend` interface (`02` D11)**, a property of the
+backend (`backends/base.py::Granularity`); each term a backend returns carries its own
+method.
+
+| | step-level | op-level |
+|---|---|---|
+| Input | features `ScheduledBatch` already carries | a concrete operator graph, captured at the step's decode width or prefill (T, B) |
+| Form | a closed form over `tokens`, `Sum N_Q^2`, `Sum N_Q*N_KV`, `Sum ctx`, rung padding, its coefficients stated (`StepStubBackend`) or fitted (`StepLinearBackend`); or a measured grid (`StepGridBackend`, `17`) | sum over priced nodes, with a stated per-leaf parameter extractor |
+| Construction cost | none | one capture per **shape**, 7.6 s on Qwen3.8-27B TP1 |
+| Per-step cost | microseconds | target: one layer body, not 2,999 operators |
+| Used for | sweeps, structure discovery, M1 plumbing | acceptance cells |
+
+No fallback crosses the two (#952). An op-level backend covers a shape it has not
+captured by a lazy trace, and an unpriced leaf by its analytical law (`02` D11). A capture
+that fails is an error and the run exits; with lazy trace disabled an uncaptured shape is
+a refusal.
+
+### The composition, which is the point
+
+**The step level is the discovery mechanism for the op level.** Drive ATOM's real scheduler
+device-free with a step-level backend, log the structure key and shape per step in a
+record directory, and capture exactly the distinct shapes its steps hold (`trace ops
+--population`). The step table needed already exists — predict mode records
+`num_scheduled_tokens`, `context_lens`, `req_ids` and the scheduler's own decision per
+step.
+
+This is also why hand-written admission arithmetic is forbidden. A prior attempt to
+re-derive `Scheduler.schedule()`'s Phase 1/Phase 2 plus `_chunked_prefill_size` omitted
+`_finalize_prefill_chunk`'s `checkpoint_cut`, the `BlockManager`, preemption and the
+pool — which change *which requests coexist*, not just chunk sizes — and so was not
+conservative in either direction. Measured against the real classes it under-counted
+prefill steps 3 vs 8 on one cell and over-counted width 5 seqs vs 4 on another.
+
+A second consequence: **a step-level form can eventually be *derived* from the op level**,
+and then it has stated provenance instead of being a separately-fitted thing that can
+disagree with the fine one for unknown reasons. Not required for M1; recorded as the
+intended direction (T8). Capture is concrete (D18), so there is no closed-form step-cost
+expression to take it from; how it would be derived is part of T8.
+
+### Open issues
+
+- The structure count is expected to be small — prior evidence gives unchunked prefill at
+  **319 operators**, chunked prefill at **356**, and decode as **one** structure across
+  all eleven CUDA-graph rungs (*"330 operators, 19 distinct kinds, one identical operator
+  multiset at every rung"*). But nobody has enumerated it for the hybrid 27B, and on the
+  27B a symbolic decode capture needed five graphs across B = 2 to 512 (D18). The number
+  of graphs is the number of distinct shapes captured, since capture is concrete.
+- Whether a step-level backend's fitted coefficients and the op-level priced sum should be required to
+  agree, and what to do when they do not.
+
+---
+
+## D18. Capture mechanism
+
+### Problem
+
+The IR needs an operator list with shapes, taken without a GPU, for a configuration
+that may never have been run.
+
+### Options
+
+**A. `TorchDispatchMode` + `FakeTensorMode(shape_env=ShapeEnv())` + `torch._C._EnablePythonDispatcher()`.**
+
+**B. `torch.export` + `Dim`.**
+
+**C. Concrete traces at the shapes that actually occur** (decode = the capture ladder,
+prefill = the enumerable chunk sizes).
+
+**D. Concrete trace plus shape-family synthesis** — the prior `synth_shapes` rule,
+"rewrite any leading dimension equal to the traced token count".
+
+### Evidence gathered
+
+Route A was built and validated on this exact stack (torch 2.10.0+rocm7.2.4). One
+symbolic trace at hint T=17, substituted, against a fresh concrete trace at each point:
+
+| T | symbolic prediction | concrete trace | |
+|---|---|---|---|
+| 2 | 197,632 | 197,632 | exact |
+| 17 | 1,745,152 | 1,745,152 | exact |
+| 64 | 7,340,032 | 7,340,032 | exact |
+| 512 | 117,440,512 | 117,440,512 | exact |
+| 4096 | 4,697,620,480 | 4,697,620,480 | exact |
+
+`FLOPs(T) = 256*T^2 + 98304*T`, zero guards installed.
+
+**Route D is unsound, measured.** Two-point fitting mispredicted **3 of 11 dimensions**
+at a held-out point: quadratic (`T*T`), **ceil-division (`ceil(T/16)`, 9.5x off — and two
+sample points straddling a block boundary hide it entirely, since the fit then reports a
+constant)**, and saturating (`min(T, cap)`). All three are load-bearing in paged attention
+and chunked prefill. The prior one-point rule is a weaker version of the same thing.
+
+### Decision
+
+**Option C, through option A's mechanism: `TorchDispatchMode` + `FakeTensorMode`, at
+concrete shapes.** Revised 2026-10-18 by the owner's
+[capture ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252),
+which replaces option A's symbolic capture. One graph is captured per decode width and per
+prefill (T, B) that `trace ops` is given or that a record directory's steps hold (`07`
+D38, Phase 1a), device-free, and no
+graph answers a shape it was not captured at, so route D's synthesis is never needed.
+`torch.export` is recorded as an unverified alternative in D18.1.
+
+Why concrete, measured on Qwen3.8-27B TP1 on the PoC behind that ruling: symbolic decode
+needed **five** graphs for B = 2 to 512 anyway, cut by ATOM's implementation switches
+(17/18, 73/74, 128, 292/293, 512), and a symbolic prefill T specialises at an assert on
+`cu_seqlens_q` in the attention builder; one concrete capture takes **7.6 s**, 2.2 s of
+it the traced forward, and a concrete prefill (T = 512) **6.9 s**.
+
+### One symbol: a DP prefill's gathered rows
+
+Revised 2026-11-09 by the owner's
+[ruling on #2956](https://github.com/jgong5/ATOM/issues/2956#issuecomment-6742702610).
+Under DP a graph is keyed by G, the rows the step's MoE gathers (`07` Phase 1a), and a
+simulated DeepSeek-V4-Pro DPA-TP8 prefill meets a G no real run met at most steps: at
+#975's c=256 cell, 4,259 new (T, B, G) over 612 (T, B), 130 of them new, about 5 h of
+concrete traces against 76 min real. So a run's lazy trace of a DP prefill with no drafter
+holds G as one symbol, `ir.G`, and its graph is keyed by (T, B) alone, with the width W a
+sampling prefill's LM head pads to where it pads past B (`capture.forward.symbolic_shape`). The symbol is a backed `SymInt` made where the peer
+stand-in builds the gathered rows or MORI's received rows (`capture/peers.py`); a size
+that is G itself is recorded as `ir.G`, any other symbolic size refuses the record.
+Route A's specialization detector runs on it: a symbol the shape env replaced by a value
+refuses the record, and the guards the trace installed on G are the record's
+applicability, each read back true at its hint (`forward._guards`).
+
+ATOM keeps each rank's rows in numpy (`DPMetadata.running_tokens_per_dp_rank`), which
+carries the hint and never the symbol, so in place of the fourth discipline's census each
+(T, B) is traced at both ends of G's range, from a prefilling peer's one row past T to
+each peer at `max_num_batched_tokens` (`forward.Tracer.symbolic`). The two records must
+agree once G and each DP exchange's `sizes`, restated by the stand-in's split
+(`peers.split`), are put at either end; the check compares operators, not guards, since a
+guard holding a hint-derived constant differs by construction. The upper end is traced
+first, after the warm-up steps any trace runs, and the lower end follows it at the same
+(T, B) with none of its own. The upper end's record is kept, MORI's trim guarding G at most
+its hint, with the paths that hold G (`peers.slots`). A step's G inside the hints that the guards
+admit is put into the record (`peers.at`), copying only what holds G; any other G, and
+every G of a (T, B) whose ends differ (`forward.PerG`, named with the first difference in
+the run summary's `lazy_per_g`), is traced concretely as before. `trace ops --symbolic`
+traces the same graph ahead of a run for each prefill (T, B) of a record's steps, so only
+a (T, B) no record holds is traced on a run's step path. The probe behind the ruling put such records at 60 of 60 G
+across five configurations, V4-Pro, V4.1-Flash and Qwen3-235B-A22B, gather and MORI, each
+byte-identical to a full trace once `sizes` was restated.
+
+### Route A's four disciplines: the record of the symbolic capture
+
+They bind no concrete capture. They are kept because they are what a symbolic capture,
+if one is wanted again, must hold, and each was measured; the fake-tensor material after
+them still applies.
+
+Three of them keep the *tracing* symbolic and are listed here; the fourth is about
+what the **engine around the trace** does to a symbol, needs the FakeTensor material
+below to state, and is therefore a section of its own -- "A fourth discipline: the
+engine's host arithmetic asks a symbol for a number". A reader who stops at the end of
+this numbered list has three of four.
+
+1. **`torch._C._EnablePythonDispatcher()` is not optional.** Without it, `torch.matmul` on
+   ndim>2 is a C++ CompositeImplicitAutograd decomposition that calls non-symbolic
+   `sizes()`; the ShapeEnv resolves it by installing `Eq(s52, 17)` and the graph is
+   concrete from there. No error, no warning. The resulting cost model is **linear where
+   the model is quadratic**: **8.44x wrong at T=512, 46x wrong at T=4096.**
+2. **Post-trace assertions.** `assert not shape_env.replacements` is the specialization
+   detector. Then check every entry of `shape_env.guards` is one you intended, assert the
+   output shapes still carry free symbols, and call `shape_env.freeze()` so a later
+   accidental guard is an error rather than a silently widened artifact.
+3. **Trace at a hint >= 2.** A dimension whose trace-time hint is 1 is **silently
+   specialized to a constant**. Decode steps have `num_tokens == 1` per sequence, so
+   tracing one yields a fully constant graph with no warning. Trace at >= 2 and
+   substitute T=1 afterwards; that evaluates correctly.
+
+Plus one from an earlier era that still holds: **trace at step >= 2.** Triton autotunes on
+a kernel's first launch. Tracing step one recorded **90,838 operators** against step two's
+**101**; `chunk_fwd_kernel_o` alone appeared **34,269 times**.
+
+### FakeTensor, not bare meta
+
+A `FakeTensor` is a meta tensor plus a device tag, a `ShapeEnv` hookup, stride and
+memory-format propagation, and an op cache.
+
+| | `device='meta'` | `FakeTensor` |
+|---|---|---|
+| `x.device.type` | `'meta'` | **`'cuda'`** |
+| Reaches a `register_fake` impl | yes | yes |
+| **Symbolic shapes** | **no** | **yes** |
+| Mixing with real weights | must convert everything | `allow_non_fake_inputs=True` |
+| `__enter__` probes CUDA | no | **yes** |
+
+Symbolic shapes were route A's decisive reason — `ShapeEnv` attaches to `FakeTensorMode`,
+and bare meta put it back on the unsound route D. The device tag is the reason that holds
+for a concrete capture:
+ATOM registers its ops at `dispatch_key="CUDA"` (`atom/utils/custom_register.py::direct_register_custom_op`) and
+the model and runner branch on device throughout; under meta that code takes paths nobody
+runs. The prior work felt this directly — *"meta accepts kernels real devices reject"*
+(AITER's fused qk-rmsnorm takes fp16/bf16 only, yet meta traced happily at fp32, so model
+dtype has to be pinned from the config, not from torch's default).
+
+**What FakeTensor does not fix: `torch.cuda.*` module-level calls.** The device tag is on
+tensors, not on the namespace. This is why a meta ModelRunner was rejected outright —
+**62 `torch.cuda.` sites in `model_runner.py`**. Stubs are required:
+
+```python
+torch.cuda.is_available  = lambda: True     # must be True, see below
+torch.cuda.device_count  = lambda: 1
+torch.cuda._lazy_init    = lambda *a, **k: None
+torch.cuda.get_rng_state = lambda *a, **k: torch.zeros(16, dtype=torch.uint8)
+torch.cuda.set_rng_state = lambda *a, **k: None
+```
+
+`is_available()` must report **True**. Reporting False makes `FakeTensorMode.__enter__`
+take its `avoid_device_init` path, which calls `_ensureCUDADeviceGuardSet()` and probes
+the driver anyway. Measured both ways on a host with a wedged driver: False hangs, True
+completes.
+
+Three FakeTensor traps, each of which silently produces a wrong artifact:
+
+1. **Build the real tensor outside the mode, then `from_tensor`.** Allocating inside
+   `with fm:` yields an already-fake **static** tensor and `from_tensor` becomes a no-op —
+   you get plain `int` shapes with no indication anything went wrong.
+2. **Weights need `from_tensor(w, static_shapes=True)`** or they are symbolized too.
+3. The torch 2.10 signature is
+   `symbolic_context=StatelessSymbolicContext(dynamic_sizes=[...])`, not `dynamic_dims=`.
+
+### A fourth discipline: the engine's host arithmetic asks a symbol for a number
+
+Route A only, like the three above: a concrete capture has no symbol to ask.
+
+The three disciplines above keep the *tracing* symbolic. They are not enough on a real
+engine, because **`SymInt.__index__` and `SymInt.__int__` are `guard_int`.** Every
+host-side use of a step's width -- filling a staging buffer's numpy view, slicing a list,
+checking a count -- asks for a number, gets the symbol's trace-time hint, and *records the
+ask as `Eq(s, hint)`*. The graph is constant from there, with no error and no warning.
+Many ATOM lines do this in one decode forward, and **repairing them one at a time does not
+converge**: closing one hands the symbol to whichever line reaches it next.
+
+**The conversion is not the defect; the recording is.** A host fill genuinely needs a
+number, and the number it needs is the hint, which is the count the engine computed. So a
+symbolic capture keeps the conversion and replaces the guard with its own log -- every
+conversion, with the line it happened on -- and asserts that log, as a multiset of
+`(line, conversions)`, against a stated set. A log nothing compares records a conversion
+at a new line and says nothing. **`__bool__` stays untouched**, so a branch on a width
+still installs its guard and a step whose shape decides which path the engine takes still
+records that it did.
+
+ATOM's decode step needs more answers on the capture side:
+
+- **`SymInt.__hash__`** is answered with the hint and logged: aiter's greedy top-k caches
+  a tensor per row count, and hashing a symbol otherwise raises.
+- **Block-table padding** compares the padded width with the batch's own host rows, and is
+  handed the hint.
+- **Raw FlyDSL launches**, like raw Triton ones, never enter the dispatcher; they are
+  recorded and skipped, so the inventory is diagnostic.
+
+**What the symbol has to be attached to is the batch, not the buffers.** A staged buffer's
+dimensions are engine capacities, not a function of the step, so none is symbolised. The
+width is set on the `ScheduledBatch` and the engine derives every bound from it. A decode
+step is one query row per sequence, so its token count and its sequence count are **one**
+symbol; two would have to be equated later, which is the specialisation again by a longer
+route. The one exception is `ScheduledBatch.__init__`, which compares the staged token
+array's length against the count and so solves the width by comparison rather than
+conversion: the capture builds the batch at the concrete width and rebinds its count
+fields afterwards.
+
+**One place the width is not free: the H2D publication.** `atom/utils/h2d.py` checks each
+staged count with `operator.index` and copies with the number that returns, so its copies
+take the hint; the view it hands back carries the symbol. The digest below leaves the
+publication's operators out by name.
+
+**The evidence that the symbol is free, rather than a hint in disguise.** The engine
+computes its host values from the hint, so a graph built this way would still be a graph
+about one width if any dimension had taken the hint instead of the symbol, and nothing in
+a census would say so. The step is therefore traced at **two** widths, at **each** group
+width the result is claimed at, and the inventories compared operator for operator and
+shape for shape with the symbol's name set aside. They must be identical. The digest
+covers operator names and tensor shapes only, not scalar arguments, dtypes or strides, so
+a value-level difference shows only in the distinct-operator sets.
+
+Pinned by `tests/compass/test_capture_real_model.py`, which holds the measured sites, the
+declared conversion set and the guards.
+
+### The gating cost turned out to be small
+
+An operator with no fake/meta impl is a **hard stop**, not a degradation:
+`RuntimeError: There was no fake impl registered for <CustomOpDef(...)>`.
+
+aiter has **314 `@compile_ops` decorations and only 83 with `gen_fake`**. But **every
+ATOM-registered opaque op already carries a `fake_impl`** — `moe_forward`,
+`unified_attention_with_output_base`, `linear_attention_with_output_base`,
+`maybe_dual_stream_forward`, `v4_attention_with_output`, `v4_attn_compress`,
+`v4_qk_norm_rope`, `indexer_score_topk`, `tbo_all_reduce`, both `topK` ops, both
+`kimi_k3` ops. ATOM had to write them for Dynamo; Compass inherits them.
+
+That composes with D20: **the trace stops at the opaque leaf** (the two MoE wrappers
+aside, D20), which is where 60-75% of
+the step time lives and exactly where a parameterized price is wanted anyway. The ~231
+fake-less aiter ops sit *inside* those leaves and are never reached.
+
+### Collectives at TP>1 — measured, and the group is not what the trace needs
+
+> **Provenance — measured under a capture that has since been withdrawn.** Every count in
+> this section was taken with the fake-tensor capture module that PR #10 added under
+> `atom/compass/capture/`, driven by scripts that were never committed and writing JSON
+> records that no longer exist. That module and its tests have been withdrawn from the
+> tree, so **none of the numbers below was reproducible here**. They are kept because they
+> are the specification a replacement capture is written from, not because they can be
+> re-run; anything that builds on them re-takes them first.
+>
+> **Partly re-taken since, by `tests/compass/test_capture_real_model.py`.** That test
+> traces the 27B at both widths through a group of the honest width, and agrees with the
+> 27B row on what it is a claim about rather than on its totals: at TP2 it records
+> `aiter.all_reduce_` **129** — 128 row-parallel at `communication_op.py::tensor_model_parallel_all_reduce` plus the
+> vocab-parallel one at `embed_head.py::VocabParallelEmbedding.forward`, the 128 predicted from the config's layer
+> types and not read off the inventory — one all-gather at `embed_head.py::ParallelLMHead.forward`, and one
+> broadcast, plus two `_c10d_functional.wait_tensor` entries that belong to the
+> substitution below rather than to ATOM. The raw Triton traffic agrees exactly:
+> **33 launches across 3 kernels**. The operator totals do
+> **not** match and are not expected to: they are 2,521 at TP1 and 2,662 at TP2 against
+> 2,471 and 2,611 here, on a decode step of two sequences at a block size and a batch
+> budget this file never recorded, which is the reason a total is not the assertion.
+>
+> **The TP2 inventory is conditional on two stated substitutions, and every number in
+> the paragraph above inherits them.** `ATOM_USE_CUSTOM_ALL_GATHER=0` selects the
+> non-custom vocab-parallel gather: it is a **non-default** ATOM path, and a default TP2
+> deployment takes the `ca_comm` custom gather, which is not what was traced — with the
+> default the forward dies on `ca_comm` after roughly 2,500 operators, so this is the
+> difference between a run that refuses part-way and one that completes. Second, the four
+> call sites reaching `c10d`'s legacy in-place collectives are routed to their functional
+> forms, which is where every `_c10d_functional.*` entry, including both `wait_tensor`s,
+> comes from; only the 129 `aiter.all_reduce_` are ATOM's own dispatch.
+>
+> **The gather's shapes — both arrangements, each read off the live call.** ATOM hands
+> `all_gather_into_tensor` an output buffer of `(world_size,) + input_size`, measured as
+> `[2, 2, 124160]`; the functional substitute concatenates the `[2, 124160]` input along
+> dim 0 into `[4, 124160]`, and the shim reshapes that into ATOM's buffer. `[4, 124160]`
+> is therefore the **substitute's** arrangement and not the 27B's. An earlier revision of
+> this paragraph gave it as the 27B's output shape, and gave it from the width rather
+> than from any record: the dispatched operator carries only its input, so nothing
+> recorded a destination shape at all until the test began recording both.
+
+The open issue *"whether ATOM's real model classes trace cleanly under this mode at
+TP>1"* is **answered yes**, on two models at both widths, with the collectives in the
+inventory rather than substituted away.
+
+> **These are DIAGNOSTIC inventories.** Every run below was taken with raw
+> `@triton.jit` launches recorded and **not executed** -- 33 launches across 3 kernels on
+> the 27B decode -- so anything downstream of a skipped kernel read uninitialised fake
+> memory, and each record carries `diagnostic_inventory: true`. The operator and
+> collective counts are an enumeration of what a step reaches. They are **not** a cost
+> model input at any width.
+
+| model | TP1 | TP2 | collectives recorded at TP2 |
+|---|---|---|---|
+| Qwen3.8-27B (hybrid; vision tower, linear attention) | 2,471 ops / 33 distinct | 2,611 / 38 | `aiter.all_reduce_` **129**, functional all-gather 1, broadcast 1 |
+| Qwen3-0.6B (dense MHA) | 389 / 17 | 457 / 23 | `aiter.all_reduce_` **57**, functional all-gather 1, broadcast 1 |
+
+Both widths complete a full decode step. The 27B's TP1 inventory is identical
+operator-for-operator to the TP1 record taken through `apply_simulated_tp`, so the TP2
+difference is attributable to width rather than to a different capture. The 0.6B's 57 is
+28 layers x 2 row-parallel linears plus 1 vocab-parallel reduce, which its parameter
+geometry predicts independently. A third model with a different collective pattern,
+Qwen3-30B-A3B, was attempted and is not reachable on this stack: `AutoConfig` rejects the
+checkpoint before any capture code runs.
+
+**Why no process-group substitution is required.** The collective ATOM issues at TP>1
+goes through a **registered custom operator with a registered fake implementation** —
+aiter's `all_reduce_`. Under `FakeTensorMode` the fake answers and the body that needs a
+device communicator is unreachable, so the operator is recorded with its real shapes
+having allocated and communicated nothing. It does not need the group to exist at all:
+called with a group name that does not, it still returns the input's shape.
+
+**The exception, which is not the group either.** Four call sites reach
+`torch.distributed`'s legacy entry points instead — the non-custom `all_gather`,
+`gather`, `broadcast`, and the `barrier` in `allocate_kv_cache`. On this stack those
+`c10d::*` operators carry a backend kernel and **neither a `Meta` nor a
+`CompositeExplicitAutograd` one**, so `FakeTensorMode` raises
+`UnsupportedOperatorException` rather than producing a meta operation. The functional
+forms do carry a kernel it can run, and give the same shapes — a `[2, 124160]` input
+gathers to `[4, 124160]` as one recorded collective. This is the same fact as the
+`c10d.broadcast_` gap, measured to be general rather than particular to `broadcast`.
+
+A width-N group inside one process is available from torch's own `fake` backend and needs
+no peer. What one process cannot build is the **transport**: the device communicator opens
+a collective rendezvous that waits for absent ranks, as does the message-queue
+broadcaster, so both have to be declined when the group is built.
+
+Declining the device communicator is **not free**, and the earlier claim that nothing
+reaches it once the group exists is wrong. ATOM's default `ATOM_USE_CUSTOM_ALL_GATHER`
+takes `embed_head.py::ParallelLMHead.forward`'s vocab-parallel gather down the custom path, which asserts on
+`device_communicator.ca_comm` and fails with `'NoneType' object has no attribute
+'ca_comm'` after 2,588 operators. The runs above therefore set
+**`ATOM_USE_CUSTOM_ALL_GATHER=0`**, selecting the non-custom gather; that is a stated
+configuration of the capture and belongs in the record beside the device readings. It is
+the whole difference between the run that fails at 2,588 and the one that completes at
+2,611.
+
+The test that enumerated both operator sets by name — so that a future torch growing a
+meta kernel for one of the legacy forms would fail there rather than leave unexplained
+code behind — was withdrawn along with the capture module it exercised. Nothing on this
+tree holds either set in place today.
+
+### A drafter's step: target and drafter cut at `forward_done_event`
+
+Under a drafter (`--method mtp`), a step that samples runs the target forward, the
+rejection sampler and the sampling, records `forward_done_event`, then runs the drafter:
+`num_speculative_tokens` passes of its MTP layer in sequence, each through the target's
+shared embedding and LM head and a greedy pick. The parity record splits the measured
+device window at that event (`d_target_ns`, [#1208](https://github.com/jgong5/ATOM/pull/1208)),
+and a step-level law prices the two parts apart (`StepCost.draft_seconds`,
+[#1565](https://github.com/jgong5/ATOM/pull/1565)). Capture cuts at the same point
+([#1270](https://github.com/jgong5/ATOM/issues/1270)):
+
+- **A decode shape is a verify step.** Each row schedules K + 1 tokens, K of them stated
+  drafts, as ATOM's scheduler builds the batch, and the batch is not a dummy run, since
+  ATOM scores drafts only on a real step. The MTP status and draft ids the runner reads
+  back from the device read as zeros: nothing computed them, and no shape depends on them.
+- **Two graphs per step that samples.** The recorder marks the cut when the runner records
+  `forward_done_event`. What precedes it is the target's graph, keyed as before: its
+  engine config names the drafter's method and width; what follows is the drafter's, the
+  same key plus `draft`. Sampling and the rejection sampler are the target's, as in the record.
+- **Priced apart.** The op-level backend prices the drafter's graph at the step's shape,
+  under DP at the rows the drafter's first pass gathers (`draft_moe_rows`: every rank's
+  verified tokens, unpadded), and tags each of its terms `draft` (`draft op.<kind>`), so
+  `StepCost.draft_seconds` is the drafter's and `target_seconds` the target's. A decode's
+  default G counts each row's drafts, `dp x width x (drafts + 1)` (`Shape.at`).
+- **A padded decode's drafter at its rows.** A decode of fewer rows than its rung replays
+  the target at the rung, but `EagleProposer.propose` runs the drafter's first pass
+  eagerly on the target's real tokens, the rows' `drafts + 1` each, and its later passes,
+  a row a sequence, at the rung (`running_bs`) when it declares a draft graph, at the
+  rows otherwise (MRoPE, one draft). The drafter's graph is keyed by both, `decode T=<rows>
+  B=<rung>`: `--population` captures it from the rows' batch, its later passes at the
+  rung, and publishes the drafter's half alone, as the target ran at the rung
+  ([#1961](https://github.com/jgong5/ATOM/issues/1961)). Its default G is every rank's
+  rows' tokens.
+- **Later passes at `running_bs` on every step.** `ForwardMode.decide` sets `running_bs`
+  on every step, replayed or not: the ladder's rung of the group's widest batch, or that
+  batch itself off the ladder and under `enforce_eager`. So a sampling prefill, a decode
+  beside a prefilling DP peer and an eager DP decode run their drafter's later passes
+  past their rows too. The step's view states that batch as `draft_bs` (the record line
+  too) for a drafter that declares a draft graph. A decode's drafter is then keyed
+  `decode T=<rows> B=<draft_bs>`, a sampling prefill's `prefill T=<tokens> B=<rows>
+  W=<draft_bs>`; `--population` captures each and publishes the drafter's half alone
+  ([#1982](https://github.com/jgong5/ATOM/issues/1982)).
+- **A target padded without a replay is read at its width.** Two targets run at
+  `running_bs` with no graph: a decode every rank of whose DP group decodes, which
+  `ModelRunner._padded_decode_inputs` widens to `running_tokens` while its sampler keeps the
+  rows, and a sampling prefill, whose LM head reads `cu_seqlens_q`
+  padded to `running_bs + 1`. The view states that batch as `target_bs` (the record line
+  too); the target is keyed `decode B=<rows> W=<target_bs>`, its default G the group's
+  padded gather, or `prefill T=<tokens> B=<rows> W=<target_bs>`. A capture runs each
+  shape on a ladder of its one width (`W`, else `B`), so `decide` settles `running_bs`
+  as the real step did, for the target and the drafter's later passes alike. It
+  publishes a target at `W` only from the step that samples (a DP middle chunk's is read
+  at its rows), and a decode's drafter only from its own shape
+  ([#2033](https://github.com/jgong5/ATOM/issues/2033)).
+- **A middle chunk is cut where its draft-KV pass starts.** ATOM runs that pass
+  (`compute_draft_kv`) after every target forward of a real step, a middle chunk's included,
+  and a middle chunk records no `forward_done_event`. Under a drafter a prefill shape is
+  therefore traced as a real step's batch, each row stating its next token as ATOM's
+  scheduler does, and the middle chunk is cut where the pass starts, as the parity record
+  stamps `d_target_ns` there ([#1585](https://github.com/jgong5/ATOM/pull/1585),
+  [#1874](https://github.com/jgong5/ATOM/issues/1874)). Under DP ATOM skips that pass on
+  an all-middle-chunk batch and runs the drafter's propose for its collectives
+  (`propose_draft_token_ids(..., align_only=True)`), all `mtp_k` passes; the cut is where
+  that starts, as the parity record stamps `d_propose_ns` there
+  ([#1991](https://github.com/jgong5/ATOM/issues/1991)). Its passes 2+ run at
+  `running_bs`, so its drafter is keyed `W=<draft_bs>` as a sampling prefill's is, and
+  `--population` captures that width's middle chunk too, drafter half alone
+  ([#2053](https://github.com/jgong5/ATOM/issues/2053)). A GDN prefill under ReplaySSM counts
+  its live state slots with a boolean index, a size no fake tensor holds; the host-staged
+  slot indices bind it.
+- **A block drafter's draft-KV pass is a third graph.** A block drafter (DSpark) runs its
+  draft-KV pass after the target's forward and before its sampling, so before
+  `forward_done_event` on a step that samples ([#1607](https://github.com/jgong5/ATOM/pull/1607)).
+  Capture marks both ends of the pass there, as the parity record stamps `d_draft_kv_ns`:
+  the target's graph is what runs outside it up to the event, the pass is its own graph,
+  the target's key plus `draft kv`, and the drafter's graph is its propose after the event
+  ([#2345](https://github.com/jgong5/ATOM/issues/2345)). The op-level backend reads the
+  pass's graph at the target's shape and prices it among the target's terms, named
+  `draft_kv op.<kind>`: the step's output waits for it, so it is in `D_target` (`01` D4),
+  as the step linear law prices it ([#2080](https://github.com/jgong5/ATOM/issues/2080)).
+  A middle chunk's pass starts its drafter's graph, as any drafter's does.
+
+The drafter's roofline is not its measured time. On #1208's MTP1 record
+(Qwen3.5-35B-A3B-FP8, TP1, MI308X) the drafter's roofline is 0.39 of the measured draft at
+p50, 342 us against 874 us; the LM head's weight read is 232 us of it. The rest is time no
+leaf's roofline holds, and the op level fits no residual
+([#1489](https://github.com/jgong5/ATOM/issues/1489)).
+
+### A mono decode binds and builds as its deployment does
+
+A mono runner (`atom/mono/runtime`), DeepSeek-V4.1's mono decode among them, is created on
+its model's first eligible decode step and builds each step width on that width's first
+step (`route.LazyRunner`, `widths.WidthBuilds`). Both are collective over the TP group,
+and a capture's group is one process. Capture stands in for what needs a peer or a device
+(`capture.forward._mono`, [#2560](https://github.com/jgong5/ATOM/issues/2560)):
+
+- **The consensus runs on the host.** `consensus.tp_agree` all-reduces a flag it builds with
+  `torch.tensor`, which inside the fake mode leaves `item()` a data-dependent guard on a
+  fake. It runs outside the fake mode and the recorder, as the step's DP exchange does, and
+  over the fake group agrees with this rank: every rank of a capture is this one.
+- **The peer buffer has no device.** `lifecycle.owned_peer_buffer` gets
+  `capture.driverless.PeerBuffer`: the regions the runner asks for, on the declared
+  device, with no IPC heap and no handle exchange.
+- **A width compiles for real.** Capture's FlyDSL entries record a launch and compile
+  nothing, so the build's `compile.scratch_bytes` would find no binary and mono would
+  decline the width. A width's kernels compile compile-only at the declared arch, through
+  FlyDSL's own entries and outside the modes; their scratch is read off their binaries,
+  and capture logs it.
+- **A refusal is the deployment's or the capture's.** A bind check's `MonoUnsupported` and
+  a kernel that needs scratch are refusals the deployment makes too: the step traces the
+  original path, and the `declared` of each graph whose steps it turned away names it under
+  `mono`. Any other bind failure, which `consensus.bind_agreed` converts to a refusal, and
+  any build failure, which `WidthBuilds.prepare` logs and declines, stop the capture by
+  name: the deployment does
+  not fail there, so it runs mono, and the original path is not its step.
+
+Past its bind and its builds, a mono runner's launches lift by the lift rule (D20).
+
+### Open issues
+
+- Whether any op on the forward path **outside** an opaque leaf lacks a fake impl. One
+  class of them is now measured -- the legacy `c10d::*` collectives above. The rest is
+  expected to be small; unmeasured.
+
+---
+
+## D18.1. `torch.export` — recorded as an unverified alternative
+
+Not chosen. Recorded because it is genuinely attractive and the reasons against it are
+specific enough to re-examine later.
+
+**What it would give**
+
+- **Refuses rather than silently specializing.** `UserError: Constraints violated (T3)! ...
+  Suggested fixes: T3 = Dim('T3', max=128)`. On the 0/1 case: *"You marked Tg as dynamic
+  but your code specialized it to be a constant (1)"*. This is the opposite failure mode
+  from route A's, and the safer one.
+- The Python dispatcher is enabled for you, so the 46x trap cannot be forgotten.
+- `node.meta['val']` is documented per-node shape/dtype metadata; `range_constraints` is a
+  documented domain readout; `unbacked_bindings` handles data-dependent symbols.
+- An `ExportedProgram` is a serializable, diffable, versionable artifact.
+- The FX graph **is** a def-use graph, which is most of what the activation liveness walk
+  needs to reconstruct by hand.
+- `run_decompositions()` works on this stack once the `torch.cuda` stubs above are in
+  place, and custom ops **survive** decomposition as single opaque nodes. Two structurally
+  different readouts of the same exported program produced identical FLOP expressions.
+
+**Why it was not chosen**
+
+1. **Decomposition changes the thing being priced.** The objection raised by the project
+   owner, and it is sound in two ways. It adds a third representation on top of the
+   existing eager-vs-compiled gap, with its own fidelity to establish. More seriously, it
+   can **shatter an opaque leaf**: custom ops survive, but aten composites do not, so
+   `aten.linear` lowering to `mm` + `add` would price at a different granularity than the
+   fused hipBLASLt GEMM that actually runs. The whole leaf-pricing design rests on the
+   trace boundary coinciding with the tuned-kernel boundary, and decomposition moves it.
+2. **It captures a model call, not an engine step.** ATOM's step is `ModelRunner.forward`
+   -> `prepare_model` (attention metadata build, H2D staging, `ForwardMode.decide` with a
+   cross-DP all-reduce) -> `run_model` -> `postprocess` (sampler, rejection sampler,
+   logprobs). The prior work found tracing had to go **through the runner, not the model**,
+   because `model(input_ids, positions)` fails at `fwd_ctx.context.is_dummy_run` —
+   attention reads a forward context only the runner establishes.
+3. Dynamo must get through the model end to end; a graph break is a hard failure rather
+   than a degradation.
+4. Stream annotations are not in FX metadata, and whether Dynamo traces stream ops is
+   unverified. Route A can record `torch.cuda.current_stream()` per node directly, which
+   D19 needs for `Par`.
+
+**When to re-examine:** if route A's three silent-failure disciplines prove hard to keep,
+or if the hand-written def-use reconstruction becomes a maintenance burden.
+
+---
+
+## D19. The IR
+
+### Problem
+
+A flat operator list is the obvious IR and it fails three ways. The prior work's flat
+`OpGraph` held **2,999 operators** for the 27B, pricing cost ~39 ms per step summing
+~2,440 operator prices, and it could only answer for the exact shape it was traced at.
+
+### Decision
+
+**Hierarchical, concrete, stream-annotated.** Concrete since 2026-10-18 by the owner's
+[capture ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252):
+a graph holds one shape (D18), and a node's arguments are its contract (D20).
+
+```
+Graph   := (applicability, Region)
+Region  := Seq[Node] | Repeat(body: Region, count: int) | Par([Region], join: JoinPolicy)
+Node    := Op(name, kind, args: {slot: Arg}, out_shapes: [Shape],
+              stream_id, context_ref, stated: {name: Value})
+Arg     := Tensor(shape, dtype, stride, role, shuffled, host, pageable) | Value | ModuleRef(path)
+role    := activation | weight | KV | metadata
+shuffled := bool, ATOM's `is_shuffled` mark on a preshuffled weight
+host    := bool, whether ATOM holds the tensor on the host; an `op_graph` states
+           `"device": "cpu"` on a host tensor alone, and a tensor stating none is on
+           the device
+pageable := bool, whether ATOM keeps a host tensor in memory it did not ask to pin;
+           an `op_graph` states `"pageable": true` on such a tensor alone, and a host
+           tensor stating none is pinned
+```
+
+### `Repeat` — the efficiency property
+
+An LLM forward is a prologue, N layer bodies, and an epilogue. `Repeat` prices the body's
+operators once and **reuses those prices** for every instance — the same prices, in the
+same order, added the same way. What is reused is the body's sequence of per-operator
+prices, re-emitted in order once per instance, and not a body total; it does not multiply
+a body price by the count. Float addition is not associative, so multiplying re-associates,
+and it reproduces the recorded price in **none of the three shapes measured**: eight
+identical layers, 3.2e-05 s multiplied against 3.200000000000001e-05 s recorded; a
+four-block pattern repeated twenty times, 0.00036 against 0.0003600000000000009; six
+instances of 0.1 s, 0.6000000000000001 against 0.6. Reuse reproduces all three exactly.
+
+For Qwen3.8-27B that is 64 layers collapsing to roughly two bodies —
+**48 `linear_attention` and 16 `full_attention`**, `full_attention_interval: 4` — plus
+embedding and the head.
+
+This is the direct attack on the per-step replay cost, which is what actually threatens
+the >=5x speed gate. Measured previously, device-free, against a 32.7 ms modelled step:
+41.7 ms uncached, ~39 ms of it summing prices; 2.3 ms with a shape-keyed cache (**and
+unsound**, see below); 4.3 ms once the key carried the bound allocation.
+
+> **Why a shape-only price cache is unsound.** `signature_of` reads each operator's
+> `context`, and `context` is where the binder writes this step's `slot_mapping` and
+> state indices. A second valid allocation for the same shape moved **64 of 2,439**
+> signatures and took a step from 32.667 ms over 2,424 priced operators to 28.360 ms over
+> 2,376 — 48 operators priced under one allocation are unpriced under the other. A
+> shape-only cache answers the first number, with a complete-coverage claim, for a step
+> that is neither.
+
+**`Repeat` must be validated, not assumed.** Derive flat, group, and compare the two forms
+**term by term, in order** — not total against total. A step cost is reported as a
+breakdown, one row per term, so individual prices are read downstream and not only their
+sum; two forms agreeing on the sum while disagreeing on a term disagree in what gets
+reported. Measured: one instance priced one bit above the others left the two forms
+bit-identical in total, so the elementwise comparison refuses that grouping and a
+total-only one accepts it. Layer 0 often differs structurally; per-layer quantization
+scales differ without differing in cost; a hybrid's layer types interleave rather than
+block.
+
+### `Par` — concurrency
+
+The concurrency taxonomy in ATOM is exactly three shapes and only one belongs inside a
+graph:
+
+| Shape | Example | IR treatment |
+|---|---|---|
+| compute \|\| compute, fork/join, graph-captured | dual-stream MoE; V4 compressor + indexer | **`Par`** |
+| compute \|\| collective, two micro-batches, CPU-baton-serialized compute | TBO | **not** a `Par` — two graphs interleaved, modelled one level up |
+| step-crossing async | D2H sampled ids, PP isend, KV offload | not a node; a latency annotation at the step boundary |
+
+`JoinPolicy` (`atom/compass/ir/nodes.py`) has `max` and `resource_bound`, because `max()`
+is wrong once both branches are compute-heavy:
+
+- **`max`** — branches small, device not saturated. The V4 source states its own case:
+  *"side streams ~25us, main Q/KV chain ~87us"*, so the join is free.
+- **`resource_bound`** — both branches compute-heavy: `max(t_a, t_b, (w_a + w_b) / peak)`.
+
+**MORI dispatch and combine do not hold the whole device.**
+`MoriPrepareAndFinalize._get_dispatch_config`
+(`atom/model_ops/fused_moe/mori_prepare_finalize.py`) launches `min(128, get_cu_num())`
+blocks at 16 warps in prefill and `min(64, get_cu_num())` at 4 warps in decode. The cap at
+the CU count exists because both kernels spin on a grid-wide barrier that needs all of
+their own blocks co-resident (on an 80-CU MI308X, 128 blocks deadlock). On MI355X (256
+CUs) a prefill dispatch launches 128 blocks, half its CUs, and a decode dispatch launches
+64 blocks, fewer than either device's CUs. Without TBO `prepare` and `finalize` run them
+in order on the one stream, a `Seq`. Under TBO ATOM takes one of two paths, and both
+overlap the other micro-batch's compute:
+
+- **Comm stream** (MORI's default `high-throughput` mode, or `low-latency` across nodes):
+  `_prepare_async_comm_stream` and `_finalize_async_comm_stream` yield to the other
+  micro-batch, then run `dispatch` and `combine` on the comm stream at
+  `_get_dispatch_config`'s block count.
+- **Split send and receive** (`--all2all-backend low-latency` within one node,
+  `_use_split_send_recv`): `_prepare_async_ll` and `_finalize_async_ll` issue
+  `dispatch_send` or `combine_send` on the compute stream and yield; the other
+  micro-batch's thread issues the matching `dispatch_recv` or `combine_recv` at its next
+  MoE prepare or finalize, or as it exits. No comm stream and no `_get_dispatch_config`.
+
+On the comm-stream path a TBO step is priced by laying both micro-batches' operators on
+the compute and comm streams in ATOM's order and taking the finish time, the DP group's
+`max` kept (owner's
+[ruling on #531](https://github.com/jgong5/ATOM/issues/531#issuecomment-6244543796)).
+That price cannot see the split path's overlap: `UBatchWrapper` hands both micro-batches
+one compute stream, so each send and the partner's matching receive lie in order on it,
+and the overlap is the transfer in flight between them, which no stream carries. A TBO
+step on the split path is refused by name (`08` D50.1) until that transfer has a price.
+
+**The tracer has to earn a `Par`.** `torch.cuda.stream()` and `wait_stream()` are not
+dispatcher events — a dispatch trace records a *serial* operator list for work the device
+runs concurrently. So the tracer records `torch.cuda.current_stream()` as a field on every
+node and hooks `Event.record` / `wait_event` / `wait_stream` for the edges. `Par` is then
+**derived** from stream ids rather than stated.
+
+**Staging.** In M1 and in M2's first gate every node carries one stream id and `Par`
+never materialises: Qwen3.8-27B is dense-MLP (no `num_experts`, no `shared_expert`) so
+dual-stream MoE cannot fire; it is not MLA so there is no metadata `prep_stream`; TBO
+defaults off and needs `--enable-tbo` plus `--enable-dp-attention` plus >=2 GPUs; and PP
+asserts `enforce_eager` so it cannot coexist with CUDA graphs. **DeepSeek-V4-Pro populates
+`Par` in M2**, on both nodes of each nightly 1P+1D cell in `recipes/mesh/DeepSeek-V4.md`.
+Only the DPA cells pass `--enable-dp-attention`, and only their prefill node adds
+`--enable-tbo`.
+
+- **Decode, in every cell, runs without TBO.** Inside the replayed graph,
+  `DeepseekV4Attention.maybe_compressors_async` forks the compressors onto `alt_stream`
+  and `indexer_stream`, and `MoE` runs the shared expert on `alt_stream` against the
+  routed experts whenever this rank's tokens <= `ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`
+  (1024 by default) — i.e. **every decode step** at the cells' concurrencies. The shared
+  expert stays unfused because it is FP8 and the routed experts FP4.
+- **Prefill never forks the compressors**: it runs eager, and the compressor fork needs
+  `fc.in_hipgraph`, which only decode graph capture sets. A prefill step is one of:
+  - **a TBO step** (DPA cells only), taken when some DP rank reaches
+    `ATOM_TBO_PREFILL_MIN_TOKENS` (8192 by default) and every rank can split
+    (`local_tbo_precompute`, `atom/utils/tbo/ubatching.py`): two microbatches alternate
+    between a compute and a comm stream joined by events, and `tbo_active()` keeps the
+    shared-expert fork off;
+  - **any other step with at most 1024 tokens on this rank**: `maybe_dual_stream_forward`
+    forks the shared expert in eager mode, a `Par` on the prefill node;
+  - **any other step**: one stream.
+
+So `Par` is defined now and populated at M2, from its first DeepSeek-V4-Pro step.
+
+### Concrete shapes, and what no capture buys
+
+A graph is captured at one decode width or one prefill (T, B) (D18), so its cache key is
+the shape and a step's cost is the sum of its leaves' prices at that shape. A step-cost
+closed form over symbols is not built. Three things no capture buys, stated so nobody
+expects them:
+
+- **Shapes do not make cost smooth.** GEMMs cliff **2.4x between M=768 and M=1024**
+  (`MT256x1...` -> `MT256x2...`), and prefill attention sits on plateaus quantised in
+  sequence length with a step of ~2.27 us/token at `ceil(L / 2530)`. A cost function over
+  shapes must be piecewise and dispatch-band aware (`09` D60).
+- **`Ctx` is a multiset, and row order is an unstated treatment.** At one fixed 32-row
+  context multiset, row **order alone** moves measured decode attention across **1.77x**
+  (grouped-descending 276.1 us, grouped-ascending 292.2 us, alternating 376.5 us,
+  ladder-interleaved 489.5 us). KV-pool footprint, co-residency, shape and launch-wave
+  packing were all refuted as causes. Every candidate feature is a function of the
+  multiset and therefore blind to this. A corpus that mixes orderings is fitting an
+  unstated treatment.
+- **Data-dependent shapes stay unknown.** MoE per-expert token counts depend on the
+  router, which a capture does not run. A balance assumption has to be stated; ATOM's
+  `fake_eplb` is the hook.
+
+### Applicability: no branches in the IR
+
+A trace is a straight-line record of one path at one shape, so branch modelling lives
+**outside** the graph as an applicability key, matched by equality, in two parts:
+
+| Part | Covers |
+|---|---|
+| **discrete key** | `ForwardMode`, `has_cached`, `produces_output()`, spec width, replayed vs eager, `tbo_on`, attention backend, routed-expert kernel path (aiter or Triton), `is_dummy_run` |
+| **shape** | the decode width, or the prefill (T, B), the graph was captured at |
+
+ATOM already emits most of the discrete key: `atom/model_engine/run_labels.py` builds
+`prefill[bs=... tok=... ctx=...]` / `decode[bs=117/128 ... spec=...]` and appends `tbo=1`
+driven by `forward_context.ubatch_slices is not None`.
+
+Every branch ATOM takes on a shape was taken at capture, at that shape, so the graph needs
+no guard domain: its path is ATOM's own control flow, which cannot drift from itself, and
+a step whose key and shape no graph holds is captured lazily or refused (D17) rather than
+mispriced. One graph is the exception: a DP prefill's that holds G (D18) carries the G
+range its two traces span and the guards its trace installed on G, and answers only a G
+both admit.
+
+### `Repeat` must nest, and must tolerate a non-contiguous pattern
+
+The obvious form of `Repeat` — one layer class, N identical instances, contiguous — is
+what a dense decoder looks like and not what real models are. They break it in two
+distinct ways, and the IR has to carry both or it silently flattens back to a linear `Seq`
+and loses the compression that makes pricing cheap.
+
+**Way 1 — prologue and epilogue.** The first and last layer routinely differ: a dense
+first layer in an otherwise-MoE stack, a different attention variant on layer 0, a final
+norm fused into the last block. These break a naive run-length scan over the whole body.
+
+**Way 2 — hierarchical and non-contiguous repetition.** A model may interleave layer
+classes on a period, and repeat *that period*. Concretely:
+
+```
+sub-pattern P  =  LayerClassA x3  then  LayerClassB
+global pattern =  P x20
+```
+
+Nothing about this is exotic — it is how hybrid attention/SSM stacks, MoE-every-k-layers
+schedules and shared-expert variants are laid out. A flat run-length encoder sees
+`AAABAAAB...` and produces either 80 singleton groups or 20 groups of 4, never the
+nested form, and in both cases the `Repeat` body it emits is no longer a single
+priceable structure.
+
+**The IR change is small; the detection is the work.** `Repeat` already takes a *body*,
+so the representation is sufficient the moment the body is allowed to be a composite and
+`Repeat` is allowed to nest:
+
+```
+Seq[
+  Block(embed),
+  Block(layer_0_dense),                    <- prologue, a plain sibling
+  Repeat( n=20, body = Seq[                <- outer period
+            Repeat( n=3, body=Block(A) ),  <- inner run
+            Block(B),
+          ] ),
+  Block(layer_last),                       <- epilogue
+  Block(norm), Block(lm_head),
+]
+```
+
+Three rules make this well-formed rather than merely expressible:
+
+1. **A `Repeat` body is any node**, including a `Seq` and including another `Repeat`.
+   No arity or depth limit; in practice depth 2 covers everything seen.
+2. **`Repeat` carries the index binding it varies over**, so a body whose cost depends on
+   layer index (KV cache offsets, per-layer expert counts, a sliding-window pattern that
+   changes period) prices per instance rather than being assumed uniform. Without this,
+   nesting is a lie: `Repeat(20, P)` claims 20 identical `P`s.
+3. **Grouping is an optimisation and must be provably free.** `Repeat` is only emitted
+   where the flattened and grouped forms price identically, term by term; otherwise the
+   node stays a `Seq`. This is already **T6**, and the nested form makes it load-bearing
+   rather than a nicety — a wrong nesting is a systematic error multiplied by the repeat
+   count.
+
+**Detection algorithm.** Bottom-up run-length encoding over a *canonical block
+signature*, not over the module name:
+
+1. Give every top-level block a signature = the hash of its leaf op sequence with its
+   shapes, layer index excluded. Two blocks with the same signature are
+   interchangeable for pricing.
+2. Run-length-encode the signature string. This finds Way 1 for free (the prologue and
+   epilogue are runs of length 1 and simply stay as siblings) and finds contiguous runs.
+3. Re-encode the *resulting* symbol string. `AAAB AAAB ...` becomes `(A³B)` at step 2
+   and `(A³B)²⁰` at step 3. Iterate until a pass changes nothing — bounded by the depth
+   of real nesting, which is small.
+4. Emit `Repeat` only where step 3 of the rules above holds.
+
+This is standard run-length composition, it is device-free, it runs on the traced
+signature string rather than on tensors, and it costs microseconds on an 80-layer model.
+The risk is not cost, it is a *near*-miss: two blocks whose signatures differ only in a
+constant the pricing ignores will fail to group, costing compression but never
+correctness. That is the right way round.
+
+**Recorded as T51:** enumerate the actual layer-pattern shapes for the two target models
+(Qwen3.8-27B, DeepSeek-V4-Pro) and confirm the detector reaches the nested form on both.
+DeepSeek-V4-Pro is the one that matters. In `atom/models/deepseek_v4.py` every layer is the
+same `Block` with an `MoE` and one shared expert, so its shape comes from per-layer
+switches: `MoE` routes by hash on layers below `n_hash_layers`,
+`DeepseekV4Attention` picks CSA or HCA from `compress_ratios[layer_id]`, and `Block` runs
+layer 0's mHC unfused (`enable_fused_hc` is false on layer 0 only, so `Block.fuse_hc` calls
+`mhc_post_pre` there and `mhc_fused_post_pre` on every later layer). The DeepSeek-V4-Pro
+checkpoint's `config.json` makes the hash-routed layers HCA, HCA, CSA, then alternates HCA and CSA to
+the last layer. With the unfused layer 0, no two hash-routed layers are the same
+block: a prologue (Way 1) before a period-2 interleave (Way 2), in which a flat
+run-length scan finds nothing to group.
+
+### Open issues
+
+- ~~Whether `resource_bound`'s `peak` should come from the device spec's derated compute or
+  be fitted.~~ Answered for the analytical method on
+  [#1392](https://github.com/jgong5/ATOM/issues/1392): the join sums the branches' work and
+  takes one roofline at the attainable peaks probed on the device (`10` D64).
+- Nothing yet validates that a `Par` reconstructed from stream ids matches the real
+  fork/join structure.
+
+---
+
+## D20. Opaque leaves
+
+### What they are
+
+An operator the tracer records as **one node whose internal kernels are invisible**,
+because ATOM deliberately registers a whole subsystem as a single dispatcher op. The
+intent is stated in the `atom/model_ops/module_dispatch_ops.py` module docstring: hide dynamic-shape
+internals from Dynamo while leaving CUDA-graph capture transparent. The same property
+makes them opaque to any trace.
+
+There are ~19 ATOM-registered ones. The ones that matter: `moe_forward`
+(`atom/model_ops/moe.py`), `unified_attention_with_output_base`
+(`atom/model_ops/base_attention.py`), `linear_attention_with_output_base`
+(`atom/model_ops/base_attention.py`), `gemm_a16w16` (aiter), and the `v4_*` family.
+
+### Why this is good news
+
+**Concentration is extreme.** Sixteen distinct operators cover a step, with half the time
+in two — `aiter::gemm_a16w16` at **33.7%** and `aiter::unified_attention_with_output_base`
+at **23.8%** — and **twelve kinds cover 99.7%**. Roughly **60-75% of step time sits in
+8-20 opaque leaves**.
+
+So the IR's job is not decomposition. It is **pricing ~20 leaves well**: bounded,
+enumerable, and reviewable.
+
+### The load-bearing consequence: cost is not a function of arguments
+
+Opaque leaves take `layer_name: str` and look the module up in
+`compilation_config.static_forward_context`. The tensors that decide cost —
+`block_tables`, `context_lens`, `slot_mapping`, `cu_seqlens_q`, `max_seqlen_q/k` — are
+**ambient**, not arguments.
+
+A prior attempt to fix this by widening the operator's signature was **reverted**, and the
+reason generalises:
+
+> An op graph records arguments. Arguments cannot carry non-tensor ambient state through
+> `torch.compile`. Therefore an op graph cannot, on its own, describe an operator whose
+> cost depends on non-tensor ambient state, and no change to that operator's signature
+> will make it able to.
+
+Specifically: `md = get_forward_context().attn_metadata` is traced by Dynamo. Tensor reads
+become graph inputs and flow per step; everything else is a compile-time constant read
+once from whichever forward triggered compilation — `max_seqlen_q` because it is an int,
+`block_tables` because it happened to be `None` in the warmup dummy.
+
+**So each leaf needs a stated parameter extractor:**
+
+```
+(forward_context, the graph's shape) -> cost parameters
+```
+
+A ~20-entry hand-written table. It is the principal hand-authored asset of this design and
+should be visible as such rather than buried in the tracer.
+
+### The leaf contract
+
+Owner's [ruling on #1489](https://github.com/jgong5/ATOM/issues/1489#issuecomment-6249950252),
+2026-10-18. Capture records, for each leaf, what `measure ops` needs to call it again
+(`07` D38, Phase 1b):
+
+- **Arguments by schema slot.** Each tensor carries its shape, dtype, stride, role and
+  preshuffled mark. The stride is part of the call: qk-norm's q and k are strided views
+  of the qkv output, and contiguous stand-ins read it 2.1% to 4.8% low. The mark is too
+  ([#1953](https://github.com/jgong5/ATOM/issues/1953)): ATOM sets `is_shuffled` on a
+  weight it preshuffled after loading, and aiter's `fused_moe_` picks its kernel by that
+  mark on `w1` and `w2`, which no shape or dtype shows. A replay without it calls a
+  different kernel, which D20's contract forbids; unmarked mxfp4 MoE weights reach CK
+  stage kernels that refuse the shape. So is the host mark
+  ([#2857](https://github.com/jgong5/ATOM/issues/2857)): ATOM's forward copies values
+  it staged on the host to the device, DeepSeek-V4.1's cursors and slots among them,
+  and a Python number it writes reaches a fill as a host scalar. A replay that takes
+  such a tensor from a device buffer copies device to device, or nothing. The graph
+  states `"device": "cpu"` on a host tensor alone, so a tensor stating none, every
+  tensor of a graph captured before the mark among them, is on the device, as it was
+  read before. A capture places each tensor where ATOM's runner does: it caches
+  torch's default-device constructors before it patches `torch.zeros`, which
+  otherwise leaves every later `torch.zeros` of ATOM's, V4.1's MoE weight scales
+  among them, on the host. So is the pageable mark
+  ([#3172](https://github.com/jgong5/ATOM/issues/3172)): a CUDA graph captures a copy
+  with pinned host memory only, and DeepSeek-V4-Pro's prefill indptrs (`upload_numpy`)
+  are pageable. A host tensor ATOM asked to pin (a `CpuGpuBuffer`'s host side,
+  `pin_memory=True`, `pin_memory()`) states none, so every host tensor of a graph
+  captured before the mark reads pinned, as before.
+- **Role by provenance.** `activation`, `weight`, `KV` or `metadata`, read from where the
+  tensor's storage came from rather than from the argument's name, so an ambient tensor
+  passed under another name, such as `kv_indptr_convert`, still reads metadata.
+- **Non-tensor arguments and module references are kept**, the module by its path.
+- **Objects are kept in pickle's reduce shape.** Owner's
+  [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811), 2026-10-20. An argument
+  or receiver that is a direct attribute of the live runner is recorded as
+  `ModuleRef("runner.<attr>")`. Any other object that pickle reduces to its class and a
+  dict of attributes, each attribute contract-legal in turn, is recorded in that shape
+  (`ir.nodes.Reduced`): its class by `module:qualname` and its state, an enum member by
+  its value, a plain dict by its items, a NamedTuple by its fields, which a callee reads
+  by name (DeepSeek-V4.1's FP4 index plane,
+  [#3001](https://github.com/jgong5/ATOM/issues/3001)). Anything else, a callable among
+  it, refuses the leaf by its type. Widening to the runner's whole object graph or the
+  full reduce protocol is additive, and a refusal on an in-scope configuration forces it.
+  [#1812's census](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6296604735)
+  holds the Triton MoE's `RoutingData`, `ExptData`, `Bitmatrix` and
+  `DequantScaleRoundingMode` and V4's `UnifiedPoolGeometry`, `ClassLayout` and
+  `WindowParams` this way, and finds no argument that is a runner attribute. `measure
+  ops` rebuilds such an argument as the replay does
+  ([#1853](https://github.com/jgong5/ATOM/issues/1853)).
+- **An integer that moves with the context is stored affine in it.** A decode shape is
+  traced at two contexts; an integer argument that differs between them is stored as
+  `{"affine": [slope, intercept]}`, and `measure ops` binds it at the point's context
+  ([#1572](https://github.com/jgong5/ATOM/issues/1572)). One that is not affine, or a
+  non-integer that moves, refuses the shape by operator and slot; traces that differ
+  otherwise refuse it by both operators or both operator counts.
+- **A raw Triton or FlyDSL launch lifts to the function that issues it** (the lift rule
+  below).
+- **What a leaf reads but is not passed may be stated beside its arguments**, in the
+  op's `stated` field, by name; a call does not take it, and `bench.ops.signature`
+  includes it. Owner's [ruling on #1689](https://github.com/jgong5/ATOM/issues/1689#issuecomment-6292555659):
+  only DeepSeek-V4's decode attention leaves (`capture.forward.V4_DECODES`: the fp8 KV
+  cache's, its asm kernel where that launches alone, as in a drafter's later pass, the
+  bf16 one's and the persistent kernel) state their layer's `window_size`,
+  `compress_ratio` and `index_topk` (null for a layer with no indexer), and its
+  indexer's score and top-k states its `compress_ratio`, read in the opened
+  attention's body from the layer `layer_name` names. Their index lists are sized for
+  the deployment's longest row, so the entries a row reads follow from these and its
+  context, not from the lists. The fused QK-norm and RoPE
+  (`capture.forward.V4_QKNS`: the fp8 KV cache's
+  `aiter._fused_qk_norm_rope_group_quant_kernel.default` and the bf16 one's
+  `aiter.ops.flydsl.kernels.qk_norm_rope_quant:flydsl_qk_norm_rope_quant`) states its
+  layer's `compress_ratio` too ([ruling on #1973](https://github.com/jgong5/ATOM/issues/1973#issuecomment-6358962981),
+  extended to the bf16 leaf by [#2031](https://github.com/jgong5/ATOM/issues/2031)):
+  at decode it writes each token's window row to the destination rows of that ratio's
+  class, which `bench.ops.V4_METADATA` binds to `v4_swa_dest_{dense,csa,hca}`.
+  DeepSeek-V4's prefill attention (`capture.forward.V4_PREFILLS`: the fp8 KV cache's
+  `aiter.pa_sparse_prefill_fp8_opus.default` and the bf16 one's
+  `aiter.pa_sparse_prefill_opus.default`) states its layer's `compress_ratio` too: it is
+  passed the prefix index list and indptr of that ratio's class, which
+  `bench.ops.V4_METADATA` binds to `kv_{indices,indptr}_prefix_{swa,csa,hca}`
+  ([ruling on #3023](https://github.com/jgong5/ATOM/pull/3040#issuecomment-6730173331),
+  extended to the bf16 leaf by [#3038](https://github.com/jgong5/ATOM/issues/3038)). The
+  bf16 leaf is V4.1's sparse attention's operator, so `bench.ops.V4_SHARED` binds it so
+  only on a step holding V4's prefill lists.
+  DeepSeek-V4.1's sparse attention (`capture.forward.V41_ATTENTION`, over its FP8 pool
+  `V41_FP8_ATTENTION`), its index lists sized as V4's, states the same three of its
+  layer, and its indexer's scorers
+  (`capture.forward.V41_SCORERS`: gfx1250's FlyDSL one and gfx950's Triton one) its
+  `compress_ratio` and `index_candidates`, the most entries it scores where an earlier
+  layer chose its candidates, else null (#2344), and its top-k
+  (`capture.forward.V41_TOPKS`) its `compress_ratio`: the row bounds ATOM stages for
+  it are that ratio's visible rows, which `bench.ops.V41_NAMES` binds. In a graph
+  captured before, `measure ops` takes such a top-k's ratio from a scorer in its point
+  whose logits are as wide, and refuses it by name where none is
+  ([#3321](https://github.com/jgong5/ATOM/issues/3321)). Its index keys' RoPE
+  (`capture.forward.V41_ROPE`, under `Indexer.project_keys`) states their indexer's
+  `compress_ratio`: their positions are that ratio's compress plan's, which
+  `bench.ops.V41_NAMES` binds, and at a decode with no drafter both ratios' plans hold
+  a row a request, so the leaf's shape cannot tell them apart
+  ([#3141](https://github.com/jgong5/ATOM/issues/3141)). The indexer query's RoPE, on
+  the step's positions at every ratio, states none. In a graph captured before,
+  `measure ops` takes a key's ratio from the one ratio's compress plan in its point
+  that holds as many rows, in a point holding every ratio's compressor; elsewhere, or
+  where none or both do, it refuses the key by name until its shape is traced again
+  ([#3235](https://github.com/jgong5/ATOM/issues/3235), #3321).
+
+Under capture an opaque leaf runs only its fake implementation (the two MoE wrappers,
+DeepSeek-V4's attention and V4.1's guarded ops aside, below), so its ambient reads stay
+invisible to the trace; the bench does not need them, because it times the leaf at a
+point `ModelRunner.prepare_model` prepared, where ATOM has built the forward context for
+that point, and runs no forward (`07` D39).
+That is also what the two failures below needed by hand.
+
+### The lift rule
+
+Owner's [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811), 2026-10-20, as
+[#1854](https://github.com/jgong5/ATOM/pull/1854) built it. It replaces the rule that a
+launch lifts to its innermost ATOM function, which hid ATOM's Triton MXFP4 experts in one
+function whose arguments state neither their format nor their expert count
+([#1744](https://github.com/jgong5/ATOM/issues/1744)). One leaf has one contract, for
+the analytical extractor and `measure ops` alike.
+
+- **A leaf is the function that issues the kernel launch.** From the launch, capture
+  walks outward past Triton's and FlyDSL's own frames, closures and lambdas (a function
+  its `module:qualname` does not name), and generic launchers (a frame one of whose
+  arguments, or an attribute of whose first argument, is the launched kernel object or
+  an autotuner wrapping it), to the first function its `module:qualname` names, in
+  whichever package: aiter's `mla_decode_fwd_v4_nm`, not the ATOM function that calls
+  it.
+- **The entry points.** Triton is taken at `JITFunction.run`, gluon included; a
+  `warmup=True` call launches nothing; a direct `CompiledKernel` launch, through its
+  `run` or a `kernel[grid]` call, lifts as `JITFunction.run` does
+  ([ruling on #2344](https://github.com/jgong5/ATOM/issues/2344#issuecomment-6469812924)): a leaf's arguments come from its function's call entry,
+  not from the launch. gfx950's FP8 index scorer, aiter's
+  `deepgemm_fp8_paged_mqa_logits`, launches that way.
+  FlyDSL is taken at `JitFunction.__call__` and at `CompiledFunction.__call__`, which
+  capture's `_compile_impl` maps back to its jit function, so both give one leaf name and
+  contract; a `CompiledFunction` compiled before the capture names no jit function and is
+  refused by name.
+- **A leaf is one complete call.** A launching function called inside another, and a
+  dispatcher-visible custom op inside one, fold into the outermost, so a replay never
+  runs a nested leaf twice. On V4-Pro fp8 prefill `swa_write` holds its two inner calls:
+  61 leaves where the innermost rule gave 122, 95.5 us less per step, one `t0` floor per
+  layer fewer, which prices low (#1854). A call that launches no kernel and dispatches
+  no operator outside torch's gives back what it ran.
+- **Arguments come from call entry.** Each traced step follows two untraced steps of its
+  own shape (owner's [ruling on #1812](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6304727730),
+  2026-10-21): a runner's first step takes its own path, a decode filling no deferred
+  ids, so `fill_deferred_decode_ids` first launches in the second. The untraced steps
+  find the launching functions; the traced one snapshots each call's parameters as it
+  enters, through `sys.monitoring` on those functions alone, so a parameter the function
+  reassigns before its launch is recorded as passed. A launch in the traced step outside
+  every found function is refused by name.
+- **Each contract replays to the same work.** The first call of each distinct contract
+  is called again, rebuilt from it under the fake mode, and must launch the same kernels
+  and dispatch the same operators outside torch's; one that does not, or does not rebuild, is refused by
+  name. So is a leaf that raises after it launched, or is still open when the step ends:
+  a call cut short has no contract to replay. One that raises having launched nothing
+  gives back what it ran.
+- **A leaf that holds cross-rank communication gets no rule of its own**: one pricing
+  unit, its comm term inside `10` D64's `max`, measured on the multi-rank bench.
+
+[#1812's census](https://github.com/jgong5/ATOM/issues/1812#issuecomment-6296604735)
+covers Qwen3.8-27B TP1 and V4-Pro at TP8, DPA-TP8 and DPA EP8, each at fp8 and bf16 KV,
+with `ATOM_USE_TRITON_MOE` off and on: every configuration captures, where the innermost
+rule refused 8 of the 16, and the rule refuses none. Qwen's leaves keep their names
+(`fused_qk_norm`, `try_mrope_qk_fused`, `kv_indices_generate_triton`) but one: the
+sampler's FlyDSL argmax is `topk_per_row_argmax`, not `_apply_greedy_tokens`, whose
+`le` and `where` are now graph operators. A kernel switch inside a function stays in its
+leaf: `try_mrope_qk_fused` launches mrope's tiled kernel at B >= 128.
+
+### The `op_graph` key
+
+Owner's [ruling on #1811](https://github.com/jgong5/ATOM/issues/1811), 2026-10-20, as
+[#1867](https://github.com/jgong5/ATOM/pull/1867) built it. An `op_graph` is keyed by its
+structure, its shape, the torch it was traced under, and the digest of the files its trace ran and read (`07` D41); a DP prefill's graph that holds G (D18) by the shape
+`prefill T=<T> B=<B> G=G`, ` W=<W>` before G where its LM head pads, its hints and guards in its graph member. The structure (`capture.forward.structure`) is the
+model's architecture, the device arch, the config.json digest, the engine config the
+step law is keyed by less its ladder and its compilation level
+(`capture.forward.graph_engine`, `run.step_grid.keyed`, `09` D54), the TP width and
+the DP and EP widths when set, the phase, the mode, and whether the step produces
+output. The structure keys no level, by the [ruling on #3052](https://github.com/jgong5/ATOM/issues/3052#issuecomment-6942839264):
+every trace runs eager at level 0 and serves a run at any level (D23). That engine config holds the KV block size and dtype, the quantization's hash,
+the parallel layout, TBO, speculation when it is on, `moe_backend`,
+`moe_all2all_backend`, `eplb_enable` and `enable_decoder_swa_bounded_replay` when
+they are off ATOM's default, the `index_cache_dtype` ATOM resolved where it differs
+from `kv_cache_dtype` (the [ruling on #2981](https://github.com/jgong5/ATOM/issues/2981)),
+whether `mori` imports where it does not, MiniMax-M3's indexer-only context
+parallelism (`dcp_config.indexer_dcp_only`) when it is on, `--hf-overrides` when it
+states any, and the performance environment
+(`atom.benchmarks.results.metadata.PERFORMANCE_KEYS`) less the client's `AIPERF_*`
+variables and the device selection; ATOM's Triton expert and GEMM switches
+(`ATOM_USE_TRITON_MOE`, `ATOM_USE_TRITON_MOE_A4W4`, `ATOM_USE_TRITON_MOE_DECODE`,
+`ATOM_USE_TRITON_GEMM`) are in it, and ATOM's prefill token buckets
+(`ATOM_TOKEN_GRAPH_SIZES`), vocabulary-embedding replication
+(`ATOM_REPLICATE_VOCAB_EMBED`), `ATOM_FUSE_SHARED_EXPERT`, `ATOM_DISABLE_MORI_EP` and
+`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4` only when ATOM reads them off their default.
+The last three, with the all-to-all backend and `mori`, decide whether a MoE fuses
+its shared expert into aiter's top-k table, which changes its graph ([#3333](https://github.com/jgong5/ATOM/issues/3333)). One store holds V4-Pro graphs of one shape that
+differ only in `kv_cache_dtype`, only in `ATOM_USE_TRITON_MOE`, or only in the index
+cache dtype ATOM resolves for a P/D side and for a plain start at gfx950
+(`atom/config.py::Config.__post_init__`), and each run reads its own.
+
+A run, or `measure ops`, that finds no graph at its key where the store holds one at
+the same shape and otherwise the same structure refuses, naming the torch it was traced
+under, each of its files that reads otherwise, and each engine field that differs, a performance variable by its own name (`run.step_grid.differ`, which the step
+law's engine check shares). Every key moved with #1867, so a store is traced again in the
+environment its reader runs in.
+
+**Keying on an environment variable that changes what an operator computes is a
+workaround.** ATOM chooses its MoE and GEMM kernels from the process environment, not
+from an argument the call takes, so no leaf's contract records the choice, and the key
+has to. The ruling records this as a workaround for an ATOM design that should take the
+choice as an argument.
+
+### What getting it wrong costs, both directions, measured
+
+- **7.1x over.** Attention priced at **163.6 us/call against a true 23.0 us**. Cause:
+  `unified_attention_with_output_base` rebuilds a forward context from its arguments *only
+  when there is not one already*, and after `capture_cudagraph()` there always is —
+  `set_forward_context` assigns a module global and nothing clears it. What stood was the
+  last rung of the descending capture ladder: **batch 1 at the model's maximum context**,
+  so the kernel was handed `context_lens=(1,)[16384]` while four sequences of 155 tokens
+  were passed. **26x the KV traffic.** The 163.7 us was real device time in a real kernel.
+  Fix: reset the forward context **per signature**, not once, because an operator that
+  rebuilds it leaves it behind for whatever is priced next.
+- **~100x under.** `linear_attention_with_output_base` priced at **5.793 us/call against
+  0.567 ms in situ** — 0.277 ms against 27.214 ms over 48 layers. `attention_gdn.py` opens
+  with `if gdn_metadata is None: core_attn_out.zero_(); return`. **The benchmark was timing
+  48 `zero_()` calls.** Correcting it moved priced prefill kernels from 296.999 ms to
+  **319.310 ms against 318.351 ms in situ — from -6.7% to +0.30%** — and explained a sign
+  puzzle: the 0.6B priced 2.28% high and the 27B 6.7% low, not two models disagreeing
+  about pricing but one model with an entire layer type missing from its cost.
+
+The second case needed two things beyond copying the first: the recurrent/convolution
+state is **not recorded** (it lives in `kv_cache_data`, set once at start-up, so it is
+already real in the pricing process), and the convolution metadata is **recomputed, not
+recorded** — `nums_dict`, `batch_ptr`, `token_chunk_offset_ptr` are a pure function of the
+recorded query start offsets, so the installer calls the engine's own
+`compute_causal_conv1d_metadata`.
+
+### They also bound what capture sees
+
+Inside a leaf, the fake impl gives the output shape, not the internal work. The leaf's
+cost model is its own thing — a measured price table with dispatch bands (`09` D60), or an
+analytical roofline. **Its shapes feed it; they do not replace it.** And the boundary is
+the right one, because a leaf is also where ATOM's own autotuning happens — one leaf is
+one tuned kernel family.
+
+### The MoE wrappers run; their exchanges are declared
+
+`moe_forward` and `maybe_dual_stream_forward` are the two opaque leaves capture opens: it
+runs their Python bodies in place of their fakes, because the step's MoE exchanges, the
+shared expert's side stream and the expert kernels are inside. What the bodies dispatch is
+recorded like the rest of the step: the expert kernels as leaves, the side stream as a
+`Par` (D19), each Triton or FlyDSL launch lifted by the lift rule. aiter's experts are
+`fused_moe_`; under `ATOM_USE_TRITON_MOE=1` the census finds aiter's Triton launchers,
+`downcast_to_mxfp`, `moe_gemm_a8w4` twice (the second holding `_reduce_grouped`) and
+`ep_sort_routing` at EP8, and `topk`, `sort_tokens`, `sort_tokens_fused`,
+`moe_gemm_a16w4` and `fused_clamp_act_mul` with EP off.
+
+Their exchanges with other ranks are **declared nodes** (D21), as #1401 and the
+[ruling on #531](https://github.com/jgong5/ATOM/issues/531#issuecomment-6244543796) ask,
+since a TBO step lays MORI's dispatch and combine on the comm stream as ops of their own.
+Each is named `module:qualname` for the function ATOM calls, its arguments by that
+function's parameter names: the DP gather and reduce-scatter as `atom.model_ops.moe`'s
+functions, MORI's dispatch and combine as `EpDispatchCombineOp`'s methods, which also
+state the EP width ATOM built their handle for (`num_ep_ranks`). A capture runs
+one rank, so each exchange's rows are stated, every peer at this rank's shape but for
+its token count: the peers split evenly the rows the shape's MoE gathers, G, less this
+rank's, every peer at this rank's count when G is its default (`capture/peers.py`;
+`07` Phase 1a). A drafter's pass all-reduces its own count: its first, the target's
+stream, takes the step's counts; a later one, a row a sequence, this rank's at every
+peer, MORI's dispatch included. A TBO step, two micro-batches interleaved, is refused by name until
+its graphs exist (#1581).
+
+DeepSeek-V4's `v4_attention_with_output` is opened the same way (#1678), its body run as
+a real step's, not a dummy run's, so its projections, compressors and sparse attention are
+leaves under the lift rule, with no special case: the compressors as FlyDSL's
+`flydsl_fused_compress_attn` and `flydsl_hca_compress_attn`, the fp8 KV cache's decode
+as `aiter.mla:mla_decode_fwd_v4_nm`, the bf16 one's as
+`_sparse_attn_v4_paged_decode_triton`, with its KV quantization a FlyDSL leaf of its
+own, `flydsl_qk_norm_rope_quant`. The indexer's score and top-k stays one leaf: its FP4 kernels
+launch through aiter's own launcher.
+
+DeepSeek-V4.1's guarded ops (`capture.forward.V41_OPENED`: its attention, Engram, the
+step's staging around the forward and the record of a TBO expert output) run their bodies
+too (#2344), on a real step's batch whose rows each hold a state slot: V4.1 serves a dummy
+run as idle padding. Its compressor, index writes, scorer, top-k and sparse attention are
+leaves under the lift rule; the delayed hyper-connection seam, `v41_mhc_pre_delayed`,
+stays one leaf with its own arguments. The state cursors V4.1 reads back to the host read
+zeros, and its check that each request's state is where the scheduler put it has no values
+to judge. Each decode row holds a token before its new one at both contexts
+(`capture.forward.CONTEXTS`), since a request's first forward starts its state over.
+
+A FlyDSL launch outside an opaque leaf capture keeps closed, the sampler's argmax or one
+in the opened bodies, lifts by the lift rule; inside a closed one it is never reached.
+
+Recorded for completeness, since it would otherwise look like an unexamined hole: FlyDSL
+is a standalone Python-embedded **MLIR DSL and JIT compiler** (`flydsl` 0.3.1), not part
+of aiter and not Triton. The path is `python -> ctypes fnptr -> MLIR-generated native host
+code -> mgpuLaunchKernel -> HIP`; arguments are erased to `data_ptr()` before the call, so
+even a tensor-subclass trace would see nothing. aiter's integration has **96 `@flyc.kernel`,
+132 `@flyc.jit`, 87 `.launch(...)` sites**, and **one `JitFunction.__call__` is 1 to 12
+kernel launches** (`moe_sorting_kernel.py` has 12). Under `--moe-backend mega` a single
+dispatcher event covers the entire EP-MoE step: dispatch + GEMM1 + quant + GEMM2 + combine
+([#1815](https://github.com/jgong5/ATOM/issues/1815)). Capture intercepts FlyDSL at its two
+Python entries, before the arguments are erased.
+
+### Open issues
+
+- The op-level extractor table is `backends/op_work.py::EXTRACTORS` (`10` D64); a leaf
+  kind with none is refused by name. V4-Pro bf16 prefill's `pa_sparse_prefill_opus` takes
+  V4.1's extractor, which refuses it for the `window_size` and `index_topk` it does not
+  state.
+- Leaf prices are not repeatable to better than about 1%: two runs of one graph, one box,
+  back to back, identical code moved the summed contribution **0.96%**, median
+  per-signature **1.18%**, **p90 32%**. **Any residual quoted below ~2% is quoting the
+  instrument.**
+
+---
+
+## D21. Operator coverage
+
+### Problem
+
+An operator whose cost is invisible is an invisible cost. But coverage-by-count is a
+misleading metric, and chasing it made the prior model *worse*.
+
+### What each interception mechanism bought
+
+| Added | Coverage of a 0.6B decode step |
+|---|---|
+| dispatch mode, tensor arguments only | 54.8% |
+| + scalars in the signature | 90.3% |
+| + attention via recorded forward context | 98.8% |
+| + raw Triton (`JITFunction.run`) | 99.4% |
+| + inductor-generated (`CachingAutotuner.run`) | 99.7% |
+| + profiler operators excluded from the graph | **100%** on chunked prefill |
+
+### The trap
+
+On a hybrid model **~34% of recorded operators are Triton launches** the dispatcher cannot
+see. The reflex is to call that 34% of the model missing. **It is not.** Every one of
+those 433 launches in a 27B prefill graph happened *inside* a dispatched operator and was
+a duplicate of work already in that operator's price. Recording both **double-charged** —
+attention priced 59.958 ms where its in-situ kernels are 47.382 + 5.883 = 53.265 ms.
+Dropping them moved priced kernel time by **1 ms out of ~296 ms** while raising
+coverage-by-count 25 points.
+
+The rule: **record a Triton launch only when no dispatched operator is on the stack**
+(`inside_an_operator()`).
+
+Similarly, `record_function` dispatches `profiler::_record_function_enter_new` / `_exit`,
+which run no kernel and take arguments no artifact can hold. Executing them without
+recording them took chunked prefill from 365/366 to **364/364**.
+
+### What is genuinely absent
+
+| | cost |
+|---|---|
+| inductor-generated graph regions, decode | **~4.8% of a step** (112 kernels, 0.465 ms) |
+| inductor-generated graph regions, prefill | ~0.6% |
+| EP dispatch/combine and the DP gathers | declared nodes, their rows stated (D20); their kernels are not seen |
+| CUDA-graph replay internals | unobservable in principle |
+
+The 8x prefill/decode spread is structural: the per-layer generated-kernel count is fixed
+and a decode step is ~30x shorter.
+
+### Decision: stated nodes, and refusal over silence
+
+1. Do not chase 100% capture. The IR carries **stated nodes** (`ir/nodes.py::NodeKind.DECLARED`) alongside captured ones,
+   so something the tracer cannot see becomes an **explicit assumption in the artifact**
+   rather than an absence, and its terms carry the `declared` method (`02` D11).
+2. Record `unpriced{signature: reason}` and report coverage as a fraction, always.
+3. **A failed forward writes no graph.** A 101-operator capture of a 64-layer model was a
+   crashed forward written from a `finally` block — structurally valid, and merely wrong.
+   What is written is additionally checked against model depth, since attention runs once
+   per layer.
+
+### Open issues
+
+- The first stated nodes are the MoE exchanges (D20); no op-level backend prices one yet.
+- At `ep_size == tp_size` EP is close to a no-op — without EP each rank holds all experts
+  sharded along the intermediate dimension, with EP each rank holds half the experts
+  whole. Same FLOPs, graphs structurally identical (488 operators, 23 kinds either way),
+  timings within 3-8%. A prior "EP works" result was withdrawn for exactly this reason.
+  **Any EP claim must be made at a degree where EP is not a no-op.**
+
+---
+
+## D22. Activation liveness under fake tensors
+
+### Problem
+
+`03_memory_and_kv_model.md` D16 makes a def-use liveness walk the activation term's source
+once capture lands.
+The prior implementation was **observational** — `weakref.finalize` firing when the CUDA
+allocator reclaimed — and there is no allocator device-free.
+
+### Finding: three of the four prior faults carry over, and one is easier
+
+A `weakref.finalize` on a `FakeTensor` fires at the same program point as on a real
+tensor: when Python drops the last reference. A real CUDA tensor's storage is freed by
+that same dealloc. So the observational method is preserved.
+
+**Fault 1 — a death is not a last read.** A residual held across a block outlives every
+read of it.
+
+```
+op index:   1    2    3    4    5   ...  32
+            |    |    |    |    |         |
+residual ---*----+----+----+----+---------+-->
+            ^         ^                   ^
+         created   last read          actually freed
+                   <- naive death      <- true death
+```
+
+**Fault 2 — deaths are per output, not per operator.**
+
+```
+fused_add_norm(x, residual) -> (normed, new_residual)
+                                  |            |
+          normed ------> dies into the next gemm (2 ops later)
+          new_residual --------------------> lives to end of block
+
+  one death for the pair -> the residual is held an extra step, every layer
+                         -> 36% of the term at TP=4
+```
+
+**Fault 3 — the address map must forget.** *Easier* device-free. On hardware the allocator
+hands a freed address straight back, so a map keyed on storage address credits the next
+tensor to whoever held it before. With fake tensors there are no addresses: key on a
+**monotonic creation counter**, never on `id()`, which Python also reuses after GC. The
+failure mode is designed out rather than guarded against.
+
+**Fault 4 — this one breaks, and harder.** `torch.empty` inside a custom operator never
+reached a dispatch mode on hardware either, but the operator *ran* and the allocator delta
+was observable. Device-free, the operator does not run at all — its **fake impl** runs,
+returning a shape and allocating nothing.
+
+```
+   REAL run                              FAKE run
+   --------                              --------
+   unified_attention(...)                unified_attention(...)
+     |- torch.empty(scratch)  <-105 MB     `- fake_impl(shapes) -> out shape
+     |- kernel launches                        allocates nothing
+     `- returns out                            runs nothing
+
+   dispatch mode sees : [out]            dispatch mode sees : [out]
+   allocator saw      : [out, scratch]   allocator          : does not exist
+                              ^
+                   recoverable as a delta on hardware;
+                   structurally unobservable device-free
+```
+
+What that gap looked like on the 27B: a **near-constant -105.8 MB** behind the allocator
+through the whole layer stack, opened and closed around
+`unified_attention_with_output_base` and `_fused_qk_rmsnorm_group_quant_kernel`, ending
+correct at -0.012 MB.
+
+```
+bytes
+  ^          ,--.      ,--.      ,--.          <- true (allocator)
+  |      ,--'    `--,-'    `--,-'    `--,
+  |     ,  ,--.      ,--.      ,--.            <- visible walk
+  | ,--'  '    `--,-'    `--,-'    `--,        (parallel, 105.8 MB low)
+  |       :
+  |       :  gap opens at each opaque leaf, closes at the next op
+  +-------+--------------------------------> op index
+```
+
+Also note the sign of the *other* known divergence: at each attention operator the walk
+runs ~27 MB **below** the allocator and recovers at the next, because finalizers for q/k/v
+fire before attention dispatches while the allocator still holds the memory (views onto a
+storage something else keeps alive). Transient, self-correcting, nowhere near the peak.
+
+### Decision
+
+**Declare a scratch parameter per opaque leaf**, symmetric with the cost parameter
+extractor of D20: `bytes = f(shape)` or the single bytes-per-token number the prior work
+found generalises. Sourced from kernel source, documentation, or one measurement on
+whatever device happens to be available — and in every case recorded as a **stated
+constant in the artifact**, not a hidden absence.
+
+Measured magnitudes: **0.1 KB/token on the 0.6B, 39.6 KB/token on the 27B**, worth the
+difference between **-35.0% and +3.4%** held out.
+
+Deliberately **not** per-operator attribution from a recorded curve: that reproduces the
+traced curve exactly, is worth nothing at any other shape, and is a recording dressed as a
+model.
+
+**Revised 2026-10-10: the walk is not the activation term's first source.** Until capture
+lands, the term is one coefficient per model and width measured on a real run
+(`03` D16, [#704](https://github.com/jgong5/ATOM/issues/704)), and the scratch is inside
+that reading, so neither this walk nor the per-leaf constants gate stages 2 and 3. The
+walk replaces the coefficient when it lands, and the per-leaf constants are needed from
+then (T4). A configuration with no measured coefficient refuses (`10` T34).
+
+### Open issues
+
+- Nothing establishes the scratch constants for Qwen3.8-27B under this design yet; they
+  are needed once the walk replaces the measured coefficient.
+- The fault-4 case that is *not* an opaque leaf — the MLP's silu destination, **13.6 MB a
+  layer at TP=1 and exactly where the high-water mark sits** — was handled by an
+  out-variant rule: an operator returning no tensor is an out-variant, and what it produces
+  is the destination it was handed, recorded as its output when no live tensor already owns
+  that storage. Whether that rule works unchanged against fake tensors is unverified.
+
+---
+
+## D23. Eager versus compiled
+
+### Problem
+
+Device-free means the model cannot be compiled: inductor must codegen and autotune for the
+target architecture. So the op-level backend traces the **eager** operator stream, while production
+runs at `--level 3` PIECEWISE with `use_inductor = True` and `--cudagraph-mode FULL`
+(`atom/model_engine/arg_utils.py::EngineArgs.add_cli_args`).
+
+### Why this is more sound than it sounds
+
+ATOM registers its expensive operators as opaque custom ops precisely so Dynamo cannot
+look inside them, and Dynamo preserves custom ops as opaque calls. **So the eager and
+compiled operator streams agree on exactly the 60-75% of step time that matters.**
+
+What differs is the cheap material around them, and it was measured: **386 derived (eager)
+against 330 captured (compiled)**. Inductor accounted for **exactly one** operator
+(`aten::embedding` -> `inductor::triton_poi_fused_embedding_0`); the other 56 are
+`split_with_sizes` and `empty` that inductor resolves into offsets and a buffer plan.
+**Compute totals are 283 operators either way.**
+
+So compilation does not thin the graph in a way that would justify capturing at
+`--level 0`, which nobody deploys.
+
+### The launch regime belongs to the step, not the trace
+
+| regime | paid per | constant |
+|---|---|---|
+| replayed (CUDA graph) | kernel launch | **2.02 us** |
+| eager | operator | **67.4 us** |
+
+Thirtyfold apart. One eager trace supplies the operator list; the constant is chosen by
+whether the *real* step replays. **Prefill is eager** — its token count is not on the
+capture ladder, which is captured at one token per sequence — and **decode is replayed**.
+Two regimes in one run.
+
+A prior bug derived the CUDA-graph bucket from batch size alone and so assigned a rung to
+prefill steps too, charging 2 us per launch instead of 67 us per operator. *"The fix above
+it did nothing until this was corrected."* `StepShape.capture_bucket` must be `None`
+whenever nothing was replayed.
+
+Related, and ATOM's own defect rather than Compass's: the padding site takes the
+**largest** rung where its comment says a 65-request batch should replay the 128 graph —
+`reversed(capture_sizes)` is correct only on a descending list, and `capture_cudagraph`
+re-sorts ascending when it finishes. The rule that actually selects the graph is
+`ForwardMode.decide`. Mirroring the buggy site made every step in a 1,662-row sweep report
+bucket 512.
+
+### TODO (not decided)
+
+**The inductor fusion gap.** An eager trace shows N unfused operators where one fused
+kernel runs, over-counting launches and mispricing the fusion. Magnitude: **~4.8% of a
+decode step, ~0.6% of a prefill step.** Three candidate treatments, none chosen, and the
+second excluded since 2026-10-18 because the op level fits no residual ([#1489](https://github.com/jgong5/ATOM/issues/1489)):
+
+1. declare the bias and report it alongside every result;
+2. ~~fit a fusion correction per structure;~~
+3. capture the compiled operator list **once** on whatever device is available and diff it
+   against the eager trace to build a structural correction — a one-time calibration,
+   which the `measure` flag of D11 already sanctions, leaving simulation device-free.
+
+Deferred to future work by decision on 2026-09-18.
+
+### Open issues
+
+- Whether a `TorchDispatchMode` is even entered during a compiled run is unresolved and
+  probably moot here, but it bears on option 3 above. Inductor-generated kernels do not go
+  through the dispatcher at all — they are reached via
+  `torch._inductor.runtime.triton_heuristics.CachingAutotuner.run`, not
+  `JITFunction.run`. A prior in-tree precedent
+  (`atom/model_loader/online_quant_streaming.py::_CopyCounter`) overrides
+  `ignore_compile_internals()` because *"TorchDispatchMode keeps its compile-internal
+  state in process-global booleans"*.
+- One in-tree hazard for mode-based instrumentation, recorded in a code comment in
+  `atom/spec_decode/dspark_scheduler.py::schedule_prefix_lengths_tensor`: `torch.tensor(N, device=...)`
+  under an active `DeviceContext` `__torch_function__` guard **hung all 8 ranks on ROCm**.
+  The comment records a hang observed while the function was written; no landed version
+  makes that call, as the function builds the value with `torch.full_like` on a device
+  tensor. The mechanism is unexplained.
+
+  **How much this gates T5.** A `FakeTensorMode` trace should be **GPU-free and
+  collective-free**, so a hang whose mechanism is a desynchronised collective should not
+  be reachable from it.
+
+  Two things have to hold for that, and both look true:
+
+  1. **No real collective executes under the mode.** ATOM's collectives are either
+     dispatcher-visible ops (which have `register_fake` impls — every ATOM opaque op
+     does) or invisible ones reached through stated nodes, which the tracer records
+     rather than calls. Nothing should reach RCCL.
+  2. **The specific hazard is not the same mode.** `dspark_scheduler.py::schedule_prefix_lengths_tensor` hung under
+     an active `DeviceContext` **`__torch_function__`** guard doing
+     `torch.tensor(N, device=...)` — a
+     *real* run with a real device, not a fake-tensor trace.
+
+  So the honest status is: **the hang gates `--measure` runs and any mode-based
+  instrumentation of a real execution. It probably does not gate Phase 1a.** "Probably"
+  is doing work there — both points above are reasoned from the code, not observed — and
+  the cheap way to convert them into evidence is T5 itself, which will either trace
+  cleanly at TP>1 or produce the hang and settle the question.
+
+  **It gets root-caused rather than worked around**, for a reason independent of T5: a `__torch_function__` mode (the `DeviceContext` guard) hung all 8 ranks while that function was written, and
+  `--measure` is a designed path. A workaround that avoids the one known call site leaves
+  the mechanism unexplained and the next call site undiscovered.
+
+  **Ordering:** run T5 *first* and cheaply. If it traces clean at TP>1, T52 drops to
+  ordinary priority and gates nothing on the critical path.
+
+  What root-causing means concretely, and why it is tractable: the failure is a
+  *collective* hang, so the question is which rank diverges. `torch.tensor(N,
+  device=...)` under a `__torch_function__` guard either (a) triggers a H2D copy on a
+  stream the other ranks are not on, (b) takes a different branch on one rank because the
+  guard intercepts a `.item()` and turns a device value into a host one, or (c) causes a
+  lazy-init ordering difference. All three are distinguishable from a single `rocgdb`
+  attach reading `info dispatches` per rank, which the in-tree
+  `debug-agent-locate-kernel` procedure already automates. Estimated at well under a day
+  on a quiet node, and it gates T5.
+
+  Recorded as **T52**, and placed *before* the first tracing work in the execution plan
+  rather than beside it.
+
+---
+
+## Decision log
+
+| # | Decision | Date |
+|---|---|---|
+| D17 | Two granularities behind one `CostBackend`; the step level discovers the shapes the op level captures. No fallback crosses granularity: a capture failure fails the run, lazy trace off makes an uncaptured shape a refusal | 2026-09-18; revised 2026-10-14 (#952); per shape 2026-10-18 (#1489) |
+| D18 | Capture with `TorchDispatchMode` + `FakeTensorMode`, on FakeTensor rather than bare meta, at concrete shapes: one graph per decode width and prefill (T, B) that `trace ops` is given or that a record directory's steps hold. The symbolic route A and its four disciplines (the fourth: the engine's host arithmetic asks a symbol for a number, so a symbolic capture keeps the conversion, logs it with its line, and asserts that log against a stated set) are recorded, not built. Under a drafter a step that samples is two graphs, the target's and the drafter's, cut at `forward_done_event`; a block drafter's draft-KV pass before that event is a third, priced among the target's terms. A mono runner binds and builds its widths as its deployment does: a refusal the deployment makes too is declared, any other bind or build failure refused by name. A run's lazy trace of a DP prefill holds G, the rows its MoE gathers, as one symbol, keyed by (T, B) and the width its LM head pads to, traced at both ends of G's range and kept when the two agree but for the exchanges' `sizes`; a G its hints and guards admit is put into it, any other traced concretely | 2026-09-18, fourth discipline 2026-09-22; concrete 2026-10-18 (#1489); drafter 2026-10-21 (#1270); block drafter 2026-10-30 (#2345); mono 2026-10-31 (#2560); a DP prefill's G 2026-11-09 (#2956) |
+| D18.1 | `torch.export` recorded as an unverified alternative; rejected now on decomposition fidelity and on capturing a model call rather than an engine step | 2026-09-18 |
+| D19 | Hierarchical, concrete, stream-annotated IR: `Seq` / `Repeat` / `Par`, a node's arguments its leaf contract. No branches in the IR — applicability is a discrete key and the captured shape, matched by equality | 2026-09-18; revised 2026-10-18 (#531); concrete 2026-10-18 (#1489) |
+| D20 | Opaque leaves are priced, not decomposed. Each carries a stated parameter extractor and a contract: arguments by schema slot, each tensor's stride, role by provenance (activation, weight, KV, metadata), preshuffled, host and pageable marks, non-tensor arguments and module references kept, a runner attribute as `runner.<attr>`, any other object in pickle's reduce shape or refused by its type. A raw Triton (`JITFunction.run`, a warmup aside) or FlyDSL (`JitFunction.__call__`, `CompiledFunction.__call__`) launch lifts to the first function its `module:qualname` names, past the languages' frames, closures and generic launchers, and so does a direct `CompiledKernel` launch. Nested launching calls and custom ops fold into the outermost; arguments come from call entry in a traced step that follows two untraced steps of its shape; each contract must replay to the same kernels and operators outside torch's, and a launch outside a found function, a raise after a launch or a call open at the step's end is refused. An `op_graph` is keyed by the step law's engine config less its ladder and its compilation level, the performance environment in it, and a miss names each differing field; keying on a kernel-selecting environment variable is a workaround for an ATOM design that should take the choice as an argument. Capture runs the two MoE wrappers' bodies; their DP and MORI exchanges are declared nodes named for the function ATOM calls, and a TBO step is refused. | 2026-09-18; contract 2026-10-18 (#1489); MoE exchanges 2026-10-19 (#1401); lift rule and key 2026-10-20 (#1811); two untraced steps 2026-10-21 (#1812); preshuffled mark 2026-10-22 (#1953); host mark 2026-11-10 (#2857); pageable mark 2026-11-12 (#3172); compiled kernels lift 2026-10-28 (#2344); NamedTuple arguments 2026-11-08 (#3001); compilation level left out 2026-11-17 (#3052) |
+| D21 | Stated nodes over chased coverage, their terms declared; refuse and record `unpriced` reasons; a failed forward writes no graph. The MoE exchanges are the first stated nodes | 2026-09-18; revised 2026-10-14 (#952); MoE exchanges 2026-10-19 (#1401) |
+| D22 | Liveness stays observational under fake tensors; internal scratch of an opaque leaf is a stated per-leaf constant. Revised: until capture lands the activation term is a coefficient measured on a real run, scratch inside it, and the walk replaces it after | 2026-09-18; revised 2026-10-10 |
+| D23 | Trace eager, price with the regime constant of the real step. The inductor fusion gap (~4.8% decode) is a documented **TODO**, not a decision. | 2026-09-18 |
+
+---
+
+## TODO register
+
+This topic's items only. The consolidated register across all topics, with the
+load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_items.md).
+
+| # | Item | Why deferred |
+|---|---|---|
+| T1 | Inductor fusion correction (D23) | ~4.8% of a decode step; three candidate treatments, none chosen |
+| T2 | Enumerate the structure set for Qwen3.8-27B | needs a step-level backend run against the real scheduler on the 27B |
+| T3 | Build the per-leaf parameter-extractor table (~20 entries) | the main hand-written asset; needs the leaf list frozen first |
+| T4 | Establish scratch constants per leaf for the 27B | needed once the liveness walk replaces the measured activation coefficient (D22); unobservable device-free, so it needs a source or one measurement |
+| T5 | Verify ATOM's model classes trace cleanly under FakeTensorMode at TP>1 | needs a non-wedged node |
+| T6 | Validate that `Repeat` grouping reproduces the flat prices term by term | needs a first trace |
+| T7 | Validate `Par` reconstruction from stream ids | not exercised until M2 (DeepSeek-V4-Pro) |
+| T8 | Decide whether a step-level form is fitted independently or derived from the op level | the op-level backend does not exist yet |
+| T9 | State a row-ordering treatment for decode attention | 1.77x effect, invisible to every current feature |

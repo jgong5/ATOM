@@ -29,8 +29,14 @@ PERFORMANCE_KEYS = {
     "AITER_LOG_LEVEL",
     "AITER_QUICK_REDUCE_QUANTIZATION",
     "AITER_USE_FLYDSL_MOE_SORTING",
+    "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION",
     "ATOM_FORCE_ATTN_TRITON",
+    "ATOM_USE_TRITON_GEMM",
+    "ATOM_USE_TRITON_MOE",
+    "ATOM_USE_TRITON_MOE_A4W4",
+    "ATOM_USE_TRITON_MOE_DECODE",
     "ATOM_MOE_GU_ITLV",
+    "ATOM_MONO_ENABLE",
     "ATOM_NUMA_BIND",
     "ATOM_DSV41_BENCHMARK_SYNTHETIC",
     "ENABLE_TORCH_PROFILER",
@@ -208,6 +214,9 @@ def synthetic_settings(argv, environment):
         value = option(argv, (f"--spec-decode-acceptance-{key}",))
         if value is not None:
             settings[f"acceptance_{key}"] = float(value)
+    value = option(argv, ("--spec-decode-acceptance-rates",))
+    if value is not None:
+        settings["acceptance_rates"] = [float(v) for v in value.split(",")]
     declared = environment.get("ATOM_DSV41_BENCHMARK_SYNTHETIC")
     forced = bool(settings)
     # A declaration can describe older/custom synthetic mechanisms. Preserve it

@@ -1,0 +1,277 @@
+{
+  "schema_version": 1,
+  "name": "mi308x-hjbog39",
+  "provenance": {
+    "authored_by": "compass agent for jgong5",
+    "date": "2026-10-18",
+    "origin": "mixed",
+    "origins": {
+      "device.name": {
+        "origin": "probed",
+        "model": "Qwen/Qwen3.8-27B",
+        "width": 1,
+        "source_root": "commit:ce625ddd9",
+        "record": "sha256:e7c309168326a052460eb20e1cec1f0744415b69161e80856069339158600c52"
+      },
+      "device.arch": {
+        "origin": "probed",
+        "model": "Qwen/Qwen3.8-27B",
+        "width": 1,
+        "source_root": "commit:ce625ddd9",
+        "record": "sha256:e7c309168326a052460eb20e1cec1f0744415b69161e80856069339158600c52"
+      },
+      "device.count_per_node": {
+        "origin": "probed",
+        "model": "Qwen/Qwen3.8-27B",
+        "width": 1,
+        "source_root": "commit:ce625ddd9",
+        "record": "sha256:e7c309168326a052460eb20e1cec1f0744415b69161e80856069339158600c52"
+      },
+      "device.memory.capacity_bytes": {
+        "origin": "probed",
+        "model": "Qwen/Qwen3.8-27B",
+        "width": 1,
+        "source_root": "commit:ce625ddd9",
+        "record": "sha256:e7c309168326a052460eb20e1cec1f0744415b69161e80856069339158600c52"
+      },
+      "device.software_pinned_to.rocm": {
+        "origin": "probed",
+        "model": "Qwen/Qwen3.8-27B",
+        "width": 1,
+        "source_root": "commit:ce625ddd9",
+        "record": "sha256:e7c309168326a052460eb20e1cec1f0744415b69161e80856069339158600c52"
+      },
+      "device.software_pinned_to.aiter": {
+        "origin": "probed",
+        "model": "Qwen/Qwen3.8-27B",
+        "width": 1,
+        "source_root": "commit:ce625ddd9",
+        "record": "sha256:e7c309168326a052460eb20e1cec1f0744415b69161e80856069339158600c52"
+      },
+      "device.software_pinned_to.rccl": {
+        "origin": "probed",
+        "model": "Qwen/Qwen3.8-27B",
+        "width": 1,
+        "source_root": "commit:ce625ddd9",
+        "record": "sha256:e7c309168326a052460eb20e1cec1f0744415b69161e80856069339158600c52"
+      },
+      "device.software_pinned_to.torch": {
+        "origin": "probed",
+        "model": "Qwen/Qwen3.8-27B",
+        "width": 1,
+        "source_root": "commit:ce625ddd9",
+        "record": "sha256:e7c309168326a052460eb20e1cec1f0744415b69161e80856069339158600c52"
+      },
+      "device.memory.bandwidth_bytes_per_s": {
+        "origin": "assumed"
+      },
+      "device.memory.bandwidth_curve": {
+        "origin": "assumed"
+      },
+      "device.compute.bf16_flops": {
+        "origin": "assumed"
+      },
+      "device.compute.fp8_flops": {
+        "origin": "assumed"
+      },
+      "device.kernel_floor_s": {
+        "origin": "assumed"
+      },
+      "interconnect.intra_node.topology": {
+        "origin": "assumed"
+      },
+      "interconnect.intra_node.domain_devices": {
+        "origin": "assumed"
+      },
+      "interconnect.intra_node.link_bandwidth_bytes_per_s": {
+        "origin": "assumed"
+      },
+      "interconnect.intra_node.link_latency_s": {
+        "origin": "assumed"
+      },
+      "interconnect.inter_node.link_bandwidth_bytes_per_s": {
+        "origin": "assumed"
+      },
+      "interconnect.inter_node.link_latency_s": {
+        "origin": "assumed"
+      },
+      "device.memory.derate": {
+        "origin": "assumed"
+      },
+      "device.compute.derate.bf16": {
+        "origin": "assumed"
+      },
+      "device.compute.derate.fp8": {
+        "origin": "assumed"
+      },
+      "interconnect.intra_node.derate": {
+        "origin": "assumed"
+      },
+      "interconnect.inter_node.derate": {
+        "origin": "assumed"
+      },
+      "device.ptl": {
+        "origin": "probed"
+      },
+      "interconnect.intra_node.pp.rccl.eager_threshold_bytes": {
+        "origin": "probed",
+        "source_root": "commit:f61652a37",
+        "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+        "p10": 33554432,
+        "p90": 33554432
+      },
+      "interconnect.intra_node.pp.rccl.latency_s": {
+        "origin": "probed",
+        "source_root": "commit:f61652a37",
+        "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+        "p10": 1.551059540361166e-06,
+        "p90": 1.8452992662787437e-06
+      },
+      "interconnect.intra_node.pp.rccl.overhead_s": {
+        "origin": "probed",
+        "source_root": "commit:f61652a37",
+        "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+        "p10": 3.775578707541332e-05,
+        "p90": 3.815520707354402e-05
+      },
+      "interconnect.intra_node.pp.rccl.per_byte_s": {
+        "origin": "probed",
+        "source_root": "commit:f61652a37",
+        "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+        "p10": 2.0040145304535237e-11,
+        "p90": 2.0241865040412074e-11
+      },
+      "interconnect.intra_node.pp.rccl.rendezvous_fixed_s": {
+        "origin": "probed",
+        "source_root": "commit:f61652a37",
+        "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+        "p10": 5.7052271857238044e-05,
+        "p90": 5.7605673286806436e-05
+      },
+      "interconnect.intra_node.pp.gloo.eager_threshold_bytes": {
+        "origin": "probed",
+        "source_root": "commit:f61652a37",
+        "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+        "p10": 0,
+        "p90": 0
+      },
+      "interconnect.intra_node.pp.gloo.latency_s": {
+        "origin": "probed",
+        "source_root": "commit:f61652a37",
+        "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+        "p10": 6.898597348481417e-06,
+        "p90": 1.1346652172505856e-05
+      },
+      "interconnect.intra_node.pp.gloo.overhead_s": {
+        "origin": "probed",
+        "source_root": "commit:f61652a37",
+        "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+        "p10": 1.3180740542832e-05,
+        "p90": 2.1155269091286356e-05
+      },
+      "interconnect.intra_node.pp.gloo.per_byte_s": {
+        "origin": "probed",
+        "source_root": "commit:f61652a37",
+        "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+        "p10": 1.1753227517226192e-10,
+        "p90": 1.4222777041488327e-10
+      },
+      "interconnect.intra_node.pp.gloo.rendezvous_fixed_s": {
+        "origin": "probed",
+        "source_root": "commit:f61652a37",
+        "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+        "p10": 2.3030740387005117e-05,
+        "p90": 2.5839193858153713e-05
+      },
+      "interconnect.intra_node.pp.gloo.wake_s": {
+        "origin": "probed",
+        "source_root": "commit:f61652a37",
+        "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+        "p10": 0.0001359877788747081,
+        "p90": 0.00019833540571732194
+      },
+      "interconnect.intra_node.pp.gloo.wake_rise_s": {
+        "origin": "probed",
+        "source_root": "commit:f61652a37",
+        "record": "sha256:877791cd3ee2a69c25aca30824fdcf45d2e192d37b67b41f76fea040176724c9",
+        "p10": 0.38485740280609293,
+        "p90": 0.7250460403446475
+      }
+    },
+    "fragments": [
+      "device",
+      "assumed",
+      "ptl",
+      "pp"
+    ],
+    "notes": "one Qwen3.8-27B TP1 start at ce625ddd9 | no probe fills these | ptl_enable | pp_carriers.py on two GPUs at f61652a37"
+  },
+  "device": {
+    "name": "MI308X",
+    "arch": "gfx942",
+    "count_per_node": 8,
+    "ptl": "disabled",
+    "memory": {
+      "capacity_bytes": 206141652992,
+      "bandwidth_bytes_per_s": 5300000000000.0,
+      "bandwidth_curve": [
+        [
+          4096,
+          110000000000.0
+        ],
+        [
+          4294967296,
+          4505000000000.0
+        ]
+      ],
+      "derate": 0.85
+    },
+    "compute": {
+      "bf16_flops": 344000000000000.0,
+      "fp8_flops": 688000000000000.0,
+      "derate": {
+        "bf16": 0.7,
+        "fp8": 0.7
+      }
+    },
+    "kernel_floor_s": 2e-06,
+    "software_pinned_to": {
+      "rocm": "7.2.4",
+      "aiter": "9205e1059",
+      "rccl": "2.27.7",
+      "torch": "2.10.0+rocm7.2.4.git3d3aa833"
+    }
+  },
+  "interconnect": {
+    "intra_node": {
+      "topology": "fully_connected",
+      "domain_devices": 8,
+      "link_bandwidth_bytes_per_s": 64000000000.0,
+      "link_latency_s": 2e-06,
+      "pp": {
+        "rccl": {
+          "eager_threshold_bytes": 33554432,
+          "latency_s": 1.5106052160263062e-06,
+          "overhead_s": 3.796907745993579e-05,
+          "per_byte_s": 2.0165586891245436e-11,
+          "rendezvous_fixed_s": 5.63815019316789e-05
+        },
+        "gloo": {
+          "eager_threshold_bytes": 0,
+          "latency_s": 1.0642048437148333e-05,
+          "overhead_s": 1.3869054915274048e-05,
+          "per_byte_s": 1.207313759980259e-10,
+          "rendezvous_fixed_s": 2.428104060241613e-05,
+          "wake_s": 0.00018016894767673692,
+          "wake_rise_s": 0.5825204944577904
+        }
+      },
+      "derate": 0.8
+    },
+    "inter_node": {
+      "link_bandwidth_bytes_per_s": 50000000000.0,
+      "link_latency_s": 5e-06,
+      "derate": 0.8
+    }
+  }
+}

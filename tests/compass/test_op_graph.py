@@ -1,0 +1,1741 @@
+# SPDX-License-Identifier: MIT
+"""The op-level backend: a step priced from the graph captured at its shape.
+
+Each leaf is one roofline over its work; a `Seq` adds, a `Repeat` re-emits its
+body's prices, a `max` `Par` takes its longest branch, and a
+`resource_bound` `Par` costs one roofline over the branches' summed work. A step runs at its rung's
+graph, or its width's under ``padding: none``, a prefill at its tokens and
+rows; attention reads its context in the run's KV format. What cannot be
+priced is refused by name, each reason once. The Qwen3.8-27B TP1 capture prices leaf by leaf, and `run.runner` installs the
+backend from a run file's ``op_graph`` over the store's graphs. With a price
+list, a leaf takes its price first, measured on a point or estimated between
+two of one kernel, at the step's counts and its rows' context, a decode's
+longest row and a prefill's mean cached tokens; anything
+the list declines, a line the fit declined among them, is its roofline,
+carrying why. Under a list, a `resource_bound` `Par` takes its longest branch
+where that is longer than its roofline.
+"""
+
+import copy
+import json
+import os
+import pathlib
+import re
+import signal
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+from test_artifact_store import clean_checkout  # noqa: F401  autouse
+from test_backend_step_linear import _installed, law, view
+from test_backend_step_roofline import COMPUTE, MEMORY, ROOFLINE, _spec
+from test_capture_ir import CONFIG, TREE, WIDTH_2, _ops, capture
+from test_memory_readings import DOCUMENT, WORKER
+from test_op_graph_arch import ENGINE
+from test_op_work import leaf, t
+from test_op_work_v4_attention import FP8, POOL, decode
+from test_work import SPEC
+
+from atom.compass import run as compass_run
+from atom.compass.artifacts import ArtifactRefusal
+from atom.compass.backends import (
+    BatchView,
+    CostRefused,
+    Method,
+    RequestShape,
+    op_graph,
+    op_work,
+)
+from atom.compass.backends.cost import fold_seconds
+from atom.compass.backends.op_graph import NONE, OpGraphBackend
+from atom.compass.backends.op_work import work
+from atom.compass.backends.provenance import Refusal
+from atom.compass.backends.step_roofline import micro_batches, overlap
+from atom.compass.backends.work import Work, attention, gemm, price
+from atom.compass.bench.ops import leaves, signature
+from atom.compass.capture.peers import MORI
+from atom.compass.fit import ops as fit_ops
+from atom.compass.run import _op_graphs
+from atom.compass.runner.overrides import PricedSteps
+from atom.compass.spec import MachineSpec
+
+GEMM = "aiter.gemm_a16w16.default"
+ATTENTION = "aiter.unified_attention_with_output_base.default"
+GATHER = "atom.model_ops.moe:all_gatherv"
+DECODE = view((1, 900, True), (1, 300, True), rung=2)
+PREFILLS = "--prefill 512 2 --prefill 300 3"
+QWEN3 = pathlib.Path(__file__).with_name("qwen3_0_6b_config.json")
+
+
+def g(m, n, k):
+    """A GEMM leaf of `[m, k] @ [n, k]^T`."""
+    return leaf(GEMM, [[m, n]], A=t([m, k]), B=t([n, k], role="weight"), bias=None)
+
+
+def backend(region, machine=SPEC, kv="bf16", **kwargs):
+    return OpGraphBackend(machine, lambda *shape, **_: region, kv=kv, **kwargs)
+
+
+def by_name(cost):
+    return {t.name: t.seconds for t in (*cost.terms, *cost.draft_terms)}
+
+
+def test_a_step_is_one_roofline_per_leaf_composed_by_the_graph_s_joins():
+    view_leaf = leaf("aten.view.default", [[2, 64]], self=t([2, 64]), size=[2, 64])
+    region = {
+        "seq": [
+            g(2, 64, 64),
+            view_leaf,
+            {"repeat": g(2, 128, 64), "count": 3, "index": "l0", "start": 0, "step": 1},
+            {"par": [g(2, 2048, 4096), {"seq": [g(2, 4096, 4096)]}], "join": "max"},
+            {
+                "par": [
+                    {
+                        "par": [
+                            {"seq": [g(4096, 4096, 4096), g(4096, 4096, 4096)]},
+                            g(4096, 2048, 4096),
+                        ],
+                        "join": "max",
+                    },
+                    g(4096, 1024, 4096),
+                ],
+                "join": "resource_bound",
+            },
+        ]
+    }
+    cost = backend(region).price(DECODE)
+    one, body = price(gemm(2, 64, 64), SPEC), price(gemm(2, 128, 64), SPEC)
+    longest = price(gemm(2, 4096, 4096), SPEC)
+    big = gemm(4096, 4096, 4096)
+    summed = big + big + gemm(4096, 2048, 4096) + gemm(4096, 1024, 4096)
+
+    assert by_name(cost) == {
+        f"op.{GEMM}": fold_seconds([one, body, body, body, longest]),
+        "par.resource_bound": price(summed, SPEC),
+    }
+
+
+MIDDLE = BatchView((RequestShape(9, 9, False),), produces_output=False)
+FINAL = BatchView((RequestShape(9, 9, False),), produces_output=True)
+
+
+@pytest.mark.parametrize(
+    "batch,padded,shape",
+    [
+        (view(*[(1, 90, True)] * 3, rung=4), True, ("decode", 4, 4, True)),
+        (view(*[(1, 90, True)] * 3, rung=4), False, ("decode", 3, 3, True)),
+        (view((1, 90, True), (1, 9, True)), True, ("decode", 2, 2, True)),
+        (view((100, 100, False), (1, 50, True)), True, ("prefill", 101, 2, True)),
+        (MIDDLE, True, ("prefill", 9, 1, False)),
+        (FINAL, True, ("prefill", 9, 1, True)),
+    ],
+    ids=["rung", "padding-none", "eager-decode", "mixed", "middle", "final"],
+)
+def test_a_step_reads_the_graph_captured_at_its_shape(batch, padded, shape):
+    asked = []
+
+    def graph(*at):
+        asked.append(at)
+        return g(1, 8, 8)
+
+    OpGraphBackend(SPEC, graph, kv="bf16", padded=padded).price(batch)
+
+    assert asked == [shape]
+
+
+@pytest.mark.parametrize(
+    "batch,graph,named",
+    [
+        (
+            view((2, 9, True)),
+            g(1, 8, 8),
+            "a step that decodes more than one token in a row",
+        ),
+        (view((1, 9, True)), None, "no op_graph holds a decode step of 1 tokens"),
+        (MIDDLE, None, "of 9 tokens over 1 sequences that produces no output;"),
+        (
+            BatchView((RequestShape(9, 9, False),)),
+            g(1, 8, 8),
+            "a prefill step whose view does not say whether it produces output",
+        ),
+        (
+            BatchView((RequestShape(9, 9, False),), image_tokens=5),
+            g(1, 8, 8),
+            "a step with image tokens",
+        ),
+    ],
+    ids=[
+        "speculative",
+        "uncaptured",
+        "uncaptured-middle",
+        "output-unsaid",
+        "images",
+    ],
+)
+def test_a_step_with_no_graph_to_price_it_is_refused_by_name(batch, graph, named):
+    with pytest.raises(CostRefused, match=named):
+        backend(graph).price(batch)
+
+
+@pytest.mark.parametrize(
+    "steps,graph,reason",
+    [
+        (
+            [view((2, 9, True)), view((3, 9, True), (1, 9, True))],
+            g(1, 8, 8),
+            (
+                "a step that decodes more than one token in a row: a speculative "
+                "decode step is not captured"
+            ),
+        ),
+    ],
+    ids=["speculative"],
+)
+def test_steps_declined_for_one_cause_share_one_reason(steps, graph, reason):
+    """Steps of one kind the graph declines, whatever their counts, are
+    refused for one reason."""
+    reasons = set()
+    for step in steps:
+        with pytest.raises(CostRefused) as refused:
+            backend(graph).price(step)
+        reasons.update(refused.value.declined)
+
+    assert reasons == {Refusal("op-graph", reason)}
+
+
+def test_a_data_parallel_step_with_no_moe_exchange_prices_as_its_own_rows():
+    dp = backend(g(9, 8, 8)).price(replace(FINAL, moe_rows=18))
+
+    assert by_name(dp) == by_name(backend(g(9, 8, 8)).price(FINAL))
+
+
+def test_each_reason_a_graph_refuses_is_named_once():
+    region = {
+        "seq": [
+            leaf("foo.bar.default"),
+            {
+                "repeat": {"seq": [leaf("foo.bar.default"), g(2, 8, 8)]},
+                "count": 4,
+                "index": "l0",
+                "start": 0,
+                "step": 1,
+            },
+            leaf("foo.baz.default"),
+        ]
+    }
+    with pytest.raises(CostRefused) as refused:
+        backend(region).price(DECODE)
+
+    assert refused.value.declined == (
+        Refusal("op-work", "no extractor for the op kind foo.bar.default"),
+        Refusal("op-work", "no extractor for the op kind foo.baz.default"),
+    )
+
+
+def test_a_spec_field_a_leaf_reads_and_the_spec_lacks_refuses_naming_it():
+    lacking = SimpleNamespace(values={}, value=SPEC.value, origin=SPEC.origin)
+
+    with pytest.raises(CostRefused, match=f"{GEMM} reads device.kernel_floor_s,"):
+        backend(g(2, 8, 8), lacking).price(DECODE)
+
+
+def test_a_leaf_refused_on_one_step_is_refused_on_the_next():
+    lacking = SimpleNamespace(values={}, value=SPEC.value, origin=SPEC.origin)
+    ops = backend(g(2, 8, 8), lacking)
+    for step in (DECODE, DECODE):
+        with pytest.raises(CostRefused, match=f"{GEMM} reads device.kernel_floor_s,"):
+            ops.price(step)
+
+
+def test_a_collective_wider_than_the_scale_up_domain_refuses_naming_it():
+    reduce = leaf("aiter.all_reduce_.default", [[2, 64]], tensor=t([2, 64]))
+
+    with pytest.raises(CostRefused, match="over 16 ranks leaves the scale-up"):
+        backend(reduce, tp=16).price(DECODE)
+
+
+@pytest.mark.parametrize("kv", ["bf16", "fp8"])
+def test_attention_reads_its_context_in_the_run_s_kv_format(kv):
+    attn = leaf(ATTENTION, [[2, 6144]], q=t([2, 24, 256]), k=t([2, 4, 256]))
+    long = view((1, 200_000, True), (1, 100_000, True), rung=2)
+    cost = backend(attn, kv=kv).price(long)
+    expected = attention([1, 1], [200_000, 100_000], 24 * 256, 1, 4 * 256, "bf16", kv)
+
+    assert by_name(cost) == {f"op.{ATTENTION}": price(expected, SPEC)}
+
+
+@pytest.mark.parametrize(
+    "batch,reads",
+    [
+        (view((1, 900, True)), MEMORY),
+        (BatchView((RequestShape(8192, 8192, False),), produces_output=True), COMPUTE),
+    ],
+    ids=["memory", "compute"],
+)
+@pytest.mark.parametrize("origin", ["probed", "assumed"])
+def test_a_term_is_declared_iff_a_field_its_winning_bound_reads_is_stated(
+    batch, reads, origin
+):
+    big = g(sum(r.query_tokens for r in batch.requests), 4096, 4096)
+    (term,) = backend(big, _spec(origin)).price(batch).terms
+    note = term.provenance.note
+
+    if origin == "probed":
+        assert term.provenance.method is Method.ANALYTICAL and not note
+    else:
+        assert term.provenance.method is Method.DECLARED
+        assert [p for p in MEMORY + COMPUTE if p in note] == list(reads)
+        assert note.endswith(NONE)
+
+
+def test_a_step_works_each_distinct_leaf_once_and_keeps_what_reads_no_step(
+    monkeypatch,
+):
+    """Equal leaves share one work a step; a GEMM leaf, which reads
+    nothing of the step, keeps its work across steps; attention, which reads
+    the step's rows, is worked again at each step's."""
+    worked = []
+
+    def counted(op, *args):
+        worked.append(op["op"])
+        return work(op, *args)
+
+    monkeypatch.setattr(op_graph, "work", counted)
+    attn = leaf(ATTENTION, [[2, 6144]], q=t([2, 24, 256]), k=t([2, 4, 256]))
+    region = {"seq": [g(2, 64, 64), attn, g(2, 64, 64), copy.deepcopy(attn)]}
+    steps = [DECODE, view((1, 9_000, True), (1, 30, True), rung=2)]
+    ops = backend(region)
+    costs = [ops.price(step) for step in steps]
+
+    assert worked == [GEMM, ATTENTION, ATTENTION]
+    assert costs == [backend(region).price(step) for step in steps]
+    assert costs[0] != costs[1]
+
+
+def test_leaves_that_differ_only_in_what_they_state_price_apart():
+    def indexer(ratio):
+        op = leaf(
+            "aiter.indexer_score_topk.default",
+            [[2, 2048]],
+            q_quant=t([2, 64, 128], "torch.float8_e4m3fn"),
+            weights=t([2, 64]),
+            topk=2048,
+        )
+        return op | {"stated": {"compress_ratio": ratio}}
+
+    a, b = indexer(4), indexer(128)
+    step = view((1, 900_000, True), (1, 300_000, True), rung=2)
+    both = by_name(backend({"seq": [a, b]}, kv="fp8").price(step))
+    alone = [by_name(backend(x, kv="fp8").price(step)) for x in (a, b)]
+
+    assert alone[0] != alone[1]
+    assert both == {k: fold_seconds([alone[0][k], alone[1][k]]) for k in both}
+
+
+def test_a_leaf_in_and_out_of_a_resource_bound_par_prices_each_way():
+    big = g(2, 4096, 4096)
+    params = listed(
+        *[pt(g(b, 4096, 4096), f"decode B={b}", 1e3, c) for b in (2, 4) for c in (1, 9)]
+    )
+    pooled = {"par": [g(2, 4096, 4096), g(2, 4096, 4096)], "join": "resource_bound"}
+    cost = backend({"seq": [big, pooled]}, price_list=params).price(DECODE)
+    alone = backend(big, price_list=params).price(DECODE)
+
+    summed = gemm(2, 4096, 4096) + gemm(2, 4096, 4096)
+    assert by_name(cost) == by_name(alone) | {"par.resource_bound": price(summed, SPEC)}
+
+
+def alone(region, steps, **kwargs):
+    """Each step's prices as each leaf of `region`'s sequence priced alone
+    gives them, folded."""
+    each = [
+        [by_name(backend(x, **kwargs).price(s)) for x in region["seq"]] for s in steps
+    ]
+    return [{k: fold_seconds(a[k] for a in s) for k in s[0]} for s in each]
+
+
+def test_layers_that_differ_only_in_what_no_extractor_reads_work_once_a_step(
+    monkeypatch,
+):
+    """V4 decode attention layers whose KV pools differ in rows are worked once
+    a step for each compression ratio."""
+    worked = []
+
+    def counted(op, *args):
+        worked.append(op["stated"]["compress_ratio"])
+        return work(op, *args)
+
+    monkeypatch.setattr(op_graph, "work", counted)
+    layers = [
+        decode(window_size=4, compress_ratio=r, index_topk=16) for r in (4, 128) * 3
+    ]
+    for rows, layer in enumerate(layers):
+        layer["args"]["kv_buffer"] = t([POOL + rows, 1, 1, 16], FP8, role="kv")
+    steps = [DECODE, view((1, 9_000, True), (1, 30, True), rung=2)]
+    ops = backend({"seq": layers}, kv="fp8")
+    costs = [by_name(ops.price(s)) for s in steps]
+
+    assert worked == [4, 128, 4, 128]
+    assert costs == alone({"seq": layers}, steps, kv="fp8")
+
+
+def test_a_part_of_a_leaf_read_only_on_some_leaves_keys_each_leaf(monkeypatch):
+    kind = "aiter.reads_b_when_a.default"
+
+    def extract(op, view, tp, kv):
+        return Work({}, op["args"]["b"] if op["args"]["a"] else 1)
+
+    monkeypatch.setitem(op_work.EXTRACTORS, kind, extract)
+    region = {
+        "seq": [leaf(kind, [[1]], a=a, b=b) for a, b in ((0, 5), (1, 5e9), (1, 9e9))]
+    }
+    assert [by_name(backend(region).price(DECODE))] == alone(region, [DECODE])
+
+
+def test_a_leaf_with_stated_fields_and_one_without_price_apart(monkeypatch):
+    kind = "aiter.reads_whether_stated.default"
+
+    def extract(op, view, tp, kv):
+        return Work({}, 1e9 if "stated" in op else 2e9)
+
+    monkeypatch.setitem(op_work.EXTRACTORS, kind, extract)
+    region = {"seq": [leaf(kind, [[1]]) | {"stated": {"k": 1}}, leaf(kind, [[1]])]}
+    assert [by_name(backend(region).price(DECODE))] == alone(region, [DECODE])
+
+
+@pytest.mark.parametrize("walk", [len, lambda op: sum(1 for _ in op)])
+def test_leaves_whose_work_walks_their_keys_price_apart_by_each_key(monkeypatch, walk):
+    kind = "aiter.walks_its_keys.default"
+    monkeypatch.setitem(
+        op_work.EXTRACTORS, kind, lambda op, *_: Work({}, walk(op) * 1e9)
+    )
+    region = {"seq": [leaf(kind, [[1]]), leaf(kind, [[1]]) | {"stated": {"k": 1}}]}
+    assert [by_name(backend(region).price(DECODE))] == alone(region, [DECODE])
+
+
+def test_a_graph_s_price_kept_for_leaves_shared_otherwise_is_not_reused(monkeypatch):
+    """The `x` 2 leaf reads `y` first at the first step, so its last leaf
+    shares with the first only at the second, at the same values elsewhere."""
+    kind = "aiter.reads_y_when_x_2.default"
+
+    def extract(op, view, tp, kv):
+        long = max(r.context_tokens for r in view.requests) > 1_000
+        if op["args"]["x"] == 2 and op["args"]["y"] == 0:
+            return Work({}, 1e9 if long else 3e9)
+        return Work({}, op["args"]["x"] * 1e9)
+
+    monkeypatch.setitem(op_work.EXTRACTORS, kind, extract)
+    xy = ((1, 0), (3, 0), (3, 1), (2, 0), (1, 0))
+    region = {"seq": [leaf(kind, [[1]], x=x, y=y) for x, y in xy]}
+    steps = [DECODE, view((1, 9_000, True), (1, 30, True), rung=2)]
+    ops = backend(region)
+    assert [by_name(ops.price(s)) for s in steps] == alone(region, steps)
+
+
+def test_a_graph_s_price_is_kept_only_for_its_leaves_prices_and_work_in_a_par():
+    """Attention at the kernel floor at either step's rows, its bytes summed
+    with a memory-bound GEMM's."""
+    attn = leaf(ATTENTION, [[2, 6144]], q=t([2, 24, 256]), k=t([2, 4, 256]))
+    pooled = {"par": [attn, g(2, 8192, 8192)], "join": "resource_bound"}
+    steps = [
+        view((1, 9, True), (1, 3, True), rung=2),
+        view((1, 20, True), (1, 9, True), rung=2),
+    ]
+    ops = backend(pooled)
+    costs = [by_name(ops.price(s)) for s in steps + steps]
+
+    assert len({str(by_name(backend(attn).price(s))) for s in steps}) == 1
+    assert costs == [by_name(backend(pooled).price(s)) for s in steps + steps]
+    assert costs[0] != costs[1]
+
+
+def test_a_leaf_refused_at_a_kept_graph_s_next_step_refuses_it(monkeypatch):
+    kind = "aiter.refuses_long_rows.default"
+
+    def extract(op, view, tp, kv):
+        if max(r.context_tokens for r in view.requests) > 1_000:
+            raise op_work._Unpriced("a row past 1000")
+        return Work()
+
+    monkeypatch.setitem(op_work.EXTRACTORS, kind, extract)
+    ops = backend({"seq": [g(2, 64, 64), leaf(kind, [[1]])]})
+    ops.price(DECODE)
+
+    with pytest.raises(CostRefused, match="a row past 1000"):
+        ops.price(view((1, 9_000, True), (1, 30, True), rung=2))
+
+
+# --- two-batch overlap -------------------------------------------------------------
+
+#: A machine whose kernel floor is a second, so each small leaf costs one.
+FLOOR = copy.deepcopy(ROOFLINE)
+FLOOR["device"]["kernel_floor_s"] = 1.0
+SECOND = MachineSpec.from_mapping(FLOOR)
+SCATTER = "atom.model_ops.moe:reduce_scatterv"
+#: This rank's 7 tokens split 3 then 4, cutting the first request; its peer
+#: splits the same.
+SPLIT = BatchView(
+    (RequestShape(4, 4, False), RequestShape(3, 10, False)),
+    moe_rows=14,
+    produces_output=True,
+    tbo_tokens=((3, 3), (4, 4)),
+)
+
+
+def layers(*lead, count=3):
+    """`lead`, then `count` layers of compute 3, gather 2, experts 4 and
+    scatter 2, each leaf a second."""
+    gather, scatter = leaf(GATHER, [[2, 8]], x=t([1, 8])), leaf(
+        SCATTER, [[1, 8]], x=t([2, 8])
+    )
+    layer = [g(1, 8, 8)] * 3 + [gather] * 2 + [g(1, 8, 8)] * 4 + [scatter] * 2
+    body = {"seq": layer}
+    return {
+        "seq": [
+            *lead,
+            {"repeat": body, "count": count, "index": "l0", "start": 0, "step": 1},
+        ]
+    }
+
+
+def test_a_split_step_lays_both_micro_batches_on_the_compute_and_comm_streams():
+    asked = []
+
+    def graph(*at, **_):
+        asked.append(at)
+        return layers()
+
+    cost = OpGraphBackend(SECOND, graph, kv="bf16").price(SPLIT)
+
+    # Each micro-batch from its own shape's graph, the second with the output.
+    assert asked == [("prefill", 3, 1, False, 6), ("prefill", 4, 2, True, 8)]
+    # The timeline ATOM's TBO ring runs: 44 seconds, against 66 one after the
+    # other.
+    assert by_name(cost) == {"op.tbo": 44.0}
+    assert cost.terms[0].provenance.detail.endswith(
+        "prefill T=3 B=1 G=6 that produces no output and prefill T=4 B=2 G=8"
+    )
+
+
+def test_a_gather_of_token_ids_runs_inline_on_the_compute_stream():
+    ids = leaf(GATHER, [[2, 1]], x=t([1, 1], role="metadata"))
+    cost = OpGraphBackend(
+        SECOND, lambda *at, **_: layers(ids, count=1), kv="bf16"
+    ).price(SPLIT)
+
+    assert by_name(cost) == {"op.tbo": overlap([[(4, 4), (2, 2), (4, 4), (2, 2)]])}
+
+
+@pytest.mark.parametrize(
+    "batch,graph,split,named",
+    [
+        (SPLIT, layers(), True, "on MoRI's split send and receive"),
+        (
+            replace(SPLIT, tbo_tokens=((3, 4), (4, 3))),
+            layers(),
+            False,
+            r"split \(\(3, 4\), \(4, 3\)\) names no single pair",
+        ),
+        (SPLIT, None, False, "no op_graph holds a prefill step of 3 tokens"),
+        (
+            replace(SPLIT, produces_output=None),
+            layers(),
+            False,
+            "does not say whether it produces output",
+        ),
+        (replace(SPLIT, image_tokens=5), layers(), False, "a step with image tokens"),
+    ],
+    ids=[
+        "split-send-recv",
+        "no-pair",
+        "uncaptured",
+        "output-unsaid",
+        "images",
+    ],
+)
+def test_a_split_step_with_no_price_is_refused_by_name(batch, graph, split, named):
+    with pytest.raises(CostRefused, match=named):
+        backend(graph, split_send_recv=split).price(batch)
+
+
+@pytest.mark.parametrize("join", ["max", "resource_bound"])
+def test_a_micro_batch_whose_exchange_shares_a_par_is_refused(join):
+    routed = {"seq": [leaf(GATHER, [[2, 8]], x=t([1, 8])), g(1, 8, 8)]}
+    dual = {"par": [routed, g(1, 8, 8)], "join": join}
+
+    with pytest.raises(CostRefused, match="runs an MoE exchange beside a second"):
+        OpGraphBackend(SECOND, lambda *at, **_: dual, kv="bf16").price(SPLIT)
+
+
+def test_micro_batches_whose_graphs_exchange_unalike_are_refused():
+    def graph(phase, tokens, seqs, output, gathered, **_):
+        return layers(count=tokens - 2)
+
+    with pytest.raises(CostRefused, match="change streams 3 and 7 times"):
+        OpGraphBackend(SECOND, graph, kv="bf16").price(SPLIT)
+
+
+def test_a_leaf_one_micro_batch_refuses_is_named_before_the_stream_count():
+    def graph(phase, tokens, seqs, output, gathered, **_):
+        exchange = "atom.model_ops.moe:foo" if tokens == 3 else GATHER
+        return {"seq": [g(1, 8, 8), leaf(exchange, [[2, 8]], x=t([1, 8])), g(1, 8, 8)]}
+
+    with pytest.raises(CostRefused) as refused:
+        OpGraphBackend(SECOND, graph, kv="bf16").price(SPLIT)
+
+    assert refused.value.declined == (
+        Refusal("op-work", "no extractor for the op kind atom.model_ops.moe:foo"),
+    )
+
+
+def test_the_first_micro_batch_issues_first_on_each_stream():
+    gather = leaf(GATHER, [[2, 8]], x=t([1, 8]))
+
+    def graph(phase, tokens, seqs, output, gathered, **_):
+        compute, exchange = {3: (1, 10), 4: (10, 1)}[tokens]
+        return {"seq": [g(1, 8, 8)] * compute + [gather] * exchange}
+
+    cost = OpGraphBackend(SECOND, graph, kv="bf16").price(SPLIT)
+
+    # The first micro-batch's long exchange hides under the second's compute:
+    # 12 seconds, against 21 issued the other way round.
+    assert by_name(cost) == {"op.tbo": 12.0}
+
+
+def test_a_mori_dispatch_with_an_unset_argument_rides_the_comm_stream():
+    dispatch = leaf(
+        f"{MORI}.dispatch",
+        [[2, 8]],
+        input=t([1, 8]),
+        weights=t([1, 2]),
+        scales=None,
+        indices=t([1, 2]),
+    )
+    region = {"seq": [g(1, 8, 8), dispatch, g(1, 8, 8)]}
+    cost = OpGraphBackend(SECOND, lambda *at, **_: region, kv="bf16").price(SPLIT)
+
+    assert by_name(cost) == {"op.tbo": overlap([[(1, 1), (1, 1), (1, 1)]])}
+
+
+def test_an_exchange_two_pars_deep_is_refused():
+    routed = {"seq": [leaf(GATHER, [[2, 8]], x=t([1, 8])), g(1, 8, 8)]}
+    inner = {"par": [routed, g(1, 8, 8)], "join": "max"}
+    nested = {"par": [inner, g(1, 8, 8)], "join": "max"}
+
+    with pytest.raises(CostRefused, match="runs an MoE exchange beside a second"):
+        OpGraphBackend(SECOND, lambda *at, **_: nested, kv="bf16").price(SPLIT)
+
+
+def test_each_micro_batch_s_attention_prices_at_its_own_rows():
+    split = replace(
+        SPLIT, requests=(RequestShape(4, 40_000, False), RequestShape(3, 90_000, False))
+    )
+    attn = leaf(ATTENTION, [[4, 6144]], q=t([4, 24, 256]), k=t([4, 4, 256]))
+    cost = OpGraphBackend(SPEC, lambda *at, **_: attn, kv="bf16").price(split)
+    each = [price(work(attn, h, 1, "bf16"), SPEC) for h in micro_batches(split)]
+
+    assert each[0] != each[1]
+    assert by_name(cost) == {"op.tbo": pytest.approx(sum(each))}
+
+
+def test_a_split_step_s_note_names_the_stated_fields_of_every_price():
+    region = {"seq": [g(8192, 4096, 4096), g(1, 4096, 4096)]}
+    (term,) = backend(region, _spec("assumed")).price(SPLIT).terms
+
+    assert term.provenance.method is Method.DECLARED
+    assert [p for p in MEMORY + COMPUTE if p in term.provenance.note] == list(
+        MEMORY + COMPUTE
+    )
+
+
+# --- the published 27B -----------------------------------------------------------
+
+
+#: DeepSeek-V4-Pro's DPA-TP8 steps whose KV pools differ, in the order a run
+#: meets them: a decode's the fewest blocks a capture allocates
+#: (`forward.KV_BLOCKS`), a prefill of one-token rows a block a row.
+POOLS = (("decode", 2, 2), ("prefill", 100, 100), ("prefill", 80, 80))
+
+
+def _alone(root, phase, tokens, seqs):
+    """V4-Pro's DPA-TP8 step at a shape alone in a `trace ops` of its own into
+    `root`, a prefill as one forward: `root` and the finished process."""
+    from test_capture_v4_pro import DPA_TP8, trace
+
+    at = f"--width {seqs}" if phase == "decode" else f"--prefill {tokens} {seqs}"
+    return root, trace(root, f"{at} --whole{DPA_TP8}")
+
+
+@pytest.fixture(scope="module")
+def ahead(tmp_path_factory):
+    """The module's longest traces, each a process of its own, all started at
+    the first test that reads one: the 27B's captures by their shapes
+    (`capture`) and each step of `POOLS` alone (`_alone`), each a future of
+    what it returns. The module ends once every one has."""
+    # The session's base directory is made at its first use, and threads that
+    # each first use it make one apiece: make it here, before they start.
+    tmp_path_factory.getbasetemp()
+    with ThreadPoolExecutor(2 + len(POOLS)) as each:
+        started = {
+            shapes: each.submit(capture, 1, shapes, tmp_path_factory)
+            for shapes in (WIDTH_2, PREFILLS)
+        }
+        for at in POOLS:
+            started[at] = each.submit(_alone, tmp_path_factory.mktemp("alone"), *at)
+        yield started
+
+
+def captured(ahead, shapes):
+    """`capture(1, shapes)`, once both of the 27B's captures have published:
+    a test reads every TP1 store whole."""
+    for done in (ahead[WIDTH_2], ahead[PREFILLS]):
+        done.result()
+    return ahead[shapes].result()
+
+
+def test_the_27b_s_captured_decode_step_prices_leaf_by_leaf(ahead):
+    graph, _ = captured(ahead, WIDTH_2)["decode B=2"]
+    cost = backend(graph["region"]).price(DECODE)
+    flat: dict = {}
+    for op in _ops(graph["region"]):
+        w = work(op, DECODE, 1, "bf16")
+        if w is not None:
+            flat.setdefault(f"op.{op['op']}", []).append(price(w, SPEC))
+
+    assert by_name(cost) == {name: fold_seconds(s) for name, s in flat.items()}
+    assert {f"op.{GEMM}", f"op.{ATTENTION}"} <= by_name(cost).keys()
+
+
+def _engine(graph) -> dict:
+    """`ENGINE` at the quantization hash the capture's own config keyed `graph`
+    by, which a stand-in config cannot compute."""
+    quantization = json.loads(graph["structure"].split()[3])["quantization"]
+    return {
+        **ENGINE,
+        "quant_config": SimpleNamespace(compute_hash=lambda: quantization),
+    }
+
+
+def test_the_run_s_lookup_reads_the_eager_graph_at_a_shape(ahead, tmp_path_factory):
+    graph, _ = captured(ahead, WIDTH_2)["decode B=2"]
+    base = tmp_path_factory.getbasetemp()
+    hf = SimpleNamespace(architectures=json.loads(CONFIG.read_text())["architectures"])
+    found = []
+    for store in base.glob("tp1*/store"):
+        config = SimpleNamespace(
+            model=str(store.parent / "model"),
+            hf_config=hf,
+            tensor_parallel_size=1,
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            enable_expert_parallel=False,
+            enforce_eager=False,
+            **_engine(graph),
+        )
+        lookup = _op_graphs(str(store), config, "gfx942")
+        found.append((lookup("decode", 2, 2), lookup("decode", 3, 3)))
+
+    assert (graph["region"], None) in found
+
+
+def test_a_27b_middle_chunk_prices_from_its_graph_with_no_lm_head(
+    ahead, tmp_path_factory
+):
+    (graph, _), *_ = captured(ahead, PREFILLS).values()
+    hf = SimpleNamespace(architectures=json.loads(CONFIG.read_text())["architectures"])
+    lookups = [
+        _op_graphs(
+            str(store),
+            SimpleNamespace(
+                model=str(store.parent / "model"),
+                hf_config=hf,
+                tensor_parallel_size=1,
+                parallel_config=SimpleNamespace(data_parallel_size=1),
+                enable_expert_parallel=False,
+                enforce_eager=True,
+                **_engine(graph),
+            ),
+            "gfx942",
+        )
+        for store in tmp_path_factory.getbasetemp().glob("tp1*/store")
+    ]
+    lookup = next(at for at in lookups if at("prefill", 512, 2))
+    final, middle = lookup("prefill", 512, 2, True), lookup("prefill", 512, 2, False)
+
+    def rows(region):
+        return {op["args"]["A"]["shape"][0] for op in _ops(region) if op["op"] == GEMM}
+
+    # The head takes each sequence's last token; a middle chunk runs no head.
+    assert (rows(final), rows(middle)) == ({512, 2}, {512})
+    assert leaves(middle).keys() < leaves(final).keys()
+    chunk = (RequestShape(256, 256, False),) * 2
+    priced = {
+        output: by_name(
+            OpGraphBackend(SPEC, lookup, kv="bf16").price(
+                BatchView(chunk, produces_output=output)
+            )
+        )
+        for output in (True, False)
+    }
+    assert priced[False].keys() <= priced[True].keys()
+    assert sum(priced[False].values()) < sum(priced[True].values())
+    (head,) = [op for op in _ops(final) if rows(op) == {2}]
+    dropped = priced[True][f"op.{GEMM}"] - priced[False][f"op.{GEMM}"]
+    assert dropped == pytest.approx(price(work(head, FINAL, 1, "bf16"), SPEC))
+
+
+@pytest.mark.parametrize("padding,padded", [({}, True), ({"padding": "none"}, False)])
+def test_a_run_file_op_graph_installs_the_op_level_backend(
+    monkeypatch, tmp_path, padding, padded
+):
+    monkeypatch.setitem(WORKER, "kv_cache_dtype", "fp8")
+    installed = _installed(monkeypatch, tmp_path, op_graph=True, **padding)
+
+    assert isinstance(installed, OpGraphBackend)
+    assert (installed.tp, installed.kv, installed.padded) == (1, "fp8", padded)
+
+
+def test_a_run_file_op_graph_under_low_latency_ep_refuses_its_split_steps(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setitem(WORKER, "enable_low_latency", True)
+    split = [
+        _installed(monkeypatch, tmp_path, op_graph=True, ep=ep) for ep in (False, True)
+    ]
+
+    assert [b.split_send_recv for b in split] == [False, True]
+
+
+def test_a_run_file_op_graph_that_is_not_true_is_refused(monkeypatch, tmp_path):
+    with pytest.raises(TypeError, match="op_graph is 'yes'; it is true"):
+        _installed(monkeypatch, tmp_path, op_graph="yes")
+
+
+def test_a_run_file_with_op_graph_and_another_backend_is_refused(monkeypatch, tmp_path):
+    with pytest.raises(ValueError, match="has step_linear and op_graph"):
+        _installed(monkeypatch, tmp_path, step_linear=law(), op_graph=True)
+
+
+# --- the price list first ------------------------------------------------------
+
+
+def pt(leaf, shape, ns, context=None, kernel="k", rows=None):
+    """A `measure ops` point of `leaf` at `shape`."""
+    point = {"shape": shape, "context": context, "op": leaf["op"], "cold_ns": ns}
+    point |= {"leaf": signature(leaf), "kernels": [kernel]}
+    return point | ({"rows": rows} if rows else {})
+
+
+def listed(*points):
+    """`compass fit ops`'s params over `points`, declined lines included, as
+    the price list a run reads."""
+    params = fit_ops.fit(list(points))
+    fit_ops.held_out(params)
+    return fit_ops.PriceList(params)
+
+
+# A GEMM whose time does not move with context: its family runs over B alone.
+FLAT = listed(
+    *[
+        pt(g(b, 64, 64), f"decode B={b}", ns, c)
+        for b, ns in ((2, 5e3), (4, 7e3))
+        for c in (100, 1000)
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "batch,padded,priced,method",
+    [
+        (DECODE, True, 5e-6, Method.MEASURED),
+        (view(*[(1, 90, True)] * 3), False, 6e-6, Method.ESTIMATED),
+    ],
+    ids=["on-a-point", "between-two"],
+)
+def test_a_leaf_the_price_list_holds_is_priced_from_it(batch, padded, priced, method):
+    (term,) = backend(g(2, 64, 64), padded=padded, price_list=FLAT).price(batch).terms
+
+    assert (term.name, term.seconds) == (f"op.{GEMM}.price_list", pytest.approx(priced))
+    assert (term.provenance.method, term.provenance.source) == (method, "price-list")
+    assert not term.provenance.refusals
+
+
+def test_a_leaf_the_price_list_declines_is_its_roofline_and_carries_why():
+    wide = view(*[(1, 90, True)] * 5, rung=8)
+    alone = backend(g(2, 64, 64)).price(wide)
+    cost = backend(g(2, 64, 64), price_list=FLAT).price(wide)
+
+    assert (
+        by_name(cost) == by_name(alone) == {f"op.{GEMM}": by_name(alone)[f"op.{GEMM}"]}
+    )
+    assert cost.fell_back and cost.terms[0].provenance.method is Method.ANALYTICAL
+    assert cost.refusals == (
+        Refusal("price-list", f"{GEMM}: B = 8 is outside the measured 2 to 4"),
+    )
+
+
+# Along context at B = 2 the middle point reads +25% off its neighbours' line.
+BENT = listed(
+    *[
+        pt(g(2, 64, 64), "decode B=2", ns, c)
+        for c, ns in ((1000, 1e4), (2000, 2e4), (3000, 4e4))
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "rows,answer",
+    [
+        ([(1, 2000, True)] * 2, 2e-5),
+        (
+            [(1, 1500, True)] * 2,
+            (
+                f"{GEMM}: the fit declined context at B = 2: context = 2000 reads "
+                "+25.0% off its neighbours"
+            ),
+        ),
+    ],
+    ids=["its-measured-point", "along-it"],
+)
+def test_a_line_the_fit_declined_answers_its_points_only(rows, answer):
+    cost = backend(g(2, 64, 64), price_list=BENT).price(view(*rows, rung=2))
+
+    if isinstance(answer, float):
+        assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(answer)}
+    else:
+        assert cost.refusals == (Refusal("price-list", answer),)
+
+
+# Linear in context, one kernel to 2000 and another at 3000.
+BANDED = listed(
+    *[
+        pt(g(2, 64, 64), "decode B=2", ns, c, kernel)
+        for c, ns, kernel in ((1000, 1e4, "a"), (2000, 2e4, "a"), (3000, 3e4, "b"))
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "rows,priced,method",
+    [
+        ([(1, 1500, True)] * 2, 1.5e-5, Method.ESTIMATED),
+        ([(1, 1000, True), (1, 2000, True)], 2e-5, Method.MEASURED),
+        ([(1, 1000, True), (1, 3000, True)], 3e-5, Method.MEASURED),
+    ],
+    ids=["uniform", "uneven-in-one-kernel", "uneven-across-two"],
+)
+def test_a_decode_step_prices_at_its_longest_row_s_context(rows, priced, method):
+    # decode attention's time follows its longest row, so does the query
+    cost = backend(g(2, 64, 64), price_list=BANDED).price(view(*rows, rung=2))
+
+    assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(priced)}
+    assert cost.terms[0].provenance.method is method
+
+
+def test_one_backend_prices_each_step_at_its_own_bound():
+    ops = backend(g(2, 64, 64), price_list=BANDED)
+    steps = [
+        view(*rows, rung=2)
+        for rows in ([(1, 1500, True)] * 2, [(1, 1000, True), (1, 3000, True)])
+    ]
+
+    assert [by_name(ops.price(s)) for s in steps] == [
+        by_name(backend(g(2, 64, 64), price_list=BANDED).price(s)) for s in steps
+    ]
+
+
+def test_leaves_whose_work_skips_what_they_state_take_the_list_s_price_apart():
+    a, b = (g(2, 64, 64) | {"stated": {"x": x}} for x in (1, 2))
+    params = listed(*[pt(a, "decode B=2", 5e5, c) for c in (100, 1000)])
+    one = [by_name(backend(x, price_list=params).price(DECODE)) for x in (a, b)]
+    both = by_name(backend({"seq": [a, b]}, price_list=params).price(DECODE))
+
+    assert one[0] != one[1]
+    assert sorted(both) == sorted(one[0] | one[1])
+
+
+def test_leaves_whose_work_skips_an_argument_take_the_list_s_price_apart():
+    a, b = g(2, 64, 64), g(2, 64, 64)
+    a["args"]["x"], b["args"]["x"] = 1, 2
+    params = listed(*[pt(a, "decode B=2", 5e5, c) for c in (100, 1000)])
+    one = [by_name(backend(x, price_list=params).price(DECODE)) for x in (a, b)]
+    both = by_name(backend({"seq": [a, b]}, price_list=params).price(DECODE))
+
+    assert one[0] != one[1]
+    assert sorted(both) == sorted(one[0] | one[1])
+
+
+def test_a_leaf_the_list_holds_at_other_outputs_refuses_beside_one_it_holds():
+    kind = "aiter.no_extractor_listed.default"
+    a, b = (leaf(kind, [[2, n]], x=t([2, 64])) for n in (64, 128))
+    params = listed(*[pt(a, "decode B=2", 5e5, c) for c in (100, 1000)])
+    backend(a, price_list=params).price(DECODE)
+
+    with pytest.raises(CostRefused):
+        backend({"seq": [a, b]}, price_list=params).price(DECODE)
+
+
+ATTN = leaf(ATTENTION, [[64, 6144]], q=t([64, 24, 256]), k=t([64, 4, 256]))
+# A prefill of 64 tokens over two rows, each past 0, 1024 or 2048 cached tokens.
+CACHED = listed(
+    *[
+        pt(ATTN, "prefill T=64 B=2", ns, c, rows=[[32, 32 + c, False]] * 2)
+        for c, ns in ((0, 1e4), (1024, 2e4), (2048, 3e4))
+    ]
+)
+# The same, one kernel to 1024 cached tokens and another at 2048.
+BANDED_CACHED = listed(
+    *[
+        pt(ATTN, "prefill T=64 B=2", ns, c, kernel, [[32, 32 + c, False]] * 2)
+        for c, ns, kernel in ((0, 1e4, "a"), (1024, 2e4, "a"), (2048, 3e4, "b"))
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "rows,params,answer",
+    [
+        ([(32, 32 + 512, False)] * 2, CACHED, 1.5e-5),
+        ([(32, 32, False), (32, 32 + 2048, False)], CACHED, 2e-5),
+        (
+            [(32, 32, False), (32, 32 + 2048, False)],
+            BANDED_CACHED,
+            f"{ATTENTION}: its rows' cached tokens from 1024 to 2048 cross from a to b",
+        ),
+        (
+            [(32, 32 + 512, False)] * 2,
+            listed(pt(ATTN, "prefill T=64 B=2", 1e4)),
+            (
+                f"{ATTENTION}: at T = 64, at B = 2, context = 512 is outside the "
+                "measured 0 to 0"
+            ),
+        ),
+    ],
+    ids=["uniform", "uneven", "uneven-across-two", "fresh-rows-only"],
+)
+def test_a_prefill_prices_linearly_in_its_rows_cached_tokens(rows, params, answer):
+    final = replace(view(*rows), produces_output=True)
+    cost = backend(ATTN, price_list=params).price(final)
+
+    if isinstance(answer, float):
+        assert by_name(cost) == {f"op.{ATTENTION}.price_list": pytest.approx(answer)}
+    else:
+        assert cost.refusals == (Refusal("price-list", answer),)
+
+
+@pytest.mark.parametrize(
+    "rows,validated",
+    [
+        ([(32, 32 + 512, False)] * 2, True),
+        ([(32, 32, False), (32, 1056, False)], False),
+    ],
+    ids=["uniform", "uneven"],
+)
+def test_a_prefill_whose_rows_cached_tokens_differ_is_not_validated(rows, validated):
+    # both means are 512, inside the held-out 1024's bracket 0 to 2048
+    final = replace(view(*rows), produces_output=True)
+    (term,) = backend(ATTN, price_list=CACHED).price(final).terms
+
+    assert term.seconds == pytest.approx(1.5e-5)
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is validated
+
+
+def test_a_resource_bound_par_whose_roofline_passes_its_listed_branches_is_it():
+    big = g(2, 4096, 4096)
+    params = listed(
+        *[pt(g(b, 4096, 4096), f"decode B={b}", 1e3, c) for b in (2, 4) for c in (1, 9)]
+    )
+    pooled = {"par": [big, big], "join": "resource_bound"}
+    cost = backend(pooled, price_list=params).price(DECODE)
+
+    summed = gemm(2, 4096, 4096) + gemm(2, 4096, 4096)
+
+    assert by_name(cost) == {"par.resource_bound": price(summed, SPEC)}
+
+
+def test_a_resource_bound_par_whose_listed_branch_passes_its_roofline_is_it():
+    # each GEMM listed at a millisecond, far past the three's roofline
+    params = listed(
+        *[pt(g(b, 4096, 4096), f"decode B={b}", 1e6, c) for b in (2, 4) for c in (1, 9)]
+    )
+    two = {"seq": [g(2, 4096, 4096), g(2, 4096, 4096)]}
+    pooled = {"par": [two, g(2, 4096, 4096)], "join": "resource_bound"}
+    cost = backend(pooled, price_list=params).price(DECODE)
+
+    assert price(gemm(2, 4096, 4096), SPEC) * 3 < 1e-3
+    assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(2e-3)}
+    assert cost.terms[0].provenance.method is Method.MEASURED
+
+
+def test_a_resource_bound_par_whose_declined_branch_passes_its_roofline_is_it():
+    # three GEMMs at the kernel floor beside one, under a list of another
+    # GEMM: the four's roofline is a floor, and with no list the join alone
+    other = listed(
+        *[pt(g(b, 8, 8), f"decode B={b}", 1e3, c) for b in (2, 4) for c in (1, 9)]
+    )
+    three = {"seq": [g(2, 64, 64) for _ in range(3)]}
+    pooled = {"par": [three, g(2, 64, 64)], "join": "resource_bound"}
+    floor = price(gemm(2, 64, 64), SPEC)
+
+    assert price(sum([gemm(2, 64, 64)] * 4, Work()), SPEC) == floor
+    assert by_name(backend(pooled, price_list=other).price(DECODE)) == {
+        f"op.{GEMM}": fold_seconds([floor] * 3)
+    }
+    assert by_name(backend(pooled).price(DECODE)) == {"par.resource_bound": floor}
+
+
+def test_each_micro_batch_of_a_split_step_prices_at_its_own_shape():
+    # flat in cached tokens, so each prefill family runs over T alone
+    params = listed(
+        *[
+            pt(g(t, 8, 8), f"prefill T={t} B={b}", ns, c)
+            for t, b, ns in ((3, 1, 3e9), (4, 2, 4e9))
+            for c in (0, 8)
+        ]
+    )
+
+    def graph(phase, tokens, seqs, output, gathered, **_):
+        return {"seq": [g(tokens, 8, 8)]}
+
+    cost = OpGraphBackend(SECOND, graph, kv="bf16", dp=2, price_list=params)
+    cost = cost.price(SPLIT)
+
+    # each a second as a roofline: 3 and 4 seconds are the list's
+    assert by_name(cost) == {"op.tbo.price_list": overlap([[(3.0, 4.0)]])}
+    assert cost.terms[0].provenance.method is Method.MEASURED
+
+
+@pytest.mark.parametrize(
+    "rows,shape,ns,want",
+    [(3, "prefill T=3 B=1", 3e9, (3.0, 1.0)), (4, "prefill T=4 B=2", 4e9, (1.0, 4.0))],
+    ids=["first-listed", "second-listed"],
+)
+def test_a_split_step_the_list_prices_in_part_is_a_roofline_carrying_why(
+    rows, shape, ns, want
+):
+    # the list holds one micro-batch's GEMM only; the other's is its
+    # roofline, a second
+    params = listed(*[pt(g(rows, 8, 8), shape, ns, c) for c in (0, 8)])
+
+    def graph(phase, tokens, seqs, output, gathered, **_):
+        return {"seq": [g(tokens, 8, 8)]}
+
+    cost = OpGraphBackend(SECOND, graph, kv="bf16", dp=2, price_list=params)
+    cost = cost.price(SPLIT)
+
+    assert by_name(cost) == {"op.tbo": overlap([[want]])}
+    assert cost.refusals == (
+        Refusal("price-list", f"{GEMM}: no point of its signature was measured"),
+    )
+
+
+def flat(n, *bs):
+    """Decode points of a GEMM into `n` outputs, B microseconds at B, flat in
+    context, so its family runs over B alone."""
+    return [
+        pt(g(b, n, 64), f"decode B={b}", b * 1e3, c) for b in bs for c in (100, 1000)
+    ]
+
+
+THIRTY_TWO = view(*[(1, 90, True)] * 32)
+
+
+@pytest.mark.parametrize(
+    "params,validated",
+    [
+        (listed(*flat(64, 1, 64)), False),
+        (listed(*flat(64, 1, 8, 64)), True),
+        (fit_ops.PriceList(fit_ops.fit(flat(64, 1, 8, 64))), False),
+    ],
+    ids=["B=1,64", "B=1,8,64", "no-brackets"],
+)
+def test_b_32_is_validated_only_inside_a_held_out_bracket(params, validated):
+    # on 1, 8, 64 the held-out B = 8 was priced from 1 and 64, around 32
+    listing = backend(g(2, 64, 64), padded=False, price_list=params)
+    (term,) = listing.price(THIRTY_TWO).terms
+
+    assert term.seconds == pytest.approx(32e-6)
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is validated
+
+
+@pytest.mark.parametrize(
+    "bs,contexts,context,validated",
+    [
+        ((1, 8, 64), (1000, 2000, 3000), 1500, True),
+        ((1, 8, 64), (1000, 3000), 1500, False),
+        ((1, 64), (1000, 2000, 3000), 1500, False),
+        ((1, 8, 64), (1000, 3000), 1000, True),
+    ],
+    ids=["both-bracketed", "context-not", "b-not", "along-b-only"],
+)
+def test_a_query_on_two_dimensions_is_validated_only_when_both_lines_are(
+    bs, contexts, context, validated
+):
+    params = listed(
+        *[
+            pt(g(b, 64, 64), f"decode B={b}", b * 1e4 + c * 10, c)
+            for b in bs
+            for c in contexts
+        ]
+    )
+    step = view(*[(1, context, True)] * 32)
+    (term,) = backend(g(2, 64, 64), padded=False, price_list=params).price(step).terms
+
+    assert term.seconds == pytest.approx((32e4 + context * 10) * 1e-9)
+    assert term.provenance.validated is validated
+
+
+@pytest.mark.parametrize(
+    "points,step",
+    [
+        (
+            # B = 1, 4, 8 launch one kernel and 64, 512 another: the held-out
+            # B = 4's bracket 1 to 8 is on B = 300's line, not around it
+            [
+                pt(g(b, 64, 64), f"decode B={b}", b * 1e3, c, kernel)
+                for b, kernel in ((1, "a"), (4, "a"), (8, "a"), (64, "b"), (512, "b"))
+                for c in (100, 1000)
+            ],
+            view(*[(1, 90, True)] * 300),
+        ),
+        (
+            # the held-out B = 8's bracket 1 to 64 is at context 3000, while
+            # context 1000 holds B = 8 and 64 only
+            [
+                pt(g(b, 64, 64), f"decode B={b}", b * 1e4 + c * 10, c)
+                for b, c in ((8, 1000), (64, 1000), (1, 3000), (8, 3000), (64, 3000))
+            ],
+            view(*[(1, 1000, True)] * 32),
+        ),
+    ],
+    ids=["another-kernel-band", "a-sibling-line"],
+)
+def test_a_bracket_not_around_the_query_on_its_own_line_does_not_validate_it(
+    points, step
+):
+    listing = backend(g(2, 64, 64), padded=False, price_list=listed(*points))
+    (term,) = listing.price(step).terms
+
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is False
+
+
+@pytest.mark.parametrize(
+    "bs_64,bs_128,validated",
+    [
+        ((1, 32, 64), (1, 8, 64), True),
+        ((1, 32, 64), (1, 64), False),
+        ((1, 8, 64), (1, 64), False),
+    ],
+    ids=["measured-and-validated", "measured-and-not", "validated-and-not"],
+)
+def test_a_term_is_validated_only_when_every_estimated_leaf_is(
+    bs_64, bs_128, validated
+):
+    # at B = 32, N = 64 is measured or validated; N = 128 is validated or not
+    params = listed(*flat(64, *bs_64), *flat(128, *bs_128))
+    pair = {"seq": [g(2, 64, 64), g(2, 128, 64)]}
+    (term,) = backend(pair, padded=False, price_list=params).price(THIRTY_TWO).terms
+
+    assert term.seconds == pytest.approx(64e-6)
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is validated
+
+
+@pytest.mark.parametrize("ts,validated", [((2, 4, 5, 8), True), ((2, 4), False)])
+def test_a_split_step_of_measured_and_validated_leaves_is_validated(ts, validated):
+    # T = 4 is measured; T = 3 lies inside 2 to 5, which priced T = 4 held out
+    params = listed(
+        *[pt(g(t, 8, 8), f"prefill T={t} B=1", t * 1e9, c) for t in ts for c in (0, 8)]
+    )
+
+    def graph(phase, tokens, seqs, output, gathered, **_):
+        return {"seq": [g(tokens, 8, 8)]}
+
+    cost = OpGraphBackend(SECOND, graph, kv="bf16", dp=2, price_list=params)
+    (term,) = cost.price(SPLIT).terms
+
+    assert term.name == "op.tbo.price_list"
+    assert term.provenance.method is Method.ESTIMATED
+    assert term.provenance.validated is validated
+
+
+# An MoE GEMM over the rows a DP-2 group gathers, at T = 4 and two stated G;
+# flat in cached tokens, so its family runs over G alone.
+GATHERED = listed(
+    *[
+        pt(g(rows, 8, 8), f"prefill T=4 B=1 G={rows}", ns, c)
+        for rows, ns in ((12, 3e9), (16, 4e9))
+        for c in (0, 8)
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "rows,answer,method",
+    [
+        (12, 3.0, Method.MEASURED),
+        (14, 3.5, Method.ESTIMATED),
+        (32, f"{GEMM}: G = 32 is outside the measured 12 to 16", None),
+        (8, f"{GEMM}: no point of its signature was measured", None),
+    ],
+    ids=["measured", "between-two", "unmeasured", "every-rank-s-t"],
+)
+def test_a_gathered_count_nobody_measured_is_declined(rows, answer, method):
+    def graph(phase, tokens, seqs, output, gathered):
+        return {"seq": [g(gathered, 8, 8)]}
+
+    step = replace(FINAL, requests=(RequestShape(4, 4, False),), moe_rows=rows)
+    cost = OpGraphBackend(SPEC, graph, kv="bf16", dp=2, price_list=GATHERED).price(step)
+
+    if method is None:
+        assert cost.refusals == (Refusal("price-list", answer),)
+    else:
+        assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(answer)}
+        assert cost.terms[0].provenance.method is method
+
+
+def test_a_prefill_kind_measured_at_one_row_count_prices_another():
+    # no two points share T and cached tokens, so no point says rows move it
+    params = listed(
+        *[
+            pt(g(t, 8, 8), f"prefill T={t} B=1", ns, c)
+            for t, ns in ((4, 4e9), (8, 8e9))
+            for c in (0, 8)
+        ]
+    )
+    step = replace(FINAL, requests=(RequestShape(2, 2, False),) * 2)
+    cost = backend(g(4, 8, 8), price_list=params).price(step)
+
+    assert by_name(cost) == {f"op.{GEMM}.price_list": pytest.approx(4.0)}
+    assert cost.terms[0].provenance.method is Method.MEASURED
+
+
+def _published(tmp_path, root=None):
+    """The fields of a `price_list` key holding `FLAT`, published under the
+    readings a run on the suite's machine document takes from this ATOM
+    source, or from the ATOM source `root`."""
+    from atom.compass.artifacts import Key, Kind, keyed_platform, machine_platform
+    from atom.compass.fit.publish import publish
+    from atom.compass.run import _machine, atom_source
+    from atom.compass.run.step_grid import readings
+
+    source = atom_source(root)
+    machine = _machine({"machine": DOCUMENT})
+    platform = machine_platform(machine)
+    conditions = readings(platform, atom_src=source, model="m", engine_config="{}")
+    key = Key.of(
+        Kind.PRICE_LIST,
+        model="sha256:" + "0" * 64,
+        dp=1,
+        pp=1,
+        pcp=1,
+        tp=1,
+        decode_context_parallel_size=1,
+        enable_expert_parallel=False,
+        enable_dp_attention=False,
+        **keyed_platform(Kind.PRICE_LIST, machine_platform(machine)),
+        source_root="tree-" + "a" * 40,
+    )
+    args = SimpleNamespace(store=str(tmp_path / "store"), out=str(tmp_path), ptl=None)
+    publish(args, "compass fit ops", key, conditions, FLAT.params, {})
+    return key.values
+
+
+def test_a_run_file_price_list_prices_leaves_from_the_store_s_entry(
+    monkeypatch, tmp_path
+):
+    fields = _published(tmp_path)
+    installed = _installed(monkeypatch, tmp_path, op_graph=True, price_list=fields)
+
+    assert installed.resolver.sources[0].params == FLAT.params
+
+
+def test_a_run_file_price_list_under_dp_2_prices_a_step_gathering_2t(
+    monkeypatch, tmp_path
+):
+    fields = _published(tmp_path)
+    installed = _installed(
+        monkeypatch, tmp_path, dp=2, op_graph=True, price_list=fields
+    )
+    installed.graph = lambda *shape: {"seq": [g(2, 64, 64)]}
+
+    (term,) = installed.price(replace(DECODE, moe_rows=4)).terms
+
+    assert (term.seconds, term.provenance.method) == (
+        pytest.approx(5e-6),
+        Method.MEASURED,
+    )
+
+
+def test_a_run_file_price_list_from_another_tree_is_refused_at_load(
+    monkeypatch, tmp_path
+):
+    fields = _published(tmp_path, root="b" * 40)
+
+    with pytest.raises(ArtifactRefusal, match="`price_list` x `ATOM src`"):
+        _installed(monkeypatch, tmp_path, op_graph=True, price_list=fields)
+
+
+def test_a_run_file_price_list_without_op_graph_is_refused(monkeypatch, tmp_path):
+    with pytest.raises(ValueError, match="names a price_list and no op_graph"):
+        _installed(monkeypatch, tmp_path, step_linear=law(), price_list={})
+
+
+# --- a shape no graph holds, traced in the run -----------------------------------
+
+
+def _reader(graph, model, config=CONFIG) -> SimpleNamespace:
+    """A run's config of the 27B (or the model `config` describes) at `model`,
+    keyed as the capture keyed `graph`."""
+    hf = SimpleNamespace(architectures=json.loads(config.read_text())["architectures"])
+    return SimpleNamespace(
+        model=str(model),
+        hf_config=hf,
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        **_engine(graph),
+    )
+
+
+def _counts() -> dict:
+    return {"lazy_traces": 0, "lazy_trace_wall_seconds": 0}
+
+
+def in_thread(monkeypatch):
+    """A lookup's lazy traces run in a thread of this process, not a process
+    of their own, so what a test patches reaches them."""
+    monkeypatch.setattr(compass_run, "_trace_process", lambda: ThreadPoolExecutor(1))
+
+
+def test_a_shape_no_graph_holds_is_traced_in_the_run_as_trace_ops_traces_it(
+    ahead, tmp_path_factory, tmp_path
+):
+    (graph, _), *_ = captured(ahead, PREFILLS).values()
+    stores = tmp_path_factory.getbasetemp().glob("tp1*/store")
+    model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
+    config, lazy = _reader(graph, model), _counts()
+    offline = next(
+        lookup
+        for lookup in (_op_graphs(str(s), config, "gfx942") for s in stores)
+        if lookup("prefill", 512, 2)
+    )
+    lookup = _op_graphs(str(tmp_path), config, "gfx942", ["--model", str(model)], lazy)
+    chunk = (RequestShape(256, 256, False),) * 2
+    for output in (True, False):
+        view = BatchView(chunk, produces_output=output)
+        OpGraphBackend(SPEC, lookup, kv="bf16").price(view)
+
+    # Both chunks of the shape came from one trace, the graphs trace ops publishes.
+    assert [lookup("prefill", 512, 2, o) for o in (True, False)] == [
+        offline("prefill", 512, 2, o) for o in (True, False)
+    ]
+    assert lazy["lazy_traces"] == 1 and lazy["lazy_trace_wall_seconds"] > 0
+
+
+def _lazily(ahead, tmp_path_factory, root, *atom_args, model_config=CONFIG, **engine):
+    """The run's lookup of the 27B (or the model `model_config` describes)
+    under `engine`'s config fields into the store at `root`, tracing a missing
+    shape from the server's `atom_args`, and its counts."""
+    if model_config == CONFIG:
+        prefills = captured(ahead, PREFILLS)
+    else:
+        prefills = capture(1, PREFILLS, tmp_path_factory, model_config)
+    (graph, _), *_ = prefills.values()
+    stem = "tp1" if model_config == CONFIG else model_config.stem
+    model = next(tmp_path_factory.getbasetemp().glob(f"{stem}*/model"))
+    config, lazy = _reader(graph, model, model_config), _counts()
+    vars(config).update(engine)
+    args = ["--model", str(model), *atom_args]
+    return _op_graphs(str(root), config, "gfx942", args, lazy), lazy
+
+
+def test_a_prefill_two_batch_overlap_would_split_is_traced_lazily_as_one_forward(
+    ahead, tmp_path_factory, tmp_path, monkeypatch
+):
+    # ATOM splits a prefill under --enable-tbo from this many tokens on, on a
+    # model whose attention a micro-batch can carry: it refuses TBO on a GDN
+    # model such as the 27B.
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "256")
+    lookup, lazy = _lazily(
+        ahead,
+        tmp_path_factory,
+        tmp_path,
+        "--enable-tbo",
+        model_config=QWEN3,
+        enable_tbo=True,
+    )
+
+    assert isinstance(lookup("prefill", 512, 2), dict)
+    assert lazy["lazy_traces"] == 1
+
+
+def test_a_lazy_trace_reads_atom_s_arguments_in_either_spelling_as_its_server_does(
+    ahead, tmp_path_factory, tmp_path
+):
+    args = "--kv-cache-dtype", "fp8"
+    lookup, lazy = _lazily(
+        ahead, tmp_path_factory, tmp_path, *args, kv_cache_dtype="fp8"
+    )
+
+    assert isinstance(lookup("decode", 2, 2), dict)
+    assert lazy["lazy_traces"] == 1
+
+
+def _run_config(structure: str, model) -> SimpleNamespace:
+    """An eager run's config of the model directory `model` that
+    `forward.structure` keys as `structure` keys it."""
+    from atom.compass.capture.forward import _engine
+
+    head, engine, _ = _engine(structure)
+    fixed = ("quantization", "tensor_parallel_size", "data_parallel_size", "env")
+    return SimpleNamespace(
+        model=str(model),
+        hf_config=SimpleNamespace(architectures=[head.split()[0]]),
+        tensor_parallel_size=engine["tensor_parallel_size"],
+        parallel_config=SimpleNamespace(
+            data_parallel_size=engine["data_parallel_size"]
+        ),
+        quant_config=SimpleNamespace(compute_hash=lambda: engine["quantization"]),
+        enforce_eager=True,
+        **{k: v for k, v in engine.items() if k not in fixed},
+    )
+
+
+def _spawned(monkeypatch) -> list:
+    """The lazy-trace processes the test's lookups spawn, as they spawn them."""
+    spawned, spawn = [], compass_run._trace_process
+    monkeypatch.setattr(
+        compass_run, "_trace_process", lambda: spawned.append(spawn()) or spawned[-1]
+    )
+    return spawned
+
+
+def _tracers() -> tuple[int, int]:
+    """In a lookup's lazy-trace process: the tracers it made, and the traces
+    that took one made before them."""
+    made = compass_run._tracer.cache_info()
+    return made.misses, made.hits
+
+
+def test_a_run_s_lazy_traces_share_one_process_and_trace_as_a_process_each(
+    ahead, tmp_path, monkeypatch
+):
+    from test_capture_v4_pro import DPA_TP8
+
+    from atom.compass.artifacts import ArtifactStore, Kind, Topology
+    from atom.compass.capture.forward import Shape
+
+    # Each shape alone in a `trace ops` of its own, a prefill as one forward.
+    alone, rank = {}, Topology().ranks()[0]
+    for at in POOLS:
+        root, done = ahead[at].result()
+        published = re.findall(r"^published .* as (\w+)$", done.stdout, re.MULTILINE)
+        assert published, done.stderr[-4000:]
+        store = ArtifactStore(str(root / "store"))
+        for token in published:
+            entry = store.read(store.key_from_token(Kind.OP_GRAPH, token))
+            graph = json.loads(entry.read_member("graph", rank, "json"))
+            output = not graph["structure"].endswith("no output")
+            alone[graph["shape"], output] = graph["region"]
+    config = _run_config(graph["structure"], root / "model")
+    args = ["--model", config.model, "-tp", "8", *DPA_TP8.split()[1:]]
+    spawned, lazy = _spawned(monkeypatch), _counts()
+    lookup = _op_graphs(str(tmp_path), config, "gfx950", args, lazy)
+    warm = {}
+    for phase, tokens, seqs in POOLS:
+        for output in (False, True) if phase == "prefill" else (True,):
+            warm[str(Shape(phase, tokens, seqs)), output] = lookup(
+                phase, tokens, seqs, output
+            )
+
+    # Byte for byte the graphs a process each traces, each pool its own.
+    assert warm.keys() == alone.keys() and len(alone) == 5
+    same = {at: json.dumps(warm[at]) == json.dumps(r) for at, r in alone.items()}
+    assert all(same.values()), same
+    # One process traced the three, its tracer made at the first and kept.
+    made = spawned[0].submit(_tracers).result()
+    assert (len(spawned), lazy["lazy_traces"], made) == (1, 3, (1, 2))
+
+
+def _held(atom_args) -> list[tuple[int, int, int]]:
+    """In a lookup's lazy-trace process: what its tracer of the 27B under
+    `atom_args` holds after each of three more traces, of a decode B=2, a B=3
+    and a B=2 again: its storage roles, the leaves it replayed and the fake
+    mode's cached outputs."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from atom.compass.capture.forward import decode
+    from atom.compass.drive.runfile import _engine_args, engine_only
+
+    model, kept = _engine_args(atom_args).model, tuple(engine_only(atom_args))
+    _, tracer = compass_run._tracer(model, 1, kept, "gfx942")
+    held = []
+    for shape in (decode(2), decode(3), decode(2)):
+        for _ in tracer.trace([shape], [shape]):
+            pass
+        recorder = tracer.recorder
+        held.append(
+            (len(recorder.roles), len(recorder.replayed), len(FakeTensorMode.cache))
+        )
+    return held
+
+
+def test_a_warm_tracer_holds_one_trace_s_worth_whatever_it_traced_before(
+    ahead, tmp_path_factory, tmp_path, monkeypatch
+):
+    spawned = _spawned(monkeypatch)
+    lookup, _ = _lazily(ahead, tmp_path_factory, tmp_path)
+    assert isinstance(lookup("decode", 2, 2), dict)
+    model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
+
+    # A trace keeps nothing of the one before it but the runner: the second
+    # decode B=2 holds the roles and replays the first did, and a fake-mode
+    # cache kept across traces could only have grown past the B=3's.
+    held = spawned[0].submit(_held, ["--model", str(model)]).result()
+    assert held[0][:2] == held[2][:2] and held[2][2] < held[1][2], held
+
+
+def _alive(pid: int) -> bool:
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):  # reaped before or mid-read
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def test_a_run_s_trace_process_ends_with_the_process_that_spawned_it(tmp_path):
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_bytes(CONFIG.read_bytes())
+    # Its process traces a shape, which builds the 27B's runner there, then the
+    # spawner is killed outright: it runs no exit of its own. Its output goes
+    # to a file, which a process that outlives it cannot hold open.
+    spawner = (
+        "import os, signal, sys; from atom.compass import run; "
+        "from atom.compass.capture.forward import decode; "
+        "tracing = run._trace_process(); "
+        "args = sys.argv[2], ['--model', sys.argv[3]], 'gfx942', decode(2); "
+        "tracing.submit(run._trace, *args).result(); "
+        "pid = tracing.submit(os.getpid).result(); "
+        "open(sys.argv[1], 'w').write(str(pid)); os.kill(os.getpid(), signal.SIGKILL)"
+    )
+    paths = [tmp_path / name for name in ("pid", "store", "model")]
+    with open(tmp_path / "log", "w") as log:
+        subprocess.run(
+            [sys.executable, "-c", spawner, *map(str, paths)],
+            stdout=log,
+            stderr=log,
+            check=False,  # it ends killed
+            timeout=300,
+            cwd=TREE,
+            env={**os.environ, "PYTHONPATH": str(TREE)},
+        )
+    assert (tmp_path / "pid").exists(), (tmp_path / "log").read_text()[-4000:]
+    pid = int((tmp_path / "pid").read_text())
+    try:
+        deadline = time.monotonic() + 60
+        while _alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not _alive(pid)
+    finally:
+        if _alive(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_a_lazy_trace_that_fails_ends_the_run_naming_the_shape(tmp_path):
+    (tmp_path / "model").mkdir()  # holds no config.json, so no capture builds it
+    (tmp_path / "read").mkdir()
+    (tmp_path / "read" / "config.json").write_text("{}")
+    config = SimpleNamespace(
+        model=str(tmp_path / "read"),
+        hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        **ENGINE,
+    )
+    lazy = _counts()
+    args = ["--model", str(tmp_path / "model")]
+    lookup = _op_graphs(str(tmp_path / "store"), config, "gfx942", args, lazy)
+    rows = BatchView((RequestShape(100, 100, False),) * 3, produces_output=True)
+
+    with pytest.raises(RuntimeError, match="a lazy trace of prefill T=300 B=3 failed"):
+        OpGraphBackend(SPEC, lookup, kv="bf16").price(rows)
+    assert lazy["lazy_traces"] == 0
+
+
+def test_a_dirty_tree_s_lazy_trace_answers_its_run_and_publishes_nothing(
+    monkeypatch, tmp_path
+):
+    from test_artifact_store import AITER_ROOT, ATOM_ROOT
+
+    from atom.compass import artifacts
+    from atom.compass.capture import forward
+    from atom.compass.capture.graph import Traced, to_json
+    from atom.compass.ir import Graph, Op
+
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_text("{}")
+    config = SimpleNamespace(
+        model=str(tmp_path / "model"),
+        hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_expert_parallel=False,
+        enforce_eager=True,
+        **ENGINE,
+    )
+    at = forward.structure(config, "decode", True, "gfx942", True, False)
+    traced = []
+
+    def trace(shapes, unsplit):
+        leaf = Op("aiter.leaf", "opaque_leaf", (("n", 2),), ())
+        traced.append(Graph(Traced(at, str(shapes[0])), leaf))
+        return [(traced[-1], config.model, {"arch": "gfx942"})]
+
+    dirty = (replace(ATOM_ROOT, dirty=3), AITER_ROOT)
+    monkeypatch.setattr(artifacts, "roots_for", lambda modules: dirty)
+    tracer = SimpleNamespace(trace=trace)
+    monkeypatch.setattr(compass_run, "_tracer", lambda *args: (None, tracer))
+    in_thread(monkeypatch)
+    lazy, store = _counts(), tmp_path / "store"
+    lookup = _op_graphs(str(store), config, "gfx942", ["--model", config.model], lazy)
+
+    assert lookup("decode", 2, 2) == json.loads(to_json(traced[0]))["region"]
+    assert lazy["lazy_traces"] == 1
+    assert not store.exists()
+
+
+def test_a_run_file_op_graph_traces_from_the_server_s_arguments(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(
+        compass_run,
+        "_op_graphs",
+        lambda *a, **kw: seen.append(a[3:]) or (lambda *s: None),
+    )
+    _installed(monkeypatch, tmp_path, op_graph=True, atom_args=["--model", "m"])
+
+    assert seen == [(["--model", "m"], _counts())]
+
+
+def test_the_run_summary_totals_each_engine_s_lazy_traces(monkeypatch, tmp_path):
+    run = {"admission_s": 0.54e-3, "ipc_s": 2.0**-10, "stream_s": 2.0**-9}
+    run.update(bound_s=100.0, client_runs=None, out_dir=str(tmp_path))
+    monkeypatch.setenv(compass_run.ENV, str(tmp_path / "run.json"))
+    authority = compass_run._RecordingAuthority(run)
+    worker = SimpleNamespace(compass_lazy={**_counts(), "lazy_traces": 2})
+    worker.compass_lazy["lazy_trace_wall_seconds"] = 9.5
+    compass_run._hand_in(run, "engine", [], priced=PricedSteps.priced_steps(worker))
+    compass_run._hand_in(run, "frontend", [])
+    compass_run._write_summary(run, authority, ended=True)
+
+    cost = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())["cost"]
+    assert (cost["lazy_traces"], cost["lazy_trace_wall_seconds"]) == (2, 9.5)

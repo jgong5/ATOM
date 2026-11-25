@@ -16,8 +16,11 @@ from atom.config import Config, KVCacheTensor, ParallelConfig
 
 # A module, not its names: `region_graph` reads this one back at call time.
 from atom.utils import region_graph
+
+# Called through the module, so a caller that replaces
+# `ubatching.sync_dp_metadata` (Compass's driverless capture) reaches the call.
+from atom.utils.tbo import ubatching
 from atom.utils.tbo.ubatch_splitting import UBatchSlice, decode_bucket_splits
-from atom.utils.tbo.ubatching import sync_dp_metadata
 
 if TYPE_CHECKING:
     from atom.distributed.pcp_utils import PcpBalGroup
@@ -249,7 +252,7 @@ class ForwardMode:
         meets_min, can_split, ub0, ub1 = local_tbo
         # Every rank's row of the step, a group of one's included (its own
         # row, with nothing exchanged).
-        sync = sync_dp_metadata(
+        sync = ubatching.sync_dp_metadata(
             dp_group=dp_group,
             dp_size=dp_size,
             scheduled_tokens=scheduled_tokens,
@@ -485,8 +488,14 @@ class ForwardMode:
             return
 
         def _rows(name):
+            # `t.shape[0]` is already an `int` for any tensor with a real size,
+            # so this returns exactly what an `int()` around it returned. It is
+            # written without one so that a tensor whose size is symbolic keeps
+            # its symbol here: the equalities below then compare two symbolic
+            # widths and hold or fail as algebra, where converting one side to a
+            # number first forces the other to become that number.
             t = getattr(attn_metadata, name, None)
-            return None if t is None else int(t.shape[0])
+            return None if t is None else t.shape[0]
 
         # `input_ids` is the scheduled prefix at the runner boundary. Uniform
         # decode exposes `running_tokens` to the model in both eager and graph

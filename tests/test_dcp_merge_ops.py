@@ -1769,6 +1769,8 @@ def tp_group():
 
     import torch.distributed as dist
 
+    from atom.utils import get_open_port
+
     try:
         from aiter import destroy_dist_env
         from aiter.dist.parallel_state import (
@@ -1790,13 +1792,14 @@ def tp_group():
     leaked = ("HIP_VISIBLE_DEVICES", "MASTER_ADDR", "MASTER_PORT")
     saved = {name: os.environ.get(name) for name in leaked}
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29578")
+    port = get_open_port()
+    os.environ.setdefault("MASTER_PORT", str(port))
     torch.cuda.set_device(0)
     init_distributed_environment(
         world_size=1,
         rank=0,
         local_rank=0,
-        distributed_init_method="tcp://127.0.0.1:29578",
+        distributed_init_method=f"tcp://127.0.0.1:{port}",
     )
     initialize_model_parallel(tensor_model_parallel_size=1)
     try:

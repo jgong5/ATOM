@@ -29,6 +29,21 @@ if ATOM_ROOT not in sys.path:
 
 # ── 2. Import atom submodules ──────────────────────────────────────────────
 
+# Compass's GPU checks leave out the process that runs them by the KFD entry
+# its first open of /dev/kfd adds. `atom.utils.region_graph` below opens it
+# (`atom.utils.forward_context` asks torch whether a GPU is available), so the
+# session takes that first open here.
+from atom.compass.drive.gpu import kfd_pid
+
+# A compass test that skips for want of a driver-run input fails unless
+# scripts/compass/gpu_gate_driver_run.txt lists its file.
+from tests.compass.driver_run_skips import (  # noqa: F401
+    pytest_make_collect_report,
+    pytest_runtest_makereport,
+)
+
+kfd_pid()
+
 from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
@@ -111,6 +126,12 @@ class MockConfig:
             "offload_min_load_tokens": int(
                 os.environ.get("OFFLOAD_MIN_LOAD_TOKENS", "8192")
             ),
+            # A Compass step reads it as ModelRunner.prepare_model does.
+            "enable_tbo": False,
+            # A Compass record reads them as `keyed` does.
+            "enable_dp_attention": False,
+            "enable_expert_parallel": False,
+            "enable_tbo_decode": False,
             # Scheduler.__init__ reads config.hf_config.architectures for V4
             # SWA-warmup detection; a non-V4 stub keeps that path inert.
             "hf_config": _MockHFConfig(),
@@ -197,6 +218,18 @@ def block_manager_prefix(mock_config_with_prefix_caching):
 @pytest.fixture
 def scheduler(mock_config):
     return Scheduler(mock_config)
+
+
+@pytest.fixture(scope="module")
+def unpriced():
+    """A Compass step priced at zero, for modules whose subject is not the price.
+
+    Apply with `pytestmark = pytest.mark.usefixtures("unpriced")`."""
+    from atom.compass.runner import overrides
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(overrides, "_group_step_seconds", lambda *_: 0.0)
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -290,6 +323,37 @@ def keep_envs_lazy():
     for name in list(vars(envs)):
         if name in envs.environment_variables:
             delattr(envs, name)
+
+
+_SHIM_SWAPPED = ("Context", "Poller", "Socket")
+
+
+@pytest.fixture(autouse=True)
+def keep_zmq_shim_choosing():
+    """Fail the test that leaves `zmq_shim` a fixed `Context`, `Poller` or
+    `Socket`, and undo it.
+
+    `atom.utils.zmq_shim` picks each of the three on every read, through a
+    module-level `__getattr__`: pyzmq's with no LP runtime installed, the
+    runtime's own with one. `monkeypatch.setattr` on the shim restores by
+    `setattr`, so the pyzmq class it read stays in the module dict, and a later
+    test that installs a runtime gets pyzmq's: an engine input thread then never
+    reports its requests. Patch it in the shim's dict instead
+    (`monkeypatch.setitem(vars(zmq_shim), ...)`), whose undo deletes it.
+
+    pytest sets autouse fixtures up in name order, and this name sorts before
+    `mono_runs_on_gfx950`, the first to take `monkeypatch`: its check runs
+    after monkeypatch's undo.
+    """
+    yield
+    shim = sys.modules.get("atom.utils.zmq_shim")
+    fixed = [n for n in _SHIM_SWAPPED if shim is not None and n in vars(shim)]
+    for name in fixed:
+        delattr(shim, name)
+    assert not fixed, (
+        f"this test left zmq_shim's {fixed} fixed, which a later test's LP "
+        "runtime would not get; patch it with `monkeypatch.setitem(vars(...))`"
+    )
 
 
 @pytest.fixture

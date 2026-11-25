@@ -6,7 +6,6 @@
 
 import logging
 import queue
-import time
 from collections import deque
 
 from atom.distributed.pp_ipc import pp_ipc_enabled
@@ -24,7 +23,8 @@ from atom.model_engine.engine_core import (
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.observability import tracing
-from atom.utils import envs
+from atom.utils import clock, envs
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
@@ -101,7 +101,11 @@ class PPEngineCoreProc(EngineCore):
                     next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
-                shutdown = shutdown or self.pull_and_process_input_queue()
+                shutdown = (
+                    clock.idle(lambda: self._idle_deadline(), next_metrics_push)
+                    or shutdown
+                    or self.pull_and_process_input_queue()
+                )
                 if shutdown:
                     break
                 if self._is_engine_held():
@@ -415,15 +419,17 @@ class PPEngineCoreProc(EngineCore):
 
         # Mooncake's send already has PP-wide completion semantics. Report it
         # independently of saves: the scheduler owns the joint release barrier,
-        # including suffix saves that have not been dispatched yet.
+        # including suffix saves that have not been dispatched yet. Every poll's,
+        # empty included, as `EngineCore._poll_kv_transfer_progress` passes it:
+        # a connector's `process_completions` may have work its workers did not
+        # report.
         non_offload = KVConnectorOutput(
             finished_sending=kvoutput.finished_sending,
             finished_recving=kvoutput.finished_recving,
             failed_recving=kvoutput.failed_recving,
             received_handoffs=kvoutput.received_handoffs,
         )
-        if not non_offload.is_empty():
-            self.scheduler._update_from_kv_xfer_finished(non_offload)
+        self.scheduler._update_from_kv_xfer_finished(non_offload)
 
         # Offload fields go through PP aggregator.
         has_offload = (
@@ -495,7 +501,11 @@ class PPEngineCoreProc(EngineCore):
                 if now >= next_metrics_push:
                     next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics(scheduler_metrics=False)
-                shutdown = shutdown or self.pull_and_process_input_queue()
+                shutdown = (
+                    clock.idle(lambda: self._idle_deadline(), next_metrics_push)
+                    or shutdown
+                    or self.pull_and_process_input_queue()
+                )
                 if shutdown:
                     break
                 if self._is_engine_held():

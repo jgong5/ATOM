@@ -1,0 +1,12 @@
+# Rendered views of the design documents. Derived from the .md sources next to
+# them, regenerated locally, and not worth reviewing in a diff.
+*.html
+
+# Editor backups.
+*~
+
+# Handed-off artifacts from the earlier PoC. Their .md originals are in git on
+# feature/atomcompass and feature/atomcompass_take2; these renders are large and
+# would only duplicate them.
+DESIGN_NOTES.html
+POC_SUMMARY.html

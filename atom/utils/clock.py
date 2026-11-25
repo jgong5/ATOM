@@ -1,0 +1,1217 @@
+# SPDX-License-Identifier: MIT
+"""The logical-process side of the simulated clock: time requests, sends and release.
+
+One `LPRuntime` per logical process (LP), in the process of its clock owner: the
+engine step loop or the frontend event loop. The owner is the only thread that
+moves the LP clock and the only one that produces a cross-LP message. It asks the
+clock authority for time over an injected connection, ``conn.send((kind, t,
+log, t_daemon))`` then ``conn.recv() -> (G, released)``, and every request
+carries the sends registered since the previous one, so the authority knows each
+message an LP produced before it moves that LP's clock.
+
+An LP starts from the clock and next sequence numbers its connection's bind
+was answered with (``conn.joined``), 0 for each without one. A grant marked as
+the end of client run ``k`` moves nothing and calls `client_run_ended(k)`,
+where the LP hands in its part of that client run's summary.
+
+A grant to ``+inf`` closes the simulation window (`end_run`) before the process
+begins to shut down: the run is finished, and the owner's loop must exit rather
+than run its timers at ``+inf``. A clock call after it raises; the wrappers send
+shutdown frames unstamped (arrival ``None``), so only a direct `stamp_send` call
+returns a ``+inf`` arrival; and `close` raises if the owner leaves before it.
+
+A grant with a ceiling (`atom.compass.clock.Released`) lets the owner answer
+its own `advance_to` and `next_event` below it, as the authority would have
+answered them, without a call. Each such step goes with the next call, with
+how many of the call's logged sends were made before it. Once a grant has
+carried one, `next_event` asks the authority for every message below the next
+ceiling ahead of time; the owner releases each in the step that reaches it.
+`ask_next_event`, whose caller waits on the connection, always asks.
+
+A member of a DP group, its connection bound as one (``conn.member``), asks
+its group step's rounds up to its own return in one call, and the rounds it
+owes in one more (`advance_group`, `settle`); the call's one grant releases
+what each of its rounds released to it. When the grant it returns at carries
+a ceiling, the authority granted its owed rounds below it ahead and sent what
+they release with that grant: `settle` steps through them, releasing each
+message in the step that reaches it, and reports the steps with the call for
+the rounds left or, with none left, in a ``REPORT`` that waits for no reply.
+
+A grant names the messages it releases as ``{channel: [(seq, arrival)]}``.
+`_step_through` releases them one at a time in ``(arrival, channel, seq)``
+order, setting the LP clock to each arrival. On a ``thread`` channel it then
+waits until the receiving thread is back at its wait point, so a handler runs
+with the clock at its message's arrival and nothing else in the LP moving. An
+``inline`` channel is read by the owner itself at its own receive point, so
+there is nothing to wait for. Messages are counted by ``(channel, seq)``, so a
+channel need not be FIFO. The ``(channel, seq)`` sets here are only ever tested
+for membership, never iterated.
+
+The receive side (`WrappedSocket`, `WrappedPoller`) calls `check_arrival` for
+every stamped frame it reads, holds a frame back until `is_released`, and
+brackets handing one to ATOM with `handed_over` and `back_at_wait_point`. The
+send side stamps each frame with `stamp_send`, directly or through the
+`RelayQueue` that stands in for the engine's output queue.
+
+A handler, or a thread a handler wakes, that would send instead `offer`s the
+send: the owner makes it once the handler is back at its wait point, stamped at
+the arrival of the message the handler was given, before it releases the next.
+A grant releasing a message on a channel the table marks offering may fall
+short of the TAR rounds asked, at that message's arrival: the owner then asks
+the rounds left again, and a parked member parks again. An own step counts the
+sends offered while it walks as made before it (#3767).
+"""
+
+import contextlib
+import json
+import logging
+import math
+import os
+import pickle
+import queue
+import threading
+
+import zmq
+
+from atom.compass.clock import ChannelTable, LpId
+from atom.compass.clock.channels import ReceiveMode
+
+logger = logging.getLogger("atom")
+
+#: Wall seconds a released message may stay unhandled before one diagnostic is
+#: printed. The wait itself goes on: it costs no simulated time.
+DIAG_S = 30.0
+
+#: The runtime of the LP this process belongs to, or None on a real run.
+_installed: "LPRuntime | None" = None
+
+
+def install(runtime: "LPRuntime | None") -> None:
+    """Make every `now` in this process read `runtime`; None restores the real clock."""
+    global _installed
+    _installed = runtime
+
+
+def installed() -> "LPRuntime | None":
+    """The runtime installed in this process, or None on a real run."""
+    return _installed
+
+
+def now(real) -> float:
+    """The LP clock while a runtime is installed; otherwise `real()`.
+
+    A serving-path read passes the machine clock it read before, so a real run
+    reads exactly what it did, and a simulated one never calls it.
+    """
+    runtime = _installed
+    return real() if runtime is None else runtime.read_clock()
+
+
+def sleep(seconds: float, real) -> None:
+    """In a run, the clock owner's idle point until `seconds` from now or its
+    next arrival, whichever is first; otherwise `real(seconds)`."""
+    runtime = _installed
+    if runtime is None or not runtime.in_run:
+        real(seconds)
+    else:
+        runtime.next_event(runtime.now + seconds)
+
+
+#: The station job this thread is serving, as ``job.cur = (station, k)``; the
+#: executor running the job sets it and clears it.
+job = threading.local()
+
+
+def current_job_time() -> float | None:
+    """The clock inside this thread's station job, or ``None`` outside one."""
+    cur = getattr(job, "cur", None)
+    return None if cur is None else cur[0].time_in_job(cur[1])
+
+
+class Straggler(Exception):
+    """An unreleased message whose arrival this LP has already released past."""
+
+
+class _Wakeup(threading.Event):
+    """An event `zmq.zmq_poll` can also wait on, through `fd`, beside the sockets.
+
+    A release sets it when its channel is in `channels`, the ones its thread's
+    poller waits on, and every release sets it while `channels` is None."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        # ponytail: one eventfd per receiving thread, never closed; threads are few
+        self.fd = os.eventfd(0, os.EFD_NONBLOCK)
+        self.channels: frozenset[str] | None = None
+
+    def set(self) -> None:
+        super().set()
+        os.eventfd_write(self.fd, 1)
+
+    def clear(self) -> None:
+        super().clear()
+        with contextlib.suppress(BlockingIOError):
+            os.eventfd_read(self.fd)
+
+
+class LPRuntime:
+    def __init__(
+        self,
+        me: LpId,
+        table: ChannelTable,
+        conn,
+        *,
+        owner: threading.Thread | None = None,
+        diag_s: float = DIAG_S,
+    ) -> None:
+        self.me, self.table, self.conn, self.diag_s = me, table, conn, diag_s
+        self.member = getattr(conn, "member", None)  # of a DP group's LP, or None
+        self.owner = owner or threading.current_thread()
+        self.lock = threading.Lock()
+        self.cv = threading.Condition(self.lock)
+        self.in_run = False
+        self.now, seqs = getattr(conn, "joined", None) or (0.0, {})
+        self.send_log: list[tuple[str, int, float]] = []
+        self.next_seq = {c.name: seqs.get(c.name, 0) for c in table.channels_from(me)}
+        self.client_run_ended = None  # called with k at the end of client run k
+        into = [c.name for c in table.channels_into(me)]
+        self.arrived: dict[str, set[int]] = {ch: set() for ch in into}
+        self.released: dict[str, set[int]] = {ch: set() for ch in into}
+        self.handled: dict[str, set[int]] = {ch: set() for ch in into}
+        # Released and not yet read, per channel, and how many released are not
+        # yet handled: kept as messages come and go, so a check reads them
+        # without walking every message the run has brought.
+        self.unread: dict[str, set[int]] = {ch: set() for ch in into}
+        self.unhandled: dict[str, int] = dict.fromkeys(into, 0)
+        self.inline = tuple(c for c in into if table.recv_mode(c) is ReceiveMode.INLINE)
+        # Frames read but not released, (channel, seq) -> arrival: checked at each drain.
+        self.unreleased: dict[tuple[str, int], float] = {}
+        self.taken_by: dict[threading.Thread, tuple[str, int]] = {}
+        self.wakes: dict[threading.Thread, _Wakeup] = {}
+        self.endpoints: dict[str, str] = {}  # address -> channel kind it carries
+        self.relays: dict[str, RelayQueue] = {}  # channel -> the engine's output relay
+        self.calls = 0  # clock calls made, TAR and NER, its own steps included
+        self.ceiling = -math.inf  # the latest grant's, below which it answers itself
+        self.asks_ahead = False  # a grant has carried a ceiling
+        self.ahead: list[tuple[float, str, int]] = []  # sent ahead, by arrival
+        self.steps: list[tuple] = []  # (kind, t, G, n) taken since its last call
+        self.asked = False  # a next-event request is out, its grant not taken
+        self.idle_calls = 0  # `calls` when the step loop last passed its idle point
+        self.owed: list[float] = []  # DP group rounds left before (`advance_group`)
+        # A member's: its owed rounds below this were granted ahead of it.
+        self.owed_ceiling = -math.inf
+        # A member's owed rounds paid, those it stepped through on its own, and
+        # the reports that paid them all.
+        self.paid = {"rounds": 0, "ahead": 0, "reports": 0}
+        self.parking = False  # a DP member between its state sync and its park
+        self.woken = False  # the last grant released a message on an offering channel
+        # The frontend's event loop, once built: a frame a thread takes is a job on it.
+        self.loop = None
+        # Clock calls refused, as run-summary reasons ``clock:<call> ...``: a
+        # caller such as an output thread or an HTTP handler may log and drop
+        # the exception.
+        self.refusals: list[str] = []
+        # One-shot stall diagnostics printed in this process, for the run summary.
+        self.diagnostics = 0
+        # Whether the owner holds work a bounded poll must not idle past: then
+        # the poll's bound is an essential deadline, else a daemon one.
+        self.holds_work = lambda: False
+        # The clock it held before the ``+inf`` grant that ended its run, once
+        # that grant came: its last finite clock.
+        self.before_inf: float | None = None
+        # Sends offered off the owner (`offer`), in order, not yet made.
+        self.offers: list = []
+
+    def start_run(self) -> None:
+        self.in_run = True
+
+    def end_run(self) -> None:
+        self.in_run = False
+        with self.lock:  # a frame held for the run's end is ready now
+            for w in self.wakes.values():
+                w.set()
+
+    # ---- clock owner ----
+
+    def read_clock(self) -> float:
+        """The LP clock, or on a thread serving a station job, the time in that job."""
+        t = current_job_time()
+        return self.now if t is None else t
+
+    def stamp_send(self, ch: str, at: float | None = None) -> tuple[float, int]:
+        """Register one message on `ch` as produced now, arriving `at` or, by
+        default, after the channel's lookahead; returns its ``(arrival, seq)``.
+
+        Refused while a next-event request is out, as a run-summary reason
+        ``clock:stamp_send on <channel> while a next-event request is out``: the
+        authority may already have granted other LPs past this LP's clock, so
+        the send could only be backdated, or stamped at whichever grant is out
+        when, in wall time, the handler that sends runs.
+        """
+        self._require_owner("stamp_send")
+        if self.asked:
+            why = f"stamp_send on {ch} while a next-event request is out"
+            self.refusals.append(f"clock:{why}")
+            raise RuntimeError(f"{self.me}: {why}, so no time can be given to it")
+        with self.lock:
+            seq = self.next_seq[ch]
+            self.next_seq[ch] = seq + 1
+            arrival = self.now + self.table.lookahead(ch) if at is None else at
+            self.send_log.append((ch, seq, arrival))
+        return arrival, seq
+
+    def offer(self, send) -> None:
+        """Queue `send`, a call that sends on this LP's channels, for the clock
+        owner, which alone stamps a send: a handler's offer runs once the handler
+        is back at its wait point, the clock still at the arrival of the message
+        it was given, before the next one is released; any other offer, the
+        owner's own included, runs at the owner's next clock call. Outside the
+        run nothing is stamped, and `send` runs now, on the caller."""
+        if not self.in_run:
+            send()
+            return
+        with self.lock:
+            self.offers.append(send)
+
+    def _make_offers(self) -> None:
+        """The owner makes every offered send, in order; the caller holds
+        `lock`, which each send takes itself."""
+        while self.offers:
+            send = self.offers.pop(0)
+            self.lock.release()
+            try:
+                send()
+            finally:
+                self.lock.acquire()
+
+    def advance_to(self, T: float, *later: float) -> None:
+        """Price an event: block until granted `T`, releasing what arrives up
+        to it. A DP member asks the `later` rounds of its group step, each past
+        the one before, in the same call, and returns at the last one."""
+        self._require_open("advance_to")
+        if self.owed and T < self.owed[-1]:
+            self._refuse(f"advance_to({T}) before the owed group round {self.owed[-1]}")
+        self.settle()
+        if T < self.now:
+            raise ValueError(f"{self.me} cannot advance to {T}, it is at {self.now}")
+        self._rounds([T, *later])
+
+    def _rounds(self, rounds: list) -> None:
+        """TAR through `rounds`, answering one below the ceiling itself. A grant
+        short of the last released a message on an offering channel at its
+        arrival: the rounds left are asked again."""
+        while rounds:
+            if rounds[0] < self.ceiling:  # a member's stays -inf
+                self._own_step("TAR", rounds[0], rounds[0])
+            else:
+                self._grant(*self._ca_call("TAR", rounds[0], rounds=rounds[1:]))
+            rounds = [t for t in rounds if t > self.now]
+
+    def advance_group(self, targets, mine: float) -> None:
+        """A DP group step: each distinct target is a round every member asks,
+        ascending; this one returns at `mine` and owes the later rounds. A
+        member asks its rounds up to `mine` in one call."""
+        rounds = sorted(set(targets))
+        asked = [t for t in rounds if t <= mine]
+        if self.member is not None and asked:
+            self.advance_to(*asked)
+        else:
+            for t in asked:
+                self.advance_to(t)
+        self.owed = [t for t in rounds if t > mine]
+
+    def settle(self) -> None:
+        """Pay the owed rounds: step through those granted ahead, below the
+        owed ceiling, and join the rest in one call that reports the steps, or
+        with none left report them without waiting. They end the owing step,
+        so `idle` counts none."""
+        if not self.owed:
+            return
+        owed, self.owed, calls = self.owed, [], self.calls
+        ahead = [t for t in owed if t < self.owed_ceiling]
+        self.owed_ceiling = -math.inf
+        for t in ahead:
+            self._own_step("TAR", t, t)
+        rest = owed[len(ahead) :]
+        if rest:
+            self._rounds(rest)
+        else:
+            self._ca_send("REPORT", self.now, math.inf)
+        self.calls = calls
+        self.paid["rounds"] += len(owed)
+        self.paid["ahead"] += len(ahead)
+        self.paid["reports"] += not rest
+
+    def next_event(self, t: float, t_daemon: float = float("inf")) -> float:
+        """Idle until `t`, the daemon deadline `t_daemon` or the earliest arrival,
+        whichever the grant is; returns it.
+
+        A daemon deadline is a housekeeping timer that does not keep the run
+        alive: it fires only once essential work reaches it.
+        """
+        self._require_open("next_event")
+        first = self.ahead[0][0] if self.ahead else math.inf
+        own = min(t, t_daemon, first)
+        # A daemon deadline is granted only at or below some essential time.
+        if self.now <= own < self.ceiling and (t < math.inf or self.ahead):
+            self._own_step("NER", t, own)
+            return own
+        self.ask_next_event(t, t_daemon, self.asks_ahead)
+        return self.take_grant()
+
+    def ask_next_event(
+        self, t: float, t_daemon: float = float("inf"), ahead: bool = False
+    ) -> None:
+        """Send `next_event`'s request; `take_grant` waits for its grant. The LP
+        clock stands still between the two. `ahead` asks for every message
+        below the grant's ceiling with it."""
+        self._require_open("next_event")
+        if self.owed:
+            self._refuse(f"next_event while owing group rounds {self.owed}")
+        if self.ahead:
+            self._refuse(f"next_event with messages sent ahead unreached: {self.ahead}")
+        self._ca_send("NER", t, t_daemon, ahead)
+        self.asked = True
+
+    def park(self) -> None:
+        """A DP member's last clock call before it dispatches a forward: wait,
+        standing in its peers' rounds with no target, until every member has
+        parked; then walk the messages released to it meanwhile, each at its
+        arrival, and leave at the group's clock, the latest member's. A message
+        on an offering channel is walked at its grant, and the member parks
+        again."""
+        self._require_open("park")
+        if self.owed:
+            self._refuse(f"park while owing group rounds {self.owed}")
+        self.woken = True
+        while self.woken and self.now < math.inf:
+            self.parking = False
+            self._ca_send("PARK", math.inf, math.inf)
+            self.asked = True
+            self.take_grant()
+
+    def take_grant(self) -> float:
+        """Wait for the grant of the request `ask_next_event` sent; returns it."""
+        G, released, *ended = self.conn.recv()
+        self.asked = False
+        self._grant(G, released)
+        if ended and self.client_run_ended is not None:
+            self.client_run_ended(*ended)
+        if G == float("inf"):
+            self.end_run()
+        return G
+
+    def close(self) -> None:
+        """The owner leaves its loop; refused before the ``+inf`` grant."""
+        if self.now != float("inf"):
+            raise RuntimeError(
+                f"{self.me} left its loop at {self.now}, before the +inf grant "
+                "finished the run"
+            )
+
+    def _require_owner(self, what: str) -> None:
+        me = threading.current_thread()
+        if me is not self.owner:
+            self.refusals.append(f"clock:{what} from {me.name}")
+            raise RuntimeError(
+                f"{what} from thread {me.name!r}: only the clock "
+                f"owner {self.owner.name!r} of {self.me} moves its clock or sends"
+            )
+
+    def _refuse(self, why: str) -> None:
+        self.refusals.append(f"clock:{why}")
+        raise RuntimeError(f"{self.me}: {why}")
+
+    def _require_open(self, what: str) -> None:
+        self._require_owner(what)
+        if self.now == float("inf"):
+            raise RuntimeError(f"{what} from {self.me} after the +inf grant")
+
+    def _ca_call(self, kind: str, t: float, t_daemon: float = float("inf"), rounds=()):
+        if self.parking:
+            self._refuse(
+                f"{kind}({t}) between the DP state sync and the forward dispatch; "
+                "a member's park is its last clock call there"
+            )
+        self._ca_send(kind, t, t_daemon, rounds=rounds)
+        return self.conn.recv()
+
+    def _ca_send(
+        self, kind: str, t: float, t_daemon: float, ahead: bool = False, rounds=()
+    ) -> None:
+        with self.lock:
+            self._make_offers()
+            log, self.send_log = self.send_log, []
+        steps, self.steps = self.steps, []
+        self.calls += 1
+        extra = (steps, ahead) if steps or ahead or rounds else ()
+        if rounds:
+            extra += (list(rounds),)
+        self.conn.send((kind, t, log, t_daemon, *extra))
+
+    def _own_step(self, kind: str, t: float, G: float) -> None:
+        """Answer a call below the ceiling, as the authority would: walk the
+        messages sent ahead up to `G`, and keep the step for the next call. A
+        send offered in the walk, at an arrival up to `G`, counts before it."""
+        with self.lock:
+            self._make_offers()
+        self.calls += 1
+        cut = next((k for k, m in enumerate(self.ahead) if m[0] > G), len(self.ahead))
+        reached, self.ahead = self.ahead[:cut], self.ahead[cut:]
+        walk = {}
+        for a, ch, seq in reached:
+            walk.setdefault(ch, []).append((seq, a))
+        self._step_through(G, walk)
+        with self.lock:
+            sent = len(self.send_log)
+        self.steps.append((kind, t, G, sent))
+
+    def _grant(self, G: float, released: dict) -> None:
+        """Take a grant: walk what it releases up to `G` and every message sent
+        ahead before it, and keep its ceiling and the messages it sends ahead."""
+        ceiling = getattr(released, "ceiling", None)
+        below = -math.inf if ceiling is None else ceiling
+        offering = self.table.offering
+        self.woken = any(msgs and offering(ch) for ch, msgs in released.items())
+        if self.member is None:
+            self.ceiling = below
+        else:  # a member answers none of its own calls, only its owed rounds
+            self.owed_ceiling = below
+        if ceiling is None and not self.ahead:
+            self._step_through(G, released)
+            return
+        if any(a > G for a, _, _ in self.ahead):
+            self._refuse(f"a grant to {G} short of messages sent ahead: {self.ahead}")
+        walk = {
+            ch: [(s, a) for s, a in msgs if a <= G] for ch, msgs in released.items()
+        }
+        for a, ch, seq in self.ahead:
+            walk.setdefault(ch, []).append((seq, a))
+        self.ahead = sorted(
+            (a, ch, s) for ch, msgs in released.items() for s, a in msgs if a > G
+        )
+        self.asks_ahead |= ceiling is not None and self.member is None
+        self._step_through(G, walk)
+
+    def _step_through(self, G: float, released: dict) -> None:
+        order = sorted((a, ch, seq) for ch, msgs in released.items() for seq, a in msgs)
+        with self.lock:
+            for a, ch, seq in order:
+                self.now = max(self.now, a)
+                if seq not in self.released[ch]:
+                    self.released[ch].add(seq)
+                    if seq not in self.arrived[ch]:
+                        self.unread[ch].add(seq)
+                    if seq not in self.handled[ch]:
+                        self.unhandled[ch] += 1
+                self.unreleased.pop((ch, seq), None)
+                for w in self.wakes.values():
+                    if w.channels is None or ch in w.channels:
+                        w.set()
+                if self.table.recv_mode(ch) is ReceiveMode.INLINE:
+                    continue
+                reported = False
+                while seq not in self.handled[ch]:
+                    if not self.cv.wait(self.diag_s) and not reported:
+                        logger.warning(
+                            "%s: released %s seq %d (arrival %s) is not handled after "
+                            "%s wall seconds; still waiting",
+                            self.me,
+                            ch,
+                            seq,
+                            a,
+                            self.diag_s,
+                        )
+                        reported = True
+                        self.diagnostics += 1
+                self._make_offers()  # stamped at `a`, before the next release
+            if G == math.inf:
+                self.before_inf = self.now
+            self.now = G
+            late = [(a, ch, s) for (ch, s), a in self.unreleased.items() if a < G]
+            if late:
+                self._straggler(*min(late))
+
+    def _straggler(self, arrival: float, ch: str, seq: int) -> None:
+        raise Straggler(
+            f"{ch} seq {seq} arrives at {arrival} but {self.me} has released up to "
+            f"{self.now} without it (lookahead {self.table.lookahead(ch)})"
+        )
+
+    def receive(self, ch: str, seq: int) -> None:
+        """The owner's inline receive of a message no socket carries: idle
+        until (`ch`, `seq`) is released, then count it taken."""
+        while seq not in self.released[ch]:
+            self.next_event(math.inf)
+        with self.lock:
+            self.arrived[ch].add(seq)
+            self.unread[ch].discard(seq)
+            self.count_done_locked(ch, seq)
+
+    def inline_pending(self) -> bool:
+        """Is there a released inline message not yet taken?"""
+        with self.lock:
+            return any(self.unhandled[ch] for ch in self.inline)
+
+    # ---- receive side ----
+
+    def check_arrival(self, ch: str, arrival: float, seq: int) -> None:
+        """Called once per stamped frame read; frames may arrive in any order."""
+        with self.lock:
+            if seq in self.arrived[ch]:
+                raise RuntimeError(f"{ch} seq {seq} arrived twice")
+            self.arrived[ch].add(seq)
+            self.unread[ch].discard(seq)
+            if seq not in self.released[ch]:
+                self.unreleased[ch, seq] = arrival
+                if arrival < self.now:
+                    self._straggler(arrival, ch, seq)
+
+    def my_wakeup(self, channels=None) -> _Wakeup:
+        """This thread's event, set whenever a message on one of `channels` is
+        released, or any message while `channels` is None. No release sets the
+        clock owner's: the owner makes every release itself, so none comes while
+        it waits, as it waits before the run for the engines' first frames."""
+        with self.lock:
+            me = threading.current_thread()
+            if me not in self.wakes:
+                self.wakes[me] = _Wakeup()
+            if me is self.owner:
+                channels = ()
+            self.wakes[me].channels = None if channels is None else frozenset(channels)
+            return self.wakes[me]
+
+    def is_released(self, ch: str, seq: int) -> bool:
+        """Caller holds `lock`."""
+        return seq in self.released[ch]
+
+    def holds_unstamped(self) -> bool:
+        """Caller holds `lock`. In the run, a frame sent outside it, a sender's
+        shutdown, waits until no frame a thread channel brought is unhandled:
+        the grant that ends the run releases any still held back."""
+        return self.in_run and any(
+            self.arrived[ch] - self.handled[ch]
+            for ch in self.arrived
+            if self.table.recv_mode(ch) is ReceiveMode.THREAD
+        )
+
+    def handed_over(self, ch: str, seq: int) -> None:
+        with self.lock:
+            self.taken_by[threading.current_thread()] = (ch, seq)
+            # The owner waits at this frame's arrival until it is handled.
+            arrival = self.now
+        if self.loop is not None:
+            self.loop.job_begin(arrival)
+
+    def back_at_wait_point(self) -> None:
+        if self.loop is not None:
+            self.loop.job_end()
+        with self.lock:
+            taken = self.taken_by.pop(threading.current_thread(), None)
+            if taken is not None:
+                self.count_done_locked(*taken)
+
+    def count_done_locked(self, ch: str, seq: int) -> None:
+        """Caller holds `lock`."""
+        if seq in self.released[ch] and seq not in self.handled[ch]:
+            self.unhandled[ch] -= 1
+        self.handled[ch].add(seq)
+        self.cv.notify_all()
+
+
+class UnsentRelayItem(Exception):
+    """The output thread took a stamped item off a `RelayQueue` and never sent it."""
+
+
+class WrappedSocket:
+    """One end of a channel's zmq socket, with the ``(channel, arrival, seq)`` header.
+
+    The header is its own frame: first, or after the identity frame on a ROUTER.
+    Frames read are held back until the runtime releases them, then handed over
+    in ``(arrival, seq)`` order; frames sent outside the run pass straight through,
+    in the run only once `LPRuntime.holds_unstamped` lets them.
+    A socket that several LPs send to receives each of `more`'s channels too.
+    """
+
+    def __init__(self, rt: LPRuntime, raw: zmq.Socket, ch: str, *more: str) -> None:
+        self.rt, self.raw, self.ch, self.into = rt, raw, ch, (ch, *more)
+        self.relay: RelayQueue | None = None
+        self.buf: list[tuple] = []  # (ch, arrival, seq, payload frame) read, not taken
+
+    def send(self, data, *, at: float | None = None, **kw) -> None:
+        self.send_multipart([data], at=at, **kw)
+
+    def send_multipart(self, frames: list, *, at: float | None = None, **kw) -> None:
+        """Send `frames` stamped as arriving at `at`, by default after the
+        channel's lookahead (`LPRuntime.stamp_send`); a relay's stamp is the
+        one its queue took."""
+        if not self.rt.in_run:
+            stamp = (None, None)
+        elif self.relay is not None:
+            stamp = self.relay.take_stamp()
+        else:
+            stamp = self.rt.stamp_send(self.ch, at)
+        hdr = pickle.dumps((self.ch, *stamp))  # arrival None: outside the run
+        k = 1 if self.raw.type == zmq.ROUTER else 0
+        self.raw.send_multipart([*frames[:k], hdr, *frames[k:]], **kw)
+
+    def recv_multipart(self, *args, **kw) -> list:
+        """A frame sent outside the run, ATOM's connect handshake: the frames, header removed."""
+        frames = self.raw.recv_multipart(*args, **kw)
+        ch, arrival, seq = pickle.loads(
+            frames.pop(1 if self.raw.type == zmq.ROUTER else 0)
+        )
+        if arrival is not None:
+            raise RuntimeError(f"{ch} seq {seq} read by recv_multipart, past the clock")
+        return frames
+
+    def pull(self) -> None:
+        """Read every frame already here, without blocking; check and buffer each.
+        The socket's events say when it is empty, so no read fails with `zmq.Again`."""
+        while self.raw.get(zmq.EVENTS) & zmq.POLLIN:
+            hdr, payload = self.raw.recv_multipart(zmq.NOBLOCK, copy=False)
+            ch, arrival, seq = pickle.loads(hdr.bytes)
+            if arrival is not None:
+                self.rt.check_arrival(ch, arrival, seq)
+            self.buf.append((ch, arrival, seq, payload))
+            self.buf.sort(key=lambda f: (-math.inf, 0) if f[1] is None else f[1:3])
+
+    def _first_ready(self) -> int | None:
+        with self.rt.lock:
+            # `holds_unstamped` reads every frame the run brought: ask it only
+            # when a frame sent outside the run is here for it to decide.
+            held = any(f[1] is None for f in self.buf) and self.rt.holds_unstamped()
+            for k, (ch, arrival, seq, _) in enumerate(self.buf):
+                if (arrival is None and not held) or (
+                    arrival is not None and self.rt.is_released(ch, seq)
+                ):
+                    return k
+        return None
+
+    def ready(self) -> bool:
+        return self._first_ready() is not None
+
+    def _take(self, copy: bool):
+        ch, arrival, seq, payload = self.buf.pop(self._first_ready())
+        return ch, arrival, seq, payload.bytes if copy else payload
+
+    def recv(self, copy: bool = True):
+        """A receiving thread's wait point, or the clock owner's on an inline channel."""
+        if self.rt.table.recv_mode(self.ch) is ReceiveMode.INLINE:
+            return self._recv_inline(copy)
+        if not self.ready():  # nothing to take: the poller is the wait point
+            WrappedPoller(self.rt, [self]).poll()
+        ch, arrival, seq, payload = self._take(copy)
+        if arrival is not None:
+            self.rt.handed_over(ch, seq)
+        return payload
+
+    # ---- inline receive: the clock owner takes released frames itself ----
+
+    def settle(self) -> None:
+        """Block until every frame released on this channel has physically arrived."""
+        while True:
+            self.pull()
+            with self.rt.lock:
+                if not any(self.rt.unread[c] for c in self.into):
+                    return
+            self.raw.poll()
+
+    def _recv_inline(self, copy: bool):
+        while not self.poll():
+            pass
+        ch, arrival, seq, payload = self._take(copy)
+        if arrival is not None:
+            with self.rt.lock:
+                self.rt.count_done_locked(ch, seq)
+        return payload
+
+    def poll(self, timeout_ms: int | None = None) -> bool:
+        """A bounded poll is an idle point until an arrival or its bound. The
+        bound is an essential deadline while the owner holds work, else a daemon
+        one, which paces the loop without keeping the run alive. Zero never idles.
+
+        Outside the run there is no clock to ask: it waits on the socket itself.
+        """
+        self.settle()
+        if not self.ready() and timeout_ms != 0:
+            if not self.rt.in_run:
+                self.raw.poll(timeout_ms)
+            elif timeout_ms is None:
+                self.rt.next_event(math.inf)
+            else:
+                bound = self.rt.now + timeout_ms / 1000.0
+                self.rt.next_event(bound if self.rt.holds_work() else math.inf, bound)
+            self.settle()
+        return self.ready()
+
+
+class WrappedPoller:
+    """`zmq.Poller` for a receiving thread: the wait point where a frame counts as done.
+
+    Channel sockets count as readable only with a released frame; any other socket
+    registered (a shutdown signal) counts once `zmq_poll` has reported it.
+    """
+
+    def __init__(self, rt: LPRuntime, socks=()) -> None:
+        self.rt, self.socks = rt, list(socks)
+
+    def register(self, sock, flags: int = zmq.POLLIN) -> None:
+        self.socks.append(sock)
+
+    def poll(self) -> list[tuple]:
+        wrapped = [s for s in self.socks if isinstance(s, WrappedSocket)]
+        wake = self.rt.my_wakeup([ch for s in wrapped for ch in s.into])
+        waits = [(getattr(s, "raw", s), zmq.POLLIN) for s in self.socks]
+        polled, back = [], True
+        while True:
+            wake.clear()
+            try:
+                for s in wrapped:
+                    s.pull()
+            finally:
+                if back:
+                    # The frame taken before counts as handled only now, with
+                    # the wakeup cleared and the sockets read, so the owner it
+                    # lets go finds this thread about to block rather than
+                    # holding the GIL; and also when a read raises, as a
+                    # straggler's does, so the owner's drain fails the run.
+                    self.rt.back_at_wait_point()
+                    back = False
+            ready = [
+                s
+                for s in self.socks
+                if (
+                    s.ready()
+                    if isinstance(s, WrappedSocket)
+                    else getattr(s, "raw", s) in polled
+                )
+            ]
+            if ready:
+                return [(s, zmq.POLLIN) for s in ready]
+            polled = [p for p, _ in zmq.zmq_poll([*waits, (wake.fd, zmq.POLLIN)])]
+
+
+class RelayQueue:
+    """The engine's output queue: `put` stamps the send, and the send carries the stamp.
+
+    Only the clock owner puts in the run, and one consumer thread gets. The
+    stamp travels with its item, FIFO, so the header is the step's time, not the
+    moment the output thread woke. Every item taken in the run must be sent.
+    """
+
+    def __init__(self, rt: LPRuntime, wsock: WrappedSocket) -> None:
+        self.rt, self.wsock, self.q = rt, wsock, queue.Queue()
+        self.pending: tuple | None = None  # stamp of the item taken, not yet sent
+        self.consumer: threading.Thread | None = None
+        wsock.relay = self
+
+    def put(self, item) -> None:
+        stamp = self.rt.stamp_send(self.wsock.ch) if self.rt.in_run else (None, None)
+        self.q.put((stamp, item))
+
+    put_nowait = put
+
+    def get(self, block: bool = True):
+        me = threading.current_thread()
+        if self.consumer not in (None, me):
+            raise RuntimeError(
+                f"{self.wsock.ch}: get from thread {me.name!r}; the relay's one "
+                f"consumer is {self.consumer.name!r}"
+            )
+        self.consumer = me
+        if self.pending is not None and self.pending[0] is not None:
+            raise UnsentRelayItem(
+                f"{self.wsock.ch}: the item stamped (arrival {self.pending[0]}, seq "
+                f"{self.pending[1]}) was taken and never sent"
+            )
+        self.pending, item = self.q.get(block)
+        return item
+
+    def get_nowait(self):
+        return self.get(False)
+
+    def take_stamp(self) -> tuple:
+        if self.pending is None:
+            raise RuntimeError(f"{self.wsock.ch}: one relay item sent twice")
+        stamp, self.pending = self.pending, None
+        return stamp
+
+
+# ---- channel endpoints: named by ATOM's wiring, read by `atom.utils.zmq_shim` ----
+
+
+def _of_kind(rt: LPRuntime, kind: str) -> list[str]:
+    return [
+        c.name
+        for c in rt.table.channels_from(rt.me) + rt.table.channels_into(rt.me)
+        if c.name.endswith(":" + kind)
+    ]
+
+
+def socket_channels(rt: LPRuntime, kind: str) -> tuple[str, ...]:
+    """The channels one socket of `rt`'s LP carries for `kind`: its one channel,
+    or every one of that kind into the LP, when several LPs send to one socket
+    it binds, as each downstream pipeline stage sends the head its KV status."""
+    names = _of_kind(rt, kind)
+    if len(names) > 1 and all(rt.table.channel(n).target == rt.me for n in names):
+        return tuple(names)
+    return (channel_of(rt, kind),)
+
+
+def channel_of(rt: LPRuntime, kind: str) -> str:
+    """The one channel of `rt`'s LP whose name ends ``:kind``."""
+    names = _of_kind(rt, kind)
+    if len(names) != 1:
+        raise KeyError(
+            f"{rt.me} has {len(names)} channels of kind {kind!r} ({names}); a "
+            "channel socket names exactly one"
+        )
+    return names[0]
+
+
+def name_endpoints(
+    dp: int | None,
+    input_address: str,
+    control_address: str,
+    output_address: str,
+    config=None,
+) -> None:
+    """Record the channel kind each address carries; a real run records nothing.
+
+    `dp` None is `config`'s data-parallel rank, read only on a simulated run.
+
+    A socket this LP binds or connects to a recorded address becomes that
+    channel's `WrappedSocket`; the channel is looked up then, so an address no
+    socket of this LP opens is never resolved. An engine passes its `config`,
+    which holds its pipeline-stage and prefill/decode addresses; a pipeline
+    stage's own channels carry the index ATOM's engine core manager gives it,
+    its stage, as the frontend names them (ATOM runs no pipeline beside DP),
+    and the head's batch to
+    stage ``k`` goes on ``meta#pp<k>``. A RapidServe decode engine's channels carry
+    index 1, its place after the prefill engine in ATOM's disaggregated core
+    manager.
+    """
+    rt = _installed
+    if rt is None:
+        return
+    kinds = {}
+    if config is not None:
+        pc = config.parallel_config
+        dp = pc.data_parallel_rank if dp is None else dp
+        dp += getattr(pc, "pipeline_parallel_rank", 0)
+        dp += getattr(config, "disagg_is_decode", False)
+        kinds |= {a: f"meta#pp{k}" for k, a in enumerate(pc.pp_meta_addrs)}
+        kinds |= {
+            pc.pp_token_addr: "tokens",
+            pc.pp_kv_status_addr: "kv_status",
+            config.disagg_p2d_addr: "prefill_done",
+            config.disagg_d2p_addr: "block_assignment",
+        }
+    tag = f"#dp{dp}"
+    kinds |= {
+        input_address: "request" + tag,
+        control_address: "control" + tag,
+        output_address: "output" + tag,
+    }
+    kinds.pop("", None)  # an address the deployment does not use
+    rt.endpoints |= kinds
+
+
+def relay_queue(parallel):
+    """The engine's output queue: a `RelayQueue` on its output channel, else a `queue.Queue`.
+
+    The channel is the data-parallel rank's that `parallel`, the engine's
+    parallel config, names, or the LP's only one: a pipeline stage is an LP of
+    its own. Its socket is opened later, on the output thread, and takes the
+    relay's placeholder when it connects to the output address. The rank is
+    read only on a simulated run.
+    """
+    rt = _installed
+    if rt is None:
+        return queue.Queue() if _stamps is None else _StampedQueue()
+    outs = [c.name for c in rt.table.channels_from(rt.me) if ":output#" in c.name]
+    dp = parallel.data_parallel_rank
+    ch = outs[0] if len(outs) == 1 else channel_of(rt, f"output#dp{dp}")
+    rt.relays[ch] = RelayQueue(rt, WrappedSocket(rt, None, ch))
+    return rt.relays[ch]
+
+
+#: Wall seconds a simulated run waits for one worker's KV aggregation reply.
+REPLY_WAIT_S = 10.0
+
+
+class _WaitingReplyQueue(queue.Queue):
+    """A worker's KV aggregation replies on a simulated run: `get_nowait` waits.
+
+    The aggregation drains each worker's reply without waiting and returns None
+    while one is missing, and the scheduler then skips that poll's
+    `process_completions`. Whether a transfer is reported at this step or a
+    later one would turn on how fast a worker process answered in wall time. A
+    simulated worker answers in wall milliseconds and costs no simulated time,
+    so the poll waits for it, up to `REPLY_WAIT_S`.
+    """
+
+    def get_nowait(self):
+        return self.get(timeout=REPLY_WAIT_S)
+
+
+def reply_queue() -> queue.Queue:
+    """A worker's KV aggregation reply queue, which waits on a simulated run."""
+    return queue.Queue() if _installed is None else _WaitingReplyQueue()
+
+
+class PullStamps:
+    """A real recording's engine loop: the first input pull and the first
+    output put after each worker reply, one ``{"t_pull_ns" | "t_put_ns": ns}``
+    line each in `path`, read off `now`, the machine clock its caller hands in.
+
+    In `handoff`, one line per item through the engine's IO-thread queues: an
+    input frame's ``t_recv_ns`` (the input thread's receipt, on the same
+    clock), ``t_in_put_ns``, ``t_in_get_ns``, ``t_pull_ns`` (the busy loop's
+    idle point in the pass that got it) and ``prompt_tokens``; an
+    output's ``t_out_put_ns``, ``t_out_sent_ns`` (the output thread's next
+    get, so its send returned) and ``rows``.
+
+    Both files get their lines when the engine leaves its loop (`write_held`);
+    after that, each line as it comes. A write on the loop is time the loop
+    spends: on a record kept on NFS, a pull stamp written tens of
+    microseconds after the put stamp blocked for about 1 ms in most forwards,
+    inside the `E` it opens."""
+
+    def __init__(self, path, handoff, now) -> None:
+        self.file, self.now = open(path, "w"), now  # noqa: SIM115
+        self.handoff = open(handoff, "w")  # noqa: SIM115
+        # Reentrant: the stop handler writes the held lines on the loop's own
+        # thread, which a signal may have caught inside `stamp`.
+        self.lock = threading.RLock()
+        self.armed: set[str] = set()
+        self.inputs: dict[int, int] = {}  # id of an input item -> its put
+        self.pull = 0  # the busy loop's last idle point
+        self.held: dict | None = {self.file: [], self.handoff: []}
+
+    def arm(self) -> None:
+        with self.lock:
+            self.armed = {"t_pull_ns", "t_put_ns"}
+
+    def stamp(self, key: str) -> None:
+        with self.lock:
+            if key in self.armed:
+                self.armed.discard(key)
+                self._put(self.file, f'{{"{key}": {self.now()}}}\n')
+
+    def write(self, line: dict) -> None:
+        with self.lock:
+            self._put(self.handoff, json.dumps(line) + "\n")
+
+    def _put(self, file, line: str) -> None:
+        if self.held is None:
+            file.write(line)
+            file.flush()
+        else:
+            self.held[file].append(line)
+
+    def write_held(self) -> None:
+        """Write the lines held so far; later ones are written as they come.
+        The lines are taken first, so a stop handler that runs inside this
+        write finds none left to write again."""
+        with self.lock:
+            held, self.held = self.held, None
+            for file, lines in (held or {}).items():
+                file.write("".join(lines))
+                file.flush()
+
+
+#: The engine's `PullStamps` on a real recording, else None.
+_stamps: PullStamps | None = None
+
+
+def stamp_pulls(path, handoff, now) -> None:
+    """Stamp this engine's pulls and puts into `path`, and its IO-thread
+    queue handoffs into `handoff`, off the clock `now`; a real recording's only."""
+    global _stamps
+    _stamps = PullStamps(path, handoff, now)
+
+
+def write_stamps() -> None:
+    """A real recording's engine leaves its loop: write the stamps it holds."""
+    if _stamps is not None:
+        _stamps.write_held()
+
+
+class _StampedQueue(queue.Queue):
+    """A real recording's output queue: each put is offered as a ``t_put_ns``
+    stamp, and the output thread's next get writes the item before it with its
+    batch's row count, its send returned."""
+
+    taken = None  # (put, item) the output thread took last
+
+    def put(self, item, block: bool = True, timeout=None) -> None:
+        _stamps.stamp("t_put_ns")
+        super().put((_stamps.now(), item), block, timeout)
+
+    def get(self, block: bool = True, timeout=None):
+        if self.taken is not None:
+            (put, item), self.taken = self.taken, None
+            rows = item[1] if isinstance(item, tuple) and item[0] == "STREAM" else item
+            if isinstance(rows, list):
+                sent = _stamps.now()
+                _stamps.write(
+                    {"t_out_put_ns": put, "t_out_sent_ns": sent, "rows": len(rows)}
+                )
+        self.taken = super().get(block, timeout)
+        return self.taken[1]
+
+
+class _StampedInputQueue(queue.Queue):
+    """A real recording's input queue: the busy loop's get of each request
+    frame writes the frame's receipt, put and get, and its prompt tokens."""
+
+    def put(self, item, block: bool = True, timeout=None) -> None:
+        _stamps.inputs[id(item)] = _stamps.now()
+        super().put(item, block, timeout)
+
+    def get(self, block: bool = True, timeout=None):
+        item = super().get(block, timeout)
+        got, put = _stamps.now(), _stamps.inputs.pop(id(item), None)
+        timing = getattr(item[0], "queue_timing", None) if item else None
+        if put is not None and timing is not None:
+            prompt = sum(s.num_prompt_tokens for s in item)
+            recv = int(timing.received_at * 1e9)  # perf_counter: CLOCK_MONOTONIC
+            _stamps.write(
+                {
+                    "t_recv_ns": recv,
+                    "t_in_put_ns": put,
+                    "t_in_get_ns": got,
+                    "t_pull_ns": _stamps.pull,
+                    "prompt_tokens": prompt,
+                }
+            )
+        return item
+
+
+def stamp_input(engine) -> None:
+    """On a real recording, make `engine`'s input queue write each request
+    frame's handoff (`_StampedInputQueue`); the queue keeps what it holds."""
+    if _stamps is not None:
+        engine.input_queue.__class__ = _StampedInputQueue
+
+
+# ---- the engine step loop: hooks ATOM calls, each a no-op on a real run ----
+
+
+def charge(reply):
+    """A reply whose ``ScheduledBatchOutput.predicted_s`` is set advances the clock by it,
+    then by its ``out_s``, the engine loop's seconds from the forward's return to its
+    next input pull, where the reply has one.
+
+    The reply is what says the call cost time, not the call's name. A real
+    forward leaves the field None, and no other reply has it. Under DP, the
+    reply's `group_targets` are every member's return and its `group_out` every
+    member's pull that has an ``out_s``; this member asks each as a group round
+    and returns at its own pull. On a real recording every reply arms the next
+    pull and put stamp.
+    """
+    rt = _installed
+    if rt is None:
+        if _stamps is not None:
+            _stamps.arm()
+    elif getattr(reply, "predicted_s", None) is not None:
+        targets = getattr(reply, "group_targets", None) or (reply.predicted_s,)
+        mine = reply.predicted_s + (getattr(reply, "out_s", None) or 0.0)
+        pulls = getattr(reply, "group_out", None) or (mine,)
+        rt.advance_group([rt.now + t for t in (*targets, *pulls)], rt.now + mine)
+    return reply
+
+
+#: The `torch.distributed` collectives `settle_before_collectives` wraps.
+COLLECTIVES = (  # noqa: SIM905
+    "all_gather all_gather_into_tensor all_gather_object all_reduce all_to_all "
+    "all_to_all_single barrier broadcast broadcast_object_list gather reduce "
+    "reduce_scatter reduce_scatter_tensor scatter"
+).split()
+
+
+def _on_host(args, kwargs) -> bool:
+    """No tensor among a call's arguments, or in a list of them, is off the CPU."""
+    import torch
+
+    for a in (*args, *kwargs.values()):
+        for x in a if isinstance(a, (list, tuple)) else (a,):
+            if isinstance(x, torch.Tensor) and x.device.type != "cpu":
+                return False
+    return True
+
+
+def settle_before_collectives() -> None:
+    """The clock owner pays its owed group rounds before a host collective, a
+    `torch.distributed` collective whose tensors are all on the CPU, or that
+    has none: it returns at the latest arrival. A device collective returns
+    once enqueued, so it settles nothing."""
+    import torch.distributed as dist
+
+    def settled(fn):
+        def call(*args, **kwargs):
+            rt = _installed
+            if (
+                rt is not None
+                and threading.current_thread() is rt.owner
+                and _on_host(args, kwargs)
+            ):
+                rt.settle()
+            return fn(*args, **kwargs)
+
+        return call
+
+    for name in COLLECTIVES:
+        setattr(dist, name, settled(getattr(dist, name)))
+
+
+def idle(deadline, t_daemon: float = math.inf) -> bool:
+    """An idle point of a loop that never blocks; True once the run is finished.
+
+    A pass through the loop that made no clock call ran nothing, so this one
+    first waits for the LP's next event: an arrival, or ``deadline()``, the time
+    the loop next acts on its own. `t_daemon` is a deadline that does not keep
+    the run alive. The loop takes True as its shutdown. It runs just before
+    the loop's input pull, so on a real recording it offers a ``t_pull_ns`` stamp.
+    """
+    rt = _installed
+    if rt is None:
+        if _stamps is not None:
+            _stamps.stamp("t_pull_ns")
+            _stamps.pull = _stamps.now()
+        return False
+    if rt.in_run and rt.calls == rt.idle_calls:
+        rt.next_event(deadline(), t_daemon)
+    rt.idle_calls = rt.calls
+    return rt.now == math.inf
+
+
+def finish() -> None:
+    """Offline teardown: wait for the run to finish before the engines are stopped.
+
+    An engine leaves its loop on the ``+inf`` grant, so a shutdown sent at a
+    finite time would take it out before the finish. Outside a run, or once it
+    has finished, this asks nothing.
+    """
+    rt = _installed
+    while rt is not None and rt.in_run:
+        rt.next_event(math.inf)
+
+
+def wait_output(q: queue.Queue) -> None:
+    """The offline driver's idle point: ask for time until `q` holds an output."""
+    rt = _installed
+    if rt is None:
+        return
+    while rt.in_run and q.empty():
+        rt.next_event(math.inf)
+    if rt.now == math.inf and q.empty():
+        raise RuntimeError(f"{rt.me}: the run finished with no output left to get")
+
+
+def close() -> None:
+    """The step loop's process leaves; refused before the ``+inf`` grant."""
+    if _installed is not None:
+        _installed.close()

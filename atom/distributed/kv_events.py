@@ -11,13 +11,14 @@ import itertools
 import logging
 import queue
 import threading
-import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable
 from typing import Any, Final
 
 import msgspec
+
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 

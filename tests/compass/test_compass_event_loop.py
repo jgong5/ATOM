@@ -1,0 +1,1820 @@
+# SPDX-License-Identifier: MIT
+"""`CompassEventLoop` against the co-hosted clock authority.
+
+Three LPs as in a one-engine run. The frontend is the loop under test; the
+engine waits in NER(+inf), and so does the traffic LP unless a test drives it.
+The daemon timers are the real ones: the API server's metrics refresh loop,
+and uvicorn's server tick and keep-alive timeout.
+"""
+
+import asyncio
+import errno
+import http.client
+import importlib.util
+import json
+import logging
+import math
+import queue
+import socket
+import threading
+import time
+import uuid
+import warnings
+from types import SimpleNamespace
+
+import fastapi
+import pytest
+import uvicorn
+
+from atom.compass import carriers, clock_transport
+from atom.compass.clock import (
+    NER,
+    ClockAuthority,
+    LpId,
+    prefill_decode_table,
+    single_engine_table,
+)
+from atom.entrypoints.openai import api_server
+from atom.utils import clock
+from atom.utils.clock import LPRuntime
+from atom.utils.compass_loop import (
+    CompassEventLoop,
+    CompassSelector,
+    HttpChannel,
+    Station,
+    charge,
+    wrap_decode,
+    wrap_encode,
+)
+
+TABLE = single_engine_table(admission_s=0.54e-3, ipc_s=0.001, stream_s=0.002)
+TRAFFIC, FRONTEND, ENGINE = LpId("traffic"), LpId("frontend"), LpId("engine")
+HTTP = "traffic->frontend:http"
+INF = math.inf
+
+
+class _Watched:
+    """The frontend's connection: each request, each grant, and each NER sent
+    while a released request was unread."""
+
+    def __init__(self, conn) -> None:
+        self.conn, self.sent, self.grants, self.unread = conn, [], [], []
+        self.rt = None
+
+    def send(self, msg) -> None:
+        if self.rt.inline_pending():
+            self.unread.append(msg)
+        self.sent.append(msg)
+        if len(self.sent) > 1000:
+            raise RuntimeError("1000 time requests: a timer keeps the run alive")
+        self.conn.send(msg)
+
+    def recv(self):
+        g, released = self.conn.recv()
+        self.grants.append(g)
+        return g, released
+
+
+@pytest.fixture
+def run(monkeypatch):
+    endpoint = f"inproc:test-compass-loop-{uuid.uuid4().hex}"
+    server = clock_transport.serve(ClockAuthority(TABLE), endpoint)
+    clock_transport.connect(ENGINE, endpoint).send((NER, INF, [], INF))
+    conn = _Watched(clock_transport.connect(FRONTEND, endpoint))
+    conn.rt = rt = LPRuntime(FRONTEND, TABLE, conn)
+    rt.start_run()
+    clock.install(rt)
+    # Every loop the test builds, uvicorn's included, is stopped after 20 wall
+    # seconds, and the test fails: a loop that never stops cannot hang it.
+    loops, fired, init = [], [], CompassEventLoop.__init__
+
+    def tracked(self):
+        init(self)
+        loops.append(self)
+
+    def stop_all():
+        fired.append(True)
+        for loop in loops:
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(loop.stop)
+
+    monkeypatch.setattr(CompassEventLoop, "__init__", tracked)
+    guard = threading.Timer(20, stop_all)
+    guard.start()
+    try:
+        yield SimpleNamespace(rt=rt, conn=conn, endpoint=endpoint)
+    finally:
+        guard.cancel()
+        clock.install(None)
+        server.close()
+    assert not fired, "a loop ran 20 wall seconds without stopping"
+
+
+def _idle_traffic(run) -> None:
+    clock_transport.connect(TRAFFIC, run.endpoint).send((NER, INF, [], INF))
+
+
+def _until(cond) -> None:
+    deadline = time.monotonic() + 10
+    while not cond():
+        assert time.monotonic() < deadline, "not reached in 10 wall seconds"
+        time.sleep(0.001)
+
+
+def _traffic(run, stamps: queue.Queue, before_ner, n=1) -> threading.Thread:
+    """The traffic LP: stamps `n` requests at 0, then `before_ner()`, then idles."""
+
+    def body():
+        rt = LPRuntime(TRAFFIC, TABLE, clock_transport.connect(TRAFFIC, run.endpoint))
+        rt.start_run()
+        for _ in range(n):
+            stamps.put(rt.stamp_send(HTTP))
+        before_ner()
+        rt.next_event(INF)
+        rt.close()
+
+    thread = threading.Thread(target=body, name="traffic", daemon=True)
+    thread.start()
+    return thread
+
+
+def _stamp(scope):
+    """Stands in for the request carrier: ``x-test-stamp: <arrival> <seq>``."""
+    for name, value in scope["headers"]:
+        if name == b"x-test-stamp":
+            arrival, seq = value.split()
+            return float(arrival), int(seq)
+    return None
+
+
+async def _no_body():
+    """An ASGI ``receive`` for a request with an empty body."""
+    return {"type": "http.request", "body": b"", "more_body": False}
+
+
+def test_a_60_second_sleep_ends_at_lp_60_with_no_wall_wait(run):
+    _idle_traffic(run)
+    loop = CompassEventLoop()
+    wall = time.monotonic()
+    loop.run_until_complete(asyncio.sleep(60))
+    wall, lp = time.monotonic() - wall, loop.time()
+    loop.run_forever()  # nothing is left: the finish grants +inf and the loop stops
+    loop.close()
+    print(f"\n  asyncio.sleep(60): {lp} LP seconds in {wall:.4f} wall seconds")
+    assert lp == 60.0 and wall < 5.0
+    assert run.conn.sent == [(NER, 60.0, [], INF), (NER, INF, [], INF)]
+    assert run.rt.now == INF
+
+
+def test_the_metrics_refresh_is_a_daemon_and_the_finish_stops_the_loop(run):
+    _idle_traffic(run)
+    refreshed, late = [], []
+
+    async def refresh():
+        loop = asyncio.get_running_loop()
+        refreshed.append(loop.time())
+        # A plain callback, a daemon because the periodic job schedules it.
+        loop.call_later(4, lambda: late.append(loop.time()))
+
+    async def serve():
+        asyncio.create_task(api_server._periodic(5, refresh))
+        await asyncio.sleep(12)  # the last essential timer
+        await asyncio.Event().wait()  # serves until stopped, as uvicorn does
+
+    # asyncio.run, as uvicorn calls it: a stop ends the main task early.
+    with pytest.raises(RuntimeError, match="Event loop stopped before Future"):
+        asyncio.run(serve(), loop_factory=CompassEventLoop)
+    # The timers due at 14 and 15 never run, not even at +inf.
+    assert refreshed == [5.0, 10.0] and late == [9.0]
+    assert run.conn.sent == [
+        (NER, 12.0, [], 5.0),
+        (NER, 12.0, [], 9.0),
+        (NER, 12.0, [], 10.0),
+        (NER, 12.0, [], 14.0),
+        (NER, INF, [], 14.0),
+    ]
+    assert run.conn.grants == [5.0, 9.0, 10.0, 12.0, INF]
+
+
+def test_no_time_is_asked_while_a_station_job_is_open(run):
+    _idle_traffic(run)
+    loop = CompassEventLoop()
+
+    async def go():
+        later = asyncio.ensure_future(asyncio.sleep(1))  # a timer to jump to
+
+        def do_preprocess():
+            time.sleep(0.2)  # open across the loop's next select
+
+        await loop.run_in_executor(None, do_preprocess)
+        done = loop.time()
+        await later
+        return done
+
+    assert loop.run_until_complete(go()) == 0.0
+    assert len(loop.executor.station.jobs) == 1  # the default executor's station
+    loop.run_forever()
+    loop.close()
+
+
+def test_closing_the_loop_before_the_finish_is_refused(run):
+    _idle_traffic(run)
+    loop = CompassEventLoop()
+    loop.run_until_complete(asyncio.sleep(1))
+    with pytest.raises(RuntimeError, match=r"before the \+inf grant"):
+        loop.close()
+
+
+def test_a_request_released_before_it_is_read_is_handed_over_at_its_arrival(run):
+    stamps, handled, got = queue.Queue(), [], {}
+
+    async def app(scope, receive, send):
+        handled.append(asyncio.get_running_loop().time())
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            HttpChannel(app, _stamp),
+            host="127.0.0.1",
+            port=0,
+            loop="atom.utils.compass_loop:CompassEventLoop",
+            lifespan="off",
+            log_level="warning",
+        )
+    )
+    traffic = _traffic(run, stamps, before_ner=lambda: None)
+    arrival, seq = stamps.get(timeout=10)
+
+    def released():
+        with run.rt.lock:
+            return run.rt.is_released(HTTP, seq)
+
+    def client():
+        _until(lambda: server.started and released())
+        port = server.servers[0].sockets[0].getsockname()[1]
+        got["conn"] = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        got["conn"].request("GET", "/", headers={"x-test-stamp": f"{arrival!r} {seq}"})
+        # The connection stays open, so its keep-alive timer stays set.
+        got["body"] = got["conn"].getresponse().read()
+
+    thread = threading.Thread(target=client, name="client", daemon=True)
+    thread.start()
+    try:
+        server.run()  # the finish ends it with nothing pending
+    finally:
+        thread.join(10)
+        traffic.join(10)
+        if "conn" in got:
+            got["conn"].close()
+    assert got["body"] == b"ok" and handled == [arrival]
+    assert run.conn.unread == []
+    # The server tick and the keep-alive timeout never move the clock.
+    assert max(g for g in run.conn.grants if g < INF) == arrival
+    assert run.conn.grants[-1] == INF
+
+
+def test_an_unstamped_generation_request_in_the_run_is_refused_naming_its_endpoint(
+    run,
+):
+    """While a stamped completion is released and unread, an unstamped one and
+    an unstamped ``/health`` arrive. The completion is answered 400 by name and
+    reaches no app; ``/health`` and the stamped completion are served."""
+    stamps, served, got = queue.Queue(), [], {}
+
+    async def app(scope, receive, send):
+        served.append(scope["path"])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            HttpChannel(app, api_server._tracestate_stamp),
+            host="127.0.0.1",
+            port=0,
+            loop="atom.utils.compass_loop:CompassEventLoop",
+            lifespan="off",
+            log_level="warning",
+        )
+    )
+    traffic = _traffic(run, stamps, before_ner=lambda: None)
+    arrival, seq = stamps.get(timeout=10)
+
+    def released():
+        with run.rt.lock:
+            return run.rt.is_released(HTTP, seq)
+
+    def ask(method, path, headers):
+        port = server.servers[0].sockets[0].getsockname()[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            conn.request(
+                method, path, body=b"{}" if method == "POST" else None, headers=headers
+            )
+            response = conn.getresponse()
+            return response.status, response.read()
+        finally:
+            conn.close()
+
+    def client():
+        _until(lambda: server.started and released())
+        got["unstamped"] = ask("POST", "/v1/completions", {})
+        got["health"] = ask("GET", "/health", {})
+        stamp = carriers.tracestate_with(None, arrival, seq)
+        got["stamped"] = ask("POST", "/v1/completions", {"tracestate": stamp})
+
+    thread = threading.Thread(target=client, name="client", daemon=True)
+    thread.start()
+    try:
+        server.run()  # the finish ends it once the stamped request is served
+    finally:
+        thread.join(10)
+        traffic.join(10)
+    assert served == ["/health", "/v1/completions"]
+    assert run.rt.refusals == ["http:unstamped POST /v1/completions"]
+    assert got["health"] == got["stamped"] == (200, b"ok")
+    status, body = got["unstamped"]
+    message = json.loads(body)["error"]["message"]
+    assert status == 400 and "POST /v1/completions carries no Compass stamp" in message
+    assert "traffic LP" in message
+
+
+def test_the_finish_shuts_uvicorn_down_with_no_error_and_no_join_warning(
+    run, caplog, monkeypatch
+):
+    _idle_traffic(run)
+    # An earlier server may have left uvicorn's log config: no propagation, WARNING.
+    monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+    server = uvicorn.Server(
+        uvicorn.Config(
+            fastapi.FastAPI(),
+            host="127.0.0.1",
+            port=0,
+            loop="atom.utils.compass_loop:CompassEventLoop",
+            lifespan="on",
+            log_config=None,
+        )
+    )
+    with (
+        caplog.at_level(logging.INFO, "uvicorn.error"),
+        warnings.catch_warnings(record=True) as warned,
+    ):
+        warnings.simplefilter("always")
+        try:
+            server.run()
+            stopped = None
+        except RuntimeError as e:  # the loop stopped with uvicorn's task pending
+            stopped = str(e)
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    joins = [str(w.message) for w in warned if w.category is RuntimeWarning]
+    assert (stopped, errors, joins) == (None, [], [])
+    assert run.rt.now == INF and "Application shutdown complete." in caplog.messages
+
+
+def test_the_api_server_s_lifespan_starts_and_stops_inside_the_run(
+    run, caplog, monkeypatch
+):
+    """ATOM's lifespan hands tracing's setup and flush to a thread as the server
+    starts and as it leaves; the loop is in its run by then, so both are station
+    jobs, and the server starts, reaches the finish and shuts down."""
+    _idle_traffic(run)
+    monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
+    # The process-wide collector settings startup makes, kept out of the test run.
+    for name in (
+        "tune_gc",
+        "maybe_attach_gc_debug_callback",
+        "freeze_gc_heap",
+        "arm_reclaim_watch",
+    ):
+        monkeypatch.setattr(api_server, name, lambda *_: None)
+    server = uvicorn.Server(
+        uvicorn.Config(
+            fastapi.FastAPI(lifespan=api_server.lifespan),
+            host="127.0.0.1",
+            port=0,
+            loop="atom.utils.compass_loop:CompassEventLoop",
+            lifespan="on",
+            log_config=None,
+        )
+    )
+    with caplog.at_level(logging.INFO, "uvicorn.error"):
+        try:
+            server.run()
+            stopped = None
+        except RuntimeError as e:
+            stopped = str(e)
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert (stopped, errors) == (None, [])
+    assert "Application startup complete." in caplog.messages
+    assert run.rt.now == INF and "Application shutdown complete." in caplog.messages
+
+
+def test_a_request_read_before_its_release_is_held_until_it(run):
+    stamps, handled = queue.Queue(), []
+    traffic = _traffic(
+        run, stamps, before_ner=lambda: _until(lambda: run.rt.arrived[HTTP])
+    )
+    arrival, seq = stamps.get(timeout=10)
+
+    async def app(scope, receive, send):
+        handled.append(asyncio.get_running_loop().time())
+
+    scope = {
+        "type": "http",
+        "headers": [(b"x-test-stamp", f"{arrival!r} {seq}".encode())],
+    }
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(HttpChannel(app, _stamp)(scope, _no_body, None))
+        loop.run_forever()
+    finally:
+        traffic.join(10)
+    loop.close()
+    assert handled == [arrival]
+    assert run.conn.grants == [arrival, INF] and run.conn.unread == []
+
+
+@pytest.mark.parametrize("done", [True, False], ids=["done", "no-done"])
+def test_the_done_event_ends_the_response_and_the_app_s_later_sends_are_dropped(
+    run, done
+):
+    """The client returns a request at its body's end, which the traffic LP
+    holds its clock for once the ``[DONE]`` is released: the body message that
+    ends in ``[DONE]`` ends the body, whatever the app sends after it. A stream
+    with no ``[DONE]`` ends where the app ends it."""
+    stamps, wire, finished = queue.Queue(), [], []
+
+    def traffic():
+        rt = LPRuntime(TRAFFIC, TABLE, clock_transport.connect(TRAFFIC, run.endpoint))
+        rt.start_run()
+        stamps.put(rt.stamp_send(HTTP))
+        _until(lambda: run.rt.arrived[HTTP])
+        while rt.next_event(INF) < INF:  # the stream's events reach it
+            pass
+        rt.close()
+
+    thread = threading.Thread(target=traffic, name="traffic", daemon=True)
+    thread.start()
+    arrival, seq = stamps.get(timeout=10)
+    last = b"data: [DONE]\n\n" if done else b'data: {"end": 1}\n\n'
+
+    async def app(scope, receive, send):
+        await receive()
+        sse = [(b"content-type", b"text/event-stream")]
+        await send({"type": "http.response.start", "status": 200, "headers": sse})
+        for body, more in ((b"data: {}\n\n", True), (last, True), (b"", False)):
+            await send({"type": "http.response.body", "body": body, "more_body": more})
+        finished.append(True)
+
+    async def send(message):
+        wire.append(message)
+
+    scope = {
+        "type": "http",
+        "headers": [(b"x-test-stamp", f"{arrival!r} {seq}".encode())],
+    }
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(HttpChannel(app, _stamp)(scope, _no_body, send))
+        loop.run_forever()
+    finally:
+        thread.join(10)
+    loop.close()
+    assert finished == [True]
+    bodies = [(m["body"], m["more_body"]) for m in wire[1:]]
+    stamped = [carriers.sse_stamp(b.decode().partition("\n")[0]) for b, _ in bodies]
+    assert all(s is not None for s in stamped[:2])
+    assert [b.partition(b"\n")[2] for b, _ in bodies[:2]] == [b"data: {}\n\n", last]
+    # The app's own end, an empty body, goes out only with no [DONE] before it.
+    ends = [True, False] if done else [True, True, False]
+    assert [more for _, more in bodies] == ends
+
+
+def test_a_body_that_arrives_after_the_next_timer_is_handed_on_at_its_release(run):
+    stamps, handled = queue.Queue(), []
+    traffic = _traffic(
+        run, stamps, before_ner=lambda: _until(lambda: run.rt.arrived[HTTP])
+    )
+    arrival, seq = stamps.get(timeout=10)
+    loop = CompassEventLoop()
+    rest = loop.create_future()  # the body's last part, sent late
+    parts = [
+        {"type": "http.request", "body": b"a", "more_body": True},
+        {"type": "http.request", "body": b"b", "more_body": False},
+    ]
+
+    async def receive():
+        if len(parts) == 1:
+            await rest
+        return parts.pop(0) if parts else {"type": "http.disconnect"}
+
+    async def app(scope, receive, send):
+        got = [await receive()]
+        while got[-1]["more_body"]:
+            got.append(await receive())
+        handled.append((loop.time(), b"".join(m["body"] for m in got)))
+
+    def deliver():
+        # The rest of the body comes once the clock passes the arrival, or
+        # after 0.3 wall seconds with the clock standing at it.
+        def released():
+            with run.rt.lock:
+                return run.rt.is_released(HTTP, seq)
+
+        _until(released)
+        end = time.monotonic() + 0.3
+        while run.rt.now <= arrival and time.monotonic() < end:
+            time.sleep(0.001)
+        loop.call_soon_threadsafe(rest.set_result, None)
+
+    async def go():
+        async def tick():  # the frontend's next timers, as its 0.1 s tick
+            while not handled:
+                await asyncio.sleep(0.1)
+
+        ticker = asyncio.ensure_future(tick())
+        scope = {
+            "type": "http",
+            "headers": [(b"x-test-stamp", f"{arrival!r} {seq}".encode())],
+        }
+        await HttpChannel(app, _stamp)(scope, receive, None)
+        await ticker
+
+    thread = threading.Thread(target=deliver, name="body", daemon=True)
+    thread.start()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        thread.join(10)
+        traffic.join(10)
+    loop.close()
+    assert handled == [(arrival, b"ab")]
+    assert run.conn.unread == []
+
+
+def test_requests_with_one_arrival_are_handed_over_in_seq_order(run):
+    stamps, handled = queue.Queue(), []
+    traffic = _traffic(run, stamps, before_ner=lambda: None, n=2)
+    (arrival, _), (again, _) = stamps.get(timeout=10), stamps.get(timeout=10)
+    assert arrival == again
+
+    async def app(scope, receive, send):
+        handled.append(_stamp(scope)[1])
+
+    def read(seq):
+        scope = {
+            "type": "http",
+            "headers": [(b"x-test-stamp", b"%r %d" % (arrival, seq))],
+        }
+        return HttpChannel(app, _stamp)(scope, _no_body, None)
+
+    async def go():
+        await asyncio.sleep(arrival)  # both are released, neither is read yet
+        first = asyncio.ensure_future(read(1))
+        for _ in range(3):  # the loop selects with seq 0 still unread
+            await asyncio.sleep(0)
+        await asyncio.gather(first, read(0))
+
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        traffic.join(10)
+    loop.close()
+    assert handled == [0, 1]
+    assert run.conn.grants == [arrival, INF] and run.conn.unread == []
+
+
+def test_requests_with_one_arrival_reach_the_app_in_seq_order_whatever_body_ends_first(
+    run,
+):
+    stamps, entered = queue.Queue(), []
+    traffic = _traffic(run, stamps, before_ner=lambda: None, n=2)
+    (arrival, _), (again, _) = stamps.get(timeout=10), stamps.get(timeout=10)
+    assert arrival == again
+
+    async def app(scope, receive, send):
+        entered.append(_stamp(scope)[1])
+
+    def read(seq):
+        async def receive():  # seq 0's body takes more socket reads than seq 1's
+            for _ in range(3 if seq == 0 else 0):
+                await asyncio.sleep(0)
+            return {"type": "http.request", "body": b"x", "more_body": False}
+
+        scope = {
+            "type": "http",
+            "headers": [(b"x-test-stamp", b"%r %d" % (arrival, seq))],
+        }
+        return HttpChannel(app, _stamp)(scope, receive, None)
+
+    async def go():
+        await asyncio.sleep(arrival)
+        await asyncio.gather(read(0), read(1))
+
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        traffic.join(10)
+    loop.close()
+    print(f"\n  app entered in seq order {entered}")
+    assert entered == [0, 1]
+    assert run.conn.grants == [arrival, INF] and run.conn.unread == []
+
+
+@pytest.mark.parametrize("order", [1, -1], ids=["entry-last", "entry-first"])
+def test_a_stamp_split_over_two_tracestate_lines_holds_the_served_app(
+    run, monkeypatch, order
+):
+    stamps, handled = queue.Queue(), []
+    traffic = _traffic(
+        run, stamps, before_ner=lambda: _until(lambda: run.rt.arrived[HTTP])
+    )
+    arrival, seq = stamps.get(timeout=10)
+
+    async def app(scope, receive, send):
+        handled.append(asyncio.get_running_loop().time())
+
+    monkeypatch.setattr(api_server, "app", app)
+    lines = [b"vendor=x", carriers.tracestate_with(None, arrival, seq).encode()]
+    scope = {"type": "http", "headers": [(b"tracestate", v) for v in lines[::order]]}
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(api_server._served_app()(scope, _no_body, None))
+        assert handled == [arrival]
+        loop.run_forever()
+    finally:
+        traffic.join(10)
+    loop.close()
+    assert run.conn.grants == [arrival, INF] and run.conn.unread == []
+
+
+def test_compass_off_keeps_uvloop_and_on_names_a_loop_uvicorn_builds(run):
+    clock.install(None)
+    off = "uvloop" if importlib.util.find_spec("uvloop") else "auto"
+    assert api_server._loop_impl() == off
+    assert api_server._served_app() is api_server.app
+    clock.install(run.rt)
+    config = uvicorn.Config(lambda *_: None, loop=api_server._loop_impl())
+    assert config.get_loop_factory() is CompassEventLoop
+
+
+def test_select_returns_nothing_only_once_its_timeout_has_passed_on_the_lp_clock(
+    run, monkeypatch
+):
+    _idle_traffic(run)
+    calls, select = [], CompassSelector.select
+
+    def recorded(self, timeout=None):
+        t0 = self.loop.time()
+        got = select(self, timeout)
+        calls.append((t0, timeout, got, self.loop.time()))
+        return got
+
+    monkeypatch.setattr(CompassSelector, "select", recorded)
+    loop = CompassEventLoop()
+
+    async def go():
+        later = asyncio.ensure_future(asyncio.sleep(1))
+
+        def do_preprocess():
+            time.sleep(0.2)  # open across the loop's next select
+
+        await loop.run_in_executor(None, do_preprocess)
+        await later
+
+    loop.run_until_complete(go())
+    loop.run_forever()
+    loop.close()
+    early = [
+        c for c in calls if not c[2] and c[3] < c[0] + (INF if c[1] is None else c[1])
+    ]
+    assert calls and early == []
+
+
+def test_a_stall_warns_once_across_diag_s_periods_and_unrelated_fd_events(run, caplog):
+    _idle_traffic(run)
+    run.rt.diag_s = 0.05
+    loop = CompassEventLoop()
+    stop = threading.Event()
+
+    def poke():  # an unrelated fd event every 10 ms: a self-pipe write
+        while not stop.wait(0.01):
+            loop.call_soon_threadsafe(lambda: None)
+
+    async def go():
+        def do_preprocess():
+            time.sleep(0.5)  # open for ten diag_s periods
+
+        poker = threading.Thread(target=poke, daemon=True)
+        poker.start()
+        try:
+            await loop.run_in_executor(None, do_preprocess)
+        finally:
+            stop.set()
+            poker.join()
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        loop.run_until_complete(go())
+    loop.run_forever()
+    loop.close()
+    warned = [
+        r.getMessage() for r in caplog.records if "still waiting" in r.getMessage()
+    ]
+    assert len(warned) == 1 and "station job 0 is open" in warned[0]
+
+
+def test_http_channel_refuses_a_plain_asyncio_loop():
+    scope = {"type": "http", "headers": [(b"x-test-stamp", b"0.5 0")]}
+    with pytest.raises(TypeError, match="on a CompassEventLoop, not on"):
+        asyncio.run(HttpChannel(None, _stamp)(scope, None, None))
+
+
+CONTROL = "frontend->engine:control#dp0"
+
+
+def _frontend_on_tcp(monkeypatch, poke, main):
+    """Runs `main(loop)` on a frontend whose clock connection is tcp, so its
+    loop serves its sockets while its next-event request is out.
+
+    The frontend has an essential timer at 1. Traffic idles from the start; the
+    engine joins only once `poke(loop)`, called while the frontend's request is
+    out, has returned, so no grant reaches the frontend before then. Returns
+    the frontend's runtime, the engine's control releases, and the loop's LP
+    time at the finish.
+    """
+    authority = clock_transport.serve(ClockAuthority(TABLE), "tcp://127.0.0.1:0")
+    # Kept referenced: a dropped connection closes its socket, ending the run.
+    traffic = clock_transport.connect(TRAFFIC, authority.endpoint)
+    traffic.send((NER, INF, [], INF))
+    engine = clock_transport.connect(ENGINE, authority.endpoint)
+    rt = LPRuntime(
+        FRONTEND, TABLE, clock_transport.connect(FRONTEND, authority.endpoint)
+    )
+    rt.start_run()
+    monkeypatch.setattr(clock, "_installed", rt)
+    loop = CompassEventLoop()
+    loop.call_at(1.0, lambda: None)
+    released = []
+
+    def engine_lp():
+        _until(lambda: rt.asked)
+        poke(loop)
+        g = None
+        while g != INF:
+            engine.send((NER, INF, [], INF))
+            g, got = engine.recv()
+            released.extend(got[CONTROL])
+
+    thread = threading.Thread(target=engine_lp, daemon=True)
+    thread.start()
+    # A loop the finish does not stop is stopped after 20 wall seconds.
+    guard = threading.Timer(20, lambda: loop.call_soon_threadsafe(loop.stop))
+    guard.start()
+    try:
+        main(loop)
+        thread.join(10)
+        return rt, released, loop.ended and loop.ended[0]
+    finally:
+        guard.cancel()
+        authority.close()
+        if loop.ended:
+            loop.close()
+
+
+def test_a_send_while_the_request_is_out_is_refused_naming_its_channel(monkeypatch):
+    """A client hangs up while the frontend's request is out, and the handler
+    stamps a control send, as the frontend's abort of that request does. The
+    send is refused and the run goes on to its finish."""
+    client, peer = socket.socketpair()
+    refused, handling = [], threading.Event()
+
+    def main(loop):
+        def hang_up():
+            loop.remove_reader(peer)
+            handling.set()
+            try:
+                loop.rt.stamp_send(CONTROL)
+            except RuntimeError as e:
+                refused.append(str(e))
+
+        loop.add_reader(peer, hang_up)
+        loop.run_forever()
+
+    def poke(loop):
+        client.send(b"x")
+        handling.wait(10)
+
+    try:
+        rt, released, end = _frontend_on_tcp(monkeypatch, poke, main)
+    finally:
+        client.close()
+        peer.close()
+    assert len(refused) == 1 and CONTROL in refused[0]
+    assert rt.refusals == [
+        f"clock:stamp_send on {CONTROL} while a next-event request is out"
+    ]
+    assert released == [] and end == 1.0
+
+
+def test_a_keep_alive_timer_set_while_the_request_is_out_holds_no_finish(
+    monkeypatch,
+):
+    """An unstamped GET is served while the frontend's request is out, as
+    ``/health`` is before the traffic LP joins, and its connection stays open,
+    so uvicorn's keep-alive timer is set. The run still finishes at the
+    frontend's essential timer."""
+    served, got = [], {}
+
+    async def app(scope, receive, send):
+        served.append(clock.installed().asked)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app, host="127.0.0.1", port=0, lifespan="off", log_level="warning"
+        )
+    )
+
+    def poke(loop):
+        _until(lambda: server.started)
+        port = server.servers[0].sockets[0].getsockname()[1]
+        got["conn"] = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        got["conn"].request("GET", "/health")
+        got["body"] = got["conn"].getresponse().read()
+
+    try:
+        _, _, end = _frontend_on_tcp(
+            monkeypatch, poke, lambda loop: loop.run_until_complete(server.serve())
+        )
+    finally:
+        if "conn" in got:
+            got["conn"].close()
+    assert got["body"] == b"ok" and served == [True]
+    # The timer at 1 fires at the server tick that reaches it within asyncio's
+    # clock resolution; the keep-alive timer, due at 5, never moves the clock.
+    assert end == pytest.approx(1.0)
+
+
+def test_a_stamped_cancel_hangs_its_request_up_at_its_arrival_never_the_socket(run):
+    """Request 0 is stamped at 0 and its socket closes as soon as its body is
+    read; the cancel naming it is stamped at 1. The app serving request 0
+    reads ``http.disconnect`` at the cancel's arrival, and the cancel reaches
+    no app: it is answered 204."""
+    stamps = queue.Queue()
+
+    def traffic():
+        rt = LPRuntime(TRAFFIC, TABLE, clock_transport.connect(TRAFFIC, run.endpoint))
+        rt.start_run()
+        stamps.put(rt.stamp_send(HTTP))
+        rt.advance_to(1.0)
+        stamps.put(rt.stamp_send(HTTP))
+        rt.next_event(INF)
+        rt.close()
+
+    thread = threading.Thread(target=traffic, name="traffic", daemon=True)
+    thread.start()
+    arrival, seq = TABLE.lookahead(HTTP), 0
+    cancel_at, cancel = 1.0 + arrival, 1
+    loop = CompassEventLoop()
+    served, answered = [], []
+
+    async def app(scope, receive, send):
+        served.append((await receive())["body"])
+        served.append(((await receive())["type"], loop.time()))
+
+    def wire(body: bytes):
+        parts = [{"type": "http.request", "body": body, "more_body": False}]
+
+        async def receive():
+            return parts.pop(0) if parts else {"type": "http.disconnect"}
+
+        return receive
+
+    async def answer(message):
+        answered.append(message)
+
+    def scope(a, s):
+        return {"type": "http", "headers": [(b"x-test-stamp", b"%r %d" % (a, s))]}
+
+    async def go():
+        channel = HttpChannel(app, _stamp)
+        await asyncio.gather(
+            channel(scope(arrival, seq), wire(b"{}"), None),
+            channel(scope(cancel_at, cancel), wire(carriers.cancel_body(seq)), answer),
+        )
+
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        thread.join(10)
+    loop.close()
+    assert [stamps.get(timeout=10) for _ in range(2)] == [
+        (arrival, seq),
+        (cancel_at, cancel),
+    ]
+    assert served == [b"{}", ("http.disconnect", cancel_at)]
+    assert answered == [
+        {"type": "http.response.start", "status": 204},
+        {"type": "http.response.body", "body": b""},
+    ]
+
+
+def test_a_cancel_on_the_relay_hangs_its_request_up_at_its_arrival_never_the_socket():
+    """Behind a router LP, frontend-D's requests come in on ``relay``, each
+    stamped in its body. Request 0 is relayed at 0 and its socket closes as
+    soon as its body is read; the cancel the router hands on for it, relay seq
+    1, is stamped at 1. The app serving request 0 reads ``http.disconnect`` at
+    the cancel's arrival, and the cancel reaches no app: it is answered 204."""
+    table = prefill_decode_table(
+        admission_s=0.54e-3,
+        ipc_s=0.001,
+        stream_s=0.002,
+        router_s=2.0**-12,
+        kv_write_req_s=2.0**-10,
+        router_in_s=2.0**-14,
+    )
+    relay, router, me = "router->frontend-D:relay", LpId("router"), LpId("frontend-D")
+    endpoint = f"inproc:test-compass-loop-{uuid.uuid4().hex}"
+    server = clock_transport.serve(ClockAuthority(table), endpoint)
+    for lp in table.registry.ids():
+        if lp not in (router, me):
+            clock_transport.connect(lp, endpoint).send((NER, INF, [], INF))
+    rt = LPRuntime(me, table, clock_transport.connect(me, endpoint))
+    rt.start_run()
+    clock.install(rt)
+    stamps = queue.Queue()
+
+    def hop():
+        rt = LPRuntime(router, table, clock_transport.connect(router, endpoint))
+        rt.start_run()
+        stamps.put(rt.stamp_send(relay))
+        rt.advance_to(1.0)
+        stamps.put(rt.stamp_send(relay))
+        rt.next_event(INF)
+        rt.close()
+
+    thread = threading.Thread(target=hop, name="router", daemon=True)
+    thread.start()
+    arrival, seq = table.lookahead(relay), 0
+    cancel_at, cancel = 1.0 + arrival, 1
+    loop = CompassEventLoop()
+    guard = threading.Timer(20, loop.call_soon_threadsafe, (loop.stop,))
+    served, answered = [], []
+    request = b'{"kv_transfer_params": {"compass": "a:%r;s:%d"}}' % (arrival, seq)
+    cancelled = (
+        b'{"compass_cancel": %d, "kv_transfer_params": {"compass": "a:%r;s:%d"}}'
+    )
+
+    async def app(scope, receive, send):
+        served.append((await receive())["body"])
+        served.append(((await receive())["type"], loop.time()))
+
+    def wire(body: bytes):
+        parts = [{"type": "http.request", "body": body, "more_body": False}]
+
+        async def receive():
+            return parts.pop(0) if parts else {"type": "http.disconnect"}
+
+        return receive
+
+    async def answer(message):
+        answered.append(message)
+
+    async def go():
+        channel = HttpChannel(app, _stamp)
+        scope = {"type": "http", "headers": []}
+        await asyncio.gather(
+            channel(scope, wire(request), None),
+            channel(scope, wire(cancelled % (seq, cancel_at, cancel)), answer),
+        )
+
+    guard.start()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        guard.cancel()
+        thread.join(10)
+        clock.install(None)
+        server.close()
+    loop.close()
+    assert [stamps.get(timeout=10) for _ in range(2)] == [
+        (arrival, seq),
+        (cancel_at, cancel),
+    ]
+    assert served == [request, ("http.disconnect", cancel_at)]
+    assert answered == [
+        {"type": "http.response.start", "status": 204},
+        {"type": "http.response.body", "body": b""},
+    ]
+
+
+def _relayed_to_decode(sends, bodies):
+    """frontend-D behind a router LP: the router stamps a relay send at each
+    LP time in `sends`; frontend-D's `HttpChannel` serves a request per send,
+    relay seq `k` with body ``bodies(k, arrival)``, to an app that records
+    the seq it reads and the loop time it is entered at. Returns those
+    records in entry order and the relay channel's lookahead."""
+    table = prefill_decode_table(
+        admission_s=0.54e-3,
+        ipc_s=0.001,
+        stream_s=0.002,
+        router_s=2.0**-12,
+        kv_write_req_s=2.0**-10,
+        router_in_s=2.0**-14,
+    )
+    relay, router, me = "router->frontend-D:relay", LpId("router"), LpId("frontend-D")
+    endpoint = f"inproc:test-compass-loop-{uuid.uuid4().hex}"
+    server = clock_transport.serve(ClockAuthority(table), endpoint)
+    for lp in table.registry.ids():
+        if lp not in (router, me):
+            clock_transport.connect(lp, endpoint).send((NER, INF, [], INF))
+    rt = LPRuntime(me, table, clock_transport.connect(me, endpoint))
+    rt.start_run()
+    clock.install(rt)
+
+    def hop():
+        rt = LPRuntime(router, table, clock_transport.connect(router, endpoint))
+        rt.start_run()
+        for at in sends:
+            rt.advance_to(at)
+            rt.stamp_send(relay)
+        rt.next_event(INF)
+        rt.close()
+
+    thread = threading.Thread(target=hop, name="router", daemon=True)
+    thread.start()
+    lookahead = table.lookahead(relay)
+    loop = CompassEventLoop()
+    guard = threading.Timer(20, loop.call_soon_threadsafe, (loop.stop,))
+    entered = []
+
+    async def app(scope, receive, send):
+        body = (await receive())["body"]
+        entered.append((carriers.relay_stamp(body)[1], loop.time()))
+
+    def wire(body: bytes):
+        parts = [{"type": "http.request", "body": body, "more_body": False}]
+
+        async def receive():
+            return parts.pop(0) if parts else {"type": "http.disconnect"}
+
+        return receive
+
+    async def go():
+        channel = HttpChannel(app, _stamp)
+        scope = {"type": "http", "headers": []}
+        await asyncio.gather(
+            *(
+                channel(scope, wire(bodies(k, at + lookahead)), None)
+                for k, at in enumerate(sends)
+            )
+        )
+
+    guard.start()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        guard.cancel()
+        thread.join(10)
+        clock.install(None)
+        server.close()
+    loop.close()
+    return entered, lookahead
+
+
+def test_relays_in_flight_together_take_decode_s_loop_one_service_at_a_time():
+    """Prefill writes each relayed response's relay service time beside its
+    stamp; frontend-D charges it on its loop at the request's turn. Relays 0-2
+    arrive at one instant, serving 4, 2 and no ms: they take the loop
+    smallest service first, each after those ahead of it, so relay 0 enters
+    6 ms past its arrival, as relays queued on r256's decode frontend (#3720).
+    Relay 3 arrives alone a second later and enters its own 3 ms past its
+    arrival, as the term's lone time delayed it before."""
+    service = {0: 4e-3, 1: 2e-3, 3: 3e-3}
+
+    def bodies(k, arrival):
+        params = {"compass": f"a:{arrival!r};s:{k}"}
+        if k in service:
+            params[carriers.RELAY_SERVICE] = service[k]
+        return json.dumps({"kv_transfer_params": params}).encode()
+
+    entered, lookahead = _relayed_to_decode([0.0, 0.0, 0.0, 1.0], bodies)
+    t0, t1 = lookahead, 1.0 + lookahead
+    print(f"\n  entered {entered}")
+    assert [k for k, _ in entered] == [2, 1, 0, 3]
+    assert [t for _, t in entered] == pytest.approx(
+        [t0, t0 + 2e-3, t0 + 2e-3 + 4e-3, t1 + 3e-3]
+    )
+
+
+def test_a_released_request_whose_accept_ran_out_of_descriptors_is_still_read(
+    run, monkeypatch
+):
+    """The traffic LP's request is released before its connection reaches the
+    frontend, and the frontend's accept fails for want of a file descriptor, as
+    a c=512 cell's 756 cancels on top of its open streams made it fail.
+    asyncio takes the listening socket off the loop and serves it again a
+    second later: on the LP clock, which stands still while the request is
+    unread, that second never came and the run hung. It comes on the wall."""
+    stamps, failed, read = queue.Queue(), [], []
+    traffic = _traffic(run, stamps, before_ner=lambda: None)
+    arrival, seq = stamps.get(timeout=10)
+    accept, exhausted = socket.socket.accept, threading.Event()
+    exhausted.set()
+
+    def out_of_descriptors(sock):
+        # Every accept fails until the client, on the wall, closes streams and
+        # frees descriptors, 0.2 s after the first failure.
+        if not exhausted.is_set():
+            return accept(sock)
+        if not failed:
+            threading.Timer(0.2, exhausted.clear).start()
+        failed.append(time.monotonic())
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(socket.socket, "accept", out_of_descriptors)
+
+    class Frontend(asyncio.Protocol):
+        def data_received(self, data):
+            if read:  # the request's bytes came in more than one read
+                return
+            rt = clock.installed()
+            rt.check_arrival(HTTP, arrival, seq)
+            with rt.lock:
+                rt.count_done_locked(HTTP, seq)
+            read.append(time.monotonic())
+
+    listener = socket.create_server(("127.0.0.1", 0))
+
+    def client():
+        _until(lambda: seq in run.rt.released[HTTP])
+        with socket.create_connection(listener.getsockname()) as sock:
+            sock.sendall(b"request")
+            _until(lambda: read)
+
+    sending = threading.Thread(target=client, daemon=True)
+    sending.start()
+    loop = CompassEventLoop()
+    loop.set_exception_handler(lambda loop, context: None)  # asyncio logs the EMFILE
+    try:
+        server = loop.run_until_complete(loop.create_server(Frontend, sock=listener))
+        loop.run_forever()
+    finally:
+        traffic.join(10)
+        sending.join(10)
+    server.close()
+    loop.close()
+    # The first accept failed for the whole backlog; one retry, a wall second on.
+    assert len(read) == 1 and 1.0 <= read[0] - failed[0] < 10.0
+    assert run.conn.grants == [arrival, INF] and run.conn.unread == []
+
+
+def _intake_run_file(monkeypatch, tmp_path, intake) -> None:
+    """A run file whose host entry states `intake` as its http_intake, or
+    with no host entry for None."""
+    from atom.compass import run as compass_run
+
+    run = {"bound_s": 600.0}
+    if intake is not None:
+        terms = ("fixed_s", "per_byte_s", "idle_s")
+        run["host"] = {"http_intake": dict(zip(terms, intake))}
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps(run))
+    monkeypatch.setenv(compass_run.ENV, str(path))
+
+
+def _burst(run, monkeypatch, n, app, sizes=None, receives=None, jitters=None):
+    """`n` stamped requests at one arrival, through the served app, each with a
+    body of ``sizes[seq]`` bytes, or read from ``receives(seq)``, and the
+    intake jitter ``jitters[seq]`` in its stamp, if given; returns the arrival
+    once the loop has finished."""
+    stamps = queue.Queue()
+    traffic = _traffic(run, stamps, before_ner=lambda: None, n=n)
+    arrival = stamps.get(timeout=10)[0]
+    for _ in range(n - 1):
+        assert stamps.get(timeout=10)[0] == arrival
+    monkeypatch.setattr(api_server, "app", app)
+    served = api_server._served_app()
+
+    def read(seq):
+        async def receive():
+            body = b"x" * (sizes[seq] if sizes else 0)
+            return {"type": "http.request", "body": body}
+
+        jitter = None if jitters is None else jitters[seq]
+        tracestate = carriers.tracestate_with(None, arrival, seq, jitter).encode()
+        scope = {"type": "http", "headers": [(b"tracestate", tracestate)]}
+        return served(scope, receives(seq) if receives else receive, None)
+
+    async def go():
+        await asyncio.sleep(arrival)
+        await asyncio.gather(*(read(seq) for seq in range(n)))
+
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        traffic.join(10)
+    loop.close()
+    return arrival
+
+
+@pytest.mark.parametrize("intake", [(2e-3, 1e-6), None], ids=["probed", "unstated"])
+def test_a_burst_reaches_the_app_one_intake_charge_at_a_time(
+    run, monkeypatch, tmp_path, intake
+):
+    _intake_run_file(monkeypatch, tmp_path, intake)
+    sizes, entered = {0: 1000, 1: 3000}, []
+
+    async def app(scope, receive, send):
+        entered.append(asyncio.get_running_loop().time())
+
+    arrival = _burst(run, monkeypatch, 2, app, sizes)
+    fixed, per_byte = intake or (0.0, 0.0)
+    first = arrival + fixed + sizes[0] * per_byte
+    print(f"\n  app entered at {entered}")
+    assert entered == pytest.approx([first, first + fixed + sizes[1] * per_byte])
+
+
+def test_a_same_instant_burst_reaches_the_app_smallest_body_first_whatever_ends_first(
+    run, monkeypatch, tmp_path
+):
+    # The real frontend reads a burst's sockets at once, so its small bodies
+    # are in first, and its loop then takes each one in at its intake's cost.
+    # Request 0's body, the largest, is read first on the wall; requests 1 and
+    # 3 tie, and keep seq order.
+    fixed, per_byte = 2e-3, 1e-6
+    _intake_run_file(monkeypatch, tmp_path, (fixed, per_byte))
+    sizes, entered = [3000, 1000, 2000, 1000], []
+
+    async def app(scope, receive, send):
+        seq = api_server._tracestate_stamp(scope)[1]
+        entered.append((seq, asyncio.get_running_loop().time()))
+
+    def receives(seq):
+        async def receive():
+            for _ in range(seq):  # a later seq's body takes more socket reads
+                await asyncio.sleep(0)
+            return {"type": "http.request", "body": b"x" * sizes[seq]}
+
+        return receive
+
+    arrival = _burst(run, monkeypatch, 4, app, receives=receives)
+    order, at, t = [1, 3, 2, 0], [], arrival
+    for seq in order:
+        t += fixed + per_byte * sizes[seq]
+        at.append(t)
+    print(f"\n  app entered {entered}")
+    assert [seq for seq, _ in entered] == order
+    assert [t for _, t in entered] == pytest.approx(at)
+
+
+#: One burst's intake jitters, in bytes, as two seeds of the traffic LP might
+#: draw them, per seq; None: no seed.
+JITTERS = {
+    "no seed": None,
+    "seed a": {0: 0.0, 1: 2500.0, 2: 0.0, 3: 100.0},
+    "seed b": {0: 10.0, 1: 0.0, 2: 1800.0, 3: 0.0},
+}
+
+
+@pytest.mark.parametrize(
+    "draw, order",
+    [("no seed", [1, 3, 2, 0]), ("seed a", [3, 2, 0, 1]), ("seed b", [1, 3, 0, 2])],
+)
+def test_an_intake_jitter_orders_a_burst_as_if_each_body_were_that_much_longer(
+    run, monkeypatch, tmp_path, draw, order
+):
+    # Bodies of 3000, 1000, 2000 and 1500 bytes, the largest read first on the
+    # wall. With no seed they take the exact intake order, smallest first; a
+    # seed's jitters order them by body + jitter: seed a 3000, 3500, 2000,
+    # 1600 bytes; seed b 3010, 1000, 3800, 1500. Each draw gives one order and
+    # one set of times, every run; each request is charged its own body.
+    fixed, per_byte = 2e-3, 1e-6
+    _intake_run_file(monkeypatch, tmp_path, (fixed, per_byte))
+    sizes, entered = [3000, 1000, 2000, 1500], []
+
+    async def app(scope, receive, send):
+        seq = api_server._tracestate_stamp(scope)[1]
+        entered.append((seq, asyncio.get_running_loop().time()))
+
+    def receives(seq):
+        async def receive():
+            for _ in range(seq):  # a later seq's body takes more socket reads
+                await asyncio.sleep(0)
+            return {"type": "http.request", "body": b"x" * sizes[seq]}
+
+        return receive
+
+    arrival = _burst(run, monkeypatch, 4, app, receives=receives, jitters=JITTERS[draw])
+    at, t = [], arrival
+    for seq in order:
+        t += fixed + per_byte * sizes[seq]
+        at.append(t)
+    print(f"\n  {draw}: app entered {entered}")
+    assert [seq for seq, _ in entered] == order
+    assert [t for _, t in entered] == pytest.approx(at)
+
+
+def test_a_request_released_inside_an_intake_takes_its_place_among_those_waiting(
+    run, monkeypatch, tmp_path
+):
+    # Requests 0 and 1 arrive together. Request 2 arrives inside request 0's
+    # intake with an empty body, which takes 0.2 wall seconds to come: it is
+    # in before request 1's, 1 ms after it arrives. The loop is not idle until
+    # request 2 waits for its turn, so request 1's turn waits for it too, and
+    # request 2 goes first, whatever the wall.
+    fixed, per_byte = 2e-3, 1e-6
+    _intake_run_file(monkeypatch, tmp_path, (fixed, per_byte))
+    sends, stamps = [0.0, 0.0, 1e-3], queue.Queue()
+
+    def traffic():
+        rt = LPRuntime(TRAFFIC, TABLE, clock_transport.connect(TRAFFIC, run.endpoint))
+        rt.start_run()
+        for at in sends:
+            rt.advance_to(at)
+            stamps.put(rt.stamp_send(HTTP))
+        rt.next_event(INF)
+        rt.close()
+
+    thread = threading.Thread(target=traffic, name="traffic", daemon=True)
+    thread.start()
+    arrivals = [at + TABLE.lookahead(HTTP) for at in sends]
+    sizes, entered = [1000, 2000, 0], []
+
+    async def app(scope, receive, send):
+        entered.append((_stamp(scope)[1], asyncio.get_running_loop().time()))
+
+    def request(seq):
+        scope = {
+            "type": "http",
+            "headers": [(b"x-test-stamp", b"%r %d" % (arrivals[seq], seq))],
+        }
+
+        async def receive():
+            if seq == 2:
+                loop, body = asyncio.get_running_loop(), asyncio.Event()
+                threading.Timer(0.2, loop.call_soon_threadsafe, (body.set,)).start()
+                await body.wait()
+            return {"type": "http.request", "body": b"x" * sizes[seq]}
+
+        return scope, receive, None
+
+    async def go():
+        channel = HttpChannel(app, _stamp)
+        await asyncio.gather(*(channel(*request(seq)) for seq in range(len(sends))))
+
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        thread.join(10)
+    loop.close()
+    assert [stamps.get(timeout=10) for _ in sends] == list(zip(arrivals, range(3)))
+    t, at = arrivals[0], []
+    for seq in (0, 2, 1):
+        t += fixed + per_byte * sizes[seq]
+        at.append(t)
+    print(f"\n  app entered {entered}")
+    assert [seq for seq, _ in entered] == [0, 2, 1]
+    assert [t for _, t in entered] == pytest.approx(at)
+
+
+def test_a_burst_s_bodies_leave_the_socket_while_a_tokenizer_job_is_open(
+    run, monkeypatch, tmp_path
+):
+    # Each intake costs 2 ms and each body comes in two socket reads. Request
+    # 0's tokenizer job holds its real thread until request 2's body is read
+    # to its end, for at most 2 wall seconds. Request 2's turn waits on the
+    # wall for job 0, but its body may not: a client whose send stalls on an
+    # unread socket drops the connection at its TCP_USER_TIMEOUT (aiperf's
+    # 30 s), which aborted cell A's c=256 warmup burst. Each request still
+    # reaches the app one intake charge after the one before.
+    _intake_run_file(monkeypatch, tmp_path, (2e-3, 0.0))
+    read_out, seen, entered = threading.Event(), [], []
+
+    async def app(scope, receive, send):
+        loop, seq = asyncio.get_running_loop(), api_server._tracestate_stamp(scope)[1]
+        entered.append((seq, loop.time()))
+
+        def do_preprocess():
+            if seq == 0:
+                seen.append(read_out.wait(2))
+
+        await loop.run_in_executor(None, do_preprocess)
+
+    def receives(seq):
+        parts = [b"a", b"b"]
+
+        async def receive():
+            await asyncio.sleep(0)  # a socket read
+            chunk = parts.pop(0)
+            if seq == 2 and not parts:
+                read_out.set()
+            return {"type": "http.request", "body": chunk, "more_body": bool(parts)}
+
+        return receive
+
+    arrival = _burst(run, monkeypatch, 3, app, receives=receives)
+    assert seen == [True]
+    assert [s for s, _ in entered] == [0, 1, 2]
+    assert [t for _, t in entered] == pytest.approx(
+        [arrival + 2e-3, arrival + 4e-3, arrival + 6e-3]
+    )
+
+
+def test_with_no_intake_a_burst_s_tokenizer_jobs_still_run_in_turn_order(
+    run, monkeypatch, tmp_path
+):
+    # Host laws with no http_intake charge no intake, and each body is read
+    # before its turn: what paces the turns is the wait for the idle loop alone.
+    # Each handler yields to the loop fewer times than the one before it, so
+    # without that wait request 2's tokenizer job would run first. The segment
+    # tokenizer's cache makes a job's charge depend on the jobs run before it.
+    _intake_run_file(monkeypatch, tmp_path, None)
+    ran = []
+
+    async def app(scope, receive, send):
+        loop, seq = asyncio.get_running_loop(), api_server._tracestate_stamp(scope)[1]
+        for _ in range(3 - seq):
+            await asyncio.sleep(0)
+
+        def do_preprocess():
+            ran.append(seq)
+
+        await loop.run_in_executor(None, do_preprocess)
+
+    _burst(run, monkeypatch, 3, app)
+    assert ran == [0, 1, 2]
+
+
+def test_a_body_outside_the_intake_hull_is_charged_nothing_and_named(
+    run, monkeypatch, tmp_path
+):
+    from atom.compass import run as compass_run
+
+    intake = {"fixed_s": 2e-3, "per_byte_s": 1e-6, "idle_s": 2e-3, "bytes": [500, 2000]}
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"bound_s": 600.0, "host": {"http_intake": intake}}))
+    monkeypatch.setenv(compass_run.ENV, str(path))
+    entered, named = [], []
+
+    async def app(scope, receive, send):
+        loop = asyncio.get_running_loop()
+        entered.append(loop.time())
+        named.append(list(loop.rt.refusals))
+
+    arrival = _burst(run, monkeypatch, 2, app, {0: 1000, 1: 3000})
+    first = arrival + 2e-3 + 1000 * 1e-6
+    assert entered == pytest.approx([first, first])
+    assert named[1] == [
+        "http:intake of a 3000-byte body, outside the 500 to 2000 bytes its "
+        + "http_intake was fitted on"
+    ]
+
+
+def test_a_request_that_finds_no_intake_on_the_loop_is_charged_the_idle_one(
+    run, monkeypatch, tmp_path
+):
+    # Requests 0 and 1 arrive together; request 2 arrives after both intakes
+    # have ended, and request 3 while request 2's is still being charged.
+    fixed, per_byte, idle = 2e-3, 1e-6, 5e-4
+    _intake_run_file(monkeypatch, tmp_path, (fixed, per_byte, idle))
+    sends, stamps = [0.0, 0.0, 1.0, 1.0001], queue.Queue()
+
+    def traffic():
+        rt = LPRuntime(TRAFFIC, TABLE, clock_transport.connect(TRAFFIC, run.endpoint))
+        rt.start_run()
+        for at in sends:
+            rt.advance_to(at)
+            stamps.put(rt.stamp_send(HTTP))
+        rt.next_event(INF)
+        rt.close()
+
+    thread = threading.Thread(target=traffic, name="traffic", daemon=True)
+    thread.start()
+    arrivals = [at + TABLE.lookahead(HTTP) for at in sends]
+    sizes, entered = [1000, 3000, 2000, 4000], {}
+
+    async def app(scope, receive, send):
+        entered[_stamp(scope)[1]] = asyncio.get_running_loop().time()
+
+    def request(seq):
+        scope = {
+            "type": "http",
+            "headers": [(b"x-test-stamp", b"%r %d" % (arrivals[seq], seq))],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"x" * sizes[seq]}
+
+        return scope, receive, None
+
+    async def go():
+        channel = HttpChannel(app, _stamp)
+        await asyncio.gather(*(channel(*request(seq)) for seq in range(len(sends))))
+
+    loop = CompassEventLoop()
+    try:
+        loop.run_until_complete(go())
+        loop.run_forever()
+    finally:
+        thread.join(10)
+    loop.close()
+    assert [stamps.get(timeout=10) for _ in sends] == list(zip(arrivals, range(4)))
+    e0 = arrivals[0] + idle + sizes[0] * per_byte
+    e1 = e0 + fixed + sizes[1] * per_byte
+    e2 = arrivals[2] + idle + sizes[2] * per_byte
+    e3 = e2 + fixed + sizes[3] * per_byte
+    print(f"\n  app entered at {entered}")
+    assert [entered[seq] for seq in range(4)] == pytest.approx([e0, e1, e2, e3])
+
+
+def test_an_intake_waits_for_the_open_tokenizer_job_so_its_result_is_not_late(
+    run, monkeypatch, tmp_path
+):
+    # Each intake costs 2 ms; each request's tokenizer job is charged 1 ms, and
+    # the first one's real thread takes 0.3 wall seconds. Job 0 completes at
+    # 3 ms, inside request 1's intake, so its result runs when that intake
+    # ends, at 4 ms, not once the clock has run on through every intake.
+    _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-9))  # empty bodies
+    entry = {"fixed_s": 1e-3, "tokens_per_s": 1.0}
+    encode, done = wrap_encode(list, entry), []
+
+    async def app(scope, receive, send):
+        seq = api_server._tracestate_stamp(scope)[1]
+
+        def do_preprocess():
+            time.sleep(0.3 if seq == 0 else 0)
+            encode()
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, do_preprocess)
+        done.append((seq, loop.time()))
+
+    arrival = _burst(run, monkeypatch, 3, app)
+    print(f"\n  tokenizer results at {done}")
+    expected = [(0, 4e-3), (1, 6e-3), (2, 7e-3)]
+    assert [s for s, _ in done] == [s for s, _ in expected]
+    assert [t for _, t in done] == pytest.approx([arrival + t for _, t in expected])
+
+
+def test_a_tokenizer_result_due_when_an_intake_starts_runs_before_its_charge(
+    run, monkeypatch, tmp_path
+):
+    # Each intake costs 2 ms and each tokenizer job is charged nothing; the
+    # first one's real thread takes 0.3 wall seconds. Job 0 completes at 2 ms,
+    # the instant request 1's intake starts, so its result runs then, before
+    # that intake is charged, not when the intake ends at 4 ms.
+    _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-9))  # empty bodies
+    entry = {"fixed_s": 0.0, "tokens_per_s": 1.0}
+    encode, done = wrap_encode(list, entry), []
+
+    async def app(scope, receive, send):
+        seq = api_server._tracestate_stamp(scope)[1]
+
+        def do_preprocess():
+            time.sleep(0.3 if seq == 0 else 0)
+            encode()
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, do_preprocess)
+        done.append((seq, loop.time()))
+
+    arrival = _burst(run, monkeypatch, 2, app)
+    print(f"\n  tokenizer results at {done}")
+    assert [t for _, t in sorted(done)] == pytest.approx(
+        [arrival + 2e-3, arrival + 4e-3]
+    )
+
+
+@pytest.mark.parametrize("delay_s", [0.0, 0.1], ids=["fast", "slow"])
+@pytest.mark.parametrize("hops", [0, 1, 2, 4])
+def test_a_burst_tokenizer_results_do_not_depend_on_loop_turns_or_thread_speed(
+    run, monkeypatch, tmp_path, hops, delay_s
+):
+    # Each intake costs 2 ms and each tokenizer job 1 ms. Each handler yields
+    # to the loop `hops` times before it submits its job, as a web framework's
+    # awaits do, and job 0's real thread takes `delay_s` wall seconds. Neither
+    # moves a result: each job is submitted when its own intake ends and placed
+    # before the next intake is charged, so job 0's result runs when request
+    # 1's intake ends, at 4 ms, job 1's when request 2's ends, at 6 ms, and
+    # job 2's at its completion, 7 ms.
+    _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-9))  # empty bodies
+    entry = {"fixed_s": 1e-3, "tokens_per_s": 1.0}
+    encode, done = wrap_encode(list, entry), []
+
+    async def app(scope, receive, send):
+        seq = api_server._tracestate_stamp(scope)[1]
+        for _ in range(hops):
+            await asyncio.sleep(0)
+
+        def do_preprocess():
+            time.sleep(delay_s if seq == 0 else 0)
+            encode()
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, do_preprocess)
+        done.append((seq, loop.time()))
+
+    arrival = _burst(run, monkeypatch, 3, app)
+    print(f"\n  tokenizer results at {done}")
+    assert [t for _, t in sorted(done)] == pytest.approx(
+        [arrival + 4e-3, arrival + 6e-3, arrival + 7e-3]
+    )
+
+
+@pytest.mark.parametrize("tick", [None, 0.1, 9.0, 20.0], ids=lambda t: f"tick{t}")
+@pytest.mark.parametrize("probes", [0, 1, 2], ids=lambda n: f"{n}probes")
+def test_tokenizer_results_due_at_one_instant_resume_in_submission_order(
+    run, probes, tick
+):
+    # Jobs 1 and 3 are charged alike, so their results are due at one instant.
+    # A server tick may be pending, and each health probe served before the
+    # burst leaves its keep-alive timer, cancelled when its connection closed,
+    # in the loop's heap. Neither may decide which of the two resumes first.
+    _idle_traffic(run)
+    loop = CompassEventLoop()
+    entry = {"fixed_s": 0.0, "tokens_per_s": 1.0}
+    encode, tokens, resumed = wrap_encode(list, entry), [5, 2, 3, 2, 4, 1, 6, 7], []
+    # A server per job, whatever the host's pool width: every job starts at 0.
+    loop.executor.station = Station(len(tokens))
+
+    async def request(k):
+        def do_preprocess():
+            encode(range(tokens[k]))
+
+        await loop.run_in_executor(None, do_preprocess)
+        resumed.append(k)
+
+    async def burst():
+        pending = tick and loop.call_later(tick, lambda: None)
+        for _ in range(probes):
+            loop.call_later(1e6, lambda: None).cancel()
+        await asyncio.gather(*map(request, range(len(tokens))))
+        if pending:
+            pending.cancel()
+
+    loop.run_until_complete(burst())
+    loop.run_forever()
+    loop.close()
+    assert resumed == sorted(range(len(tokens)), key=lambda k: (tokens[k], k))
+
+
+@pytest.mark.parametrize("delay_s", [0.0, 0.3], ids=["fast", "slow"])
+def test_an_on_loop_tokenizer_call_places_open_encode_jobs_first(run, caplog, delay_s):
+    # An encode job charged 1 ms, whose real thread takes `delay_s` wall
+    # seconds; a decode on the loop thread at 0 charged 5 ms; a 3 ms timer
+    # whose callback decodes 5 ms more. The job completes inside the first
+    # decode, so its result runs when that decode ends, at 5 ms, before the
+    # timer's decode, however long its thread took. The slow thread outlasts
+    # diag_s, so the wait warns once.
+    _idle_traffic(run)
+    loop = CompassEventLoop()
+    loop.executor.station = Station(1, diag_s=0.1)
+    encode = wrap_encode(list, {"fixed_s": 1e-3, "tokens_per_s": 1.0})
+    decode = wrap_decode(
+        lambda ids: "",
+        {"fixed_s": 5e-3, "tokens_per_s": 1.0},
+    )
+    seen = {}
+
+    async def request():
+        def do_preprocess():
+            time.sleep(delay_s)
+            encode()
+
+        await loop.run_in_executor(None, do_preprocess)
+        seen["result"] = loop.time()
+
+    async def on_loop():
+        time.sleep(0.05)  # noqa: ASYNC251 - wall only: a fast thread is done by now
+        await asyncio.sleep(0)
+        decode([])
+        seen["decode"] = loop.time()
+
+    async def at_3ms():
+        await asyncio.sleep(3e-3)
+        for _ in range(3):  # past the callbacks that hand a result to its coroutine
+            await asyncio.sleep(0)
+        decode([])
+        seen["timer"] = loop.time()
+
+    async def go():
+        await asyncio.gather(request(), on_loop(), at_3ms())
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        loop.run_until_complete(go())
+    loop.run_forever()
+    loop.close()
+    print(f"\n  {delay_s} s thread: {seen}")
+    assert seen == pytest.approx({"result": 5e-3, "decode": 5e-3, "timer": 10e-3})
+    warned = [r for r in caplog.records if "event-loop charge waits" in r.getMessage()]
+    assert len(warned) == (delay_s > 0.1)
+
+
+def test_an_off_owner_charge_is_refused_before_it_places_the_loop_s_jobs(run):
+    # Another thread with no job of its own charges while the loop's tokenizer
+    # job is open. It is refused at once: it neither waits for the job nor
+    # places it, so no timer is set off the loop. The loop places it once it runs.
+    _idle_traffic(run)
+    loop = CompassEventLoop()
+    loop.executor.start_run()
+    release, refused, seen = threading.Event(), [], {}
+
+    def do_preprocess():  # a service job, by name
+        release.wait()
+
+    job = loop.executor.submit(do_preprocess)
+
+    def off_owner():
+        try:
+            charge(0.1)
+        except RuntimeError as e:
+            refused.append(str(e))
+
+    thread = threading.Thread(target=off_owner, name="EngineCoreOutputThread-DP0")
+    thread.start()
+    thread.join(5)
+    seen["waited"] = thread.is_alive()
+    release.set()
+    thread.join(5)
+    loop.executor.serial.submit(lambda: None).result(5)  # the job's thread is done
+    station = loop.executor.station
+    seen["placed"], seen["timers"] = station.final, len(loop._scheduled)
+    seen["left_for_the_loop"] = not loop.executor.done.empty()
+    loop.run_forever()
+    loop.close()
+    assert seen == {
+        "waited": False,
+        "placed": 0,
+        "timers": 0,
+        "left_for_the_loop": True,
+    }
+    assert "only the clock owner" in refused[0]
+    assert run.rt.refusals == ["clock:advance_to from EngineCoreOutputThread-DP0"]
+    assert station.final == 1 and job.done() and run.rt.now == INF
+
+
+class _Scripted:
+    """A clock connection that answers each request with the next scripted grant."""
+
+    def __init__(self, *grants) -> None:
+        self.grants = list(grants)
+
+    def send(self, msg) -> None:
+        pass
+
+    def recv(self):
+        return self.grants.pop(0)
+
+
+def _loop_after(frames):
+    """A frontend's loop whose engine output has brought `frames` frames, each
+    read and handled, and whose next request is released and not read yet."""
+    out = "engine->frontend:output#dp0"
+    grant = {out: [(k, k + 0.5) for k in range(frames)], HTTP: [(0, frames + 0.5)]}
+    rt = LPRuntime(FRONTEND, TABLE, _Scripted((frames + 1.0, grant), (INF, {})))
+    for k in range(frames):
+        rt.check_arrival(out, k + 0.5, k)
+    with rt.lock:
+        for k in range(frames):
+            rt.count_done_locked(out, k)
+    rt.advance_to(frames + 1.0)
+    clock.install(rt)
+    return rt, CompassEventLoop()
+
+
+def test_naming_the_unread_request_costs_the_same_however_many_frames_came_before():
+    """While a released request is unread, the loop names it at each idle point
+    (`CompassEventLoop.unread`)."""
+    costs = []
+    for frames in (10, 50_000):
+        rt, loop = _loop_after(frames)
+        try:
+            assert loop.unread() == (0, HTTP)
+            best = math.inf
+            for _ in range(3):
+                start = time.perf_counter()
+                for _ in range(200):
+                    loop.unread()
+                best = min(best, time.perf_counter() - start)
+            costs.append(best / 200 * 1e6)
+        finally:
+            rt.next_event(INF)
+            loop.close()
+            clock.install(None)
+    assert (
+        costs[1] < 5 * costs[0] + 5
+    ), f"{costs[0]:.1f} us after 10 frames, {costs[1]:.1f} us after 50,000"

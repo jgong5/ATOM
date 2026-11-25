@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# The real cells the step linear law and the host laws are fitted from: cc-traces 256
+# to 392 on a real TP1 server through `REAL=1 cctraces_sim.sh`, at each
+# concurrency in CELLS, one cell at a time, since a cell run beside another
+# moves the host time the host laws measure. Each cell is stopped STEPS_S
+# seconds after aiperf's profiling phase starts, past its warmup, as aiperf.log
+# records it, or in its warmup, STEPS_S seconds after the warmup started, if its
+# profiling has not started by then.
+# Qwen3.8-27B TP1 on MI308X captures with
+# CELLS="1 4 16": at 64 and 256 its warmup cannot finish within STEPS_S, so the
+# owner dropped them for that model and machine as not a sustainable
+# configuration (https://github.com/jgong5/ATOM/issues/1590#issuecomment-6281930268).
+# It then captures, into another OUT_DIR, CELLS="4 8 10 12" with
+# AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0":
+# cells that start every trajectory at its first turn, so they decode at batch
+# sizes the sampled starts miss, 8 sequences included. Within STEPS_S they
+# reach about 170k tokens of context, so their 8-sequence steps run at shorter
+# contexts than the graded c=16 runs' (207k to 217k).
+# Last, into a third OUT_DIR, CELLS=1 with AIPERF_EXTRA_ARGS="--trajectory-start-min-ratio
+# 0.06 --trajectory-start-max-ratio 0.06": its one lane resumes its trace at
+# 195k tokens, so it decodes single sequences up to 255k, past the sampled c=1
+# cell's 193k.
+#
+# Usage: calib_capture.sh RUN_FILE OUT_DIR
+#   RUN_FILE, MODEL, TRACES, HARNESS_PYTHON  as cctraces_sim.sh takes them
+#   CELLS        concurrencies, in run order (default: 1 4 16 64 256, which
+#                DeepSeek-V4-Pro DPA-TP8 captures at)
+#   STEPS_S      wall seconds of aiperf's profiling per cell (default 1800)
+#   SERVER_ARGS  API server flags (default: --max-model-len 262144, so decode
+#                runs on captured graphs)
+#   HIP_VISIBLE_DEVICES  the GPUs as HIP numbers them (default 0); a cell refuses
+#                to start while `rocm-smi` lists a process on any of them
+#
+# OUT_DIR/c<C>/ is the cell's cctraces_sim.sh directory, its step record in
+# steps/; OUT_DIR/c<C>.log holds the tree's commit, the host load (`uptime`),
+# the GPUs' processes, VRAM and use at the cell's start and end, and the cell's
+# exit status, aiperf's: on SIGINT aiperf writes its export, unless in its
+# warmup. A cell whose aiperf duration has passed is not stopped: aiperf ends it
+# with its export. The cell's run.json gains a `compass record` identity.
+# The capture exits 1 naming each cell left without artifacts/client_run.json
+# or without that identity.
+#   compass fit steps --backend step-linear OUT_DIR/c<C>... --client-run OUT_DIR/c<C> \
+#       OUT_DIR/c<C>/artifacts/client_run.json... --store S --out D
+set -uo pipefail
+. "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
+
+ROOT=$(compass_tree_root) || exit $?
+RUN_FILE=$(realpath "${1:?usage: calib_capture.sh RUN_FILE OUT_DIR}")
+OUT=${2:?usage: calib_capture.sh RUN_FILE OUT_DIR}
+mkdir -p "$OUT" && OUT=$(realpath "$OUT")
+export REAL=1 RECORD=1 FIRST_SESSION=256 SESSIONS=137 WAIT_S=${WAIT_S:-1800}
+export SERVER_ARGS=${SERVER_ARGS:---max-model-len 262144}
+export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
+unset ATOM_COMPASS_RUN
+# The same GPUs as rocm-smi indexes them, which its listings use.
+SMI_GPUS=$(compass_gpus smi "$HIP_VISIBLE_DEVICES") || exit 2
+# The GPUs `rocm-smi` lists a process on.
+busy() { rocm-smi --showpids --showpidgpus | awk '/is using [1-9]/ {getline; print}' | tr ' ' '\n'; }
+state() {
+    echo "$1 $(date -u +%FT%TZ) uptime:$(uptime)"
+    { rocm-smi --showpids --showpidgpus; rocm-smi --showmeminfo vram --showuse; } | sed 's/^/  /'
+}
+# Sends the cell's aiperf SIGINT and logs it: aiperf runs as a child of
+# cctraces_sim.sh ($sim), which runs under timeout.
+stop_aiperf() { pkill -INT -P "$(pgrep -P $sim)" -f "^aiperf system_controller" && echo "stopped aiperf $(date -u +%FT%TZ)" >>"$log"; }
+
+for c in ${CELLS:-1 4 16 64 256}; do
+    o=$OUT/c$c log=$OUT/c$c.log
+    [[ -e $o ]] && { echo "calib_capture: $o exists" >&2; exit 4; }
+    { cat "$ROOT/.compass-commit" 2>/dev/null || git -C "$ROOT" rev-parse HEAD
+      echo "CONCURRENCY=$c GPU=$HIP_VISIBLE_DEVICES ROCM_SMI_GPU=$SMI_GPUS STEPS_S=${STEPS_S:-1800} SERVER_ARGS=$SERVER_ARGS"
+      state start; } >"$log"
+    gpu=$(busy | grep -xFm1 -f <(tr , '\n' <<<"$SMI_GPUS")) && { echo "calib_capture: rocm-smi GPU $gpu is in use" | tee -a "$log" >&2; exit 3; }
+    CONCURRENCY=$c timeout 7200 bash "$ROOT/scripts/compass/cctraces_sim.sh" "$RUN_FILE" "$o" >"$o.out" 2>&1 &
+    sim=$!
+    # Not the step record: the server writes it only at its exit. warmup_s
+    # counts the seconds slept since aiperf's warmup started, empty before.
+    warmup_s=
+    until grep -qsF "Phase profiling (profiling) started" "$o/aiperf.log" || ! kill -0 $sim 2>/dev/null; do
+        if [[ -z $warmup_s ]]; then
+            grep -qsF "Phase warmup (warmup) started" "$o/aiperf.log" && warmup_s=0 && echo "aiperf warmup started $(date -u +%FT%TZ)" >>"$log"
+        elif ((++warmup_s >= ${STEPS_S:-1800})); then
+            # Stopped in its warmup, aiperf exits 1 and writes no export.
+            stop_aiperf
+            break
+        fi
+        sleep 1
+    done
+    if kill -0 $sim 2>/dev/null && grep -qsF "Phase profiling (profiling) started" "$o/aiperf.log"; then
+        echo "aiperf profiling started $(date -u +%FT%TZ)" >>"$log"
+        # Wakes each 10 s, so a cell that ends on its own is not held to STEPS_S.
+        for ((t = 0; t < ${STEPS_S:-1800}; t += 10)); do kill -0 $sim 2>/dev/null && sleep 10; done
+        # Once aiperf's duration has passed it ends the cell itself after its
+        # grace period, and a SIGINT within that period exits 1.
+        if grep -qsF "Phase profiling (profiling) sending complete" "$o/aiperf.log"; then
+            echo "aiperf duration ended $(date -u +%FT%TZ)" >>"$log"
+        else
+            stop_aiperf
+        fi
+    fi
+    wait $sim
+    echo "CELL_RC=$?" >>"$log"
+    # The identity `compass record` writes, so `compass fit` reads the cell.
+    (cd / && PYTHONPATH=$ROOT python3 -c 'import json, sys; from pathlib import Path
+from atom.compass.drive.identity import identity
+o, model, gpus, *argv = sys.argv[1:]; run = Path(o, "run.json")
+ids = identity(Path(o, "steps/dp0.engine.json"), model, argv, tuple(map(int, gpus.split(","))))
+run.write_text(json.dumps(json.loads(run.read_text()) | ids))' "$o" "${MODEL-}" "$SMI_GPUS" \
+        "$ROOT/scripts/compass/cctraces_sim.sh" "$RUN_FILE" "$o") 2>>"$log" || { echo "no identity" >>"$log"; unidentified+=" c$c"; }
+    state end >>"$log"
+    [[ -s $o/artifacts/client_run.json ]] || unexported+=" c$c"
+done
+[[ -z ${unexported-} ]] || echo "calib_capture: no client-run export:$unexported" >&2
+[[ -z ${unidentified-} ]] || echo "calib_capture: no record identity:$unidentified" >&2
+[[ -z ${unexported-}${unidentified-} ]] || exit 1

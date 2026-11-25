@@ -2,11 +2,16 @@
 
 ATOM is a lightweight LLM inference engine built on AITER GPU kernels for the AMD ROCm platform.
 
+This is a development branch for ATOM Compass. Check its design doc under `atom/compass/design`.
+AI agents work under the `agent-team` plugin (enabled in `.claude/settings.json`); its project settings are `.claude/agent-team.md`.
+
 ## Build & Test & Lint
 
 ```bash
 pip install -e .                          # editable install
-python -m pytest tests/                   # all tests (no GPU needed — mocks AITER and torch.cuda)
+python -m pytest tests/                   # the full suite; needs a GPU driver
+scripts/compass/gate_targeted.sh          # task gate: the test files a change adds or edits
+scripts/compass/gate_cpu.sh               # CPU gate, per landing batch; no driver as a batch; must be green: scripts/compass/README.md
 black . && ruff check .                   # format + lint (CI enforced)
 ```
 

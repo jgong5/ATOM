@@ -422,19 +422,28 @@ def validate_runtime_config(config):
             # restores PAGE bytes and rebuilds the state by replay. MoRI-IO and
             # in-process offload read SLOT codecs this runtime does not publish.
             # P/D with CPU offload composes one Mooncake leg and one offload tier.
+            # Compass's simulated connector stands in for the Mooncake P/D leg
+            # and prices the same PAGE units and STATE slot, moving no bytes.
+            # It is admitted as Mooncake is, unnamed here, so a run without
+            # Compass refuses in upstream's words.
             (
                 "KV transfer other than lmcache_mp, mooncake_store or mooncake "
                 "(multi: mooncake plus one offload tier)"
             ),
             names is None
             or any(
-                name not in ("lmcache_mp", "mooncake", "mooncake_store")
+                name not in ("lmcache_mp", "mooncake", "mooncake_store", "compass")
                 for name in names
             )
             or (
                 is_multi
                 and names
-                not in (["lmcache_mp", "mooncake"], ["mooncake", "mooncake_store"])
+                not in (
+                    ["lmcache_mp", "mooncake"],
+                    ["mooncake", "mooncake_store"],
+                    ["compass", "lmcache_mp"],
+                    ["compass", "mooncake_store"],
+                )
             ),
         ),
         (
@@ -444,7 +453,7 @@ def validate_runtime_config(config):
             # into the slot before handing it over.
             "Mooncake P/D without an explicit kv_role",
             any(
-                name == "mooncake"
+                name in ("mooncake", "compass")
                 and leaf.kv_transfer_config.get("kv_role")
                 not in ("kv_producer", "kv_consumer")
                 for name, leaf in leaves or ()

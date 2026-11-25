@@ -13,13 +13,13 @@ import array
 import logging
 import random
 import threading
-import time
 from asyncio import AbstractEventLoop, Event
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple
 
 from atom.model_engine.sequence import new_token_ids
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 

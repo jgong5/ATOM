@@ -4,12 +4,12 @@
 """Chat completion handler for the OpenAI-compatible API."""
 
 import logging
-import time
 from collections.abc import AsyncGenerator
 from functools import partial
 from typing import Any
 
 from atom.structured_output.validation import raise_for_structured_error
+from atom.utils import time_shim as time
 
 from .logprobs import (
     LogprobCollector,

@@ -14,12 +14,13 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
+
+from atom.utils import time_shim as time
 
 from .images import NO_FILES_API
 from .protocol import openai_stop_reason

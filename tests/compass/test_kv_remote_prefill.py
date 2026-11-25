@@ -1,0 +1,1193 @@
+# SPDX-License-Identifier: MIT
+"""A disaggregated prefill through two real schedulers, and the blob that starts one.
+
+**The blob's field set is not asserted against a list typed into this file.**
+It is parsed out of Mooncake, the backend the simulated connector stands in
+for, so a field added there, or renamed, turns this red.
+
+**The transfer is not asserted by calling the connector.** A prefill engine
+and a decode engine, each a real `Scheduler` with the connector's scheduler
+half on its own `LPRuntime`, are stepped in `EngineCore`'s order: schedule,
+the forward, the KV poll, postprocess. The clock authority is a script: every
+clock request is granted the next time the test names, releasing the write
+requests it names.
+"""
+
+from __future__ import annotations
+
+import ast
+import dataclasses
+import ipaddress
+import itertools
+import json
+import pathlib
+import queue
+import socket
+import sys
+import time
+from types import SimpleNamespace
+
+import numpy
+import pytest
+import torch
+from conftest import MockConfig, atom_config_double
+from test_kv_simulated_connector import BLOCK_SIZE, CONFIG_JSON, PEAKS, TICK, model_for
+from test_runner_non_allocating import ATOM_RUNNER, PACKAGE, _classes
+from transformers import PretrainedConfig
+
+from atom.compass.backends import KvGeometry
+from atom.compass.clock import LpId, prefill_decode_table
+from atom.compass.kv import TRANSFER_KEY, WRITE_REQ_KEY
+from atom.compass.kv import connector as connector_module
+from atom.compass.kv.connector import SimulatedKVConnector
+from atom.compass.kv.handoff import (
+    SIMULATED_ENGINE_ID,
+    SIMULATED_HOST,
+    SIMULATED_PORT,
+    transfer_params,
+)
+from atom.compass.runner.overrides import NonAllocatingRunner, RunnerRefusal
+from atom.kv_transfer import disaggregation
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.sequence import Sequence, SequenceStatus
+from atom.sampling_params import SamplingParams
+from atom.utils import clock, forward_context
+from atom.utils.clock import LPRuntime
+
+#: The backend whose blob shape the router and the consumer were built around.
+MOONCAKE_SOURCE = (
+    pathlib.Path(disaggregation.__file__).parent / "mooncake" / "mooncake_connector.py"
+)
+
+#: The first sampled token the producer hands back; the consumer resumes on it.
+FIRST_TOKEN_ID = 7
+
+#: A prompt long enough to occupy several blocks of the pool below.
+PROMPT = list(range(40))
+
+#: The write request's declared latency, which is also the notify latency.
+L = 2.0**-10
+KV = "engine-D->engine-P:kv_write_req"
+TABLE = prefill_decode_table(
+    admission_s=0.54e-3,
+    ipc_s=L,
+    stream_s=L,
+    router_s=L,
+    kv_write_req_s=L,
+)
+_PAIRS = itertools.count()
+
+
+@pytest.fixture(scope="module")
+def geometry():
+    """One worker's KV block, for a real model's shape at one rank."""
+    raw = json.loads(CONFIG_JSON.read_text())
+    hf = PretrainedConfig.from_dict(raw["text_config"])
+    return KvGeometry.from_hf_config(hf, block_size=BLOCK_SIZE)
+
+
+class Script:
+    """The clock authority: each clock request gets the next scripted grant."""
+
+    def __init__(self):
+        self.grants = []
+
+    def send(self, request):
+        pass
+
+    def recv(self):
+        return self.grants.pop(0)
+
+
+def runtime(lp):
+    rt = LPRuntime(LpId(lp), TABLE, Script())
+    rt.start_run()
+    return rt
+
+
+def at(rt, t, *released):
+    """Move `rt`'s clock to `t`, releasing the write requests `(seq, arrival)`."""
+    rt.conn.grants.append((t, {KV: list(released)} if released else {}))
+    rt.advance_to(t)
+
+
+def connector(rt, monkeypatch, model, *, kv_role, address="inproc://unused", **cfg):
+    """The scheduler half, built the way the engine builds it, on `rt`."""
+    monkeypatch.setattr(clock, "_installed", rt)
+    kv = {
+        "kv_connector": "compass",
+        "kv_role": kv_role,
+        TRANSFER_KEY: model,
+        WRITE_REQ_KEY: address,
+    }
+    half = KVConnectorFactory.create_connector(
+        atom_config_double(kv_transfer_config=kv, **cfg), role="scheduler"
+    )
+    monkeypatch.setattr(clock, "_installed", None)
+    return half
+
+
+@pytest.fixture
+def pd(geometry, monkeypatch):
+    """A prefill and a decode engine whose connectors share one write-request pair."""
+    model = model_for(geometry, PEAKS[0])
+    address = f"inproc://kv-write-req-{next(_PAIRS)}"
+    rt_p, rt_d = runtime("engine-P"), runtime("engine-D")
+    p = connector(rt_p, monkeypatch, model, kv_role="kv_producer", address=address)
+    d = connector(rt_d, monkeypatch, model, kv_role="kv_consumer", address=address)
+    return SimpleNamespace(
+        model=model,
+        address=address,
+        rt_p=rt_p,
+        rt_d=rt_d,
+        p=scheduler_with(p),
+        d=scheduler_with(d),
+    )
+
+
+def scheduler_with(connector_half, **config):
+    """A real scheduler, sized by the caller, carrying this connector."""
+    settings = {
+        "num_kvcache_blocks": 100,
+        "max_num_seqs": 4,
+        "max_num_batched_tokens": 1000,
+    }
+    settings.update(config)
+    engine = Scheduler(MockConfig(**settings))
+    engine.kv_connector = connector_half
+    return engine
+
+
+def engine_step(engine, rt, t, *released):
+    """`EngineCore`'s order: schedule, the forward ending at `t`, the KV poll,
+    postprocess. With nothing scheduled it is the idle drain: the poll only."""
+    result = engine.schedule()
+    at(rt, t, *released)
+    engine._update_from_kv_xfer_finished(KVConnectorOutput())
+    batch = None if result is None else result[0]
+    if batch is not None and batch.req_ids:
+        engine.postprocess(
+            list(result[1].values()),
+            ScheduledBatchOutput(
+                req_ids=list(batch.req_ids),
+                token_ids=[(FIRST_TOKEN_ID,)] * len(batch.req_ids),
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch,
+        )
+
+
+def admit(engine):
+    """An admission step that runs no forward, as `EngineCore` steps one: the
+    schedule, then the KV poll at the same time, where decode posts the write
+    requests it queued, the device having no forward of this step to run."""
+    engine.schedule()
+    engine._update_from_kv_xfer_finished(KVConnectorOutput())
+
+
+#: What the router attaches to a request it sends to prefill.
+TO_PREFILL = {"do_remote_decode": True}
+
+
+def prefilled(pd, n, r, params=TO_PREFILL):
+    """`n` requests prefilled on engine-P by a forward that ends at `r`."""
+    seqs = [
+        Sequence(
+            PROMPT,
+            4,
+            sampling_params=SamplingParams(max_tokens=1),
+            kv_transfer_params=dict(params) if params else None,
+        )
+        for _ in range(n)
+    ]
+    for seq in seqs:
+        pd.p.add(seq)
+    engine_step(pd.p, pd.rt_p, r)
+    return seqs
+
+
+def admitted(pd, seqs, seq_factory, t):
+    """Decode requests for the prefilled `seqs`, admitted by engine-D at `t`."""
+    at(pd.rt_d, t)
+    out = [
+        seq_factory(PROMPT, kv_transfer_params=dict(seq.kv_transfer_params_output))
+        for seq in seqs
+    ]
+    for seq in out:
+        pd.d.add(seq)
+    admit(pd.d)
+    return out
+
+
+def free_blocks(engine):
+    return engine.block_manager.kv.num_free
+
+
+# -- The transfer --------------------------------------------------------
+
+#: Prefill's forward ends at R; decode is busy until SEND, so admits late.
+R, SEND = 1.0, 2.0
+
+
+def queued(pd, seqs, seq_factory, t):
+    """Decode requests for the prefilled `seqs`, queued by engine-D's admission
+    schedule at `t` and not yet posted: no forward has returned since."""
+    at(pd.rt_d, t)
+    out = [
+        seq_factory(PROMPT, kv_transfer_params=dict(seq.kv_transfer_params_output))
+        for seq in seqs
+    ]
+    for seq in out:
+        pd.d.add(seq)
+    pd.d.schedule()
+    return out
+
+
+def returned(pd, t, device_end):
+    """Engine-D's forward returns at `t`, its device work ending at
+    `device_end`, as `run.engine`'s watch of `call_func` tells the connector."""
+    at(pd.rt_d, t)
+    connector_module.forward_returned(
+        SimpleNamespace(predicted_s=0.0, device_end=device_end)
+    )
+
+
+def test_a_write_request_leaves_once_the_forward_after_its_admission_ends_on_the_device(
+    pd, seq_factory
+):
+    """Mooncake's write-request thread synchronizes the device before it posts:
+    the request queued by the admission step leaves when the device work of
+    the forward the engine dispatched next is done, not at the admission, and
+    decode is ready a write and a notice after that."""
+    (x,) = prefilled(pd, 1, R)
+    (y,) = queued(pd, [x], seq_factory, SEND)
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert pd.rt_d.send_log == [], "posted before the device ran the forward"
+    assert pd.d.kv_connector.has_pending_work() is True, "an idle decode stops polling"
+
+    end = SEND + 3 * TICK  # the forward returns at SEND + TICK; its device later
+    returned(pd, SEND + TICK, end)
+    a = end + L
+    assert pd.rt_d.send_log == [(KV, 0, a)], "the write request's arrival"
+
+    ready = a + pd.model.duration_s(len(y.block_table)) + L
+    engine_step(pd.p, pd.rt_p, a, (0, a))
+    engine_step(pd.d, pd.rt_d, ready)
+    pd.d.schedule()
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS, "one poll early"
+    engine_step(pd.d, pd.rt_d, ready + TICK)
+    pd.d.schedule()
+    assert y.status is SequenceStatus.RUNNING
+
+
+def test_a_device_already_done_posts_at_the_return_and_a_later_forward_posts_nothing(
+    pd, seq_factory
+):
+    """A forward whose device work ended before its return, or one with no
+    device end (no host recurrence), posts at the return: a send is never
+    stamped before the clock. Each request is posted once."""
+    xs = prefilled(pd, 2, R)
+    queued(pd, xs[:1], seq_factory, SEND)
+    returned(pd, SEND + TICK, SEND)
+    # The log holds the sends since the last clock call.
+    assert pd.rt_d.send_log == [(KV, 0, SEND + TICK + L)]
+    queued(pd, xs[1:], seq_factory, SEND + 2 * TICK)
+    returned(pd, SEND + 3 * TICK, None)
+    assert pd.rt_d.send_log == [(KV, 1, SEND + 3 * TICK + L)]
+    returned(pd, SEND + 4 * TICK, SEND + 9 * TICK)
+    assert pd.rt_d.send_log == []
+
+
+def test_an_admission_step_with_no_forward_posts_at_its_poll_once_the_device_is_done(
+    pd, seq_factory
+):
+    """At DP width one an admission step that runs no forward is followed by
+    none: its KV poll posts, once the last forward's device work is done."""
+    xs = prefilled(pd, 2, R)
+    returned(pd, SEND - TICK, SEND + 2 * TICK)  # a forward still on the device
+    queued(pd, xs[:1], seq_factory, SEND)
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert pd.rt_d.send_log == [(KV, 0, SEND + 2 * TICK + L)]
+    queued(pd, xs[1:], seq_factory, SEND + 3 * TICK)
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert pd.rt_d.send_log == [(KV, 1, SEND + 3 * TICK + L)]
+
+
+def test_a_dp_rank_waits_for_the_group_dummy_after_an_admission_step_with_no_forward(
+    pd, geometry, monkeypatch, seq_factory
+):
+    """Above DP width one the rank's KV poll comes before the group's dummy
+    forward, which the device runs before the sync returns: the poll posts
+    nothing, the dummy's device end posts it."""
+    half = connector(
+        pd.rt_d,
+        monkeypatch,
+        pd.model,
+        kv_role="kv_consumer",
+        address=pd.address,
+        parallel_config=SimpleNamespace(data_parallel_rank=0, data_parallel_size=2),
+    )
+    pd.d = scheduler_with(half)
+    (x,) = prefilled(pd, 1, R)
+    queued(pd, [x], seq_factory, SEND)
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert pd.rt_d.send_log == [], "posted before the group's dummy ran"
+    returned(pd, SEND + TICK, SEND + 2 * TICK)
+    assert pd.rt_d.send_log == [(KV, 0, SEND + 2 * TICK + L)]
+
+
+def test_the_engine_tells_the_connector_of_each_priced_forward_it_dispatches(
+    monkeypatch,
+):
+    """`run.engine` wraps `call_func` once: a forward's or the DP dummy's
+    priced reply reaches `forward_returned`; any other call's does not."""
+    from aiter_stub import stubbed_aiter
+
+    from atom.compass import run
+
+    replies = {
+        "forward": SimpleNamespace(predicted_s=0.1, device_end=2.0),
+        "dummy_execution": SimpleNamespace(predicted_s=0.1, device_end=3.0),
+        "process_kvconnector_output": None,
+        "unpriced": SimpleNamespace(predicted_s=None, device_end=4.0),
+    }
+    told = []
+    monkeypatch.setattr(connector_module, "forward_returned", told.append)
+    with stubbed_aiter():  # the class the engine's import finds is this one
+        from atom.model_engine.async_proc import AsyncIOProcManager
+
+        monkeypatch.setattr(
+            AsyncIOProcManager, "call_func", lambda self, name, *a, **k: replies[name]
+        )
+        run._watch_forwards()
+        run._watch_forwards()
+        mgr = object.__new__(AsyncIOProcManager)
+        for name, reply in replies.items():
+            assert mgr.call_func(name) is reply
+    assert told == [replies["forward"], replies["dummy_execution"]]
+
+
+def test_prefill_frees_at_max_a_r_plus_t_and_decode_is_ready_at_a_t_notify(
+    pd, seq_factory
+):
+    """One request whose decode admission is delayed past prefill's finish."""
+    total = free_blocks(pd.p)
+    (x,) = prefilled(pd, 1, R)
+    assert x.id in pd.p.deferred_free_blocks
+    (y,) = admitted(pd, [x], seq_factory, SEND)
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert y.kv_transfer_params["do_remote_prefill"] is False, "Mooncake clears it"
+    assert pd.d.kv_connector.has_pending_work() is True, "an idle decode stops polling"
+
+    a = SEND + L
+    T = pd.model.duration_s(len(y.block_table))
+    e, ready = max(a, R) + T, a + T + L
+    assert pd.rt_d.send_log == [(KV, 0, a)], "the write request's arrival"
+
+    engine_step(pd.p, pd.rt_p, a, (0, a))
+    engine_step(pd.p, pd.rt_p, e - TICK)
+    assert x.id in pd.p.deferred_free_blocks, "freed before the write was done"
+    engine_step(pd.p, pd.rt_p, e)
+    assert x.id in pd.p.deferred_free_blocks, "freed at the poll that saw it done"
+    engine_step(pd.p, pd.rt_p, e + TICK)
+    assert pd.p.deferred_free_blocks == {}
+    assert free_blocks(pd.p) == total
+
+    engine_step(pd.d, pd.rt_d, ready - TICK)
+    pd.d.schedule()
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS, "ready early"
+    engine_step(pd.d, pd.rt_d, ready)
+    pd.d.schedule()
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS, "one poll early"
+    engine_step(pd.d, pd.rt_d, ready + TICK)
+    pd.d.schedule()
+    assert y.status is SequenceStatus.RUNNING
+    assert y.token_ids[y.num_prompt_tokens] == FIRST_TOKEN_ID
+    assert pd.d.finished_recving_kv_req_ids == [], "an id with no reachable pop"
+    assert pd.d.kv_connector.has_pending_work() is False
+
+
+def test_decode_learns_of_a_write_at_the_poll_the_engines_aggregation_reports_it(
+    pd, seq_factory
+):
+    """A real decode hears of a write-done through `call_func_with_aggregation`,
+    whose workers each answer a poll's aggregation after that poll returns. The
+    connector reports at the same poll, on the same poll times."""
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.async_proc import AsyncIOProcManager
+
+    (x,) = prefilled(pd, 1, R)
+    (y,) = admitted(pd, [x], seq_factory, SEND)
+    ready = SEND + L + pd.model.duration_s(len(y.block_table)) + L
+    mgr = AsyncIOProcManager.__new__(AsyncIOProcManager)
+    mgr.label, mgr.proc_num, mgr.kv_output_aggregator = "decode", 1, None
+    mgr.kv_outputs_queues, mgr._pending_kv_aggregation = [queue.Queue()], None
+    asked = []
+    mgr.rpc_broadcast_mq = SimpleNamespace(enqueue=asked.append)
+    told = set()
+
+    def real(t):
+        out = mgr.call_func_with_aggregation("async_proc_aggregation", timeout=0)
+        for _ in asked:  # the idle worker's `get_finished`, once the poll returned
+            done = {y.id} - told if ready <= t else set()
+            told.update(done)
+            mgr.kv_outputs_queues[0].put(KVConnectorOutput(finished_recving=done))
+        asked.clear()
+        return out is not None and y.id in out.finished_recving
+
+    def simulated(t):
+        engine_step(pd.d, pd.rt_d, t)
+        return y.id in pd.d.finished_recving_kv_req_ids
+
+    polls = [ready - TICK, ready, ready + TICK, ready + 2 * TICK]
+    assert [real(t) for t in polls] == [False, False, True, False]
+    assert [simulated(t) for t in polls] == [False, False, True, False]
+
+
+def test_writes_posted_together_queue_on_the_link_on_both_ends(pd, seq_factory):
+    """Two writes posted at once move one after the other: the second is done
+    only once the first has moved its bytes, and each end reports both at
+    those times."""
+    prompts = [PROMPT[:24], PROMPT]
+    xs = [
+        Sequence(
+            p,
+            4,
+            sampling_params=SamplingParams(max_tokens=1),
+            kv_transfer_params=dict(TO_PREFILL),
+        )
+        for p in prompts
+    ]
+    for x in xs:
+        pd.p.add(x)
+    engine_step(pd.p, pd.rt_p, R)
+    at(pd.rt_d, SEND)
+    ys = [
+        seq_factory(p, kv_transfer_params=dict(x.kv_transfer_params_output))
+        for p, x in zip(prompts, xs)
+    ]
+    for y in ys:
+        pd.d.add(y)
+    admit(pd.d)
+
+    a = SEND + L
+    small, large = (len(y.block_table) * pd.model.bytes_per_block for y in ys)
+    bw = pd.model.bandwidth_bytes_per_s
+    first = a + pd.model.latency_s + small / bw
+    last = first + large / bw
+    d = (last - first) / 4
+    engine_step(pd.p, pd.rt_p, a, (0, a), (1, a))
+    # Each poll reports what the one before it saw.
+    polls = [first + d, first + 2 * d, last + d, last + 2 * d]
+    held = [[True, True], [False, True], [False, True], [False, False]]
+    for t, want in zip(polls, held):
+        engine_step(pd.p, pd.rt_p, t)
+        assert [x.id in pd.p.deferred_free_blocks for x in xs] == want, t
+    for t, want in zip(polls, held):
+        engine_step(pd.d, pd.rt_d, t + L)
+        pd.d.schedule()
+        waiting = [y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS for y in ys]
+        assert waiting == want, t
+
+
+@pytest.fixture
+def pd_shared(geometry, monkeypatch):
+    """`pd` on a link whose NIC moves 1.5 links' worth (`SharedNic`)."""
+    base = model_for(geometry, PEAKS[0])
+    model = dataclasses.replace(
+        base, nic_bandwidth_bytes_per_s=1.5 * base.bandwidth_bytes_per_s
+    )
+    address = f"inproc://kv-write-req-{next(_PAIRS)}"
+    rt_p, rt_d = runtime("engine-P"), runtime("engine-D")
+    p = connector(rt_p, monkeypatch, model, kv_role="kv_producer", address=address)
+    d = connector(rt_d, monkeypatch, model, kv_role="kv_consumer", address=address)
+    return SimpleNamespace(
+        model=model,
+        address=address,
+        rt_p=rt_p,
+        rt_d=rt_d,
+        p=scheduler_with(p),
+        d=scheduler_with(d),
+    )
+
+
+def test_writes_posted_together_share_a_nic_on_both_ends(pd_shared, seq_factory):
+    """Under a NIC's rate, two writes posted at once move together at 0.75 of
+    the link's rate each until the smaller is done, then the larger alone at
+    the link's: each end reports both at those times, a poll late as ever."""
+    pd = pd_shared
+    prompts = [PROMPT[:24], PROMPT]
+    xs = [
+        Sequence(
+            p,
+            4,
+            sampling_params=SamplingParams(max_tokens=1),
+            kv_transfer_params=dict(TO_PREFILL),
+        )
+        for p in prompts
+    ]
+    for x in xs:
+        pd.p.add(x)
+    engine_step(pd.p, pd.rt_p, R)
+    at(pd.rt_d, SEND)
+    ys = [
+        seq_factory(p, kv_transfer_params=dict(x.kv_transfer_params_output))
+        for p, x in zip(prompts, xs)
+    ]
+    for y in ys:
+        pd.d.add(y)
+    admit(pd.d)
+
+    a = SEND + L
+    small, large = (len(y.block_table) * pd.model.bytes_per_block for y in ys)
+    assert small < large
+    bw = pd.model.bandwidth_bytes_per_s
+    together = small / (0.75 * bw)
+    first = a + together + pd.model.latency_s
+    last = a + together + (large - small) / bw + pd.model.latency_s
+    d = (last - first) / 4
+    engine_step(pd.p, pd.rt_p, a, (0, a), (1, a))
+    polls = [first + d, first + 2 * d, last + d, last + 2 * d]
+    held = [[True, True], [False, True], [False, True], [False, False]]
+    for t, want in zip(polls, held):
+        engine_step(pd.p, pd.rt_p, t)
+        assert [x.id in pd.p.deferred_free_blocks for x in xs] == want, t
+    for t, want in zip(polls, held):
+        engine_step(pd.d, pd.rt_d, t + L)
+        pd.d.schedule()
+        waiting = [y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS for y in ys]
+        assert waiting == want, t
+
+
+def test_a_shared_nic_prices_one_prefill_stage(geometry, monkeypatch):
+    """Two stages' links would each need a NIC of their own: refused by name."""
+    base = model_for(geometry, PEAKS[0])
+    model = dataclasses.replace(base, nic_bandwidth_bytes_per_s=1e12)
+    rt = runtime("engine-D")
+    monkeypatch.setattr(clock, "_installed", rt)
+    kv = {
+        "kv_connector": "compass",
+        "kv_role": "kv_consumer",
+        TRANSFER_KEY: (model, model),
+        WRITE_REQ_KEY: "inproc://unused",
+    }
+    with pytest.raises(ValueError, match="one prefill stage"):
+        KVConnectorFactory.create_connector(
+            atom_config_double(kv_transfer_config=kv), role="scheduler"
+        )
+
+
+def test_a_prefill_the_router_does_not_send_on_is_freed_at_once(pd):
+    """No `do_remote_decode`, no send claim: the blocks go back at finish."""
+    total = free_blocks(pd.p)
+    prefilled(pd, 1, R, params=None)
+    assert pd.p.deferred_free_blocks == {}
+    assert free_blocks(pd.p) == total
+
+
+def test_an_aborted_prefill_takes_no_send_claim(pd, seq_factory):
+    """Mooncake's rule: no peer will read an abort's blocks."""
+    seq = seq_factory(PROMPT, kv_transfer_params=dict(TO_PREFILL))
+    seq.block_table = [0, 1]
+    seq.leave_reason = "aborted"
+    pd.p.kv_connector.request_finished(seq)
+    assert pd.p.kv_connector.should_defer_free(seq) is False
+
+
+def test_a_write_request_for_an_unfinished_prefill_is_refused(pd, seq_factory):
+    """r > a: the write request arrived before prefill had the data."""
+    x = SimpleNamespace(
+        kv_transfer_params_output={"do_remote_prefill": True, "transfer_id": 999}
+    )
+    admitted(pd, [x], seq_factory, SEND)
+    with pytest.raises(ValueError, match="before its prefill finished"):
+        engine_step(pd.p, pd.rt_p, SEND + L, (0, SEND + L))
+
+
+# -- An abort between prefill's finish and decode's pull -----------------
+
+
+def test_an_abort_before_the_write_request_frees_prefill_at_once(pd, seq_factory):
+    """Mooncake's abort with no write request taken: the send is done at the
+    abort, reported as a write-done is, and a write request that still comes
+    is no error."""
+    total = free_blocks(pd.p)
+    (x,) = prefilled(pd, 1, R)
+
+    assert pd.p.abort_request(x.id) is True
+    engine_step(pd.p, pd.rt_p, R + TICK)
+    assert x.id in pd.p.deferred_free_blocks, "one poll in flight, as any report"
+    engine_step(pd.p, pd.rt_p, R + 2 * TICK)
+    assert pd.p.deferred_free_blocks == {}
+    assert pd.p.is_finished()
+    assert free_blocks(pd.p) == total
+
+    admitted(pd, [x], seq_factory, SEND)
+    engine_step(pd.p, pd.rt_p, SEND + L, (0, SEND + L))
+    assert pd.p.kv_connector.has_pending_work() is False, "no claim waits on it"
+
+
+@pytest.mark.parametrize("polled", [True, False], ids=["taken", "released"])
+def test_an_abort_mid_write_frees_nothing_until_the_write_is_done(
+    pd, seq_factory, polled
+):
+    """A write request already here when the abort comes is served first, as
+    Mooncake's listener takes one on arrival, whether or not prefill has
+    polled since it was released."""
+    total = free_blocks(pd.p)
+    (x,) = prefilled(pd, 1, R)
+    (y,) = admitted(pd, [x], seq_factory, SEND)
+    a = SEND + L
+    e = a + pd.model.duration_s(len(y.block_table))
+    if polled:
+        engine_step(pd.p, pd.rt_p, a, (0, a))
+    else:
+        at(pd.rt_p, a, (0, a))
+
+    assert pd.p.abort_request(x.id) is True
+    engine_step(pd.p, pd.rt_p, e - TICK)
+    engine_step(pd.p, pd.rt_p, e)
+    assert x.id in pd.p.deferred_free_blocks, "freed under a running write"
+    engine_step(pd.p, pd.rt_p, e + TICK)
+    assert pd.p.deferred_free_blocks == {}
+    assert free_blocks(pd.p) == total
+
+
+def test_a_decode_abort_before_its_write_request_frees_prefill(pd, seq_factory):
+    """Decode aborts a request it has not admitted, so it never asks for the
+    write, and prefill hears no abort: its leg of the request is over. Decode
+    tells it that no write will come, on the write request's channel, and
+    prefill's send is done at that notice's arrival, reported as a write-done
+    is."""
+    total = free_blocks(pd.p)
+    (x,) = prefilled(pd, 1, R)
+    at(pd.rt_d, SEND)
+    y = seq_factory(PROMPT, kv_transfer_params=dict(x.kv_transfer_params_output))
+    pd.d.add(y)
+
+    assert pd.d.abort_request(y.id) is True
+    a = SEND + L
+    assert pd.rt_d.send_log == [(KV, 0, a)], "the notice's arrival"
+    assert pd.d.kv_connector.has_pending_work() is False, "nothing comes back"
+
+    engine_step(pd.p, pd.rt_p, a, (0, a))
+    assert x.id in pd.p.deferred_free_blocks, "one poll in flight, as any report"
+    engine_step(pd.p, pd.rt_p, a + TICK)
+    assert pd.p.deferred_free_blocks == {}
+    assert pd.p.is_finished()
+    assert free_blocks(pd.p) == total
+
+
+#: The decode pool's block size (`MockConfig`'s), and a different one.
+HBS = 4
+
+
+@pytest.mark.parametrize(
+    "dcp, blob_fields, reused",
+    [
+        (1, {"hash_block_size": HBS}, True),
+        (1, {"hash_block_size": 4 * HBS}, False),
+        (2, {"block_size": HBS, "dcp_size": 1, "hash_block_size": HBS}, True),
+        (2, {"block_size": 2 * HBS, "dcp_size": 1, "hash_block_size": 2 * HBS}, False),
+        (2, {"hash_block_size": HBS}, True),
+    ],
+    ids=[
+        "matching",
+        "different",
+        "dcp1-into-dcp2",
+        "dcp1-into-dcp2-other-block-size",
+        "dcp1-into-dcp2-hash-only",
+    ],
+)
+def test_a_decode_side_prefix_hit_is_written_only_when_the_pages_line_up(
+    pd, monkeypatch, seq_factory, dcp, blob_fields, reused
+):
+    """Mooncake's rule: the blocks decode already caches are not written when
+    prefill's pages line up with decode's, as an unsharded producer's do with
+    a DCP consumer's at one block size; otherwise all are."""
+    half = connector(
+        pd.rt_d,
+        monkeypatch,
+        pd.model,
+        kv_role="kv_consumer",
+        address=pd.address,
+        kv_cache_block_size=HBS,
+        decode_context_parallel_size=dcp,
+    )
+    pd.d = scheduler_with(
+        half, enable_prefix_caching=True, decode_context_parallel_size=dcp
+    )
+    warm = seq_factory(PROMPT)
+    pd.d.block_manager.allocate(warm)
+    pd.d.block_manager.hash_blocks(warm, warm.num_tokens)
+    pd.d.block_manager.deallocate(warm)
+
+    blob = {"do_remote_prefill": True, "transfer_id": 0, **blob_fields}
+    (y,) = admitted(
+        pd, [SimpleNamespace(kv_transfer_params_output=blob)], seq_factory, SEND
+    )
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert y.num_cached_tokens == len(PROMPT) - HBS * dcp, "no decode-side hit"
+
+    priced = 1 if reused else len(y.block_table)
+
+    ready = SEND + L + pd.model.duration_s(priced) + L
+    # Two polls before `ready`: the second reports what the first saw.
+    engine_step(pd.d, pd.rt_d, ready - 2 * TICK)
+    engine_step(pd.d, pd.rt_d, ready - TICK)
+    pd.d.schedule()
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS, "ready early"
+    engine_step(pd.d, pd.rt_d, ready)
+    engine_step(pd.d, pd.rt_d, ready + TICK)
+    pd.d.schedule()
+    assert y.status is SequenceStatus.RUNNING
+
+
+@pytest.mark.parametrize("follower", [False, True], ids=["idle", "follower"])
+def test_an_idle_producer_frees_every_finished_prefill(pd, seq_factory, follower):
+    """N prefills, then nothing (or one more request): all freed on their times."""
+    total = free_blocks(pd.p)
+    seqs = prefilled(pd, 3, R)
+    if follower:
+        seqs += prefilled(pd, 1, R + 0.5)
+    held = sum(len(seq.block_table) for seq in seqs)
+    assert len(pd.p.deferred_free_blocks) == len(seqs)
+    assert free_blocks(pd.p) == total - held
+
+    admitted(pd, seqs, seq_factory, SEND)
+    a = SEND + L
+    engine_step(pd.p, pd.rt_p, a, *[(k, a) for k in range(len(seqs))])
+    T = pd.model.duration_s(sum(len(seq.block_table) for seq in seqs))
+    engine_step(pd.p, pd.rt_p, a + T + TICK)
+    engine_step(pd.p, pd.rt_p, a + T + 2 * TICK)
+    assert pd.p.deferred_free_blocks == {}
+    assert free_blocks(pd.p) == total
+
+
+def test_a_request_the_cap_bounced_parks_on_a_later_step(pd, seq_factory):
+    """The claim is not spent on the asking: the flag is cleared at allocation.
+
+    So a request bounced before allocation asks again and parks, and each
+    parked request sends exactly one write request.
+    """
+    pd.d.max_num_seqs = 1
+    blob = {"do_remote_prefill": True, "transfer_id": 0}
+    first = seq_factory(PROMPT, kv_transfer_params=dict(blob))
+    bounced = seq_factory(PROMPT, kv_transfer_params=dict(blob, transfer_id=1))
+    pd.d.add(first)
+    pd.d.add(bounced)
+    admit(pd.d)
+    assert first.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert bounced.status is SequenceStatus.WAITING, "the cap did not bounce it"
+    pd.d.max_num_seqs = 4
+    admit(pd.d)
+    assert bounced.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert [seq for _, seq, _ in pd.rt_d.send_log] == [0, 1]
+
+
+@pytest.mark.parametrize("side", ["p", "d"])
+def test_an_ordinary_request_is_neither_claimed_nor_sent(pd, seq_factory, side):
+    seq = seq_factory(PROMPT)
+    half = getattr(pd, side).kv_connector
+    assert half.get_num_new_matched_tokens(seq) == (0, False)
+    seq.block_table = [0, 1]
+    half.update_state_after_alloc(seq)
+    assert getattr(pd, f"rt_{side}").send_log == []
+
+
+def test_the_producing_side_refuses_a_remote_fill(pd, seq_factory):
+    """A deployment cannot wait for a transfer it is the source of."""
+    seq = seq_factory(PROMPT, kv_transfer_params={"do_remote_prefill": True})
+    with pytest.raises(ValueError, match="producer side"):
+        pd.p.kv_connector.update_state_after_alloc(seq)
+
+
+def test_a_parked_request_is_not_counted_as_admittable_work(pd, seq_factory):
+    """The engine's guards read the suspended state; the request must have it."""
+    seq = seq_factory(
+        PROMPT, kv_transfer_params={"do_remote_prefill": True, "transfer_id": 0}
+    )
+    pd.d.add(seq)
+    pd.d.schedule()
+    assert seq.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert pd.d._waiting_new_token_count() == 0
+    assert pd.d._can_admit_head_prefill() is False
+    assert pd.d._oldest_waiting_prefill_age_ms() == 0.0
+
+    # The positive control: an ordinary request queued beside it is counted.
+    queued = seq_factory(list(range(24)))
+    queued.arrive_time = time.time() - 1.0
+    pd.d.add(queued)
+    assert pd.d._waiting_new_token_count() == 24
+    assert pd.d._can_admit_head_prefill() is True
+    assert 1000.0 <= pd.d._oldest_waiting_prefill_age_ms() < 60_000.0
+
+
+# -- The blob ------------------------------------------------------------
+
+
+def literal_keys(blob: ast.Dict, source: pathlib.Path) -> frozenset:
+    """The keys of a dict display: string constants, and the keys of a
+    `**helper(...)` whose helper, a function of Mooncake's own package,
+    returns one dict display."""
+    keys = set()
+    for key, value in zip(blob.keys, blob.values):
+        if key is None:
+            assert isinstance(value, ast.Call) and isinstance(
+                value.func, ast.Name
+            ), f"{source.name} unpacks something other than a helper's call"
+            keys |= helper_keys(value.func.id)
+            continue
+        assert isinstance(key, ast.Constant) and isinstance(
+            key.value, str
+        ), f"{source.name} builds its blob with computed keys"
+        keys.add(key.value)
+    return frozenset(keys)
+
+
+def helper_keys(name: str) -> frozenset:
+    """The keys of the one dict display function `name` returns, found in a
+    module beside Mooncake's connector."""
+    found = []
+    for source in sorted(MOONCAKE_SOURCE.parent.glob("*.py")):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                returns = [r for r in ast.walk(node) if isinstance(r, ast.Return)]
+                assert len(returns) == 1 and isinstance(
+                    returns[0].value, ast.Dict
+                ), f"{source.name}: {name} does not return one dict display"
+                found.append(literal_keys(returns[0].value, source))
+    assert len(found) == 1, f"expected one definition of {name}, found {len(found)}"
+    return found[0]
+
+
+def relayed_fields() -> frozenset:
+    """The keys of Mooncake's own transfer blob, read from its source.
+
+    Parsed rather than imported: the module reaches for an RDMA library the
+    CPU gate does not have. Exactly one assignment is expected.
+    """
+    tree = ast.parse(MOONCAKE_SOURCE.read_text())
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+            continue
+        if not any(
+            isinstance(target, ast.Attribute)
+            and target.attr == "kv_transfer_params_output"
+            for target in node.targets
+        ):
+            continue
+        found.append(literal_keys(node.value, MOONCAKE_SOURCE))
+    assert len(found) == 1, f"expected one blob assignment, found {len(found)}"
+    return found[0]
+
+
+def assert_relays_every_field(blob) -> None:
+    """The check the field-set test makes, and the one the drop test breaks."""
+    missing = sorted(relayed_fields() - set(blob))
+    assert not missing, f"the relayed blob would not carry {missing}"
+    extra = sorted(set(blob) - relayed_fields())
+    assert not extra, f"the relayed blob would carry {extra}, which nothing reads"
+
+
+#: What a finished request holds when the producer hands it back.
+FINISHED_ID = 11
+FINISHED_BLOCKS = [4, 5, 6]
+FINISHED_HIT_TOKENS = 128
+
+
+def finished_sequence():
+    """A request the way `request_finished` finds one: done, with a table."""
+    return SimpleNamespace(
+        id=FINISHED_ID,
+        block_table=list(FINISHED_BLOCKS),
+        output_tokens=[FIRST_TOKEN_ID, 8, 9],
+        spec_token_ids=[],
+        prefix_cache_hit_tokens=FINISHED_HIT_TOKENS,
+        kv_transfer_params_output=None,
+    )
+
+
+def simulated_blob(tp_size=4, dp_rank=2) -> dict:
+    return transfer_params(
+        finished_sequence(),
+        tp_size=tp_size,
+        dp_rank=dp_rank,
+        pp_size=1,
+        block_size=16,
+        dcp_size=1,
+    )
+
+
+def assert_could_not_be_dialled(value, field) -> None:
+    """Refuse a value anything downstream could turn into a connection.
+
+    Asserted as a property of whatever the field holds, not as an identity
+    with the constant beside it, because a defect that moves the constant
+    moves both sides of such an identity and is invisible to it.
+    """
+    host = str(value).split(":")[0]
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"{field} carries the address {host!r}")
+    own = socket.gethostname()
+    labels = {part.lower() for part in str(value).replace(":", ".").split(".")}
+    borrowed = labels & {own.lower(), own.lower().split(".")[0]}
+    assert not borrowed, (
+        f"{field} carries {sorted(borrowed)}, taken from the name of the "
+        "machine this run is on"
+    )
+
+
+def test_the_blob_carries_the_field_set_the_router_relays():
+    """The emitted set equals Mooncake's, re-derived."""
+    assert set(simulated_blob()) == relayed_fields()
+    assert_relays_every_field(simulated_blob())
+
+
+@pytest.mark.parametrize("field", sorted(relayed_fields()))
+def test_dropping_one_field_from_the_blob_is_refused_by_name(field):
+    """Every field is load-bearing, and the check says which one went."""
+    short = dict(simulated_blob())
+    del short[field]
+    with pytest.raises(AssertionError) as refusal:
+        assert_relays_every_field(short)
+    assert field in str(refusal.value)
+
+
+def test_no_field_of_the_blob_names_a_machine_the_simulation_runs_on():
+    """A simulated peer has no address, and must not borrow a real one.
+
+    The identities say the blob is built from the constants; the properties
+    say what those constants may hold, and survive the constants changing.
+    """
+    blob = simulated_blob()
+    assert blob["remote_host"] == SIMULATED_HOST
+    assert blob["remote_port"] == SIMULATED_PORT == 0
+    assert blob["remote_handshake_port"] == SIMULATED_PORT
+    assert blob["remote_engine_id"] == SIMULATED_ENGINE_ID
+
+    host = blob["remote_host"]
+    assert host.endswith(".invalid"), "a name that could resolve"
+    assert host.count(".") == 1, (
+        f"{host!r} is a real name with the reserved suffix pinned on the end; "
+        "the whole point is that there is one label and it was invented here"
+    )
+    assert ":" not in blob["remote_engine_id"], "an identity, not host:port"
+    for field in ("remote_host", "remote_engine_id"):
+        assert_could_not_be_dialled(blob[field], field)
+
+
+def test_the_engine_id_is_the_label_the_host_invents_and_nothing_else():
+    """The engine id is one invented label, the one the host reserves."""
+    blob = simulated_blob()
+    engine_id = blob["remote_engine_id"]
+    assert "." not in engine_id, (
+        f"remote_engine_id {engine_id!r} is a dotted name, which a resolver "
+        "can route; it must be the single invented label"
+    )
+    assert blob["remote_host"] == f"{engine_id}.invalid", (
+        f"remote_engine_id {engine_id!r} is not the label remote_host "
+        f"{blob['remote_host']!r} reserves under .invalid"
+    )
+
+
+def test_the_ranks_the_router_reads_are_numbers(pd, geometry, monkeypatch):
+    """The router drops `dp_rank` unless it is a number, and says nothing.
+
+    Driven through the connector from a config carrying the widths as floats
+    with no fractional part: each is converted to an `int` on the way in.
+    """
+    half = connector(
+        pd.rt_p,
+        monkeypatch,
+        pd.model,
+        kv_role="kv_producer",
+        address=f"inproc://kv-write-req-{next(_PAIRS)}",
+        tensor_parallel_size=8.0,
+        parallel_config=SimpleNamespace(data_parallel_rank=3.0),
+    )
+    seq = finished_sequence()
+    half.request_finished(seq)
+    relayed = seq.kv_transfer_params_output
+    assert isinstance(relayed["tp_size"], int) and relayed["tp_size"] == 8
+    assert isinstance(relayed["dp_rank"], int) and relayed["dp_rank"] == 3
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        pytest.param("tp_size", 8.5, id="tp_size-float"),
+        pytest.param("tp_size", "8.5", id="tp_size-text"),
+        pytest.param("tp_size", "eight", id="tp_size-word"),
+        pytest.param("dp_rank", 2.5, id="dp_rank-float"),
+        pytest.param("dp_rank", "2.5", id="dp_rank-text"),
+        pytest.param("tp_size", "8.0", id="tp_size-decimal-text"),
+        pytest.param("tp_size", "1e1", id="tp_size-exponent-text"),
+        pytest.param("tp_size", True, id="tp_size-true"),
+        pytest.param("tp_size", False, id="tp_size-false"),
+        pytest.param("dp_rank", True, id="dp_rank-true"),
+        pytest.param("dp_rank", False, id="dp_rank-false"),
+        pytest.param("tp_size", numpy.bool_(True), id="tp_size-numpy-true"),
+        pytest.param("tp_size", numpy.bool_(False), id="tp_size-numpy-false"),
+        pytest.param("tp_size", torch.tensor(True), id="tp_size-torch-true"),
+        pytest.param("tp_size", "8", id="tp_size-integer-text"),
+        pytest.param("dp_rank", "3", id="dp_rank-integer-text"),
+        pytest.param("tp_size", " 8 ", id="tp_size-padded-text"),
+    ],
+)
+def test_a_width_that_is_not_a_whole_number_is_refused_by_name(
+    geometry, monkeypatch, field, value
+):
+    """A width that is not exactly an integer refuses the connector by name.
+
+    Refused when the connector is built, so a malformed config never serves a
+    request: 8.5 cast to 8, or a boolean sent as 1 or 0, would name a
+    deployment that was never launched.
+    """
+    widths = {"tp_size": 8, "dp_rank": 3, field: value}
+    with pytest.raises(ValueError, match=f"^{field} is .*not a whole number"):
+        connector(
+            runtime("engine-P"),
+            monkeypatch,
+            model_for(geometry, PEAKS[0]),
+            kv_role="kv_producer",
+            tensor_parallel_size=widths["tp_size"],
+            parallel_config=SimpleNamespace(data_parallel_rank=widths["dp_rank"]),
+        )
+
+
+def test_the_blob_carries_the_request_and_not_a_template():
+    """What is specific to the request comes off the request."""
+    blob = simulated_blob()
+    assert blob["do_remote_prefill"] is True
+    assert blob["do_remote_decode"] is False
+    assert blob["remote_block_ids"] == FINISHED_BLOCKS
+    assert blob["transfer_id"] == FINISHED_ID
+    assert blob["first_token_id"] == FIRST_TOKEN_ID
+    assert blob["draft_token_ids"] == []
+    assert blob["prefix_cache_hit_tokens"] == FINISHED_HIT_TOKENS
+
+
+def test_a_finished_request_carries_the_blob_out(pd):
+    """The connector attaches it where the API layer looks for it."""
+    seq = finished_sequence()
+    pd.p.kv_connector.request_finished(seq)
+    assert seq.kv_transfer_params_output == transfer_params(
+        seq, tp_size=1, dp_rank=0, pp_size=1, block_size=16, dcp_size=1
+    )
+
+
+def test_the_emitted_blob_is_one_a_consumer_can_actually_consume():
+    """The blob goes back in where a consumer reads it, through `ReqMeta`."""
+    blob = simulated_blob(tp_size=4, dp_rank=2)
+    meta = ConnectorMetadata()
+    meta.add_new_req_to_recv(
+        request_id=FINISHED_ID, local_block_ids=[0, 1], kv_transfer_params=blob
+    )
+    req = meta.reqs_to_recv[FINISHED_ID]
+
+    assert req.remote_block_ids == FINISHED_BLOCKS
+    assert req.remote_host == SIMULATED_HOST
+    assert req.remote_port == SIMULATED_PORT
+    assert req.remote_handshake_port == SIMULATED_PORT
+    assert req.remote_engine_id == SIMULATED_ENGINE_ID
+    assert req.tp_size == 4
+    assert req.transfer_id == FINISHED_ID
+
+
+# -- The runner ----------------------------------------------------------
+
+
+def test_the_compass_runner_builds_the_worker_half(monkeypatch):
+    """The worker the engine polls is built by the runner and reports nothing.
+
+    Importing either runner needs a driver, so `CompassModelRunner`'s class
+    statement is compiled from source over the overrides and an ATOM
+    `ModelRunner` holding only its `process_kvconnector_output`, and the TP
+    group `ModelRunner.__init__` opens is stood in at rank 0.
+    """
+    atom_runner = _classes(ATOM_RUNNER)["ModelRunner"]
+    (method,) = [
+        n
+        for n in atom_runner.body
+        if isinstance(n, ast.FunctionDef) and n.name == "process_kvconnector_output"
+    ]
+    atom_runner.body = [method]
+    namespace = {
+        "torch": torch,
+        "get_kvconnector": forward_context.get_kvconnector,
+        "NonAllocatingRunner": NonAllocatingRunner,
+    }
+    compass_runner = _classes(PACKAGE / "model_runner.py")["CompassModelRunner"]
+    exec(ast.unparse(atom_runner), namespace)  # noqa: S102
+    exec(ast.unparse(compass_runner), namespace)  # noqa: S102
+    group = SimpleNamespace(get_tp_group=lambda: SimpleNamespace(rank_in_group=0))
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", group)
+    monkeypatch.setattr(forward_context, "_global_kvconnector", None)
+
+    runner = object.__new__(namespace["CompassModelRunner"])
+    runner.config = atom_config_double(
+        kv_transfer_config={"kv_connector": "compass", "kv_role": "kv_consumer"}
+    )
+    assert runner.allocate_kv_cache(100) is True
+    worker = forward_context.get_kvconnector()
+    assert isinstance(worker, SimulatedKVConnector)
+    meta = ConnectorMetadata()
+    meta.add_new_req_to_recv(request_id=0, local_block_ids=[0], kv_transfer_params={})
+    runner.process_kvconnector_output(meta)
+    assert worker.get_finished() == (set(), set())
+
+
+@pytest.mark.parametrize(
+    "kv", [{"kv_connector": "mooncake"}, {"kv_connector": "moriio"}, {}]
+)
+def test_the_compass_runner_refuses_a_real_transfer_backend(kv, monkeypatch):
+    """Refused by name before anything is built; `{}` is the factory's moriio."""
+    calls = []
+    monkeypatch.setattr(
+        forward_context, "set_kv_cache_data", lambda *a, **k: calls.append(a)
+    )
+    runner = object.__new__(NonAllocatingRunner)
+    runner.config = atom_config_double(
+        kv_transfer_config={"kv_role": "kv_consumer", **kv}
+    )
+    name = kv.get("kv_connector", "moriio")
+    with pytest.raises(RunnerRefusal, match=f"kv_connector '{name}' is a real"):
+        runner.allocate_kv_cache(100)
+    assert calls == []
+
+
+def test_the_compass_runner_accepts_no_transfer_config(monkeypatch):
+    """`{}` is ATOM's default: every run that sets no kv_transfer_config takes this."""
+    calls = []
+    monkeypatch.setattr(
+        forward_context, "set_kv_cache_data", lambda *a, **k: calls.append(a)
+    )
+    runner = object.__new__(NonAllocatingRunner)
+    runner.config = atom_config_double(kv_transfer_config={})
+    assert runner.allocate_kv_cache(100) is True
+    assert len(calls) == 1
+
+
+def test_the_compass_runner_refuses_a_config_that_lacks_the_field(monkeypatch):
+    """A config with no `kv_transfer_config` is refused, not read as unset."""
+    calls = []
+    monkeypatch.setattr(
+        forward_context, "set_kv_cache_data", lambda *a, **k: calls.append(a)
+    )
+    runner = object.__new__(NonAllocatingRunner)
+    runner.config = SimpleNamespace(kv_transfer_config_renamed={})
+    with pytest.raises(RunnerRefusal, match="no field 'kv_transfer_config'"):
+        runner.allocate_kv_cache(100)
+    assert calls == []

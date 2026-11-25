@@ -4,13 +4,13 @@
 
 import itertools
 import logging
-import time
 from collections import Counter
 from dataclasses import fields, replace
 from typing import Any
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
+from atom.compass import run as compass_run
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
@@ -23,7 +23,8 @@ from atom.structured_output.validation import (
     WorkerGrammarPreflight,
     validate_execution_options,
 )
-from atom.utils import envs
+from atom.utils import clock, envs
+from atom.utils import time_shim as time
 
 logger = logging.getLogger("atom")
 
@@ -98,10 +99,11 @@ class LLMEngine:
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
-        if config.enable_rapidserve:
-            self.core_mgr = DisaggCoreManager(config)
-        else:
-            self.core_mgr = CoreManager(config)
+        with compass_run.frontend(config):
+            if config.enable_rapidserve:
+                self.core_mgr = DisaggCoreManager(config)
+            else:
+                self.core_mgr = CoreManager(config)
         self._structured_preflight = WorkerGrammarPreflight(
             self, self.tokenizer, config
         )
@@ -128,6 +130,7 @@ class LLMEngine:
         """Shut down engine and release all GPU resources."""
         if getattr(self, "_structured_preflight", None) is not None:
             self._structured_preflight.close()
+        clock.finish()
         if hasattr(self, "core_mgr"):
             self.core_mgr.close()
 

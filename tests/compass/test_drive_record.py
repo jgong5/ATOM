@@ -1,0 +1,489 @@
+# SPDX-License-Identifier: MIT
+"""`compass record`, on records `StepRecord` wrote on
+`test_parity_device_window.py`'s planted device, with steps from two planted
+client runs.
+
+A planted server stands in for ATOM's: it copies such a record to where the
+step record's variable points, answers ``/health`` once and exits. `rocm-smi`,
+`rocminfo`, ``preflight.sh`` and the checkouts run.json's identity reads are
+planted as `test_drive_gpu.py` and `test_drive_identity.py` plant them, so
+run.json's identity is the one `identity` builds, and `fit.samples` reads it.
+"""
+
+import json
+import os
+import re
+import shutil
+import sys
+
+import pytest
+from test_drive_gpu import FREE, SHOWHW
+from test_drive_identity import CARD, GIT, _checkout, _git, read_marked
+from test_fit_samples import HOST, RUNS, edit
+from test_fit_samples import record as planted_out
+from test_fit_steps import fit
+from test_parity_record import BLOCK, BUDGET, LADDER
+from test_parity_served import recorded
+from test_validate_runs import _aiter
+
+from atom.compass import cli
+from atom.compass.backends.step_labels import TABLE_VERSION, label
+from atom.compass.drive import aiter_jit, gpu, identity, record, serve
+from atom.compass.fit.samples import load
+from atom.compass.parity import WRITE_THROUGH
+
+PLANTED = """\
+import http.server, os, shutil, sys
+shutil.copytree(os.environ["PLANTED_RECORD"], os.environ["ATOM_COMPASS_PARITY_RECORD"])
+port = int(sys.argv[sys.argv.index("--server-port") + 1])
+
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+http.server.HTTPServer(("127.0.0.1", port), Health).handle_request()
+"""
+#: The engine `test_parity_record.py`'s config resolves.
+ENGINE = {
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": BUDGET,
+    "max_model_len": 2048,
+    "kv_cache_block_size": BLOCK,
+    "num_kvcache_blocks": 4096,
+    "ladder": LADDER,
+}
+
+
+def _lines(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_a_stopped_server_s_directory_gains_its_engine_entry_and_cost_lines(
+    tmp_path, monkeypatch
+):
+    """The named result."""
+    out = planted_out(tmp_path, monkeypatch)
+    before = json.loads((out / "run.json").read_text())
+    record.write_engine_and_costs(out)
+
+    assert json.loads((out / "run.json").read_text()) == {**before, "engine": ENGINE}
+    steps = [s for s in _lines(out / "steps/dp0.jsonl") if not s["is_dummy_run"]]
+    table = _lines(out / "steps/dp0.cost.jsonl")
+    assert table[0] == {"version": TABLE_VERSION}
+    assert [(r["step"], r["d_busy_s"]) for r in table[1:]] == [
+        (s["step"], s["d_busy_ns"] * 1e-9) for s in steps
+    ]
+    assert table[1:] == json.loads(json.dumps(label(out / "steps/dp0.jsonl")[1]))
+
+
+def _two_ranks(tmp_path, monkeypatch, blocks, **other):
+    """A planted out directory whose DP rank 1 copies rank 0's record and
+    states `blocks` KV blocks and the engine fields `other` names."""
+    out = planted_out(tmp_path, monkeypatch)
+    for suffix in (".jsonl", ".engine.json"):
+        shutil.copy(out / f"steps/dp0{suffix}", out / f"steps/dp1{suffix}")
+    edit(
+        out / "steps/dp1.engine.json",
+        lambda e: e.update(num_kvcache_blocks=blocks, **other),
+    )
+    return out
+
+
+def test_each_dp_rank_gets_its_cost_lines_under_one_engine_entry(tmp_path, monkeypatch):
+    out = _two_ranks(tmp_path, monkeypatch, ENGINE["num_kvcache_blocks"])
+    record.write_engine_and_costs(out)
+
+    assert json.loads((out / "run.json").read_text())["engine"] == ENGINE
+    dp0, dp1 = ((out / f"steps/dp{r}.cost.jsonl").read_text() for r in (0, 1))
+    assert dp0 == dp1
+
+
+def test_a_dp_rank_no_request_reached_gets_the_version_line_alone(
+    tmp_path, monkeypatch
+):
+    out = _two_ranks(tmp_path, monkeypatch, ENGINE["num_kvcache_blocks"])
+    dummies = [
+        {**s, "is_dummy_run": True, "batch": [], "named": []}
+        for s in _lines(out / "steps/dp1.jsonl")
+    ]
+    (out / "steps/dp1.jsonl").write_text("".join(json.dumps(s) + "\n" for s in dummies))
+    record.write_engine_and_costs(out)
+
+    assert _lines(out / "steps/dp1.cost.jsonl") == [{"version": TABLE_VERSION}]
+    assert len(_lines(out / "steps/dp0.cost.jsonl")) > 1
+
+
+def test_dp_ranks_differing_only_in_kv_blocks_state_the_smallest(tmp_path, monkeypatch):
+    out = _two_ranks(tmp_path, monkeypatch, 4000)
+    record.write_engine_and_costs(out)
+
+    engine = json.loads((out / "run.json").read_text())["engine"]
+    assert engine == {**ENGINE, "num_kvcache_blocks": 4000}
+
+
+def test_dp_ranks_resolving_different_engines_refuse_the_entry(tmp_path, monkeypatch):
+    out = _two_ranks(tmp_path, monkeypatch, 4000, max_num_seqs=4)
+
+    refusal = "states none:\nmax_num_seqs: 8 in dp0; 4 in dp1$"
+    with pytest.raises(ValueError, match=refusal):
+        record.write_engine_and_costs(out)
+    assert "engine" not in json.loads((out / "run.json").read_text())
+    for r in (0, 1):
+        rows = label(out / f"steps/dp{r}.jsonl")[1]
+        assert rows
+        assert _lines(out / f"steps/dp{r}.cost.jsonl") == [
+            {"version": TABLE_VERSION},
+            *json.loads(json.dumps(rows)),
+        ]
+
+
+def test_a_dp_rank_whose_first_forward_is_a_dummy_gets_its_timed_steps_lines(
+    tmp_path, monkeypatch
+):
+    out = _two_ranks(tmp_path, monkeypatch, ENGINE["num_kvcache_blocks"])
+    steps = _lines(out / "steps/dp1.jsonl")
+    steps[0] = {**steps[0], "is_dummy_run": True, "batch": [], "named": []}
+    (out / "steps/dp1.jsonl").write_text("".join(json.dumps(s) + "\n" for s in steps))
+    record.write_engine_and_costs(out)
+
+    table = _lines(out / "steps/dp1.cost.jsonl")
+    assert [r["step"] for r in table[1:]] == [s["step"] for s in steps[1:]]
+    assert len(table) > 2
+
+
+@pytest.mark.parametrize(
+    "ours, atoms, refusal",
+    [
+        (["--profile-ops"], [], "--profile-ops and --profile-steps profile ops, and"),
+        (["--profile-steps", "2:5"], [], "--profile-ops and --profile-steps profile"),
+        ([], ["--load_dummy"], "--load_dummy is among ATOM's arguments; a record"),
+        ([], ["--load-dummy=zero"], "--load-dummy=zero is among"),
+        ([], ["--load_d"], "--load_d is among"),
+        ([], ["--host", "0.0.0.0"], "--host is among ATOM's arguments; the driver"),
+    ],
+)
+def test_ops_profiling_dummy_weights_and_owned_flags_refuse_before_a_server_starts(
+    tmp_path, monkeypatch, ours, atoms, refusal
+):
+    """`serve` makes the out directory before its GPU checks and its server,
+    which exits at once here, so a refusal that regresses cannot hang."""
+    monkeypatch.setattr(serve, "SERVER", (sys.executable, "-c", "pass"))
+    out = tmp_path / "out"
+    argv = ["record", "--gpu", "7", "--out", str(out), *ours, "--", "--model", "m"]
+
+    with pytest.raises(SystemExit, match=f"^compass record: {re.escape(refusal)}"):
+        cli.main([*argv, *atoms])
+    assert not out.exists()
+
+
+@pytest.mark.parametrize(
+    "atoms",
+    [
+        ["-dp", "2"],
+        ["--enable-dp-attention", "-tp", "2"],
+        ["--pipeline-parallel-size=2"],
+    ],
+)
+def test_a_dp_or_pipeline_trace_run_refuses_before_a_server_starts(
+    tmp_path, monkeypatch, atoms
+):
+    monkeypatch.setattr(serve, "SERVER", (sys.executable, "-c", "pass"))
+    out = tmp_path / "out"
+    argv = ["record", "--gpu", "7", "--out", str(out), "--trace", "--", "--model", "m"]
+
+    with pytest.raises(SystemExit, match="^compass record: --trace reduces each TP"):
+        cli.main([*argv, *atoms])
+    assert not out.exists()
+
+
+@pytest.fixture
+def planted_gpu(tmp_path, monkeypatch):
+    """The planted server, `rocm-smi` listing GPU 7 free, `rocminfo`, a
+    ``preflight.sh`` that passes, the checkouts and the model whose config.json
+    run.json digests; returns the model. The real ``preflight.sh``'s census
+    reads this host's load and can refuse on it."""
+    steps = recorded(tmp_path / "planted", monkeypatch, key=HOST)
+    monkeypatch.setenv("PLANTED_RECORD", str(steps))
+    (tmp_path / "server.py").write_text(PLANTED)
+    monkeypatch.setattr(serve, "SERVER", (sys.executable, str(tmp_path / "server.py")))
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    # The planted rocm-smi's GPUs, whatever ROCm mask the session runs under.
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    (bindir / "listing").write_text(FREE)
+    (bindir / "cards.json").write_text(json.dumps({"card7": CARD}))
+    (bindir / "showhw").write_text(SHOWHW)
+    (bindir / "rocm-smi").write_text(
+        f'#!/bin/sh\ncase "$*" in *--showproductname*|*--showbus*) cat {bindir}/cards.json;;\n'
+        f"*--showpids*) cat {bindir}/listing;;\n"
+        f"*--showhw*) cat {bindir}/showhw;;\nesac\n"
+    )
+    (bindir / "rocminfo").write_text("#!/bin/sh\nexit 0\n")
+    for tool in ("rocm-smi", "rocminfo"):
+        (bindir / tool).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    (bindir / "preflight.sh").write_text("echo PREFLIGHT_RC=0\n")
+    monkeypatch.setattr(gpu, "PREFLIGHT", bindir / "preflight.sh")
+    trees = {
+        m: _checkout(tmp_path / m, tag) for m, tag in (("atom", None), ("aiter", "v0"))
+    }
+    monkeypatch.setattr(identity, "module_root", lambda module: str(trees[module]))
+    monkeypatch.setattr(identity, "PCI", str(tmp_path / "pci"))
+    (tmp_path / "rocm" / ".info").mkdir(parents=True)
+    (tmp_path / "rocm" / ".info" / "version").write_text("7.2.4\n")
+    monkeypatch.setenv("ROCM_PATH", str(tmp_path / "rocm"))
+    # The record names what any process writes to aiter's, FlyDSL's, Inductor's
+    # and Triton's caches while it serves: the test's own, not the ones its box
+    # shares. FlyDSL's is set beside aiter's own: importing the installed aiter
+    # points FLYDSL_RUNTIME_CACHE_DIR at its jit/flydsl_cache for the rest of
+    # the process.
+    _aiter(tmp_path / "box", monkeypatch)
+    for var in (
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TRITON_CACHE_DIR",
+        "FLYDSL_RUNTIME_CACHE_DIR",
+    ):
+        monkeypatch.setenv(var, str(tmp_path / var.lower()))
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_text('{"hidden_size": 8}')
+    return tmp_path / "model"
+
+
+@pytest.mark.skipif(GIT is None, reason="needs git")
+def test_a_record_s_out_directory_loads_through_the_fit_s_loader(tmp_path, planted_gpu):
+    out = tmp_path / "out"
+    cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
+
+    assert sorted(p.name for p in out.iterdir()) == [
+        *("gpu_after.txt", "gpu_before.txt", "preflight_after.txt"),
+        *("preflight_before.txt", "run.json", "server.json", "server.log", "steps"),
+    ]
+    assert sorted(p.name for p in (out / "steps").iterdir()) == [
+        *("dp0.cost.jsonl", "dp0.engine.json", "dp0.jsonl", "dp0.key.json")
+    ]
+    run = json.loads((out / "run.json").read_text())
+    assert run.keys() == {
+        *("format_version", "argv", "source", "host_key", "device", "ptl", "stack"),
+        *("profiled", "env", "engine"),
+    }
+    assert (run["profiled"], run["engine"]) == (False, ENGINE)
+    samples, config = load({out: RUNS})
+    steps = _lines(out / "steps/dp0.jsonl")
+    assert len(samples) == sum(not s["is_dummy_run"] for s in steps)
+    aiter = _git(tmp_path / "aiter", "rev-parse", "--short=9", "HEAD")
+    engine = config["engine_config"]
+    assert (
+        config["device"],
+        engine["tensor_parallel_size"],
+        engine["data_parallel_size"],
+        config["stack"]["aiter"],
+    ) == ("MI308X gfx942", 1, 1, aiter)
+
+
+#: Put before the planted server: the values its environment holds for Triton's
+#: autotune cache and its directory, written where ``PLANTED_SEEN`` points.
+SEES = """\
+import os
+seen = repr([os.environ.get(k) for k in ("TRITON_CACHE_AUTOTUNING", "TRITON_CACHE_DIR")])
+open(os.environ["PLANTED_SEEN"], "w").write(seen)
+"""
+
+
+@pytest.mark.skipif(GIT is None, reason="needs git")
+@pytest.mark.parametrize("caller", [(None, None), ("0", "/caller/cache")])
+def test_a_record_s_server_keeps_triton_s_autotune_choices_unless_the_caller_says(
+    tmp_path, planted_gpu, monkeypatch, caller
+):
+    """The named result: the server's environment holds
+    TRITON_CACHE_AUTOTUNING=1 and the TRITON_CACHE_DIR Triton resolves, or the
+    caller's values, which run.json states."""
+    server = tmp_path / "server.py"
+    server.write_text(SEES + server.read_text())
+    monkeypatch.setenv("PLANTED_SEEN", str(tmp_path / "seen"))
+    monkeypatch.setenv("TRITON_HOME", str(tmp_path / "home"))
+    names = ("TRITON_CACHE_AUTOTUNING", "TRITON_CACHE_DIR")
+    for name, value in zip(names, caller):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    held = ["1", str(tmp_path / "home" / ".triton" / "cache")]
+    held = [c or h for c, h in zip(caller, held)]
+    out = tmp_path / "out"
+    cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
+
+    assert (tmp_path / "seen").read_text() == repr(held)
+    run = json.loads((out / "run.json").read_text())
+    assert run["env"] == dict(zip(names, held)) | {WRITE_THROUGH: "0"}
+    assert [os.environ.get(name) for name in names] == list(caller)
+
+
+@pytest.mark.skipif(GIT is None, reason="needs git")
+def test_a_record_binds_the_host_it_names_which_its_url_names(tmp_path, planted_gpu):
+    """A server bound only to the host its arguments name answers `/health`."""
+    server = tmp_path / "server.py"
+    host = 'sys.argv[sys.argv.index("--host") + 1]'
+    # Unasked for 10 s, the server exits, so one bound elsewhere fails `serve`.
+    timeout = "import http.server\nhttp.server.HTTPServer.timeout = 10\n"
+    server.write_text(timeout + server.read_text().replace('"127.0.0.1"', host))
+    out = tmp_path / "out"
+
+    cli.main(
+        f"record --gpu 7 --host 127.0.0.2 --out {out} -- --model {planted_gpu}".split()
+    )
+
+    url = json.loads((out / serve.READY_FILE).read_text())["url"]
+    assert url.startswith("http://127.0.0.2:")
+
+
+#: Put around the planted server: a module its start builds, written a second
+#: before it answers ``/health``, and those it builds once its ``server.json``
+#: is written, while it serves; each a path ``PLANTED_START`` or
+#: ``PLANTED_BUILT`` names.
+BUILDS = """\
+import os, pathlib, time
+def build(path):
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+    return path
+start = build(os.environ["PLANTED_START"])
+earlier = start.stat().st_mtime_ns - 10**9
+os.utime(start, ns=(earlier, earlier))
+"""
+SERVING = """
+ready = pathlib.Path(os.environ["ATOM_COMPASS_PARITY_RECORD"]).parent / "server.json"
+for _ in range(600):
+    if ready.exists():
+        break
+    time.sleep(0.05)
+for path in os.environ["PLANTED_BUILT"].split(os.pathsep):
+    build(path)
+"""
+
+
+@pytest.mark.skipif(GIT is None, reason="needs git")
+def test_a_record_names_each_aiter_module_its_server_built_while_it_served(
+    tmp_path, planted_gpu, monkeypatch
+):
+    """Of the installed aiter's JIT directory and of ``AITER_ROOT_DIR``'s, a
+    build cut short included; not a module the image held, nor one its start
+    built."""
+    jit = _aiter(tmp_path, monkeypatch)
+    root = tmp_path / "aiter_root"
+    monkeypatch.setenv("AITER_ROOT_DIR", str(root))
+    built = [
+        *(jit / "build" / "mha_x" / "build" / "mha_x.so", jit / "mha_x.so"),
+        *(jit / "build" / "mha_y" / "blob.staging" / "kernel.cpp",),
+        *(root / "build" / "pa_x" / "lib.so",),
+    ]
+    monkeypatch.setenv("PLANTED_START", str(root / "build" / "pa_ps_x" / "lib.so"))
+    monkeypatch.setenv("PLANTED_BUILT", os.pathsep.join(map(str, built)))
+    server = tmp_path / "server.py"
+    server.write_text(BUILDS + server.read_text() + SERVING)
+    out = tmp_path / "out"
+    cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
+
+    run = json.loads((out / "run.json").read_text())
+    assert run[aiter_jit.BUILDS] == ["mha_x", "mha_y", "pa_x"]
+
+
+@pytest.mark.skipif(GIT is None, reason="needs git")
+@pytest.mark.parametrize(
+    "written, names",
+    [
+        (
+            "inductor/triton/0/K3/triton_poi_fused_add_0.hsaco",
+            ["triton_poi_fused_add_0"],
+        ),
+        ("triton/K4/__grp___pa_decode.json", ["_pa_decode"]),
+        (
+            "home/.cache/atom/torch_compile_cache/c/rank_0/triton_cache/K5/_fwd.hsaco",
+            [],
+        ),
+        ("site/aiter/jit/flydsl_cache/launch_gemm1_c5/01b8.pkl", ["launch_gemm1_c5"]),
+        ("aiter_root/build/gfx942/pa_decode_16_1.hsaco", ["pa_decode_16_1"]),
+    ],
+    ids=["inductor", "triton", "atom", "flydsl", "hsaco"],
+)
+def test_a_record_names_each_compile_its_server_ran_while_it_served(
+    tmp_path, planted_gpu, monkeypatch, written, names
+):
+    """In Inductor's cache, Triton's, FlyDSL's under the installed aiter's JIT
+    directory, and `compile_hsaco`'s under ``AITER_ROOT_DIR``'s build
+    directory, named by its kernel or file; the record is refused naming it.
+    Not one in ATOM's compile cache, a directory every start derives afresh."""
+    _aiter(tmp_path, monkeypatch)
+    for var, root in (
+        ("AITER_ROOT_DIR", "aiter_root"),
+        ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+        ("TRITON_CACHE_DIR", "triton"),
+    ):
+        monkeypatch.setenv(var, str(tmp_path / root))
+    monkeypatch.delenv("FLYDSL_RUNTIME_CACHE_DIR", raising=False)
+    monkeypatch.setenv("PLANTED_START", str(tmp_path / "start" / "inert"))
+    monkeypatch.setenv("PLANTED_BUILT", str(tmp_path / written))
+    server = tmp_path / "server.py"
+    server.write_text(BUILDS + server.read_text() + SERVING)
+    out = tmp_path / "out"
+    cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
+
+    run = json.loads((out / "run.json").read_text())
+    assert run.get(aiter_jit.BUILDS, []) == names
+    if names:
+        assert f"JIT compile of {names}" in aiter_jit.refusal(run)
+
+
+#: Put after the planted server: once `compass record` has read its card's PTL
+#: state while it serves (``PLANTED_READ``), PTL is disabled on that card by a
+#: file renamed over ``ptl_enable``, so no reading finds it empty, as on sysfs.
+FLIPS = """
+import os, pathlib, time
+for _ in range(600):
+    if os.path.exists(os.environ["PLANTED_READ"]):
+        break
+    time.sleep(0.05)
+staged = pathlib.Path(os.environ["PLANTED_PTL"] + ".new")
+staged.write_text("disabled\\n")
+staged.replace(os.environ["PLANTED_PTL"])
+"""
+
+
+@pytest.mark.skipif(GIT is None, reason="needs git")
+def test_a_record_whose_card_flips_ptl_while_it_serves_is_refused_by_both_fits(
+    tmp_path, planted_gpu, monkeypatch
+):
+    """The named result: run.json names the change, and both fits refuse it."""
+    enable = tmp_path / "pci" / CARD["PCI Bus"].lower() / "ptl" / "ptl_enable"
+    enable.parent.mkdir(parents=True)
+    enable.write_text("enabled\n")
+    monkeypatch.setenv("PLANTED_PTL", str(enable))
+    monkeypatch.setenv("PLANTED_READ", str(tmp_path / "read"))
+    monkeypatch.setattr(identity, "PTL_POLL_S", 0.01)
+    read_marked(monkeypatch, tmp_path / "read")
+    server = tmp_path / "server.py"
+    server.write_text(server.read_text() + FLIPS)
+    out = tmp_path / "record"
+    cli.main(f"record --gpu 7 --out {out} -- --model {planted_gpu}".split())
+
+    run = json.loads((out / "run.json").read_text())
+    [change] = run[identity.PTL_CHANGES]
+    assert (change["from"], change["to"], run["ptl"]) == (
+        "enabled",
+        "disabled",
+        "disabled",
+    )
+    clients = []
+    for k, requests in enumerate(RUNS):
+        export = tmp_path / f"client{k}.json"
+        export.write_text(json.dumps({"requests": requests}))
+        clients += ["--client-run", out, export]
+    for command in ("fit steps", "fit host"):
+        backend = ["--backend", "step-linear"] if command == "fit steps" else []
+        with pytest.raises(SystemExit) as refused:
+            fit(tmp_path, command, *backend, out, *clients)
+        assert str(refused.value) == (
+            f"compass {command}: {out} is not fitted: its cards' PTL state changed "
+            f"while it served, enabled to disabled at {change['at']}"
+        )

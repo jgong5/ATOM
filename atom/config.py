@@ -12,6 +12,7 @@ import re
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
@@ -1410,8 +1411,9 @@ class SpeculativeConfig:
     # (accepted_draft / total_draft), i.e. (length - 1) / num_speculative_tokens.
     synthetic_acceptance_rate: float | None = None
     # Resolved per-position *unconditional* acceptance rates (entry i = marginal
-    # probability that the first i+1 draft tokens are all accepted), filled in by
-    # __post_init__. None => real draft/target rejection sampling.
+    # probability that the first i+1 draft tokens are all accepted), given by
+    # --spec-decode-acceptance-rates or filled in by __post_init__ from a scalar.
+    # None => real draft/target rejection sampling.
     synthetic_acceptance_rates: list[float] | None = None
     # The draft's KV dtype as the user asked for it (--spec-decode-kv-cache-dtype):
     # None = not asked, else "bf16" / "fp8". Never rewritten; the dtype the draft
@@ -1490,15 +1492,10 @@ class SpeculativeConfig:
     def _resolve_synthetic_acceptance(self) -> None:
         """Validate the forced-acceptance knobs and resolve to per-position rates.
 
-        Both knobs describe the same curve, so exactly one may be set; the rate
+        The knobs describe the same curve, so at most one may be set; the rate
         form is converted to a length and everything downstream reads only
         ``synthetic_acceptance_rates``.
         """
-        # Local import: the schedule lives next to the kernel that consumes it,
-        # and that module pulls in triton, which has no business loading just
-        # because someone imported a config.
-        from atom.model_ops.rejection_sampler import acceptance_length_to_rates
-
         if (
             self.synthetic_acceptance_length is not None
             and self.synthetic_acceptance_rate is not None
@@ -1508,7 +1505,16 @@ class SpeculativeConfig:
                 "describe the same curve; set at most one."
             )
         length = self.synthetic_acceptance_length
-        if self.synthetic_acceptance_rate is None and length is None:
+        rates = self.synthetic_acceptance_rates
+        if rates is not None and (
+            length is not None or self.synthetic_acceptance_rate is not None
+        ):
+            raise ValueError(
+                "--spec-decode-acceptance-rates and the scalar "
+                "--spec-decode-acceptance-length / -rate describe the same curve; "
+                "set at most one."
+            )
+        if self.synthetic_acceptance_rate is None and length is None and rates is None:
             return
 
         n = self.num_speculative_tokens
@@ -1517,7 +1523,22 @@ class SpeculativeConfig:
                 "Forced speculative acceptance needs --num-speculative-tokens, "
                 f"but it is {n!r}."
             )
-        if self.synthetic_acceptance_rate is not None:
+        if rates is not None:
+            if len(rates) != n:
+                raise ValueError(
+                    f"--spec-decode-acceptance-rates needs {n} rates, one per "
+                    f"speculative position, but got {len(rates)}: {rates}."
+                )
+            if not all(0.0 <= r <= 1.0 for r in rates):
+                raise ValueError(
+                    f"--spec-decode-acceptance-rates must be in [0, 1], got {rates}."
+                )
+            if any(b > a for a, b in pairwise(rates)):
+                raise ValueError(
+                    f"--spec-decode-acceptance-rates must be non-increasing, got {rates}."
+                )
+            length = 1.0 + sum(rates)
+        elif self.synthetic_acceptance_rate is not None:
             rate = self.synthetic_acceptance_rate
             if not 0.0 <= rate <= 1.0:
                 raise ValueError(
@@ -1531,8 +1552,14 @@ class SpeculativeConfig:
                 f"must be in [1, {n + 1}] for num_speculative_tokens={n}, but got "
                 f"{length}."
             )
-        self.synthetic_acceptance_length = length
-        self.synthetic_acceptance_rates = acceptance_length_to_rates(length, n)
+        if rates is None:
+            # Local import: the schedule lives next to the kernel that consumes
+            # it, and that module pulls in triton and aiter, which a config (or
+            # a given list) has no need to load.
+            from atom.model_ops.rejection_sampler import acceptance_length_to_rates
+
+            self.synthetic_acceptance_length = length
+            self.synthetic_acceptance_rates = acceptance_length_to_rates(length, n)
         logger.info(
             "Forced speculative acceptance ON: mean acceptance length %.4f over "
             "%d draft positions (per-position rates %s). Throughput numbers from "
@@ -2888,7 +2915,7 @@ class Config:
         ):
             raise ValueError(
                 "Forced speculative acceptance (--spec-decode-acceptance-length "
-                "/ --spec-decode-acceptance-rate) cannot be combined with the "
+                "/ -rate / -rates) cannot be combined with the "
                 "DSpark confidence scheduler (--dspark-config "
                 "'{\"confidence_schedule\": true}'): it sizes each request's "
                 "verify length at runtime, and a short one caps acceptance below "
@@ -2906,6 +2933,15 @@ class Config:
         ):
             self.runner_qualname = (
                 "atom.model_engine.model_runner.RapidServeModelRunner"
+            )
+        if self.enable_rapidserve and self.runner_qualname not in RAPIDSERVE_RUNNERS:
+            raise ValueError(
+                f"enable_rapidserve=True with runner_qualname="
+                f"{self.runner_qualname!r}: the RapidServe engine cores call "
+                f"{', '.join(RAPIDSERVE_RPCS)} on the runner and wait for each "
+                "reply, and only RapidServeModelRunner defines them. Leave "
+                "runner_qualname at its default, or name a RapidServeModelRunner "
+                "subclass listed in atom.config.RAPIDSERVE_RUNNERS."
             )
 
         assert 1 <= self.tensor_parallel_size <= 8
@@ -3884,6 +3920,31 @@ class Config:
             str(factors).encode(), usedforsecurity=False
         ).hexdigest()[:10]
         return hash_str
+
+
+# The RPCs that `enable_rapidserve`'s engine cores (PrefillEngineCore and
+# DecodeEngineCore) call on the runner and wait on. Only RapidServeModelRunner
+# defines them; a runner that lacks one leaves its caller blocked forever.
+RAPIDSERVE_RPCS = (
+    "export_model_weight_ipc_handles",
+    "import_model_weight_ipc_handles",
+    "create_prefill_stream_pool",
+    "export_kv_cache_ipc_handle",
+    "import_kv_cache_ipc_handle",
+    "create_decode_stream_pool",
+    "prefill_forward",
+)
+# Runners accepted under `enable_rapidserve`, by qualname. Compared as strings
+# because importing a runner module initialises the GPU runtime and loads
+# AITER, and on a host with no driver the import raises. A subclass of
+# RapidServeModelRunner is accepted once its qualname is added here.
+RAPIDSERVE_RUNNERS = frozenset(
+    {
+        "atom.model_engine.model_runner.RapidServeModelRunner",
+        "atom.compass.runner.model_runner.CompassRapidServeModelRunner",
+        "atom.compass.drive.rapidserve_memory_runner.MemoryReadingRapidServeModelRunner",
+    }
+)
 
 
 def local_device_index(config: Config, rank: int) -> int:

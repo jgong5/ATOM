@@ -22,7 +22,6 @@ import contextlib
 import json
 import logging
 import os
-import time
 import uuid
 from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -42,6 +41,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
+from atom.compass import run as compass_run
+from atom.compass.carriers import tracestate_stamp
 from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
 from atom.kv_transfer.disaggregation.chunked_prefill import chunked_topology_supported
 from atom.kv_transfer.disaggregation.mooncake.endpoint import (
@@ -72,7 +73,8 @@ from atom.structured_output.validation import (
     validate_responses_output,
     validate_tool_calls,
 )
-from atom.utils import envs
+from atom.utils import clock, envs
+from atom.utils import time_shim as time
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
     arm_reclaim_watch,
@@ -3784,7 +3786,24 @@ def main():
         default=None,
         help="Path to JSONL file for logging all API requests and responses (debug)",
     )
+    parser.add_argument(
+        "--compass-run",
+        type=str,
+        default=None,
+        help=f"Compass run file: serve a simulated run (sets {compass_run.ENV})",
+    )
+    parser.add_argument(
+        "--compass-clock-endpoint",
+        type=str,
+        default=None,
+        help="tcp://host:port of a standalone Compass clock authority; absent, "
+        f"this server co-hosts it (sets {compass_run.CLOCK_ENV})",
+    )
     args = parser.parse_args()
+    if args.compass_run:
+        os.environ[compass_run.ENV] = args.compass_run
+    if args.compass_clock_endpoint:
+        os.environ[compass_run.CLOCK_ENV] = args.compass_clock_endpoint
     if args.api_server_count < 1:
         parser.error("--api-server-count must be at least 1")
     if envs.ATOM_PRELOAD == "daemon":
@@ -3823,6 +3842,9 @@ def main():
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
     _setup_stream_dispatch(args)
+    # After the probe: its decodes are startup work, not served traffic, so
+    # they are not charged to a simulated run's clock.
+    compass_run.tokenizer(tokenizer, engine.config)
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
     # their chunks into a thread-local; the engine core manager's output thread
@@ -3939,6 +3961,7 @@ def _setup_stream_dispatch(args) -> None:
         if (
             args.spec_decode_acceptance_length is not None
             or args.spec_decode_acceptance_rate is not None
+            or args.spec_decode_acceptance_rates is not None
         )
         else None
     )
@@ -3948,7 +3971,7 @@ def _setup_stream_dispatch(args) -> None:
             "delivered as %r instead of its decoded text. Token counts, timings "
             "and throughput are unaffected; the text was already meaningless. "
             "Unset --spec-decode-acceptance-length / --spec-decode-acceptance-rate "
-            "to read the model's own output again.",
+            "/ --spec-decode-acceptance-rates to read the model's own output again.",
             SYNTHETIC_TOKEN_TEXT,
         )
     _stream_batch_dispatcher = StreamBatchDispatcher(
@@ -4062,6 +4085,9 @@ def _frontend_worker_main(args, config, info, parent_pid) -> None:
 
 
 def _loop_impl() -> str:
+    """uvicorn's ``loop``: on a simulated run, the loop that runs on the LP clock."""
+    if clock.installed() is not None:
+        return "atom.utils.compass_loop:CompassEventLoop"
     # uvloop replaces the stdlib asyncio selector loop with a libuv-backed one,
     # which is markedly faster at the SSE socket I/O (sock.send / selector
     # register-unregister) that saturates the event loop under high streaming
@@ -4116,12 +4142,29 @@ def _serve(args) -> None:
         f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
     )
     uvicorn.run(
-        app,
+        _served_app(),
         host=args.host,
         port=args.server_port,
         loop=loop_impl,
         access_log=not args.disable_uvicorn_access_log,
         timeout_keep_alive=args.timeout_keep_alive,
+    )
+    compass_run.frontend_done(engine)
+
+
+def _served_app():
+    """The ASGI app ``main`` serves: on a simulated run, behind `HttpChannel`."""
+    if clock.installed() is None:
+        return app
+    from atom.utils.compass_loop import HttpChannel
+
+    return HttpChannel(app, _tracestate_stamp)
+
+
+def _tracestate_stamp(scope) -> tuple[float, int] | None:
+    """A request's ``(arrival, seq)`` from all its ``tracestate`` header lines."""
+    return tracestate_stamp(
+        ",".join(v.decode("latin-1") for k, v in scope["headers"] if k == b"tracestate")
     )
 
 

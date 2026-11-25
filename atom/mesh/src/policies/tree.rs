@@ -11,6 +11,8 @@ use std::{
 use dashmap::{mapref::entry::Entry, DashMap};
 use tracing::debug;
 
+use crate::determinism::{self, PolicyHasher};
+
 type NodeRef = Arc<Node>;
 
 /// Shard counts for DashMaps to balance concurrency vs allocation overhead.
@@ -34,8 +36,8 @@ fn new_children_map() -> DashMap<char, NodeRef, CharHasherBuilder> {
 
 /// Create a tenant access time DashMap for non-root nodes
 #[inline]
-fn new_tenant_map() -> DashMap<TenantId, u64> {
-    DashMap::with_shard_amount(NODE_SHARD_COUNT)
+fn new_tenant_map() -> DashMap<TenantId, u64, PolicyHasher> {
+    DashMap::with_hasher_and_shard_amount(determinism::hasher(), NODE_SHARD_COUNT)
 }
 
 /// Interned tenant ID to avoid repeated string allocations.
@@ -258,7 +260,7 @@ struct Node {
     /// Node text with cached character count
     text: RwLock<NodeText>,
     /// Per-tenant last access epoch for LRU ordering. Using TenantId (Arc<str>) for cheap cloning.
-    tenant_last_access_time: DashMap<TenantId, u64>,
+    tenant_last_access_time: DashMap<TenantId, u64, PolicyHasher>,
     /// Parent pointer for upward traversal during timestamp updates
     parent: RwLock<Option<NodeRef>>,
     /// The holder with the newest timestamp above 0, so a match need not scan holders
@@ -416,7 +418,10 @@ impl Tree {
                     ROOT_SHARD_COUNT,
                 ),
                 text: RwLock::new(NodeText::empty()),
-                tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
+                tenant_last_access_time: DashMap::with_hasher_and_shard_amount(
+                    determinism::hasher(),
+                    ROOT_SHARD_COUNT,
+                ),
                 parent: RwLock::new(None),
                 newest: parking_lot::RwLock::new(None),
             }),

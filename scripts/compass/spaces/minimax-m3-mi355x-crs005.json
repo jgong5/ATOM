@@ -1,0 +1,113 @@
+{
+  "model": "/shared_nfs/huggingface_models/amd/MiniMax-M3-MXFP4",
+  "machine": {
+    "device": "mi355x",
+    "ptl": "disabled"
+  },
+  "store": "/shared_nfs/xingjche/compass/store",
+  "commit": "ac272852e1e6eae126849b1f1dac2bf0372714e8",
+  "workload": {
+    "traces": "/shared_nfs/huggingface_models/datasets--semianalysisai--cc-traces-weka-062126/snapshots/23f152f6f0f9399a85901b89a6458def0ef16729/traces.jsonl",
+    "select": "agentx",
+    "concurrency": [1, 2, 4, 5, 8, 10, 12, 15, 20, 24, 25, 28, 30, 40, 48]
+  },
+  "slo": {
+    "min_interactivity_p90": 30,
+    "max_ttft_p90_s": 5
+  },
+  "common": {
+    "args": {
+      "--trust-remote-code": true,
+      "--kv_cache_dtype": "fp8",
+      "--block-size": 128,
+      "--max-num-batched-tokens": 32768,
+      "--gpu-memory-utilization": 0.95,
+      "--cudagraph-capture-sizes": "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,20,22,24,26,28,30,32,34,36,40,48,56,64]",
+      "--index-cache-dtype": "fp8",
+      "--online_quant_config": "{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"vision_tower\",\"multi_modal_projector\",\"patch_merge_mlp\",\"*block_sparse_moe\"]}",
+      "--default-chat-template-kwargs": "{\"thinking_mode\":\"enabled\"}",
+      "--method": "eagle3",
+      "--draft-model": "/shared_nfs/huggingface_models/Inferact/MiniMax-M3-EAGLE3-GQA",
+      "--num-speculative-tokens": 3,
+      "--spec-decode-acceptance-length": 2.78
+    },
+    "per_concurrency": {
+      "--max-num-seqs": 2
+    },
+    "env": {
+      "PYTHONNOUSERSITE": "1",
+      "AITER_LOG_LEVEL": "WARNING",
+      "AITER_SITUV2_A4W4": "1",
+      "AITER_QUICK_REDUCE_QUANTIZATION": "INT4",
+      "AITER_FLYDSL_STAGE2_FP8": "1",
+      "ATOM_FORCE_ATTN_TRITON": "1",
+      "ATOM_PA_FLYDSL": "1",
+      "ATOM_PA_FLYDSL_PLAN": "1"
+    },
+    "departures": {
+      "--model": "the checkpoint's directory on crsuse2-m2m-v3-005 and -013, not the Hugging Face id amd/MiniMax-M3-MXFP4: its revision b83d14e3, the submission's",
+      "--draft-model": "the draft's directory on crsuse2-m2m-v3-005 and -013, not the Hugging Face id Inferact/MiniMax-M3-EAGLE3-GQA: its revision 96692486, the submission's",
+      "--served-model-name": "unset: ATOM then serves the model under its --model, as the submission's name is its --model"
+    }
+  },
+  "dimensions": {
+    "arm": {
+      "TP4": {
+        "basis": "InferenceX 4b94f096 minimaxm3/atom/mi355x-fp4-mtp/agentic.yaml, as run 37598205362 ran it; arm TP4: its points at 1, 2, 4, 5, 8, 10 and 12",
+        "args": {
+          "--tensor-parallel-size": 4
+        }
+      },
+      "TP4_indexer_CP": {
+        "basis": "InferenceX 4b94f096 minimaxm3/atom/mi355x-fp4-mtp/agentic.yaml, as run 37598205362 ran it; arm TP4, indexer CP: its points at 15, 20, 24 and 28",
+        "args": {
+          "--tensor-parallel-size": 4
+        },
+        "env": {
+          "ATOM_M3_INDEXER_CP": "1"
+        }
+      },
+      "TP2": {
+        "basis": "InferenceX 4b94f096 minimaxm3/atom/mi355x-fp4-mtp/agentic.yaml, as run 37598205362 ran it; arm TP2: its points at 1, 2 and 4",
+        "args": {
+          "--tensor-parallel-size": 2
+        }
+      },
+      "TP2_LMCache": {
+        "basis": "InferenceX 4b94f096 minimaxm3/atom/mi355x-fp4-mtp/agentic.yaml, as run 37598205362 ran it; arm TP2, LMCache: its points at 20, 25 and 30",
+        "args": {
+          "--tensor-parallel-size": 2,
+          "--kv-transfer-config": "{\"kv_connector\":\"lmcache_offload\",\"kv_role\":\"offload\"}"
+        },
+        "env": {
+          "PYTHONHASHSEED": "0",
+          "LMCACHE_LOCAL_CPU": "True",
+          "LMCACHE_MAX_LOCAL_CPU_SIZE": "257",
+          "LMCACHE_CHUNK_SIZE": "256",
+          "LMCACHE_CACHE_POLICY": "ATOM_SLRU",
+          "LMCACHE_LOOKUP_SERVER_WORKER_IDS": "0,1",
+          "ATOM_PREFIX_CACHE_POLICY": "slru",
+          "ATOM_PREFIX_CACHE_PROTECTED_RATIO": "0.5"
+        }
+      },
+      "TP4_indexer_CP_LMCache": {
+        "basis": "InferenceX 4b94f096 minimaxm3/atom/mi355x-fp4-mtp/agentic.yaml, as run 37598205362 ran it; arm TP4, indexer CP, LMCache: its points at 40 and 48",
+        "args": {
+          "--tensor-parallel-size": 4,
+          "--kv-transfer-config": "{\"kv_connector\":\"lmcache_offload\",\"kv_role\":\"offload\"}"
+        },
+        "env": {
+          "ATOM_M3_INDEXER_CP": "1",
+          "PYTHONHASHSEED": "0",
+          "LMCACHE_LOCAL_CPU": "True",
+          "LMCACHE_MAX_LOCAL_CPU_SIZE": "257",
+          "LMCACHE_CHUNK_SIZE": "256",
+          "LMCACHE_CACHE_POLICY": "ATOM_SLRU",
+          "LMCACHE_LOOKUP_SERVER_WORKER_IDS": "0,1,2,3",
+          "ATOM_PREFIX_CACHE_POLICY": "slru",
+          "ATOM_PREFIX_CACHE_PROTECTED_RATIO": "0.5"
+        }
+      }
+    }
+  }
+}

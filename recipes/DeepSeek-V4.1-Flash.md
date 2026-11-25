@@ -204,6 +204,18 @@ python3 -m atom.entrypoints.openai_server \
 `--max-num-seqs` counts per DP rank. If the image's mori loads only
 `libamd_smi.so.<N>`, point `MORI_AMD_SMI_PATH` at it.
 
+**MI455X A0 nodes only: DP attention needs `ATOM_ENGRAM_UVA=0`.** Under
+`--enable-dp-attention` each rank's attention runs at TP 1, so every rank needs
+the whole Engram table (183.1 GiB for V4.1-Flash). Held in HBM
+(`ATOM_ENGRAM_UVA_HBM=1`) it leaves no KV cache beside the rank's 82.7 GB of
+weights on a 288 GB card, and DEP4 runs out of memory in its warmup. The
+default shared page-locked host copy needs about 196 GB, which does not fit
+next to four ranks on an A0 node's 250 GB host. On those nodes, set
+`ATOM_ENGRAM_UVA=0` for DP attention: the rows are gathered on the host,
+which costs about 50 ms of CPU per decode step, so treat the results as a
+functional bring-up, not as performance. Hosts with enough memory, MI355X
+among them, keep the Engram defaults.
+
 Validation on MI455X, GSM8K 3-shot on the full test set (`lm_eval
 local-completions`, `num_concurrent=32`):
 

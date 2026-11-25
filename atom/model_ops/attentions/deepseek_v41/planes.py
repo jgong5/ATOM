@@ -227,22 +227,53 @@ def write_window_planes(values, scales, planes, step, window, dim, cached_until=
             scale[row].copy_(scales.flatten(0, -2)[t].view(torch.uint8))
         return
     if step.running_tokens:
-        _write_planes[(step.running_tokens,)](
-            values.view(torch.uint8),
-            scales.view(torch.uint8),
-            values.stride(-2),
-            scales.stride(-2),
+        _launch_write_planes(
+            values,
+            scales,
             data,
             scale,
             step.positions,
             step.batch_ids,
             step.cu_seqlens_q,
             step.slots,
+            window,
             cached_until,
-            cached_until is not None,
-            window.ring_slots,
-            dim,
+            dim=dim,
         )
+
+
+def _launch_write_planes(
+    values,
+    scales,
+    data,
+    scale,
+    positions,
+    batch_ids,
+    cu_seqlens_q,
+    slots,
+    window,
+    cached_until,
+    *,
+    dim,
+):
+    """`write_window_planes`' launch, from the step's fields it reads: no
+    `BatchStep`, whose per-request host state the kernel does not read."""
+    _write_planes[(positions.numel(),)](
+        values.view(torch.uint8),
+        scales.view(torch.uint8),
+        values.stride(-2),
+        scales.stride(-2),
+        data,
+        scale,
+        positions,
+        batch_ids,
+        cu_seqlens_q,
+        slots,
+        cached_until,
+        cached_until is not None,
+        window.ring_slots,
+        dim,
+    )
 
 
 @triton.jit(do_not_specialize=["B"])

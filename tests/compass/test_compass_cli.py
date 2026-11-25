@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: MIT
+"""The `compass` console script: its command table, its refusals and its entry.
+
+`fit steps` and `fit host` run through it in `test_fit_steps.py` and
+`test_fit_host.py`, and here on records that refuse; elsewhere a
+command's module is planted where one is needed.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import types
+from pathlib import Path
+
+import pytest
+import tomllib
+from test_fit_samples import edit
+from test_fit_steps import LINEAR, clients, record
+
+from atom.compass import cli
+from atom.compass.drive.gpu import GpuRefusal
+
+VERBS = [
+    "record",
+    "trace steps",
+    "trace ops",
+    "measure steps",
+    "measure ops",
+    "measure memory",
+    "fit steps",
+    "fit ops",
+    "fit host",
+    "fit ingress",
+    "run",
+]
+
+
+def test_the_console_script_is_cli_main():
+    pyproject = Path(__file__).parents[2] / "pyproject.toml"
+    scripts = tomllib.loads(pyproject.read_text())["project"]["scripts"]
+
+    assert scripts["compass"] == "atom.compass.cli:main"
+
+
+def test_help_lists_every_verb(capsys):
+    cli.main(["--help"])
+
+    out = capsys.readouterr().out
+    assert [v for v in VERBS if re.search(rf"^  {v} ", out, re.MULTILINE)] == VERBS
+
+
+def test_a_command_dispatches_its_arguments_and_its_refusals(monkeypatch):
+    got = []
+
+    def main(argv):
+        got.append(argv)
+        raise ValueError("planted refusal")
+
+    monkeypatch.setitem(sys.modules, "planted_fit", types.SimpleNamespace(main=main))
+    monkeypatch.setitem(cli.COMMANDS, "fit steps", ("planted_fit", ""))
+
+    with pytest.raises(SystemExit, match="^compass fit steps: planted refusal$"):
+        cli.main(["fit", "steps", "--backend", "x", "a"])
+    assert got == [["--backend", "x", "a"]]
+
+
+def test_a_gpu_refusal_exits_with_its_message(monkeypatch):
+    def main(argv):
+        raise GpuRefusal("GPU 7 has PID 9 on it before the run, so it was not started")
+
+    monkeypatch.setitem(
+        sys.modules, "planted_measure", types.SimpleNamespace(main=main)
+    )
+    monkeypatch.setitem(cli.COMMANDS, "measure steps", ("planted_measure", ""))
+
+    with pytest.raises(SystemExit, match="^compass measure steps: GPU 7 has PID 9 "):
+        cli.main(["measure", "steps"])
+
+
+def test_a_module_not_built_refuses_and_a_missing_dependency_does_not_read_as_one(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setitem(cli.COMMANDS, "run", ("atom.compass.no_such.run", ""))
+    with pytest.raises(SystemExit, match="^compass run: not built yet$"):
+        cli.main(["run", "--device", "d"])
+
+    (tmp_path / "planted_run.py").write_text("import planted_dependency\n")
+    monkeypatch.syspath_prepend(tmp_path)
+    monkeypatch.setitem(cli.COMMANDS, "run", ("planted_run", ""))
+    with pytest.raises(ModuleNotFoundError, match="planted_dependency"):
+        cli.main(["run"])
+
+
+@pytest.mark.parametrize(
+    "words, named",
+    [
+        (
+            "plan",
+            "compass measure steps --grid plans the step grid's points, and compass run --coverage",
+        ),
+        ("validate", "grading is python -m atom.compass.validate"),
+        ("measure collectives", "priced by compass measure ops"),
+        ("discover", "renamed compass trace steps"),
+        ("trace", "use compass trace steps or compass trace ops"),
+    ],
+)
+def test_a_deprecated_command_refuses_naming_where_its_work_went(words, named):
+    with pytest.raises(SystemExit, match=f"^compass {words}: .*{re.escape(named)}"):
+        cli.main([*words.split(), "--out", "d"])
+
+
+@pytest.mark.parametrize("words", ["validate", "validate bound", "validate project"])
+def test_validate_refuses_naming_both_python_m_checks_and_compass_project(words):
+    with pytest.raises(SystemExit) as refused:
+        cli.main([*words.split(), "--model", "m"])
+
+    assert refused.value.code == (
+        "compass validate: deprecated: grading is python -m atom.compass.validate, "
+        "the analytical bound check python -m atom.compass.validate.bound, and a "
+        "projection compass project"
+    )
+
+
+def test_project_is_a_command_and_the_bound_check_runs_by_python_m(
+    monkeypatch, tmp_path
+):
+    from atom.compass.validate import project
+
+    got = []
+    monkeypatch.setattr(project, "main", got.append)
+    cli.main(["project", "--model", "m", "rec"])
+    assert got == [["--model", "m", "rec"]]
+
+    spec = tmp_path / "spec.json"
+    bound = ["-m", "atom.compass.validate.bound", "--model", "m", "--device", spec]
+    bound += ["--ptl", "disabled"]
+    argv = [sys.executable, *map(str, bound), "--store", "s", "rec"]
+    done = subprocess.run(argv, capture_output=True, text=True, check=False)
+    assert done.returncode == 1 and "Traceback" not in done.stderr
+    assert done.stderr.splitlines()[-1] == (
+        "python -m atom.compass.validate.bound: "
+        f"[Errno 2] No such file or directory: '{spec}'"
+    )
+
+
+@pytest.mark.parametrize(
+    "argv", [[], ["fit"], ["measure", "everything"], ["explain"], ["probe"], ["spec"]]
+)
+def test_no_command_refuses_with_the_usage(argv):
+    with pytest.raises(SystemExit, match="usage: compass <command>"):
+        cli.main(argv)
+
+
+@pytest.mark.parametrize("verb, args", [("fit steps", LINEAR), ("fit host", ())])
+def test_a_refusal_exits_fit_with_its_message(tmp_path, verb, args):
+    a = record(tmp_path / "a", 19)
+    edit(a / "run.json", lambda r: r.pop("ptl"))
+
+    tail = ["--store", tmp_path / "store", "--out", tmp_path]
+    with pytest.raises(SystemExit) as exited:
+        cli.main([*verb.split(), *args, *map(str, [a, *clients(a), *tail])])
+    assert exited.value.code == (
+        f"compass {verb}: the records carry no PTL state; --ptl states their "
+        "cards' state"
+    )
+
+
+def test_a_malformed_record_exits_fit_with_its_traceback(tmp_path):
+    """Its message names no file, so it is not printed as a refusal."""
+    a = record(tmp_path / "a", 19)
+    (a / "run.json").write_text("{")
+
+    tail = ["--store", tmp_path / "store", "--out", tmp_path]
+    with pytest.raises(json.JSONDecodeError):
+        cli.main(["fit", "host", *map(str, [a, *clients(a), *tail])])
+
+
+LAUNCHER = Path(__file__).parents[2] / "scripts/compass/compass"
+
+
+def test_the_launcher_runs_its_own_tree_from_anywhere_it_is_linked(tmp_path):
+    shadow = tmp_path / "atom"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("raise ImportError('the shadow atom')\n")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin/compass").symlink_to(LAUNCHER)
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+
+    done = subprocess.run(
+        [tmp_path / "bin/compass", "--help"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.startswith("usage: compass <command>")
+
+
+def test_the_launcher_refuses_inside_another_tree(tmp_path):
+    other = tmp_path / "other"
+    (other / "scripts/compass").mkdir(parents=True)
+    (other / "scripts/compass/_lib.sh").write_text("")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin/compass").symlink_to(LAUNCHER)
+
+    done = subprocess.run(
+        [tmp_path / "bin/compass", "--help"],
+        cwd=other / "scripts",
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert done.returncode == 99, done.stderr
+    assert done.stdout == ""

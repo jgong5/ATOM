@@ -1,0 +1,348 @@
+# SPDX-License-Identifier: MIT
+"""`compass project`: real runs' steps priced on a device none of them ran on,
+at step and op level, published as a `projection`.
+
+    compass project --model M [--tp N] --device DEV --ptl PTL [--stack STACK]
+        --store S RECORD... [-- RECORD [ATOM args] ...]
+
+SPEC is the machine spec composed from DEV's datasheet and the readings S
+holds for it at PTL (`fit.device.compose`), assumed for a device never run. A cell
+is a real run's directory, its step record in `steps/`, and the ATOM
+arguments it ran under: after `--` in the command line its run.json holds,
+less the server's and `--model`, as `--model` names the model here; for a
+record whose run.json names none, or a `--draft-model`, those in its own
+`-- RECORD` group. Its steps are priced as `validate.bound` prices them,
+on SPEC, the op_graphs S holds for SPEC's arch; nothing is compared with the
+measured time, which is another device's. Each cell is priced in a process of
+its own, since a build declares one engine per process.
+
+The `projection` published in S states, per cell and granularity, the steps
+priced and refused by reason, the projected seconds per phase (under a
+drafter, the target's, its drafter's apart in `draft_s`), and the tokens a
+second over the steps priced; per granularity, the cells ranked by those
+tokens a second, its first (top-1) and first three (top-3); and each field of
+SPEC whose origin is `assumed` that a price read, with its value, and for an
+assumed arch the compute units and stepping its op_graphs were traced at.
+Each cell also states its projected seconds per phase by the roofline part that
+set them (`bound.gate`). Its `band` re-prices every cell at each carried value
+a price read times each of its factors, one at a time (`band`), and ranks the
+cells again.
+"""
+
+import argparse
+import datetime
+import hashlib
+import json
+import multiprocessing
+import os
+from pathlib import Path
+
+from atom.compass.artifacts import (
+    ArtifactStore,
+    Conditions,
+    GateState,
+    Key,
+    Kind,
+    Provenance,
+    Topology,
+    machine_platform,
+    member_name,
+    roots_for,
+)
+from atom.compass.backends.cost import fold_parts, fold_seconds
+from atom.compass.fit.device import BANDWIDTH, CURVE, compose
+from atom.compass.spec import MachineSpec
+
+from . import bound
+
+PROG = "compass project"
+FLOOR = "device.kernel_floor_s"
+
+
+class Reads:
+    """A machine spec that keeps the path of each field a price reads."""
+
+    def __init__(self, spec: MachineSpec):
+        self.spec, self.read = spec, set()
+
+    def value(self, path: str):
+        self.read.add(path)
+        return self.spec.value(path)
+
+    def __getattr__(self, name):
+        return getattr(self.spec, name)
+
+
+def cell(model: str, tp: int, machine: dict, store: str, record: str, atom_args):
+    """One cell priced at both granularities on the spec document `machine`:
+    its report per granularity, the model's identity, the engine config its
+    op graphs are keyed by (`capture.forward.graph_engine`), its step records'
+    digest and the spec fields its prices read."""
+    from atom.compass.capture.forward import graph_engine
+    from atom.compass.run import _file_digest
+
+    spec = Reads(MachineSpec.from_mapping(machine))
+    config, _, priced = bound.backends(model, tp, atom_args, spec, store, [record])
+    report = bound.gate(
+        [record], priced, config.enable_tbo, config.speculative_config is not None
+    )
+    steps = hashlib.sha256()
+    for path in sorted(Path(record, "steps").glob("dp*[0-9].jsonl")):
+        steps.update(path.read_bytes())
+    levels = {}
+    for level, r in report.items():
+        rate = r["ranking"] and r["ranking"]["tokens_per_s"][record]["analytical"]
+        held = ("steps", "steps_refused", "refused", "analytical_s", "by_bound")
+        levels[level] = {k: r[k] for k in (*held, "draft_s")} | {"tokens_per_s": rate}
+    return {
+        "model": _file_digest(config.model, "config.json"),
+        "engine": graph_engine(config),
+        "steps": f"sha256:{steps.hexdigest()}",
+        "levels": levels,
+        "read": sorted(spec.read),
+    }
+
+
+def _each(jobs: list) -> list:
+    """`cell` of each job, each in a process of its own, as many at once as
+    this process may use CPUs."""
+    spawn = multiprocessing.get_context("spawn")
+    width = max(1, min(len(jobs), len(os.sched_getaffinity(0))))
+    with spawn.Pool(width, maxtasksperchild=1) as pool:
+        return pool.starmap(cell, jobs, chunksize=1)
+
+
+def _ranked(cells: dict) -> dict:
+    """Per granularity, the cells by tokens a second, fastest first, and
+    their first (top-1) and first three (top-3)."""
+    ranking = {}
+    for level in ("step", "op"):
+        rates = {r: c["levels"][level]["tokens_per_s"] for r, (_, c) in cells.items()}
+        order = sorted((r for r, t in rates.items() if t), key=lambda r: -rates[r])
+        ranking[level] = {"order": order, "top_1": order[:1], "top_3": order[:3]}
+    return ranking
+
+
+def factors(path: str) -> tuple[float, ...]:
+    """The factors `band` re-prices the carried value at `path` at: a ratio (an
+    assumed derate, or the bandwidth curve over the datasheet bandwidth) and
+    the kernel floor at 0.8 and 1.2, a link latency also at 2 and 4, since a
+    switched fabric may sit further from the hop it was probed on; none for
+    another field."""
+    if path in (CURVE, FLOOR) or "derate" in path.split("."):
+        return (0.8, 1.2)
+    return (0.8, 1.2, 2, 4) if path.endswith(".link_latency_s") else ()
+
+
+def scaled(machine: MachineSpec, path: str, factor: float):
+    """`machine` with the value at `path` times `factor`, a ratio capped at 1,
+    the datasheet; for the bandwidth curve, each point's rate over the
+    datasheet bandwidth. Also whether the cap applied."""
+    values = dict(machine.values)
+    if path == CURVE:
+        top = machine.value(BANDWIDTH)
+        curve = [[size, rate * factor] for size, rate in machine.value(CURVE)]
+        capped = any(rate > top for _, rate in curve)
+        values[CURVE] = [[size, min(rate, top)] for size, rate in curve]
+    elif "derate" in path.split("."):
+        capped = machine.value(path) * factor > 1
+        values[path] = min(machine.value(path) * factor, 1.0)
+    else:
+        capped, values[path] = False, machine.value(path) * factor
+    return MachineSpec(values), capped
+
+
+def band(machine: MachineSpec, assumed: dict, jobs: list, base: dict) -> dict:
+    """Each carried value a price read at each of its `factors`, the others
+    held: per factor, whether the cap applied, the cells ranked, and per
+    granularity whether the order of `base`, the ranking at the carried
+    values, holds."""
+    specs = [(p, f, *scaled(machine, p, f)) for p in assumed for f in factors(p)]
+    results = iter(
+        _each([(*j[:2], s.echo(), *j[3:]) for _, _, s, _ in specs for j in jobs])
+    )
+    out = {}
+    for path, factor, _, capped in specs:
+        cells = {j[4]: (None, next(results)) for j in jobs}
+        ranking = _ranked(cells)
+        holds = {k: ranking[k]["order"] == base[k]["order"] for k in ranking}
+        out.setdefault(path, {})[str(factor)] = {
+            "capped": capped,
+            "ranking": ranking,
+            "order_holds": holds,
+            "tokens_per_s": {
+                k: {r: c["levels"][k]["tokens_per_s"] for r, (_, c) in cells.items()}
+                for k in ranking
+            },
+        }
+    return out
+
+
+def projection(machine: MachineSpec, cells: dict) -> dict:
+    """The document of `cells`, each a record to its ATOM arguments and its
+    `cell` result, priced on `machine`. An assumed arch also names the compute
+    units and stepping its op_graphs were traced at, which chose their kernels."""
+    from atom.compass.capture.driverless import DEVICES, REVISIONS
+
+    read = sorted(set().union(*(c["read"] for _, c in cells.values())))
+    assumed = {
+        p: machine.value(p) for p in read if machine.origin(p)["origin"] == "assumed"
+    }
+    if arch := assumed.get("device.arch"):
+        assumed["capture.compute_units"] = DEVICES[arch][0]
+        assumed["capture.revision"] = REVISIONS.get(arch, 0)
+    return {
+        "machine": {"name": machine.values["name"], "digest": machine.digest()},
+        "assumed": assumed,
+        "cells": {
+            r: {"atom_args": a, "engine": c["engine"], **c["levels"]}
+            for r, (a, c) in cells.items()
+        },
+        "ranking": _ranked(cells),
+    }
+
+
+def publish(store: str, document: dict, cells: dict, machine, command: str):
+    """Publish `document` in `store` as a `projection`, keyed by its model,
+    spec, ATOM source, cells and this process's torch."""
+    import torch
+
+    from atom.compass.run import atom_source, host_cpu, source_root
+
+    model = next(iter(cells.values()))[1]["model"]
+    roots = roots_for({"atom": "atom", "aiter": "aiter"})
+    engines = json.dumps([c["engine"] for _, c in cells.values()], sort_keys=True)
+    identity = json.dumps([[c["steps"], c["engine"]] for _, c in cells.values()])
+    key = Key.of(
+        Kind.PROJECTION,
+        model=model,
+        spec=machine.digest(),
+        source_root=source_root(),
+        cells=f"sha256:{hashlib.sha256(identity.encode()).hexdigest()}",
+        torch=torch.__version__,
+    )
+    rank = Topology().ranks()[0]
+    ArtifactStore(store).publish(
+        key,
+        provenance=Provenance(
+            command, datetime.datetime.now(datetime.timezone.utc).isoformat(), roots
+        ),
+        topology=Topology(),
+        conditions=Conditions.of(
+            **{**machine_platform(machine), "torch": torch.__version__},
+            atom_src=atom_source(),
+            model=model,
+            host_cpu=host_cpu(),
+            engine_config=engines,
+        ),
+        gates=GateState.of(),
+        members={
+            member_name("projection", rank, "json"): json.dumps(document).encode()
+        },
+    )
+    return key
+
+
+def text(document: dict) -> str:
+    assumed = ", ".join(document["assumed"]) or "none"
+    out = [
+        f"projection on {document['machine']['name']}; assumed fields read: {assumed}"
+    ]
+    for level, k in document["ranking"].items():
+        out.append(f"{level} level: top-1 {k['top_1']}, top-3 {k['top_3']}")
+        for record, c in document["cells"].items():
+            r = c[level]
+            rate = f"{r['tokens_per_s']:.0f}" if r["tokens_per_s"] else "-"
+            phases = "; ".join(
+                f"{p} {s['total']:.2f} s, median {s['median'] * 1e3:.3f} ms"
+                for p, s in r["analytical_s"].items()
+            )
+            out.append(
+                f"  {record}: {r['steps']} steps priced, {r['steps_refused']} "
+                f"refused, {rate} tokens/s; {phases}"
+            )
+            out += [f"    refused {n} steps: {why}" for why, n in r["refused"].items()]
+            out += [f"    drafter: {p} {t:.2f} s" for p, t in r["draft_s"].items()]
+            parts = fold_parts(r["by_bound"].values())
+            whole = fold_seconds(parts.values())
+            shares = ", ".join(
+                f"{k} {s / whole:.1%}" for k, s in parts.items() if whole
+            )
+            out.append(f"    seconds by bound: {shares or '-'}")
+    for path, at in document["band"].items():
+        for factor, b in at.items():
+            cap = ", capped at 1" if b["capped"] else ""
+            out.append(f"{path} x{factor}{cap}:")
+            for level, k in b["ranking"].items():
+                holds = "holds" if b["order_holds"][level] else "changes"
+                out.append(
+                    f"  {level} level: top-1 {k['top_1']}, top-3 {k['top_3']}; "
+                    f"the order {holds}"
+                )
+    for level, k in document["ranking"].items():
+        moved = [
+            f"{p} x{f}"
+            for p, at in document["band"].items()
+            for f, b in at.items()
+            if b["ranking"][level]["top_1"] != k["top_1"]
+        ]
+        out.append(f"{level} level: top-1 changed at {', '.join(moved) or 'none'}")
+    return "\n".join(out)
+
+
+def recorded(record: str) -> list[str]:
+    """ATOM's arguments after `--` in the command line `record`'s run.json
+    holds, less the server's and `--model`; refused when it names none, or a
+    `--draft-model`, another path on the host that ran it."""
+    from atom.compass.drive.runfile import engine_only
+
+    run = Path(record, "run.json")
+    argv = json.loads(run.read_text()).get("argv", []) if run.exists() else []
+    why = "names no ATOM arguments after -- in its argv"
+    if "--" in argv:
+        paths = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+        paths.add_argument("--model")
+        paths.add_argument("--draft-model", "--draft_model")
+        named, rest = paths.parse_known_args(engine_only(argv[argv.index("--") + 1 :]))
+        if named.draft_model is None:
+            return rest
+        why = "names --draft-model, a path on the host that ran it"
+    raise ValueError(f"{run} {why}; name the record as -- {record} [ATOM args]")
+
+
+def main(argv: list[str]) -> None:
+    cuts = [i for i, word in enumerate(argv) if word == "--"]
+    p = argparse.ArgumentParser(prog=PROG, description=__doc__)
+    p.add_argument(
+        "records",
+        nargs="*",
+        metavar="RECORD",
+        help="a real run's directory, whose run.json names its ATOM arguments",
+    )
+    p.add_argument("--model", required=True, help="a model name or directory")
+    p.add_argument("--tp", type=int, default=1, help="tensor-parallel width")
+    p.add_argument("--device", required=True, help="the datasheet, SKU or path")
+    p.add_argument("--ptl", required=True, choices=("enabled", "disabled"))
+    p.add_argument("--stack", help="the readings' stack and torch, of several")
+    p.add_argument(
+        "--store",
+        required=True,
+        help="the artifact store: op_graphs and readings in, projection out",
+    )
+    args = p.parse_args(argv[: cuts[0] if cuts else len(argv)])
+    groups = [argv[i + 1 : j] for i, j in zip(cuts, [*cuts[1:], len(argv)])]
+    if not all(groups) or not (args.records or groups):
+        p.error("name each cell: RECORD, or -- RECORD [ATOM args]")
+    groups = [[r, *recorded(r)] for r in args.records] + groups
+    echo = compose(args.device, ArtifactStore(args.store), args.ptl, args.stack).echo()
+    jobs = [(args.model, args.tp, echo, args.store, g[0], g[1:]) for g in groups]
+    results = _each(jobs)
+    cells = {g[0]: (g[1:], c) for g, c in zip(groups, results)}
+    if len({c["model"] for _, c in cells.values()}) > 1:
+        raise ValueError("the cells ran different models; a projection ranks one")
+    machine = MachineSpec.from_mapping(echo)
+    document = projection(machine, cells)
+    document["band"] = band(machine, document["assumed"], jobs, document["ranking"])
+    print(text(document))
+    key = publish(args.store, document, cells, machine, " ".join([PROG, *argv]))
+    print(f"published {key} as {key.token()}")

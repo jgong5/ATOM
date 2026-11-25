@@ -1,0 +1,941 @@
+# SPDX-License-Identifier: MIT
+"""`compass fit steps --backend step-grid`, run through `cli.main`, its bundle
+loaded by `run/step_grid.py::load` and priced by `StepGridBackend`.
+
+The grid is planned over one record whose steps hold every node batch of
+`DEFINITION`'s grid for `BOUNDS` and rung 8: decode at B 1 and 8 and c 0, 512
+and 1023, and prefill, producing output or not, at B 1 and 8, T 16 and 256 and
+c 0 and 768. So the plan is those 22 points, each measured at `time` of its
+node, which is linear in each coordinate, so a cell's interpolation reproduces
+it. Every target is timed at that lookup times `factor`, 1.25 at a node. The
+record and the measurements are taken on `test_run_step_grid.py`'s deployment
+at `BOUNDS`, under the readings a run of it takes.
+"""
+
+import itertools
+import json
+import math
+import re
+import statistics
+import sys
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+from test_artifact_invalidation import moved
+from test_artifact_store import stanza
+from test_backend_step_grid import past_pool_alpha
+from test_backend_step_grid import view as rows_view
+from test_backend_step_linear_fit import _record
+from test_bench_window import BUSY, MS, Bench
+from test_bench_window import batch as bench_batch
+from test_fit_samples import DEVICE, HOST, SOURCE
+from test_fit_steps import fit, planted_roots  # noqa: F401
+from test_memory_readings import DOCUMENT, STACK
+from test_parity_served import SAMPLING
+from test_run_step_grid import deployment, readings
+
+from atom.compass.artifacts import (
+    PLATFORM,
+    ArtifactStore,
+    Axis,
+    GateState,
+    Topology,
+    member_name,
+)
+from atom.compass.backends import (
+    BatchView,
+    CostRefused,
+    RequestShape,
+    step_grid_fit,
+    step_grid_plan,
+    step_linear_fit,
+)
+from atom.compass.backends.step_grid import (
+    StepGridBackend,
+    equivalent_shape,
+    length_statistics,
+)
+from atom.compass.backends.step_grid_residual import Residual, order, raggedness
+from atom.compass.backends.step_labels import digest
+from atom.compass.bench import window
+from atom.compass.bench.measure import measurement_key, view_of
+from atom.compass.fit import publish
+from atom.compass.fit.samples import MEMBER
+from atom.compass.run import step_grid
+from atom.compass.spec import MachineSpec
+
+BOUNDS = {"max_num_seqs": 8, "max_num_batched_tokens": 256, "max_model_len": 1024}
+DEFINITION = {
+    "prefill": {"B": [1], "T": [16], "c": [0]},
+    "decode": {"c": [0, 512]},
+    "margin": 0,
+}
+DECODE = [(b, c) for b in (1, 8) for c in (0, 512, 1023)]
+PREFILL = [(b, t, c) for b in (1, 8) for t in (16, 256) for c in (0, 768)]
+GRID = ("--backend", "step-grid", "--grid")
+#: The bench's reply for a batch on `test_bench_window.py`'s planted device,
+#: whose kept repeats a measurement publishes as they are.
+BENCHED = Bench(itertools.repeat(MS), itertools.repeat(BUSY)).bench_step(
+    bench_batch(), window.REPEATS
+)
+
+
+def batch(rows, output=True) -> dict:
+    """A step-record line's view of `rows`, rung 8 for decode."""
+    rung = 8 if rows[0][2] else None
+    return {"rows": [list(r) for r in rows], "rung": rung, "produces_output": output}
+
+
+def nodes() -> list[dict]:
+    """Every node batch of the grid."""
+    out = [batch([(1, c + 1, True)] * b) for b, c in DECODE]
+    for output in (True, False):
+        out += [batch([(t // b, c + t // b, False)] * b, output) for b, t, c in PREFILL]
+    return out
+
+
+def mixed(seed=1, n=20) -> list[dict]:
+    """`n` decode batches of 2 to 8 rows, and `n` prefill chunks of 1 to 8 rows of
+    each kind, with rows of other lengths, all inside the grid."""
+    rng, out = np.random.default_rng(seed), []
+    for _ in range(n):
+        ks = rng.integers(1, 1025, rng.integers(2, 9))
+        out.append(batch([(1, int(k), True) for k in ks]))
+    for output in (True, False) * n:
+        b = int(rng.integers(1, 9))
+        qs, cs = rng.integers(16 // b + 1, 256 // b + 1, b), rng.integers(0, 401, b)
+        out.append(batch([(int(q), int(q + c), False) for q, c in zip(qs, cs)], output))
+    return out
+
+
+def with_output(lines) -> list[dict]:
+    """`lines` but the prefill chunks that produce no output: a grid planned on
+    them holds no such point, which a fit with no such target refuses."""
+    return [x for x in lines if x["rows"][0][2] or x["produces_output"]]
+
+
+def view(line) -> BatchView:
+    rows = tuple(RequestShape(*r) for r in line["rows"])
+    return BatchView(rows, line["rung"], produces_output=line["produces_output"])
+
+
+def time(line) -> float:
+    """The planted measurement at a node, and so the lookup anywhere; a prefill
+    chunk with no output takes 0.5 ms less than one with output."""
+    b, n_q, c = map(float, equivalent_shape(view(line).requests))
+    if line["rows"][0][2]:
+        return 2e-3 + 1e-5 * b + 1e-7 * c + 1e-9 * b * c
+    head = 1e-3 if line["produces_output"] else 5e-4
+    return head + 1e-5 * b + 2e-6 * b * n_q + 1e-6 * c + 1e-9 * b * n_q * c
+
+
+def factor(line) -> float:
+    """The residual's planted factor: on order, and on prefill raggedness too."""
+    rows = view(line).requests
+    ragged = 0 if rows[0].decode else float(raggedness(rows) - 1)
+    return 1.25 * math.exp(0.2 * float(order(rows)) - 0.1 * ragged)
+
+
+@pytest.fixture
+def run(tmp_path):
+    """The deployment, its readings and the inputs' configuration."""
+    r = deployment(tmp_path, **BOUNDS, capture_sizes=[8])
+    here = readings(r)
+    configuration = {
+        "model": here.reading(Axis.MODEL).value,
+        "source_root": "{0.kind}-{0.value}".format(here.reading(Axis.ATOM_SRC)),
+        **{a.field: here.reading(a).value for a in PLATFORM},
+    }
+    return r, here, configuration
+
+
+def record(
+    tmp_path, run, lines, name="a", trace="trace-300", session=300, blocks=1024, slow=0
+):
+    """`tmp_path/name`, a real run's record of `lines`, each timed at its lookup
+    times `factor`, the first `slow` at 3 times that, on a pool of `blocks` KV
+    blocks, with the export `client.json` of the client run sending it from
+    `trace`, which the export gives `session`."""
+    r, _, configuration = run
+    directory = tmp_path / name
+    path = directory / "steps" / "dp0.jsonl"
+    path.parent.mkdir(parents=True)
+    timed = [time(x) * factor(x) * (3 if i < slow else 1) for i, x in enumerate(lines)]
+    _record(path, [(x["rows"], x["rung"], t) for x, t in zip(lines, timed)])
+    written, sent = [json.loads(x) for x in path.read_text().splitlines()], {}
+    for line, x in zip(written, lines):
+        line |= {"produces_output": x["produces_output"]}
+        line["named"] = [[q[0], f"r{q[0]}"] for q in line["batch"]]
+        sent |= {n: {"trace": trace, "sampling": SAMPLING} for _, n in line["named"]}
+    path.write_text("".join(json.dumps(x) + "\n" for x in written))
+    export = {"requests": sent, "sessions": {trace: session}}
+    (directory / "client.json").write_text(json.dumps(export))
+    engine = {**step_grid.keyed(r.config), **BOUNDS, "num_kvcache_blocks": blocks}
+    (path.parent / "dp0.engine.json").write_text(json.dumps(engine))
+    atom = configuration["source_root"].split("-", 1)[1]
+    run_json = {
+        "format_version": 2,
+        "argv": ["compass", "record", "--out", str(directory)],
+        "source": SOURCE,
+        "host_key": {
+            **HOST,
+            "atom": atom,
+            "model": configuration["model"],
+            "engine": step_grid.keyed(r.config),
+        },
+        "device": [DEVICE],
+        "stack": STACK,
+        "ptl": "disabled",
+        "profiled": False,
+    }
+    (directory / "run.json").write_text(json.dumps(run_json))
+    return directory
+
+
+def measured(
+    tmp_path, run, line, origin="plan", seconds=None, conditions=None, sources=None
+):
+    """`line`'s step measurement as `measure steps` publishes one, its token,
+    measured from the inputs `sources`."""
+    r, here, configuration = run
+    engine = step_grid.keyed(r.config)
+    key = measurement_key(configuration, engine, SAMPLING, line)
+    member = {
+        **line,
+        "seconds": time(line) if seconds is None else seconds,
+        "statistic": "median",
+        "repeats": BENCHED["repeats"],
+        "origin": origin,
+        "sources": sources or ["planted"],
+        "traces": ["trace-7"],
+        "plan": "sha256:another-plan",
+    }
+    ArtifactStore(tmp_path / "store").publish(
+        key,
+        provenance=stanza("compass measure steps"),
+        topology=Topology(),
+        conditions=conditions or here,
+        gates=GateState.of(),
+        members={member_name(*MEMBER): json.dumps(member).encode()},
+    )
+    return key.token()
+
+
+def fitted(tmp_path, *args, grid="a"):
+    """`fit steps --backend step-grid` over each `tmp_path/<name>` of the names
+    `grid` lists, and `args`; the readable copy it writes."""
+    path = tmp_path / "definition.json"
+    path.write_text(json.dumps(DEFINITION))
+    inputs = [tmp_path / name for name in grid.split()]
+    fit(tmp_path, "fit steps", *GRID, *inputs, "--grid-definition", path, *args)
+    return json.loads((tmp_path / "out/step_grid_bundle.json").read_text())
+
+
+def clients(directory):
+    return ["--client-run", directory, directory / "client.json"]
+
+
+def loaded(tmp_path, run, copy):
+    spec = {"store": str(tmp_path / "store"), **copy["key"]}
+    return step_grid.load(spec, run[0].config, MachineSpec.from_mapping(DOCUMENT))[0]
+
+
+def test_a_fitted_bundle_prices_each_grid_node_at_its_measured_time_times_the_factor(
+    tmp_path, run
+):
+    a = record(tmp_path, run, nodes() * 4 + mixed())
+    for line in nodes():
+        measured(tmp_path, run, line)
+    # A measurement no plan places is no point.
+    measured(tmp_path, run, batch([(1, 300, True)] * 4))
+
+    copy = fitted(tmp_path, a, *clients(a))
+    backend = loaded(tmp_path, run, copy)
+
+    residual = Residual(copy["params"]["residual"])
+    for line in nodes():
+        priced = backend.price(view(line)).seconds
+        assert priced == time(line) * residual.factor(view(line))[0]
+        assert priced == pytest.approx(time(line) * 1.25, rel=1e-3)
+    grid = copy["params"]["grid"]
+    points = grid["decode"]["points"] + [
+        p for kind in ("output", "no_output") for p in grid["prefill"][kind]
+    ]
+    assert len(points) == len(nodes()) == 22
+    # A point counts its measurement's kept repeats.
+    assert {(p["statistic"], p["repeats"]) for p in points} == {
+        ("median", window.REPEATS)
+    }
+    assert (grid["unit"], grid["value"]) == ("s", "bench window")
+    assert copy["params"]["definition"] == DEFINITION
+    assert copy["params"]["bounds"] == BOUNDS
+    assert copy["params"]["sources"] == ["record"]
+
+
+def test_a_fitted_bundle_validates_its_held_out_batches_and_not_a_batch_outside_them(
+    tmp_path, run
+):
+    """Every target lies in the box whose corners are the prefill nodes, so a
+    prefill node is inside the hull of the held-out batches iff one of them has
+    its shape. A held-out batch outside the residual's hull, which is of the
+    batches fitted, is extrapolated, and so unvalidated."""
+    lines = nodes() * 4 + mixed()
+    a = record(tmp_path, run, lines)
+    for line in nodes():
+        measured(tmp_path, run, line)
+
+    copy = fitted(tmp_path, a, *clients(a))
+    backend = loaded(tmp_path, run, copy)
+
+    def validated(line, priced_by=backend):
+        try:
+            (term,) = priced_by.price(view(line)).terms
+        except CostRefused:
+            return None
+        return term.provenance.validated
+
+    def shape(line):
+        return line["produces_output"], equivalent_shape(view(line).requests)
+
+    report = copy["report"]
+    assert (report["unpriced"], report["cut"]) == ([], {})  # triple i is lines[i]
+    held = [lines[i] for k in report["kinds"].values() for i in k["held_out"]]
+    outcomes = [validated(x) for x in held]
+    past = [backend.price(view(x)).terms[0].provenance.extrapolated for x in held]
+    assert outcomes == [not p for p in past] and True in outcomes
+    corners = [x for x in nodes() if not x["rows"][0][2]]
+    inside = [shape(x) in set(map(shape, held)) for x in corners]
+    assert [validated(x) for x in corners] == inside
+    assert any(inside) and not all(inside)
+    # A bundle that records no held-out batches validates none.
+    residual = copy["params"]["residual"]
+    for fitted_kind in residual["kinds"].values():
+        del fitted_kind["held_out"]
+    bare = StepGridBackend(backend.grid, Residual(residual), "bare")
+    assert [validated(x, bare) for x in held] == [o and False for o in outcomes]
+
+
+def test_a_decode_node_past_the_pool_is_measured_shared_and_read_as_measured(
+    tmp_path, run
+):
+    """At a 511-block pool, 8 decode rows on c 1023 hold 512 blocks apart; the
+    plan has them share 1, and puts c 1007, their KV limit, among rung 8's c
+    nodes. The bundle states the share, and a step on that node reads it."""
+    lines = nodes() * 4 + mixed()
+    a = record(tmp_path, run, lines, blocks=511)
+    engine = json.loads((a / "steps/dp0.engine.json").read_text())
+    planned = step_grid_plan.plan(DEFINITION, enumerate(lines), {"a": engine})
+    for line in planned["lines"]:
+        measured(tmp_path, run, view_of(line))
+
+    copy = fitted(tmp_path, a, *clients(a))
+
+    points = copy["params"]["grid"]["decode"]["points"]
+    assert [(p["at"], p["shared"]) for p in points if "shared" in p] == [
+        ([8, 8, 1023], 1)
+    ]
+    top = view(batch([(1, 1024, True)] * 8))
+    (term,) = loaded(tmp_path, run, copy).price(top).terms
+    assert term.provenance.source == "step-grid"
+    assert term.provenance.detail.split(";")[0].endswith("measured")
+
+
+def test_a_planned_point_the_store_does_not_hold_refuses_naming_each(tmp_path, run):
+    a = record(tmp_path, run, nodes() * 4 + mixed())
+    held, lost = nodes()[2:], nodes()[:2]
+    for line in held:
+        measured(tmp_path, run, line)
+    engine = step_grid.keyed(run[0].config)
+    named = [str(measurement_key(run[2], engine, SAMPLING, x)) for x in lost]
+
+    with pytest.raises(SystemExit) as refused:
+        fitted(tmp_path, a, *clients(a))
+    assert "2 of the 22 planned points are not measured" in str(refused.value)
+    assert all(key in str(refused.value) for key in named)
+
+
+def test_a_grid_measured_under_sessions_fits_given_the_same_sessions(tmp_path, run):
+    """`a` serves trace 3 and `b` trace 7, so `measure steps --grid a b
+    --sessions 0:4` plans over `a`'s lines alone: every node but decode's at c
+    1023, which only `b`'s lines reach."""
+    top = [x for x in nodes() if x["rows"][0][2] and x["rows"][0][1] == 1024]
+    rest = [x for x in nodes() if x not in top]
+    a = record(tmp_path, run, rest, trace="trace-3", session=3)
+    b = record(tmp_path, run, top, name="b", trace="trace-7", session=7)
+    for line in nodes():
+        if line not in top:
+            measured(tmp_path, run, line)
+    t = record(tmp_path, run, mixed(), name="t")
+    named = [*clients(a), *clients(b), *clients(t)]
+
+    with pytest.raises(SystemExit, match="2 of the 22 planned points are not measured"):
+        fitted(tmp_path, t, *named, grid="a b")
+    copy = fitted(tmp_path, t, "--sessions", "0:4", *named, grid="a b")
+
+    grid = copy["params"]["grid"]
+    decode = [p["at"] for p in grid["decode"]["points"]]
+    assert sorted(decode) == sorted([8, n, c] for n in (1, 8) for c in (0, 512))
+    assert sum(len(grid["prefill"][k]) for k in ("output", "no_output")) == 16
+
+
+@pytest.mark.parametrize("sources", [["record"], ["replay"], ["record", "replay"]])
+def test_the_residual_is_fitted_on_records_replays_or_both_and_reported_by_source(
+    tmp_path, run, sources
+):
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    targets, named = [], clients(g)
+    if "record" in sources:
+        a = record(tmp_path, run, mixed(seed=3))
+        targets, named = [a], named + clients(a)
+    if "replay" in sources:
+        targets += [
+            measured(tmp_path, run, x, "replay", time(x) * factor(x)) for x in mixed()
+        ]
+
+    copy = fitted(tmp_path, *targets, *named, grid="grid")
+
+    assert copy["params"]["sources"] == sources
+    for report in copy["report"]["kinds"].values():
+        counts = [
+            (s["kept"] + s["dropped"], s["held_out"])
+            for s in report["sources"].values()
+        ]
+        assert list(report["sources"]) == sources
+        held = len(report["held_out"])
+        assert (
+            sum(map(sum, counts)) == (20 * len(sources))
+            and sum(h for _, h in counts) == held
+        )
+        # Record `a` and the replays, measured from another input, are two
+        # runs, and one of them is held out whole.
+        assert report["split"] == ("run" if len(sources) == 2 else "step")
+        if len(sources) == 2:
+            assert sorted(counts) == [(0, 20), (20, 0)]
+        for spread in report["sources"].values():
+            assert spread["centre"] is None or abs(spread["centre"]) < 1e-3
+            assert spread["held_out_error"] is None or spread["held_out_error"] < 1e-3
+    *runs, planned = copy["report"]["provenance"]
+    assert sorted({r["source"] for r in runs}) == sources
+    assert (planned["source"], planned["traces"]) == ("plan", ["trace-300"])
+
+
+def test_the_residual_holds_out_whole_runs_a_replay_with_its_record(tmp_path, run):
+    """Records `a`, `b` and `c`, and replays of steps `a` ran: each replay is of
+    `a`'s run, so every kind holds out whole runs of the three and reports, per
+    run, its steps and the share past the kind's hull."""
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    targets = [
+        record(tmp_path, run, mixed(seed=seed), name=name)
+        for name, seed in (("a", 3), ("b", 4), ("c", 5))
+    ]
+    runs = [digest(d / "steps/dp0.jsonl") for d in targets]
+    replays = [
+        measured(tmp_path, run, x, "replay", time(x) * factor(x), sources=runs[:1])
+        for x in mixed(seed=6)
+    ]
+    named = [x for d in (g, *targets) for x in clients(d)]
+
+    copy = fitted(tmp_path, *targets, *replays, *named, grid="grid")
+
+    assert copy["params"]["sources"] == ["record", "replay"]
+    for report in copy["report"]["kinds"].values():
+        held = report["held_out_runs"]
+        assert report["split"] == "run" and set(held) < set(runs)
+        assert list(report["runs"]) == sorted(runs)
+        assert report["runs"][runs[0]]["steps"] == 40  # 20 run, 20 replayed
+        held_out = sum(report["runs"][r]["steps"] for r in held)
+        assert held_out == len(report["held_out"])
+        for n in report["runs"].values():
+            assert n["share"] == n["past_hull"] / n["steps"]
+        assert all("step_held_out_error" in m for m in report["members"].values())
+
+
+def test_a_fit_none_of_whose_targets_is_a_chunk_with_no_output_refuses_on_such_a_grid(
+    tmp_path, run
+):
+    """`a` holds no prefill chunk that produces no output. Planned over a record
+    holding such chunks, the fit refuses: its residual would fit none, and a run
+    would price each at the roofline. Planned over one holding none, it fits."""
+    a = record(tmp_path, run, with_output(mixed(seed=3)))
+    for line in nodes():
+        measured(tmp_path, run, line)
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    h = record(tmp_path, run, with_output(nodes() + mixed(seed=2)), name="h")
+
+    with pytest.raises(SystemExit, match="the grid holds 8 points of prefill chunks"):
+        fitted(tmp_path, a, *clients(g), *clients(a), grid="grid")
+    copy = fitted(tmp_path, a, *clients(h), *clients(a), grid="h")
+
+    assert copy["params"]["grid"]["prefill"]["no_output"] == []
+    assert list(copy["params"]["residual"]["kinds"]) == ["decode", "prefill_output"]
+
+
+def replayed(tmp_path, run, lines, slow=0):
+    """The tokens of `lines` replayed, each timed at its lookup times `factor`,
+    the first `slow` at 3 times that."""
+    return [
+        measured(
+            tmp_path, run, x, "replay", time(x) * factor(x) * (3 if i < slow else 1)
+        )
+        for i, x in enumerate(lines)
+    ]
+
+
+def test_planted_outliers_are_dropped_in_their_own_source_of_the_by_source_report(
+    tmp_path, run
+):
+    """One target per source at 3 times its factor: a replayed decode step among
+    20, and a record's prefill chunk producing output among 20. Each of those
+    kinds holds out the other source, a run of one target, so the selected
+    member fits each outlier and drops it, in its own source, and nothing else;
+    the sources' kept, dropped and held-out counts add up to the member's."""
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    lines, replays = mixed(seed=3), mixed()
+    a = record(tmp_path, run, lines[20:] + lines[:1], slow=1)
+    replays = replayed(tmp_path, run, replays[:20] + replays[20:21], slow=1)
+
+    copy = fitted(tmp_path, a, *replays, *clients(g), *clients(a), grid="grid")
+
+    slow = {("decode", "replay"), ("prefill_output", "record")}
+    kinds = copy["report"]["kinds"]
+    assert slow <= {(k, s) for k, report in kinds.items() for s in report["sources"]}
+    for k, report in kinds.items():
+        (selected,) = copy["params"]["residual"]["kinds"][k]["selected"]
+        member, sources = report["members"][selected], report["sources"]
+        for s, counts in sources.items():
+            assert counts["dropped"] == ((k, s) in slow)
+        assert sum(s["dropped"] for s in sources.values()) == member["dropped"]
+        assert sum(s["kept"] for s in sources.values()) == member["samples"]
+        assert sum(s["held_out"] for s in sources.values()) == len(report["held_out"])
+
+
+def test_a_one_source_fit_reports_its_source_at_the_members_centre_and_mad(
+    tmp_path, run
+):
+    """Replays alone, each off its factor by up to 2%, so no member fits them
+    exactly, and one decode one at 3 times it, which seed 0 fits and drops: per
+    kind, the source's counts, centre and MAD are the selected member's, the
+    dropped triples included in both."""
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    lines = mixed() + mixed(seed=3)
+    off = np.random.default_rng(4).uniform(0.98, 1.02, len(lines))
+    off[0] *= 3
+    replays = [
+        measured(tmp_path, run, x, "replay", time(x) * factor(x) * o)
+        for x, o in zip(lines, off)
+    ]
+
+    copy = fitted(tmp_path, *replays, *clients(g), grid="grid")
+
+    for k, report in copy["report"]["kinds"].items():
+        (selected,) = copy["params"]["residual"]["kinds"][k]["selected"]
+        member, (source,) = report["members"][selected], report["sources"].values()
+        assert source["kept"] == member["samples"]
+        assert source["dropped"] == member["dropped"]
+        for spread in ("centre", "mad"):
+            assert source[spread] == pytest.approx(member[spread], rel=1e-6, abs=1e-12)
+
+
+def test_a_held_out_target_outside_the_band_members_bands_reports_an_error_of_1(
+    tmp_path, run, monkeypatch
+):
+    """Token bands split at 32 and 128. A record's one-row chunks with output,
+    timed at 1.25 times their lookup below 128 tokens and 1.5 times above, so
+    the band member is selected; and a chunk of 20 tokens replayed from the
+    record, so of its run, the only one in its band, which seed 0 holds out.
+    The member holds no factor for that band, so it prices the replay at a
+    factor of 0, a held-out error of 1."""
+    monkeypatch.setattr(step_linear_fit, "TOKEN_BANDS", (32, 128))
+    g = record(tmp_path, run, with_output(nodes() + mixed(seed=2)), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    rng = np.random.default_rng(5)
+    qs, cs = rng.choice(np.arange(33, 256), 24, replace=False), rng.integers(1, 401, 24)
+    lines = [batch([(int(q), int(q + c), False)]) for q, c in zip(qs, cs)]
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "factor",
+        lambda x: 1.25 if x["rows"][0][0] < 128 else 1.5,
+    )
+    a = record(tmp_path, run, lines)
+    lone = batch([(20, 20, False)])
+    ran = [digest(a / "steps/dp0.jsonl")]
+    replay = measured(tmp_path, run, lone, "replay", time(lone) * 1.25, sources=ran)
+
+    copy = fitted(tmp_path, a, replay, *clients(g), *clients(a), grid="grid")
+
+    (k,) = copy["report"]["kinds"]
+    residual = copy["params"]["residual"]["kinds"][k]
+    assert k == "prefill_output" and residual["selected"] == {"band": 1.0}
+    assert "prefill tokens 0-32" not in residual["members"]["band"]["values"]
+    source = copy["report"]["kinds"][k]["sources"]["replay"]
+    assert (source["held_out"], source["held_out_error"]) == (1, 1.0)
+
+
+def test_a_fit_takes_replays_in_their_views_order_not_the_stores(
+    tmp_path, run, monkeypatch
+):
+    """Replays alone, fitted in two stores, as one lists them and as the other's
+    are reversed: the same residual and report by kind."""
+
+    def fit_replays(directory):
+        directory.mkdir()
+        g = record(directory, run, nodes() + mixed(seed=2), name="grid")
+        for line in nodes():
+            measured(directory, run, line)
+        replays = replayed(directory, run, mixed())
+        return fitted(directory, *replays, *clients(g), grid="grid")
+
+    listed, load = fit_replays(tmp_path / "listed"), publish.load
+
+    def reversed_load(*args):
+        samples, config = load(*args)
+        return samples[::-1], config
+
+    monkeypatch.setattr(publish, "load", reversed_load)
+    again = fit_replays(tmp_path / "reversed")
+
+    assert again["params"]["residual"] == listed["params"]["residual"]
+    assert again["report"]["kinds"] == listed["report"]["kinds"]
+
+
+def test_every_provenance_entry_states_that_its_input_was_not_profiled(tmp_path, run):
+    """A record target, a replay target and the plan, which validation reads
+    to refuse a backend fitted on profiled inputs."""
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    a = record(tmp_path, run, mixed(seed=3))
+    replays = [measured(tmp_path, run, x, "replay", time(x)) for x in mixed()]
+
+    copy = fitted(tmp_path, a, *replays, *clients(g), *clients(a), grid="grid")
+
+    entries = copy["report"]["provenance"]
+    assert {e["source"] for e in entries} == {"record", "replay", "plan"}
+    assert [e["profiled"] for e in entries] == [False] * len(entries)
+
+
+def test_a_grid_input_no_client_run_names_refuses_naming_it(tmp_path, run):
+    """As `measure steps` refuses to plan over it, with or without `--sessions`."""
+    g = record(tmp_path, run, nodes() + mixed(seed=2), name="grid")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    a = record(tmp_path, run, mixed(seed=3))
+
+    with pytest.raises(SystemExit, match=re.escape(f"{g} is named by no --client-run")):
+        fitted(tmp_path, a, *clients(a), grid="grid")
+    assert not (tmp_path / "store" / "step_grid_bundle").exists()
+
+
+def test_a_plan_whose_points_a_replay_measured_first_names_only_its_grid_inputs(
+    tmp_path, run
+):
+    """Every point is held as a replay of another run measured it, naming
+    that run's source and trace; the plan names `--grid`'s records and the
+    traces their lines served."""
+    top = [x for x in nodes() if x["rows"][0][2] and x["rows"][0][1] == 1024]
+    a = record(tmp_path, run, [x for x in nodes() if x not in top], trace="trace-3")
+    b = record(tmp_path, run, top, name="b", trace="trace-5")
+    for line in nodes():
+        measured(tmp_path, run, line, "replay")
+    t = record(tmp_path, run, mixed(), name="t")
+
+    copy = fitted(tmp_path, t, *clients(a), *clients(b), *clients(t), grid="a b")
+
+    *_, planned = copy["report"]["provenance"]
+    files = sorted(digest(d / "steps" / "dp0.jsonl") for d in (a, b))
+    assert planned["source"] == "plan"
+    assert (planned["inputs"], planned["traces"]) == (files, ["trace-3", "trace-5"])
+
+
+def test_a_planned_point_named_as_a_target_refuses(tmp_path, run):
+    a = record(tmp_path, run, nodes() * 4 + mixed())
+    tokens = [measured(tmp_path, run, line) for line in nodes()]
+
+    with pytest.raises(SystemExit, match="measured a planned point"):
+        fitted(tmp_path, a, tokens[0], *clients(a))
+
+
+@pytest.mark.parametrize("at", ["point", "replay"])
+def test_a_measurement_taken_under_other_readings_refuses_naming_the_cell(
+    tmp_path, run, at
+):
+    a = record(tmp_path, run, nodes() * 4 + mixed())
+    other = moved(run[1], Axis.TORCH)
+    for i, line in enumerate(nodes()):
+        measured(
+            tmp_path, run, line, conditions=other if at == "point" and not i else None
+        )
+    extra = mixed(seed=4)[0]
+    replay = measured(
+        tmp_path, run, extra, "replay", time(extra), other if at == "replay" else None
+    )
+
+    with pytest.raises(SystemExit, match=re.escape("`step_measurement` x `torch`")):
+        fitted(tmp_path, a, replay, *clients(a))
+
+
+def test_a_target_the_grid_refuses_is_named_and_a_cut_one_counted(tmp_path, run):
+    outside = batch([(8, 8, False)])  # T = 8, below the T nodes
+    both = batch([(8, 8, False), (1, 40, True)])
+    a = record(tmp_path, run, nodes() * 4 + mixed() + [outside, both])
+    for line in nodes():
+        measured(tmp_path, run, line)
+
+    report = fitted(tmp_path, a, *clients(a))["report"]
+
+    [step] = report["unpriced"]
+    assert step["step"].endswith(f" dp0 step {len(nodes()) * 4 + 60}")
+    assert "T is below the prefill output grid's nodes 16..256" in step["reason"]
+    assert report["cut"] == {"mixed": 1}
+
+
+@pytest.mark.parametrize(
+    "args, named",
+    [
+        (["--form", "base"], "--form is read by step-linear, not step-grid"),
+        (["--grid-definition"], "step-grid plans over --grid INPUT..."),
+    ],
+)
+def test_a_flag_step_grid_does_not_read_or_lacks_refuses(tmp_path, run, args, named):
+    a = record(tmp_path, run, nodes())
+    if args == ["--grid-definition"]:
+        argv = ["--backend", "step-grid", a, "--grid", a, *clients(a)]
+    else:
+        argv = [*GRID, a, "--grid-definition", tmp_path, *args, a, *clients(a)]
+
+    with pytest.raises(SystemExit, match=re.escape(named)):
+        fit(tmp_path, "fit steps", *argv)
+    assert not (tmp_path / "store" / "step_grid_bundle").exists()
+
+
+def ragged_lines(seed, n, rows=(2, 9), low=400):
+    """`n` decode batches at rung 8, of 2 to 8 rows on contexts `low` to 1024,
+    so the longest row is at most 2.6 times the mean."""
+    rng = np.random.default_rng(seed)
+    return [
+        batch([(1, int(k), True) for k in rng.integers(low, 1025, rng.integers(*rows))])
+        for _ in range(n)
+    ]
+
+
+def alpha_true(rows) -> float:
+    ratio, _ = length_statistics(rows)
+    return 0.2 + 0.3 * ratio
+
+
+def ragged_time(line) -> float:
+    """`time`, but a decode line is read `alpha_true` of the way from B rows at
+    its mean to B rows at its longest row."""
+    rows = view(line).requests
+    if not rows[0].decode:
+        return planted_time(line)
+    cached = [r.context_tokens - 1 for r in rows]
+    b, mean = len(rows), sum(cached) / len(rows)
+
+    def g(c):
+        return 2e-3 + 1e-5 * b + 1e-7 * c + 1e-9 * b * c
+
+    return g(mean) + alpha_true(rows) * (g(max(cached)) - g(mean))
+
+
+planted_time = time
+
+
+@pytest.mark.parametrize(
+    "records_alpha,steps",
+    [(True, 120), (False, 120), (True, 50)],
+    ids=["kept", "dropped", "one cell"],
+)
+def test_alpha_is_fitted_on_ragged_views_and_kept_only_where_no_cell_gets_worse(
+    tmp_path, run, monkeypatch, records_alpha, steps
+):
+    """The ragged views read alpha = 0.2 + 0.3 (longest / mean - 1). Where the
+    calibration records run that way too, each record's steps priced by a
+    residual fitted on the other's come nearer their times with alpha, and the
+    rung keeps it; where they run at their mean, alpha moves them away, and the
+    grid holds none. Nor does it when the second record has fewer than 100
+    steps at the rung: a rung needs two cells."""
+    g = record(tmp_path, run, with_output(nodes()), name="g")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    views = [
+        measured(tmp_path, run, x, "ragged", ragged_time(x))
+        for x in ragged_lines(5, 40)
+    ]
+    if records_alpha:
+        monkeypatch.setattr(sys.modules[__name__], "time", ragged_time)
+    cells = [
+        record(tmp_path, run, ragged_lines(s, n), name=name)
+        for s, n, name in ((6, 120, "a"), (7, steps, "b"))
+    ]
+
+    copy = fitted(
+        tmp_path,
+        *cells,
+        *views,
+        *clients(g),
+        *[a for c in cells for a in clients(c)],
+        grid="g",
+    )
+
+    report, grid = copy["report"]["alpha"]["8"], copy["params"]["grid"]
+    assert report["views"] == 40 and report["unread"] == []
+    terms = report["forms"][report["form"]]["terms"]
+    assert terms[:2] == pytest.approx([0.2, 0.3], abs=1e-6)
+    kept = records_alpha and steps >= 100
+    assert len(report["cells"]) == 1 + (steps >= 100) and report["kept"] is kept
+    assert set(grid["decode"]["alpha"]) == ({"8"} if kept else set())
+    assert copy["params"]["sources"] == ["record"]
+    assert list(copy["report"]["kinds"]["decode"]["sources"]) == ["record"]
+    if records_alpha and not kept:
+        return  # the records run ragged, and the grid reads them at their mean
+    backend = loaded(tmp_path, run, copy)
+    for line in ragged_lines(8, 10):
+        priced = backend.price(view(line)).seconds
+        expected = ragged_time(line) if records_alpha else planted_time(line)
+        assert priced == pytest.approx(expected * factor(line), rel=1e-5)
+
+
+def test_alpha_counts_the_views_it_reads_at_their_longest_row_past_the_kv_pool():
+    """32 rows, 31 at c 600 and the longest at c 900 or 1500: the pool holds 32
+    rows to c 1151, so a longest row at 1500 is read past it, and counted."""
+    views = [
+        SimpleNamespace(
+            view=rows_view(*[(1, 601, True)] * 31, (1, c + 1, True), rung=32),
+            device_s=5e-3,
+        )
+        for c in (900, 1500) * 4
+    ]
+
+    _, report = step_grid_fit._alpha(past_pool_alpha().grid, views, seed=0)
+
+    assert report["32"]["views"] == 8 and report["32"]["unread"] == []
+    assert report["32"]["past_pool"] == 4
+
+
+def test_the_fit_plans_a_ragged_targets_cells_and_refuses_until_they_are_measured(
+    tmp_path, run
+):
+    """At a 511-block pool rung 8's c nodes are 0, 512, 1007 and 1023, 1007
+    its KV limit at B 8. The grid record runs B 8 to c 1007 and no further. A
+    ragged view of seven rows on c 900 and one on c 1015 reads its longest row
+    in c 1007..1023, and eight rows on c 1023 hold 512 blocks: the fit plans
+    that corner from the view, so refuses until it is measured with the rows
+    sharing a block, and alpha then reads the view inside the pool."""
+    top = batch([(1, 1024, True)] * 8)
+    lines = [x for x in nodes() if x != top] + [batch([(1, 1008, True)] * 8)]
+    g = record(tmp_path, run, lines, name="g", blocks=511)
+    engine = {"g": json.loads((g / "steps/dp0.engine.json").read_text())}
+    for line in step_grid_plan.plan(DEFINITION, enumerate(lines), engine)["lines"]:
+        measured(tmp_path, run, view_of(line))
+    ragged = batch([(1, 901, True)] * 7 + [(1, 1016, True)])
+    token = measured(tmp_path, run, ragged, "ragged", 3e-3)
+    a = record(tmp_path, run, nodes() * 4 + mixed())
+    args = (a, token, *clients(g), *clients(a))
+    views = [("view", ragged)]
+    planned = step_grid_plan.plan(DEFINITION, enumerate(lines), engine, views)
+    [corner] = [view_of(x) for x in planned["lines"] if x["rows"] == top["rows"]]
+    key = measurement_key(run[2], step_grid.keyed(run[0].config), SAMPLING, corner)
+
+    with pytest.raises(SystemExit) as refused:
+        fitted(tmp_path, *args, grid="g")
+    assert corner["shared"] == 1
+    assert f"1 of the {len(planned['lines'])} planned" in str(refused.value)
+    assert str(key) in str(refused.value)
+    measured(tmp_path, run, corner)
+
+    report = fitted(tmp_path, *args, grid="g")["report"]["alpha"]["8"]
+    assert report == {"views": 1, "unread": [], "past_pool": 0}
+
+
+def test_alpha_rising_with_the_mean_context_is_fitted_and_priced(
+    tmp_path, run, monkeypatch
+):
+    """The ragged views and the records read alpha = 0.1 + 30 (mean cached
+    context / 2^16): the fit finds the mean's term, the rung keeps it, and the
+    bundle prices ragged batches with it."""
+
+    def by_mean(rows):
+        return 0.1 + 30 * statistics.fmean(r.context_tokens - 1 for r in rows) / 2**16
+
+    monkeypatch.setattr(sys.modules[__name__], "alpha_true", by_mean)
+    g = record(tmp_path, run, with_output(nodes()), name="g")
+    for line in nodes():
+        measured(tmp_path, run, line)
+    views = [
+        measured(tmp_path, run, x, "ragged", ragged_time(x))
+        for x in ragged_lines(5, 40)
+    ]
+    monkeypatch.setattr(sys.modules[__name__], "time", ragged_time)
+    cells = [
+        record(tmp_path, run, ragged_lines(s, 120), name=name)
+        for s, name in ((6, "a"), (7, "b"))
+    ]
+
+    copy = fitted(
+        tmp_path,
+        *cells,
+        *views,
+        *clients(g),
+        *[a for c in cells for a in clients(c)],
+        grid="g",
+    )
+
+    report = copy["report"]["alpha"]["8"]
+    terms = report["forms"][report["form"]]["terms"]
+    assert terms == pytest.approx([0.1, 0.0, 0.0, 30.0], abs=1e-6)
+    assert report["kept"] is True
+    backend = loaded(tmp_path, run, copy)
+    for line in ragged_lines(8, 10):
+        priced = backend.price(view(line)).seconds
+        assert priced == pytest.approx(ragged_time(line) * factor(line), rel=1e-5)
+
+
+def test_alpha_forms_are_judged_on_every_view_priced_out_of_fold():
+    """Four views and five folds: each view is priced by the form fitted on the
+    other three, and the constant form's held-out error is the median of those
+    errors, its terms fitted on all four."""
+    w, e = np.array([0.2, 0.4, 0.1, 0.3]), np.array([-0.05, -0.12, -0.01, -0.1])
+    ratio, spread, mean = (
+        [0.5, 1.0, 1.5, 2.0],
+        [0.2, 0.4, 0.3, 0.6],
+        [0.5, 0.6, 0.7, 0.8],
+    )
+    x = np.column_stack([np.ones(4), ratio, spread, mean])
+
+    forms = step_grid_fit._forms(x, w, e, seed=0)
+
+    def constant(views):
+        return -np.dot(w[views], e[views]) / np.dot(w[views], w[views])
+
+    out = [abs(e[i] + w[i] * constant(np.arange(4) != i)) for i in range(4)]
+    assert forms["constant"]["held_out_error"] == pytest.approx(np.median(out))
+    assert forms["constant"]["terms"] == pytest.approx(
+        [constant(np.arange(4)), 0, 0, 0]
+    )
+    # A form of three terms needs four views to fit on, and a fold leaves three.
+    assert set(forms) == {"constant", "ratio", "mean"}
+
+
+def test_a_term_about_the_same_over_a_rungs_views_is_not_fitted():
+    """Views of one seed keep its mean context within a token: no form reads
+    the mean there."""
+    rng = np.random.default_rng(3)
+    ratio = rng.uniform(0.25, 2.0, 30)
+    x = np.column_stack([np.ones(30), ratio, ratio / 3, 0.7 + rng.uniform(0, 1e-5, 30)])
+    w = rng.uniform(0.1, 0.5, 30)
+
+    forms = step_grid_fit._forms(x, w, -w * (0.2 + 0.1 * ratio), seed=0)
+
+    assert set(forms) == {"constant", "ratio", "ratio and spread"}
+    assert forms["ratio"]["terms"] == pytest.approx([0.2, 0.1, 0, 0])

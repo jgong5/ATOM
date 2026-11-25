@@ -1,0 +1,225 @@
+# SPDX-License-Identifier: MIT
+"""The weights and buffers a simulated run installs are read off its meta build.
+
+`NonAllocatingRunner._build_and_load_model` builds the model class on the meta
+device and hands the tree to `run.runner`; the weights term in the readings it
+installs is then the bytes of the tree's parameter storages, each once, and the
+buffers term those of its buffer storages.
+"""
+
+import json
+import sys
+import types
+from types import SimpleNamespace
+
+import pytest
+import torch
+from test_memory_readings import CONFIG_JSON, MAX_NUM_BATCHED_TOKENS, with_readings
+from test_vertical_slice import _run_file
+from transformers import PretrainedConfig
+
+from atom.compass import run as compass_run
+from atom.compass.backends.provenance import Method
+from atom.compass.runner.overrides import NonAllocatingRunner, RunnerRefusal
+from atom.model_ops.base_config import QuantizeMethodBase
+
+VOCAB, HIDDEN = 64, 16
+EXPERTS, ROWS, COLS = 4, 8, 32
+
+
+class TiedPacked(torch.nn.Module):
+    """A head tied two ways ATOM's models tie one, and a packed FP4-like tensor."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.embed = torch.nn.Embedding(VOCAB, HIDDEN, dtype=torch.bfloat16)
+        # Qwen3's tie: a parameter of its own over the embedding's storage.
+        self.head = torch.nn.Linear(HIDDEN, VOCAB, bias=False, dtype=torch.bfloat16)
+        self.head.weight.data = self.embed.weight.data
+        # Qwen3.5's tie: the embedding module itself under a second name.
+        self.lm_head = self.embed
+        # Two FP4 values a byte, as ATOM's MXFP4 experts are stored.
+        self.experts = torch.nn.Parameter(
+            torch.empty(EXPERTS, ROWS, COLS // 2, dtype=torch.uint8),
+            requires_grad=False,
+        )
+
+
+class Buffered(torch.nn.Module):
+    """Buffers held the ways ATOM's models hold them, and a table held as none."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.empty(VOCAB, HIDDEN, dtype=torch.bfloat16), requires_grad=False
+        )
+        # One rotary module every layer shares, as `get_rope` caches it.
+        rope = torch.nn.Module()
+        rope.register_buffer("cos_sin", torch.empty(ROWS, COLS, dtype=torch.bfloat16))
+        self.layers = torch.nn.ModuleList(torch.nn.Module() for _ in range(2))
+        for layer in self.layers:
+            layer.rope = rope
+        # A warmup placeholder, as DeepSeek-V4's indexer registers its cache.
+        self.register_buffer(
+            "kv_cache", torch.zeros(1, ROWS, HIDDEN, dtype=torch.float32)
+        )
+        # A buffer over a parameter's storage is resident once, as the parameter.
+        self.register_buffer("row", self.weight.data[0])
+        # DeepSeek-V4's rotary table: a plain attribute, so the load residue
+        # holds it and the buffers do not.
+        self.cos_cache = torch.empty(ROWS, COLS)
+
+
+def _built(monkeypatch, tmp_path, model_class=TiedPacked):
+    """A worker's runner after `_build_and_load_model` under a run file."""
+    monkeypatch.setenv(compass_run.ENV, str(_run_file(tmp_path)))
+    (tmp_path / "config.json").write_text(CONFIG_JSON.read_text())
+    hf = PretrainedConfig.from_dict(json.loads(CONFIG_JSON.read_text())["text_config"])
+    runner = SimpleNamespace(
+        config=SimpleNamespace(
+            model=str(tmp_path),
+            hf_config=hf,
+            tensor_parallel_size=1,
+            parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+            enforce_eager=True,
+            speculative_config=None,
+            kv_transfer_config={},
+        ),
+    )
+    with_readings(runner, tmp_path / "store")
+    NonAllocatingRunner._build_and_load_model(runner, model_class)
+    return runner
+
+
+def test_the_weights_are_the_meta_builds_storages_each_counted_once(
+    monkeypatch, tmp_path
+):
+    runner = _built(monkeypatch, tmp_path)
+    weights = runner.compass_readings.peak_torch.terms[0]
+    assert weights.name == "weights"
+    assert weights.method is Method.ANALYTICAL
+    assert weights.nbytes == VOCAB * HIDDEN * 2 + EXPERTS * ROWS * COLS // 2
+    assert all(p.is_meta for p in runner.model.parameters())
+
+
+def test_the_buffers_are_the_meta_builds_buffer_storages_each_counted_once(
+    monkeypatch, tmp_path
+):
+    runner = _built(monkeypatch, tmp_path, Buffered)
+    weights, buffers = runner.compass_readings.peak_torch.terms[:2]
+    assert buffers.name == "buffers"
+    assert buffers.method is Method.ANALYTICAL
+    assert buffers.nbytes == ROWS * COLS * 2 + ROWS * HIDDEN * 4
+    assert buffers.source == "2 buffer storages of a meta build of Buffered"
+    assert weights.nbytes == VOCAB * HIDDEN * 2
+
+
+class PaddedScale(QuantizeMethodBase):
+    """Re-lays a scale after load, as the MXFP4 MoE pads its 12 columns to 16."""
+
+    def create_weights(self, layer, *args, **kwargs):
+        pass
+
+    def apply(self, layer, *args, **kwargs):
+        pass
+
+    def process_weights_after_loading(self, layer):
+        layer.scale = torch.nn.Parameter(
+            torch.empty(EXPERTS, ROWS, 16, dtype=torch.uint8), requires_grad=False
+        )
+
+
+class PostLoaded(torch.nn.Module):
+    """A scale its quant method pads after load, under a module that fuses two."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.experts = torch.nn.Module()
+        self.experts.quant_method = PaddedScale()
+        self.experts.scale = torch.nn.Parameter(
+            torch.empty(EXPERTS, ROWS, 12, dtype=torch.uint8), requires_grad=False
+        )
+        self.gate = torch.nn.Parameter(torch.empty(ROWS, dtype=torch.bfloat16))
+        self.up = torch.nn.Parameter(torch.empty(ROWS, dtype=torch.bfloat16))
+
+    def process_weights_after_loading(self):
+        self.gate_up = torch.nn.Parameter(torch.cat([self.gate, self.up]))
+        del self.gate, self.up
+
+
+class OnDevice(torch.nn.Module):
+    """A post-load hook that copies a weight to the GPU."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.empty(ROWS, dtype=torch.bfloat16))
+
+    def process_weights_after_loading(self):
+        self.weight.data = self.weight.data.to(torch.device("cpu"))
+
+
+def test_the_weights_are_what_the_post_load_hooks_leave(monkeypatch, tmp_path):
+    runner = _built(monkeypatch, tmp_path, PostLoaded)
+    weights = runner.compass_readings.peak_torch.terms[0]
+    assert weights.nbytes == EXPERTS * ROWS * 16 + 2 * ROWS * 2
+    assert weights.source == "2 parameter storages of a meta build of PostLoaded"
+
+
+def test_a_hook_that_cannot_run_on_meta_refuses_the_start_by_name(
+    monkeypatch, tmp_path
+):
+    with pytest.raises(RunnerRefusal, match="OnDevice.process_weights_after_loading"):
+        _built(monkeypatch, tmp_path, OnDevice)
+
+
+CHIP_INFO = "aiter.jit.utils.chip_info"
+
+
+def _probe(name, arch):
+    """An aiter arch probe that answers `arch`."""
+
+    def probe():
+        return arch
+
+    probe.__name__, probe.__module__ = name, CHIP_INFO
+    return probe
+
+
+def test_a_meta_build_sees_the_simulated_arch_and_reads_no_engram_table(
+    monkeypatch, tmp_path
+):
+    """On a gfx942 host the run file's MI355X is what the build sees, through a
+    probe a module bound at import and one it imports while it builds; the
+    host's after, in a module imported during the build too. A loaded engram
+    preparer reads no checkpoint."""
+    chip = types.ModuleType(CHIP_INFO)
+    chip.get_gfx = _probe("get_gfx", "gfx942")
+    chip.get_gfx_runtime = _probe("get_gfx_runtime", "gfx942")
+    bound = types.ModuleType("bound_at_import")
+    bound.get_gfx = chip.get_gfx
+
+    class Preparer:
+        @classmethod
+        def from_checkpoint(cls, *args):
+            raise AssertionError("read the checkpoint")
+
+    engram = SimpleNamespace(EngramInputPreparer=Preparer)
+    monkeypatch.setitem(sys.modules, CHIP_INFO, chip)
+    monkeypatch.setitem(sys.modules, bound.__name__, bound)
+    monkeypatch.setitem(sys.modules, "atom.model_ops.engram.device.runtime", engram)
+    seen, late = [], types.ModuleType("imported_while_building")
+
+    class ArchProbing(TiedPacked):
+        def __init__(self, config):
+            super().__init__(config)
+            late.get_gfx = sys.modules[CHIP_INFO].get_gfx
+            monkeypatch.setitem(sys.modules, late.__name__, late)
+            seen.append((bound.get_gfx(), sys.modules[CHIP_INFO].get_gfx_runtime()))
+
+    _built(monkeypatch, tmp_path, ArchProbing)
+    assert seen == [("gfx950", "gfx950")]
+    assert (bound.get_gfx(), late.get_gfx(), chip.get_gfx_runtime()) == (
+        ("gfx942",) * 3
+    )
+    assert Preparer.from_checkpoint("checkpoint", None, 1, "cpu") is None

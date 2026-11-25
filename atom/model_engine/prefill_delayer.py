@@ -118,10 +118,11 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from typing import NamedTuple
 
 import torch
+
+from atom.utils import time_shim as time
 
 logger = logging.getLogger(__name__)
 
@@ -329,7 +330,7 @@ class PrefillDelayer:
         prefill_decode_interval: int = 0,
         exchange_prefill_costs: bool = False,
         cost_gate: bool = False,
-        clock=time.perf_counter,
+        clock=None,
         admit_policy: str = "interval",
     ):
         if dp_size > 1 and cpu_group is None:
@@ -452,6 +453,8 @@ class PrefillDelayer:
         # Step timing for the cost gate: the interval between two decisions is
         # one scheduler step. Moving averages of a decode step and of a prefill
         # step's time per unit of the costliest chunk it ran; 0 = not yet timed.
+        # With no `clock`, each read looks up `time.perf_counter`: the LP
+        # clock while a runtime is installed.
         self._clock = clock
         self._last_call_s = None
         # this rank's request arrivals: moving average of their spacing (0 =
@@ -646,7 +649,7 @@ class PrefillDelayer:
         # one scheduler step since the previous decision (0: none yet, or untimed)
         step_s = 0.0
         if self._cost_gate:
-            now = self._clock()
+            now = time.perf_counter() if self._clock is None else self._clock()
             if self._last_call_s is not None:
                 step_s = now - self._last_call_s
             self._last_call_s = now
@@ -664,7 +667,7 @@ class PrefillDelayer:
             self._reduce_np[self._gate_at : self._gate_at + len(gate)] = gate
         if self.admit_policy == "adaptive":
             if not self._cost_gate:
-                now_a = self._clock()
+                now_a = time.perf_counter() if self._clock is None else self._clock()
                 if self._last_call_s is not None:
                     step_s = now_a - self._last_call_s
                 self._last_call_s = now_a

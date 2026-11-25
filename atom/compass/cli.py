@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: MIT
+"""The `compass` console script: it parses a command's words and dispatches.
+
+Each command in `COMMANDS` runs its module's `main` with the arguments after
+its words; a module not yet built refuses as not built. Each command in
+`REFUSED` refuses with its reason.
+A refusal a command raises (`ValueError`, `OSError`, `ArtifactRefusal`,
+`GpuRefusal`, `SpecRefusal`) exits with its message rather than a traceback;
+a `json.JSONDecodeError` names no file, so it keeps its traceback.
+"""
+
+import importlib
+import json
+import sys
+
+from atom.compass.artifacts import ArtifactRefusal
+from atom.compass.drive.gpu import GpuRefusal
+from atom.compass.spec import SpecRefusal
+
+#: Each command, to its module and what it does.
+COMMANDS = {
+    "record": ("atom.compass.drive.record", "a real run's step record [GPU]"),
+    "trace steps": (
+        "atom.compass.drive.trace_steps",
+        "the steps a simulated run schedules, published as a shape_population",
+    ),
+    "trace ops": (
+        "atom.compass.capture",
+        "steps traced with no device, an op_graph per shape",
+    ),
+    "measure steps": (
+        "atom.compass.bench.measure",
+        "batches replayed or planned, measured on the bench [GPU]",
+    ),
+    "measure ops": (
+        "atom.compass.bench.ops",
+        "each op_graph leaf timed alone on one device, cold [GPU]",
+    ),
+    "measure memory": (
+        "atom.compass.drive.measure_memory",
+        "an engine start's memory readings [GPU]",
+    ),
+    "measure device": (
+        "atom.compass.drive.measure_device",
+        "one node's probe record: its cards' attainable rates and floors [GPU]",
+    ),
+    "fit steps": ("atom.compass.fit.steps", "a step-level backend's fit"),
+    "fit ops": (
+        "atom.compass.fit.ops",
+        "a price_list from measure ops's measurements",
+    ),
+    "fit host": ("atom.compass.fit.host", "the host laws, fitted on real runs"),
+    "fit ingress": (
+        "atom.compass.fit.ingress",
+        "an encoding ingress's hop, fitted on its stamps",
+    ),
+    "fit device": (
+        "atom.compass.fit.device",
+        "a platform's readings, from probe records or another device's",
+    ),
+    "run": ("atom.compass.drive.run", "a simulated serve"),
+    "project": (
+        "atom.compass.validate.project",
+        "real runs' steps priced analytically on another device, published as a projection",
+    ),
+    "advice": (
+        "atom.compass.advice.__main__",
+        "a space file's candidates and their points, written into OUT",
+    ),
+}
+OPS = "the op-level half of the toolchain is not built yet"
+#: Each command that refuses, to why and where its work is.
+REFUSED = {
+    "trace": "there is no bare trace: use compass trace steps or compass trace ops",
+    "plan": (
+        "deprecated: compass measure steps --grid plans the step grid's points, "
+        "and compass run --coverage checks a run's coverage before it starts"
+    ),
+    "validate": (
+        "deprecated: grading is python -m atom.compass.validate, the analytical "
+        "bound check python -m atom.compass.validate.bound, and a projection "
+        "compass project"
+    ),
+    "measure collectives": "deprecated: collectives are priced by compass measure ops",
+    "discover": "deprecated: renamed compass trace steps",
+}
+USAGE = "usage: compass <command> [<args>]; compass <command> --help for its own\n\n"
+USAGE += "\n".join(f"  {c:16} {doc}" for c, (_, doc) in COMMANDS.items())
+
+
+def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] in (["-h"], ["--help"]):
+        print(USAGE)
+        return
+    words = (" ".join(argv[:2]), " ".join(argv[:1]))
+    name = next((w for w in words if w in COMMANDS or w in REFUSED), None)
+    if name is None:
+        raise SystemExit(f"compass: no command {words[0]!r}\n{USAGE}")
+    if name in REFUSED:
+        raise SystemExit(f"compass {name}: {REFUSED[name]}")
+    module = COMMANDS[name][0]
+    try:
+        command = importlib.import_module(module)
+    except ModuleNotFoundError as missing:
+        if module != missing.name and not module.startswith(f"{missing.name}."):
+            raise
+        raise SystemExit(f"compass {name}: not built yet") from missing
+    refusing(f"compass {name}", command.main, argv[len(name.split()) :])
+
+
+def refusing(prog: str, main, argv: list[str]) -> None:
+    """`main(argv)`, a refusal it raises exiting with `prog` and its message."""
+    try:
+        main(argv)
+    except json.JSONDecodeError:  # it names no file, so it keeps its traceback
+        raise
+    except (ValueError, OSError, ArtifactRefusal, GpuRefusal, SpecRefusal) as refused:
+        raise SystemExit(f"{prog}: {refused}") from refused

@@ -25,7 +25,6 @@ import logging
 import math
 import struct
 import threading
-import time
 from collections import Counter, deque
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
@@ -73,6 +72,7 @@ from atom.observability import tracing
 from atom.sampling_params import RequiredChannel
 from atom.structured_output import StructuredRequest, is_structured
 from atom.utils import envs, get_hf_text_config
+from atom.utils import time_shim as time
 from atom.utils.selector import attn_family
 
 if TYPE_CHECKING:
@@ -616,6 +616,9 @@ class ScheduledBatchOutput:
         num_rejected: Per-request count of rejected speculative tokens.
         num_bonus: Per-request count of bonus accepted tokens.
         is_deferred_out: Whether output was deferred from a previous step.
+        predicted_s: The step's duration in seconds, as a runner that predicts
+            the step rather than running it prices it; None from a real forward.
+        group_targets: Each DP rank's predicted step duration, by rank, or None.
 
     NumPy views are copied before the result enters the output queue. Views
     returned by asynchronous D2H copies otherwise keep pinned tensor storage
@@ -634,6 +637,8 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        predicted_s: float | None = None,
+        group_targets: tuple[float, ...] | None = None,
         constraint_errors: dict[int, str] | None = None,
     ):
         self.req_ids = req_ids
@@ -650,6 +655,8 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
+        self.predicted_s = predicted_s
+        self.group_targets = group_targets
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
 
@@ -824,6 +831,9 @@ class Scheduler:
         # by `take_rejected` each EngineCore step; routed through the same
         # output_queue path as forward-finished seqs.
         self._rejected: list[Sequence] = []
+        # An aborted send handed to the connector since its last metadata,
+        # which carries the abort to the workers.
+        self._abort_awaits_meta = False
 
         # KV transfer bookkeeping
         self.finished_recving_kv_req_ids: list[int] = []
@@ -2514,8 +2524,11 @@ class Scheduler:
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
 
-        # Rejections may still need an empty batch to dispatch connector cleanup.
-        if not self.running and not self.waiting and not self._rejected:
+        # Rejections, and an abort handed to the connector, may still need an
+        # empty batch to dispatch connector cleanup.
+        if not (
+            self.running or self.waiting or self._rejected or self._abort_awaits_meta
+        ):
             return None
 
         # ---- Phase 1: resume partial prefills from running ----
@@ -3092,6 +3105,7 @@ class Scheduler:
                     scheduled_seqs, num_scheduled_tokens
                 )
                 connector_meta_output = self.kv_connector.build_connector_meta()
+                self._abort_awaits_meta = False
 
             # Freeze, per seq, whether this chunk is the last one this prefill
             # owes. Uses the pre-advance offsets so it is correct whether or not
@@ -3292,6 +3306,7 @@ class Scheduler:
             self._publish_state_stores()
             self._note_connector_scheduled_tokens(scheduled_seqs, num_scheduled_tokens)
             connector_meta_output = self.kv_connector.build_connector_meta()
+            self._abort_awaits_meta = False
 
         self._check_draft_writes_allocated(scheduled_seqs.values())
         decode_batch = ScheduledBatch(
@@ -3522,7 +3537,18 @@ class Scheduler:
             if seq.id == req_id:
                 seq.status = SequenceStatus.ABORTED
                 return True
-        return False
+        # Finished and parked for its send: the connector reports the send
+        # done once no transfer of the blocks can run, and refuses a later one.
+        seq = self._deferred_sequence(req_id)
+        if seq is None:
+            return False
+        abort_parked_send = getattr(self.kv_connector, "abort_parked_send", None)
+        if callable(abort_parked_send):
+            abort_parked_send(seq.id)
+            # An idle scheduler builds no metadata, so `_schedule` builds an
+            # empty batch to carry the abort to the workers.
+            self._abort_awaits_meta = True
+        return True
 
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.
@@ -6024,7 +6050,7 @@ class Scheduler:
         # which buys the state leg the aggregator's per-request quorum for free.
         # They cannot be confused: a KV load is refused for any sequence with a
         # per-request cache, and a state load exists only for such a sequence.
-        for req_id in kv_connector_output.finished_loading or ():
+        for req_id in sorted(kv_connector_output.finished_loading or (), key=str):
             if metrics := getattr(self, "metrics", None):
                 metrics.finish_kv_wait(req_id, succeeded=False)
             assert is_offload, "Only offload connector should update loading KV status"
@@ -6046,7 +6072,7 @@ class Scheduler:
         # channel -- still settles as a failure.
         state_survived = getattr(self.kv_connector, "take_state_load_survived", None)
         state_survived = state_survived() if state_survived is not None else set()
-        for req_id in kv_connector_output.failed_loading or ():
+        for req_id in sorted(kv_connector_output.failed_loading or (), key=str):
             if metrics := getattr(self, "metrics", None):
                 metrics.finish_kv_wait(req_id, succeeded=False)
             assert (
@@ -6064,8 +6090,8 @@ class Scheduler:
                 continue
             self.failed_recving_kv_req_ids.append(req_id)
 
-        finished_saving = kv_connector_output.finished_saving or ()
-        for req_id in kv_connector_output.finished_sending or ():
+        finished_saving = sorted(kv_connector_output.finished_saving or (), key=str)
+        for req_id in sorted(kv_connector_output.finished_sending or (), key=str):
             assert (
                 self.kv_connector.is_producer
             ), "Only producer should free blocks after sending KV"

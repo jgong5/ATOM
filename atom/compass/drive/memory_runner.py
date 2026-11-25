@@ -1,0 +1,157 @@
+# SPDX-License-Identifier: MIT
+"""ATOM's own runner, reading its rank's memory as it starts: the runner
+`compass measure memory` starts the engine with.
+
+Kept apart from the command because importing `ModelRunner` needs a driver.
+"""
+
+import json
+import os
+from functools import wraps
+from pathlib import Path
+
+import torch
+from torch._dynamo.utils import compilation_time_metrics, counters
+
+from atom.compass.artifacts import member_name
+from atom.compass.drive.measure_memory import OUT_ENV
+from atom.compass.memory.check import STORAGE
+from atom.compass.memory.readings import PAGE_BOUND
+from atom.compass.parity import key_memory_formats_by_name
+from atom.compass.run import memory
+from atom.compass.run.step_grid import BOUNDS, keyed
+from atom.model_engine.model_runner import ModelRunner
+
+key_memory_formats_by_name()
+
+#: What inductor times each kernel's autotuning under.
+AUTOTUNE = "CachingAutotuner.benchmark_all_configs"
+
+
+def _allocated(which: str) -> int:
+    return torch.cuda.memory_stats()[f"allocated_bytes.all.{which}"]
+
+
+def _storage_bytes(tensors) -> int:
+    """The bytes of the storages `tensors` hold, each storage once."""
+    held = {
+        t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+        for t in tensors
+        if t.is_cuda
+    }
+    return sum(held.values())
+
+
+class MemoryReadingModelRunner(ModelRunner):
+    """`ModelRunner`, unchanged, with its rank's memory read through its start
+    into ``readings.<rank>.json`` in the directory `OUT_ENV` names: allocated
+    bytes once the weights load, less their storages; allocated bytes where
+    the KV budget reads the device and the builder bounds its PAGEs, less
+    those; the warmup's peak above them over its tokens; the budget's
+    `non_torch` and total; the reserved bytes graph capture adds; the
+    kernels inductor autotuned and the graphs it missed, which
+    `compass measure memory` starts again for; and beside the readings, as
+    `check.STORAGE`, the bytes of the parameter storages and of the buffer
+    storages no parameter holds."""
+
+    def _build_and_load_model(self, model_class):
+        super()._build_and_load_model(model_class)
+        model = self.model
+        self._read = {
+            "loaded": _allocated("current"),
+            "weights": _storage_bytes([*model.parameters(), *model.buffers()]),
+            "parameters": _storage_bytes(model.parameters()),
+        }
+
+    def allocate_forward_vars(self):
+        super().allocate_forward_vars()
+        # The builder built next may bound its PAGEs by what is allocated as it
+        # asks (DeepSeek-V4.1's); a simulated start answers it there.
+        builder, read = self.attn_backend.get_builder_cls(), self._read
+        if bound := getattr(builder, "_page_bound", None):
+
+            @wraps(bound)
+            def reading(built, *args, **kwargs):
+                read["page_bound"] = torch.cuda.memory_allocated(built.device)
+                return bound(built, *args, **kwargs)
+
+            builder._page_bound = reading
+
+    def _maybe_warmup(self):
+        tokens, forward = [], self.forward
+        # RapidServe's prefill runner binds `prefill_forward` on the instance.
+        bound = vars(self).get("forward")
+
+        def counted(batch, *args, **kwargs):
+            tokens.append(batch.total_tokens_num)
+            return forward(batch, *args, **kwargs)
+
+        self.forward = counted
+        try:
+            super()._maybe_warmup()
+        finally:
+            del self.forward
+            if bound is not None:
+                self.forward = bound
+        self._read["warmup_tokens"] = sum(tokens)
+
+    def _read_device_memory(self):
+        readings = super()._read_device_memory()
+        self._read |= {
+            "total": readings.total,
+            "non_torch": readings.non_torch,
+            "current": _allocated("current"),
+            "peak": _allocated("peak"),
+        }
+        return readings
+
+    def get_num_blocks(self):
+        reply = super().get_num_blocks()
+        self._read["num_kvcache_blocks"] = reply["num_kvcache_blocks"]
+        self._write(None)
+        return reply
+
+    def capture_cudagraph(self):
+        reply = super().capture_cudagraph()
+        self._write(reply[2])
+        return reply
+
+    def _out(self) -> Path:
+        """The directory this rank writes its readings in."""
+        return Path(os.environ[OUT_ENV])
+
+    def _write(self, pool) -> None:
+        read, config = self._read, self.config
+        engine = keyed(config) | {name: getattr(config, name) for name in BOUNDS}
+        engine["num_kvcache_blocks"] = read["num_kvcache_blocks"]
+        readings = {
+            "capacity_bytes": read["total"],
+            "driver_and_collective_reserve_bytes": read["non_torch"],
+            "allocator_retained_after_load_bytes": read["loaded"] - read["weights"],
+            "persistent_forward_buffer_bytes": read["current"] - read["loaded"],
+            "activation_bytes": read["peak"] - read["current"],
+            "warmup_tokens": read["warmup_tokens"],
+            "cudagraph_pool_bytes": pool,
+        }
+        if "page_bound" in read:
+            readings[PAGE_BOUND] = read["page_bound"] - read["loaded"]
+        name = member_name(
+            memory.STEM, memory.coords(config, self.rank), memory.EXTENSION
+        )
+        (self._out() / name).write_text(
+            json.dumps(
+                {
+                    "key": memory.key_fields(config),
+                    "engine": engine,
+                    "readings": readings,
+                    STORAGE: {
+                        "weights": read["parameters"],
+                        "buffers": read["weights"] - read["parameters"],
+                    },
+                    "autotuned_kernels": len(
+                        compilation_time_metrics.get(AUTOTUNE, ())
+                    ),
+                    "fxgraph_cache_misses": counters["inductor"]["fxgraph_cache_miss"],
+                }
+            )
+        )

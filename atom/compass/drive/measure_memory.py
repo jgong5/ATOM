@@ -1,0 +1,286 @@
+# SPDX-License-Identifier: MIT
+"""`compass measure memory`: one engine start's memory readings, published as
+its configuration's `memory_readings` entry.
+
+    compass measure memory --gpu G --store S --out D -- <ATOM args>
+
+ATOM's engine starts from ATOM's arguments (`EngineArgs`) on the GPUs `--gpu`
+names, through `MemoryReadingModelRunner` (under `--enable-rapidserve` its
+RapidServe form, whose decode engine writes its own readings beside prefill's),
+and stops once it has started: its weights loaded, its one warmup run, its KV
+cache sized and its graphs captured; at DP and TP both above 1 under
+`serve.LOG_MORE`, as `compass record` starts a server. `gpu.quiet` checks those
+GPUs before the start and, once every process of the start has exited, after
+it. Each rank writes its readings and the key it read off its resolved config,
+and the ranks must agree on the key. The entry's key is that one with the
+platform the cards read: their device and PTL state, and this process's
+stack and torch; cards of two devices refuse before the start.
+`non_torch` refuses a spread across the ranks above `SPREAD_LIMIT`. One member per rank
+holds `memory.ENTRY_FIELDS`, its `record` the digest of the engine's log.
+`--beside` names a command the start runs first in the engine's session, such
+as the lmcache server an offload connector reaches, so the GPU checks hold it
+to the engine's rule. SIGINT or SIGTERM to the command stops the engine's
+group as `serve` stops a server's, and publishes nothing.
+
+Each start merges the JIT cache library `--store` holds for this stack into
+the container's caches, and its stop writes back each artifact it finished
+compiling (`jit_cache`), as `compass record --store` does.
+
+Each start takes a free `ATOM_DP_MASTER_PORT`, which keys ATOM's compiled-graph
+cache, and its stop removes that directory, as a parity run's server does. A
+start in which inductor autotuned a
+kernel or missed an FX graph moves its files to `<out>.cold` and starts once
+more, on the cache it warmed: what autotuning or a fresh compile left loaded
+reads in `non_torch`. A second such start refuses.
+
+``--out`` gets the engine's log, run.json's identity from the rank-0 engine
+file, and ``memory_readings.json``, the entry's readable copy (a RapidServe
+decode entry's in ``memory_readings.decode.json``). ATOM's
+``--load_dummy`` refuses until its readings are shown to match a real load's.
+The API server's `FRONTEND` flags, which `compass record` serves with, are
+taken and dropped.
+"""
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+from atom.compass import parity
+from atom.compass.artifacts import (
+    ArtifactStore,
+    GateState,
+    Key,
+    Kind,
+    Provenance,
+    keyed_platform,
+    platform_of,
+    read_back,
+    roots_for,
+)
+from atom.compass.drive import jit_cache, serve
+from atom.compass.drive.gpu import add_gpu_flag, hip_visible, quiet
+from atom.compass.drive.identity import _device, _ptl, _stack, identity
+from atom.compass.memory.check import LOG, READINGS
+from atom.compass.run import CLOCK_ENV, ENV, _write_whole, memory
+from atom.compass.spec import across_ranks
+
+PROG = "compass measure memory"
+#: Where each rank writes its readings: a directory this command names.
+OUT_ENV = "ATOM_COMPASS_MEMORY_OUT"
+#: The command `--beside` names, which the start runs before the engine.
+BESIDE_ENV = "ATOM_COMPASS_MEMORY_BESIDE"
+RUNNER = "atom.compass.drive.memory_runner.MemoryReadingModelRunner"
+RAPIDSERVE_RUNNER = (
+    "atom.compass.drive.rapidserve_memory_runner.MemoryReadingRapidServeModelRunner"
+)
+#: ATOM's dummy weights flag; its parser reads `_` in a flag as `-`.
+LOAD_DUMMY = "--load-dummy"
+START_TIMEOUT_S = 3600
+#: The API server's own flags that `compass record` passes it
+#: (`atom/entrypoints/openai/api_server.py::main`, less `serve.OWNED`), each
+#: parsed as the server parses it. They shape its HTTP frontend, which a start
+#: and the step bench (`bench/measure.py::atom_config`) have none of, so both
+#: take and drop them, and any other flag `EngineArgs` lacks still refuses.
+FRONTEND = {
+    "--tool-call-parser": {},
+    "--timeout-keep-alive": {"type": int},
+    "--disable-uvicorn-access-log": {"action": "store_true"},
+    "--chat-template": {},
+    "--default-chat-template-kwargs": {},
+    "--request-log": {},
+    "--api-server-count": {"type": int},
+}
+#: Where in `READINGS` a RapidServe decode engine writes its readings.
+DECODE = "decode"
+
+
+def start(argv: list[str]) -> None:
+    """Start ATOM's engine from ATOM's arguments `argv` through the reading
+    runner, and stop it once it has started."""
+    if beside := os.environ.get(BESIDE_ENV):
+        subprocess.Popen(shlex.split(beside))
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.model_engine.llm_engine import LLMEngine
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    parser = FlexibleArgumentParser()
+    EngineArgs.add_cli_args(parser)
+    for flag, kind in FRONTEND.items():
+        parser.add_argument(flag, **kind)
+    args = EngineArgs.from_cli_args(parser.parse_args(argv))
+    kwargs = args._get_engine_kwargs()
+    runner = RAPIDSERVE_RUNNER if args.enable_rapidserve else RUNNER
+    LLMEngine(args.model, runner_qualname=runner, **kwargs).close()
+
+
+def main(argv: list[str], again: bool = False) -> None:
+    cut = argv.index("--") if "--" in argv else len(argv)
+    args = _parser().parse_args(argv[:cut])
+    atom_args = argv[cut + 1 :]
+    for arg in atom_args:
+        flag = arg.split("=", 1)[0].replace("_", "-")
+        if len(flag) > 2 and flag.startswith("--") and LOAD_DUMMY.startswith(flag):
+            raise ValueError(
+                f"{arg} is among ATOM's arguments; dummy weights are not yet "
+                "shown to read as a real load's do"
+            )
+    model = serve._model(atom_args)
+    devices = sorted({f"{gpu['name']} {gpu['arch']}" for gpu in _device(args.gpu)})
+    if len(devices) > 1:
+        raise ValueError(f"the cards are {' and '.join(devices)}; start on one device")
+    stack = _stack()
+    platform = platform_of(devices[0], stack, _ptl(args.gpu))
+    library = jit_cache.library(args.store, stack, _device(args.gpu))
+    out = Path(args.out)
+    if out.exists() and any(out.iterdir()):
+        raise ValueError(f"{out} holds an earlier run's files; one run per directory")
+    (out / READINGS).mkdir(parents=True)
+    env = {k: v for k, v in os.environ.items() if k not in (ENV, CLOCK_ENV, parity.ENV)}
+    env[OUT_ENV] = str(out / READINGS)
+    env["HIP_VISIBLE_DEVICES"] = hip_visible(args.gpu)
+    env |= serve.log_more(atom_args)
+    if args.beside:
+        env[BESIDE_ENV] = args.beside
+    code = f"import sys; from {__name__} import start; start(sys.argv[1:])"
+    # SIGINT and SIGTERM end the wait, never the stop: the engine runs in its
+    # own session, so a command that ends first leaves it running.
+    with (
+        serve._held_ports(1) as [dp_port],
+        serve._stop_signals() as stopped,
+        quiet(args.gpu, out),
+        (out / LOG).open("w") as log,
+    ):
+        env["ATOM_DP_MASTER_PORT"] = str(dp_port)
+        # KFD lists an exited rank until the driver releases it.
+        kfd = serve._kfd()
+        # The log's creation, on the clock a cache file's mtime reads.
+        since = os.fstat(log.fileno()).st_mtime_ns
+        jit_cache.restore(library)
+        engine = subprocess.Popen(
+            [sys.executable, "-c", code, *atom_args],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+        exited = f"no exit in {START_TIMEOUT_S} s"
+        try:
+            for _ in range(int(START_TIMEOUT_S / serve.POLL_S)):
+                if stopped:
+                    break
+                try:
+                    exited = engine.wait(serve.POLL_S)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            # A member of the engine's process group can outlive its leader:
+            # the after-check reads the GPUs once every member has exited.
+            serve._stop(engine.pid, kfd)
+            engine.wait()
+            serve.drop_compiled(out / LOG)
+            jit_cache.save(library, since)
+    if stopped:
+        raise ValueError(
+            f"{signal.Signals(stopped[0]).name} stopped the command; nothing is published"
+        )
+    if exited != 0:
+        raise ValueError(f"the engine did not start ({exited}); see {out / LOG}")
+    if missed := _cold(out):
+        if again:
+            raise ValueError(
+                f"{', '.join(missed)} missed inductor caches again on a second start; "
+                "non_torch on a cold inductor cache reads high, so nothing is published"
+            )
+        # What autotuning or a fresh compile left loaded reads in `non_torch`;
+        # the next start finds both cached.
+        out.rename(f"{out}.cold")
+        return main(argv, again=True)
+    first = json.loads(min((out / READINGS).glob("*.json")).read_text())
+    (out / "engine.json").write_text(json.dumps(first["engine"]))
+    identified = identity(out / "engine.json", model, sys.argv, args.gpu)
+    _write_whole(out / "run.json", json.dumps(identified))
+    publish(out, platform, args.store, " ".join([PROG, *argv]))
+
+
+def _cold(out: Path) -> list[str]:
+    """The ranks' files in `out` whose start autotuned a kernel or missed a graph."""
+    return [
+        str(p.relative_to(out / READINGS))
+        for p in sorted((out / READINGS).rglob("*.json"))
+        if (read := json.loads(p.read_text())).get("autotuned_kernels")
+        or read.get("fxgraph_cache_misses")
+    ]
+
+
+def publish(out: Path, platform: dict, store: str, command: str) -> None:
+    """Publish the readings the ranks wrote in `out` at their key on `platform`,
+    and write the entry's readable copy; then, the same way, those a RapidServe
+    decode engine wrote in `DECODE`, unless their key is prefill's, whose
+    readings size the pool."""
+    published = set()
+    for files, readable in (
+        (out / READINGS, "memory_readings.json"),
+        (out / READINGS / DECODE, f"memory_readings.{DECODE}.json"),
+    ):
+        ranks = {p.name: json.loads(p.read_text()) for p in files.glob("*.json")}
+        keys = {json.dumps(r["key"], sort_keys=True) for r in ranks.values()}
+        # No files, or prefill's key: nothing to add.
+        if not keys <= published:
+            _publish(out, ranks, readable, platform, store, command)
+            published |= keys
+
+
+def _publish(out: Path, ranks: dict, readable: str, platform, store, command) -> None:
+    record = "sha256:" + hashlib.sha256((out / LOG).read_bytes()).hexdigest()
+    for held in ranks.values():
+        held["readings"]["record"] = record
+    keys = {json.dumps(r["key"], sort_keys=True) for r in ranks.values()}
+    if len(keys) != 1:
+        raise ValueError(
+            f"the ranks read {len(keys)} keys off their configs: {sorted(keys)}"
+        )
+    first = ranks[min(ranks)]
+    fields = first["key"]
+    reserve = [
+        r["readings"]["driver_and_collective_reserve_bytes"] for r in ranks.values()
+    ]
+    across_ranks("non_torch", reserve)
+    key = Key.of(
+        Kind.MEMORY_READINGS, **keyed_platform(Kind.MEMORY_READINGS, platform), **fields
+    )
+    members = {name: json.dumps(r["readings"]).encode() for name, r in ranks.items()}
+    ArtifactStore(store).publish(
+        key,
+        provenance=Provenance(
+            command,
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            roots_for({"atom": "atom", "aiter": "aiter"}),
+        ),
+        topology=read_back(min(ranks))[1].topology,
+        conditions=memory.conditions(fields, **platform),
+        gates=GateState.of(),
+        members=members,
+    )
+    copy = {"key": key.values, "token": key.token()}
+    copy["members"] = {name: r["readings"] for name, r in sorted(ranks.items())}
+    (out / readable).write_text(json.dumps(copy, indent=1) + "\n")
+    print(f"published {key} as {key.token()}")
+
+
+def _parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n\n")[0])
+    add_gpu_flag(p)
+    p.add_argument("--store", required=True, help="the artifact store's root")
+    p.add_argument("--out", required=True, help="an empty directory for the logs")
+    p.add_argument(
+        "--beside", help="a command to run beside the engine, such as a server"
+    )
+    return p

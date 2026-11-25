@@ -1,0 +1,413 @@
+# SPDX-License-Identifier: MIT
+"""`compass fit steps`: a step-level backend fitted on labelled samples and published.
+
+    compass fit steps --backend step-linear [--form FORM]
+        [--moe-routing E,K | --model DIR] [--seed S] RECORD...
+        --client-run RECORD EXPORT... [--ops DIR...] --store ROOT --out DIR
+    compass fit steps --backend step-grid --grid INPUT... --grid-definition FILE
+        [--sessions A:B] [--seed S] TARGET... --client-run INPUT EXPORT...
+        [--ops DIR...] --store ROOT --out DIR
+
+Each backend in `BACKENDS` states the kind it publishes, the label sources it
+takes and its fit, which returns the key fields the configuration does not
+give, the params and the report; a flag only another backend reads refuses.
+The entry is published under the readings a run on the inputs' platform
+takes, which `publish.inputs` loads each measurement under. `--ops` names
+`measure ops --out` directories whose points take the profiler's floor out
+of a trace run's drafter labels (`publish.inputs`); the report's `floor`
+counts, per kernel the floor could not place and per label field, the steps
+the fit labels whose label keeps that kernel's recorded length.
+
+`step-linear` takes real runs only and fits `step_linear_fit.FORMS`' `--form`,
+`history` by default, with `--cold-peer-rows` its prefill vector's
+`cold_peer_rows` (`step_linear_fit._cold`), with `--peer-share` its
+`peer_small` and `peer_large` (`step_linear_fit._share`), with
+`--keep-peer-tail` the MAD rounds keeping the slower steps they mark
+(`step_linear_fit._keep_peer_tail`), and the opt-in columns and rules
+`step_linear_fit.env_options` reads from the environment, each off unless set:
+`COMPASS_FIT_ROW_PADDING=1` (decode `row_padding`), `COMPASS_FIT_GATHER_ROWS=1`
+(prefill `gather_rows`; ``pad``, its pad rows alone, `gather_pad_rows`),
+`COMPASS_FIT_MOE_IMBALANCE=1` (prefill
+`moe_imbalance`, over `COMPASS_FIT_MOE_MIN_SPREAD`, 0.2 by default),
+`COMPASS_FIT_UNEVEN_ROWS=1` (prefill `uneven_rows`, over the same spread),
+`COMPASS_FIT_GRAPH_TOKENS=1` and `COMPASS_FIT_GRAPH_QUERY_CACHED=1` (prefill
+`graph_tokens` and `graph_query_cached`),
+`COMPASS_FIT_MOE_SELECT=insample` (each decode rung's MoE column by its fit on
+all its steps; ``fallback``, only where its records hold out none), `COMPASS_FIT_PEER_TOKENS` (decode `peer_tokens`: ``1`` at
+each rung whose `moe_experts` column is saturated, else the rungs named) and
+`COMPASS_FIT_DRAFT_PEER_TOKENS` (the draft law's: ``1`` at every rung, else
+the rungs named),
+joining each step's ranks at the engine config's
+`data_parallel_size`, so a record with a
+rank that gave no sample refuses; it pads prefill to the records'
+`prefill_buckets`, naming under `unfitted` records stating none, and holds
+out each run on the others when
+there are two or more, as that module's command does, the law and its report
+stating each held-out run's figures per kind; `--seed` fixes its shuffles.
+With `--moe-routing E,K`, the model's routed experts and top-k,
+the law states them as `moe_routing`, and each decode rung may adopt a MoE
+column over them, as that command's `--moe-routing` fits it. `--model DIR`
+reads them from the model directory the records served, as ATOM loads its
+config, and refuses one whose config.json is not the records'; a model that
+names no routed experts gives none. For a model with KDA layers (Kimi-K3,
+`step_linear.kda_layers`) `--model` also adds the prefill vector's KDA state
+columns (`step_linear_fit._kda`), which the records' lines must state. It reads a block drafter's own routing too
+(`DRAFT_ROUTING`), over which a draft law fitted above data-parallel width 1
+may adopt a MoE column. The law states,
+as `platform`, the platform fields of its key,
+and `engine_config`, as that command's does, and the key holds them, and
+`records_atom` as that command's states it. Each rung of the capture ladder
+no record reached gets a declared vector, filled from the fitted rungs beside
+it (`step_linear_fit.fill_rungs`), and the law and the report name each under
+`filled`; the law also lists them by law under `filled_rungs`, and the command
+warns on stderr naming them (`step_linear_fit.filled_warning`). The report's
+provenance names each run with every trace its steps served. A step stub's
+coefficients are stated, not fitted, so `step-stub` refuses.
+
+`--ladder-run RECORD EXPORT RUNGS` names one more client run RECORD's server
+served, a calibration ladder that calibrates the decode rungs RUNGS (comma
+separated): it is served and graded as a `--client-run` is, and its decode
+steps at any other rung give no sample, nor do its prefill steps
+(`step_linear_fit.ladder_cut`); the report counts them, per run and rung or
+step kind, under `ladder`. Only `step-linear` reads it.
+
+`step-grid` plans again over `--grid`'s inputs, record directories and
+`shape_population` tokens, and over its ragged targets, with the nodes and
+margin `--grid-definition` states, as `measure steps` plans, and reads each
+planned point's `step_measurement` by its batch view under its targets'
+configuration, whichever replay or plan measured it; a planned point the store
+does not hold refuses, naming each, and no other measurement is read as a
+point. Its targets
+are records and the tokens of `measure steps`' replayed batches (`TARGET`); a
+planned point named as one refuses, and a ragged one (`measure steps
+--ragged`) fits the decode lookup's alpha, not the residual. `step_grid_fit.bundle` fits the bundle,
+keyed by the grid definition's digest; `--seed` fixes its held-out split. The
+report's provenance names each target run with every trace it served, and the
+plan with the `--grid` inputs it read and the traces their lines served; the
+plan states it was not profiled, as the measurements at its points were not.
+
+A `--grid` input is read with the client runs a `--client-run` names for it,
+and one no `--client-run` names refuses, as `measure steps` refuses to plan
+over it; so does one that ran under another engine or sampling than the
+targets', naming the targets'. `--sessions A:B` keeps the `--grid` lines
+`measure steps --sessions A:B` keeps.
+"""
+
+import copy
+import dataclasses
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+from atom.compass.artifacts import ArtifactStore, GateState, Key, Kind, keyed_platform
+from atom.compass.backends import step_grid_fit, step_linear_fit
+from atom.compass.bench import measure
+from atom.compass.fit import publish
+from atom.compass.fit.samples import MEMBER
+from atom.compass.run import _file_digest
+
+PROG = "compass fit steps"
+STUB = "a step stub's coefficients are stated, not fitted; a run takes their file"
+#: What a `--grid` input's engine and sampling are compared with, as a refusal
+#: names each.
+TARGETS = ("the targets'", "the targets' sampling is")
+#: The names a model's config gives its routed experts and its top-k by, as
+#: ATOM's models read them, the first one set taken.
+EXPERTS = ("n_routed_experts", "num_local_experts", "num_experts")
+TOP_K = ("num_experts_per_tok", "num_experts_per_token")
+#: The names a block drafter's config gives its own routed experts and top-k by.
+DRAFT_ROUTING = (("dspark_n_routed_experts",), ("dspark_num_experts_per_tok",))
+
+
+def _model_routing(
+    model: str, served: str, names=(EXPERTS, TOP_K)
+) -> tuple[int, int] | None:
+    """The routed experts and top-k the model directory `model` states under
+    `names`, the target's by default, read from its config as ATOM's `Config`
+    loads it, in its text config where it has one; None for a model naming no
+    routed experts. Refused unless its config.json is `served`, the records'
+    digest of theirs."""
+    from atom.config import _normalize_minimax_m3_text_config, get_hf_config
+
+    if (digest := _file_digest(model, "config.json")) != served:
+        raise ValueError(
+            f"--model {model} holds config.json {digest}; the records served {served}"
+        )
+    config = get_hf_config(model)
+    _normalize_minimax_m3_text_config(config)
+    config = getattr(config, "text_config", config)
+    experts, top_k = (
+        next((v for v in (getattr(config, n, None) for n in kind) if v), None)
+        for kind in names
+    )
+    if experts and not top_k:
+        raise ValueError(
+            f"--model {model} names {experts} routed experts and no top-k "
+            f"({', '.join(names[1])})"
+        )
+    return (experts, top_k) if experts else None
+
+
+def _model_kda(model: str) -> bool:
+    """Whether the model directory `model` states KDA layers
+    (`step_linear.kda_layers`), its config read as ATOM's `Config` loads it;
+    `_model_routing` has checked its config.json is the records'."""
+    from atom.compass.backends.step_linear import kda_layers
+    from atom.config import get_hf_config
+
+    return bool(kda_layers(get_hf_config(model)))
+
+
+def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
+    form = args.form or "history"
+    samples, ladder = step_linear_fit.ladder_cut(samples)
+    options = {"form": form, "dp": step_linear_fit.join_width(config["engine_config"])}
+    options["moe_routing"] = args.moe_routing or (
+        args.model and _model_routing(args.model, config["model"])
+    )
+    if args.model:
+        drafter = _model_routing(args.model, config["model"], DRAFT_ROUTING)
+        options["draft_moe_routing"] = drafter
+    options["buckets"] = config.get("prefill_buckets")
+    options["cold"] = bool(args.cold_peer_rows)
+    if args.peer_share:
+        options["peer_share"] = True
+    if args.keep_peer_tail:
+        options["keep_peer_tail"] = True
+    options["kda"] = bool(args.model) and _model_kda(args.model)
+    options |= step_linear_fit.env_options()
+    law, report = step_linear_fit.fit(samples, options, args.seed)
+    if options["buckets"] is None:
+        law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
+    if len({s.provenance["run"] for s in samples}) > 1:
+        step_linear_fit.mark_held_out(law, report, samples, options, args.seed)
+    report["filled"] = step_linear_fit.fill_rungs(
+        law, config["engine_config"].get("ladder")
+    )
+    if warning := step_linear_fit.filled_warning(law):
+        print(warning, file=sys.stderr)
+    report["provenance"] = publish.runs(samples)
+    if args.ladder_run:
+        report["ladder"] = {
+            "runs": [[r, e, list(rungs)] for r, e, rungs in args.ladder_run],
+            "left_out": ladder,
+        }
+    law["platform"] = keyed_platform(Kind.STEP_LINEAR_LAW, config["platform"])
+    law["engine_config"] = config["engine_config"]
+    if atom := step_linear_fit.records_atom(samples):
+        law["records_atom"] = atom
+    return {"form": form, **law["platform"]}, law, report
+
+
+def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
+    named = [s.provenance["run"] for s in samples if s.provenance["source"] == "plan"]
+    if named:
+        raise ValueError(
+            f"{', '.join(named)} measured a planned point, and the residual's "
+            "targets are records and replayed batches"
+        )
+    store = ArtifactStore(args.store)
+    engine, sampling = config["engine_config"], config["sampling"]
+    read = measure.read_inputs(args, args.grid, store, engine, sampling, TARGETS)
+    ragged = [
+        (
+            s.provenance["run"],
+            {
+                "rows": [dataclasses.astuple(r) for r in s.view.requests],
+                "rung": s.view.capture_rung,
+                "produces_output": s.view.produces_output,
+            },
+        )
+        for s in samples
+        if s.provenance["source"] == "ragged"
+    ]
+    grid = measure.grid_plan(args, read, ragged)
+    planned = grid["plan"]
+    fields = {f: config[f] for f in ("model", "source_root")}
+    fields |= keyed_platform(Kind.STEP_MEASUREMENT, config["platform"])
+    keys = [
+        measure.measurement_key(
+            fields,
+            engine,
+            sampling,
+            measure.view_of(line),
+        )
+        for line in planned["lines"]
+    ]
+    missing = [str(key) for key in keys if not store.directory_for(key).exists()]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} of the {len(keys)} planned points are not measured:\n"
+            + "\n".join(missing)
+        )
+    entries = [
+        store.load(key, conditions=config["readings"], gates=GateState.of())
+        for key in keys
+    ]
+    points = [json.loads(entry.read_member(*MEMBER)) for entry in entries]
+    bundle, report = step_grid_fit.bundle(
+        grid["definition"], planned, points, samples, args.seed
+    )
+    report["provenance"] = publish.runs(samples) + [
+        {**grid["provenance"], "profiled": False}
+    ]
+    grid_key = keyed_platform(Kind.STEP_GRID_BUNDLE, config["platform"])
+    return {**grid_key, "grid": grid["grid"]}, bundle, report
+
+
+def _rungs(word: str) -> tuple[int, ...]:
+    """The decode rungs `--ladder-run`'s RUNGS names, comma separated, each a
+    positive whole number, once."""
+    try:
+        rungs = [int(w) for w in word.split(",")]
+    except ValueError:
+        rungs = []
+    if not rungs or min(rungs) < 1 or len(set(rungs)) != len(rungs):
+        raise ValueError(
+            f"--ladder-run RUNGS {word!r}: name the decode rungs it calibrates, "
+            "comma separated, e.g. 24,32,48,64"
+        )
+    return tuple(sorted(rungs))
+
+
+#: Each backend's name, to the kind it publishes, its label sources and its fit.
+BACKENDS = {
+    "step-linear": (Kind.STEP_LINEAR_LAW, ("record",), _step_linear),
+    "step-grid": (Kind.STEP_GRID_BUNDLE, ("record", "replay"), _step_grid),
+}
+#: The flags only one backend reads, each to that backend.
+OWN = {
+    "form": "step-linear",
+    "cold_peer_rows": "step-linear",
+    "peer_share": "step-linear",
+    "keep_peer_tail": "step-linear",
+    "moe_routing": "step-linear",
+    "model": "step-linear",
+    "ladder_run": "step-linear",
+    "grid": "step-grid",
+    "grid_definition": "step-grid",
+    "sessions": "step-grid",
+}
+
+
+def main(argv: list[str]) -> None:
+    parser = publish.parser(PROG, __doc__.split("\n\n")[0])
+    parser.add_argument("--backend", required=True, help=", ".join(BACKENDS))
+    parser.add_argument(
+        "--form", choices=step_linear_fit.FORMS, help="history by default"
+    )
+    routing = parser.add_mutually_exclusive_group()
+    routing.add_argument(
+        "--moe-routing",
+        metavar="E,K",
+        type=step_linear_fit._routing_arg,
+        help="the model's routed experts and top-k, over which each decode rung "
+        "may adopt a MoE column",
+    )
+    routing.add_argument(
+        "--model",
+        metavar="DIR",
+        help="the model directory the records served, whose config gives the "
+        "routing --moe-routing states",
+    )
+    parser.add_argument(
+        "--grid",
+        nargs="+",
+        metavar="INPUT",
+        help="record directories and shape_population tokens the planner reads",
+    )
+    parser.add_argument("--grid-definition", metavar="FILE", help="the grid's nodes")
+    parser.add_argument(
+        "--sessions",
+        type=measure._span,
+        metavar="A:B",
+        help="the --grid lines measure steps --sessions A:B keeps",
+    )
+    parser.add_argument(
+        "--cold-peer-rows",
+        action="store_const",
+        const=True,
+        help="the prefill vector adds cold_peer_rows: its peers' MoE rows on a "
+        "step outside a stretch of prefill steps (data-parallel records only)",
+    )
+    parser.add_argument(
+        "--peer-share",
+        action="store_const",
+        const=True,
+        help="the prefill vector adds peer_small and peer_large: a prefill whose "
+        "data-parallel peers run real rows under a quarter of its own, and at or "
+        "above it (data-parallel records only)",
+    )
+    parser.add_argument(
+        "--keep-peer-tail",
+        action="store_const",
+        const=True,
+        help="with --peer-share, the prefill vector's MAD rounds keep the slower "
+        "steps those columns mark, so the columns price their class's mean",
+    )
+    parser.add_argument(
+        "--ladder-run",
+        nargs=3,
+        action="append",
+        metavar=("RECORD", "EXPORT", "RUNGS"),
+        help="a client run RECORD's server served as a calibration ladder, by its "
+        "export, and the decode rungs it calibrates (comma separated); its decode "
+        "steps at any other rung give no sample",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--ops",
+        nargs="+",
+        default=(),
+        metavar="DIR",
+        help="measure ops --out directories giving a trace run's drafter kernels "
+        "their own lengths",
+    )
+    args = parser.parse_args(argv)
+    if args.backend == "step-stub":
+        raise ValueError(STUB)
+    if args.backend not in BACKENDS:
+        raise ValueError(
+            f"no backend {args.backend} is fitted; {' and '.join(BACKENDS)} are"
+        )
+    for flag, owner in OWN.items():
+        if getattr(args, flag) is not None and args.backend != owner:
+            raise ValueError(
+                f"--{flag.replace('_', '-')} is read by {owner}, not {args.backend}"
+            )
+    if args.ladder_run:
+        args.ladder_run = [
+            (record, export, _rungs(rungs)) for record, export, rungs in args.ladder_run
+        ]
+    if args.backend == "step-grid" and not (args.grid and args.grid_definition):
+        raise ValueError(
+            "step-grid plans over --grid INPUT... with the nodes and margin "
+            "--grid-definition FILE states"
+        )
+    named = {Path(r) for r, _ in args.client_run}
+    if unnamed := [n for n in args.grid or () if Path(n) not in named]:
+        raise ValueError(
+            f"{', '.join(unnamed)} is named by no --client-run; name the client "
+            "runs its server served, as measure steps planned over it with them"
+        )
+    kind, sources, fit = BACKENDS[args.backend]
+    # A --client-run naming a --grid input and no target is the planner's alone.
+    grid_only = {Path(n) for n in args.grid or ()} - {Path(i) for i in args.inputs}
+    target_args = copy.copy(args)
+    target_args.client_run = [c for c in args.client_run if Path(c[0]) not in grid_only]
+    samples, config = publish.inputs(target_args, sources, args.ops)
+    fields, params, report = fit(samples, config, args)
+    if args.ops:
+        refused = [
+            f"{f}: {w}" for s in samples for f, ws in s.floor.items() for w in ws
+        ]
+        report["floor"] = dict(Counter(refused).most_common())
+    key = Key.of(
+        kind,
+        **{f: config[f] for f in ("model", "source_root")},
+        engine_config=json.dumps(config["engine_config"], sort_keys=True),
+        **fields,
+    )
+    command = " ".join([PROG, *argv])
+    publish.publish(args, command, key, config["readings"], params, report)

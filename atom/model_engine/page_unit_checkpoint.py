@@ -9,13 +9,13 @@ import logging
 from collections import OrderedDict, deque
 from collections.abc import Hashable, Iterator, Mapping
 from dataclasses import dataclass, replace
-from time import monotonic
 
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_cache import KEEP_SETTLED, KEEP_SNAPSHOT
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_entry_bytes
+from atom.utils.time_shim import read_monotonic as monotonic
 
 _CHANGE_LOG_LIMIT = 4096
 

@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT
+# The driver-run compass files: each skips in the CPU gate for want of an input
+# gate_gpu.sh sets (a model directory, the cc-traces file, a harness Python,
+# atomesh). gate_gpu.sh runs these, of tests/compass, by default;
+# COMPASS_GPU_GATE_SCOPE=all runs every compass file.
+# tests/compass/driver_run_skips.py fails such a skip in a file this list does
+# not name.
+tests/compass/test_cctraces_sim_smoke.py
+tests/compass/test_client_runs_slice.py
+tests/compass/test_dp_slice.py
+tests/compass/test_drive_trace_steps.py
+tests/compass/test_image_scenario.py
+tests/compass/test_lmcache_mp_engine.py
+tests/compass/test_lmcache_mp_scenario.py
+tests/compass/test_meta_build_device.py
+tests/compass/test_mooncake_store_scenario.py
+tests/compass/test_multinode_dp.py
+tests/compass/test_pd_dp.py
+tests/compass/test_pd_prefill_pp.py
+tests/compass/test_pd_slice.py
+tests/compass/test_pd_widths.py
+tests/compass/test_pd_xpyd.py
+tests/compass/test_pp_send_allgather.py
+tests/compass/test_pp_stages.py
+tests/compass/test_rapidserve_lps.py
+tests/compass/test_spec_scenario.py
+tests/compass/test_tp_slice.py
+tests/compass/test_vertical_slice.py

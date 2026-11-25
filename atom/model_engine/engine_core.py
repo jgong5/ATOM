@@ -9,8 +9,8 @@ import time
 from contextlib import ExitStack
 
 import torch
-import zmq
 
+from atom.compass import run as compass_run
 from atom.config import Config
 from atom.distributed.group_agreement import group_max_each
 from atom.kv_transfer.disaggregation import KVOutputAggregator
@@ -41,12 +41,14 @@ from atom.model_engine.state_runtime import StateRuntime
 from atom.observability import tracing
 from atom.structured_output import is_structured
 from atom.utils import (
+    clock,
     engine_process_name,
     envs,
     init_exit_handler,
     make_zmq_socket,
     set_process_title,
 )
+from atom.utils import zmq_shim as zmq
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -68,9 +70,9 @@ from atom.utils.gpu_guard import (
 
 logger = logging.getLogger("atom")
 
-# Pace of the idle KV drain. The busy loops never block, so an unpaced drain
-# would fire one worker RPC round per spin; 1ms matches the PP head's existing
-# idle token-poll timeout and is far below any transfer latency.
+# Pace of the idle KV drain. No busy loop blocks while KV work is pending, so
+# an unpaced drain would fire one worker RPC round per spin; 1ms matches the PP
+# head's existing idle token-poll timeout and is far below any transfer latency.
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
@@ -137,7 +139,7 @@ class EngineCore:
         self._next_backlog_report = 0.0
         self._kv_progress_event = threading.Event()
         self.input_queue = queue.Queue[Sequence]()
-        self.output_queue = queue.Queue[list[Sequence]]()
+        self.output_queue = clock.relay_queue(config.parallel_config)
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
@@ -163,6 +165,13 @@ class EngineCore:
         assert self.control_address, (
             "parallel_config.control_address is unset -- an EngineCore must be "
             "launched through CoreManager, which allocates the control channel"
+        )
+        clock.name_endpoints(
+            None,
+            input_address=input_address,
+            control_address=self.control_address,
+            output_address=output_address,
+            config=config,
         )
         self.output_thread = threading.Thread(
             target=self.process_output_sockets, args=(self.output_address,), daemon=True
@@ -623,15 +632,17 @@ class EngineCore:
 
         engine: EngineCore = None
         try:
-            if config.pipeline_parallel_size > 1:
-                from atom.model_engine.pp_engine_core import PPEngineCoreProc
+            with compass_run.engine(config):
+                if config.pipeline_parallel_size > 1:
+                    from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
-                engine = PPEngineCoreProc(config, input_address, output_address)
-            elif config.parallel_config.data_parallel_size > 1:
-                engine = DPEngineCoreProc(config, input_address, output_address)
-            else:
-                engine = EngineCore(config, input_address, output_address)
-            engine.busy_loop()
+                    engine = PPEngineCoreProc(config, input_address, output_address)
+                elif config.parallel_config.data_parallel_size > 1:
+                    engine = DPEngineCoreProc(config, input_address, output_address)
+                else:
+                    engine = EngineCore(config, input_address, output_address)
+            with compass_run.engine_loop(engine):
+                engine.busy_loop()
         except Exception:
             logger.exception("run_engine failed")
             raise
@@ -720,12 +731,16 @@ class EngineCore:
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
-                now = time.monotonic()
+                now = clock.now(time.monotonic)
                 if now >= next_metrics_push:
                     next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
-                shutdown = shutdown or self.pull_and_process_input_queue()
+                shutdown = (
+                    clock.idle(lambda: self._idle_deadline(), next_metrics_push)
+                    or shutdown
+                    or self.pull_and_process_input_queue()
+                )
                 if shutdown:
                     break
                 if self._is_engine_held():
@@ -766,6 +781,35 @@ class EngineCore:
                 self.scheduler.close_kv_connector()
             finally:
                 tracing.shutdown()
+
+    def _wait_for_input(self, next_metrics_push: float) -> None:
+        """Park an idle loop on its input queue until a request or shutdown is
+        put there, a utility command arrives (`_notify_input`), or the earlier
+        of `_idle_deadline()` and `next_metrics_push` passes.
+
+        A loop that spun instead would hold the GIL, so the input thread would
+        take each request one or more 5 ms switch intervals late. A simulated
+        run's idle point is `clock.idle`, so there this returns at once.
+
+        Both checks run under the lock a put or `_notify_input` takes, so input
+        landing between them and the wait still wakes it. The utility check
+        reads the flag `process_queue` drains on, which the input thread sets
+        before it notifies.
+        """
+        if clock.installed() is not None:
+            return
+        deadline = min(self._idle_deadline(), next_metrics_push)
+        timeout = deadline - clock.now(time.monotonic)
+        q = self.input_queue
+        with q.not_empty:
+            if timeout > 0 and not q._qsize() and not self._has_pending_utility:
+                q.not_empty.wait(min(timeout, threading.TIMEOUT_MAX))
+
+    def _notify_input(self) -> None:
+        """Wake a loop parked in `_wait_for_input`; a put on the input queue
+        wakes it by itself."""
+        with self.input_queue.not_empty:
+            self.input_queue.not_empty.notify()
 
     def _process_engine_step(self):
         return self._run_then_publish_kv_events(self._process_engine_step_inner)
@@ -977,12 +1021,27 @@ class EngineCore:
         # back, but start no new transfers (see `_dispatch_idle_offload_work`);
         # with `ATOM_STORE_ASYNC_RENEW` the metadata build may still dispatch
         # the GET of a load parked on its lease renewal.
-        now = time.monotonic()
+        now = clock.now(time.monotonic)
         if now < self._next_idle_kv_drain:
             return
         self._next_idle_kv_drain = now + KV_IDLE_DRAIN_INTERVAL_S
         self._dispatch_idle_offload_work(dispatch_new=dispatch_new)
         self._poll_kv_transfer_progress()
+
+    def _idle_deadline(self) -> float:
+        """When an idle loop next acts on its own: at once when a transfer
+        reported after this pass's `schedule()` left a parked request ready, every
+        idle drain interval while KV work is pending, and otherwise on input."""
+        s, now = self.scheduler, clock.now(time.monotonic)
+        done = {
+            *getattr(s, "finished_recving_kv_req_ids", ()),
+            *getattr(s, "failed_recving_kv_req_ids", ()),
+        }
+        if any(seq.id in done for seq in getattr(s, "waiting", ())):
+            return now
+        if not self.has_pending_kv_work():
+            return float("inf")
+        return now + KV_IDLE_DRAIN_INTERVAL_S
 
     def _drain_kv_work_at_exit(self) -> None:
         """Give in-flight KV transfers a bounded window to report back.
@@ -1197,7 +1256,7 @@ class EngineCore:
                 for sock, _ in poller.poll():
                     # (RequestType, RequestData)
                     obj = sock.recv(copy=False)
-                    received_at = time.perf_counter()
+                    received_at = clock.now(time.perf_counter)
                     try:
                         # ADD may carry the seqs' shipped prompt chains third.
                         request_type, reqs, *chains = pickle.loads(obj)
@@ -1233,6 +1292,7 @@ class EngineCore:
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         self.utility_queue.put_nowait((cmd, reqs))
                         self._has_pending_utility = True
+                        self._notify_input()
                         self._kv_progress_event.set()
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
@@ -1363,14 +1423,18 @@ class DPEngineCoreProc(EngineCore):
                     # sync, pause). Applying them only on rounds that sync lets
                     # every rank see a hold before its next forward.
                     self.utility_handler.process_queue(self.utility_queue, self)
-                now = time.monotonic()
+                now = clock.now(time.monotonic)
                 if now >= next_metrics_push:
                     next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
-                shutdown = shutdown or self.pull_and_process_input_queue()
+                shutdown = (
+                    clock.idle(lambda: self._idle_deadline(), next_metrics_push)
+                    or shutdown
+                    or self.pull_and_process_input_queue()
+                )
                 if self._report_backlog:
-                    self._report_prefill_backlog(time.monotonic())
+                    self._report_prefill_backlog(clock.now(time.monotonic))
                 local_held = (
                     self._is_rl_weights_offloaded
                     or self._weight_sync_fenced
@@ -1740,9 +1804,11 @@ class PrefillEngineCore(EngineCore):
         EngineCore._setup_engine_process("PrefillEngineCore")
         engine = None
         try:
-            engine = PrefillEngineCore(config, input_address, output_address)
-            engine._init_disagg()
-            engine.busy_loop()
+            with compass_run.engine(config):
+                engine = PrefillEngineCore(config, input_address, output_address)
+                engine._init_disagg()
+            with compass_run.engine_loop(engine):
+                engine.busy_loop()
         except Exception:
             logger.exception("PrefillEngineCore.run_engine failed")
             raise
@@ -2007,9 +2073,11 @@ class DecodeEngineCore(EngineCore):
         EngineCore._setup_engine_process("DecodeEngineCore")
         engine = None
         try:
-            engine = DecodeEngineCore(config, input_address, output_address)
-            engine._init_disagg()
-            engine.busy_loop()
+            with compass_run.engine(config):
+                engine = DecodeEngineCore(config, input_address, output_address)
+                engine._init_disagg()
+            with compass_run.engine_loop(engine):
+                engine.busy_loop()
         except Exception:
             logger.exception("DecodeEngineCore.run_engine failed")
             raise

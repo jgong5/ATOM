@@ -1,0 +1,475 @@
+# SPDX-License-Identifier: MIT
+"""`atom.compass.clock.channels`: the channel table and the distances it gives.
+
+A grant bounds each waiting process by ``min over j of (N[j] + D(j->i))``, so a
+distance that is too large hands out time a message may still need. The
+distances are checked against values worked out by hand for the shipped
+tables, against a brute-force enumeration of every simple channel path, and on
+the worked example of an idle process in the middle of a chain.
+"""
+
+import math
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from atom.compass.clock import (
+    ChannelTable,
+    LpId,
+    LpRegistry,
+    prefill_decode_table,
+    single_engine_table,
+)
+from atom.compass.clock.channels import ReceiveMode
+from atom.utils.clock import LPRuntime, channel_of
+
+T, FP, EP, FD, ED = (
+    LpId(n) for n in ("traffic", "frontend-P", "engine-P", "frontend-D", "engine-D")
+)
+
+# Distinct values for the lookaheads that have no measurement, so every entry of
+# the distance matrix names the path that produced it.
+IPC, STREAM, ROUTER, KV, ADMIT = 1.0e-4, 2.0e-3, 5.0e-4, 3.0e-4, 5.4e-4
+
+
+def _pd():
+    return prefill_decode_table(
+        admission_s=ADMIT,
+        ipc_s=IPC,
+        stream_s=STREAM,
+        router_s=ROUTER,
+        kv_write_req_s=KV,
+    )
+
+
+def _single():
+    return single_engine_table(admission_s=ADMIT, ipc_s=IPC, stream_s=STREAM)
+
+
+def _table(*lps):
+    registry = LpRegistry()
+    for lp in lps:
+        registry.register(lp)
+    return ChannelTable(registry)
+
+
+def _enumerated(table, source, target):
+    """The least summed lookahead over every simple channel path, by brute force."""
+    best = math.inf
+    stack = [(source, 0.0, (source,))]
+    while stack:
+        lp, total, seen = stack.pop()
+        if lp == target:
+            best = min(best, total)
+            continue
+        for c in table.channels_from(lp):
+            if c.target not in seen:
+                stack.append((c.target, total + c.lookahead_s, seen + (c.target,)))
+    return best
+
+
+# --- the shipped tables ------------------------------------------------------
+
+
+def _whole(table):
+    return {
+        c.name: (c.source, c.target, table.lookahead(c.name), table.recv_mode(c.name))
+        for lp in table.registry
+        for c in table.channels_from(lp)
+    }
+
+
+def test_the_single_engine_table_is_exactly_its_channel_list():
+    table = _single()
+    F, E = LpId("frontend"), LpId("engine")
+    assert table.registry.ids() == (E, F, T)
+    assert _whole(table) == {
+        "traffic->frontend:http": (T, F, ADMIT, "inline"),
+        "frontend->traffic:stream": (F, T, STREAM, "inline"),
+        "frontend->engine:request#dp0": (F, E, IPC, "thread"),
+        "frontend->engine:control#dp0": (F, E, IPC, "thread"),
+        "engine->frontend:output#dp0": (E, F, IPC, "thread"),
+    }
+    assert [c.name for c in table.channels_into(E)] == [
+        "frontend->engine:control#dp0",
+        "frontend->engine:request#dp0",
+    ]
+    assert [c.name for c in table.channels_from(F)] == [
+        "frontend->engine:control#dp0",
+        "frontend->engine:request#dp0",
+        "frontend->traffic:stream",
+    ]
+
+
+def test_the_prefill_decode_table_is_exactly_its_channel_list():
+    table = _pd()
+    assert table.registry.ids() == (ED, EP, FD, FP, T)
+    # Behind the router the request, the stream and the relay each carry its cost.
+    assert _whole(table) == {
+        "traffic->frontend-P:http": (T, FP, ADMIT + ROUTER, "inline"),
+        "frontend-D->traffic:stream": (FD, T, STREAM + ROUTER, "inline"),
+        "frontend-P->frontend-D:relay": (FP, FD, ROUTER, "inline"),
+        "engine-D->engine-P:kv_write_req": (ED, EP, KV, "inline"),
+        "frontend-P->engine-P:request#dp0": (FP, EP, IPC, "thread"),
+        "frontend-P->engine-P:control#dp0": (FP, EP, IPC, "thread"),
+        "engine-P->frontend-P:output#dp0": (EP, FP, IPC, "thread"),
+        "frontend-D->engine-D:request#dp0": (FD, ED, IPC, "thread"),
+        "frontend-D->engine-D:control#dp0": (FD, ED, IPC, "thread"),
+        "engine-D->frontend-D:output#dp0": (ED, FD, IPC, "thread"),
+    }
+
+
+def test_each_side_of_a_prefill_decode_table_takes_its_own_zmq_hops():
+    table = prefill_decode_table(
+        admission_s=ADMIT,
+        ipc_s=IPC,
+        ipc_out_s=2 * IPC,
+        decode_ipc=(3 * IPC, 4 * IPC),
+        stream_s=STREAM,
+        router_s=ROUTER,
+        kv_write_req_s=KV,
+    )
+    whole = {name: lookahead for name, (_, _, lookahead, _) in _whole(table).items()}
+    assert whole == {
+        "traffic->frontend-P:http": ADMIT + ROUTER,
+        "frontend-D->traffic:stream": STREAM + ROUTER,
+        "frontend-P->frontend-D:relay": ROUTER,
+        "engine-D->engine-P:kv_write_req": KV,
+        "frontend-P->engine-P:request#dp0": IPC,
+        "frontend-P->engine-P:control#dp0": IPC,
+        "engine-P->frontend-P:output#dp0": 2 * IPC,
+        "frontend-D->engine-D:request#dp0": 3 * IPC,
+        "frontend-D->engine-D:control#dp0": 3 * IPC,
+        "engine-D->frontend-D:output#dp0": 4 * IPC,
+    }
+
+
+def test_the_prefill_decode_table_above_dp_width_one_has_each_ranks_channels_and_each_pairs_write_request():
+    one = _pd()
+    table = prefill_decode_table(
+        admission_s=ADMIT,
+        ipc_s=IPC,
+        stream_s=STREAM,
+        router_s=ROUTER,
+        kv_write_req_s=KV,
+        dp=2,
+    )
+    whole = _whole(table)
+    pairs = [
+        f"engine-D->engine-P:kv_write_req#dp{d}.dp{p}" for d in (0, 1) for p in (0, 1)
+    ]
+    assert {n: whole.pop(n) for n in pairs} == dict.fromkeys(
+        pairs, (ED, EP, KV, "inline")
+    )
+    # Rank 1's channels are rank 0's, renamed; the rest are the width-one table's.
+    rank0 = {n: v for n, v in _whole(one).items() if "kv_write_req" not in n}
+    assert whole == rank0 | {
+        n.replace("#dp0", "#dp1"): v for n, v in rank0.items() if n.endswith("#dp0")
+    }
+    for j in table.registry.ids():
+        for i in table.registry.ids():
+            assert table.distance(j, i) == one.distance(j, i), (j, i)
+
+
+# --- the router LP -----------------------------------------------------------
+
+R, R_IN = LpId("router"), 1.0e-4
+#: Each path through the router, by channel kind: its sender and receiver.
+PATHS = {"http": (T, FP), "stream": (FD, T), "relay": (FP, FD)}
+
+
+def _pd_at(dp=1, router_in_s=None):
+    return prefill_decode_table(
+        admission_s=ADMIT,
+        ipc_s=IPC,
+        stream_s=STREAM,
+        router_s=ROUTER,
+        kv_write_req_s=KV,
+        dp=dp,
+        router_in_s=router_in_s,
+    )
+
+
+def test_with_router_in_s_each_path_is_a_hop_into_the_router_lp_and_one_out():
+    table = _pd_at(router_in_s=R_IN)
+    assert table.registry.ids() == (ED, EP, FD, FP, R, T)
+    whole = _whole(table)
+    hops = {
+        "traffic->router:http": (T, R, R_IN, "thread"),
+        "router->frontend-P:http": (R, FP, ADMIT + ROUTER - R_IN, "inline"),
+        "frontend-D->router:stream": (FD, R, R_IN, "thread"),
+        "router->traffic:stream": (R, T, STREAM + ROUTER - R_IN, "inline"),
+        "frontend-P->router:relay": (FP, R, R_IN, "thread"),
+        "router->frontend-D:relay": (R, FD, ROUTER - R_IN, "inline"),
+    }
+    assert {n: whole.pop(n) for n in hops} == hops
+    # The rest is the table without the router, less the three paths it crossed.
+    assert whole == {
+        n: v for n, v in _whole(_pd()).items() if n.partition(":")[2] not in PATHS
+    }
+
+
+@pytest.mark.parametrize("dp", [1, 2])
+def test_the_router_lp_keeps_each_paths_total_lookahead(dp):
+    before, after = _pd_at(dp), _pd_at(dp, R_IN)
+    for kind, (src, dst) in PATHS.items():
+        one = before.lookahead(f"{src.name}->{dst.name}:{kind}")
+        hop_in = after.lookahead(f"{src.name}->router:{kind}")
+        hop_out = after.lookahead(f"router->{dst.name}:{kind}")
+        assert hop_in == R_IN and hop_out > 0.0
+        assert hop_in + hop_out == pytest.approx(one), kind
+
+
+def test_the_router_lp_distances_agree_with_every_enumerated_path():
+    table = _pd_at(router_in_s=R_IN)
+    for j in table.registry.ids():
+        for i in table.registry.ids():
+            if j != i:
+                assert table.distance(j, i) == pytest.approx(
+                    _enumerated(table, j, i)
+                ), (j, i)
+
+
+@pytest.mark.parametrize("bad", [0.0, -R_IN, ROUTER, 2 * ROUTER, math.nan])
+def test_a_router_in_s_leaving_a_hop_no_lookahead_is_refused(bad):
+    with pytest.raises(ValueError, match="0 < router_in_s < router_s"):
+        _pd_at(router_in_s=bad)
+
+
+# --- distance ----------------------------------------------------------------
+
+
+def test_the_prefill_decode_distances_match_the_hand_computed_paths():
+    A, S, I, R, K = ADMIT + ROUTER, STREAM + ROUTER, IPC, ROUTER, KV
+    expected = {
+        (T, FP): A, (T, EP): A + I, (T, FD): A + R, (T, ED): A + R + I,
+        (FP, T): R + S, (FP, EP): I, (FP, FD): R, (FP, ED): R + I,
+        (EP, T): I + R + S, (EP, FP): I, (EP, FD): I + R, (EP, ED): I + R + I,
+        (FD, T): S, (FD, FP): min(S + A, I + K + I), (FD, EP): min(S + A + I, I + K), (FD, ED): I,
+        (ED, T): I + S, (ED, FP): min(I + S + A, K + I), (ED, EP): K, (ED, FD): I,
+    }  # fmt: skip
+    table = _pd()
+    got = {pair: table.distance(*pair) for pair in expected}
+    assert got == pytest.approx(expected)
+    # The shorter of two routes into prefill's engine goes through the KV write request.
+    assert got[FD, EP] == pytest.approx(I + K)
+
+
+def test_the_single_engine_distances_match_the_hand_computed_paths():
+    table = _single()
+    F, E = LpId("frontend"), LpId("engine")
+    assert table.distance(T, E) == pytest.approx(ADMIT + IPC)
+    assert table.distance(E, T) == pytest.approx(IPC + STREAM)
+    assert table.distance(F, E) == IPC
+
+
+@pytest.mark.parametrize(
+    "table", [_pd(), _single()], ids=["prefill-decode", "single-engine"]
+)
+def test_distance_agrees_with_every_enumerated_path(table):
+    ids = table.registry.ids()
+    for j in ids:
+        for i in ids:
+            if j != i:
+                assert table.distance(j, i) == pytest.approx(
+                    _enumerated(table, j, i)
+                ), (j, i)
+
+
+def test_a_pair_with_no_path_is_infinitely_far_apart():
+    a, b, c = LpId("a"), LpId("b"), LpId("c")
+    table = _table(a, b, c)
+    table.declare("a->b:x", a, b, 1.0, "inline")
+    assert table.distance(a, b) == 1.0
+    assert table.distance(b, a) == math.inf
+    assert table.distance(c, a) == math.inf
+    assert table.distance(c, c) == 0.0
+
+
+def test_a_channel_declared_after_a_distance_was_read_is_counted():
+    a, b, c = LpId("a"), LpId("b"), LpId("c")
+    table = _table(a, b, c)
+    table.declare("a->b:x", a, b, 1.0, "inline")
+    table.declare("b->c:x", b, c, 1.0, "inline")
+    assert table.distance(a, c) == 2.0
+    table.declare("a->c:x", a, c, 0.5, "inline")
+    assert table.distance(a, c) == 0.5
+    # A second, shorter channel between the same two ends is the one that counts.
+    table.declare("a->c:y", a, c, 0.25, "thread")
+    assert table.distance(a, c) == 0.25
+    table.declare("a->c:z", a, c, 0.75, "thread")
+    assert table.distance(a, c) == 0.25
+
+
+def test_a_channel_declared_after_a_lookup_is_in_the_next_one():
+    a, b, c = LpId("a"), LpId("b"), LpId("c")
+    table = _table(a, b, c)
+    table.declare("a->b:x", a, b, 1.0, "inline")
+    assert [ch.name for ch in table.channels_from(a)] == ["a->b:x"]
+    assert table.channels_into(c) == ()
+    table.declare("a->c:x", a, c, 1.0, "thread")
+    assert [ch.name for ch in table.channels_from(a)] == ["a->b:x", "a->c:x"]
+    assert [ch.name for ch in table.channels_into(c)] == ["a->c:x"]
+
+
+def _us_a_stream_lookup(others: int) -> float:
+    """`channel_of(rt, "stream")` for an LP of two channels, in a table that
+    also holds `others` channels between two other LPs: the best of three
+    passes, in microseconds a call."""
+    f, t, x, y = (LpId(n) for n in ("f", "t", "x", "y"))
+    table = _table(f, t, x, y)
+    table.declare("f->t:stream", f, t, 1.0, "inline")
+    table.declare("t->f:http", t, f, 1.0, "inline")
+    for k in range(others):
+        table.declare(f"x->y:k{k}", x, y, 1.0, "thread")
+    rt = LPRuntime(f, table, SimpleNamespace())
+    best = math.inf
+    for _ in range(3):
+        start = time.perf_counter()
+        for _ in range(200):
+            assert channel_of(rt, "stream") == "f->t:stream"
+        best = min(best, time.perf_counter() - start)
+    return best / 200 * 1e6
+
+
+def test_an_lps_lookup_costs_the_same_whatever_else_the_table_holds():
+    """A frontend looks its stream channel up for every event it streams
+    (`atom.compass.carriers.stamp_events`), so a lookup must not cost more as
+    the run's table grows."""
+    alone, among = _us_a_stream_lookup(0), _us_a_stream_lookup(2000)
+    assert among < 5 * alone + 5, (
+        f"{alone:.1f} us a lookup in a table of 2 channels, {among:.1f} us in one "
+        "of 2,002"
+    )
+
+
+def test_the_idle_process_in_the_middle_of_a_chain():
+    # Frontend runs at 9.0 and feeds prefill (idle, so +inf) at 0.1; prefill
+    # feeds decode at 0.5. Decode has no channel from frontend, but frontend's
+    # request reaches it through prefill at 9.6, and the distance says so.
+    frontend, prefill, decode = LpId("frontend"), LpId("prefill"), LpId("decode")
+    table = _table(frontend, prefill, decode)
+    table.declare("frontend->prefill:x", frontend, prefill, 0.1, "inline")
+    table.declare("prefill->decode:x", prefill, decode, 0.5, "inline")
+    assert [c.source for c in table.channels_into(decode)] == [prefill]
+    now = {frontend: 9.0, prefill: math.inf}
+    lbts = min(now[j] + table.distance(j, decode) for j in now)
+    assert lbts == 9.6
+
+
+# --- refusals ------------------------------------------------------------------
+
+
+def test_an_undeclared_name_is_refused_with_the_declared_ones():
+    table = _single()
+    with pytest.raises(
+        KeyError,
+        match=r"'nope' is not a declared channel; declared: engine->frontend:output#dp0, ",
+    ):
+        table.lookahead("nope")
+    with pytest.raises(KeyError, match="is not a declared channel"):
+        table.recv_mode("nope")
+
+
+def test_a_duplicate_name_is_refused():
+    a, b = LpId("a"), LpId("b")
+    table = _table(a, b)
+    table.declare("a->b:x", a, b, 1.0, "inline")
+    with pytest.raises(ValueError, match="'a->b:x' is already declared"):
+        table.declare("a->b:x", a, b, 2.0, "inline")
+    assert table.lookahead("a->b:x") == 1.0
+
+
+@pytest.mark.parametrize("bad", [-1.0e-6, math.nan, math.inf])
+def test_a_lookahead_that_is_not_a_finite_non_negative_duration_is_refused(bad):
+    a, b = LpId("a"), LpId("b")
+    with pytest.raises(ValueError, match="must be a finite number of seconds"):
+        _table(a, b).declare("a->b:x", a, b, bad, "inline")
+
+
+def test_a_declared_lookahead_cannot_be_rewritten_through_a_handed_out_channel():
+    a, b = LpId("a"), LpId("b")
+    channel = _table(a, b).declare("a->b:x", a, b, 1.0, "inline")
+    with pytest.raises(AttributeError):
+        channel.lookahead_s = -1.0
+
+
+def test_a_zero_lookahead_is_a_declaration():
+    a, b = LpId("a"), LpId("b")
+    table = _table(a, b)
+    table.declare("a->b:x", a, b, 0.0, "thread")
+    assert table.distance(a, b) == 0.0
+
+
+def test_a_channel_whose_ends_are_not_registered_is_refused():
+    a, b = LpId("a"), LpId("b")
+    table = _table(a)
+    with pytest.raises(KeyError, match="b is not registered; registered: a"):
+        table.declare("a->b:x", a, b, 1.0, "inline")
+    with pytest.raises(KeyError, match="b is not registered; registered: a"):
+        table.declare("b->a:x", b, a, 1.0, "inline")
+    with pytest.raises(TypeError, match="require expects an LpId"):
+        table.declare("a->b:x", a, "b", 1.0, "inline")
+
+
+def test_a_channel_to_itself_and_an_unknown_receive_mode_are_refused():
+    a, b = LpId("a"), LpId("b")
+    table = _table(a, b)
+    with pytest.raises(ValueError, match="joins a to itself"):
+        table.declare("a->a:x", a, a, 1.0, "inline")
+    with pytest.raises(
+        ValueError,
+        match="receive mode of 'a->b:x' must be one of thread, inline, got 'poll'",
+    ):
+        table.declare("a->b:x", a, b, 1.0, "poll")
+
+
+def test_a_receive_mode_given_as_a_string_is_stored_as_its_member():
+    a, b = LpId("a"), LpId("b")
+    channel = _table(a, b).declare("a->b:x", a, b, 1.0, "inline")
+    assert channel.receive is ReceiveMode.INLINE
+
+
+def test_every_query_refuses_an_unregistered_process():
+    a, b = LpId("a"), LpId("b")
+    table = _table(a)
+    for query in (table.channels_into, table.channels_from):
+        with pytest.raises(KeyError, match="b is not registered; registered: a"):
+            query(b)
+    with pytest.raises(KeyError, match="b is not registered; registered: a"):
+        table.distance(a, b)
+
+
+OUT = 7.0e-4
+ENGINE_TABLES = {
+    "dp2": lambda **k: single_engine_table(dp=2, **k),
+    "pp2": lambda **k: single_engine_table(pp=2, **k),
+    "rapidserve": lambda **k: single_engine_table(rapidserve=True, **k),
+    "pd": lambda **k: prefill_decode_table(router_s=ROUTER, kv_write_req_s=KV, **k),
+}
+
+
+@pytest.mark.parametrize("form", sorted(ENGINE_TABLES))
+def test_an_engine_output_to_its_frontend_takes_ipc_out_s_and_other_zmq_ipc_s(form):
+    common = {"admission_s": ADMIT, "ipc_s": IPC, "stream_s": STREAM}
+    got = _whole(ENGINE_TABLES[form](ipc_out_s=OUT, **common))
+    outs = {n for n in got if ":output#" in n}
+    assert outs and {got[n][2] for n in outs} == {OUT}
+    assert OUT not in {c[2] for n, c in got.items() if n not in outs}
+    # Without it, the output channels keep ipc_s.
+    assert _whole(ENGINE_TABLES[form](**common)) == {
+        n: (*c[:2], IPC, c[3]) if n in outs else c for n, c in got.items()
+    }
+
+
+def test_a_run_files_ipc_out_s_reaches_the_output_channel():
+    from atom.compass import run as compass_run
+
+    run = {"ipc_s": IPC, "stream_s": STREAM}
+    output = "engine->frontend:output#dp0"
+    floor = compass_run.HOP_FLOOR_S
+    assert compass_run.channel_table(run).lookahead(output) == floor
+    table = compass_run.channel_table(run | {"ipc_out_s": OUT})
+    assert table.lookahead(output) == OUT
+    assert table.lookahead("frontend->engine:request#dp0") == IPC

@@ -1,3 +1,5 @@
+use std::sync::{atomic::Ordering, Arc};
+
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use crate::{
@@ -6,7 +8,10 @@ use crate::{
         HealthCheckConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
         TokenizerCacheConfig,
     },
-    core::ConnectionMode,
+    core::{
+        worker_manager::{DEFAULT_WORKER_REQUEST_TIMEOUT_SECS, WORKER_REQUEST_TIMEOUT_SECS},
+        ConnectionMode,
+    },
     observability::metrics::PrometheusConfig,
     server::{ServerConfig, ServerTlsConfig},
 };
@@ -357,6 +362,10 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     pub request_timeout_secs: u64,
 
+    /// Timeout in seconds for the router's own /get_load and /flush_cache requests to workers
+    #[arg(long, default_value_t = DEFAULT_WORKER_REQUEST_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Request Handling")]
+    pub worker_request_timeout_secs: u64,
+
     /// Grace period in seconds to wait for in-flight requests during shutdown
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
     pub shutdown_grace_period_secs: u64,
@@ -582,6 +591,7 @@ impl CliArgs {
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         self.validate_tls_args()?;
+        WORKER_REQUEST_TIMEOUT_SECS.store(self.worker_request_timeout_secs, Ordering::Relaxed);
 
         // Determine routing mode based on PD disaggregation flag
         let mode = if self.pd_disaggregation {
@@ -961,6 +971,7 @@ impl Default for CliArgs {
             prometheus_duration_buckets: Vec::new(),
             request_id_headers: Vec::new(),
             request_timeout_secs: 1800,
+            worker_request_timeout_secs: DEFAULT_WORKER_REQUEST_TIMEOUT_SECS,
             shutdown_grace_period_secs: 180,
             max_payload_size: 536_870_912,
             max_concurrent_requests: -1,

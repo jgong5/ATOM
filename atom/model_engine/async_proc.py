@@ -46,6 +46,7 @@ from atom.model_engine.collective_rpc import (
     is_plain_rpc_value,
 )
 from atom.utils import (
+    clock,
     envs,
     get_mp_context,
     get_open_port,
@@ -529,7 +530,7 @@ class AsyncIOProcManager:
         self.kv_output_aggregator: KVOutputAggregator | None = None
         self.kv_output_addrs = [self._reply_addr(i, host) for i in range(proc_num)]
         self.kv_outputs_queues: list[queue.Queue] = [
-            queue.Queue() for _ in range(proc_num)
+            clock.reply_queue() for _ in range(proc_num)
         ]
         self._pending_kv_aggregation: _PendingKvAggregation | None = None
         self.kv_output_threads: list[threading.Thread] = []
@@ -985,7 +986,7 @@ class AsyncIOProcManager:
             ret = self.outputs_queue.get()
             if isinstance(ret, SystemExit):
                 raise ret
-            return ret
+            return clock.charge(ret)
 
     def _start_kv_aggregation(
         self, func_name: str, args: tuple[object, ...]

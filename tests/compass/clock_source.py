@@ -1,0 +1,705 @@
+# SPDX-License-Identifier: MIT
+"""A static pass for reads of a real clock on the simulated path.
+
+Time on the simulated path comes from the run's own clock. A call to the
+machine's clock returns real seconds, and real seconds put into a record of
+modelled ones are not visibly different from the modelled ones -- the number
+has the right magnitude, the table still adds up, and the only sign of trouble
+is that two timestamps on one timeline disagree by a margin nobody is looking
+for. So this is a static check: the read is a failure on the day it is written,
+not on the day a number taken off it is argued about.
+
+Reads are found by parsing rather than by matching text, because the forms that
+matter are not all spelled the same. `from time import monotonic` followed by a
+bare `monotonic()` is the same read as `time.monotonic()`, and a text search for
+the second does not find the first. Imports and the aliases assigned from them
+are resolved to the name they came from, and the call target is compared against
+that -- so `now = time.monotonic` followed by `now()` is found as well, a form a
+text search for the assignment *would* have found and an earlier parse of only
+the imports did not.
+
+**What this pass does not see.** Naming the blind spots is part of the check,
+because a check whose limits are unstated gets read as a guarantee:
+
+* a read reached through a string -- `getattr(time, "perf_counter")()`, or
+  `importlib.import_module("time")` -- because the name is not in the syntax;
+* `from time import *`, because the names it binds are in the module it imports
+  and not in this one's text;
+* a name bound to the result of a call rather than to a name, since only a
+  dotted name on the right of an assignment is followed;
+* scope: a name bound anywhere in the file is treated as bound everywhere in
+  it, so a local alias in one function is resolved in another;
+* **a clock handed around as a value rather than assigned to a name.** Only an
+  import and a plain assignment are followed, so a parameter default
+  (`def step(wall_clock=time.monotonic)`), a walrus, a tuple unpacking, a class
+  attribute read back through the class, a dict entry read back by subscript
+  and a `functools.partial` all carry the clock past this pass. They are one
+  class -- the callable is bound somewhere the parser does not follow and
+  called later -- and the parameter default is the form that appears in real
+  code, which is also why a bare attribute load is not treated as a read.
+
+Each of those is a read this pass would miss and a reviewer would not, which is
+the trade the pass is worth making and not a reason to trust it alone. The list
+is what has been tried against it, not an enumeration of what Python allows.
+
+**The allow-list is part of the check, not an escape from it.** A read that is
+meant to stay real gets an entry naming its file, or its site and class, and the
+reason, so the list is reviewable, and adding to it is a decision somebody
+writes down rather than a silence.
+"""
+
+import ast
+import os
+from collections import Counter
+from dataclasses import dataclass
+
+#: The calls that return real seconds: the wall, monotonic and performance
+#: clocks, the process and thread CPU clocks, and `datetime.datetime`'s current
+#: time however it is asked for. CPU seconds are real seconds too: a step
+#: charged its own CPU time has machine time in it all the same. The `_ns` forms
+#: are the same machine clocks in different units, and a number divided by a
+#: billion after the fact is not distinguishable from one taken in seconds, so
+#: they are listed beside them rather than under them.
+#:
+#: **What is left out, and why.** An asyncio timer, `loop.time()` included, runs
+#: on the event loop's clock, which a simulated run replaces. `time.sleep` waits
+#: and reads nothing. `time.localtime`, `time.gmtime`, `time.ctime`,
+#: `time.strftime` and `datetime.date.today` read the machine clock and hand
+#: back a calendar date or a string, which no record adds up as seconds without
+#: a conversion call a reviewer sees. `os.times` and `resource.getrusage` read
+#: CPU seconds and have not been tried. A call through `atom.utils.time_shim`
+#: resolves to the shim and not to `time`, so a module that imports the shim as
+#: `time` reads the simulated clock at every clock call: the shim exposes no
+#: real read.
+#:
+#: **Every entry is the fully qualified name, because the comparison is exact.**
+#: A tail match would hand the whole list to any receiver whose attribute
+#: happens to be spelled the same -- `self.time.monotonic()`, `row.datetime.now()`,
+#: a `time` imported from somewhere that is not the standard library. The
+#: `datetime` entries are written out to `datetime.datetime` for the same
+#: reason; `from datetime import datetime` resolves to exactly that, so the
+#: short spelling costs nothing and the long one cannot be reached by accident.
+CLOCK_READS = (
+    "time.time",
+    "time.time_ns",
+    "time.monotonic",
+    "time.monotonic_ns",
+    "time.perf_counter",
+    "time.perf_counter_ns",
+    "time.clock_gettime",
+    "time.clock_gettime_ns",
+    "time.process_time",
+    "time.process_time_ns",
+    "time.thread_time",
+    "time.thread_time_ns",
+    "datetime.datetime.now",
+    "datetime.datetime.utcnow",
+    "datetime.datetime.today",
+)
+
+#: Files whose real-clock reads are deliberate, and why. A path matches on whole
+#: directory names ending at the entry, so the same entry works from any root
+#: the check is run from and a directory that merely ends in the same letters
+#: does not collect the exemption.
+DEFAULT_ALLOW_LIST: dict[str, str] = {
+    "atom/compass/run/__init__.py": (
+        "the run summary's wall seconds, each client run's from its client's "
+        "first request to its end, and each lazy trace's: the speed result, "
+        "which no simulated time reads; and a recorded real run's tokenizer-call "
+        "and HTTP intake stamps, which a simulated run never installs"
+    ),
+    "atom/compass/parity/runner.py": (
+        "a real runner's step timestamps; a simulated run runs its own runner "
+        "and never imports this module"
+    ),
+    "atom/compass/parity/traffic.py": (
+        "a real run's send times, on the clock its runner's step timestamps "
+        "read; a simulated run's traffic LP sends on the run's clock"
+    ),
+    "atom/compass/drive/trace_steps.py": (
+        "when trace steps published its population, for the entry's provenance; "
+        "the command reads it after its simulated server has stopped"
+    ),
+    "atom/compass/fit/publish.py": (
+        "when a fit published its entry, for the entry's provenance; a fit runs "
+        "offline on recorded steps and never inside a simulated run"
+    ),
+    "atom/compass/fit/device.py": (
+        "when fit device published its entry, for the entry's provenance and "
+        "date; it runs offline on probe records and never inside a simulated run"
+    ),
+    "atom/compass/drive/identity.py": (
+        "a command's phase boundaries in run.json, which are wall and monotonic "
+        "time by definition; the tool process reads them, and no simulated time"
+    ),
+    "atom/compass/bench/measure.py": (
+        "when measure steps published an entry, for the entry's provenance; the "
+        "bench runs on a GPU and never inside a simulated run"
+    ),
+    "atom/compass/bench/ops.py": (
+        "when measure ops published each point, for the entry's provenance; the "
+        "op bench runs on a GPU and never inside a simulated run"
+    ),
+    "atom/compass/capture/__init__.py": (
+        "when trace ops published each graph, for the entry's provenance, and how "
+        "long each shape took; a capture runs no device, and in a simulated run "
+        "only in a process of its own, whose clock no simulated time reads"
+    ),
+    "atom/compass/drive/measure_memory.py": (
+        "when measure memory published its entry, for the entry's provenance; it "
+        "starts a real engine and never runs inside a simulated run"
+    ),
+    "atom/compass/drive/measure_device.py": (
+        "when measure device published its record, for the entry's provenance; "
+        "it probes real devices and never runs inside a simulated run"
+    ),
+    "atom/compass/drive/pp_probe.py": (
+        "the PP carrier probe's send and receive stamps, on the monotonic clock "
+        "both its ranks share; it times two real devices and never runs inside "
+        "a simulated run"
+    ),
+    "atom/compass/validate/project.py": (
+        "when compass project published its projection, for the entry's "
+        "provenance; it prices recorded steps offline and never runs inside a "
+        "simulated run"
+    ),
+    "atom/compass/drive/clock_pair.py": (
+        "another node's CLOCK_MONOTONIC paired with this one's for a real "
+        "record's split, which deploy.sh pairs beside a real deployment alone; "
+        "a simulated run's instances share the run's clock and pair nothing"
+    ),
+}
+
+#: Packages under `atom/` a simulated run never executes, or that keep their
+#: own gate: `compass` its own, `mesh` is Rust, `benchmarks` and `examples` are
+#: scripts, and `diffusion` and `plugin` are never run by a simulation.
+NOT_CORE = ("compass", "mesh", "benchmarks", "examples", "diffusion", "plugin")
+
+_ATOM = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "atom"
+)
+
+#: ATOM's core: every module and package under `atom/` outside `NOT_CORE`, read
+#: off the tree so a new package is gated the day it lands. Paths are relative
+#: to the repository root; the clock-source and set-iteration gates both scan
+#: these.
+CORE_ROOTS = tuple(
+    f"atom/{name}"
+    for name in sorted(os.listdir(_ATOM))
+    if name not in NOT_CORE + ("__pycache__",)
+    and (name.endswith(".py") or os.path.isdir(os.path.join(_ATOM, name)))
+)
+
+_REPLACED_RUNNER = "the real model runner, which a simulated run replaces"
+_REPLACED_TRANSFER = "a transfer backend the simulator replaces with a priced one"
+_LOG_ONLY = "times real work for a log line; nothing in the simulated record reads it"
+_TRACE = (
+    "a request's OpenTelemetry span times, exported only when tracing is "
+    "configured; no simulated result reads them"
+)
+_COMPILE = "torch.compile at startup, before the simulated window"
+_LOAD = "loads or warms up the model at startup, before the simulated window"
+_WORKER_RPC = (
+    "a real-time bound on the engine's RPC to its own workers, a wait inside one "
+    "tensor-parallel group; the simulated runner answers within real "
+    "milliseconds, so the bound never fires"
+)
+_STARTUP = "waits for the deployment to come up, before the simulated window"
+_STATE_TIER = (
+    "the state-cache offload tier's verdict and touch ages; a simulated run "
+    "refuses an lmcache_offload layout that keeps a state tier"
+)
+_CONTROL_DEADLINE = (
+    "the reply deadline of an out-of-band control command, which produces no "
+    "simulated event; it stays real on purpose, because the LP clock moves only "
+    "while its owner takes a grant, so a deadline on it would never expire while "
+    "the owner waits for the reply"
+)
+
+#: Real-clock reads in ATOM's core that stay real, by site: (file, the innermost
+#: def holding the read, the call) -> (class, reason, how many such reads the
+#: def holds). A def holding a different number fails, so a new read beside a
+#: kept one is not excused by it. K8 stays real on purpose, out of the clock
+#: authority's reach; K9 is outside the model -- outside the simulated window,
+#: in code a simulated run replaces, or a timing only a log line reads. Every
+#: other read takes the LP clock through `atom.utils.clock.now` or
+#: `atom.utils.time_shim`.
+# fmt: off
+_KEPT_REAL = (
+    ("atom/model_engine/async_proc.py", "exit", "time.monotonic",
+     "K9", "the runner processes' shutdown grace period, after the simulated window", 2),
+    ("atom/model_engine/async_proc.py", "_start_kv_aggregation", "time.monotonic",
+     "K9", _LOG_ONLY, 1),
+    ("atom/model_engine/async_proc.py", "call_func_with_aggregation", "time.monotonic",
+     "K9", _LOG_ONLY, 1),
+    ("atom/model_engine/async_proc.py", "_collective_rpc", "time.monotonic",
+     "K9", _WORKER_RPC, 1),
+    ("atom/model_engine/async_proc.py", "_await_rank_reply", "time.monotonic",
+     "K9", _WORKER_RPC, 1),
+    ("atom/model_engine/engine_core.py", "exit", "time.monotonic",
+     "K9", "the runner processes' shutdown grace period, after the simulated window", 2),
+    ("atom/model_engine/engine_core.py", "_drain_kv_work_at_exit", "time.monotonic",
+     "K9", "bounds the KV drain at shutdown, after the last step is charged", 2),
+    ("atom/model_engine/engine_core.py", "_process_engine_step", "time.perf_counter",
+     "K9", _LOG_ONLY, 4),
+    ("atom/model_engine/engine_core_mgr.py", "close", "time.monotonic",
+     "K9", "the engine processes' shutdown grace period, after the simulated window", 2),
+    ("atom/model_engine/engine_core_mgr.py", "collective_rpc", "time.monotonic",
+     "K8", _CONTROL_DEADLINE, 2),
+    ("atom/model_engine/engine_core_mgr.py", "collective_rpc", "time.time",
+     "K8", _CONTROL_DEADLINE, 1),
+    ("atom/model_engine/engine_core_mgr.py", "_broadcast_and_wait", "time.monotonic",
+     "K8", _CONTROL_DEADLINE, 2),
+    ("atom/model_engine/engine_core_mgr.py", "_broadcast_and_wait", "time.time",
+     "K8", _CONTROL_DEADLINE, 1),
+    ("atom/model_engine/engine_utility.py", "_execute_utility_command", "time.monotonic",
+     "K9", _LOG_ONLY, 2),
+    ("atom/model_engine/engine_utility.py", "_remaining_timeout", "time.time",
+     "K8", _CONTROL_DEADLINE, 1),
+    ("atom/model_engine/engine_utility.py", "_prepare_engine", "time.monotonic",
+     "K8", _CONTROL_DEADLINE, 1),
+    ("atom/model_engine/engine_utility.py", "_handle_pause_generation", "time.monotonic",
+     "K8", _CONTROL_DEADLINE, 1),
+    ("atom/model_engine/engine_core.py", "prepare_kv_change", "time.monotonic",
+     "K8", _CONTROL_DEADLINE, 2),
+    *(
+        ("atom/model_engine/early_load.py", scope, "time.monotonic", "K9", _LOG_ONLY, 1)
+        for scope in ("__init__", "note_submitted", "note_prefill", "maybe_log")
+    ),
+    *(
+        ("atom/model_engine/state_offload.py", scope, "time.monotonic", "K9", _STATE_TIER, 1)
+        for scope in ("_mark_verified", "take_touches", "hold_admission")
+    ),
+    ("atom/model_engine/tp_multinode.py", "release_remote_readers", "time.monotonic",
+     "K9", _STARTUP, 2),
+    ("atom/entrypoints/openai/frontend_workers.py", "wait_for_workers", "time.monotonic",
+     "K9", _STARTUP, 2),
+    ("atom/entrypoints/openai/frontend_workers.py", "longest_silence", "time.monotonic",
+     "K9", ("the age of a front-end worker's last GC report, read by its health "
+     "metric only; no simulated result reads it"), 1),
+    *(
+        ("atom/entrypoints/openai/images.py", scope, "time.monotonic", "K8",
+         ("the deadline of fetching a prompt's image over the network, real I/O "
+          "that must time out in real seconds"), 1)
+        for scope in ("_download", "__init__", "remaining")
+    ),
+    ("atom/kv_transfer/offload/mp/transfer_thread.py", "fence", "time.monotonic", "K9",
+     "the vLLM plugin's fence on reused blocks; ATOM's engine never calls it", 2),
+    ("atom/model_engine/model_runner.py", "_build_and_load_model", "time.perf_counter",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/model_engine/model_runner.py", "_on_trace_ready", "time.time",
+     "K9", _REPLACED_RUNNER, 1),
+    ("atom/model_engine/model_runner.py", "_on_trace_ready", "time.monotonic",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/model_engine/model_runner.py", "stop_profiler", "time.monotonic",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/model_engine/model_runner.py", "warmup_model", "time.time",
+     "K9", _REPLACED_RUNNER, 3),
+    ("atom/model_engine/model_runner.py", "capture_cudagraph", "time.time",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/model_engine/model_runner.py", "_disagg_collect_rank_files", "time.monotonic",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/kv_transfer/disaggregation/mooncake/rail_engine_pool.py", "get",
+     "time.monotonic", "K9", _REPLACED_TRANSFER, 2),
+    ("atom/kv_transfer/disaggregation/moriio/moriio_connector.py", "_execute_handshake",
+     "time.perf_counter", "K9", _REPLACED_TRANSFER, 3),
+    ("atom/kv_transfer/offload/_offload_common.py", "_perf_maybe_log", "time.monotonic",
+     "K9", _LOG_ONLY, 1),
+    ("atom/kv_transfer/offload/chunked_scheduler.py", "get_num_new_matched_tokens",
+     "time.perf_counter", "K9", _LOG_ONLY, 2),
+    ("atom/kv_transfer/offload/chunked_scheduler.py", "prefetch_lookups", "time.perf_counter",
+     "K9", _LOG_ONLY, 2),
+    ("atom/kv_transfer/offload/chunked_scheduler.py", "_fresh_tier_lookup", "time.perf_counter",
+     "K9", _LOG_ONLY, 2),
+    ("atom/kv_transfer/offload/chunked_scheduler.py", "build_connector_meta",
+     "time.perf_counter", "K9", _LOG_ONLY, 2),
+    ("atom/kv_transfer/offload/dense/connector.py", "_do_load_req", "time.perf_counter",
+     "K9", _REPLACED_TRANSFER, 4),
+    ("atom/kv_transfer/offload/dense/connector.py", "_do_save_req", "time.perf_counter",
+     "K9", _REPLACED_TRANSFER, 4),
+    ("atom/kv_transfer/offload/hybrid/dsv4/connector.py", "_load_page", "time.perf_counter",
+     "K9", _REPLACED_TRANSFER, 4),
+    ("atom/kv_transfer/offload/hybrid/dsv4/connector.py", "_do_save_req", "time.perf_counter",
+     "K9", _REPLACED_TRANSFER, 4),
+    ("atom/kv_transfer/offload/hybrid/dsv4/connector.py", "_save_retries_expired",
+     "time.monotonic", "K9", _REPLACED_TRANSFER, 1),
+    ("atom/kv_transfer/offload/hybrid/dsv4/connector.py", "_release_save_watermark",
+     "time.monotonic", "K9", _REPLACED_TRANSFER, 1),
+    ("atom/kv_transfer/offload/hybrid/dsv4/connector.py", "request_finished", "time.monotonic",
+     "K9", _REPLACED_TRANSFER, 1),
+    ("atom/kv_transfer/offload/hybrid/kimi_k3/connector.py", "_refresh_save_stall",
+     "time.monotonic", "K9", _REPLACED_TRANSFER, 1),
+    ("atom/kv_transfer/offload/hybrid/kimi_k3/state_tier.py", "oldest_store_age_s",
+     "time.monotonic", "K9", _REPLACED_TRANSFER, 1),
+    ("atom/kv_transfer/offload/hybrid/kimi_k3/state_tier.py", "submit_store", "time.monotonic",
+     "K9", _REPLACED_TRANSFER, 1),
+    ("atom/kv_transfer/offload/hybrid/kimi_k3/state_tier.py", "submit_load", "time.monotonic",
+     "K9", _REPLACED_TRANSFER, 1),
+    ("atom/kv_transfer/offload/hybrid/kimi_k3/state_tier.py", "_do_load", "time.monotonic",
+     "K9", _REPLACED_TRANSFER, 1),
+    ("atom/kv_transfer/offload/hybrid/kimi_k3/state_tier.py", "arm", "time.monotonic",
+     "K9", _REPLACED_TRANSFER, 1),
+    ("atom/kv_transfer/offload/hybrid/kimi_k3/state_tier.py", "reclaim_stale_parks",
+     "time.monotonic", "K9", _REPLACED_TRANSFER, 1),
+    *(
+        (f"atom/kv_transfer/{path}", scope, f"time.{call}", "K9", _REPLACED_TRANSFER, n)
+        for path, scopes in (
+            ("disaggregation/mooncake/mla_landing.py", (
+                ("acquire", "monotonic", 2), ("begin", "monotonic", 1),
+                ("__init__", "monotonic", 1), ("quarantine", "monotonic", 1),
+                ("_retire_locked", "monotonic", 1), ("_scatter", "monotonic", 2),
+                ("sweep", "monotonic", 1), ("_unquarantine_locked", "monotonic", 1))),
+            ("disaggregation/chunked_prefill.py", (
+                ("__init__", "monotonic", 1), ("publish", "monotonic", 1),
+                ("finish", "monotonic", 1), ("source_safe", "monotonic", 1))),
+            ("disaggregation/mooncake/mooncake_connector.py", (
+                ("admission_ready", "monotonic", 1), ("build_connector_meta", "monotonic", 1),
+                ("_complete_recv", "monotonic", 1),
+                ("_dispatch_ready_chunked_requests", "monotonic", 1),
+                ("_execute_chunked_transfer", "monotonic", 1),
+                ("_expire_pending_recvs", "monotonic", 1),
+                ("get_finished", "monotonic", 1), ("_rdma_write", "monotonic", 3),
+                ("record_kv_cache_ready", "monotonic", 1), ("_record_write_ack", "monotonic", 1),
+                ("_report_held_failures", "monotonic", 1), ("start_load_kv", "monotonic", 1),
+                ("_write_listener", "monotonic", 2), ("_write_mla_slot", "monotonic", 1))),
+            ("disaggregation/moriio/moriio_connector.py", (
+                ("_accept_write_request", "monotonic", 1),
+                ("_collect_write_reports", "time", 1), ("_finish_write", "monotonic", 1),
+                ("_forget_finished_writes", "monotonic", 1), ("_hold_failure", "monotonic", 1),
+                ("_issue_ready_reads", "monotonic", 1),
+                ("_report_held_failures", "monotonic", 1), ("_request_write", "time", 1),
+                ("_service_write_requests", "monotonic", 1),
+                ("_service_write_requests", "time", 1), ("start_load_kv", "monotonic", 1))),
+            ("offload/mooncake_store/async_lookup.py", (
+                ("_warn_lookup_failure", "monotonic", 1), ("_query", "monotonic", 1))),
+            ("offload/mooncake_store/client.py", (
+                ("__init__", "monotonic", 1), ("__init__", "time", 1),
+                ("seconds", "monotonic", 1), ("seconds", "time", 1))),
+            ("offload/mooncake_store/scheduler.py", (
+                ("_build_save_request", "monotonic", 1), ("_connect", "monotonic", 1),
+                ("_count_lookup", "monotonic", 1), ("_exists_on", "monotonic", 1),
+                ("__init__", "monotonic", 1), ("lookup", "perf_counter", 2),
+                ("_pause", "monotonic", 1), ("_pools_to_ask", "monotonic", 1),
+                ("_warn", "monotonic", 1))),
+            ("offload/mooncake_store/worker.py", (
+                ("_do_load_req", "perf_counter", 6), ("_do_save_req", "monotonic", 1),
+                ("_do_save_req", "perf_counter", 8), ("_maybe_log_store_stats", "monotonic", 1),
+                ("register_kv_caches", "monotonic", 1), ("start_load_kv", "monotonic", 1),
+                ("_warn_rate_limited", "monotonic", 1))),
+        )
+        for scope, call, n in scopes
+    ),
+    ("atom/model_engine/segment_tokenizer.py", "_encode_cached", "time.perf_counter",
+     "K9", _LOG_ONLY, 2),
+    ("atom/model_loader/expert_staging.py", "_ensure_staging", "time.perf_counter",
+     "K9", _LOAD, 2),
+    ("atom/model_loader/loader.py", "load_model", "time.perf_counter", "K9", _LOAD, 2),
+    ("atom/model_loader/loader.py", "_save_online_quant_info", "time.time_ns",
+     "K9", "names a file the loader writes at startup, before the simulated window", 1),
+    ("atom/model_loader/loading_core.py", "load_weights_into_model", "time.perf_counter",
+     "K9", _LOAD, 8),
+    ("atom/model_loader/weight_iterator.py", "_run", "time.perf_counter", "K9", _LOAD, 2),
+    ("atom/model_loader/weight_utils.py", "download_weights_from_hf", "time.perf_counter",
+     "K9", _LOAD, 2),
+    ("atom/spec_decode/drafter.py", "_warmup_draft_graphs", "time.time", "K9", _LOAD, 2),
+    ("atom/model_ops/engram/host_memory.py", "_flock_logging_wait", "time.monotonic",
+     "K9", _LOAD, 2),
+    ("atom/model_ops/engram/host_memory.py", "_flock_logging_wait", "time.time",
+     "K9", _LOAD, 2),
+    ("atom/models/deepseek_v41/mono/hi_contract.py", "main", "time.time", "K9",
+     "a check of the mono runner's programs run by hand, outside any run", 2),
+    ("atom/models/deepseek_v41/mono/hi_runner.py", "__init__", "time.time",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/models/deepseek_v41/mono/hi_runner.py", "_check_host_shard", "time.time",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/models/deepseek_v41/mono/gfx1250/debug.py", "mark", "time.perf_counter",
+     "K9", _REPLACED_RUNNER, 1),
+    ("atom/models/deepseek_v41/mono/gfx1250/inputs.py", "_hm", "time.perf_counter",
+     "K9", _REPLACED_RUNNER, 1),
+    ("atom/models/deepseek_v41/mono/gfx1250/runner.py", "__init__", "time.perf_counter",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/model_ops/eplb.py", "_execute_runtime_rebalance", "time.perf_counter",
+     "K9", "moves expert weights inside the real forward, which a simulated run replaces", 4),
+    ("atom/observability/tracing.py", "now", "time.perf_counter_ns", "K9", _TRACE, 1),
+    ("atom/observability/tracing.py", "enqueue", "time.perf_counter_ns", "K9", _TRACE, 1),
+    ("atom/observability/tracing.py", "enqueue", "time.time_ns", "K9", _TRACE, 1),
+    ("atom/structured_output/validation.py", "_prepare", "time.monotonic", "K8", (
+        "the 60 s bound on structured-output admission's worker grammar "
+        "preflight; a simulated run does not model structured output"), 3),
+    ("atom/rollout/weight_sync.py", "load_weights_via_ipc", "time.time",
+     "K9", "pushes real weights to the GPU, which a simulated run never holds", 2),
+    ("atom/utils/__init__.py", "shutdown_all_processes", "time.monotonic",
+     "K9", "the process shutdown grace period, after the simulated window", 2),
+    ("atom/utils/backends.py", "compile", "time.time", "K9", _COMPILE, 3),
+    ("atom/utils/backends.py", "__call__", "time.time", "K9", _COMPILE, 1),
+    ("atom/utils/compass_loop.py", "select", "time.monotonic", "K9",
+     "times a stall's diagnostic in wall seconds; the LP clock stands still", 1),
+    ("atom/utils/decorators.py", "start_monitoring_torch_compile", "time.time",
+     "K9", _COMPILE, 1),
+    ("atom/utils/gc_utils.py", "_log", "time.perf_counter", "K9", _LOG_ONLY, 2),
+)
+# fmt: on
+CORE_ALLOW_LIST: dict[tuple[str, str, str], tuple[str, str, int]] = {
+    (path, scope, call): (kind, why, count)
+    for path, scope, call, kind, why, count in _KEPT_REAL
+}
+
+
+def _names(path: str, entry: str) -> bool:
+    """Does `entry` name `path`? Whole path segments only, from any root."""
+    posix = path.replace(os.sep, "/")
+    return posix == entry or posix.endswith("/" + entry)
+
+
+@dataclass(frozen=True)
+class ClockRead:
+    """One call to a real clock: where it is, what it calls, and inside what."""
+
+    path: str
+    line: int
+    call: str
+    scope: str
+
+    def __str__(self) -> str:
+        return f"{self.path}:{self.line}  {self.call}  in {self.scope}"
+
+
+class ClockSourceLint:
+    """Parses the simulated path and reports every real-clock read it finds."""
+
+    def __init__(self, allow_list=DEFAULT_ALLOW_LIST, sites=CORE_ALLOW_LIST) -> None:
+        self.allow_list = dict(allow_list)
+        self.sites = dict(sites)
+
+    def allowed(self, path: str) -> str | None:
+        """The recorded reason this file may read a real clock, if it may.
+
+        The match is on whole path segments. A suffix on the text alone would
+        hand the exemption to any directory whose name happens to end in the
+        first segment of an entry, which is a file nobody reviewed.
+        """
+        for entry in sorted(self.allow_list):
+            if _names(path, entry):
+                return self.allow_list[entry]
+        return None
+
+    def site(self, read: ClockRead) -> tuple[str, str, str] | None:
+        """The entry naming this read's site, if one does."""
+        for path, scope, call in self.sites:
+            if (scope, call) == (read.scope, read.call) and _names(read.path, path):
+                return path, scope, call
+        return None
+
+    def scan_source(self, source: str, path: str) -> tuple[ClockRead, ...]:
+        """Every real-clock read in one module's text, in line order.
+
+        A call counts when its resolved name is exactly an entry in the list.
+        Matching a tail instead would accuse any receiver whose attribute is
+        spelled like a module.
+        """
+        if self.allowed(path) is not None:
+            return ()
+        tree = ast.parse(source, filename=path)
+        origins, imported = _origins(tree)
+        spans = scopes(tree)
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            call = _resolve(_dotted(node.func), origins, imported)
+            if call in CLOCK_READS:
+                found.append(
+                    ClockRead(path, node.lineno, call, scope_at(spans, node.lineno))
+                )
+        return tuple(sorted(found, key=lambda read: (read.path, read.line, read.call)))
+
+    @staticmethod
+    def modules(root: str) -> tuple[str, ...]:
+        """Every module under `root`, in a fixed order on every machine."""
+        if os.path.isfile(root):
+            return (root,)
+        found = []
+        for directory, subdirectories, names in os.walk(root):
+            subdirectories[:] = sorted(
+                name for name in subdirectories if name != "__pycache__"
+            )
+            found.extend(
+                os.path.join(directory, name)
+                for name in sorted(names)
+                if name.endswith(".py")
+            )
+        return tuple(found)
+
+    def report(self, reads, scanned: int, allow_listed: int = 0, kept: int = 0) -> str:
+        """What the check prints. Clean is a line; dirty is the list and the fix.
+
+        `allow_listed` is how many of the files in this scan were passed over,
+        and `kept` how many reads a site entry kept real, not how long either
+        list is. The line reads as a statement about the scan, so it has to be
+        one: a tree containing none of the listed files is a tree where nothing
+        was exempted.
+        """
+        if not reads:
+            by_site = f", {kept} read(s) kept real by site" if kept else ""
+            return (
+                f"clock-source lint: clean over {scanned} module(s), "
+                f"{allow_listed} file(s) allow-listed{by_site}"
+            )
+        lines = [
+            f"clock-source lint: {len(reads)} real-clock read(s) on the simulated path:"
+        ]
+        lines.extend(f"  {read}" for read in reads)
+        lines.append(
+            "A run charges simulated seconds for the work it models. A real read "
+            "puts machine seconds into the same record, and the mixture is reported "
+            "as one modelled number. Take the time from the run's clock, or add the "
+            "file to the allow-list with the reason it stays real."
+        )
+        return "\n".join(lines)
+
+    def check(self, root: str) -> tuple[int, str]:
+        """Scan `root` and return an exit code beside the report. Non-zero fails CI.
+
+        A root holding no module is refused: a scan of nothing has checked
+        nothing, and a mistyped path would otherwise read as clean.
+        """
+        modules = self.modules(root)
+        if not modules:
+            return 1, f"clock-source lint: no module under {root}, nothing checked"
+        reads = []
+        for path in modules:
+            with open(path, encoding="utf-8") as handle:
+                reads.extend(self.scan_source(handle.read(), path))
+        allow_listed = sum(1 for path in modules if self.allowed(path) is not None)
+        unlisted = unkept(reads, self.sites, self.site)
+        kept = len(reads) - len(unlisted)
+        return (1 if unlisted else 0), self.report(
+            unlisted, len(modules), allow_listed, kept
+        )
+
+
+def unkept(reads, sites, site) -> list:
+    """The reads no entry keeps.
+
+    `site(read)` names a read's entry, and the entry's last field is how many
+    reads it keeps. A site holding any other number keeps none, so a new read
+    beside a kept one is reported together with them.
+    """
+    keys = [site(read) for read in reads]
+    held = Counter(keys)
+    return [
+        read
+        for read, key in zip(reads, keys)
+        if key is None or held[key] != sites[key][-1]
+    ]
+
+
+def _dotted(node) -> str | None:
+    """`a.b.c` for an attribute or name chain, or None for anything else."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _origins(tree) -> tuple[dict[str, str], set[str]]:
+    """Local name -> the dotted name it stands for: imports, and aliases of them;
+    and the local names whose origin is an import.
+
+    An alias is an assignment whose right-hand side is a dotted name, and it is
+    recorded whole -- `self._clock = time.perf_counter` binds `self._clock`, not
+    `self` -- so that the call it enables resolves the same way an import does.
+    The first binding a name gets is the one kept: a name assigned twice says
+    two things, and the check is not an interpreter.
+
+    A relative import keeps its leading dots, so a sibling module that happens
+    to be called `time` resolves to `.time` and never to the standard library.
+    """
+    origins: dict[str, str] = {}
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".")[0]
+                if name not in origins:
+                    origins[name] = alias.name
+                    imported.add(name)
+        elif isinstance(node, ast.ImportFrom):
+            package = "." * node.level + (f"{node.module}." if node.module else "")
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if name not in origins:
+                    origins[name] = package + alias.name
+                    imported.add(name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            source = _dotted(node.value)
+            if source is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                name = _dotted(target)
+                if name is not None and name != source:
+                    origins.setdefault(name, source)
+    return origins, imported
+
+
+def _resolve(
+    call: str | None, origins: dict[str, str], imported: set[str]
+) -> str | None:
+    """Rewrite a call's head through the imports and aliases that introduced it.
+
+    An alias can stand on an alias, and `ast.walk` does not visit the bindings
+    in the order they were written, so the chain is followed rather than
+    stepped once. Each name is expanded at most once along a chain: a name can
+    legitimately stand for one that contains it -- `from datetime import
+    datetime` binds `datetime` to `datetime.datetime` -- and expanding that a
+    second time would grow the name instead of resolving it.
+
+    A name an import binds is the end of the chain: what it stands for is a
+    module's own name, not a local one. `import time as wall` beside
+    `from atom.utils import time_shim as time` makes `wall.monotonic` the
+    standard library's read, not the shim's.
+    """
+    if call is None:
+        return None
+    expanded = set()
+    while True:
+        origin = origins.get(call)
+        if origin is not None:
+            if call in expanded:
+                return call
+            expanded.add(call)
+            final = call in imported
+        else:
+            head, _, rest = call.partition(".")
+            head_origin = origins.get(head)
+            if head_origin is None or head in expanded:
+                return call
+            expanded.add(head)
+            origin = f"{head_origin}.{rest}" if rest else head_origin
+            final = head in imported
+        if origin == call or final:
+            return origin
+        call = origin
+
+
+def scopes(tree) -> tuple[tuple[int, int, str], ...]:
+    """Every def and class as (first line, last line, name), outermost first."""
+    return tuple(
+        (node.lineno, node.end_lineno or node.lineno, node.name)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    )
+
+
+def scope_at(spans, line: int) -> str:
+    """The innermost def or class containing `line`, or module level.
+
+    `spans` is what `scopes` returns for the module holding `line`.
+    """
+    inner = [span for span in spans if span[0] <= line <= span[1]]
+    return max(inner)[2] if inner else "<module>"

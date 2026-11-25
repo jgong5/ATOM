@@ -858,9 +858,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
-    # runs eagerly; empty records none. The default tops out at 3072 because
-    # the pool grows with the largest bucket (16384 costs ~10 GB per GPU on
-    # V4.1 TP4) while prefills that long are GPU-bound and gain little. Only
+    # runs eagerly; empty records none. The default tops out at 7168 because
+    # the pool grows with the largest bucket, while longer prefills on
+    # V4.1-Flash TP4 are GPU-bound and gain little. Only
     # an attention backend with `supports_token_graph` takes them.
     # MiniMax-M3: record and replay prefill token graphs (attention stays an
     # eager region); see AiterAttentionMetadataBuilder.supports_token_graph.
@@ -869,9 +869,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_TOKEN_GRAPH_SIZES": lambda: tuple(
         int(s)
-        for s in os.getenv("ATOM_TOKEN_GRAPH_SIZES", "256,512,1024,2048,3072").split(
-            ","
-        )
+        for s in os.getenv(
+            "ATOM_TOKEN_GRAPH_SIZES", "256,512,1024,2048,3072,4096,5120,6144,7168"
+        ).split(",")
         if s.strip()
     ),
     # Under DP with a drafter, the largest token-bucket TR graph to record: a
@@ -1446,6 +1446,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1") == "1"
     ),
+    # First-call every native A8 GEMM variant at warmup (prewarm.prewarm_native_a8),
+    # so no FlyDSL first-call trace stalls a serving forward.
+    "ATOM_PREWARM_NATIVE_A8": lambda: os.getenv("ATOM_PREWARM_NATIVE_A8", "1") == "1",
     "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM": lambda: (
         os.getenv("ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM", "0") == "1"
     ),
@@ -1721,7 +1724,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PP_IPC": lambda: os.getenv("ATOM_PP_IPC", "1") == "1",
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
-    # page-locked (`engram.host_memory.pin_rows`), not copied to HBM; the
+    # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM
+    # unless ATOM_ENGRAM_UVA_HBM says so; the
     # GPU pulls only the rows a step names and dequantizes them there. On by default: the host gather gives the same rows
     # but costs ~50 ms of CPU per decode step with the GPU idle behind it. Set
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
@@ -1733,6 +1737,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # where Qwen Mono serves the deployment (`atom/models/qwen38/mono/ple.py`),
     # which ignores it.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
+    # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
+    # into page-locked memory of exactly its size (hipHostMalloc on base pages,
+    # so a fragmented page cache costs no compaction), one copy_ below 512 MiB, else one thread per 128 MiB (at least 8) up to
+    # 16 and the CPUs this process may use, dropping the copied checkpoint
+    # pages from the process as it goes; 0 registers the checkpoint mapping in
+    # place (one thread, under the HIP runtime lock). Either way the shard is
+    # resident once. Copying needs the HIP runtime; elsewhere it registers in
+    # place regardless. Unset, DP attention (every rank holds the whole table)
+    # registers in place -- the shared checkpoint mapping, pinned once per node
+    # rather than copied once per rank -- and copies only if that is refused.
+    # `tools/engram/bench_uva_shard.py` measures both.
+    "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
+    # With ATOM_ENGRAM_UVA: hold each rank's shard in HBM instead of page-locked
+    # host memory (`engram.host_memory.to_device`), for a host that cannot
+    # page-lock the shards; the same kernel reads it there. Copied through one
+    # page-locked bounce chunk of at most 1 GiB. The shard is in HBM before
+    # the KV cache is sized, so the KV cache gets that much less.
+    "ATOM_ENGRAM_UVA_HBM": lambda: os.getenv("ATOM_ENGRAM_UVA_HBM", "0") == "1",
+    # Optional override of the file that serializes shared in-place
+    # registration. Empty: host_memory names one from the checkpoint path.
+    "ATOM_ENGRAM_REG_LOCK": lambda: os.getenv("ATOM_ENGRAM_REG_LOCK", ""),
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.

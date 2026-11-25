@@ -50,7 +50,7 @@ from atom.kv_transfer.offload.mooncake_store.keys import (
 )
 from atom.model_engine.sequence import SequenceStatus
 from atom.spec_decode.draft_window_geometry import DraftReadWindow
-from atom.utils import envs
+from atom.utils import clock, envs
 
 logger = logging.getLogger("atom")
 
@@ -292,7 +292,7 @@ class _StoreLookup(StoreLookupBase):
     def _pools_to_ask(self) -> list[_PoolLookups]:
         """The pools neither tainted nor paused, each connected, connecting
         those not yet."""
-        now = time.monotonic()
+        now = clock.now(time.monotonic)
         return [
             pool
             for pool in self._pools
@@ -311,7 +311,7 @@ class _StoreLookup(StoreLookupBase):
         answered an error is paused (`_pause`).
         """
         asked = [STORE_TAINT_KEY, *keys]
-        asked_at = time.monotonic()
+        asked_at = clock.now(time.monotonic)
         futures = (
             [pool.executor.submit(pool.client.exists, asked) for pool in pools]
             if all(pool.executor is not None for pool in pools)
@@ -376,14 +376,14 @@ class _StoreLookup(StoreLookupBase):
         return minutes after it started, and a pause counted from before it
         would already be over. Returns the seconds paused.
         """
-        now = time.monotonic()
+        now = clock.now(time.monotonic)
         pause = max(floor_s, _LOOKUP_BACKOFF_FACTOR * (now - since))
         pool.paused_until = now + pause
         return pause
 
     def _connect(self, pool: _PoolLookups) -> bool:
         """Open ``pool``'s client; on failure pause it and return False."""
-        started = time.monotonic()
+        started = clock.now(time.monotonic)
         try:
             # Lookups are master RPCs only; tcp needs no NIC of its own.
             pool.client = store_client.MooncakeStoreClient(
@@ -412,7 +412,7 @@ class _StoreLookup(StoreLookupBase):
         self, pool: _PoolLookups, message: str, *args: Any, exc_info: Any = None
     ) -> None:
         """At most one warning per pool and `_LOOKUP_WARNING_INTERVAL_S`."""
-        now = time.monotonic()
+        now = clock.now(time.monotonic)
         if now < self._next_warning_at.get(pool.pool.master, 0.0):
             logger.debug("Mooncake Store offload: " + message, *args)
             return
@@ -489,7 +489,7 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
 
     def _lookup_starting(self, sid: str) -> None:
         # Stamped before asking: the lease runs from the master's answer.
-        self._looked_up_at[sid] = time.monotonic()
+        self._looked_up_at[sid] = clock.now(time.monotonic)
 
     def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
         hit = super()._fresh_tier_lookup(seq, sid)
@@ -524,7 +524,7 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
             pending is not None
             and pending[0] is seq
             and looked_up_at is not None
-            and time.monotonic() - looked_up_at <= _LOOKUP_REUSE_S
+            and clock.now(time.monotonic) - looked_up_at <= _LOOKUP_REUSE_S
         ):
             return True
         start = int(spec.hbm_cached_tokens)

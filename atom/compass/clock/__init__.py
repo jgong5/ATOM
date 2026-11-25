@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: MIT
+"""Identity, order, channels and the grant rule for the simulated clock.
+
+What lives here: who the participants are (`LpId`), the order they are served
+in (`LpRegistry`), the channels between them with the lookahead each declares
+and the path distances that follow (`ChannelTable`), the Clock Authority
+that grants each one time from those distances and the messages it has
+registered (`ClockAuthority`), and what a run says about itself: its timeline,
+the LP table as text, and the run summary (`observability`). The transport
+that carries a request to the authority, and the runtime inside each
+participant, sit elsewhere.
+
+Nothing here imports a device runtime, reads a clock, or opens a socket, which
+is what makes it testable on any machine.
+
+That claim is enforced, not asserted: every `.py` file under this package, at
+any depth, is held to a standard-library allowlist and to building
+no `set`. Tooling that has to read the tree, parse source, or talk to anything
+therefore does not belong here even when it is about time -- put it beside the
+package, not inside it.
+"""
+
+from .authority import (
+    ARRIVAL,
+    NER,
+    PARK,
+    REPORT,
+    TAR,
+    BackdatedEvent,
+    ClientRun,
+    ClockAbort,
+    ClockAuthority,
+    LpRow,
+    Released,
+)
+from .channels import (
+    Channel,
+    ChannelTable,
+    prefill_decode_table,
+    single_engine_table,
+)
+from .identity import LpId
+from .observability import (
+    SPEED_TARGET_RATIO,
+    DetectorState,
+    RefusalTally,
+    RunSummary,
+    TimelineLog,
+    TimelineRecord,
+    lp_table_dump,
+)
+from .registry import LpRegistry
+
+__all__ = [
+    "ARRIVAL",
+    "NER",
+    "PARK",
+    "REPORT",
+    "SPEED_TARGET_RATIO",
+    "TAR",
+    "BackdatedEvent",
+    "Channel",
+    "ChannelTable",
+    "ClientRun",
+    "ClockAbort",
+    "ClockAuthority",
+    "DetectorState",
+    "LpId",
+    "LpRegistry",
+    "LpRow",
+    "RefusalTally",
+    "Released",
+    "RunSummary",
+    "TimelineLog",
+    "TimelineRecord",
+    "lp_table_dump",
+    "prefill_decode_table",
+    "single_engine_table",
+]

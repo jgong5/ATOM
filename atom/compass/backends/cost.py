@@ -1,0 +1,400 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+"""The cost of one step, and the parts it was built from.
+
+A `StepCost` does not store a total. `seconds` is folded from `terms` on every
+read, and the breakdown is re-checked on every read rather than only at
+construction, so the whole cannot come to disagree with its parts by any route
+that leaves the object itself in place. Subclassing is refused where it would
+shadow the total, the terms or the rows, because a subclass needs no bypass at
+all to return one number while its breakdown says another.
+
+An empty breakdown is refused outright. The failure behind that is the mean of
+an empty sample, which is not an error, is not approximately zero, and is
+exactly 0.0 -- a precise and entirely fictional answer that reads as a fast
+step rather than as a missing model. The same shape is refused one layer up:
+`ProvenanceMix` will not divide by an empty run, because "nothing fell back"
+and "nothing recorded" would otherwise be the same number, and it is the
+reassuring one.
+
+Every addition of seconds in this module goes through `fold_seconds`: a left
+fold from 0.0 over values in the order given, with `fold_step` as its one-step
+form for running totals. The only `+` outside them counts whole steps and
+reasons, which are integers. Float addition is not associative, so two readers
+who sum the same terms in different orders get different bits, and a run that
+has to be reproducible cannot leave that to whoever writes the next summing
+loop. Routing every sum through one function is what makes the order a
+property of the module rather than a coincidence that holds until someone
+adds a `+`.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+
+from atom.compass.backends.provenance import Method, Provenance, Refusal
+from atom.compass.backends.shape import BatchView
+
+
+def fold_seconds(values: Iterable[float]) -> float:
+    """Sum in the given order, left fold from 0.0.
+
+    The only summation this package performs, so that a total and a check of
+    that total agree bit for bit.
+    """
+    total = 0.0
+    for value in values:
+        total += value
+    return total
+
+
+def fold_step(total: float, value: float) -> float:
+    """One step of the same fold, for a running total kept across calls."""
+    return fold_seconds((total, value))
+
+
+def fold_parts(parts: Iterable[Mapping[str, float]]) -> dict[str, float]:
+    """Seconds by name, each name's folded in the order given."""
+    grouped: dict[str, list[float]] = {}
+    for p in parts:
+        for name, seconds in p.items():
+            grouped.setdefault(name, []).append(seconds)
+    return {name: fold_seconds(s) for name, s in grouped.items()}
+
+
+@dataclass(frozen=True)
+class CostTerm:
+    """One labelled part of a step's cost.
+
+    Terms are flat. A backend that wants a hierarchy spells it in the name --
+    `attention.decode` under `attention` -- rather than nesting, because the
+    consumers of a breakdown want to group and sum, not to walk a tree.
+
+    `by_bound` is a roofline term's seconds by the part of its prices that set
+    them (`work.parts`), summing to `seconds`; empty when no roofline part
+    sets them, as for a measured price or an overlapped step.
+    """
+
+    name: str
+    seconds: float
+    provenance: Provenance
+    by_bound: Mapping[str, float] = field(default_factory=dict, hash=False)
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("a cost term must be named")
+        if not isinstance(self.provenance, Provenance):
+            raise TypeError(
+                f"{self.name}: provenance is required, got {self.provenance!r}"
+            )
+        if not math.isfinite(self.seconds):
+            raise ValueError(f"{self.name}: {self.seconds} is not a finite duration")
+        if self.seconds < 0.0:
+            raise ValueError(f"{self.name}: {self.seconds} s is negative")
+        if self.provenance.fell_through and self.seconds <= 0.0:
+            raise ValueError(
+                f"{self.name}: a refusal was priced at {self.seconds} s. Something "
+                "declined and the stand-in charged nothing, which removes the step "
+                "from the schedule while still reporting it as priced."
+            )
+        parts = fold_seconds(self.by_bound.values())
+        if self.by_bound and not math.isclose(parts, self.seconds, rel_tol=1e-9):
+            raise ValueError(
+                f"{self.name}: its parts {dict(self.by_bound)} sum to {parts} s, "
+                f"not its {self.seconds} s"
+            )
+
+    @property
+    def refusals(self) -> tuple[Refusal, ...]:
+        return self.provenance.refusals
+
+
+def _checked(terms: Sequence[CostTerm]) -> tuple[CostTerm, ...]:
+    """The breakdown, or the reason it is not one. Run at build and at read."""
+    terms = tuple(terms)
+    if not terms:
+        raise ValueError(
+            "a step cost with no terms is an aggregate with no decomposition; "
+            "name at least one part, even if the model has only one"
+        )
+    seen: set[str] = set()
+    for term in terms:
+        if not isinstance(term, CostTerm):
+            raise TypeError(f"not a cost term: {term!r}")
+        if term.name in seen:
+            raise ValueError(
+                f"duplicate term {term.name!r}: a breakdown is read by name"
+            )
+        seen.add(term.name)
+    return terms
+
+
+def _every(cost: StepCost) -> tuple[CostTerm, ...]:
+    """`cost.terms` then `cost.draft_terms`, checked."""
+    return _checked((*cost.terms, *cost.draft_terms))
+
+
+@dataclass(frozen=True)
+class StepCost:
+    """What one step costs, and what that cost is made of.
+
+    Construct it from its parts. There is no constructor that takes a total,
+    because a total that can be set independently of the parts is a total that
+    will eventually disagree with them.
+
+    `treatments` names each assumed treatment the step was priced under: a
+    factor that moves cost and that no feature of the query carries. It
+    belongs to the query, so no term's method changes with it.
+
+    `terms` are the target's device work; `draft_terms` a speculative
+    drafter's, which runs after the target's. A name is used once across both.
+    """
+
+    terms: tuple[CostTerm, ...]
+    treatments: tuple[str, ...]
+    draft_terms: tuple[CostTerm, ...]
+
+    def __init__(
+        self,
+        terms: Sequence[CostTerm],
+        treatments: Sequence[str] = (),
+        draft_terms: Sequence[CostTerm] = (),
+    ) -> None:
+        object.__setattr__(self, "terms", tuple(terms))
+        object.__setattr__(self, "treatments", tuple(treatments))
+        object.__setattr__(self, "draft_terms", tuple(draft_terms))
+        _every(self)
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        """Refuse a subclass that shadows anything this class reports.
+
+        Overriding a reader needs no bypass and defeats every check here: the
+        object is valid, the breakdown is real, and the answer returned has
+        nothing to do with it. `seconds` is the obvious one; `fell_back` is
+        the dangerous one, because hiding it makes a run report no fallback
+        steps over steps a fallback priced.
+
+        The protected set is read off this class rather than listed, so a
+        reader added later is covered the day it is added and not the day
+        somebody remembers to extend a tuple.
+        """
+        super().__init_subclass__(**kwargs)
+        owned = {
+            name
+            for name in (*vars(StepCost), *StepCost.__annotations__)
+            if not name.startswith("_")
+        }
+        shadowed = sorted(owned & set(cls.__dict__))
+        if shadowed:
+            raise TypeError(
+                f"{cls.__name__} redefines {', '.join(shadowed)}; an answer that does "
+                "not come from the terms is the thing this class exists to prevent"
+            )
+
+    @property
+    def seconds(self) -> float:
+        """The total, folded from the terms in their stored order."""
+        return fold_seconds(term.seconds for term in _every(self))
+
+    @property
+    def target_seconds(self) -> float:
+        """The fold of `terms`."""
+        return fold_seconds(t.seconds for t in _every(self)[: len(self.terms)])
+
+    @property
+    def draft_seconds(self) -> float:
+        """The fold of `draft_terms`."""
+        return fold_seconds(t.seconds for t in _every(self)[len(self.terms) :])
+
+    @property
+    def refusals(self) -> tuple[Refusal, ...]:
+        """Every refusal behind this step, term order then chain order."""
+        return tuple(r for term in _every(self) for r in term.refusals)
+
+    @property
+    def fell_back(self) -> bool:
+        """Whether a fallback priced some term after a source declined it."""
+        return any(t.provenance.fell_through for t in _every(self))
+
+    @property
+    def fallback_seconds(self) -> float:
+        """Seconds priced by a fallback after something declined.
+
+        Reported alongside the count because they answer different questions:
+        a run can fall back on 2% of its steps and 40% of its time.
+        """
+        return fold_seconds(
+            t.seconds for t in _every(self) if t.provenance.fell_through
+        )
+
+    def seconds_by_method(self) -> Mapping[tuple[Method, bool], float]:
+        """Seconds grouped by (method, validated), terms in stored order.
+
+        Each group is the fold of its own terms, in the order they appear in
+        the breakdown. Grouping re-associates, so folding these group totals
+        is a *different* sum from `seconds` and is not bit-equal to it: three
+        terms of 0.1, 0.2 and 0.15 whose first and third share a group fold
+        flat to 0.45000000000000007 and grouped to 0.45. The mixture is for
+        reporting how the time was obtained. `rows()` is the view that
+        re-folds to the total, and is what a reader checks a total against.
+        """
+        grouped: dict[tuple[Method, bool], list[float]] = {}
+        for term in _every(self):
+            key = (term.provenance.method, term.provenance.validated)
+            grouped.setdefault(key, []).append(term.seconds)
+        return {key: fold_seconds(vals) for key, vals in grouped.items()}
+
+    def rows(self) -> tuple[tuple[str, float, str], ...]:
+        """The breakdown as an artifact writes it: name, seconds, provenance."""
+        return tuple((t.name, t.seconds, str(t.provenance)) for t in _every(self))
+
+
+#: The treatment of a DP dummy forward that replays no graph, priced 0 s.
+EAGER_DP_DUMMY = "eager DP dummy"
+#: The treatment of a decode that replays no graph while a DP peer prefills, 0 s.
+EAGER_DECODE_BESIDE_PREFILL = "eager decode beside prefill"
+
+
+def eager_beside_peer(view: BatchView, source: str) -> StepCost | None:
+    """0 s, under its treatment, for a DP dummy forward or a decode while a peer
+    prefills that replays no graph; None for any other step. The group's
+    device-end max already carries the peer it waits on."""
+    if view.prefill or view.capture_rung is not None:
+        return None
+    if view.dp_dummy:
+        name, treatment = "dp_dummy", EAGER_DP_DUMMY
+        note = "real DP records give an eager dummy its busiest peer's device time"
+    elif view.group_prefills:
+        name, treatment = "decode_beside_prefill", EAGER_DECODE_BESIDE_PREFILL
+        note = "unchecked: ends before its slowest prefilling peer; #2655 removes it"
+    else:
+        return None
+    said = Provenance(Method.DECLARED, "0 s", source, note=note)
+    return StepCost([CostTerm(name, 0.0, said)], (treatment,))
+
+
+#: The treatment of a decode-phase DP dummy whose whole group is idle, priced
+#: 0 s where the law holds no vector for its rung.
+IDLE_DP_GROUP = "idle DP group dummy"
+
+
+#: The environment variable that states these steps' seconds, 0 where unset: at 0 s a producer's idle group steps
+#: without the clock moving, while its sends wait on the clock for their own time, and the run never advances. A P/D run
+#: states the median of its record's all-idle dummy steps (cell B2 r1_c128: 7.5 ms, p10 7.4, p90 8.2, p99 10.7 ms, 3999 a rank).
+IDLE_DP_GROUP_S = "COMPASS_IDLE_DP_GROUP_S"
+
+
+def idle_group_dummy(view: BatchView, dp: int, source: str) -> StepCost | None:
+    """0 s, under its treatment, for a decode-phase DP dummy forward that every
+    rank of its group of `dp` runs (`group_dummies`), no rank holding a
+    request: a P/D producer's group stepping while its sends finish, whose
+    decodes are all such steps once its requests leave at their first token.
+    A record's dummies give no fit sample, so no law fitted on that side holds
+    a vector for their rung; None for any other step."""
+    if view.prefill or not view.dp_dummy or dp < 2 or view.group_dummies < dp:
+        return None
+    seconds = float(os.environ.get(IDLE_DP_GROUP_S, "0") or 0)
+    note = (
+        "no rank of the group holds a request; real records time these steps, "
+        "but a fit takes no sample from a dummy, so no rung vector prices them"
+    )
+    if seconds:
+        note += f"; {IDLE_DP_GROUP_S} states the record's measured time"
+    said = Provenance(Method.DECLARED, f"{seconds:g} s", source, note=note)
+    return StepCost([CostTerm("idle_dp_group", seconds, said)], (IDLE_DP_GROUP,))
+
+
+#: How a run summary groups seconds: a method each, estimated seconds split
+#: into validated (`estimated`) and not (`unvalidated`).
+GROUPS = ("analytical", "declared", "measured", "estimated", "unvalidated")
+
+
+def group(method: Method, validated: bool) -> str:
+    """The `GROUPS` entry of a (method, validated) key."""
+    unvalidated = method is Method.ESTIMATED and not validated
+    return "unvalidated" if unvalidated else method.value
+
+
+class ProvenanceMix:
+    """The mixture a run reports, accumulated one step at a time.
+
+    Steps a fallback priced after a source declined are counted three ways:
+    how many, what fraction of steps, and what fraction of predicted seconds.
+    The reason counts say which measurement would close the gap.
+
+    A mix with nothing in it has no fractions. Returning 0.0 would make a run
+    that recorded no steps indistinguishable from one no fallback priced, and
+    of the two readings the wrong one is the reassuring one. Ask `is_empty`
+    first, or let the refusal say so.
+    """
+
+    def __init__(self) -> None:
+        self.steps = 0
+        self.seconds = 0.0
+        self.fallback_steps = 0
+        self.fallback_seconds = 0.0
+        #: Steps with a term its source extrapolated past its support domain.
+        self.extrapolated_steps = 0
+        self._method_seconds: dict[tuple[Method, bool], float] = {}
+        self._method_steps: dict[tuple[Method, bool], int] = {}
+        self._reasons: dict[tuple[str, str], int] = {}
+        #: Steps priced under each assumed treatment, by its name.
+        self.treatments: Counter[str] = Counter()
+
+    def record(self, step: StepCost) -> None:
+        self.steps += 1
+        self.treatments.update(step.treatments)
+        self.seconds = fold_step(self.seconds, step.seconds)
+        self.extrapolated_steps += any(t.provenance.extrapolated for t in _every(step))
+        if step.fell_back:
+            self.fallback_steps += 1
+            self.fallback_seconds = fold_step(
+                self.fallback_seconds, step.fallback_seconds
+            )
+        for key, seconds in step.seconds_by_method().items():
+            self._method_seconds[key] = fold_step(
+                self._method_seconds.get(key, 0.0), seconds
+            )
+            self._method_steps[key] = self._method_steps.get(key, 0) + 1
+        for key in dict.fromkeys((r.source, r.reason) for r in step.refusals):
+            self._reasons[key] = self._reasons.get(key, 0) + 1
+
+    @property
+    def is_empty(self) -> bool:
+        return self.steps == 0
+
+    @property
+    def fallback_step_fraction(self) -> float:
+        if self.steps == 0:
+            raise ValueError(
+                "no steps were recorded, so there is no fallback fraction of them; "
+                "0.0 here would read as a run no fallback priced"
+            )
+        return self.fallback_steps / self.steps
+
+    @property
+    def fallback_second_fraction(self) -> float:
+        if self.seconds <= 0.0:
+            raise ValueError(
+                f"no predicted seconds were recorded over {self.steps} step(s), so "
+                "there is no fallback fraction of them; 0.0 here would read as a "
+                "run no fallback priced"
+            )
+        return self.fallback_seconds / self.seconds
+
+    def seconds_by_method(self) -> Mapping[tuple[Method, bool], float]:
+        """Seconds by (method, validated)."""
+        return dict(self._method_seconds)
+
+    def steps_by_method(self) -> Mapping[tuple[Method, bool], int]:
+        """Steps with at least one term of each (method, validated)."""
+        return dict(self._method_steps)
+
+    def reasons(self) -> Mapping[tuple[str, str], int]:
+        """Distinct (source, reason) pairs with the number of steps each hit."""
+        return dict(self._reasons)

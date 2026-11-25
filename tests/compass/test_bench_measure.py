@@ -1,0 +1,1198 @@
+# SPDX-License-Identifier: MIT
+"""`compass measure steps`, run through `cli.main`.
+
+Inputs are `test_fit_samples.py`'s record, whose step record ATOM's
+`Scheduler` drove through `test_parity_record.py`'s runner and which served
+the client runs of `RUNS`, and that record's lines published as a
+`shape_population`.
+The bench is a fake in `Bench`'s place, on the record's engine, whose result
+is the batch's token count in microseconds; run.json's identity is the
+record's, so a measurement states the record's configuration; the GPU checks
+pass and the provenance names planted trees. The after-run GPU check's tests
+run the real bench on `test_bench_engine.py`'s workers, between the real
+checks.
+"""
+
+import copy
+import itertools
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from collections import Counter
+from contextlib import nullcontext, suppress
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import test_bench_engine
+from test_artifact_store import AITER_ROOT, ATOM_ROOT, CONDITIONS, stanza
+from test_bench_engine import manager  # noqa: F401  the manager fixture
+from test_drive_gpu import FREE, _plant
+from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
+from test_fit_samples import RUNS, record
+from test_parity_record import _config
+from test_parity_served import SAMPLING, client_run
+from test_step_grid_plan import DEFINITION
+
+from atom.compass import cli
+from atom.compass.artifacts import (
+    ArtifactStore,
+    GateState,
+    Key,
+    Kind,
+    Topology,
+    member_name,
+)
+from atom.compass.backends.step_grid_plan import plan
+from atom.compass.bench import measure, replay, window
+from atom.compass.drive import gpu, serve
+from atom.compass.drive import run as drive_run
+from atom.compass.fit.samples import load
+from atom.compass.parity import read
+from atom.compass.parity.served import served
+from atom.config import Config
+
+
+class Bench:
+    """The bench, measuring each batch at its token count in microseconds, every
+    burst alike, so a point keeps two bursts; `measured` holds each burst's
+    batch, `bursts` its token count and repeats."""
+
+    started, measured, bursts = [], [], []
+    refuse = None
+
+    def __init__(self, config, num_blocks):
+        config.num_kvcache_blocks = num_blocks
+        Bench.started.append(config)
+
+    def measure(self, batch, repeats):
+        Bench.measured.append(batch)
+        Bench.bursts.append((batch.total_tokens_num, repeats))
+        if Bench.refuse and batch.total_tokens_num == Bench.refuse:
+            return {"protocol": window.PROTOCOL, "refused": "a planted refusal"}
+        ns = 1_000 * batch.total_tokens_num
+        return {
+            "protocol": window.PROTOCOL,
+            "median_ns": ns,
+            "repeats": [[ns, 0, ns]] * repeats,
+            "discarded": 0,
+            "preload_ns": 5,
+            "group_needs_eager": False,
+        }
+
+    def exit(self):
+        Bench.started.append("exit")
+
+
+@pytest.fixture
+def run(tmp_path, monkeypatch, model_dir):  # noqa: F811
+    """`run(*args)`: `compass measure steps args --gpu 7 --store S --out D`,
+    with `--sampling` SAMPLING unless given. `run.named(input, sampling)` is
+    the `--client-run` arguments naming the record's two client runs for
+    `input`, their requests sent under `sampling`, trace i at session i;
+    run.json's identity is `run.identity`."""
+    rec = record(tmp_path, monkeypatch)
+    config = _config(prefill_context_parallel_size=1)
+    config.model, config.trust_remote_code = str(model_dir), False
+    config.hf_config = SimpleNamespace(model_type="llama")
+    monkeypatch.setattr(measure, "atom_config", lambda atom_args: config)
+    monkeypatch.setattr(measure, "identity", lambda *_: copy.deepcopy(run.identity))
+    monkeypatch.setattr(measure, "quiet", lambda gpus, out: nullcontext())
+    # rocm-smi GPU 7 as HIP device 3; the command sets the variable in-process.
+    monkeypatch.setattr(measure, "hip_visible", {(7,): "3"}.get)
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(measure, "roots_for", lambda _: (ATOM_ROOT, AITER_ROOT))
+    monkeypatch.setattr(measure, "start_bench", Bench)
+    monkeypatch.setattr(Bench, "started", [])
+    monkeypatch.setattr(Bench, "measured", [])
+    monkeypatch.setattr(Bench, "bursts", [])
+
+    def run(*args, out="out"):
+        args = list(args)
+        if "--sampling" not in args:
+            args += ["--sampling", json.dumps(SAMPLING)]
+        cli.main(
+            ["measure", "steps", *args, "--gpu", "7"]
+            + ["--store", str(tmp_path / "store"), "--out", str(tmp_path / out)]
+            + ["--", "--model", "m"]
+        )
+        return ArtifactStore(tmp_path / "store")
+
+    def named(name, sampling=SAMPLING):
+        args = []
+        for i, group in enumerate(([0, 1], [2, 3])):
+            export = tmp_path / f"export{i}-{json.dumps(sampling, sort_keys=True)}"
+            sessions = {f"trace-{k}": k for k in group}
+            sent = {"requests": client_run(group, sampling), "sessions": sessions}
+            export.write_text(json.dumps(sent))
+            args += ["--client-run", str(name), str(export)]
+        return args
+
+    run.record, run.tmp, run.named, run.config = rec, tmp_path, named, config
+    run.identity = json.loads((rec / "run.json").read_text())
+    return run
+
+
+def views(lines) -> set:
+    return {measure._digest({k: s[k] for k in measure.VIEW}) for s in lines}
+
+
+def entries(store) -> list:
+    """Each step measurement in `store`, as (key, member)."""
+    held = []
+    for place in sorted((store.root / "step_measurement").iterdir()):
+        document = json.loads((place / "entry.json").read_text())
+        key = Key.of(Kind.STEP_MEASUREMENT, **document["key"])
+        held.append((key, json.loads(store.read(key).read_member(*measure.MEMBER))))
+    return held
+
+
+def by_view(store) -> dict:
+    return {key.values["view"]: (key, member) for key, member in entries(store)}
+
+
+def test_the_bench_runs_on_the_hip_device_of_its_rocm_smi_gpu(run):
+    rec = str(run.record)
+    run(rec, "--sample", "all", *run.named(rec))
+    assert os.environ["HIP_VISIBLE_DEVICES"] == "3"
+
+
+def test_the_command_learns_its_kfd_pid_before_atom_config_opens_a_gpu(
+    run, monkeypatch
+):
+    order, atom_config = [], measure.atom_config
+    monkeypatch.setattr(measure, "kfd_pid", lambda: order.append("kfd_pid"))
+    monkeypatch.setattr(
+        measure, "atom_config", lambda a: order.append("atom_config") or atom_config(a)
+    )
+    rec = str(run.record)
+    run(rec, "--sample", "all", *run.named(rec))
+    assert order == ["kfd_pid", "atom_config"]
+
+
+def test_measuring_one_record_twice_publishes_each_view_once_and_then_nothing(run):
+    rec = str(run.record)
+    store = run(rec, "--sample", "all", *run.named(rec))
+    lines, split = read(run.record / "steps")[0], served(run.record / "steps", RUNS)[0]
+    held = by_view(store)
+    assert set(held) == views(lines) and len(Bench.measured) == 2 * len(held)
+    assert Bench.started[-1] == "exit"
+    for view, (key, member) in held.items():
+        assert measure._digest({k: member[k] for k in measure.VIEW}) == view
+        decode, output = member["rows"][0][2], member["produces_output"]
+        assert key.values["step_kind"] == (
+            f"decode rung {member['rung']}"
+            if decode
+            else f"prefill {'with' if output else 'without'} output"
+        )
+        assert member["seconds"] == 1e-6 * sum(q for q, *_ in member["rows"])
+        assert member["statistic"] == "median"
+        assert len(member["repeats"]) == 2 * window.BURST
+        assert member["bursts"] == [window.BURST] * 2
+        assert member["protocol"] == window.PROTOCOL
+        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 4}
+        assert member["origin"] == "replay"
+        assert member["sources"] == [
+            measure.file_digest(run.record / "steps/dp0.jsonl")
+        ]
+        assert member["traces"] == sorted(
+            {t for s in split if views([s]) == {view} for t in s["traces"]}
+        )
+    # Each key states the record's configuration as `fit` reads it.
+    config = load({run.record: RUNS})[1]
+    for key, _ in held.values():
+        stated = {f: json.loads(key.values[f]) for f in ("engine_config", "sampling")}
+        for f in ("model", "device", "source_root"):
+            stated[f] = key.values[f]
+        assert stated == {f: config[f] for f in stated}
+    phases = json.loads((run.tmp / "out/run.json").read_text())["phases"]
+    assert list(phases) == ["warm-up", "measuring"]
+    assert all("end" in edges for edges in phases.values())
+
+    Bench.started.clear()
+    run(rec, "--sample", "all", *run.named(rec))
+    assert Bench.started == [] and by_view(store).keys() == held.keys()
+
+
+@pytest.mark.parametrize(
+    "moved",
+    [
+        lambda identity: identity["stack"].update(aiter="v9.9.9"),
+        lambda identity: identity.update(ptl="enabled"),
+    ],
+    ids=["aiter", "ptl"],
+)
+def test_a_run_on_another_platform_measures_its_batches_again_at_its_own_keys(
+    run, moved
+):
+    rec = str(run.record)
+    store = run(rec, "--sample", "all", *run.named(rec))
+    held = len(entries(store))
+    moved(run.identity)
+    Bench.started.clear()
+    run(rec, "--sample", "all", *run.named(rec))
+    assert Bench.started and len(entries(store)) == 2 * held
+
+
+def test_a_held_entry_recording_other_readings_refuses_naming_it_and_a_fresh_store(
+    run,
+):
+    rec = str(run.record)
+    store = run(rec, "--sample", "all", *run.named(rec))
+    for place in (store.root / "step_measurement").iterdir():
+        path = place / "entry.json"
+        document = json.loads(path.read_text())
+        cells = document["fingerprints"]["step_measurement"]["cells"]
+        cells["software_stack"]["value"] = "v9.9.9"
+        path.chmod(0o644)
+        path.write_text(json.dumps(document))
+    Bench.started.clear()
+    tokens = "|".join(key.token() for key, _ in entries(store))
+    told = (
+        rf"other readings than this run's:\n({tokens}): .*v9\.9\.9(.|\n)*fresh --store"
+    )
+    with pytest.raises(SystemExit, match=told):
+        run(rec, "--sample", "all", *run.named(rec))
+    assert Bench.started == []
+
+
+def test_sample_n_draws_n_views_from_each_stratum_by_its_seed(run):
+    """This record decodes on rungs and prefills in chunks under 512 tokens."""
+    strata = {}
+    for s in read(run.record / "steps")[0]:
+        decode = s["rows"][0][2]
+        assert decode or sum(q for q, *_ in s["rows"]) < 512
+        stratum = f"rung {s['rung']}" if decode else s["produces_output"]
+        strata.setdefault(stratum, set()).update(views([s]))
+    drawn = []
+    for seed in (3, 3, 4):
+        rec = str(run.record)
+        store = run(rec, "--sample", "2", "--seed", str(seed), *run.named(rec))
+        drawn.append(set(by_view(store)))
+        store.root.rename(run.tmp / f"store{len(drawn)}")
+    assert drawn[0] == drawn[1] != drawn[2]
+    for held in strata.values():
+        for got in drawn:
+            assert len(got & held) == min(2, len(held))
+    assert any(len(v) > 2 for v in strata.values())
+
+
+@pytest.mark.parametrize(
+    "rows, rung, output, stratum",
+    [
+        ([[1, 9, True]] * 3, 4, True, "decode rung 4"),
+        ([[1, 9, True]] * 40, None, True, "decode eager"),
+        ([[511, 511, False]], None, True, "prefill with output tokens 0-512"),
+        (
+            [[256, 300, False]] * 2,
+            None,
+            False,
+            "prefill without output tokens 512-2048",
+        ),
+        ([[2048, 2048, False]], None, True, "prefill with output tokens 2048-8192"),
+        ([[4096, 4096, False]] * 2, None, True, "prefill with output tokens 8192+"),
+    ],
+)
+def test_a_batch_is_drawn_by_its_kind_and_rung_or_its_prefill_token_band(
+    rows, rung, output, stratum
+):
+    view = {"rows": rows, "rung": rung, "produces_output": output}
+    assert measure._stratum(view) == stratum
+
+
+@pytest.mark.parametrize(
+    "args, refusal",
+    [
+        ([], "names no input to replay"),
+        (["REC", "CR"], "drawn by --sample N --seed S or --sample all"),
+        (["--grid", "REC", "--grid-definition", "d", "--sample", "all"], "no replayed"),
+        (["REC", "CR", "--sample", "2"], "--sample N needs --seed"),
+        (["--grid", "REC"], "--grid-definition FILE"),
+        (["REC", "CR", "--sample", "all", "--grid-definition", "d"], "plans no --grid"),
+        (["REC", "CR", "--sample", "all", "--client-run", "x", "e"], "names x, which"),
+        (["REC", "--sample", "all"], "REC is named by no --client-run"),
+        (
+            ["--grid", "REC", "--grid-definition", "d"],
+            "REC is named by no --client-run",
+        ),
+        (
+            ["REC", "CR", "--sample", "all", "--sampling", '{"temp": 1}'],
+            "SamplingParams",
+        ),
+        (["REC", "CR", "--sample", "all", "--sessions", "4:9"], "no batch to measure"),
+        (
+            ["REC", "CR", "--sample", "all", "--sampling", '{"temperature": 0.7}'],
+            (
+                'REC served requests under {"temperature": 0.0, "top_p": 1.0}, and '
+                '--sampling states {"temperature": 0.7}'
+            ),
+        ),
+    ],
+)
+def test_what_does_not_say_what_to_measure_refuses(run, args, refusal):
+    rec = str(run.record)
+    args = [a for arg in args for a in (run.named(rec) if arg == "CR" else [arg])]
+    args = [rec if a == "REC" else a for a in args]
+    with pytest.raises(SystemExit, match=re.escape(refusal.replace("REC", rec))):
+        run(*args)
+    assert Bench.started == []
+
+
+def published_population(run) -> Key:
+    """The record's steps and engine, published as a shape_population."""
+    key = Key.of(
+        Kind.SHAPE_POPULATION, model="m", workload="w", engine_config="e", backend="b"
+    )
+    rank = Topology().ranks()[0]
+    files = {("steps", "jsonl"): "dp0.jsonl", ("engine", "json"): "dp0.engine.json"}
+    ArtifactStore(run.tmp / "store").publish(
+        key,
+        provenance=stanza("compass trace steps"),
+        topology=Topology(),
+        conditions=CONDITIONS,
+        gates=GateState.of(),
+        members={
+            member_name(stem, rank, ext): (run.record / "steps" / name).read_bytes()
+            for (stem, ext), name in files.items()
+        },
+    )
+    return key
+
+
+def test_grid_points_are_measured_with_origin_plan_and_new_shapes_add_only_theirs(
+    run, monkeypatch
+):
+    population = published_population(run)
+    token, rec = population.token(), str(run.record)
+    definition = run.tmp / "definition.json"
+    definition.write_text(json.dumps(DEFINITION))
+    lines = read(run.record / "steps")[0]
+    engine = {"r": json.loads((run.record / "steps/dp0.engine.json").read_text())}
+
+    def prefill(d, steps, e, views=()):
+        """The plan of the prefill steps alone."""
+        return plan(d, [(n, s) for n, s in steps if not s["rows"][0][2]], e)
+
+    first = prefill(DEFINITION, [(str(s["step"]), s) for s in lines], engine)["lines"]
+    planned = plan(DEFINITION, [(str(s["step"]), s) for s in lines], engine)["lines"]
+    assert views(first) < views(planned)
+
+    grid = ["--grid-definition", str(definition), *run.named(token)]
+    with monkeypatch.context() as patch:
+        patch.setattr(measure, "plan", prefill)
+        store = run("--grid", token, *grid)
+    assert set(by_view(store)) == views(first)
+    Bench.measured.clear()
+    store = run("--grid", token, rec, *grid, *run.named(rec))
+
+    assert len(Bench.measured) == 2 * len(views(planned) - views(first))
+    plan_digest = measure._digest(json.loads((run.tmp / "out/plan.json").read_text()))
+    record_source = measure.file_digest(run.record / "steps/dp0.jsonl")
+    for view, (_, member) in by_view(store).items():
+        new = view not in views(first)
+        assert member["origin"] == "plan" and (member["plan"] == plan_digest) == new
+        sources = {str(population), record_source} if new else {str(population)}
+        assert member["sources"] == sorted(sources)
+        assert member["traces"] == [f"trace-{i}" for i in range(4)]
+
+
+def test_a_view_both_replayed_and_planned_names_only_its_replay(run):
+    """The record is replayed on its traces; the plan places its points from
+    the same steps, published as a population whose client runs name each
+    request's trace as a graded one."""
+    population = published_population(run)
+    token, rec = population.token(), str(run.record)
+    definition = run.tmp / "definition.json"
+    definition.write_text(json.dumps(DEFINITION))
+    graded = []
+    for i, requests in enumerate(RUNS):
+        renamed = {
+            n: r | {"trace": f"graded {r['trace']}"} for n, r in requests.items()
+        }
+        (run.tmp / f"graded{i}.json").write_text(json.dumps({"requests": renamed}))
+        graded += ["--client-run", token, str(run.tmp / f"graded{i}.json")]
+    grid = ["--grid", token, "--grid-definition", str(definition), *graded]
+    store = run(rec, "--sample", "all", *run.named(rec), *grid)
+
+    planned = json.loads((run.tmp / "out/plan.json").read_text())
+    replayed = views(read(run.record / "steps")[0])
+    held = by_view(store)
+    assert views(planned["lines"]) & replayed
+    assert set(held) == views(planned["lines"]) | replayed
+    assert len(Bench.measured) == 2 * len(held)
+    for view, (_, member) in held.items():
+        if view in replayed:
+            assert member["traces"] == [f"trace-{i}" for i in range(4)]
+            assert member["origin"] == "replay" and "plan" not in member
+            assert member["sources"] == [
+                measure.file_digest(run.record / "steps/dp0.jsonl")
+            ]
+        else:
+            assert member["origin"] == "plan"
+            assert member["plan"] == measure._digest(planned)
+            assert member["sources"] == [str(population)]
+            assert member["traces"] == [f"graded trace-{i}" for i in range(4)]
+
+
+def test_the_planner_reads_the_engine_every_grid_input_states(run):
+    rec, other = str(run.record), run.tmp / "other"
+    shutil.copytree(run.record, other)
+    engine = other / "steps/dp0.engine.json"
+    engine.write_text(
+        json.dumps(json.loads(engine.read_text()) | {"max_model_len": 1024})
+    )
+    definition = run.tmp / "definition.json"
+    definition.write_text(json.dumps(DEFINITION))
+    grid = ["--grid", rec, str(other), "--grid-definition", str(definition)]
+    with pytest.raises(
+        SystemExit, match="state two engines, which differ on max_model_len"
+    ):
+        run(*grid, *run.named(rec), *run.named(other))
+
+
+def kv_blocks(line, block_size) -> int:
+    """The KV blocks `line`'s rows hold, each row its own."""
+    return sum(-(-context // block_size) for _, context, _ in line["rows"])
+
+
+def test_points_planned_at_the_inputs_pool_are_measured_where_the_budget_is_smaller(
+    run,
+):
+    """The plan puts decode c nodes at each B node's KV limit for the pool its
+    inputs state; the device's own budget, standing in the config before the
+    bench starts, gives fewer blocks than some planned points hold."""
+    steps, rec = run.record / "steps", str(run.record)
+    lines = read(steps)[0]
+    stated = json.loads((steps / "dp0.engine.json").read_text())
+    size = stated["kv_cache_block_size"]
+    stated["num_kvcache_blocks"] = pool = max(
+        kv_blocks(line, size) for line in lines if line["rows"][0][2]
+    )
+    (steps / "dp0.engine.json").write_text(json.dumps(stated))
+    named = [(str(s["step"]), s) for s in lines]
+    planned = plan(DEFINITION, named, {"r": stated})["lines"]
+    at_limit = [
+        line
+        for line in planned
+        if line["rows"][0][2]
+        and line["rows"][0][1] == size * (pool // len(line["rows"]))
+    ]
+    assert at_limit
+    run.config.num_kvcache_blocks = max(kv_blocks(line, size) for line in planned) - 1
+    definition = run.tmp / "definition.json"
+    definition.write_text(json.dumps(DEFINITION))
+    store = run("--grid", rec, "--grid-definition", str(definition), *run.named(rec))
+    assert set(by_view(store)) == views(planned)
+    engine = json.loads((run.tmp / "out/engine.json").read_text())
+    assert engine["num_kvcache_blocks"] == pool
+
+
+def test_a_point_planned_past_the_pool_is_measured_with_its_rows_sharing_blocks(
+    run,
+):
+    """The engine states a pool one block under the record's largest decode
+    step, so the plan shares blocks at the corners past it; each is keyed by
+    its share, and its rows hold the same leading blocks of the pool."""
+    steps, rec = run.record / "steps", str(run.record)
+    lines = read(steps)[0]
+    stated = json.loads((steps / "dp0.engine.json").read_text())
+    size = stated["kv_cache_block_size"]
+    stated["num_kvcache_blocks"] = pool = (
+        max(kv_blocks(line, size) for line in lines if line["rows"][0][2]) - 1
+    )
+    (steps / "dp0.engine.json").write_text(json.dumps(stated))
+    named = [(str(s["step"]), s) for s in lines]
+    shared = [
+        x for x in plan(DEFINITION, named, {"r": stated})["lines"] if "shared" in x
+    ]
+    assert shared
+    definition = run.tmp / "definition.json"
+    definition.write_text(json.dumps(DEFINITION))
+    store = run("--grid", rec, "--grid-definition", str(definition), *run.named(rec))
+
+    held = by_view(store)
+    for line in shared:
+        view = measure._digest(measure.view_of(line))
+        assert held[view][1]["shared"] == line["shared"] > 0
+        assert view not in views([line])
+    # Each point's first burst, the first pass.
+    first = Bench.measured[: len(held)]
+    tables = [[list(t) for t in batch.block_tables] for batch in first]
+    assert max(b for table in tables for row in table for b in row) < pool
+    # The leading blocks every row of a batch holds alike.
+    alike = [
+        len(list(itertools.takewhile(lambda ids: len(set(ids)) == 1, zip(*table))))
+        for table in tables
+        if len(table) > 1
+    ]
+    assert sorted(n for n in alike if n) == sorted(x["shared"] for x in shared)
+
+
+def test_the_bench_holds_the_largest_pool_an_input_states(run):
+    rec, other = str(run.record), run.tmp / "other"
+    shutil.copytree(run.record, other)
+    engine = other / "steps/dp0.engine.json"
+    stated = json.loads(engine.read_text())
+    pool = stated["num_kvcache_blocks"] + 1
+    engine.write_text(json.dumps(stated | {"num_kvcache_blocks": pool}))
+    run(rec, str(other), "--sample", "all", *run.named(rec), *run.named(other))
+    held = json.loads((run.tmp / "out/engine.json").read_text())
+    assert held["num_kvcache_blocks"] == run.config.num_kvcache_blocks == pool
+
+
+def trace(i) -> str:
+    """Request i's trace, a cc-trace id, which holds several numbers."""
+    return f"a3acb7e89fb41af79510cf1ecf36a703490f{i}"
+
+
+def mixed(run, monkeypatch, session=lambda i: 256 + i):
+    """A record serving all four requests at once, so its decode steps serve
+    all four traces; and the `--client-run` naming request i's trace `trace(i)`,
+    which its export gives session `session(i)`, or none when that is None."""
+    rec = record(run.tmp, monkeypatch, "mixed", groups=((0, 1, 2, 3),))
+    requests = client_run([0, 1, 2, 3])
+    for i, sent in enumerate(requests.values()):
+        sent["trace"] = trace(i)
+    sessions = {trace(i): session(i) for i in range(4) if session(i) is not None}
+    export = run.tmp / "mixed.json"
+    export.write_text(json.dumps({"requests": requests, "sessions": sessions}))
+    return rec, requests, ["--client-run", str(rec), str(export)]
+
+
+def test_sessions_keep_the_lines_serving_only_traces_at_sessions_a_to_b(
+    run, monkeypatch
+):
+    rec, requests, named = mixed(run, monkeypatch)
+    # A step holding a request no client run sent serves no trace.
+    steps = rec / "steps/dp0.jsonl"
+    line = {**json.loads(steps.read_text().splitlines()[-1]), "named": []}
+    line |= {"rows": [[1, 7, True]], "rung": 1, "batch": [["unsent", 1, 7]]}
+    steps.write_text(steps.read_text() + json.dumps(line) + "\n")
+    store = run(str(rec), "--sample", "all", "--sessions", "257:258", *named)
+
+    split = served(rec / "steps", [requests])[0]
+    chosen = {trace(1), trace(2)}
+    kept = [s for s in split if s["traces"] and set(s["traces"]) <= chosen]
+    assert kept and set(by_view(store)) == views(kept) < views(split)
+    # Both ends of the span are measured.
+    assert {t for _, m in entries(store) for t in m["traces"]} == chosen
+
+
+def test_a_trace_its_export_gives_no_session_refuses_sessions(run, monkeypatch):
+    rec, _, named = mixed(run, monkeypatch, lambda i: None if i == 1 else i)
+    with pytest.raises(SystemExit, match=f"served {trace(1)}, which no export gives"):
+        run(str(rec), "--sample", "all", "--sessions", "0:9", *named)
+
+
+@pytest.mark.parametrize("given", [(3, 7), (7, 3)])
+def test_a_trace_two_exports_give_two_sessions_refuses_in_either_order(run, given):
+    named = run.named(run.record)
+    for export, session in zip(named[2::3], given):
+        sent = json.loads(Path(export).read_text())
+        sent["sessions"] = {f"trace-{k}": k for k in range(4)} | {"trace-1": session}
+        Path(export).write_text(json.dumps(sent))
+    with pytest.raises(SystemExit, match="give trace-1 sessions 3 and 7, and"):
+        run(str(run.record), "--sample", "all", "--sessions", "0:4", *named)
+
+
+def test_a_deployment_above_tensor_parallel_1_measures_a_record_that_states_it(run):
+    engine = run.record / "steps/dp0.engine.json"
+    stated = json.loads(engine.read_text()) | {"tensor_parallel_size": 2}
+    engine.write_text(json.dumps(stated))
+    run.config.tensor_parallel_size = 2
+    store = run(str(run.record), "--sample", "all", *run.named(run.record))
+    assert Bench.started[0].tensor_parallel_size == 2
+    assert set(by_view(store)) == views(read(run.record / "steps")[0])
+
+
+@pytest.mark.parametrize(
+    "name", ["prefill_context_parallel_size", "decode_context_parallel_size"]
+)
+def test_a_context_parallel_width_refuses_over_a_store_that_holds_every_point(
+    run, name
+):
+    named = run.named(run.record)
+    run(str(run.record), "--sample", "all", *named)
+    Bench.started.clear()
+    setattr(run.config, name, 2)
+    with pytest.raises(SystemExit, match=rf"{name} 2: .*no context-parallel width"):
+        run(str(run.record), "--sample", "all", *named)
+    assert Bench.started == []
+
+
+def test_a_line_a_dummy_run_wrote_is_not_measured(run):
+    steps = run.record / "steps/dp0.jsonl"
+    dummy = {**json.loads(steps.read_text().splitlines()[-1]), "is_dummy_run": True}
+    dummy |= {"rows": [[1, 7, True]], "rung": 1, "batch": [], "named": []}
+    steps.write_text(steps.read_text() + json.dumps(dummy) + "\n")
+    store = run(str(run.record), "--sample", "all", *run.named(run.record))
+    assert set(by_view(store)) == views(read(run.record / "steps")[0][:-1])
+
+
+def test_the_sampling_joins_the_key_and_reaches_the_rule(run):
+    rec = str(run.record)
+    for temperature in (0.0, 0.7):
+        sampling = {**SAMPLING, "temperature": temperature}
+        named = run.named(rec, sampling)
+        store = run(rec, "--sample", "all", "--sampling", json.dumps(sampling), *named)
+        assert Bench.measured
+        for batch in Bench.measured:
+            assert batch.temperatures.tolist() == pytest.approx(
+                [temperature] * len(batch.req_ids)
+            )
+        Bench.measured.clear()
+    keys = [key for key, _ in entries(store)]
+    assert len(keys) == 2 * len(views(read(run.record / "steps")[0]))
+    assert {json.loads(k.values["sampling"])["temperature"] for k in keys} == {0.0, 0.7}
+
+
+@pytest.mark.parametrize(
+    "file, change, refusal",
+    [
+        ("dp0.engine.json", {"kv_cache_dtype": "fp8"}, "kv_cache_dtype 'fp8' there"),
+        ("dp1.jsonl", None, "holds 2 DP ranks, and the bench measures one"),
+    ],
+)
+def test_an_input_the_bench_cannot_stand_for_refuses_before_it_starts(
+    run, file, change, refusal
+):
+    steps = run.record / "steps"
+    if change:
+        (steps / file).write_text(
+            json.dumps(json.loads((steps / file).read_text()) | change)
+        )
+    else:
+        (steps / file).write_text((steps / "dp0.jsonl").read_text())
+    with pytest.raises(SystemExit, match=refusal):
+        run(str(run.record), "--sample", "all", *run.named(run.record))
+    assert Bench.started == []
+
+
+def test_a_batch_the_bench_refuses_is_not_published_and_is_named_after_the_rest(run):
+    lines = read(run.record / "steps")[0]
+    refused = Bench.refuse = sum(q for q, *_ in lines[0]["rows"])
+    try:
+        with pytest.raises(SystemExit, match="batches refused:\n.+a planted refusal"):
+            run(str(run.record), "--sample", "all", *run.named(run.record))
+    finally:
+        Bench.refuse = None
+    held = entries(ArtifactStore(run.tmp / "store"))
+    assert refused not in {sum(q for q, *_ in m["rows"]) for _, m in held}
+    # A point refused in its first burst has no second.
+    refusals = len(views(lines)) - len(held)
+    assert len(Bench.measured) == 2 * len(held) + refusals and refusals > 0
+
+
+def test_every_point_has_its_first_burst_before_any_point_has_its_second(run):
+    """`17` D98: a point's two bursts are a pass of the bench apart, the passes
+    in one order. The fake bench's bursts agree, so each point keeps ten."""
+    rec = str(run.record)
+    store = run(rec, "--sample", "all", *run.named(rec))
+
+    n = len(entries(store))
+    assert Bench.bursts[:n] == Bench.bursts[n:]
+    assert {r for _, r in Bench.bursts} == {window.BURST} and len(Bench.bursts) == 2 * n
+
+
+def tag_batches(monkeypatch):
+    """Each batch the replay rule builds carries its line, as `line`."""
+    built = replay.ReplayRule.batch
+
+    def tagged(self, line, *rest):
+        batch = built(self, line, *rest)
+        batch.line = json.dumps(line, sort_keys=True)
+        return batch
+
+    monkeypatch.setattr(replay.ReplayRule, "batch", tagged)
+
+
+def test_a_point_whose_bursts_disagree_runs_on_to_45_repeats_at_once(run, monkeypatch):
+    """Every prefill point's later bursts run 0.3% slower than its first, past
+    the 0.23% two bursts are kept within: it runs on to 45 right after its
+    second burst, and its value is the median of all 45. Decode points keep 10."""
+    tag_batches(monkeypatch)
+    reply, seen, calls = Bench.measure, Counter(), []
+
+    def drifting(self, batch, repeats):
+        got = reply(self, batch, repeats)
+        seen[batch.line] += 1
+        calls.append((batch.line, repeats))
+        if seen[batch.line] > 1 and batch.total_tokens_num_prefill:
+            ns = round(got["median_ns"] * 1.003)
+            got |= {"median_ns": ns, "repeats": [[ns, 0, ns]] * repeats}
+        return got
+
+    monkeypatch.setattr(Bench, "measure", drifting)
+    rec = str(run.record)
+    store = run(rec, "--sample", "all", *run.named(rec))
+
+    held = by_view(store).values()
+
+    def prefill(line):
+        return not json.loads(line)["rows"][0][2]
+
+    first = calls[: len(held)]
+    rest = window.REPEATS - 2 * window.BURST
+    assert calls[len(held) :] == [
+        call
+        for line, _ in first
+        for call in [(line, window.BURST)] + [(line, rest)] * prefill(line)
+    ]
+    kinds = set()
+    for key, member in held:
+        tokens = sum(q for q, *_ in member["rows"])
+        if key.values["step_kind"].startswith("prefill"):
+            assert member["bursts"] == [window.BURST, window.BURST, rest]
+            assert member["seconds"] == round(1_000 * tokens * 1.003) / 1e9
+        else:
+            assert member["bursts"] == [window.BURST] * 2
+            assert member["seconds"] == 1e-6 * tokens
+        assert len(member["repeats"]) == sum(member["bursts"])
+        kinds.add(key.values["step_kind"].split()[0])
+    assert kinds == {"prefill", "decode"}
+
+
+def test_a_point_held_under_the_first_protocol_is_kept_not_measured_again(
+    run, monkeypatch
+):
+    rec = str(run.record)
+    with monkeypatch.context() as patch:
+        patch.setattr(window, "PROTOCOL", 1)
+        store = run(rec, "--sample", "all", *run.named(rec))
+    held = by_view(store)
+    assert {m["protocol"] for _, m in held.values()} == {1}
+
+    Bench.started.clear()
+    run(rec, "--sample", "all", *run.named(rec))
+    assert Bench.started == [] and by_view(store) == held
+
+
+def clock(monkeypatch, seconds: float = 30.0):
+    """Each burst on the fake bench takes `seconds` of the command's clock."""
+    ticks = itertools.count(0, seconds)
+    monkeypatch.setattr(measure, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+
+
+def test_an_estimate_reads_the_points_held_on_any_ladder_and_source_root_alone(
+    run, monkeypatch
+):
+    """At this model, platform, sampling and engine but its ladder, under this
+    protocol: each point's two 30 s bursts, by step kind."""
+    clock(monkeypatch)
+    rec = str(run.record)
+    store = run(rec, "--sample", "all", *run.named(rec))
+    held = entries(store)
+    values = held[0][0].values
+    own = ("engine_config", "sampling", "step_kind", "view")
+    configuration = {k: v for k, v in values.items() if k not in own}
+    engine, sampling = (json.loads(values[f]) for f in ("engine_config", "sampling"))
+    kinds = Counter(key.values["step_kind"] for key, _ in held)
+
+    past = measure._past(store, configuration, engine, sampling)
+
+    assert {kind: len(seconds) for kind, seconds in past.items()} == kinds
+    assert {s for seconds in past.values() for s in seconds} == {60.0}
+    elsewhere = configuration | {"source_root": "sha256:another"}
+    laddered = engine | {"ladder": [1, 2]}
+    assert measure._past(store, elsewhere, laddered, sampling) == past
+    for other in (
+        (configuration | {"model": "another"}, engine, sampling),
+        (configuration, engine | {"tensor_parallel_size": 8}, sampling),
+        (configuration, engine, sampling | {"temperature": 0.123}),
+    ):
+        assert measure._past(store, *other) == {}
+    monkeypatch.setattr(window, "PROTOCOL", window.PROTOCOL + 1)
+    assert measure._past(store, configuration, engine, sampling) == {}
+
+
+def test_measure_steps_states_each_kinds_points_and_hours_before_it_measures(
+    run, monkeypatch, capsys
+):
+    """The first run draws one view a stratum, with no estimate; the second,
+    every view, estimating each kind the first measured at 60 s a point, and
+    after measuring states the hours each kind took."""
+    clock(monkeypatch)
+    rec = str(run.record)
+    first = run(rec, "--sample", "1", "--seed", "0", *run.named(rec))
+    printed = capsys.readouterr().out.splitlines()
+    held = Counter(key.values["step_kind"] for key, _ in entries(first))
+    assert printed[0] == f"{sum(held.values())} distinct batches, 0 in the store"
+    for kind, n in held.items():
+        assert (
+            f"  {kind}: {n} points, {n} to measure, no estimate: the store holds "
+            "none of this kind measured under this protocol, model, platform and "
+            "engine"
+        ) in printed
+        assert f"bench hours, {kind}: {n * 60 / 3600:.3f} h" in printed
+
+    store = run(rec, "--sample", "all", *run.named(rec))
+    printed = capsys.readouterr().out.splitlines()
+    every = Counter(key.values["step_kind"] for key, _ in entries(store))
+    assert printed[0] == (
+        f"{sum(every.values())} distinct batches, {sum(held.values())} in the store"
+    )
+    hours = 0.0
+    for kind, n in every.items():
+        new = n - held[kind]
+        line = f"  {kind}: {n} points, "
+        if not new:
+            assert line + "all in the store" in printed
+        else:
+            hours += new * 60 / 3600
+            assert (
+                line + f"{new} to measure, about {new * 60 / 3600:.2f} h at 60.0 s a "
+                f"point, the median of {held[kind]} the store holds"
+            ) in printed
+    assert f"about {hours:.2f} h estimated for the kinds above that have one" in printed
+
+
+def test_ragged_measures_the_views_composed_from_each_drawn_decode_view(run):
+    """Each view keeps a decode line's rung, rows and summed context within a
+    token a row; its rows are contexts the record's decode rows ran, and no
+    prefill view is measured."""
+    rec = str(run.record)
+    store = run(rec, "--sample", "2", "--seed", "3", "--ragged", *run.named(rec))
+
+    split = served(run.record / "steps", RUNS)[0]
+    decode = [s for s in split if s["rows"][0][2]]
+    contexts = {c for s in decode for _, c, _ in s["rows"]}
+    seeds = {
+        (s["rung"], len(s["rows"]), sum(c for _, c, _ in s["rows"])) for s in decode
+    }
+    held = entries(store)
+    assert 2 * len(held) == len(Bench.measured) > 0
+    for key, member in held:
+        rows, n = member["rows"], len(member["rows"])
+        total = sum(c for _, c, _ in rows)
+        assert member["origin"] == "ragged" and key.values["step_kind"].startswith(
+            "decode rung"
+        )
+        assert {c for _, c, _ in rows} <= contexts and all(d for *_, d in rows)
+        assert any(
+            (r, b) == (member["rung"], n) and abs(t - total) <= n for r, b, t in seeds
+        )
+        assert member["sources"] == [
+            measure.file_digest(run.record / "steps/dp0.jsonl")
+        ]
+        assert member["traces"] == sorted({t for s in split for t in s["traces"]})
+
+
+def test_ragged_composes_across_the_rungs_of_the_ladder_the_record_states(
+    run, monkeypatch
+):
+    rec = str(run.record)
+    ladder = json.loads((run.record / "steps/dp0.engine.json").read_text())["ladder"]
+    given, compose = [], measure.ragged.compose
+    monkeypatch.setattr(
+        measure.ragged,
+        "compose",
+        lambda *a, **k: given.append(a[-1]) or compose(*a, **k),
+    )
+
+    run(rec, "--sample", "2", "--seed", "3", "--ragged", *run.named(rec))
+
+    assert given and all(g == ladder for g in given)
+
+
+def test_ragged_under_grid_also_plans_the_cells_of_the_views_it_composes(
+    run, monkeypatch, capsys
+):
+    """Each composed view, here a drawn seed with its first row on 999 cached,
+    past every row the record ran, has its cells planned on the record's
+    nodes, its longest row's among them, and measured; the views' tokens are
+    the lines printed `measured ragged`."""
+    monkeypatch.setattr(
+        measure.ragged,
+        "compose",
+        lambda seed, *_, **__: [{**seed, "rows": [[1, 1000, True], *seed["rows"][1:]]}],
+    )
+    rec = str(run.record)
+    definition = run.tmp / "definition.json"
+    definition.write_text(json.dumps(DEFINITION))
+    grid = ["--grid", rec, "--grid-definition", str(definition)]
+    store = run(rec, "--sample", "2", "--seed", "3", "--ragged", *grid, *run.named(rec))
+
+    held = entries(store)
+    composed = [
+        (key.values["view"], {k: m[k] for k in measure.VIEW})
+        for key, m in held
+        if m["origin"] == "ragged"
+    ]
+    named = [(str(s["step"]), s) for s in read(run.record / "steps")[0]]
+    engine = {"r": json.loads((run.record / "steps/dp0.engine.json").read_text())}
+    planned = json.loads((run.tmp / "out/plan.json").read_text())["lines"]
+    assert planned == plan(DEFINITION, named, engine, composed)["lines"]
+    assert len(planned) > len(plan(DEFINITION, named, engine)["lines"])
+    digests = {measure._digest(measure.view_of(x)) for x in planned}
+    assert set(by_view(store)) == digests | {v for v, _ in composed}
+    printed = [
+        x.split()[5].rstrip(":")
+        for x in capsys.readouterr().out.splitlines()
+        if x.startswith("measured ragged ")
+    ]
+    tokens = [key.token() for key, m in held if m["origin"] == "ragged"]
+    assert sorted(printed) == sorted(tokens) != []
+
+
+def test_ragged_without_a_replayed_input_refuses(run):
+    rec = str(run.record)
+    definition = run.tmp / "definition.json"
+    definition.write_text(json.dumps(DEFINITION))
+    args = ["--grid", rec, "--grid-definition", str(definition), "--ragged"]
+    with pytest.raises(SystemExit, match="--ragged composes from no replayed input"):
+        run(*args, *run.named(rec))
+    assert Bench.started == []
+
+
+#: A bench worker's child, up once it prints a line. SIGTERM, standing in for
+#: the SIGKILL no CPU process outlives, ends it argv[1] seconds later, or never
+#: when argv[1] is "stays".
+CHILD = """\
+import signal, sys, time
+s = sys.argv[1]
+ends = lambda *a: (time.sleep(float(s)), sys.exit())
+signal.signal(signal.SIGTERM, signal.SIG_IGN if s == "stays" else ends)
+print(flush=True)
+time.sleep(600)
+"""
+
+
+class Leaves(test_bench_engine.Runner):
+    """A worker that starts `CHILD`, writing its PID to `config.child`, and
+    whose exit outlasts the manager's grace, so the manager kills its tree."""
+
+    bench_step = Bench.measure
+
+    def __init__(self, rank, config):
+        super().__init__(rank, config)
+        child = subprocess.Popen(
+            [sys.executable, "-c", CHILD, config.child_exit_s], stdout=subprocess.PIPE
+        )
+        child.stdout.readline()
+        Path(config.child).write_text(str(child.pid))
+
+    def exit(self):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(60)
+
+
+@pytest.fixture
+def leaves(run, manager, monkeypatch):  # noqa: F811
+    """`leaves(exit_s)`: `run`'s arguments for a measure on the real bench, its
+    one worker `Leaves` with a child that takes `exit_s` to exit, between the
+    real GPU checks. The planted rocm-smi lists the child on GPU 7 until it has
+    exited, and the manager's SIGKILL reaches the child as SIGTERM."""
+    child, kill = run.tmp / "child", os.kill
+    config = test_bench_engine._config(eager=True)
+    config.child = str(child)
+    blocks = test_bench_engine.BLOCKS
+    engine = test_bench_engine.engine
+    monkeypatch.setattr(engine, "RUNNER", f"{__name__}.Leaves")
+    monkeypatch.setenv("ATOM_SHUTDOWN_TIMEOUT_S", "1")
+    monkeypatch.setattr(measure, "start_bench", lambda *_: engine.Bench(config, blocks))
+    monkeypatch.setattr(measure, "quiet", gpu.quiet)
+    _plant(run.tmp, monkeypatch, FREE)
+    smi = run.tmp / "bin" / "rocm-smi"
+    listed = (
+        f"p=$(cat {child} 2>/dev/null)\n"
+        "s=$(sed 's/.*) //' /proc/$p/stat 2>/dev/null | cut -d' ' -f1)\n"
+        '[ -n "$s" ] && [ "$s" != Z ] && '
+        "printf 'PID %s is using 1 DRM device(s):\\n7\\n' $p\n"
+    )
+    smi.write_text(
+        smi.read_text().replace("*--showpids*)\n", "*--showpids*)\n" + listed)
+    )
+
+    def sent(pid, sig):
+        ours = (
+            sig == signal.SIGKILL and child.exists() and str(pid) == child.read_text()
+        )
+        kill(pid, signal.SIGTERM if ours else sig)
+
+    monkeypatch.setattr(os, "kill", sent)
+
+    def start(exit_s: str) -> list[str]:
+        config.child_exit_s = exit_s
+        rec = str(run.record)
+        return [rec, "--sample", "1", "--seed", "0", *run.named(rec)]
+
+    yield start
+    with suppress(FileNotFoundError, ProcessLookupError):
+        kill(int(child.read_text()), signal.SIGKILL)
+
+
+def test_the_after_check_waits_for_a_bench_workers_child_that_outlives_its_kill(
+    run, leaves
+):
+    """The named result: the child exits 3 s after the manager's kill."""
+    store = run(*leaves("3"))
+
+    assert (run.tmp / "out" / "gpu_after.txt").read_text() == FREE
+    assert entries(store)
+
+
+def test_a_bench_workers_child_that_stays_fails_the_after_check_naming_it(
+    run, leaves, monkeypatch
+):
+    monkeypatch.setattr(serve, "STOP_GRACE_S", 1)
+
+    with pytest.raises(SystemExit) as refused:
+        run(*leaves("stays"))
+
+    pid = (run.tmp / "child").read_text()
+    assert str(refused.value) == (
+        f"compass measure steps: GPU 7 has PID {pid} on it after the run, so it fails"
+    )
+
+
+class Orphans(Leaves):
+    """A `Leaves` that dies in `bench_step`, sending its child first the SIGTERM
+    a compile pool's workers take from their parent's death, and exits at once."""
+
+    exit = test_bench_engine.Runner.exit
+
+    def __init__(self, rank, config):
+        super().__init__(rank, config)
+        self.child = int(Path(config.child).read_text())
+
+    def bench_step(self, batch, repeats):
+        os.kill(self.child, signal.SIGTERM)
+        raise RuntimeError("HIP out of memory")
+
+
+@pytest.fixture
+def orphans(leaves, monkeypatch):
+    monkeypatch.setattr(test_bench_engine.engine, "RUNNER", f"{__name__}.Orphans")
+    return leaves
+
+
+def test_the_after_check_waits_for_the_child_of_a_bench_worker_that_died(run, orphans):
+    """The child exits 10 s after its worker died, later than the after-check
+    would run unwaited."""
+    with pytest.raises(SystemExit) as refused:
+        run(*orphans("10"))
+
+    assert str(refused.value) == (
+        "compass measure steps: a bench worker died, so bench_step got no reply"
+    )
+    assert (run.tmp / "out" / "gpu_after.txt").read_text() == FREE
+
+
+def test_the_child_of_a_bench_worker_that_died_fails_the_after_check_if_it_stays(
+    run, orphans, monkeypatch
+):
+    monkeypatch.setattr(serve, "STOP_GRACE_S", 1)
+
+    with pytest.raises(SystemExit) as refused:
+        run(*orphans("stays"))
+
+    pid = (run.tmp / "child").read_text()
+    assert str(refused.value) == (
+        f"compass measure steps: GPU 7 has PID {pid} on it after the run, so it fails"
+    )
+
+
+def test_run_and_measure_steps_lay_out_dp_attention_alike(
+    monkeypatch, model_dir  # noqa: F811
+):
+    # A step grid bundle is keyed by the config measure steps builds and loaded
+    # under the one compass run builds, from a server's arguments.
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    atom_args = ["--model", str(model_dir), "-tp", "2", "--enable-dp-attention"]
+    served = drive_run._config([*atom_args, "--timeout-keep-alive", "5"])
+    measured = measure.atom_config(atom_args)
+    for config in (served, measured):
+        pc = config.parallel_config
+        assert (config.tensor_parallel_size, pc.data_parallel_size) == (1, 2)
+    with pytest.raises(SystemExit):
+        measure.atom_config([*atom_args, "--compass-run", "run.json"])
+
+
+@pytest.mark.parametrize("node", [0, 1])
+def test_run_lays_out_one_node_of_a_dp_attention_group_across_nodes_as_its_engines(
+    monkeypatch, model_dir, node  # noqa: F811
+):
+    # Each node of a TP 2 group of two DP ranks on two nodes starts two of its
+    # four engines; a check that read the whole group would pass a step law
+    # the runner refuses. The benches run the whole group on one host.
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+    atom_args = ["--model", str(model_dir), "-tp", "2", "--enable-dp-attention"]
+    atom_args += ["--data-parallel-size", "2", "--data-parallel-size-local", "1"]
+    atom_args += ["--data-parallel-rank", str(node)]
+    served = drive_run._config(atom_args)
+    pc = served.parallel_config
+    fields = ("data_parallel_size", "data_parallel_size_local", "data_parallel_rank")
+    got = {"tensor_parallel_size": served.tensor_parallel_size}
+    got |= {name: getattr(pc, name) for name in fields}
+    print(f"\nnode {node}: {got}")
+
+    assert list(got.values()) == [1, 4, 2, 2 * node]
+    measured = measure.atom_config(atom_args).parallel_config
+    assert (measured.data_parallel_size, measured.data_parallel_size_local) == (4, 4)
+
+
+#: The API server's flags `compass record` passes it, as MiniMax-M3's
+#: submission serves with them.
+SERVED = [
+    "--default-chat-template-kwargs",
+    '{"thinking_mode":"enabled"}',
+    "--tool-call-parser",
+    "minimax_m3",
+    "--timeout-keep-alive",
+    "600",
+    "--disable-uvicorn-access-log",
+    "--chat-template",
+    "template.jinja",
+    "--request-log",
+    "requests.jsonl",
+]
+
+
+@pytest.fixture
+def config_of(monkeypatch, model_dir):  # noqa: F811
+    """`measure.atom_config` of `-tp 4` on `model_dir` and the arguments given."""
+
+    class Read(Config):
+        def __post_init__(self):  # resolving loads aiter, which needs a driver
+            pass
+
+    monkeypatch.setattr("atom.config.Config", Read)
+
+    def config_of(*argv):
+        return measure.atom_config(["--model", str(model_dir), "-tp", "4", *argv])
+
+    return config_of
+
+
+def test_measure_steps_takes_the_server_flags_record_passes_and_resolves_without_them(
+    config_of,
+):
+    assert vars(config_of(*SERVED)) == vars(config_of())
+
+
+@pytest.mark.parametrize(
+    "argv, error",
+    [
+        (["--max-num-sqes", "8"], "unrecognized arguments: --max-num-sqes 8"),
+        (["--timeout-keep-alive", "soon"], "invalid int value: 'soon'"),
+    ],
+)
+def test_measure_steps_refuses_a_misspelled_engine_flag_and_a_value_the_server_refuses(
+    config_of, argv, error, capsys
+):
+    with pytest.raises(SystemExit):
+        config_of(*SERVED[:2], *argv)
+    assert error in capsys.readouterr().err

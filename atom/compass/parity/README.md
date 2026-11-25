@@ -1,0 +1,52 @@
+<!-- SPDX-License-Identifier: MIT -->
+# The step record and its compare
+
+Record a run by setting `ATOM_COMPASS_PARITY_RECORD` to a directory before
+starting it, real or simulated; `__init__.py` says what each line holds.
+Beside each `dp<r>.jsonl`, the rank's first step writes `dp<r>.engine.json`,
+the engine its runner resolved: `keyed` (`atom/compass/run/step_grid.py`),
+which holds the ladder the runner replays; the scheduler's bounds
+`max_num_seqs`, `max_num_batched_tokens` and `max_model_len`;
+`num_kvcache_blocks`, the KV block count the runner's `allocate_kv_cache` set;
+`enable_prefix_caching`, which a JIT sweep's plan reads
+(`atom/compass/drive/sweep_plan.py`);
+`prefill_context_parallel_size` and `decode_context_parallel_size`, each
+only above 1, so a width-1 engine file is unchanged and a step linear fit
+refuses a context-parallel record by name; `min_final_prefill_rows`, only
+above 0 and in no key, the fewest rows the forward finishing a prompt runs,
+which a JIT sweep's plan reads; and `prefill_buckets`, the prefill
+token-graph buckets the runner recorded, empty where it recorded none, which a
+step linear fit pads prefill to.
+A simulated run also writes `dp<r>.cost.jsonl`, a line per step saying what
+its charge was made of (`_group_step_seconds` in
+`atom/compass/runner/overrides.py` says what each line holds).
+A 1P1D decode instance also writes `transfers.jsonl` (`transfers` in
+`__init__.py` says what it joins). On a real Mooncake P/D side, every worker writes
+`dp<r>.tp<t>.writes.jsonl` too, a line per KV write it served or write-done it
+received, a write-done's line saying when its write request was sent, and a
+line per write request none answered (`writes.py` says what each line holds).
+
+A real run's lines also state the time each launch blocked in HIP, `blocked_ns`,
+which `W_launch` leaves out (`atom/compass/backends/step_labels.py`), when the
+run starts with `ROCP_TOOL_LIBRARIES` naming the blocking-call tool:
+`python -m atom.compass.parity.blocked DIR` builds it into `DIR` with `g++`
+against ROCm's rocprofiler-sdk and prints its path (`blocked.py` says what it
+times). A trace run takes no host labels, so it needs no tool.
+
+Compare two records with
+
+```
+python -m atom.compass.parity REAL_DIR SIMULATED_DIR
+```
+
+It prints `compare`'s report as JSON: per DP rank, the first step whose
+decision differs (null where none does), the steps compared and how many are
+identical, and each request's DP rank in both.
+
+`python -m atom.compass.parity.recurrence REAL_DIR` gates the host/device
+recurrence on a real record with device windows (`recurrence.py` says how).
+
+`scripts/compass/parity_one_node.sh` runs the whole test on one node: a real
+run of `traffic.py`'s workload (DP-attention DP2, plain TP2, or DeepSeek-V4-Pro at DP8;
+its header says how to pick), then a simulated one that replays the real
+run's arrivals and step times (`replay.py`), then the compare.

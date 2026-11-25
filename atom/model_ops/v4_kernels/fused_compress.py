@@ -745,9 +745,6 @@ def fused_compress_attn(
     if has_bt:
         assert kv_cache is not None and kv_cache.dim() == 3
         assert block_tables.dim() == 2 and block_tables.is_contiguous()
-        bt_seq_stride = block_tables.stride(0)
-    else:
-        bt_seq_stride = 0
 
     # Quant validation. quant=True is FP8 cache write (Indexer-inner path);
     # requires a valid block_tables (slot resolution) AND a paired fp32 scale
@@ -785,6 +782,75 @@ def fused_compress_attn(
             assert cache_scale.shape == (*kv_cache.shape[:2], scale_width)
             assert cache_scale.stride(-1) == 1
 
+    _launch_fused_compress(
+        kv_in,
+        score_in,
+        plan.compress_plan_gpu,
+        kv_state,
+        score_state,
+        state_slot_mapping,
+        ape,
+        rms_weight,
+        cos_cache,
+        sin_cache,
+        latent_out,
+        kv_cache,
+        block_tables,
+        cache_scale,
+        write_plan,
+        rms_eps=rms_eps,
+        k_per_block=k_per_block,
+        overlap=overlap,
+        ratio=ratio,
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        quant=quant,
+        packed=packed,
+        planar=planar,
+        fp8_max=fp8_max,
+        use_ue8m0=use_ue8m0,
+        preshuffle=preshuffle,
+    )
+
+
+def _launch_fused_compress(
+    kv_in,
+    score_in,
+    plan_gpu,
+    kv_state,
+    score_state,
+    state_slot_mapping,
+    ape,
+    rms_weight,
+    cos_cache,
+    sin_cache,
+    latent_out,
+    kv_cache,
+    block_tables,
+    cache_scale,
+    write_plan,
+    *,
+    rms_eps,
+    k_per_block,
+    overlap,
+    ratio,
+    head_dim,
+    rope_head_dim,
+    quant,
+    packed,
+    planar,
+    fp8_max,
+    use_ue8m0,
+    preshuffle,
+):
+    """`fused_compress_attn`'s Triton launch, from the plan's rows: it takes
+    `plan_gpu` and no `CompressPlan`, whose live count only the caller's
+    capacity check reads."""
+    plan_capacity = plan_gpu.shape[0]
+    dim_full = (2 if overlap else 1) * head_dim
+    state_size = kv_state.shape[1]
+    has_bt = block_tables is not None
+    bt_seq_stride = block_tables.stride(0) if has_bt else 0
     BLOCK_D = triton.next_power_of_2(head_dim)
     HALF_ROPE = rope_head_dim // 2
     # the kernel reads the cos / sin row at `pair % HALF_ROPE`: a NoPE width of
@@ -792,7 +858,7 @@ def fused_compress_attn(
     assert (
         head_dim - rope_head_dim
     ) % rope_head_dim == 0, f"NoPE width {head_dim - rope_head_dim} is not whole {rope_head_dim}-wide RoPE rows"
-    K = K_pool  # pool window reduce-dim (constexpr; not equal to ring modulo)
+    K = (2 if overlap else 1) * ratio  # pool window reduce-dim (not the ring modulo)
 
     # Cache-scale args (only consumed by the quant path; pass placeholders
     # otherwise so the constexpr branch is never taken).
@@ -818,7 +884,7 @@ def fused_compress_attn(
         score_in,
         score_in.stride(0),
         dim_full,
-        plan.compress_plan_gpu,
+        plan_gpu,
         kv_state,
         kv_state.stride(0),
         kv_state.stride(1),
