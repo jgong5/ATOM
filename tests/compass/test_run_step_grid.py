@@ -429,6 +429,7 @@ NEW_KINDS = {
         **MEASURED,
         **keyed_platform(Kind.STEP_LINEAR_LAW, PLATFORM),
         "form": "fixed+tokens+seqs",
+        "fit_src": "5eed" * 16,
     },
     Kind.HOST_LAWS: None,
 }

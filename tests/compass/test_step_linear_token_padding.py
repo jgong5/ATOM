@@ -307,7 +307,7 @@ def test_the_published_law_pads_to_the_records_buckets_as_the_command_does(tmp_p
         engine.write_text(json.dumps({**held, "prefill_buckets": BUCKETS}))
     fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
 
-    law = member(tmp_path / "store", law_key(), "params")
+    law = member(tmp_path / "store", law_key(tmp_path / "store"), "params")
     assert law["prefill"]["buckets"] == BUCKETS
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     out = tmp_path / "law.json"

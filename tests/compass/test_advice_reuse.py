@@ -59,6 +59,7 @@ from atom.compass.artifacts import (
     keyed_platform,
     member_name,
 )
+from atom.compass.backends import step_linear_fit
 from atom.compass.backends.json_file import read_json
 from atom.compass.bench import ops
 from atom.compass.drive import reuse
@@ -247,14 +248,15 @@ def stored(
     records at `atom`, else at the head's digest, under `conditions`; with
     `host`, its host laws beside it, keyed to the CPU `held` states."""
     held = held or law(r)
+    step = {k: v for k, v in held.items() if k not in ("host", "host_fit")}
     key = {
         "model": compass_run._file_digest(r.config.model, "config.json"),
         "engine_config": json.dumps(keyed(r.config), sort_keys=True),
         "source_root": compass_run.source_root(atom),
         "form": held["form"],
+        "fit_src": step_linear_fit.fit_src(step),
         **keyed_platform(Kind.STEP_LINEAR_LAW, PLATFORM),
     }
-    step = {k: v for k, v in held.items() if k not in ("host", "host_fit")}
     entry = publish(tmp_path, r, Kind.STEP_LINEAR_LAW, key, step, conditions, store)
     if host:
         params = {"key": held["host"]["key"], "laws": HOST_LAWS}

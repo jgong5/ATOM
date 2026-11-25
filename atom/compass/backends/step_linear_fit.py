@@ -620,10 +620,11 @@ def _runs(samples, dp: int) -> dict[str, list[list]]:
     return {run: [ranks[r] for r in sorted(ranks)] for run, ranks in runs.items()}
 
 
-def fit_src(host: dict) -> str:
-    """The sha256 of the host laws `host`, a run file's `host` entry, without
-    its ``key``: of what was fitted, so it moves exactly when the laws do."""
-    fitted = {term: value for term, value in host.items() if term != "key"}
+def fit_src(laws: dict) -> str:
+    """The sha256 of the fitted `laws`, a run file's `host` entry or a step
+    linear law, without a ``key``: of what was fitted, so it moves exactly
+    when the laws do."""
+    fitted = {term: value for term, value in laws.items() if term != "key"}
     return hashlib.sha256(json.dumps(fitted, sort_keys=True).encode()).hexdigest()
 
 

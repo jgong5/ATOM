@@ -58,6 +58,7 @@ from atom.compass.artifacts import (
     keyed_platform,
     member_name,
 )
+from atom.compass.backends import step_linear_fit
 from atom.compass.backends.step_linear_plan import FIRST_TURN, TRACE_RUNS
 from atom.compass.drive import lacking, reuse
 from atom.compass.run import memory
@@ -89,6 +90,7 @@ def _fitted(directory, config, atom=None, platform=PLATFORM, law=check.FITTED) -
         "engine_config": json.dumps(keyed(config), sort_keys=True),
         "source_root": compass_run.source_root(atom),
         "form": "history",
+        "fit_src": step_linear_fit.fit_src(held["params"]),
         **keyed_platform(Kind.STEP_LINEAR_LAW, platform),
     }
     law.write_text(json.dumps(held))

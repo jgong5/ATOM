@@ -139,7 +139,10 @@ def test_a_fit_takes_a_record_whose_compiles_are_timed_and_cuts_their_steps(
 
     fit(tmp_path, "fit steps", *LINEAR, a, *clients(a))
 
-    assert member(tmp_path / "store", law_key(), "params")["cut"][JIT] == 1
+    assert (
+        member(tmp_path / "store", law_key(tmp_path / "store"), "params")["cut"][JIT]
+        == 1
+    )
 
 
 @pytest.mark.parametrize(
