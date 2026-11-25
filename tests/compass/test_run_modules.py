@@ -28,7 +28,7 @@ driverless.group(tp, 1)
 from atom.config import Config, set_current_atom_config
 config = Config(model=str(root / "model"), tensor_parallel_size=tp, load_dummy="empty")
 set_current_atom_config(config)
-from atom.model_engine.model_runner import support_model_arch_dict
+from atom.models.registry import support_model_arch_dict
 from atom.utils import resolve_obj_by_qualname
 from atom.compass.runner.overrides import FactoriesOnMeta
 from atom.compass.run.modules import walk

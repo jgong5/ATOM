@@ -1139,13 +1139,14 @@ def _runner(config, rank: int):
     from torch.distributed import TCPStore
 
     from atom.compass.bench.ranks import agreed, cpu_group
-    from atom.model_engine.model_runner import ModelRunner, RapidServeModelRunner
+    from atom.model_engine.model_runner import ModelRunner
+    from atom.model_engine.model_setup import build_model
+    from atom.model_loader.weight_utils import params_on_meta
 
     class MetaRunner(ModelRunner):
-        def _build_and_load_model(self, model_class):
-            with RapidServeModelRunner._init_weight_params_on_meta():
-                self.model = model_class(self.config)
-            torch.set_default_device(None)
+        def _build_and_load_model(self, config, model_class, device):
+            with params_on_meta():
+                return build_model(config, model_class, device)
 
         def _maybe_warmup(self):
             pass

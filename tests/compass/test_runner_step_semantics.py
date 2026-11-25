@@ -410,16 +410,20 @@ def test_a_speculative_config_declaring_no_acceptance_is_refused_before_the_draf
     Constructing `CompassModelRunner` needs a driver, because importing ATOM's
     runner runs aiter's architecture probe. So `_Base` stands in for
     `ModelRunner.__init__` and records what runs after the model is built. The
-    order it copies is read from ATOM's source: `_build_and_load_model` is a
-    plain statement of `__init__`'s body, under no `if` or `try`, and it comes
-    before the statement that calls `build_drafter`. The composition it copies
+    order it copies is read from ATOM's source: the statement that hands
+    `_build_and_load_model` to `get_model` is a plain statement of `__init__`'s
+    body, under no `if` or `try`, and it comes before the statement that calls
+    `_build_and_load_drafter`. The composition it copies
     is read from `CompassModelRunner`'s: its bases are `NonAllocatingRunner` then
     `ModelRunner`, and its body binds neither `__init__` nor `_build_and_load_model`.
     """
     init = _function(ATOM_RUNNER, "ModelRunner", "__init__")
     body = [ast.unparse(s) for s in init.body]
-    built = [s.startswith("self._build_and_load_model(") for s in body].index(True)
-    assert built < ["build_drafter(" in s for s in body].index(True)
+    built = [
+        s.startswith("self.model = get_model(") and "self._build_and_load_model" in s
+        for s in body
+    ].index(True)
+    assert built < ["self._build_and_load_drafter(" in s for s in body].index(True)
     runner = _class(COMPASS_RUNNER, "CompassModelRunner")
     bases = [ast.unparse(b) for b in runner.bases]
     assert bases == ["NonAllocatingRunner", "ModelRunner"]
@@ -431,7 +435,7 @@ def test_a_speculative_config_declaring_no_acceptance_is_refused_before_the_draf
     class _Base:
         def __init__(self, config):
             self.config = config
-            self._build_and_load_model(object)
+            self.model = self._build_and_load_model(config, object, None)
             ran.append("build_drafter")
 
     class _Composed(NonAllocatingRunner, _Base):

@@ -28,7 +28,7 @@ PAGE = 4096
 def engram(monkeypatch):
     """The engram modules, with every bounce chunk recorded and no real
     page-locking reachable: a test that wants the page-locked path installs
-    its own `cudaHostRegister`."""
+    its own `pin_rows`."""
     from atom.model_ops.engram import host, host_memory, tables
 
     bounces = []
@@ -273,6 +273,28 @@ def test_the_option_puts_this_ranks_heads_of_every_table_on_its_device(
     assert all(table._uva is None for table in tables.values())
 
 
+def test_under_dp_attention_the_option_holds_each_rank_s_own_copy(engram, monkeypatch):
+    """Every DP-attention rank holds the whole tables: page-locked, the node
+    shares one copy of them; in HBM each rank holds its own."""
+    monkeypatch.setenv("ATOM_ENGRAM_UVA_HBM", "1")
+    monkeypatch.setattr(
+        engram.host, "_node_share", lambda: pytest.fail("a node share in HBM")
+    )
+    tp_group(monkeypatch, world_size=1, rank=0)
+    rt = tiny_runtime(engram)
+    heads = rt.prefetcher._hash_mapping.config.num_hash_heads
+    assert rt._enable_uva(rt.prefetcher, heads) is True
+    assert rt._node_share is None
+    for table in rt.prefetcher._tables.values():
+        assert table.registered_shard()[2:] == (0, table.num_rows)
+    rt.shutdown()
+
+
+def test_an_hbm_shard_is_read_at_its_own_device_address(engram):
+    shard = SimpleNamespace(device=torch.device("cuda", 0), data_ptr=lambda: 0x7F0000)
+    assert engram.host_memory.shard_device_address(shard) == 0x7F0000
+
+
 def test_a_rank_whose_hbm_copy_fails_turns_the_group_around(engram, monkeypatch):
     """The device lookup ends in an all-gather: a rank that cannot hold its
     shard in HBM votes no, and the whole group takes the host path."""
@@ -305,18 +327,13 @@ def test_a_rank_whose_hbm_copy_fails_turns_the_group_around(engram, monkeypatch)
 
 
 def test_without_the_option_the_shard_is_page_locked_as_before(engram, monkeypatch):
-    registered = []
+    pinned = []
 
-    class Cudart:
-        def cudaHostRegister(self, ptr, size, flags):
-            registered.append(ptr)
-            return 0
+    def pin_rows(sources, share=None):
+        pinned.append(share)
+        return tuple(sources)
 
-        def cudaHostUnregister(self, ptr):
-            registered.remove(ptr)
-            return 0
-
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: Cudart())
+    monkeypatch.setattr(engram.host_memory, "pin_rows", pin_rows)
     monkeypatch.setattr(
         engram.host_memory,
         "to_device",
@@ -327,7 +344,7 @@ def test_without_the_option_the_shard_is_page_locked_as_before(engram, monkeypat
     rt = tiny_runtime(engram)
     heads = rt.prefetcher._hash_mapping.config.num_hash_heads
     assert rt._enable_uva(rt.prefetcher, heads) is True
-    assert len(registered) == len(rt.prefetcher._tables)
+    # One page-locked shard a table, a TP rank's own: no node share.
+    assert pinned == [None] * len(rt.prefetcher._tables)
     assert engram.bounces == []
     rt.shutdown()
-    assert registered == []
