@@ -114,6 +114,24 @@ floor or more is past it. A kernel no point gives its own length, or only a
 point launching it among other kernels, keeps its recorded length, and its
 sample names it under `floor` for each label holding it.
 
+With `STALL_ENV` set to ``1``, an opt-in, a step at which some DP rank's host
+stalled issuing a prefill forward is cut as `stalled` on every rank
+(`launch_stalls`): a line not a dummy run, holding a prefill row, whose launch
+window (`t_launch_ns`, the host issuing the forward's kernels) lasted
+`STALL_FACTOR` times or more its launch path's median (`launch_features.path`)
+over that rank's such lines of the run. That host was then off issuing the
+forward at least as long as on it, and every peer's device waited on its
+devices at each MoE collective, so each rank's device span holds the stall: the
+paced cut above, read off the launch alone and across the group, where a rank
+whose device runs on after a stalled launch ends escapes `_paced`. Each such
+line keeps its host labels. On #3720's cell B (DeepSeek-V4.1 1P1D, P at DP2,
+eager) a prefill's launch stays within 10-25% of its path's median at p90,
+and 0.5-4% of the lines take twice it or more, up to 80 times (4.2 s); with
+the peer columns' slower tail kept (`--keep-peer-tail`), the stalled ones among
+the 75 steps whose peer prefilled under a quarter of the rows carried
+`peer_small` from B final's 7 ms to 353 ms. Unset or ``0``, no step is cut so,
+and every label is as before.
+
 A record without device windows is refused. A step mixing prefill and decode
 rows is cut. A step of an MTP record without `d_target_ns` is cut as
 `unsplit`: its device label would hold a draft the law prices again.
@@ -198,6 +216,17 @@ PREFILL_LABEL_ENV = "COMPASS_PREFILL_LABEL"
 #: How near its host launch's end a windowed prefill's device work ends, either
 #: side, to have run at the launch's pace (`_paced`), in seconds.
 PACED_S = 2e-3
+#: The variable that, set to ``1``, cuts as `STALLED` each rank's line of a step
+#: some rank's host stalled issuing a prefill forward at (`launch_stalls`);
+#: unset or ``0``, no step is, and a fit is as before.
+STALL_ENV = "COMPASS_FIT_LAUNCH_STALL"
+#: How many times its launch path's median over its rank's prefill lines a
+#: line's launch window lasts to be a stall: its host was then off issuing the
+#: forward at least as long as on it. The same on every record and rank.
+STALL_FACTOR = 2.0
+#: The cut a stalled step's lines take under `STALL_ENV`; not one of `CUTS`,
+#: which every fit counts, since no step is cut so without the switch.
+STALLED = "stalled"
 
 
 def _prefill_label() -> str:
@@ -206,6 +235,47 @@ def _prefill_label() -> str:
     if value not in ("trace", "record"):
         raise ValueError(f"{PREFILL_LABEL_ENV}={value!r}: name trace or record")
     return value
+
+
+def _launch_stall() -> bool:
+    """Whether `STALL_ENV` is on: ``1`` on, ``0`` or unset off, any other refused."""
+    value = os.environ.get(STALL_ENV) or "0"
+    if value not in ("0", "1"):
+        raise ValueError(f"{STALL_ENV}={value!r} is not 0 or 1")
+    return value == "1"
+
+
+def launch_stalls(
+    ranks: Iterable[list[dict]], factor: float = STALL_FACTOR
+) -> frozenset[int]:
+    """The steps of one run's DP ranks, each rank's `lines`, at which some rank's
+    host stalled issuing a prefill forward: its line, not a dummy run and
+    holding a prefill row, whose launch window (`t_launch_ns`) lasted `factor`
+    times or more the median of its launch path's (`launch_features.path` of
+    its view and recorded features) over that rank's such lines. The fit's
+    `STALL_ENV` cut and any record check read the same set."""
+    from atom.compass.backends.launch_features import path as launch_path
+
+    stalled = set()
+    for lines in ranks:
+        windows = defaultdict(list)
+        for s in lines:
+            rows = s.get("rows") or ()
+            if s["is_dummy_run"] or "t_launch_ns" not in s or all(r[2] for r in rows):
+                continue
+            view = BatchView(
+                tuple(RequestShape(q, c, bool(d)) for q, c, d in rows),
+                capture_rung=s.get("rung"),
+                produces_output=s["produces_output"],
+            )
+            start, end = s["t_launch_ns"][:2]
+            windows[launch_path(view, s.get("launch", {}))].append(
+                (end - start, s["step"])
+            )
+        for got in windows.values():
+            median = statistics.median(w for w, _ in got)
+            stalled.update(step for w, step in got if w >= factor * median)
+    return frozenset(stalled)
 
 
 #: The variable that, set to ``1``, takes a record whose run.json names
@@ -638,7 +708,24 @@ def label(
     the rank records beside it.
     """
     lines = _read(record)
-    return _label(record, lines, run, [_pull(s) for s in lines], split_rule, None, None)
+    stalled = None
+    if _launch_stall():
+        peers = (
+            [read_jsonl(p) for p in _peers(Path(record))]
+            if lines and "moe_rows" in lines[0]
+            else [lines]
+        )
+        stalled = launch_stalls(peers)
+    return _label(
+        record,
+        lines,
+        run,
+        [_pull(s) for s in lines],
+        split_rule,
+        None,
+        None,
+        stalled=stalled,
+    )
 
 
 def label_run(
@@ -661,12 +748,22 @@ def label_run(
     starts = [max(_pull(x[i]) for x in ranks if i < len(x)) for i in range(n)]
     dummy_ranks, peaks = group_dummies(ranks), group_peaks(ranks)
     tails, prefills = group_tails(ranks), group_prefills(ranks)
+    stalled = launch_stalls(ranks) if _launch_stall() else None
     return [
         (
             ([], [])
             if x and all(s["is_dummy_run"] for s in x)
             else _label(
-                r, x, run, starts, split_rule, dummy_ranks, peaks, tails, prefills
+                r,
+                x,
+                run,
+                starts,
+                split_rule,
+                dummy_ranks,
+                peaks,
+                tails,
+                prefills,
+                stalled=stalled,
             )
         )
         for r, x in zip(records, ranks)
@@ -739,10 +836,12 @@ def _label(
     peaks,
     tails=None,
     prefills=None,
+    stalled=None,
 ) -> tuple[list[Sample], list[dict]]:
     """`label` of `record`'s `lines`, each `E` from `starts` at the line before;
     `prefills` the steps its group prefills at (`group_prefills`), read from
-    the rank records beside it when None."""
+    the rank records beside it when None; `stalled` the steps cut as `STALLED`
+    (`launch_stalls`), none when None."""
     path = Path(record)
     steps = [s for s in lines if not s["is_dummy_run"]]
     dummies = frozenset(s["step"] for s in lines if s["is_dummy_run"])
@@ -839,6 +938,8 @@ def _label(
             cut = "untraced"
         elif windowed and s["step"] in paced:
             cut = "paced"
+        elif stalled and s["step"] in stalled:
+            cut = STALLED
         elif mtp and "d_target_ns" not in s:
             cut = "unsplit"
         gap = 0 if view.prefill else s.get("d_gap_ns", 0)
