@@ -860,7 +860,7 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
     }
     judged_in = held["store"]
     reused = [laws[side].get("store") for side in laws if side not in keys]
-    shared_in = Path(judged_in).resolve() == Path(shared).resolve()
+    shared_in = shared and Path(judged_in).resolve() == Path(shared).resolve()
     lookup = judged_in if shared_in or judged_in in reused else None
     into, fit, waiting = _deployed(directory, lookup, keys, lent, sides)
     for side in (side for side in keys if side not in fit):

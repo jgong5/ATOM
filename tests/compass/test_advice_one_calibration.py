@@ -10,14 +10,23 @@ ended where a new one would refit its law, the other says so too, with the
 command measuring its readings into the store that law was published into.
 Where the shared store holds a stale entry at the other's readings key, which
 it refuses a second publish at, the first calibrates into its own store, unless
-the other is refused, as it then prints no readings command.
+the other is refused, as it then prints no readings command; a 1P1D first does
+too.
 
 The configuration, its stubbed resolution and starts are `test_advice_check`'s.
 """
 
 import pytest
-from test_advice_calibrating import _env, _fitted, _readings_at_another_digest
+from test_advice_calibrating import (
+    PAIR,
+    _calibrate,
+    _env,
+    _fitted,
+    _readings_at_another_digest,
+    sides,  # noqa: F401  the fixture
+)
 from test_advice_check import (
+    NETWORK,
     advise,
     resolved,
     stubbed,  # noqa: F401  the fixture
@@ -211,3 +220,24 @@ def test_a_refused_borrower_s_stale_readings_leave_its_lender_in_the_shared_stor
 
     assert found["R"]["state"] == "refused"
     assert _env(found, "S2")["STORE"] == str(store)
+
+
+def test_a_1p1d_lender_s_borrower_s_stale_readings_send_it_into_its_own_store(
+    tmp_path, sides  # noqa: F811
+):
+    """S, a lone server at A's prefill side's law key, borrows that side's law,
+    and the shared store holds S's readings stale, and nothing of A's: A fits
+    both sides into its own store, and S's readings wait on A's start."""
+    store, cal = tmp_path / "store", tmp_path / "out" / "cal" / "A"
+    s = {"args": {"--max-num-seqs": 8, "--max-model-len": 512}}
+    args = ["--max-num-seqs", "8", "--max-model-len", "512"]
+    _readings_at_another_digest(store, resolved(sides, args))
+
+    found = advise(tmp_path, {"A": PAIR["A"], "S": s}, network=NETWORK)
+
+    assert "STORE" not in _calibrate(found, "A")[0]
+    into = str(cal / "store")
+    assert found["S"]["made_by"] == [
+        check.BORROWED.format("A", cal, into),
+        check.PENDING.format(into, "A", cal),
+    ]
