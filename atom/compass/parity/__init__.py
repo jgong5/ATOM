@@ -426,6 +426,7 @@ def _record(runner):
                 DEFERS_OUTPUT,
                 MIN_FINAL_ROWS,
                 PREFILL_BUCKETS,
+                REPLAYS_STATE,
                 UNKEYED,
             )
             from atom.compass.backends.step_linear_fit import CONTEXT_PARALLEL
@@ -446,6 +447,11 @@ def _record(runner):
                     engine[name] = width
             if (rows := getattr(runner.config, MIN_FINAL_ROWS, 0)) > 0:
                 engine[MIN_FINAL_ROWS] = rows
+            # The transfer the runner hands `BlockManager`, which keeps a
+            # replaying one: it carries no checkpoint spec (`StateRuntime`).
+            state = getattr(runner, "state_runtime", None)
+            if state is not None and state.transfer.replays:
+                engine[REPLAYS_STATE] = True
             engine[PREFILL_BUCKETS] = list(TokenGraph.captured_sizes("prefill"))
             processor = getattr(runner, "tokenID_processor", None)
             engine[DEFERS_OUTPUT] = getattr(processor, "is_deferred_out", True)
