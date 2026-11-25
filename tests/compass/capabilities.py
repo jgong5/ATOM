@@ -99,8 +99,16 @@ FORMS = {
         "--fake-eplb above DP width 1",
         HERE + "test_dp_slice.py::test_fake_eplb_is_refused_at_dp_width_above_one",
     ),
-    "kimi_k3": refused("Kimi-K3", issue="#2672"),
-    "windowed_attention": refused("a model with windowed attention", issue="#2672"),
+    "kimi_k3": refused(
+        "Kimi-K3",
+        HERE + "test_run_modules_kimi_k3.py::"
+        "test_a_kda_layer_refuses_every_step_naming_its_recurrence_and_issue",
+    ),
+    "windowed_attention": refused(
+        "a model with windowed attention",
+        HERE + "test_run_modules_gpt_oss.py::"
+        "test_a_windowed_layer_refuses_every_step_naming_its_window_and_issue",
+    ),
 }
 
 
