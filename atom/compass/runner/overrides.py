@@ -2194,6 +2194,46 @@ def launch_stall(runner: Any, view: Any, host: Any) -> float:
     return got["first_s"]
 
 
+#: The step-linear prefill terms of a rank's attention over its rows' cached
+#: history (`step_linear`'s query_cached, history and query_square columns).
+HISTORY_TERMS = frozenset(
+    {"prefill.query_cached", "prefill.history", "prefill.query_square"}
+)
+
+
+def history_phase_wait(terms: Any, group: Any) -> float:
+    """The seconds this rank's prefill step waits, beyond its own price, for its
+    DP group's longest attention over cached history.
+
+    The group's `all_reduce(MAX)` prices a lockstep step as its slowest rank's
+    own sum. A real group waits at every layer's collectives, and the layers
+    differ in how much of their time is attention over the rows' cached
+    history: where one rank holds the group's longest history attention and
+    another its largest rest (new tokens, rows), the step runs for about the
+    longest history attention plus the largest rest, more than either rank's
+    sum. With ``COMPASS_PREFILL_PHASE_MAX=k`` (unset or 0: off) each rank adds
+    ``k`` x (the group's largest `HISTORY_TERMS` seconds - its own), one
+    `all_reduce(MAX)` on `group`, so at ``k`` = 1 the group's max is the
+    longest history attention plus the largest rest. `terms` are the rank's
+    target terms (none for a refused step); `group` the DP group of a step
+    some rank prefills, or None, which waits on nothing. Every rank of the
+    group calls it at the same steps.
+
+    #752 cell A v2 DPA4 (U4c law, priced on its records): prefill groups'
+    label/price - 1 grows with this premium, (phase - max)/max, on the
+    calibration records (+4.2% at 2-5%, +9.1% at 5-10%) and the targets alike
+    (c128: +0.4% under 0.5%, +2.5% at 2-5%, +10.4% over 10%); least squares
+    on the calibration records alone gives k = 1.04.
+    """
+    k = float(os.environ.get("COMPASS_PREFILL_PHASE_MAX") or 0)
+    if group is None or k <= 0:
+        return 0.0
+    own = sum(t.seconds for t in terms if t.name in HISTORY_TERMS)
+    top = torch.tensor([own], dtype=torch.float64)
+    torch.distributed.all_reduce(top, torch.distributed.ReduceOp.MAX, group)
+    return k * (top.item() - own)
+
+
 def _group_step_seconds(
     runner: Any,
     batch: Any,
@@ -2269,7 +2309,8 @@ def _group_step_seconds(
     later stage's receive, in seconds, each 0.0 where the law has none, and `skipped`,
     those its `skip` charged as 0; `device_s` and `draft_s`, the backend's
     target and draft price, the target's with any `replayed_stall`, which
-    ``replayed_stall_s`` then states, and with any `launch_stall`, which
+    ``replayed_stall_s`` then states, and any `history_phase_wait`, which
+    ``phase_wait_s`` states, and with any `launch_stall`, which
     ``launch_stall_s`` states; `charge_s`, those composed with host
     time (their sum with no host);
     `group_s`, its DP group target; `terms`, each one's `name`, `seconds`
@@ -2365,6 +2406,13 @@ def _group_step_seconds(
     # `decide` returns the collective's rows for a group of one too.
     many = mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1
     group = dp_group() if many else None
+    # A prefilling group's history attention and the rest wait at different
+    # collectives (`history_phase_wait`).
+    prefilling = many and not mode.running_tokens_are_unified
+    phase_s = history_phase_wait(
+        terms[:target_terms], group if prefilling else None
+    )
+    device_s += phase_s
     charge = getattr(host, "charge", None)
     if group is not None and isinstance(host, HostDeviceRecurrence):
 
@@ -2447,6 +2495,7 @@ def _group_step_seconds(
         "device_s": device_s,
         "draft_s": draft_s,
         **({"replayed_stall_s": stall_s} if stall_s else {}),
+        **({"phase_wait_s": phase_s} if phase_s else {}),
         **({"launch_stall_s": first_s} if first_s else {}),
         "charge_s": charge_s,
         "group_s": group_s,
