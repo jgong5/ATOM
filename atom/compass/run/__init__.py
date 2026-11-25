@@ -593,6 +593,13 @@ def refuse_unfitted_law(run: dict, config) -> None:
         )
 
 
+def _holds_laws(host: dict) -> bool:
+    """Whether the host laws `host` hold laws that price a step: at their top,
+    or, above one pipeline stage, in a stage's part under ``stages``
+    (`fit.host`), all under the one key at their top."""
+    return any(part.get("laws") for part in [host, *(host.get("stages") or ())])
+
+
 def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     """Refuse the run file's step linear law on a runner that records the
     prefill token-graph buckets `buckets`, ascending, where the law states none
@@ -602,8 +609,10 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     between a fit and a run, so one stating none says nothing of them; one
     stating them states ATOM's list, which a runner records only up to
     `warmup_max_tokens`, a bound no engine config keys, so a prefill vector's
-    are held to `buckets` either way. Host laws refuse where their key's graph
-    sets state others; `run` replaces `spec()`."""
+    are held to `buckets` either way. Above one pipeline stage, each stage's
+    part under ``stages`` (`fit.steps`) is held so, the first that fails
+    named. Host laws refuse where their key's graph sets state others; `run`
+    replaces `spec()`."""
     if not buckets or (run := spec() if run is None else run) is None:
         return
     from atom.compass.backends import launch_features
@@ -611,7 +620,7 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
 
     pick_fitted(run, "host", config)
     host = run.get("host") or {}
-    graphs = host.get("laws") and launch_features.stated(host.get("key"))[1]
+    graphs = _holds_laws(host) and launch_features.stated(host.get("key"))[1]
     if graphs and (theirs := graphs["token"]["prefill"]) != list(buckets):
         raise ValueError(
             f"the host laws' key states the prefill token-graph buckets {theirs}, "
@@ -621,15 +630,18 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
         return
     pick_fitted(run, STEP_LINEAR, config)
     law = run[STEP_LINEAR]
-    stated = sorted((law.get("prefill") or {}).get("buckets") or ())
     env = law["engine_config"]["env"]
-    if (stated or BUCKETS not in env) and stated != list(buckets):
-        said = f"{BUCKETS}={env[BUCKETS]}" if BUCKETS in env else f"no {BUCKETS}"
-        raise ValueError(
-            f"the step linear law states {said} in its engine config and "
-            f"{stated or 'none'} as its prefill vector's buckets, and this run's "
-            f"runner records the prefill token-graph buckets {list(buckets)}"
-        )
+    stages = law.get("stages")
+    for k, part in enumerate(stages) if stages else [(None, law)]:
+        stated = sorted((part.get("prefill") or {}).get("buckets") or ())
+        if (stated or BUCKETS not in env) and stated != list(buckets):
+            said = f"{BUCKETS}={env[BUCKETS]}" if BUCKETS in env else f"no {BUCKETS}"
+            whose = "its" if k is None else f"pipeline stage {k}'s"
+            raise ValueError(
+                f"the step linear law states {said} in its engine config and "
+                f"{stated or 'none'} as {whose} prefill vector's buckets, and this "
+                f"run's runner records the prefill token-graph buckets {list(buckets)}"
+            )
 
 
 def refuse_context_parallel(name: str, config) -> None:
@@ -657,7 +669,7 @@ def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     from atom.compass.backends.launch_features import GRAPHS, stated
     from atom.compass.backends.step_grid_plan import at_ladder
 
-    ours = host.get("laws") and {
+    ours = _holds_laws(host) and {
         **host_key(config),
         **keyed_platform(Kind.HOST_LAWS, platform),
     }

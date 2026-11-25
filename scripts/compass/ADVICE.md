@@ -368,11 +368,12 @@ compass fit device <token> --store OUT/cal/S1/store --out OUT/cal/S1.readings
   have changed, prints the next one into a new directory, `OUT/cal/S1+2`, then
   `OUT/cal/S1+3`, and reads that one's status; start it as above, its log in
   `OUT/cal/S1+2.log`. Where the next one would take the ATOM arguments, traces
-  and records the ended one took, and the law that one fitted is at the
+  and records the ended one took (on 1P1D, each side's ATOM arguments, the
+  router's and the sides it fits), and each law that one fitted is at its
   configuration's key (its model, the machine's platform, the head's ATOM
   digest, and its engine config with the performance variables), it would refit
-  that law, so `made by:` says so in place of a command and names the store
-  that law is in; the law's verdict line says what it lacks.
+  those laws, so `made by:` says so in place of a command and names the store
+  they are in; the law's verdict line says what it lacks.
 
 **A missing point's readings** take `compass measure memory --gpu G --out D
 --store <store> -- <ATOM's arguments>`, as printed, under the variables it
@@ -404,8 +405,10 @@ configuration's key, publishing into <store>`, and its own command fits the
 other side alone, `FIT=decode`, into the same store. Where that store is A's
 own, B's command reads `its calibration, into <store>, once A's calibration in
 OUT/cal/A has started` until A has started; run `compass advice SPACE OUT` again then. Its status file,
-resume and end are one server's, above, and its end prints each fitted side's
-tokens and held-out errors. Show the user every command the candidate prints.
+resume, end and calibrating again are one server's, above, and its end prints
+each fitted side's tokens and held-out errors; a side borrowed from a
+calibration that would only refit its law prints that one's `made by:` line.
+Show the user every command the candidate prints.
 Where the sides take more cards than one node holds, as two TP8 sides on an
 8-card MI355X do, it prints `no calibrate.sh command:` and why: a deployment on
 two nodes, as [the 1P1D deployment](README.md#a-1p1d-deployment-across-crsuse2-m2m-v3-005-and--013)

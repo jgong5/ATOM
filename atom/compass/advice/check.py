@@ -46,10 +46,10 @@ their key there; into the calibration's own store, only once it has started,
 as a publish there before would leave its directory holding files, which
 `calibrate.sh` refuses.
 A calibration that has ended records nothing more, so the next goes into a new
-directory; where a lone server's would take what the ended one took and the
-law it fitted is at the configuration's key at the head's ATOM digest
-(`_refits`), it would refit that law, and the verdict says so in place of a
-command, as does a later candidate's at that key, with the command measuring
+directory; where it would take what the ended one took and each law it fitted,
+on 1P1D each side's, is at that configuration's key at the head's ATOM digest
+(`_refits`), it would refit those laws, and the verdict says so in place of a
+command, as does a later candidate's at such a key, with the command measuring
 its readings into the store that law was published into, unless they are at
 their key there. A 1P1D point takes one `calibrate.sh` command, each
 record a `deploy.sh record` of both sides, fitting each side sent to calibrate
@@ -192,7 +192,7 @@ INPUTS = "inputs"
 #: its count from 2: no candidate's name holds a ``+``.
 AGAIN = "{}+{}"
 #: The step linear law a calibration fits, in its directory, as `calibrate.sh`
-#: writes it.
+#: writes it; on 1P1D each side's in ``fit_steps_<side>``.
 FITTED = Path("fit_steps", "step_linear_law.json")
 #: What stands for the command of a candidate whose calibration has ended,
 #: when one in a new directory would refit its law (`_refits`).
@@ -716,7 +716,9 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
                         law["made_by"] = [command]
                     into = str(into or made[0] / "store")
                     law["calibration"] |= {"in": str(made[0]), "into": into}
-                    if (ended := made[3]) and _refits(ended, command, key, atom):
+                    if (ended := made[3]) and _refits(
+                        ended, command, {None: _keys(config, machine, atom)}
+                    ):
                         held = started_store(ended) or str(ended / "store")
                         law["made_by"] = [REFITS.format(ended, held)]
                         refitting = {"in": str(ended), "into": held, "refits": True}
@@ -836,7 +838,9 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
     candidate is `refused`, name its one `calibrate.sh` command
     (`lacking.deployment_calibration`) on each side sent to calibrate: into
     the calibration directory `made` names and the store `_deployed` gives it,
-    fitting the sides `_deployed` picks. Each other side sent to calibrate is
+    fitting the sides `_deployed` picks; or why none serves, `REFITS`, where
+    it would refit the laws the calibration that ended before it, as `made`
+    names it, fitted (`_refits`). Each other side sent to calibrate is
     borrowed, made by the calibration an earlier candidate's in
     `calibrations` makes at its key, which publishes into that store, or by
     why none serves where a new one would refit its law (`_lent`), and by
@@ -845,14 +849,16 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
     one no such calibration makes and a started calibration's `INPUTS` leave
     out is `UNFITTED`. Where no command serves, each side it fits names why,
     waiting or not; else, while `_deployed` waits on that calibration, each is
-    `WAITING`, and otherwise each joins `calibrations`."""
+    `WAITING`, and otherwise each joins `calibrations`, made by that command
+    or, where it gives way to `REFITS`, by the ended calibration, as `_lent`
+    reads it."""
     laws, mine, sides = held["points"][point["name"]]["law"], {}, {}
     for side, law in laws.items():
         laws[side] = law = dict(law)
         mine[side], sides[side] = law.pop("calibration", None), law.pop("side", None)
     if refused or not any(mine.values()):
         return
-    directory, traces, shared, _ = made
+    directory, traces, shared, ended = made
     keys = {s: json.dumps(c["key"], sort_keys=True) for s, c in mine.items() if c}
     lent = {
         side: calibrations[key]
@@ -891,10 +897,13 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
         for side in fitted:
             laws[side]["made_by"] = [wait]
         return
-    published = str(into or directory / "store")
+    made_here = {"in": str(directory), "into": str(into or directory / "store")}
+    if ended and _refits(ended, command, sides):
+        published = started_store(ended) or str(ended / "store")
+        command = REFITS.format(ended, published)
+        made_here = {"in": str(ended), "into": published, "refits": True}
     for side in fitted:
         laws[side]["made_by"] = [command]
-        made_here = {"in": str(directory), "into": published}
         calibrations.setdefault(
             keys[side], made_here | {"readings": sides[side]["readings"]}
         )
@@ -1015,37 +1024,50 @@ def _started_input(directory: Path, field: str) -> str | None:
     return next((s[len(field) + 1 :] for s in given if s.startswith(f"{field} ")), None)
 
 
-def _refits(ended: Path, command: str, key: list, atom: str) -> bool:
-    """Whether the `calibrate.sh` `command` refits the law the calibration
+def _refits(ended: Path, command: str, keys: dict) -> bool:
+    """Whether the `calibrate.sh` `command` refits the laws the calibration
     that ended in `ended` fitted: it takes what that one took, as its `INPUTS`
-    state it (ATOM's arguments, the traces and the records), and that law is
-    at `key`, where the command's law publishes, at the head's ATOM digest
-    `atom`, as `reuse.law` matches a store law: `key`'s model, the platform of
-    the machine, and the engine config as `keyed` states it under the
-    instance's environment, whose performance variables the command sets. No
-    command, as `lacking.calibration` words why there is none, takes nothing;
-    a directory holding no law refits none."""
+    state it (ATOM's arguments, on 1P1D each side's, the router's and the
+    sides it fits; the traces and the records), and each law it fits is at
+    the key where it publishes, which `keys` holds as `_keys` gives it, on one
+    server under None, on 1P1D under the side: as `reuse.law` matches a store
+    law, its model, the platform of the machine, the head's ATOM digest, and
+    the engine config as `keyed` states it under the instance's environment,
+    whose performance variables the command sets. No command, as
+    `lacking.calibration` words why there is none, takes nothing; a directory
+    holding no law refits none."""
     if str(lacking.CALIBRATE) not in (line := command.split("\n")[0]):
         return False
     words = shlex.split(line)
     at = words.index(str(lacking.CALIBRATE))
     env = dict(word.split("=", 1) for word in words[:at])
-    taken = [f"atom --model {env['MODEL']} {env['SERVER_ARGS']}"]
+    if "FIT" in env:
+        fits = env["FIT"].split()
+        taken = [
+            f"atom {side} --model {env['MODEL']} {env[f'{side.upper()}_ARGS']}"
+            for side in lacking.SIDES.values()
+        ]
+        taken += [f"router {env['ROUTER_ARGS']}", f"fit {env['FIT']}"]
+    else:
+        fits, taken = [None], [f"atom --model {env['MODEL']} {env['SERVER_ARGS']}"]
     taken += [f"traces {env.get('TRACES')}"]
     taken += [f"record {record}" for record in words[at + 2 :]]
     inputs = ended / INPUTS
     given = inputs.read_text().splitlines() if inputs.is_file() else []
     # calibrate.sh writes `traces TRACES CAL_TRACES`.
     took = [s.rsplit(" ", 1)[0] if s.startswith("traces ") else s for s in given]
-    took = [s for s in took if s.startswith(("atom ", "traces ", "record "))]
-    if took != taken or not (ended / FITTED).is_file():
+    taking = ("atom ", "router ", "fit ", "traces ", "record ")
+    took = [s for s in took if s.startswith(taking)]
+    if took != taken:
         return False
-    model, platform, engine = key
-    model = compass_run._file_digest(model, "config.json")
-    held = {"model": model, "source_root": compass_run.source_root(atom)}
-    held |= keyed_platform(Kind.STEP_LINEAR_LAW, platform)
-    fitted = json.loads((ended / FITTED).read_text())["key"]
-    return reuse.at_key(fitted, engine, **held)
+    for side in fits:
+        law = ended / (Path(f"{FITTED.parent}_{side}", FITTED.name) if side else FITTED)
+        if not law.is_file():
+            return False
+        fitted, held = json.loads(law.read_text())["key"], keys[side]
+        if not reuse.at_key(fitted, held["engine"], **held["law"]):
+            return False
+    return True
 
 
 def _resolved(args, arch: str):

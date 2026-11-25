@@ -1042,7 +1042,12 @@ rung 1 and at c=64 at rungs 4 and 8, and the 1P1D decode side also at rung 2. Th
 prefill vector, and the decode law's rung 1, 2, 4 and 8 vectors with `--moe-routing 384,6`,
 DeepSeek-V4-Pro's routed experts and top-k, are refitted on their side's lone cells and on their
 side of three 1P1D `deploy.sh record` cells at c=256 over traces 256 to 392, seeds 20260707,
-20260708 and 20260709, the prefill side at `--gpu-memory-utilization 0.72`. Each law's other
+20260708 and 20260709, the prefill side at `--gpu-memory-utilization 0.72`. The decode law's
+rung 1, 2, 4 and 8 vectors also fit the decode side of two more 1P1D `deploy.sh record`
+deployments over the same traces: one serving c=1, 4, 16, 64 and 256 in turn, twice, at seed
+20260710, and one serving c=64 for 600 s and then c=256 for 900 s at seed 20260707, whose
+decode side ran on crsuse2-m2m-v3-004 in place of -013, the same ionic RDMA planes, by the
+owner's word ([#2842](https://github.com/jgong5/ATOM/issues/2842)). Each law's other
 vectors, the prefill law's rung-1 vector among them, are the ones fitted on its lone cells alone,
 and its `sources` names the records each came from. Its host laws are fitted on its side's lone
 cells re-recorded with the fp8 index cache, at a tree whose recorded engine holds its stamps
