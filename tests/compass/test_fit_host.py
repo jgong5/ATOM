@@ -37,11 +37,11 @@ from atom.compass.backends.step_linear_fit import (
     fit_host,
     fit_intake,
     fit_relay,
+    fit_src,
     fit_tokenizer,
     label_records,
 )
 from atom.compass.drive.aiter_jit import BUILDS
-from atom.compass.fit.host import fit_src
 from atom.compass.runner.overrides import OUT_SEGMENT, forward_shape
 
 

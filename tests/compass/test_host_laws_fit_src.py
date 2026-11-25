@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """A `host_laws` key holds ``fit_src``, the sha256 of the laws without their
-key (`fit.host.fit_src`): two fits of the same records whose laws differ are
-two entries, a run takes either, and the reuse check takes the newer beside a
-store law, skipping an entry whose key states none."""
+key (`step_linear_fit.fit_src`): two fits of the same records whose laws differ
+are two entries, a run takes either, and the reuse check takes the newer beside
+a store law, skipping an entry whose key states none. A law file
+`step_linear_fit` writes states it too."""
 
 import json
 
@@ -14,14 +15,17 @@ from test_advice_reuse import (  # noqa: F401  fixtures
     stored,
     verdicts,
 )
+from test_backend_step_linear_fit import platform_arg
 from test_fit_steps import clients, fit, member, planted_roots, record  # noqa: F401
-from test_memory_readings import META_8B
+from test_memory_readings import DOCUMENT, META_8B
 from test_run_step_grid import deployment, run_file
 from test_run_step_grid import publish as publish_deployment
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactStore, Kind
 from atom.compass.artifacts.store import ENTRY_FILE
+from atom.compass.backends import step_linear_fit
+from atom.compass.backends.step_labels import digest
 from atom.compass.fit import host as fit_host
 
 
@@ -62,7 +66,9 @@ def test_two_fits_of_the_same_records_whose_laws_differ_are_two_entries_a_run_ta
     keys = [store.key_from_token(Kind.HOST_LAWS, t) for t in tokens]
     hosts = [member(tmp_path / "store", k, "params") for k in keys]
     assert hosts[0]["laws"] != hosts[1]["laws"]
-    assert [k.values["fit_src"] for k in keys] == list(map(fit_host.fit_src, hosts))
+    assert [k.values["fit_src"] for k in keys] == [
+        step_linear_fit.fit_src(host) for host in hosts
+    ]
     host = hosts[taken]
     run = run_file(tmp_path, monkeypatch, host=host)
     monkeypatch.setenv(compass_run.NOW_ENV, str(tmp_path / "now.bin"))
@@ -102,3 +108,20 @@ def test_host_laws_whose_key_states_no_fit_src_are_not_taken(
 
     assert [(v["verdict"], v["requirement"]) for v in found] == [("calibrate", 1)] * 2
     assert "has no host laws beside it" in found[0]["reason"]
+
+
+def test_a_law_file_step_linear_fit_writes_states_the_fit_src_fit_host_keys_by(
+    tmp_path,
+):
+    a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
+    fit(tmp_path, "fit host", a, b, *clients(a, b))
+    paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
+    step_linear_fit.main(
+        [*map(str, paths), "--form", "history", *platform_arg(DOCUMENT)]
+        + ["--out", str(tmp_path / "law.json")]
+    )
+
+    written = json.loads((tmp_path / "law.json").read_text())["host"]
+    published = json.loads((tmp_path / "out/host_laws.json").read_text())
+    assert written["key"]["fit_src"] == step_linear_fit.fit_src(written)
+    assert written["key"]["fit_src"] == published["key"]["fit_src"]

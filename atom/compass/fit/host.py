@@ -31,9 +31,9 @@ tokenizer call as ``tokenizer.<kind>`` or a hop as ``hops.<hop>``, is left out
 and its reason listed under the report's ``unfitted``. The host key gains the
 fields of the configuration's platform a `host_laws` key states, which a run's
 spec must match, and ``fit_src``, the digest of the entry without its key
-(`fit_src`), so a refit whose laws differ, by any cause, is another entry; the
-entry is keyed by that host key's values and holds the run file's `host` entry
-as its params.
+(`step_linear_fit.fit_src`), so a refit whose laws differ, by any cause, is
+another entry; the entry is keyed by that host key's values and holds the run
+file's `host` entry as its params.
 
 `--stated-hop NAME=SECONDS` writes a hop no record times into the entry's
 ``hops``, as a committed law file states it: ``router_s``, the router's
@@ -51,7 +51,6 @@ token ids, so it rendered and tokenized nothing, and read larger bodies.
 """
 
 import gzip
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -62,6 +61,7 @@ from atom.compass.backends.step_linear_fit import (
     fit_host,
     fit_intake,
     fit_relay,
+    fit_src,
     fit_stream,
     fit_tokenizer,
     streams,
@@ -224,13 +224,6 @@ def stated_ingress(path: str) -> dict:
     if not isinstance(got, dict) or INGRESS not in got:
         raise ValueError(f"--ingress {path}: holds no {INGRESS} term")
     return check_ingress(got[INGRESS], f"--ingress {path}: its {INGRESS}")
-
-
-def fit_src(host: dict) -> str:
-    """The sha256 of the host laws `host`, a run file's `host` entry, without
-    its ``key``: of what was fitted, so it moves exactly when the laws do."""
-    fitted = {term: value for term, value in host.items() if term != "key"}
-    return hashlib.sha256(json.dumps(fitted, sort_keys=True).encode()).hexdigest()
 
 
 def main(argv: list[str]) -> None:

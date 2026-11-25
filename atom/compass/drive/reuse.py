@@ -199,7 +199,10 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
         here |= keyed_platform(Kind.HOST_LAWS, platform)
         hosts = _keyed(store, Kind.HOST_LAWS, engine, **here)
         if not hosts:
-            why = f"{where} has no host laws beside it at the head's ATOM digest"
+            why = (
+                f"{where} has no host laws beside it at the head's ATOM digest "
+                "keyed by fit_src, their laws' own digest"
+            )
             found.append(_verdict("calibrate", 1, why, **read))
             continue
         cpu = compass_run.host_cpu()
