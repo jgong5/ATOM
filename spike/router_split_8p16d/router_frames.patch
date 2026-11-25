@@ -1,0 +1,106 @@
+--- a/atom/mesh/src/compass_clock.rs
++++ b/atom/mesh/src/compass_clock.rs
+@@ -9,7 +9,7 @@
+ //! carries a `ceiling`, each request asks for its messages `ahead`, and carries
+ //! the `steps` the LP took on its own since the previous one ([`ClockClient::step`]).
+ 
+-use std::collections::HashMap;
++use std::{collections::HashMap, io::Write};
+ 
+ use serde_json::{json, Value};
+ use tokio::{
+@@ -49,9 +49,37 @@
+     pub released: Vec<Released>,
+ }
+ 
++/// Diagnostic only (COMPASS_TRACE_DIR): a line per stamp, the wall time,
++/// the event and the LP, to <dir>/<pid>.trace, as frames.patch stamps the
++/// Python LPs' clock frames: S as a frame goes out, R as one comes in.
++pub struct Trace(Option<(std::fs::File, String)>);
++
++impl Trace {
++    fn open(lp: &str) -> Self {
++        let dir = std::env::var("COMPASS_TRACE_DIR").ok();
++        let path = dir.map(|d| format!("{d}/{}.trace", std::process::id()));
++        let file = path.and_then(|p| {
++            let mut options = std::fs::OpenOptions::new();
++            options.create(true).append(true).open(p).ok()
++        });
++        Self(file.map(|f| (f, lp.to_owned())))
++    }
++
++    /// Writes one line, `<unix seconds> <event> <lp>`, in one write.
++    pub fn stamp(&mut self, event: &str) {
++        if let Some((file, lp)) = self.0.as_mut() {
++            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
++            let line = format!("{:.6} {event} {lp}\n", now.unwrap_or_default().as_secs_f64());
++            let _ = file.write_all(line.as_bytes());
++        }
++    }
++}
++
+ /// One LP's bound connection to the authority.
+ pub struct ClockClient {
+     stream: TcpStream,
++    /// The frames' stamps, and those [`ClockClient::stamp`] takes.
++    trace: Trace,
+     next_seq: HashMap<String, u64>,
+     log: Vec<(String, u64, f64)>,
+     /// Each step taken on its own since the last request: (t, time, sends before it).
+@@ -68,6 +96,7 @@
+         })?;
+         let mut client = Self {
+             stream: TcpStream::connect(address).await?,
++            trace: Trace::open(lp),
+             next_seq: HashMap::new(),
+             log: Vec::new(),
+             steps: Vec::new(),
+@@ -99,6 +128,11 @@
+         self.steps.push((t, time, self.log.len()));
+     }
+ 
++    /// Stamps `event` in the trace, when there is one.
++    pub fn stamp(&mut self, event: &str) {
++        self.trace.stamp(event);
++    }
++
+     /// Idles until `t`, the daemon deadline `t_daemon` or the earliest arrival.
+     pub async fn next_event(&mut self, t: f64, t_daemon: f64) -> Result<Grant, ClockError> {
+         let (t, t_daemon) = (time_out(t)?, time_out(t_daemon)?);
+@@ -150,6 +184,7 @@
+         let body = message.to_string().into_bytes();
+         let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+         frame.extend(body);
++        self.trace.stamp("S");
+         Ok(self.stream.write_all(&frame).await?)
+     }
+ 
+@@ -161,6 +196,7 @@
+         }
+         let mut body = vec![0; size as usize];
+         self.stream.read_exact(&mut body).await?;
++        self.trace.stamp("R");
+         // serde_json may read a 17-digit number as a neighbouring f64, and a time
+         // must come back exactly, so numbers are read as text.
+         let message: Value = serde_json::from_slice(&quote_numbers(&body)).map_err(|e| {
+--- a/atom/mesh/src/compass_router.rs
++++ b/atom/mesh/src/compass_router.rs
+@@ -270,7 +270,10 @@
+                     at = message.arrival;
+                 }
+                 determinism::set_now(message.arrival);
++                // W, H, D: the message looked for, found at its hold point, handled.
++                client.stamp("W");
+                 let take = self.taken(&message.channel, message.seq).await;
++                client.stamp("H");
+                 let (back, done) = oneshot::channel();
+                 let _ = take.send(Turn {
+                     arrival: message.arrival,
+@@ -281,6 +284,7 @@
+                 client = done
+                     .await
+                     .unwrap_or_else(|_| fail("a turn ended holding the clock"));
++                client.stamp("D");
+             }
+             if grant.time == f64::INFINITY {
+                 return Ok(());
