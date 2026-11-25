@@ -44,6 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from capabilities import capability
 from test_pd_slice import PD
 from test_vertical_slice import CONSTANT, TREE, _retry, _run_file
 
@@ -414,6 +415,7 @@ def runs(atomesh, tmp_path_factory):
     }
 
 
+@capability("router_lp")
 def test_both_runs_meet_every_scenario_check(runs):
     failed = check_run(list(runs))
     assert not failed, "\n".join(failed)

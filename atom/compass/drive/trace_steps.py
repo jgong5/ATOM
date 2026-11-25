@@ -6,11 +6,11 @@ published as one `shape_population` when it stops.
         --store S --out D -- <ATOM args>
 
 `runfile` builds the run file from `run`'s flags, the platform and the backend,
-exactly one with no default, and `serve` starts the server simulated from it
-with the step record on; it serves whatever client runs reach it until the
-command is stopped, and `--out` holds what `serve` writes. Only shapes are
-read, so any traces may drive it. A prefill or a decode instance refuses: it
-shares a clock with its peer, which one invocation does not start.
+exactly one, or the step roofline alone, with no default, and `serve` starts the
+server simulated from it with the step record on; it serves whatever client runs
+reach it until the command is stopped, and `--out` holds what `serve` writes.
+Only shapes are read, so any traces may drive it. A prefill or a decode instance
+refuses: it shares a clock with its peer, which one invocation does not start.
 
 At the stop, the store gets one `shape_population` at `Topology(dp=D)`, D the
 run file's ``data_parallel_size``, with these members per DP rank: ``steps``

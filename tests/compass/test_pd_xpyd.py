@@ -34,6 +34,7 @@ from types import SimpleNamespace
 
 import pytest
 import test_dp_slice
+from capabilities import capability
 from test_dp_slice import DP_MACHINE, MAX_TOKENS
 from test_kv_remote_prefill import Script, connector
 from test_kv_simulated_connector import PEAKS, geometry, model_for  # noqa: F401
@@ -406,6 +407,7 @@ def scripted_runs(atomesh, tmp_path_factory):  # noqa: F811
     }
 
 
+@capability("router_lp")
 def test_2p2d_through_atomesh_meets_every_scenario_check(scripted_runs):
     failed = check_run(list(scripted_runs))
     assert not failed, "\n".join(failed)
@@ -546,6 +548,7 @@ def _every_check_with_requests_on_every_deployment(runs) -> list[str]:
 
 
 @NEEDS_A_PD_RUN
+@capability("pd_xpyd")
 def test_2p2d_meets_every_scenario_check_with_requests_on_every_deployment(
     xpyd_runs,
 ):
@@ -588,6 +591,7 @@ def recipe_runs(tmp_path_factory):
 
 
 @NEEDS_A_RECIPE_RUN
+@capability("pd_xpyd")
 def test_2p2d_at_dp2_behind_the_recipe_s_router_meets_every_scenario_check(
     recipe_runs,
 ):

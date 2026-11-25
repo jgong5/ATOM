@@ -40,6 +40,7 @@ from pathlib import Path
 
 import pytest
 import test_dp_slice
+from capabilities import capability
 from test_dp_slice import DP_MACHINE
 from test_lmcache_mp_scenario import Workload
 from test_pd_dp import RouterLpRequests
@@ -312,6 +313,7 @@ def named_result(run: dict) -> dict:
 
 
 @NEEDS_A_STORE_RUN
+@capability("mooncake_store")
 def test_both_seeds_meet_every_scenario_check(store_runs):
     run = store_runs[0]
     records = {
