@@ -702,11 +702,13 @@ def test_due_waits_resolve_in_the_order_asked_and_a_withdrawn_one_asks_nothing(
     assert order == ["4.0", "3.0"] and calls == [7.0] and left == {}
 
 
-def test_the_hold_s_look_finds_the_tasks_asyncio_all_tasks_finds():
-    """`_look` reads the loop's tasks in one pass; what it returns is what the
-    same look over `asyncio.all_tasks` returns: the ready tasks, those not
-    done, and whether one it saw last time has ended."""
-    from compass_harness.traffic_lp import _look
+def test_the_hold_s_look_finds_what_a_look_over_asyncio_all_tasks_finds():
+    """The hold's look keeps each task as its last read found it; at every look
+    it returns what a look over `asyncio.all_tasks` returns: the ready tasks
+    and whether one it saw last time has ended. Tasks park on events and wake,
+    one parks again on another event, one is cancelled, one is created ready
+    and yields once before it ends."""
+    from compass_harness.traffic_lp import _LoopTasks
 
     def reference(alive):
         me = asyncio.current_task()
@@ -714,29 +716,107 @@ def test_the_hold_s_look_finds_the_tasks_asyncio_all_tasks_finds():
         ready = sorted(
             t.get_name() for t in tasks if t._fut_waiter is None or t._fut_waiter.done()
         )
-        return ready, tasks, alive is None or any(t.done() for t in alive)
+        return (ready, any(t.done() for t in alive)), tasks
+
+    async def twice(first, then):
+        await first.wait()
+        await then.wait()
 
     async def main():
-        gate = asyncio.Event()
-        blocked = [asyncio.ensure_future(gate.wait()) for _ in range(50)]
+        loop_tasks = _LoopTasks(asyncio.get_running_loop())
+        gates = [asyncio.Event() for _ in range(50)]
+        blocked = [asyncio.ensure_future(gate.wait()) for gate in gates]
+        first, then = asyncio.Event(), asyncio.Event()
+        again = asyncio.ensure_future(twice(first, then))
         await asyncio.sleep(0)
-        looks = []
-        ready, alive, ended = _look(None)
-        looks.append(((sorted(ready), alive, ended), reference(None)))
+        looks, alive = [], set()
+
+        def look():
+            nonlocal alive
+            ready, ended = loop_tasks.look()
+            theirs, alive = reference(alive)
+            looks.append(((sorted(ready), ended), theirs))
+
+        look()
         blocked[3].cancel()  # ends at its next step
+        gates[7].set()  # its wakeup is queued
+        first.set()  # `again` wakes, then parks on `then`
         fresh = asyncio.ensure_future(asyncio.sleep(0))  # ready, not yet run
-        ready, now_alive, ended = _look(alive)
-        looks.append(((sorted(ready), now_alive, ended), reference(alive)))
+        look()
         await asyncio.sleep(0)
-        ready, later, ended = _look(now_alive)
-        looks.append(((sorted(ready), later, ended), reference(now_alive)))
-        gate.set()
-        await asyncio.gather(*blocked, fresh, return_exceptions=True)
+        look()
+        await asyncio.sleep(0)
+        look()
+        then.set()
+        look()
+        for gate in gates:
+            gate.set()
+        await asyncio.gather(*blocked, again, fresh, return_exceptions=True)
+        look()
+        loop_tasks.close()
         return looks
 
     looks = _run(main())
     assert [ours for ours, _ in looks] == [theirs for _, theirs in looks]
-    assert looks[1][0][2] is False and looks[2][0][2] is True  # the cancel ended one
+    assert [ended for (_, ended), _ in looks] == [False, False, True, True, False, True]
+
+
+def test_a_task_parked_on_a_pending_future_is_read_once_whatever_the_clock_calls(
+    tmp_path,
+):
+    """Hundreds of aiperf's tasks wait on futures nothing completes while a
+    pacer waits on the clock twenty times: the hold reads each parked task at
+    the look after it parked and never again, so a look costs what changed
+    since the last one, not every task on the loop."""
+    parked, calls = 500, 20
+    reads = {}
+
+    class Counted(asyncio.Task):
+        @property
+        def _fut_waiter(self):
+            reads[self] = reads.get(self, 0) + 1
+            return asyncio.Task._fut_waiter.__get__(self)
+
+    async def main():
+        asyncio.get_running_loop().set_task_factory(
+            lambda loop, coro, **kwargs: Counted(coro, loop=loop, **kwargs)
+        )
+        never = asyncio.Event()
+        waiting = [asyncio.ensure_future(never.wait()) for _ in range(parked)]
+        await asyncio.sleep(0)
+        rt = ScriptedRuntime([])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+
+        async def pacer():
+            for t in range(1, calls + 1):
+                await traffic.wait(float(t))
+            traffic.finish()
+
+        await asyncio.wait_for(asyncio.gather(pacer(), traffic.done), 5)
+        for task in waiting:
+            task.cancel()
+        return [reads.get(task, 0) for task in waiting], rt.calls
+
+    read, asked = _run(main())
+    assert asked == [float(t) for t in range(1, calls + 1)] + [INF]
+    assert set(read) == {1}
+
+
+def test_a_task_factory_set_after_the_traffic_lp_s_fails_the_hold_by_name(tmp_path):
+    """The hold sees a new task through the task factory the traffic LP sets on
+    its loop; a factory set after it would hide new tasks from the hold, so the
+    hold's next look fails the run instead of asking for time."""
+
+    async def main():
+        rt = ScriptedRuntime([])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        asyncio.get_running_loop().set_task_factory(None)
+        traffic.wait(1.0)
+        with pytest.raises(RuntimeError, match="task factory was replaced"):
+            await asyncio.wait_for(traffic.done, 5)
+        return rt.calls
+
+    assert _run(main()) == []
 
 
 def test_a_task_ending_while_the_hold_waits_on_a_return_has_its_callbacks_run_first(
