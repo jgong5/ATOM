@@ -270,6 +270,7 @@ def _indexed(monkeypatch, model, index, arch, backend="opus", machine=True):
     monkeypatch.setitem(sys.modules, "aiter.ops.opus.pa_mqa_logits_mxfp4", mqa)
     config = _config()
     config.hf_config, config.index_cache_dtype = model, index
+    config.index_cache_layout = None  # no --index-cache-layout requested
     Config._resolve_index_cache_layout(config)
     return config, mqa, card
 
