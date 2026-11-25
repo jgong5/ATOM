@@ -1,10 +1,11 @@
 #!/bin/bash
-# The 8P16D C1228 recipe sim as m8/sims/c307_canon ran it, with #3996 and #3997, its clock frames stamped (#4029).
+# The 8P16D C1228 recipe sim as m8/sims/c307_canon ran it, with #3996, #3997 and #4004, clock frames stamped (#4029).
 #   host:          run.sh prep DIR                         DIR/ATOM: the tree measured
 #   CPU container: run.sh sim DIR/ATOM OUT [DURATION] [WARMUP_PER_LANE]
 # prep copies c307_canon's tree (m8.conf's a5691dd27: the c307 laws hold only under its `atom_digest`), applies
-# #3996 and #3997 as landed (their atom/ and compass_harness/ diffs, which `atom_digest` leaves out) and
-# frames.patch. sim is yajizhan's m8/sim_8p16d.sh on pit2-p03-g27 (m8.conf, env.sh, laws_c307.env, the recipe's
+# the integration branch's sim-speed changes #3996, #3997 and #4004 as landed (their atom/ and compass_harness/
+# diffs, which `atom_digest` leaves out) and frames.patch. The branch's whole compass tree does not run on
+# a5691dd27's engine, and the branch's engine does not run the c307 laws. sim is yajizhan's m8/sim_8p16d.sh on pit2-p03-g27 (m8.conf, env.sh, laws_c307.env, the recipe's
 # client) with that tree and OUT as the run, plus every frame into OUT.frames/<pid>.trace (COMPASS_TRACE_DIR) and
 # the Clock Authority's wall profile into OUT.caprof.jsonl (COMPASS_CA_PROFILE). DURATION 900 s and
 # WARMUP_PER_LANE 10 are the recipe's. Writes OUT.log, OUT.deploy.log and OUT.client.log beside OUT.
@@ -15,11 +16,11 @@ prep)
   DIR=${2:?DIR}; BASE=/var/tmp/yajizhan_cellb/tree/a5691dd27/ATOM; REPO=$HERE/../..
   [ -e "$DIR" ] && { echo "refused: $DIR exists"; exit 1; }
   mkdir -p "$DIR/ATOM" && tar -C "$BASE" -cf - --exclude=./atom/mesh/target --exclude=__pycache__ . | tar -C "$DIR/ATOM" -xf - || exit 1
-  for c in c15b9a02b 3f41a31fe; do  # #3996, #3997
+  for c in c15b9a02b 3f41a31fe d1c5fddf9; do  # #3996, #3997, #4004
     git -C "$REPO" diff "$c^1" "$c" -- atom compass_harness | patch -s -d "$DIR/ATOM" -p1 || exit 1
   done
   patch -s -d "$DIR/ATOM" -p1 < "$HERE/frames.patch" || exit 1
-  echo "a5691dd27 + #3996 c15b9a02b + #3997 3f41a31fe + frames.patch" > "$DIR/ATOM/MEASURED"
+  echo "a5691dd27 + #3996 c15b9a02b + #3997 3f41a31fe + #4004 d1c5fddf9 + frames.patch" > "$DIR/ATOM/MEASURED"
   ;;
 sim)
   TREE=${2:?TREE}; DEP=${3:?OUT}; DUR=${4:-900}; WPL=${5:-10}

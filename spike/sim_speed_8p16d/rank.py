@@ -33,6 +33,8 @@ COMPONENTS = [
     ("response encoding (SSE, JSON dumps)", r"^(dumps|JSONEncoder\.\w+|iterencode) |model_dump|serializ|stream_gen"),
     ("request parsing (JSON loads, pydantic)", r"^(loads|JSONDecoder\.\w+) |validate_python|TypeAdapter|pydantic"),
     ("traffic LP scans (traffic_lp.py)", r"traffic_lp\.py"),
+    ("Store LP settle (StationLP._settle)", r"StationLP\._settle"),
+    ("Store master and stations", r"mooncake_store_server\.py|lmcache_server\.py"),
     ("scheduling", r"scheduler\.py|block_manager|prefill_delayer|prefix_cach"),
     ("pricing (step and host laws)", r"compass/backends/|step_linear|host_law|step_grid"),
     ("request and sequence processing", r"sequence\.py|llm_engine\.py|io_processor|preprocess"),
@@ -132,17 +134,22 @@ for k in range(n):
     cur_t, cur = next((t, name) for t, is_a, name in reversed(ca) if not is_a)
     while cur_t > start:
         g = group(cur)
-        if cur in S:  # sent at s after receiving at r the reply the CA wrote at a
+        if cur in S:  # sent at s after receiving at r the reply to its request sent at s0, written at a
             s = latest(S[cur], cur_t)
             r = latest(R[cur], s) if s is not None else None
-            a = latest(Aat[cur], r) if r is not None else None
-            if a is None:
+            s0 = latest(S[cur], r) if r is not None else None
+            # the reply's stamp follows its write, so r may precede a: take the first reply after s0
+            i = bisect.bisect_left(Aat[cur], s0) if s0 is not None else len(Aat[cur])
+            if i == len(Aat[cur]):
+                break
+            a = Aat[cur][i]
+            if a > s and (a := latest(Aat[cur], r)) is None:
                 break
             queued = busy(cur_t) - busy(s)
             here[(g, "CA queueing")] += queued
             here[(g, "transport to CA")] += cur_t - s - queued
-            here[(g, "transport from CA")] += r - a
-            here[(g, "own work")] += s - r
+            here[(g, "transport from CA")] += max(r - a, 0.0)
+            here[(g, "own work")] += s - max(r, a)
         else:
             if (a := latest(Aat[cur], cur_t)) is None:
                 break
