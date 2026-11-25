@@ -1305,6 +1305,37 @@ def engram_tables_unread() -> None:
         prepare.from_checkpoint = classmethod(lambda cls, *a: None)
 
 
+def stacked_experts_unloaded_on_meta() -> None:
+    """Make Qwen3.8's stacked-expert loaders install nothing on a meta MoE, for
+    the life of the worker process.
+
+    Qwen3.8-Flash-Next's sparse MoE block wraps its experts' weight loaders
+    as it builds (`install_stacked_expert_loaders`), and under expert
+    parallelism first reads this rank's expert range off the MoE's
+    `expert_map` with `torch.nonzero`, which a meta map cannot answer. The
+    loaders only read a checkpoint, which a simulated start never does, and
+    they change no parameter; ATOM's `determine_expert_map` hands every rank
+    a contiguous range, so the range check they make passes on any start. On
+    a meta map nothing is installed; on any other the installer runs as
+    ATOM's. The drafter's MoE builds after the target, so the patch stays for
+    the process, as `drafts_on_meta`'s. Without the model's module loaded
+    nothing is patched.
+    """
+    model = sys.modules.get("atom.models.qwen4_exp")
+    install = getattr(model, "install_stacked_expert_loaders", None)
+    if install is None or hasattr(install, "__wrapped__"):
+        return
+
+    @wraps(install)
+    def installed(experts):
+        expert_map = getattr(experts, "expert_map", None)
+        if expert_map is not None and expert_map.is_meta:
+            return None
+        return install(experts)
+
+    model.install_stacked_expert_loaders = installed
+
+
 class UnbuiltModel(torch.nn.Module):
     """Stands in for the model a non-allocating runner never loads.
 
@@ -1765,6 +1796,7 @@ class NonAllocatingRunner(
                 )
             drafts_on_meta()
         engram_tables_unread()
+        stacked_experts_unloaded_on_meta()
         with FactoriesOnMeta(), simulated_arch(), ple_table_placed_on_device():
             self.model.tree = model_class(self.config)
             process_weights_after_loading(self.model.tree)
