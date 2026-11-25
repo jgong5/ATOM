@@ -7,13 +7,16 @@
 # #3996 + #3997 + #4004 + frames.patch. prep copies it to DIR/ATOM, applies router_frames.patch there, and commits the
 # patch on a5691dd27 in DIR/mesh, with a fixed author and date, so the commit is the same wherever it is made. The
 # router LP refuses a binary whose commit is not its tree's, so DIR/ATOM's .compass-commit names that commit;
-# nothing else in a simulated run reads it, and `atom_digest`, which the c307 laws check, reads no Rust. build
-# builds the router there, on CPUs 0-63. sim is #4029's sim with that router: every Python LP's clock frame and
+# nothing else in a simulated run reads it, and `atom_digest`, which the c307 laws check, reads no Rust. prep takes
+# the Cargo.lock of the router m8.conf names, which run 2 and the lane bases ran; build builds the router there, on
+# CPUs 0-63, and refuses it unless its crates are that router's. sim is #4029's sim with it: every Python LP's clock frame and
 # the router's, into OUT.frames/<pid>.trace; the router also stamps each released message it looks for (W), finds
 # at its hold point (H) and has handled (D). rank.py OUT [SLICE_S] ranks the run, the router's share split.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 BASE_COMMIT=a5691dd273f17e96a6d8f05843683478262d8b9f
+M8=/var/tmp/yajizhan_cellb/g27/m8/m8.conf
+BASE_ROUTER=$(. $M8 && echo "$CELLB_ATOMESH")  # the router run 2 and the lane bases ran
 case ${1:-} in
 prep)
   DIR=${2:?DIR}; BASE=${3:-/var/tmp/xingjche_simspeed/tree/m4029b/ATOM}
@@ -24,7 +27,7 @@ prep)
     git -C "$DIR/mesh" checkout -q FETCH_HEAD && git -C "$DIR/mesh" apply "$HERE/router_frames.patch" || exit 1
   GIT_AUTHOR_DATE=2026-11-25T00:00:00Z GIT_COMMITTER_DATE=2026-11-25T00:00:00Z git -C "$DIR/mesh" \
     -c user.name=spike-4117 -c user.email=spike-4117@invalid commit -q -am "router_frames.patch (#4117)" || exit 1
-  cp "$BASE/atom/mesh/Cargo.lock" "$DIR/mesh/atom/mesh/" || exit 1  # the crate versions c307_canon's router ran
+  cp "${BASE_ROUTER%/target/release/atomesh}/Cargo.lock" "$DIR/mesh/atom/mesh/" || exit 1
   patch -s -d "$DIR/ATOM" -p1 < "$HERE/router_frames.patch" || exit 1
   git -C "$DIR/mesh" rev-parse HEAD > "$DIR/ATOM/.compass-commit"
   sed -i "s/\$/ + router_frames.patch (router commit $(git -C "$DIR/mesh" rev-parse --short HEAD))/" "$DIR/ATOM/MEASURED"
@@ -35,12 +38,15 @@ build)
   cd "$DIR/mesh/atom/mesh" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' \
     taskset -c 0-63 cargo build --release --locked -j 32 || exit 1
   target/release/atomesh --version-verbose | grep -E 'Git (Commit|Status)'
+  crates() { strings "$1" | grep -oE 'index\.crates\.io-[0-9a-f]+/[A-Za-z0-9_-]+-[0-9][0-9A-Za-z.+-]*' | sort -u; }
+  diff <(crates "$BASE_ROUTER") <(crates target/release/atomesh) || { echo "refused: crates differ from $BASE_ROUTER's"; exit 1; }
+  echo "crates: $(crates target/release/atomesh | wc -l), each as $BASE_ROUTER has it"
   ;;
 sim)
   DIR=${2:?DIR}; DEP=${3:?OUT}; DUR=${4:-900}; WPL=${5:-10}
   ROUTER=$DIR/mesh/atom/mesh/target/release/atomesh
   [ -x "$ROUTER" ] || { echo "refused: no $ROUTER; run.sh build $DIR"; exit 1; }
-  . /var/tmp/yajizhan_cellb/g27/m8/m8.conf
+  . $M8
   export CELLB_TREE=$DIR/ATOM
   source /var/tmp/yajizhan_cellb/g27/env.sh
   export ATOMESH=$ROUTER
@@ -78,5 +84,5 @@ sim)
   log "EXIT client=$rc deploy=$drc"
   [ $rc = 0 ] && [ $drc = 0 ]
   ;;
-*) sed -n '2,4p' "$0"; exit 2 ;;
+*) sed -n '2,5p' "$0"; exit 2 ;;
 esac

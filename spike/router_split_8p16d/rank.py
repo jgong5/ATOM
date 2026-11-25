@@ -237,6 +237,13 @@ for g in sorted(messages):
     for (h, part), v in acc.most_common():
         if h == g:
             print(f"| {part} | {v:.0f} | {100 * v / walked:.1f}% | {1e6 * v / hops[g]:.0f} |")
+    print(f"\n## {g}'s walked time besides CA serve, by slice: own work / HTTP in / CA queueing and transport\n")
+    print("| slice | own work | HTTP in | CA queueing and transport |\n|---|---|---|---|")
+    for k, here in [*enumerate(per_slice), ("window", acc)]:
+        part = {p: v for (h, p), v in here.items() if h == g and p != "CA serve"}
+        mine, own = sum(part.values()), sum(v for p, v in part.items() if p.startswith("own work"))
+        http = sum(v for p, v in part.items() if p.startswith("HTTP in"))
+        print(f"| {k} | {own / mine:.3f} | {http / mine:.3f} | {(mine - own - http) / mine:.3f} |")
 print("\n## Stack samples by LP group (all threads; waiting samples left out of the split)\n")
 for g, c in sorted(samples.items()):
     tot = sum(c.values())
