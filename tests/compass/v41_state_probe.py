@@ -34,6 +34,8 @@ import numpy as np
 BLOCK, DRAFTS = 32, 5
 #: The compressor that owns layer 1's pool rows, at ratio 2.
 OWNER = 1
+#: V4.1's attention over its FP8 planes.
+V41_FP8 = "aiter.mla_sparse_prefill_v41.default"
 
 
 def cache_of(drafts=DRAFTS, kv="bf16"):
@@ -127,9 +129,10 @@ def ops_placements(
     pool view's name and offset from ATOM's on the bench, or refusal and None.
     With `tail`, the step publishes a bounded replay's tail `tail` rows wide,
     each request's window starting at its first row (`_publish_decoder`).
-    At `kv` fp8, each pool view is taken as its values and scales, `_scale`,
-    as `fp8_attention._split` passes them: the main pool's owner's planes and
-    the ring's (`main_view`, `ring_view`)."""
+    At `kv` fp8, the leaf is the attention ATOM calls on its FP8 planes,
+    `mla_sparse_prefill_v41`: the pool, its owner's planes at `ratio` and none
+    at ratio 0 (`main_view`), and the ring's (`ring_view`), each its data and
+    its scales as `fp8_attention._split` types them, by aiter's slots."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -147,7 +150,8 @@ def ops_placements(
     point = point or decode(2)
     tokens = point.tokens * (1 + drafts if point.phase == "decode" else 1)
     built = assembled(cache_of(drafts, kv), point.seqs, tokens)
-    split = {"fp8": lambda f, t: zip((f, f"{f}_scale"), _split(t, 512))}
+    named = {"pool": ("unified_kv", "unified_kv_scale"), "ring": ("kv", "kv_scale")}
+    split = {"fp8": lambda f, t: zip(named[f], _split(t, 512))}
     split = split.get(kv, lambda f, t: [(f, t)])
 
     class Runner(OpsRunner):
@@ -197,19 +201,21 @@ def ops_placements(
             )
 
             capture = PagedAttentionCache(cache.geometry, 4, slots, "cpu")
-            states = [("pool", capture.main_view(OWNER))]
+            states = [("pool", capture.main_view(OWNER if ratio else None))]
             states += [("ring", capture.ring_view(1))] if pool == "ring" else []
             states = [v for f, t in states for v in split(f, t)]
         dtyped = [(f, _t(t.shape, "kv", t.stride(), str(t.dtype))) for f, t in states]
         query = query or tokens
-        leaf = _leaf("v41.states", ("kv", _t([query, 4], "activation")), *dtyped)
+        # at FP8, the attention ATOM calls on its planes, by its slots
+        op, act = ("v41.states", "kv") if kv != "fp8" else (V41_FP8, "q")
+        leaf = _leaf(op, (act, _t([query, 4], "activation")), *dtyped)
         if pool in ("ring", "prefix"):  # two rows' blocks hold 32 rows at ratio 2
             runner.config.kv_cache_block_size = BLOCK
             top = ("index_topk", 1 if ratio else None)
             stated = ("window_size", 8), ("compress_ratio", ratio), top
             leaf = dataclasses.replace(leaf, stated=stated)
         # two rows' slots, every layer of each
-        read = sum(2 * t.select(int(whole), 0).nbytes for _, t in states)
+        read = sum(2 * t.select(int(whole), 0).nbytes for _, t in states if t.numel())
         if pool == "whole":  # and the ring's window, as the ring's writers take it
             window = cache.geometry.window(1, 4)
             cls = f"{type(window).__module__}:{type(window).__name__}"
@@ -232,7 +238,8 @@ def ops_placements(
         replay.seat_states = real
     kept = {"slots": runner.batches, "refused": refused, "got": got}
     if pool:
-        atom = {"pool": built.cache.main_view(OWNER), "ring": built.cache.ring_view(1)}
+        atom = {"pool": built.cache.main_view(OWNER if ratio else None)}
+        atom |= {"ring": built.cache.ring_view(1)}
         atom = dict(v for f, t in atom.items() for v in split(f, t))
         kept["bound"] = {
             p: [n, v if v is None else v.data_ptr() - atom[p].data_ptr()]
