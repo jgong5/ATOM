@@ -151,7 +151,11 @@ def test_a_pp4_prefill_s_store_logs_give_its_per_rank_fields_and_laws(
     import json
 
     from test_mooncake_store_fit import CAPACITY, FLAGS, START, copy, lookups
-    from test_mooncake_store_fit import started as started_line  # noqa: F401
+    from test_mooncake_store_fit import logged
+
+    def started_line(values):
+        return logged("Mooncake Store offload worker", values)
+
 
     from atom.compass.backends.step_linear_fit import offload_main
 

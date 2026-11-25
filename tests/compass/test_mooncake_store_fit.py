@@ -21,7 +21,14 @@ import pytest
 from atom.compass.backends.step_linear_fit import offload_main
 from atom.kv_transfer.offload.mooncake_store import scheduler as store_scheduler
 
-WORKER = Path(store_scheduler.__file__).with_name("worker.py")
+# The Store worker's log calls: kv_store's where the tree split the Store into
+# kv_store and mooncake_store (the 1P2D repro), else mooncake_store's own.
+_KV_STORE_WORKER = Path(store_scheduler.__file__).parents[1] / "kv_store" / "worker.py"
+WORKER = (
+    _KV_STORE_WORKER
+    if _KV_STORE_WORKER.exists()
+    else Path(store_scheduler.__file__).with_name("worker.py")
+)
 CHUNKED = Path(store_scheduler.__file__).parents[1] / "chunked_scheduler.py"
 FLAGS = (
     "--rpc_thread_num=32 --default_kv_lease_ttl=10000 "
@@ -61,18 +68,41 @@ MATCHED = {
 FIXED_MS, PER_KEY_MS = 0.30, 0.02
 
 
+#: The Store worker's start line where kv_store logs it for every Store: its
+#: label and endpoint as `%s` (`LABEL`, `_endpoint_log`), a draft window's
+#: chunk bytes last (`%s`, empty without one), as Mooncake's worker writes them.
+LABELLED = {
+    "%s worker rank=": "Mooncake Store offload worker rank=",
+    "namespace=%s %s ": "namespace=%s nic=%s master=%s ",
+}
+
+
 def logged(start: str, values, source: Path = WORKER) -> str:
     """The line `source`'s logger call whose format starts `start` writes for
     `values`."""
-    [fmt] = [
-        node.args[0].value
+    def head(arg):
+        # A format whose tail a call appends (`"..." + self._draft_prof(...)`,
+        # empty without a draft window) is its constant head.
+        while isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Add):
+            arg = arg.left
+        return arg.value if isinstance(arg, ast.Constant) else None
+
+    formats = [
+        fmt
         for node in ast.walk(ast.parse(source.read_text()))
         if isinstance(node, ast.Call)
         and getattr(node.func, "attr", None) in ("info", "debug")
         and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and str(node.args[0].value).startswith(start)
+        and (fmt := head(node.args[0])) is not None
     ]
+    if not any(str(f).startswith(start) for f in formats):
+        labelled = []
+        for f in formats:
+            for a, b in LABELLED.items():
+                f = str(f).replace(a, b)
+            labelled.append(f.removesuffix("%s"))
+        formats = labelled
+    [fmt] = [f for f in formats if str(f).startswith(start)]
     names = re.findall(r"(\w+)=%", fmt)
     return "[atom 12:00:00] " + fmt % tuple(values[name] for name in names)
 
