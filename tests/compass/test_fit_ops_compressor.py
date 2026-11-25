@@ -64,33 +64,46 @@ def test_a_compressor_s_alternating_points_fit_one_line_each_way(context):
 
 
 def test_a_step_completing_an_entry_on_a_row_short_of_its_longest_prices_so():
-    # The longest row ends 3 past a multiple of 4 and completes none; the
-    # other ends 1 past one, so the step runs the entry's attention.
-    step = BatchView((RequestShape(2, 1003, True), RequestShape(2, 801, True)))
+    # The longest row, at 1007 unmeasured, ends 3 past a multiple of 4 and
+    # completes none; the other ends 1 past one, so the step runs the entry's
+    # attention.
+    rows = (2, 1007), (2, 801)
+    step = BatchView(tuple(RequestShape(q, c, True) for q, c in rows))
 
     got = _priced(
         MEASURED, step, lambda draft, _: {"seq": []} if draft else _compressor(4), 1
     )
 
-    assert got == {f"op.{OP}.price_list": pytest.approx(_ns([(2, 1004)], 1003) * 1e-9)}
+    assert got == {f"op.{OP}.price_list": pytest.approx(_ns(rows, 1007) * 1e-9)}
+
+
+def _lines(bend, q):
+    """A compressor's family on one row of `q` query tokens: its completing
+    line bends at `bend`; the other is straight and reaches neither 1000 nor
+    1400."""
+    times = {1000: 6000, bend: 7000, 1400: 6200, 1101: 1600, 1201: 1620, 1301: 1640}
+    records = [_point(c, b=1, q=q) | {"cold_ns": ns} for c, ns in times.items()]
+    return bench_ops._families(records, bench_ops._dependent(records))
 
 
 def test_a_plan_halves_each_line_of_a_compressor_on_it_and_reaches_its_ends():
-    # One row verifying a draft: an entry completes at contexts 0 or 3 past a
-    # multiple of 4. The completing line bends at 1203; the other is straight
-    # and reaches neither 1000 nor 1400.
-    times = {1000: 6000, 1203: 7000, 1400: 6200, 1101: 1600, 1201: 1620, 1301: 1640}
-    records = [_point(c, b=1) | {"cold_ns": ns} for c, ns in times.items()]
-    families = bench_ops._families(records, bench_ops._dependent(records))
-
-    want = bench_ops._densify(families, set(), drafts=1)
+    # No drafter: an entry completes at a multiple of 4.
+    want = bench_ops._densify(_lines(1204, 1), set())
 
     assert {at: len(fams) for at, fams in want.items()} == {
-        (decode(1), 1100): 1,  # 1101 halfway completes none; 1100 does
-        (decode(1), 1300): 1,  # 1301 halfway completes none; 1300 does
+        (decode(1), 1100): 1,  # 1102 halfway completes none; 1100 does
+        (decode(1), 1300): 1,  # so 1302 and 1300
         (decode(1), 1001): 1,  # the other line's nearest to 1000
-        (decode(1), 1398): 1,  # and to 1400
+        (decode(1), 1399): 1,  # and to 1400
     }
+
+
+def test_a_plan_reads_a_drafted_row_s_line_past_the_draft_it_verifies():
+    # MTP1: the row holds its context and the draft, so an entry completes at
+    # contexts 0 or 3 past a multiple of 4.
+    want = bench_ops._densify(_lines(1203, 2), set(), drafts=1)
+
+    assert {context for _, context in want} == {1100, 1300, 1001, 1398}
 
 
 def test_coverage_prices_a_compressor_s_step_on_the_line_its_rows_hold(
