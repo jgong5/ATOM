@@ -690,3 +690,39 @@ def test_two_coverage_reports_at_one_law_key_print_one_calibration(
     assert printed.count(f"{lacking.CALIBRATE} ") == (0 if ended else 1)
     for line in held["S5-c1"]["made_by"]:
         assert f"S5 at concurrency 1, made by: {line}\n" in printed
+
+
+def test_a_coverage_report_s_command_runs_under_the_candidate_s_own_variables(
+    tmp_path, simulating, monkeypatch  # noqa: F811
+):
+    """b's one point a coverage report under the suite's law file, b under a
+    variable no law key states: its calibrate.sh command sets that variable."""
+    for name, text in (("server", SERVER), ("client", CLIENT)):
+        (tmp_path / name).write_text(text.format(python=sys.executable))
+        (tmp_path / name).chmod(0o755)
+    monkeypatch.setattr(check, "COMPASS", tmp_path / "server")
+    monkeypatch.setattr(simulate, "CLIENT", tmp_path / "client")
+    monkeypatch.setenv("STUB_DIR", str(tmp_path))
+    (tmp_path / "summaries.json").write_text(json.dumps({"*": COVERAGE}))
+    (tmp_path / "run_file.json").write_text(json.dumps({"machine": DOCUMENT}))
+    made(tmp_path / "made" / "b-c1", 1, summary=None)
+    flags = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
+    b = {"args": {"--max-num-seqs": 8}, "env": {"STUB_OWN": "1"}}
+    space = {
+        "model": str(tmp_path),
+        "machine": {"device": flags[1], "ptl": flags[3]},
+        "store": str(tmp_path / "store"),
+        "workload": {"traces": str(tmp_path / "traces.jsonl"), "select": "agentx"},
+        "slo": {},
+        "common": {"basis": "a recipe"},
+        "dimensions": {"config": {"b": b}},
+    }
+    space["workload"]["concurrency"] = [1]
+    (tmp_path / "space.json").write_text(json.dumps(space))
+
+    cli.main(["advice", str(tmp_path / "space.json"), str(tmp_path / "out")])
+
+    held = rows(json.loads((tmp_path / "out" / results.RESULTS).read_text()))
+    (command,) = held["b-c1"]["made_by"]
+    assert f" {lacking.CALIBRATE} " in command
+    assert "STUB_OWN=1" in shlex.split(command.split("\n")[0])

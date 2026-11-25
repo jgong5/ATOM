@@ -35,20 +35,35 @@ none, as a resume must take the store it started with; before one starts, into
 the shared store when the verdicts were judged there and it holds neither a
 step linear law of the configuration at the head's ATOM digest nor readings at
 their key, since it refuses a second publish at a key, else into the
-calibration's own; on a 1P1D side `deploy.sh record` and a fit of that side.
-Where an earlier candidate none of whose verdicts is refused calibrates a law
-at the same key, by model, platform and engine config, a candidate names that
-calibration in place of its own command, which the store would refuse as a
-second law at the key, with the command measuring its readings into the store
-that calibration publishes into, unless they are at their key there; into the
-calibration's own store, only once it has started, as a publish there before
-would leave its directory holding files, which `calibrate.sh` refuses.
+calibration's own. Where an earlier candidate none of whose verdicts is refused
+calibrates a law at the same key, by model, platform and engine config, a
+candidate names that calibration in place of its own command, which the store
+would refuse as a second law at the key, with the command measuring its
+readings into the store that calibration publishes into, unless they are at
+their key there; into the calibration's own store, only once it has started,
+as a publish there before would leave its directory holding files, which
+`calibrate.sh` refuses.
 A calibration that has ended records nothing more, so the next goes into a new
-directory; where it would take what the ended one took and the law it fitted is
-at the configuration's key at the head's ATOM digest (`_refits`), it would refit
-that law, and the verdict says so in place of a command, as does a later
-candidate's at that key, with the command measuring its readings into the store
-that law was published into, unless they are at their key there.
+directory; where a lone server's would take what the ended one took and the
+law it fitted is at the configuration's key at the head's ATOM digest
+(`_refits`), it would refit that law, and the verdict says so in place of a
+command, as does a later candidate's at that key, with the command measuring
+its readings into the store that law was published into, unless they are at
+their key there. A 1P1D point takes one `calibrate.sh` command, each
+record a `deploy.sh record` of both sides, fitting each side sent to calibrate
+but one it borrows so: its store is that of a side's lender, where that holds
+nothing the sides it fits would publish, and, when it is the lender's own,
+once the lender has started, each side it fits waiting until then; else, where
+it holds nothing the sides sent to calibrate would publish, the store the
+candidate is looked up in, when a lone server's calibration would take it or a
+side reuses a law there, as from a lender that has ended; else its own, into
+which it fits both sides, as that store holds neither. Once one has started,
+the command takes the store and the sides its `INPUTS` name, and a side they
+leave out that no earlier candidate's calibration makes gets why none fits it.
+A borrowed side whose readings key is its lender side's takes no readings
+command: the lender measures them. Where no command serves, as when the sides
+take more cards than one node holds, each side it would fit gets why, and the
+calibration lends no side.
 A readings verdict ``measure`` names the `compass measure memory` command,
 under the instance's variables, a 1P1D side's on the connector a real start of
 it takes; an offloading instance's with the candidate's lmcache server beside
@@ -101,10 +116,12 @@ from pathlib import Path
 from atom.compass import run as compass_run
 from atom.compass.artifacts import (
     ArtifactRefusal,
+    ArtifactStore,
     Kind,
     keyed_platform,
     machine_platform,
 )
+from atom.compass.artifacts.store import ENTRY_FILE
 from atom.compass.drive import lacking, reuse, runfile, serve
 from atom.compass.drive import run as drive_run
 from atom.compass.fit.device import compose
@@ -150,8 +167,24 @@ PENDING = (
     "its readings, into {}, once {}'s calibration in {} has started: compass "
     "advice then prints their command"
 )
+#: What stands for a 1P1D calibration's command into the store an earlier
+#: candidate's calibration publishes into, its own, until that one starts.
+WAITING = (
+    "its calibration, into {}, once {}'s calibration in {} has started: compass "
+    "advice then prints its command"
+)
+#: Why a 1P1D side sent to calibrate gets no command: the calibration started
+#: in its candidate's directory fits the other side alone, and no earlier
+#: candidate's calibration makes its law.
+UNFITTED = (
+    "no calibrate.sh command: the calibration started in {} fits {} alone, as "
+    "its inputs name, and no earlier candidate's calibration makes this side's "
+    "law; once it no longer runs, rename that directory in place, as compass "
+    "advice still reads its store, and run compass advice again"
+)
 #: The file a calibration writes its inputs to, in its directory: a line
-#: ``store <path>`` names the store it publishes into, when one was named.
+#: ``store <path>`` names the store it publishes into, when one was named, and
+#: on 1P1D a line ``fit <sides>`` the sides it fits.
 INPUTS = "inputs"
 #: A candidate's calibration directory after its first, in OUT's `CAL`, by
 #: its count from 2: no candidate's name holds a ``+``.
@@ -211,12 +244,12 @@ def check(expansion: dict, out: Path) -> dict:
             continue
         holding_law, reached = None, _reached(candidate, points)
         directory, ended = calibrating(out, candidate["name"])
+        made = directory, expansion["workload"]["traces"]
+        made += (expansion["store"], ended)
         for store in reuse.stores(expansion["store"], out):
             given = (machine["device"], store, machine["ptl"])
             given += (machine.get("stack"), machine.get("network"))
             spec = _or_refused(compose, *given)
-            made = directory, expansion["workload"]["traces"]
-            made += (expansion["store"], ended)
             judge = functools.partial(_judged, store, spec, head["atom"], seen, made)
             verdicts = {p["name"]: _point(p, judge) for p in reached}
             if isinstance(spec, dict):
@@ -230,7 +263,7 @@ def check(expansion: dict, out: Path) -> dict:
         else:
             store, verdicts = holding_law or (store, verdicts)
         judged[candidate["name"]] = {"store": str(store.root), "points": verdicts}
-        _borrowing(reached, judged[candidate["name"]], calibrations)
+        _borrowing(candidate, reached, judged[candidate["name"]], calibrations, made)
         new = lacking.readings_store(out / CAL / READINGS, head["atom"])
         _measuring(judged[candidate["name"]], new)
     written = {"head": head, "refused": refused, "candidates": judged}
@@ -608,32 +641,30 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     """The instance `one`'s law and readings verdicts in `store` on `machine`,
     a spec or the verdict its refusal gives, at the head's ATOM digest `atom`:
     each instance's config resolved once, under its variables, and judged once
-    a store, both kept in `seen`. A 1P1D `side` takes the KV transfer config
-    `deploy.sh` adds, on the simulated connector, and runs under its variables
-    over this process's ``AITER_LOG_LEVEL``, with those the script sets over
-    them (`drive_run.side_env`). `made` is the calibration's directory, traces
-    and the shared store a ``calibrate`` verdict's command takes, and the
-    directory of one that ended before it, or None, whose law a command
-    refitting it (`_refits`) gives way to `REFITS`; a
-    `calibrate.sh` command's verdict states, for `_borrowing`, its
-    ``calibration``: the ``key`` its law is published at, by model, platform
-    and engine config, its directory, ``in``, and the store it publishes
-    ``into``; one giving way to `REFITS`, the ended one's directory and the
-    store its law was published into, and that it ``refits``. An instance
-    holding a verdict as ``refused`` takes it for both; one holding a command
-    as ``beside`` gives it its readings' ``measuring``, to run beside the
+    a store, both kept in `seen`. A 1P1D `side` runs as `_side` gives it, on
+    the simulated connector. `made` is the calibration's directory, traces and
+    the shared store a ``calibrate`` verdict's command takes, and the directory
+    of one that ended before it, or None, whose law a command refitting it
+    (`_refits`) gives way to `REFITS`; a ``calibrate`` verdict states, for
+    `_borrowing`, its ``calibration``: the ``key`` its law is published at, by
+    model, platform and engine config, and on one server its directory,
+    ``in``, and the store it publishes ``into``; one giving way to `REFITS`,
+    the ended one's directory and the store its law was published into, and
+    that it ``refits``. A 1P1D side's law verdict states what the one command
+    of its deployment takes of it, ``side``: its `lacking.calibrate_inputs`,
+    where a calibration of it publishes (`_keys`), and the cards one node of
+    `machine` holds, ``node``; `seen` keeps nothing of one candidate's there,
+    as two candidates' deployments may run a side alike. An instance holding a
+    verdict as ``refused`` takes it for both; one holding a command as
+    ``beside`` gives it its readings' ``measuring``, to run beside the
     engine."""
     if isinstance(machine, dict):
         return machine, machine
     if "refused" in one:
         return one["refused"], one["refused"]
-    args, env = one["args"], one["env"]
-    if side in drive_run.ROLES:
-        args = _or_refused(drive_run.side_args, side, args, drive_run.SIMULATED)
-        if isinstance(args, dict):
-            return args, args
-        env = {"AITER_LOG_LEVEL": os.environ.get("AITER_LOG_LEVEL", "")} | env
-        env |= drive_run.side_env(env)
+    args, env = _side(side, one, drive_run.SIMULATED)
+    if isinstance(args, dict):
+        return args, args
     instance = (tuple(args), tuple(env.items()))
     if (store.root, *instance) not in seen:
         with _env(env):
@@ -645,28 +676,30 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
             else:
                 law = _or_refused(reuse.law, store, config, machine, args, atom)
                 readings = _or_refused(reuse.readings, store, config, machine, law)
-                if law["verdict"] == "calibrate" and side in drive_run.ROLES:
-                    fits = lacking.FITS.values()
-                    law["made_by"] = [
-                        lacking.SIDE_LAW.format(fit=f, side=side) for f in fits
-                    ]
-                elif law["verdict"] == "calibrate":
+                refused = "refused" in (law["verdict"], readings["verdict"])
+                if side in drive_run.ROLES and not refused:
+                    given = one["args"], config, one["env"]
+                    law["side"] = lacking.calibrate_inputs(*given)
+                    law["side"] |= _keys(config, machine, atom)
+                    law["side"]["node"] = machine.value("device.count_per_node")
+                if law["verdict"] == "calibrate":
+                    key = [config.model, machine_platform(machine), keyed(config)]
+                    law["calibration"] = {"key": key}
+                if law["verdict"] == "calibrate" and side not in drive_run.ROLES:
                     into = _publishing(store, made, law, readings)
                     with _env({"TRACES": made[1]}):
-                        command = lacking.calibration(made[0], args, config, into)
+                        given = made[0], args, config, into, one["env"]
+                        command = lacking.calibration(*given)
                         law["made_by"] = [command]
-                    key = [config.model, machine_platform(machine), keyed(config)]
                     into = str(into or made[0] / "store")
-                    law["calibration"] = {"key": key, "in": str(made[0]), "into": into}
+                    law["calibration"] |= {"in": str(made[0]), "into": into}
                     if (ended := made[3]) and _refits(ended, command, key, atom):
                         held = started_store(ended) or str(ended / "store")
                         law["made_by"] = [REFITS.format(ended, held)]
                         refitting = {"in": str(ended), "into": held, "refits": True}
                         law["calibration"] |= refitting
                 if readings["verdict"] != "refused":
-                    real = args
-                    if side in drive_run.ROLES:
-                        real = drive_run.side_args(side, one["args"], drive_run.REAL)
+                    real = _side(side, one, drive_run.REAL)[0]
                     readings["measuring"] = (
                         memory.key_of(config, machine),
                         real,
@@ -678,9 +711,50 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     return seen[(store.root, *instance)]
 
 
-def _borrowing(points: list, held: dict, calibrations: dict) -> None:
+def _side(side: str, one: dict, connector: str) -> tuple:
+    """The ATOM arguments and variables the instance `one` runs under, or the
+    verdict a refusal of its arguments gives, as both: on one server its own;
+    on a 1P1D `side`, with the KV transfer config `deploy.sh` adds, on
+    `connector`, and its variables over this process's ``AITER_LOG_LEVEL``,
+    with those the script sets over them (`drive_run.side_env`)."""
+    args, env = one["args"], one["env"]
+    if side in drive_run.ROLES:
+        args = _or_refused(drive_run.side_args, side, args, connector)
+        env = {"AITER_LOG_LEVEL": os.environ.get("AITER_LOG_LEVEL", "")} | env
+        env |= drive_run.side_env(env)
+    return args, env
+
+
+def _keys(config, machine, atom: str) -> dict:
+    """Where a calibration of `config` on `machine` publishes, in any store:
+    its readings' entry, as a ``readings`` path under the store; and its step
+    linear law's key at the head's ATOM digest `atom`, as the reuse check
+    finds one (`reuse.law`), by ``engine`` config and the ``law``'s other
+    fields."""
+    readings = memory.key_of(config, machine)
+    law = {"model": compass_run._file_digest(config.model, "config.json")}
+    law["source_root"] = compass_run.source_root(atom)
+    law |= keyed_platform(Kind.STEP_LINEAR_LAW, machine_platform(machine))
+    return {
+        "readings": str(Path(readings.kind.value, readings.dirname())),
+        "engine": keyed(config),
+        "law": law,
+    }
+
+
+def _holds(root, keys: dict) -> bool:
+    """Whether the store at `root` holds what a calibration publishing at
+    `keys` (`_keys`) would publish there, which it would refuse: readings at
+    their key, or a step linear law at its key at the head's ATOM digest."""
+    if _holds_readings(root, keys["readings"]):
+        return True
+    store, engine = ArtifactStore(Path(root)), keys["engine"]
+    return bool(reuse._keyed(store, Kind.STEP_LINEAR_LAW, engine, **keys["law"]))
+
+
+def _borrowing(candidate: dict, points: list, held: dict, calibrations: dict, made):
     """Take each ``calibration`` `_judged` states out of the law verdicts in
-    `held`, a candidate's at its `points`, and name, in place of a verdict's own
+    `held`, `candidate`'s at its `points`, and name, in place of a verdict's own
     `calibrate.sh` command, the calibration an earlier candidate's in
     `calibrations` makes at its key, since the store refuses a second law at a
     key: such a verdict is made by that calibration, or, where a new one would
@@ -688,29 +762,154 @@ def _borrowing(points: list, held: dict, calibrations: dict) -> None:
     measures this candidate's readings into the store it publishes into
     (`_readings_by`), unless they are at their key there. Each other
     calibration joins `calibrations`, unless a verdict of the candidate is
-    refused, whose state prints no command."""
+    refused, whose state prints no command. A 1P1D point's sides take one
+    command into `made`'s calibration directory (`_deploying`)."""
     refused = any(v["verdict"] == "refused" for v in _each(held["points"]))
     for point in points:
         verdicts = held["points"][point["name"]]
+        if candidate["deployment"] != "single":
+            _deploying(point, held, refused, calibrations, made)
+            continue
         for side, law in verdicts["law"].items():
             law = dict(law)
             if (mine := law.pop("calibration", None)) is None:
                 continue
             key = json.dumps(mine["key"], sort_keys=True)
-            made = calibrations.get(key, mine)
-            if made["in"] == mine["in"] and not refused:
+            lending = calibrations.get(key, mine)
+            if lending["in"] == mine["in"] and not refused:
                 calibrations[key] = mine
-            elif made["in"] != mine["in"]:
-                lender, into = Path(made["in"]), made["into"]
-                if made.get("refits"):
-                    law["made_by"] = [REFITS.format(lender, into)]
-                else:
-                    law["made_by"] = [BORROWED.format(_candidate(lender), lender, into)]
+            elif lending["in"] != mine["in"]:
+                lender, into = Path(lending["in"]), lending["into"]
+                law["made_by"] = [_lent(lending)]
                 there = Path(into) == Path(held["store"])
                 if verdicts["readings"][side]["verdict"] != "reuse" or not there:
                     one = point["instances"][side]
                     law["made_by"].append(_readings_by(lender, into, one))
             verdicts["law"][side] = law
+
+
+def _lent(lending: dict) -> str:
+    """What makes a law the calibration `lending`, an earlier candidate's in
+    `calibrations`, makes at its key: that calibration (`BORROWED`), or, where
+    a new one would refit the law it fitted, why none serves (`REFITS`)."""
+    lender, into = Path(lending["in"]), lending["into"]
+    if lending.get("refits"):
+        return REFITS.format(lender, into)
+    return BORROWED.format(_candidate(lender), lender, into)
+
+
+def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> None:
+    """Take each ``calibration`` and ``side`` `_judged` states out of the law
+    verdicts of the 1P1D `point` in `held`, and, unless a verdict of its
+    candidate is `refused`, name its one `calibrate.sh` command
+    (`lacking.deployment_calibration`) on each side sent to calibrate: into
+    the calibration directory `made` names and the store `_deployed` gives it,
+    fitting the sides `_deployed` picks. Each other side sent to calibrate is
+    borrowed, made by the calibration an earlier candidate's in
+    `calibrations` makes at its key, which publishes into that store, or by
+    why none serves where a new one would refit its law (`_lent`), and by
+    the command measuring its readings there (`_readings_by`), unless its
+    readings key is that calibration's side's or they are at their key there;
+    one no such calibration makes and a started calibration's `INPUTS` leave
+    out is `UNFITTED`. While `_deployed` waits on that calibration, each side
+    it fits is `WAITING`; else each joins `calibrations`, unless no command
+    serves, which names why on each side it fits."""
+    laws, mine, sides = held["points"][point["name"]]["law"], {}, {}
+    for side, law in laws.items():
+        laws[side] = law = dict(law)
+        mine[side], sides[side] = law.pop("calibration", None), law.pop("side", None)
+    if refused or not any(mine.values()):
+        return
+    directory, traces, shared, _ = made
+    keys = {s: json.dumps(c["key"], sort_keys=True) for s, c in mine.items() if c}
+    lent = {
+        side: calibrations[key]
+        for side, key in keys.items()
+        if calibrations.get(key, {}).get("in", str(directory)) != str(directory)
+    }
+    judged_in = held["store"]
+    reused = [laws[side].get("store") for side in laws if side not in keys]
+    shared_in = Path(judged_in).resolve() == Path(shared).resolve()
+    lookup = judged_in if shared_in or judged_in in reused else None
+    into, fit, waiting = _deployed(directory, lookup, keys, lent, sides)
+    for side in (side for side in keys if side not in fit):
+        if side not in lent:
+            laws[side]["made_by"] = [UNFITTED.format(directory, " ".join(fit))]
+            continue
+        lender, there = Path(lent[side]["in"]), lent[side]["into"]
+        laws[side]["made_by"] = [_lent(lent[side])]
+        read = sides[side]["readings"]
+        if read != lent[side].get("readings") and not _holds_readings(there, read):
+            one = point["instances"][side]
+            args, env = _side(side, one, drive_run.REAL)
+            one = one | {"args": args, "env": env}
+            laws[side]["made_by"].append(_readings_by(lender, there, one))
+    fitted = [side for side in keys if side in fit]
+    if waiting:
+        lender = Path(waiting["in"])
+        wait = WAITING.format(waiting["into"], _candidate(lender), lender)
+        for side in fitted:
+            laws[side]["made_by"] = [wait]
+        return
+    try:
+        with _env({"TRACES": traces}):
+            given = directory, sides, fit, ROUTER, sides["prefill"]["node"], into
+            command = lacking.deployment_calibration(*given)
+    except ValueError as why:
+        for side in fitted:
+            laws[side]["made_by"] = [f"no calibrate.sh command: {why}"]
+        return
+    published = str(into or directory / "store")
+    for side in fitted:
+        laws[side]["made_by"] = [command]
+        made_here = {"in": str(directory), "into": published}
+        calibrations.setdefault(
+            keys[side], made_here | {"readings": sides[side]["readings"]}
+        )
+
+
+def _deployed(directory: Path, lookup: str | None, keys, lent, sides) -> tuple:
+    """The store a 1P1D calibration into `directory` publishes into, None its
+    own; the sides it fits; and the calibration it waits on, as `lent` holds
+    it, else None. `keys` holds each side sent to calibrate, `lent` each of
+    them an earlier candidate's calibration makes at its key, and `sides`
+    where each side's calibration publishes (`_keys`).
+    Once one has started in `directory`, the store and the sides its `INPUTS`
+    name, every side where they name none: a resume takes the inputs it
+    started with, though a side it has fitted now holds its key there. Before
+    then, the store a side's lender publishes into, where it holds nothing a
+    side the calibration fits there would publish (`_holds`); while that store
+    is the lender's own and the lender has not started, waiting on it, as a
+    publish there would leave the lender's directory holding files, which
+    `calibrate.sh` refuses. Else `lookup`, the store the candidate is looked
+    up in where it is the shared one, as one server's calibration takes it
+    (`_publishing`), or a side reuses a law there, as from a lender that has
+    ended, when it holds nothing a side sent to calibrate would publish; else
+    its own. Into a store of its own it fits both sides, as that holds
+    neither; into another, each side sent to calibrate but one whose lender
+    publishes there."""
+
+    def fitting(into) -> list:
+        lenders = {s: Path(lent[s]["into"]).resolve() for s in lent}
+        return [s for s in keys if lenders.get(s) != Path(into).resolve()]
+
+    if (directory / INPUTS).is_file():
+        fit = _started_input(directory, "fit")
+        return started_store(directory), fit.split() if fit else list(sides), None
+    for lender in lent.values():
+        into, fits = lender["into"], fitting(lender["into"])
+        if any(_holds(into, sides[s]) for s in fits):
+            continue
+        own = Path(lender["in"]) / "store"
+        if (
+            Path(into).resolve() == own.resolve()
+            and not (own.parent / INPUTS).is_file()
+        ):
+            return into, fits, lender
+        return into, fits, None
+    if lookup and not any(_holds(lookup, sides[s]) for s in keys):
+        return lookup, list(keys), None
+    return None, list(sides), None
 
 
 def _measuring(held: dict, new: Path) -> None:
@@ -749,6 +948,11 @@ def _readings_by(lender: Path, into: str, one: dict) -> str:
     return lacking.measure_memory(into, one["args"], one["env"], one.get("beside"))
 
 
+def _holds_readings(root, at: str) -> bool:
+    """Whether the store at `root` holds readings at the entry `at` under it."""
+    return (Path(root) / at / ENTRY_FILE).is_file()
+
+
 def _publishing(store, made, law: dict, readings: dict) -> str | None:
     """The store the calibration into `made`'s directory, whose verdicts `law`
     and `readings` were judged in `store`, publishes into, None its own. Once
@@ -767,9 +971,16 @@ def _publishing(store, made, law: dict, readings: dict) -> str | None:
 def started_store(directory: Path) -> str | None:
     """The store the `INPUTS` of the calibration started in `directory` name,
     None when they name none or no calibration started there."""
+    return _started_input(directory, "store")
+
+
+def _started_input(directory: Path, field: str) -> str | None:
+    """What the line of the `INPUTS` of the calibration started in `directory`
+    that `field` opens holds after it, None when they hold none or no
+    calibration started there."""
     inputs = directory / INPUTS
     given = inputs.read_text().splitlines() if inputs.is_file() else []
-    return next((s[len("store ") :] for s in given if s.startswith("store ")), None)
+    return next((s[len(field) + 1 :] for s in given if s.startswith(f"{field} ")), None)
 
 
 def _refits(ended: Path, command: str, key: list, atom: str) -> bool:
