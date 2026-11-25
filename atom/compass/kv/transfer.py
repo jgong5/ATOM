@@ -38,7 +38,12 @@ write that moves bytes also pays the link's one-off setup, when the spec
 declares one; a write that moves no block and no slot makes no transfer call
 and pays none. Writes on different links do not contend, even where real ones
 share a rail or a NIC, so writes that fan in on one are each priced at a lone
-writer's rate.
+writer's rate -- unless the link states a NIC's bandwidth
+(`nic_bandwidth_bytes_per_s`, opt-in): then the writes into one NIC share it
+(`SharedNic`). On a recorded 1P1D run at c=256 (#3720), a write alone on its
+D rank's NIC moved 7.9 GB/s and two to five at once 5.7 to 3.1 GB/s each,
+whatever the prefill rank's other writes or forwards did: one write is held
+to the link's rate, several share a NIC's ~12 GB/s.
 
 Nothing in this module imports the engine or a tensor library. Reaching it
 through the package around it is not the same import: `atom.compass.kv` loads
@@ -87,6 +92,9 @@ class TransferModel:
     slot_bytes: int = 0
     staging_bytes: int = 0
     slot_after_blocks: bool = False
+    #: What the writes into one NIC reach together, 0 when the link states no
+    #: NIC: each write is then priced alone on its rank pair's `Link`.
+    nic_bandwidth_bytes_per_s: float = 0.0
 
     def __post_init__(self) -> None:
         if self.latency_s < 0:
@@ -108,6 +116,11 @@ class TransferModel:
             raise ValueError(
                 f"staging_bytes must not be negative, got {self.staging_bytes}"
             )
+        if self.nic_bandwidth_bytes_per_s < 0:
+            raise ValueError(
+                "nic_bandwidth_bytes_per_s must not be negative, got "
+                f"{self.nic_bandwidth_bytes_per_s}"
+            )
 
     @classmethod
     def from_spec(
@@ -125,7 +138,10 @@ class TransferModel:
 
         The spec refuses a link it does not carry, and refuses a peak
         bandwidth whose derate is missing; both refusals travel out of here
-        unchanged, naming the field and the rule that declined it.
+        unchanged, naming the field and the rule that declined it. A link
+        that states `nic_bandwidth_bytes_per_s` (an attained rate, not a peak)
+        has its writes into one NIC share it; one that does not prices each
+        write alone on its pair's link.
         """
         link = f"interconnect.{scope.value}"
         peak = spec.value(f"{link}.link_bandwidth_bytes_per_s")
@@ -138,6 +154,9 @@ class TransferModel:
             slot_bytes=slot_bytes,
             staging_bytes=staging_bytes,
             slot_after_blocks=slot_after_blocks,
+            nic_bandwidth_bytes_per_s=spec.values.get(
+                f"{link}.nic_bandwidth_bytes_per_s", 0.0
+            ),
         )
 
     def bytes_moved(self, blocks: int) -> int:
@@ -215,3 +234,96 @@ class Link:
         gap = (self._model.writes(blocks) - 1) * self._model.latency_s
         self._free = start + gap + moved / self._model.bandwidth_bytes_per_s
         return done
+
+
+class SharedNic:
+    """The writes into one NIC, which share it (`nic_bandwidth_bytes_per_s`).
+
+    A write arriving at `a` moves its bytes from `a` on, each write moving
+    bytes at `min(bandwidth, nic / n)` while `n` are: alone it reaches the
+    link's rate, beside others they split the NIC's. It completes the latency
+    after its last byte, once per write it takes (`TransferModel.writes`), as
+    on a `Link`, and the NIC's first write that moves bytes pays `setup_s` on
+    top. A write with no bytes completes at its arrival plus the latency.
+
+    Unlike a `Link`'s, a write's completion depends on the writes that arrive
+    after it, so it is known once the NIC has been advanced past it:
+    `advance(t)` returns each write whose last byte moved by `t`, once, with
+    its completion, and is exact so long as every write arriving before `t`
+    was added first. Writes are added in arrival order.
+    """
+
+    def __init__(self, model: TransferModel) -> None:
+        if model.nic_bandwidth_bytes_per_s <= 0:
+            raise ValueError("a shared NIC needs nic_bandwidth_bytes_per_s above 0")
+        self._model = model
+        self._t = -math.inf  # how far the bytes have been moved
+        self._last = -math.inf  # the latest arrival
+        self._left: dict = {}  # key -> bytes still to move, of the writes moving
+        self._tail: dict = {}  # key -> what it pays after its last byte
+        self._found: list = []  # (key, completion) not yet taken
+        self._set_up = False
+
+    def add(self, key, a: float, blocks: int) -> None:
+        """A write of `blocks`, named `key`, arrives at `a`."""
+        if a < self._last:
+            raise ValueError(
+                f"a write arrives at {a}, before one that arrived at "
+                f"{self._last}; a NIC takes its writes in time order"
+            )
+        self._last = a
+        self._move(a)
+        m = self._model
+        moved = m.bytes_moved(blocks)
+        tail = m.writes(blocks) * m.latency_s
+        if moved <= 0:
+            self._found.append((key, a + tail))
+            return
+        if not self._set_up:
+            self._set_up = True
+            tail += m.setup_s
+        self._left[key] = float(moved)
+        self._tail[key] = tail
+
+    def _move(self, t: float) -> None:
+        """Move every write's bytes up to `t`, finding each that completes."""
+        m = self._model
+        while self._left:
+            rate = min(
+                m.bandwidth_bytes_per_s, m.nic_bandwidth_bytes_per_s / len(self._left)
+            )
+            key = min(self._left, key=self._left.get)
+            finish = self._t + max(self._left[key], 0.0) / rate
+            if finish > t:
+                if t > self._t:
+                    for k in self._left:
+                        self._left[k] -= rate * (t - self._t)
+                break
+            done = self._left.pop(key)
+            for k in self._left:
+                self._left[k] -= done
+            self._t = finish
+            self._found.append((key, finish + self._tail.pop(key)))
+        self._t = max(self._t, t)
+
+    def advance(self, t: float) -> list:
+        """`(key, completion)` of each write whose last byte moved by `t`,
+        each once."""
+        self._move(t)
+        found, self._found = self._found, []
+        return found
+
+    def busy(self) -> bool:
+        """Whether a write added is still to be returned by `advance`."""
+        return bool(self._left or self._found)
+
+
+def shared_completions(model: TransferModel, writes) -> list:
+    """The completion of each `(arrival, blocks)` of `writes`, in arrival
+    order, all into one `SharedNic` of `model`: what a record's writes on one
+    NIC replay to, and what the run prices them at."""
+    nic = SharedNic(model)
+    for i, (a, blocks) in enumerate(writes):
+        nic.add(i, a, blocks)
+    done = dict(nic.advance(math.inf))
+    return [done[i] for i in range(len(writes))]

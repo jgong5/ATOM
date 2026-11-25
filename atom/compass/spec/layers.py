@@ -92,6 +92,7 @@ NETWORK = (
     "interconnect.inter_node.link_bandwidth_bytes_per_s",
     "interconnect.inter_node.link_latency_s",
     "interconnect.inter_node.link_setup_s",
+    "interconnect.inter_node.nic_bandwidth_bytes_per_s",
     "interconnect.inter_node.derate",
 )
 

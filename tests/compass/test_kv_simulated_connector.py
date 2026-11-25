@@ -30,7 +30,7 @@ from atom.compass.kv import (
     TransferModel,
     UnboundSeam,
 )
-from atom.compass.kv.transfer import Link
+from atom.compass.kv.transfer import Link, SharedNic, shared_completions
 from atom.compass.spec import MachineSpec, SpecRefusal
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata
@@ -262,3 +262,89 @@ def test_the_setup_is_the_named_links_and_zero_when_absent(geometry, scope):
     )
     other = next(s for s in Scope if s is not scope)
     assert TransferModel.from_spec(spec, geometry.bytes_per_block, other).setup_s == 0
+
+
+# -- Writes sharing one NIC (opt-in) ----------------------------------------
+
+#: EXACT with a NIC that moves 1.5 links' worth: two writes at once share it.
+SHARED = dataclasses.replace(EXACT, nic_bandwidth_bytes_per_s=6.0)
+
+
+def test_a_link_that_states_no_nic_shares_none(geometry):
+    """No field, no sharing: the model the run builds is the per-pair one."""
+    model = TransferModel.from_spec(
+        spec_with(PEAKS[0]), geometry.bytes_per_block, Scope.INTER_NODE
+    )
+    assert model.nic_bandwidth_bytes_per_s == 0
+    with pytest.raises(ValueError, match="nic_bandwidth_bytes_per_s above 0"):
+        SharedNic(model)
+
+
+@pytest.mark.parametrize("scope", list(Scope))
+def test_the_nic_rate_is_the_named_links_and_attained_not_a_peak(geometry, scope):
+    """The spec's number is used as stated: it is what writes reached together."""
+    document = copy.deepcopy(DOCUMENT)
+    document["interconnect"][scope.value]["nic_bandwidth_bytes_per_s"] = 12e9
+    spec = MachineSpec.from_mapping(document)
+    model = TransferModel.from_spec(spec, geometry.bytes_per_block, scope)
+    assert model.nic_bandwidth_bytes_per_s == 12e9
+    other = next(s for s in Scope if s is not scope)
+    assert (
+        TransferModel.from_spec(spec, geometry.bytes_per_block, other)
+        .nic_bandwidth_bytes_per_s
+        == 0
+    )
+
+
+def test_a_write_alone_on_a_shared_nic_costs_its_duration():
+    """Alone, a write reaches the link's rate, not the NIC's."""
+    assert shared_completions(SHARED, [(1.0, 3), (9.0, 3)]) == [
+        1.0 + EXACT.duration_s(3),
+        9.0 + EXACT.duration_s(3),
+    ]
+
+
+def test_writes_in_flight_together_split_the_nic():
+    """x (4 B) and y (4 B) arrive at 0: each moves at 6 / 2 = 3 B/s, both last
+    bytes at 4/3 s. z (8 B) at 0 too would make it 2 B/s each: x and y at 2 s,
+    then z alone at the link's 4 B/s for its last 4 B, to 3 s. Each completes
+    the latency after its last byte."""
+    lat = EXACT.latency_s
+    assert shared_completions(SHARED, [(0.0, 2), (0.0, 2)]) == [4 / 3 + lat] * 2
+    assert shared_completions(SHARED, [(0.0, 2), (0.0, 2), (0.0, 4)]) == [
+        2.0 + lat,
+        2.0 + lat,
+        3.0 + lat,
+    ]
+
+
+def test_a_later_write_slows_an_earlier_one_from_its_arrival():
+    """x (8 B) alone from 0 moves 4 B by 1; y (2 B) arrives at 1: both at 3 B/s,
+    y's 2 B by 1 + 2/3, x's last 2 B at 4 B/s alone, by 1 + 2/3 + 1/2."""
+    lat = EXACT.latency_s
+    x, y = shared_completions(SHARED, [(0.0, 4), (1.0, 1)])
+    assert y == pytest.approx(1 + 2 / 3 + lat)
+    assert x == pytest.approx(1 + 2 / 3 + 1 / 2 + lat)
+
+
+def test_a_shared_nic_returns_each_write_once_it_has_moved_past_it():
+    """Before its last byte a write is not returned; after, once."""
+    nic = SharedNic(SHARED)
+    nic.add("x", 0.0, 2)
+    assert nic.advance(0.5) == [] and nic.busy()
+    assert nic.advance(1.0) == [("x", 1.0 + EXACT.latency_s)]
+    assert nic.advance(5.0) == [] and not nic.busy()
+    with pytest.raises(ValueError, match="before one that arrived"):
+        nic.add("y", -1.0, 1)
+
+
+def test_a_shared_nic_pays_the_setup_once_and_a_zero_block_write_the_latency():
+    nic = SharedNic(dataclasses.replace(SHARED, setup_s=4.0))
+    nic.add("empty", 0.0, 0)
+    nic.add("x", 0.0, 2)
+    nic.add("y", 10.0, 2)
+    assert dict(nic.advance(100.0)) == {
+        "empty": EXACT.latency_s,
+        "x": 1.0 + EXACT.latency_s + 4.0,
+        "y": 11.0 + EXACT.latency_s,
+    }
