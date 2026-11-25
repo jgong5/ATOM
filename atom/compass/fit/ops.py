@@ -119,7 +119,7 @@ SIGNED = 1 << 14
 #: The dimensions a bound states by place, as `op_graph.OpGraphBackend._bound`
 #: lays them out: (phase, T, B, G, context, last, real, largest, rows).
 BOUND = (None, "T", "B", "G", "context")
-#: Where a bound states its rows, each its query and context tokens.
+#: Where a bound states its rows, `op_graph.counted_rows`.
 ROWS = 8
 
 
@@ -334,8 +334,9 @@ def fit(points) -> dict:
     dispatch and combine), so a step may hold between two points' rows;
     ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad
     every rank to the same rows and keep it; and ``left_out``, each point
-    whose leaf may have run at two places in its family (`ran_counts`), by
-    its shape, operator and why; and ``tokens`` (`_tokens_at`)."""
+    whose leaf may have run at two places in its family (`ran_counts`) or a
+    compressor's stating no rows, by its shape, operator and why; and
+    ``tokens`` (`_tokens_at`)."""
     from atom.compass.bench.ops import (
         DP_GROUP,
         _dependent,
@@ -446,6 +447,12 @@ def fit(points) -> dict:
                 dims.append("mean")
                 at_p["mean"] = mean or PERMILLE
                 if ratio := sig["args"].get("ratio"):  # a compressor
+                    if "rows" not in p:  # measured before points stated them
+                        why = "a compressor's point states no rows to read it at"
+                        left_out.append(
+                            {"shape": p["shape"], "op": p["op"], "why": why}
+                        )
+                        continue
                     dims += ["completes", "past"]
                     at_p["completes"], at_p["past"] = completion(p["rows"], ratio)
             dims += ["context"] if moves else []
@@ -667,8 +674,8 @@ class PriceList(CostSource):
             stated = real[0] if real else None
             at["pad"] = 0 if stated is None else routed_rows(leaf) - stated
         if "completes" in dims:  # a compressor, at how the step's rows complete
-            ratio = leaf["args"]["ratio"]
-            at["completes"], at["past"] = completion(bound[ROWS], ratio)
+            rows = [row for row, n in bound[ROWS] for _ in range(n)]
+            at["completes"], at["past"] = completion(rows, leaf["args"]["ratio"])
         if phase == "decode":
             if "mean" in dims:
                 at["mean"] = PERMILLE * bound[5] / bound[4]

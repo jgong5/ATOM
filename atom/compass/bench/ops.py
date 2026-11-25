@@ -4291,7 +4291,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     `arch`'s; a part's graph
     the store does not hold leaves the step out, by its refusal."""
     from atom.compass.artifacts import ArtifactRefusal
-    from atom.compass.backends.op_graph import band
+    from atom.compass.backends.op_graph import band, counted_rows
     from atom.compass.backends.provenance import Refusal
     from atom.compass.capture.forward import decode
     from atom.compass.fit.ops import PriceList, fit, held_out, ran_counts
@@ -4327,7 +4327,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
         ]
 
     for line, reads in steps:
-        whys = {}
+        whys, rows = {}, counted_rows((q, c) for q, c, _ in line["rows"])
         for part, shape, output, draft in reads:
             by_part.setdefault(part, Counter())["steps"] += 1
             decoding, before = shape.phase == "decode", len(whys)
@@ -4353,7 +4353,6 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
                     bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
-                    rows = frozenset((q, c) for q, c, _ in line["rows"])
                     bound += (None if part else _real(line), peak, rows)
                 elif asked:  # a prefill's drafter's leaf at each bound a run asks
                     each = [(*b, mean, top) for b, _ in asked]

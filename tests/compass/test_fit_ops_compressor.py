@@ -13,6 +13,7 @@ from test_fit_ops import _priced
 from test_op_work import leaf, t
 
 from atom.compass.backends import BatchView, RequestShape
+from atom.compass.backends.op_graph import counted_rows
 from atom.compass.bench import ops as bench_ops
 from atom.compass.capture.forward import decode
 from atom.compass.fit import ops
@@ -63,7 +64,7 @@ def test_a_compressor_s_alternating_points_fit_a_line_each_way(context):
     ops.held_out(params)
     (f,) = params["families"].values()
     rows = [(2, context + 1)]
-    bound = ("decode", 2, 2, None, context, context, 4, None, frozenset(rows))
+    bound = ("decode", 2, 2, None, context, context, 4, None, counted_rows(rows))
 
     got = ops.PriceList(params).price((_compressor(4), bound, 0))
 
@@ -83,6 +84,33 @@ def test_a_step_completing_an_entry_on_a_row_short_of_its_longest_prices_so():
     )
 
     assert got == {f"op.{OP}.price_list": pytest.approx(_ns(rows, 1007) * 1e-9)}
+
+
+def test_a_step_whose_rows_repeat_counts_each_of_them():
+    # Two rows at 1033 run past the entry they complete and one at 1032 ends
+    # on it: most of the three run past.
+    rows = (2, 1033), (2, 1033), (2, 1032)
+    step = BatchView(tuple(RequestShape(q, c, True) for q, c in rows))
+    measured = [_point(c, b=3) for c in range(1000, 1100, 3)]
+
+    got = _priced(
+        measured, step, lambda draft, _: {"seq": []} if draft else _compressor(6), 1
+    )
+
+    assert got == {f"op.{OP}.price_list": pytest.approx(_ns(rows, 1033) * 1e-9)}
+
+
+def test_a_compressor_s_point_stating_no_rows_is_left_out_by_why():
+    # a point measured before points stated their rows
+    rowless = {k: v for k, v in _point(1006).items() if k != "rows"}
+
+    params = ops.fit([*MEASURED, rowless])
+
+    (f,) = params["families"].values()
+    assert [p["why"] for p in params["left_out"]] == [
+        "a compressor's point states no rows to read it at"
+    ]
+    assert len(f["points"]) == len(MEASURED)
 
 
 def _family(times, q):
