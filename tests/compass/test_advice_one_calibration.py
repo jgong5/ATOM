@@ -44,6 +44,8 @@ from atom.compass.drive import lacking
 S2, ARGS2 = {"args": {"--max-num-seqs": 12}}, ["--max-num-seqs", "12"]
 S5 = {"args": S2["args"] | {"--max-model-len": 512}}
 ARGS5 = [*ARGS2, "--max-model-len", "512"]
+#: A third candidate at their law key, with readings of its own.
+S6 = {"args": S2["args"] | {"--max-model-len": 1024}}
 
 
 def _calibrations(found: dict) -> list[str]:
@@ -253,13 +255,14 @@ def test_a_borrower_s_stale_readings_in_its_started_lender_s_store_calibrate_its
     ended, so a new one would refit its law; the shared store holds S5's
     readings measured at another ATOM source, which it refuses again, and S2's
     keeps that store, as its inputs name it, resolved: S5 prints its own
-    calibrate.sh command, into its own store, and no readings command."""
+    calibrate.sh command, into its own store, and no readings command; S6, at
+    that law key and with no readings there, borrows S5's calibration."""
     monkeypatch.setenv("AIPERF_PYTHON", "/real/python")
     store, cal = tmp_path / "store", tmp_path / "out" / "cal"
-    (tmp_path / "shared").mkdir()
+    store.rename(tmp_path / "shared")
     store.symlink_to(tmp_path / "shared")
     if ended:
-        (first,) = _calibrations(advise(tmp_path, {"S2": S2, "S5": S5}))
+        (first,) = _calibrations(advise(tmp_path, {"S2": S2, "S5": S5, "S6": S6}))
         assert _calibrated(tmp_path, first)[0] == 0
         _fitted(cal / "S2", resolved(stubbed.config, ARGS2))
     else:
@@ -269,7 +272,7 @@ def test_a_borrower_s_stale_readings_in_its_started_lender_s_store_calibrate_its
     _readings_at_another_digest(store, resolved(stubbed.config, ARGS5))
     capsys.readouterr()
 
-    found = advise(tmp_path, {"S2": S2, "S5": S5})
+    found = advise(tmp_path, {"S2": S2, "S5": S5, "S6": S6})
 
     if ended:
         refits = check.REFITS.format(cal / "S2", store.resolve())
@@ -280,6 +283,11 @@ def test_a_borrower_s_stale_readings_in_its_started_lender_s_store_calibrate_its
     assert not [c for c in found["S5"]["made_by"] if measure in c]
     env, given = _calibrate(found, "S5")
     assert "STORE" not in env and given[0] == str(cal / "S5")
+    own = cal / "S5"
+    assert found["S6"]["made_by"] == [
+        check.BORROWED.format("S5", own, own / "store"),
+        check.PENDING.format(own / "store", "S5", own),
+    ]
     printed = capsys.readouterr().out
     assert measure not in printed
     assert "".join(f"    made by: {c}\n" for c in found["S5"]["made_by"]) in printed
