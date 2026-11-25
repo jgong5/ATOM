@@ -151,7 +151,7 @@ def test_a_pp4_prefill_s_store_logs_give_its_per_rank_fields_and_laws(
     import json
 
     from test_mooncake_store_fit import CAPACITY, FLAGS, START, copy, lookups
-    from test_mooncake_store_fit import started as started_line
+    from test_mooncake_store_fit import started as started_line  # noqa: F401
 
     from atom.compass.backends.step_linear_fit import offload_main
 
@@ -199,3 +199,29 @@ def test_a_pp4_prefill_s_store_logs_give_its_per_rank_fields_and_laws(
         )
         assert of_rank(entry, "load_s", r) == pytest.approx([0.5e-3, 1.5e-3])
     assert len(entry["fit"]["store_s"]["ranks"]) == 4
+
+
+def test_per_nic_pools_fill_and_evict_each_rank_s_pool_alone():
+    """A pool a writer rank (`capacity_bytes` a list): rank 1's puts fill its
+    own pool and refuse there, rank 0's pool holds its own; a lookup finds a
+    key in its rank's pool alone."""
+    entry = _pp_entry()
+    entry["capacity_bytes"] = [10 * c for c in entry["chunk_bytes"]]
+    pools = store.master_of(entry)
+    assert isinstance(pools, store.Pools) and len(pools.masters) == 4
+    key = lambda r, i: f"ns/w{r}of4/k{i}"  # noqa: E731
+    new = pools.put([key(1, i) for i in range(10)], ["g1"] * 10, "engine-P", 0.0)
+    pools.publish(new, 0.0)
+    assert pools.masters[1].used == pools.masters[1].capacity
+    assert pools.masters[0].used == 0
+    with pytest.raises(store.MooncakeStoreRefusal, match="Store's"):
+        pools.put([key(1, 10)], ["g2"], "engine-P", 1.0)
+    new = pools.put([key(0, 0)], ["g3"], "engine-P", 1.0)
+    pools.publish(new, 1.0)
+    assert set(pools.exists([key(0, 0), key(1, 0), key(2, 0)], 2.0)) == {
+        key(0, 0),
+        key(1, 0),
+    }
+    pools.reset([5, 5, 5, 5])
+    assert [m.capacity for m in pools.masters] == [5, 5, 5, 5]
+    assert all(m.used == 0 for m in pools.masters)

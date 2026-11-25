@@ -66,6 +66,7 @@ standard library.
 from __future__ import annotations
 
 import argparse
+import collections
 import heapq
 import itertools
 import math
@@ -95,7 +96,16 @@ CLIENT_RUN_FIELDS = ("clear_between_client_runs", "capacity_by_client_run")
 #: different layers, so each stage's chunk takes other bytes, its pools other
 #: slots and its copies other seconds. An entry fitted on one stage's ranks
 #: states each as one value, which every rank takes.
-PER_RANK = ("chunk_bytes", "save_slots", "load_slots", "store_s", "load_s")
+PER_RANK = (
+    "chunk_bytes",
+    "save_slots",
+    "load_slots",
+    "store_s",
+    "load_s",
+    # Per-NIC pools (`mooncake_store.pools`): a master a pool, the writer
+    # rank on the pool's NIC putting there (`Pools`).
+    "capacity_bytes",
+)
 #: A chunk key's rank and world (`kv_store.keys.rank_key_prefix`).
 KEY_RANK = re.compile(r"/w(\d+)of(\d+)/")
 #: The entry's fields the deployment must match.
@@ -523,13 +533,104 @@ class Master:
         return g is not None and g.rank is not None and g.deadline == deadline
 
 
+def master_of(entry: dict):
+    """The Store this LP plays for `entry`: one `Master`, or, with
+    ``capacity_bytes`` a list of one size a writer rank, a pool a rank
+    (`Pools`)."""
+    return Pools(entry) if isinstance(entry["capacity_bytes"], list) else Master(entry)
+
+
+class Pools:
+    """Mooncake's per-NIC pools (``mooncake_store.pools``, the 1P2D recipe's
+    ``per_nic``): a master a pool, each with its own owners and capacity, a
+    worker saving to the pool of the NIC its Store client uses. A pipelined
+    prefill puts each stage's rank on its own NIC, so the pool of a chunk is
+    its key's rank (`KEY_RANK`), each pool a `Master` of
+    ``capacity_bytes[rank]``, filling and evicting by itself. A lookup asks
+    every pool for every key and a key is held where its rank's pool holds it,
+    so one call on the LP stands for the concurrent calls Mooncake makes, one
+    a master, at the same keys."""
+
+    def __init__(self, entry: dict) -> None:
+        self.sizes = list(entry["capacity_bytes"])
+        self.masters = [Master({**entry, "capacity_bytes": b}) for b in self.sizes]
+        first = self.masters[0]
+        self.ttl, self.threads, self.chunk_bytes = (
+            first.ttl,
+            first.threads,
+            first.chunk_bytes,
+        )
+
+    def _pool(self, key: str) -> Master:
+        m = KEY_RANK.search(key)
+        if m is None:
+            raise MooncakeStoreRefusal(
+                f"key {key!r} names no rank, and the {ENTRY} entry states a pool a "
+                "rank"
+            )
+        return self.masters[int(m[1])]
+
+    def _split(self, keys, groups=None) -> dict:
+        by = collections.defaultdict(lambda: ([], []))
+        for i, key in enumerate(keys):
+            held = by[id(pool := self._pool(key))]
+            held[0].append(key)
+            held[1].append(None if groups is None else groups[i])
+            by[id(pool)] = held
+        pools = {id(m): m for m in self.masters}
+        return {pools[k]: v for k, v in by.items()}.items()
+
+    def size(self, key: str) -> int:
+        return self._pool(key).size(key)
+
+    def reset(self, capacity) -> None:
+        """Every pool empty, at ``capacity`` a pool (a list), or the entry's
+        sizes scaled to ``capacity`` in all."""
+        if isinstance(capacity, list):
+            sizes = capacity
+        else:
+            sizes = [b * capacity // sum(self.sizes) for b in self.sizes]
+        for master, size in zip(self.masters, sizes, strict=True):
+            master.reset(size)
+
+    def put(self, keys, groups, publisher: str, now: float) -> list:
+        new = []
+        for master, (ks, gs) in self._split(keys, groups):
+            new += master.put(ks, gs, publisher, now)
+        return new
+
+    def publish(self, keys, now: float) -> None:
+        for master, (ks, _) in self._split(keys):
+            master.publish(ks, now)
+
+    def exists(self, keys, now: float) -> dict:
+        present = {}
+        for master, (ks, _) in self._split(keys):
+            present |= master.exists(ks, now)
+        return present
+
+    def next_tick(self, now: float) -> float:
+        return min(master.next_tick(now) for master in self.masters)
+
+    def evict(self, now: float) -> Round:
+        """A round on each pool whose eviction thread runs at `now`."""
+        rounds = [m.evict(now) for m in self.masters if m.next_tick(now) <= now]
+        return Round(
+            max((r.target for r in rounds), default=0.0),
+            sum(r.goal for r in rounds),
+            sum(r.objects for r in rounds),
+            [g for r in rounds for g in r.evicted],
+            [g for r in rounds for g in r.skipped],
+        )
+
+
 class MooncakeStoreLP(StationLP):
     """LP ``mooncake_store``'s loop over `master`: its lookups and renewals on
     the master's handler threads, its puts' starts and ends and the eviction
     thread's rounds as daemon deadlines. `check_plans()` runs at the first
     stamped request, when every engine it serves has planned its pool."""
 
-    def __init__(self, rt, sock, master: Master, *, lookup_s, check_plans):
+    def __init__(self, rt, sock, master, *, lookup_s, check_plans):
         super().__init__(rt, sock, {"master": master.threads})
         self.master, self.per_key, self.hop = master, lookup_s[1], lookup_s[0] / 2
         self._check_plans = check_plans

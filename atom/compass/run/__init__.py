@@ -1420,10 +1420,13 @@ def _launch_mooncake_store(config, run: dict, side: str | None) -> None:
     entry = run[store.ENTRY]
     store.check_entry(entry)
     cfg = parse_mooncake_store_config(sub.kv_transfer_config)
-    if len(masters := cfg.store_masters()) > 1:
+    masters = cfg.store_masters()
+    pooled = isinstance(entry["capacity_bytes"], list)
+    if len(masters) > 1 and not pooled:
         raise ValueError(
             f"mooncake_store.pools addresses {len(masters)} masters "
-            f"({', '.join(m.master for m in masters)}); LP mooncake_store plays one"
+            f"({', '.join(m.master for m in masters)}); LP mooncake_store plays one, "
+            "or a pool a writer rank where the entry states capacity_bytes a rank"
         )
     # ATOM's writer ranks: a DP replica's TP ranks, of each pipeline stage
     # (`pp_aware_rank_and_world`); each rank's slots from its own chunk.
@@ -1503,7 +1506,7 @@ def mooncake_store(block_tokens: int) -> None:
     lp = store.MooncakeStoreLP(
         rt,
         sock,
-        store.Master(entry),
+        store.master_of(entry),
         lookup_s=entry["lookup_s"],
         check_plans=check_plans,
     )

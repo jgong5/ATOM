@@ -390,9 +390,14 @@ class StoreShell:
             scheduler.AsyncStoreLookup = made
         self._lookup = self._inner._lookup_client
         backend = self._lookup.backend
-        [pool] = backend._pools  # one master, as LP mooncake_store's launch holds
+        # One master, or per-NIC pools LP mooncake_store plays as one Store a
+        # rank a pool (`Pools`): a lookup asks it once for the keys each pool
+        # would be asked, at once, for.
+        pool = backend._pools[0]
+        backend._pools = [pool]
+        pool.executor = None
         self._client = StandInClient(
-            pool.pool.master, entry["chunk_bytes"], store.Master(entry).size
+            pool.pool.master, entry["chunk_bytes"], store.master_of(entry).size
         )
         pool.client = self._client
         self.chunk, self._world = self._inner.chunk_size, backend._world

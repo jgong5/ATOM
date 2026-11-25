@@ -36,7 +36,9 @@ _DEFAULT_BACKEND = "moriio"
 PD_TRANSFER_BACKENDS = frozenset({"moriio", "mooncake"})
 # ATOM_MOONCAKE_STORE_DRAFT_WINDOW: the tier that splits the draft rows, the P/D
 # connector that hands on where they end, and the composite of the two.
-_DRAFT_WINDOW_BACKENDS = frozenset({"mooncake_store", "mooncake", "multi"})
+# "compass": Compass's simulated P/D connector, which stands in for mooncake's
+# (it prices what Mooncake moves and tells no decode anything itself).
+_DRAFT_WINDOW_BACKENDS = frozenset({"mooncake_store", "mooncake", "multi", "compass"})
 
 
 def resolve_pd_backend(kv_transfer_config: dict | None) -> str | None:
@@ -529,6 +531,8 @@ class KVConnectorFactory:
         backend_name = cls.canonical_name(
             kv_cfg.get("kv_connector", _DEFAULT_BACKEND), path="kv_transfer_config"
         )
+
+        from atom.utils import envs
 
         entry = cls._registry[backend_name]
         if (
