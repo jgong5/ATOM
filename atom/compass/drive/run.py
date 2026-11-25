@@ -228,6 +228,28 @@ def side_args(side: str, atom_args, connector: str) -> list[str]:
     return [*atom_args, KV_FLAG, json.dumps(kv)]
 
 
+def real_kv(kv_transfer_config: str) -> str:
+    """ATOM's `--kv-transfer-config` JSON `kv_transfer_config` with the
+    simulated connector, alone or one of a ``multi``'s, the `REAL` one at its
+    role, as `deploy.sh record` starts the side it stands in for; any other
+    connector as it is."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    def real(sub):
+        try:
+            name = KVConnectorFactory.canonical_name(sub.get("kv_connector"))
+        except (AttributeError, ValueError):
+            return sub
+        if name != SIMULATED:
+            return sub
+        return {k: v for k, v in sub.items() if k == "kv_role"} | {"kv_connector": REAL}
+
+    kv = real(json.loads(kv_transfer_config or "{}"))
+    if isinstance(kv, dict) and isinstance(kv.get("connectors"), list):
+        kv["connectors"] = [real(sub) for sub in kv["connectors"]]
+    return json.dumps(kv)
+
+
 def side_env(env) -> dict:
     """The variables deploy.sh's `compass_env` (scripts/compass/_lib.sh) sets
     over the environment `env` it starts a side in: AITER_LOG_LEVEL WARNING

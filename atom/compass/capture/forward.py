@@ -1751,9 +1751,10 @@ def _affine(shape: str, first, second):
     return out
 
 
-def _config(model, tp, atom_args):
+def _config(model, tp, atom_args, real_kv=False):
     """ATOM's `Config` for its engine arguments `atom_args`, eager, at level 0,
-    the checkpoint an empty dummy.
+    the checkpoint an empty dummy; with `real_kv`, its simulated KV connector
+    the real one (`drive.run.real_kv`).
 
     Under `--enable-dp-attention` each TP rank is a DP rank of TP 1, as
     `CoreManager` rewrites it.
@@ -1767,6 +1768,10 @@ def _config(model, tp, atom_args):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog="trace ops --"))
     forced = ["--enforce-eager", "--level", "0", "--load_dummy", "empty"]
     args = parser.parse_args(["--model", model, "-tp", str(tp), *atom_args, *forced])
+    if real_kv:
+        from atom.compass.drive.run import real_kv as real
+
+        args.kv_transfer_config = real(args.kv_transfer_config)
     engine = EngineArgs.from_cli_args(args)
     names = {field.name for field in dataclasses.fields(Config)}
     kwargs = engine._get_engine_kwargs().items()
@@ -1835,12 +1840,17 @@ class Tracer:
     `trace`, once, and every later one steps the same runner. The capture's
     patches hold until `close`; the declared device, for the process. Each
     graph states the files its process ran and read up to its step
-    (`capture.files_of`), from the reads watched since this one was made."""
+    (`capture.files_of`), from the reads watched since this one was made.
+
+    A P/D side's simulated connector is traced as Mooncake's, as `deploy.sh
+    record` starts that side (`drive.run.real_kv`): ATOM's attention builders
+    publish their transfer regions by connector name, and Kimi's MLA+GDN
+    builder refuses any but Mooncake and MoRI-IO as it allocates."""
 
     def __init__(self, model, tp, tmpdir, atom_args=(), arch="gfx942", read=None):
         self.reads = watch_reads()
         self.declared = driverless.install(tmpdir, arch, read)
-        self.config = _config(model, tp, atom_args)
+        self.config = _config(model, tp, atom_args, real_kv=True)
         self.stack, self.runner, self.blocks = contextlib.ExitStack(), None, 0
 
     def close(self):

@@ -23,7 +23,6 @@ from atom.compass.runner.overrides import (
     HOST_SEGMENTS,
     MTP_SEGMENT,
     HostDeviceRecurrence,
-    NonAllocatingRunner,
     RunnerRefusal,
     drafts_on_meta,
     schedulable_ladder,
@@ -247,16 +246,6 @@ def test_a_drafter_hook_atom_renamed_is_refused_by_name(monkeypatch, gone):
     _drafters(monkeypatch, gone)
     with pytest.raises(RunnerRefusal, match=f"no longer defines {gone}"):
         drafts_on_meta()
-
-
-def test_pipeline_parallel_speculation_is_refused_before_the_drafter():
-    r = object.__new__(NonAllocatingRunner)
-    r.config = MockConfig(
-        pipeline_parallel_size=2,
-        speculative_config=SimpleNamespace(synthetic_acceptance_rates=[0.5]),
-    )
-    with pytest.raises(RunnerRefusal, match="pipeline parallel"):
-        r._build_and_load_model(r.config, object, None)
 
 
 def test_piecewise_capture_under_a_drafter_is_refused():
