@@ -7,9 +7,10 @@ Every figure is in wall seconds per simulated second of the window, the wall's o
 1. LP. An LP's own work is serial, so the wall is at least the busiest LP's. Own work runs from a reply
    received to the last request sent before the next reply; a DP group's is the union of its ranks'. The Rust
    router stamps nothing: its own work runs from the CA's reply to its next request and holds its transport.
-   With schedstat, the same floor in CPU: the busiest process, all threads (one GIL), over the sampled seconds.
+   With schedstat, the same floor in CPU: the busiest thread of any process, over the sampled seconds. A
+   process's threads together are no floor: a socket read, or a ZMQ thread, holds no GIL.
 2. CA. The CA serves one request at a time, under one lock: its serve seconds, from its wall profile. With
-   schedstat, its process CPU, all threads: each connection's thread reads its frames under the same GIL.
+   schedstat, its busiest thread's CPU; its threads spend most of their samples reading sockets, outside the GIL.
 3. Chain. The critical path, walked back from each SLICE_S (default 60) slice's last request as #4029's
    rank.py walks it: a hop is its LP's own work, then the CA round trip that freed it (transport, queueing
    behind other requests, and the serve of the request that made the reply due). The hop's LP heads it; the
@@ -183,7 +184,7 @@ if os.path.exists(f"{out}.spy/schedstat.json"):
         if (pid := key.split("/")[0].split(".")[1]) in pids:
             proc[pid][0] += run_s
             proc[pid][1] = max(proc[pid][1], run_s)
-    cpu = {pids[pid]: (run_s / seconds * wall, top_s / seconds * wall) for pid, (run_s, top_s) in proc.items()}
+    cpu = {pids[pid]: (top_s / seconds * wall, run_s / seconds * wall) for pid, (run_s, top_s) in proc.items()}
 ca_cpu = cpu.pop("CA", None)
 
 # the floors, ranked
@@ -194,10 +195,9 @@ rows = [("chain: the critical path walked", sum(chain.values()), ""),
         ("CA: serve", ca_serve / sim, "")]
 if cpu:
     name = max(cpu, key=lambda p: cpu[p][0])
-    rows.append((f"LP: CPU, the busiest process, all threads ({name})", cpu[name][0],
-                 f"its busiest thread {cpu[name][1]:.2f}"))
+    rows.append((f"LP: CPU, the busiest thread ({name})", cpu[name][0], f"its process, all threads {cpu[name][1]:.2f}"))
 if ca_cpu:
-    rows.append(("CA: CPU, all threads", ca_cpu[0], f"its busiest thread {ca_cpu[1]:.2f}"))
+    rows.append(("CA: CPU, its busiest thread", ca_cpu[0], f"all threads {ca_cpu[1]:.2f}"))
 print(f"## Floors of {out}\n\nWindow: {t1 - t0:.0f} s of wall over {sim:.0f} simulated s, **{wall:.2f} wall s per "
       f"simulated s**. Critical path walked over {walked:.0f} s, {n} slices of {slice_s:.0f} s.\n")
 print("| rank | floor | wall s per simulated s | share of the wall | note |\n|---|---|---|---|---|")
@@ -226,7 +226,7 @@ for (a, b), v in freed.items():
 print("The chain by what freed each hop, as shares of the walked wall: "
       + "; ".join(f"{k} {100 * v / walked:.1f}%" for k, v in edges.most_common()) + ". Its leading edges: "
       + "; ".join(f"{k} {100 * v / walked:.1f}%" for k, v in kinds_of.most_common(6)) + ".\n")
-print("| LP | own work per simulated s | CPU per simulated s, all threads / busiest thread | hops it heads, per "
+print("| LP | own work per simulated s | CPU per simulated s, busiest thread / all threads | hops it heads, per "
       "simulated s | share of the chain | own work per hop on the chain, ms |\n|---|---|---|---|---|---|")
 for g in sorted(own_s, key=own_s.get, reverse=True):
     mine = [c for name, c in cpu.items() if group(name) == g]
