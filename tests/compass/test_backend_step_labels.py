@@ -36,6 +36,7 @@ from atom.compass.backends import (
     StepLinearBackend,
     StepLinearLaw,
 )
+from atom.compass.backends.cost import EAGER_DECODE_BESIDE_PREFILL, eager_beside_peer
 from atom.compass.backends.step_labels import (
     TABLE_VERSION,
     digest,
@@ -408,7 +409,8 @@ def _dp_view(rows, rank, **group):
 
 
 #: Each rank's views of a DP2 group's steps: a decode graph at rung 4 whose
-#: gather pads the group's 4 real rows to 8, then a prefill step split in two.
+#: gather pads the group's 4 real rows to 8, then a prefill step split in two,
+#: which the group prefills (`group_prefills`).
 GROUP = [
     [
         _dp_view(
@@ -421,6 +423,7 @@ GROUP = [
             moe_tokens=900,
             tbo_tokens=((300, 200), (200, 200)),
             group_max_tokens=500,
+            group_prefills=True,
         ),
     ]
     for rank, decode, prefill in (
@@ -430,11 +433,11 @@ GROUP = [
 ]
 
 
-def _dp2_record(directory, monkeypatch):
-    """`GROUP`, recorded on each rank by `StepRecord`."""
+def _dp2_record(directory, monkeypatch, group=GROUP):
+    """`group`, `GROUP` by default, recorded on each rank by `StepRecord`."""
     monkeypatch.setattr(projection, "batch_view", lambda batch, mode, run: batch.view)
     clock = itertools.count()
-    for rank, views in enumerate(GROUP):
+    for rank, views in enumerate(group):
         record = StepRecord(directory, rank)
         for view in views:
             t = [next(clock)] * 2
@@ -493,6 +496,38 @@ def test_a_dp2_record_rebuilds_each_step_s_group_counts(tmp_path, monkeypatch):
     path = tmp_path / "dp1.jsonl"
     path.write_text(path.read_text().splitlines(keepends=True)[0])
     assert [s.view.moe_tokens for s in label(tmp_path / "dp0.jsonl")[0]] == [4, None]
+
+
+#: A DP2 group's steps as the projection states them: rank 0 decodes eagerly
+#: while rank 1 prefills, then both decode in a rung-4 graph.
+BESIDE = [
+    [
+        _dp_view([(1, 9, True)], 0, moe_rows=301, moe_tokens=301, group_prefills=True),
+        _dp_view([(1, 10, True)], 0, capture_rung=4, moe_rows=8, moe_tokens=2),
+    ],
+    [
+        _dp_view(
+            [(300, 300, False)], 1, moe_rows=301, moe_tokens=301, group_prefills=True
+        ),
+        _dp_view([(1, 7, True)], 1, capture_rung=4, moe_rows=8, moe_tokens=2),
+    ],
+]
+
+
+def test_a_dp_view_states_whether_a_rank_of_its_group_prefills(tmp_path, monkeypatch):
+    """A labelled view states `group_prefills` as the projection does: some
+    rank's line at its step, not a dummy run, holds a prefill row. An eager
+    decode beside a prefilling peer then takes its 0 s treatment
+    (`eager_beside_peer`)."""
+    _dp2_record(tmp_path, monkeypatch, BESIDE)
+    got = [label(tmp_path / f"dp{rank}.jsonl")[0] for rank in range(2)]
+    together = label_run([tmp_path / f"dp{rank}.jsonl" for rank in range(2)])
+
+    for rank in range(2):
+        assert [s.view.group_prefills for s in got[rank]] == [True, False]
+        assert [s.view.group_prefills for s in together[rank][0]] == [True, False]
+    beside = eager_beside_peer(got[0][0].view, "test")
+    assert beside.treatments == (EAGER_DECODE_BESIDE_PREFILL,)
 
 
 def test_a_dp_view_counts_its_step_s_dummy_forwards_from_every_rank_s_line(tmp_path):

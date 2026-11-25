@@ -20,7 +20,8 @@ its `group_max_tokens` is the most tokens their lines at its step run
 (`group_peaks`). Its `prefill_duty` is its rank's `shape.PrefillDuty` at its
 line's `t_enter_ns`, over the rank's earlier lines from `t_enter_ns` to
 `t_exit_ns`, each a prefill forward when some rank's line at its step, not a
-dummy run, holds a prefill row (`group_prefills`).
+dummy run, holds a prefill row (`group_prefills`); a data-parallel view's
+`group_prefills` says that of its own step, as the projection does.
 A view also takes its line's `target_bs`, `draft_bs`, `draft_moe_rows` and
 `draft_rows`, the widths and rows its target and drafter ran at, which an op
 graph reads, and its `group_needs_eager`, which a line states only where it is
@@ -810,6 +811,7 @@ def _label(
             group_max_tokens=peaks.get(s["step"]) if dp else None,
             group_needs_eager=s.get("group_needs_eager", False),
             group_tail=dp and s["step"] in (tails or ()),
+            group_prefills=dp and s["step"] in prefills,
             prefill_duty=duties[i],
         )
         cut = None
