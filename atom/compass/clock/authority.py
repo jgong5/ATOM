@@ -186,6 +186,9 @@ class Released(dict):
     def __init__(self, released=(), /) -> None:
         super().__init__(released)
         self.ceiling: float | None = None
+        # The ceiling without its cycle term, below which the LP answers its
+        # own TARs while its sends since the grant allow (`_replay`).
+        self.wide: float | None = None
 
 
 def _seconds(value, finite: bool, what: str, *args) -> float:
@@ -292,6 +295,16 @@ class ClockAuthority:
         for i in self._ids if ceilings else ():
             back = [channels.distance(i, j) + d for j, d in self._from[i]]
             self._cycle[i] = min(back, default=math.inf)
+        # LP -> its latest grant's ceiling less the cycle term, for its TARs
+        self._wide = {}
+        # LP -> min over its sends since its latest grant of the arrival plus
+        # the least distance from the receiver back to it
+        self._sent_min = {}
+        # LP -> channel out of it -> the least distance from its receiver back
+        self._back = {
+            i: {c.name: channels.distance(c.target, i) for c in channels.channels_from(i)}
+            for i in self._ids
+        }
         for lp, owned in (members or {}).items():
             channels.registry.require(lp)
             if not owned:
@@ -735,8 +748,12 @@ class ClockAuthority:
                 for seq, a in sorted([*reached.get(c, {}).items(), *released[c]])
             ]
         self._ceiling.pop(i, None)
+        self._wide.pop(i, None)
+        self._sent_min[i] = math.inf
         if self._ceilings and not recovered and g < math.inf and i not in self._members:
             released.ceiling = self._ceiling[i] = self._ceiling_of(i, g, released)
+            if not self._offering[i]:
+                released.wide = self._wide[i] = self._wide_of(i, g)
         target = self._target[i]
         short = self._state[i] == TAR and g < target
         if self.timeline is not None:
@@ -790,6 +807,12 @@ class ClockAuthority:
         rest = [a for n in self._into[i] for a in self._undelivered[n].values()]
         return min([ceiling, *rest])
 
+    def _wide_of(self, i: LpId, g: float) -> float:
+        """The ceiling of `i`'s grant to `g` less its cycle term: LBTS(i), the
+        bound and every message still unreleased to it, those sent ahead gone."""
+        rest = [a for n in self._into[i] for a in self._undelivered[n].values()]
+        return max(g, min([self._lbts(i), self._bound, *rest]))
+
     def _catch_up(self, lp: LpId, steps, log, member) -> list:
         """Register the sends `lp` logged before each of its own `steps`, and
         replay each step after them; returns the rest of `log`."""
@@ -813,9 +836,14 @@ class ClockAuthority:
                 self.lp_table(),
             )
         k = 0
+        back = self._back[lp]
         for kind, t, to, n in steps:
             for name, seq, arrival in log[k:n]:
                 self._register(lp, name, seq, arrival, member)
+                if member is None:
+                    reach = float(arrival) + back[name]
+                    if reach < self._sent_min.get(lp, math.inf):
+                        self._sent_min[lp] = reach
             if self.timeline is not None:
                 self._sent[lp] += map(tuple, log[k:n])
             if member is None:
@@ -843,6 +871,11 @@ class ClockAuthority:
         """One step `i` took on its own, asking `t` and answered `to`, as the
         grant its own request would have had."""
         ceiling = self._ceiling.get(i, -math.inf)
+        if kind == TAR and to >= ceiling:
+            ceiling = max(
+                ceiling,
+                min(self._wide.get(i, -math.inf), self._sent_min.get(i, math.inf)),
+            )
         if t < math.inf:
             self._horizon = max(self._horizon, t)
         if (
@@ -884,6 +917,7 @@ class ClockAuthority:
         unless it is the last, the client resigns and every other LP is told."""
         end, k = max(self._now.values()), len(self.ended)
         self._ceiling.clear()  # no LP runs below one now
+        self._wide.clear()
         clocks, grants = tuple(self._now.items()), dict(self.grants)
         diagnostics = self.diagnostics - self._diagnosed
         served = dict(self.requests_served)

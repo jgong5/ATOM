@@ -227,6 +227,8 @@ def _grant_out(_, g, released, *ended) -> dict:
         (body["ended"],) = ended
     if getattr(released, "ceiling", None) is not None:
         body["ceiling"] = _out(released.ceiling)
+    if getattr(released, "wide", None) is not None:
+        body["wide"] = _out(released.wide)
     return body
 
 
@@ -237,6 +239,8 @@ def _grant_in(body) -> tuple:
     )
     if "ceiling" in body:
         released.ceiling = _in(body["ceiling"])
+    if "wide" in body:
+        released.wide = _in(body["wide"])
     ended = (body["ended"],) if "ended" in body else ()
     return (GRANT, _in(body["G"]), released, *ended)
 

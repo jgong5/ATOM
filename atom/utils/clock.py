@@ -192,6 +192,17 @@ class LPRuntime:
         self.relays: dict[str, RelayQueue] = {}  # channel -> the engine's output relay
         self.calls = 0  # clock calls made, TAR and NER, its own steps included
         self.ceiling = -math.inf  # the latest grant's, below which it answers itself
+        # The latest grant's ceiling less its cycle term, below which it answers
+        # its own TARs while `sent_reach` allows; only with no offering channel
+        # into it, whose messages a TAR must stop at.
+        self.wide = -math.inf
+        self.may_widen = not any(table.offering(c) for c in into)
+        # Min over its sends since its last call of the arrival plus the least
+        # distance from the receiver back to it: a reaction reaches it no earlier.
+        self.sent_reach = math.inf
+        self._back = {
+            c.name: table.distance(c.target, me) for c in table.channels_from(me)
+        }
         self.asks_ahead = False  # a grant has carried a ceiling
         self.ahead: list[tuple[float, str, int]] = []  # sent ahead, by arrival
         self.steps: list[tuple] = []  # (kind, t, G, n) taken since its last call
@@ -258,6 +269,9 @@ class LPRuntime:
             self.next_seq[ch] = seq + 1
             arrival = self.now + self.table.lookahead(ch) if at is None else at
             self.send_log.append((ch, seq, arrival))
+            reach = arrival + self._back[ch]
+            if reach < self.sent_reach:
+                self.sent_reach = reach
         return arrival, seq
 
     def offer(self, send) -> None:
@@ -301,7 +315,9 @@ class LPRuntime:
         short of the last released a message on an offering channel at its
         arrival: the rounds left are asked again."""
         while rounds:
-            if rounds[0] < self.ceiling:  # a member's stays -inf
+            if rounds[0] < self.ceiling or (  # a member's stays -inf
+                rounds[0] < self.wide and rounds[0] < self.sent_reach
+            ):
                 self._own_step("TAR", rounds[0], rounds[0])
             else:
                 self._grant(*self._ca_call("TAR", rounds[0], rounds=rounds[1:]))
@@ -442,6 +458,7 @@ class LPRuntime:
         with self.lock:
             self._make_offers()
             log, self.send_log = self.send_log, []
+            self.sent_reach = math.inf
         steps, self.steps = self.steps, []
         self.calls += 1
         extra = (steps, ahead) if steps or ahead or rounds else ()
@@ -475,6 +492,8 @@ class LPRuntime:
         self.woken = any(msgs and offering(ch) for ch, msgs in released.items())
         if self.member is None:
             self.ceiling = below
+            wide = getattr(released, "wide", None)
+            self.wide = -math.inf if wide is None or not self.may_widen else wide
         else:  # a member answers none of its own calls, only its owed rounds
             self.owed_ceiling = below
         if ceiling is None and not self.ahead:

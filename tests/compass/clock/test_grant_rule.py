@@ -675,13 +675,16 @@ def test_a_step_out_of_bounds_or_past_a_registered_message_aborts():
         _first_grant(ca, 1.0, [(AB, 0, 0.5)])  # b's ceiling: 1.25
         return ca
 
-    for steps, needle in [
-        ([(TAR, 1.25, 1.25, 0)], "below its ceiling 1.25"),
-        ([(NER, 0.75, 0.8, 0)], "answered 0.8"),
-        ([(TAR, 0.75, 0.75, 1)], "over a log of 0"),
+    for log, steps, needle in [
+        # b sent nothing: a TAR is bound by LBTS(b), 1.5, not by the cycle
+        ([], [(TAR, 1.5, 1.5, 0)], "below its ceiling 1.5"),
+        # b's send arrives at a at 0.75, and a's reaction back at 1.25
+        ([(BA, 0, 0.75)], [(TAR, 1.3, 1.3, 1)], "below its ceiling 1.25"),
+        ([], [(NER, 0.75, 0.8, 0)], "answered 0.8"),
+        ([], [(TAR, 0.75, 0.75, 1)], "over a log of 0"),
     ]:
         with pytest.raises(ClockAbort, match=needle):
-            ceilinged().on_request(B, NER, INF, [], steps=steps)
+            ceilinged().on_request(B, NER, INF, log, steps=steps)
     ca = ceilinged()
     ca._undelivered[AB][1] = 0.95  # a message the ceiling should have kept out
     with pytest.raises(BackdatedEvent, match=r"past \(0.95"):
@@ -1006,3 +1009,19 @@ def test_rounds_granted_ahead_of_a_member_leave_every_grant_as_one_call_a_round(
     assert ahead["stepped"] > 0 and ahead["reports"] > 0
     assert ahead["sent ahead"] > 0 or not far
     assert ahead["waits"] < counts[False]["waits"]
+
+
+def test_a_tar_steps_on_its_own_past_the_cycle_while_its_sends_allow():
+    """b's ceiling is 1.25, its grant plus its cycle; its grant's `wide` is
+    LBTS(b), 1.5. A TAR to 1.4 with no send since is b's own step, replayed as
+    its grant; after a send arriving at 0.75, whose reaction reaches b at 1.25,
+    the bound is 1.25 again."""
+    ca = _ceilinged(ceilings=True)
+    ((_, _, released),) = _first_grant(ca, 1.0, [(AB, 0, 0.5)])
+    assert (released.ceiling, released.wide) == (1.25, 1.5)
+    ca.on_request(B, NER, INF, [], steps=[(TAR, 1.4, 1.4, 0)])
+    assert ca._now[B] == 1.4 and ca.grants["b"] == 2
+    ca = _ceilinged(ceilings=True)
+    _first_grant(ca, 1.0, [(AB, 0, 0.5)])
+    ca.on_request(B, NER, INF, [(BA, 0, 0.75)], steps=[(TAR, 1.2, 1.2, 1)])
+    assert ca._now[B] == 1.2
