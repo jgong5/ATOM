@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 import test_pp_launch_send as launch
+from capabilities import capability
 from test_dp_slice import (  # noqa: F401
     MAX_TOKENS,
     device_classes_put_back,
@@ -134,6 +135,7 @@ def test_a_backend_that_prices_no_all_gather_is_refused_by_name(tmp_path, monkey
 
 
 @NEEDS_A_RUN
+@capability("pp")
 def test_a_tp2_pipeline_meets_the_run_properties(tmp_path, monkeypatch):
     monkeypatch.setenv("ATOM_PP_SEND_ALLGATHER", "1")
     runs = [

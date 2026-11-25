@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from capabilities import capability
 from test_backend_step_linear_fit import _price, _record, _steps, traced
 from test_parity_device_window import KV, PROPOSE, _recorded
 from test_parity_record import _config, _drive
@@ -294,16 +295,21 @@ def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("eagle3")
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(test_dp_slice, "MODEL", M3)
-        mp.setattr(test_dp_slice, "CONSTANT", STUB)
         mp.setattr(test_dp_slice, "publish_entry", _publish_remapped)
         return [
             test_dp_slice.run_dp_slice(
-                root / f"seed{s}", s, flags, dp=1, machine=copy.deepcopy(MACHINE)
+                root / f"seed{s}",
+                s,
+                flags,
+                dp=1,
+                machine=copy.deepcopy(MACHINE),
+                backend=STUB,
             )
             for s in ("1", "2")
         ]
 
 
+@capability("eagle3")
 def test_m3_with_its_eagle3_drafter_meets_every_scenario_check(runs):
     from test_dp_slice import MAX_TOKENS
 

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 import test_dp_slice
+from capabilities import capability
 from test_dp_slice import MAX_TOKENS, run_dp_slice
 from test_vertical_slice import NEEDS_A_RUN, _run_file
 
@@ -260,6 +261,7 @@ def runs(tmp_path_factory):
 
 
 @NEEDS_A_RUN
+@capability("rapidserve")
 def test_rapidserve_meets_every_scenario_check_on_both_engines(runs):
     run = runs[0]
     print(f"\n{run['table']}")

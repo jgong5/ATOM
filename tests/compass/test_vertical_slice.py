@@ -30,6 +30,7 @@ from unittest import mock
 
 import pytest
 import torch
+from capabilities import ROOFLINE, ROOFLINE_MACHINE, capability, cost_overrides
 from test_memory_readings import DOCUMENT, META_8B, publish_readings
 
 from atom.compass import run as compass_run
@@ -221,6 +222,8 @@ def _run_file(out: Path, **overrides) -> Path:
         "store": str(out / "store"),
         "out_dir": str(out),
     } | overrides
+    if run["step_stub"] is None:  # the step roofline alone (`cost_overrides`)
+        del run["step_stub"]
     (out / "run.json").write_text(json.dumps(run))
     return out / "run.json"
 
@@ -260,15 +263,16 @@ def publish_entry_on_arch(store, machine, argv, env) -> None:
     )
 
 
-def run_slice(out: Path, seed: str) -> dict:
-    """One run in its own process tree; its step table, summary and request times."""
+def run_slice(out: Path, seed: str, backend=CONSTANT, machine=DOCUMENT) -> dict:
+    """One run in its own process tree, priced by `backend` on `machine`
+    (`cost_overrides`); its step table, summary and request times."""
     out.mkdir()
     with held_ports(2) as (clock_port, port):
         endpoint = f"tcp://127.0.0.1:{clock_port}"
         run_file = _run_file(
             out,
             clock_endpoint=endpoint,
-            step_stub=CONSTANT,
+            **cost_overrides(backend, machine),
             host={"tokenizer": TOKENIZER},
         )
         env = dict(
@@ -280,7 +284,7 @@ def run_slice(out: Path, seed: str) -> dict:
         )
         args = ["--model", MODEL, "--host", "127.0.0.1", "--server-port", str(port)]
         args += ["--enforce-eager", "--max-model-len", "2048"]
-        publish_entry(out / "store", DOCUMENT, args, env)
+        publish_entry(out / "store", machine, args, env)
         with open(out / "server.log", "w") as log:
             server = subprocess.Popen(
                 [sys.executable, "-m", "atom.entrypoints.openai.api_server", *args]
@@ -320,6 +324,7 @@ def runs(tmp_path_factory):
 
 
 @NEEDS_A_RUN
+@capability("tp1")
 def test_one_request_meets_every_scenario_check(runs):
     run = runs[0]
     arrive, first_token, leave = run["request"]
@@ -330,6 +335,38 @@ def test_one_request_meets_every_scenario_check(runs):
         [MAX_TOKENS],
         [line for _, line in run["events"]],
         {"engine": run["out"] / "parity"},
+    )
+    assert not failed, "\n".join(failed)
+    assert 0 < arrive < first_token <= leave
+    assert 0 < run["summary"]["cost"]["wall_seconds"]
+    assert run["bound"] == (600.0, "run file bound_s")
+
+
+@pytest.fixture(scope="module")
+def roofline_runs(tmp_path_factory):
+    root = tmp_path_factory.mktemp("slice_roofline")
+    return [
+        run_slice(root / f"seed{seed}", seed, ROOFLINE, ROOFLINE_MACHINE)
+        for seed in ("1", "2")
+    ]
+
+
+@NEEDS_A_RUN
+@capability("tp1", 1)
+def test_one_request_meets_every_scenario_check_under_the_step_roofline(
+    roofline_runs,
+):
+    """The level-0 case's checks but one: the engine's hand-computed
+    timeline, `check_run`'s records, which it computes only for a constant
+    step stub, from that stub's prefill and decode costs."""
+    run = roofline_runs[0]
+    arrive, first_token, leave = run["request"]
+    print(f"\nrequest 0: arrive {arrive!r} first token {first_token!r} leave {leave!r}")
+    print(f"{run['summary']['schedule']['seconds_by_method']}\n{run['table']}")
+    failed = check_run(
+        [r["out"] for r in roofline_runs],
+        [MAX_TOKENS],
+        [line for _, line in run["events"]],
     )
     assert not failed, "\n".join(failed)
     assert 0 < arrive < first_token <= leave
