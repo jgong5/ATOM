@@ -16,9 +16,9 @@ on its wall time: the standard library's JSON and pydantic held 14.4% of the
   which for every body it decodes is ``json.loads``'s; ``json.loads`` reads or
   refuses any other. A list of ids msgspec takes as non-negative ints is those
   ints, as pydantic returns them; pydantic coerces or refuses any other.
-- A prefill frontend's response whose top-level ``prompt_token_ids`` msgspec
-  writes as integers alone is the original rendering of the rest with that
-  text in their place; the original renders any other.
+- A prefill frontend's response whose top-level ``prompt_token_ids`` holds
+  ints alone is the original rendering of the rest with msgspec's text of
+  them in their place; the original renders any other.
 
 What a run is charged is unchanged: no charge reads the wall time these take.
 """
@@ -102,18 +102,19 @@ class CheckedIds:
 
 def _writing(render):
     """`render`, Starlette's ``JSONResponse.render``, writing a dict's
-    top-level `KEY` list with msgspec where its text is integers alone."""
+    top-level `KEY` list with msgspec where it holds ints alone."""
 
     @functools.wraps(render)
     def write(response, content):
         ids = content.get(KEY) if type(content) is dict else None
         if type(ids) is list:
+            # Ints alone are written alike; anything else, render writes or
+            # refuses as it always has.
             try:
-                text = _ENCODE.encode(ids)
-            except (TypeError, ValueError, RecursionError):
-                text = b""  # render writes it, or refuses it as it always has
-            # Integers are written alike; a set, a float or a bool is not.
-            if text.translate(None, b"0123456789,-") == b"[]":
+                text = _ENCODE.encode(msgspec.convert(ids, list[int]))
+            except (msgspec.ValidationError, ValueError):
+                text = None
+            if text is not None:
                 stand_in = render(response, _STAND_IN)
                 rest = render(response, {**content, KEY: _STAND_IN})
                 if rest.count(stand_in) == 1:

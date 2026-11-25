@@ -21,6 +21,7 @@ import json
 import math
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 import starlette.requests
 from conftest import atom_config_double
@@ -187,6 +188,7 @@ RESPONSES = {
     "floats": {**_response([1]), handoff.KEY: [1.0, 1e16]},
     "a nested list": {**_response([1]), handoff.KEY: [[1], 2]},
     "a set": {**_response([1]), handoff.KEY: [1, {2}]},
+    "raw JSON": {**_response([1]), handoff.KEY: [1, msgspec.Raw(b"7")]},
     "a tuple": {**_response([1]), handoff.KEY: (1, 2)},
     "the stand-in elsewhere": {"note": handoff._STAND_IN, **_response([1, 2])},
     "NaN elsewhere": {**_response([1, 2]), "ttft_s": math.nan},
@@ -213,6 +215,7 @@ def test_a_prefill_response_renders_as_before_and_its_ids_reach_no_standard_enco
     handoff.install("P")
     assert {name: _rendered(content) for name, content in RESPONSES.items()} == before
     assert before["a set"].startswith("TypeError")
+    assert before["raw JSON"].startswith("TypeError")
     assert before["NaN elsewhere"].startswith("ValueError")
     seen.clear()
     _rendered(RESPONSES["ids"])
