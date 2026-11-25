@@ -33,7 +33,9 @@ logger = logging.getLogger("atom")
 _DEFAULT_BACKEND = "moriio"
 
 # Backends with a remote peer. The rest of the registry is local storage.
-PD_TRANSFER_BACKENDS = frozenset({"moriio", "mooncake"})
+# `compass`, Compass's simulated connector, stands in for a Mooncake or MoRI-IO
+# peer, so a simulated prefill or decode instance is a P/D one.
+PD_TRANSFER_BACKENDS = frozenset({"moriio", "mooncake", "compass"})
 
 
 def resolve_pd_backend(kv_transfer_config: dict | None) -> str | None:
