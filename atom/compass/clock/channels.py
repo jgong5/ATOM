@@ -139,8 +139,8 @@ class ChannelTable:
 
     def mark_reactions(self, lp: LpId, reactions: dict) -> None:
         """Declare, for each kind of channel into `lp`, the kinds of channel out
-        of it that a message there can provoke. A kind of `lp`'s inbound channels
-        left out provokes nothing."""
+        of it that a message there can provoke. A kind left out can provoke a
+        send on every channel out of `lp`."""
         self.registry.require(lp)
         self._reactions[lp] = {k: tuple(v) for k, v in reactions.items()}
         self._reach.clear()
@@ -151,8 +151,9 @@ class ChannelTable:
 
     def reacts(self, into: str, out: str) -> bool:
         """Whether a message on `into` can provoke its receiver's send on `out`."""
-        declared = self._reactions.get(self.channel(into).target)
-        return declared is None or kind_of(out) in declared.get(kind_of(into), ())
+        declared = self._reactions.get(self.channel(into).target, {})
+        provoked = declared.get(kind_of(into))
+        return provoked is None or kind_of(out) in provoked
 
     def reach(self, name: str, target: LpId) -> float:
         """The least lookahead from a message on `name`, at its receiver, to a
