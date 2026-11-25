@@ -230,6 +230,10 @@ if [ -z "$NO_DRIVER_RUN" ] && grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/co
     # Qwen3.5-0.8B, DSpark from DeepSeek-V4.1-Flash's config with V4-Flash's tokenizer.
     export ATOM_COMPASS_MTP_MODEL=${ATOM_COMPASS_MTP_MODEL:-$(hf_snapshot Qwen3.5-0.8B)}
     export ATOM_COMPASS_DSPARK_MODEL=${ATOM_COMPASS_DSPARK_MODEL:-/root/cells/deepseek-v41-flash-dspark}
+    # MiniMax-M3 with its EAGLE3 drafter, at TP4, the same: each one's config
+    # and the target's tokenizer.
+    export ATOM_COMPASS_M3_MODEL=${ATOM_COMPASS_M3_MODEL:-/root/cells/minimax-m3-mxfp4}
+    export ATOM_COMPASS_M3_EAGLE3=${ATOM_COMPASS_M3_EAGLE3:-/root/cells/minimax-m3-eagle3}
     # The cc-traces smoke replays turns longer than the slice model's context, so
     # it runs alone, with this model as its slice model.
     SMOKE=tests/compass/test_cctraces_sim_smoke.py
@@ -248,6 +252,8 @@ if [ -z "$NO_DRIVER_RUN" ] && grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/co
     [ -d "$ATOM_COMPASS_IMAGE_MODEL" ] || MISSING+="ATOM_COMPASS_IMAGE_MODEL, a Qwen3.5-9B directory; "
     [ -d "$ATOM_COMPASS_MTP_MODEL" ] || MISSING+="ATOM_COMPASS_MTP_MODEL, a Qwen3.5-0.8B directory; "
     [ -d "$ATOM_COMPASS_DSPARK_MODEL" ] || MISSING+="ATOM_COMPASS_DSPARK_MODEL $ATOM_COMPASS_DSPARK_MODEL; "
+    [ -d "$ATOM_COMPASS_M3_MODEL" ] || MISSING+="ATOM_COMPASS_M3_MODEL $ATOM_COMPASS_M3_MODEL; "
+    [ -d "$ATOM_COMPASS_M3_EAGLE3" ] || MISSING+="ATOM_COMPASS_M3_EAGLE3 $ATOM_COMPASS_M3_EAGLE3; "
     [ -d "$ATOM_COMPASS_CCTRACES_MODEL" ] || MISSING+="ATOM_COMPASS_CCTRACES_MODEL, a Qwen3.8-27B directory; "
     [ -r "$ATOM_COMPASS_CCTRACES" ] || MISSING+="ATOM_COMPASS_CCTRACES $ATOM_COMPASS_CCTRACES; "
     [ -x "$COMPASS_HARNESS_PYTHON" ] || MISSING+="COMPASS_HARNESS_PYTHON $COMPASS_HARNESS_PYTHON; "
@@ -259,7 +265,8 @@ if [ -z "$NO_DRIVER_RUN" ] && grep -rqs ATOM_COMPASS_SLICE_MODEL "$ROOT/tests/co
     [ -z "$MISSING" ] || finish 92 "the driver-run tests lack ${MISSING%; }; nothing was run"
     printf 'driver-run: slice %s\n            image %s\n            router %s\n' \
         "$ATOM_COMPASS_SLICE_MODEL" "$ATOM_COMPASS_IMAGE_MODEL" "$ATOMESH"
-    printf 'spec:       mtp %s\n            dspark %s\n' "$ATOM_COMPASS_MTP_MODEL" "$ATOM_COMPASS_DSPARK_MODEL"
+    printf 'spec:       mtp %s\n            dspark %s\n            m3 %s\n            eagle3 %s\n' \
+        "$ATOM_COMPASS_MTP_MODEL" "$ATOM_COMPASS_DSPARK_MODEL" "$ATOM_COMPASS_M3_MODEL" "$ATOM_COMPASS_M3_EAGLE3"
     printf 'cc-traces:  model %s\n            traces %s\n            harness %s\n            aiperf %s\n' \
         "$ATOM_COMPASS_CCTRACES_MODEL" "$ATOM_COMPASS_CCTRACES" "$COMPASS_HARNESS_PYTHON" "$COMPASS_AIPERF_PYTHON"
 fi

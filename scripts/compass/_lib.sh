@@ -310,7 +310,7 @@ import compass_harness, aiperf; print(aiperf.__file__, compass_harness.__file__)
 # A SKIPPED line naming one of gate_gpu.sh's driver-run inputs, or the router it
 # puts on PATH: a driver-run test that did not run for want of it. The
 # alternation is tests/compass/driver_run_skips.py's DRIVER_RUN.
-COMPASS_DRIVER_RUN_SKIP='^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK|CCTRACES)|COMPASS_(HARNESS|AIPERF)_PYTHON|ATOMESH|needs atomesh|atomesh on PATH)'
+COMPASS_DRIVER_RUN_SKIP='^SKIPPED .*(ATOM_COMPASS_(SLICE|IMAGE|MTP|DSPARK|M3|CCTRACES)|COMPASS_(HARNESS|AIPERF)_PYTHON|ATOMESH|needs atomesh|atomesh on PATH)'
 
 # A SKIPPED line from a test that cargo-builds atomesh, taken where `cargo
 # metadata` cannot resolve atomesh's crates: no driver-run input would run it,
