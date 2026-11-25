@@ -742,10 +742,11 @@ def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time, or
     whose ``tokenizer`` or ``http_intake`` term the frontend would misread."""
     from atom.compass.backends.launch_features import PATHS
+    from atom.compass.backends.step_labels import STALLS
     from atom.compass.runner.overrides import ADMISSION_IN_E, HOST_LAW_KINDS, SEGMENTS
 
     laws, columns = host.get("laws", {}), host.get("columns", {})
-    paths = host.get(PATHS, {})
+    paths, stalls = host.get(PATHS, {}), host.get(STALLS, {})
     if (
         set(host)
         - {
@@ -756,6 +757,7 @@ def _check_host(path, host: dict) -> None:
             "hops",
             "columns",
             PATHS,
+            STALLS,
             *HOST_TERMS,
             INGRESS,
             RELAY_TERM,
@@ -774,13 +776,21 @@ def _check_host(path, host: dict) -> None:
         )
         or {len(c) for v in laws.values() for c in v.values()} - {3}
         or len(host.get("admit") or ADMISSION_IN_E) != 3
+        or not all(
+            isinstance(v, dict)
+            and set(v) == {"rate", "excess_s"}
+            and 0 <= v["rate"] <= 1
+            and v["excess_s"] >= 0
+            for v in stalls.values()
+        )
     ):
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
             f"laws, mapping {HOST_LAW_KINDS} to segments to three coefficients, "
             "columns, mapping them to segments to launch features' coefficients, "
             f"{PATHS}, mapping them to segments their laws state to launch paths' "
-            "non-negative constants, "
+            f"non-negative constants, {STALLS}, mapping launch paths to a stall "
+            "rate in [0, 1] and its non-negative excess_s, "
             "admit, three coefficients on a forward's admissions or null, "
             "key, the host key the laws were fitted under, hops, the terms "
             f"{' and '.join(HOST_TERMS)}, {RELAY_TERM}, {STREAM_TERM}, and {INGRESS}, "
@@ -2260,6 +2270,7 @@ def runner(model_runner, tree) -> None:
     from atom.compass.artifacts import machine_platform
     from atom.compass.backends.geometry import Parallelism
     from atom.compass.backends.launch_features import PATHS, stated
+    from atom.compass.backends.step_labels import STALLS
     from atom.compass.backends.step_linear import StepLinearBackend, StepLinearLaw
     from atom.compass.backends.step_roofline import (
         StepFallbackBackend,
@@ -2444,6 +2455,7 @@ def runner(model_runner, tree) -> None:
             launch=launch,
             defer=getattr(processor, "is_deferred_out", True),
             paths=host.get(PATHS),
+            stalls=host.get(STALLS),
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])

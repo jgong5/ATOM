@@ -64,7 +64,15 @@ from collections import Counter
 from pathlib import Path
 
 from atom.compass.artifacts import Key, Kind, keyed_platform
-from atom.compass.backends.step_labels import digest, group_prefills
+from atom.compass.backends.step_labels import (
+    STALLS,
+    digest,
+    group_prefills,
+    launch_stall_on,
+    record_ranks,
+    stall_entry,
+    stall_prices,
+)
 from atom.compass.backends.step_linear_fit import (
     fit_hops,
     fit_host,
@@ -95,7 +103,11 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
     (`host_blocks.steady_windows`), the kind-block host fit: the launch laws
     refitted per launch path (`host_blocks.refit`), the tokenizer and intake
     terms fitted within those windows, none in a record with none, and the
-    report's ``kind_blocks``."""
+    report's ``kind_blocks``. Under ``COMPASS_FIT_LAUNCH_STALL=1``
+    (`step_labels.STALL_ENV`) the entry also states `step_labels.STALLS`, the
+    records' launch stalls per launch path (`step_labels.stall_prices`, which
+    the report states with their counts), which a run draws on each prefill
+    forward (`runner.overrides.launch_stall`)."""
     from scipy.spatial import QhullError
 
     bare = sorted(
@@ -118,6 +130,10 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
     host, report = fit_host(samples)
     if steady is not None:
         host_blocks.refit(samples, host, report)
+    if launch_stall_on():
+        # `step_labels.STALL_ENV`: the records' launch stalls, per launch path.
+        report[STALLS] = stall_prices(map(record_ranks, records))
+        host[STALLS] = stall_entry(report[STALLS])
     stamped = [r for r in records if (Path(r) / "steps" / INTAKE_RECORD).is_file()]
     windows = None if steady is None else [steady.get(Path(r), []) for r in stamped]
     steps = [Path(r) / "steps" / INTAKE_RECORD for r in stamped]
