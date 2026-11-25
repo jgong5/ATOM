@@ -5,7 +5,7 @@ share, as Mooncake's master answers them at commit 206d634.
 `Master` holds the index: objects keyed as ATOM keys them, each in its chunk's
 group, the bytes they take against the owners' mounted capacity, and the leases
 and eviction that decide what later lookups find. Every object takes the
-entry's ``chunk_bytes``.
+entry's ``chunk_bytes``, or under a pipelined prefill its rank's (`PER_RANK`).
 
 - A group's members share one lease, a deadline that only grows. A query or
   renewal leases each present key's group to its end plus
@@ -89,6 +89,15 @@ TERMS = ("lookup_s", "store_s", "load_s")
 #: ``capacity_by_client_run``: the owners' bytes for client run ``k``, the
 #: last repeating, its first ``capacity_bytes``'s.
 CLIENT_RUN_FIELDS = ("clear_between_client_runs", "capacity_by_client_run")
+#: The entry's fields a pipelined prefill's writer ranks may each state apart:
+#: a list of one value per rank, ``world`` of them in ATOM's rank order
+#: (``pp_rank x tp + tp_rank``, `pp_aware_rank_and_world`). Its stages hold
+#: different layers, so each stage's chunk takes other bytes, its pools other
+#: slots and its copies other seconds. An entry fitted on one stage's ranks
+#: states each as one value, which every rank takes.
+PER_RANK = ("chunk_bytes", "save_slots", "load_slots", "store_s", "load_s")
+#: A chunk key's rank and world (`kv_store.keys.rank_key_prefix`).
+KEY_RANK = re.compile(r"/w(\d+)of(\d+)/")
 #: The entry's fields the deployment must match.
 MATCHED = (
     "protocol",
@@ -184,15 +193,24 @@ def check_entry(entry) -> argparse.Namespace:
         raise MooncakeStoreRefusal(
             f"the run file's {ENTRY} entry has unknown {', '.join(extra)}"
         )
-    for name in TERMS:
-        term = entry[name]
-        if not (
+
+    def law(term) -> bool:
+        return (
             isinstance(term, list)
             and len(term) == 2
             and all(isinstance(v, (int, float)) and 0 <= v < math.inf for v in term)
-        ):
+        )
+
+    def positive(value) -> bool:
+        return type(value) is int and value > 0
+
+    world = entry["world"]
+    for name in TERMS:
+        term = entry[name]
+        if not (law(term) or _ranked(entry, name, law)):
             raise MooncakeStoreRefusal(
-                f"{ENTRY}.{name} is {term!r}, not [fixed, per item] seconds"
+                f"{ENTRY}.{name} is {term!r}, not [fixed, per item] seconds, or "
+                f"one such a rank of world {world!r} (a pipelined prefill's)"
             )
     if not entry["lookup_s"][0] > 0:
         raise MooncakeStoreRefusal(
@@ -203,9 +221,10 @@ def check_entry(entry) -> argparse.Namespace:
     if entry["protocol"] not in ("rdma", "tcp"):
         raise MooncakeStoreRefusal(f"{ENTRY}.protocol is {entry['protocol']!r}")
     for name in (*MATCHED[1:], "capacity_bytes"):
-        if not (type(entry[name]) is int and entry[name] > 0):
+        if not (positive(entry[name]) or _ranked(entry, name, positive)):
             raise MooncakeStoreRefusal(
                 f"{ENTRY}.{name} is {entry[name]!r}, not a positive int"
+                + (" or one a rank" if name in PER_RANK else "")
             )
     clear = entry.get("clear_between_client_runs", False)
     if type(clear) is not bool:
@@ -240,6 +259,29 @@ def check_entry(entry) -> argparse.Namespace:
     return parse_master_flags(argv)
 
 
+def _ranked(entry: dict, name: str, each) -> bool:
+    """Whether `entry`'s `name` is one value a rank, each of which `each`
+    accepts: a list of ``world`` values, for a field `PER_RANK` names."""
+    value, world = entry[name], entry.get("world")
+    return (
+        name in PER_RANK
+        and type(world) is int
+        and isinstance(value, list)
+        and len(value) == world
+        and all(each(v) for v in value)
+    )
+
+
+def of_rank(entry: dict, name: str, rank: int):
+    """Writer rank `rank`'s `name` in `entry`: the entry's one value, or the
+    rank's own where it states one a rank (`PER_RANK`)."""
+    value = entry[name]
+    ranked = isinstance(value, list) and (
+        name not in TERMS or isinstance(value[0], list)
+    )
+    return value[rank] if ranked else value
+
+
 def client_run_capacity(entry: dict, k: int) -> int:
     """The owners' bytes client run `k` starts with: ``capacity_by_client_run``'s
     ``k``-th, its last past its end, else ``capacity_bytes``."""
@@ -251,15 +293,27 @@ def check_plans(entry: dict, plans: dict, block_tokens: int) -> None:
     """Refuse a member of the engines LP mooncake_store serves whose published
     plan (`atom.compass.run.publish_transfer`) gives a chunk, its KV block's
     bytes over the entry's ``chunk_tokens`` of `block_tokens`, or a TP world
-    other than the entry's, at which its laws were fitted."""
+    other than the entry's, at which its laws were fitted. Under a pipelined
+    prefill each stage's members (``-pp<k>``) plan their own layers' chunk,
+    which the entry states at the stage's ranks, and the world is the stages'
+    TP worlds together."""
     blocks = entry["chunk_tokens"] // block_tokens
+    stages = len({_stage(name) for name in plans}) or 1
     for name, plan in plans.items():
         chunk, tp = plan["block_bytes"] * blocks, plan["tp"]
-        if (chunk, tp) != (entry["chunk_bytes"], entry["world"]):
+        want = of_rank(entry, "chunk_bytes", _stage(name) * tp)
+        if (chunk, tp * stages) != (want, entry["world"]):
             raise MooncakeStoreRefusal(
-                f"{name} plans a {chunk} B chunk at TP {tp}, and the {ENTRY} "
-                f"entry states {entry['chunk_bytes']} B at world {entry['world']}"
+                f"{name} plans a {chunk} B chunk at TP {tp} of {stages} stage(s), "
+                f"and the {ENTRY} entry states {want} B at world {entry['world']}"
             )
+
+
+def _stage(name: str) -> int:
+    """The pipeline stage of an engine LP's member `name` (``engine-P-pp2.dp0``
+    is stage 2), 0 outside a pipeline."""
+    m = re.search(r"-pp(\d+)$", name.partition(".")[0])
+    return int(m[1]) if m else 0
 
 
 def store_rpc_s(entry: dict) -> float:
@@ -323,7 +377,21 @@ class Master:
         )
         self.threads = flags.rpc_thread_num
         self.chunk_bytes = entry["chunk_bytes"]
+        self._entry = entry
         self.reset(entry["capacity_bytes"])
+
+    def size(self, key: str) -> int:
+        """The bytes object `key` takes: the entry's ``chunk_bytes``, or the
+        one of the rank its key names where it states one a rank."""
+        if not isinstance(self.chunk_bytes, list):
+            return self.chunk_bytes
+        m = KEY_RANK.search(key)
+        if m is None:
+            raise MooncakeStoreRefusal(
+                f"key {key!r} names no rank, and the {ENTRY} entry states its "
+                "chunk bytes a rank"
+            )
+        return of_rank(self._entry, "chunk_bytes", int(m[1]))
 
     def reset(self, capacity: int) -> None:
         """An empty Store of `capacity` bytes: every object, group, lease and
@@ -347,7 +415,7 @@ class Master:
                 new.append((key, gid))
             elif obj.published:
                 self._lease(obj.group, now + self.ttl)
-        need = len(new) * self.chunk_bytes
+        need = sum(self.size(key) for key, _ in new)
         if self.used + need > self.capacity:
             raise MooncakeStoreRefusal(
                 f"a put of {len(new)} objects ({need} B) at {now:.6f} s, with "
@@ -418,7 +486,7 @@ class Master:
                 for key in g.published:
                     del self.objects[key]
                 evicted += len(g.published)
-                self.used -= len(g.published) * self.chunk_bytes
+                self.used -= sum(self.size(key) for key in g.published)
                 self.filed -= len(g.published)
                 g.published, g.rank = [], None
                 if not g.pending:

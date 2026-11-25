@@ -361,7 +361,16 @@ class Lanes:
 
     def __init__(self, rt, ranks, terms: dict, name: str) -> None:
         self._rt, self._name = rt, name
-        self._terms = {kind: tuple(terms[term]) for kind, term in COPY_TERMS.items()}
+        # A term is ``[fixed, per chunk]``, or one such a rank (a pipelined
+        # prefill's ranks copy other layers' chunks).
+        self._terms = [
+            {
+                kind: tuple(t[k] if isinstance(t[0], (list, tuple)) else t)
+                for kind, term in COPY_TERMS.items()
+                for t in (terms[term],)
+            }
+            for k in range(len(ranks))
+        ]
         self._free = [
             {"load": [0.0] * r.load_workers, "save": [0.0] * r.save_workers}
             for r in ranks
@@ -380,7 +389,7 @@ class Lanes:
         """Queue rank `k`'s `kind` copy of `req`, `chunks` chunks, now; its
         priced start and end. `extra` comes back with it from `due`."""
         now, lanes = self._rt.read_clock(), self._free[k][kind]
-        fixed, per_chunk = self._terms[kind]
+        fixed, per_chunk = self._terms[k][kind]
         start = max(now, heapq.heappop(lanes))
         end = start + (fixed + per_chunk * chunks if chunks else 0.0)
         heapq.heappush(lanes, end)

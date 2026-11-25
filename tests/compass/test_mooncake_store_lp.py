@@ -474,7 +474,7 @@ def test_a_decode_side_that_does_not_offload_starts_nothing(tmp_path, started):
         (_prefill(0), {store.ENTRY: None}, "P", {}, "has no mooncake_store entry"),
         ({}, {}, None, {}, "offloads no KV to a Mooncake Store and the run file has a"),
         (STORE, {}, "D", {}, "decode side offloads"),
-        (STORE, {}, None, {"pipeline_parallel_size": 2}, "no pipelined prefill"),
+        (STORE, {}, None, {"pipeline_parallel_size": 2}, r"world 2 \(the entry's 1\)"),
         (STORE, {}, None, {"tensor_parallel_size": 2}, r"world 2 \(the entry's 1\)"),
         (
             _store(**{"mooncake_store.chunk_tokens": 512}),
@@ -508,7 +508,7 @@ def test_a_decode_side_that_does_not_offload_starts_nothing(tmp_path, started):
         "no-entry",
         "no-deployment",
         "decode",
-        "pp",
+        "pp-world",
         "world",
         "chunk",
         "slots",
@@ -529,11 +529,18 @@ def test_each_launch_refusal_is_by_name_and_starts_nothing(
 # --- the channels ---------------------------------------------------------------
 
 
-def test_a_pipelined_prefill_with_a_store_entry_is_refused(tmp_path):
+def test_a_pipelined_prefill_s_head_stage_alone_talks_to_the_store(tmp_path):
+    """The head stage schedules, so its lookups and its ranks' puts, every
+    stage's, ride its channels; a later stage has none."""
+    from test_dp_slice import DP_MACHINE  # a machine stating its stage sends
+
     run = _run(tmp_path, router_s=2.0**-12, kv_write_req_s=2.0**-10)
     run[compass_run.PREFILL_PP] = 2
-    with pytest.raises(ValueError, match="no pipelined prefill"):
-        compass_run.channel_table(run)
+    run["machine"] = copy.deepcopy(DP_MACHINE)
+    table = compass_run.channel_table(run)
+    ms = LpId("mooncake_store")
+    assert {c.source.name for c in table.channels_into(ms)} == {"engine-P-pp0"}
+    assert {c.target.name for c in table.channels_from(ms)} == {"engine-P-pp0"}
 
 
 def test_deploy_sh_s_run_file_for_the_recipe_s_3p4d_has_17_lps_and_18_store_channels(

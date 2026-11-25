@@ -48,7 +48,15 @@ run whose ``on_refusal`` is ``abort``.
 
 `process_completions` reports what the ranks' `get_finished`, aggregated over
 the TP group, gave at the previous call, as the engine's aggregation answers
-one poll behind. Importing this module loads no third-party package; using it
+one poll behind.
+
+Under a pipelined prefill the writer ranks are every stage's (``world`` =
+stages x TP, ATOM's `pp_aware_rank_and_world`), all kept by the head stage's
+shell, the one that schedules: a request's lookup asks every rank's keys, a
+load is all or nothing over them, and each rank's copies run on its own lanes
+at its own chunk bytes, slots and laws where the entry states them a rank
+(`mooncake_store_server.PER_RANK`). A later stage's shell is inert: its
+scheduler never runs, as ATOM's does not. Importing this module loads no third-party package; using it
 loads zmq and torch, and ATOM's Store modules.
 """
 
@@ -132,10 +140,12 @@ class StandInClient:
     LP that published it). A put stores, a get reads all of what the answer
     holds, and the taint key is never present."""
 
-    def __init__(self, master: str, chunk_bytes: int) -> None:
+    def __init__(self, master: str, chunk_bytes: int, size=None) -> None:
         from atom.kv_transfer.offload.mooncake_store import client
 
         self.master_server_addr, self.chunk_bytes = master, chunk_bytes
+        # A key's bytes, where they differ by rank (`Master.size`).
+        self.size = size or (lambda key: chunk_bytes)
         self.missing = client.OBJECT_NOT_FOUND
         self.answer: dict[str, str] = {}
 
@@ -146,7 +156,7 @@ class StandInClient:
         return [0] * len(keys)
 
     def get(self, keys, ptrs, sizes):
-        return [self.chunk_bytes if k in self.answer else self.missing for k in keys]
+        return [self.size(k) if k in self.answer else self.missing for k in keys]
 
     def stats(self) -> dict:
         return {"counts": {}, "failures": {}}
@@ -165,9 +175,14 @@ class StandInPool:
 
     device = "cpu"
 
-    def __init__(self, entry: dict) -> None:
-        self._capacity = {"save": entry["save_slots"], "load": entry["load_slots"]}
-        self.chunk_bytes = entry["chunk_bytes"]
+    def __init__(self, entry: dict, rank: int = 0) -> None:
+        from atom.compass.kv.mooncake_store_server import of_rank
+
+        self._capacity = {
+            "save": of_rank(entry, "save_slots", rank),
+            "load": of_rank(entry, "load_slots", rank),
+        }
+        self.chunk_bytes = of_rank(entry, "chunk_bytes", rank)
         self.slot_stride = self.chunk_bytes
 
     def capacity(self, region: str) -> int:
@@ -335,6 +350,10 @@ class StoreShell:
         self._rt = rt = clock.installed()
         if rt is None:
             raise RuntimeError("no LP runtime is installed to run the Store's calls on")
+        if getattr(config.parallel_config, "pipeline_parallel_rank", 0):
+            # A later pipeline stage: the head's shell keeps its ranks.
+            self._inert = True
+            return
         run = compass_run.spec()
         entry = run[ENTRY]
         flags = store.check_entry(entry)
@@ -368,7 +387,9 @@ class StoreShell:
         self._lookup = self._inner._lookup_client
         backend = self._lookup.backend
         [pool] = backend._pools  # one master, as LP mooncake_store's launch holds
-        self._client = StandInClient(pool.pool.master, entry["chunk_bytes"])
+        self._client = StandInClient(
+            pool.pool.master, entry["chunk_bytes"], store.Master(entry).size
+        )
         pool.client = self._client
         self.chunk, self._world = self._inner.chunk_size, backend._world
         self._namespace = self._inner._namespace
@@ -376,8 +397,9 @@ class StoreShell:
         for k in range(self._world):
             rank = MooncakeStoreOffloadConnector(config)
             rank._rank, rank._world, rank._namespace = k, self._world, self._namespace
-            rank._chunk_bytes, rank._in_place = entry["chunk_bytes"], False
-            rank._client, rank._pool = self._client, StandInPool(entry)
+            rank._chunk_bytes = store.of_rank(entry, "chunk_bytes", k)
+            rank._in_place = False
+            rank._client, rank._pool = self._client, StandInPool(entry, k)
             safe = rank._source_group_safe if rank._early_release else None
             rank._gpu_connector = StandInCopies(safe)
             self._ranks.append(rank)
@@ -710,6 +732,10 @@ class StoreShell:
     def build_connector_meta(self):
         """ATOM's metadata, each rank's share of it queued as its worker takes
         it, each load and save on its lanes."""
+        if self.__dict__.get("_inert"):
+            from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+
+            return ConnectorMetadata()
         meta = self._inner.build_connector_meta()
         self._run_due()
         for k, rank in enumerate(self._ranks):
@@ -723,6 +749,8 @@ class StoreShell:
     def process_completions(self, output):
         """Run the copies due; report what the ranks gave at the previous
         call, then let ATOM's scheduler half read it."""
+        if self.__dict__.get("_inert"):
+            return output
         self._flush()
         self._run_due()
         held = self._tp.aggregate([rank.get_finished() for rank in self._ranks])
@@ -734,6 +762,8 @@ class StoreShell:
         return self._inner.process_completions(output)
 
     def has_pending_work(self) -> bool:
+        if self.__dict__.get("_inert"):
+            return False
         self._flush()
         held = self._held is not None and not self._held.is_empty()
         pending = bool(self._lanes) or held or bool(self._offered)
@@ -741,6 +771,8 @@ class StoreShell:
 
     def offload_statistics(self) -> dict:
         """ATOM's counters, rank 0's priced copies, and the shell's counts."""
+        if self.__dict__.get("_inert"):
+            return {}
         return {
             "connector": self._inner.get_statistics(),
             "copies": self._lanes.copies(),
@@ -748,6 +780,8 @@ class StoreShell:
         }
 
     def close(self) -> None:
+        if self.__dict__.get("_inert"):
+            return
         self._inner.close()
         for rank in self._ranks:
             rank.close()
