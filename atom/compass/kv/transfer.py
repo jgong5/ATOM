@@ -220,6 +220,11 @@ class Link:
         self._free = -math.inf  # when the link has moved every byte so far
         self._set_up = False  # whether a write that moves bytes has paid setup_s
 
+    @property
+    def last(self) -> float:
+        """The latest arrival so far: a write may not arrive before it."""
+        return self._last
+
     def start(self, a: float, blocks: int, *, bare: bool = False) -> float:
         """A write of `blocks` arrives at `a`; when it completes. With `bare`,
         it moves the blocks alone, no slot or staging row."""
@@ -366,6 +371,7 @@ class ChunkedSend:
         self.handoff: float | None = None
         self.writes: list = []  # (start, end, blocks)
         self.done: float | None = None
+        self.clamped = 0.0  # seconds its writes queued behind ones decided earlier
 
     def publish(self, t: float, tokens: int, prompt_tokens: int, block_size: int):
         """A forward ending at `t` computed the prompt through `tokens`: its
@@ -418,6 +424,16 @@ class ChunkedSend:
         self.at = t
         ready = self._ready(t)
         if ready > self.cursor:
+            # A later PP stage decides a send that handed off to its end at
+            # once (it takes no poll, `CompassKVConnector.prefill_done`): a
+            # write it decides afterwards from an earlier publication queues
+            # behind those, arriving with the link's latest. Where every
+            # publication is known first -- the head stage, a replay -- the
+            # sends are decided in time order and this changes nothing.
+            if t < self.link.last:
+                self.clamped += self.link.last - t
+                t = self.at = self.link.last
+                ready = self._ready(t)
             n, last = ready - self.cursor, ready >= self.total
             end = self.link.start(t, n, bare=not last)
             self.writes.append((t, end, n))

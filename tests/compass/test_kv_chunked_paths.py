@@ -7,6 +7,7 @@ done on ``kv_write_done``. The prefill's `/kv_transfer_info` tells the router
 it may chunk, as a Mooncake producer's does, naming no host."""
 
 import asyncio
+from importlib import metadata
 from types import SimpleNamespace
 
 import pytest
@@ -16,7 +17,12 @@ from atom.compass.run import TRAFFIC
 from atom.entrypoints.openai import api_server
 from atom.utils.clock import LPRuntime
 
-HOPS = dict(admission_s=2.0**-11, ipc_s=2.0**-10, stream_s=2.0**-10, router_s=2.0**-12)
+HOPS = {
+    "admission_s": 2.0**-11,
+    "ipc_s": 2.0**-10,
+    "stream_s": 2.0**-10,
+    "router_s": 2.0**-12,
+}
 
 
 def _names(table, lp, into=False):
@@ -42,6 +48,20 @@ def test_a_chunked_table_sends_each_request_to_both_frontends_and_relays_nothing
     assert table.lookahead(done[0]) == 2.0**-9
 
 
+def test_each_stage_of_a_pipelined_chunked_prefill_tells_decode_its_writes():
+    """Each stage writes its own layers: decode hears from every one."""
+    table = prefill_decode_table(
+        **HOPS, kv_write_req_s=2.0**-9, dp=(1, 4), prefill_pp=4, chunked=True
+    )
+    names = {c.name for lp in table.registry.ids() for c in table.channels_from(lp)}
+    done = sorted(n for n in names if ":kv_write_done" in n)
+    assert done == [
+        f"engine-P-pp{s}->engine-D:kv_write_done#dp0.dp{d}"
+        for s in range(4)
+        for d in range(4)
+    ]
+
+
 def test_a_table_that_is_not_chunked_is_as_before():
     old = prefill_decode_table(**HOPS, kv_write_req_s=2.0**-9, dp=(1, 4))
     names = {c.name for lp in old.registry.ids() for c in old.channels_from(lp)}
@@ -64,7 +84,10 @@ class _Script:
 
 def test_traffic_stamps_each_request_alike_on_both_frontends():
     try:
+        metadata.version("compass-harness")
         from compass_harness.traffic_lp import TrafficLP
+    except metadata.PackageNotFoundError as e:
+        pytest.skip(f"{e.name} is not installed")
     except RuntimeError as e:  # compass_harness checks aiperf at import
         pytest.skip(str(e))
 
