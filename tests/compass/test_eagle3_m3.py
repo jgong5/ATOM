@@ -310,6 +310,7 @@ def runs(tmp_path_factory):
 
 
 @capability("eagle3")
+@capability("minimax_m3")
 def test_m3_with_its_eagle3_drafter_meets_every_scenario_check(runs):
     from test_dp_slice import MAX_TOKENS
 

@@ -26,8 +26,12 @@ module's own per-rank parameter shapes and attributes:
 - `Attention` (not MLA), `LinearAttention`: attention over the step's rows,
   at their own heads and dims; neither is gone into. An `Attention` with a
   sliding window is refused by name (below), and one whose model plugs in an
-  impl other than ATOM's dense `PagedAttentionImpl` (MiniMax-M3's sparse
-  layers) is unclassified.
+  impl other than ATOM's dense `PagedAttentionImpl` is unclassified, but
+  MiniMax-M3's sparse one (`SparseMHAPagedAttentionImpl`): attention over the
+  blocks each query selects, with its indexer's scoring where the layer does
+  not reuse an earlier layer's selection, the KV and index keys at their
+  caches' formats; under indexer context parallelism, unclassified. A layer
+  that reuses the selection runs no indexer norm.
 - `Attention` over MLA: its attention kernels, at the rank's heads, the
   heads the decode kernel pads them to, and the latent, rope, no-rope and
   value widths, the KV at the cache's format. Its up-projection linear
@@ -174,6 +178,9 @@ V4 = "atom.models.deepseek_v4."
 ROW = OPS + "linear.RowParallelLinear"
 #: The impl a non-MLA `Attention` runs unless its model plugs in another.
 DENSE_MHA = OPS + "attention_mha.PagedAttentionImpl"
+#: MiniMax-M3's sparse impl, and the index cache formats it is priced at.
+SPARSE_MHA = OPS + "attention_mha.SparseMHAPagedAttentionImpl"
+INDEX_FORMATS = ("bf16", "fp8", "fp4")
 FP8_MOE = OPS + "moe.Fp8MoEMethod"
 NORMS = tuple(
     OPS + "layernorm." + n for n in ("RMSNorm", "GemmaRMSNorm", "RMSNormGated")
@@ -185,6 +192,7 @@ VISION = "atom.models.qwen3_5_vl.Qwen3VisionTransformer"
 #: A pipeline stage's stand-in for a layer another stage runs.
 PP_MISSING = "atom.models.utils.PPMissingLayer"
 M3 = "atom.models.minimax_m3.model."
+M3_SPARSE = M3 + "MiniMaxM3SparseAttention"
 #: V4's rotary tables, read inside the attention and compressor kernels.
 V4_ROPE = V4 + "_V4RoPE"
 V41 = "atom.models.deepseek_v41."
@@ -400,9 +408,12 @@ def _inside(module, parent) -> bool:
     """Whether `module` runs inside a kernel its V4.1 parent is priced as: a
     block's norms in its mixes, an attention's Q and KV norms in their one
     launch, a compressor's norm in its pooling, an indexer's key projection
-    and norm in its index keys."""
+    and norm in its index keys. Or not at all: the indexer norms of a
+    MiniMax-M3 sparse layer that reuses an earlier layer's selection."""
     held = ()
-    if _is(parent, V41_BLOCK):
+    if _is(parent, M3_SPARSE) and parent.skip_index_topk:
+        held = ("index_q_norm", "index_k_norm")
+    elif _is(parent, V41_BLOCK):
         held = ("attn_norm", "ffn_norm")
     elif _is(parent, V41_ATTENTION):
         held = ("q_norm", "kv_norm")
@@ -550,6 +561,8 @@ def _classify(module, name, parent):
         # An impl a model plugs in, even one derived from the dense one (as
         # MiniMax-M3's sparse attention is), runs a kernel of its own.
         impl = type(module.impl)
+        if f"{impl.__module__}.{impl.__qualname__}" == SPARSE_MHA:
+            return kv and _m3_sparse(module, name, kv)
         if f"{impl.__module__}.{impl.__qualname__}" != DENSE_MHA:
             return None
         if getattr(module.impl, "sliding_window", -1) > 0:
@@ -637,6 +650,23 @@ def _mla(impl, name, kv):
     dims = (impl.num_heads, impl.padded_num_heads, impl.kv_lora_rank)
     dims += (impl.qk_rope_head_dim, impl.qk_nope_head_dim, impl.v_head_dim)
     return Module(name, "mla_attention", dims, kv)
+
+
+def _m3_sparse(attention, name, kv):
+    """MiniMax-M3's sparse attention from its `Attention`, or None where its
+    indexer runs context-parallel or its index cache is of no format priced
+    here. A layer that reuses an earlier layer's selection
+    (`skip_index_topk`) runs no indexer."""
+    from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
+
+    impl = attention.impl
+    index = impl.index_cache_dtype
+    if impl.indexer_cp_group is not None or index not in INDEX_FORMATS:
+        return None
+    dims = (attention.num_heads, attention.num_kv_heads, attention.head_dim)
+    dims += (impl.topk, SPARSE_BLOCK_SIZE)
+    dims += (0 if impl.skip_index_topk else impl.num_idx_heads, impl.index_head_dim)
+    return Module(name, "block_sparse_attention", dims, kv, index=index)
 
 
 def _mla_up_of(linear, parent):
