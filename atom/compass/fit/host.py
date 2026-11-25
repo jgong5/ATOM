@@ -6,7 +6,12 @@
 
 `host_laws` fits the samples' host labels by `step_linear_fit.fit_host`, under
 the host key the real runner writes beside each record, and its report names
-each run with every trace its steps served. From the tokenizer calls and HTTP
+each run with every trace its steps served. On a pipeline's records it fits
+each stage's samples (`Sample.stage`) apart, each `E` from its release
+(`step_labels.label_run`), into one entry: each stage's ``laws``, ``admit``
+and ``columns`` under ``stages``, in stage order, and the report's under its
+own ``stages``, beside the frontend's terms below and the host key, once;
+stages under two host keys refuse. From the tokenizer calls and HTTP
 intake stamps the recorded server wrote beside its steps
 (`atom.compass.run.TOKENIZER_RECORD`, `INTAKE_RECORD`) it fits the entry's
 ``tokenizer`` term (`step_linear_fit.fit_tokenizer`) and ``http_intake`` term
@@ -63,7 +68,7 @@ from atom.compass.ingress import KEY as INGRESS
 from atom.compass.ingress import check as check_ingress
 from atom.compass.parity.client_run import RAW
 from atom.compass.run import INTAKE_RECORD, LOCAL, TOKENIZER_RECORD
-from atom.compass.validate.runs import SIDES
+from atom.compass.validate.runs import SIDES, deployment_side
 
 PROG = "compass fit host"
 
@@ -72,7 +77,8 @@ def host_laws(samples, records=(), client_runs=()) -> tuple[dict, dict]:
     """The host laws over `samples`, with the tokenizer, HTTP intake and hop
     terms of the record directories `records`, each served the client runs
     `client_runs` pairs it with by their exports, as a run file's `host` entry,
-    and their report; samples with no host labels under a host key refuse."""
+    and their report, a pipeline's stages fitted apart (`_staged`); samples
+    with no host labels under a host key refuse."""
     from scipy.spatial import QhullError
 
     bare = sorted(
@@ -92,7 +98,7 @@ def host_laws(samples, records=(), client_runs=()) -> tuple[dict, dict]:
                     f"its lines; steps/{name + LOCAL} names the file that holds "
                     f"them, {named.read_text().strip()}"
                 )
-    host, report = fit_host(samples)
+    host, report = _staged(samples)
     stamped = [r for r in records if (Path(r) / "steps" / INTAKE_RECORD).is_file()]
     steps = [Path(r) / "steps" / INTAKE_RECORD for r in stamped]
     calls = [d.with_name(TOKENIZER_RECORD) for d in steps]
@@ -130,6 +136,24 @@ def host_laws(samples, records=(), client_runs=()) -> tuple[dict, dict]:
     return host, {"provenance": publish.runs(samples), **report}
 
 
+def _staged(samples) -> tuple[dict, dict]:
+    """`fit_host` of `samples`, on a pipeline's each stage's apart: one entry
+    under their one host key, each stage's part under ``stages``."""
+    pp = 1 + max((s.stage for s in samples), default=0)
+    if pp == 1:
+        return fit_host(samples)
+    parts = [fit_host([s for s in samples if s.stage == k]) for k in range(pp)]
+    keys = [json.dumps(host["key"], sort_keys=True) for host, _ in parts]
+    if len(set(keys)) > 1:
+        raise ValueError(
+            f"the pipeline's stages carry the host keys {' / '.join(keys)}; a "
+            "pipeline's host laws are fitted under one"
+        )
+    stages = [{k: v for k, v in host.items() if k != "key"} for host, _ in parts]
+    host = {"key": parts[0][0]["key"], "stages": stages}
+    return host, {"stages": [report for _, report in parts], "unfitted": {}}
+
+
 def _client(record, exports) -> dict:
     """Each request's send and ack on CLOCK_MONOTONIC, in ns, from the aiperf
     raw records beside the client runs' `exports` of `record`, as `fit_hops`
@@ -137,7 +161,7 @@ def _client(record, exports) -> dict:
     ``request_ack_ns`` on the wall clock it read beside it as
     ``request_start_ns``. A prefill-decode side's requests and streams pass the
     router, so its client's sends and acks time no hop of its own."""
-    if Path(record).name in SIDES and (Path(record).parent / SIDES[0]).is_dir():
+    if deployment_side(record):
         return {"missing": f"{record} is a side of a deployment, behind its router"}
     sent, acked = [], []
     for export in exports:

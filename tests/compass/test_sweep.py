@@ -211,6 +211,26 @@ def test_a_steps_requests_park_decodes_reuse_prefixes_and_fill_before_a_cut():
     assert groups[0][0]["prompt_token_ids"][:32] == prefix["prompt_token_ids"]
 
 
+def test_a_prefix_row_a_replaying_engine_starts_a_hash_block_lower_reuses_its_hit():
+    engine = {
+        "max_num_batched_tokens": 64,
+        "enable_dp_attention": True,
+        "kv_cache_block_size": 16,
+        "replays_state": True,
+    }
+    body = {"ignore_eos": True, "max_tokens": 2}
+    tokens = iter(range(10**6))
+    first, _, groups = sweep._requests(
+        [Point(0, ((21, 37),), ("prefix",), 0, False, 7, body)],
+        engine,
+        lambda n: list(itertools.islice(tokens, n)),
+    )
+    # ATOM starts the row at 16, a block below the hit at 32.
+    (prefix,) = first
+    assert len(prefix["prompt_token_ids"]) == 32
+    assert groups[0][0]["prompt_token_ids"][:32] == prefix["prompt_token_ids"]
+
+
 def test_a_failed_request_is_printed_and_the_sweep_goes_on(capsys):
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
