@@ -672,3 +672,67 @@ def test_a_pipeline_whose_stages_ran_other_forwards_refuses(tmp_path):
     named = f"{path}'s pipeline stages hold [{len(head)}, {len(head) - 1}] lines"
     with pytest.raises(ValueError, match=re.escape(named)):
         label_run([path], stage=1)
+
+
+def _producer(out) -> list[dict]:
+    """`pp2`'s record as a stopped producer server's directory `out`: stage
+    0's `dp0.jsonl`, every forward a prefill and none reading a token, with its
+    engine file, and an empty run.json. Returns stage 0's lines."""
+    from test_drive_record import ENGINE
+
+    (out / "steps").mkdir()
+    head, _ = pp2(out / "steps", 19)
+    (out / "steps/dp0.engine.json").write_text(json.dumps(ENGINE))
+    (out / "run.json").write_text("{}")
+    return head
+
+
+def _rewrite(path, lines) -> None:
+    path.write_text("".join(json.dumps(s) + "\n" for s in lines))
+
+
+@pytest.mark.parametrize("dummy", [False, True])
+def test_a_pipeline_producer_s_head_gets_its_cost_lines_and_engine_entry(
+    tmp_path, dummy
+):
+    """The named result: a pipeline producer's stage 0 reads no token, and with
+    no decode step its labels need no token read exit, so its record gets its
+    cost lines and run.json its `engine` entry. A dummy forward holding a decode
+    row is no decode step: it gives no sample."""
+    from test_drive_record import ENGINE
+
+    from atom.compass.drive.record import write_engine_and_costs
+
+    head = _producer(tmp_path)
+    assert not any("t_recv_ns" in s or "t_read_ns" in s for s in head)
+    if dummy:
+        head[5] |= {"is_dummy_run": True, "rows": [[1, 1, True]], "batch": []}
+        _rewrite(tmp_path / "steps/dp0.jsonl", head)
+    write_engine_and_costs(tmp_path)
+
+    assert json.loads((tmp_path / "run.json").read_text()) == {"engine": ENGINE}
+    version, *table = map(json.loads, (tmp_path / "steps/dp0.cost.jsonl").open())
+    assert version == {"version": TABLE_VERSION}
+    steps = [s["step"] for s in head if not s["is_dummy_run"]]
+    assert [row["step"] for row in table] == steps
+    assert {(row["cut"], row["launch_exposed"]) for row in table} == {
+        ("untraced", False)
+    }
+    assert all(row["W_launch"] > 0 for row in table)
+
+
+def test_a_head_with_a_decode_step_and_no_token_read_exit_refuses(tmp_path):
+    """A decode step is cut by where its device started on the host clock, which
+    only a token read exit places: `pp2`'s head with one refuses, writing no
+    cost lines and no `engine` entry."""
+    from atom.compass.drive.record import write_engine_and_costs
+
+    head = _producer(tmp_path)
+    head[5] |= {"rows": [[1, 4096, True]], "batch": [[0, 1, 4096]]}
+    _rewrite(tmp_path / "steps/dp0.jsonl", head)
+
+    refusal = "no token read exit (`t_recv_ns` or `t_read_ns`) ties the record's"
+    with pytest.raises(ValueError, match=re.escape(refusal)):
+        write_engine_and_costs(tmp_path)
+    assert not (tmp_path / "steps/dp0.cost.jsonl").exists()
+    assert json.loads((tmp_path / "run.json").read_text()) == {}

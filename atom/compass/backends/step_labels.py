@@ -44,7 +44,9 @@ exit of each wait for the previous output's token copy (`t_recv_ns`)
 bounds the host clock's lead over the device's (that forward had finished by
 then), as does the exit of a forward's read of its own tokens (`t_read_ns`)
 over its device start, its target's end under MTP; the tightest of the last
-`ANCHORS` bounds is the lead. The copy itself
+`ANCHORS` bounds is the lead. A record with a decode step and no such exit
+refuses; one with no decode step, as a pipeline producer's head that reads no
+token, needs none and is labelled without it. The copy itself
 lands on its own stream after the exit event the bound reads, by 14 to 29 us
 measured on one host (median 17 us), so each bound carries that much more lead
 than the clocks actually have; on the step linear law's records the gap never
@@ -656,7 +658,8 @@ def _paced(lines, mtp: bool = True) -> set[int]:
 def _host_cut(lines) -> tuple[set[int], set[int]]:
     """The steps whose device start precedes their host launch end, and the
     MTP decodes whose device reached the propose pass before the host's draft
-    copy wait."""
+    copy wait; neither, on `lines` with no decode step and no token read exit,
+    since only a decode step is cut by them."""
     output_end, timed = None, []
     for s, start, _, _ in _timed(lines):
         bound = None
@@ -668,7 +671,14 @@ def _host_cut(lines) -> tuple[set[int], set[int]]:
             output_end = start + s["d_busy_ns"]
         timed.append((s, start, bound))
     bounds = [b for _, _, b in timed if b is not None]
+    decodes = {
+        s["step"]
+        for s, _, _ in timed
+        if not s["is_dummy_run"] and all(r[2] for r in s["rows"])
+    }
     if not bounds:
+        if not decodes:
+            return set(), set()
         raise ValueError(
             "no token read exit (`t_recv_ns` or `t_read_ns`) ties the record's "
             "host and device clocks"
@@ -680,7 +690,6 @@ def _host_cut(lines) -> tuple[set[int], set[int]]:
             recent.append(bound)
         if start + min(recent, default=first) < s["t_launch_ns"][1]:
             exposed.add(s["step"])
-    decodes = {s["step"] for s, _, _ in timed if all(r[2] for r in s["rows"])}
     return exposed, decodes & host_paced_drafts(lines)
 
 
