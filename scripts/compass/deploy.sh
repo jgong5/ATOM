@@ -117,6 +117,12 @@
 # `across_nodes`, apart from `kv_link`. KV_EXTRA, a JSON object, is merged into
 # each real instance's Mooncake kv config, such as '{"protocol": "tcp"}' on a
 # node with no RDMA HCA; a simulated instance's connector takes none.
+# PREFILL_KV_EXTRA and DECODE_KV_EXTRA, JSON objects, are merged into that
+# side's kv config after KV_EXTRA, such as a decode's `pd_admission` (the M3.1
+# 1P1D recipe's) or a prefill's chunked-transfer settings, which a real
+# instance takes whole; a simulated one takes `SIM_KV_KEYS` among them, the
+# settings its connector honours as Mooncake's does (`pd_admission`), and the
+# script names on stderr each key it leaves out.
 # Each instance runs its
 # command, OUT/<name>.sh, which first writes its process id to OUT/<name>.pid;
 # one given --on as `PREFIX bash OUT/<name>.sh`, stopped as `PREFIX kill -TERM
@@ -224,10 +230,13 @@ KV_LINK=intra_node ACROSS_NODES=0
 ((!any_on)) || KV_LINK=inter_node ACROSS_NODES=1
 ((!KV_OVER_NETWORK)) || KV_LINK=inter_node
 ((!ACROSS_NODES || !KV_OVER_NETWORK)) || bad "--kv-over-network keeps the decode on this node, and --on starts it on another"
-if [[ -n ${KV_EXTRA:-} ]]; then
-    python3 -c 'import json, sys; assert isinstance(json.loads(sys.argv[1]), dict)' "$KV_EXTRA" 2>/dev/null ||
-        bad "KV_EXTRA is no JSON object: $KV_EXTRA"
-fi
+for extra in KV_EXTRA PREFILL_KV_EXTRA DECODE_KV_EXTRA; do
+    [[ -z ${!extra:-} ]] ||
+        python3 -c 'import json, sys; assert isinstance(json.loads(sys.argv[1]), dict)' "${!extra}" 2>/dev/null ||
+        bad "$extra is no JSON object: ${!extra}"
+done
+# The side kv settings a simulated instance's connector honours.
+SIM_KV_KEYS=pd_admission
 read -ra prefill_env <<<"${PREFILL_ENV:-}"
 read -ra decode_env <<<"${DECODE_ENV:-}"
 for word in "${prefill_env[@]}" "${decode_env[@]}"; do
@@ -387,6 +396,16 @@ instance() { # I: write instance I's command, OUT/<name>.sh, and run it
         [[ -z ${KV_EXTRA:-} ]] || kv=$(python3 -c 'import json, sys
 print(json.dumps({**json.loads(sys.argv[2]), **json.loads(sys.argv[1])}))' "$kv" "$KV_EXTRA")
     fi
+    local side_extra=PREFILL_KV_EXTRA
+    [[ ${sides[i]} == prefill ]] || side_extra=DECODE_KV_EXTRA
+    [[ -z ${!side_extra:-} ]] || kv=$(python3 -c 'import json, sys
+kv, extra, keep = json.loads(sys.argv[1]), json.loads(sys.argv[2]), sys.argv[3].split()
+if sys.argv[4] == "run":
+    left = sorted(k for k in extra if k not in keep)
+    if left:
+        print(f"deploy.sh: {sys.argv[5]} leaves {left} out of a simulated instance", file=sys.stderr)
+    extra = {k: v for k, v in extra.items() if k in keep}
+print(json.dumps({**extra, **kv}))' "$kv" "${!side_extra}" "$SIM_KV_KEYS" "$cmd" "$side_extra")
     command+=("${own[@]}" --out "$OUT/$name" -- "${atom[@]}" --kv-transfer-config "$kv")
     # Its process id, which exec keeps; then this tree, checked, and the caller's directory.
     printf 'echo $$ >%q\n. %q && compass_env %q && compass_require_tree %q && cd %q &&\n    exec' \
