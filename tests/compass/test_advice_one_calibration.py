@@ -11,7 +11,8 @@ command measuring its readings into the store that law was published into.
 Where the shared store holds a stale entry at the other's readings key, which
 it refuses a second publish at, the first calibrates into its own store, unless
 the other is refused, as it then prints no readings command; a 1P1D first does
-too.
+too. A first that has started there, or ended, keeps that store, so the other
+calibrates its own law into its own store.
 
 The configuration, its stubbed resolution and starts are `test_advice_check`'s.
 """
@@ -241,3 +242,44 @@ def test_a_1p1d_lender_s_borrower_s_stale_readings_send_it_into_its_own_store(
         check.BORROWED.format("A", cal, into),
         check.PENDING.format(into, "A", cal),
     ]
+
+
+@pytest.mark.parametrize("ended", [False, True], ids=["started", "ended, refitting"])
+def test_a_borrower_s_stale_readings_in_its_started_lender_s_store_calibrate_its_own(
+    tmp_path, stubbed, monkeypatch, capsys, ended  # noqa: F811
+):
+    """S2's calibration has started into the shared store, named through a
+    link, or, run there by `calibrate.sh` in `test_calibrate`'s stub tree, has
+    ended, so a new one would refit its law; the shared store holds S5's
+    readings measured at another ATOM source, which it refuses again, and S2's
+    keeps that store, as its inputs name it, resolved: S5 prints its own
+    calibrate.sh command, into its own store, and no readings command."""
+    monkeypatch.setenv("AIPERF_PYTHON", "/real/python")
+    store, cal = tmp_path / "store", tmp_path / "out" / "cal"
+    (tmp_path / "shared").mkdir()
+    store.symlink_to(tmp_path / "shared")
+    if ended:
+        (first,) = _calibrations(advise(tmp_path, {"S2": S2, "S5": S5}))
+        assert _calibrated(tmp_path, first)[0] == 0
+        _fitted(cal / "S2", resolved(stubbed.config, ARGS2))
+    else:
+        (cal / "S2").mkdir(parents=True)
+        inputs = f"tree c0ffee\nstore {store.resolve()}\nrecord 1\n"
+        (cal / "S2" / "inputs").write_text(inputs)
+    _readings_at_another_digest(store, resolved(stubbed.config, ARGS5))
+    capsys.readouterr()
+
+    found = advise(tmp_path, {"S2": S2, "S5": S5})
+
+    if ended:
+        refits = check.REFITS.format(cal / "S2", store.resolve())
+        assert found["S2"]["made_by"] == [refits]
+    else:
+        assert _env(found, "S2")["STORE"] == str(store.resolve())
+    measure = "compass measure memory "
+    assert not [c for c in found["S5"]["made_by"] if measure in c]
+    env, given = _calibrate(found, "S5")
+    assert "STORE" not in env and given[0] == str(cal / "S5")
+    printed = capsys.readouterr().out
+    assert measure not in printed
+    assert "".join(f"    made by: {c}\n" for c in found["S5"]["made_by"]) in printed
