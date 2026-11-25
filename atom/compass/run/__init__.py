@@ -368,6 +368,11 @@ INSTANCES = {"P": "prefill_instances", "D": "decode_instances"}
 DP_WIDTHS = {"P": "prefill_data_parallel_size", "D": "decode_data_parallel_size"}
 #: The run-file key of a prefill-decode run's prefill pipeline width.
 PREFILL_PP = "prefill_pipeline_parallel_size"
+#: The run-file key that a prefill-decode run transfers its KV chunked
+#: (Mooncake's ``enable_chunked_transfer`` on the prefill side, which
+#: `deploy.sh run` sets from PREFILL_KV_EXTRA): `prefill_decode_table`'s
+#: `chunked`.
+KV_CHUNKED = "kv_chunked"
 #: The kv_transfer_config key a deployment names its index among them by.
 INSTANCE_KEY = "compass_instance"
 #: The run-file key of each side's worker order in the router, a per-run outcome.
@@ -1001,6 +1006,7 @@ def _engines_table(run: dict):
             decode=run.get(INSTANCES["D"], 1),
             prefill_pp=pp,
             pp_links=links,
+            chunked=run.get(KV_CHUNKED, False),
         )
     return single_engine_table(
         **common,

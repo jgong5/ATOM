@@ -34,7 +34,7 @@ def test_each_side_s_kv_settings_reach_its_kv_config(
     env, flags = planted
     env |= {
         "PREFILL_KV_EXTRA": json.dumps(CHUNKED),
-        "DECODE_KV_EXTRA": json.dumps(ADMISSION),
+        "DECODE_KV_EXTRA": json.dumps({**ADMISSION, "ib_device": "rdma4"}),
     }
     words = argv(tmp_path, flags if cmd == "run" else ["--gpu", "0,1"])
     words[3] = cmd
@@ -53,14 +53,19 @@ def test_each_side_s_kv_settings_reach_its_kv_config(
     assert (p["kv_role"], dk["kv_role"]) == ("kv_producer", "kv_consumer")
     assert dk["pd_admission"] == ADMISSION["pd_admission"]
     assert "pd_admission" not in p
+    assert {k: p[k] for k in CHUNKED} == CHUNKED
     if cmd == "record":
-        assert {k: p[k] for k in CHUNKED} == CHUNKED
         assert p["kv_connector"] == dk["kv_connector"] == "mooncake"
+        assert dk["ib_device"] == "rdma4"
     else:
-        assert not CHUNKED.keys() & p.keys()
         assert p["kv_connector"] == dk["kv_connector"] == "compass"
-        assert "PREFILL_KV_EXTRA leaves ['chunked_admission_timeout_s', " in err
-        assert "DECODE_KV_EXTRA leaves" not in err
+        assert "ib_device" not in dk
+        assert "DECODE_KV_EXTRA leaves ['ib_device'] out" in err
+        assert "PREFILL_KV_EXTRA leaves" not in err
+        # Chunked: the run file says so, and both ends name one notice address.
+        run = json.loads((d / "run_file.json").read_text())
+        assert run["kv_chunked"] is True
+        assert p["compass_kv_write_done"] == dk["compass_kv_write_done"]
 
 
 def test_a_side_s_kv_settings_that_are_no_json_object_exit_2(
