@@ -449,9 +449,6 @@ class TrafficLP:
 
     def _take(self, report) -> None:
         self._changed.set()
-        if isinstance(report, list):  # the stream events a worker read in one turn
-            self._take_events(report)
-            return
         if len(report) == 1:  # a worker wrote this request's cancel
             self._written.add(report[0])
             return
@@ -459,15 +456,11 @@ class TrafficLP:
             key, nbytes = report
             self._bodies[key] = nbytes
             return
-        self._take_events((report,))
-
-    def _take_events(self, events) -> None:
-        """Take stream events, each ``(key, seq, arrival, final)``."""
-        for key, seq, arrival, final in events:
-            # A cancelled request's seq may be dropped already, before its report.
-            if key not in self.cancelled:
-                self.rt.check_arrival(self.stream, arrival, seq)
-            self._reports[seq] = (key, final)
+        key, seq, arrival, final = report
+        # A cancelled request's seq may be dropped already, before its report.
+        if key not in self.cancelled:
+            self.rt.check_arrival(self.stream, arrival, seq)
+        self._reports[seq] = (key, final)
 
     async def _pass_returns(self) -> None:
         while True:
