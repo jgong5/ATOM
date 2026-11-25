@@ -36,6 +36,8 @@ MiniMax-M3's indexer-only context parallelism when on, the decode
 context-parallel width above one with its sub-config's knobs, the model config's
 ``--hf-overrides`` when it states any, the performance environment, each
 variable of `READ_OFF_DEFAULT` in it when ATOM reads it off its default too,
+each of MiniMax-M3.1's amd-kernels switches (`KERNEL_SWITCHES`) set off ATOM's
+default, each aiter tuned-table variable (`TABLES`) by its file's content,
 and, under speculation, its method and draft width, and the digest of the
 draft's config.json where it is not the target's. Loading refuses, naming
 what differs:
@@ -66,6 +68,7 @@ summary records the digest of the bundle it priced with.
 """
 
 import functools
+import hashlib
 import importlib.util
 import io
 import json
@@ -133,6 +136,63 @@ READ_OFF_DEFAULT = (
     "ATOM_DISABLE_MORI_EP",
     "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4",
 )
+#: ATOM's default and parser of a switch ATOM reads as ``== "1"``.
+_FLAG = ("0", lambda value: value == "1")
+#: MiniMax-M3.1's amd-kernels decode stack (ganyi's C17; the 1P2D AgentX
+#: recipe's ``env/d_env*.sh``): each switch changes a kernel, a GEMM path, the
+#: draft or verify head, or the prefix cache's eviction order, and ATOM reads
+#: most where it imports the kernel, outside `atom.utils.envs`. Each is keyed by
+#: its value only where ATOM reads it off its default, so keys of servers that
+#: set none, or set one at its default, do not move: its default and parser,
+#: as ATOM's reader states them (``ak_kernels.py``, ``p1_front.py``,
+#: ``ak_gemm.py``, ``ak_moe.py``, ``dspark.py``, ``dspark_draft.py``,
+#: ``minimax_m3/model.py``, ``utils/envs.py``).
+KERNEL_SWITCHES = {
+    # MoE through amd-kernels (a4w4 at every row count) and its tiling
+    "ATOM_M3_AK_MOE": _FLAG,
+    "ATOM_P1_MOE_TILES": _FLAG,
+    "ATOM_P1_MOE_IDROWS": _FLAG,
+    "ATOM_P1_MBF_ASM": _FLAG,
+    "ATOM_P1_MBF_BACK": _FLAG,
+    # verify and draft lm_head on amd-kernels, and its ring
+    "ATOM_DG_LMHEAD_AK": _FLAG,
+    "ATOM_P1_LMHEAD_RING": _FLAG,
+    # decode indexer and attention
+    "ATOM_M3_AK_DECODE": _FLAG,
+    "ATOM_P1_INDEXER_SPLIT4": _FLAG,
+    "ATOM_P1_INDEXER_SPLIT4_WIDE": _FLAG,
+    "ATOM_P1_INDEXER_SPLIT4_MIN8": ("8", int),
+    "ATOM_P1_K2_SCORER": ("", str),
+    "ATOM_M3_AK_INSERT": _FLAG,
+    "ATOM_M3_AK_DECODE_QOUT": _FLAG,
+    "ATOM_P1_AK_WIDE": _FLAG,
+    "ATOM_P1_L2_D2": _FLAG,
+    "ATOM_M3_FUSED_DECODE": _FLAG,
+    # layer front, all-reduce and MXFP8 GEMMs
+    "ATOM_AK_MXFP8_GEMM": _FLAG,
+    "ATOM_P1_FRONT_QKV_CHAIN": _FLAG,
+    "ATOM_P1_AR_QKV_CODES": _FLAG,
+    "ATOM_P1_L4_PULLQ": _FLAG,
+    "ATOM_MINIMAX_AK_AR_NORM": _FLAG,
+    # DSpark draft and verify head
+    "ATOM_M3_DRAFT_AK_AR_NORM": _FLAG,
+    "ATOM_M3_DRAFT_FUSED_CTX_ROPE": _FLAG,
+    "ATOM_M3_DRAFT_MARKOV_WIDE": _FLAG,
+    "ATOM_M3_DRAFT_POS_MAJOR": _FLAG,
+    "ATOM_P1_DRAFT_MARKOV_PERSIST": _FLAG,
+    "ATOM_P1_DRAFT_FC_AK": _FLAG,
+    "ATOM_P1_FAST_CONCAT": _FLAG,
+    "ATOM_P1_DSPARK_AUX_NEXT": ("0", lambda value: int(value or 0)),
+    "ATOM_M3_VERIFY_HEAD_CHUNK_TUNED": _FLAG,
+    # a finished request's generated blocks evicted first
+    "ATOM_P1_PREFIX_DEMOTE_DECODE": _FLAG,
+}
+#: aiter's tuned-table variables: each names a file that replaces aiter's own
+#: table (and its model_configs/ merge) for an op. Keyed where set, by the
+#: file's content, ``sha256:`` and the first 16 hex digits of its digest, since
+#: its path moves with the tree or job that holds it; a path no file answers is
+#: keyed as it stands.
+TABLES = "AITER_CONFIG_"
 #: Whether mori, the all-to-all ATOM selects by default, imports: keyed only
 #: where it does not, so keys written where it imports do not move.
 MORI = "mori_imports"
@@ -291,12 +351,48 @@ def _remapped(pickled: bytes) -> str:
 def keyed_env() -> dict:
     """This process's performance environment as `keyed` states it: less the
     client's variables and the device selection, each of `READ_OFF_DEFAULT` in
-    it only where ATOM reads it off its default."""
+    it only where ATOM reads it off its default, each of `KERNEL_SWITCHES` only
+    where set off its default (`_switches`), and each `TABLES` variable by its
+    file's content (`_tables`)."""
+    held = performance_env() | _off_default() | _switches() | _tables()
     return {
         k: v
-        for k, v in sorted((performance_env() | _off_default()).items())
+        for k, v in sorted(held.items())
         if not (k.startswith("AIPERF_") or k.endswith("_VISIBLE_DEVICES"))
     }
+
+
+def _switches() -> dict:
+    """Each of `KERNEL_SWITCHES` as this process sets it where its parser reads
+    it apart from its default; a value the parser refuses, which ATOM refuses
+    too, as set."""
+    held = {}
+    for name, (default, read) in KERNEL_SWITCHES.items():
+        if (value := os.environ.get(name)) is None:
+            continue
+        try:
+            off = read(value) != read(default)
+        except ValueError:
+            off = True
+        if off:
+            held[name] = value
+    return held
+
+
+def _tables() -> dict:
+    """Each `TABLES` variable this process sets, by its file's content."""
+    held = {}
+    for name, path in os.environ.items():
+        if not (name.startswith(TABLES) and path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            held[name] = path
+            continue
+        held[name] = f"sha256:{digest[:16]}"
+    return held
 
 
 def _off_default() -> dict:
