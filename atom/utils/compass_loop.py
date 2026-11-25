@@ -83,8 +83,7 @@ from functools import partial
 
 from atom.compass.carriers import (
     cancel_seq,
-    relay_service,
-    relay_stamp,
+    relay_carried,
     stamp_events,
     tracestate_jitter,
     with_relay_stamp,
@@ -304,6 +303,14 @@ class SimExecutor(ThreadPoolExecutor):
                 if done is not None:
                     self.loop.call_at(self.station.completion(j), done)
 
+    def unplaced(self) -> bool:
+        """On the loop thread: whether a service job is submitted and not yet
+        placed. It reads the station without its lock, since only the loop
+        thread enqueues and places. A job counts until `place` takes it, its
+        thread done or not."""
+        station = self.station
+        return station is not None and station.final < len(station.jobs)
+
     def idle(self) -> bool:
         """The loop is idle at the LP clock now: end `placed`'s wait, if there
         is one and every service job is placed; returns whether it ended one."""
@@ -328,7 +335,7 @@ def charge(d: float) -> None:
     rt = clock.installed()
     if rt is not None and rt.in_run:
         loop = rt.loop if threading.current_thread() is rt.owner else None
-        if loop is not None and loop.executor.station is not None:
+        if loop is not None and loop.executor.unplaced():
             loop.executor.place(wait=True)
         rt.advance_to(rt.now + d)
 
@@ -906,9 +913,10 @@ class HttpChannel:
             send = _stamping_events(send, rt, self.per_event)
         if relay_out is not None:
             send = _stamping(send, rt, relay_out, self.relay, taken)
+        service = 0.0  # the seconds its relay serves it for, where stated
         if relay_in is not None:
             body, receive = await _read_body(receive)
-            got = relay_stamp(body)
+            got, service = relay_carried(body)
         else:
             got = self.stamp(scope) if scope["type"] == "http" else None
         if (
@@ -935,7 +943,6 @@ class HttpChannel:
             arrival, seq = got
             rt.check_arrival(ch, arrival, seq)
             jitter = 0.0 if relay_in is not None else _intake_jitter(scope)
-            service = relay_service(body) if relay_in is not None else 0.0
             wake, ready = loop.create_future(), loop.create_future()
             # Its body leaves the socket as it comes, not at its turn.
             reading = asyncio.ensure_future(_body_messages(receive))
