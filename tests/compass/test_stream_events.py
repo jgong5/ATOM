@@ -2,7 +2,7 @@
 """What a simulated decode frontend's loop does per streamed event and per relayed request.
 
 Streams are served behind ATOM's own middleware, as the API server installs
-it, through `HttpChannel` on a `CompassEventLoop`, with frontend-D's
+it, imported or run as ``__main__`` as a server runs it, through `HttpChannel` on a `CompassEventLoop`, with frontend-D's
 `LPRuntime` on a co-hosted clock authority and an ``http_stream`` term in its
 host entry: each event is charged that term and stamped on frontend-D's stream
 to the router, with no anyio ``Event`` built per body message and no
@@ -13,11 +13,14 @@ service are read from one decode of its body.
 import json
 import math
 import threading
+import types
 import uuid
 
 import anyio
 import fastapi
 import pytest
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import StreamingResponse
 
 from atom.compass import carriers, clock_transport
@@ -100,11 +103,24 @@ def frontend_d(tmp_path, monkeypatch):
         server.close()
 
 
-def _atom_app(frames: list[str]) -> fastapi.FastAPI:
+def _as_main(m: Middleware) -> Middleware:
+    """`m` as ``python -m`` defines it, a ``BaseHTTPMiddleware``'s dispatch in
+    a module named ``__main__`` whose spec names the module it is imported as."""
+    if m.cls is not BaseHTTPMiddleware:
+        return m
+    fn = m.kwargs["dispatch"]
+    module = {**fn.__globals__, "__name__": "__main__"}
+    main = types.FunctionType(fn.__code__, module, fn.__name__, fn.__defaults__)
+    assert main.__module__ == "__main__" and main.__qualname__ == fn.__qualname__
+    return Middleware(BaseHTTPMiddleware, dispatch=main)
+
+
+def _atom_app(frames: list[str], run_as_main: bool) -> fastapi.FastAPI:
     """An app with the API server's middleware, streaming `frames` through the
     wrapper every streaming endpoint returns."""
     app = fastapi.FastAPI()
-    app.user_middleware = list(api_server.app.user_middleware)
+    middleware = api_server.app.user_middleware
+    app.user_middleware = [_as_main(m) if run_as_main else m for m in middleware]
 
     async def replay():
         for f in frames:
@@ -120,7 +136,7 @@ def _atom_app(frames: list[str]) -> fastapi.FastAPI:
     return app
 
 
-def _served(rt, monkeypatch, streams: list[list[str]]) -> list[dict]:
+def _served(rt, monkeypatch, streams: list[list[str]], run_as_main) -> list[dict]:
     """Each of `streams` served in turn behind `HttpChannel` on one loop: for
     each, the LP clock it starts at, the events the client is sent, their
     sends, the anyio Events built and the station placements made."""
@@ -152,7 +168,7 @@ def _served(rt, monkeypatch, streams: list[list[str]]) -> list[dict]:
         start, log = rt.now, len(rt.sent)
         for seen in (sent, built, placed):
             seen.clear()
-        channel = HttpChannel(_atom_app(frames), lambda scope: None)
+        channel = HttpChannel(_atom_app(frames, run_as_main), lambda scope: None)
         loop.run_until_complete(channel(dict(SCOPE), receive, send))
         out.append(
             {
@@ -168,8 +184,9 @@ def _served(rt, monkeypatch, streams: list[list[str]]) -> list[dict]:
     return out
 
 
+@pytest.mark.parametrize("run_as_main", [False, True], ids=["imported", "main"])
 def test_each_event_behind_atoms_middleware_is_charged_then_stamped_on_its_own_task(
-    frontend_d, monkeypatch
+    frontend_d, monkeypatch, run_as_main
 ):
     """Each event but ``[DONE]`` is charged the term before its stamp, on the
     stream to the router. A 40-event stream builds no more anyio Events than a
@@ -178,7 +195,7 @@ def test_each_event_behind_atoms_middleware_is_charged_then_stamped_on_its_own_t
     streams = [
         [f"data: {k}\n\n" for k in range(n)] + ["data: [DONE]\n\n"] for n in (2, 40)
     ]
-    short, long = _served(frontend_d, monkeypatch, streams)
+    short, long = _served(frontend_d, monkeypatch, streams, run_as_main)
     lookahead = TABLE.lookahead(STREAM)
     for got, frames in zip((short, long), streams):
         n = len(frames) - 1

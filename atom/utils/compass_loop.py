@@ -830,7 +830,12 @@ def _without_pass_through(app) -> None:
 
 
 def _qualified(fn) -> str:
-    return f"{getattr(fn, '__module__', None)}.{getattr(fn, '__qualname__', None)}"
+    """`fn`'s module and qualified name, the module by the name it is imported
+    as: a server runs the API server's module as ``__main__``
+    (``python -m``), and its spec still names it."""
+    spec = getattr(fn, "__globals__", {}).get("__spec__")
+    module = getattr(spec, "name", None) or getattr(fn, "__module__", None)
+    return f"{module}.{getattr(fn, '__qualname__', None)}"
 
 
 class HttpChannel:
