@@ -40,7 +40,9 @@ A prefill or decode instance's run reads a network file across nodes, as
 arguments a real start of it takes, where they are not the run's, and the
 environment the run's check set. Its step linear law and host laws are made
 by `deploy.sh record`, which records both sides together, and a fit of that
-side's records (`SIDE_LAW`); `calibrate.sh` records a lone server.
+side's records (`SIDE_LAW`): this check knows one side's arguments, and the
+`calibrate.sh` command that takes both sides' (`deployment_calibration`) is
+`compass advice`'s, which knows both.
 
 Printed apart, outside the exit status: the gaps `--coverage`'s check counts;
 an op graph's absent price list, which prices every leaf by its analytical
@@ -68,7 +70,11 @@ from atom.compass.artifacts import (
     machine_platform,
 )
 from atom.compass.artifacts.store import ENTRY_FILE
-from atom.compass.backends.step_linear_plan import records, scheduled_rungs
+from atom.compass.backends.step_linear_plan import (
+    TRACE_RUNS,
+    records,
+    scheduled_rungs,
+)
 from atom.compass.backends.step_stub import Coefficients
 from atom.compass.drive import runfile, serve
 from atom.compass.kv.lmcache_offload import ENTRY as OFFLOAD
@@ -464,36 +470,140 @@ def _ladder(config) -> list[int]:
     return [] if config.enforce_eager else schedulable_ladder(config)
 
 
-def calibration(out, atom_args, config, store=None) -> str:
-    """The `calibrate.sh` command that records and fits a step linear law for
-    `config`, ATOM's arguments `atom_args` resolved, into `out`, publishing
-    into `store` when given, else into its own, then its expected time: the
-    records `step_linear_plan.records` plans, the trace runs only where
-    `compass record --trace` takes one; on as many GPUs as ATOM's ranks use;
-    under this process's environment as a law's key states it (`keyed_env`),
-    and each of `CLIENT_ENV` it sets, then a line naming each it does not,
-    which `calibrate.sh` refuses to run without. Where `calibrate.sh` cannot
-    take ATOM's arguments, why."""
+def calibrate_inputs(atom_args, config, env=None) -> dict:
+    """What a `calibrate.sh` command takes of the server, or the 1P1D side,
+    that ATOM's arguments `atom_args` start under its variables `env`, resolved
+    as `config`, under this process's environment: its ``model``; its
+    ``server`` arguments (`_server_args`); ``env``, `env` and the environment
+    as a law's key states it (`keyed_env`); ``gpus``, as many as its ranks
+    use; ``rungs``, a first-turn
+    record of each decode rung it schedules (`step_linear_plan.records`); and
+    ``untraced``, why `compass record --trace` refuses it, else None. Where
+    `calibrate.sh` cannot take its arguments, ``refused`` alone says why."""
     from atom.compass.drive.record import refuse_trace
     from atom.compass.run.step_grid import keyed_env
 
     try:
         server = _server_args(atom_args)
     except ValueError as refused:
-        return f"no calibrate.sh command: {refused}"
+        return {"refused": str(refused)}
     try:
         refuse_trace(atom_args)
-        untraced = ""
+        untraced = None
     except ValueError as refused:
-        untraced = (
-            f"\n  no trace run, which compass record refuses: {refused}; so the "
-            "law's prefill stays unfitted"
-        )
-    bound, width = schedulable_bound(config), runfile._dp_width(atom_args)
-    planned = records(_ladder(config), bound, width, not untraced)
+        untraced = str(refused)
     engine = runfile._engine_args(atom_args)
     gpus = engine.tensor_parallel_size * engine.data_parallel_size
     gpus *= engine.pipeline_parallel_size * engine.prefill_context_parallel_size
+    bound, width = schedulable_bound(config), runfile._dp_width(atom_args)
+    return {
+        "model": str(Path(engine.model).resolve()),
+        "server": server,
+        "env": dict(sorted(((env or {}) | keyed_env()).items())),
+        "gpus": gpus,
+        "rungs": records(_ladder(config), bound, width, False),
+        "untraced": untraced,
+    }
+
+
+def calibration(out, atom_args, config, store=None, env=None) -> str:
+    """The `calibrate.sh` command that records and fits a step linear law for
+    `config`, ATOM's arguments `atom_args` resolved under the server's
+    variables `env`, into `out`, publishing into `store` when given, else into
+    its own, then its expected time: the records `step_linear_plan.records`
+    plans, the trace runs only where `compass record --trace` takes one; on as
+    many GPUs as ATOM's ranks use; under `env` and this process's environment
+    as a law's key states it (`keyed_env`), and each of `CLIENT_ENV` it sets,
+    then a line naming each it does not, which `calibrate.sh` refuses to run
+    without. Where `calibrate.sh` cannot take ATOM's arguments, why."""
+    held = calibrate_inputs(atom_args, config, env)
+    if "refused" in held:
+        return f"no calibrate.sh command: {held['refused']}"
+    env = {
+        "MODEL": held["model"],
+        "GPU": _cards(0, held["gpus"]),
+        "SERVER_ARGS": " ".join(held["server"]),
+    }
+    traced = held["untraced"] is None
+    untraced = (
+        ""
+        if traced
+        else f"\n  no trace run, which compass record refuses: {held['untraced']}; "
+        "so the law's prefill stays unfitted"
+    )
+    planned = held["rungs"] + (list(TRACE_RUNS) if traced else [])
+    return _command(out, held["env"], env, planned, store, untraced)
+
+
+def deployment_calibration(out, sides: dict, fit, router, node: int, store=None) -> str:
+    """The `calibrate.sh` command that records a 1P1D configuration, each
+    record one `deploy.sh record` of both sides, its router on the arguments
+    `router`, and fits the laws of each side `fit` names, into `out`,
+    publishing into `store` when given, else into its own, then its expected
+    time, as `calibration`'s; `sides` holds each side's `calibrate_inputs`.
+    Its records are a first-turn record of each decode rung the decode side
+    schedules, whose prefill side the prefill side's laws are fitted on too,
+    and, when it fits the prefill side, the trace runs, where `compass record
+    --trace` takes the prefill side. Both sides take cards of one node, which
+    holds `node`: the prefill side the first, the decode side the next. The
+    variables both sides run under alike are the command's, and each side's
+    others its ``PREFILL_ENV`` or ``DECODE_ENV``. A ValueError says why no
+    command serves: `calibrate.sh` cannot take a side's arguments or
+    variables, or the sides serve two models or take more cards than one node
+    holds, as a deployment across two nodes does."""
+    for side, held in sides.items():
+        if "refused" in held:
+            raise ValueError(f"the {side} side: {held['refused']}")
+    prefill, decode = sides["prefill"], sides["decode"]
+    if prefill["model"] != decode["model"]:
+        raise ValueError(
+            "it takes one MODEL, and the prefill side "
+            f"serves {prefill['model']} and the decode side {decode['model']}"
+        )
+    if (cards := prefill["gpus"] + decode["gpus"]) > node:
+        raise ValueError(
+            f"it records both sides on one node, and they take {cards} cards, "
+            f"where a node holds {node}; a deployment across two nodes is not one "
+            "command"
+        )
+    both = {k: v for k, v in prefill["env"].items() if decode["env"].get(k) == v}
+    env, first, own = {"MODEL": prefill["model"]}, 0, {}
+    for side in SIDES.values():
+        held = sides[side]
+        env[f"{side.upper()}_GPU"] = _cards(first, held["gpus"])
+        first += held["gpus"]
+        own[side] = [f"{k}={v}" for k, v in held["env"].items() if k not in both]
+        if spaced := [word for word in own[side] if len(word.split()) != 1]:
+            raise ValueError(
+                f"deploy.sh splits {side.upper()}_ENV on whitespace, and "
+                f"{', '.join(spaced)} holds whitespace"
+            )
+    for side in SIDES.values():
+        env[f"{side.upper()}_ARGS"] = " ".join(sides[side]["server"])
+    env |= {f"{s.upper()}_ENV": " ".join(words) for s, words in own.items() if words}
+    env["FIT"] = " ".join(side for side in SIDES.values() if side in fit)
+    env["ROUTER_ARGS"] = " ".join(router)
+    traced = "prefill" in fit and prefill["untraced"] is None
+    untraced = (
+        f"\n  no trace run, which compass record refuses of the prefill side: "
+        f"{prefill['untraced']}; so its law's prefill stays unfitted"
+        if "prefill" in fit and not traced
+        else ""
+    )
+    planned = decode["rungs"] + (list(TRACE_RUNS) if traced else [])
+    return _command(out, both, env, planned, store, untraced)
+
+
+def _cards(first: int, count: int) -> str:
+    """`count` cards from card `first`, as `--gpu` takes them."""
+    return ",".join(map(str, range(first, first + count)))
+
+
+def _command(out, keyed: dict, env: dict, planned: list, store, untraced: str) -> str:
+    """`calibrate.sh` into `out` of the records `planned`, under the keyed
+    variables `keyed`, then each of `CLIENT_ENV` this process sets, then `env`
+    and `store` as ``STORE`` when given; a line naming each of `CLIENT_ENV`
+    unset, `untraced`, and its expected time."""
     # `calibrate.sh` refuses an empty value as it refuses an unset one.
     clients = {k: os.environ[k] for k in CLIENT_ENV if os.environ.get(k)}
     unset = [k for k in CLIENT_ENV if k not in clients]
@@ -503,12 +613,7 @@ def calibration(out, atom_args, config, store=None) -> str:
         if unset
         else ""
     )
-    env = keyed_env() | clients
-    env |= {
-        "MODEL": str(Path(engine.model).resolve()),
-        "GPU": ",".join(map(str, range(gpus))),
-        "SERVER_ARGS": " ".join(server),
-    }
+    env = keyed | clients | env
     if store is not None:
         env["STORE"] = str(store)
     words = [f"{k}={shlex.quote(v)}" for k, v in env.items()]
