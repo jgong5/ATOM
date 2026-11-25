@@ -244,8 +244,10 @@ for name, v in d.items():
     print(f"| {name} | {len(v):,} | {sum(x < 0 for x in v)} | {1e3 * v[0]:.3f} | {1e3 * v[len(v) // 2]:.3f} | "
           + (f"{round(1e3 * (v[0] - OUTBOUND[name]), 3) + 0.0:.3f} |" if name in OUTBOUND else "- |"))
 print(f"\nRequests sent to a prefill engine and never output by a prefill step (rejected, or unfinished at the end): "
-      f"{unnamed}. Cancels: {cancels} relays, sent by traffic at simulated {cancel:.3f} s. The least prefill step that "
-      f"outputs a finished prefill: {1e3 * FIN:.3f} ms. Relays from frontend-P in the simulated window: "
+      f"{unnamed}. Cancels: {cancels} relays, sent by traffic at simulated {cancel:.3f} s. Prefill steps in the "
+      f"simulated window: {sum(w0 <= b < w1 for m in steps for b, _, _ in m):,}, of which "
+      f"{sum(w0 <= b < w1 and fin for m in steps for b, _, fin in m):,} output a finished prefill; the least of all "
+      f"such steps: {1e3 * FIN:.3f} ms. Relays from frontend-P in the simulated window: "
       f"{sum(w0 <= ra < w1 for _, ra, _, _ in chain) / duration:.1f} per simulated s, each a REPORT when its decode "
       f"request leaves frontend-D's handler.\n")
 print("| a chain into engine-D, from | least distance, ms |\n|---|---|")
