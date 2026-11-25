@@ -500,6 +500,33 @@ def uncached_bytes(nbytes, device):
     return torch.empty(nbytes, dtype=torch.uint8, device=device)
 
 
+def scratch_word(scratch, area, name=""):
+    """A mono runner's copy word for its dual area, as a capture declares it:
+    0, every XCD reading each page's copy 0, the word ATOM falls back to when
+    its NUMA calibration finds no home rule. The calibration times round trips
+    on the device; the word is a kernel argument, not a build's constant, so
+    the kernels a capture records are the same whatever it is."""
+    return 0
+
+
+class PeerView(peer_memory.PeerView):
+    """Every rank's address of a device allocation this rank holds, on the
+    declared device: no IPC handle exchange, since every rank of a capture is
+    this one, so every peer's address is this rank's. Closing it unmaps
+    nothing."""
+
+    def __init__(self, make_local, rank=0, npes=1, group=None, what="peer memory"):
+        if not 0 <= rank < npes:
+            raise ValueError(f"rank must be in [0, {npes}), got {rank}")
+        self.rank, self.npes, self.group = rank, npes, group
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        self._remote_bases, self._safety_barrier_complete = [], True
+        self.local_address = make_local()
+        self.addresses = torch.full(
+            (npes,), self.local_address, dtype=torch.int64, device=self.device
+        )
+
+
 class PeerBuffer(peer_memory.PeerBuffer):
     """A mono runner's peer buffer of the sizes it asks for, on the declared
     device: no IPC heap and no handle exchange, since every rank of a capture

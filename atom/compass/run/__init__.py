@@ -84,7 +84,7 @@ priced by `StepLinearBackend`; its ``platform``, the platform fields of its key,
 and its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, a run whose ladder is a prefix of the law's read at the law's, and a
 law missing either refuses; a runner that records prefill token-graph buckets
-refuses a law whose engine config, or else prefill vector, states none or others
+refuses a law whose prefill vector, or else engine config, states none or others
 (`refuse_other_buckets`); a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
@@ -116,7 +116,9 @@ essential work is left, and the last one's end finishes the run),
 ``local_grants`` (optional, ``true``, the default, or ``false``: with ``true``
 the authority gives each grant a ceiling, below which the LP answers its own
 clock calls and reports them with its next one, a DP member at its settle,
-`ClockAuthority`; the step table is the same),
+`ClockAuthority`; the sends are the same, and so is the step table but for an
+own step walking an arrival on an offering channel: one ``TAR`` row where a
+run with ``false`` records ``ARRIVAL`` and ``TAR``),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -227,8 +229,8 @@ its ``kv_transfer_config`` as ``compass_instance``; above one, its LPs carry
 the index (``engine-P1``), and the router is the ``router`` LP, which chooses
 among them. An optional ``worker_order`` gives, by side (``P`` or ``D``), the
 (instance, DP rank) pairs in the order that LP's policies list the side's
-workers, each once (`worker_order`); a side it does not name is sorted by URL
-and rank. `frontend(config)` refuses such a
+workers, each once (`worker_order`); a side it does not name lists them by
+instance, then rank. `frontend(config)` refuses such a
 deployment unless the authority is standalone: a prefill-decode run spans two
 API servers that must share one.
 
@@ -447,6 +449,13 @@ COMPASS_ONLY = {
     },
     "utils/zmq_shim.py": {"_Socket", "_ChannelSocket", "_Context"},
 }
+#: A simulated server's tokenizer environment. The segment tokenizer encodes a
+#: long prompt's uncached segments in one ``encode_batch`` call, and while its
+#: station job is open the frontend's clock stands still, so every other LP
+#: waits on its wall time; the C1228 recipe's environment turns the backend's
+#: parallelism off, which jgong5/ATOM#3992 measured. In parallel the ids are
+#: the same.
+_PARALLEL_TOKENIZER = {"TOKENIZERS_PARALLELISM": "true"}
 #: The module `pip install -e .` writes (setuptools_scm) and git ignores: no
 #: commit holds it, so the host-law key leaves it out.
 INSTALL_WRITTEN = Path("_version.py")
@@ -584,14 +593,26 @@ def refuse_unfitted_law(run: dict, config) -> None:
         )
 
 
+def _holds_laws(host: dict) -> bool:
+    """Whether the host laws `host` hold laws that price a step: at their top,
+    or, above one pipeline stage, in a stage's part under ``stages``
+    (`fit.host`), all under the one key at their top."""
+    return any(part.get("laws") for part in [host, *(host.get("stages") or ())])
+
+
 def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     """Refuse the run file's step linear law on a runner that records the
     prefill token-graph buckets `buckets`, ascending, where the law states none
-    or others: in its engine config, which `refuse_unfitted_law` held to
-    `config`'s, or else in its prefill vector, those its records' runner
-    recorded. An engine config states them only off ATOM's default, which can
-    move between a fit and a run, so one stating none says nothing of them. Host
-    laws refuse where their key's graph sets state others; `run` replaces `spec()`."""
+    or others: in its prefill vector, those its records' runner recorded, or
+    else in its engine config, which `refuse_unfitted_law` held to `config`'s.
+    An engine config states them only off ATOM's default, which can move
+    between a fit and a run, so one stating none says nothing of them; one
+    stating them states ATOM's list, which a runner records only up to
+    `warmup_max_tokens`, a bound no engine config keys, so a prefill vector's
+    are held to `buckets` either way. Above one pipeline stage, each stage's
+    part under ``stages`` (`fit.steps`) is held so, the first that fails
+    named. Host laws refuse where their key's graph sets state others; `run`
+    replaces `spec()`."""
     if not buckets or (run := spec() if run is None else run) is None:
         return
     from atom.compass.backends import launch_features
@@ -599,7 +620,7 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
 
     pick_fitted(run, "host", config)
     host = run.get("host") or {}
-    graphs = host.get("laws") and launch_features.stated(host.get("key"))[1]
+    graphs = _holds_laws(host) and launch_features.stated(host.get("key"))[1]
     if graphs and (theirs := graphs["token"]["prefill"]) != list(buckets):
         raise ValueError(
             f"the host laws' key states the prefill token-graph buckets {theirs}, "
@@ -609,13 +630,18 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
         return
     pick_fitted(run, STEP_LINEAR, config)
     law = run[STEP_LINEAR]
-    stated = sorted((law.get("prefill") or {}).get("buckets") or ())
-    if BUCKETS not in law["engine_config"]["env"] and stated != list(buckets):
-        raise ValueError(
-            f"the step linear law states no {BUCKETS} in its engine config and "
-            f"{stated or 'none'} as its prefill vector's buckets, and this run's "
-            f"runner records the prefill token-graph buckets {list(buckets)}"
-        )
+    env = law["engine_config"]["env"]
+    stages = law.get("stages")
+    for k, part in enumerate(stages) if stages else [(None, law)]:
+        stated = sorted((part.get("prefill") or {}).get("buckets") or ())
+        if (stated or BUCKETS not in env) and stated != list(buckets):
+            said = f"{BUCKETS}={env[BUCKETS]}" if BUCKETS in env else f"no {BUCKETS}"
+            whose = "its" if k is None else f"pipeline stage {k}'s"
+            raise ValueError(
+                f"the step linear law states {said} in its engine config and "
+                f"{stated or 'none'} as {whose} prefill vector's buckets, and this "
+                f"run's runner records the prefill token-graph buckets {list(buckets)}"
+            )
 
 
 def refuse_context_parallel(name: str, config) -> None:
@@ -643,7 +669,7 @@ def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     from atom.compass.backends.launch_features import GRAPHS, stated
     from atom.compass.backends.step_grid_plan import at_ladder
 
-    ours = host.get("laws") and {
+    ours = _holds_laws(host) and {
         **host_key(config),
         **keyed_platform(Kind.HOST_LAWS, platform),
     }
@@ -854,19 +880,24 @@ def _dp(run: dict, side: str | None = None) -> int:
 
 
 def worker_order(run: dict) -> dict:
-    """The run file's ``worker_order``, ``{}`` when absent. Refuses a side
-    other than ``P`` and ``D``, and a list that is not each of the side's
-    (instance, DP rank) pairs once."""
-    order = run.get(WORKER_ORDER, {})
-    for side, pairs in order.items():
-        known = side in INSTANCES
-        n, dp = (run.get(INSTANCES[side], 1), _dp(run, side)) if known else (0, 0)
-        if not n or sorted(pairs) != [[k, r] for k in range(n) for r in range(dp)]:
+    """Each side's (instance, DP rank) pairs, ``P`` then ``D``, in the order
+    the router LP lists that side's workers: the run file's ``worker_order``
+    where it names the side, else by instance, then rank, never by the
+    workers' URLs, whose ports deploy.sh draws afresh each run. Refuses a
+    side other than ``P`` and ``D``, and a list that is not each of the
+    side's (instance, DP rank) pairs once."""
+    named = run.get(WORKER_ORDER, {})
+    order = {
+        side: [[k, r] for k in range(run.get(key, 1)) for r in range(_dp(run, side))]
+        for side, key in INSTANCES.items()
+    }
+    for side, pairs in named.items():
+        if not order.get(side) or sorted(pairs) != order[side]:
             raise ValueError(
                 f"{WORKER_ORDER}[{side!r}] is {pairs}: name side P or D, and list "
                 "each of its deployments' (instance, DP rank) pairs once"
             )
-    return order
+    return order | named
 
 
 def _widths(run: dict) -> int | tuple[int, int]:
@@ -1342,10 +1373,10 @@ def _launch_mooncake_store(config, run: dict, side: str | None) -> None:
     widths differ from those the entry was fitted at."""
     from atom.compass.kv import mooncake_store_server as store
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+    from atom.kv_transfer.offload.kv_store.pool import _SLOT_ALIGN, _round_up
     from atom.kv_transfer.offload.mooncake_store.config import (
         parse_mooncake_store_config,
     )
-    from atom.kv_transfer.offload.mooncake_store.pool import _SLOT_ALIGN, _round_up
     from atom.utils import envs
 
     leaves = KVConnectorFactory.leaf_connectors(config) or ()
@@ -2124,10 +2155,11 @@ def refuse_offload_tier(config, run: dict) -> None:
 def _store_shell(config, run: dict) -> None:
     """Have the connector factory build ``mooncake_store`` as Compass's
     (`atom.compass.kv.mooncake_store`) when this deployment offloads to a
-    Mooncake Store; refuse one whose run file has no ``mooncake_store`` entry.
-    Its frontend checked the rest against the entry
-    (`_launch_mooncake_store`)."""
+    Mooncake Store; refuse one whose run file has no ``mooncake_store`` entry,
+    or under ``ATOM_STORE_ASYNC_RENEW``. Its frontend checked the rest against
+    the entry (`_launch_mooncake_store`)."""
     from atom.compass.kv import mooncake_store
+    from atom.utils import envs
 
     if not _offloads(config.kv_transfer_config, ENTRY_STORE):
         return
@@ -2135,6 +2167,12 @@ def _store_shell(config, run: dict) -> None:
         raise ValueError(
             "this deployment offloads KV to a Mooncake Store and the run file "
             f"has no {ENTRY_STORE} entry"
+        )
+    if envs.ATOM_STORE_ASYNC_RENEW:
+        raise ValueError(
+            "ATOM_STORE_ASYNC_RENEW renews a load's prebuilt keys and polls the "
+            "renewal on the wall clock; the simulated Store renews a sequence's "
+            "range on LP mooncake_store"
         )
     mooncake_store.substitute()
 
@@ -2525,20 +2563,9 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     files each read here as they did in its trace (`capture.lookup`), so one
     traced under another torch, or that ran a file since edited, is a miss
     like any other. One the store holds, at a shape or holding G, is
-    loaded through `ArtifactStore.load` under this process's `graph_readings`,
-    its files' reading here (`capture.source_of`),
-    and its engine config as it records it: that cell holds the tracer's own
-    ATOM arguments, which no reader restates, and the key's structure names
-    the engine config in their place."""
-    from atom.compass.artifacts import (
-        ArtifactStore,
-        Axis,
-        Conditions,
-        GateState,
-        Row,
-        Topology,
-    )
-    from atom.compass.capture import graph_key, lookup, peers, source_of
+    loaded under this process's `graph_readings` (`load_graph`)."""
+    from atom.compass.artifacts import ArtifactStore, Topology
+    from atom.compass.capture import graph_key, lookup, peers
     from atom.compass.capture.forward import (
         PerG,
         Shape,
@@ -2580,16 +2607,13 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         return graph_readings(config.model)
 
     def parsed(key) -> dict:
-        """The graph the store holds at `key`, loaded under `here` and the
-        engine config it records, parsed and frozen with the rest of the live
-        heap, a collection first so no garbage is kept, as
-        `gc_utils.freeze_gc_heap` freezes the startup heap and under the same
-        `ATOM_GC_FREEZE`: this lookup's caches keep what it parses alive, and
-        every full collection walked all of it."""
-        cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
-        readings = here() | {"atom_src": source_of(store, key)}
-        conditions = Conditions.of(**readings, engine_config=cells[Axis.ENGINE_CONFIG])
-        entry = store.load(key, conditions=conditions, gates=GateState.of())
+        """The graph the store holds at `key`, loaded under `here`
+        (`load_graph`), parsed and frozen with the rest of the live heap, a
+        collection first so no garbage is kept, as `gc_utils.freeze_gc_heap`
+        freezes the startup heap and under the same `ATOM_GC_FREEZE`: this
+        lookup's caches keep what it parses alive, and every full collection
+        walked all of it."""
+        entry = load_graph(store, key, here())
         graph = json.loads(entry.read_member("graph", rank, "json"))
         if envs.ATOM_GC_FREEZE:
             gc.collect()
@@ -2679,6 +2703,23 @@ def graph_readings(model: str) -> dict:
         **traced_under(),
         "model": _file_digest(model, "config.json"),
     }
+
+
+def load_graph(store, key, readings: dict):
+    """The `op_graph` entry at `key` in `store`, loaded through
+    `ArtifactStore.load` under `readings` (`graph_readings`), its files'
+    reading here (`capture.source_of`), and its engine config as it records
+    it: that cell holds the tracer's own ATOM arguments, which no reader
+    restates, and the key's structure names the engine config in their place.
+    An entry whose row states another torch, ATOM source or model refuses,
+    naming the axis."""
+    from atom.compass.artifacts import Axis, Conditions, GateState, Row
+    from atom.compass.capture import source_of
+
+    cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
+    readings = readings | {"atom_src": source_of(store, key)}
+    conditions = Conditions.of(**readings, engine_config=cells[Axis.ENGINE_CONFIG])
+    return store.load(key, conditions=conditions, gates=GateState.of())
 
 
 def _trace_process():
@@ -2809,11 +2850,19 @@ def tokenizer(tok, config) -> None:
     entry, its engine config's among several: a term fitted on another backend
     is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
     ends the run before the server serves (`_end_before_serving`). With no
-    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer,
+    term, `tok` is charged 0 s; ``segment`` wraps the segment tokenizer,
     and its ``chars_per_s`` charges each comparison of its stored-prefix search.
+    Beneath those charges, a segment text any frontend of the deployment has
+    encoded is read back rather than encoded again (`token_ids`), charged the
+    same.
 
     On a real run recording its steps (`parity.ENV`), it records instead
-    (`_record_host`); with neither, `tok` is left as it is."""
+    (`_record_host`); with neither, `tok` is left as it is.
+
+    A simulated server's Rust backend encodes a batch's texts in parallel
+    (`_PARALLEL_TOKENIZER`), whatever ``TOKENIZERS_PARALLELISM`` its
+    environment sets: what tokenization costs is the term's charge, never its
+    wall time, and the ids are the same either way."""
     global _frontend_host
     run = spec()
     if run is None:
@@ -2822,6 +2871,8 @@ def tokenizer(tok, config) -> None:
         if record := os.environ.get(parity.ENV):
             _record_host(tok, Path(record))
         return
+    # Read by the tokenizers library at each call, so it holds from here on.
+    os.environ.update(_PARALLEL_TOKENIZER)
     from tokenizers import Tokenizer
 
     from atom.compass.spec.rules import FingerprintMismatch
@@ -2834,6 +2885,11 @@ def tokenizer(tok, config) -> None:
         raise
     if isinstance(run.get("host"), list):
         _frontend_host = host
+    from atom.compass.run import token_ids
+
+    backend = getattr(tok, "_tokenizer", None)
+    if isinstance(backend, Tokenizer) and (where := token_ids.directory(run)):
+        token_ids.install(backend, where)
     if term is None:
         return
     if (loaded := _fingerprint(tok)) not in (None, term["fingerprint"]):

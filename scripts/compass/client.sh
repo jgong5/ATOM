@@ -207,10 +207,7 @@ print(json.load(open(sys.argv[1]))["url"])' "$OUT/prefill/server.json") ||
     aiperf=(-m aiperf)
 else
     [[ $plugins != *compass_harness* ]] || fail "harness: the server is real, and $HARNESS_PYTHON has compass-harness installed"
-    aiperf=(-c 'import uuid, aiperf.cli_runner as r
-r.uuid4 = lambda: uuid.UUID(int=0)
-from aiperf.cli import app
-app()')
+    aiperf=(-c "$COMPASS_REAL_AIPERF" "$ROOT/compass_harness/compass_harness/session_ids.py")
 fi
 
 mkdir "$OUT/client" 2>/dev/null || fail "out: $OUT/client exists; one client run per server --out"

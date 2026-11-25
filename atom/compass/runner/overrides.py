@@ -98,6 +98,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import importlib
 import json
 import logging
 import math
@@ -709,6 +710,74 @@ def _resident(readings: DeviceReadings, config: Any) -> int:
     return resident + (readings.page_bound.nbytes if fp4 else 0)
 
 
+def _mqa_logits_config_on_host(runner: Any, config: Any) -> None:
+    """Under an FP4 indexer layout whose attention builder sizes its block table
+    from aiter's `mqa_logits_mxfp4_config` on the runner's device (DeepSeek-V4's
+    `fp4-gfx950-opus` and `fp4-gfx1250-natural`), that function, asked about the
+    runner's device, answers as on the run's simulated device, and about any
+    other device as before; without a run file nothing is answered.
+
+    On a device aiter picks a kernel instance off its arch's registry, whose
+    residency it asks HIP for, and the instance sets the table width the
+    builder reads: the logits width in whole KV tiles, counted in table entries
+    of `page_size * pages_per_block` rows. Every instance's tile is aiter's
+    `_TILE` on gfx950 and gfx1250, and the builder's 64-row page is one tile an
+    entry, so the width needs no device. The answer holds it beside the
+    config's other public fields, the arch of the run's machine spec and the
+    bounds asked; the instance and its schedule are a launch's, and no launch
+    runs on the host. A request the builder does not make (other heads or
+    pages, an arch aiter has no rule for, a bound aiter refuses) is refused by
+    name, as a device's aiter would refuse it or pick another instance."""
+    from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+        FP4_GFX950_OPUS,
+        FP4_GFX1250_NATURAL,
+    )
+
+    layout = getattr(config, "index_cache_layout", None)
+    if layout not in (FP4_GFX950_OPUS, FP4_GFX1250_NATURAL):
+        return
+    if (arch := _simulated_device_arch()) is None:
+        return
+    mqa = importlib.import_module("aiter.ops.opus.pa_mqa_logits_mxfp4")
+    real, tile = mqa.mqa_logits_mxfp4_config, mqa._TILE
+    built = {"heads": 64, "page_size": tile, "pages_per_block": 1}
+
+    @wraps(real)
+    def answered(device: Any, **bounds: Any) -> Any:
+        if torch.device(device) != runner.device:
+            return real(device, **bounds)
+        bounds = {"pages_per_block": 1} | bounds
+        sizes = [bounds[k] for k in ("max_rows", "max_seqs", "max_qlen", "max_seq_len")]
+        if (
+            arch not in mqa._RULES
+            or {k: bounds[k] for k in built} != built
+            or min(sizes) < 1
+            or bounds["max_seq_len"] >= mqa._MAX_SEQ_LEN
+        ):
+            raise RunnerRefusal(
+                "on the host aiter's mqa_logits_mxfp4_config answers DeepSeek-V4's "
+                f"attention builder alone: {built}, on an arch aiter has a rule "
+                f"for ({', '.join(mqa._RULES)}), each bound 1 or more and "
+                f"max_seq_len under {mqa._MAX_SEQ_LEN}; asked {bounds} on {arch}"
+            )
+        width = -(-bounds["max_seq_len"] // tile)  # one tile an entry
+        return SimpleNamespace(arch=arch, **bounds, block_table_width=width)
+
+    mqa.mqa_logits_mxfp4_config = answered
+
+
+def _simulated_device_arch() -> str | None:
+    """The run's simulated device's arch, its machine spec's; None without a
+    run file."""
+    from atom.compass import run
+    from atom.compass.spec.machine import MachineSpec
+
+    spec = run.spec()
+    if spec is None:
+        return None
+    return MachineSpec.from_mapping(spec["machine"]).value("device.arch")
+
+
 @contextlib.contextmanager
 def simulated_arch():
     """aiter's arch probes answer the run's simulated device's arch.
@@ -718,27 +787,28 @@ def simulated_arch():
     the meta device. Each probe bound by name in a loaded module is swapped,
     the probes' own module among them, so a module imported inside the block
     binds the swapped one. On the way out every module holding the swapped one
-    gets the probe back, one imported inside the block too: a test process
+    gets its own probe back, and one imported inside the block the probes'
+    module's: a test process
     builds many runners and runs other tests on the host's arch after. Without
     a run file nothing is swapped, nor without aiter loaded, as where there is
     no driver.
     """
-    from atom.compass import run
-    from atom.compass.spec.machine import MachineSpec
-
-    spec = run.spec()
-    real = {}
+    arch = _simulated_device_arch()
+    # each swapped module's own probe, and the probe module's, by name
+    own, real = {}, {}
+    chip_info = "aiter.jit.utils.chip_info"
 
     def simulated():
         return arch
 
-    if spec is not None:
-        arch = MachineSpec.from_mapping(spec["machine"]).value("device.arch")
-        for module in list(sys.modules.values()):
+    if arch is not None:
+        for name, module in list(sys.modules.items()):
             for n in ("get_gfx", "get_gfx_runtime"):
                 probe = getattr(module, "__dict__", {}).get(n)
-                if getattr(probe, "__module__", None) == "aiter.jit.utils.chip_info":
-                    real.setdefault(n, probe)
+                if getattr(probe, "__module__", None) == chip_info:
+                    own[(id(module), n)] = probe
+                    if name == chip_info or n not in real:
+                        real[n] = probe
                     setattr(module, n, simulated)
     try:
         yield
@@ -746,7 +816,7 @@ def simulated_arch():
         for module in list(sys.modules.values()):
             for n, probe in real.items():
                 if getattr(module, "__dict__", {}).get(n) is simulated:
-                    setattr(module, n, probe)
+                    setattr(module, n, own.get((id(module), n), probe))
 
 
 def start_on_host(runner: Any, rank: int, config: Any) -> None:
@@ -769,7 +839,10 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
     group. A simulated TP width is refused: it starts fewer workers than the
     TP group `apply_simulated_tp` then reports on a device group. In a simulated
     run the DP group then runs its small collectives over shared memory when
-    its ranks share a host (`shm_collectives`).
+    its ranks share a host (`shm_collectives`), and DeepSeek-V4's attention
+    builder, under an FP4 indexer whose block table it sizes by aiter's config
+    on the runner's device, gets the config's answer for the simulated device
+    (`_mqa_logits_config_on_host`).
     """
     pc = config.parallel_config
     if config.tp_world_size != config.tensor_parallel_size:
@@ -801,6 +874,7 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
     torch.cuda.memory_allocated = _device_memory(
         torch.cuda.memory_allocated, runner, lambda r: _resident(r, config)
     )
+    _mqa_logits_config_on_host(runner, config)
     os.environ["MASTER_ADDR"] = config.master_addr
     os.environ["MASTER_PORT"] = str(config.port)
     method = get_distributed_init_method(
@@ -1036,7 +1110,8 @@ def drafts_on_meta() -> None:
     worker process.
 
     `ModelRunner.__init__` builds the drafter on this rank's device and loads it
-    right after `_build_and_load_model`, with no override point between. The
+    (`_build_and_load_drafter`) right after `_build_and_load_model`, the
+    building in each flavor's `_build_draft_model`. The
     drafter's own buffers stay on the host; only the draft model is meta. Every
     subclass of `Drafter` is patched, at any depth; a hook `Drafter` no longer
     defines is refused by name, since the flavors would then build on this
@@ -1245,7 +1320,7 @@ def _staging_row_bytes(runner: Any) -> int:
 def _refused(method: str):
     """A worker method that answers with its refusal instead of doing its work."""
 
-    def refuse(self, *args: Any) -> str:
+    def refuse(self, *args: Any, **kwargs: Any) -> str:
         reason = f"command:{method}"
         vars(self).setdefault("_refused_commands", []).append(reason)
         logger.warning(
@@ -1275,6 +1350,7 @@ class RefusedControlCommands:
     update_weights = _refused("update_weights")
     update_weights_from_shm = _refused("update_weights_from_shm")
     update_weights_from_ipc = _refused("update_weights_from_ipc")
+    receive_weights_rdma = _refused("receive_weights_rdma")
     discard_failed_weight_sync = _refused("discard_failed_weight_sync")
     release_memory = _refused("release_memory")
     resume_memory = _refused("resume_memory")
@@ -1498,11 +1574,11 @@ class NonAllocatingRunner(
 ):
     """Overrides that construct a model runner without touching device memory."""
 
-    def _build_and_load_model(self, model_class: Any) -> None:
+    def _build_and_load_model(self, config: Any, model_class: Any, device: Any) -> Any:
         """Build the module tree on the meta device and read no checkpoint.
 
-        The base class constructs the model with the default device set to this
-        rank's GPU and then fills it from disk. Here it is built on the meta
+        The base class constructs the model on this rank's GPU and then fills
+        it from disk, and `__init__` keeps what it returns. Here it is built on the meta
         device, shapes and no bytes, a factory function's tensor on a named
         device included, because ATOM sizes the KV pool by walking its attention
         modules; the load is skipped, so no checkpoint is read. The tree is
@@ -1519,10 +1595,10 @@ class NonAllocatingRunner(
         What stands in for the model is installed here instead, on a simulated
         run: the cost backend and the device readings its run file declares.
         """
-        self.model = UnbuiltModel(model_class)
-        # Cleared on the way out, as both of ATOM's own implementations do: the
-        # caller set the default device to this rank's GPU before calling, and
-        # the code that runs next is written against a cleared default.
+        model = UnbuiltModel(model_class)
+        # Cleared on the way out, as ATOM's own `build_model` does: the caller
+        # set the default device to this rank's GPU before calling, and the
+        # code that runs next is written against a cleared default.
         torch.set_default_device(None)
         spec = _config_field(self, "speculative_config")
         if spec is not None:
@@ -1540,15 +1616,16 @@ class NonAllocatingRunner(
             drafts_on_meta()
         engram_tables_unread()
         with FactoriesOnMeta(), simulated_arch():
-            self.model.tree = model_class(self.config)
-            process_weights_after_loading(self.model.tree)
+            model.tree = model_class(config)
+            process_weights_after_loading(model.tree)
         from atom.compass import run
 
-        run.runner(self, self.model.tree)
+        run.runner(self, model.tree)
         logger.info(
             "%s built on meta and no checkpoint read; no weight bytes on a device.",
-            self.model.model_class_name,
+            model.model_class_name,
         )
+        return model
 
     def _maybe_warmup(self) -> None:
         """Skip warmup.
@@ -1812,7 +1889,7 @@ class NonAllocatingRunner(
 
         What a replacement owes its callers. These sites broadcast this name --
         `EngineCore._process_engine_step_inner` and
-        `DecodeEngineCore._process_engine_step` in
+        `DecodeEngineCore._process_engine_step_inner` in
         `atom/model_engine/engine_core.py`, and
         `PPEngineCoreProc._pp_head_step` (which waits and discards the reply)
         and `PPEngineCoreProc._downstream_busy_loop` in

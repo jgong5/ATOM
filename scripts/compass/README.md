@@ -216,13 +216,13 @@ do not claim green.
 ## The CPU gate container
 
 `gate_cpu.sh` and the two list regenerators run in a container on
-`rocm/atom-dev:nightly_202611151511`, built from upstream `273c78de5` with aiter
-`95d211284`, with no GPU device and the worktree root's parent mounted at its
+`rocm/atom-dev:nightly_202611240650`, built from upstream `dc6cd23bb` with aiter
+`82b6b4f19`, with no GPU device and the worktree root's parent mounted at its
 own path:
 
 ```
 docker run -d --init --name <user>_gate --network host -v <parent>:<parent> \
-  rocm/atom-dev:nightly_202611151511 sleep infinity
+  rocm/atom-dev:nightly_202611240650 sleep infinity
 docker exec <user>_gate bash -c 'cd /app/ATOM/atom/mesh && cargo fetch --locked'
 docker exec <user>_gate bash -c 'tar -C <tree> --exclude=atom/mesh/target -cf - atom/mesh |
   tar -x -C /tmp && cd /tmp/atom/mesh && cp /app/ATOM/atom/mesh/Cargo.lock . &&
@@ -232,13 +232,13 @@ docker exec <user>_gate python3 -m pip install --no-deps -r <tree>/scripts/compa
 ```
 
 "atomesh's cargo tests run offline" below says why `cargo fetch` runs once. The
-image built atomesh from `273c78de5`'s manifest, and its lockfile lacks what the
-tree's `atom/mesh/Cargo.toml` asks for since (`llm-tokenizer` 1.4.2, `protox`,
-`zmq`), so the gate's cargo probe fails offline and a diff touching `atom/mesh`
-exits 96. The third line resolves the tree's manifest starting from the image's
-lockfile, which adds only what it lacks, and puts the result where the gates
-read their lockfile. The `safe.directory` line lets git, run as the container's
-root, read a tree another user owns; without it `regen_gpu_gate_triggers.sh`
+image built atomesh from `dc6cd23bb`'s manifest. When the tree's
+`atom/mesh/Cargo.toml` asks for a crate that lockfile lacks, the gate's cargo
+probe fails offline and a diff touching `atom/mesh` exits 96. The third line
+resolves the tree's manifest starting from the image's lockfile, which adds
+only what it lacks, and puts the result where the gates read their lockfile.
+The `safe.directory` line lets git, run as the container's root, read a tree
+another user owns; without it `regen_gpu_gate_triggers.sh`
 records the tree's commit as `UNKNOWN`. Run the gate with
 `COMPASS_AGENTX_HARNESS` naming the wheel the next section builds.
 
@@ -862,7 +862,9 @@ so a real and a simulated cell at one seed, concurrency and traces hash send the
 same requests and warm up on the same ones. The server runs ATOM's own runner
 (no `--compass-run`), and aiperf runs as shipped: `HARNESS_PYTHON` must have
 agentx-harness without compass-harness (exit 92 otherwise), and the script pins
-the benchmark id as compass-harness does. The result line reads aiperf's export
+the benchmark id and draws each session's id from its trace and branch as
+compass-harness does (`_lib.sh`'s `COMPASS_REAL_AIPERF`), so both send one
+session id, which ATOM's DP router breaks a tie by. The result line reads aiperf's export
 alone and adds `contaminated`, true when `rocm-smi` lists any process on one of the
 cell's GPUs before or after it, with each one's pid and VRAM bytes. Both modes
 write the TP1 step record to `steps/dp0.jsonl` (`atom/compass/parity`);
@@ -1027,9 +1029,9 @@ hull. Host keys and the fp4 indexer as the gpu-45 pair's.
 
 `scripts/compass/laws/deepseek-v4-pro-dpa8-ep8-mi355x-crs005-{prefill,decode}.json.xz`
 are the EP8 pair for the cell on crsuse2-m2m-v3-005 (prefill) and -013 (decode), keyed by
-the platform their `platform` states, in the image of that stack: the `base` form with host
-laws, each written by `step_linear_fit` from its side's cells. The cells are the gpu-40 EP8
-pair's, run by `calib_capture.sh` at `--gpu-memory-utilization 0.75` with each side's EP8
+the platform their `platform` states, in the image of that stack: the `base` form, each written
+by `step_linear_fit` from its side's cells, with host laws from `compass fit host`. The cells are
+the gpu-40 EP8 pair's, run by `calib_capture.sh` at `--gpu-memory-utilization 0.75` with each side's EP8
 arguments, the prefill side's on 005. -013's page cache served other bytes than its disk while
 its first decode cells ran ([#2794](https://github.com/jgong5/ATOM/issues/2794)), so the decode
 cells were run again, on 005 and, after -013's reboot, on both nodes at once, each started once
@@ -1040,13 +1042,21 @@ rung 1 and at c=64 at rungs 4 and 8, and the 1P1D decode side also at rung 2. Th
 prefill vector, and the decode law's rung 1, 2, 4 and 8 vectors with `--moe-routing 384,6`,
 DeepSeek-V4-Pro's routed experts and top-k, are refitted on their side's lone cells and on their
 side of three 1P1D `deploy.sh record` cells at c=256 over traces 256 to 392, seeds 20260707,
-20260708 and 20260709, the prefill side at `--gpu-memory-utilization 0.72`. Each law's other
-vectors, the prefill law's rung-1 vector among them, and its host laws are the ones fitted on its
-lone cells alone, and its `sources` names the records each came from. The prefill law's rung-2
+20260708 and 20260709, the prefill side at `--gpu-memory-utilization 0.72`. The decode law's
+rung 1, 2, 4 and 8 vectors also fit the decode side of two more 1P1D `deploy.sh record`
+deployments over the same traces: one serving c=1, 4, 16, 64 and 256 in turn, twice, at seed
+20260710, and one serving c=64 for 600 s and then c=256 for 900 s at seed 20260707, whose
+decode side ran on crsuse2-m2m-v3-004 in place of -013, the same ionic RDMA planes, by the
+owner's word ([#2842](https://github.com/jgong5/ATOM/issues/2842)). Each law's other
+vectors, the prefill law's rung-1 vector among them, are the ones fitted on its lone cells alone,
+and its `sources` names the records each came from. Its host laws are fitted on its side's lone
+cells re-recorded with the fp8 index cache, at a tree whose recorded engine holds its stamps
+([#2838](https://github.com/jgong5/ATOM/issues/2838)), and its `host_fit.provenance` names
+their records. The prefill law's rung-2
 vector is not: it is the decode law's, stating `declared`, since no prefill-side record decodes at
 rung 2, which the 1P1D prefill side reaches at c=64 ([#2878](https://github.com/jgong5/ATOM/issues/2878)).
-Host keys and the fp8 indexer key as the crs005 DPA-TP8 pair's, its lone cells fp4 and its 1P1D
-cells fp8; the gap between the two is unmeasured on this pair.
+Host keys and the fp8 indexer key as the crs005 DPA-TP8 pair's. The step vectors' lone cells ran
+fp4 and their 1P1D cells fp8; the gap between the two is unmeasured on this pair.
 
 `scripts/compass/laws/deepseek-v4-pro-tp8-mi355x-crs005-{prefill,decode}-host.json.xz` hold host
 laws alone (`host`, `host_fit`, `platform` and `provenance`, no step law), one per side of
@@ -1064,10 +1074,16 @@ blocking-call tool through `ROCP_TOOL_LIBRARIES`; the c=1 cell's prefill side ra
 holds each band's errors with each record held out in turn. A term a side's records cannot give is
 the crs005 DPA8 law's of that side, as `provenance` names: `admission_s` and `stream_s`, since a
 side's requests and streams pass the router; `kv_write_req_s` and `router_s`, which `compass fit
-host` does not fit; the prefill side's `ipc_out_s`, since no output message ran alone on it; and the
-decode side's `http_intake`, since its requests render no chat template
-([#3229](https://github.com/jgong5/ATOM/issues/3229)). A decode side encodes no prompt and admits no
-request, so its entry states no encode term and `admit` null.
+host` does not fit; and the prefill side's `ipc_out_s`, since no output message ran alone on it. A
+decode side encodes no prompt and admits no request, so its entry states no encode term and `admit`
+null. Each side's `http_intake` is refitted by `compass fit host` on that side of twelve records:
+those three cells and [#3179](https://github.com/jgong5/ATOM/issues/3179)'s nine graded rounds,
+c=1, 4 and 16 three each over traces 0 to 255 for 3600 s at ATOM 82df6c583
+([#3919](https://github.com/jgong5/ATOM/issues/3919)). The prefill side's
+spans bodies of 1,547 to 971,174 bytes. The decode side renders no chat template, so its requests
+are timed from the app call to the engine send ([#3229](https://github.com/jgong5/ATOM/issues/3229)),
+and its term spans the relayed bodies, which carry the prompt's ids, of 3,593 to 2,195,990 bytes. A
+body outside its side's range is refused and charged nothing.
 
 `scripts/compass/laws/deepseek-v4-pro-tp8-mtp3-mi355x-crs005-{prefill,decode}.json.xz` and
 `deepseek-v4-pro-dpa8-mtp1-mi355x-crs005-{prefill,decode}.json.xz` hold host laws alone, one per
@@ -1482,10 +1498,11 @@ list, Runs and Grading steps, with these differences:
   No graph or point key holds the utilization, so the decode side's simulated run stays at 0.70.
 - **Host laws only.** `P` and `D` are the tree's
   `laws/deepseek-v4-pro-tp8-mi355x-crs005-prefill-host.json.xz` and `-decode-host.json.xz`,
-  host terms with no step linear law: the op-level backend prices every device step. The
-  decode side's `http_intake` is the crs005 DPA8 law's, whose fitted body range stops below
-  the largest bodies traces 0 to 255 send, so a run of them refuses each larger intake and
-  `validate` grades no such run ([#3919](https://github.com/jgong5/ATOM/issues/3919)).
+  host terms with no step linear law: the op-level backend prices every device step. Each
+  side's `http_intake` spans the bodies the cell's real rounds over traces 0 to 255 sent
+  (above). A simulated relayed body runs 50 to 54 bytes over the real one, so a decode-side
+  intake above 2,195,990 bytes stays refused, and `validate` grades no run that refused one
+  ([#3919](https://github.com/jgong5/ATOM/issues/3919)).
 
 ### The EP8 cell under the op-level backend
 
@@ -1574,8 +1591,12 @@ builds a JIT module the first time a server meets a kernel variant its image did
 not prebuild, such as `mha_varlen_fwd`'s for a prefill step of one new token a
 row, about 60 s inside the run, and keeps it in the container's aiter tree, which
 no cache directory above holds. A record names each module its server built, or
-began to, in run.json's `aiter_jit_builds`, and grading, `compass fit steps`,
-`compass fit host`, `step_linear_fit` and `validate.cost` refuse it, naming them.
+began to, in run.json's `aiter_jit_builds`, times each in `jit_compiles` with
+the clocks that place it among the steps (`clock_ns`). `compass fit steps`,
+`compass fit host`, `step_linear_fit` and `validate.cost` cut the steps that
+overlap one, and refuse the record, naming them, when its run.json times none,
+or the cut is above `step_labels.JIT_BOUND` of a rank's forwards. Grading
+refuses the run, naming them: a stall delays every later request.
 So sweep a fresh container before its first record, on a server whose record
 nothing reads: `compass record --sweep --gpu G $S --out $R/sweep1 -- $ATOM` with
 `client.sh $R/sweep1 --sweep --traces A-B --stop`, A to B every trace the cell's

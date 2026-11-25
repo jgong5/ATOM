@@ -8,12 +8,16 @@ import re
 
 import numpy as np
 import pytest
-from test_backend_step_labels import pulled
+from test_backend_step_labels import QUARTER, RECV, pp2, pulled
+from test_backend_step_linear_fit import HOST as LAWS
+from test_backend_step_linear_fit import HOST_ADMIT
 from test_fit_samples import edit
 from test_fit_steps import (  # noqa: F401
     ENGINE,
     HOST,
     PLATFORM,
+    PP2,
+    as_record,
     clients,
     fit,
     member,
@@ -827,3 +831,48 @@ def test_the_relay_term_is_fitted_from_prefill_s_last_output_row_to_decode_s_app
 def test_a_relay_with_no_request_alone_on_it_is_left_unfitted(tmp_path):
     with pytest.raises(ValueError, match="0 forwards for 2 coefficients"):
         fit_relay(_relayed(tmp_path, [], 1.5e-3, 11e-9))
+
+
+def _pipeline(directory):
+    """`directory`, a record of `pp2`'s two stages, its frontend's tokenizer
+    calls and intake stamped (`stamped`)."""
+    key = {**HOST, "engine": PP2}
+    (directory / "steps").mkdir(parents=True)
+    pp2(directory / "steps", 19, key)
+    stamped(as_record(directory, key))
+    return directory
+
+
+def test_a_pipeline_s_entry_holds_each_stage_s_laws_and_its_frontend_s_terms_once(
+    tmp_path,
+):
+    """Each stage's laws are its own, each `E` from its release; stage 1's
+    hold `W_recv`, and the head's admissions' `admit`."""
+    a = _pipeline(tmp_path / "a")
+    fit(tmp_path, "fit host", a, *clients(a))
+
+    key = host_laws_key({**HOST, "engine": PP2})
+    host = member(tmp_path / "store", key, "params")
+    report = member(tmp_path / "store", key, "report")
+    assert {"tokenizer", "http_intake"} <= set(host) and "laws" not in host
+    assert [set(part) for part in host["stages"]] == [{"laws", "admit"}] * 2
+    assert len(report["stages"]) == 2 and "tokenizer" in report
+    first, last = host["stages"]
+    assert first["admit"] == pytest.approx(HOST_ADMIT, rel=1e-4, abs=1e-12)
+    for kind in ("prefill", "middle"):
+        assert "W_recv" not in first["laws"][kind]
+        recv = last["laws"][kind].pop("W_recv")
+        assert recv == pytest.approx(RECV, rel=1e-4, abs=1e-12)
+        for part, scale in zip(host["stages"], (1, QUARTER)):
+            assert set(part["laws"][kind]) == set(LAWS[kind])
+            for segment, c in LAWS[kind].items():
+                got = part["laws"][kind][segment]
+                assert got == pytest.approx([scale * v for v in c], rel=1e-4, abs=1e-12)
+
+
+def test_a_pipeline_whose_stages_hold_two_host_keys_refuses(tmp_path):
+    a = _pipeline(tmp_path / "a")
+    edit(a / "steps/pp1.dp0.key.json", lambda k: k.update(host_cpu="another cpu"))
+
+    with pytest.raises(SystemExit, match="the pipeline's stages carry the host keys"):
+        fit(tmp_path, "fit host", a, *clients(a))

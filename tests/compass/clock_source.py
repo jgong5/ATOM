@@ -129,7 +129,8 @@ DEFAULT_ALLOW_LIST: dict[str, str] = {
         "date; it runs offline on probe records and never inside a simulated run"
     ),
     "atom/compass/drive/identity.py": (
-        "a command's phase boundaries in run.json, which are wall and monotonic "
+        "a command's phase boundaries in run.json, and the clock pair that places "
+        "its server's JIT compiles among its steps, which are wall and monotonic "
         "time by definition; the tool process reads them, and no simulated time"
     ),
     "atom/compass/bench/measure.py": (
@@ -241,7 +242,9 @@ _KEPT_REAL = (
     ("atom/model_engine/engine_core.py", "_drain_kv_work_at_exit", "time.monotonic",
      "K9", "bounds the KV drain at shutdown, after the last step is charged", 2),
     ("atom/model_engine/engine_core.py", "_process_engine_step", "time.perf_counter",
-     "K9", _LOG_ONLY, 4),
+     "K9", _LOG_ONLY, 2),
+    ("atom/model_engine/engine_core.py", "_process_engine_step_inner", "time.perf_counter",
+     "K9", _LOG_ONLY, 2),
     ("atom/model_engine/engine_core_mgr.py", "close", "time.monotonic",
      "K9", "the engine processes' shutdown grace period, after the simulated window", 2),
     ("atom/model_engine/engine_core_mgr.py", "collective_rpc", "time.monotonic",
@@ -286,6 +289,8 @@ _KEPT_REAL = (
     ("atom/kv_transfer/offload/mp/transfer_thread.py", "fence", "time.monotonic", "K9",
      "the vLLM plugin's fence on reused blocks; ATOM's engine never calls it", 2),
     ("atom/model_engine/model_runner.py", "_build_and_load_model", "time.perf_counter",
+     "K9", _REPLACED_RUNNER, 2),
+    ("atom/model_engine/model_runner.py", "_build_and_load_drafter", "time.perf_counter",
      "K9", _REPLACED_RUNNER, 2),
     ("atom/model_engine/model_runner.py", "_on_trace_ready", "time.time",
      "K9", _REPLACED_RUNNER, 1),
@@ -344,7 +349,7 @@ _KEPT_REAL = (
     *(
         (f"atom/kv_transfer/{path}", scope, f"time.{call}", "K9", _REPLACED_TRANSFER, n)
         for path, scopes in (
-            ("disaggregation/mooncake/mla_landing.py", (
+            ("disaggregation/mooncake/landing.py", (
                 ("acquire", "monotonic", 2), ("begin", "monotonic", 1),
                 ("__init__", "monotonic", 1), ("quarantine", "monotonic", 1),
                 ("_retire_locked", "monotonic", 1), ("_scatter", "monotonic", 2),
@@ -361,7 +366,7 @@ _KEPT_REAL = (
                 ("get_finished", "monotonic", 1), ("_rdma_write", "monotonic", 3),
                 ("record_kv_cache_ready", "monotonic", 1), ("_record_write_ack", "monotonic", 1),
                 ("_report_held_failures", "monotonic", 1), ("start_load_kv", "monotonic", 1),
-                ("_write_listener", "monotonic", 2), ("_write_mla_slot", "monotonic", 1))),
+                ("_write_listener", "monotonic", 2), ("_passed_deadline", "monotonic", 1))),
             ("disaggregation/moriio/moriio_connector.py", (
                 ("_accept_write_request", "monotonic", 1),
                 ("_collect_write_reports", "time", 1), ("_finish_write", "monotonic", 1),
@@ -371,21 +376,24 @@ _KEPT_REAL = (
                 ("_service_write_requests", "monotonic", 1),
                 ("_service_write_requests", "time", 1), ("start_load_kv", "monotonic", 1))),
             ("offload/mooncake_store/async_lookup.py", (
-                ("_warn_lookup_failure", "monotonic", 1), ("_query", "monotonic", 1))),
+                ("_warn_failure", "monotonic", 1), ("_query", "monotonic", 1))),
             ("offload/mooncake_store/client.py", (
                 ("__init__", "monotonic", 1), ("__init__", "time", 1),
                 ("seconds", "monotonic", 1), ("seconds", "time", 1))),
             ("offload/mooncake_store/scheduler.py", (
-                ("_build_save_request", "monotonic", 1), ("_connect", "monotonic", 1),
-                ("_count_lookup", "monotonic", 1), ("_exists_on", "monotonic", 1),
-                ("__init__", "monotonic", 1), ("lookup", "perf_counter", 2),
-                ("_pause", "monotonic", 1), ("_pools_to_ask", "monotonic", 1),
-                ("_warn", "monotonic", 1))),
-            ("offload/mooncake_store/worker.py", (
+                ("_connect", "monotonic", 1), ("_exists_on", "monotonic", 1),
+                ("lookup", "perf_counter", 2), ("_pause", "monotonic", 1),
+                ("_pools_to_ask", "monotonic", 1), ("_warn", "monotonic", 1))),
+            ("offload/kv_store/scheduler.py", (
+                ("_build_save_request", "monotonic", 1), ("_count_lookup", "monotonic", 1),
+                ("__init__", "monotonic", 1))),
+            ("offload/kv_store/worker.py", (
                 ("_do_load_req", "perf_counter", 6), ("_do_save_req", "monotonic", 1),
                 ("_do_save_req", "perf_counter", 8), ("_maybe_log_store_stats", "monotonic", 1),
                 ("register_kv_caches", "monotonic", 1), ("start_load_kv", "monotonic", 1),
-                ("_warn_rate_limited", "monotonic", 1))),
+                ("_warn_rate_limited", "monotonic", 1), ("_save_segments", "perf_counter", 2))),
+            ("offload/kv_store/save_pipeline.py", (
+                ("_put_native", "perf_counter", 2), ("close", "monotonic", 2))),
         )
         for scope, call, n in scopes
     ),
@@ -402,10 +410,45 @@ _KEPT_REAL = (
     ("atom/model_loader/weight_utils.py", "download_weights_from_hf", "time.perf_counter",
      "K9", _LOAD, 2),
     ("atom/spec_decode/drafter.py", "_warmup_draft_graphs", "time.time", "K9", _LOAD, 2),
-    ("atom/model_ops/engram/host_memory.py", "_flock_logging_wait", "time.monotonic",
+    ("atom/model_ops/engram/host_memory.py", "_fill_segment", "time.monotonic",
      "K9", _LOAD, 2),
-    ("atom/model_ops/engram/host_memory.py", "_flock_logging_wait", "time.time",
-     "K9", _LOAD, 2),
+    *(
+        (f"atom/model_loader/weight_cache/{path}", scope, f"time.{call}", "K9", (
+            "the weight cache daemon (ATOM_PRELOAD) and its client, which hold and "
+            "hand over real weights at startup; a simulated runner builds its model "
+            "on the meta device and asks no daemon"), n)
+        for path, scope, call, n in (
+            ("__main__.py", "_status", "time", 1),
+            ("client.py", "__init__", "perf_counter", 2),
+            ("client.py", "_stop_and_reclaim", "monotonic", 5),
+            ("client.py", "_wait_together", "monotonic", 5),
+            ("client.py", "load_drafter_from_cache", "perf_counter", 2),
+            ("client.py", "load_from_cache", "perf_counter", 4),
+            ("daemon.py", "_load_and_serve", "perf_counter", 1),
+            ("daemon.py", "_serve_rank", "perf_counter", 1),
+            ("daemon.py", "run_daemon", "monotonic", 2),
+            ("preload.py", "_hold_unused", "monotonic", 2),
+            ("preload.py", "_record_launch", "time", 1),
+            ("preload.py", "_spawn_daemon", "monotonic", 2),
+            ("preload.py", "stop_daemon", "monotonic", 4),
+            ("transport.py", "__init__", "monotonic", 3),
+            ("transport.py", "__init__", "perf_counter", 2),
+            ("transport.py", "__init__", "time", 1),
+            ("transport.py", "_handle", "monotonic", 1),
+            ("transport.py", "_hold", "monotonic", 1),
+            ("transport.py", "_idle_for", "monotonic", 1),
+            ("transport.py", "set_state", "time", 1),
+            ("transport.py", "watch", "monotonic", 1),
+        )
+    ),
+    ("atom/kv_transfer/offload/mooncake_store/async_lookup.py", "renew_async",
+     "time.monotonic", "K9",
+     "the asynchronous lease renewal (ATOM_STORE_ASYNC_RENEW), which a simulated run refuses", 2),
+    ("atom/entrypoints/atomesh/token_bridge.py", "render_chat", "time.monotonic", "K9",
+     ("the Rust frontend's rendered-prompt cache (--frontend rust), which a "
+      "simulated launch does not start"), 1),
+    ("atom/rollout/rdma_weight_receiver.py", "receive_weight_stream", "time.perf_counter",
+     "K9", "times the rollout runner's RDMA weight stream, which a simulated runner refuses", 2),
     ("atom/models/deepseek_v41/mono/hi_contract.py", "main", "time.time", "K9",
      "a check of the mono runner's programs run by hand, outside any run", 2),
     ("atom/models/deepseek_v41/mono/hi_runner.py", "__init__", "time.time",

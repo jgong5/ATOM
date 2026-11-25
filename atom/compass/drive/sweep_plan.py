@@ -34,7 +34,12 @@ roots: each point is planned once, on the rank its place in the walk names.
   budget doubling, then the last aligned context a whole budget fits behind
   in the longest prompt; with prefix caching on, a prefix another request
   computed, from one KV block up. A step's chunked rows take as many earlier
-  chunks each.
+  chunks each. A final chunk of fewer rows than the engine's
+  ``min_final_prefill_rows`` is planned as the row ATOM runs, which starts at
+  least that many rows before the prompt's end, on the hash-block grid
+  (`BlockManager.replay_start`), and so is a prefix row: where the engine
+  states ``replays_state``, on a hit of whole hash blocks from one up, and a
+  block below it first. A row past the budget, which ATOM cuts, is not planned.
 
 Every request asks for two output tokens, so its decode is reached too, with
 the workload's other sampling arguments copied unchanged; a parked decode asks
@@ -55,6 +60,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from atom.compass.backends.step_grid_plan import MIN_FINAL_ROWS, REPLAYS_STATE
 from atom.compass.validate.bound import _split
 from atom.model_engine.dynamic_chunking import chunk_alignment
 from atom.utils import envs
@@ -71,8 +77,8 @@ PARKED_TOKENS = 128
 #: The fewest tokens of a micro-batch in 256 to 511, a launch size
 #: `csa_translate_pack` takes a block size of its own for.
 HALF = 256
-#: The engine fields `plan` reads; `speculative` and
-#: `prefill_context_parallel_size` too, where a rank states them.
+#: The engine fields `plan` reads; `speculative`, the context-parallel widths,
+#: `MIN_FINAL_ROWS` and `REPLAYS_STATE` too, where a rank states them.
 ENGINE = (
     "max_num_seqs",
     "max_num_batched_tokens",
@@ -93,8 +99,8 @@ class Point:
     `rows` is the step's prefill rows in batch order, each (query tokens,
     context tokens), as its record line states them. `cached` says for each
     row how the context before its query was computed: '' none, 'chunk' its
-    own prompt's earlier chunks, 'prefix' another request sharing that many
-    leading tokens of its prompt. `held` decodes, each a one-token prompt, are
+    own prompt's earlier chunks, 'prefix' another request sharing `hit` leading
+    tokens of its prompt. `held` decodes, each a one-token prompt, are
     parked on the rank before the step. `split` is None for an A point whose
     step two-batch overlap does not split, True for one it splits at DP
     width 1, and for a B point whether it splits the step. `step` is the A round
@@ -209,6 +215,30 @@ def _fits(engine: dict, rows, held: int) -> bool:
     )
 
 
+def _grid(engine: dict) -> int:
+    """The engine's hash block, a block-table entry (`hash_block_size_for`)."""
+    return engine["kv_cache_block_size"] * engine.get("decode_context_parallel_size", 1)
+
+
+def _final(c: int, q: int, least: int, grid: int, below: int) -> tuple[int, int]:
+    """The row ATOM runs for a prompt's last `q` tokens on the `c` it computed
+    before them (`BlockManager.replay_start`): from `below` tokens under `c`,
+    then, under `least` rows, from `least` rows before the end, floored onto
+    `grid`-token hash blocks."""
+    start = c - below
+    if (short := least - (c + q - start)) > 0:
+        start = (start - short) // grid * grid
+    return c + q - max(0, start), c + q
+
+
+def hit(engine: dict, row) -> int:
+    """The leading tokens another request computes for a `prefix` point's
+    `row` on `engine`: those before its query, and a hash block more where the
+    state transfer replays, since ATOM starts the row a block below its hit."""
+    q, c = row
+    return c - q + (_grid(engine) if engine.get(REPLAYS_STATE) else 0)
+
+
 def _rows(t: int, cap: int) -> tuple:
     """Count `t` on no context in as few rows as hold it, none past `cap`."""
     n = -(-t // cap)
@@ -299,18 +329,25 @@ def plan(engine, workload: dict, a_only: bool = False) -> list[Point]:
             ]
         )
     align = chunk_alignment(e["kv_cache_block_size"])
+    least, grid = e.get(MIN_FINAL_ROWS, 0), _grid(e)
+    # The hash block a replaying hit's forward starts below.
+    replayed = grid if e.get(REPLAYS_STATE) else 0
     starts = {"chunk": align}
     if e["enable_prefix_caching"]:
-        starts["prefix"] = e["kv_cache_block_size"]
-    families += [
-        [
-            (((q, c + q),), (kind,), 1, False)
-            for c in _contexts(start, b, cap)
+        starts["prefix"] = replayed or e["kv_cache_block_size"]
+    for kind, start in starts.items():
+        below = replayed if kind == "prefix" else 0
+        # ATOM hits a prefix in whole hash blocks.
+        hits = sorted({c - c % (below or 1) for c in _contexts(start, b, cap)})
+        rows = [
+            _final(c, q, least, grid, below)
+            for c in hits
             for q in _queries(b, align)
             if c + q <= cap
         ]
-        for kind, start in starts.items()
-    ]
+        # Two designs ATOM runs as one row are one point.
+        rows = [r for r in dict.fromkeys(rows) if r[0] <= b]
+        families.append([((r,), (kind,), 1, False) for r in rows])
     seen = set()
     for family in families:
         kept = [d for d in family if (d[3], d[0]) not in seen and _fits(e, d[0], d[2])]

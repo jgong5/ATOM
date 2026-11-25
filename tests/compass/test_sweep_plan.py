@@ -3,11 +3,15 @@
 their coverage read off a step record's lines."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
-from atom.compass.drive.sweep_plan import Point, covered, plan
+from atom.compass.drive.sweep_plan import Point, covered, hit, plan
 from atom.compass.validate.bound import _split
+from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.prefix_hash import hash_block_size_for
+from atom.model_engine.state_runtime import StateTransfer
 
 SAMPLING = {"ignore_eos": True, "temperature": 0}
 #: The server's ATOM_TBO_PREFILL_MIN_TOKENS.
@@ -165,6 +169,104 @@ def test_a_steps_chunked_rows_take_as_many_earlier_chunks_each(tmp_path):
             earlier.setdefault(p.step, set()).add(-(-(c - q) // 512))
     assert {len(chunks) for chunks in earlier.values()} == {1}
     assert set().union(*earlier.values()) == {1, 2, 4, 5}
+
+
+@pytest.mark.parametrize("dcp", [1, 2])
+def test_a_final_chunk_under_the_last_forwards_rows_is_planned_where_atom_runs_it(
+    tmp_path, dcp
+):
+    # DeepSeek-V4.1's 128-token blocks, under no minimum and then under its
+    # decoder SWA bounded replay's, its 128-row window.
+    engine = _engine(
+        data_parallel_size=1,
+        enable_prefix_caching=False,
+        kv_cache_block_size=128,
+        max_num_batched_tokens=1024,
+        **({"decode_context_parallel_size": dcp} if dcp > 1 else {}),
+    )
+    designed = plan(_write(tmp_path, engine), _workload(3000))
+    v41 = engine | {"min_final_prefill_rows": 128}
+    points = [p for p in plan(_write(tmp_path, v41), _workload(3000)) if p.cached[0]]
+    # Each designed final chunk as ATOM's own `replay_start` starts it, once.
+    manager = SimpleNamespace(
+        min_final_prefill_rows=128, hash_block_size=hash_block_size_for(128, dcp)
+    )
+    ran = []
+    for p in designed:
+        if p.cached == ("chunk",):
+            ((q, c),) = p.rows
+            seq = SimpleNamespace(has_per_req_cache=True, num_tokens=c)
+            ran.append(
+                (c - BlockManager.replay_start(manager, seq, c - q, hit=False), c)
+            )
+    assert [p.rows[0] for p in points] == list(dict.fromkeys(ran))
+    assert len(points) < len(ran) and min(q for p in points for q, _ in p.rows) == 128
+    if dcp == 1:
+        # A 1-token tail runs as [129, 129] at context 128, [129, 257] at 256.
+        assert {((129, 129),), ((129, 257),)} <= {p.rows for p in points}
+    # A line of the row ATOM runs covers a moved point.
+    tail = next(p for p in points if p.rows not in {d.rows for d in designed})
+    line = {"rows": [[*tail.rows[0], False], [1, 9, True]], "is_dummy_run": False}
+    assert covered([tail], {0: [line]}) == ([tail], [])
+
+
+@pytest.mark.parametrize("budget", [1024, 1000])
+@pytest.mark.parametrize("dcp", [1, 2])
+def test_a_prefix_row_is_planned_where_atom_starts_it_at_the_hit_the_sweep_sends(
+    tmp_path, dcp, budget
+):
+    # DeepSeek-V4.1's 128-token blocks, so at DCP 1 on a budget of whole
+    # blocks a prefix's hits are the chunk cuts and its designs the chunk rows
+    # unmoved; a budget off the blocks moves ATOM's hits below its contexts.
+    # Then its 128-row minimum and its encoder SWA bounded replay, a `replay`
+    # state transfer.
+    engine = _engine(
+        data_parallel_size=1,
+        kv_cache_block_size=128,
+        max_num_batched_tokens=budget,
+        **({"decode_context_parallel_size": dcp} if dcp > 1 else {}),
+    )
+    designed = plan(_write(tmp_path, engine), _workload(3000))
+    v41 = engine | {"min_final_prefill_rows": 128, "replays_state": True}
+    points = plan(_write(tmp_path, v41), _workload(3000))
+    hbs = hash_block_size_for(128, dcp)
+    manager = SimpleNamespace(
+        min_final_prefill_rows=128,
+        hash_block_size=hbs,
+        state=SimpleNamespace(transfer=StateTransfer.replay()),
+    )
+
+    def ran(q, c):
+        # ATOM on a prompt's last `q` tokens behind `c` another request
+        # computed: its hit, whole hash blocks short of the prompt's last
+        # (`_walk_prefix`), then its own `replay_start`.
+        at = min(c // hbs, -(-(c + q) // hbs) - 1) * hbs
+        seq = SimpleNamespace(has_per_req_cache=True, num_tokens=c + q)
+        return c + q - BlockManager.replay_start(manager, seq, at, hit=True), c + q
+
+    # Each row is ATOM's at the hit the sweep sends, on every whole hash
+    # block a design's context holds, and within the budget.
+    prefix = [p.rows[0] for p in points if p.cached == ("prefix",)]
+    assert all(ran(c - hit(v41, (q, c)), hit(v41, (q, c))) == (q, c) for q, c in prefix)
+    # The contexts: from a hash block doubling, the budget doubling, and a
+    # budget below the longest prompt.
+    contexts = (128 * dcp, 256, 512, budget, 2 * budget, 3000 - budget)
+    assert {hit(v41, r) for r in prefix} == {c // hbs * hbs for c in contexts}
+    assert len(prefix) > 100 and max(q for q, _ in prefix) <= budget
+    assert hit(engine, (5, 640)) == 635
+    if dcp == 1 and budget == 1024:
+        # Each design as ATOM runs it, once, where no chunk point runs it:
+        # query 128 at hit 512 as [256, 640], query 1 as the final chunk's
+        # own row, [129, 513].
+        chunks = {p.rows for p in points if p.cached == ("chunk",)}
+        designs = [p.rows[0] for p in designed if p.cached == ("chunk",)]
+        want = dict.fromkeys(ran(q, c - q) for q, c in designs)
+        assert prefix == [r for r in want if (r,) not in chunks and r[0] <= budget]
+        assert (256, 640) in prefix and ((129, 513),) in chunks
+    # A line of the row ATOM runs covers a moved point.
+    moved = next(p for p in points if p.cached == ("prefix",))
+    line = {"rows": [[*moved.rows[0], False], [1, 9, True]], "is_dummy_run": False}
+    assert covered([moved], {0: [line]}) == ([moved], [])
 
 
 def test_no_point_leaves_the_engine_or_the_workload(tmp_path):

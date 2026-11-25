@@ -214,12 +214,12 @@ class Traffic:
             for line in post(self.port, body, {"tracestate": tracestate}):
                 stamp = sse_stamp(line) or stamp
                 if line.startswith("data:") and stamp is not None:
-                    self.rt.check_arrival(self.stream, *stamp)
-                    if first is not None:
-                        first.set()
-                    with self.cv:
+                    with self.cv:  # read and held as one, as `_take` sees them
+                        self.rt.check_arrival(self.stream, *stamp)
                         self.frames[stamp[1]] = line
                         self.cv.notify_all()
+                    if first is not None:
+                        first.set()
                     stamp = None
         except BaseException as e:  # noqa: BLE001 - the clock owner raises it
             with self.cv:
@@ -228,8 +228,10 @@ class Traffic:
 
     def _take(self) -> None:
         """Take every released stream event, waiting for any not read yet."""
-        with self.rt.lock:
-            due = sorted(self.rt.released[self.stream] - self.rt.handled[self.stream])
+        rt, ch = self.rt, self.stream
+        with self.cv, rt.lock:  # released and not taken: read and held, or unread
+            held = (seq for seq in self.frames if rt.is_released(ch, seq))
+            due = sorted(rt.unread[ch].union(held))
         for seq in due:
             with self.cv:
                 if not self.cv.wait_for(

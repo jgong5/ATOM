@@ -11,6 +11,7 @@ the LP clock. The run file's host entry states `test_served_tokenizer`'s term.
 """
 
 import json
+import os
 import random
 from types import SimpleNamespace
 
@@ -149,8 +150,18 @@ def test_a_resent_prompt_is_charged_nothing_and_its_next_turn_its_new_text(rt, p
     assert seconds == pytest.approx(_law(encoded))
 
 
+def test_a_simulated_server_encodes_its_batches_in_parallel(rt, monkeypatch):
+    """Whatever the deployment's environment says, as the C1228 recipe's says
+    off: a simulated server's tokenization costs its charge, not its wall."""
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
+    compass_run.tokenizer(_tokenizer(), _config())
+    assert os.environ["TOKENIZERS_PARALLELISM"] == "true"
+
+
 def test_on_a_real_run_the_backend_is_left_as_it_is(monkeypatch):
     monkeypatch.delenv(compass_run.ENV, raising=False)
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
     tok = _tokenizer()
     compass_run.tokenizer(tok, _config())
     assert vars(tok._tokenizer) == {}
+    assert os.environ["TOKENIZERS_PARALLELISM"] == "false"

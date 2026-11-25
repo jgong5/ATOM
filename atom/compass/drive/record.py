@@ -35,8 +35,8 @@ client run it served included; `parity.served` splits it per client run.
 `--trace` makes it a trace run, a second run of a record's recipe and client
 that labels its prefill passes: the server runs ATOM's profiler on every rank
 from before the first request to its stop (`serve`), and the record gets its
-busy lines (`parity.busy`) before its cost lines. A run under DP or pipeline
-stages refuses it before its server starts.
+busy lines (`parity.busy`) before its cost lines, each pipeline stage's beside
+its own record. A run under DP refuses it before its server starts.
 
 The server's environment holds `AUTOTUNE_CACHE` as the command's does, 1 when
 the command's has none, and ``TRITON_CACHE_DIR`` as the command's does, or the
@@ -50,9 +50,13 @@ first launch, inside the record.
 
 run.json's ``aiter_jit_builds`` names each aiter JIT module or kernel built, or begun,
 since serve wrote ``server.json``, when ``/health`` first answered
-(`aiter_jit`): a step may have waited on its build, so grading, `compass fit
-steps`, `compass fit host`, `step_linear_fit` and `validate.cost` refuse the
-record. A server that built none leaves no entry.
+(`aiter_jit`), ``jit_compiles`` times each compile, and ``clock_ns`` copies
+``server.json``'s pair of clocks, which places them among the steps: a step
+may have waited on a build, so `compass fit steps`, `compass fit host`,
+`step_linear_fit` and `validate.cost` cut each step that overlaps one, and
+refuse the record when they cut too many (`step_labels.cut_refusal`), and
+grading refuses it (`step_labels.refusal`). A server that built none leaves no
+entry.
 Its ``ptl_changes`` names each change of its cards' PTL state from then until
 the stop (`identity.ptl_changes`), which the fits refuse; ``ptl`` is the
 state at the stop.
@@ -80,7 +84,7 @@ from pathlib import Path
 from triton import knobs
 
 from atom.compass.backends.step_grid_plan import TARGET
-from atom.compass.backends.step_labels import label_run, write_table
+from atom.compass.backends.step_labels import CLOCK, cut_spans, label_run, write_table
 from atom.compass.cli import OPS
 from atom.compass.drive import aiter_jit, runfile, serve
 from atom.compass.drive.gpu import add_gpu_flag
@@ -135,6 +139,8 @@ def main(argv: list[str]) -> None:
         )
     run_json = Path(args.out) / serve.RUN_JSON
     builds = aiter_jit.builds_since(ready.stat().st_mtime_ns) if ready.exists() else {}
+    if builds:  # the clocks that place its compiles among its steps
+        builds[CLOCK] = json.loads(ready.read_text())[CLOCK]
     run = {**json.loads(run_json.read_text()), "env": env, **builds}
     if changes:
         run[PTL_CHANGES] = changes
@@ -145,15 +151,12 @@ def main(argv: list[str]) -> None:
 
 
 def refuse_trace(atom_args) -> None:
-    """Refuse a trace run of ATOM's arguments `atom_args` that runs DP ranks or
-    pipeline stages: its busy time is reduced per TP rank."""
-    if (
-        runfile._dp_width(atom_args) > 1
-        or runfile._engine_args(atom_args).pipeline_parallel_size > 1
-    ):
+    """Refuse a trace run of ATOM's arguments `atom_args` that runs DP ranks:
+    its busy time is reduced per TP rank of each pipeline stage."""
+    if runfile._dp_width(atom_args) > 1:
         raise ValueError(
-            "--trace reduces each TP rank's busy time, and ATOM's arguments run "
-            "DP ranks or pipeline stages"
+            "--trace reduces each TP rank's busy time per pipeline stage, and "
+            "ATOM's arguments run DP ranks"
         )
 
 
@@ -184,13 +187,15 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def write_engine_and_costs(out) -> None:
-    """Write each DP rank's cost lines and run.json's ``engine`` entry into
-    `out`, a stopped server's directory."""
+    """Write each DP rank's cost lines, cut by the compiles its run.json times
+    (`step_labels.cut_spans`), and run.json's ``engine`` entry into `out`, a
+    stopped server's directory."""
     out = Path(out)
     records = sorted(
         (out / serve.STEPS).glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:])
     )
-    for record, (_, table) in zip(records, label_run(records)):
+    run = json.loads((out / serve.RUN_JSON).read_text())
+    for record, (_, table) in zip(records, label_run(records, spans=cut_spans(run))):
         write_table(record, table)
     engines = {}
     for record in records:
@@ -208,6 +213,5 @@ def write_engine_and_costs(out) -> None:
             + "\n".join(differ)
         )
     blocks = min(e["num_kvcache_blocks"] for e in engines.values())
-    run = json.loads((out / serve.RUN_JSON).read_text())
     run["engine"] = {**engines[records[0].stem], "num_kvcache_blocks": blocks}
     _write_whole(out / serve.RUN_JSON, json.dumps(run))

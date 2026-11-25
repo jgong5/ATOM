@@ -11,13 +11,16 @@ sets, checked as `test_run_lacking_rungs` checks it; the printed command runs
 in the stub tree `test_calibrate` runs `calibrate.sh` in. A side of a
 `deploy.sh` deployment, checked as `test_run_check_side` checks it, prints
 `deploy.sh record` and a fit of that side's records for its step linear law
-and host laws instead.
+and host laws instead. A server that decodes on pipeline stages prints why no
+command serves, as the fit cuts a stage's decode steps; a 1P1D producer on
+pipeline stages keeps its trace runs.
 """
 
 import os
 import re
 import shlex
 import subprocess
+from types import SimpleNamespace
 
 import platforms
 import pytest
@@ -116,7 +119,7 @@ def test_a_dp_rank_takes_each_rung_s_batch_and_no_trace_run_is_planned(
     assert env["GPU"] == "0,1,2,3,4,5,6,7"
     untraced = (
         "no trace run, which compass record refuses: --trace reduces each TP "
-        "rank's busy time, and ATOM's arguments run DP ranks or pipeline stages; "
+        "rank's busy time per pipeline stage, and ATOM's arguments run DP ranks; "
         "so the law's prefill stays unfitted"
     )
     assert after == [untraced, UNKNOWN]
@@ -186,6 +189,56 @@ def test_an_argument_calibrate_sh_would_split_prints_why_in_place_of_a_command(
         f"cannot pass ATOM's argument {quant[1]!r}"
     )
     assert after == []
+
+
+def test_a_server_that_decodes_on_pipeline_stages_prints_why_in_place_of_a_command(
+    tmp_path, monkeypatch, capsys
+):
+    _, command, after = printed(
+        tmp_path, monkeypatch, capsys, ["-pp", "2"], pipeline_parallel_size=2
+    )
+
+    assert command == (
+        "no calibrate.sh command: it decodes on 2 pipeline stages, and the fit "
+        "cuts each stage's decode steps, whose window holds the stream hold of "
+        "the stage's last send and its wait for the stage before, which no label "
+        "parts from its own work"
+    )
+    assert after == []
+
+
+#: Each 1P1D side's transfer config, by its role.
+ROLES = {
+    side: {"kv_role": role, "kv_connector": "compass"}
+    for side, role in drive_run.ROLES.items()
+}
+
+
+@pytest.mark.parametrize("staged", ["prefill", "decode"])
+def test_on_pipeline_stages_a_1p1d_producer_keeps_its_trace_runs_and_a_decoder_none(
+    tmp_path, staged
+):
+    # The development template's prefill side runs PP4 x TP1, eager.
+    config = deployment(tmp_path, max_num_seqs=8, capture_sizes=[1, 2, 4, 8]).config
+    sides = {}
+    for side, kv in ROLES.items():
+        args = ["--model", str(tmp_path), "-tp", "1"]
+        resolved = SimpleNamespace(**vars(config) | {"kv_transfer_config": kv})
+        if side == staged:
+            args += ["-pp", "4", "--enforce-eager"]
+            vars(resolved).update(pipeline_parallel_size=4, enforce_eager=True)
+        sides[side] = lacking.calibrate_inputs(args, resolved)
+    given = "o", sides, ["prefill", "decode"], [], 8
+
+    if staged == "decode":
+        with pytest.raises(ValueError, match="^the decode side: it decodes on 4 pipe"):
+            lacking.deployment_calibration(*given)
+        return
+    command, *after = lacking.deployment_calibration(*given).split("\n  ")
+    env, _, _, records = parts(command)
+    assert records == [f"{rung} {FIRST_TURN}" for rung in (1, 2, 4, 8)] + TRACES
+    assert (env["PREFILL_GPU"], env["DECODE_GPU"]) == ("0,1,2,3", "4")
+    assert after == [UNKNOWN]
 
 
 def test_the_printed_command_runs_as_printed(tmp_path, monkeypatch, capsys):
