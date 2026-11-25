@@ -537,7 +537,15 @@ _FROM = ("replay_start", "cached_until")
 _SWA = "atom.model_ops.v4_kernels.state_writes:swa_write"
 _GATHER = "atom.model_ops.attentions.token_layout.gather:gather_rows"
 _COMMIT = "atom.model_ops.attentions.deepseek_v41.speculative:_launch_commit_cursors"
+# its FP8 attention's pool and ring planes, as ATOM passes them (`_planes`)
+_PLANES = "attn_metadata_builder.cache.planes"
+_FP8_SLOTS = ("unified_kv", "unified_kv_scale"), ("kv", "kv_scale")
 V41_NAMES = {
+    **{
+        ("aiter.mla_sparse_prefill_v41.default", slot): f"{_PLANES}.{at}.{i}"
+        for at, slots in zip(("{ratio}", "ring"), _FP8_SLOTS)
+        for i, slot in enumerate(slots)
+    },
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_prefix"): f"{_CACHE}.0",
     ("aiter.pa_sparse_prefill_opus.default", "kv_indptr_extend"): f"{_CACHE}.1",
     ("aiter.mla_sparse_prefill_v41.default", "kv_indptr_prefix"): f"{_CACHE}.0",
@@ -1935,7 +1943,7 @@ class Stub:
                     if top := stated.get("index_topk"):
                         chosen = self._selected(sig)
                         unit = min(unit, rows * top if chosen is None else chosen)
-                elif window and self.state.get(name):
+                elif window and (self.state.get(name) or name.startswith(_PLANES)):
                     unit = 0  # its window is read from the ring alone
                 if self.state.get(name):
                     # its window rings: a ring cut from it (`ring_view`), smaller
@@ -1950,7 +1958,8 @@ class Stub:
                     )
                     given = op["args"].get("window")
                     writes = isinstance(given, dict) and "object" in given
-                    if whole < widest if window else writes:
+                    ring = name.startswith(f"{_PLANES}.ring.")  # planes of its own
+                    if ring or (whole < widest if window else writes):
                         reach = acts[0]["shape"][0] + rows * ((window or 1) - 1)
                         unit, slotted = min(reach, rows * self.ring), 1
                     elif window and not decode:
@@ -3206,9 +3215,26 @@ def _bound(name, value, old, device) -> dict[str, torch.Tensor]:
                 items = [(f.name, value.view(f.name)) for f in value.fields]
                 items += [(f"buf.{t}", value.buf.view(t)) for t in dtypes]
             elif hasattr(value, "__dict__"):
-                items = vars(value).items()
+                items = [*vars(value).items(), *_planes(value)]
             queue += [(f"{name}.{key}", item) for key, item in items]
     return out
+
+
+def _planes(cache) -> list:
+    """DeepSeek-V4.1's split FP8 KV `cache` as ATOM's FP8 attention takes it
+    (`fp8_attention._split`): each ratio's pool, none at ratio 0, and its
+    last layer's ring (`ring`), each its data and its scales, as `planes`;
+    nothing for another object."""
+    if not getattr(cache, "window_fp8", False) or not hasattr(cache, "ring_view"):
+        return []
+    from atom.model_ops.attentions.deepseek_v41.fp8_attention import _split
+
+    dim = cache.geometry.head_dim
+    scale = torch.float8_e4m3fn if cache.packed else torch.float8_e8m0fnu
+    owners = ((None, 0), *cache.geometry.owners)
+    planes = {r: _split(cache.main_view(o), dim, scale) for o, r in owners}
+    planes["ring"] = _split(cache.ring_view(len(cache.window_sources) - 1), dim)
+    return [("planes", planes)]
 
 
 def _cut_from(t, held) -> bool:
@@ -3229,7 +3255,8 @@ def _state(runner, held) -> dict[str, bool]:
     tensor inside the state arena of a metadata builder's cache (`BUILDERS`,
     DeepSeek-V4.1's `cache.state`: its fields, a layer of one, the cursor),
     each to False; and each that holds such an arena past its pages as one
-    view (V4.1's `cache.pool`, whose window rings lie in it) to True.
+    view (V4.1's `cache.pool`, whose window rings lie in it) to True, as is
+    a ring on planes of its own (V4.1's FP8 one, `_planes`).
     A KV registry entry of it caps a point's placements at its slots instead."""
     from atom.model_ops.attentions.pool_layout.entry_arena import SplitEntryMajorArena
 
@@ -3247,7 +3274,12 @@ def _state(runner, held) -> dict[str, bool]:
         or any(_inside(t, buf) for buf in bufs)
         for n in (name, f"{name}.{len(t) - 1}" if t.dim() else name)
     }
-    return {n: True for n, t in held.items() for b in bufs if _inside(b, t)} | named
+    rings = {n: True for n in held if n.startswith(f"{_PLANES}.ring.")}
+    return (
+        {n: True for n, t in held.items() for b in bufs if _inside(b, t)}
+        | named
+        | rings
+    )
 
 
 def _inside(t, buf) -> bool:
