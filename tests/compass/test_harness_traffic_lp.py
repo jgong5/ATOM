@@ -1021,6 +1021,40 @@ def test_a_pass_scans_only_the_open_stream_events(tmp_path):
     assert held_at_call == [0] * (n + 1)
 
 
+def test_a_message_of_several_stream_events_reports_each_of_them(tmp_path):
+    """A worker reports the stream events one turn of its loop read in one
+    list: credit 0's three events, the last final, come in one message, each
+    is released by its own grant, and the hold passes credit 0's return."""
+
+    async def main():
+        conn = ScriptedConn(3)
+        conn.rt = rt = LPRuntime(LpId("traffic"), TABLE, conn)
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        passed = []
+
+        async def on_return(worker_id, ret):
+            passed.append(ret.credit.id)
+
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(str(tmp_path / "lp"))[1])
+        traffic.send(_key(0))
+        await traffic.hold(on_return)(
+            "worker_0", SimpleNamespace(credit=_credit(0), error=None)
+        )
+        events = [(_key(0), seq, float(seq + 1), seq == 2) for seq in range(3)]
+        push.send_pyobj(events)
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 10)
+        finally:
+            push.close(linger=0)
+        return passed, traffic._reports, rt
+
+    passed, reports, rt = _run(main())
+    assert passed == [0] and rt.now == INF
+    assert reports == {0: (_key(0), False), 1: (_key(0), False), 2: (_key(0), True)}
+
+
 class ReportedDuringTheCall(ScriptedConn):
     """Grant ``k`` releases stream seq ``k - 1`` of request 0, the last one
     final; that event's report reaches the traffic LP's socket while the owner

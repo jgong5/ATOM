@@ -215,6 +215,16 @@ def _run(coro):
     return asyncio.run(asyncio.wait_for(coro, 30))
 
 
+async def _events(pull, n: int) -> list[tuple]:
+    """The next `n` stream events a worker reports: each message is a list of
+    those one turn of its event loop read."""
+    events = []
+    while len(events) < n:
+        events += await pull.recv_pyobj()
+    assert len(events) == n
+    return events
+
+
 def _ns(seconds: float) -> int:
     return round(seconds * 1e9) + EPOCH_NS
 
@@ -231,10 +241,7 @@ def test_aiperf_ttft_and_latency_are_the_stamped_differences(tmp_path, monkeypat
             for num in SENDS:
                 await h.stamp(num)
             records = [await h.send(num) for num in SENDS]
-            reports = [
-                await h.pull.recv_pyobj()
-                for _ in range(sum(map(len, TOKENS.values())) + 3)
-            ]
+            reports = await _events(h.pull, sum(map(len, TOKENS.values())) + 3)
             return h, records, reports
 
     h, records, reports = _run(run())
@@ -265,6 +272,27 @@ def test_aiperf_ttft_and_latency_are_the_stamped_differences(tmp_path, monkeypat
         expected.append((_key(num), seq, tokens[-1], True))
         seq += 1
     assert reports == expected
+
+
+def test_the_events_a_worker_reads_in_one_turn_reach_the_traffic_lp_together(
+    tmp_path, monkeypatch
+):
+    """Credit 0's last write carries its last token and ``[DONE]``: the worker
+    reads both in one turn of its event loop and reports them in one message,
+    and each earlier event, written apart, in a message of its own."""
+
+    async def run():
+        async with Harness(tmp_path, monkeypatch) as h:
+            await h.stamp(0)
+            await h.send(0)
+            return [await h.pull.recv_pyobj() for _ in range(3)]
+
+    k = _key(0)
+    assert _run(run()) == [
+        [(k, 0, 2.75, False)],
+        [(k, 1, 3.0, False)],
+        [(k, 2, 4.5, False), (k, 3, 4.5, True)],
+    ]
 
 
 def test_the_stamp_may_reach_the_worker_before_or_after_its_credit(
@@ -448,8 +476,7 @@ def test_the_worker_that_sent_a_request_posts_its_stamped_cancel(tmp_path, monke
         async with CancelHarness(tmp_path, monkeypatch) as h:
             await h.stamp(0)
             await h.send(0)
-            for _ in range(len(TOKENS[0]) + 1):
-                await h.pull.recv_pyobj()
+            await _events(h.pull, len(TOKENS[0]) + 1)
             await h.pub.send_pyobj((_key(0), 11.0, 3, "cancel"))
             await h.pub.send_pyobj((_key(1), 11.0, 4, "cancel"))  # not this worker's
             written = await h.pull.recv_pyobj()
@@ -485,8 +512,7 @@ def test_a_cancel_naming_a_url_is_posted_there_on_its_request_s_path(
             async with CancelHarness(tmp_path, monkeypatch) as h:
                 await h.stamp(0)
                 await h.send(0)
-                for _ in range(len(TOKENS[0]) + 1):
-                    await h.pull.recv_pyobj()
+                await _events(h.pull, len(TOKENS[0]) + 1)
                 await h.pub.send_pyobj((_key(0), 11.0, 3, "cancel", url))
                 written = await h.pull.recv_pyobj()
         finally:

@@ -8,7 +8,8 @@ the worker in either order. The request carries its stamp in ``tracestate``,
 with its intake jitter when the traffic LP drew one (a seeded run).
 Each SSE event ATOM streams back carries its own stamp in a comment line; the
 transport reports each one to the traffic LP as it arrives, ``[DONE]`` marked
-final, and rewrites the record's times from the stamps, so aiperf's TTFT, ITL
+final, those one turn of its event loop reads in one message at the next turn,
+and rewrites the record's times from the stamps, so aiperf's TTFT, ITL
 and latency read simulated time measured from the send: the request's arrival,
 or behind an encoding ingress the start its stamp names, its arrival at the
 ingress. When the run file states an ingress (`atom.compass.ingress`), the
@@ -61,6 +62,8 @@ class CompassTransport(AioHttpTransport):
         self._sending: dict[tuple, tuple] = {}
         self._sent: dict[tuple, tuple[str, int]] = {}  # key -> (url, seq)
         self._cancels: list[asyncio.Task] = []
+        # Stream events read in this turn of the event loop, not yet reported.
+        self._events: list[tuple] = []
 
     @on_init
     async def _connect_traffic_lp(self) -> None:
@@ -87,6 +90,7 @@ class CompassTransport(AioHttpTransport):
     @on_stop
     async def _close_traffic_lp(self) -> None:
         await asyncio.gather(*self._cancels)
+        self._report_events()
         self._reader.cancel()
         self._sub.close(linger=0)
         self._push.close(linger=0)
@@ -127,6 +131,13 @@ class CompassTransport(AioHttpTransport):
         # Closing first would let the frontend read a hang-up instead of the body.
         await asyncio.wait_for(reader.read(), self.model_endpoint.endpoint.timeout)
         writer.close()
+
+    def _report_events(self) -> None:
+        """Report the stream events read since the last report, in one message:
+        the traffic LP reads each message on its clock's critical path."""
+        events, self._events = self._events, []
+        if events:
+            self._push.send_pyobj(events)
 
     def _stamp(self, key: tuple) -> asyncio.Future:
         if key not in self._stamps:
@@ -186,7 +197,9 @@ class CompassTransport(AioHttpTransport):
             done = any(
                 p.name == "data" and p.value == "[DONE]" for p in message.packets
             )
-            await self._push.send_pyobj((key, seq, arrival, done))
+            if not self._events:
+                asyncio.get_running_loop().call_soon(self._report_events)
+            self._events.append((key, seq, arrival, done))
             message.perf_ns = _ns(arrival)
             stamped.append(message)
             if first_token is not None and await first_token(
