@@ -85,7 +85,9 @@ and its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run unde
 any other, a run whose ladder is a prefix of the law's read at the law's, and a
 law missing either refuses; a runner that records prefill token-graph buckets
 refuses a law whose prefill vector, or else engine config, states none or others, and keeps
-one with no prefill vector, which prices no prefill step (`refuse_other_buckets`); a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
+one with no prefill vector, which prices no prefill step (`refuse_other_buckets`); a list of them is one per engine config, a process taking its own;
+above one pipeline stage, a law of one part per stage under ``stages``, each
+stage priced by its own (`stage_part`)), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
 holds at its shape and output, traced under this process's torch, each file it
@@ -158,7 +160,9 @@ prefill-decode run with no entry stating it names under
 charged 0 s and the run summary names it, a kind of tokenizer call as
 ``tokenizer.<kind>`` and a ``segment`` without ``chars_per_s`` as
 ``tokenizer.segment.chars_per_s``, under ``uncharged_host_terms``; ``hops``, the
-`HOPS` `runfile` writes to the run file; a list of them as ``step_linear``'s),
+`HOPS` `runfile` writes to the run file; a list of them as ``step_linear``'s;
+an entry with laws above one pipeline stage holds each stage's `STAGE_HOST` as
+a part under ``stages``, which that stage reads (`host_part`)),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
 ``decode/``, ``prefill<k>/`` and ``decode<k>/`` above one of a side, and for a
@@ -550,6 +554,35 @@ def pick_fitted(run: dict, name: str, config) -> None:
     run[name] = _fitted_here(run[name], keyed(config), engines[name], name)
 
 
+def stage_part(entry: dict, config, what: str) -> dict:
+    """The run file's step linear law or host laws `entry`, named `what`, as
+    `config`'s pipeline stage reads them: above one stage, its part under
+    ``stages`` at the stage's rank, beside what the entry states once for
+    every stage; on one stage, `entry` itself. Refused where its parts are not
+    one per stage of `config`'s pipeline."""
+    pp = getattr(config, "pipeline_parallel_size", 1)
+    parts = entry.get("stages")
+    if parts is None and pp == 1:
+        return entry
+    if parts is None or len(parts) != pp:
+        held = "no part per stage" if parts is None else f"{len(parts)} stages' parts"
+        raise ValueError(
+            f"the run file's {what} holds {held}, and this run has {pp} pipeline "
+            f"stage{'s' * (pp > 1)}, each priced by its own part of one entry, as "
+            "compass fit steps and fit host fit a pipeline"
+        )
+    rank = config.parallel_config.pipeline_parallel_rank
+    return {k: v for k, v in entry.items() if k != "stages"} | parts[rank]
+
+
+def host_part(host: dict, config) -> dict:
+    """`stage_part` of the run file's host entry `host`; an entry with neither
+    laws nor parts prices no forward on any stage, and is read as it is."""
+    if "laws" not in host and "stages" not in host:
+        return host
+    return stage_part(host, config, "host laws")
+
+
 def refuse_unfitted_law(run: dict, config) -> None:
     """Refuse the run file's step linear law where `config` is not what it was
     fitted under: its engine config, at its ladder where this run's is a prefix
@@ -681,10 +714,11 @@ def refuse_context_parallel(name: str, config, widths=CONTEXT_PARALLEL) -> None:
 
 
 def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
-    """Refuse the run file's host laws `host` when fitted under another host
-    key than this run's, on `platform` (`machine_platform`), the host CPU and
-    graph sets their key states taken as this run's, which records none, and
-    its engine config read at their ladder where this run's is a prefix of it."""
+    """Refuse the run file's host laws `host`, a pipeline's with a part per
+    stage among them, when fitted under another host key than this run's, on
+    `platform` (`machine_platform`), the host CPU and graph sets their key
+    states taken as this run's, which records none, and its engine config read
+    at their ladder where this run's is a prefix of it."""
     from atom.compass.artifacts import Kind, keyed_platform
     from atom.compass.backends.launch_features import GRAPHS, stated
     from atom.compass.backends.step_grid_plan import at_ladder
@@ -732,6 +766,9 @@ TOKENIZER_RECORD, INTAKE_RECORD = "tokenizer.jsonl", "intake.stamps"
 LOCAL = ".local"
 #: This server's ``host`` entry among several, which `tokenizer` resolves.
 _frontend_host: dict | None = None
+#: The laws a pipeline's ``host`` entry holds per stage, in its parts under
+#: ``stages``, and never beside them (with `launch_features.PATHS`).
+STAGE_HOST = ("laws", "admit", "columns")
 
 
 def spec() -> dict | None:
@@ -766,10 +803,28 @@ def spec() -> dict | None:
 
 def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time, or
-    whose ``tokenizer`` or ``http_intake`` term the frontend would misread."""
+    whose ``tokenizer`` or ``http_intake`` term the frontend would misread; a
+    pipeline's holds each stage's part under ``stages``, each checked as an
+    entry is with no key or parts of its own, and none of `STAGE_HOST` beside
+    them."""
     from atom.compass.backends.launch_features import PATHS
     from atom.compass.runner.overrides import ADMISSION_IN_E, HOST_LAW_KINDS, SEGMENTS
 
+    stages = host.get("stages")
+    if stages is not None and not (
+        isinstance(stages, list)
+        and stages
+        and all(isinstance(p, dict) and not {"key", "stages"} & set(p) for p in stages)
+        and not {*STAGE_HOST, PATHS} & set(host)
+    ):
+        raise ValueError(
+            f"{path}: host's stages is {stages!r}; a pipeline's entry holds there "
+            "a part per stage, in stage order, each an entry with no key or parts "
+            f"of its own, and states none of {', '.join((*STAGE_HOST, PATHS))} "
+            "beside them"
+        )
+    for part in stages or ():
+        _check_host(path, part)
     laws, columns = host.get("laws", {}), host.get("columns", {})
     paths = host.get(PATHS, {})
     if (
@@ -782,6 +837,7 @@ def _check_host(path, host: dict) -> None:
             "hops",
             "columns",
             PATHS,
+            "stages",
             *HOST_TERMS,
             INGRESS,
             RELAY_TERM,
@@ -2333,6 +2389,8 @@ def runner(model_runner, tree) -> None:
 
     config = model_runner.config
     tp = config.tensor_parallel_size
+    pp = getattr(config, "pipeline_parallel_size", 1)
+    stage = (config.parallel_config.pipeline_parallel_rank, pp) if pp > 1 else None
     refuse_renamed_keys(run, "the run file")
     for name in (STEP_LINEAR, "host"):
         pick_fitted(run, name, config)
@@ -2353,30 +2411,31 @@ def runner(model_runner, tree) -> None:
         from atom.compass.parity.replay import ReplayHost
 
         dp_rank = config.parallel_config.data_parallel_rank
-        stage = config.parallel_config.pipeline_parallel_rank
+        pp_rank = config.parallel_config.pipeline_parallel_rank
         # This engine's record: prefill/, or prefill1/ for engine-P1.
         name = _engine_name(config, run) or ""
         side = {"P": "prefill", "D": "decode"}.get(name[:1], "") + name[1:]
-        replay = ReplayHost(Path(run["replay"]) / side, dp_rank, stage)
+        replay = ReplayHost(Path(run["replay"]) / side, dp_rank, pp_rank)
     if STEP_LINEAR in run:
         # A law prices a rank at the tensor-parallel width its engine config states.
         refuse_unfitted_law(run, config)
         # Under DP-attention every rank runs at TP 1, and experts shard over the group.
         dpa = config.enable_dp_attention
         dp = config.parallel_config.data_parallel_size if dpa else 1
-        backend = StepLinearBackend(StepLinearLaw(run[STEP_LINEAR]), dp)
+        # A pipeline stage is priced by its own part of the law.
+        law = StepLinearLaw(stage_part(run[STEP_LINEAR], config, "step linear law"))
+        backend = StepLinearBackend(law, dp, stage)
     elif STEP_STUB in run:
         # A pipeline stage is priced for its own span of the stack, the span
         # ATOM's `make_layers` builds it from.
-        hf, pp = config.hf_config, getattr(config, "pipeline_parallel_size", 1)
+        hf = config.hf_config
         depth, share = hf.num_hidden_layers, None
         start, end = 0, depth
         if pp > 1:
             from atom.compass.backends.geometry import paged_layers
             from atom.models.utils import get_pp_indices
 
-            pp_rank = config.parallel_config.pipeline_parallel_rank
-            start, end = get_pp_indices(depth, pp_rank, pp)
+            start, end = get_pp_indices(depth, stage[0], pp)
             text = getattr(hf, "text_config", hf)
             paged = paged_layers(text, 0, depth)
             if not paged:
@@ -2452,7 +2511,6 @@ def runner(model_runner, tree) -> None:
         modules = walk(tree, drafter(config))
         roofline = StepRooflineBackend(machine, modules, padded=padding != "none")
         backend = StepFallbackBackend(backend, roofline)
-    pp = getattr(config, "pipeline_parallel_size", 1)
     if pp > 1 and tp > 1 and not hasattr(backend, "all_gather_s"):
         from atom.utils import envs
 
@@ -2475,11 +2533,9 @@ def runner(model_runner, tree) -> None:
         if planned and model_runner.rank == 0:
             model_runner.compass_block_file = _block_file(now)
         slot = np.memmap(now, np.float64, "r", shape=(1,))
-        host = run.get("host", {})
+        host = host_part(run.get("host", {}), config)
         refuse_unfitted_host(host, config, platform)
         launch = stated(host.get("key"))
-        pp = getattr(config, "pipeline_parallel_size", 1)
-        stage = (config.parallel_config.pipeline_parallel_rank, pp) if pp > 1 else None
         # A drafter's runner waits for the last output's MTP status when it
         # defers its output.
         mtp = bool(getattr(config, "speculative_config", None)) and (

@@ -2308,8 +2308,9 @@ def _group_step_seconds(
     two is largest.
 
     A pipeline stage runs only its own layers, so it is refused unless its
-    backend states the `stage_share` it prices; any other backend prices the
-    whole step, and every stage would charge the whole model.
+    backend states the `stage_share` it prices, or the `stage` it prices,
+    ``(rank, stages)``, as this runner's; any other backend prices the whole
+    step, and every stage would charge the whole model.
 
     A step the cost backend refuses charges no device time on this rank, its
     answered terms included, and still counts as a priced step; its reason,
@@ -2354,11 +2355,18 @@ def _group_step_seconds(
         # collectives are inside the step that rank prices.
         return 0.0
     pp = int(_config_field(runner, "pipeline_parallel_size") or 1)
-    if pp > 1 and getattr(backend, "stage_share", None) is None:
+    stage = getattr(backend, "stage", None)
+    if pp > 1 and getattr(backend, "stage_share", None) is None and stage is None:
         raise RunnerRefusal(
             "this runner is one stage of a pipeline and runs only its own "
             f"layers, but {type(backend).__name__} prices a whole step; charging "
             "each stage the whole model would count it once per stage"
+        )
+    here = stage and (runner.config.parallel_config.pipeline_parallel_rank, pp)
+    if stage != here:
+        raise RunnerRefusal(
+            f"this runner is pipeline stage {here[0]} of {pp}, and "
+            f"{type(backend).__name__} prices stage {stage[0]} of {stage[1]}"
         )
     from atom.compass.backends.cost import (
         EAGER_DP_DUMMY,
