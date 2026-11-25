@@ -554,7 +554,8 @@ def _classify(module, name, parent):
             from atom.utils import envs
 
             # A prefill reads its window alone only through unified attention
-            # (`PagedAttentionImpl.dispatch_backend`).
+            # (`PagedAttentionImpl.dispatch_backend`), which then runs every
+            # decode too (`_dispatch_decode`).
             alone = envs.ATOM_USE_UNIFIED_ATTN or module.impl.use_flash_layout
             dims += (window, int(not alone))
         return kv and Module(name, "attention", dims, kv) or None
