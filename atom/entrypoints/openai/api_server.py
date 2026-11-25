@@ -3636,12 +3636,18 @@ async def kv_transfer_info():
 
     for sub, _ in iter_connector_configs(kv_cfg):
         if (
-            sub.get("kv_connector") == "mooncake"
+            sub.get("kv_connector") in ("mooncake", "compass")
             and sub.get("kv_role", "kv_producer") == "kv_producer"
             and sub.get("enable_chunked_transfer", False)
         ):
             info["chunked_transfer"] = producer_endpoint(
-                host=get_ip(),
+                # Compass's simulated producer stands in for Mooncake's and
+                # names no host (`atom.compass.kv.handoff`).
+                host=(
+                    "compass-simulated.invalid"
+                    if sub.get("kv_connector") == "compass"
+                    else get_ip()
+                ),
                 handshake_port=sub.get("handshake_port", DEFAULT_HANDSHAKE_PORT),
                 pp_size=cfg.pipeline_parallel_size,
                 block_size=cfg.kv_cache_block_size,

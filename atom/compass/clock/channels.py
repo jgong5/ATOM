@@ -432,10 +432,13 @@ def prefill_decode_table(
     ``engine-P-pp<k>`` (`_pipeline`, with `pp_links`), and decode writes to its
     head, ``engine-P-pp0``. A pipeline runs at DP width one.
 
-    With `chunked`, Mooncake's chunked transfer: prefill tells decode its write
+    With `chunked`, Mooncake's chunked transfer: the router sends each request
+    to prefill and to decode at once (atomesh's `dispatch_atom_chunked_internal`),
+    so traffic has a request path into each frontend and prefill relays
+    nothing, its reply drained by the router; and prefill tells decode its write
     is done on ``kv_write_done`` (prefill engine to decode engine, a channel per
-    rank pair as ``kv_write_req``, ``#dp<prefill rank>.dp<decode rank>``, at
-    the write request's lookahead), as no relay carries prefill's finish there.
+    rank pair as ``kv_write_req``, ``#dp<prefill rank>.dp<decode rank>``, at the
+    write request's lookahead). One deployment of a side, with no router LP.
 
     A prefill deployment's ZMQ messages each take `ipc_s`, but an engine's
     output to its frontend, which takes `ipc_out_s` (`ipc_s` when None); a
@@ -455,13 +458,26 @@ def prefill_decode_table(
             f"{prefill} prefill and {decode} decode deployments put a choice in "
             "the router, which makes it an LP: set router_in_s"
         )
+    if chunked and (max(prefill, decode) > 1 or router_in_s is not None):
+        raise ValueError(
+            "a chunked transfer is simulated for one prefill and one decode "
+            "deployment behind a router that is no LP; the router LP's concurrent "
+            "sends are not modeled"
+        )
     ps = [f"P{k}" if prefill > 1 else "P" for k in range(prefill)]
     ds = [f"D{k}" if decode > 1 else "D" for k in range(decode)]
     paths = [("traffic", f"frontend-{p}", "http", admission_s + router_s) for p in ps]
     paths += [(f"frontend-{d}", "traffic", "stream", stream_s + router_s) for d in ds]
-    paths += [
-        (f"frontend-{p}", f"frontend-{d}", "relay", router_s) for p in ps for d in ds
-    ]
+    if chunked:
+        paths += [
+            ("traffic", f"frontend-{d}", "http", admission_s + router_s) for d in ds
+        ]
+    else:
+        paths += [
+            (f"frontend-{p}", f"frontend-{d}", "relay", router_s)
+            for p in ps
+            for d in ds
+        ]
     # Each deployment's engine LPs and their channels to its frontend.
     engines, rows = {}, []
     for s in ps + ds:

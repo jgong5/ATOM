@@ -121,8 +121,12 @@
 # side's kv config after KV_EXTRA, such as a decode's `pd_admission` (the M3.1
 # 1P1D recipe's) or a prefill's chunked-transfer settings, which a real
 # instance takes whole; a simulated one takes `SIM_KV_KEYS` among them, the
-# settings its connector honours as Mooncake's does (`pd_admission`), and the
-# script names on stderr each key it leaves out.
+# settings its connector honours as Mooncake's does (`pd_admission`, and the
+# chunked transfer's), and the script names on stderr each key it leaves out.
+# A prefill's `enable_chunked_transfer` true makes a simulated run's KV
+# transfer chunked: the run file's `kv_chunked`, and each instance's
+# write-done notice address (`compass_kv_write_done`), from a port block of
+# its own.
 # Each instance runs its
 # command, OUT/<name>.sh, which first writes its process id to OUT/<name>.pid;
 # one given --on as `PREFIX bash OUT/<name>.sh`, stopped as `PREFIX kill -TERM
@@ -236,7 +240,12 @@ for extra in KV_EXTRA PREFILL_KV_EXTRA DECODE_KV_EXTRA; do
         bad "$extra is no JSON object: ${!extra}"
 done
 # The side kv settings a simulated instance's connector honours.
-SIM_KV_KEYS=pd_admission
+SIM_KV_KEYS="pd_admission enable_chunked_transfer chunked_admission_timeout_s"
+KV_CHUNKED=0
+if [[ -n ${PREFILL_KV_EXTRA:-} ]] && python3 -c 'import json, sys
+sys.exit(json.loads(sys.argv[1]).get("enable_chunked_transfer") is not True)' "$PREFILL_KV_EXTRA"; then
+    KV_CHUNKED=1
+fi
 read -ra prefill_env <<<"${PREFILL_ENV:-}"
 read -ra decode_env <<<"${DECODE_ENV:-}"
 for word in "${prefill_env[@]}" "${decode_env[@]}"; do
@@ -254,8 +263,8 @@ RUN_FILE= CLOCK=
 # listeners take one per rank from its handshake port. The decode's handshake
 # port, the prefill's plus its ranks as the nightly's 1P1D launch gives it, is
 # not held: its listeners bind ports the kernel hands out.
-ports=$(python3 - $$ "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${decode_on[*]}" "$PREFIX_S" "$NP" "$ND" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
-import argparse, json, random, socket, subprocess, sys
+ports=$(DEPLOY_KV_CHUNKED=$KV_CHUNKED python3 - $$ "$RUN_FILE" "$KV_LINK" "$ROUTER_LP" "${decode_on[*]}" "$PREFIX_S" "$NP" "$ND" "${#flags[@]}" "${flags[@]}" "${#prefill[@]}" "${prefill[@]}" "${decode[@]}" <<'EOF'
+import argparse, json, os, random, socket, subprocess, sys
 from pathlib import Path
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactRefusal
@@ -314,6 +323,9 @@ runfile.add_arguments(parser)
 args = parser.parse_args(flags)
 try:
     run = runfile.prefill_decode(args, prefill, decode, kv_link, decode_env if on else None)
+    chunked = os.environ.get("DEPLOY_KV_CHUNKED") == "1"
+    if chunked:
+        run[compass_run.KV_CHUNKED] = True
     for side, count in (("prefill_instances", np_), ("decode_instances", nd)):
         if count > 1:
             run[side] = count
@@ -328,17 +340,20 @@ except (ValueError, OSError, subprocess.TimeoutExpired, ArtifactRefusal, SpecRef
 clock = block(1)
 # One write-request port a (prefill instance, decode instance, prefill rank,
 # decode rank), from one base every instance is given (`kv.connector`).
-base = block(np_ * nd * run["prefill_data_parallel_size"] * run["decode_data_parallel_size"])
+pairs = np_ * nd * run["prefill_data_parallel_size"] * run["decode_data_parallel_size"]
+base = block(pairs)
+# Chunked: one write-done port a pair, which decode binds and prefill connects to.
+done = [block(pairs)] * (np_ + nd) if chunked else []
 run |= {"out_dir": str(Path(run_file).parent), "clock_endpoint": f"tcp://127.0.0.1:{clock}"}
 Path(run_file).write_text(json.dumps(run))
-hand(router, prometheus, clock, lookaheads, *[base] * (np_ + nd))
+hand(router, prometheus, clock, lookaheads, *[base] * (np_ + nd), *done)
 EOF
 )
 # Its last line; an import may print before it.
 # Then each instance's KV port, in instance order.
 read -ra drawn <<<"${ports##*$'\n'}"
 ROUTER_PORT=${drawn[0]} PROMETHEUS_PORT=${drawn[1]} CLOCK_PORT=${drawn[2]} LOOKAHEADS=${drawn[3]}
-KV_PORTS=("${drawn[@]:4}")
+KV_PORTS=("${drawn[@]:4:$((NP + ND))}") DONE_PORTS=("${drawn[@]:$((4 + NP + ND))}")
 
 pids=()
 instance_pid() { # I: instance I's command's process id, waiting up to PREFIX_S while its prefix runs
@@ -389,6 +404,7 @@ instance() { # I: write instance I's command, OUT/<name>.sh, and run it
     [[ ${sides[i]} == decode ]] || role=kv_producer several=$NP
     local kv="{\"kv_role\":\"$role\",\"kv_connector\":\"compass\",\"compass_kv_write_req\":\"tcp://127.0.0.1:${KV_PORTS[i]}\""
     ((several == 1)) || kv+=",\"compass_instance\":${index[i]}"
+    [[ $cmd != run ]] || ((!KV_CHUNKED)) || kv+=",\"compass_kv_write_done\":\"tcp://127.0.0.1:${DONE_PORTS[i]}\""
     kv+="}"
     if [[ $cmd == record ]]; then
         command=("$cmd" "${flags[@]}")

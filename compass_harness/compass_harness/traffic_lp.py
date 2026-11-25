@@ -158,6 +158,8 @@ class TrafficLP:
         # jitter_median: of a seeded request's intake jitter, in bytes.
         # ingress: the encoding ingress in front of the HTTP channel, or None.
         self.rt, self.http, self.stream = rt, http, stream
+        # The other frontends each request goes to at once (`from_env`).
+        self.also: tuple[str, ...] = ()
         self.cancel_url, self.seed = cancel_url, seed
         self.ingress = ingress
         # Behind an ingress: each sent request's body bytes, None for none, as
@@ -220,10 +222,15 @@ class TrafficLP:
         table = compass_run.channel_table(run)
         # One channel each way: into the frontend (frontend-P, or the router
         # LP, behind a PD router) and back from the one that streams
-        # (frontend-D, or the router LP).
-        (http,), (stream,) = table.channels_from(TRAFFIC), table.channels_into(TRAFFIC)
+        # (frontend-D, or the router LP). Under a chunked transfer the router
+        # sends each request to both frontends at once: it takes both, each
+        # request stamped alike on each (`also`).
+        into = sorted(
+            table.channels_from(TRAFFIC), key=lambda c: c.name != PREFILL_HTTP
+        )
+        (http, *also), (stream,) = into, table.channels_into(TRAFFIC)
         entry = compass_ingress.stated(run)
-        return cls(
+        lp = cls(
             LPRuntime(TRAFFIC, table, conn),
             os.environ[ADDRESS_ENV],
             http.name,
@@ -237,6 +244,19 @@ class TrafficLP:
                 else compass_ingress.Ingress(entry, table.lookahead(http.name))
             ),
         )
+        lp.also = tuple(c.name for c in also)
+        return lp
+
+    def _stamp(self, at: float | None = None) -> tuple[float, int]:
+        """Stamp one request on `http`, and alike on each of `also`."""
+        arrival, seq = self.rt.stamp_send(self.http, at)
+        for ch in self.also:
+            if self.rt.stamp_send(ch, arrival) != (arrival, seq):
+                raise RuntimeError(
+                    f"{ch} and {self.http} take every request together, so each "
+                    "stamp is the same on both"
+                )
+        return arrival, seq
 
     # ---- the clock ClockPacedLoopScheduler paces on ----
 
@@ -301,10 +321,10 @@ class TrafficLP:
         """
         for rank, key in sorted(self._unstamped, key=lambda sent: self._place(sent[0])):
             if self.ingress is None:
-                arrival, seq = self.rt.stamp_send(self.http)
+                arrival, seq = self._stamp()
             else:
                 start, at = self.ingress.admit(self.rt.now, self._bodies.pop(key))
-                arrival, seq = self.rt.stamp_send(self.http, at)
+                arrival, seq = self._stamp(at)
                 self._arrivals[key] = arrival
             self.open[key] = None
             jitter = self.jitter(rank)
@@ -366,11 +386,11 @@ class TrafficLP:
         to = (self.cancel_url,) if self.cancel_url else ()
         for key in keys:
             if self.ingress is None:
-                arrival, seq = self.rt.stamp_send(self.http)
+                arrival, seq = self._stamp()
             else:
                 at = self.rt.now + self.ingress.lookahead_s
                 at = max(at, self._arrivals.pop(key))
-                arrival, seq = self.rt.stamp_send(self.http, at)
+                arrival, seq = self._stamp(at)
             self._pub.send_pyobj((key, arrival, seq, "cancel", *to))
         while not self._written.issuperset(keys):
             self._changed.clear()
