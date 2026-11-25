@@ -4,9 +4,9 @@ judged requirement by requirement, the first that fails named.
 
 Only the head is supported. `head` takes it from the git repository of the tree
 `atom` resolves under (`TREE`): the commit a space file freezes, which must be
-one of the integration branch's (`INTEGRATION`), else that branch's tip at its
-remote-tracking ref, as last fetched; and the ATOM digest of the ``atom/`` it
-holds (`run.committed_atom_digest`). A tree that is not its repository's root,
+one of the integration branch's (`INTEGRATION`, or the line `INTEGRATION_REF`
+names), else that branch's tip at its remote-tracking ref, as last fetched;
+and the ATOM digest of the ``atom/`` it holds (`run.committed_atom_digest`). A tree that is not its repository's root,
 a repository with no such ref, or with two remotes' refs at two commits,
 refuses by name. `refuse_another_tree` refuses a tree whose ATOM digest
 (`run.atom_digest`) is not the head's, naming both and the commit taken as the
@@ -57,6 +57,7 @@ orders the stores a candidate is looked up in.
 """
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -87,6 +88,10 @@ TREE = Path(atom.__file__).resolve().parents[1]
 LAWS = TREE / "scripts" / "compass" / "laws"
 #: The integration branch, whose tip at its remote-tracking ref is the head.
 INTEGRATION = "feature/atomcompass_new"
+#: The variable naming another line's branch as the integration branch, as the
+#: gate scripts read it (`scripts/compass/_lib.sh`): a branch name, which each
+#: remote's same-named ref resolves, or one remote's ref, ``<remote>/<name>``.
+INTEGRATION_REF = "COMPASS_INTEGRATION_REF"
 #: The cost-accuracy gate, and the figures of a held-out run's kind it holds.
 GATE, GATED = 0.05, ("on_totals", "held_out", "median")
 #: A configuration's verdicts on its laws, the first preferred.
@@ -113,16 +118,19 @@ def head(commit: str | None = None) -> dict:
             f"the tree atom resolves under, {TREE}, is not a git repository's "
             f"root, so the head's ATOM digest cannot be read: {top.strip()}"
         )
+    line = os.environ.get(INTEGRATION_REF) or INTEGRATION
+    remotes = git("remote")[1].split()
+    # One remote's ref, named whole, is taken alone; a branch name, each remote's.
+    named = [line] if line.split("/", 1)[0] in remotes else []
     tips = {}
-    for remote in git("remote")[1].split():
-        ref = f"{remote}/{INTEGRATION}"
+    for ref in named or [f"{remote}/{line}" for remote in remotes]:
         code, tip = git("rev-parse", "--verify", f"refs/remotes/{ref}^{{commit}}")
         if not code:
             tips[ref] = tip.strip()
     if len(set(tips.values())) != 1:
         raise ValueError(
             f"{TREE}'s repository has {len(set(tips.values()))} commits at a "
-            f"remote-tracking ref of {INTEGRATION}, and the head is one: "
+            f"remote-tracking ref of {line}, and the head is one: "
             + ("; ".join(f"{r} at {t}" for r, t in tips.items()) or "fetch it")
         )
     ref, tip = next(iter(tips.items()))

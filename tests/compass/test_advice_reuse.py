@@ -918,3 +918,41 @@ def test_the_head_is_the_frozen_commit_of_the_integration_branch_with_its_atom(
     assert reuse.head()["atom"] != digest
     with pytest.raises(ValueError, match=f"the frozen commit {off} is not one of"):
         reuse.head(off)
+
+
+@pytest.mark.parametrize("named", ["pit2/line", "origin/pit2/line"])
+def test_the_integration_ref_names_another_line_s_branch_as_the_head(
+    tmp_path, monkeypatch, named
+):
+    tree = tmp_path / "tree"
+    monkeypatch.setattr(reuse, "TREE", tree)
+    tree.mkdir()
+    (main,) = repository(tree, "X = 1\n")
+    (tree / "atom" / "x.py").write_text("X = 2\n")
+    git(tree, "commit", "-q", "-am", "the line")
+    line = git(tree, "rev-parse", "HEAD")
+    git(tree, "update-ref", "refs/remotes/origin/pit2/line", line)
+
+    monkeypatch.setenv(reuse.INTEGRATION_REF, named)
+    taken = reuse.head()
+    frozen = reuse.head(line[:7])
+    monkeypatch.delenv(reuse.INTEGRATION_REF)
+
+    assert taken["commit"] == line and taken["ref"] == "origin/pit2/line"
+    assert frozen["commit"] == line
+    assert reuse.head()["commit"] == main
+    with pytest.raises(ValueError, match=f"the frozen commit {line} is not one of"):
+        reuse.head(line)
+
+
+def test_an_integration_ref_no_remote_holds_refuses_by_name(tmp_path, monkeypatch):
+    tree = tmp_path / "tree"
+    monkeypatch.setattr(reuse, "TREE", tree)
+    tree.mkdir()
+    repository(tree, "X = 1\n")
+    monkeypatch.setenv(reuse.INTEGRATION_REF, "pit2/absent")
+
+    with pytest.raises(
+        ValueError, match="0 commits at a remote-tracking ref of pit2/absent"
+    ):
+        reuse.head()
