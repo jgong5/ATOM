@@ -436,6 +436,36 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             engine_id=engine_id(self._rt.me.name),
         )
 
+    @property
+    def supports_pd_admission(self) -> bool:
+        """Decode admits a receive under ``pd_admission`` as Mooncake's
+        consumer does (`PdAdmissionController`): this connector's decode side
+        receives the range `pd_receive_block_offset` names."""
+        return not self.is_producer
+
+    def pd_receive_block_offset(self, seq, num_blocks, num_cached_blocks):
+        """The first block of `seq`'s receive, which `pd_admission` charges up
+        to `num_blocks`, or None where it receives nothing: Mooncake's rule
+        (`_receive_block_offset`). A local prefix of `num_cached_blocks` is
+        skipped where the producer's pages line up with this side's
+        (`_pages_line_up`, as `update_state_after_alloc` skips it) and a
+        legacy transfer's source holds more blocks than the prefix; a prefix
+        that is the whole prompt is received whole."""
+        params = seq.kv_transfer_params or {}
+        if self.is_producer or not params.get("do_remote_prefill"):
+            return None
+        if seq.has_per_req_cache:
+            raise ValueError("PD admission supports paged KV receives only")
+        cached = num_cached_blocks if self._pages_line_up(params) else 0
+        sources = len(params.get("remote_block_ids") or [])
+        if (
+            cached < 0
+            or cached >= num_blocks
+            or (not params.get("chunked_transfer") and cached >= sources)
+        ):
+            return 0
+        return cached
+
     def should_defer_free(self, seq) -> bool:
         return str(seq.id) in self._awaiting_send
 
