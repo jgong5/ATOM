@@ -83,8 +83,7 @@ from functools import partial
 
 from atom.compass.carriers import (
     cancel_seq,
-    relay_service,
-    relay_stamp,
+    relay_carried,
     stamp_events,
     tracestate_jitter,
     with_relay_stamp,
@@ -304,6 +303,14 @@ class SimExecutor(ThreadPoolExecutor):
                 if done is not None:
                     self.loop.call_at(self.station.completion(j), done)
 
+    def unplaced(self) -> bool:
+        """On the loop thread: whether a service job is submitted and not yet
+        placed. It reads the station without its lock, since only the loop
+        thread enqueues and places. A job counts until `place` takes it, its
+        thread done or not."""
+        station = self.station
+        return station is not None and station.final < len(station.jobs)
+
     def idle(self) -> bool:
         """The loop is idle at the LP clock now: end `placed`'s wait, if there
         is one and every service job is placed; returns whether it ended one."""
@@ -328,7 +335,7 @@ def charge(d: float) -> None:
     rt = clock.installed()
     if rt is not None and rt.in_run:
         loop = rt.loop if threading.current_thread() is rt.owner else None
-        if loop is not None and loop.executor.station is not None:
+        if loop is not None and loop.executor.unplaced():
             loop.executor.place(wait=True)
         rt.advance_to(rt.now + d)
 
@@ -792,6 +799,38 @@ class CompassSelector(selectors.DefaultSelector):
 GENERATION_PATHS = frozenset(
     ("/v1/completions", "/v1/chat/completions", "/v1/messages", "/v1/responses")
 )
+#: The API server's ``BaseHTTPMiddleware`` dispatchers, by module and qualified
+#: name, that hand every request on unchanged in the process `HttpChannel`
+#: serves: the front-end hub relay acts only in a front-end worker, which
+#: serves the app without `HttpChannel`.
+PASS_THROUGH_DISPATCH = frozenset(
+    {"atom.entrypoints.openai.api_server._forward_to_frontend_hub"}
+)
+
+
+def _without_pass_through(app) -> None:
+    """Take the `PASS_THROUGH_DISPATCH` layers out of `app`'s middleware, if
+    it is a Starlette app; its stack is built again at its next call. Such a
+    layer hands each body message of a response between two tasks through a
+    memory stream, an anyio ``Event`` and two loop turns a streamed event,
+    and changes nothing the app sends."""
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    middleware = getattr(app, "user_middleware", None)
+    if middleware is None:
+        return
+    kept = [
+        m
+        for m in middleware
+        if m.cls is not BaseHTTPMiddleware
+        or _qualified(m.kwargs.get("dispatch")) not in PASS_THROUGH_DISPATCH
+    ]
+    if len(kept) < len(middleware):
+        app.user_middleware, app.middleware_stack = kept, None
+
+
+def _qualified(fn) -> str:
+    return f"{getattr(fn, '__module__', None)}.{getattr(fn, '__qualname__', None)}"
 
 
 class HttpChannel:
@@ -864,7 +903,9 @@ class HttpChannel:
     the loop is charged ``per_event_s`` for each event but a ``[DONE]`` before
     it stamps them: a real decode server's loop spends ~50 us of CPU an
     event, a fifth of its wall time at c=256 (r256, #3720), and the relays
-    and intakes it takes in wait behind that work.
+    and intakes it takes in wait behind that work. A Starlette app is served
+    without its `PASS_THROUGH_DISPATCH` layers, so its body messages reach
+    the stamping on the task that sends them.
 
     Taking in a stamped request other than a cancel costs the event loop its
     relay's service time, if it came on a relay that states one, then
@@ -887,6 +928,7 @@ class HttpChannel:
     def __init__(self, app, stamp) -> None:
         from atom.compass.run import http_intake, http_intake_hull, http_stream, relay
 
+        _without_pass_through(app)
         self.app, self.stamp = app, stamp
         self.intake, self.hull = http_intake(), http_intake_hull()
         self.relay, self.per_event = relay(), http_stream()
@@ -904,9 +946,10 @@ class HttpChannel:
             send = _stamping_events(send, rt, self.per_event)
         if relay_out is not None:
             send = _stamping(send, rt, relay_out, self.relay, taken)
+        service = 0.0  # the seconds its relay serves it for, where stated
         if relay_in is not None:
             body, receive = await _read_body(receive)
-            got = relay_stamp(body)
+            got, service = relay_carried(body)
         else:
             got = self.stamp(scope) if scope["type"] == "http" else None
         if (
@@ -933,7 +976,6 @@ class HttpChannel:
             arrival, seq = got
             rt.check_arrival(ch, arrival, seq)
             jitter = 0.0 if relay_in is not None else _intake_jitter(scope)
-            service = relay_service(body) if relay_in is not None else 0.0
             wake, ready = loop.create_future(), loop.create_future()
             # Its body leaves the socket as it comes, not at its turn.
             reading = asyncio.ensure_future(_body_messages(receive))
@@ -1090,10 +1132,10 @@ def _stamping_events(send, rt, per_event=None):
     and what the app sends after it is dropped. The traffic LP holds its clock
     until the client has the return of a request whose ``[DONE]`` it was
     released, and the client returns at the body's end. Left to the app, that
-    end comes loop turns after ``[DONE]`` (Starlette hands each body message
-    between tasks), and in those turns the loop's on-loop decodes advance the
-    LP clock; one that reaches past the traffic LP's horizon waits for a grant
-    the traffic LP only asks for once the return is in, and the run hangs.
+    end can come loop turns after ``[DONE]``, and in those turns the loop's
+    on-loop decodes advance the LP clock; one that reaches past the traffic
+    LP's horizon waits for a grant the traffic LP only asks for once the
+    return is in, and the run hangs.
     """
     events = ended = False
 
