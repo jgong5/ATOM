@@ -181,6 +181,9 @@ class TrafficLP:
         self._pub.bind(stamps)
         self._pull = ctx.socket(zmq.PULL)
         self._pull.bind(reports)
+        # The same socket, whose queued reports `_take_queued` reads with no
+        # future each.
+        self._pull_queued = zmq.Socket.shadow(self._pull.underlying)
         self._subscribers = 0
         # sent at this instant, not yet stamped: (rank, key), in aiperf's order
         self._unstamped: list[tuple[tuple, tuple]] = []
@@ -259,7 +262,7 @@ class TrafficLP:
         A `phase_deadline` is asked for as a daemon deadline while a request
         is open, and a wait due at or past it only once it has fired.
         """
-        fut = asyncio.get_running_loop().create_future()
+        fut = _ClockWait(self._loop_tasks)
         self._waiters[fut] = (t, phase_deadline)
         heap = self._deadlines if phase_deadline else self._plain
         heapq.heappush(heap, (t, next(self._asked), fut))
@@ -436,9 +439,10 @@ class TrafficLP:
     def _take_queued(self) -> None:
         """Take the reports already queued without a turn of the event loop:
         most reach the socket while the owner is blocked in a clock call."""
+        recv = self._pull_queued.recv
         while True:
             try:
-                frame = self._pull.recv(zmq.NOBLOCK).result()
+                frame = recv(zmq.NOBLOCK)
             except zmq.Again:
                 return
             self._take(pickle.loads(frame))
@@ -598,21 +602,52 @@ class TrafficLP:
             )
 
 
+class _ClockWait(asyncio.Future):
+    """A clock wait (`TrafficLP.wait`). However it completes, by its result, an
+    exception or a cancel (a waiting task's cancel cancels it), it hands the
+    tasks waiting on it to its loop's next look at once, before its callbacks,
+    the tasks' wakeups among them, can run."""
+
+    def __init__(self, tasks: "_LoopTasks") -> None:
+        super().__init__(loop=tasks.loop)
+        self.tasks = tasks
+
+    def set_result(self, result) -> None:
+        super().set_result(result)
+        self.tasks.woke(self)
+
+    def set_exception(self, exception) -> None:
+        super().set_exception(exception)
+        self.tasks.woke(self)
+
+    def cancel(self, msg=None) -> bool:
+        if not super().cancel(msg):
+            return False
+        self.tasks.woke(self)
+        return True
+
+
 class _LoopTasks:
     """The tasks of one event loop, each as its last read found it.
 
     The loop's task factory hands each task it creates to the next look. A read
     keeps the future a task waits on, and a task cannot run while that future
-    is pending, so a look reads again only the tasks whose futures are done,
-    which one pass in C finds (`asyncio.Future.done` over every kept future),
-    and those its last read found waiting on none. So the Python a look runs
-    grows with what changed since the last look, not with the loop's tasks.
+    is pending, so a look reads again only the tasks whose futures are done
+    and those its last read found waiting on none. A clock wait says when it
+    completes (`_ClockWait`); the done ones among the other futures kept, one
+    pass in C finds (`asyncio.Future.done` over each). So the Python a look
+    runs grows with what changed since the last look, and its pass with the
+    tasks waiting on something other than the clock, not with the loop's
+    tasks: most of aiperf's parked tasks wait on the clock.
     """
 
     def __init__(self, loop) -> None:
-        self._loop = loop
-        # Each task its last read found waiting on a pending asyncio future.
+        self.loop = loop
+        # Each task its last read found waiting on a pending asyncio future
+        # other than one of this loop's clock waits.
         self._waiting: dict[asyncio.Task, asyncio.Future] = {}
+        # The tasks its last read found waiting on each pending clock wait.
+        self._clocked: dict[_ClockWait, list[asyncio.Task]] = {}
         # The tasks to read at the next look: those created since the last one,
         # and those it found ready or waiting on a future asyncio's C pass
         # cannot read.
@@ -636,7 +671,7 @@ class _LoopTasks:
         A task that ends queues its done callbacks behind the current task, so
         they run only on the loop's next turn.
         """
-        if self._loop.get_task_factory() != self._factory:
+        if self.loop.get_task_factory() != self._factory:
             raise RuntimeError(
                 "the event loop's task factory was replaced after the traffic LP "
                 "set its own: the hold no longer sees the tasks the loop creates"
@@ -658,13 +693,19 @@ class _LoopTasks:
             elif (waiter := task._fut_waiter) is None or waiter.done():
                 ready.append(task.get_name())
                 self._unread.add(task)
+            elif isinstance(waiter, _ClockWait) and waiter.tasks is self:
+                self._clocked.setdefault(waiter, []).append(task)
             elif isinstance(waiter, asyncio.Future):
                 waiting[task] = waiter
             else:
                 self._unread.add(task)
         return ready, ended
 
+    def woke(self, wait: _ClockWait) -> None:
+        """`wait` completed: the next look reads the tasks waiting on it."""
+        self._unread.update(self._clocked.pop(wait, ()))
+
     def close(self) -> None:
         """Give the loop back the task factory it had, unless another replaced ours."""
-        if self._loop.get_task_factory() == self._factory:
-            self._loop.set_task_factory(self._previous)
+        if self.loop.get_task_factory() == self._factory:
+            self.loop.set_task_factory(self._previous)

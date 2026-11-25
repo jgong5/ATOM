@@ -802,6 +802,98 @@ def test_a_task_parked_on_a_pending_future_is_read_once_whatever_the_clock_calls
     assert set(read) == {1}
 
 
+def test_tasks_parked_on_the_clock_stay_out_of_every_look_s_pass(
+    tmp_path, monkeypatch
+):
+    """Hundreds of idle watchdogs wait on the clock past every time asked while
+    a pacer waits on it twenty times: no look's pass over the kept futures
+    reads their waits, so a look costs the same with them parked as without."""
+    parked, calls = 500, 20
+    passes = []
+
+    class Passes(dict):
+        def values(self):
+            passes.append(len(self))
+            return super().values()
+
+    async def main():
+        rt = ScriptedRuntime([])
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        traffic._loop_tasks._waiting = Passes()
+        monkeypatch.setattr(ClockPacedLoopScheduler, "clock", traffic)
+        timers = [ClockTimer(10.0 * calls, lambda: None) for _ in range(parked)]
+
+        async def pacer():
+            for t in range(1, calls + 1):
+                await traffic.wait(float(t))
+            for timer in timers:
+                timer.cancel()
+            traffic.finish()
+
+        await asyncio.wait_for(asyncio.gather(pacer(), traffic.done), 5)
+        return rt.calls
+
+    asked = _run(main())
+    assert asked == [float(t) for t in range(1, calls + 1)] + [INF]
+    assert len(passes) >= calls and max(passes) < 10
+
+
+def test_the_look_finds_a_task_on_a_clock_wait_however_the_wait_completes():
+    """Tasks park on clock waits: one wait resolves, one fails, one is
+    cancelled, and one task is cancelled, which cancels its wait. At every look
+    the hold's look returns what a look over `asyncio.all_tasks` returns: the
+    ready tasks and whether one it saw last time has ended."""
+    from compass_harness.traffic_lp import _ClockWait, _LoopTasks
+
+    def reference(alive):
+        me = asyncio.current_task()
+        tasks = {t for t in asyncio.all_tasks() if t is not me and not t.done()}
+        ready = sorted(
+            t.get_name() for t in tasks if t._fut_waiter is None or t._fut_waiter.done()
+        )
+        return (ready, any(t.done() for t in alive)), tasks
+
+    async def park(wait):
+        await wait
+
+    async def main():
+        loop_tasks = _LoopTasks(asyncio.get_running_loop())
+        waits = [_ClockWait(loop_tasks) for _ in range(5)]
+        tasks = [asyncio.ensure_future(park(wait)) for wait in waits]
+        await asyncio.sleep(0)
+        looks, alive = [], set()
+
+        def look():
+            nonlocal alive
+            ready, ended = loop_tasks.look()
+            theirs, alive = reference(alive)
+            looks.append(((sorted(ready), ended), theirs))
+
+        look()
+        waits[0].set_result(None)
+        look()
+        await asyncio.sleep(0)
+        look()
+        waits[1].set_exception(RuntimeError("failed"))
+        waits[2].cancel()
+        tasks[3].cancel()
+        look()
+        await asyncio.sleep(0)
+        look()
+        waits[4].set_result(None)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        look()
+        loop_tasks.close()
+        return looks, waits
+
+    looks, waits = _run(main())
+    assert [ours for ours, _ in looks] == [theirs for _, theirs in looks]
+    assert [ready != [] for (ready, _), _ in looks] == [
+        False, True, False, True, False, False
+    ]
+    assert waits[3].cancelled()
+
+
 def test_a_task_factory_set_after_the_traffic_lp_s_fails_the_hold_by_name(tmp_path):
     """The hold sees a new task through the task factory the traffic LP sets on
     its loop; a factory set after it would hide new tasks from the hold, so the
