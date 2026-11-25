@@ -20,6 +20,10 @@ from atom.kv_transfer.disaggregation.types import DEFAULT_SHARDED_STAGING_WORKER
 _PD_TRANSFER_CONNECTORS = frozenset({"mooncake", "moriio"})
 # Only Mooncake consumes staging callbacks / pool slots (DSA index and MLA).
 _MOONCAKE_CONNECTORS = frozenset({"mooncake"})
+# Compass's simulated connector (`factory.py` registers it): it stands in for
+# Mooncake on each side of a simulated P/D deployment, so it puts the engine in
+# its P/D role as the connector it stands in for does.
+_SIMULATED_PD_CONNECTORS = frozenset({"compass"})
 # KV staging: one slot of this size per send worker, the pool capped in bytes
 # so a large ``num_worker_threads`` makes workers share slots.
 STAGING_SLOT_BYTES = 8 << 20
@@ -103,7 +107,9 @@ def disaggregated_kv_role(config) -> str | None:
         name = entry.get("kv_connector", _DEFAULT_BACKEND)
         if not isinstance(name, str):
             continue
-        if name.strip().casefold() not in PD_TRANSFER_BACKENDS:
+        if name.strip().casefold() not in PD_TRANSFER_BACKENDS | (
+            _SIMULATED_PD_CONNECTORS
+        ):
             continue
         role = entry.get("kv_role", "kv_producer")
         if role in ("kv_producer", "kv_consumer"):

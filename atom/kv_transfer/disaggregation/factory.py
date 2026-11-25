@@ -601,4 +601,8 @@ KVConnectorFactory.register(
     worker_class="SimulatedKVConnector",
     scheduler_module="atom.compass.kv.connector",
     scheduler_class="SimulatedKVConnectorScheduler",
+    # It prices the pages and draft rows the runner planned, whatever their
+    # dtype, where Mooncake, which it stands in for, moves both.
+    moves_nvfp4_pages=True,
+    moves_own_dtype_draft=True,
 )
