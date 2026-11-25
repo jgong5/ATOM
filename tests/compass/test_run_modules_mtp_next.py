@@ -7,13 +7,12 @@ their modules with its passes, one a draft token, as it does Qwen3.5's
 (`test_run_modules_mtp`). Qwen3-Next's MTP layer is a Qwen3-Next decoder layer
 behind a Qwen3.5-style prologue whose `fc` output is all-gathered over the TP
 group; each pass runs its first MTP layer. MiMo-V2's MTP block attends a
-sliding window, so a step under it stays refused by the window's name until
-#3965 prices one.
+sliding window, priced over that window (#3965).
 
 Qwen3-Next-80B-A3B's config is its Hugging Face checkpoint's
 (`qwen3_next_80b_a3b_config.json`), MiMo-V2-Flash's too
 (`mimo_v2_flash_config.json`), its target cut to its first layer, full
-attention and a dense MLP, so the drafter's window is the one refused. Each is
+attention and a dense MLP, which the roofline prices. Each is
 built at TP 4 on `tests/compass/machines/mi355x-gpu40.json`, in a process of
 its own, as `test_run_modules_mtp` builds its models.
 """
@@ -38,7 +37,6 @@ from test_run_modules_mtp import (
     verify,
 )
 
-from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView, RequestShape, sum_tokens
 from atom.compass.backends.step_roofline import UNCLASSIFIED, StepRooflineBackend
 from atom.compass.backends.work import (
@@ -50,8 +48,8 @@ from atom.compass.backends.work import (
     elementwise,
     gemm,
     grouped_gemm,
+    price,
 )
-from atom.compass.run.modules import WINDOW_REFUSED
 from atom.compass.spec import MachineSpec
 
 QWEN3_NEXT = HERE / "qwen3_next_80b_a3b_config.json"
@@ -204,13 +202,33 @@ def test_a_middle_chunk_runs_the_first_qwen3_next_pass_alone_and_no_head(built):
     assert cost.draft_seconds == pytest.approx(next_pass(chunk.requests, 0), rel=1e-12)
 
 
-def test_mimo_v2_s_windowed_mtp_block_stays_refused_by_its_window(built):
-    """Every module of MiMo-V2's drafter is classified but its MTP block's
-    sliding-window attention, which the walk refuses by name (#3965); the
-    target's one full-attention layer prices."""
+def test_mimo_v2_s_windowed_mtp_block_is_priced_over_its_window(built):
+    """Every module of MiMo-V2-Flash's drafter is classified, its MTP block's
+    sliding-window attention priced over its window (#3965): on 4 rows
+    verifying 1 draft at contexts past the window, each query attends the
+    last 128 keys and each request's last 128 keys and values are read."""
+    hf = json.loads(MIMO.read_text())
+    heads, kv = hf["swa_num_attention_heads"] // TP, hf["swa_num_key_value_heads"] // TP
+    dim, window = hf["swa_head_dim"], hf["sliding_window_size"]
     modules = built["mimo-v2-mtp1"]["modules"]
-    refused = [m.name for m in modules if m.kind == UNCLASSIFIED]
-    attn = "drafter.model.layers.1.mtp_block.self_attn.attn"
-    assert refused == [f"Attention at {attn} ({WINDOW_REFUSED})"]
-    with pytest.raises(CostRefused, match=r"a sliding window; .* before #3965"):
-        built["mimo-v2-mtp1"]["installed"].price(verify(1))
+    (attn,) = [m for m in modules if m.passes and m.kind == "attention"]
+    assert [m.name for m in modules if m.kind == UNCLASSIFIED] == []
+    assert attn.name == "drafter.model.layers.1.mtp_block.self_attn.attn"
+    assert attn.dims == (heads, kv, dim, window, 1)
+
+    step = verify(1)
+    rows = len(step.requests)
+    keys = rows * 2 * window  # two queries a row, each past the window
+    # Q read and O written, and each request's last `window` keys and values.
+    moved = (rows * 2 * 2 * heads + rows * window * 2 * kv) * 2 * dim
+    hand = price(Work({"bf16": 4 * heads * dim * keys}, moved), MACHINE)
+    alone = StepRooflineBackend(MACHINE, [attn]).price(step)
+    assert alone.draft_seconds == pytest.approx(hand, rel=1e-12)
+    cost = built["mimo-v2-mtp1"]["installed"].price(step)
+    terms = {t.name: t.seconds for t in cost.draft_terms}
+    print(
+        f"\nMiMo-V2-Flash MTP1 TP4 on MI355X, 4 rows of 2 tokens: draft "
+        f"{cost.draft_seconds:.9g} s, its windowed attention {hand:.9g} s by "
+        f"hand; " + ", ".join(f"{n} {s * 1e6:.2f} us" for n, s in sorted(terms.items()))
+    )
+    assert terms["draft roofline.attention"] == pytest.approx(hand, rel=1e-12)

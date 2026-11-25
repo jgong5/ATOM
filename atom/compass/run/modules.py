@@ -128,7 +128,7 @@ reduces its residual copies (`hc_head`, by its own mixing weights) and
 norms the result, on the rows the head samples alone (`Module.head`,
 `DeepseekV4MTPModel._head_input`). Qwen3.5's and Qwen3-Next's all-gather
 their `fc`'s output over the TP group. MiMo-V2's MTP block attends a sliding
-window, refused by name as the target's windowed layers are. Where a
+window, priced over it as the target's windowed layers are. Where a
 data-parallel group shards a draft's argmax (`ATOM_DP_DRAFT_ARGMAX`, a head
 at TP 1, its vocabulary split evenly), its LM head carries the group's width
 and the most rows it shards (`ParallelLMHead._can_use_dp_sharded_argmax`).
