@@ -233,6 +233,27 @@ def test_a_window_s_of_no_whole_minutes_is_refused(tmp_path):
         _main("--scan", root, "--out", tmp_path / "d.html", "--window", WINDOW)
 
 
+def test_the_ttft_p90_sits_between_the_ttft_p50_and_p99(tmp_path):
+    """one_real.py lists ``p90 TTFT`` among InferenceX's rows, after the TTFT
+    P50 and P99: the page shows it between them, named TTFT p90."""
+    root = tmp_path / "root"
+    _cell(root / "M1/pd/1P1D/c8", "pd")
+    rows = {"TTFT p50 ms": 1000.0, "TTFT p99 ms": 9000.0, "TPOT p50 ms": 9.0}
+    rows |= {"p90 interactivity": 90.0, "p90 TTFT": 3.0}
+    line = json.dumps({"real": rows, "sim_a": dict(rows, **{"p90 TTFT": 3.3})})
+    (root / "M1/pd/1P1D/c8" / dash.SCAN_ONE_REAL).write_text(line + "\n")
+    out = tmp_path / "dash.html"
+
+    _main("--scan", root, "--out", out, "--window", WINDOW)
+
+    data = _page(out)
+    (cell,) = data["cells"]
+    assert cell["one_real"]["metrics"][:3] == ["TTFT p50 ms", "p90 TTFT", "TTFT p99 ms"]
+    assert data["request_names"]["p90 TTFT"] == "TTFT p90 ms"
+    labels = [c["label"] for c in data["request_cols"]]
+    assert labels[:3] == ["TTFT p50", "TTFT p90", "TTFT p99"]
+
+
 def test_no_manifest_and_no_scan_is_a_usage_error(tmp_path):
     with pytest.raises(SystemExit):
         _main("--out", tmp_path / "d.html")

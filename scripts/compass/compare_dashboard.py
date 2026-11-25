@@ -154,8 +154,8 @@ SHORT = {
 #: one_real.py's metrics the request matrix shows, in order, and their headers.
 REQUEST_COLS = [
     ("TTFT p50 ms", "TTFT p50"),
+    ("p90 TTFT", "TTFT p90"),
     ("TTFT p99 ms", "TTFT p99"),
-    ("p90 TTFT", "p90 TTFT"),
     ("TPOT p50 ms", "TPOT p50"),
     ("TPOT p90 ms", "TPOT p90"),
     ("E2E p50 ms", "E2E p50"),
@@ -165,6 +165,9 @@ REQUEST_COLS = [
     ("GPU hit rate", "GPU hit"),
     ("requests", "requests"),
 ]
+#: one_real.py's rows the per-request table names otherwise: its InferenceX
+#: ``p90 TTFT`` is the TTFT P90, shown beside P50 and P99.
+REQUEST_NAMES = {"p90 TTFT": "TTFT p90 ms"}
 THRESHOLDS = (0.05, 0.15)
 CHART_JS = "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"
 
@@ -584,7 +587,13 @@ def merge_one_real(parsed: list[dict]) -> dict | None:
         out["tail_sims"].update(p["tail_sims"])
         out["paired"].update(p["paired"])
         out["notes"] += [n for n in p["notes"] if n not in out["notes"]]
-    out["metrics"] = list(out["real"])
+    metrics = list(out["real"])
+    # one_real.py lists p90 TTFT among InferenceX's rows; the table shows it
+    # between TTFT p50 and p99.
+    if "p90 TTFT" in metrics and "TTFT p50 ms" in metrics:
+        metrics.remove("p90 TTFT")
+        metrics.insert(metrics.index("TTFT p50 ms") + 1, "p90 TTFT")
+    out["metrics"] = metrics
     return out
 
 
@@ -821,6 +830,7 @@ def build(cells: list[dict], window: float, args) -> dict:
         "panels": panel_list,
         "matrix_cols": matrix_cols,
         "request_cols": [{"key": k, "label": v} for k, v in REQUEST_COLS],
+        "request_names": REQUEST_NAMES,
         "cells": out_cells,
     }
 
@@ -1358,7 +1368,7 @@ function drawPerRequest() {
   for (const r of sims) h += "<th>" + esc(r.label) + "</th><th>error</th>";
   h += "<th>real's own 95% interval</th></tr></thead><tbody>";
   for (const m of o.metrics) {
-    h += '<tr><td class="lbl">' + esc(m) + "</td><td>" + fmtReq(m, o.real[m]) + "</td>";
+    h += '<tr><td class="lbl">' + esc(D.request_names[m] || m) + "</td><td>" + fmtReq(m, o.real[m]) + "</td>";
     for (const r of sims) {
       const row = o.sims[r.key];
       const s = row ? row[m] : null, e = errOf(o.real[m], s);
