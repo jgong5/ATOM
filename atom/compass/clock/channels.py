@@ -22,6 +22,7 @@ arrival (`atom.utils.clock.LPRuntime.offer`), so the authority grants an LP
 waiting in TAR such a message's arrival first (`ClockAuthority`, #3767).
 """
 
+import heapq
 import math
 from dataclasses import dataclass
 from enum import StrEnum
@@ -58,6 +59,11 @@ class ChannelTable:
         self._into: dict[LpId, tuple[Channel, ...]] = {}
         # The offering channels' names, an ordered set.
         self._offering: dict[str, None] = {}
+        # LP -> inbound channel kind -> the outbound kinds a message there can
+        # provoke; an LP not here reacts on every outbound channel.
+        self._reactions: dict[LpId, dict[str, tuple[str, ...]]] = {}
+        # target LP -> channel name -> reach(name, target)
+        self._reach: dict[LpId, dict[str, float]] = {}
 
     def declare(
         self,
@@ -90,6 +96,7 @@ class ChannelTable:
         channel = Channel(name, source, target, lookahead, ReceiveMode(receive))
         self._channels[name] = channel
         self._distances = None
+        self._reach.clear()
         self._from.clear()
         self._into.clear()
         return channel
@@ -130,6 +137,61 @@ class ChannelTable:
         """Whether the handler of a message on `name` may offer a send."""
         return name in self._offering
 
+    def mark_reactions(self, lp: LpId, reactions: dict) -> None:
+        """Declare, for each kind of channel into `lp`, the kinds of channel out
+        of it that a message there can provoke. A kind of `lp`'s inbound channels
+        left out provokes nothing."""
+        self.registry.require(lp)
+        self._reactions[lp] = {k: tuple(v) for k, v in reactions.items()}
+        self._reach.clear()
+
+    def declares(self, lp: LpId) -> bool:
+        """Whether `lp` declared its reactions."""
+        return lp in self._reactions
+
+    def reacts(self, into: str, out: str) -> bool:
+        """Whether a message on `into` can provoke its receiver's send on `out`."""
+        declared = self._reactions.get(self.channel(into).target)
+        return declared is None or kind_of(out) in declared.get(kind_of(into), ())
+
+    def reach(self, name: str, target: LpId) -> float:
+        """The least lookahead from a message on `name`, at its receiver, to a
+        message arriving at `target`, over the sends each receiver's reactions
+        allow: zero when `name` goes into `target`."""
+        self.registry.require(target)
+        if target not in self._reach:
+            self._reach[target] = self._reach_into(target)
+        return self._reach[target].get(self.channel(name).name, math.inf)
+
+    def reaction_distance(self, source: LpId, target: LpId) -> float:
+        """``D(source->target)`` over the reactions: the least lookahead of a
+        channel out of `source` plus its reach; zero to itself."""
+        if source == target:
+            return 0.0
+        return min(
+            (
+                c.lookahead_s + self.reach(c.name, target)
+                for c in self.channels_from(source)
+            ),
+            default=math.inf,
+        )
+
+    def _reach_into(self, target: LpId) -> dict[str, float]:
+        dist = {c.name: 0.0 for c in self._channels.values() if c.target == target}
+        heap = [(0.0, name) for name in sorted(dist)]
+        while heap:
+            d, out = heapq.heappop(heap)
+            if d > dist[out]:
+                continue
+            via = d + self._channels[out].lookahead_s
+            for into in self.channels_into(self._channels[out].source):
+                if into.target == target or not self.reacts(into.name, out):
+                    continue
+                if via < dist.get(into.name, math.inf):
+                    dist[into.name] = via
+                    heapq.heappush(heap, (via, into.name))
+        return dist
+
     def lookahead(self, name: str) -> float:
         return self.channel(name).lookahead_s
 
@@ -161,6 +223,22 @@ class ChannelTable:
                     if via < d.get((j, i), math.inf):
                         d[j, i] = via
         return d
+
+
+def kind_of(name: str) -> str:
+    """A channel name's kind: ``http`` of ``traffic->router:http``, ``request``
+    of ``frontend->engine:request#dp0``."""
+    return name.rpartition(":")[2].partition("#")[0]
+
+
+#: LP ``router``'s reactions: each message it handles goes on as one of its own
+#: kind, and a cancel on ``http`` goes on as ``http`` or as ``relay``
+#: (``atom/mesh/src/compass_router.rs``).
+ROUTER_REACTIONS = {
+    "http": ("http", "relay"),
+    "relay": ("relay",),
+    "stream": ("stream",),
+}
 
 
 def _table(lps: tuple[str, ...], rows: list) -> ChannelTable:
@@ -490,7 +568,7 @@ def prefill_decode_table(
         )
     pairs = [f"#dp{d}.dp{p}" for d in range(dp_d) for p in range(dp_p)]
     pairs = [""] if pairs == ["#dp0.dp0"] else pairs
-    return _table(
+    table = _table(
         lps,
         [*hops]
         + [
@@ -507,3 +585,6 @@ def prefill_decode_table(
         ]
         + rows,
     )
+    if "router" in lps:
+        table.mark_reactions(LpId("router"), ROUTER_REACTIONS)
+    return table

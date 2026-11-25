@@ -948,6 +948,24 @@ def channel_table(run: dict):
     return table
 
 
+#: Prototype switch for #4135: wide local grants, read by the authority's host.
+WIDE_GRANTS_ENV = "COMPASS_WIDE_GRANTS"
+_WIDE = {"": 0, "tar": 1, "reactions": 2}
+
+
+def _wide_grants(local: bool) -> int:
+    """``COMPASS_WIDE_GRANTS``: empty for none, ``tar`` for #3968's TAR ahead
+    and state-aware cycle, ``reactions`` for those over the declared
+    reactions (#4135). Refused without local grants."""
+    value = os.environ.get(WIDE_GRANTS_ENV, "")
+    if value not in _WIDE or _WIDE[value] and not local:
+        raise ValueError(
+            f"{WIDE_GRANTS_ENV}={value!r}: one of {', '.join(map(repr, _WIDE))}, "
+            "and not empty only with local grants"
+        )
+    return _WIDE[value]
+
+
 def _lmcache_engine(run: dict) -> str:
     """The engine LP that LP `lmcache` serves: a prefill-decode run's prefill
     side, else the run's one engine."""
@@ -1614,6 +1632,7 @@ class _RecordingAuthority(ClockAuthority):
             client=TRAFFIC,
             client_runs=math.inf if count is None else count,
             ceilings=local,
+            wide=_wide_grants(local),
         )
 
     def record(self, lp, time_from, time_to, kind, recovered, released=(), *_):

@@ -126,7 +126,7 @@ carries requests in and replies out.
 import math
 from dataclasses import dataclass, field
 
-from .channels import ChannelTable
+from .channels import ChannelTable, kind_of
 from .identity import LpId
 
 TAR, NER, PARK, REPORT = "TAR", "NER", "PARK", "REPORT"
@@ -226,6 +226,7 @@ class ClockAuthority:
         client: LpId | None = None,
         client_runs: float = 1,
         ceilings: bool = False,
+        wide: int = 0,
     ) -> None:
         if not client_runs >= 1 or client is None and client_runs != 1:
             raise ValueError(
@@ -292,6 +293,66 @@ class ClockAuthority:
         for i in self._ids if ceilings else ():
             back = [channels.distance(i, j) + d for j, d in self._from[i]]
             self._cycle[i] = min(back, default=math.inf)
+        if wide not in (0, 1, 2) or wide and not ceilings:
+            raise ValueError(f"wide grants {wide!r}: 0, or 1 or 2 with ceilings")
+        self._wide = wide
+        # LP -> (L(c) + the distance back from c's receiver, c, receiver) per
+        # channel c out of it, ascending: the cycle's terms.
+        self._outs = {}
+        for i in self._ids if wide else ():
+            terms = []
+            for c in channels.channels_from(i):
+                back = (
+                    channels.reach(c.name, i)
+                    if wide == 2
+                    else channels.distance(c.target, i)
+                )
+                terms.append((c.lookahead_s + back, c.name, c.target))
+            self._outs[i] = sorted(terms, key=lambda term: (term[0], term[1]))
+        # Under wide 2, an LP that declares its reactions gives each other LP
+        # i a term of its own events plus one per class of inbound channels:
+        # LP -> class -> its channels; i -> [(j, D(j->i), [reach per class])].
+        self._classes = {}
+        self._from_declared = {i: () for i in self._ids}
+        # The earliest undelivered arrival on each channel into such an LP.
+        self._first = {}
+        if wide == 2:
+            self._from = {
+                i: tuple(
+                    (j, channels.reaction_distance(j, i))
+                    for j in self._ids
+                    if j != i and not channels.declares(j)
+                )
+                for i in self._ids
+            }
+            for j in self._ids:
+                if not channels.declares(j):
+                    continue
+                kinds = {}
+                for c in channels.channels_into(j):
+                    kinds.setdefault(kind_of(c.name), []).append(c.name)
+                self._classes[j] = tuple(tuple(v) for _, v in sorted(kinds.items()))
+            self._first = {
+                name: math.inf
+                for classes in self._classes.values()
+                for names in classes
+                for name in names
+            }
+            self._from_declared = {
+                i: tuple(
+                    (
+                        j,
+                        channels.reaction_distance(j, i),
+                        tuple(
+                            min(channels.reach(n, i) for n in names)
+                            for names in self._classes[j]
+                        ),
+                    )
+                    for j in self._classes
+                    if j != i
+                )
+                for i in self._ids
+            }
         for lp, owned in (members or {}).items():
             channels.registry.require(lp)
             if not owned:
@@ -606,6 +667,8 @@ class ClockAuthority:
             )
         else:
             self._undelivered[name][seq] = a
+            if name in self._first:
+                self._first[name] = min(self._first[name], a)
             self._horizon = max(self._horizon, a)
             self._next_seq[name] = seq + 1
             state = self._state[channel.target]
@@ -648,7 +711,25 @@ class ClockAuthority:
 
     def _row(self, i: LpId) -> tuple[tuple[LpId, float], ...]:
         nv = self._nv
-        return tuple((j, nv[j] + d) for j, d in self._from[i])
+        row = tuple((j, nv[j] + d) for j, d in self._from[i])
+        if not self._from_declared[i]:
+            return row
+        return row + tuple(
+            (j, self._declared_term(j, d, back))
+            for j, d, back in self._from_declared[i]
+        )
+
+    def _declared_term(self, j: LpId, d: float, back: tuple) -> float:
+        """LP `j`'s term in another LP's LBTS, `j` having declared its
+        reactions: its own events' plus `d`, and in NER each class's earliest
+        undelivered arrival plus that class's reach."""
+        if self._state[j] != NER:
+            return self._nv[j] + d
+        term = min(self._target[j], self._daemon[j]) + d
+        first = self._first
+        for names, reach in zip(self._classes[j], back):
+            term = min(term, min(first[name] for name in names) + reach)
+        return term
 
     def _lbts(self, i: LpId) -> float:
         return min((term for _, term in self._row(i)), default=math.inf)
@@ -737,6 +818,10 @@ class ClockAuthority:
         self._ceiling.pop(i, None)
         if self._ceilings and not recovered and g < math.inf and i not in self._members:
             released.ceiling = self._ceiling[i] = self._ceiling_of(i, g, released)
+        if i in self._classes:
+            for name in self._into[i]:
+                pending = self._undelivered[name].values()
+                self._first[name] = min(pending, default=math.inf)
         target = self._target[i]
         short = self._state[i] == TAR and g < target
         if self.timeline is not None:
@@ -776,10 +861,12 @@ class ClockAuthority:
         """The ceiling of `i`'s grant to `g`: `released` takes every message
         below it when `i` asked for them ahead. An LP with members takes none:
         the rounds granted below it release them."""
-        ceiling = min(self._lbts(i), g + self._cycle[i], self._bound)
+        cycle = self._cycle_now(i) if self._wide else self._cycle[i]
+        ceiling = min(self._lbts(i), g + cycle, self._bound)
         if i in self._members:
             return ceiling
-        for name in self._into[i] if self._asks.get(i) else ():
+        ship = self._asks.get(i) or self._wide and self._state[i] == TAR
+        for name in self._into[i] if ship else ():
             pending = self._undelivered[name]
             early = [(seq, a) for seq, a in pending.items() if a < ceiling]
             for seq, _ in early:
@@ -789,6 +876,15 @@ class ClockAuthority:
                 released[name] += early
         rest = [a for n in self._into[i] for a in self._undelivered[n].values()]
         return min([ceiling, *rest])
+
+    def _cycle_now(self, i: LpId) -> float:
+        """`i`'s shortest cycle through a first hop that can react now: one
+        that runs or waits in NER, or takes the channel as offering. An LP
+        waiting in TAR reacts at its target at the earliest, which LBTS holds."""
+        for term, name, j in self._outs[i]:
+            if self._state[j] != TAR or self._channels.offering(name):
+                return term
+        return math.inf
 
     def _catch_up(self, lp: LpId, steps, log, member) -> list:
         """Register the sends `lp` logged before each of its own `steps`, and
