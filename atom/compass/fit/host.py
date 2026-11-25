@@ -68,7 +68,7 @@ from atom.compass.ingress import KEY as INGRESS
 from atom.compass.ingress import check as check_ingress
 from atom.compass.parity.client_run import RAW
 from atom.compass.run import INTAKE_RECORD, LOCAL, TOKENIZER_RECORD
-from atom.compass.validate.runs import SIDES
+from atom.compass.validate.runs import SIDES, deployment_side
 
 PROG = "compass fit host"
 
@@ -161,7 +161,7 @@ def _client(record, exports) -> dict:
     ``request_ack_ns`` on the wall clock it read beside it as
     ``request_start_ns``. A prefill-decode side's requests and streams pass the
     router, so its client's sends and acks time no hop of its own."""
-    if Path(record).name in SIDES and (Path(record).parent / SIDES[0]).is_dir():
+    if deployment_side(record):
         return {"missing": f"{record} is a side of a deployment, behind its router"}
     sent, acked = [], []
     for export in exports:

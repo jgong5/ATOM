@@ -890,15 +890,19 @@ def read(directory, stage: int = 0) -> dict[int, list[dict]]:
     return record
 
 
-def transfers(directory) -> dict[tuple[int, int], str]:
+def transfers(directory, fields=None) -> dict[tuple[int, int], str]:
     """`TRANSFERS` in `directory` as {(prefill DP rank, prefill request id):
-    decode response id}; empty without it."""
+    decode response id}; empty without it. With `fields`, one prefill
+    instance's `INSTANCE_FIELDS` values, only the transfers that came from it:
+    each of a deployment's prefill instances numbers its transfer ids from its
+    own sequence ids, so two instances' ids meet."""
     path = pathlib.Path(directory) / TRANSFERS
     if not path.exists():
         return {}
     return {
         (t["remote_dp_rank"], t["transfer_id"]): t["response_id"]
         for t in read_jsonl(path)
+        if all(t.get(f) == v for f, v in (fields or {}).items())
     }
 
 

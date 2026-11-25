@@ -353,6 +353,49 @@ def test_a_deployment_s_prefill_side_fits_from_the_deployment_s_export(tmp_path)
     assert report["provenance"] == served(HOST, {p: "trace"})
 
 
+def test_each_prefill_instance_fits_from_the_export_through_its_own_transfers(
+    tmp_path,
+):
+    # Prefill instance k's record names each request `p<k>-<key>`; the export,
+    # `d<k>-<key>`, decode 1-k's response id. The two instances number their
+    # requests alike, so their transfer ids meet: a transfer names the instance
+    # it came from by the handshake port run.json states.
+    cell, export, prefills = tmp_path / "cell", {}, []
+    instances = [
+        {"name": f"prefill{k}", "handshake_port": 11 * (k + 1)} for k in (0, 1)
+    ]
+    for k, seed in enumerate((19, 20)):
+        p = record(cell / f"prefill{k}", seed, trace=f"trace-{k}")
+        path = p / "steps/dp0.jsonl"
+        lines = [json.loads(x) for x in path.read_text().splitlines()]
+        for line in lines:
+            line["named"] = [[r, key, f"p{k}-{key}"] for r, key in line["named"]]
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+        sent = json.loads((p / "client.json").read_text())["requests"]
+        export |= {f"d{k}-{key}": v for key, v in sent.items()}
+        joined = [
+            {
+                "response_id": f"d{k}-{key}",
+                "remote_dp_rank": 0,
+                "transfer_id": int(key[1:]),
+                "remote_handshake_port": instances[k]["handshake_port"],
+            }
+            for key in sent
+        ]
+        decode = cell / f"decode{1 - k}" / "steps"
+        decode.mkdir(parents=True)
+        (decode / TRANSFERS).write_text("".join(json.dumps(t) + "\n" for t in joined))
+        prefills.append(p)
+    (cell / "run.json").write_text(json.dumps({"instances": instances}))
+    (cell / "client_run.json").write_text(json.dumps({"requests": export}))
+    runs = [x for p in prefills for x in ("--client-run", p, cell / "client_run.json")]
+    fit(tmp_path, "fit steps", *LINEAR, *prefills, *runs)
+
+    report = member(tmp_path / "store", law_key(), "report")
+    traced = {p: f"trace-{k}" for k, p in enumerate(prefills)}
+    assert report["provenance"] == served(HOST, traced)
+
+
 @pytest.mark.parametrize(
     "backend, named",
     [
