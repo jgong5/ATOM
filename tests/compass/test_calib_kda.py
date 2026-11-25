@@ -12,6 +12,7 @@ states changes.
 """
 
 import copy
+import json
 
 import pytest
 from test_calib_v1 import _record_dir
@@ -102,3 +103,39 @@ def test_without_kda_state_the_views_state_none_and_the_variant_is_not_counted()
     )
     kda = next(r for r in vector["variants"] if r["variant"] != "base")
     assert "error" in kda
+
+
+def _lines(rec, rows):
+    """Rank 0's step lines: each a prefill row of (request, q, n), its first
+    line a request's resume point (n - q), a later one its next chunk; beside
+    them, a version stamp and a cost file, no forward's lines."""
+    lines = [{"version": 1}] + [
+        {
+            "step": i,
+            "is_dummy_run": False,
+            "batch": [[r, q, n]],
+            "rows": [[q, n, False]],
+        }
+        for i, (r, q, n) in enumerate(rows)
+    ]
+    (rec / "steps" / "dp0.jsonl").write_text(
+        "".join(json.dumps(x) + "\n" for x in lines)
+    )
+    (rec / "steps" / "dp0.cost.jsonl").write_text(json.dumps({"version": 1}) + "\n")
+    return rec
+
+
+def test_a_kda_records_prefix_unit_is_where_its_requests_resume(tmp_path):
+    """The serve line's interval is 4096 (`SERVE`). Hits on prompt-end
+    checkpoints resume off it, on whole KV blocks: the unit is the block; hits
+    only at interval rungs keep the interval; a request's next chunk, which
+    starts where its previous one ended, is no resume point."""
+    anchors = _record_dir(tmp_path / "anchors", kda=True)
+    _lines(anchors, [(0, 8192, 8192), (0, 1000, 9192), (1, 64, 16320), (2, 448, 896)])
+    assert deploy.from_record(anchors)["prefix_unit"] == 64
+    rungs = _record_dir(tmp_path / "rungs", kda=True)
+    _lines(rungs, [(0, 4096, 4096), (0, 2000, 6096), (1, 300, 8492), (2, 50, 12338)])
+    assert deploy.from_record(rungs)["prefix_unit"] == 4096
+    fresh = _record_dir(tmp_path / "fresh", kda=True)
+    _lines(fresh, [(0, 8000, 8000), (1, 64, 64)])
+    assert deploy.from_record(fresh)["prefix_unit"] == 4096

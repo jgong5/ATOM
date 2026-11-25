@@ -67,6 +67,7 @@ into it.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -299,9 +300,10 @@ def from_record(record) -> dict:
     and the forced acceptance (else one plus the mean accepted drafts of
     ``dp0.acceptance.json``); and the model's config.json, where it can be
     read, for the routed experts and top-k, and for a model with KDA layers
-    (``linear_attn_config``) the state checkpoint interval a prefix hit lands
-    on, refused below one token, and `kda_state`. `$VAR`s in the path expand. A field the
-    record does not state is left out."""
+    (``linear_attn_config``) the unit its prefix hits land on, refused at a
+    checkpoint interval below one token (`resume_unit`: the interval, finer
+    where the record's requests resume off it), and `kda_state`. `$VAR`s in the
+    path expand. A field the record does not state is left out."""
     record = Path(os.path.expandvars(str(record)))
     if not (record / "run.json").exists() and (record / "real" / "run.json").exists():
         record = record / "real"  # a calibration run's: its server's record
@@ -360,9 +362,38 @@ def from_record(record) -> dict:
                     "keeps no checkpoint every so many tokens, so a KDA model's "
                     "prefix hit lands on no fixed unit"
                 )
-            out["prefix_unit"] = interval
+            out["prefix_unit"] = resume_unit(steps, interval)
             out["kda_state"] = True
     return out
+
+
+def resume_unit(steps: Path, interval: int) -> int:
+    """The tokens a KDA model's prefix hits come in on the record whose step
+    lines `steps` holds: the greatest common divisor of its state checkpoint
+    `interval` and every request's resume point, the history its first
+    scheduled prefill row starts on (``batch``'s ``n - q``), on each DP rank's
+    lines. A model that resumes only at interval rungs keeps the interval; one
+    that resumes at prompt-end checkpoints (GLM-5.3-Flash, step A's smoke
+    record: 95 of 104 hits off the 8192-token interval) gets the KV block those
+    land on. A record without step lines keeps the interval."""
+    unit = interval
+    for path in sorted(steps.glob("dp*.jsonl")):
+        if not path.stem[2:].isdigit():
+            continue  # dp<r>.jsonl, not its cost or handoff lines
+        seen = set()
+        with path.open() as lines:
+            for line in lines:
+                step = json.loads(line)
+                if step.get("is_dummy_run"):
+                    continue
+                rows = step.get("rows") or ()
+                for (req, q, n), row in zip(step.get("batch") or (), rows):
+                    if row[2] or req in seen:
+                        continue
+                    seen.add(req)
+                    if n > q:
+                        unit = math.gcd(unit, n - q)
+    return unit
 
 
 def deployment_of(d: dict, record=None) -> dict:
