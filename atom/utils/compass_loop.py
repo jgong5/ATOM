@@ -799,43 +799,6 @@ class CompassSelector(selectors.DefaultSelector):
 GENERATION_PATHS = frozenset(
     ("/v1/completions", "/v1/chat/completions", "/v1/messages", "/v1/responses")
 )
-#: The API server's ``BaseHTTPMiddleware`` dispatchers, by module and qualified
-#: name, that hand every request on unchanged in the process `HttpChannel`
-#: serves: the front-end hub relay acts only in a front-end worker, which
-#: serves the app without `HttpChannel`.
-PASS_THROUGH_DISPATCH = frozenset(
-    {"atom.entrypoints.openai.api_server._forward_to_frontend_hub"}
-)
-
-
-def _without_pass_through(app) -> None:
-    """Take the `PASS_THROUGH_DISPATCH` layers out of `app`'s middleware, if
-    it is a Starlette app; its stack is built again at its next call. Such a
-    layer hands each body message of a response between two tasks through a
-    memory stream, an anyio ``Event`` and two loop turns a streamed event,
-    and changes nothing the app sends."""
-    from starlette.middleware.base import BaseHTTPMiddleware
-
-    middleware = getattr(app, "user_middleware", None)
-    if middleware is None:
-        return
-    kept = [
-        m
-        for m in middleware
-        if m.cls is not BaseHTTPMiddleware
-        or _qualified(m.kwargs.get("dispatch")) not in PASS_THROUGH_DISPATCH
-    ]
-    if len(kept) < len(middleware):
-        app.user_middleware, app.middleware_stack = kept, None
-
-
-def _qualified(fn) -> str:
-    """`fn`'s module and qualified name, the module by the name it is imported
-    as: a server runs the API server's module as ``__main__``
-    (``python -m``), and its spec still names it."""
-    spec = getattr(fn, "__globals__", {}).get("__spec__")
-    module = getattr(spec, "name", None) or getattr(fn, "__module__", None)
-    return f"{module}.{getattr(fn, '__qualname__', None)}"
 
 
 class HttpChannel:
@@ -908,9 +871,7 @@ class HttpChannel:
     the loop is charged ``per_event_s`` for each event but a ``[DONE]`` before
     it stamps them: a real decode server's loop spends ~50 us of CPU an
     event, a fifth of its wall time at c=256 (r256, #3720), and the relays
-    and intakes it takes in wait behind that work. A Starlette app is served
-    without its `PASS_THROUGH_DISPATCH` layers, so its body messages reach
-    the stamping on the task that sends them.
+    and intakes it takes in wait behind that work.
 
     Taking in a stamped request other than a cancel costs the event loop its
     relay's service time, if it came on a relay that states one, then
@@ -933,7 +894,6 @@ class HttpChannel:
     def __init__(self, app, stamp) -> None:
         from atom.compass.run import http_intake, http_intake_hull, http_stream, relay
 
-        _without_pass_through(app)
         self.app, self.stamp = app, stamp
         self.intake, self.hull = http_intake(), http_intake_hull()
         self.relay, self.per_event = relay(), http_stream()
@@ -1137,10 +1097,10 @@ def _stamping_events(send, rt, per_event=None):
     and what the app sends after it is dropped. The traffic LP holds its clock
     until the client has the return of a request whose ``[DONE]`` it was
     released, and the client returns at the body's end. Left to the app, that
-    end can come loop turns after ``[DONE]``, and in those turns the loop's
-    on-loop decodes advance the LP clock; one that reaches past the traffic
-    LP's horizon waits for a grant the traffic LP only asks for once the
-    return is in, and the run hangs.
+    end comes loop turns after ``[DONE]`` (Starlette hands each body message
+    between tasks), and in those turns the loop's on-loop decodes advance the
+    LP clock; one that reaches past the traffic LP's horizon waits for a grant
+    the traffic LP only asks for once the return is in, and the run hangs.
     """
     events = ended = False
 

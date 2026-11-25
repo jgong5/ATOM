@@ -2,25 +2,20 @@
 """What a simulated decode frontend's loop does per streamed event and per relayed request.
 
 Streams are served behind ATOM's own middleware, as the API server installs
-it, imported or run as ``__main__`` as a server runs it, through `HttpChannel` on a `CompassEventLoop`, with frontend-D's
+it, through `HttpChannel` on a `CompassEventLoop`, with frontend-D's
 `LPRuntime` on a co-hosted clock authority and an ``http_stream`` term in its
 host entry: each event is charged that term and stamped on frontend-D's stream
-to the router, with no anyio ``Event`` built per body message and no
-tokenizer station placed while none is open. A relayed request's stamp and
-service are read from one decode of its body.
+to the router, and a charge places no tokenizer station while none is open. A
+relayed request's stamp and service are read from one decode of its body.
 """
 
 import json
 import math
 import threading
-import types
 import uuid
 
-import anyio
 import fastapi
 import pytest
-from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import StreamingResponse
 
 from atom.compass import carriers, clock_transport
@@ -103,24 +98,11 @@ def frontend_d(tmp_path, monkeypatch):
         server.close()
 
 
-def _as_main(m: Middleware) -> Middleware:
-    """`m` as ``python -m`` defines it, a ``BaseHTTPMiddleware``'s dispatch in
-    a module named ``__main__`` whose spec names the module it is imported as."""
-    if m.cls is not BaseHTTPMiddleware:
-        return m
-    fn = m.kwargs["dispatch"]
-    module = {**fn.__globals__, "__name__": "__main__"}
-    main = types.FunctionType(fn.__code__, module, fn.__name__, fn.__defaults__)
-    assert main.__module__ == "__main__" and main.__qualname__ == fn.__qualname__
-    return Middleware(BaseHTTPMiddleware, dispatch=main)
-
-
-def _atom_app(frames: list[str], run_as_main: bool) -> fastapi.FastAPI:
+def _atom_app(frames: list[str]) -> fastapi.FastAPI:
     """An app with the API server's middleware, streaming `frames` through the
     wrapper every streaming endpoint returns."""
     app = fastapi.FastAPI()
-    middleware = api_server.app.user_middleware
-    app.user_middleware = [_as_main(m) if run_as_main else m for m in middleware]
+    app.user_middleware = list(api_server.app.user_middleware)
 
     async def replay():
         for f in frames:
@@ -136,22 +118,17 @@ def _atom_app(frames: list[str], run_as_main: bool) -> fastapi.FastAPI:
     return app
 
 
-def _served(rt, monkeypatch, streams: list[list[str]], run_as_main) -> list[dict]:
+def _served(rt, monkeypatch, streams: list[list[str]]) -> list[dict]:
     """Each of `streams` served in turn behind `HttpChannel` on one loop: for
     each, the LP clock it starts at, the events the client is sent, their
-    sends, the anyio Events built and the station placements made."""
-    built, placed, out = [], [], []
-    new, place = anyio.Event.__new__, SimExecutor.place
-
-    def counted(cls):
-        built.append(cls)
-        return new(cls)
+    sends and the station placements made."""
+    placed, out = [], []
+    place = SimExecutor.place
 
     def counted_place(self, wait=False):
         placed.append(wait)
         return place(self, wait)
 
-    monkeypatch.setattr(anyio.Event, "__new__", staticmethod(counted))
     monkeypatch.setattr(SimExecutor, "place", counted_place)
 
     async def receive():
@@ -166,16 +143,15 @@ def _served(rt, monkeypatch, streams: list[list[str]], run_as_main) -> list[dict
     loop = CompassEventLoop()
     for frames in streams:
         start, log = rt.now, len(rt.sent)
-        for seen in (sent, built, placed):
-            seen.clear()
-        channel = HttpChannel(_atom_app(frames, run_as_main), lambda scope: None)
+        sent.clear()
+        placed.clear()
+        channel = HttpChannel(_atom_app(frames), lambda scope: None)
         loop.run_until_complete(channel(dict(SCOPE), receive, send))
         out.append(
             {
                 "start": start,
                 "events": "".join(sent).split("\n\n")[:-1],
                 "sends": rt.sent[log:],
-                "anyio_events": len(built),
                 "placed": list(placed),
             }
         )
@@ -184,20 +160,17 @@ def _served(rt, monkeypatch, streams: list[list[str]], run_as_main) -> list[dict
     return out
 
 
-@pytest.mark.parametrize("run_as_main", [False, True], ids=["imported", "main"])
-def test_each_event_behind_atoms_middleware_is_charged_then_stamped_on_its_own_task(
-    frontend_d, monkeypatch, run_as_main
+def test_each_event_behind_atoms_middleware_is_charged_then_stamped_placing_nothing(
+    frontend_d, monkeypatch
 ):
     """Each event but ``[DONE]`` is charged the term before its stamp, on the
-    stream to the router. A 40-event stream builds no more anyio Events than a
-    2-event one: no layer hands its body messages between tasks. With no
+    stream to the router, in a 2-event stream and a 40-event one. With no
     tokenizer job open, a charge places nothing."""
     streams = [
         [f"data: {k}\n\n" for k in range(n)] + ["data: [DONE]\n\n"] for n in (2, 40)
     ]
-    short, long = _served(frontend_d, monkeypatch, streams, run_as_main)
     lookahead = TABLE.lookahead(STREAM)
-    for got, frames in zip((short, long), streams):
+    for got, frames in zip(_served(frontend_d, monkeypatch, streams), streams):
         n = len(frames) - 1
         charged = [(k + 1) * PER_EVENT for k in range(n)] + [n * PER_EVENT]
         assert [e.split("\n", 1)[1] + "\n\n" for e in got["events"]] == frames
@@ -209,7 +182,6 @@ def test_each_event_behind_atoms_middleware_is_charged_then_stamped_on_its_own_t
             [got["start"] + c + lookahead for c in charged]
         )
         assert got["placed"] == []
-    assert long["anyio_events"] == short["anyio_events"]
 
 
 def test_a_relayed_request_s_stamp_and_service_are_read_from_one_decode(monkeypatch):
