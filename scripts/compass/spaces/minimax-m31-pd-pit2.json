@@ -6,6 +6,7 @@
   "network": "/share_nfs/xingjche/m31pd/net/pit2-link.json"
  },
  "store": "/share_nfs/xingjche/m31pd/store",
+ "commit": "f1230b51ad807358a9c1b54e910734d092b7119b",
  "workload": {
   "traces": "/share_nfs/xingjche/m31pd/inputs/traces.jsonl",
   "select": "agentx",
