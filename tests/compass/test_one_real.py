@@ -200,3 +200,126 @@ def test_prefix_hits_name_none_where_no_record_states_its_cached_tokens(tmp_path
     assert _hits_line(done.stdout, "step_linear") == (
         "step_linear: prefix hits: no request both ran states its cached tokens"
     )
+
+
+def _phased(d, warmup, profiled):
+    """A run at c=8 whose export holds warmup requests `warmup` and profiling
+    requests `profiled`, each (conversation, turn, input tokens[, cached])."""
+    run = _run(d, 8, server=False)
+    records = [
+        {
+            "metadata": {
+                "benchmark_phase": phase,
+                "conversation_id": conversation,
+                "turn_index": turn,
+                "request_start_ns": B + i * 10**9,
+                "request_end_ns": B + (i + 1) * 10**9,
+            },
+            "metrics": {
+                "time_to_first_token": {"value": 100.0, "unit": "ms"},
+                "inter_token_latency": {"value": 5.0, "unit": "ms"},
+                "request_latency": {"value": 1000.0, "unit": "ms"},
+                "input_sequence_length": {"value": tokens, "unit": "tokens"},
+                "output_sequence_length": {"value": 10, "unit": "tokens"},
+            }
+            | (
+                {"usage_prompt_cache_read_tokens": {"value": cached[0]}}
+                if cached
+                else {}
+            ),
+        }
+        for i, (phase, (conversation, turn, tokens, *cached)) in enumerate(
+            [("warmup", w) for w in warmup] + [("profiling", p) for p in profiled]
+        )
+    ]
+    (run / curves.RECORDS).write_text("".join(json.dumps(r) + "\n" for r in records))
+    return run
+
+
+def _one_real_env(env, *runs):
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *map(str, runs)],
+        capture_output=True,
+        text=True,
+        env={"PYTHONPATH": str(ROOT), **env},
+        check=False,
+    )
+
+
+def _warmup_runs(tmp_path):
+    real = _phased(
+        tmp_path / "real1",
+        [("w", 0, 3000, 300), ("w", 1, 3000, 600), ("x", 0, 2000)],
+        [("a", 0, 1000, 800), ("b", 0, 1000, 800)],
+    )
+    sim = _phased(
+        tmp_path / "step_linear",
+        [("w", 0, 3000, 900), ("w", 1, 3000, 1200), ("x", 0, 2000, 0)],
+        [("a", 0, 1000, 800), ("b", 0, 1000, 800)],
+    )
+    return real, sim
+
+
+def test_warmup_hits_are_each_run_s_cached_share_of_the_warmup_requests_both_ran(
+    tmp_path,
+):
+    real, sim = _warmup_runs(tmp_path)
+
+    done = _one_real_env({one_real.WARMUP_HITS_ENV: "1"}, real, sim)
+
+    assert done.returncode == 0, done.stderr
+    (line,) = [
+        x for x in done.stdout.splitlines() if x.startswith("step_linear: warmup")
+    ]
+    # ("x", 0) states no cached tokens in the real run, so the requests both ran
+    # are ("w", 0) and ("w", 1): 2100 of 6000 against 900; the warmup holds 8000
+    # of the real run's 10000 prompt tokens, so the +20 pt gap moves +16 pt.
+    assert line == (
+        "step_linear: warmup prefix hits over the 2 warmup requests both ran "
+        "35.0% against the real run's 15.0% (+20.0 pt); the warmup holds 80% "
+        "of the real run's prompt tokens, so it moves the GPU hit rate by about "
+        "+16.0 pt"
+    )
+    # the profiled requests' own line is unchanged and the table's JSON stays last
+    assert _hits_line(done.stdout, "step_linear").startswith(
+        "step_linear: prefix hits over the 2 requests both ran 80.0%"
+    )
+    json.loads(done.stdout.splitlines()[-1])
+
+
+def test_without_the_switch_the_output_is_unchanged(tmp_path):
+    real, sim = _warmup_runs(tmp_path)
+
+    off = _one_real_env({}, real, sim)
+    zero = _one_real_env({one_real.WARMUP_HITS_ENV: "0"}, real, sim)
+    on = _one_real_env({one_real.WARMUP_HITS_ENV: "1"}, real, sim)
+
+    assert off.returncode == zero.returncode == on.returncode == 0, off.stderr
+    assert off.stdout == zero.stdout
+    assert "warmup prefix hits" not in off.stdout
+    extra = [x for x in on.stdout.splitlines() if x not in off.stdout.splitlines()]
+    assert len(extra) == 1 and extra[0].startswith("step_linear: warmup prefix hits")
+
+
+def test_warmup_hits_name_none_where_no_warmup_record_states_its_cached_tokens(
+    tmp_path,
+):
+    real = _phased(tmp_path / "real1", [("w", 0, 3000)], [("a", 0, 1000, 800)])
+    sim = _phased(tmp_path / "step_linear", [("w", 0, 3000, 10)], [("a", 0, 1000, 800)])
+
+    done = _one_real_env({one_real.WARMUP_HITS_ENV: "1"}, real, sim)
+
+    assert done.returncode == 0, done.stderr
+    assert (
+        "step_linear: warmup prefix hits: no warmup request both ran states its "
+        "cached tokens"
+    ) in done.stdout.splitlines()
+
+
+def test_a_warmup_switch_other_than_0_or_1_exits_2(tmp_path):
+    real, sim = _warmup_runs(tmp_path)
+
+    done = _one_real_env({one_real.WARMUP_HITS_ENV: "yes"}, real, sim)
+
+    assert done.returncode == 2
+    assert one_real.WARMUP_HITS_ENV in done.stderr
