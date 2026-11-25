@@ -22,6 +22,23 @@ handed; ``hca``, the HCA of the engine those calls wrote through, the rail
 ran; and ``t_notify_ns``, ``[enter, exit]``, and ``success`` of its first
 write-done (`_notify_transfer_result`).
 
+Under ``enable_chunked_transfer`` a send worker serves a write request as the
+prefill runs (`_execute_chunked_transfer`), and its line says so,
+``chunked: true``, with what a replay of it needs (`replay_chunked`):
+``t_receipt_ns``, when the listener queued it, where a dispatch saw it queued
+(`_dispatch_ready_chunked_requests`; absent otherwise); ``blocks``, ``[first,
+total]``, the source blocks past decode's cached prefix and the prompt's;
+``block_size`` and ``prompt_tokens``; ``target``, decode's
+``host:port``; ``chunks``, ``[enter, exit, first, end,
+rdma]`` per wait for published blocks (`ChunkedPrefill.wait_chunk`), the
+source blocks it took and the index of its first entry in ``rdma``, whose
+write follows the forward's device synchronize; and ``t_handoff_ns``,
+``[enter, exit]`` of the wait for the prefill's handoff, before the
+write-done. A producer rank also writes a line per forward that publishes a
+chunked prefill's blocks (`publish_prefill_chunks`): ``t_publish_ns``, when
+it was called, the forward launched, and ``publish``, ``[transfer_id,
+tokens]`` per chunked prefill it ran, the prompt computed through ``tokens``.
+
 A consumer rank writes a line per write-done it receives
 (`_record_write_done`), the first of each producer's repeats: ``request_id``,
 the producer's ``pp_rank`` and ``tp_rank``, ``write_nonce``, ``success`` and
@@ -47,6 +64,7 @@ record's end has a line of its own with those stamps, ``request_id`` and
 
 import functools
 import json
+import math
 import os
 import threading
 
@@ -101,6 +119,16 @@ class WriteRecord:
             c._notify_transfer_result = functools.partial(
                 self.notify_transfer_result, c._notify_transfer_result
             )
+            if hasattr(c, "_execute_chunked_transfer"):
+                c._execute_chunked_transfer = functools.partial(
+                    self.execute_chunked, c._execute_chunked_transfer
+                )
+                c._dispatch_ready_chunked_requests = functools.partial(
+                    self.dispatch_chunked, c._dispatch_ready_chunked_requests
+                )
+                c.publish_prefill_chunks = functools.partial(
+                    self.publish_chunks, c.publish_prefill_chunks
+                )
         else:
             c._record_write_done = functools.partial(
                 self.record_write_done, c._record_write_done
@@ -121,6 +149,9 @@ class WriteRecord:
         self.loading = threading.local()
         self.posted: dict = {}  # id(parts) -> (parts, request stamps), until sent
         self.requested: dict = {}  # request id -> its write request's stamps
+        # id(request) -> (request, when the listener queued it): chunked write
+        # requests a dispatch saw queued, until a send worker serves them.
+        self.queued: dict = {}
 
     def serve_write(self, call, request_data):
         keys = ("request_id", "transfer_id", "write_nonce")
@@ -138,6 +169,78 @@ class WriteRecord:
             line["t_serve_ns"] = [start, self.clock()]
             self.serving.line = None
             self.lines.append(line)
+
+    def dispatch_chunked(self, call):
+        # Copied: the listener appends while the dispatcher replaces it.
+        for data, queued_at in list(self.connector._pending_chunked_requests):
+            self.queued.setdefault(id(data), (data, round(queued_at * 1e9)))
+        return call()
+
+    def execute_chunked(self, call, request_data, state):
+        keys = ("request_id", "transfer_id", "write_nonce")
+        line = {k: request_data.get(k) for k in keys}
+        line["chunked"] = True
+        line["target"] = (
+            f"{request_data.get('consumer_host')}:{request_data.get('consumer_rpc_port')}"
+        )
+        queued = self.queued.pop(id(request_data), None)
+        if queued is not None and queued[0] is request_data:
+            line["t_receipt_ns"] = queued[1]
+        skip = max(1, request_data.get("src_block_skip_factor", 1))
+        first = request_data.get("num_computed_blocks", 0) * skip
+        line["blocks"] = [first, len(state.block_ids)]
+        line["block_size"], line["prompt_tokens"] = state.block_size, state.num_tokens
+        line["chunks"], line["rdma"] = [], []
+        self.watch(state)
+        self.serving.line = line
+        start = self.clock()
+        try:
+            return call(request_data, state)
+        finally:
+            line["t_serve_ns"] = [start, self.clock()]
+            self.serving.line = None
+            self.lines.append(line)
+
+    def watch(self, state) -> None:
+        """Stamp `state`'s waits on the line its calling send worker serves:
+        one prefill may have a reader per decode rank."""
+        if state.__dict__.get("_compass_watched"):
+            return
+        state._compass_watched = True
+        wait_chunk, wait_handoff = state.wait_chunk, state.wait_handoff
+
+        def chunk(src_block_offset, *args, **kwargs):
+            enter = self.clock()
+            got = wait_chunk(src_block_offset, *args, **kwargs)
+            line = getattr(self.serving, "line", None)
+            if line is not None:
+                at = [enter, self.clock(), src_block_offset, got[2], len(line["rdma"])]
+                line["chunks"].append(at)
+            return got
+
+        def handoff():
+            enter = self.clock()
+            got = wait_handoff()
+            line = getattr(self.serving, "line", None)
+            if line is not None:
+                line["t_handoff_ns"] = [enter, self.clock()]
+            return got
+
+        state.wait_chunk, state.wait_handoff = chunk, handoff
+
+    def publish_chunks(self, call, batch):
+        ids = self.connector._chunked_local_ids
+        if ids:
+            t = self.clock()
+            n = batch.total_seqs_num_prefill
+            pubs = [
+                [ids[r], int(batch.context_lens[i])]
+                for i, r in enumerate(batch.req_ids[:n])
+                if r in ids
+            ]
+            if pubs:
+                self.lines.append({"t_publish_ns": t, "publish": pubs})
+        return call(batch)
 
     def rdma_write(self, call, target, src_addrs, dst_addrs, sizes, *args, **kwargs):
         line = getattr(self.serving, "line", None)
@@ -246,9 +349,58 @@ class WriteRecord:
                     | {k: asked[k] for k in REQUEST_STAMPS}
                 )
             del self.requested[req_id]
+        self.queued.clear()  # failed unserved: the write-done says so
         lines, self.lines = self.lines, []
         self.file.write("".join(json.dumps(line) + "\n" for line in lines))
         self.file.flush()
+
+
+def replay_chunked(lines, model, *, hop_s: float = 0.0) -> dict:
+    """Each chunked write of one producer rank's record (`lines`, its
+    ``writes.jsonl`` read), decided by `chunk_writes` as the simulated run
+    decides it, on one `Link` of `model` per decode target: its write request
+    at its receipt (else its serve's start), each forward's publication at
+    its ``t_publish_ns`` plus `hop_s` (the launch to the device end, which the
+    record does not stamp), and its handoff at its wait's exit. Returns, by
+    transfer id, the replay's ``(writes, done)`` -- writes ``(start, end,
+    blocks)`` -- and the record's: each chunk's first write call's start to
+    its last's end with its blocks, and the write-done's ``t_notify_ns`` exit;
+    in seconds on the record's clock."""
+    from atom.compass.kv.transfer import ChunkedSend, Link, chunk_writes
+
+    ns = 1e-9
+    served = [x for x in lines if x.get("chunked") and x.get("success")]
+    pubs: dict = {}
+    for x in lines:
+        for transfer_id, tokens in x.get("publish", ()):
+            pubs.setdefault(transfer_id, []).append((x["t_publish_ns"], tokens))
+    links: dict = {}
+    sends, out = [], {}
+    for x in sorted(served, key=lambda x: x.get("t_receipt_ns", x["t_serve_ns"][0])):
+        first, total = x["blocks"]
+        link = links.setdefault(x["target"], Link(model))
+        start = x.get("t_receipt_ns", x["t_serve_ns"][0]) * ns
+        send = ChunkedSend(link, start, first, total)
+        for t, tokens in sorted(pubs.get(x["transfer_id"], ())):
+            send.publish(t * ns + hop_s, tokens, x["prompt_tokens"], x["block_size"])
+        send.finish(x["t_handoff_ns"][1] * ns)
+        sends.append(send)
+        calls = x["rdma"]
+        chunks = x["chunks"]
+        recorded = []
+        for k, (_, _, lo, hi, i) in enumerate(chunks):
+            j = chunks[k + 1][4] if k + 1 < len(chunks) else len(calls)
+            if i < j:
+                recorded.append((calls[i][0] * ns, calls[j - 1][1] * ns, hi - lo))
+        out[x["transfer_id"]] = {
+            "replay": send,
+            "record": (recorded, x["t_notify_ns"][1] * ns),
+        }
+    chunk_writes(sends, math.inf)
+    return {
+        k: {"replay": (v["replay"].writes, v["replay"].done), "record": v["record"]}
+        for k, v in out.items()
+    }
 
 
 def mooncake(connector):

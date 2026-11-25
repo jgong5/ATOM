@@ -488,3 +488,147 @@ def test_an_unrecorded_run_wraps_nothing(mc, monkeypatch):
     assert sorted(call[0] for call in log) == ["ionic_2"] * 3 + ["ionic_6"] * 3
     for runner in runners:
         runner.exit()
+
+
+def _chunked_producer(mc, log, monkeypatch, tmp_path):
+    """A producer rank with one chunked prefill, ``p-a``'s three blocks of a
+    10-token prompt: ATOM's publication, its CUDA event aside, and block
+    writes of 64 bytes a block through `_rdma_write`."""
+    from atom.kv_transfer.disaggregation.chunked_prefill import ChunkedPrefill
+
+    producer = _producer(mc, log, threading.Barrier(1), False)
+    state = ChunkedPrefill("p-a", [1, 2, 3], 10, 4)
+    producer.__dict__.update(
+        _chunked_prefills={"a": state}, _chunked_local_ids={"p-a": "a"}
+    )
+    event = SimpleNamespace(synchronize=lambda: None)
+
+    def publish(batch):
+        for i, req_id in enumerate(batch.req_ids[: batch.total_seqs_num_prefill]):
+            transfer_id = producer._chunked_local_ids.get(req_id)
+            if transfer_id is not None:
+                producer._chunked_prefills[transfer_id].publish(
+                    int(batch.context_lens[i]), event
+                )
+        producer._dispatch_ready_chunked_requests()
+
+    def blocks(request_data, target, src, dst, req_id, ready=None, *, engine=None):
+        sizes = [64] * len(src)
+        written = producer._rdma_write(
+            target, list(src), list(dst), sizes, req_id, "block", engine=engine
+        )
+        return written is not False
+
+    producer.publish_prefill_chunks = publish
+    producer._execute_block_transfer = blocks
+    monkeypatch.setenv(ENV, str(tmp_path / "prefill"))
+    return producer, state, _runner(producer, monkeypatch)
+
+
+def test_a_chunked_write_is_stamped_per_chunk_and_its_publications(
+    mc, tmp_path, monkeypatch
+):
+    """Decode's write request is queued before the prefill publishes; the
+    reader takes block 0 from the first forward and blocks 1-2 from the
+    last, then waits for the handoff and tells decode."""
+    log = []
+    producer, state, prefill = _chunked_producer(mc, log, monkeypatch, tmp_path)
+    request = _request("a", 11, 7002, "ionic_2", [5, 6, 7]) | {
+        "chunked_transfer": True,
+        "consumer_tp_size": 1,
+        "consumer_tp_rank": 0,
+    }
+    frames = [[b"d", mc.MSG_WRITE_REQUEST, msgpack.dumps(request)]]
+    before = time.monotonic_ns()
+    _listen(mc, monkeypatch, producer._write_listener, frames)
+
+    def forward(tokens):
+        batch = SimpleNamespace(
+            req_ids=["p-a", "p-x"], context_lens=[tokens, 9], total_seqs_num_prefill=2
+        )
+        producer.publish_prefill_chunks(batch)
+
+    forward(4)
+    deadline = time.monotonic() + 10
+    while not log and time.monotonic() < deadline:
+        time.sleep(0.001)  # the reader's first write
+    forward(10)
+    state.finish({"first_token_id": 7})
+    producer._send_executor.shutdown(wait=True)
+    prefill.exit()
+
+    path = tmp_path / "prefill" / "dp2.tp0.writes.jsonl"
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    publishes = [x for x in lines if "publish" in x]
+    assert [x["publish"] for x in publishes] == [[["a", 4]], [["a", 10]]]
+    (line,) = [x for x in lines if x.get("chunked")]
+    assert line["request_id"] == "d-a" and line["success"] is True
+    assert line["blocks"] == [0, 3]
+    assert (line["block_size"], line["prompt_tokens"]) == (4, 10)
+    assert line["target"] == "10.0.0.9:7002"
+    assert [c[2:] for c in line["chunks"]] == [[0, 1, 0], [1, 3, 1]]
+    assert [n for *_, n in line["rdma"]] == [64, 128]
+    stamps = [
+        line["t_receipt_ns"],
+        line["t_serve_ns"][0],
+        *(
+            t
+            for chunk, call in zip(line["chunks"], line["rdma"])
+            for t in (*chunk[:2], *call[:2])
+        ),
+        *line["t_handoff_ns"],
+        *line["t_notify_ns"],
+        line["t_serve_ns"][1],
+    ]
+    assert before <= stamps[0] and stamps == sorted(stamps)
+    assert publishes[0]["t_publish_ns"] <= line["chunks"][0][1]
+
+
+def test_a_chunked_record_replays_on_the_run_s_decisions():
+    """`replay_chunked` decides a record's writes with `chunk_writes`, the
+    run's function, from its stamps: two transfers to one decode target take
+    one link in order; the record's own chunks come back beside them."""
+    from atom.compass.kv.transfer import TransferModel
+    from atom.compass.parity.writes import replay_chunked
+
+    s = 10**9
+    model = TransferModel(latency_s=0.5, bandwidth_bytes_per_s=1.0, bytes_per_block=1)
+
+    def served(transfer_id, receipt, chunks, rdma, handoff, notify):
+        return {
+            "transfer_id": transfer_id,
+            "chunked": True,
+            "success": True,
+            "target": "10.0.0.9:7002",
+            "blocks": [0, 2],
+            "block_size": 4,
+            "prompt_tokens": 8,
+            "t_receipt_ns": receipt * s,
+            "t_serve_ns": [receipt * s, notify * s],
+            "chunks": chunks,
+            "rdma": rdma,
+            "t_handoff_ns": [0, handoff * s],
+            "t_notify_ns": [notify * s - 1, notify * s],
+        }
+
+    lines = [
+        {"t_publish_ns": 1 * s, "publish": [["a", 4]]},
+        {"t_publish_ns": 2 * s, "publish": [["a", 8], ["b", 8]]},
+        served(
+            "a",
+            0,
+            [[0, 0, 0, 1, 0], [0, 0, 1, 2, 1]],
+            [[1 * s, 2 * s, 1], [3 * s, 4 * s, 1]],
+            2,
+            5,
+        ),
+        served("b", 0, [[0, 0, 0, 2, 0]], [[4 * s, 6 * s, 2]], 2, 7),
+    ]
+    got = replay_chunked(lines, model)
+    # a writes block 0 from 1 s, to 2.5 s; b, published at 2 s, arrives
+    # before a's reader is back and moves its two blocks from 2 s, the link
+    # free then, to 4.5 s; a's block 1, arriving at 2.5 s, waits for them.
+    assert got["a"]["replay"] == ([(1.0, 2.5, 1), (2.5, 5.5, 1)], 5.5)
+    assert got["b"]["replay"] == ([(2.0, 4.5, 2)], 4.5)
+    assert got["a"]["record"] == ([(1.0, 2.0, 1), (3.0, 4.0, 1)], 5.0)
+    assert got["b"]["record"] == ([(4.0, 6.0, 2)], 7.0)
