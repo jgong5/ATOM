@@ -1199,6 +1199,7 @@ def _planned_transfer() -> tuple:
         stages = planned.setdefault(deployment + dot + member, {})
         stages[int(stage or 0)] = published
     prefill = [u for u in planned if u.startswith(f"{ENGINE.name}-P")]
+    landing = 1.0
     for key, what in (
         ("block_bytes", "KV block"),
         ("slot_bytes", "state slot"),
@@ -1207,6 +1208,28 @@ def _planned_transfer() -> tuple:
         sizes = {u: [s[k][key] for k in sorted(s)] for u, s in planned.items()}
         first = sizes[prefill[0]]
         for u, b in sizes.items():
+            tp_u, tp_p = planned[u][0]["tp"], planned[prefill[0]][0]["tp"]
+            if (
+                key == "block_bytes"
+                and u not in prefill
+                and tp_u > tp_p
+                and tp_u * sum(b) >= sum(first) > sum(b)
+            ):
+                # A decode at a wider TP than prefill's (the 1P2D recipe's TP1
+                # PP4 prefill landing on TP4 decodes, ATOM_PD_MINIMAX_LANDING):
+                # each decode rank takes its own block, its head slice of each
+                # sharded region and each replicated region whole, so the wire
+                # carries the decode's TP times its block per prefill block,
+                # each prefill stage its share of it.
+                scale = tp_u * sum(b) / sum(first)
+                if landing not in (1.0, scale):
+                    raise ValueError(
+                        f"{u} lands a prefill block at {scale:.4f} its bytes and "
+                        f"another decode at {landing:.4f}: one prefill prices one "
+                        "write"
+                    )
+                landing = scale
+                continue
             if b != first if u in prefill else sum(b) != sum(first):
                 (a, x), (c, y) = (
                     (f"{v} at TP {planned[v][0]['tp']}", " + ".join(map(str, sizes[v])))
@@ -1222,7 +1245,7 @@ def _planned_transfer() -> tuple:
     return tuple(
         TransferModel.from_spec(
             machine,
-            s["block_bytes"],
+            round(s["block_bytes"] * landing),
             scope,
             s["slot_bytes"],
             s["staging_bytes"],
