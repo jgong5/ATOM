@@ -25,7 +25,9 @@ member, the frontend's included, connects to.
   Atomesh entrypoints, and makes a sync utility command on the frontend's
   clock owner refuse. Each image a chat request's media preparation loads
   charges that tokenizer-station job the run file's ``image_preprocess_s``;
-  an image named by a remote URL is refused. After each metrics refresh
+  an image named by a remote URL is refused. A prefill or decode frontend
+  writes or reads the prompt token ids it hands off with msgspec, the same
+  bytes and the same ids (`handoff`). After each metrics refresh
   the frontend samples its Prometheus series (`metrics.sample_frontend`).
   On a worker node of a multi-node DP group it only selects the simulated
   runner.
@@ -1856,6 +1858,9 @@ def frontend(config):
         return contextlib.nullcontext()
     _refuse_sync_utility_commands()
     _price_images(run.get(IMAGE_PREPROCESS))
+    from atom.compass.run import handoff
+
+    handoff.install(side)
     lp = _frontend_lp(config, run)
     authority = None
     if not standalone:

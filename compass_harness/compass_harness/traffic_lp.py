@@ -91,8 +91,6 @@ import logging
 import math
 import os
 import pickle
-import sys
-import weakref
 from statistics import NormalDist
 
 import zmq
@@ -207,10 +205,6 @@ class TrafficLP:
         self._deadlines: list[tuple[float, int, asyncio.Future]] = []
         self._asked = itertools.count()
         self._passing = False  # a return is inside aiperf's callback
-        # The tasks not done at the hold's last look. The loop does not turn while
-        # the owner is in a clock call, so the next hold starts from them; None
-        # once the loop may have turned with no look.
-        self._alive: set | None = None
         self._finishing = False
         self._changed = asyncio.Event()
         self._tasks = [
@@ -218,6 +212,8 @@ class TrafficLP:
             asyncio.ensure_future(self._pass_returns()),
         ]
         self.done = asyncio.ensure_future(self._own())
+        self._loop_tasks = _LoopTasks(self.done.get_loop())
+        self.done.add_done_callback(lambda _: self._loop_tasks.close())
 
     @classmethod
     def from_env(cls) -> "TrafficLP":
@@ -479,7 +475,6 @@ class TrafficLP:
             await self._settle()
             if not (self.open or self._waiters or self._finishing):
                 self._changed.clear()
-                self._alive = None
                 await self._changed.wait()
                 continue
             t, deadline = self._earliest(self._plain), self._earliest(self._deadlines)
@@ -539,7 +534,6 @@ class TrafficLP:
             unsized = self._unsized()
             if unreported or unreturned or self._passing or unsized:
                 self._changed.clear()
-                self._alive = None
                 try:
                     await asyncio.wait_for(self._changed.wait(), DIAG_S)
                 except TimeoutError:
@@ -570,7 +564,7 @@ class TrafficLP:
                             DIAG_S,
                         )
                 continue
-            ready, self._alive, ended = _look(self._alive)
+            ready, ended = self._loop_tasks.look()
             if not ready and not ended:
                 self._stamp_sends()
                 if not self._caught_up:
@@ -604,47 +598,73 @@ class TrafficLP:
             )
 
 
-def _look(alive: set | None) -> tuple[list[str], set, bool]:
-    """One look at this loop's tasks, but the current one.
+class _LoopTasks:
+    """The tasks of one event loop, each as its last read found it.
 
-    Returns the names of those not waiting on a pending future, those not done,
-    and whether one of ``alive``, the tasks not done at the last look, has ended
-    since. A task that ends queues its done callbacks behind the current task,
-    so they run only on the loop's next turn; with ``alive`` None, after turns
-    of the loop no look saw, whether one has ended is unknown, and it reads as
-    one.
+    The loop's task factory hands each task it creates to the next look. A read
+    keeps the future a task waits on, and a task cannot run while that future
+    is pending, so a look reads again only the tasks whose futures are done,
+    which one pass in C finds (`asyncio.Future.done` over every kept future),
+    and those its last read found waiting on none. So the Python a look runs
+    grows with what changed since the last look, not with the loop's tasks.
     """
-    me = asyncio.current_task()
-    tasks = {task for task in _tasks_of(me.get_loop()) if not task.done()}
-    tasks.discard(me)
-    # ponytail: Task._fut_waiter is private; a loop-level idle hook would not be.
-    ready = [
-        task.get_name()
-        for task in tasks
-        if (waiter := task._fut_waiter) is None or waiter.done()
-    ]
-    # A task of `alive` still in `tasks` is not done; one not in it may be.
-    ended = alive is None or any(task.done() for task in alive - tasks)
-    return ready, tasks, ended
 
+    def __init__(self, loop) -> None:
+        self._loop = loop
+        # Each task its last read found waiting on a pending asyncio future.
+        self._waiting: dict[asyncio.Task, asyncio.Future] = {}
+        # The tasks to read at the next look: those created since the last one,
+        # and those it found ready or waiting on a future asyncio's C pass
+        # cannot read.
+        self._unread = set(asyncio.all_tasks(loop))
+        self._previous = loop.get_task_factory()
+        self._factory = self._create
+        loop.set_task_factory(self._factory)
 
-def _tasks_of(loop) -> list:
-    """The tasks of `loop`, some perhaps done, in one pass: `asyncio.all_tasks`
-    walks a `WeakSet` item by item in Python and checks each task's loop
-    through a Python helper, over every open session's task once a clock call
-    (jgong5/ATOM#3992 measured it). Before 3.14 every task is in
-    ``asyncio.tasks._scheduled_tasks`` (or ``_eager_tasks`` while it runs
-    eagerly), whose weak references are read here directly; 3.14 keeps
-    native tasks elsewhere, so there it asks `asyncio.all_tasks`."""
-    scheduled = getattr(asyncio.tasks, "_scheduled_tasks", None)
-    eager = getattr(asyncio.tasks, "_eager_tasks", ())
-    if sys.version_info >= (3, 14) or not isinstance(scheduled, weakref.WeakSet):
-        return list(asyncio.all_tasks(loop))
-    while True:
-        try:  # a collection can drop a reference mid-copy, as all_tasks retries
-            refs = list(scheduled.data)
-            break
-        except RuntimeError:
-            continue
-    tasks = [*map(weakref.ref.__call__, refs), *eager]
-    return [task for task in tasks if task is not None and task.get_loop() is loop]
+    def _create(self, loop, coro, **kwargs) -> asyncio.Task:
+        if self._previous is None:
+            task = asyncio.Task(coro, loop=loop, **kwargs)
+        else:
+            task = self._previous(loop, coro, **kwargs)
+        self._unread.add(task)
+        return task
+
+    def look(self) -> tuple[list[str], bool]:
+        """The names of the loop's tasks, but the current one, not waiting on a
+        pending future, and whether one has ended since the last look.
+
+        A task that ends queues its done callbacks behind the current task, so
+        they run only on the loop's next turn.
+        """
+        if self._loop.get_task_factory() != self._factory:
+            raise RuntimeError(
+                "the event loop's task factory was replaced after the traffic LP "
+                "set its own: the hold no longer sees the tasks the loop creates"
+            )
+        me = asyncio.current_task()
+        waiting = self._waiting
+        woken = list(
+            itertools.compress(waiting, map(asyncio.Future.done, waiting.values()))
+        )
+        unread, self._unread = self._unread, set()
+        ready, ended = [], False
+        for task in itertools.chain(woken, unread):
+            waiting.pop(task, None)
+            if task is me:
+                continue
+            if task.done():
+                ended = True
+            # ponytail: Task._fut_waiter is private; a loop-level idle hook would not be.
+            elif (waiter := task._fut_waiter) is None or waiter.done():
+                ready.append(task.get_name())
+                self._unread.add(task)
+            elif isinstance(waiter, asyncio.Future):
+                waiting[task] = waiter
+            else:
+                self._unread.add(task)
+        return ready, ended
+
+    def close(self) -> None:
+        """Give the loop back the task factory it had, unless another replaced ours."""
+        if self._loop.get_task_factory() == self._factory:
+            self._loop.set_task_factory(self._previous)
