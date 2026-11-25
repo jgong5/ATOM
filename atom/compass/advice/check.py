@@ -811,9 +811,9 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
     the command measuring its readings there (`_readings_by`), unless its
     readings key is that calibration's side's or they are at their key there;
     one no such calibration makes and a started calibration's `INPUTS` leave
-    out is `UNFITTED`. While `_deployed` waits on that calibration, each side
-    it fits is `WAITING`; else each joins `calibrations`, unless no command
-    serves, which names why on each side it fits."""
+    out is `UNFITTED`. Where no command serves, each side it fits names why,
+    waiting or not; else, while `_deployed` waits on that calibration, each is
+    `WAITING`, and otherwise each joins `calibrations`."""
     laws, mine, sides = held["points"][point["name"]]["law"], {}, {}
     for side, law in laws.items():
         laws[side] = law = dict(law)
@@ -845,12 +845,6 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
             one = one | {"args": args, "env": env}
             laws[side]["made_by"].append(_readings_by(lender, there, one))
     fitted = [side for side in keys if side in fit]
-    if waiting:
-        lender = Path(waiting["in"])
-        wait = WAITING.format(waiting["into"], _candidate(lender), lender)
-        for side in fitted:
-            laws[side]["made_by"] = [wait]
-        return
     try:
         with _env({"TRACES": traces}):
             given = directory, sides, fit, ROUTER, sides["prefill"]["node"], into
@@ -858,6 +852,12 @@ def _deploying(point, held: dict, refused: bool, calibrations: dict, made) -> No
     except ValueError as why:
         for side in fitted:
             laws[side]["made_by"] = [f"no calibrate.sh command: {why}"]
+        return
+    if waiting:
+        lender = Path(waiting["in"])
+        wait = WAITING.format(waiting["into"], _candidate(lender), lender)
+        for side in fitted:
+            laws[side]["made_by"] = [wait]
         return
     published = str(into or directory / "store")
     for side in fitted:
