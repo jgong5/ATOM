@@ -468,7 +468,7 @@ config = Config(model=str(root / "model"), tensor_parallel_size=1, load_dummy="e
                 enable_dp_attention=True, dp_logical_size=8, enable_expert_parallel=ep,
                 kv_cache_dtype="fp8")
 set_current_atom_config(config)
-from atom.model_engine.model_runner import support_model_arch_dict
+from atom.models.registry import support_model_arch_dict
 from atom.utils import resolve_obj_by_qualname
 from atom.compass.runner.overrides import FactoriesOnMeta, process_weights_after_loading
 from atom.compass.run.modules import walk

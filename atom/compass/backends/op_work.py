@@ -466,6 +466,47 @@ def _batched_gemm(op, view, tp, kv) -> Work:
     return sum([one] * groups, Work({}, scales))
 
 
+def _mx_batched_gemm(op, view, tp, kv) -> Work:
+    """gfx1250's FlyDSL grouped MXFP8 GEMM, as `_batched_gemm` prices V4's:
+    `XQ [m, g, k]` through each group's `[n, k]` of `WQ`, both block scales
+    read once and the output's scales, `y_scale_out`, written once."""
+    args = op["args"]
+    x, w = args["XQ"], args["WQ"]
+    m, groups, k = x["shape"]
+    fmt = _fmt(x["dtype"])
+    one = gemm(m, w["shape"][1], k, fmt, _fmt(w["dtype"]), fmt)
+    scales = _only("x_scale", "w_scale", "y_scale_out")(op, view, tp, kv)
+    return sum([one] * groups, scales)
+
+
+def _mx_batched_gemm_launch(op, view, tp, kv) -> Work:
+    """gfx950's FlyDSL grouped MXFP8 GEMM at its launch, whose `tensors` are
+    Out, XQ, WQ, x_scale, w_scale, then the split-K partials and counters:
+    priced as `_mx_batched_gemm` prices gfx1250's, the partials left out."""
+    _, x, w, x_scale, w_scale = op["args"]["tensors"][:5]
+    named = {"XQ": x, "WQ": w, "x_scale": x_scale, "w_scale": w_scale}
+    return _mx_batched_gemm({"args": named}, view, tp, kv)
+
+
+def _quantize_taps(op, view, tp, kv) -> Work:
+    """`quantize_fp8` of the taps' concatenation, which it never builds: each
+    tap read once and written as `_quantize` writes it."""
+    return sum(
+        (_quantize({"args": {"x": tap}}, view, tp, kv) for tap in op["args"]["taps"]),
+        Work(),
+    )
+
+
+def _draft_src(op, view, tp, kv) -> Work:
+    """V4.1 DSpark's two-source draft indices from each row's anchor position:
+    the positions read once and, per row, its `width` positions' int32 indices
+    of every ring slot and of the block's rows up to each, and both indptrs."""
+    args = op["args"]
+    rows, ring, width = args["positions"]["shape"][0], args["ring"], args["width"]
+    each = width * (ring + width + 2) * _size("torch.int32")
+    return Work({}, _bytes(args["positions"]) + rows * each)
+
+
 def _v4_prefill(op, view, tp, kv) -> Work:
     """V4's prefill attention over the KV entries its index lists name, the
     cached prefix's and the chunk's own: each query against each of its
@@ -691,6 +732,41 @@ def _commit_cursors(op, view, tp, kv) -> Work:
     return Work({}, 2 * args["count"] * row) + indices
 
 
+def _verify_ids(op, view, tp, kv) -> Work:
+    """A step's verify from its head's ids (`verify_ids.IdVerifier.launch`):
+    the head's ids read, as many of the step's input ids, which it reaches by
+    its row tables, and those tables (`cu`, `target`, `bonus`) and any forced
+    acceptance's rates read once; each row's verdict (`out`) and the step's
+    status words (`spec_status`) written once. The rest of the input ids'
+    buffer, sized for the largest step, is not read."""
+    args = op["args"]
+    state = dict(args["self"]["state"])
+    head = args["head_ids"]
+    ids = head["shape"][0] * _size(args["input_ids"]["dtype"])
+    held = ("cu", "target", "bonus", "cond_rates", "out", "spec_status")
+    tables = sum(_bytes(t) for k in held for t in _tensors(state.get(k)))
+    return Work({}, _bytes(head) + ids + tables)
+
+
+def _head_pick(op, view, tp, kv) -> Work:
+    """A pick over a vocabulary shard's logits, which the LM head's GEMM, a
+    leaf of its own, wrote (`lm_head_argmax._pack`): the logits read once, and
+    each row's best value and index written as an fp32 pair."""
+    rows = op["args"]["logits"]["shape"][0]
+    pairs = 2 * rows * _size("torch.float32")
+    return _only("logits")(op, view, tp, kv) + Work({}, pairs)
+
+
+def _mixed_sample(op, view, tp, kv) -> Work:
+    """aiter's exponential race, or a greedy row's argmax, over each row's
+    logits (`fused_mixed_sample`): the logits, their noise and the
+    temperatures read once, and each row's id written as int32."""
+    rows = op["args"]["input"]["shape"][0]
+    ids = rows * _size("torch.int32")
+    read = _only("input", "exponentials", "temperatures")(op, view, tp, kv)
+    return read + Work({}, ids)
+
+
 def _shape(value):
     if isinstance(value, dict) and "dtype" in value:
         return value["shape"]
@@ -816,6 +892,9 @@ EXTRACTORS = {
     + "fused_compress_attn_hca_gfx1250:flydsl_hca_compress_attn_gfx1250": COMPRESS,
     "aiter._build_tiles_raw.default": _launch,
     "aiter._build_sched_raw.default": _launch,
+    # aiter's OPUS MXFP4 MQA-logits Table schedule, built once a step for V4's
+    # indexer layers
+    "aiter._build_schedule_raw.default": _launch,
     # The kernel reads only the kv and score rows write_plan names, at most
     # (1 + overlap) * ratio per sequence, so neither is counted.
     f"{V4}state_writes:update_compressor_states": _only("ape", "state_slot_mapping"),
@@ -826,6 +905,7 @@ EXTRACTORS = {
         "topk_local", "positions", "kv_indptr_csa", "batch_id_per_q_token"
     ),
     "aiter.topk_gating_fwd.default": _in_place(),
+    "aiter_routed.topk_gating.default": _in_place(),
     "atom.model_ops.triton_hash_topk:hash_topk_triton": _gather("tid2eid"),
     "aiter.fused_moe_.default": _fused_moe,
     "aiter.rocm_aiter_fused_moe.default": _fused_moe,
@@ -844,6 +924,11 @@ EXTRACTORS = {
     # ceil(tokens / 8) + rows programs, which the floor bounds.
     "atom.model_ops.mamba_ops.causal_conv1d:compute_causal_conv1d_metadata": _launch,
     "atom.model_ops.rejection_sampler:rejection_sample": _in_place(),
+    # The verify head's: a step's verify from its head's ids, the head's pick
+    # over a vocabulary shard, and a drafter's sample.
+    "atom.model_ops.verify_ids:IdVerifier.launch": _verify_ids,
+    "atom.model_ops.lm_head_argmax:_pack": _head_pick,
+    "aiter.ops.triton.fusions.fused_mixed_sample:fused_mixed_sample": _mixed_sample,
     **{kind: _experts(fmt) for kind, fmt in EXPERTS.items()},
     TRITON_MOE + "quant_moe:downcast_to_mxfp": _downcast,
     "aiter.ops.triton.quant.quant:dynamic_mxfp4_quant": _in_place(),
@@ -874,6 +959,8 @@ EXTRACTORS = {
     "aten.embedding.default": _gather("weight"),
     "aten.index.Tensor": _gather("self"),
     "aiter.all_reduce_.default": _all_reduce,
+    # the all-reduce with the residual add after it, `other` read once
+    "aiter.all_reduce_add_.default": _all_reduce,
     "aiter.fused_allreduce_rmsnorm_.default": _fused_all_reduce_norm,
     "_c10d_functional.all_gather_into_tensor.default": _all_gather,
     "_c10d_functional.broadcast.default": _broadcast,
@@ -899,20 +986,38 @@ EXTRACTORS = {
 V41 = "atom.model_ops.deepseek_v41."
 V41_INDICES = "atom.model_ops.attentions.deepseek_v41.indices:"
 TOPK = "aiter.ops.flydsl.topk.topk_per_row:"
+#: An aiter routed operator (`aiter_routed.<name>.default`) is the aiter
+#: operator of its name, which picks its kernel itself: priced as that one is.
+ROUTED_OP = "aiter_routed.{}.default"
 EXTRACTORS |= {
     "aten.index_fill_.int_Scalar": _index_fill,
-    "aiter.gemm_a8w8_blockscale.default": _gemm(
-        "XQ", "WQ", "dtype", ("x_scale", "w_scale")
+    **dict.fromkeys(
+        (
+            "aiter.gemm_a8w8_blockscale.default",
+            ROUTED_OP.format("gemm_a8w8_blockscale"),
+        ),
+        _gemm("XQ", "WQ", "dtype", ("x_scale", "w_scale")),
+    ),
+    "aiter.ops.flydsl.batched_gemm_a8w8_gfx1250:run_bmm_a8w8_mxfp8_32_gfx1250": (
+        _mx_batched_gemm
     ),
     "aiter.router_logits.default": _gemm("x", "weight"),
     "atom.model_ops.blockscale:quantize_fp8": _quantize,
-    "aiter.ops.triton.quant.fused_mxfp8_quant:fused_dual_rmsnorm_mxfp8_quant": _mx(
-        "q", "k", read=("q_weight", "k_weight")
+    "atom.model_ops.blockscale:quantize_fp8_taps": _quantize_taps,
+    **dict.fromkeys(
+        (
+            "aiter.ops.triton.quant.fused_mxfp8_quant:fused_dual_rmsnorm_mxfp8_quant",
+            ROUTED_OP.format("fused_dual_rmsnorm_mxfp8_quant"),
+        ),
+        _mx("q", "k", read=("q_weight", "k_weight")),
     ),
     "aiter.dynamic_per_token_scaled_quant.default": _only("input", "out", "scales"),
     "aiter.dynamic_per_group_scaled_quant.default": _only("input", "out", "scales"),
     "aiter.v41_mhc_pre_delayed.default": _mhc_delayed,
     f"{V41}mhc:collapse_streams": _only("residual", "pre_mix"),
+    # The initial residual streams and pre-mix it writes from the anchors'
+    # embeddings, and a DSpark block's fill.
+    f"{V41}mhc:write_stream_state": _only("residual", "pre_mix", "anchors", "fill"),
     "atom.model_ops.engram.device.gate:engram_post_wkv": _only(
         "hidden", "kv", "weight"
     ),
@@ -939,7 +1044,20 @@ EXTRACTORS |= {
     f"{V41}indexer:_block_maxima": _only("visible", "maxima"),
     TOPK + "flydsl_radix_topk_one_block": _only("row_starts", "row_ends", "indices"),
     TOPK + "flydsl_top_k_per_row_decode": _only("seq_lens", "indices"),
-    "aiter._top_k_per_row_decode.default": _only("seqLens", "indices"),
+    **dict.fromkeys(
+        (
+            "aiter._top_k_per_row_decode.default",
+            ROUTED_OP.format("top_k_per_row_decode"),
+        ),
+        _only("seqLens", "indices"),
+    ),
+    # This aiter's gfx950 batched GEMM, lifted at its FlyDSL launch.
+    "aiter.ops.flydsl.batched_gemm_a8w8_gfx950:_launch": _mx_batched_gemm_launch,
+    # aiter's routed inverse RoPE group quant: its fp8 rows and their e8m0
+    # scales, a byte an element each.
+    ROUTED_OP.format("inverse_rope_group_quant"): _only(
+        "o", "positions", out="torch.float8_e4m3fn"
+    ),
     "atom.model_ops.attentions.token_layout.gather:gather_rows": _gather_rows,
     **dict.fromkeys(
         (
@@ -955,11 +1073,12 @@ EXTRACTORS |= {
 }
 #: DeepSeek-V4.1's DSpark drafter's kinds: its draft-KV pass and its block.
 DSPARK = "atom.model_ops.deepseek_v41.dspark:"
-MARKOV = "atom.model_ops.dspark_markov_sample:"
+MARKOV = "atom.model_ops.dspark_markov_argmax:"
 EXTRACTORS |= {
     DSPARK + "fused_draft_kv_tail": _draft_kv_tail,
     DSPARK + "gather_window_rows": _window_rows,
     DSPARK + "draft_step_indices": _draft_indices,
+    DSPARK + "draft_src_indices": _draft_src,
     DSPARK + "build_block_state": _block_state,
     "atom.model_ops.sparse_attn_v4:_sparse_attn_triton": _block_attention,
     MARKOV + "_launch": _markov,

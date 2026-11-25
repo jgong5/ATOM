@@ -115,7 +115,7 @@ def test_a_stage_builds_its_drafter_on_meta_only_on_a_declared_acceptance(
     spec = SimpleNamespace(synthetic_acceptance_rates=rates)
     stage.config = MockConfig(pipeline_parallel_size=2, speculative_config=spec)
     with pytest.raises(RunnerRefusal if rates is None else Built) as raised:
-        stage._build_and_load_model(object)
+        stage._build_and_load_model(stage.config, object, None)
     assert rates is not None or "declares none" in str(raised.value)
 
 

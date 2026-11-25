@@ -1184,11 +1184,11 @@
    "mechanism_why": "inside a transfer backend the simulator replaces with a priced one"
   },
   {
-   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._execute_mla_regions::credits.acquire(target, epoch, MLA_LANDING_CREDIT_WAIT_S)::lock_acquire#0",
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._execute_staged_transfer::self._landing_credits.acquire( target, epoch, LANDING_CREDIT_WAIT_S )::lock_acquire#0",
    "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
-   "symbol": "MooncakeConnector._execute_mla_regions",
-   "call": "credits.acquire",
-   "expr": "credits.acquire(target, epoch, MLA_LANDING_CREDIT_WAIT_S)",
+   "symbol": "MooncakeConnector._execute_staged_transfer",
+   "call": "self._landing_credits.acquire",
+   "expr": "self._landing_credits.acquire( target, epoch, LANDING_CREDIT_WAIT_S )",
    "shape": "lock_acquire",
    "peer": "thread",
    "why": "waits for a staging slot or credit in a transfer backend the simulator replaces with a priced one",
@@ -1208,9 +1208,9 @@
    "mechanism_why": "inside a transfer backend the simulator replaces with a priced one"
   },
   {
-   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._gather_mla_rows::stream.synchronize()::device_sync#0",
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._execute_staged_transfer::stream.synchronize()::device_sync#0",
    "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
-   "symbol": "MooncakeConnector._gather_mla_rows",
+   "symbol": "MooncakeConnector._execute_staged_transfer",
    "call": "stream.synchronize",
    "expr": "stream.synchronize()",
    "shape": "device_sync",
@@ -1220,11 +1220,11 @@
    "mechanism_why": "inside a transfer backend the simulator replaces with a priced one"
   },
   {
-   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._write_mla_slot::self._mla_staging_slots.acquire()::lock_acquire#0",
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._write_staging_slot::self._kv_staging_slots.acquire()::lock_acquire#0",
    "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
-   "symbol": "MooncakeConnector._write_mla_slot",
-   "call": "self._mla_staging_slots.acquire",
-   "expr": "self._mla_staging_slots.acquire()",
+   "symbol": "MooncakeConnector._write_staging_slot",
+   "call": "self._kv_staging_slots.acquire",
+   "expr": "self._kv_staging_slots.acquire()",
    "shape": "lock_acquire",
    "peer": "thread",
    "why": "waits for a staging slot or credit in a transfer backend the simulator replaces with a priced one",
@@ -2247,9 +2247,9 @@
    "mechanism_why": "a direct send on the prefill/decode channel, made and logged on the step loop"
   },
   {
-   "id": "atom/model_engine/engine_core.py::DecodeEngineCore._process_engine_step::self.runner_mgr.call_func(\"forward\", scheduled_batch, wait_out=True)::worker_rpc#0",
+   "id": "atom/model_engine/engine_core.py::DecodeEngineCore._process_engine_step_inner::self.runner_mgr.call_func(\"forward\", scheduled_batch, wait_out=True)::worker_rpc#0",
    "file": "atom/model_engine/engine_core.py",
-   "symbol": "DecodeEngineCore._process_engine_step",
+   "symbol": "DecodeEngineCore._process_engine_step_inner",
    "call": "self.runner_mgr.call_func",
    "expr": "self.runner_mgr.call_func(\"forward\", scheduled_batch, wait_out=True)",
    "shape": "worker_rpc",
@@ -3073,8 +3073,8 @@
    "mechanism_why": "inside the forward pass the simulator replaces: the wrapper that starts these threads wraps the real runner's model, and a simulated step never calls it"
   },
   {
-   "id": "atom/kv_transfer/disaggregation/mooncake/mla_landing.py::LandingCredits.acquire::self._cv.wait(remaining)::event_wait#0",
-   "file": "atom/kv_transfer/disaggregation/mooncake/mla_landing.py",
+   "id": "atom/kv_transfer/disaggregation/mooncake/landing.py::LandingCredits.acquire::self._cv.wait(remaining)::event_wait#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/landing.py",
    "symbol": "LandingCredits.acquire",
    "call": "self._cv.wait",
    "expr": "self._cv.wait(remaining)",
@@ -3085,8 +3085,8 @@
    "mechanism_why": "inside a transfer backend the simulator replaces with a priced one"
   },
   {
-   "id": "atom/kv_transfer/disaggregation/mooncake/mla_landing.py::LandingReceiver._copy_segments::self._stream.synchronize()::device_sync#0",
-   "file": "atom/kv_transfer/disaggregation/mooncake/mla_landing.py",
+   "id": "atom/kv_transfer/disaggregation/mooncake/landing.py::LandingReceiver._copy_segments::self._stream.synchronize()::device_sync#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/landing.py",
    "symbol": "LandingReceiver._copy_segments",
    "call": "self._stream.synchronize",
    "expr": "self._stream.synchronize()",
@@ -3097,8 +3097,8 @@
    "mechanism_why": "inside a transfer backend the simulator replaces with a priced one"
   },
   {
-   "id": "atom/kv_transfer/disaggregation/mooncake/mla_landing.py::LandingReceiver._copy_segments::self._stream.synchronize()::device_sync#1",
-   "file": "atom/kv_transfer/disaggregation/mooncake/mla_landing.py",
+   "id": "atom/kv_transfer/disaggregation/mooncake/landing.py::LandingReceiver._copy_segments::self._stream.synchronize()::device_sync#1",
+   "file": "atom/kv_transfer/disaggregation/mooncake/landing.py",
    "symbol": "LandingReceiver._copy_segments",
    "call": "self._stream.synchronize",
    "expr": "self._stream.synchronize()",
@@ -3109,8 +3109,8 @@
    "mechanism_why": "inside a transfer backend the simulator replaces with a priced one"
   },
   {
-   "id": "atom/kv_transfer/disaggregation/mooncake/mla_landing.py::LandingReceiver._drain::self._queue.get(block=block)::queue_get#0",
-   "file": "atom/kv_transfer/disaggregation/mooncake/mla_landing.py",
+   "id": "atom/kv_transfer/disaggregation/mooncake/landing.py::LandingReceiver._drain::self._queue.get(block=block)::queue_get#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/landing.py",
    "symbol": "LandingReceiver._drain",
    "call": "self._queue.get",
    "expr": "self._queue.get(block=block)",
@@ -3121,8 +3121,8 @@
    "mechanism_why": "inside a transfer backend the simulator replaces with a priced one"
   },
   {
-   "id": "atom/kv_transfer/disaggregation/mooncake/mla_landing.py::LandingReceiver.start::self._stream.synchronize()::device_sync#0",
-   "file": "atom/kv_transfer/disaggregation/mooncake/mla_landing.py",
+   "id": "atom/kv_transfer/disaggregation/mooncake/landing.py::LandingReceiver.start::self._stream.synchronize()::device_sync#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/landing.py",
    "symbol": "LandingReceiver.start",
    "call": "self._stream.synchronize",
    "expr": "self._stream.synchronize()",
@@ -3347,18 +3347,6 @@
    "why": "an RL trainer's process synchronizes its device buffers while it pushes weights to the engine over CUDA IPC",
    "mechanism": "K9",
    "mechanism_why": "outside the serving path: the trainer calls it through AsyncLLMEngine.load_weights, and the simulated runner refuses the weight-update command it sends"
-  },
-  {
-   "id": "atom/rollout/weight_updater.py::WeightUpdaterMixin._await_readers_of::torch.cuda.synchronize(device)::device_sync#0",
-   "file": "atom/rollout/weight_updater.py",
-   "symbol": "WeightUpdaterMixin._await_readers_of",
-   "call": "torch.cuda.synchronize",
-   "expr": "torch.cuda.synchronize(device)",
-   "shape": "device_sync",
-   "peer": "none",
-   "why": "the rollout runner waits for a parameter's readers before overwriting it with updated weights",
-   "mechanism": "K9",
-   "mechanism_why": "the rollout runner's weight and memory commands; the simulated runner answers each of them with a refusal by name, so none reaches a device"
   },
   {
    "id": "atom/spec_decode/dspark_proposer.py::DSparkProposer._build_paged_block_metadata::torch.gather(block_tables, 1, page_idx)::collective#0",
@@ -3656,11 +3644,11 @@
    "mechanism_why": "a diagnostic endpoint off the serving path a simulated run drives"
   },
   {
-   "id": "atom/kv_transfer/disaggregation/mooncake/mla_landing.py::LandingReceiver.start::threading.Thread( target=self._run, daemon=True, name=\"mooncake-mla-landing\" )::thread_start#0",
-   "file": "atom/kv_transfer/disaggregation/mooncake/mla_landing.py",
+   "id": "atom/kv_transfer/disaggregation/mooncake/landing.py::LandingReceiver.start::threading.Thread( target=self._run, daemon=True, name=\"mooncake-landing\" )::thread_start#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/landing.py",
    "symbol": "LandingReceiver.start",
    "call": "threading.Thread",
-   "expr": "threading.Thread( target=self._run, daemon=True, name=\"mooncake-mla-landing\" )",
+   "expr": "threading.Thread( target=self._run, daemon=True, name=\"mooncake-landing\" )",
    "shape": "thread_start",
    "peer": "none",
    "lp": "engine",
@@ -3721,9 +3709,9 @@
    "mechanism_why": "inside a transfer backend the simulator replaces; a simulated run refuses any kv_connector but compass"
   },
   {
-   "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector.register_kv_caches::threading.Thread( target=self._handshake_listener, args=( metadata, ready_event, self.side_channel_port, self.tp_rank, self.dp_rank, self.layer_name_to_local_kv::thread_start#0",
+   "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector._start_handshake_listener::threading.Thread( target=self._handshake_listener, args=( metadata, ready_event, self.side_channel_port, self.tp_rank, self.dp_rank, self.layer_name_to_local_kv::thread_start#0",
    "file": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py",
-   "symbol": "MoRIIOConnector.register_kv_caches",
+   "symbol": "MoRIIOConnector._start_handshake_listener",
    "call": "threading.Thread",
    "expr": "threading.Thread( target=self._handshake_listener, args=( metadata, ready_event, self.side_channel_port, self.tp_rank, self.dp_rank, self.layer_name_to_local_kv",
    "shape": "thread_start",
@@ -6350,11 +6338,11 @@
    "mechanism_why": "a collective inside the forward step, which the simulator replaces with a priced one"
   },
   {
-   "id": "atom/model_engine/model_runner.py::ModelRunner.postprocess::get_pcp_group().broadcast(verdict, src=0)::collective#0",
+   "id": "atom/model_engine/model_runner.py::ModelRunner.postprocess::get_pcp_group().broadcast(spec_status, src=0)::collective#0",
    "file": "atom/model_engine/model_runner.py",
    "symbol": "ModelRunner.postprocess",
    "call": "get_pcp_group().broadcast",
-   "expr": "get_pcp_group().broadcast(verdict, src=0)",
+   "expr": "get_pcp_group().broadcast(spec_status, src=0)",
    "shape": "collective",
    "peer": "process",
    "why": "a sampling broadcast inside the runner the simulator replaces",
@@ -6760,11 +6748,11 @@
    "mechanism_why": "inside the runner the simulator replaces"
   },
   {
-   "id": "atom/distributed/group_agreement.py::group_max::dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)::collective#0",
+   "id": "atom/distributed/group_agreement.py::group_max_each::dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=group)::collective#0",
    "file": "atom/distributed/group_agreement.py",
-   "symbol": "group_max",
+   "symbol": "group_max_each",
    "call": "dist.all_reduce",
-   "expr": "dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)",
+   "expr": "dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=group)",
    "shape": "collective",
    "peer": "process",
    "why": "a rank-local verdict every rank of a CPU group takes alike: the agreed KV budget, Engram's UVA vote, a mono runner's agreements",
@@ -7303,8 +7291,8 @@
    "mechanism_why": "an idle point of the step loop: NER until the reply's arrival, its RENEW_TIMEOUT_S bound a daemon deadline that keeps no run alive; in a DP group the waiting member asks NER alone and its peers park before their forwards (run.engine arms the park for mooncake_store)"
   },
   {
-   "id": "atom/kv_transfer/offload/mooncake_store/pool.py::TransferSlotPool.acquire::self._cond.wait()::event_wait#0",
-   "file": "atom/kv_transfer/offload/mooncake_store/pool.py",
+   "id": "atom/kv_transfer/offload/kv_store/pool.py::TransferSlotPool.acquire::self._cond.wait()::event_wait#0",
+   "file": "atom/kv_transfer/offload/kv_store/pool.py",
    "symbol": "TransferSlotPool.acquire",
    "call": "self._cond.wait",
    "expr": "self._cond.wait()",
@@ -7388,11 +7376,11 @@
    "mechanism_why": "in a simulated run the worker half is compass's, which moves nothing, and the Store shell (atom/compass/kv/mooncake_store.py) keeps each rank's MooncakeStoreOffloadConnector over a stand-in pool, GPU copy and client, never registered, so no startup probe runs"
   },
   {
-   "id": "atom/kv_transfer/offload/mooncake_store/worker.py::MooncakeStoreOffloadConnector._do_save_req::pool.acquire(\"save\", len(window))::lock_acquire#0",
-   "file": "atom/kv_transfer/offload/mooncake_store/worker.py",
-   "symbol": "MooncakeStoreOffloadConnector._do_save_req",
+   "id": "atom/kv_transfer/offload/kv_store/worker.py::KVStoreOffloadConnector._do_save_req::pool.acquire(\"save\", len(segment))::lock_acquire#0",
+   "file": "atom/kv_transfer/offload/kv_store/worker.py",
+   "symbol": "KVStoreOffloadConnector._do_save_req",
    "call": "pool.acquire",
-   "expr": "pool.acquire(\"save\", len(window))",
+   "expr": "pool.acquire(\"save\", len(segment))",
    "shape": "lock_acquire",
    "peer": "thread",
    "why": "a save thread takes the slots for one window of chunks from the transfer pool, waiting while other saves hold them",
@@ -7400,9 +7388,9 @@
    "mechanism_why": "in a simulated run the worker half is compass's, which moves nothing, and the Store shell (atom/compass/kv/mooncake_store.py) keeps each rank's MooncakeStoreOffloadConnector over a stand-in pool, GPU copy and client: ATOM's _do_save_req runs on the step loop at its save lane's priced end, and the stand-in pool hands its slots at once"
   },
   {
-   "id": "atom/kv_transfer/offload/mooncake_store/worker.py::MooncakeStoreOffloadConnector._do_load_req::pool.acquire(\"load\", len(window))::lock_acquire#0",
-   "file": "atom/kv_transfer/offload/mooncake_store/worker.py",
-   "symbol": "MooncakeStoreOffloadConnector._do_load_req",
+   "id": "atom/kv_transfer/offload/kv_store/worker.py::KVStoreOffloadConnector._do_load_req::pool.acquire(\"load\", len(window))::lock_acquire#0",
+   "file": "atom/kv_transfer/offload/kv_store/worker.py",
+   "symbol": "KVStoreOffloadConnector._do_load_req",
    "call": "pool.acquire",
    "expr": "pool.acquire(\"load\", len(window))",
    "shape": "lock_acquire",
@@ -7412,8 +7400,8 @@
    "mechanism_why": "in a simulated run the worker half is compass's, which moves nothing, and the Store shell (atom/compass/kv/mooncake_store.py) keeps each rank's MooncakeStoreOffloadConnector over a stand-in pool, GPU copy and client: ATOM's _do_load_req runs on the step loop at its load lane's priced end, and the stand-in pool hands its slots at once"
   },
   {
-   "id": "atom/kv_transfer/offload/mooncake_store/worker.py::_synchronize::torch.cuda.synchronize(device)::device_sync#0",
-   "file": "atom/kv_transfer/offload/mooncake_store/worker.py",
+   "id": "atom/kv_transfer/offload/kv_store/worker.py::_synchronize::torch.cuda.synchronize(device)::device_sync#0",
+   "file": "atom/kv_transfer/offload/kv_store/worker.py",
    "symbol": "_synchronize",
    "call": "torch.cuda.synchronize",
    "expr": "torch.cuda.synchronize(device)",
@@ -7787,11 +7775,11 @@
    "mechanism_why": "a liveness poll on the TP ranks of another node, a failure detector that stays on the real clock"
   },
   {
-   "id": "atom/rollout/weight_updater.py::WeightUpdaterMixin._synced_by_module::torch.cuda.synchronize(self.device)::device_sync#0",
+   "id": "atom/rollout/weight_updater.py::_synchronize::torch.cuda.synchronize(device)::device_sync#0",
    "file": "atom/rollout/weight_updater.py",
-   "symbol": "WeightUpdaterMixin._synced_by_module",
+   "symbol": "_synchronize",
    "call": "torch.cuda.synchronize",
-   "expr": "torch.cuda.synchronize(self.device)",
+   "expr": "torch.cuda.synchronize(device)",
    "shape": "device_sync",
    "peer": "none",
    "why": "the rollout runner synchronizes the device before a module's updated weights are read",
@@ -7870,6 +7858,199 @@
    "why": "`python -m atom.compass.parity.blocked DIR` compiles the blocking-call tool with g++, with no bound, before a script starts a recording real server with it",
    "mechanism": "K9",
    "mechanism_why": "a build step before a real server starts; it is no LP and serves no simulated run"
+  },
+  {
+   "id": "atom/distributed/indexer_cp.py::CandidateMailbox.__init__::torch.cuda.synchronize(device)::device_sync#0",
+   "file": "atom/distributed/indexer_cp.py",
+   "symbol": "CandidateMailbox.__init__",
+   "call": "torch.cuda.synchronize",
+   "expr": "torch.cuda.synchronize(device)",
+   "shape": "device_sync",
+   "peer": "none",
+   "why": "the indexer-CP candidate mailbox waits for its zeroing, then for its peers' addresses, as the model is built",
+   "mechanism": "K9",
+   "mechanism_why": "a startup synchronize inside the runner the simulator replaces, before any request exists"
+  },
+  {
+   "id": "atom/distributed/indexer_cp.py::CandidateMailbox.__init__::torch.cuda.synchronize(device)::device_sync#1",
+   "file": "atom/distributed/indexer_cp.py",
+   "symbol": "CandidateMailbox.__init__",
+   "call": "torch.cuda.synchronize",
+   "expr": "torch.cuda.synchronize(device)",
+   "shape": "device_sync",
+   "peer": "none",
+   "why": "the indexer-CP candidate mailbox waits for its zeroing, then for its peers' addresses, as the model is built",
+   "mechanism": "K9",
+   "mechanism_why": "a startup synchronize inside the runner the simulator replaces, before any request exists"
+  },
+  {
+   "id": "atom/kv_transfer/offload/kv_store/save_pipeline.py::Sender.__init__::threading.Thread( target=self._run, daemon=True, name=\"store-save-sender\" )::thread_start#0",
+   "file": "atom/kv_transfer/offload/kv_store/save_pipeline.py",
+   "symbol": "Sender.__init__",
+   "call": "threading.Thread",
+   "expr": "threading.Thread( target=self._run, daemon=True, name=\"store-save-sender\" )",
+   "shape": "thread_start",
+   "peer": "none",
+   "lp": "engine",
+   "why": "a Store worker's save pipeline (ATOM_STORE_SAVE_BATCH_CHUNKS) starts its sender thread, which puts a batch of saved chunks into the Store",
+   "mechanism": "K9",
+   "mechanism_why": "in a simulated run the worker half is compass's, which moves nothing, and the Store shell (atom/compass/kv/mooncake_store.py) keeps each rank's MooncakeStoreOffloadConnector over a stand-in pool, GPU copy and client: no device, no probe, and no stand-in copy fails, so nothing waits for one"
+  },
+  {
+   "id": "atom/kv_transfer/offload/kv_store/save_pipeline.py::Sender._run::self.jobs.get()::queue_get#0",
+   "file": "atom/kv_transfer/offload/kv_store/save_pipeline.py",
+   "symbol": "Sender._run",
+   "call": "self.jobs.get",
+   "expr": "self.jobs.get()",
+   "shape": "queue_get",
+   "peer": "thread",
+   "why": "a Store worker's save pipeline (ATOM_STORE_SAVE_BATCH_CHUNKS): its sender thread waits for the next batch a save thread hands it",
+   "mechanism": "K9",
+   "mechanism_why": "in a simulated run the worker half is compass's, which moves nothing, and the Store shell (atom/compass/kv/mooncake_store.py) keeps each rank's MooncakeStoreOffloadConnector over a stand-in pool, GPU copy and client: no device, no probe, and no stand-in copy fails, so nothing waits for one"
+  },
+  {
+   "id": "atom/kv_transfer/offload/kv_store/save_pipeline.py::Sender.close::self.thread.join()::join#0",
+   "file": "atom/kv_transfer/offload/kv_store/save_pipeline.py",
+   "symbol": "Sender.close",
+   "call": "self.thread.join",
+   "expr": "self.thread.join()",
+   "shape": "join",
+   "peer": "thread",
+   "why": "a Store worker's save pipeline (ATOM_STORE_SAVE_BATCH_CHUNKS) joins its sender thread at close",
+   "mechanism": "K9",
+   "mechanism_why": "in a simulated run the worker half is compass's, which moves nothing, and the Store shell (atom/compass/kv/mooncake_store.py) keeps each rank's MooncakeStoreOffloadConnector over a stand-in pool, GPU copy and client: no device, no probe, and no stand-in copy fails, so nothing waits for one"
+  },
+  {
+   "id": "atom/kv_transfer/offload/kv_store/save_pipeline.py::Sender.close::time.sleep(0.001)::sleep#0",
+   "file": "atom/kv_transfer/offload/kv_store/save_pipeline.py",
+   "symbol": "Sender.close",
+   "call": "time.sleep",
+   "expr": "time.sleep(0.001)",
+   "shape": "sleep",
+   "peer": "none",
+   "why": "a Store worker's save pipeline (ATOM_STORE_SAVE_BATCH_CHUNKS) waits for the batches in flight at close",
+   "mechanism": "K9",
+   "mechanism_why": "in a simulated run the worker half is compass's, which moves nothing, and the Store shell (atom/compass/kv/mooncake_store.py) keeps each rank's MooncakeStoreOffloadConnector over a stand-in pool, GPU copy and client: no device, no probe, and no stand-in copy fails, so nothing waits for one"
+  },
+  {
+   "id": "atom/kv_transfer/offload/kv_store/save_pipeline.py::Sender.drain_request::self.condition.wait()::event_wait#0",
+   "file": "atom/kv_transfer/offload/kv_store/save_pipeline.py",
+   "symbol": "Sender.drain_request",
+   "call": "self.condition.wait",
+   "expr": "self.condition.wait()",
+   "shape": "event_wait",
+   "peer": "thread",
+   "why": "a Store worker's save pipeline (ATOM_STORE_SAVE_BATCH_CHUNKS): a save thread waits for its request's batches to be put",
+   "mechanism": "K9",
+   "mechanism_why": "in a simulated run the worker half is compass's, which moves nothing, and the Store shell (atom/compass/kv/mooncake_store.py) keeps each rank's MooncakeStoreOffloadConnector over a stand-in pool, GPU copy and client: no device, no probe, and no stand-in copy fails, so nothing waits for one"
+  },
+  {
+   "id": "atom/kv_transfer/offload/kv_store/save_pipeline.py::Sender.finish_lookup::future.result()::event_wait#0",
+   "file": "atom/kv_transfer/offload/kv_store/save_pipeline.py",
+   "symbol": "Sender.finish_lookup",
+   "call": "future.result",
+   "expr": "future.result()",
+   "shape": "event_wait",
+   "peer": "thread",
+   "why": "a Store worker's save pipeline (ATOM_STORE_SAVE_BATCH_CHUNKS): a save thread waits for the Store's answer on which of its chunks it already holds",
+   "mechanism": "K9",
+   "mechanism_why": "in a simulated run the worker half is compass's, which moves nothing, and the Store shell (atom/compass/kv/mooncake_store.py) keeps each rank's MooncakeStoreOffloadConnector over a stand-in pool, GPU copy and client: no device, no probe, and no stand-in copy fails, so nothing waits for one"
+  },
+  {
+   "id": "atom/kv_transfer/offload/kv_store/save_pipeline.py::Sender.reserve::self.credits.acquire()::lock_acquire#0",
+   "file": "atom/kv_transfer/offload/kv_store/save_pipeline.py",
+   "symbol": "Sender.reserve",
+   "call": "self.credits.acquire",
+   "expr": "self.credits.acquire()",
+   "shape": "lock_acquire",
+   "peer": "thread",
+   "why": "a Store worker's save pipeline (ATOM_STORE_SAVE_BATCH_CHUNKS): a save thread waits for a free batch credit",
+   "mechanism": "K9",
+   "mechanism_why": "in a simulated run the worker half is compass's, which moves nothing, and the Store shell (atom/compass/kv/mooncake_store.py) keeps each rank's MooncakeStoreOffloadConnector over a stand-in pool, GPU copy and client: no device, no probe, and no stand-in copy fails, so nothing waits for one"
+  },
+  {
+   "id": "atom/kv_transfer/offload/kv_store/worker.py::KVStoreOffloadConnector._do_save_req::sender.submit(req, segment, keys, slots)::executor_handoff#0",
+   "file": "atom/kv_transfer/offload/kv_store/worker.py",
+   "symbol": "KVStoreOffloadConnector._do_save_req",
+   "call": "sender.submit",
+   "expr": "sender.submit(req, segment, keys, slots)",
+   "shape": "executor_handoff",
+   "peer": "thread",
+   "why": "a Store worker's save pipeline (ATOM_STORE_SAVE_BATCH_CHUNKS): a save thread hands a window of chunks to the sender thread",
+   "mechanism": "K9",
+   "mechanism_why": "in a simulated run the worker half is compass's, which moves nothing, and the Store shell (atom/compass/kv/mooncake_store.py) keeps each rank's MooncakeStoreOffloadConnector over a stand-in pool, GPU copy and client: no device, no probe, and no stand-in copy fails, so nothing waits for one"
+  },
+  {
+   "id": "atom/kv_transfer/offload/mooncake_store/async_lookup.py::AsyncStoreLookup.renew_async::self.renew_executor.submit(self._renew_keys, keys)::executor_handoff#0",
+   "file": "atom/kv_transfer/offload/mooncake_store/async_lookup.py",
+   "symbol": "AsyncStoreLookup.renew_async",
+   "call": "self.renew_executor.submit",
+   "expr": "self.renew_executor.submit(self._renew_keys, keys)",
+   "shape": "executor_handoff",
+   "peer": "thread",
+   "why": "the Store's scheduler half submits a lease renewal to its renewal worker and polls it on later steps (ATOM_STORE_ASYNC_RENEW)",
+   "mechanism": "K9",
+   "mechanism_why": "a simulated run refuses ATOM_STORE_ASYNC_RENEW by name: its Store shell answers a renewal of a sequence's range, not of prebuilt keys"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::yield_gil::time.sleep(0)::sleep#0",
+   "file": "atom/model_engine/engine_core.py",
+   "symbol": "yield_gil",
+   "call": "time.sleep",
+   "expr": "time.sleep(0)",
+   "shape": "sleep",
+   "peer": "thread",
+   "why": "a zero-length sleep that hands the GIL to the process's other threads, the output sender and the input reader, after an idle pass or a step's outputs",
+   "mechanism": "K6",
+   "mechanism_why": "parks for no time on any clock; it orders the LP's own threads, whose receipts and sends the clock owner stamps"
+  },
+  {
+   "id": "atom/rollout/rdma_weight_receiver.py::_receive::dist.broadcast(tensor, src=0, group=group, async_op=True).wait(timeout=timeout)::event_wait#0",
+   "file": "atom/rollout/rdma_weight_receiver.py",
+   "symbol": "_receive",
+   "call": "dist.broadcast(tensor, src=0, group=group, async_op=True).wait",
+   "expr": "dist.broadcast(tensor, src=0, group=group, async_op=True).wait(timeout=timeout)",
+   "shape": "event_wait",
+   "peer": "process",
+   "why": "the rollout runner's RDMA weight stream (receive_weights_rdma) waits for each broadcast frame",
+   "mechanism": "K9",
+   "mechanism_why": "the rollout runner's weight and memory commands; the simulated runner answers each of them with a refusal by name, so none reaches a device"
+  },
+  {
+   "id": "atom/rollout/rdma_weight_receiver.py::_receive::dist.broadcast(tensor, src=0, group=group, async_op=True)::collective#0",
+   "file": "atom/rollout/rdma_weight_receiver.py",
+   "symbol": "_receive",
+   "call": "dist.broadcast",
+   "expr": "dist.broadcast(tensor, src=0, group=group, async_op=True)",
+   "shape": "collective",
+   "peer": "process",
+   "why": "the rollout runner's RDMA weight stream (receive_weights_rdma) receives each frame as a broadcast from the trainer",
+   "mechanism": "K9",
+   "mechanism_why": "the rollout runner's weight and memory commands; the simulated runner answers each of them with a refusal by name, so none reaches a device"
+  },
+  {
+   "id": "atom/rollout/rdma_weight_receiver.py::_take_frames::while True::spin_loop#0",
+   "file": "atom/rollout/rdma_weight_receiver.py",
+   "symbol": "_take_frames",
+   "call": "while True",
+   "expr": "while True",
+   "shape": "spin_loop",
+   "peer": "process",
+   "why": "the rollout runner's RDMA weight stream (receive_weights_rdma) takes frames until the stream ends",
+   "mechanism": "K9",
+   "mechanism_why": "the rollout runner's weight and memory commands; the simulated runner answers each of them with a refusal by name, so none reaches a device"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._write_staging_slot::stream.synchronize()::device_sync#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
+   "symbol": "MooncakeConnector._write_staging_slot",
+   "call": "stream.synchronize",
+   "expr": "stream.synchronize()",
+   "shape": "device_sync",
+   "peer": "none",
+   "why": "device-stream synchronization in a transfer backend the simulator replaces with a priced one",
+   "mechanism": "K9",
+   "mechanism_why": "inside a transfer backend the simulator replaces with a priced one"
   }
  ],
  "anchors": [

@@ -703,6 +703,12 @@ def test_an_engine_that_offloads_to_the_store_needs_the_entry(tmp_path):
     compass_run._store_shell(_config({}), {})  # no Store, nothing to build
 
 
+def test_an_engine_that_renews_store_leases_asynchronously_is_refused(monkeypatch):
+    monkeypatch.setenv("ATOM_STORE_ASYNC_RENEW", "1")
+    with pytest.raises(ValueError, match="ATOM_STORE_ASYNC_RENEW"):
+        compass_run._store_shell(_config(), {store.ENTRY: _entry()})
+
+
 def test_the_channel_table_names_the_shell_s_channels(tmp_path):
     run = {
         "bound_s": 60.0,

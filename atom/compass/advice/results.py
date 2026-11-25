@@ -262,9 +262,9 @@ def _calibrating(
     deployment; else the `calibrate.sh` command of `point`'s instance into
     the candidate's latest calibration directory (`check.calibrating`), its
     clients on SPACE's traces, resolved under its variables on the device arch
-    of the machine its run file states, publishing into the store a
-    calibration started there names, as its resume must. Once that calibration
-    has ended, why no command serves instead.
+    of the machine its run file states and run under them, publishing into the
+    store a calibration started there names, as its resume must. Once that
+    calibration has ended, why no command serves instead.
 
     That calibration joins `calibrations` at its law key, by model, platform
     and engine config, unless an earlier row's calibration is there, since a
@@ -303,7 +303,7 @@ def _calibrating(
             )
             return [f"no calibrate.sh command: {why}"]
         if lender == latest:
-            return [lacking.calibration(made, one["args"], config, started)]
+            return [lacking.calibration(made, one["args"], config, started, one["env"])]
         borrowed = [check.BORROWED.format(check._candidate(lender), lender, into)]
         return borrowed + ([] if reads else [check._readings_by(lender, into, one)])
 

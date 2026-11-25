@@ -50,6 +50,7 @@ def _extract(class_name: str, method: str):
         # Compass's clock hook: with no LP runtime installed it reads `time`.
         "clock": clock,
         "HELD_POLL_S": 0.0,
+        "yield_gil": lambda: None,
     }
     exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module([func], []), str(ENGINE_CORE), "exec"), scope

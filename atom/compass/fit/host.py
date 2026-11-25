@@ -30,8 +30,10 @@ not in its steps. A term the records cannot give, or a kind of
 tokenizer call as ``tokenizer.<kind>`` or a hop as ``hops.<hop>``, is left out
 and its reason listed under the report's ``unfitted``. The host key gains the
 fields of the configuration's platform a `host_laws` key states, which a run's
-spec must match; the entry is keyed by that host key's values and holds the run file's `host` entry as its
-params.
+spec must match, and ``fit_src``, the digest of the entry without its key
+(`step_linear_fit.fit_src`), so a refit whose laws differ, by any cause, is
+another entry; the entry is keyed by that host key's values and holds the run
+file's `host` entry as its params.
 
 `--stated-hop NAME=SECONDS` writes a hop no record times into the entry's
 ``hops``, as a committed law file states it: ``router_s``, the router's
@@ -59,6 +61,7 @@ from atom.compass.backends.step_linear_fit import (
     fit_host,
     fit_intake,
     fit_relay,
+    fit_src,
     fit_stream,
     fit_tokenizer,
     streams,
@@ -252,6 +255,7 @@ def main(argv: list[str]) -> None:
         report["stated_ingress"] = {"file": args.ingress, INGRESS: ingress}
     k = host["key"]
     k |= keyed_platform(Kind.HOST_LAWS, config["platform"])
+    k["fit_src"] = fit_src(host)
     key = Key.of(
         Kind.HOST_LAWS,
         **keyed_platform(Kind.HOST_LAWS, k),
@@ -259,6 +263,7 @@ def main(argv: list[str]) -> None:
         atom_src=k["atom"],
         model=k["model"],
         engine_config=json.dumps(k["engine"], sort_keys=True),
+        fit_src=k["fit_src"],
     )
     command = " ".join([PROG, *argv])
     publish.publish(args, command, key, publish.conditions(config), host, report)
