@@ -1403,9 +1403,9 @@ LBTS, which a ceiling never passes.
 3. **Only the router declares**: `http` to `http` and `relay`, `relay` to `relay`, `stream`
    to `stream`. Basis: code. Traffic receives only `stream` and sends only `http`, so its
    declaration would be every reaction. A frontend sends to its engine on an output: the
-   output thread re-feeds held requests (`engine_core_mgr.py::CoreManager._bp_dispatch_or_refill`),
-   and a stop aborts (`CoreManager.abort_request`). Rejected: a decode frontend's
-   `output` to `stream` only, which those sends break.
+   output thread re-feeds held requests
+   (`engine_core_mgr.py::CoreManager._bp_dispatch_or_refill`). Rejected: a decode
+   frontend's `output` to `stream` only, which that send breaks.
 4. **Declared in the channel table**, by `ChannelTable.mark_reactions`, which
    `channels.py::prefill_decode_table` calls where it declares LP `router`. Basis:
    principle, follow the project's conventions: `mark_offering` declares offering
@@ -1421,7 +1421,9 @@ LBTS, which a ceiling never passes.
    LBTS at more CA work per request.
 6. **The cycle term is #3968's over `reach`**: the least `L(c) + reach(c, i)` over `i`'s
    outbound channels `c` whose receiver runs, waits in NER or takes `c` as offering.
-   Rejected: `D` as today in the cycle, which keeps 1.5 ms through the router.
+   Basis: #3968's cycle rule, taken over decision 2's `reach`; code,
+   `ClockAuthority._ceiling_of` adds the cycle to the grant. Rejected: `D` as today in the
+   cycle, which keeps 1.5 ms through the router.
 7. **No ceiling for an LP with members.** Run 2's later window (simulated 1890 s to
    1920 s): an `engine-D` LP takes 236 rounds per simulated second, and each of its members
    makes about 59 requests (the 16 decode members about 950 together), so one call already
@@ -1431,8 +1433,8 @@ LBTS, which a ceiling never passes.
 8. **No input points.** Letting an engine's rounds that read no input pass without LBTS
    would remove the ping-pong between a decode engine's releases and its frontend's reports.
    It relaxes D3's safety invariant and the straggler check on the request channels, and
-   the model below bounds its gain by 131 of the 543 decode-frontend calls left per
-   simulated second and the engines' 247 on-path hops. Rejected for that cost.
+   its gain is bounded by the engines' on-path hops, 247 of 3,793 per simulated second
+   in run 2's later window. Basis: data, #4029's per-slice walk. Rejected for that cost.
 
 The soundness argument. A message not yet registered into `i` ends a chain of sends. The
 chain starts at an LP's own event, no earlier than that LP's own term (its clock while it
@@ -1448,14 +1450,14 @@ and #3968's argument drops a first hop into an LP waiting in TAR. A stream event
 
 ### Predictions on run 2
 
-From run 2's step table and frames over simulated 1890 s to 1920 s, the later, slower
-part of its profiling window (6.72 wall s per simulated s, 3,793 hops, parallelism 1.55).
-A replay of the decode frontends' steps under each ceiling rule gives their CA calls; it
-gives 7,979 per simulated second for today's rule, where the frames count 8,251. The
-decode frontends' on-path hops are taken as the same share of their calls as measured
-(0.358); the other groups' 837 on-path hops are kept. Wall is the sum, over windows of the
-rule's frontend cycle, of the busiest LP's own work, plus 81 us per window, the figure
-that fits today's 6.72.
+Low confidence (below). From run 2's step table and frames over simulated 1890 s to
+1920 s, the later, slower part of its profiling window (6.72 wall s per simulated s,
+3,793 hops, parallelism 1.55). A replay of the decode frontends' steps under each ceiling
+rule gives their CA calls; it gives 7,979 per simulated second for today's rule, where
+the frames count 8,251. The decode frontends' on-path hops are taken as the same share
+of their calls as measured (0.358); the other groups' 837 on-path hops are kept. Wall is
+the sum, over windows of the rule's frontend cycle, of the busiest LP's own work, plus
+81 us per window, the figure that fits today's 6.72.
 
 | rule | decode frontends' CA calls per sim s | critical-path hops per sim s | wall s per sim s | LPs' parallelism |
 |---|---|---|---|---|
@@ -1471,12 +1473,21 @@ traffic, one LP, does 1.73 s of own work per simulated second, which
 
 ### Simpler alternative
 
-#3968 alone. It leaves a decode frontend's ceiling and LBTS at the router's 1.5 ms, the
-requirement's second mechanism, and 60% more decode-frontend calls than D3.6.
+#3968 alone. It leaves a decode frontend's ceiling and LBTS at the router's 1.5 ms, which
+the requirement's second mechanism asks to pass.
 
 ### Low confidence
 
-None.
+The predictions above bound the gain from above. The replay restarts a decode frontend's
+ceiling a full cycle past each of its calls. The protocol holds its LBTS at the first
+stream event of its last window plus 3.06 ms, or 1.5 ms while the router runs, until
+the router and traffic have taken that window. A frontend, router and traffic chain per
+window adds calls and puts the router's and traffic's turns on the path; today's 70.6 us
+cycle hides the gap, so the replay's fit to today does not test it. The flagged
+prototype ([#4140](https://github.com/jgong5/ATOM/pull/4140)) grades them on a short
+cell of the recipe: #3968 alone against #3968 with channel reactions, each against its
+lane's base. No decision here rests on the figures: decisions 2 to 6 follow from the
+bound they lift, decisions 7 and 8 from run 2's measured rounds and hops.
 
 ### Dependencies
 
@@ -1506,8 +1517,8 @@ One code task, after #3968:
 
 Acceptance, on a short cell of the recipe, the flag on against off: client metrics
 identical; `atom.compass.detect.scenario` raises no `BackdatedEvent`; the decode
-frontends' CA calls and the window's critical-path hops per simulated second, against the
-table above.
+frontends' CA calls, the window's critical-path hops and wall per simulated second, as the
+prototype's short cell measures them.
 
 ---
 
