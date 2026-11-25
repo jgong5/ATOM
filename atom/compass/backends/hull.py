@@ -45,13 +45,16 @@ class Hull:
             )
         if not np.isfinite(self.facets).all():
             raise ValueError(f"{label} has a facet that is not finite")
+        # What `contains` reads of the facets, taken once.
+        self._normals, self._offsets = self.facets[:, :-1], self.facets[:, -1]
+        self._magnitudes = np.abs(self._normals), np.abs(self._offsets)
 
     def contains(self, point: tuple[float, ...]) -> bool:
         if any(point[i] != value for i, value in self.equal.items()):
             return False
         x = np.array([point[i] for i in self.vary], dtype=np.float64)
-        normals, offsets = self.facets[:, :-1], self.facets[:, -1]
-        scale = np.abs(normals) @ np.abs(x) + np.abs(offsets)
+        normals, offsets = self._normals, self._offsets
+        scale = self._magnitudes[0] @ np.abs(x) + self._magnitudes[1]
         return bool(np.all(normals @ x + offsets <= _HULL_TOLERANCE * scale))
 
     def excess(self, point: tuple[float, ...]) -> float:
