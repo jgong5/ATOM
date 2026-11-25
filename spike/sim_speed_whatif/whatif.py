@@ -1,4 +1,4 @@
-"""whatif.py OUT [BASE]: the wall the 8P16D sim's profiling window would take with one LP group's own work
+"""whatif.py OUT [BASE [--check]]: the wall the 8P16D sim's profiling window would take with one LP group's own work
 halved, the critical path recomputed (#4196). OUT is a run of #4029's `run.sh sim`: its aiperf.log and its
 stamped clock frames OUT.frames.
 
@@ -11,12 +11,14 @@ stamped clock frames OUT.frames.
    its own work holds its transport, as there. Transport, CA queueing and serves stay as measured. A DP rank's
    wait on a peer is unshortened: its reply still follows its group's last request, as the CA joins the round,
    and moves only as far as that request does.
-3. Check, with BASE, a run of the same recipe without the cut OUT measures. Client metrics: every field of
-   BASE's profile_export_aiperf.json but paths, URLs and the command line, against OUT's. Then BASE is replayed
-   with its own work cut to OUT's, group by group, two ways: each request's own work at its quantile of OUT's
-   (the cut lands on the hops it shortened), and every request's scaled by the group's total, OUT's over BASE's
-   (a cut spread over every hop, as a halving is). Each saving it predicts is set against the measured one,
-   BASE's wall less OUT's.
+3. With BASE, a run of the same recipe and simulated timeline: client metrics, every field of BASE's
+   profile_export_aiperf.json but paths, URLs and the command line, against OUT's; a number differs when its
+   relative difference passes 1e-9, as float sums in another order do not.
+4. Check, with --check as well, when OUT is BASE with a cut that changes only own work, not the clock protocol.
+   BASE is replayed with its own work cut to OUT's, group by group, two ways: each request's own work at its
+   quantile of OUT's (the cut lands on the hops it shortened), and every request's scaled by the group's total,
+   OUT's over BASE's (a cut spread over every hop, as a halving is). Each saving it predicts is set against the
+   measured one, BASE's wall less OUT's.
 """
 
 import bisect
@@ -131,9 +133,21 @@ print(f"| - | every LP group | {sum(c['spans'].values()) / c['sim']:.2f} | {ever
 if len(sys.argv) > 2:
     base = sys.argv[2]
     a, b = fields(out), fields(base)
-    differ = sorted(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
-    print(f"\n### Against {base}\n\nClient metrics: {len(a)} fields here, {len(b)} there, {len(differ)} differ"
-          + ("" if not differ else ": " + "; ".join(f"{k} {a.get(k)} / {b.get(k)}" for k in differ[:8])) + ".\n")
+
+    def differs(x, y):
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)) and not isinstance(x, bool):
+            return abs(x - y) > 1e-9 * max(abs(x), abs(y))
+        return x != y
+
+    keys = sorted(a.keys() | b.keys())
+    rel = [abs(a[k] - b[k]) / max(abs(a[k]), abs(b[k])) for k in keys if k in a and k in b and a[k] != b[k]
+           and isinstance(a[k], (int, float)) and isinstance(b[k], (int, float))]
+    differ = [k for k in keys if differs(a.get(k), b.get(k))]
+    print(f"\n### Against {base}\n\nClient metrics: {len(a)} fields here, {len(b)} there; {len(differ)} differ"
+          + ("" if not differ else ": " + "; ".join(f"{k} {a.get(k)} / {b.get(k)}" for k in differ[:8]))
+          + f". Numbers not equal bit for bit: {len(rel)}, at most {max(rel, default=0.0):.1e} apart, relatively.")
+if sys.argv[3:] == ["--check"]:
+    print()
     cb = load(base)
     walls = {"here": wall, "there": (cb["t1"] - cb["t0"]) / cb["sim"]}
     scale = {g: c["spans"].get(g, 0.0) / v for g, v in cb["spans"].items() if v}
