@@ -143,6 +143,52 @@ def next_pass(rows, sampled: int, tokens: int = 0) -> float:
     return sum(serial(w, MACHINE) for w in works)
 
 
+def mimo_window(rows) -> Work:
+    """MiMo-V2-Flash's MTP block attention at TP 4 over `rows` of decode, a
+    query at position `p` attending its last `min(p, 128)` keys: Q read and
+    O written, each request's last 128 keys and values read, in bf16."""
+    hf = json.loads(MIMO.read_text())
+    heads, kv = hf["swa_num_attention_heads"] // TP, hf["swa_num_key_value_heads"] // TP
+    dim, window = hf["swa_head_dim"], hf["sliding_window_size"]
+    keys = sum(
+        min(x, window)
+        for r in rows
+        for x in range(r.context_tokens - r.query_tokens + 1, r.context_tokens + 1)
+    )
+    read = sum(min(r.context_tokens, window) for r in rows)
+    moved = (sum_tokens(rows) * 2 * heads + read * 2 * kv) * 2 * dim
+    return Work({"bf16": 4 * heads * dim * keys}, moved)
+
+
+def mimo_pass(rows, sampled: int) -> float:
+    """One pass of MiMo-V2-Flash's MTP layer over `rows` at TP 4, module by
+    module from its config, its LM head on `sampled` rows: each module's
+    kernel bound, then its collective. Its fp8 linears read fp8 activations;
+    `eh_proj` and `o_proj`, which the checkpoint holds unscaled, run bf16."""
+    hf = json.loads(MIMO.read_text())
+    h, d = hf["hidden_size"], hf["swa_head_dim"]
+    q, kv = hf["swa_num_attention_heads"] // TP, hf["swa_num_key_value_heads"] // TP
+    inter, v = hf["intermediate_size"] // TP, hf["swa_v_head_dim"]
+    rotary = int(d * hf["partial_rotary_factor"])
+    t = sum_tokens(rows)
+    works = [
+        elementwise(t * h) + allreduce(TP, t * h * 2),  # embed_tokens
+        *[elementwise(t * h)] * 5,  # enorm, hnorm, the block's two, final
+        gemm(t, h, 2 * h),  # eh_proj over the embedding and the hidden state
+        gemm(t, (q + kv) * d + kv * v, h, "fp8", "fp8"),  # qkv_proj
+        elementwise(t * rotary),  # rotary_emb, a third of the head
+        mimo_window(rows),
+        gemm(t, h, q * v) + allreduce(TP, t * h * 2),  # o_proj
+        gemm(t, 2 * inter, h, "fp8", "fp8"),  # gate_up_proj
+        elementwise(t * inter, reads=2),  # SiluAndMul
+        gemm(t, h, inter, "fp8", "fp8") + allreduce(TP, t * h * 2),  # down_proj
+    ]
+    if sampled:
+        vocab = hf["vocab_size"] // TP
+        works.append(gemm(sampled, vocab, h) + allgather(TP, sampled * 8 * TP))
+    return sum(serial(w, MACHINE) for w in works)
+
+
 @pytest.mark.parametrize("name", BUILDS)
 def test_each_drafter_is_built_and_walked_its_passes_one_a_draft_token(built, name):
     found = built[name]
@@ -204,9 +250,11 @@ def test_a_middle_chunk_runs_the_first_qwen3_next_pass_alone_and_no_head(built):
 
 def test_mimo_v2_s_windowed_mtp_block_is_priced_over_its_window(built):
     """Every module of MiMo-V2-Flash's drafter is classified, its MTP block's
-    sliding-window attention priced over its window (#3965): on 4 rows
-    verifying 1 draft at contexts past the window, each query attends the
-    last 128 keys and each request's last 128 keys and values are read."""
+    sliding-window attention priced over its window (#3965), and its pass
+    priced by hand: on 4 rows verifying 1 draft at contexts past the window,
+    each query attends the last 128 keys and each request's last 128 keys
+    and values are read. Before, its drafter was not built: `prices no
+    draft`."""
     hf = json.loads(MIMO.read_text())
     heads, kv = hf["swa_num_attention_heads"] // TP, hf["swa_num_key_value_heads"] // TP
     dim, window = hf["swa_head_dim"], hf["sliding_window_size"]
@@ -218,17 +266,20 @@ def test_mimo_v2_s_windowed_mtp_block_is_priced_over_its_window(built):
 
     step = verify(1)
     rows = len(step.requests)
-    keys = rows * 2 * window  # two queries a row, each past the window
-    # Q read and O written, and each request's last `window` keys and values.
-    moved = (rows * 2 * 2 * heads + rows * window * 2 * kv) * 2 * dim
-    hand = price(Work({"bf16": 4 * heads * dim * keys}, moved), MACHINE)
+    assert mimo_window(step.requests).flops_by_format == {
+        "bf16": 4 * heads * dim * rows * 2 * window
+    }
+    window_s = price(mimo_window(step.requests), MACHINE)
     alone = StepRooflineBackend(MACHINE, [attn]).price(step)
-    assert alone.draft_seconds == pytest.approx(hand, rel=1e-12)
+    assert alone.draft_seconds == pytest.approx(window_s, rel=1e-12)
     cost = built["mimo-v2-mtp1"]["installed"].price(step)
+    hand = mimo_pass(step.requests, rows)
     terms = {t.name: t.seconds for t in cost.draft_terms}
     print(
         f"\nMiMo-V2-Flash MTP1 TP4 on MI355X, 4 rows of 2 tokens: draft "
-        f"{cost.draft_seconds:.9g} s, its windowed attention {hand:.9g} s by "
-        f"hand; " + ", ".join(f"{n} {s * 1e6:.2f} us" for n, s in sorted(terms.items()))
+        f"{cost.draft_seconds:.9g} s, by hand {hand:.9g} s, its windowed "
+        f"attention {window_s:.9g} s; "
+        + ", ".join(f"{n} {s * 1e6:.2f} us" for n, s in sorted(terms.items()))
     )
-    assert terms["draft roofline.attention"] == pytest.approx(hand, rel=1e-12)
+    assert terms["draft roofline.attention"] == pytest.approx(window_s, rel=1e-12)
+    assert cost.draft_seconds == pytest.approx(hand, rel=1e-12)
