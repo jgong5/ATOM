@@ -58,7 +58,9 @@ manifest did before. The deployment, ``pd`` (or ``disaggregated``) or
 given: a prefill or decode side is PD's. A cell whose runs' reports disagree,
 or disagree with the manifest, is refused, and so are two cells that share
 model, deployment, parallel and ``c``. The page shows a cell the panels its
-own reports hold.
+own reports hold. A cell's ``window_s`` keeps its runs to that window instead
+of the page's (``--window``, else the manifest's ``window_s``): a run scored
+over a shorter time than the others is compared over its own minutes only.
 
 MANIFEST is JSON (YAML when PyYAML is installed). Relative paths resolve
 against a cell's ``dir``, which resolves against ``base`` (default: the
@@ -338,6 +340,7 @@ def normalize(manifest: dict, manifest_path: Path) -> list[dict]:
                 ),
                 "note": cell.get("note", ""),
                 "one_real_note": cell.get("one_real_note", ""),
+                "window_s": cell.get("window_s"),
                 "real": real,
                 "sims": sims,
                 "one_real": [_path(root, f) for f in one_real],
@@ -642,7 +645,12 @@ def build(cells: list[dict], window: float, args) -> dict:
             raise SystemExit(
                 f"{where(cell)}: report step {step} s does not divide 60 s"
             )
-        n = int(window // step) + 1
+        cell_window = float(cell.get("window_s") or window)
+        if cell_window <= 0 or cell_window % 60:
+            raise SystemExit(
+                f"{where(cell)}: window_s {cell_window:g} is not whole minutes"
+            )
+        n = int(cell_window // step) + 1
         per_minute = int(60 // step)
         for run, rep in zip(runs, reports):
             for pid, p in rep["panels"].items():
@@ -702,7 +710,7 @@ def build(cells: list[dict], window: float, args) -> dict:
                     "window": meta.get("window"),
                     "report_title": meta.get("title"),
                     "report_notes": meta.get("notes", []),
-                    "covered": meta["end"] >= t0 + window,
+                    "covered": meta["end"] >= t0 + cell_window,
                     "series": series,
                     "minutes": mins,
                     "means": means,
@@ -742,7 +750,7 @@ def build(cells: list[dict], window: float, args) -> dict:
         for r in out_runs:
             if not r["covered"]:
                 warnings.append(
-                    f"{r['label']}: its report ends before t0 + {window:g} s"
+                    f"{r['label']}: its report ends before t0 + {cell_window:g} s"
                 )
         out_cells.append(
             {
@@ -754,7 +762,7 @@ def build(cells: list[dict], window: float, args) -> dict:
                 "note": cell["note"],
                 "one_real_note": cell["one_real_note"],
                 "step": step,
-                "window": window,
+                "window": cell_window,
                 "runs": out_runs,
                 "one_real": one_real,
                 "warnings": warnings,
@@ -954,7 +962,7 @@ h3 { font-size: 14px; margin: 0; font-weight: 650; }
 .small { font-size: 12px; }
 .controls { position: sticky; top: 0; z-index: 5; background: var(--page); display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; padding-top: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
 .ctl { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.ctl > span { color: var(--ink2); font-size: 12px; }
+.ctl > span, .ctl > label { color: var(--ink2); font-size: 12px; }
 .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); }
 .seg button { font: inherit; font-size: 13px; color: var(--ink2); background: none; border: 0; padding: 5px 11px; cursor: pointer; border-right: 1px solid var(--border); }
 .seg button:last-child { border-right: 0; }
@@ -1035,9 +1043,9 @@ dl.defs dd { margin: 0; color: var(--ink2); }
 </header>
 <div class="controls">
   <div class="wrap" style="display:flex;flex-wrap:wrap;gap:10px 22px;align-items:center;padding:0 16px;margin:0 auto;width:100%">
-    <div class="ctl" id="modelCtl"><span>Model</span><div class="seg" id="modelSel"></div></div>
+    <div class="ctl" id="modelCtl"><label for="modelSel">Model</label><select id="modelSel"></select></div>
     <div class="ctl" id="depCtl"><span>Deployment</span><div class="seg" id="depSel"></div></div>
-    <div class="ctl" id="parCtl"><span>Parallel</span><div class="seg" id="parSel"></div></div>
+    <div class="ctl" id="parCtl"><label for="parSel">Parallel</label><select id="parSel"></select></div>
     <div class="ctl"><span>Concurrency</span><div class="seg" id="cSel"></div></div>
     <div class="ctl"><span>Statistic</span><div class="seg" id="statSel"></div></div>
     <div class="ctl"><span>Y axis</span><div class="seg" id="ySel"></div></div>
@@ -1087,7 +1095,7 @@ dl.defs dd { margin: 0; color: var(--ink2); }
   <section class="card">
     <h3>Definitions</h3>
     <dl class="defs">
-      <dt>Alignment</dt><dd>The real run's series are on the wall clock, each simulated run's on its simulated clock. Each run is shifted so that 0 is the send of its first graded request (the earliest profiling-phase record with no error in its client export), and kept to <span class="win"></span> s. Points are interpolated onto one grid of the reports' step.</dd>
+      <dt>Alignment</dt><dd>The real run's series are on the wall clock, each simulated run's on its simulated clock. Each run is shifted so that 0 is the send of its first graded request (the earliest profiling-phase record with no error in its client export), and kept to its cell's window (<span class="win"></span>). Points are interpolated onto one grid of the reports' step.</dd>
       <dt>Panel points</dt><dd>As in CI's report: a histogram point (latency, batch, token panels) is a histogram estimate of the statistic over the rate window before it (60 s here); the cache panel's point is the reuse ratio over that window; queue and KV curves are sampled state.</dd>
       <dt>Y axis</dt><dd>Fit cuts a panel whose peak is over 3&times; its 98th-percentile point at 1.25&times; that point and says so under the chart; Full shows every point; Log is logarithmic (zeros not drawn).</dd>
       <dt>60 s table</dt><dd>One row per minute: a histogram or cache panel's point at the minute's end (so the statistic over that minute), a queue or KV panel's mean over the minute's samples. The last row is the mean of the rows.</dd>
@@ -1208,6 +1216,8 @@ const subOf = (p) => (p.kind ? st.subs[p.id] || p.default_sub : st.stat);
 // [real mean, sim mean, minutes] over the minutes both runs have a value in.
 const pairOf = (run, pid, sub) => ((run.pairs || {})[pid] || {})[sub] || null;
 const nMin = (cell) => Math.round(cell.window / 60);
+// "0–1800 s", or "0–900 / 0–1800 s" over cells kept to different windows.
+const winText = (cells) => "0–" + [...new Set(cells.map((c) => c.window))].sort((a, b) => a - b).join(" / 0–") + " s";
 function pairErr(run, pid, sub, unit, cell) {
   const pr = pairOf(run, pid, sub);
   if (!pr) return { e: null, html: fmtErr(null), title: "no minute both runs have a value in" };
@@ -1216,6 +1226,11 @@ function pairErr(run, pid, sub, unit, cell) {
     title: "over the " + pr[2] + " of " + nMin(cell) + " minutes both have: real " + fmtVal(pr[0], unit) + ", " + run.label + " " + fmtVal(pr[1], unit) };
 }
 const subName = (p, sub) => (p.kind ? sub : STAT_LABEL[sub]);
+// A drop-down of [value, label] items: the lists that grow with the cells.
+function pickList(sel, items, current, onPick) {
+  sel.innerHTML = items.map(([v, l]) => "<option" + (v === current ? " selected" : "") + ">" + esc(l) + "</option>").join("");
+  sel.onchange = () => onPick(items[sel.selectedIndex][0]);
+}
 function seg(box, items, current, onPick) {
   box.innerHTML = "";
   for (const [value, label] of items) {
@@ -1245,11 +1260,11 @@ function drawControls() {
       pool.find((x) => x.deployment === cell.deployment) || pool[0];
     st.ci = nearest(ng, cell.c); drawAll();
   };
-  seg($("modelSel"), MODELS.map((m) => [m, m || "—"]), cell.model, (m) => pick(GROUPS.filter((x) => x.model === m)));
+  pickList($("modelSel"), MODELS.map((m) => [m, m || "—"]), cell.model, (m) => pick(GROUPS.filter((x) => x.model === m)));
   const deps = [...new Set(GROUPS.filter((x) => x.model === cell.model).map((x) => x.deployment))];
   seg($("depSel"), deps.map((d) => [d, depName(d) || "—"]), cell.deployment,
     (d) => pick(GROUPS.filter((x) => x.model === cell.model && x.deployment === d)));
-  seg($("parSel"), GROUPS.filter((x) => x.model === cell.model && x.deployment === cell.deployment).map((x) => [x.key, x.parallel || "—"]), g.key, (k) => {
+  pickList($("parSel"), GROUPS.filter((x) => x.model === cell.model && x.deployment === cell.deployment).map((x) => [x.key, x.parallel || "—"]), g.key, (k) => {
     st.ci = nearest(GROUPS.find((x) => x.key === k), cell.c); drawAll();
   });
   seg($("cSel"), g.cells.map((i) => [i, "c = " + D.cells[i].c]), st.ci, (i) => { st.ci = i; drawAll(); });
@@ -1264,7 +1279,7 @@ function drawMatrix() {
   const groupCells = groupOf(st.ci).cells.map((i) => D.cells[i]);
   const cols = panelMode ? D.matrix_cols.filter((col) => groupCells.some((c) => hasPanel(c, col.pid))) : D.request_cols;
   $("mCaption").textContent = panelMode
-    ? "Each cell: the mean of a panel's one-minute values over 0–" + D.meta.window + " s, over the minutes both runs have a value in (* when fewer than all), histogram panels at " +
+    ? "Each cell: the mean of a panel's one-minute values over " + winText(groupCells) + ", over the minutes both runs have a value in (* when fewer than all), histogram panels at " +
       STAT_LABEL[st.stat] + " (switch above). Running, waiting and KV are sampled state and ignore the statistic. Hover a cell for both values."
     : "Each cell: one_real.py's per-request metric over each run's graded requests (the issues' figures). The statistic switch does not apply.";
   $("mTitle").textContent = "Error by concurrency and metric, (sim − real) / real · " + groupName(groupOf(st.ci));
@@ -1316,6 +1331,7 @@ function drawCellHead() {
   const cell = D.cells[st.ci];
   let h = '<div class="card-head"><h2>' + esc(cellName(cell)) + "</h2>" + depChip(cell.deployment) + "</div>";
   if (cell.note) h += '<div class="small">' + esc(cell.note) + "</div>";
+  if (cell.window !== D.meta.window) h += '<div class="small muted">Kept to ' + winText([cell]) + " from each run's first graded request, not the page's " + winText([D.meta]) + ".</div>";
   h += '<div class="runs">';
   cell.runs.forEach((r, i) => {
     h += '<span class="run">' + lineSample(i, r.sim) + "<b>" + esc(r.label) + "</b><small>" + (r.sim ? "simulated" : "real") + " · " +
@@ -1627,11 +1643,11 @@ function drawAll() {
 
 $("title").textContent = D.meta.title;
 document.title = D.meta.title;
-$("subtitle").textContent = "Generated " + D.meta.generated + " · window 0–" + D.meta.window +
-  " s from each run's first graded request · solid = real, dashed = simulated · " + GROUPS.length + " configuration(s) over " +
+$("subtitle").textContent = "Generated " + D.meta.generated + " · window " + winText(D.cells) +
+  " from each run's first graded request · solid = real, dashed = simulated · " + GROUPS.length + " configuration(s) over " +
   MODELS.length + " model(s) · concurrencies: " + CS.join(", ");
 $("ovMetric").addEventListener("change", (e) => { st.ov = e.target.value; writeHash(); drawOverview(); });
-document.querySelectorAll(".win").forEach((e) => (e.textContent = D.meta.window));
+document.querySelectorAll(".win").forEach((e) => (e.textContent = winText(D.cells)));
 $("footer").textContent = "Sources: " + D.meta.manifest + " · scripts/compass/compare_dashboard.py";
 if ((D.meta.skipped || []).length) {
   $("skippedCard").hidden = false;

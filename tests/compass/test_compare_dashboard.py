@@ -200,6 +200,39 @@ def test_a_manifest_and_a_scan_merge(tmp_path):
     ]
 
 
+def test_a_cell_s_window_s_keeps_its_runs_to_its_own_window(tmp_path):
+    """Every report covers WINDOW s. On a page kept to a longer window, a cell
+    without its own ``window_s`` reports that its runs end early; the cell whose
+    ``window_s`` is WINDOW is kept to it and has no such warning."""
+    root = tmp_path / "root"
+    _cell(root / "M1/pd/1P1D/c8", "pd")
+    _cell(root / "M1/pd/4P4D/c8", "pd")
+    (root / "M1/pd/4P4D/cell.json").write_text(json.dumps({"window_s": WINDOW}))
+    out = tmp_path / "dash.html"
+
+    _main("--scan", root, "--out", out, "--window", WINDOW + 60)
+
+    data = _page(out)
+    cells = {c["parallel"]: c for c in data["cells"]}
+    assert data["meta"]["window"] == WINDOW + 60
+    assert cells["4P4D"]["window"] == WINDOW
+    assert cells["4P4D"]["warnings"] == []
+    assert len(cells["4P4D"]["runs"][0]["series"]["decode_itl"]["p50"]) == (
+        WINDOW // STEP + 1
+    )
+    assert cells["1P1D"]["window"] == WINDOW + 60
+    assert "real: its report ends before t0 + 180 s" in cells["1P1D"]["warnings"]
+
+
+def test_a_window_s_of_no_whole_minutes_is_refused(tmp_path):
+    root = tmp_path / "root"
+    _cell(root / "M1/pd/1P1D/c8", "pd")
+    (root / "M1/pd/1P1D/c8/cell.json").write_text('{"window_s": 90}')
+
+    with pytest.raises(SystemExit, match="window_s 90 is not whole minutes"):
+        _main("--scan", root, "--out", tmp_path / "d.html", "--window", WINDOW)
+
+
 def test_no_manifest_and_no_scan_is_a_usage_error(tmp_path):
     with pytest.raises(SystemExit):
         _main("--out", tmp_path / "d.html")
