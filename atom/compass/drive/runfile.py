@@ -228,6 +228,9 @@ def build(args, atom_args, across: bool = False) -> dict:
     for name in ("lmcache", "lmcache_offload", "mooncake_store"):
         if entry := getattr(args, name, None):
             out[name] = json.loads(Path(entry).read_text())
+    # A pipeline above one stage: its width, which each stage's LP names.
+    if (pp := _engine_args(atom_args).pipeline_parallel_size) > 1:
+        out["pipeline_parallel_size"] = pp
     return out
 
 
@@ -296,6 +299,9 @@ def prefill_decode(args, prefill_args, decode_args, kv_link, decode_env=None) ->
                 f"and the decode side's {decode}; one run file names one"
             )
     del out["data_parallel_size"]
+    # A pipelined prefill's width; the decode side runs one stage.
+    if (pp := out.pop("pipeline_parallel_size", 1)) > 1:
+        out[run.PREFILL_PP] = pp
     out[run.DP_WIDTHS["P"]] = _dp_width(prefill_args)
     out[run.DP_WIDTHS["D"]] = _dp_width(decode_args)
     if hosts := run.entries(out, "host"):
