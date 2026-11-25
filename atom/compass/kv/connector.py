@@ -78,7 +78,17 @@ write and the handoff, ``c``, and it sends decode a write-done notice on
 ``kv_write_done`` (prefill to decode, the address at
 ``kv_transfer_config[WRITE_DONE_KEY]``), arriving at ``c + notify``, when
 decode is ready. Decode takes the handoff's first token as the prompt's last.
-One prefill stage, on a `Link`.
+
+Above one prefill stage each stage writes its own layers, as each of
+Mooncake's stage workers serves its own reads: the head relays each admitted
+chunked request (its transfer id, the write request's arrival and the blocks
+to write) in its connector metadata, which the scheduled batch carries to every
+stage (`relayed`); a stage's `ChunkedSend` reads its forwards' publications onto
+its own stage link and sends its own notice on its ``kv_write_done``. Decode is
+ready once every stage's notice is in, and tells the head (a release on the
+write-request channel), whose blocks are freed then, as Mooncake's head frees
+the shared page table on the consumer's release. On a `Link`; a shared NIC is
+refused.
 
 The worker half reports nothing. The engine still builds and polls it.
 """
@@ -266,6 +276,9 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         # the device, and when the last forward's device work ends.
         self._queued: list = []
         self._device_end = -math.inf
+        # Whether the last KV poll found write requests queued with no forward
+        # since: above DP width one the group's dummy normally follows it.
+        self._polled_queued = False
         # Above DP width one an admission step with nothing to run is followed
         # by the group's dummy forward.
         self._dummies = getattr(parallel, "data_parallel_size", 1) > 1
@@ -281,9 +294,29 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         self._sends: dict = {}
         self._notices: list = []  # prefill: (c, pair, transfer id) to send
         self._done_socks: dict = {}  # each pair's write-done notice socket
-        self._listening: dict = {}  # decode: transfer id -> request, its notice due
-        if getattr(parallel, "pipeline_parallel_rank", 0):
-            return  # Mooncake reports a send on the head stage only.
+        self._listening: dict = (
+            {}
+        )  # decode: transfer id -> [request, notices due, latest]
+        self._stage = int(getattr(parallel, "pipeline_parallel_rank", 0) or 0)
+        self._relay: dict = {}  # prefill head: what the stages are told of new sends
+        self._released: dict = (
+            {}
+        )  # prefill head: request -> its send, done, awaiting release
+        if self._stage:
+            # Mooncake reports a send on the head stage only; under a chunked
+            # transfer a later stage writes its own layers (`relayed`).
+            if self.is_producer and self._chunked:
+                table = self._rt.table
+                pairs = [
+                    c.name
+                    for c in table.channels_from(self._rt.me)
+                    if ":kv_write_done" in c.name
+                ]
+                if pairs:
+                    self._latency_s = table.lookahead(pairs[0])
+                self._bind_write_done(kv_config, table, self._rt.me)
+                _CHUNKED.add(self)
+            return
         address = kv_config.get(WRITE_REQ_KEY)
         if not isinstance(address, str):
             raise UnboundSeam(
@@ -331,11 +364,10 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             _CONSUMERS.add(self)
         self._bind_write_done(kv_config, table, me)
         if self.is_producer and self._chunked:
-            if len(self._transfer) > 1 or self._shared:
+            if self._shared:
                 raise ValueError(
-                    "a chunked transfer is priced over one prefill stage on its "
-                    "rank pair's link; this deployment prices "
-                    f"{len(self._transfer)} stage(s){' on a shared NIC' * self._shared}"
+                    "a chunked transfer is priced on its rank pair's link; this "
+                    "deployment's link states a shared NIC"
                 )
             _CHUNKED.add(self)
 
@@ -419,7 +451,11 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         return 0, False
 
     def build_connector_meta(self) -> ConnectorMetadata:
-        return ConnectorMetadata()
+        meta = ConnectorMetadata()
+        if self._relay:
+            # The stages' share of each chunked send admitted since (`relayed`).
+            meta.compass_chunked, self._relay = self._relay, {}
+        return meta
 
     def _pages_line_up(self, params) -> bool:
         """Mooncake's rule for skipping decode's cached prefix: the producer
@@ -481,7 +517,11 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             # Its prompt pages, not the lookahead past them (`_prompt_block_ids`).
             page = self._block_size * self._dcp_size
             blocks = max(0, -(-seq.num_prompt_tokens // page) - computed)
-            self._listening[params["transfer_id"]] = seq
+            self._listening[params["transfer_id"]] = [
+                seq,
+                params.get("remote_pp_size", 1),
+                -math.inf,
+            ]
         self._queued.append((seq.id, params, blocks))
 
     def device_done(self, end: float | None) -> None:
@@ -493,6 +533,7 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         now = self._rt.now
         self._device_end = max(self._device_end, now if end is None else end)
         self._post(self._device_end)
+        self._polled_queued = False
 
     def _post(self, t: float) -> None:
         """Decode: send every queued write request, leaving at `t`, no earlier
@@ -603,11 +644,36 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         send = ChunkedSend(self._links[pair][0], a, max(0, total - blocks), total)
         self._sends[seq.id] = (send, pair, params["transfer_id"], seq.num_prompt_tokens)
         self._awaiting_send.add(str(seq.id))
+        if self._pp_size > 1:
+            self._relay[seq.id] = (
+                params["transfer_id"],
+                pair,
+                a,
+                blocks,
+                seq.num_prompt_tokens,
+            )
+
+    def relayed(self, batch) -> None:
+        """A later stage: start a send for each chunked request the head
+        admitted, its metadata riding the batch (`build_connector_meta`)."""
+        meta = getattr(batch, "connector_meta_output", None)
+        metas = getattr(meta, "metas", None) or ([meta] if meta is not None else [])
+        page = self._block_size * self._dcp_size
+        for m in metas:
+            for req_id, (tid, pair, a, blocks, prompt) in (
+                getattr(m, "compass_chunked", None) or {}
+            ).items():
+                total = -(-prompt // page)
+                link = self._links[pair][self._stage]
+                send = ChunkedSend(link, a, max(0, total - blocks), total)
+                self._sends[req_id] = (send, pair, tid, prompt)
 
     def prefill_done(self, end, batch) -> None:
         """Prefill: the forward that ran `batch` returned, its device work
         ending at `end` (None: now): each chunked request's prompt computed
         through its ``context_lens`` is published then."""
+        if self._stage:
+            self.relayed(batch)
         if not self._sends:
             return
         t = self._rt.now if end is None else end
@@ -618,6 +684,19 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             if (held := self._sends.get(req_id)) is not None:
                 page = self._block_size * self._dcp_size
                 held[0].publish(t, int(tokens), held[3], page)
+                if self._stage and int(tokens) >= held[3]:
+                    # A later stage hands off with its last forward: the head
+                    # samples once the last stage's has run.
+                    held[0].finish(t)
+        if self._stage:
+            # A later stage takes no step loop's poll: it settles at its
+            # forwards, deciding every send to its end as far as what is
+            # published allows -- one whose prompt is all published to its
+            # end, its notice stamped to arrive then -- in time order across
+            # them (`ChunkedSend.step`: a later publication's write queues
+            # behind what is decided).
+            chunk_writes([v[0] for v in self._sends.values()], math.inf)
+            self._settle_chunked(self._rt.now)
 
     def _handoff(self, seq) -> None:
         """Prefill: a chunked request finished its prefill, or was aborted;
@@ -639,19 +718,36 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         if not self._sends:
             return
         sends = {id(v[0]): (req_id, v) for req_id, v in self._sends.items()}
-        for send in chunk_writes([v[0] for v in self._sends.values()], now):
+        chunk_writes([v[0] for v in self._sends.values()], now)
+        # Each send done, now or decided to its end at its last forward.
+        finished = sorted(
+            (v[0] for v in self._sends.values() if v[0].done is not None),
+            key=lambda send: send.done,
+        )
+        for send in finished:
             req_id, (_, pair, transfer_id, _) = sends[id(send)]
             del self._sends[req_id]
-            self._due[req_id] = send.done
+            if self._stage:
+                pass  # the head's scheduler holds the blocks; it frees them
+            elif self._pp_size > 1:
+                # Freed on decode's release, once every stage's write is done.
+                self._released[transfer_id] = req_id
+            else:
+                self._due[req_id] = send.done
             self._notices.append((send.done, pair, transfer_id))
             logger.info(
                 "compass: chunked KV transfer %s, %d writes, %d blocks, from %r "
-                "to %r simulated s",
+                "to %r simulated s%s",
                 req_id,
                 len(send.writes),
                 sum(w[2] for w in send.writes),
                 send.writes[0][0] if send.writes else send.done,
                 send.done,
+                (
+                    f", queued {send.clamped:.6f} s behind writes decided before"
+                    if send.clamped
+                    else ""
+                ),
             )
         for c, pair, transfer_id in self._notices:
             sock = self._done_socks.get(pair)
@@ -670,13 +766,24 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         for sock in self._done_socks.values() if not self.is_producer else ():
             while sock.poll(0):
                 transfer_id, at = pickle.loads(sock.recv())
-                seq = self._listening.pop(transfer_id, None)
-                if seq is None:
+                held = self._listening.get(transfer_id)
+                if held is None:
                     continue
+                seq, left, latest = held
+                latest = max(latest, at)
+                if left > 1:
+                    self._listening[transfer_id] = [seq, left - 1, latest]
+                    continue
+                del self._listening[transfer_id]
                 params = seq.kv_transfer_params
                 params.setdefault("first_token_id", int(seq.prompt_token_ids[-1]))
                 params.setdefault("draft_token_ids", [])
-                self._due[seq.id] = at
+                self._due[seq.id] = latest
+                if params.get("remote_pp_size", 1) > 1:
+                    # Mooncake's release: the head may reuse its page table.
+                    self._send(
+                        params, "release", max(latest, self._rt.now) + self._latency_s
+                    )
 
     @property
     def supports_pd_admission(self) -> bool:
@@ -746,6 +853,11 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         """Prefill: time each write request released so far on its link; a
         chunked one opens its request's admission (`admission_ready`)."""
         for other, (req_id, blocks, a, rank, *chunked) in self._write_requests():
+            if blocks == "release":
+                # Decode received every stage's chunked write.
+                if (done := self._released.pop(req_id, None)) is not None:
+                    self._due[done] = a
+                continue
             if chunked and blocks is not None:
                 if not self._chunked:
                     raise ValueError(
@@ -798,6 +910,11 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         self._take_write_requests()
         if self._queued and not self._dummies:
             self._post(self._device_end)
+        elif self._queued and self._polled_queued:
+            # A second poll and still no dummy: no rank of the group had a
+            # forward to run, so none follows, and the device is idle now.
+            self._post(self._device_end)
+        self._polled_queued = bool(self._queued)
         # The engine's aggregation keeps one poll in flight, so a poll returns
         # the snapshot the workers took at the previous poll: report that one.
         now = self._rt.read_clock()
@@ -827,5 +944,8 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             or self._sends
             or self._notices
             or self._listening
+            or self._released
+            # A chunked request's write request is in: its admission is due.
+            or bool(self._reads)
             or any(nic.busy() for nic in self._nics.values())
         )

@@ -438,7 +438,8 @@ def prefill_decode_table(
     nothing, its reply drained by the router; and prefill tells decode its write
     is done on ``kv_write_done`` (prefill engine to decode engine, a channel per
     rank pair as ``kv_write_req``, ``#dp<prefill rank>.dp<decode rank>``, at the
-    write request's lookahead). One deployment of a side, with no router LP.
+    write request's lookahead), from each stage of a pipelined prefill. One
+    deployment of a side, with no router LP.
 
     A prefill deployment's ZMQ messages each take `ipc_s`, but an engine's
     output to its frontend, which takes `ipc_out_s` (`ipc_s` when None); a
@@ -530,14 +531,9 @@ def prefill_decode_table(
             for pair in pairs
         ]
         + [
-            (
-                engines[p][0],
-                f"engine-{d}",
-                "kv_write_done" + pair,
-                kv_write_req_s,
-                "inline",
-            )
+            (stage, f"engine-{d}", "kv_write_done" + pair, kv_write_req_s, "inline")
             for p in ps
+            for stage in engines[p]
             for d in ds
             for pair in (done if chunked else ())
         ]

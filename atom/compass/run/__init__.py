@@ -2060,7 +2060,11 @@ def engine(config):
         lp = LpId(f"{lp.name}-pp{pc.pipeline_parallel_rank}")
     if side is not None:
         _bind_transfer(config, run)
-    if side == "D":
+    if side == "D" or (
+        side == "P" and (_pd_kv(config) or {}).get("enable_chunked_transfer")
+    ):
+        # Decode posts its write requests at a forward's device end; a chunked
+        # producer publishes its prompts' blocks at each forward's.
         _watch_forwards()
     if "lmcache" in run:
         from atom.compass.kv.lmcache_mp import substitute

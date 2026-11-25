@@ -19,8 +19,8 @@ import pytest
 from conftest import atom_config_double
 from test_kv_remote_prefill import (
     FIRST_TOKEN_ID,
-    L,
     PROMPT,
+    L,
     Script,
     geometry,  # noqa: F401  a fixture
     scheduler_with,
@@ -114,6 +114,31 @@ def test_two_sends_on_one_link_take_it_in_decision_order():
     b.finish(1.5)
     assert chunk_writes([b, a], math.inf) == [a, b]
     assert a.writes == [(1.0, 3.5, 2)] and b.writes == [(1.5, 5.5, 2)]
+
+
+def test_a_write_decided_after_a_later_one_queues_behind_it():
+    """A later PP stage decides a send that handed off to its end at its last
+    forward (it takes no poll): `a`'s second write arrives at 2.5 s. `b`'s
+    publication at 2 s, told afterwards, writes once the link's latest has
+    arrived, and says how long it queued; told first, nothing queues."""
+    link = Link(UNIT)
+    a, b = ChunkedSend(link, 0.0, 0, 2), ChunkedSend(link, 0.0, 0, 2)
+    a.publish(1.0, 4, 8, 4)
+    a.publish(1.5, 8, 8, 4)
+    a.finish(1.5)
+    assert chunk_writes([a, b], math.inf) == [a]
+    assert a.writes == [(1.0, 2.5, 1), (2.5, 4.0, 1)] and a.clamped == 0.0
+    b.publish(2.0, 8, 8, 4)
+    b.finish(2.0)
+    assert chunk_writes([a, b], math.inf) == [b]
+    assert b.writes == [(2.5, 6.0, 2)] and b.clamped == 0.5
+    link = Link(UNIT)
+    a, b = ChunkedSend(link, 0.0, 0, 2), ChunkedSend(link, 0.0, 0, 2)
+    for s, t in ((a, 1.0), (b, 2.0)):
+        s.publish(t, 8, 8, 4)
+        s.finish(t)
+    assert chunk_writes([a, b], math.inf) == [a, b]
+    assert b.writes == [(2.0, 5.5, 2)] and b.clamped == 0.0
 
 
 def test_a_middle_write_moves_blocks_alone_and_the_last_the_slot():
@@ -265,7 +290,7 @@ def test_prefill_holds_a_request_until_decode_s_write_request_then_writes_as_it_
     bare = (
         lambda n: pd.model.latency_s
         + n * pd.model.bytes_per_block / pd.model.bandwidth_bytes_per_s
-    )  # noqa: E731
+    )
     w1 = (2.0, 2.0 + bare(4), 4)
     assert send.writes[0] == w1
 
@@ -280,8 +305,8 @@ def test_prefill_holds_a_request_until_decode_s_write_request_then_writes_as_it_
     )
     assert send.writes[-1][1] == send.done == c
     assert send.writes[-1][1] == send.writes[-1][0] + T(send.writes[-1][2])
-    [(ch, _, arrival)] = [e for e in pd.rt_p.send_log if e[0] == DONE]
-    assert arrival == max(c, arrival - L) + L
+    [(_, _, arrival)] = [e for e in pd.rt_p.send_log if e[0] == DONE]
+    assert arrival >= c + L  # the notice leaves once the write is done
 
     _at(pd.rt_d, arrival, **{DONE: [(0, arrival)]})
     pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
@@ -309,3 +334,81 @@ def test_prefill_aborts_a_request_decode_never_admits_at_its_timeout(chunked):
     _forward(pd.p, pd.rt_p, 52.0)
     assert x.status is SequenceStatus.ABORTED
     assert x.kv_transfer_params_output is None, "nothing is relayed"
+
+
+def test_a_later_stage_writes_its_layers_from_the_relay_and_frees_nothing(
+    geometry, monkeypatch  # noqa: F811
+):
+    """Stage 1 of a two-stage prefill: the head's relay opens its send, each
+    forward publishes its layers' blocks, and its last forward hands off; the
+    stage tells decode on its own notice channel and holds nothing after, as
+    the head's scheduler frees the blocks on decode's release."""
+    import socket
+
+    table = prefill_decode_table(
+        admission_s=0.54e-3, ipc_s=L, stream_s=L, router_s=L, kv_write_req_s=L,
+        prefill_pp=2, chunked=True,
+    )  # fmt: skip
+    rts = {}
+    for lp in ("engine-D", "engine-P-pp1"):
+        rts[lp] = LPRuntime(clock.LpId(lp), table, Script())
+        rts[lp].start_run()
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    model = model_for(geometry, PEAKS[0])
+    kv = {
+        "kv_connector": "compass",
+        TRANSFER_KEY: (model, model),
+        WRITE_REQ_KEY: f"inproc://chunked-stage-req-{port}",
+        WRITE_DONE_KEY: f"tcp://127.0.0.1:{port}",
+    }
+    parallel = SimpleNamespace(
+        data_parallel_rank=0, data_parallel_size=1, pipeline_parallel_rank=1
+    )
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    halves = {}
+    # Decode binds a notice socket per stage, so it is built first.
+    for lp, role, extra in (
+        ("engine-D", "kv_consumer", {}),
+        ("engine-P-pp1", "kv_producer", {"enable_chunked_transfer": True}),
+    ):
+        monkeypatch.setattr(clock, "_installed", rts[lp])
+        halves[lp] = KVConnectorFactory.create_connector(
+            atom_config_double(
+                kv_transfer_config={**kv, "kv_role": role, **extra},
+                kv_cache_block_size=4,
+                pipeline_parallel_size=2,
+                parallel_config=parallel if role == "kv_producer" else
+                SimpleNamespace(data_parallel_rank=0, data_parallel_size=1),
+            ),
+            role="scheduler",
+        )  # fmt: skip
+    monkeypatch.setattr(clock, "_installed", None)
+    stage = halves["engine-P-pp1"]
+    pair = ("engine-D", 0)
+
+    def forward(end, tokens, relay=None):
+        meta = SimpleNamespace(compass_chunked=relay) if relay else None
+        batch = SimpleNamespace(
+            connector_meta_output=meta,
+            req_ids=["r"],
+            context_lens=[tokens],
+            total_seqs_num_prefill=1,
+        )
+        stage.prefill_done(end, batch)
+
+    # A 10-token prompt, three blocks, all of which decode asked for.
+    forward(1.0, 8, relay={"r": ("t", pair, 0.5, 3, 10)})
+    send = stage._sends["r"][0]
+    assert send.writes and send.writes[0][0] == 1.0 and send.writes[0][2] == 2
+    assert send.done is None and stage.has_pending_work()
+    forward(2.0, 10)
+    assert "r" not in stage._sends and send.done is not None
+    assert [w[2] for w in send.writes] == [2, 1]
+    assert send.done == max(send.writes[-1][1], 2.0)
+    (notice,) = [e for e in rts["engine-P-pp1"].send_log if ":kv_write_done" in e[0]]
+    assert notice[0] == "engine-P-pp1->engine-D:kv_write_done"
+    assert notice[2] == send.done + L
+    assert not stage._released and not stage.has_pending_work()
