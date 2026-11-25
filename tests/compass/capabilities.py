@@ -104,11 +104,7 @@ FORMS = {
         HERE + "test_run_modules_kimi_k3.py::"
         "test_a_kda_layer_refuses_every_step_naming_its_recurrence_and_issue",
     ),
-    "windowed_attention": refused(
-        "a model with windowed attention",
-        HERE + "test_run_modules_gpt_oss.py::"
-        "test_a_windowed_layer_refuses_every_step_naming_its_window_and_issue",
-    ),
+    "windowed_attention": Form("a model with windowed attention"),
 }
 
 

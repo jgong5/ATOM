@@ -182,7 +182,10 @@ class Module:
     logits a row its exchange holds),
     `hc_head` (residual copies, width), a pass (elements a token; a `norm`'s
     second, those of them it writes in fp8), `act` (output
-    elements a token), `attention` (heads, KV heads, head dim),
+    elements a token), `attention` (heads, KV heads, head dim, then where
+    it attends a sliding window, the window and 1 where a prefill row reads
+    its whole context, 0 where every row reads only the keys its queries
+    attend, under unified attention),
     `linear_attention` (value heads, key heads, key dim, value dim), `mhc`
     (residual copies, width), `sparse_attention` (heads, head dim, window,
     compression ratio, top k, indexer heads and head dim, then optionally the
@@ -308,6 +311,8 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
     if m.kind == "act":
         return elementwise(tokens * d[0], reads=2)
     rows = view.requests
+    if m.kind == "attention" and len(d) > 3:
+        return _windowed_attention(m, rows)
     if m.kind == "attention":
         q, kv = [r.query_tokens for r in rows], [r.context_tokens for r in rows]
         return attention(q, kv, d[0], d[2], d[1], kv_fmt=m.fmt)
@@ -501,6 +506,32 @@ def _index_scores(rows, ratio, heads, dim, fmt, cap=None) -> Work:
     else:
         _, _, scored, entries = _sparse_reads(rows, 0, ratio)
     return Work({fmt: 2 * heads * dim * scored}, entries * dim * ELEMENT_BYTES[fmt])
+
+
+def _windowed_attention(m: Module, rows) -> Work:
+    """Dense attention over a sliding `window`, as `PagedAttentionImpl` runs
+    it: a query at position `p` attends the last `min(p, window)` keys, every
+    kernel skipping the tiles before them, so the products are
+    `_sparse_reads`' over the window, at `attention`'s rate. Q is read and O
+    written in bf16, and each request's keys and values read once at `fmt`.
+    Under unified attention (not `whole`), which runs every row, each row
+    reads the span its first query's window opens. Else a prefill row reads
+    its whole context (the CK kernel's new rows, the cached ones gathered
+    first by `_gather_prefix_and_concat_kv`), and a decode row its last
+    `window`, where the gluon kernel starts: at most what unified attention
+    reads past gluon's limit."""
+    heads, kv_heads, dim, window, whole = m.dims
+    keys, read = _sparse_reads(rows, window, 0)[0], 0
+    for r in rows:
+        if not whole:
+            read += min(r.context_tokens, r.query_tokens + window - 1)
+        elif r.decode:
+            read += min(r.context_tokens, window)
+        else:
+            read += r.context_tokens
+    moved = sum_tokens(rows) * 2 * heads * ELEMENT_BYTES[ACT]
+    moved += read * 2 * kv_heads * ELEMENT_BYTES[m.fmt]
+    return Work({_wider(ACT, m.fmt): 4 * heads * dim * keys}, moved * dim)
 
 
 def _sparse_attention(m: Module, rows) -> Work:
