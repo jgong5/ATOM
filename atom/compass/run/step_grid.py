@@ -148,8 +148,12 @@ _FLAG = ("0", lambda value: value == "1")
 #: ``ak_gemm.py``, ``ak_moe.py``, ``dspark.py``, ``dspark_draft.py``,
 #: ``minimax_m3/model.py``, ``utils/envs.py``).
 KERNEL_SWITCHES = {
-    # MoE through amd-kernels (a4w4 at every row count) and its tiling
+    # MoE through amd-kernels (a4w4 at every row count) and its tiling; the row range it takes (others keep
+    # aiter's MoE) and, with every row there, its one routed w13 copy (`ak_moe.py`)
     "ATOM_M3_AK_MOE": _FLAG,
+    "ATOM_M3_AK_MOE_MIN": ("1", int),
+    "ATOM_M3_AK_MOE_MAX": ("87381", int),
+    "ATOM_M3_AK_MOE_SHARE_W13": ("1", lambda value: value == "1"),
     "ATOM_P1_MOE_TILES": _FLAG,
     "ATOM_P1_MOE_IDROWS": _FLAG,
     "ATOM_P1_MBF_ASM": _FLAG,

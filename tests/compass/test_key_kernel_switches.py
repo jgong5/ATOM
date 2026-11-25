@@ -54,6 +54,12 @@ D06 = {
     "ATOM_M3_VERIFY_HEAD_CHUNK_TUNED": "1",
     "ATOM_P1_PREFIX_DEMOTE_DECODE": "1",
 }
+#: The AK MoE's row range and w13 sharing, which the recipe leaves at ATOM's defaults: keyed only off them.
+AK_MOE_RANGE = {
+    "ATOM_M3_AK_MOE_MIN": "1",
+    "ATOM_M3_AK_MOE_MAX": "87381",
+    "ATOM_M3_AK_MOE_SHARE_W13": "1",
+}
 #: The same recipe's settings that are no kernel switch: never keyed here.
 NOT_KEYED = {
     "ATOM_M3_INDEXER_CP": "0",
@@ -85,8 +91,29 @@ def test_the_recipes_decode_switches_are_each_keyed_by_value(monkeypatch):
     assert keyed_env() == D06
 
 
-def test_every_switch_is_in_the_recipes_decode():
-    assert set(KERNEL_SWITCHES) == set(D06)
+def test_every_switch_is_in_the_recipes_decode_or_its_ak_moe_range():
+    assert set(KERNEL_SWITCHES) == set(D06) | set(AK_MOE_RANGE)
+
+
+def test_the_ak_moe_range_at_atoms_defaults_keys_as_unset(monkeypatch):
+    for name, value in (D06 | AK_MOE_RANGE).items():
+        monkeypatch.setenv(name, value)
+
+    assert keyed_env() == D06
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ATOM_M3_AK_MOE_MAX", "2048"),
+        ("ATOM_M3_AK_MOE_MIN", "17"),
+        ("ATOM_M3_AK_MOE_SHARE_W13", "0"),
+    ],
+)
+def test_an_ak_moe_range_off_default_is_keyed(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+
+    assert keyed_env() == {name: value}
 
 
 @pytest.mark.parametrize("name", sorted(KERNEL_SWITCHES))
