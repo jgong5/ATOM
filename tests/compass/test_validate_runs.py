@@ -1174,3 +1174,100 @@ def test_deployments_and_single_servers_are_not_one_cell(tmp_path):
 
     with pytest.raises(ValueError, match="the runs' servers wrote different sides"):
         grade(real, simulated)
+
+
+#: The handshake port of each of `_two_by_two`'s instances, as `deploy.sh`
+#: writes it to a real deployment's run.json.
+PORTS = {"prefill0": 11, "prefill1": 22, "decode0": 33, "decode1": 44}
+
+
+def _two_by_two(cell, **run):
+    """`cell` as `deploy.sh` lays out two prefill and two decode instances, each
+    `_recorded`'s steps on one DP rank, with `run`'s entries in its run.json:
+    prefill0 prefills `ka` and `kb` after its warmup's `kw`, which decode1
+    decodes, and prefill1 `ja`, `jb` and `jw`, which decode0 does, each pair
+    named as `_named_as_deployed` names it. Both prefill instances number their
+    requests alike, so their transfer ids meet. Each transfer names the prefill
+    instance it came from as `kv.handoff` and Mooncake fill it in: a simulated
+    one, `run` holding `run_file`, by its engine id, a real one by the
+    handshake port run.json states. The client's export, naming all six, is
+    beside them."""
+    from atom.compass.kv.connector import engine_id
+
+    simulated = "run_file" in run
+    export = {}
+    for k, key in enumerate("kj"):
+        pair = cell / f"pair{k}"
+        keys = {7: f"{key}a", 8: f"{key}b"}
+        for side in SIDES:
+            _recorded(_cell(pair / side, _schedule(), keys), warmup=(f"{key}w",), **run)
+        _named_as_deployed(pair)
+        sent = json.loads((pair / "decode" / CLIENT_RUN).read_text())
+        export = sent | {n: export.get(n, {}) | sent[n] for n in ("requests", "warmup")}
+        if simulated:
+            sender = engine_id(f"engine-P{k}")
+            fields = {"remote_engine_id": sender, "remote_host": f"{sender}.invalid"}
+            fields["remote_handshake_port"] = 0
+        else:
+            fields = {"remote_engine_id": "None", "remote_host": "10.0.0.1"}
+            fields["remote_handshake_port"] = PORTS[f"prefill{k}"]
+        path = pair / "decode" / "steps" / TRANSFERS
+        lines = [json.loads(x) | fields for x in path.read_text().splitlines()]
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+        shutil.rmtree(cell / "artifacts", ignore_errors=True)
+        (pair / "decode" / "artifacts").rename(cell / "artifacts")
+        shutil.rmtree(pair / "prefill" / "artifacts")
+        (pair / "prefill").rename(cell / f"prefill{k}")
+        (pair / "decode").rename(cell / f"decode{1 - k}")
+        pair.rmdir()
+    (cell / CLIENT_RUN).write_text(json.dumps(export))
+    instances = [
+        {"name": name, "side": name[0].upper(), "index": int(name[-1])}
+        | ({} if simulated else {"handshake_port": port})
+        for name, port in PORTS.items()
+    ]
+    meta = {"kv_link": "inter_node", "instances": instances}
+    if simulated:
+        meta["run_file"] = run["run_file"]
+    (cell / "run.json").write_text(json.dumps(meta))
+    return cell
+
+
+@pytest.mark.parametrize("fitted", ["trace-kz", "trace-ja"])
+def test_each_prefill_instance_is_graded_through_the_transfers_that_name_it(
+    tmp_path, fitted
+):
+    """A prefill instance is split from the client's export through every
+    decode instance's transfers that name it, and through no other's: its
+    transfer ids meet the other instance's. A backend fitted on a trace only
+    prefill1 prefilled refuses prefill1, the first side that served it."""
+    real = [_two_by_two(tmp_path / f"r{i}") for i in range(3)]
+    inputs = [{"run": "fit.jsonl", "traces": [fitted]}]
+    provenance = {"digest": "sha256:0", "provenance": {"inputs": inputs}}
+    simulated = _two_by_two(tmp_path / "sim", **(GRADED | {"provenance": provenance}))
+
+    if fitted == "trace-ja":
+        named = re.escape("its backend was fitted on traces it served: ['trace-ja']")
+        with pytest.raises(ValueError, match=f"sim/prefill1 is not graded: {named}$"):
+            grade(real, simulated)
+        return
+    report = grade(real, simulated)
+    names = [f"{side}{k}" for side in SIDES for k in range(2)]
+    assert set(report) == {
+        *(f"{family} {name}" for family in ("counts", "distributions", "one run") for name in names),
+        "end to end",
+    }  # fmt: skip
+    for name in names:
+        counts = report[f"counts {name}"]
+        # `test_counts_match_across_runs_whose_request_ids_differ`'s: the
+        # warmup's step is not graded.
+        assert {k: g["simulated"] for k, g in counts.items()} == {
+            "prefill steps": 3,
+            "decode steps": 3,
+            "prefill tokens": 453,
+            "decode tokens": 5,
+            "preemptions": 1,
+            "prefill streaks": 2,
+            "requests completed": 3.0,
+        }
+        assert {g["verdict"] for g in counts.values()} == {"exact"}

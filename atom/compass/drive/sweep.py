@@ -20,7 +20,8 @@ arguments on its command line, as `compass record --sweep` starts it.
 A point's requests are completions of fresh token ids, each asking for its
 two output tokens and naming its DP rank, so placement needs no session
 affinity. First, and read to their end, the prompts whose KV a row reuses:
-the shared prefix the row's prompt starts with. Then every rank's parked
+the shared prefix the row's prompt starts with, the hit ATOM starts the row a
+hash block below where its state transfer replays. Then every rank's parked
 decodes at once, each decoding before the rows follow, so the PrefillDelayer
 holds the rows until all are admitted and runs them as one batch; then the
 rows, every rank's first, each group admitted before the next is sent. A row
@@ -337,7 +338,8 @@ def _requests(step: list[Point], engine: dict, fresh) -> tuple[list, list, list]
         for (q, c), how in zip(point.rows, point.cached):
             ids = fresh(c)
             if how == "prefix":
-                first.append({**body, "prompt_token_ids": ids[: c - q]})
+                hit = sweep_plan.hit(engine, (q, c))
+                first.append({**body, "prompt_token_ids": ids[:hit]})
             elif how == "chunk" and (pad := -(c - q) % sweep_plan.budget(engine)):
                 lane.append({**body, "prompt_token_ids": fresh(pad)})
             lane.append({**body, "prompt_token_ids": ids})

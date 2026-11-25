@@ -98,6 +98,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import importlib
 import json
 import logging
 import math
@@ -709,6 +710,74 @@ def _resident(readings: DeviceReadings, config: Any) -> int:
     return resident + (readings.page_bound.nbytes if fp4 else 0)
 
 
+def _mqa_logits_config_on_host(runner: Any, config: Any) -> None:
+    """Under an FP4 indexer layout whose attention builder sizes its block table
+    from aiter's `mqa_logits_mxfp4_config` on the runner's device (DeepSeek-V4's
+    `fp4-gfx950-opus` and `fp4-gfx1250-natural`), that function, asked about the
+    runner's device, answers as on the run's simulated device, and about any
+    other device as before; without a run file nothing is answered.
+
+    On a device aiter picks a kernel instance off its arch's registry, whose
+    residency it asks HIP for, and the instance sets the table width the
+    builder reads: the logits width in whole KV tiles, counted in table entries
+    of `page_size * pages_per_block` rows. Every instance's tile is aiter's
+    `_TILE` on gfx950 and gfx1250, and the builder's 64-row page is one tile an
+    entry, so the width needs no device. The answer holds it beside the
+    config's other public fields, the arch of the run's machine spec and the
+    bounds asked; the instance and its schedule are a launch's, and no launch
+    runs on the host. A request the builder does not make (other heads or
+    pages, an arch aiter has no rule for, a bound aiter refuses) is refused by
+    name, as a device's aiter would refuse it or pick another instance."""
+    from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+        FP4_GFX950_OPUS,
+        FP4_GFX1250_NATURAL,
+    )
+
+    layout = getattr(config, "index_cache_layout", None)
+    if layout not in (FP4_GFX950_OPUS, FP4_GFX1250_NATURAL):
+        return
+    if (arch := _simulated_device_arch()) is None:
+        return
+    mqa = importlib.import_module("aiter.ops.opus.pa_mqa_logits_mxfp4")
+    real, tile = mqa.mqa_logits_mxfp4_config, mqa._TILE
+    built = {"heads": 64, "page_size": tile, "pages_per_block": 1}
+
+    @wraps(real)
+    def answered(device: Any, **bounds: Any) -> Any:
+        if torch.device(device) != runner.device:
+            return real(device, **bounds)
+        bounds = {"pages_per_block": 1} | bounds
+        sizes = [bounds[k] for k in ("max_rows", "max_seqs", "max_qlen", "max_seq_len")]
+        if (
+            arch not in mqa._RULES
+            or {k: bounds[k] for k in built} != built
+            or min(sizes) < 1
+            or bounds["max_seq_len"] >= mqa._MAX_SEQ_LEN
+        ):
+            raise RunnerRefusal(
+                "on the host aiter's mqa_logits_mxfp4_config answers DeepSeek-V4's "
+                f"attention builder alone: {built}, on an arch aiter has a rule "
+                f"for ({', '.join(mqa._RULES)}), each bound 1 or more and "
+                f"max_seq_len under {mqa._MAX_SEQ_LEN}; asked {bounds} on {arch}"
+            )
+        width = -(-bounds["max_seq_len"] // tile)  # one tile an entry
+        return SimpleNamespace(arch=arch, **bounds, block_table_width=width)
+
+    mqa.mqa_logits_mxfp4_config = answered
+
+
+def _simulated_device_arch() -> str | None:
+    """The run's simulated device's arch, its machine spec's; None without a
+    run file."""
+    from atom.compass import run
+    from atom.compass.spec.machine import MachineSpec
+
+    spec = run.spec()
+    if spec is None:
+        return None
+    return MachineSpec.from_mapping(spec["machine"]).value("device.arch")
+
+
 @contextlib.contextmanager
 def simulated_arch():
     """aiter's arch probes answer the run's simulated device's arch.
@@ -724,10 +793,7 @@ def simulated_arch():
     a run file nothing is swapped, nor without aiter loaded, as where there is
     no driver.
     """
-    from atom.compass import run
-    from atom.compass.spec.machine import MachineSpec
-
-    spec = run.spec()
+    arch = _simulated_device_arch()
     # each swapped module's own probe, and the probe module's, by name
     own, real = {}, {}
     chip_info = "aiter.jit.utils.chip_info"
@@ -735,8 +801,7 @@ def simulated_arch():
     def simulated():
         return arch
 
-    if spec is not None:
-        arch = MachineSpec.from_mapping(spec["machine"]).value("device.arch")
+    if arch is not None:
         for name, module in list(sys.modules.items()):
             for n in ("get_gfx", "get_gfx_runtime"):
                 probe = getattr(module, "__dict__", {}).get(n)
@@ -774,7 +839,10 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
     group. A simulated TP width is refused: it starts fewer workers than the
     TP group `apply_simulated_tp` then reports on a device group. In a simulated
     run the DP group then runs its small collectives over shared memory when
-    its ranks share a host (`shm_collectives`).
+    its ranks share a host (`shm_collectives`), and DeepSeek-V4's attention
+    builder, under an FP4 indexer whose block table it sizes by aiter's config
+    on the runner's device, gets the config's answer for the simulated device
+    (`_mqa_logits_config_on_host`).
     """
     pc = config.parallel_config
     if config.tp_world_size != config.tensor_parallel_size:
@@ -806,6 +874,7 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
     torch.cuda.memory_allocated = _device_memory(
         torch.cuda.memory_allocated, runner, lambda r: _resident(r, config)
     )
+    _mqa_logits_config_on_host(runner, config)
     os.environ["MASTER_ADDR"] = config.master_addr
     os.environ["MASTER_PORT"] = str(config.port)
     method = get_distributed_init_method(
