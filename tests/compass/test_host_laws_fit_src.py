@@ -1,95 +1,69 @@
 # SPDX-License-Identifier: MIT
-"""A `host_laws` key holds the digest of the code that fitted it
-(`run.fit_digest`): `compass fit host`'s module and the `step_linear_fit`
-functions it fits with. Two fits of the same records by two fit codes are two
-entries, a run takes either, and the reuse check looks host laws up at this
-tree's fit code."""
+"""A `host_laws` key holds ``fit_src``, the sha256 of the laws without their
+key (`fit.host.fit_src`): two fits of the same records whose laws differ are
+two entries, a run takes either, and the reuse check takes the newer beside a
+store law, skipping an entry whose key states none."""
 
 import json
-from pathlib import Path
 
 import pytest
 from test_advice_reuse import (  # noqa: F401  fixtures
-    HOST_LAWS,
     advise,
     at_head,
-    law,
-    publish,
     searched,
     stored,
     verdicts,
 )
-from test_fit_steps import clients, fit, member, record
+from test_fit_steps import clients, fit, member, planted_roots, record  # noqa: F401
 from test_memory_readings import META_8B
-from test_run_step_grid import deployment, host_laws_key, run_file
+from test_run_step_grid import deployment, run_file
 from test_run_step_grid import publish as publish_deployment
 
-import atom
 from atom.compass import run as compass_run
 from atom.compass.artifacts import ArtifactStore, Kind
+from atom.compass.artifacts.store import ENTRY_FILE
 from atom.compass.fit import host as fit_host
 
-SLF, HOST = compass_run.FIT_CODE[1], compass_run.FIT_CODE[0]
+
+def refits(tmp_path, monkeypatch, directory, changed_first=False) -> list[str]:
+    """The tokens of two `compass fit host` runs over the record `directory`
+    into `tmp_path`'s store, in order: one by this tree's fit code, one by code
+    that prices every host law's intercept a microsecond higher, that one first
+    when `changed_first`."""
+    fitted = fit_host.fit_host
+
+    def changed(samples):
+        host, report = fitted(samples)
+        for segments in host["laws"].values():
+            for coefficients in segments.values():
+                coefficients[0] += 1e-6
+        return host, report
+
+    tokens = []
+    for code in (changed, fitted) if changed_first else (fitted, changed):
+        monkeypatch.setattr(fit_host, "fit_host", code)
+        fit(tmp_path, "fit host", directory, *clients(directory))
+        out = json.loads((tmp_path / "out/host_laws.json").read_text())
+        tokens.append(out["token"])
+    return tokens
 
 
-def fit_code(root: Path, *edits) -> Path:
-    """`root`, a package directory holding this tree's fit code with each
-    ``(path, old, new)`` of `edits` made."""
-    for path in compass_run.FIT_CODE:
-        text = (Path(atom.__file__).parent / path).read_text()
-        for at, old, new in edits:
-            assert at != path or text.count(old) == 1
-            text = text.replace(old, new) if at == path else text
-        (root / path).parent.mkdir(parents=True, exist_ok=True)
-        (root / path).write_text(text)
-    return root
-
-
-@pytest.mark.parametrize(
-    "path, old, new, moves",
-    [
-        (SLF, "MAD_K = 3.5", "MAD_K = 3.0", True),
-        (HOST, '("router_s", "kv_write_req_s")', '("router_s",)', True),
-        (
-            SLF,
-            "def fill_rungs(law: dict, ladder)",
-            "def fill_rungs(law, ladder)",
-            False,
-        ),
-    ],
-    ids=["host fit's outlier cut", "fit host's module", "a step law's rung fill"],
-)
-def test_the_digest_moves_with_the_code_fit_host_fits_with_alone(
-    tmp_path, path, old, new, moves
-):
-    here = compass_run.fit_digest()
-    assert compass_run.fit_digest(fit_code(tmp_path / "copy")) == here
-    edited = compass_run.fit_digest(fit_code(tmp_path / "edited", (path, old, new)))
-    assert (edited != here) is moves
-
-
-def test_a_refit_of_the_same_records_by_changed_code_is_another_entry_a_run_takes(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("taken", [0, 1], ids=["the first", "the second"])
+def test_two_fits_of_the_same_records_whose_laws_differ_are_two_entries_a_run_takes(
+    tmp_path, monkeypatch, taken
 ):
     r = deployment(tmp_path)
     publish_deployment(tmp_path, r)
     a = record(tmp_path / "a", 19, key=compass_run.host_key(r.config), trace="t")
 
-    def token() -> str:
-        fit(tmp_path, "fit host", a, *clients(a))
-        return json.loads((tmp_path / "out/host_laws.json").read_text())["token"]
-
-    tokens = [token()]
-    changed = fit_code(tmp_path / "changed", (SLF, "MAD_K = 3.5", "MAD_K = 3.0"))
-    digest = compass_run.fit_digest(changed)
-    monkeypatch.setattr(fit_host, "fit_digest", lambda: digest, raising=False)
-    tokens.append(token())
+    tokens = refits(tmp_path, monkeypatch, a)
 
     store = ArtifactStore(tmp_path / "store")
     keys = [store.key_from_token(Kind.HOST_LAWS, t) for t in tokens]
-    assert [k.values["fit_src"] for k in keys] == [compass_run.fit_digest(), digest]
-    host = member(tmp_path / "store", keys[1], "params")
-    assert host["key"]["fit_src"] == digest
+    hosts = [member(tmp_path / "store", k, "params") for k in keys]
+    assert hosts[0]["laws"] != hosts[1]["laws"]
+    assert [k.values["fit_src"] for k in keys] == list(map(fit_host.fit_src, hosts))
+    host = hosts[taken]
     run = run_file(tmp_path, monkeypatch, host=host)
     monkeypatch.setenv(compass_run.NOW_ENV, str(tmp_path / "now.bin"))
     compass_run._PublishedClock(
@@ -99,15 +73,32 @@ def test_a_refit_of_the_same_records_by_changed_code_is_another_entry_a_run_take
     assert r.compass_host.laws == host["laws"]
 
 
-def test_host_laws_beside_a_store_law_fitted_by_other_code_are_not_reused(
-    tmp_path, searched  # noqa: F811
+@pytest.mark.parametrize(
+    "changed_first", [False, True], ids=["changed code second", "changed code first"]
+)
+def test_the_reuse_check_takes_the_newer_of_two_fits_beside_a_store_law(
+    tmp_path, monkeypatch, searched, changed_first  # noqa: F811
 ):
     stored(tmp_path, searched, host=False)
-    params = {"key": law(searched)["host"]["key"], "laws": HOST_LAWS}
-    key = host_laws_key(searched) | {"fit_src": "0" * 64}
-    publish(tmp_path, searched, Kind.HOST_LAWS, key, params)
+    host_key = compass_run.host_key(searched.config)
+    a = record(tmp_path / "a", 19, key=host_key, trace="t")
+    tokens = refits(tmp_path, monkeypatch, a, changed_first)
+
+    found = verdicts(advise(tmp_path), "law")
+
+    assert [v["run"][1] for v in found] == [tokens[1]] * 2
+
+
+def test_host_laws_whose_key_states_no_fit_src_are_not_taken(
+    tmp_path, searched  # noqa: F811
+):
+    stored(tmp_path, searched)
+    for entry in (tmp_path / "store" / Kind.HOST_LAWS.value).glob(f"*/{ENTRY_FILE}"):
+        document = json.loads(entry.read_text())
+        del document["key"]["fit_src"]
+        entry.write_text(json.dumps(document))
 
     found = verdicts(advise(tmp_path), "law")
 
     assert [(v["verdict"], v["requirement"]) for v in found] == [("calibrate", 1)] * 2
-    assert "fitted by this tree's fit code" in found[0]["reason"]
+    assert "has no host laws beside it" in found[0]["reason"]

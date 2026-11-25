@@ -21,13 +21,13 @@ ladder the config's is a prefix of; of several, reuse comes
 first, then refused, then calibrate. The requirement a verdict names:
 
 1. the same key: none there, a store law, or host laws beside it, at another
-   ATOM digest than the head's, or host laws beside it fitted by other code
-   than this tree's (`run.fit_digest`), or a law file whose host key states
-   another ATOM digest,
+   ATOM digest than the head's, or a law file whose host key states another,
    or a law the runner refuses for the prefill token-graph buckets it records
    whose records ran at another ATOM digest (`records_atom`) or state none,
    since a calibration of the config records them (calibrate); host laws
-   fitted on another host CPU serve, predicting the host they timed;
+   fitted on another host CPU serve, predicting the host they timed, and of
+   several beside a law, those of this host CPU are taken first, then the
+   newest (``produced_at``): a refit whose laws differ is another entry;
 2. not invalidated: a store law the store refuses to load under the head's
    readings (calibrate);
 3. coverage: a decode rung the config schedules with no vector
@@ -56,6 +56,7 @@ are at their key, since the store refuses a second publish there. `stores`
 orders the stores a candidate is looked up in.
 """
 
+import datetime
 import json
 import subprocess
 from pathlib import Path
@@ -63,6 +64,7 @@ from pathlib import Path
 import atom
 from atom.compass import run as compass_run
 from atom.compass.artifacts import (
+    KEY_FIELDS,
     ArtifactRefusal,
     ArtifactStore,
     Axis,
@@ -193,17 +195,15 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
                 raise
             found.append(_verdict("calibrate", 2, f"{where}: {refused}", **read))
             continue
-        here = {"model": model, "atom_src": atom, "fit_src": compass_run.fit_digest()}
+        here = {"model": model, "atom_src": atom}
         here |= keyed_platform(Kind.HOST_LAWS, platform)
         hosts = _keyed(store, Kind.HOST_LAWS, engine, **here)
         if not hosts:
-            why = (
-                f"{where} has no host laws beside it at the head's ATOM digest "
-                "fitted by this tree's fit code"
-            )
+            why = f"{where} has no host laws beside it at the head's ATOM digest"
             found.append(_verdict("calibrate", 1, why, **read))
             continue
-        hosts.sort(key=lambda k: k.values["host_cpu"] != compass_run.host_cpu())
+        cpu = compass_run.host_cpu()
+        hosts.sort(key=lambda k: (k.values["host_cpu"] != cpu, -_produced(store, k)))
         host = runfile._member(store.read(hosts[0]), "params")
         found.append(_judged(where, step[0], host, config, machine, atom) | read)
         found[-1]["run"] = [key.token(), hosts[0].token()]
@@ -311,13 +311,23 @@ def _folded(law: dict) -> dict:
 
 def _keyed(store: ArtifactStore, kind: Kind, engine: dict, **fields) -> list[Key]:
     """The keys of `store`'s `kind` entries that state each of `fields` as
-    given, and `engine` as their engine config, less its graph sets."""
+    given, and `engine` as their engine config, less its graph sets; an entry
+    whose key lacks a field `kind` is keyed by, published before the kind
+    gained it, is skipped."""
     keys = []
     for path in sorted((store.root / kind.value).glob(f"*/{ENTRY_FILE}")):
         key = json.loads(path.read_text())["key"]
-        if at_key(key, engine, **fields):
+        if set(KEY_FIELDS[kind]) <= key.keys() and at_key(key, engine, **fields):
             keys.append(Key.of(kind, **key))
     return keys
+
+
+def _produced(store: ArtifactStore, key: Key) -> float:
+    """When `store`'s entry at `key` was published, its ``produced_at``, in
+    seconds since the epoch."""
+    entry = json.loads((store.directory_for(key) / ENTRY_FILE).read_text())
+    when = entry["provenance"]["produced_at"]
+    return datetime.datetime.fromisoformat(when).timestamp()
 
 
 def at_key(key: dict, engine: dict, **fields) -> bool:

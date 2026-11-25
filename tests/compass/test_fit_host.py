@@ -30,6 +30,7 @@ from test_run_step_grid import B37, decode, deployment, publish, run_file
 
 from atom.compass import run as compass_run
 from atom.compass.artifacts import Key, Kind, keyed_platform
+from atom.compass.artifacts.store import ENTRY_FILE
 from atom.compass.backends.step_labels import digest
 from atom.compass.backends.step_linear_fit import (
     _intakes,
@@ -40,19 +41,24 @@ from atom.compass.backends.step_linear_fit import (
     label_records,
 )
 from atom.compass.drive.aiter_jit import BUILDS
+from atom.compass.fit.host import fit_src
 from atom.compass.runner.overrides import OUT_SEGMENT, forward_shape
 
 
-def host_laws_key(key) -> Key:
-    return Key.of(
-        Kind.HOST_LAWS,
-        host_cpu=key["host_cpu"],
-        atom_src=key["atom"],
-        model=key["model"],
-        engine_config=json.dumps(key["engine"], sort_keys=True),
-        fit_src=compass_run.fit_digest(),
+def host_laws_key(key, tmp_path) -> Key:
+    """The key of the one `host_laws` entry in `tmp_path`'s store fitted under
+    the host key `key` on `PLATFORM`, whose ``fit_src`` the laws give."""
+    values = {
+        "host_cpu": key["host_cpu"],
+        "atom_src": key["atom"],
+        "model": key["model"],
+        "engine_config": json.dumps(key["engine"], sort_keys=True),
         **keyed_platform(Kind.HOST_LAWS, PLATFORM),
-    )
+    }
+    entries = (tmp_path / "store" / Kind.HOST_LAWS.value).glob(f"*/{ENTRY_FILE}")
+    keys = [json.loads(entry.read_text())["key"] for entry in entries]
+    [held] = [k for k in keys if values.items() <= k.items()]
+    return Key.of(Kind.HOST_LAWS, **held)
 
 
 def test_the_host_laws_published_are_fit_hosts_and_a_run_file_carrying_them_runs(
@@ -65,13 +71,13 @@ def test_the_host_laws_published_are_fit_hosts_and_a_run_file_carrying_them_runs
     b = record(tmp_path / "b", 20, key=key, trace="trace-b")
     fit(tmp_path, "fit host", a, b, *clients(a, b))
 
-    host = member(tmp_path / "store", host_laws_key(key), "params")
+    host = member(tmp_path / "store", host_laws_key(key, tmp_path), "params")
     # In run digest order, as the command reads them: a least-squares fit's
     # last bits depend on the order of its samples.
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     laws, report = fit_host(label_records(paths)[0])
     platform = keyed_platform(Kind.HOST_LAWS, PLATFORM)
-    fitted = {**platform, "fit_src": compass_run.fit_digest()}
+    fitted = {**platform, "fit_src": fit_src(laws)}
     assert host == {**laws, "key": {**laws["key"], **fitted}}
     # Records with no tokenizer calls or intake stamps give none of these terms.
     report["unfitted"].update(
@@ -79,7 +85,7 @@ def test_the_host_laws_published_are_fit_hosts_and_a_run_file_carrying_them_runs
         http_intake=f"no record holds steps/{compass_run.INTAKE_RECORD}",
         hops=f"no record holds steps/{compass_run.INTAKE_RECORD}",
     )
-    assert member(tmp_path / "store", host_laws_key(key), "report") == {
+    assert member(tmp_path / "store", host_laws_key(key, tmp_path), "report") == {
         "provenance": served(key, {a: "trace-a", b: "trace-b"}),
         **report,
     }
@@ -104,9 +110,9 @@ def test_a_stated_hop_is_written_into_the_entry_s_hops_and_named_in_its_report(
     stated = ["--stated-hop", "router_s=0.0015", "--stated-hop", "kv_write_req_s=1e-4"]
     fit(tmp_path, "fit host", a, *clients(a), *stated)
 
-    host = member(tmp_path / "store", host_laws_key(key), "params")
+    host = member(tmp_path / "store", host_laws_key(key, tmp_path), "params")
     assert host["hops"] == {"router_s": 0.0015, "kv_write_req_s": 1e-4}
-    report = member(tmp_path / "store", host_laws_key(key), "report")
+    report = member(tmp_path / "store", host_laws_key(key, tmp_path), "report")
     assert report["stated_hops"] == host["hops"]
 
 
@@ -132,9 +138,9 @@ def test_a_stated_ingress_is_written_as_the_entry_s_term_and_named_in_its_report
         str(tmp_path / "ingress.json"),
     )
 
-    host = member(tmp_path / "store", host_laws_key(key), "params")
+    host = member(tmp_path / "store", host_laws_key(key, tmp_path), "params")
     assert host["ingress"] == term
-    report = member(tmp_path / "store", host_laws_key(key), "report")
+    report = member(tmp_path / "store", host_laws_key(key, tmp_path), "report")
     assert report["stated_ingress"] == {
         "file": str(tmp_path / "ingress.json"),
         "ingress": term,
@@ -218,7 +224,7 @@ def test_records_with_pull_stamps_give_every_kind_an_E_out_law_a_run_prices(
     pulled(a / "steps/dp0.jsonl")
     fit(tmp_path, "fit host", a, *clients(a))
 
-    host = member(tmp_path / "store", host_laws_key(key), "params")
+    host = member(tmp_path / "store", host_laws_key(key, tmp_path), "params")
     assert {k: OUT_SEGMENT in v for k, v in host["laws"].items()} == {
         k: True for k in ("decode", "prefill", "middle")
     }
@@ -249,7 +255,7 @@ def test_a_dp_pair_s_host_laws_start_E_at_the_group_s_latest_pull(tmp_path):
         pulled(path, parts)
     fit(tmp_path, "fit host", a, *clients(a))
 
-    laws = member(tmp_path / "store", host_laws_key(key), "params")["laws"]
+    laws = member(tmp_path / "store", host_laws_key(key, tmp_path), "params")["laws"]
     alone = [fit_host(label_records([p])[0])[0]["laws"] for p in paths]
     assert set(laws) == {"decode", "prefill", "middle"}
     for kind, law in laws.items():
@@ -401,7 +407,7 @@ def test_a_record_s_tokenizer_calls_and_intake_stamps_fit_the_entry_s_terms(
     stamped(a, burst=(40_000, 60_000, 50_000, 45_000))
     fit(tmp_path, "fit host", a, *clients(a))
 
-    host = member(tmp_path / "store", host_laws_key(key), "params")
+    host = member(tmp_path / "store", host_laws_key(key, tmp_path), "params")
     tok, intake = host["tokenizer"], host["http_intake"]
     assert {k: tok[k] for k in TOKENIZER} == TOKENIZER
     assert tok["encode"] == pytest.approx(
@@ -424,7 +430,7 @@ def test_a_record_s_tokenizer_calls_and_intake_stamps_fit_the_entry_s_terms(
         },
         rel=1e-6,
     )
-    report = member(tmp_path / "store", host_laws_key(key), "report")
+    report = member(tmp_path / "store", host_laws_key(key, tmp_path), "report")
     assert not _unfitted(report) and report["http_intake"]["burst"]["requests"] == 4
     # The segment tokenizer call's own work: its wall less its encode_batch's,
     # over the ids that returned.
@@ -585,8 +591,8 @@ def test_a_term_the_records_cannot_give_is_left_out_and_listed_unfitted(
         stamped(a, lone, burst, encodes=encodes)
     fit(tmp_path, "fit host", a, *clients(a))
 
-    host = member(tmp_path / "store", host_laws_key(HOST), "params")
-    report = member(tmp_path / "store", host_laws_key(HOST), "report")
+    host = member(tmp_path / "store", host_laws_key(HOST, tmp_path), "params")
+    report = member(tmp_path / "store", host_laws_key(HOST, tmp_path), "report")
     assert _unfitted(report) == unfitted
     left = {t.split(".")[-1] for t in unfitted}
     assert not left & (set(host) | set(host.get("tokenizer", {})))
@@ -619,8 +625,8 @@ def test_with_no_burst_or_a_negative_one_fixed_s_is_idle_s_and_a_run_charges_it(
     stamped(a, burst=burst, fixed=fixed)
     fit(tmp_path, "fit host", a, *clients(a))
 
-    host = member(tmp_path / "store", host_laws_key(HOST), "params")
-    report = member(tmp_path / "store", host_laws_key(HOST), "report")
+    host = member(tmp_path / "store", host_laws_key(HOST, tmp_path), "params")
+    report = member(tmp_path / "store", host_laws_key(HOST, tmp_path), "report")
     assert host["http_intake"] == pytest.approx(
         {
             "fixed_s": IDLE,
@@ -647,8 +653,8 @@ def test_fixed_s_is_the_mean_over_every_burst_of_every_record(tmp_path):
     stamped(b, burst=(45_000, 55_000, 65_000, 35_000, 50_000), fixed=1e-3)
     fit(tmp_path, "fit host", a, b, *clients(a, b))
 
-    host = member(tmp_path / "store", host_laws_key(HOST), "params")
-    report = member(tmp_path / "store", host_laws_key(HOST), "report")
+    host = member(tmp_path / "store", host_laws_key(HOST, tmp_path), "params")
+    report = member(tmp_path / "store", host_laws_key(HOST, tmp_path), "report")
     values = [2e-3] * 2 + [1e-3] * 4
     assert host["http_intake"]["fixed_s"] == pytest.approx(np.mean(values), rel=1e-6)
     assert report["http_intake"]["burst"] == pytest.approx(
@@ -853,7 +859,7 @@ def test_a_pipeline_s_entry_holds_each_stage_s_laws_and_its_frontend_s_terms_onc
     a = _pipeline(tmp_path / "a")
     fit(tmp_path, "fit host", a, *clients(a))
 
-    key = host_laws_key({**HOST, "engine": PP2})
+    key = host_laws_key({**HOST, "engine": PP2}, tmp_path)
     host = member(tmp_path / "store", key, "params")
     report = member(tmp_path / "store", key, "report")
     assert {"tokenizer", "http_intake"} <= set(host) and "laws" not in host

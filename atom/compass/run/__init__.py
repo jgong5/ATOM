@@ -459,9 +459,6 @@ _PARALLEL_TOKENIZER = {"TOKENIZERS_PARALLELISM": "true"}
 #: The module `pip install -e .` writes (setuptools_scm) and git ignores: no
 #: commit holds it, so the host-law key leaves it out.
 INSTALL_WRITTEN = Path("_version.py")
-#: The code `compass fit host` fits host laws with, by path under the package:
-#: its module, then the module whose functions it imports to fit with.
-FIT_CODE = ("compass/fit/host.py", "compass/backends/step_linear_fit.py")
 #: The run-file key of each backend a flag names (`atom.compass.drive.runfile`).
 STEP_STUB, STEP_LINEAR, STEP_GRID = "step_stub", "step_linear", "step_grid"
 OP_GRAPH, PRICE_LIST = "op_graph", "price_list"
@@ -654,9 +651,9 @@ def refuse_context_parallel(name: str, config) -> None:
 def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     """Refuse the run file's host laws `host` when fitted under another host
     key than this run's, on `platform` (`machine_platform`), the host CPU,
-    graph sets and fit code (`fit_digest`) their key states taken as this
-    run's, which records none, and its engine config read at their ladder where
-    this run's is a prefix of it."""
+    graph sets and digest of what was fitted (``fit_src``) their key states
+    taken as this run's, which records none, and its engine config read at
+    their ladder where this run's is a prefix of it."""
     from atom.compass.artifacts import Kind, keyed_platform
     from atom.compass.backends.launch_features import GRAPHS, stated
     from atom.compass.backends.step_grid_plan import at_ladder
@@ -671,7 +668,7 @@ def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
         # The host they timed is the host the run predicts, from any CPU.
         ours["host_cpu"] = theirs["host_cpu"]
     if ours and "fit_src" in theirs:
-        # The code that fitted them, which says nothing of the run they price.
+        # The digest of the laws themselves, which says nothing of the run.
         ours["fit_src"] = theirs["fit_src"]
     if ours:
         ours["engine"] = at_ladder(ours["engine"], theirs.get("engine"))
@@ -3480,48 +3477,6 @@ def atom_text(path: Path, relative: Path) -> bytes | None:
         if node is doc or names & skip:
             del lines[prev.end_lineno if prev else 0 : node.end_lineno]
     return b"".join(lines)
-
-
-def fit_digest(root: Path | None = None) -> str:
-    """The sha256 of the code `compass fit host` fits host laws with, here or
-    in the package directory `root` (`FIT_CODE`): its module, and of the module
-    it fits with each top-level statement, with the comments above it, that
-    defines a name it imports from there or a name such a statement reads."""
-    root = Path(atom.__file__).parent if root is None else root
-    command, fitter = (root / path for path in FIT_CODE)
-    module = "atom." + FIT_CODE[1].removesuffix(".py").replace("/", ".")
-    wanted = [
-        alias.name
-        for node in ast.walk(ast.parse(command.read_bytes()))
-        if isinstance(node, ast.ImportFrom) and node.module == module
-        for alias in node.names
-    ]
-    if not wanted:
-        raise ValueError(f"{command} imports no name from {module} to fit with")
-    lines = fitter.read_bytes().splitlines(keepends=True)
-    body = ast.parse(b"".join(lines)).body
-    defined = {name: node for node in body for name in _defines(node)}
-    reached = set()
-    while wanted:
-        if (name := wanted.pop()) in defined and name not in reached:
-            reached.add(name)
-            wanted += [n.id for n in ast.walk(defined[name]) if isinstance(n, ast.Name)]
-    digest = hashlib.sha256(command.read_bytes())
-    for prev, node in zip([None, *body], body):
-        if _defines(node) & reached:
-            digest.update(
-                b"".join(lines[prev.end_lineno if prev else 0 : node.end_lineno])
-            )
-    return digest.hexdigest()
-
-
-def _defines(node) -> set[str]:
-    """The names the top-level statement `node` defines: its def's or class's,
-    or each it assigns."""
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return {node.name}
-    targets = [*getattr(node, "targets", ()), getattr(node, "target", None)]
-    return {n.id for t in targets if t for n in ast.walk(t) if isinstance(n, ast.Name)}
 
 
 def committed_atom_digest(repo: Path, commit: str) -> str:
