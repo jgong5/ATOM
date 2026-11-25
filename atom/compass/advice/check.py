@@ -37,13 +37,14 @@ step linear law of the configuration at the head's ATOM digest nor readings at
 their key, nor a stale entry at the readings key of a later candidate looked up
 there, none of whose verdicts is refused, that names that calibration (below),
 since it refuses a second publish at a key, else into the calibration's own.
-Where an earlier candidate none of whose verdicts is refused calibrates a law
-at the same key, by model, platform and engine config, a candidate names that
-calibration in place of its own command, which the store would refuse as a
-second law at the key, with the command measuring its readings into the store
-that calibration publishes into, unless they are at their key there; into the
-calibration's own store, only once it has started, as a publish there before
-would leave its directory holding files, which `calibrate.sh` refuses.
+Where an earlier candidate none of whose verdicts is refused
+calibrates a law at the same key, by model, platform and engine config, a
+candidate names that calibration in place of its own command, which the store
+would refuse as a second law at the key, with the command measuring its
+readings into the store that calibration publishes into, unless they are at
+their key there; into the calibration's own store, only once it has started,
+as a publish there before would leave its directory holding files, which
+`calibrate.sh` refuses.
 A calibration that has ended records nothing more, so the next goes into a new
 directory; where a lone server's would take what the ended one took and the
 law it fitted is at the configuration's key at the head's ATOM digest
@@ -665,9 +666,9 @@ def _judged(store, machine, atom, seen: dict, made, side: str, one: dict) -> tup
     a store, both kept in `seen`. A 1P1D `side` runs as `_side` gives it, on
     the simulated connector. `made` is the calibration's directory, traces and
     the shared store a ``calibrate`` verdict's command may take, or None,
-    which `seen` keeps a verdict apart for, and the directory of one that ended
-    before it, or None, whose law a command refitting it (`_refits`) gives way
-    to `REFITS`; a ``calibrate`` verdict states, for
+    which `seen` keeps a verdict apart for, and the directory
+    of one that ended before it, or None, whose law a command refitting it
+    (`_refits`) gives way to `REFITS`; a ``calibrate`` verdict states, for
     `_borrowing`, its ``calibration``: the ``key`` its law is published at, by
     model, platform and engine config, and on one server its directory,
     ``in``, and the store it publishes ``into``; one giving way to `REFITS`,
