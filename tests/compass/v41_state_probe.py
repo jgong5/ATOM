@@ -129,9 +129,10 @@ def ops_placements(
     pool view's name and offset from ATOM's on the bench, or refusal and None.
     With `tail`, the step publishes a bounded replay's tail `tail` rows wide,
     each request's window starting at its first row (`_publish_decoder`).
-    At `kv` fp8, each pool view is taken as its values and scales, `_scale`,
-    as `fp8_attention._split` passes them: the main pool's owner's planes and
-    the ring's (`main_view`, `ring_view`)."""
+    At `kv` fp8, the leaf is the attention ATOM calls on its FP8 planes,
+    `mla_sparse_prefill_v41`: the pool, its owner's planes at `ratio` and none
+    at ratio 0 (`main_view`), and the ring's (`ring_view`), each its data and
+    its scales as `fp8_attention._split` types them, by aiter's slots."""
     import torch
 
     here = pathlib.Path(__file__).parent
@@ -149,7 +150,7 @@ def ops_placements(
     point = point or decode(2)
     tokens = point.tokens * (1 + drafts if point.phase == "decode" else 1)
     built = assembled(cache_of(drafts, kv), point.seqs, tokens)
-    named = dict(zip(("pool", "ring"), ops._FP8_SLOTS))
+    named = {"pool": ("unified_kv", "unified_kv_scale"), "ring": ("kv", "kv_scale")}
     split = {"fp8": lambda f, t: zip(named[f], _split(t, 512))}
     split = split.get(kv, lambda f, t: [(f, t)])
 
