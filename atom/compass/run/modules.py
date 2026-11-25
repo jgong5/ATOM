@@ -39,11 +39,19 @@ module's own per-rank parameter shapes and attributes:
   context-parallel group, and its fp8 forms switched on by
   `ATOM_USE_FLYDSL_FP8_PREFILL_ATTN` and `ATOM_USE_TRITON_MXFP4_BMM`, are
   unclassified.
-- `SiluAndMul`: the input width of the one row-parallel linear beside it.
-- a torch or transformers activation module, the vision tower, and V4's
-  rotary tables: nothing. ATOM's text stacks call no bare activation module
-  (GDN holds one it never calls), the backend refuses a step with images, and
-  V4 reads its tables inside the attention and compressor kernels.
+- `SiluAndMul`, Kimi-K3's `SituAndMul`: the input width of the one
+  row-parallel linear beside it.
+- Kimi-K3's `KimiKDAAttention` (GLM-5.3-Flash's too), priced and then gone
+  into: one causal convolution over its q, k and v channels, and its KDA
+  recurrence, at the rank's heads and head dim and the state pool's format.
+  Its in-projection is one GEMM, its beta and forget-gate projections folded
+  into it after load; its q, k and v convolutions run as the one. Its
+  `KimiRMSNormGated` normalizes each head of a token by its gate.
+- a torch or transformers activation module, the vision towers, a NoPE
+  model's identity rotary, and V4's rotary tables: nothing. ATOM's text
+  stacks call no bare activation module (GDN holds one it never calls), the
+  backend refuses a step with images, and V4 reads its tables inside the
+  attention and compressor kernels.
 - `PPMissingLayer`, which a pipeline stage holds where another stage runs the
   layer, and a `VocabParallelEmbedding` on any stage but the first, which a
   tied last stage holds only to load its LM head from: nothing.
@@ -135,13 +143,11 @@ serial drafters ATOM maps (#3984).
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
 first of each class comes back as an `unclassified` module named by class
-and path, which the backend refuses. Two are refused by name: Kimi-K3's
-`KimiKDAAttention`, not gone into, whose KDA recurrence runs inside its
-forward, in no module the walk reads, and an `Attention` with a sliding
-window, which no roofline class prices over its window. The first of each
-comes back as such a module whose name also says why and the issue that
-would price it. Each module carries the index of the decoder layer it sits
-in, read off its path.
+and path, which the backend refuses. One is refused by name: an
+`Attention` with a sliding window, which no roofline class prices over its
+window. The first comes back as such a module whose name also says why and
+the issue that would price it. Each module carries the index of the decoder
+layer it sits in, read off its path.
 """
 
 import dataclasses
@@ -179,9 +185,16 @@ NORMS = tuple(
     OPS + "layernorm." + n for n in ("RMSNorm", "GemmaRMSNorm", "RMSNormGated")
 )
 #: Modules that price nothing: activation modules ATOM's text stacks hold and
-#: never call, and the vision tower.
+#: never call, and the vision towers.
 SILENT = ("torch.nn.modules.activation", "transformers.activations")
-VISION = "atom.models.qwen3_5_vl.Qwen3VisionTransformer"
+VISION = (
+    "atom.models.qwen3_5_vl.Qwen3VisionTransformer",
+    "atom.models.kimi_k3_vl.KimiK3VisionTower",
+    "atom.models.kimi_k3_vl.KimiK3PatchMergerProjector",
+)
+#: The rotary of a model with no positional encoding: its forward returns Q
+#: and K as they are (Kimi-K3's MLA layers).
+NOPE = OPS + "rotary_embedding.NoPositionalRotaryEmbedding"
 #: A pipeline stage's stand-in for a layer another stage runs.
 PP_MISSING = "atom.models.utils.PPMissingLayer"
 M3 = "atom.models.minimax_m3.model."
@@ -220,9 +233,16 @@ V41_SILENT = (
 HELD = tuple(f"w{w}_{p}" for w in (13, 2) for p in ("weight", "weight_scale", "bias"))
 #: The containers a serial drafter's model holds its MTP layers in.
 LISTS = (torch.nn.ModuleList, torch.nn.ModuleDict)
-#: Kimi-K3's KDA attention, and why the walk refuses it.
-KDA = "atom.models.kimi_k3.model.KimiKDAAttention"
-KDA_REFUSED = "Kimi-K3's KDA recurrence; no roofline class prices it before #3963"
+K3 = "atom.models.kimi_k3."
+#: Kimi-K3's KDA attention, its gated output norm and its activation.
+KDA, GATED_NORM = K3 + "model.KimiKDAAttention", K3 + "model.KimiRMSNormGated"
+ACTS = (OPS + "activation.SiluAndMul", K3 + "model.SituAndMul")
+#: What a KDA layer runs inside its own kernels: one causal convolution over
+#: `conv_weight`, the q, k and v kernels concatenated, and the in-projection
+#: its beta and forget-gate tails (and GLM-5.3's output gate) fold into after
+#: load (`KimiKDAAttention.process_weights_after_loading`).
+KDA_HELD = ("q_conv1d", "k_conv1d", "v_conv1d", "b_proj", "f_a_proj")
+KDA_HELD += ("g_a_proj", "g_b_proj")
 #: Why the walk refuses an `Attention` with a sliding window.
 WINDOW_REFUSED = "a sliding window; no roofline class prices it before #3965"
 LAYER = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
@@ -400,7 +420,8 @@ def _inside(module, parent) -> bool:
     """Whether `module` runs inside a kernel its V4.1 parent is priced as: a
     block's norms in its mixes, an attention's Q and KV norms in their one
     launch, a compressor's norm in its pooling, an indexer's key projection
-    and norm in its index keys."""
+    and norm in its index keys; or inside a KDA layer's convolution or
+    in-projection (`KDA_HELD`)."""
     held = ()
     if _is(parent, V41_BLOCK):
         held = ("attn_norm", "ffn_norm")
@@ -410,6 +431,8 @@ def _inside(module, parent) -> bool:
         held = ("norm",)
     elif _is(parent, V41_INDEXER):
         held = ("wk", "k_norm")
+    elif _is(parent, KDA):
+        held = KDA_HELD
     return any(module is getattr(parent, h, None) for h in held)
 
 
@@ -453,7 +476,7 @@ def _classify(module, name, parent):
     if parent is not None and _inside(module, parent):
         return NOTHING
     if _is(module, KDA):
-        return KDA_REFUSED
+        return (*_kda(module, name), DESCEND)
     weight = getattr(module, "weight", None)
     fmt = FORMATS.get(getattr(weight, "dtype", None))
     if _is(module, V4 + "Block"):
@@ -541,6 +564,12 @@ def _classify(module, name, parent):
         logits = _is(parent, *NORMED_IN_LOGITS) and module is parent.norm
         dims = (weight.shape[0],)
         return Module(name, "norm", dims, ranks=tp, fused=tp > 1, logits=logits)
+    if _is(module, GATED_NORM) and _is(parent, KDA):
+        # Each head of each token, its output in fp8 where it fuses o_proj's
+        # per-token quant (`rmsnorm_gated`).
+        out = FORMATS.get(module.quant_dtype or torch.bfloat16)
+        dims = (parent.num_local_heads * weight.shape[0],)
+        return out and Module(name, "gated_norm", dims, out)
     if _is(module, "aiter.rotary_embedding.RotaryEmbedding"):
         return Module(name, "rotary", (module.rotary_dim,))
     if _is(module, OPS + "paged_attention.Attention"):
@@ -561,10 +590,10 @@ def _classify(module, name, parent):
         dims = (module.num_v_heads // tp, module.num_k_heads // tp)
         dims += (module.head_k_dim, module.head_v_dim)
         return state and Module(name, "linear_attention", dims, state)
-    if _is(module, OPS + "activation.SiluAndMul"):
+    if _is(module, *ACTS):
         down = [c for c in parent.children() if _is(c, ROW)]
         return len(down) == 1 and Module(name, "act", (_in_width(down[0]),)) or None
-    if _is(module, VISION, V4_ROPE, PP_MISSING, *V41_SILENT):
+    if _is(module, *VISION, NOPE, V4_ROPE, PP_MISSING, *V41_SILENT):
         return NOTHING
     if type(module).__module__.startswith(SILENT):
         return NOTHING
@@ -607,6 +636,29 @@ def _csa2(module, name):
         keys = (ix.head_dim, module.head_dim, spec.ratio)
         found.append(Module(f"{name}.indexer", "index_keys", keys, index))
     return found
+
+
+def _kda(module, name):
+    """A KDA layer's work outside its linears and norm
+    (`KimiKDAAttention._forward_impl`): one causal convolution over its q, k
+    and v channels, and the recurrence, at the rank's heads and head dim, its
+    state at the pool's format (`GDNStateMixin._state_dtypes`: a KDA model's
+    is `ATOM_GDN_SSM_DTYPE`, fp32 by default, a 2-byte one at bf16's bytes);
+    then 1 where its decode rows run ReplaySSM, as the GDN builder decides it:
+    under speculative decoding unless `ATOM_ENABLE_REPLAYSSM` says otherwise."""
+    from atom.config import get_current_atom_config
+    from atom.utils import envs
+
+    spec = get_current_atom_config().speculative_config
+    replayssm = envs.ATOM_ENABLE_REPLAYSSM
+    if replayssm is None:
+        replayssm = bool(spec and spec.num_speculative_tokens)
+    state = "fp32" if envs.ATOM_GDN_SSM_DTYPE == "fp32" else "bf16"
+    dims = (module.num_local_heads, module.head_dim, int(replayssm))
+    return (
+        Module(f"{name}.conv", "conv", (3 * module.local_proj_size,)),
+        Module(name, "kda", dims, state),
+    )
 
 
 def _dspark(module, name):
