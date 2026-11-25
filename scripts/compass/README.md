@@ -790,6 +790,32 @@ On node 18 (`xiaobizh_n18_next13`), `tests/attentions/deepseek_v41/test_tbo.py`
 hangs; a run that passes `--ignore` for it reads that file's passes short of
 `BASE_PASSED`.
 
+### The capability matrix — `capability_table.py`
+
+Each scenario case carries a mark, `capability(name, level)`, naming a form of
+`tests/compass/capabilities.py` (`08` D120): level 0 when its run file names the
+step stub, level 1 when it names the step roofline alone, on
+`tests/compass/machines/mi355x-gpu40.json` (`cost_overrides`). A level-1 case
+holds its level-0 twin's checks but those on step timing, which its docstring
+names: always the hand-computed timeline, which `check_run` computes only for a
+constant stub, and at DP above 1 which rank serves which request. The table is
+printed from pytest's collection:
+
+```bash
+python3 scripts/compass/capability_table.py                    # every collected case counts
+scripts/compass/gate_gpu.sh -vv 2>&1 | tee gate_gpu.log
+python3 scripts/compass/capability_table.py --log gate_gpu.log # only a case it reports PASSED counts
+```
+
+A row gives a form's highest level, its cases at level 0 and at level 1, or for a
+refused form its refusal test; a form with no case or no refusal test yet names
+the issue that adds it. The script exits 1 naming each finding: an unknown form
+or level, a mark on a refused form, a supported form with no level-0 case, a
+refusal test that does not collect, and an entry still naming its issue once a
+case of it collects or it names its refusal test. The change that adds a form's
+first case or refusal test drops the issue from its entry.
+`tests/compass/test_capability_matrix.py` runs it in the CPU gate.
+
 ## Why the gates refuse a caller-supplied `-r`
 
 Both gates forward `"$@"` to pytest. pytest's `-r` is **store-last-wins**, so a

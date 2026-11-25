@@ -26,6 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from capabilities import ROOFLINE, ROOFLINE_MACHINE, capability, cost_overrides
 from test_dp_slice import DP_MACHINE, MAX_TOKENS, Requests
 from test_kv_remote_prefill import Script, connector
 from test_kv_simulated_connector import PEAKS, geometry, model_for  # noqa: F401
@@ -59,9 +60,12 @@ FORMS = {
 }
 
 
-def run_pd_dp(out: Path, seed: str, form: str, sides=None) -> dict:
+def run_pd_dp(
+    out: Path, seed: str, form: str, sides=None, backend=CONSTANT, machine=DP_MACHINE
+) -> dict:
     """One run under `pd_sim.sh` at DP width 2 on each side, or at `sides`,
-    (prefill width, decode width), each side at its own."""
+    (prefill width, decode width), each side at its own, priced by `backend`
+    on `machine` (`cost_overrides`)."""
     cell, requests = FORMS[form]
     p, d = sides or (DP, DP)
     widths, flags = {"data_parallel_size": DP}, {"SERVER_ARGS": SERVER_ARGS}
@@ -83,8 +87,7 @@ def run_pd_dp(out: Path, seed: str, form: str, sides=None) -> dict:
             out,
             clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
             **widths,
-            step_stub=CONSTANT,
-            machine=DP_MACHINE,
+            **cost_overrides(backend, machine),
             **PD,
         )
         env = dict(
@@ -98,7 +101,7 @@ def run_pd_dp(out: Path, seed: str, form: str, sides=None) -> dict:
             **cell,
             **{name: str(port) for name, port in ports.items()},
         )
-        publish_pd_entries(out / "store", DP_MACHINE, env)
+        publish_pd_entries(out / "store", machine, env)
         log = out / "pd_sim.log"
         with open(log, "w") as f:
             sim = subprocess.Popen(
@@ -145,6 +148,7 @@ def runs(request, tmp_path_factory):
 
 
 @NEEDS_A_PD_RUN
+@capability("pd_dp")
 def test_every_request_meets_every_scenario_check_with_a_kv_transfer_over_its_rank_pair(
     runs,
 ):
@@ -168,6 +172,55 @@ def test_every_request_meets_every_scenario_check_with_a_kv_transfer_over_its_ra
     # The requests were spread over both ranks of each side.
     assert {p.split(".")[0] for p in pairs} == {"dp0", "dp1"}
     assert {p.split(".")[1] for p in pairs} == {"dp0", "dp1"}
+    assert run["handed_in"] == sorted(
+        compass_run.LP_FILE.format(n)
+        for n in ["frontend-P", "frontend-D"]
+        + [f"engine-{s}.dp{r}" for s in "PD" for r in range(DP)]
+    )
+
+
+@pytest.fixture(scope="module", params=FORMS)
+def roofline_runs(request, tmp_path_factory):
+    root = tmp_path_factory.mktemp(f"pd_dp_roofline_{request.param}")
+    return [
+        run_pd_dp(
+            root / f"seed{s}",
+            s,
+            request.param,
+            backend=ROOFLINE,
+            machine=ROOFLINE_MACHINE,
+        )
+        for s in ("1", "2")
+    ]
+
+
+@NEEDS_A_PD_RUN
+@capability("pd_dp", 1)
+def test_every_request_meets_every_scenario_check_under_the_step_roofline(
+    roofline_runs,
+):
+    """The level-0 case's checks but two. The hand-computed timelines of
+    engine-P and engine-D, `check_run`'s records, which it computes only for a
+    constant step stub, from that stub's prefill and decode costs. And that the
+    requests spread over both ranks of each side: the rank a request lands on
+    follows the in-flight load when it arrives, which turns on when earlier
+    requests finish, and so on the step cost."""
+    run = roofline_runs[0]
+    rows = [r.split() for r in run["table"].splitlines()[1:]]
+    pairs = Counter(
+        r[4].rpartition("#")[2]
+        for r in rows
+        if r[3] == "release" and ":kv_write_req#" in r[4]
+    )
+    print(f"\n{run['summary']['schedule']['seconds_by_method']}")
+    print("KV transfers per decode.prefill rank pair:", dict(sorted(pairs.items())))
+    failed = check_run(
+        [r["out"] for r in roofline_runs],
+        MAX_TOKENS,
+        [line for _, line in run["events"]],
+    )
+    assert not failed, "\n".join(failed)
+    assert sum(pairs.values()) == len(MAX_TOKENS)
     assert run["handed_in"] == sorted(
         compass_run.LP_FILE.format(n)
         for n in ["frontend-P", "frontend-D"]

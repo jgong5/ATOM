@@ -99,9 +99,11 @@ run` writes, a shape the store holds no graph at is traced first, in the
 one process each engine spawns for its traces, the model built once there,
 and published there, or from a tree with uncommitted files kept for this run
 alone, unpublished, and a trace that fails ends the run, naming the shape),
+or none of them and ``step_roofline`` alone;
 ``step_roofline`` (optional, ``true`` or ``false``: with ``true`` a
 `StepRooflineBackend` prices the steps the backend refuses, through
-`StepFallbackBackend`, as it always does under ``step_grid``, from the
+`StepFallbackBackend`, as it always does under ``step_grid``, or, with none of
+the four, every step, as the run's only backend; from the
 modules `run.modules.walk` reads off the meta build and its block drafter's,
 `run.modules.drafter`), ``padding`` (optional:
 ``none`` prices a replayed graph's real rows in place of the rows it pads to,
@@ -461,6 +463,7 @@ _PARALLEL_TOKENIZER = {"TOKENIZERS_PARALLELISM": "true"}
 INSTALL_WRITTEN = Path("_version.py")
 #: The run-file key of each backend a flag names (`atom.compass.drive.runfile`).
 STEP_STUB, STEP_LINEAR, STEP_GRID = "step_stub", "step_linear", "step_grid"
+STEP_ROOFLINE = "step_roofline"
 OP_GRAPH, PRICE_LIST = "op_graph", "price_list"
 #: The run-file key of ATOM's arguments an op graph run's server was started with.
 ATOM_ARGS = "atom_args"
@@ -2264,10 +2267,20 @@ def runner(model_runner, tree) -> None:
         pick_fitted(run, name, config)
     backends = (STEP_STUB, STEP_LINEAR, STEP_GRID, OP_GRAPH)
     keys = [k for k in backends if k in run]
-    if len(keys) != 1:
+    fallback = run.get(STEP_ROOFLINE, False)
+    if not isinstance(fallback, bool):
+        raise TypeError(
+            f"the run file's step_roofline is {fallback!r}; it is true, which "
+            "prices the steps the backend refuses by the step roofline, or every "
+            "step when the run file names no other backend, or false"
+        )
+    # The step roofline alone prices every step; beside one backend, the steps
+    # that backend refuses.
+    if len(keys) > 1 or not (keys or fallback):
         raise ValueError(
-            f"a run file prices its steps from one of {', '.join(backends[:-1])} "
-            f"and {backends[-1]}, and this one has {' and '.join(keys) or 'none'}"
+            f"a run file prices its steps from one of {', '.join(backends)}, or "
+            f"from {STEP_ROOFLINE} alone, and this one has "
+            f"{' and '.join(keys) or 'none'}"
         )
     replay = None
     if "replay" in run:
@@ -2340,12 +2353,6 @@ def runner(model_runner, tree) -> None:
     # reading warmed up with are the ones this deployment's warmup runs.
     warmup = measured.values["warmup_tokens"]
     model = ModelTerms.from_tree(tree, activations=measured.activations())
-    fallback = run.get("step_roofline", False)
-    if not isinstance(fallback, bool):
-        raise TypeError(
-            f"the run file's step_roofline is {fallback!r}; it is true, which "
-            "prices the steps the backend refuses by the step roofline, or false"
-        )
     padding = run.get("padding", "executed")
     if padding not in ("executed", "none"):
         raise ValueError(
@@ -2377,7 +2384,7 @@ def runner(model_runner, tree) -> None:
 
         modules = walk(tree, drafter(config))
         roofline = StepRooflineBackend(machine, modules, padded=padding != "none")
-        backend = StepFallbackBackend(backend, roofline)
+        backend = StepFallbackBackend(backend, roofline) if keys else roofline
     pp = getattr(config, "pipeline_parallel_size", 1)
     if pp > 1 and tp > 1 and not hasattr(backend, "all_gather_s"):
         from atom.utils import envs

@@ -35,6 +35,7 @@ import pytest
 import torch
 import uvicorn
 from aiter_stub import stubbed_aiter
+from capabilities import ROOFLINE, ROOFLINE_MACHINE, capability, cost_overrides
 from conftest import atom_config_double
 from starlette.responses import JSONResponse
 from test_vertical_slice import (
@@ -108,13 +109,16 @@ def publish_pd_entries(store, machine, env, publish=publish_entry) -> None:
         publish(store, machine, [*argv, "--kv-transfer-config", kv], env)
 
 
-def run_pd(out: Path, seed: str) -> dict:
-    """One run under `pd_sim.sh`; its step table and request times."""
+def run_pd(out: Path, seed: str, backend=CONSTANT, machine=DOCUMENT) -> dict:
+    """One run under `pd_sim.sh`, priced by `backend` on `machine`
+    (`cost_overrides`); its step table and request times."""
     out.mkdir()
     with held_ports(len(PORTS)) as drawn:
         ports = dict(zip(PORTS, drawn))
         endpoint = f"tcp://127.0.0.1:{ports['CLOCK_PORT']}"
-        run_file = _run_file(out, clock_endpoint=endpoint, step_stub=CONSTANT, **PD)
+        run_file = _run_file(
+            out, clock_endpoint=endpoint, **cost_overrides(backend, machine), **PD
+        )
         env = dict(
             os.environ,
             PYTHONHASHSEED=seed,
@@ -125,7 +129,7 @@ def run_pd(out: Path, seed: str) -> dict:
             DECODE_EXEC=os.environ.get("ATOM_COMPASS_PD_DECODE_EXEC", ""),
             **{name: str(port) for name, port in ports.items()},
         )
-        publish_pd_entries(out / "store", DOCUMENT, env)
+        publish_pd_entries(out / "store", machine, env)
         log = out / "pd_sim.log"
         with open(log, "w") as f:
             sim = subprocess.Popen(
@@ -199,6 +203,7 @@ def test_one_request_crosses_atomesh_to_prefill_and_decode(runs):
 
 
 @NEEDS_A_PD_RUN
+@capability("pd_1p1d")
 def test_one_request_meets_every_scenario_check(runs):
     run = runs[0]
     parity = run["out"] / "parity"
@@ -207,6 +212,35 @@ def test_one_request_meets_every_scenario_check(runs):
         [MAX_TOKENS],
         [line for _, line in run["events"]],
         {"engine-P": parity / "prefill", "engine-D": parity / "decode"},
+    )
+    assert not failed, "\n".join(failed)
+    assert run["handed_in"] == [compass_run.LP_FILE.format(lp) for lp in LPS[:-1]]
+    assert 0 < run["summary"]["cost"]["wall_seconds"]
+
+
+@pytest.fixture(scope="module")
+def roofline_runs(tmp_path_factory):
+    root = tmp_path_factory.mktemp("pd_roofline")
+    return [
+        run_pd(root / f"seed{seed}", seed, ROOFLINE, ROOFLINE_MACHINE)
+        for seed in ("1", "2")
+    ]
+
+
+@NEEDS_A_PD_RUN
+@capability("pd_1p1d", 1)
+def test_one_request_meets_every_scenario_check_under_the_step_roofline(
+    roofline_runs,
+):
+    """The level-0 case's checks but one: the hand-computed timelines of
+    engine-P and engine-D, `check_run`'s records, which it computes only for
+    a constant step stub, from that stub's prefill and decode costs."""
+    run = roofline_runs[0]
+    print(f"\n{run['summary']['schedule']['seconds_by_method']}\n{run['table']}")
+    failed = check_run(
+        [r["out"] for r in roofline_runs],
+        [MAX_TOKENS],
+        [line for _, line in run["events"]],
     )
     assert not failed, "\n".join(failed)
     assert run["handed_in"] == [compass_run.LP_FILE.format(lp) for lp in LPS[:-1]]

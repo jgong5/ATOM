@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 import pytest
+from capabilities import ROOFLINE, ROOFLINE_MACHINE, capability, cost_overrides
 from test_dp_slice import DP_MACHINE, MAX_TOKENS, Requests, _deployment
 from test_vertical_slice import (
     CONSTANT,
@@ -70,8 +71,9 @@ def _wait_listening(endpoint: str, alive) -> None:
             time.sleep(0.05)
 
 
-def run_two_trees(out: Path, seed: str) -> dict:
-    """One run: the authority, then each node's API server, each its own tree."""
+def run_two_trees(out: Path, seed: str, backend=CONSTANT, machine=MACHINE) -> dict:
+    """One run: the authority, then each node's API server, each its own tree,
+    priced by `backend` on `machine` (`cost_overrides`)."""
     out.mkdir()
     with _ports() as (clock_port, master_port, base_port, *ports):
         endpoint = f"tcp://127.0.0.1:{clock_port}"
@@ -79,8 +81,7 @@ def run_two_trees(out: Path, seed: str) -> dict:
             out,
             clock_endpoint=endpoint,
             data_parallel_size=DP,
-            step_stub=CONSTANT,
-            machine=MACHINE,
+            **cost_overrides(backend, machine),
         )
         env = dict(
             os.environ,
@@ -98,7 +99,7 @@ def run_two_trees(out: Path, seed: str) -> dict:
             *("--data-parallel-base-port", str(base_port)),
             *compass,
         ]
-        publish_entry(out / "store", MACHINE, common, env)
+        publish_entry(out / "store", machine, common, env)
         procs = []
 
         def start(name, *args):
@@ -150,6 +151,7 @@ def runs(tmp_path_factory):
 
 
 @NEEDS_A_RUN
+@capability("multinode_dp")
 def test_two_trees_of_two_ranks_meet_every_scenario_check(runs):
     run = runs[0]
     print(f"\n{(run['out'] / compass_run.STEP_TABLE_FILE).read_text()}")
@@ -167,6 +169,41 @@ def test_two_trees_of_two_ranks_meet_every_scenario_check(runs):
     # The worker node's ranks served requests too.
     steps = read(run["out"] / "parity")
     assert all(any(s["batch"] for s in steps[rank]) for rank in (2, 3))
+
+
+@pytest.fixture(scope="module")
+def roofline_runs(tmp_path_factory):
+    root = tmp_path_factory.mktemp("multinode_dp_roofline")
+    return [
+        run_two_trees(root / f"seed{seed}", seed, ROOFLINE, ROOFLINE_MACHINE)
+        for seed in ("1", "2")
+    ]
+
+
+@NEEDS_A_RUN
+@capability("multinode_dp", 1)
+def test_two_trees_of_two_ranks_meet_every_scenario_check_under_the_step_roofline(
+    roofline_runs,
+):
+    """The level-0 case's checks but two. The engine's hand-computed
+    timeline, `check_run`'s records, which it computes only for a constant
+    step stub, from that stub's prefill and decode costs. And that the worker
+    node's ranks served requests: the rank a request lands on follows the
+    in-flight load when it arrives, which turns on when earlier requests
+    finish, and so on the step cost."""
+    run = roofline_runs[0]
+    summary = json.loads((run["out"] / compass_run.SUMMARY_FILE).read_text())
+    print(f"\n{summary['schedule']['seconds_by_method']}")
+    failed = check_run(
+        [r["out"] for r in roofline_runs],
+        MAX_TOKENS,
+        [line for _, line in run["events"]],
+    )
+    assert not failed, "\n".join(failed)
+    assert run["handed_in"] == sorted(
+        compass_run.LP_FILE.format(n)
+        for n in ["frontend"] + [f"engine.dp{r}" for r in range(DP)]
+    )
 
 
 # --- without a driver ---------------------------------------------------------
