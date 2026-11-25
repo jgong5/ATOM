@@ -129,7 +129,17 @@ eager) a prefill's launch stays within 10-25% of its path's median at p90,
 and 0.5-4% of the lines take twice it or more, up to 80 times (4.2 s); with
 the peer columns' slower tail kept (`--keep-peer-tail`), the stalled ones among
 the 75 steps whose peer prefilled under a quarter of the rows carried
-`peer_small` from B final's 7 ms to 353 ms. Unset or ``0``, no step is cut so,
+`peer_small` from B final's 7 ms to 353 ms. Under the same switch a host fit
+(`fit.host.host_laws`) prices the stalls its records hold (`stall_prices`) as
+the first launch of a shape on a rank: on #752's cell A v2 (DeepSeek-V4.1, DPA4,
+MoE over TP) 95-100% of the stalled prefill lines are their rank's first of
+their exact token count, and no exact shape stalls twice, but only 1-3% of such
+first lines stall; most are a warm-up that dies out 15 minutes after the first
+forward (1-1.7 stalls a rank-minute, then 0.05-0.15). Per launch path, the host
+entry's `STALLS` states the stalls' excess past the path's median over the
+records' first launches of a `first_launch_key` on a rank, and the key, which a
+run charges on each such first launch (`runner.overrides.launch_stall`), with
+no randomness. Unset or ``0``, no step is cut so, no host entry states stalls,
 and every label is as before.
 
 A record without device windows is refused. A step mixing prefill and decode
@@ -227,6 +237,13 @@ STALL_FACTOR = 2.0
 #: The cut a stalled step's lines take under `STALL_ENV`; not one of `CUTS`,
 #: which every fit counts, since no step is cut so without the switch.
 STALLED = "stalled"
+#: A host entry's launch stalls under `STALL_ENV` (`stall_prices`): by launch
+#: path, ``first_s``, what a rank's first launch of a `first_launch_key` costs,
+#: and ``key``, `FIRST_LAUNCH_KEY`, which a run refuses any other of.
+STALLS = "stalls"
+#: The shape `first_launch_key` reads: a forward's prefill tokens, up to the
+#: next power of 2.
+FIRST_LAUNCH_KEY = "pow2_prefill_tokens"
 
 
 def _prefill_label() -> str:
@@ -237,7 +254,7 @@ def _prefill_label() -> str:
     return value
 
 
-def _launch_stall() -> bool:
+def launch_stall_on() -> bool:
     """Whether `STALL_ENV` is on: ``1`` on, ``0`` or unset off, any other refused."""
     value = os.environ.get(STALL_ENV) or "0"
     if value not in ("0", "1"):
@@ -253,29 +270,100 @@ def launch_stalls(
     holding a prefill row, whose launch window (`t_launch_ns`) lasted `factor`
     times or more the median of its launch path's (`launch_features.path` of
     its view and recorded features) over that rank's such lines. The fit's
-    `STALL_ENV` cut and any record check read the same set."""
-    from atom.compass.backends.launch_features import path as launch_path
-
+    `STALL_ENV` cut, `stall_prices` and any record check read the same set."""
     stalled = set()
     for lines in ranks:
-        windows = defaultdict(list)
-        for s in lines:
-            rows = s.get("rows") or ()
-            if s["is_dummy_run"] or "t_launch_ns" not in s or all(r[2] for r in rows):
-                continue
-            view = BatchView(
-                tuple(RequestShape(q, c, bool(d)) for q, c, d in rows),
-                capture_rung=s.get("rung"),
-                produces_output=s["produces_output"],
-            )
-            start, end = s["t_launch_ns"][:2]
-            windows[launch_path(view, s.get("launch", {}))].append(
-                (end - start, s["step"])
-            )
-        for got in windows.values():
-            median = statistics.median(w for w, _ in got)
-            stalled.update(step for w, step in got if w >= factor * median)
+        for got in _launch_windows(lines).values():
+            median = statistics.median(w for w, _, _ in got)
+            stalled.update(step for w, step, _ in got if w >= factor * median)
     return frozenset(stalled)
+
+
+def _launch_windows(lines: list[dict]) -> dict[str, list[tuple]]:
+    """One rank's prefill launch windows by launch path, `launch_stalls`'
+    lines: per line not a dummy run, holding a prefill row and stamping its
+    launch, in order, ``(window_ns, step, first_launch_key)`` under
+    `launch_features.path` of its view and recorded features."""
+    from atom.compass.backends.launch_features import path as launch_path
+
+    windows = defaultdict(list)
+    for s in lines:
+        rows = s.get("rows") or ()
+        if s["is_dummy_run"] or "t_launch_ns" not in s or all(r[2] for r in rows):
+            continue
+        shapes = tuple(RequestShape(q, c, bool(d)) for q, c, d in rows)
+        view = BatchView(
+            shapes, capture_rung=s.get("rung"), produces_output=s["produces_output"]
+        )
+        start, end = s["t_launch_ns"][:2]
+        key = first_launch_key(shapes)
+        path = launch_path(view, s.get("launch", {}))
+        windows[path].append((end - start, s["step"], key))
+    return windows
+
+
+def first_launch_key(requests: Iterable[RequestShape]) -> int:
+    """The shape, `FIRST_LAUNCH_KEY`, whose first launch on a rank `STALLS`
+    prices, of a forward holding the requests `requests`: its prefill tokens
+    up to the next power of 2. On #752's cell A v2 it is the key a rule fixed
+    before the numbers chose on the calibration records alone, from 14
+    candidates (exact, multiple-of-16/64/256 and power-of-2 buckets of tokens,
+    MoE tokens, context, rows): the least summed error predicting the stall
+    excess of each held-out segment of the calibration record and its
+    addendum, and of each record from the other, the coarsest within 10%."""
+    tokens = sum(r.query_tokens for r in requests if not r.decode)
+    return 1 << max(tokens - 1, 0).bit_length()
+
+
+def stall_prices(
+    runs: Iterable[Iterable[list[dict]]], factor: float = STALL_FACTOR
+) -> dict[str, dict]:
+    """The launch stalls of `runs`, each a run's DP ranks' `lines`, per launch
+    path a line `launch_stalls` names stalled on: ``forwards``, that path's
+    prefill lines it weighs; ``stalled``, those it finds stalled (`factor`
+    times or more their rank's median of the path); ``excess_s``, their
+    summed launch window past that median; ``first``, the path's lines that
+    are their rank's first of their `first_launch_key` on it; and
+    ``first_s``, the excess over those, what a host entry's `STALLS` charges
+    each first launch (`stall_entry`)."""
+    count, stalled, first = Counter(), Counter(), Counter()
+    past = defaultdict(float)
+    for ranks in runs:
+        for lines in ranks:
+            for path, got in _launch_windows(lines).items():
+                median = statistics.median(w for w, _, _ in got)
+                seen = set()
+                for w, _, key in got:
+                    count[path] += 1
+                    first[path] += key not in seen
+                    seen.add(key)
+                    if w >= factor * median:
+                        stalled[path] += 1
+                        past[path] += (w - median) / 1e9
+    return {
+        path: {
+            "forwards": count[path],
+            "stalled": stalled[path],
+            "excess_s": past[path],
+            "first": first[path],
+            "first_s": past[path] / first[path],
+        }
+        for path in sorted(stalled)
+    }
+
+
+def stall_entry(prices: dict[str, dict]) -> dict[str, dict]:
+    """A host entry's `STALLS` from `stall_prices`: each path's ``first_s``,
+    and the `FIRST_LAUNCH_KEY` it was counted on."""
+    return {
+        p: {"first_s": v["first_s"], "key": FIRST_LAUNCH_KEY} for p, v in prices.items()
+    }
+
+
+def record_ranks(record) -> list[list[dict]]:
+    """The lines of each DP rank record of the run in the directory `record`,
+    its ``steps/dp<r>.jsonl`` (`_peers`)."""
+    return [read_jsonl(p) for p in _peers(Path(record) / "steps" / "dp0.jsonl")]
 
 
 #: The variable that, set to ``1``, takes a record whose run.json names
@@ -709,7 +797,7 @@ def label(
     """
     lines = _read(record)
     stalled = None
-    if _launch_stall():
+    if launch_stall_on():
         peers = (
             [read_jsonl(p) for p in _peers(Path(record))]
             if lines and "moe_rows" in lines[0]
@@ -748,7 +836,7 @@ def label_run(
     starts = [max(_pull(x[i]) for x in ranks if i < len(x)) for i in range(n)]
     dummy_ranks, peaks = group_dummies(ranks), group_peaks(ranks)
     tails, prefills = group_tails(ranks), group_prefills(ranks)
-    stalled = launch_stalls(ranks) if _launch_stall() else None
+    stalled = launch_stalls(ranks) if launch_stall_on() else None
     return [
         (
             ([], [])
