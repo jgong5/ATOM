@@ -120,8 +120,8 @@ groups = sorted(c["spans"], key=c["spans"].get, reverse=True)
 whatif = {g: replay(c, lambda h, w, g=g: w / 2 if h == g else 0.0) for g in groups}
 print(f"## What each LP group's own work, halved, saves in {out}\n\nWindow: {c['t1'] - c['t0']:.0f} s of wall over "
       f"{c['sim']:.0f} simulated s, **{wall:.2f} wall s per simulated s**; replayed unchanged, {replay(c):.2f}.\n")
-print("| rank | LP group halved | its own work per simulated s | replayed wall s per simulated s | saving | share of "
-      "the wall |\n|---|---|---|---|---|---|")
+print("| rank | LP group halved | its own work per simulated s, its processes summed | replayed wall s per "
+      "simulated s | saving | share of the wall |\n|---|---|---|---|---|---|")
 for i, g in enumerate(sorted(groups, key=whatif.get), 1):
     print(f"| {i} | {g} | {c['spans'][g] / c['sim']:.2f} | {whatif[g]:.2f} | {wall - whatif[g]:.2f} | "
           f"{100 * (wall - whatif[g]) / wall:.1f}% |")
