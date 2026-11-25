@@ -111,9 +111,14 @@ those rounds, each with its own target, aborts the run.
 
 With `wide_ceilings` as well, a ceiling's cycle term is the least, over each
 channel ``c`` out of the LP to an LP ``j`` that runs, waits in NER or is
-reached on an offering channel, of ``L(c) + D(j->i)``: an LP waiting in TAR
-sends nothing before its own next grant, at or past its ``N``, so whatever a
-message to it provokes reaches the LP at or past ``LBTS(i)``. A grant
+reached on an offering channel, of ``L(c) + D(j->i)``. An LP waiting in TAR
+sends nothing before its own next grant, at or past its ``N`` unless an
+arrival on an offering channel comes first. A chain of sends bringing one
+starts at another LP's own event or a registered message, at or past
+``LBTS(i)`` back at the LP, or at the LP's own send, at or past the grant plus
+the term over that send's first hop, or ``LBTS(i)`` again where that hop waits
+in TAR. So whatever a message to it provokes reaches the LP at or past the
+ceiling. A grant
 answering a TAR then sends every message below its ceiling ahead, as an NER
 asking for them does, and any grant that sends messages ahead has its ceiling
 at or below the LP's earliest unreleased arrival on an offering channel, so

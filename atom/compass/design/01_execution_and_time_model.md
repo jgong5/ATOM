@@ -737,11 +737,15 @@ with local grants;
   offering channel, of `L(c) + D(j->i)`; with every LP able to react, it is the static
   cycle. A message `i` sends on a channel that is not offering to `j` waiting in
   `TAR(T_j)` provokes nothing from `j` before `j`'s next grant: `j`'s owner is inside its
-  call (I1), and its handlers send nothing (I4). That grant is at `N[j]` or later, unless
-  an arrival on an offering channel lowers `N[j]` first, and such an arrival comes from
-  `i` on an offering channel, which the term counts, or from an LP whose own `N` and
-  distance bound it. A return along a path whose first hop is `j` therefore lands at or
-  past `N[j] + D(j->i)`, which is at least `LBTS(i)`, and so at or past the ceiling. An
+  call (I1), and its handlers send nothing (I4). That grant is at `N[j]` or later, and
+  what `j` then sends reaches `i` at or past `N[j] + D(j->i)`, at least `LBTS(i)`, unless
+  an arrival on an offering channel lowers `N[j]` first. Such an arrival ends a chain of
+  sends. A chain starting at another LP's own event, or at a message already registered,
+  lands at or past `LBTS(i)`. A chain starting at a send of `i`'s after its grant `G`, over
+  a channel `c` to an LP `k`, lands back at `i` at or past `G + L(c) + D(k->i)` when `k`
+  can react, a term the cycle counts, `j` reached on an offering channel included; when
+  `k` waits in TAR on a channel that is not offering, this argument bounds it by
+  `LBTS(i)` in turn. Every return through `j` therefore lands at or past the ceiling. An
   LP with members counts as unable to react only while it waits in TAR as a whole, every
   member in the round. The decode frontends of the 8P16D C1228 cell are the case: the
   static cycle runs through each one's engine and caps each grant near one SSE event's
