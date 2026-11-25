@@ -99,7 +99,8 @@ def _tree(tmp_path, driver=DRIVER, smoke=SMOKE):
     hub = tmp_path / "hf" / "hub"
     for name in ("Qwen3-0.6B", "Qwen3.5-9B", "Qwen3.5-0.8B", "Qwen3.8-27B"):
         (hub / f"models--Qwen--{name}" / "snapshots" / "abc").mkdir(parents=True)
-    (tmp_path / "dspark").mkdir()
+    for model in ("dspark", "m3", "m3-eagle3"):
+        (tmp_path / model).mkdir()
     (tmp_path / "bin").mkdir()
     (tmp_path / "bin" / "atomesh").write_text("")
     (tmp_path / "traces.jsonl").write_text("{}\n")
@@ -118,6 +119,8 @@ def _run(tmp_path, root, **env_over):
     env["ATOMESH"] = str(tmp_path / "bin" / "atomesh")
     env["ATOM_COMPASS_CCTRACES"] = str(tmp_path / "traces.jsonl")
     env["ATOM_COMPASS_DSPARK_MODEL"] = str(tmp_path / "dspark")
+    env["ATOM_COMPASS_M3_MODEL"] = str(tmp_path / "m3")
+    env["ATOM_COMPASS_M3_EAGLE3"] = str(tmp_path / "m3-eagle3")
     env["COMPASS_HARNESS_PYTHON"] = env["COMPASS_AIPERF_PYTHON"] = sys.executable
     env["HIP_VISIBLE_DEVICES"] = "4,5,6,7"
     env["RUNS"] = str(root / "runs.txt")
@@ -154,12 +157,14 @@ def test_driver_run_tests_run_once_on_every_card_with_their_inputs(tmp_path):
 
 
 def test_the_speculative_models_reach_the_tests(tmp_path):
-    spec = "' '.join(os.environ[f'ATOM_COMPASS_{m}_MODEL'] for m in ('MTP', 'DSPARK'))"
+    names = ("MTP_MODEL", "DSPARK_MODEL", "M3_MODEL", "M3_EAGLE3")
+    spec = f"' '.join(os.environ['ATOM_COMPASS_' + m] for m in {names!r})"
     root = _tree(tmp_path, DRIVER.replace("'compass'", spec))
     out, verdict = _run(tmp_path, root)
     assert verdict == "GATE_GPU_RC=0 PASSED", out.stdout[-3000:]
     mtp = f"{tmp_path}/hf/hub/models--Qwen--Qwen3.5-0.8B/snapshots/abc/"
-    assert f"{mtp} {tmp_path}/dspark 4,5,6,7 " in (root / "runs.txt").read_text()
+    want = f"{mtp} {tmp_path}/dspark {tmp_path}/m3 {tmp_path}/m3-eagle3"
+    assert f"{want} 4,5,6,7 " in (root / "runs.txt").read_text()
 
 
 @pytest.mark.parametrize(
@@ -174,6 +179,14 @@ def test_the_speculative_models_reach_the_tests(tmp_path):
         (
             {"ATOM_COMPASS_DSPARK_MODEL": "/nonexistent"},
             "ATOM_COMPASS_DSPARK_MODEL /nonexistent",
+        ),
+        (
+            {"ATOM_COMPASS_M3_MODEL": "/nonexistent"},
+            "ATOM_COMPASS_M3_MODEL /nonexistent",
+        ),
+        (
+            {"ATOM_COMPASS_M3_EAGLE3": "/nonexistent"},
+            "ATOM_COMPASS_M3_EAGLE3 /nonexistent",
         ),
         (
             {"ATOM_COMPASS_CCTRACES_MODEL": "/nonexistent"},
@@ -217,6 +230,12 @@ def test_a_missing_input_refuses_by_name_before_any_test(tmp_path, env, named):
         ("smoke", "needs COMPASS_AIPERF_PYTHON", "test_cctraces_sim_smoke.py"),
         ("driver", "needs ATOM_COMPASS_MTP_MODEL naming a model", "test_d.py"),
         ("driver", "needs ATOM_COMPASS_DSPARK_MODEL naming a model", "test_d.py"),
+        # test_eagle3_m3.py's reason.
+        (
+            "driver",
+            "a run needs a driver, ATOM_COMPASS_M3_MODEL and ATOM_COMPASS_M3_EAGLE3",
+            "test_d.py",
+        ),
     ],
 )
 def test_a_driver_run_skip_fails_by_name(tmp_path, which, reason, where):
@@ -407,6 +426,7 @@ SKIP = "import pytest\n\n\n@pytest.mark.skip(reason={!r})\ndef test_a():\n    pa
         (True, SKIP.format("needs ATOM_COMPASS_SLICE_MODEL"), "1 skipped"),
         (False, SKIP.format("a run needs atomesh on PATH"), "1 error"),
         (False, SKIP.format("needs COMPASS_HARNESS_PYTHON"), "1 error"),
+        (False, SKIP.format("needs ATOM_COMPASS_M3_EAGLE3"), "1 error"),
         (
             False,
             (

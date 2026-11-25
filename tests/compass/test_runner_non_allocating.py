@@ -209,6 +209,40 @@ def test_calling_that_model_refuses_and_names_the_class_it_stands_for():
         UnbuiltModel(SomeModel)(torch.zeros(1))
 
 
+class MonoRouted(torch.nn.Module):
+    """A model whose mono decode takes the drafter, as MiniMax-M3's does."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.bound = None
+
+    def bind_mono_drafter(self, drafter):
+        self.bound = drafter
+
+
+def _m3_mono_installer():
+    """ATOM's MiniMax-M3 `install_mono_decode`, compiled from its source:
+    importing its module probes aiter's arch, which needs a GPU."""
+    path = REPO / "atom" / "models" / "minimax_m3" / "mono" / "dispatch.py"
+    tree = ast.parse(path.read_text())
+    (fn,) = [n for n in tree.body if getattr(n, "name", "") == "install_mono_decode"]
+    scope = {"torch": torch}
+    code = compile(ast.Module([fn], []), str(path), "exec")
+    exec(code, scope)  # noqa: S102 - this repository's own source, read above
+    return scope["install_mono_decode"]
+
+
+def test_m3s_mono_installer_binds_its_drafter_through_that_model_to_the_tree():
+    """The runner hands a mono installer the model in place of ATOM's;
+    MiniMax-M3's binds the drafter to it whenever there is one."""
+    runner = Runner()
+    runner._build_and_load_model(MonoRouted)
+    drafter = object()
+    installed = _m3_mono_installer()(runner.model, runner.config, drafter)
+    assert installed is runner.model
+    assert runner.model.tree.bound is drafter
+
+
 class AttentionModel(torch.nn.Module):
     """A model whose construction registers a parameter and a buffer."""
 

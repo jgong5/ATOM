@@ -10,8 +10,8 @@ prefill vector), each held out by run.
 
 The scenario run needs a driver and two model directories, each holding a
 config and the target's a tokenizer: `ATOM_COMPASS_M3_MODEL`, MiniMax-M3, and
-`ATOM_COMPASS_M3_EAGLE3`, its EAGLE3 drafter; no weight is read. The rest run
-anywhere.
+`ATOM_COMPASS_M3_EAGLE3`, its EAGLE3 drafter; no weight is read. `gate_gpu.sh`
+sets both, as `scripts/compass/README.md` names them. The rest run anywhere.
 """
 
 import copy

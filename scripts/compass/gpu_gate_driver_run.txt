@@ -9,6 +9,7 @@ tests/compass/test_cctraces_sim_smoke.py
 tests/compass/test_client_runs_slice.py
 tests/compass/test_dp_slice.py
 tests/compass/test_drive_trace_steps.py
+tests/compass/test_eagle3_m3.py
 tests/compass/test_image_scenario.py
 tests/compass/test_lmcache_mp_engine.py
 tests/compass/test_lmcache_mp_scenario.py
