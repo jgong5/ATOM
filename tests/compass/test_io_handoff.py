@@ -22,6 +22,7 @@ from test_vertical_slice import _run_file
 
 from atom.compass import parity
 from atom.compass import run as compass_run
+from atom.model_engine import scheduler
 from atom.model_engine.engine_core import EngineCore
 from atom.model_engine.sequence import SequenceStatus, get_exit_sequence
 from atom.utils import clock
@@ -48,10 +49,19 @@ def _frame(*prompts):
     ]
 
 
+def _original_count(monkeypatch):
+    """ATOM's `_count_inflight_load`, put back after the test (`parity.parks`)."""
+    count = scheduler.Scheduler._count_inflight_load
+    count = getattr(count, "parks_wrapped", count)
+    monkeypatch.setattr(scheduler.Scheduler, "_count_inflight_load", count)
+    return count
+
+
 def test_a_recorded_engine_writes_each_frame_and_output_handoff(tmp_path, monkeypatch):
     monkeypatch.delenv(compass_run.ENV, raising=False)
     monkeypatch.setenv(parity.ENV, str(tmp_path))
     monkeypatch.setattr(clock, "_stamps", None)
+    count = _original_count(monkeypatch)
     config = _deployment()
     with compass_run.engine(config):
         engine = Engine(SimpleNamespace())
@@ -85,17 +95,22 @@ def test_a_recorded_engine_writes_each_frame_and_output_handoff(tmp_path, monkey
     assert 0 < f["t_pull_ns"] <= f["t_in_get_ns"]
     assert [h["rows"] for h in outs] == [1, 2]  # the frames' finished requests
     assert all(h["t_out_put_ns"] <= h["t_out_sent_ns"] for h in outs)
+    # The scheduler's parks for remote KV go beside them (`parity.parks`).
+    assert scheduler.Scheduler._count_inflight_load.parks_wrapped is count
+    assert (tmp_path / "dp0.parks.jsonl").exists()
 
 
 def test_a_real_run_without_a_record_stamps_nothing(tmp_path, monkeypatch):
     monkeypatch.delenv(compass_run.ENV, raising=False)
     monkeypatch.delenv(parity.ENV, raising=False)
     monkeypatch.setattr(clock, "_stamps", None)
+    count = _original_count(monkeypatch)
     with compass_run.engine(_deployment()):
         q = clock.relay_queue(_deployment().parallel_config)
     inputs = queue.Queue()
     clock.stamp_input(SimpleNamespace(input_queue=inputs))
     assert (type(q), type(inputs), clock._stamps) == (queue.Queue, queue.Queue, None)
+    assert scheduler.Scheduler._count_inflight_load is count
 
 
 def test_a_simulated_run_with_a_record_stamps_nothing(
@@ -108,6 +123,7 @@ def test_a_simulated_run_with_a_record_stamps_nothing(
     monkeypatch.setattr(clock, "_installed", None)
     monkeypatch.setattr(utils, "LP_OF_RANK", None, raising=False)
     monkeypatch.setattr(compass_run, "connect", lambda *_: None)
+    count = _original_count(monkeypatch)
     with compass_run.engine(_deployment()):
         q = clock.relay_queue(_deployment().parallel_config)
     inputs = queue.Queue()
@@ -118,6 +134,8 @@ def test_a_simulated_run_with_a_record_stamps_nothing(
         None,
     )
     assert not list(tmp_path.glob("**/*.handoff.jsonl"))
+    assert not list(tmp_path.glob("**/*.parks.jsonl"))
+    assert scheduler.Scheduler._count_inflight_load is count
 
 
 def test_the_reader_buckets_an_output_by_its_steps_batch(tmp_path):

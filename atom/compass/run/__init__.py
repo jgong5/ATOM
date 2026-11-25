@@ -2013,8 +2013,9 @@ def engine(config):
 
     A real run recording its steps (`parity.ENV`) outside a pipeline stamps the
     engine's input pulls and output puts into ``dp<rank>.pulls.jsonl`` beside
-    the record, and its IO-thread queue handoffs into ``dp<rank>.handoff.jsonl``
-    (`clock.stamp_pulls`).
+    the record, its IO-thread queue handoffs into ``dp<rank>.handoff.jsonl``
+    (`clock.stamp_pulls`), and its scheduler's parks for remote KV into
+    ``dp<rank>.parks.jsonl`` (`parity.parks`).
     """
     global _member
     run = spec()
@@ -2030,6 +2031,11 @@ def engine(config):
             pulls = record / f"dp{rank}.pulls.jsonl"
             handoff = record / f"dp{rank}.handoff.jsonl"
             clock.stamp_pulls(pulls, handoff, time.monotonic_ns)
+            from atom.compass.parity import parks
+
+            parks.install(
+                record / parks.FILE.format(rank=rank), rank, time.monotonic_ns
+            )
         return contextlib.nullcontext()
     from atom.compass.run import metrics
     from atom.compass.runner import shm_collectives
