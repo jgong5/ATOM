@@ -9,7 +9,7 @@ use mesh::{
     determinism,
     policies::{
         tree::Tree, CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, LoadBalancingPolicy,
-        RandomPolicy, SelectWorkerInfo,
+        RandomPolicy, RoundRobinPolicy, SelectWorkerInfo,
     },
 };
 use rand::Rng;
@@ -30,8 +30,9 @@ fn session(id: &str) -> http::HeaderMap {
 }
 
 /// One run: cache_aware breaking four-way load ties, then two-way ties when
-/// imbalanced, and placing at random with no tree; random's draws; dp_sticky
-/// sessions idling past expiry on the simulated clock, and radix-tree owner picks
+/// imbalanced, and placing at random with no tree; random's draws; a new
+/// round_robin's first pick; dp_sticky sessions idling past expiry on the
+/// simulated clock, and radix-tree owner picks
 /// after each node's cached owner leaves. A random wall-clock pause precedes
 /// every request.
 async fn run(seed: u64) -> Vec<String> {
@@ -71,6 +72,8 @@ async fn run(seed: u64) -> Vec<String> {
 
         let pick = RandomPolicy::new().select_worker(&workers, &info).await;
         picks.push(format!("random {pick:?}"));
+        let pick = RoundRobinPolicy::new().select_worker(&workers, &info).await;
+        picks.push(format!("round_robin {pick:?}"));
     }
 
     // Ranks 0 and 1 past balance_abs_threshold: the imbalanced branch breaks
@@ -108,10 +111,12 @@ async fn run(seed: u64) -> Vec<String> {
         }
     }
     tree.remove_tenant("rank0");
+    let ranks = ["rank0", "rank1", "rank2", "rank3"];
     for i in 0..16 {
         picks.push(format!(
             "tree {}",
-            tree.prefix_match(&format!("{i:02} shared prefix")).1
+            tree.prefix_match_among(&format!("{i:02} shared prefix"), &ranks)
+                .tenant
         ));
     }
     picks

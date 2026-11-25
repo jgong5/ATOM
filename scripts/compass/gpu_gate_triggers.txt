@@ -11,7 +11,7 @@
 #
 # THE RULE: an atom module named by an excluded test is a blind spot unless a
 # CPU-gate test that actually runs names it too. Imports are read at any
-# indentation on the excluded side -- 1971 of this tree's `import atom.*`
+# indentation on the excluded side -- 2110 of this tree's `import atom.*`
 # lines are indented -- but coverage is credited only for a module-level import
 # in a CPU-gate file that collects at least one test, because those are the only
 # imports that provably execute. At 236abfd9a the MODULE-LEVEL half carried both
@@ -44,19 +44,19 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at dfc23fba0d93f109bbd9ec851e7d9d61f038e184 over this tree:
-#   tests/       1234 files  = 88 in tests/plugin/ + 87 excluded + 1059 CPU gate
-#   CPU gate      982 files collect >=1 test, 77 collect none
-#   imports      1971 indented `import atom.*` lines in non-plugin test files
-#   collected  22839 tests by --collect-only. A run of the same set reports
-#              the same 22839 outcomes. Its "skipped" total is LARGER than any
-#              skip count here, because a module-level skip in one of the 77
+# Measured at 0e444c07ab719af58997d8ad73b044fb5e48cd0e over this tree:
+#   tests/       1323 files  = 92 in tests/plugin/ + 93 excluded + 1138 CPU gate
+#   CPU gate     1057 files collect >=1 test, 81 collect none
+#   imports      2110 indented `import atom.*` lines in non-plugin test files
+#   collected  25561 tests by --collect-only. A run of the same set reports
+#              the same 25561 outcomes. Its "skipped" total is LARGER than any
+#              skip count here, because a module-level skip in one of the 81
 #              files that collect nothing is counted as skipped without ever
 #              becoming a collected test. This file states the set; gate_cpu.sh
 #              prints the run, and is the only source for its outcome counts.
-#   candidates    234 paths named by an excluded test, any indentation
-#   covered       509 paths named at module level by a live CPU-gate file
-#   triggers      120 derived paths below, then 4 listed by name
+#   candidates    259 paths named by an excluded test, any indentation
+#   covered       544 paths named at module level by a live CPU-gate file
+#   triggers      134 derived paths below, then 4 listed by name
 atom/distributed/pcp_utils.py
 atom/distributed/pp_comm.py
 atom/model_engine/pp_engine_core.py
@@ -74,12 +74,11 @@ atom/model_ops/attentions/deepseek_v41/packed_rows.py
 atom/model_ops/attentions/deepseek_v41/planes.py
 atom/model_ops/attentions/deepseek_v41/score_planner.py
 atom/model_ops/attentions/deepseek_v4_attn.py
-atom/model_ops/attentions/pool_layout/mha_page_unit_geometry.py
+atom/model_ops/attentions/pool_layout/layer_major_page_unit_geometry.py
 atom/model_ops/attentions/qwen4_exp_attn.py
 atom/model_ops/attentions/triton_merge_attn_states.py
 atom/model_ops/base_attention.py
 atom/model_ops/blockscale.py
-atom/model_ops/dcp_ops.py
 atom/model_ops/deepseek_v41/candidate_table.py
 atom/model_ops/deepseek_v41/compressor.py
 atom/model_ops/deepseek_v41/draft_block.py
@@ -96,6 +95,8 @@ atom/model_ops/engram/device/uva.py
 atom/model_ops/engram/host.py
 atom/model_ops/engram/tables.py
 atom/model_ops/fla_ops/chunk.py
+atom/model_ops/fla_ops/gdn_flydsl.py
+atom/model_ops/fla_ops/state_checkpoint.py
 atom/model_ops/fp4_mqa_ragged_metadata.py
 atom/model_ops/fused_moe/mori_v2_prepare_finalize.py
 atom/model_ops/fused_moe/sp_mega_moe.py
@@ -107,7 +108,6 @@ atom/model_ops/indexer/__init__.py
 atom/model_ops/indexer/rows.py
 atom/model_ops/indexer/score.py
 atom/model_ops/layernorm.py
-atom/model_ops/linear.py
 atom/model_ops/minimax_m3/index_buffers.py
 atom/model_ops/module_dispatch_ops.py
 atom/model_ops/qwen4_exp/hyperconnection.py
@@ -124,6 +124,7 @@ atom/models/deepseek_v4/
 atom/models/deepseek_v41/attention.py
 atom/models/deepseek_v41/bounded_replay.py
 atom/models/deepseek_v41/dspark.py
+atom/models/deepseek_v41/layers.py
 atom/models/deepseek_v41/moe.py
 atom/models/deepseek_v41/mono/contract.py
 atom/models/deepseek_v41/mono/dispatch.py
@@ -131,9 +132,15 @@ atom/models/deepseek_v41/mono/gfx1250/
 atom/models/deepseek_v41/mono/hi_dispatch.py
 atom/models/deepseek_v41/mono/kernels/attn_post.py
 atom/models/deepseek_v41/mono/kernels/attn_pre.py
+atom/models/deepseek_v41/mono/kernels/col_gather.py
+atom/models/deepseek_v41/mono/kernels/compress.py
+atom/models/deepseek_v41/mono/kernels/draft_ctx.py
+atom/models/deepseek_v41/mono/kernels/draft_head.py
+atom/models/deepseek_v41/mono/kernels/engram.py
 atom/models/deepseek_v41/mono/kernels/layer_post.py
 atom/models/deepseek_v41/mono/kernels/moe.py
 atom/models/deepseek_v41/mono/kernels/moe_shape.py
+atom/models/deepseek_v41/mono/runner.py
 atom/models/deepseek_v41/mono/weights.py
 atom/models/deepseek_v41/runtime.py
 atom/models/deepseek_v4_dspark.py
@@ -143,10 +150,13 @@ atom/models/glm52/mono/kernels/tp4_op.py
 atom/models/glm52/mono/weights.py
 atom/models/glm5_next_mtp.py
 atom/models/kimi_k3/model.py
+atom/models/kimi_k3/mono/dispatch.py
 atom/models/kimi_k3/mono/weights.py
 atom/models/kimi_k3_dspark.py
 atom/models/kimi_k3_dspark_gqa.py
 atom/models/minimax_m3/dspark.py
+atom/models/minimax_m3/mono/contract.py
+atom/models/minimax_m3/mono/kernels/dense_post.py
 atom/models/qwen38/mono/config.py
 atom/models/qwen38/mono/dispatch.py
 atom/models/qwen38/mono/draft_fallback.py
@@ -165,16 +175,20 @@ atom/models/qwen38/mono/runner.py
 atom/models/qwen38/mono/step_meta.py
 atom/models/qwen4_exp.py
 atom/models/qwen4_exp_mtp.py
+atom/mono/device/mx.py
 atom/mono/device/ops.py
 atom/mono/dsa_indexer/bind.py
+atom/mono/dsa_indexer/local_step.py
+atom/mono/dsa_indexer/runner.py
+atom/mono/weights/layer.py
 atom/plugin/rtpllm/models/qwen4_exp_mtp_hooks.py
 atom/plugin/sglang/qwen4_exp_bridge.py
+atom/plugin/vllm/kv_transfer/mp_page_layout.py
 atom/plugin/vllm/v41_core_overrides.py
 atom/rollout/model_runner_ext.py
 atom/spec_decode/dspark_lossless.py
 atom/spec_decode/pp_aux_relay.py
 atom/structured_output/
-atom/utils/custom_register.py
 atom/utils/decorators.py
 atom/utils/tbo/
 # Block tables: no excluded test imports these, so they are never candidates.

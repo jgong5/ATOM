@@ -216,13 +216,13 @@ do not claim green.
 ## The CPU gate container
 
 `gate_cpu.sh` and the two list regenerators run in a container on
-`rocm/atom-dev:nightly_202611151511`, built from upstream `273c78de5` with aiter
-`95d211284`, with no GPU device and the worktree root's parent mounted at its
+`rocm/atom-dev:nightly_202611240650`, built from upstream `dc6cd23bb` with aiter
+`82b6b4f19`, with no GPU device and the worktree root's parent mounted at its
 own path:
 
 ```
 docker run -d --init --name <user>_gate --network host -v <parent>:<parent> \
-  rocm/atom-dev:nightly_202611151511 sleep infinity
+  rocm/atom-dev:nightly_202611240650 sleep infinity
 docker exec <user>_gate bash -c 'cd /app/ATOM/atom/mesh && cargo fetch --locked'
 docker exec <user>_gate bash -c 'tar -C <tree> --exclude=atom/mesh/target -cf - atom/mesh |
   tar -x -C /tmp && cd /tmp/atom/mesh && cp /app/ATOM/atom/mesh/Cargo.lock . &&
@@ -232,13 +232,13 @@ docker exec <user>_gate python3 -m pip install --no-deps -r <tree>/scripts/compa
 ```
 
 "atomesh's cargo tests run offline" below says why `cargo fetch` runs once. The
-image built atomesh from `273c78de5`'s manifest, and its lockfile lacks what the
-tree's `atom/mesh/Cargo.toml` asks for since (`llm-tokenizer` 1.4.2, `protox`,
-`zmq`), so the gate's cargo probe fails offline and a diff touching `atom/mesh`
-exits 96. The third line resolves the tree's manifest starting from the image's
-lockfile, which adds only what it lacks, and puts the result where the gates
-read their lockfile. The `safe.directory` line lets git, run as the container's
-root, read a tree another user owns; without it `regen_gpu_gate_triggers.sh`
+image built atomesh from `dc6cd23bb`'s manifest. When the tree's
+`atom/mesh/Cargo.toml` asks for a crate that lockfile lacks, the gate's cargo
+probe fails offline and a diff touching `atom/mesh` exits 96. The third line
+resolves the tree's manifest starting from the image's lockfile, which adds
+only what it lacks, and puts the result where the gates read their lockfile.
+The `safe.directory` line lets git, run as the container's root, read a tree
+another user owns; without it `regen_gpu_gate_triggers.sh`
 records the tree's commit as `UNKNOWN`. Run the gate with
 `COMPASS_AGENTX_HARNESS` naming the wheel the next section builds.
 
@@ -1042,7 +1042,12 @@ rung 1 and at c=64 at rungs 4 and 8, and the 1P1D decode side also at rung 2. Th
 prefill vector, and the decode law's rung 1, 2, 4 and 8 vectors with `--moe-routing 384,6`,
 DeepSeek-V4-Pro's routed experts and top-k, are refitted on their side's lone cells and on their
 side of three 1P1D `deploy.sh record` cells at c=256 over traces 256 to 392, seeds 20260707,
-20260708 and 20260709, the prefill side at `--gpu-memory-utilization 0.72`. Each law's other
+20260708 and 20260709, the prefill side at `--gpu-memory-utilization 0.72`. The decode law's
+rung 1, 2, 4 and 8 vectors also fit the decode side of two more 1P1D `deploy.sh record`
+deployments over the same traces: one serving c=1, 4, 16, 64 and 256 in turn, twice, at seed
+20260710, and one serving c=64 for 600 s and then c=256 for 900 s at seed 20260707, whose
+decode side ran on crsuse2-m2m-v3-004 in place of -013, the same ionic RDMA planes, by the
+owner's word ([#2842](https://github.com/jgong5/ATOM/issues/2842)). Each law's other
 vectors, the prefill law's rung-1 vector among them, are the ones fitted on its lone cells alone,
 and its `sources` names the records each came from. Its host laws are fitted on its side's lone
 cells re-recorded with the fp8 index cache, at a tree whose recorded engine holds its stamps

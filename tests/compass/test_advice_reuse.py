@@ -7,8 +7,9 @@ instance, with its readings and platform readings in the store; its laws are
 the checked-in DPA8 decode law re-keyed to that configuration, as a law file
 (`reuse.LAWS`) or a store entry beside host laws. The 1P1D sides whose config
 resolves for real are DeepSeek-V4-Pro's, judged by the shipped crs005 DPA8
-pair. The head is the tree's own digest, except where a test builds a
-repository for the tree.
+pair. A pipeline's law is that law with a part per stage, served to the
+configuration on pipeline stages as a producer. The head is the tree's own
+digest, except where a test builds a repository for the tree.
 """
 
 import functools
@@ -410,6 +411,84 @@ def test_a_figure_past_5_percent_names_requirement_4(
     assert (found["verdict"], found["requirement"]) == (verdict, 4)
     figure = f"run {run}, decode, median +5.12% of source refitted, past 5%"
     assert figure in found["reason"] and named in found["reason"]
+
+
+#: A prefill-decode producer's transfer config, as the development template's
+#: PP4 prefill side runs: it schedules no decode rung.
+PRODUCER = {"kv_role": "kv_producer", "kv_connector": "compass"}
+
+
+def staged(tmp_path, r, *medians, eager=True) -> dict:
+    """`r`'s config on as many pipeline stages as `medians`, a producer as the
+    template's prefill side, eager unless `eager` is false, with its readings
+    in the store; and `law` re-keyed to it with a part per stage, as `fit
+    steps` and `fit host` write one: each stage's decode cut, its figures on
+    prefill within the gate but one run's median, `medians[k]` on stage k."""
+    stages = len(medians)
+    vars(r.config).update(
+        pipeline_parallel_size=stages, enforce_eager=eager, kv_transfer_config=PRODUCER
+    )
+    publish_readings(tmp_path / "store", r.config)
+    held = law(r)
+    top = {k: held.pop(k) for k in ("platform", "engine_config", "records_atom")}
+    host = held.pop("host")
+    del held["sources"]
+    parts = []
+    for median in medians:
+        figures = {run: {"prefill": dict(WITHIN)} for run in held["runs"]}
+        figures[held["runs"][1]]["prefill"]["median"] = median
+        parts.append(held | {"decode": {}, "figures": figures})
+    laws = {k: v for k, v in host.items() if k != "key"}
+    host = {"key": host["key"], "stages": [laws] * stages}
+    return top | {"provenance": "planted", "stages": parts, "host": host}
+
+
+@pytest.mark.parametrize(
+    "medians, verdict",
+    [
+        ((-0.02, -0.02), ("reuse", None)),
+        ((-0.02, 0.0512), ("refused", 4)),
+        ((0.0512, -0.02), ("refused", 4)),
+    ],
+    ids=["both within", "stage 1 past", "stage 0 past"],
+)
+def test_a_pipeline_s_law_holds_each_stage_s_figures_to_5_percent_the_stage_named(
+    tmp_path, searched, medians, verdict
+):
+    held = staged(tmp_path, searched, *medians)
+    where = law_file(tmp_path, held)
+
+    found = verdicts(advise(tmp_path), "law")
+
+    assert [(v["verdict"], v["requirement"]) for v in found] == [verdict] * 2
+    if verdict[0] == "reuse":
+        assert found[0]["reason"] == where
+        return
+    (stage,) = [k for k, median in enumerate(medians) if median > reuse.GATE]
+    figure = f"run {held['stages'][stage]['runs'][1]}, prefill, median +5.12%"
+    assert found[0]["reason"] == (
+        f"{where}: {figure} of pipeline stage {stage}, past 5%, on records run at "
+        "the head, which a calibration refits alike"
+    )
+
+
+@pytest.mark.parametrize("parts", ["laws", "stages"])
+def test_a_pipeline_s_host_laws_under_another_key_are_refused_as_one_stage_s_are(
+    tmp_path, searched, parts
+):
+    held = staged(tmp_path, searched, -0.02, -0.02)
+    if parts == "laws":
+        held["host"] = {"key": held["host"]["key"], **held["host"]["stages"][0]}
+    held["host"]["key"]["engine"]["tensor_parallel_size"] = 2
+    law_file(tmp_path, held)
+
+    found = verdicts(advise(tmp_path), "law")
+
+    assert [(v["verdict"], v["requirement"]) for v in found] == [("refused", None)] * 2
+    assert found[0]["reason"].startswith(
+        "the run file's host laws were fitted under another "
+        "['engine.tensor_parallel_size']; this run's key is "
+    )
 
 
 def test_a_law_with_a_source_stating_no_figures_names_requirement_4(tmp_path, searched):

@@ -256,7 +256,7 @@ def test_pipeline_parallel_speculation_is_refused_before_the_drafter():
         speculative_config=SimpleNamespace(synthetic_acceptance_rates=[0.5]),
     )
     with pytest.raises(RunnerRefusal, match="pipeline parallel"):
-        r._build_and_load_model(object)
+        r._build_and_load_model(r.config, object, None)
 
 
 def test_piecewise_capture_under_a_drafter_is_refused():

@@ -37,7 +37,9 @@ first, then refused, then calibrate. The requirement a verdict names:
    (calibrate); a figure on totals, holding out the costliest step or per step
    at the median past `GATE`, on some held-out run and kind, refused when the
    law's records ran at the head's ATOM digest (`records_atom`), since a
-   calibration refits the same miss, else calibrate.
+   calibration refits the same miss, else calibrate. A law above one pipeline
+   stage is judged on each stage's part under ``stages`` as a law is, the
+   stage named.
 
 A verdict on a law found names, as ``run``, the ``--step-linear`` and
 ``--host-laws`` values a run of it takes, and one on a store's own step linear
@@ -276,8 +278,7 @@ def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> di
         )
         return _verdict("calibrate", 3, why, law=where, rungs=rungs)
     past = []
-    for name, held in _folded(law).items():
-        of = f" of source {name}" if name else ""
+    for of, held in _folded(law):
         if not held.get("figures"):
             why = f"{where} states no cost-accuracy figures{of}"
             return _verdict("calibrate", 4, why, law=where)
@@ -298,18 +299,27 @@ def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> di
     return _verdict("calibrate", 4, f"{worst}, on records re-keyed {ran}", law=where)
 
 
-def _folded(law: dict) -> dict:
-    """What of `law` states cost-accuracy figures, by source name: each of its
-    `sources` with a vector that prices a step, the prefill one or a decode one
-    (`step_linear_fit._vector_of`), as ``step_linear_fit figures`` folds no
-    other, such as one of host laws alone; else the law itself, named ``""``."""
+def _folded(law: dict) -> list[tuple[str, dict]]:
+    """What of `law` states cost-accuracy figures, each with the words naming
+    it: above one pipeline stage, what of each stage's part under ``stages``
+    does, as of a law, ``of pipeline stage <k>`` added (`fit.steps`); of a
+    law, each of its `sources` with a vector that prices a step, the prefill
+    one or a decode one (`step_linear_fit._vector_of`), as ``step_linear_fit
+    figures`` folds no other, such as one of host laws alone, ``of source
+    <name>``; else the law itself, named by nothing."""
+    if stages := law.get("stages"):
+        return [
+            (f"{of} of pipeline stage {k}", held)
+            for k, part in enumerate(stages)
+            for of, held in _folded(part)
+        ]
     sources = (law.get("sources") or {}).items()
-    priced = {
-        name: source
+    priced = [
+        (f" of source {name}", source)
         for name, source in sources
         if any(v == "prefill" or v.startswith("decode ") for v in source["vectors"])
-    }
-    return priced or {"": law}
+    ]
+    return priced or [("", law)]
 
 
 def _keyed(store: ArtifactStore, kind: Kind, engine: dict, **fields) -> list[Key]:
