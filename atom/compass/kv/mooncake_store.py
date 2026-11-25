@@ -152,10 +152,12 @@ class StandInClient:
     def exists(self, keys):
         return [int(k in self.answer) for k in keys]
 
-    def put(self, keys, ptrs, sizes, group_ids=None):
+    def put(self, keys, ptrs, sizes, group_ids=None, *, tally=""):
+        # `tally` names the op a real client counts the call under (the 1P2D
+        # repro's draft window puts its draft chunks under "draft_").
         return [0] * len(keys)
 
-    def get(self, keys, ptrs, sizes):
+    def get(self, keys, ptrs, sizes, *, tally=""):
         return [self.size(k) if k in self.answer else self.missing for k in keys]
 
     def stats(self) -> dict:
