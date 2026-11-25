@@ -11,7 +11,7 @@
 #
 # THE RULE: an atom module named by an excluded test is a blind spot unless a
 # CPU-gate test that actually runs names it too. Imports are read at any
-# indentation on the excluded side -- 2109 of this tree's `import atom.*`
+# indentation on the excluded side -- 2110 of this tree's `import atom.*`
 # lines are indented -- but coverage is credited only for a module-level import
 # in a CPU-gate file that collects at least one test, because those are the only
 # imports that provably execute. At 236abfd9a the MODULE-LEVEL half carried both
@@ -44,12 +44,12 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at d51847c4ea3ddaf581807fbd8dfb4dfc33f9174e over this tree:
+# Measured at 0e444c07ab719af58997d8ad73b044fb5e48cd0e over this tree:
 #   tests/       1323 files  = 92 in tests/plugin/ + 93 excluded + 1138 CPU gate
 #   CPU gate     1057 files collect >=1 test, 81 collect none
-#   imports      2109 indented `import atom.*` lines in non-plugin test files
-#   collected  25529 tests by --collect-only. A run of the same set reports
-#              the same 25529 outcomes. Its "skipped" total is LARGER than any
+#   imports      2110 indented `import atom.*` lines in non-plugin test files
+#   collected  25561 tests by --collect-only. A run of the same set reports
+#              the same 25561 outcomes. Its "skipped" total is LARGER than any
 #              skip count here, because a module-level skip in one of the 81
 #              files that collect nothing is counted as skipped without ever
 #              becoming a collected test. This file states the set; gate_cpu.sh
