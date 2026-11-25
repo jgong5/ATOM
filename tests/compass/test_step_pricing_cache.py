@@ -20,6 +20,7 @@ from test_dp_step_max import decode, dp2, runner  # noqa: F401  the dp2 fixture
 from test_parity_record import BLOCK, _config, _Runner
 
 from atom.compass.backends import step_linear
+from atom.compass.backends.launch_features import LaunchFeatures
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_linear import StepLinearBackend, StepLinearLaw
 from atom.compass.parity import ENV
@@ -104,6 +105,24 @@ HOST = {
 }
 
 
+class Deepest(LaunchFeatures):
+    """A launch feature a forward's tokens and rows do not settle: the
+    deepest row's context in whole 32-token spans, which a streak's decodes
+    pass at batch sizes they met before."""
+
+    features = ("deepest",)
+
+    def predict(self, view, graphs):
+        return {"deepest": float(max(r.context_tokens for r in view.requests) // 32)}
+
+
+#: Each kind's `E` and `W_launch` adopt `Deepest`'s column.
+COLUMNS = {
+    kind: {"E": {"deepest": 1e-4}, "W_launch": {"deepest": 3e-4}}
+    for kind in ("decode", "prefill", "middle")
+}
+
+
 def forget(backend, runner):
     """Empty what `backend`'s vectors, `runner`'s host and its cost lines kept."""
     laws = [backend.law]
@@ -122,15 +141,17 @@ def forget(backend, runner):
 
 def drive(directory, monkeypatch, kept):
     """ATOM's scheduler over requests that decode past their hulls, each step
-    recorded and priced by `LAW` with `HOST`'s host time, with what earlier
-    steps kept or with it emptied before each step: each step's reply, the
-    cost table's lines, the runner's priced-steps mix and its host."""
+    recorded and priced by `LAW` with `HOST`'s host time and `COLUMNS`, with
+    what earlier steps kept or with it emptied before each step: each step's
+    reply, the cost table's lines, the runner's priced-steps mix and its host."""
     monkeypatch.setenv(ENV, str(directory))
     config = _config(0)
     scheduler, r, clock = Scheduler(config), _Runner(config), [0.0]
     backend = StepLinearBackend(StepLinearLaw(LAW))
     install_cost_backend(r, backend)
-    r.compass_host = HostDeviceRecurrence(HOST, (), lambda: clock[0])
+    r.compass_host = HostDeviceRecurrence(
+        HOST, (), lambda: clock[0], columns=COLUMNS, launch=(Deepest(), None)
+    )
     # The first prompt's middle chunk and its last are one budget each, so a
     # middle and a prefill forward run at the same tokens and rows.
     for i in range(16):
