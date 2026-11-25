@@ -94,13 +94,13 @@ LAW = {
         "draft_kv": {"coefficients": {"step": 1e-4, "seqs": 2e-5}, "hull": box(4)},
     },
 }
-#: Each forward kind's host segments, on (1, tokens, seqs).
+#: Each forward kind's host segments, on (1, tokens, seqs), each kind's apart.
 HOST = {
     kind: {
-        s: [1e-4 * (i + 1), 2e-7, 3e-6]
+        s: [1e-4 * (i + k), 2e-7 * k, 3e-6]
         for i, s in enumerate((*HOST_SEGMENTS, OUT_SEGMENT))
     }
-    for kind in ("decode", "prefill", "middle")
+    for k, kind in enumerate(("decode", "prefill", "middle"), 1)
 }
 
 
@@ -131,8 +131,10 @@ def drive(directory, monkeypatch, kept):
     backend = StepLinearBackend(StepLinearLaw(LAW))
     install_cost_backend(r, backend)
     r.compass_host = HostDeviceRecurrence(HOST, (), lambda: clock[0])
+    # The first prompt's middle chunk and its last are one budget each, so a
+    # middle and a prefill forward run at the same tokens and rows.
     for i in range(16):
-        prompt = list(range(5 + 100 * i, 29 + 100 * i))
+        prompt = list(range(5 + 1000 * i, 5 + 1000 * i + (128 if i == 0 else 24)))
         params = SamplingParams(max_tokens=48, ignore_eos=True)
         scheduler.add(Sequence(prompt, BLOCK, sampling_params=params))
     replies = []
