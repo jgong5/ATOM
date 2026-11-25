@@ -351,8 +351,12 @@ class StoreShell:
         if rt is None:
             raise RuntimeError("no LP runtime is installed to run the Store's calls on")
         if getattr(config.parallel_config, "pipeline_parallel_rank", 0):
-            # A later pipeline stage: the head's shell keeps its ranks.
+            # A later pipeline stage: the head's shell keeps its ranks. ATOM's
+            # half is built, for what a composite asks of it (`is_offload`,
+            # ...), and never asked to schedule or look up, as ATOM's is not.
             self._inert = True
+            with simulated_arch():
+                self._inner = scheduler.MooncakeStoreOffloadScheduler(config)
             return
         run = compass_run.spec()
         entry = run[ENTRY]
