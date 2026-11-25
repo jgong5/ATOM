@@ -33,10 +33,14 @@ short window's throughput is the tokens of the requests the client sent in it,
 and a run whose system went idle where the other's did not jumps its whole
 replay ahead. Last, per SIM, its prefix hits over the requests both ran beside
 REAL's (`hits`): which DP rank a follow-up lands on, and so whether it finds
-its conversation's prefix, is a draw of the schedule.
+its conversation's prefix, is a draw of the schedule. With
+COMPASS_ONE_REAL_WARMUP_HITS=1 (`WARMUP_HITS_ENV`), then per SIM its prefix
+hits over the warmup requests both runs sent and the warmup's share of REAL's
+prompt tokens (`warmup_hits`): the GPU hit rate counts the warmup too.
 """
 
 import json
+import os
 import random
 import re
 import sys
@@ -89,6 +93,11 @@ def main(argv: list[str]) -> int:
         print(__doc__.split("\n\n")[1], file=sys.stderr)
         return 2
     real, *sims = map(Path, argv)
+    switch = os.environ.get(WARMUP_HITS_ENV) or "0"
+    if switch not in ("0", "1"):
+        print(f"{WARMUP_HITS_ENV} is {switch!r}: 1 on, 0 or unset off", file=sys.stderr)
+        return 2
+    warmup = switch == "1"
     given = arguments(real)
     for sim in sims:
         if arguments(sim) != given:
@@ -117,6 +126,9 @@ def main(argv: list[str]) -> int:
         print(window(real, sim))
     for sim in sims:
         print(hits(real, sim))
+    if warmup:
+        for sim in sims:
+            print(warmup_hits(real, sim))
     print(json.dumps(rows))
     return 0
 
@@ -322,6 +334,62 @@ def hits(real: Path, sim: Path) -> str:
         f"({100 * (cb / ib - ca / ia):+.1f} pt), their uncached input tokens {shift}"
     )
 
+
+#: Set to 1, `main` also prints each SIM's `warmup_hits`; unset or 0, nothing
+#: more (the output is unchanged); any other value is refused.
+WARMUP_HITS_ENV = "COMPASS_ONE_REAL_WARMUP_HITS"
+
+
+def _warmup_cached(run: Path) -> dict:
+    """`_cached` over `run`'s warmup records with no error: each by
+    (conversation, turn), its input tokens and its cached ones (None where its
+    record states none)."""
+    out = {}
+    for r in read_jsonl(run / RECORDS):
+        m = r.get("metadata", {})
+        if r.get("error") or m.get("benchmark_phase") != "warmup":
+            continue
+        isl = _metric(r, "input_sequence_length", int)
+        if isl and "conversation_id" in m and "turn_index" in m:
+            out[m["conversation_id"], m["turn_index"]] = (
+                isl,
+                _metric(r, "usage_prompt_cache_read_tokens", int),
+            )
+    return out
+
+
+def warmup_hits(real: Path, sim: Path) -> str:
+    """`sim`'s prefix hits over the warmup requests both runs sent against
+    `real`'s, and the warmup's share of `real`'s prompt tokens over its warmup
+    and profiled records. The GPU hit rate is the engines' counters from
+    before the warmup on (`validate.curves.metrics`), so where the warmup holds
+    most of the prompt tokens its hits, not the profiled requests', move the
+    rate: by about that share of their gap. #752 DEPA2 c=256: 2845 one-token
+    warmup prompts held 79% of the prompt tokens, each rank's queue writing
+    about its whole KV pool between a conversation's turns, so whether a
+    prefix survived was a draw of the order (warmup hits 15-35% over nine
+    simulated runs, 18% real, beside profiled ones of 31-36% and 35%)."""
+    a, b = _warmup_cached(real), _warmup_cached(sim)
+    both = [
+        k for k in set(a) & set(b) if a[k][1] is not None and b[k][1] is not None
+    ]
+    if not both:
+        return (
+            f"{sim.name}: warmup prefix hits: no warmup request both ran states "
+            "its cached tokens"
+        )
+    (ia, ca), (ib, cb) = (
+        (sum(x[k][0] for k in both), sum(x[k][1] for k in both)) for x in (a, b)
+    )
+    warm = sum(isl for isl, _ in a.values())
+    share = warm / (warm + sum(isl for isl, _ in _cached(real).values()))
+    gap = 100 * (cb / ib - ca / ia)
+    return (
+        f"{sim.name}: warmup prefix hits over the {len(both)} warmup requests "
+        f"both ran {cb / ib:.1%} against the real run's {ca / ia:.1%} "
+        f"({gap:+.1f} pt); the warmup holds {share:.0%} of the real run's prompt "
+        f"tokens, so it moves the GPU hit rate by about {share * gap:+.1f} pt"
+    )
 
 def stalled(real: Path) -> str:
     """REAL's stalled forwards (`validate.stalls`), which no simulated run
