@@ -295,3 +295,84 @@ def test_a_simulated_runner_puts_its_dp_group_on_shared_memory(
             return t.item(), shm_collectives._GROUPS[local.group].round
 
     assert on_ranks(2, rank) == [(1, 1)] * 2
+
+
+def test_a_rank_whose_peer_is_late_waits_in_atoms_state_sync_without_a_core(
+    on_ranks,
+):
+    """A rank of ATOM's DP state sync whose peer is still on its step's output
+    sleeps until the peer comes, instead of spinning through the wait."""
+    shm_collectives.install()
+    late = 0.3
+
+    def rank(r, port):
+        with gloo_group(r, 2, port) as group:
+            assert shm_collectives.attach(group)
+            if r == 1:
+                time.sleep(late)
+            cpu, t0 = time.thread_time(), time.monotonic()
+            _, synced = _state_sync(r, group)
+            return synced, time.thread_time() - cpu, time.monotonic() - t0
+
+    (synced, cpu, waited), (peer, _, _) = on_ranks(2, rank)
+    assert synced == peer == (True, False, True)
+    assert waited > late / 2
+    assert cpu < 0.005 * waited
+
+
+def test_ranks_that_arrive_apart_agree_and_a_sleeping_rank_wakes_on_the_last(
+    on_ranks,
+):
+    """Rounds whose ranks arrive up to milliseconds apart, past the spin: each
+    returns gloo's answer, and a rank asleep on its doorbell wakes when the last
+    rank arrives, not at its check on its peers' processes a second later."""
+    gloo = dist.all_reduce, dist.all_gather
+    shm_collectives.install()
+    routed = dist.all_reduce, dist.all_gather
+    delays = (0.0, 1e-5, 1e-3, 3e-3)
+
+    def rank(r, port):
+        rng = np.random.default_rng(r)
+        with gloo_group(r, 4, port) as group:
+            assert shm_collectives.attach(group)
+            differ, longest = 0, 0.0
+            for _ in range(CALLS):
+                v = values(rng, torch.int64, 3)
+                time.sleep(rng.choice(delays))
+                t0 = time.monotonic()
+                a = call(routed, "max", v.clone(), group)
+                longest = max(longest, time.monotonic() - t0)
+                differ += a != call(gloo, "max", v.clone(), group)
+            return differ, longest
+
+    ranks = on_ranks(4, rank)
+    assert [differ for differ, _ in ranks] == [0] * 4
+    assert max(longest for _, longest in ranks) < shm_collectives.CHECK_S / 2
+
+
+@pytest.mark.parametrize("cannot", ["bind its doorbell", "share the network namespace"])
+def test_a_group_one_rank_cannot_ring_stays_on_gloo_on_every_rank(
+    on_ranks, monkeypatch, cannot
+):
+    doorbell, network = shm_collectives._doorbell, shm_collectives._network
+
+    def bound(name, rank):
+        refused = cannot == "bind its doorbell" and local.rank == 1
+        return None if refused else doorbell(name, rank)
+
+    def namespace():
+        return network() + (cannot == "share the network namespace" and local.rank == 1)
+
+    monkeypatch.setattr(shm_collectives, "_doorbell", bound)
+    monkeypatch.setattr(shm_collectives, "_network", namespace)
+    shm_collectives.install()
+
+    def rank(r, port):
+        t = torch.tensor([r, -r])
+        with gloo_group(r, 2, port) as group:
+            attached = shm_collectives.attach(group)
+            dist.all_reduce(t, dist.ReduceOp.MAX, group)
+            return attached, t.tolist()
+
+    assert on_ranks(2, rank) == [(False, [1, 0])] * 2
+    assert shm_collectives._GROUPS == {}

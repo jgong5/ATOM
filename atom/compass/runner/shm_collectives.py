@@ -11,18 +11,24 @@ cache line and waits for every rank's, then reads the rows in rank order. It
 relies on x86's store order: a rank that sees a peer's round sees the row the
 peer wrote before it.
 
-A group stays on gloo unless every rank maps the segment, from one PID
-namespace, on x86; a group spanning hosts is one. A call stays on gloo when it
-is async, its tensor is not a CPU tensor of one of the integer or float types
-both gloo and numpy hold, it moves over `ROW` bytes a rank, or it is a float
-SUM, whose bits hang on the order of the adds; the ranks of a group make the
-same call, so each makes the same choice. What comes back is gloo's bit for bit: an integer SUM wraps as gloo's
-does, MAX and MIN are exact in any order, and a float MAX or MIN that meets a
-NaN or a zero, whose sign gloo's order picks, is redone on gloo.
+A group stays on gloo unless every rank maps the segment and binds its
+doorbell, from one PID and network namespace, on x86; a group spanning hosts is
+one. A call stays on gloo when it is async, its tensor is not a CPU tensor of
+one of the integer or float types both gloo and numpy hold, it moves over `ROW`
+bytes a rank, or it is a float SUM, whose bits hang on the order of the adds;
+the ranks of a group make the same call, so each makes the same choice. What
+comes back is gloo's bit for bit: an integer SUM wraps as gloo's does, MAX and
+MIN are exact in any order, and a float MAX or MIN that meets a NaN or a zero,
+whose sign gloo's order picks, is redone on gloo.
 
-A rank waiting for its peers yields its core, then sleeps between looks; about
-every second it checks its late peers' processes, and raises RuntimeError, as
-gloo does, once one has exited.
+A rank waiting for its peers yields its core between looks for `SPIN_S`, about
+what waking a sleeping core costs, then sleeps on its doorbell, an abstract Unix
+datagram socket. A rank that publishes its round rings each peer that published
+it first, so a wait on the group's last rank, such as a DP state sync waiting on
+a peer still handling its step's output, holds no core. No ring is lost: a rank
+sleeps only `SPIN_S` after it published, and a peer that publishes later reads
+its round and rings it. Asleep, it checks its late peers' processes about every
+second, and raises RuntimeError, as gloo does, once one has exited.
 """
 
 from __future__ import annotations
@@ -32,6 +38,8 @@ import logging
 import os
 import platform
 import secrets
+import select
+import socket
 import time
 from multiprocessing import shared_memory
 from unittest import mock
@@ -46,10 +54,13 @@ logger = logging.getLogger(__name__)
 ROW = 4096
 #: A rank's round sits alone on a cache line.
 LINE = 64
-#: A waiting rank's looks at its peers' rounds: yielding its core for the first
-#: `YIELDS`, then sleeping 0.1 ms between them, and checking its late peers'
-#: processes every `CHECK`, about a second.
-YIELDS, CHECK = 1000, 10000
+#: A waiting rank yields its core between looks at its peers' rounds for
+#: `SPIN_S` seconds, then sleeps on its doorbell, checking its late peers'
+#: processes every `CHECK_S`.
+SPIN_S, CHECK_S = 1e-4, 1.0
+#: A doorbell's socket: a ring never blocks its sender, and its reader takes
+#: the rings queued without blocking.
+_DATAGRAM = socket.SOCK_DGRAM | socket.SOCK_NONBLOCK
 #: The types gloo reduces and numpy holds.
 _INTS = (torch.uint8, torch.int8, torch.int32, torch.int64)
 _FLOATS = (torch.float16, torch.float32, torch.float64)
@@ -59,32 +70,55 @@ _GROUPS: dict = {}
 
 class _Segment:
     """A group's segment: each rank's round on a line of its own, then two
-    slots of every rank's row, which the rounds take in turn."""
+    slots of every rank's row, which the rounds take in turn; and this rank's
+    doorbell, with its peers' addresses."""
 
-    def __init__(self, memory, rank: int, world: int, pids: list[int]):
+    def __init__(self, memory, rank: int, world: int, pids: list[int], bell, name):
         self.memory, self.rank, self.world, self.pids = memory, rank, world, pids
         self.round = 0
+        self.bell, self.asleep = bell, select.poll()
+        self.asleep.register(bell, select.POLLIN)
+        self.ringer = socket.socket(socket.AF_UNIX, _DATAGRAM)
+        self.peers = [(p, _address(name, p)) for p in range(world) if p != rank]
 
     def exchange(self, a: np.ndarray) -> np.ndarray:
         """Every rank's `a`, stacked in rank order."""
         self.round += 1
-        buf, world = self.memory.buf, self.world
-        rounds = np.ndarray((world,), np.int64, buf, 0, (LINE,))
-        slot = LINE * world + (self.round & 1) * world * ROW
+        r, buf, world = self.round, self.memory.buf, self.world
+        rounds = buf[: LINE * world].cast("q")[:: LINE // 8]
+        slot = LINE * world + (r & 1) * world * ROW
         rows = np.ndarray((world, ROW), np.uint8, buf, slot)
         raw = np.ascontiguousarray(a).reshape(-1).view(np.uint8)
         rows[self.rank, : raw.size] = raw
-        rounds[self.rank] = self.round
-        looks = 0
-        while rounds.min() < self.round:
-            looks += 1
-            if looks % CHECK == 0:
-                late = np.flatnonzero(rounds < self.round)
-                if gone := [int(r) for r in late if not _alive(self.pids[r])]:
-                    raise RuntimeError(f"DP ranks {gone} of the group have exited")
-            os.sched_yield() if looks < YIELDS else time.sleep(1e-4)
+        rounds[self.rank] = r
+        for p, address in self.peers:
+            if rounds[p] >= r:  # it came first and may be asleep
+                with contextlib.suppress(BlockingIOError, ConnectionError):
+                    self.ringer.sendto(b"\1", address)
+        if min(rounds) < r:
+            self._wait(rounds, r)
         out = rows[:, : raw.size].copy().view(a.dtype)
         return out.reshape((world, *a.shape))
+
+    def _wait(self, rounds, r: int) -> None:
+        """Until every rank has published round `r`; then takes the rings its
+        peers sent it on the way."""
+        spun = time.monotonic() + SPIN_S
+        while min(rounds) < r:
+            if time.monotonic() < spun:
+                os.sched_yield()
+            elif self.asleep.poll(CHECK_S * 1e3):
+                self._take_rings()
+            else:
+                late = [p for p in range(self.world) if rounds[p] < r]
+                if gone := [p for p in late if not _alive(self.pids[p])]:
+                    raise RuntimeError(f"DP ranks {gone} of the group have exited")
+        self._take_rings()
+
+    def _take_rings(self) -> None:
+        with contextlib.suppress(BlockingIOError):
+            while True:
+                self.bell.recv(1)
 
 
 def _alive(pid: int) -> bool:
@@ -110,6 +144,27 @@ def _segment(name: str, size: int = 0):
         return None
 
 
+def _address(name: str, rank: int) -> str:
+    """The abstract socket rank `rank` of the group on segment `name` sleeps on."""
+    return f"\0{name}-{rank}"
+
+
+def _doorbell(name: str, rank: int):
+    """Rank `rank`'s doorbell for the segment `name`, bound; None if that fails."""
+    bell = socket.socket(socket.AF_UNIX, _DATAGRAM)
+    try:
+        bell.bind(_address(name, rank))
+    except OSError:
+        bell.close()
+        return None
+    return bell
+
+
+def _network() -> int:
+    """This process's network namespace, which an abstract socket lives in."""
+    return os.stat("/proc/self/ns/net").st_ino
+
+
 def _here() -> list[int]:
     """Whether this host is x86, this process's PID namespace and its pid."""
     x86 = platform.machine() in ("x86_64", "AMD64")
@@ -118,8 +173,9 @@ def _here() -> list[int]:
 
 def attach(group) -> bool:
     """Put the gloo group `group` on shared memory if every rank maps rank 0's
-    segment, from one PID namespace, on x86; whether it did. A collective over
-    `group`, which stays on gloo otherwise."""
+    segment and binds its doorbell, from one PID and network namespace, on
+    x86; whether it did. A collective over `group`, which stays on gloo
+    otherwise."""
     world, rank = group.size(), group.rank()
     if world < 2:
         return False
@@ -127,21 +183,30 @@ def attach(group) -> bool:
     token = torch.tensor([secrets.randbits(63) if rank == 0 else 0])
     memory = _segment(f"atom-compass-dp-{token.item():x}", size) if rank == 0 else None
     dist.all_reduce(token, group=group)  # rank 0's token reaches every rank
+    name = f"atom-compass-dp-{token.item():x}"
     if rank:
-        memory = _segment(f"atom-compass-dp-{token.item():x}")
-    me = torch.tensor([memory is not None, *_here()], dtype=torch.int64)
+        memory = _segment(name)
+    bell = _doorbell(name, rank)
+    joins = memory is not None and bell is not None
+    me = torch.tensor([joins, *_here(), _network()], dtype=torch.int64)
     rows = [torch.empty_like(me) for _ in range(world)]
     dist.all_gather(rows, me, group=group)
     rows = [r.tolist() for r in rows]
     if rank == 0 and memory is not None:
         memory.unlink()  # every rank has opened it or failed to
-    if all(m and x86 and ns == rows[0][2] for m, x86, ns, _ in rows):
-        _GROUPS[group] = _Segment(memory, rank, world, [pid for *_, pid in rows])
+    same = rows[0][2], rows[0][4]
+    if all(j and x86 and (ns, net) == same for j, x86, ns, _, net in rows):
+        pids = [row[3] for row in rows]
+        _GROUPS[group] = _Segment(memory, rank, world, pids, bell, name)
         said = "on shared memory"
     else:
-        if memory is not None:
-            memory.close()
-        said = f"kept on gloo: {rows} (mapped, x86, PID namespace, pid by rank)"
+        for held in (memory, bell):
+            if held is not None:
+                held.close()
+        said = (
+            f"kept on gloo: {rows} (mapped and bound, x86, PID namespace, pid, "
+            "network namespace by rank)"
+        )
     logger.info("DP group, rank %d of %d, %s", rank, world, said)
     return group in _GROUPS
 
