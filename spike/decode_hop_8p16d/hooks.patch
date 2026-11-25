@@ -1,0 +1,25 @@
+--- a/atom/compass/run/__init__.py
++++ b/atom/compass/run/__init__.py
+@@ -1985,6 +1985,10 @@
+     inner = _ignoring_sigterm_from_ready(_named(_start_on_leaving(rt)))
+     if _member is not None:
+         inner = shm_collectives.attaching_engine_group(inner)
++    if os.environ.get("COMPASS_TRACE_DIR") and _member is not None and "-D" in lp.name:
++        from atom.compass import hopstamps  # jgong5/ATOM#4151, diagnostic only
++
++        hopstamps.install_engine(f"{lp.name}/{_member}")
+     return sleeping_workers(inner)
+ 
+ 
+--- a/atom/compass/runner/model_runner.py
++++ b/atom/compass/runner/model_runner.py
+@@ -151,3 +151,9 @@
+     still contributes is its `__init__`, which makes prefill's `forward` its
+     `prefill_forward`, and the reserve its KV budget holds back for the second
+     process on the card, which ATOM's budget arithmetic calls on prefill."""
++
++
++if os.environ.get("COMPASS_TRACE_DIR"):
++    from atom.compass import hopstamps  # jgong5/ATOM#4151, diagnostic only
++
++    hopstamps.install_worker(CompassModelRunner)
