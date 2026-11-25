@@ -141,6 +141,74 @@ def test_a_decode_graphs_lm_head_runs_on_its_pad_rows_unless_padding_is_none(
     assert term.seconds == _module(gemm(rows, 1000, 64)) + comm
 
 
+def _sharded(rows, exchanged=250):
+    """A data-parallel group of 4's sharded LM head by hand on `rows`
+    gathered rows: a quarter of the 1000-row vocabulary over them, then the
+    rows of 64 gathered and the logits exchanged at `exchanged` a row, in
+    bf16, each collective one hop and 3/4 of its bytes over 3 links."""
+    sent = 3 / 4 * rows * (64 + exchanged) * 2
+    return _module(gemm(rows, 250, 64)) + 2 * 2e-6 + sent / (3 * 1.0e12 * 0.80)
+
+
+DECODE = ((1, 40, True), (1, 90, True))
+
+
+@pytest.mark.parametrize(
+    "dims,padded,step,price",
+    [
+        ((250,), True, view(*DECODE, rung=4), lambda: _sharded(16)),
+        (
+            (250,),
+            True,
+            view((3, 40, True), (3, 90, True), rung=4),
+            lambda: _sharded(48),
+        ),
+        ((250,), False, view(*DECODE, rung=4), lambda: _sharded(8)),
+        ((1000,), True, view(*DECODE, rung=4), lambda: _sharded(16, 1000)),
+        (
+            (250,),
+            True,
+            BatchView(tuple(RequestShape(*r) for r in DECODE), group_prefills=True),
+            lambda: _module(gemm(2, 1000, 64)),
+        ),
+        ((250,), True, view((512, 512, False)), lambda: _module(gemm(1, 1000, 64))),
+        (
+            (250,),
+            True,
+            BatchView((RequestShape(512, 512, False),), produces_output=False),
+            lambda: None,
+        ),
+    ],
+    ids=[
+        "decode",
+        "verify",
+        "padding-none",
+        "allgather",
+        "beside-a-prefilling-peer",
+        "prefill",
+        "middle-chunk",
+    ],
+)
+def test_a_tp1_lm_head_its_data_parallel_group_shards_runs_sharded_on_its_decodes(
+    dims, padded, step, price
+):
+    """`ParallelLMHead._can_use_dp_sharded_head`: on a decode every rank of
+    the group runs, a verify's too, the group's rows gathered (4 ranks of a
+    rung-4 graph's rows, or of the real rows under ``padding: none``), a
+    quarter of the vocabulary over them and the logits exchanged all-to-all,
+    or all-gathered under `ATOM_DP_LM_HEAD_MODE` allgather; beside a
+    prefilling peer, and on a prefill, the whole vocabulary on this rank's
+    rows; on a middle chunk none."""
+    head = Module("lm_head", "lm_head", (1000, 64, 4, *dims))
+    backend = StepRooflineBackend(MACHINE, STACK[:1] + [head], padded=padded)
+    terms = {t.name: t.seconds for t in backend.price(step).terms}
+    expected = price()
+
+    assert terms.get("roofline.lm_head") == (
+        expected and pytest.approx(expected, rel=1e-12)
+    )
+
+
 @pytest.mark.parametrize("bf16", [2.5e15, 1e9], ids=["memory-bound", "compute-bound"])
 def test_linear_attention_and_act_on_a_padded_two_token_decode_step_by_hand(bf16):
     document = copy.deepcopy(ROOFLINE)
@@ -193,8 +261,16 @@ def test_a_spec_field_a_module_reads_and_the_spec_lacks_refuses_naming_it():
         lacking.price(view((1, 9, True)))
 
 
-def test_a_collective_wider_than_the_scale_up_domain_refuses_naming_it():
-    wide = StepRooflineBackend(MACHINE, [Module("o_proj", "gemm", (64, 8), ranks=16)])
+@pytest.mark.parametrize(
+    "module",
+    [
+        Module("o_proj", "gemm", (64, 8), ranks=16),
+        Module("lm_head", "lm_head", (1024, 64, 16, 64)),
+    ],
+    ids=["tp", "data-parallel-head"],
+)
+def test_a_collective_wider_than_the_scale_up_domain_refuses_naming_it(module):
+    wide = StepRooflineBackend(MACHINE, [module])
 
     with pytest.raises(CostRefused, match="over 16 ranks leaves the scale-up domain"):
         wide.price(view((1, 9, True)))

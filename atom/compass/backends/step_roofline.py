@@ -18,7 +18,13 @@ rows when built with `padded=False` (the run file's ``padding: none``).
 Attention runs over the real rows, a pad row holding no context. The LM head
 runs on each prefill row's last token (`ParallelLMHead.forward` cuts to
 them) and on every row of a decode, a graph's pad rows too, which the runner
-hands it (`running_tokens`); on none of a step that produces no output. The
+hands it (`running_tokens`); on none of a step that produces no output. A
+target LM head at TP 1 that its data-parallel group shards (`lm_head`'s group
+width) does so on a decode every rank of the group runs, none prefilling
+(`ParallelLMHead._can_use_dp_sharded_head`): it gathers every rank's rows,
+this rank's times the group's width, multiplies them by its vocabulary shard
+and exchanges the logits, all-to-all or all-gathered (`_dp_sharded_logits`);
+on a step some rank prefills it runs the whole vocabulary on its own rows. The
 modules the model's `compute_logits` runs before it (`Module.logits`: V4's
 `hc_head`, which reduces the residual copies, and V4's and V4.1's final
 norm) run on every row of a step whose LM head samples, on none of another.
@@ -93,7 +99,8 @@ tensor it receives: one collective of `hidden` bf16 elements a row over the
 Refused: a step with image tokens, since nothing here prices the vision
 encoder that fills them; any step, while the walk found a module it could not
 classify; a step whose modules read a spec field the spec does not state; a
-data-parallel MoE step with no `moe_rows`; a split step whose counts name no
+data-parallel MoE step with no `moe_rows`; a step with a collective wider than
+the scale-up domain; a split step whose counts name no
 single pair for this rank, or whose MoE runs MoRI's split send and receive,
 whose overlap no stream carries.
 
@@ -170,7 +177,9 @@ class Module:
     `kind` picks its work; `dims` are its per-rank shapes in that kind's order:
     `gemm` (n, k, then the rows it runs a token where more than one),
     `lm_head` (n, k, then, where a serial drafter's data-parallel group may
-    shard its argmax, that group's width and the most rows it shards),
+    shard its argmax, that group's width and the most rows it shards; where
+    the target's group shards it on a decode, that group's width and the
+    logits a row its exchange holds),
     `hc_head` (residual copies, width), a pass (elements a token; a `norm`'s
     second, those of them it writes in fp8), `act` (output
     elements a token), `attention` (heads, KV heads, head dim),
@@ -268,15 +277,26 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
         if not sampled:
             return None
         pair = 2 * ELEMENT_BYTES["fp32"]  # an argmax's (value, id)
-        if len(d) > 2:  # the data-parallel group's sharded argmax (`_serial`)
+        if len(d) > 2 and m.passes:  # the group's sharded argmax (`_serial`)
             dp, rows = d[2], d[2] * sampled
             hidden = allgather(dp, rows * d[1] * act)
             pairs = allgather(dp, dp * rows * pair)
             return gemm(rows, d[0] // dp, d[1], b=m.fmt) + hidden + pairs
+        if len(d) > 2 and not (view.prefill or view.group_prefills):
+            # The group's sharded head: its rows gathered, multiplied by this
+            # rank's vocabulary shard, the logits exchanged at `d[3]` a row,
+            # each rank's shard spread over the group (all-to-all) or the
+            # whole vocabulary on every rank (all-gather). ponytail: the copy
+            # that then lays this rank's rows out for the sampler moves no
+            # compulsory byte; it is left out of this lower bound.
+            dp, rows = d[2], d[2] * sampled
+            hidden = allgather(dp, rows * d[1] * act)
+            logits = all_to_all(dp, rows * d[3] * act)
+            return gemm(rows, d[0] // dp, d[1], b=m.fmt) + hidden + logits
         gathered = sampled * d[0] * m.ranks * act
         if m.passes:  # a serial drafter's argmax: each rank's (value, id) pair
             gathered = sampled * pair * m.ranks
-        return gemm(sampled, *d, b=m.fmt) + allgather(m.ranks, gathered)
+        return gemm(sampled, *d[:2], b=m.fmt) + allgather(m.ranks, gathered)
     if m.kind in PASSES:
         # ponytail: one pass over the module's own width; a per-head norm or
         # rotary touches heads times that, left out of this lower bound.
@@ -698,9 +718,11 @@ class StepRooflineBackend(CostBackend):
                 f"{m.kind} reads {', '.join(dict.fromkeys(missing))}, "
                 "which the machine spec does not state"
             )
-        if work.comm and m.ranks > self.domain:
+        # Its own group's, or a data-parallel group's it joins.
+        wide = max([m.ranks, *(c.ranks for c in work.comm)])
+        if work.comm and wide > self.domain:
             return (
-                f"a {m.kind} collective over {m.ranks} ranks leaves the "
+                f"a {m.kind} collective over {wide} ranks leaves the "
                 f"scale-up domain of {self.domain} devices"
             )
         p = parts(work, self.machine)

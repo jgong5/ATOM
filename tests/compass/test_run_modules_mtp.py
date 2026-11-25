@@ -16,7 +16,9 @@ every row before its logits, none on a middle chunk, and its LM head runs a
 decode graph's pad rows too; at TP 2 Qwen3.5's gathers its `fc`'s output
 and its argmax alone, and under a pure data-parallel group of two its later
 passes run at the step's `running_bs`, draft graph or none, the group
-sharding their argmax. A speculative step then answers
+sharding their argmax. Under V4-Pro's DP8 at TP 1 the target's LM head,
+which its drafts share, is sharded over the group on a decode every rank
+runs, a draft's never. A speculative step then answers
 `_group_step_seconds`' "prices no draft" check, the roofline alone or below a
 backend that refuses the step; a run with no drafter laid out, Eagle3's
 (#3962), is still refused.
@@ -49,6 +51,7 @@ from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import BatchView, RequestShape, sum_tokens
 from atom.compass.backends.step_roofline import (
     UNCLASSIFIED,
+    Module,
     StepFallbackBackend,
     StepRooflineBackend,
 )
@@ -61,7 +64,7 @@ from atom.compass.backends.work import (
     gemm,
     price,
 )
-from atom.compass.run.modules import _dp_argmax
+from atom.compass.run.modules import _dp_argmax, _dp_head
 from atom.compass.spec import MachineSpec
 
 HERE = pathlib.Path(__file__).parent
@@ -82,6 +85,7 @@ BUILDS = {
     "qwen3.5-tp2": (CONFIG, 2, MI308X, 1, []),
     "qwen3.5-2layers": (CONFIG, 1, MI308X, 1, []),
     "qwen3.5-dp2-mtp3": (CONFIG, 1, MI308X, 3, ["--data-parallel-size", "2"]),
+    "v4-dp8-mtp2": (V4_PRO, 8, MI355X, 2, ["--enable-dp-attention"]),
 }
 #: Builds whose text config is edited: two MTP layers.
 TEXT = {"qwen3.5-2layers": {"mtp_num_hidden_layers": 2}}
@@ -93,6 +97,7 @@ DRAFTERS = {
     "qwen3.5-dp2-mtp3": "Qwen3_5MTP",
     "v3-mtp2": "DeepSeekMTP",
     "v4-mtp2": "DeepseekV4MTP",
+    "v4-dp8-mtp2": "DeepseekV4MTP",
 }
 
 #: Builds the model under argv's root and its drafter on the meta device at
@@ -535,6 +540,54 @@ def test_a_dp_group_shards_no_argmax_past_its_cap(built, monkeypatch):
     assert (_dp_argmax(group), _dp_argmax(alone)) == ((2, 256), ())
     monkeypatch.setenv("ATOM_DP_DRAFT_ARGMAX", "0")
     assert _dp_argmax(group) == ()
+
+
+def test_a_dp_group_shards_its_targets_lm_head_at_tp1_by_its_mode(monkeypatch):
+    """`ParallelLMHead._can_use_dp_sharded_head`: a head at TP 1, a group of
+    two or more ranks that divides its vocabulary, `ATOM_DP_LM_HEAD_MODE`
+    all2all, the default, or allgather. The head carries the group and the
+    logits a row its exchange holds: a rank's shard, or the whole vocabulary;
+    under any other mode ("default", ATOM's opt-out) it runs unsharded."""
+    import atom.config
+
+    def at(dp):
+        config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=dp))
+        monkeypatch.setattr(atom.config, "get_current_atom_config", lambda: config)
+
+    head = Module("lm_head", "lm_head", (1000, 64))
+    at(4)
+    monkeypatch.delenv("ATOM_DP_LM_HEAD_MODE", raising=False)
+    assert _dp_head(head).dims == (1000, 64, 4, 250)
+    assert _dp_head(dataclasses.replace(head, ranks=2)) == dataclasses.replace(
+        head, ranks=2
+    )
+    assert _dp_head(dataclasses.replace(head, dims=(1002, 64))).dims == (1002, 64)
+    monkeypatch.setenv("ATOM_DP_LM_HEAD_MODE", "allgather")
+    assert _dp_head(head).dims == (1000, 64, 4, 1000)
+    monkeypatch.setenv("ATOM_DP_LM_HEAD_MODE", "default")
+    assert _dp_head(head) == head
+    monkeypatch.delenv("ATOM_DP_LM_HEAD_MODE")
+    at(1)
+    assert _dp_head(head) == head
+
+
+def test_a_v4_dp8_target_shards_its_lm_head_and_its_drafts_do_not(built, monkeypatch):
+    """V4-Pro MTP2 under `--enable-dp-attention -tp 8`, DP8 at TP 1, on
+    MI355X. The target's LM head carries the group and an eighth of the
+    vocabulary; its drafts', the same head, the group and their argmax's cap
+    alone. `ForwardMode.decide` settles a verify while every rank decodes
+    into a rung-4 graph of no prefilling group, which the head shards on, and
+    one beside a prefilling peer into no graph of a prefilling group."""
+    hf = json.loads(V4_PRO.read_text())
+    vocab, d = hf["vocab_size"], hf["hidden_size"]
+    found = built["v4-dp8-mtp2"]["modules"]
+    heads = [(m.passes, m.dims) for m in found if m.kind == "lm_head"]
+    assert heads == [(0, (vocab, d, 8, vocab // 8)), (2, (vocab, d, 8, 256))]
+    rows = [(3, 600 + i, True) for i in range(3)]
+    alike = settled(monkeypatch, rows, [(3, 9, False)] * 7)
+    beside = settled(monkeypatch, rows, [(3, 9, False)] * 6 + [(1, 16, True)])
+    assert (alike.capture_rung, alike.group_prefills) == (4, False)
+    assert (beside.capture_rung, beside.group_prefills) == (None, True)
 
 
 class _Refuses(CostBackend):

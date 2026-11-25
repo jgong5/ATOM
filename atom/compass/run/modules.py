@@ -13,7 +13,9 @@ module's own per-rank parameter shapes and attributes:
   (GDN keeps its `conv1d` in a column-parallel linear): one pass over its
   channels.
 - `VocabParallelEmbedding`, `ParallelLMHead`: a lookup and its all-reduce; a
-  GEMM and its all-gather.
+  GEMM and its all-gather. A target's at TP 1 under a data-parallel group
+  that shards its vocabulary on a decode (`_dp_head`) carries that group's
+  width and the logits a row its exchange holds.
 - `RMSNorm`, `GemmaRMSNorm`, `RMSNormGated`: one pass over the weight's
   width; an `RMSNorm` built with `fused_allreduce` joins its all-reduce
   inside the norm, and so do the norms MiniMax-M3's decoder reduces the
@@ -115,7 +117,8 @@ Its modules carry its passes, the config's `num_speculative_tokens`
 (`Module.passes`). Each pass runs the first of its MTP layers, since
 `EagleProposer` passes no `spec_step_idx`. A drafter that holds no LM head of
 its own runs the target's, and its embedding, in each pass (V4's
-`share_with_target`), so those of the target's are its modules too. V4's MTP
+`share_with_target`), so those of the target's are its modules too, the
+head without the target's decode sharding (a draft pass takes none). V4's MTP
 block norms its two inputs itself, as a V4 block does not, its hidden-state
 norm and `h_proj` on each residual copy of a token; before the LM head it
 reduces its residual copies (`hc_head`, by its own mixing weights) and
@@ -251,6 +254,7 @@ def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
             found.append(Module(where, UNCLASSIFIED))
 
     visit(tree, "", None, 0)
+    found[:] = [_dp_head(m) if m.kind == "lm_head" else m for m in found]
     if drafted is None:
         return found
     if not _is(drafted, *SERIAL):
@@ -263,11 +267,15 @@ def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
     target = list(found)
     visit(drafted, "drafter", None, 0, passes)
     if not any(m.passes and m.kind == "lm_head" for m in found):
-        # V4's MTP blocks run the target's (`share_with_target`).
+        # V4's MTP blocks run the target's (`share_with_target`), a draft's
+        # head unsharded by the target's group (`is_draft`).
         shared = [m for m in target if m.kind in ("embedding", "lm_head")]
         found += [
             dataclasses.replace(
-                m, name=f"drafter, the target's {m.name}", passes=passes
+                m,
+                name=f"drafter, the target's {m.name}",
+                passes=passes,
+                dims=m.dims[:2],
             )
             for m in shared
         ]
@@ -289,6 +297,28 @@ def _dp_argmax(config) -> tuple[int, ...]:
     if dp <= 1 or not envs.ATOM_DP_DRAFT_ARGMAX:
         return ()
     return dp, envs.ATOM_DP_DRAFT_ARGMAX_MAX_ROWS
+
+
+def _dp_head(head: Module) -> Module:
+    """`head`, a target's LM head, carrying its data-parallel group's width
+    and the logits a row its exchange holds where the group shards its
+    vocabulary on a decode (`ParallelLMHead._can_use_dp_sharded_head`): at
+    TP 1, over a group of two or more ranks that divides the vocabulary,
+    under `ATOM_DP_LM_HEAD_MODE` all2all, its default, each rank's shard, sent
+    to the ranks whose rows it holds, or allgather, the whole vocabulary
+    every rank gathers. Else `head`."""
+    if head.ranks != 1:
+        return head
+    from atom.config import get_current_atom_config
+    from atom.utils import envs
+
+    vocab = head.dims[0]
+    dp = get_current_atom_config().parallel_config.data_parallel_size
+    mode = envs.ATOM_DP_LM_HEAD_MODE
+    if dp <= 1 or vocab % dp or mode not in ("all2all", "allgather"):
+        return head
+    width = vocab // dp if mode == "all2all" else vocab
+    return dataclasses.replace(head, dims=head.dims + (dp, width))
 
 
 def drafter(config):
