@@ -12,10 +12,15 @@ process-global.
 """
 
 import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
 
 import numpy as np
 import pytest
-from test_backend_step_roofline_mla import MI355X, _build
+from test_backend_step_roofline_mla import BUILD, MI355X, TREE, _build
 from test_backend_step_roofline_v4 import BOUND, _module, _price, view
 
 from atom.compass.backends.step_roofline import (
@@ -171,6 +176,51 @@ def test_a_layer_reusing_the_selection_runs_no_indexer(monkeypatch):
     assert index_norms == [
         "model.layers.0.self_attn.index_q_norm",
         "model.layers.0.self_attn.index_k_norm",
+    ]
+
+
+def _walk_index(index: str) -> list:
+    """`M3` walked as `_build` walks it at TP4, over an fp8 KV cache and an
+    `index` index cache in pages of 128 tokens, as M3's recipe runs: the
+    layer, dims and index format of each sparse attention module."""
+    cache = f'index_cache_dtype="{index}", kv_cache_block_size=128,'
+    script = BUILD.replace('kv_cache_dtype="fp8",', 'kv_cache_dtype="fp8", ' + cache)
+    assert script != BUILD
+    script += (
+        "print(json.dumps([[m.layer, list(m.dims), m.index] for m in walk(tree)"
+        " if m.kind == 'block_sparse_attention']))\n"
+    )
+    with tempfile.TemporaryDirectory() as root:
+        (pathlib.Path(root) / "model").mkdir()
+        (pathlib.Path(root) / "model" / "config.json").write_text(json.dumps(M3))
+        done = subprocess.run(
+            [sys.executable, "-c", script, "tp4", root],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=900,
+            cwd=TREE,
+            env={**os.environ, "PYTHONPATH": str(TREE)},
+        )
+    assert done.returncode == 0, done.stderr[-4000:]
+    return json.loads(done.stdout.splitlines()[-1])
+
+
+def test_the_indexer_scores_at_its_own_caches_format(monkeypatch):
+    monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
+    # An fp4 index cache beside the fp8 KV cache.
+    assert _walk_index("fp4") == [[1, [16, 1, 128, 16, 128, 1, 128], "fp4"]]
+
+
+def test_an_indexer_sharding_the_context_is_unclassified(monkeypatch):
+    monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
+    # Indexer context parallelism, valid at TP4 over M3's 4 KV heads: each
+    # rank scores every index head over a quarter of the blocks.
+    monkeypatch.setenv("ATOM_M3_INDEXER_CP", "1")
+    walked = _build("tp4", M3)
+
+    assert [m.name for m in walked if m.kind == "unclassified"] == [
+        "Attention at model.layers.1.self_attn.attn"
     ]
 
 

@@ -560,9 +560,9 @@ def _block_sparse_attention(m: Module, view: BatchView) -> Work:
     the module's own (`10` D64): it adds no work.
     The attention (`sparse_pa_per_row`) attends each query over its selected
     blocks (`_block_keys`), two products of the head dim per head and key at
-    the wider of Q's format `act` and the KV's `fmt`. Each request reads K and
-    V of the blocks its last query selects once at each KV head, the least
-    any of its queries reads; Q is read at `act`, O written in bf16.
+    the wider of Q's format `act` and the KV's `fmt`. The blocks a request
+    reads include those its last query selects, whose K and V are counted
+    once at each KV head; Q is read at `act`, O written in bf16.
     """
     heads, kv_heads, dim, top, block, index_heads, index_dim = m.dims
     rows = view.requests
