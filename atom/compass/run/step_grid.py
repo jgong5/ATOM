@@ -278,7 +278,7 @@ def _remapped(pickled: bytes) -> str:
     with tempfile.TemporaryDirectory(prefix="compass-remap-") as tmpdir:
         driverless.install(tmpdir, REMAP_ARCH)  # before anything imports aiter
         quant, hf_config = pickle.loads(pickled)
-        from atom.model_engine.model_runner import support_model_arch_dict
+        from atom.models.registry import support_model_arch_dict
         from atom.utils import resolve_obj_by_qualname
 
         arch = hf_config.architectures[0]

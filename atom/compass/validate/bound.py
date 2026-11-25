@@ -403,7 +403,7 @@ def _build(model: str, tp: int, atom_args, arch: str, tmpdir: str):
         config.tensor_parallel_size, config.parallel_config.data_parallel_size
     )
     set_current_atom_config(config)
-    from atom.model_engine.model_runner import (
+    from atom.models.registry import (
         support_model_arch_dict,
     )  # needs the declared arch
 
