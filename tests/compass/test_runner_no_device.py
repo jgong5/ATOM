@@ -18,6 +18,7 @@ import torch
 from test_memory_readings import CONFIG_JSON, DOCUMENT, EXPECTED, readings_at
 from transformers import PretrainedConfig
 
+from atom.compass import run as compass_run
 from atom.compass.runner.overrides import (
     HostEvent,
     HostStream,
@@ -228,67 +229,132 @@ def test_a_host_start_refuses_what_it_holds_only_on_the_fp4_index_plane(
     assert torch.cuda.memory_allocated(runner.device) == held
 
 
-def _indexed(monkeypatch, model, index, arch, backend="opus"):
+#: A machine spec of each arch, as a run file states its machine.
+MACHINES = {
+    "gfx942": "mi308x-hjbog18.json",
+    "gfx950": "mi355x-crs005.json",
+    "gfx1250": "mi455-a0.json",
+}
+#: What aiter's `mqa_logits_mxfp4_config` answered DeepSeek-V4's attention
+#: builder on one MI355X (pit2-p03-g08, nightly_202611151511's aiter, whose
+#: `_TILE` is 64), by `max_model_len` and `max_num_seqs`: its block table
+#: width. gfx1250's registry, in the same aiter's source, tiles each instance
+#: at 64 keys too, so it answers the same.
+ON_DEVICE = {(1000, 1): 4, (2048, 512): 8, (100003, 16): 391, (1048576, 512): 4096}
+
+
+def _indexed(monkeypatch, model, index, arch, backend="opus", machine=True):
     """`_config()` for `model` under `--index-cache-dtype index`, its indexer
-    layout resolved as `Config` resolves it on a device of `arch`."""
+    layout resolved as `Config` resolves it on a device of `arch`, under a run
+    file whose machine is of `arch` (of `machine` when it names one, none when
+    None), with aiter's MQA-logits module stood in: its config function
+    answers a card, and its tile, rules and width bound are aiter's."""
     monkeypatch.setitem(
         sys.modules,
         "aiter.jit.utils.chip_info",
         SimpleNamespace(get_gfx_runtime=lambda: arch),
     )
     monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", backend)
+    name = MACHINES[arch if machine is True else machine] if machine else None
+    machines = REPO / "tests/compass/machines"
+    spec = {"machine": json.loads((machines / name).read_text())} if name else None
+    monkeypatch.setattr(compass_run, "spec", lambda: spec)
+
+    def card(device, **bounds):
+        return "card", device, bounds
+
+    rules = {"gfx950": None, "gfx1250": None}
+    mqa = SimpleNamespace(
+        mqa_logits_mxfp4_config=card, _TILE=64, _RULES=rules, _MAX_SEQ_LEN=1 << 29
+    )
+    monkeypatch.setitem(sys.modules, "aiter.ops.opus.pa_mqa_logits_mxfp4", mqa)
     config = _config()
     config.hf_config, config.index_cache_dtype = model, index
     Config._resolve_index_cache_layout(config)
-    return config
+    return config, mqa, card
 
 
-@pytest.mark.parametrize(
-    "arch, remedies",
-    [
-        ("gfx950", ["ATOM_V4_UNIFIED_MQA=flydsl", "--index-cache-dtype fp8"]),
-        ("gfx1250", ["--index-cache-dtype fp8"]),
-    ],
-    ids=["gfx950", "gfx1250"],
-)
-def test_deepseek_v4_under_the_fp4_indexer_is_refused_by_name_before_anything_is_replaced(
-    started, monkeypatch, arch, remedies
+def _builders_request(max_model_len, max_num_seqs):
+    """What `DeepseekV4AttentionMetadataBuilder.__init__` asks the config for."""
+    return {
+        "heads": 64,
+        "page_size": 64,
+        "max_rows": max_num_seqs,
+        "max_seqs": max_num_seqs,
+        "max_qlen": 1,
+        "max_seq_len": max_model_len // 4,
+    }
+
+
+@pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
+def test_deepseek_v4_under_the_fp4_indexer_gets_its_devices_table_width_on_the_host(
+    started, monkeypatch, arch
 ):
     """An unset `--index-cache-dtype` resolves to fp4 for DeepSeek-V4 off
     gfx942, and there its attention builder sizes its block table from aiter's
     `mqa_logits_mxfp4_config` on the runner's device, the host after this
-    start, which aiter refuses on every rank: refused before that, naming what
-    starts. On gfx950 that is first the flydsl backend, which keeps the fp4
-    indexer that step laws are keyed by; on gfx1250 it leaves the layout as is."""
-    config = _indexed(monkeypatch, V4, "fp4", arch)
-    stream, event = torch.cuda.Stream, torch.cuda.Event
-    with pytest.raises(RunnerRefusal, match="pass --index-cache-dtype fp8") as e:
-        started(config)
-    message = str(e.value)
-    assert config.index_cache_layout in message
-    named = ("ATOM_V4_UNIFIED_MQA=flydsl", "--index-cache-dtype fp8")
-    assert sorted([r for r in named if r in message], key=message.index) == remedies
-    assert torch.cuda.Stream is stream
-    assert torch.cuda.Event is event
+    start, which aiter refuses. Asked about the host, the config answers the
+    width the device gives, and the arch of the run's machine; asked about a
+    card, it is aiter's."""
+    config, mqa, card = _indexed(monkeypatch, V4, "fp4", arch)
+    runner, _ = started(config)
+    assert runner.device == torch.device("cpu")
+    for (length, seqs), width in ON_DEVICE.items():
+        request = _builders_request(length, seqs)
+        answer = mqa.mqa_logits_mxfp4_config(runner.device, **request)
+        assert answer.block_table_width == width, (length, seqs)
+        assert answer.arch == arch
+        assert {k: getattr(answer, k) for k in request} == request
+        assert answer.pages_per_block == 1
+    assert mqa.mqa_logits_mxfp4_config(0, heads=64) == card(0, heads=64)
 
 
 @pytest.mark.parametrize(
-    "model, index, arch, backend",
+    "machine, asked",
     [
-        (V4, "fp8", "gfx950", "opus"),
-        (V4, "fp4", "gfx942", "opus"),
-        (V4, "fp4", "gfx950", "flydsl"),
-        (V41, "fp4", "gfx950", "opus"),
+        ("gfx942", {}),
+        ("gfx950", {"heads": 32}),
+        ("gfx950", {"page_size": 8}),
+        ("gfx950", {"pages_per_block": 2}),
+        ("gfx950", {"max_rows": 0}),
+        ("gfx950", {"max_seq_len": 1 << 29}),
     ],
-    ids=["v4-fp8", "v4-fp4-on-gfx942", "v4-fp4-flydsl", "v41-fp4"],
+    ids=["no-rule", "heads", "page", "entry", "rows", "width"],
 )
-def test_a_start_whose_builder_asks_aiter_nothing_of_the_device_is_not_refused(
-    started, monkeypatch, model, index, arch, backend
+def test_a_request_the_v4_builder_does_not_make_is_refused_on_the_host(
+    started, monkeypatch, machine, asked
+):
+    """Answered on the host is the builder's request alone: 64 index heads on
+    64-row pages, on an arch aiter has a rule for, bounds aiter takes. Any other
+    a device's aiter would refuse or answer with another instance."""
+    config, mqa, _ = _indexed(monkeypatch, V4, "fp4", "gfx950", machine=machine)
+    runner, _ = started(config)
+    request = _builders_request(2048, 512) | asked
+    with pytest.raises(RunnerRefusal, match="DeepSeek-V4's attention builder alone"):
+        mqa.mqa_logits_mxfp4_config(runner.device, **request)
+
+
+@pytest.mark.parametrize(
+    "model, index, arch, backend, machine",
+    [
+        (V4, "fp8", "gfx950", "opus", True),
+        (V4, "fp4", "gfx942", "opus", True),
+        (V4, "fp4", "gfx950", "flydsl", True),
+        (V41, "fp4", "gfx950", "opus", True),
+        (V4, "fp4", "gfx950", "opus", None),
+    ],
+    ids=["v4-fp8", "v4-fp4-on-gfx942", "v4-fp4-flydsl", "v41-fp4", "no-run-file"],
+)
+def test_a_start_whose_builder_asks_aiter_nothing_of_the_device_leaves_it_aiters(
+    started, monkeypatch, model, index, arch, backend, machine
 ):
     """fp8, and fp4 on gfx942, where V4 falls back to the fp8 indexer, leave
     V4 no FP4 layout; the flydsl backend's preshuffled layout sizes its table
     without aiter; DeepSeek-V4.1's fp4 plane has its own layout names, and
-    `_resident` answers for it. Each starts as before."""
-    runner, calls = started(_indexed(monkeypatch, model, index, arch, backend))
+    `_resident` answers for it. Each starts as before, aiter's config function
+    as it was, as is every start without a run file, which states no device."""
+    config, mqa, card = _indexed(monkeypatch, model, index, arch, backend, machine)
+    runner, calls = started(config)
     assert runner.device == torch.device("cpu")
     assert [k["backend"] for _, k in calls[:1]] == ["gloo"]
+    assert mqa.mqa_logits_mxfp4_config is card
