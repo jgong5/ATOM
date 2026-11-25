@@ -186,7 +186,13 @@ class CompassTransport(AioHttpTransport):
             done = any(
                 p.name == "data" and p.value == "[DONE]" for p in message.packets
             )
-            await self._push.send_pyobj((key, seq, arrival, done))
+            if seq is not None:  # a clock message: the traffic LP waits on it
+                await self._push.send_pyobj((key, seq, arrival, done))
+            elif done:
+                raise ValueError(
+                    f"request {request_info.x_request_id} (credit {key}): its "
+                    "[DONE] event is no clock message"
+                )
             message.perf_ns = _ns(arrival)
             stamped.append(message)
             if first_token is not None and await first_token(

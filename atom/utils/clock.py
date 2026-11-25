@@ -274,6 +274,18 @@ class LPRuntime:
                 self.sent_reach = reach
         return arrival, seq
 
+    def stamp_unsent(self, ch: str) -> float:
+        """The arrival `stamp_send` would give a message on `ch` now, for one
+        that carries its stamp and is no clock message: it takes no seq and is
+        logged nowhere, so no LP is held for it. Refused where `stamp_send` is."""
+        self._require_owner("stamp_unsent")
+        if self.asked:
+            why = f"stamp_unsent on {ch} while a next-event request is out"
+            self.refusals.append(f"clock:{why}")
+            raise RuntimeError(f"{self.me}: {why}, so no time can be given to it")
+        with self.lock:
+            return self.now + self.table.lookahead(ch)
+
     def offer(self, send) -> None:
         """Queue `send`, a call that sends on this LP's channels, for the clock
         owner, which alone stamps a send: a handler's offer runs once the handler

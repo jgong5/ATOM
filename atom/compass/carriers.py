@@ -29,6 +29,7 @@ simulated seconds in ns plus `EPOCH_NS`.
 """
 
 import math
+import os
 import re
 from typing import Any
 
@@ -41,6 +42,13 @@ RELAY_SERVICE = "compass_relay_s"
 _ENTRY = re.compile(rf"a:{_NUM};s:(\d+)")
 _TRACE_ENTRY = re.compile(rf"a:{_NUM};s:(\d+)(?:;j:{_NUM})?")
 _COMMENT = re.compile(rf": compass a={_NUM} s=(\d+)")
+#: The seq of a stream event that carries its stamp and is no clock message.
+UNSENT = "-"
+_UNSENT_COMMENT = re.compile(rf": compass a={_NUM} s=-")
+#: ``all`` stamps every event of a decode stream as a clock message; by default
+#: only its terminal ``[DONE]`` event is one (`stamp_events`).
+STREAM_CLOCK_ENV = "ATOM_COMPASS_STREAM_CLOCK"
+_DONE = "data: [DONE]"
 _MAX_ENTRIES = 32
 #: Added to every simulated ns stamp a client records. Simulated time starts at
 #: 0, and aiperf reads a 0 start stamp as missing.
@@ -126,18 +134,27 @@ def stamp_events(text: str, rt) -> str:
     *events, tail = text.split("\n\n")
     if tail:
         raise ValueError(f"unterminated SSE frame {tail!r}: no blank line after it")
+    every = os.environ.get(STREAM_CLOCK_ENV) == "all"
     out = []
     for event in events:
-        arrival, seq = rt.stamp_send(ch)
-        out.append(f": compass a={arrival!r} s={seq}\n{event}\n\n")
+        # The router LP takes an event holding a [DONE] as the stream's end.
+        if every or _DONE in event:
+            arrival, seq = rt.stamp_send(ch)
+            out.append(f": compass a={arrival!r} s={seq}\n{event}\n\n")
+        else:
+            arrival = rt.stamp_unsent(ch)
+            out.append(f": compass a={arrival!r} s={UNSENT}\n{event}\n\n")
     return "".join(out)
 
 
-def sse_stamp(line: str) -> tuple[float, int] | None:
-    """The ``(arrival, seq)`` of a compass comment line; None for any other line."""
+def sse_stamp(line: str) -> tuple[float, int | None] | None:
+    """The ``(arrival, seq)`` of a compass comment line, seq None for an event
+    that is no clock message (`UNSENT`); None for any other line."""
     line = line.rstrip("\r\n")
     if not line.startswith(": compass "):
         return None
+    if (m := _UNSENT_COMMENT.fullmatch(line)) is not None:
+        return float(m[1]), None
     return _parse(_COMMENT, line, "SSE comment")
 
 

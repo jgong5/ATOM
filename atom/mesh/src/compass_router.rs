@@ -380,6 +380,17 @@ fn cancel_seq(body: &[u8]) -> Option<u64> {
 /// intake jitter after the seq, `a:<arrival>;s:<seq>;j:<bytes>`
 /// (`atom/compass/carriers.py`); the router forwards the header unchanged and
 /// takes no jitter of its own, so the seq ends at the next `;`.
+/// The arrival of a stream event that carries its stamp and is no clock
+/// message, `a=<arrival> s=-`; None for any other stamp.
+fn unsent(text: &str) -> Option<f64> {
+    let arrival = text.strip_suffix(" s=-")?.strip_prefix("a=")?;
+    Some(
+        arrival
+            .parse()
+            .unwrap_or_else(|_| fail(format!("malformed compass stamp {text:?}"))),
+    )
+}
+
 fn stamp(text: &str) -> (f64, u64) {
     let parsed = text
         .strip_prefix("a")
@@ -615,7 +626,21 @@ impl Lp {
         let Some(text) = line.strip_prefix(b": compass ") else {
             return event;
         };
-        let seq = stamp(&String::from_utf8_lossy(text)).1;
+        let text = String::from_utf8_lossy(text);
+        if let Some(arrival) = unsent(&text) {
+            // No clock message: restamped at the arrival plus the lookahead, as
+            // a held one is, and not held.
+            if memmem::find(&event, b"data: [DONE]").is_some() {
+                fail(format!("a stream's [DONE] event from {from} is no clock message"));
+            }
+            let Some(lookahead) = self.lookaheads.get("router->traffic:stream") else {
+                fail("no outbound channel router->traffic:stream");
+            };
+            let mut out = format!(": compass a={:?} s=-", arrival + lookahead).into_bytes();
+            out.extend_from_slice(&event[line.len()..]);
+            return out;
+        }
+        let seq = stamp(&text).1;
         let mut turn = self.hold(from, seq).await;
         let (arrival, seq) = turn.send("router->traffic:stream");
         let mut out = format!(": compass a={arrival:?} s={seq}").into_bytes();
