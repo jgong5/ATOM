@@ -116,3 +116,55 @@ def test_a_slot_after_the_blocks_is_a_second_write_unless_no_block_moves(
     )
     link = Link(model)
     assert (link.start(0.0, 1), link.start(0.0, 0)) == (first, second)
+
+
+#: A lazy trace of the model under argv's root on argv's cell, `compass run`'s
+#: on a store miss (`run._tracer`): ATOM's runner stepped at one decode, its KV
+#: pool allocated as a trace allocates it.
+TRACE = """
+import json, pathlib, sys
+from types import SimpleNamespace
+root, out, *atom_args = sys.argv[1:]
+from atom.compass.capture import forward
+raw = json.loads(pathlib.Path(root, "model", "config.json").read_text())
+tracer = forward.Tracer(root + "/model", 8, root + "/declared", atom_args, "gfx950")
+tracer.config.multimodal_config = SimpleNamespace(
+    vision_config=SimpleNamespace(**raw["vision_config"])
+)
+graph, *_ = next(iter(tracer.trace([forward.decode(1)], [forward.decode(1)])))
+print(json.dumps({"kv": tracer.config.kv_transfer_config,
+                  "structure": graph.applicability.structure}))
+"""
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+def test_a_lazy_trace_of_a_kimi_k3_side_runs_on_mooncake_s_connector(
+    monkeypatch, tmp_path, role
+):
+    """A side's simulated connector is traced as Mooncake's, at the side's
+    role, so ATOM's KV allocation, which asks Kimi's builder for the regions
+    a P/D backend moves, traces the step. A Mooncake decode serves Kimi-K3's
+    mono kernels, which a capture holds no graph of, as for an aggregated
+    deployment (#4143): the decode is traced with mono off."""
+    if role == "kv_consumer":
+        monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
+    kv = {"kv_connector": "compass", "kv_role": role, "compass_instance": 0}
+    cell = [*CELL[:-1], json.dumps(kv)]
+    traced = build_each(tmp_path, {"kimi-k3": CONFIG}, TRACE, cell)["kimi-k3"]
+    assert traced["kv"] == {"kv_role": role, "kv_connector": "mooncake"}
+    assert traced["structure"]
+
+
+def test_only_the_simulated_connector_is_made_real():
+    """The simulated connector, alone or in a `multi`, becomes Mooncake's at
+    its role; any other connector stays as it is."""
+    from atom.compass.drive.run import real_kv
+
+    store = {"kv_connector": "mooncake_store", "kv_role": "kv_consumer"}
+    simulated = {"kv_connector": "Compass", "kv_role": "kv_consumer", "x": 1}
+    multi = {"kv_connector": "multi", "connectors": [simulated, store]}
+    real = {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
+    assert json.loads(real_kv(json.dumps(simulated))) == real
+    assert json.loads(real_kv(json.dumps(multi)))["connectors"] == [real, store]
+    for other in ({}, store, {"kv_role": "kv_producer"}):
+        assert json.loads(real_kv(json.dumps(other))) == other
