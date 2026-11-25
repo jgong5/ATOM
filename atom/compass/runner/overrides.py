@@ -1079,6 +1079,50 @@ def shared_mxfp8_fused_on_meta():
         staging.fuse = fuse
 
 
+def flydsl_launches_nothing() -> None:
+    """The C17 decode stack's amd-kernels (vendored at the tree root, the 1P2D
+    recipe's decode) compile and launch FlyDSL kernels at load to warm their
+    variants (`ak_gemm.prepare`, the norm and front chains, the MoE tiles),
+    each module through its own launch helper. A simulated process launches
+    nothing: FlyDSL's compile-and-run (`jit_function._compile_impl`, behind
+    both `flyc.compile` and a jit function's call) returns a callable that does
+    nothing, so a warm-up compiles no kernel and a cached dispatch runs none.
+    The tensors the hooks lay out are built by torch on the meta device as on
+    the GPU."""
+    try:
+        from flydsl.compiler import jit_function
+    except ImportError:  # no FlyDSL in this image
+        return
+    if getattr(jit_function, "_compass_launches_nothing", False):
+        return
+
+    def nothing(*args, **kwargs):
+        return None
+
+    def compile_nothing(func, *args, **kwargs):
+        return nothing
+
+    jit_function._compile_impl = compile_nothing
+    jit_function._compass_launches_nothing = True
+
+
+@contextlib.contextmanager
+def device_waits_return():
+    """A load hook's wait for the device it warmed (`torch.cuda.synchronize`,
+    `torch.accelerator.synchronize`) returns at once: on a meta build no kernel
+    ran (`flydsl_launches_nothing`) and this process has no device to wait on."""
+    saved = torch.cuda.synchronize, torch.accelerator.synchronize
+
+    def no_wait(*args, **kwargs):
+        return None
+
+    torch.cuda.synchronize = torch.accelerator.synchronize = no_wait
+    try:
+        yield
+    finally:
+        torch.cuda.synchronize, torch.accelerator.synchronize = saved
+
+
 def process_weights_after_loading(tree: torch.nn.Module) -> None:
     """Run on a meta tree the post-load hooks `load_model` runs after a load.
 
@@ -1096,7 +1140,13 @@ def process_weights_after_loading(tree: torch.nn.Module) -> None:
     if not isinstance(tree, torch.nn.Module):
         return
     loaded_whole(tree)
-    with gathers_by_shape(), mhc_packed_on_meta(), shared_mxfp8_fused_on_meta():
+    flydsl_launches_nothing()
+    with (
+        gathers_by_shape(),
+        mhc_packed_on_meta(),
+        shared_mxfp8_fused_on_meta(),
+        device_waits_return(),
+    ):
         _run_post_load_hooks(tree)
 
 
@@ -1694,11 +1744,15 @@ class NonAllocatingRunner(
         with FactoriesOnMeta(), simulated_arch():
             model.tree = model_class(config)
             process_weights_after_loading(model.tree)
-        if int(_config_field(self, "pipeline_parallel_size") or 1) > 1:
+        inner = getattr(model.tree, "language_model", model.tree)
+        if int(_config_field(self, "pipeline_parallel_size") or 1) > 1 or hasattr(
+            inner, "_mono"
+        ):
             # A pipeline stage's aux relay finds the target's decoder layers
-            # under `language_model` (`PPAuxRelay`, `_resolve_decoder_layers`):
-            # the tree's, held as an attribute, not a submodule. Its hooks arm
-            # on the meta tree, which runs no forward.
+            # under `language_model` (`PPAuxRelay`, `_resolve_decoder_layers`),
+            # and MiniMax-M3's mono installer its router there
+            # (`install_mono_decode`): the tree's, held as an attribute, not a
+            # submodule. Its hooks arm on the meta tree, which runs no forward.
             object.__setattr__(
                 model,
                 "language_model",
