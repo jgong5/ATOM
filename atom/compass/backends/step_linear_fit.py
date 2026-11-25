@@ -863,7 +863,7 @@ def _features(
     for s in samples:
         view = s.view
         if s.cut:
-            cut[s.cut] += 1
+            cut[s.cut] = cut.get(s.cut, 0) + 1
         else:
             tokens = dummy = None
             peers = 0
@@ -2737,7 +2737,10 @@ def _groups(
         )
         for rank in run
     ]
-    cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
+    cut = {
+        k: sum(c.get(k, 0) for _, c in got)
+        for k in dict.fromkeys(k for _, c in got for k in c)
+    }
     if len(run) == 1:
         return [{0: r[:8]} for r in got[0][0]], cut, []
     ranks = [{r[3]: r for r in rows} for rows, _ in got]
