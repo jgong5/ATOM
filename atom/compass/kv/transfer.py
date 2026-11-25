@@ -56,6 +56,7 @@ having, and it is not a bare import of this file.
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import math
 from dataclasses import dataclass
@@ -212,27 +213,32 @@ class Link:
 
     def __init__(self, model: TransferModel) -> None:
         self._model = model
+        # A chunked prefill's middle reads move its blocks alone: the slot and
+        # the staging row go with its last (`ChunkedSend`).
+        self._bare = dataclasses.replace(model, slot_bytes=0, staging_bytes=0)
         self._last = -math.inf  # the latest arrival
         self._free = -math.inf  # when the link has moved every byte so far
         self._set_up = False  # whether a write that moves bytes has paid setup_s
 
-    def start(self, a: float, blocks: int) -> float:
-        """A write of `blocks` arrives at `a`; when it completes."""
+    def start(self, a: float, blocks: int, *, bare: bool = False) -> float:
+        """A write of `blocks` arrives at `a`; when it completes. With `bare`,
+        it moves the blocks alone, no slot or staging row."""
         if a < self._last:
             raise ValueError(
                 f"a write arrives at {a}, before one that arrived at "
                 f"{self._last}; a link takes its writes in time order"
             )
         self._last = a
+        model = self._bare if bare else self._model
         start = max(a, self._free)
-        moved = self._model.bytes_moved(blocks)
+        moved = model.bytes_moved(blocks)
         if moved > 0 and not self._set_up:
             self._set_up = True
-            start += self._model.setup_s
-        done = start + self._model.duration_s(blocks)
+            start += model.setup_s
+        done = start + model.duration_s(blocks)
         # A second write leaves when the first write completes.
-        gap = (self._model.writes(blocks) - 1) * self._model.latency_s
-        self._free = start + gap + moved / self._model.bandwidth_bytes_per_s
+        gap = (model.writes(blocks) - 1) * model.latency_s
+        self._free = start + gap + moved / model.bandwidth_bytes_per_s
         return done
 
 
@@ -327,3 +333,112 @@ def shared_completions(model: TransferModel, writes) -> list:
         nic.add(i, a, blocks)
     done = dict(nic.advance(math.inf))
     return [done[i] for i in range(len(writes))]
+
+
+class ChunkedSend:
+    """One consumer's reads of one chunked prefill on one prefill rank:
+    Mooncake's send task under ``enable_chunked_transfer``
+    (`ChunkedPrefill.wait_chunk`'s loop, `_dispatch_ready_chunked_requests`).
+
+    The write request arrives at `start`, before the prefill has run: the task
+    waits from then. At each decision it takes every block the prefill has
+    published by then past its cursor and writes them, one write on its
+    `Link`, and decides again when that write completes; with none new, it
+    waits for the next publication. A publication is a forward's end on the
+    device: the prompt's whole blocks computed by then, every block once the
+    prompt is (`publish`, `ChunkedPrefill.publish`'s rule). The last write
+    carries the transfer's slot and staging row; the middle ones move blocks
+    alone. Once the prompt's last block is written and the prefill has handed
+    off (`finish`, its sampled token), the send is `done`, the later of the
+    two: what the producer's write-done notice says.
+
+    `cursor` is the first block it writes, past the consumer's cached prefix,
+    and `total` the prompt's blocks. Decisions need every publication up to
+    their time, so the caller publishes forwards as they end and asks
+    `chunk_writes` to decide only up to a time it has seen.
+    """
+
+    def __init__(self, link: Link, start: float, cursor: int, total: int) -> None:
+        if not 0 <= cursor <= total:
+            raise ValueError(f"cursor {cursor} outside a prompt of {total} blocks")
+        self.link, self.at, self.cursor, self.total = link, start, cursor, total
+        self.pubs: list = []  # (time, blocks ready), both rising
+        self.handoff: float | None = None
+        self.writes: list = []  # (start, end, blocks)
+        self.done: float | None = None
+
+    def publish(self, t: float, tokens: int, prompt_tokens: int, block_size: int):
+        """A forward ending at `t` computed the prompt through `tokens`: its
+        whole blocks, or every block once the prompt is done."""
+        tokens = min(tokens, prompt_tokens)
+        blocks = (
+            -(-tokens // block_size)
+            if tokens == prompt_tokens
+            else tokens // block_size
+        )
+        blocks = min(blocks, self.total)
+        if self.pubs and (t < self.pubs[-1][0] or blocks < self.pubs[-1][1]):
+            raise ValueError(
+                f"a publication of {blocks} blocks at {t} after one of "
+                f"{self.pubs[-1][1]} at {self.pubs[-1][0]}: a prefill publishes "
+                "forward in time and in blocks"
+            )
+        self.pubs.append((t, blocks))
+
+    def finish(self, t: float) -> None:
+        """The prefill handed off at `t`: it sampled the first token."""
+        self.handoff = t
+
+    def _ready(self, t: float) -> int:
+        """The blocks published by `t`."""
+        ready = 0
+        for when, blocks in self.pubs:
+            if when > t:
+                break
+            ready = blocks
+        return ready
+
+    def next_at(self) -> float | None:
+        """When its next decision is, or None while it waits for what it has
+        not been told: a later publication, or the handoff."""
+        if self.done is not None:
+            return None
+        if self._ready(self.at) > self.cursor:
+            return self.at
+        if self.cursor >= self.total:
+            return None if self.handoff is None else self.at
+        later = [t for t, blocks in self.pubs if t > self.at and blocks > self.cursor]
+        return later[0] if later else None
+
+    def step(self) -> None:
+        """Make its next decision: write what is ready, or finish."""
+        t = self.next_at()
+        if t is None:
+            raise ValueError("a chunked send stepped with nothing to decide")
+        self.at = t
+        ready = self._ready(t)
+        if ready > self.cursor:
+            n, last = ready - self.cursor, ready >= self.total
+            end = self.link.start(t, n, bare=not last)
+            self.writes.append((t, end, n))
+            self.cursor, self.at = ready, end
+            return
+        self.done = max(t, self.handoff)
+
+
+def chunk_writes(sends, until: float) -> list:
+    """Decide every chunked send of `sends` up to `until`, in time order
+    across them, as their links take writes in arrival order: each that is
+    done by then, once, in the order it finished. One function for the
+    simulated run, which calls it at each poll with the time it has seen, and
+    for a record's replay, which calls it once with ``inf``."""
+    done = []
+    while True:
+        due = [(t, i) for i, s in enumerate(sends) if (t := s.next_at()) is not None]
+        due = [d for d in due if d[0] <= until]
+        if not due:
+            return done
+        _, i = min(due)
+        sends[i].step()
+        if sends[i].done is not None:
+            done.append(sends[i])

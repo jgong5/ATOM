@@ -2254,7 +2254,10 @@ def _watch_forwards() -> None:
     def watched(self, func_name, *args, **kwargs):
         out = call(self, func_name, *args, **kwargs)
         if func_name in FORWARD_CALLS and getattr(out, "predicted_s", None) is not None:
-            connector.forward_returned(out)
+            if func_name == "forward" and args:
+                connector.forward_returned(out, args[0])  # the batch it ran
+            else:
+                connector.forward_returned(out)
         return out
 
     watched.compass_watched = True
