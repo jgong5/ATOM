@@ -380,7 +380,9 @@ def test_a_routed_rung_fits_each_fold_of_the_form_it_adopts_once(cells, monkeypa
     assert law["decode"][str(RUNG)]["fit"]["moe_column"]["adopted"] == "moe_experts"
     assert fitted.count(tuple(EXPERTS)) == 1
     rowmod, fitted[:] = step_linear_fit._rowmod, []
-    monkeypatch.setattr(step_linear_fit, "_rowmod", lambda *a: rowmod(*a[:-1], None))
+    monkeypatch.setattr(
+        step_linear_fit, "_rowmod", lambda *a, **k: rowmod(*a[:-1], None, **k)
+    )
     assert json.dumps(_routed(full + sparse)[0]) == json.dumps(law)
     assert fitted.count(tuple(EXPERTS)) == 2
 

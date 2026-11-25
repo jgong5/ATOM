@@ -251,7 +251,10 @@ Outside `shared`, a decode rung may adopt a `rowmod(k)` column (`StepLinearLaw`)
 read from its rows in scheduled order, by the rule `_rowmod` states; the
 vector then names `k` and records, under `fit.rowmod`, the MAD without the
 column, the mean MAD with each step's rows shuffled, and per held-out record
-the p50 error without and with it.
+the p50 error without and with it. `rowmod_vif` (`ROWMOD_VIF_ENV`) also gates
+each `k` on the column's variance inflation factor over the steps its fit
+keeps, at most `ROWMOD_VIF`; the vector then states under `fit.rowmod_vif`
+the factor at each `k` read, adopted or not.
 
 With two or more runs it also prints, per form, the error on each run of a
 law fitted on the others, warm steps left out: per kind and rung, or prefill
@@ -435,6 +438,16 @@ MOE_BOTH = "moe_tokens+moe_experts"
 #: acceptance bound (`calib.deploy`'s default). Past it, at a rung whose steps
 #: all reach nearly every expert, `moe_experts` is the intercept again.
 MOE_BOTH_VIF = 10.0
+#: Whether a decode rung's `rowmod` choice (`_rowmod`) is also gated on the
+#: column's variance inflation factor, `ROWMOD_VIF`: ``1`` on.
+ROWMOD_VIF_ENV = "COMPASS_FIT_ROWMOD_VIF"
+#: The largest variance inflation factor `rowmod` may take over the steps its
+#: fit keeps for a rung to adopt it under `ROWMOD_VIF_ENV`, `MOE_BOTH`'s bound.
+#: Past it the other columns already hold the column, and the MAD it cuts is
+#: theirs to cut (#752 cell A v2, its calibration record and addendum fitted
+#: together: rung 32 adopted `rowmod(16)` at VIF 57, `graph_padding` then 49,
+#: for a 24% MAD cut that moved neither record's held-out p50 by 0.05 points).
+ROWMOD_VIF = MOE_BOTH_VIF
 #: The decode rungs that add `peer_tokens` (`_peer_rung`): ``1`` for each
 #: rung whose `moe_experts` column is `SATURATED`, else the rungs, comma separated.
 PEER_TOKENS_ENV = "COMPASS_FIT_PEER_TOKENS"
@@ -679,9 +692,9 @@ def env_options(environ=None) -> dict:
     ``pad``), `MOE_IMBALANCE_ENV` and `UNEVEN_ROWS_ENV` at ``1`` (the last two
     with `MOE_MIN_SPREAD_ENV`'s share), `GRAPH_TOKENS_ENV` and
     `GRAPH_QUERY_CACHED_ENV` at ``1``, the
-    `MOE_SELECT_ENV` rule and the `PEER_TOKENS_ENV` and `DRAFT_PEER_TOKENS_ENV`
-    rungs; none set, none. A switch set to anything but ``0`` or ``1`` is
-    refused (`_switch`)."""
+    `MOE_SELECT_ENV` rule, `MOE_BOTH_ENV` and `ROWMOD_VIF_ENV` at ``1``, and
+    the `PEER_TOKENS_ENV` and `DRAFT_PEER_TOKENS_ENV` rungs; none set, none.
+    A switch set to anything but ``0`` or ``1`` is refused (`_switch`)."""
     env = os.environ if environ is None else environ
     out = {}
     if _switch(env, ROW_PADDING_ENV):
@@ -716,6 +729,8 @@ def env_options(environ=None) -> dict:
         out["moe_select"] = select
     if _switch(env, MOE_BOTH_ENV):
         out["moe_both"] = True
+    if _switch(env, ROWMOD_VIF_ENV):
+        out["rowmod_vif"] = True
     if peers := env.get(PEER_TOKENS_ENV):
         out["peer_tokens"] = (
             "saturated" if peers == "1" else tuple(int(r) for r in peers.split(","))
@@ -764,6 +779,17 @@ def _vif(points, features, columns) -> dict:
         if spread > 0:
             out[f] = spread / residual if residual > 0 else math.inf
     return out
+
+
+def _kept_vif(solved, vector: dict, routing, columns) -> dict:
+    """`_vif` of `columns` over the steps `solved`, `vector`'s `_fit_vector`,
+    keeps, each its rows as `_counts` counts them."""
+    points = [
+        _counts(vector, routing, r[2], *r[5:])
+        for r, keep in zip(solved["rows"], solved["keep"])
+        if keep
+    ]
+    return _vif(points, vector["coefficients"], columns)
 
 
 def _eager_dummies(samples, options) -> bool:
@@ -2306,12 +2332,7 @@ def _moe_column(
     if both:
         wide = {"coefficients": [*base, *MOE_COLUMNS]}
         solved = _fit_vector(steps, wide, routing)
-        points = [
-            _counts(wide, routing, r[2], *r[5:])
-            for r, keep in zip(solved["rows"], solved["keep"])
-            if keep
-        ]
-        vif = _vif(points, wide["coefficients"], list(MOE_COLUMNS))
+        vif = _kept_vif(solved, wide, routing, list(MOE_COLUMNS))
         if len(vif) == len(MOE_COLUMNS) and max(vif.values()) <= MOE_BOTH_VIF:
             forms[MOE_BOTH] = wide
     columns = [f for f in forms if f != "none"]
@@ -2363,7 +2384,9 @@ def _moe_column(
     return vector, figures, held[adopted or "none"]
 
 
-def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing, folds):
+def _rowmod(
+    steps, rung: int, vector: dict, base: dict, seed: int, routing, folds, vifs=None
+):
     """The `rowmod(k)` column decode rung `rung` adopts, or None.
 
     `steps` are the rung's steps, each its ranks' `fit` rows, `vector` the
@@ -2377,7 +2400,11 @@ def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing, fold
     column. Every cell
     needs `ROWMOD_CELL_STEPS` steps at the rung, and a rung needs two cells.
     The qualifying `k` of smallest MAD is adopted: returned with its fit and
-    the evidence the law records.
+    the evidence the law records. Given `vifs`, a dict (`ROWMOD_VIF_ENV`), a
+    `k` whose fit cuts the MAD qualifies only where the column's variance
+    inflation factor over the steps that fit keeps (`_kept_vif`) is
+    `ROWMOD_VIF` or less, a column the other columns hold being no evidence
+    of order; the factor is stated in `vifs` under `k`, adopted or not.
     """
     cell = np.array([s[0][0] for s in steps])
     cells = sorted(set(cell.tolist()))
@@ -2406,7 +2433,12 @@ def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing, fold
     target = (1.0 - ROWMOD_GAIN) * base["mad"]
     while k <= rung:
         solved = _fit_vector(steps, wide(k), routing)
-        if solved["mad"] < min(target, best[1]["mad"] if best else target):
+        cuts = solved["mad"] < min(target, best[1]["mad"] if best else target)
+        if cuts and vifs is not None:
+            vif = _kept_vif(solved, wide(k), routing, ["rowmod"])
+            vifs[str(k)] = vif.get("rowmod", math.inf)
+            cuts = vifs[str(k)] <= ROWMOD_VIF
+        if cuts:
             shuffled = shuffled_mad(k)
             held = p50(_max_affine_folds(steps, wide(k), routing))
             if shuffled >= target and all(
@@ -2658,10 +2690,12 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     buckets, under which the prefill vector adds `padding`, `cold`, under
     which above `dp` 1 it adds `cold_peer_rows` (`_cold`), and `kda`, under
     which it adds `KDA`'s columns and states `kda_chunk` (`_kda`); `seed` fixes the
-    `rowmod` shuffles; `draft`, or a sample with a draft label, adds `seqs` and
-    `out` to the prefill vector. `peer_share`, false by default, adds
-    `PEER_SHARE` to it above `dp` 1 (`_share`), and `keep_peer_tail`, false by
-    default and only with `peer_share`, keeps in its solve the slower steps a
+    `rowmod` shuffles, and `rowmod_vif` gates each `rowmod` choice on the
+    column's variance inflation factor (`_rowmod`); `draft`, or a sample with
+    a draft label, adds `seqs` and `out` to the prefill vector. `peer_share`,
+    false by default, adds `PEER_SHARE` to it above `dp` 1 (`_share`), and
+    `keep_peer_tail`, false by default and only with `peer_share`, keeps in
+    its solve the slower steps a
     `PEER_SHARE` column marks on some rank (`_fit_form`'s `protect`); its
     `fit` then counts under `peer_tail` those kept past the MAD band.
     """
@@ -2679,6 +2713,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     cols = _columns(options, draft)
     select = (not draft and (options or {}).get("moe_select")) or MOE_SELECTS[0]
     both = not draft and bool((options or {}).get("moe_both"))
+    gated = bool((options or {}).get("rowmod_vif"))
     peers = (options or {}).get("draft_peer_tokens" if draft else "peer_tokens")
     if peers and dp == 1:
         raise ValueError(
@@ -2782,6 +2817,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         else:
             solved = _fit_steps(steps, names, lambda r: r[2])
         rowmod_k = figures = folds = None
+        rowmod_vif = {} if gated else None
         if key and key.isdigit():
             vector = {"coefficients": names}
             if routing:
@@ -2793,7 +2829,9 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             if _peer_rung(steps, int(key), vector, routing, peers):
                 vector = {"coefficients": [*vector["coefficients"], "peer_tokens"]}
                 solved, folds = _fit_vector(steps, vector, routing), None
-            chosen = _rowmod(steps, int(key), vector, solved, seed, routing, folds)
+            chosen = _rowmod(
+                steps, int(key), vector, solved, seed, routing, folds, vifs=rowmod_vif
+            )
             if chosen:
                 rowmod_k, solved, evidence = chosen
             names = [*vector["coefficients"], *["rowmod"] * bool(rowmod_k)]
@@ -2868,6 +2906,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             if rowmod_k:
                 vector["rowmod"] = rowmod_k
                 vector["fit"]["rowmod"] = evidence
+            if rowmod_vif:
+                vector["fit"]["rowmod_vif"] = rowmod_vif
             if k == "prefill":
                 if buckets:
                     vector["buckets"] = list(buckets)
