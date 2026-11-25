@@ -29,7 +29,7 @@ from test_dp_step_max import prefill, runner
 from test_filler_tokens import model_dir  # noqa: F401  a fixture
 from test_memory_readings import DOCUMENT, META_8B
 from test_pd_slice import publish_pd_entries
-from test_pp_drafter import DRAFT, QWEN, STAGES
+from test_run_modules_minimax_m3 import M3
 from test_run_step_grid import deployment
 from test_speculative_step import _speculative
 from test_vertical_slice import MAX_TOKENS, TREE, _run_file, publish_entry_on_arch
@@ -51,6 +51,28 @@ from atom.compass.runner.overrides import (
     _installed_backend,
 )
 from atom.compass.spec import MachineSpec
+
+#: A small target's config, its stages' layers few.
+QWEN = json.loads(Path(__file__).with_name("qwen3_0_6b_config.json").read_text())
+#: A one-layer M3.1 DSpark draft over the target's widths, with M3's
+#: activation, tapping a layer on each stage, so stage 0 relays its tap to the
+#: last; one KV head, which the TP1 decode's draft needs (`M3DSparkAttention`).
+DRAFT = (
+    QWEN
+    | {k: M3[k] for k in ("hidden_act", "swiglu_alpha", "swiglu_limit")}
+    | {
+        "architectures": ["DSparkMiniMaxDraftModel"],
+        "num_hidden_layers": 1,
+        "num_key_value_heads": 1,
+        "dspark_target_layer_ids": [7, 21],
+        "dspark_ffn_hidden_size": 3072,
+        "mask_token_id": QWEN["vocab_size"] - 1,
+        "dspark_markov_rank": 256,
+        "partial_rotary_factor": M3["partial_rotary_factor"],
+    }
+)
+#: Each prefill stage's parity record, by stage.
+STAGES = ("dp0", "pp1.dp0")
 
 #: Each stage's constant prefill price, and the last stage's draft's.
 PREFILL_S, DRAFT_S = (2.0**-9, 2.0**-8), 2.0**-10
@@ -183,11 +205,11 @@ def test_a_backend_pricing_another_stage_is_refused_naming_both():
     "host, refusal",
     [
         ({"stages": HOST_PARTS}, None),
-        ({"stages": [{**HOST_PARTS[0], "skip": ["E"]}]}, "host's stages is"),
+        ({"stages": [{**HOST_PARTS[0], "key": {}}]}, "host's stages is"),
         ({**HOST_PARTS[0], "stages": HOST_PARTS}, "host's stages is"),
         ({"stages": [{"laws": {"decod": {}}}]}, "host is {'laws': {'decod'"),
     ],
-    ids=["staged", "part-holds-skip", "laws-beside", "part-checked"],
+    ids=["staged", "part-holds-key", "laws-beside", "part-checked"],
 )
 def test_a_run_file_reads_a_pipeline_s_host_entry_and_refuses_a_misshapen_one(
     monkeypatch, tmp_path, host, refusal

@@ -2372,6 +2372,7 @@ def _group_step_seconds(
         EAGER_DP_DUMMY,
         IDLE_DP_GROUP,
         ProvenanceMix,
+        StepCost,
         fold_seconds,
     )
     from atom.compass.backends.resolver import CostRefused, Refusal
@@ -2381,6 +2382,8 @@ def _group_step_seconds(
         mode = forward_mode(batch, runner)
     mix = vars(runner).setdefault("_priced", ProvenanceMix())
     spec = getattr(runner.config, "speculative_config", None)
+    # ATOM builds the drafter on the last pipeline stage alone.
+    drafts = pp == 1 or runner.config.parallel_config.pipeline_parallel_rank == pp - 1
     terms, target_terms, refused = (), 0, None
     host = getattr(runner, "compass_host", None)
     if isinstance(host, HostDeviceRecurrence) and host.admit != ADMISSION_IN_E:
@@ -2408,12 +2411,14 @@ def _group_step_seconds(
             batch.compass_path = host.path(view)
             batch.compass_dummy = bool(view.dp_dummy and view.prefill)
         cost = backend.price(view)
+        if not drafts:
+            cost = StepCost(cost.terms, cost.treatments)
         dummy = {EAGER_DP_DUMMY, IDLE_DP_GROUP} & set(cost.treatments)
         # A draft whose work on this step is only its draft-KV pass (a producer's output prefill under a draft law
         # with output_prefill_kv, step_linear's module text) is priced among the target's terms, as `draft.` terms,
         # and states no draft_terms: that is a priced draft, not a missing one.
         in_kv = any(t.name.startswith("draft.") for t in cost.terms)
-        if spec and not cost.draft_terms and not in_kv and not dummy:
+        if spec and drafts and not cost.draft_terms and not in_kv and not dummy:
             name = type(backend).__name__
             raise CostRefused(batch, [Refusal(name, "prices no draft")])
     except CostRefused as refusal:
