@@ -31,6 +31,10 @@ divided by its price under the fitted coefficients, not its label, iterated unti
 prices settle, and the MAD test reads the same residuals (D53); host laws drop no sample
 ([Ruling](https://github.com/jgong5/ATOM/issues/3383#issuecomment-6891448532), 2026-11-15; D54, D57).
 
+**Revised 2026-11-24 by [#4050](https://github.com/jgong5/ATOM/issues/4050):** a pipeline
+stage's step linear law and host laws price its own work, a part per stage of one entry,
+labelled from per-stage trace runs with the handoff in no pass (D54.1).
+
 **Scope.** How measurements become a model: objective, feature construction, outlier
 handling, guards, and how a functional form is chosen and shown to be right. This is a
 separate concern from the toolchain that produces the data and from the protocol that
@@ -276,9 +280,9 @@ Owner ruling on [#843](https://github.com/jgong5/ATOM/issues/843#issuecomment-61
   prefill device law fits from trace runs only, and a fit given none names its prefill
   vector unfitted; a trace run's decodes and host segments are profiled, so it gives no
   decode or host label, and an ordinary record fits the decode and host laws. A trace run
-  under DP refuses. Checked-in laws keep their labels until refitted, and a refit needs a
-  trace run. A DP law's prefill vector keeps its window labels at a refit, its provenance
-  naming them and the tree it was fitted at, until [#3010](https://github.com/jgong5/ATOM/issues/3010)
+  under DP refuses; under pipeline stages each stage is reduced on its own (D54.1).
+  Checked-in laws keep their labels until refitted, and a refit needs a trace run. A DP
+  law's prefill vector keeps its window labels at a refit, its provenance naming them and the tree it was fitted at, until [#3010](https://github.com/jgong5/ATOM/issues/3010)
   gives DP ranks a trace run ([Ruling](https://github.com/jgong5/ATOM/issues/2853#issuecomment-6717057158)).
   On Run 4B's TP0 trace the busy time of device-paced forwards sat within 0.6%
   of the window per target pass and the final's draft at +2.3%, where copy-stream copies
@@ -447,6 +451,206 @@ and output prefill laws adopt the column at 193 and 197 ms, and a split middle c
   intake terms (`05` D25), which the machine spec no longer states.
 - **Use:** the runner composes them with any backend's device time by `01` D4's
   recurrence; no backend adds them to its own price.
+
+---
+
+## D54.1. A step linear law of a pipeline stage
+
+Decided 2026-11-24 by [#4050](https://github.com/jgong5/ATOM/issues/4050), for the
+development template's PP4 x TP1 prefill, whose law `19` D116 calibrates anew. It answers
+[#3030](https://github.com/jgong5/ATOM/issues/3030)'s questions and narrows `07` T129.
+
+### Problem
+
+No step linear law prices or is fitted for a pipeline stage. `_group_step_seconds`
+(`atom/compass/runner/overrides.py`) refuses a stage whose backend states no `stage_share`,
+and only the step stub states one. `atom/compass/fit/samples.py::_record` reads stage 0
+alone, its `dp<r>.jsonl`, where stage `k` above 0 writes `pp<k>.dp<r>.jsonl` (`parity`).
+`atom/compass/drive/record.py::refuse_trace` refuses a trace run under stages and
+`parity/busy.py::_ranks` reduces only `rank_<r>` traces, so a stage has no prefill label
+(D54, *Traced prefill*). `atom/compass/run/step_grid.py::keyed` states no pipeline field, so
+a PP4 law and a one-stage law of one model and width share an engine config.
+
+### Decision
+
+1. **A stage's law prices its own device work**: its layers, stage 0's embedding, the last
+   stage's head, sampler and drafter. Its handoff, the receive of its input and the send
+   of its output, is `15` D91's, priced on the carriers with the waits through `pp_data`
+   and `pp_ack`. Basis: `atom/compass/parity/recurrence.py::_charged` charges a later
+   stage its target less `d_recv_ns`, and `18` D107 leaves that receive wait out of its
+   target. Rejected: the stage's whole window, which the run would charge the handoff
+   again and which carries a neighbour's pace: the receive waits for the stage before,
+   and `commit_pp_send_work` holds the stream until the next stage takes the last send.
+2. **One law per stage, fitted on that stage's steps.** The stages differ past their layer
+   count: `ModelRunner.__init__` builds the drafter on the last stage alone, only the first
+   embeds, and a stage holding DSpark taps packs them into its send
+   (`ModelRunner.run_model`, `PP_AUX_KEY`). Rejected: one law scaled per stage by its
+   layer share, as `stage_share` prices the stub (*Simpler alternative*).
+3. **Prefill labels from trace runs, each stage reduced on its own.** `compass record
+   --trace` admits pipeline stages and still refuses DP
+   ([#3010](https://github.com/jgong5/ATOM/issues/3010)). ATOM names stage `k`'s traces
+   `pp<k>_rank_<r>` (`ModelRunner.__init__`) and starts the profiler on every stage
+   (`atom/model_engine/engine_core_mgr.py::CoreManager._utility_phases`); `parity.busy`
+   reduces each stage's ranks against that stage's lines into busy lines beside them,
+   `pp<k>.dp0.busy.jsonl` above stage 0, which `step_labels._read` joins. Within a stage, collectives align and a
+   pass takes its largest rank, as now. Basis: *Traced prefill*'s rulings, and the recipe's
+   prefill runs `--enforce-eager`, where the host paces launches. Rejected: each stage's
+   window less its receive under `COMPASS_PREFILL_LABEL=record`
+   (`step_labels.PREFILL_LABEL_ENV`): it holds the idle the host paced, and its `paced`
+   cut drops the eager forwards that do.
+4. **The handoff counts in no pass.** The recorder opens a range of its own around a
+   stage's receive and around its send, as around a drafter pass
+   (`atom/compass/parity/__init__.py::StepRecording._draft_pass`). The reducer puts the
+   kernels launched inside them in no pass, ends no pass at them, and counts no gap over
+   the receive's device span, its first kernel's start to its last one's end: a kernel the
+   host queued behind the receive would count its wait whole (`parity/busy.py::_walk`).
+   The recorder also records a device event at the send's start, `d_send_ns`, so a
+   sending stage's window less its handoff is `d_send_ns - d_recv_ns`. Rejected: handoff
+   kernels told by name: `busy.COLLECTIVE` matches `nccl`, which RCCL's TP collectives
+   share, and nothing in the tree pins RCCL's point-to-point kernel names.
+5. **The last stage's draft.** Only the last stage's law holds a draft law, labelled from
+   its busy lines as on one stage; the taps the earlier stages relay ride the handoff,
+   which `runner/overrides.py::PipelineFrames._pp_output` sizes. `_group_step_seconds`
+   asks for draft terms on the last stage alone. Basis: `ModelRunner.__init__` builds the
+   drafter only where `get_pp_group().is_last_rank`. Rejected: a draft part on every
+   stage, a drafter priced where none runs.
+6. **Host laws per stage**, fitted on each stage's lines in the untraced records, a
+   pipeline's stages labelled together: a stage's `E` runs from its release, the head's at
+   the last stage's exit of the forward whose ack it waits for, a later stage's at the
+   head's call, as `parity/recurrence.py::pipeline` derives them, and a later stage's
+   `W_recv` is fitted as `fit host` fits it now. Basis: `01` D4 refuses a later stage
+   whose law lacks `W_recv`, and a pipeline's record stamps no input pull
+   (`atom/compass/run/__init__.py::engine`), so `E` from the previous exit holds a later
+   stage's wait for the head's metadata, a channel the run prices. Rejected: the head's
+   host laws on every stage, which lack `W_recv` and carry scheduling no later stage runs.
+7. **One entry per pipeline, a part per stage.** A pipeline's `step_linear_law` and
+   `host_laws` are one entry each at the configuration's key, each stage's vectors with
+   their held-out figures, or its host laws, under `stages` in stage order; the platform,
+   engine config, provenance, `records_atom` and the frontend's tokenizer, intake and hop
+   terms stay at the top, once. `run/__init__.py::runner` builds the backend from the part
+   at its `pipeline_parallel_rank` and `HostDeviceRecurrence` from the host part there;
+   the backend states the stage it prices, which `_group_step_seconds` admits as it admits
+   `stage_share`. The reuse check holds each stage's figures to `19` D112's gate
+   (`atom/compass/drive/reuse.py::_judged`). Basis: a configuration's memory readings are
+   one entry, a member per rank with its stage among the coordinates
+   (`run/memory.py::coords`), and `19` D113 borrows a 1P1D side at one key. Rejected: an
+   entry per stage, the stage in its key: the readings' key would part from the laws', the
+   frontend's terms would be fitted once a stage, and a side's reuse verdict would span a
+   key a stage.
+8. **The key.** Above one stage `keyed` states `pipeline_parallel_size` and each stage's
+   layer span as `get_pp_indices` gives it, never re-derived (`15` D91 Q4); one stage
+   states neither, so no key moves. The memory readings' key reads `keyed`, so a
+   pipeline's readings key apart too. Rejected: `VLLM_PP_LAYER_PARTITION` among the keyed
+   variables, which keys the override, not the split: the default split and an equal
+   override would key apart.
+9. **The record list, and a stage's decode.** `19` D113's list is unchanged: a prefill
+   above one stage takes D113's trace runs, which `drive/lacking.py::calibration` plans
+   wherever `refuse_trace` passes, and a 1P1D producer schedules no decode rung
+   (`lacking.uncovered_rungs`). A stage's decode is not designed: the fit cuts a pipeline
+   stage's decode step as `pipelined`, and `calibration` prints no command for a server
+   above one stage that decodes, naming `07` T129. Basis: `run/__init__.py::frontend`
+   refuses a pipelined decode side, and a stage's decode window holds the last send's
+   stream hold and its wait for the stage before, which no rule parts. Rejected: designed
+   prefill at a stage (`07` D119): `EngineCore.__init__` builds no PrefillDelayer above
+   one stage, so a point's rows are not one batch (`07` T105).
+10. **The label check.** One trace run of the template's prefill at c=16 on a pit2 MI355X
+    node, under a gpool lease: per stage, on the forwards no kernel of which waited on its
+    launch, the target's busy time against its window less its handoff (`d_send_ns -
+    d_recv_ns` on a sending stage, its target window less `d_recv_ns` on the last), p10
+    and p90 within 2%, the pipeline gate's band (`parity/recurrence.py::STEP_BAND`). A
+    miss goes to the owner. Basis: *Traced prefill*, where device-paced busy time sat
+    within 0.6% of its window ([#2072](https://github.com/jgong5/ATOM/issues/2072)).
+    Rejected: the stage laws' held-out figures alone: a label holding a handoff wait fits
+    and folds as well as one without.
+
+### Scenarios
+
+A's calibration, its prefill side (`19` D116, step 3), into one store:
+
+```
+ deploy.sh record, each RECORD (calibrate.sh, #4053); the prefill PP4 x TP1
+   rung records     prefill untraced: dp0.jsonl, pp1..pp3.dp0.jsonl
+   trace 16, 4      prefill --trace, every stage profiled
+                      trace/pp<k>_rank_0 -> busy per stage, handoff in no pass
+                      -> pp<k>.dp0.busy.jsonl beside its lines
+ fit steps          per stage: prefill vector on trace 16 and 4, each folded
+                    stage 3 also: its draft law
+ fit host           per stage: the rung records' lines, E from its release,
+                    W_recv on stages 1 to 3
+   -> one step_linear_law, one host_laws at A's key (PP 4, spans 0-16 16-32
+      32-48 48-60), each with stages[0..3]
+ compass advice     reuse check: every stage's figures within 5% -> reuse
+```
+
+A simulated A prefill, once #4049 and #4051 land:
+
+```
+ engine-P-pp<k>: runner() -> StepLinearBackend(law.stages[k]),
+                             HostDeviceRecurrence(host.stages[k], stage (k, 4))
+   _group_step_seconds: a stage priced; draft terms asked of pp3 alone
+   pp<k> -> pp<k+1>: pp_data and pp_ack, each send on its carriers (15 D91)
+```
+
+The label check, on #4047's merge:
+
+```
+ pit2-p03-gXX, a gpool lease of the node; deploy.sh record, prefill --trace,
+   c=16, 120 s
+   per stage, forwards no kernel of which waited on its launch:
+     busy target  vs  d_send_ns - d_recv_ns (stages 0-2), target - d_recv_ns (3)
+     p10 and p90 within 2% -> the labels hold; a miss -> the owner
+```
+
+A server above one stage that decodes:
+
+```
+ compass advice   lacking: no calibrate.sh command, a stage's decode is not
+                  fitted (07 T129)
+ fit steps        its decode steps cut `pipelined`; prefill fitted as above
+```
+
+### Simpler alternative
+
+One law fitted at one stage and priced per stage by its layer share, as `stage_share`
+prices the stub: no stage records, no trace run under stages, no new law shape. It fails
+the requirement: the recipe's prefill runs only at PP4 x TP1, so such a law comes from
+another engine config, every term `declared` (README glossary), and a layer share prices
+neither the last stage's head, sampler and drafter nor the first's embedding. The next
+simplest, window labels per stage, fails *Traced prefill*'s rulings (decision 3).
+
+### Low confidence
+
+None. Decision 10's check measures whether the labels hold; no decision waits on it.
+
+### Dependencies
+
+No spike and no sync issue. The recipe's ATOM is
+[#4047](https://github.com/jgong5/ATOM/issues/4047)'s merge, which the label check waits for;
+a simulated A prefill also waits for [#4049](https://github.com/jgong5/ATOM/issues/4049) (a
+drafter on a pipeline) and
+[#4051](https://github.com/jgong5/ATOM/issues/4051) (the Store under one).
+
+### Summary
+
+**Deliverable.** A pipeline stage's step linear law and host laws: its own work, a part
+per stage of one entry, labelled from per-stage trace runs with the handoff in no pass.
+**Not in scope:** a stage's decode and designed load at a stage (`07` T129); DP trace runs
+(#3010); a stage at TP above 1 under ATOM's PP send all-gather and a step roofline
+fallback over a stage, both refused as today (`run/__init__.py::runner`,
+`_group_step_seconds`); the Store under a pipeline (#4051).
+
+| Issue | Where | Change | Named result |
+|---|---|---|---|
+| [#4066](https://github.com/jgong5/ATOM/issues/4066) | `drive/record.py`, `parity/__init__.py`, `parity/busy.py` | `--trace` under stages; the handoff's ranges and `d_send_ns`; each stage reduced, the handoff in no pass | planted stage traces: each stage's busy lines, a queued kernel behind the receive counting none of its wait |
+| [#4067](https://github.com/jgong5/ATOM/issues/4067) | `run/step_grid.py`, `fit/samples.py`, `fit/steps.py`, `backends/step_linear_fit.py`, `backends/step_labels.py` | the key; every stage's samples; one law with `stages`, each folded; a stage's decode cut | a planted PP2 trace pair's law: two parts, the second with its draft |
+| [#4068](https://github.com/jgong5/ATOM/issues/4068) | `backends/step_labels.py`, `parity/recurrence.py`, `fit/host.py` | a pipeline's stages labelled together, `E` from its release; host laws with `stages` | a planted PP2 record's host laws: `W_recv` on stage 1, its `E` free of the head's wait |
+| [#4069](https://github.com/jgong5/ATOM/issues/4069) | `run/__init__.py`, `runner/overrides.py`, `backends/step_linear.py` | each stage's parts built; the backend states its stage; draft terms on the last stage alone | a simulated PP2 run on a planted law: every step priced, draft on stage 1 alone |
+| [#4070](https://github.com/jgong5/ATOM/issues/4070) | `drive/reuse.py`, `drive/lacking.py` | each stage's figures judged; no command for a decoding pipeline | the verdicts on planted laws, one stage past 5% |
+| [#4071](https://github.com/jgong5/ATOM/issues/4071) | pit2 [GPU] | decision 10's check | the per-stage table |
+
+**Acceptance.** Each task's named result; decision 10's check within 2% on every stage;
+A's prefill law fitted with every stage's held-out figures inside `19` D112's 5% gate, and
+reused by `compass advice`.
 
 ---
 
@@ -947,6 +1151,7 @@ choice that must be visible.
 |---|---|---|
 | D53 | Fit relative error, not absolute seconds, each equation divided by its price under the fitted coefficients, from its label until the prices settle. MAD outlier test on the same relative residuals, price less label over price. | 2026-09-18; revised 2026-11-14 (fitted price, #3383) |
 | D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. Under TP, DP and EP, the step linear law is one per-rank law per engine config, which states the parallel layout, pools records and serves runs at prefixes of its capture ladder, with the DP-unified rung and the MoE row count as features (`T_moe`, EP on or off), captured on a real deployment at that layout and fitted by line-searched alternating max-affine regression, each vector on the rows it prices. Its label is one forward's device busy time, plus the device gap before it on a decode, with launch-exposed decodes cut and a decode's `propose` label cut where the device reached the pass before the host's draft copy wait, and on prefill a trace run's busy time per pass; host laws (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs`, `W_pre` split at the MTP status wait, and `L_mtp`, the status copy's latency), each `(1, tokens, seqs)` per decode, output prefill and pure middle chunk (a middle chunk has no sampler launch, output or R1 wait, so its `W_post` is zero and not fitted), and `admit`, `(admits, uncached, cached)` over every kind, on what a forward's `E` spends admitting requests, which its kind's `E` is fitted without, are fitted beside it, keyed by host CPU, `atom` digest, model, engine config, device, software stack and torch, with no transfer; a run takes the host CPU from the laws, predicting the host they timed from any CPU. | 2026-09-18; revised 2026-10-01, 2026-10-09 (`T_moe`, #502) and 2026-10-11 (#815); label per step kind 2026-10-12 (#843); named 2026-10-14 (#952); `W_inputs` 2026-10-16 (#829); EP on 2026-10-15 (#627, #1106); engine config as the key 2026-10-16 (#973); machine-spec digest in the host-law key 2026-10-16 (#952); host-paced prefill cut 2026-10-24 (#1983); traced prefill 2026-10-24 (#2072); `L_mtp` and the decode draft-KV vector 2026-10-25 (#2080); output prefill draft-KV pass 2026-10-25 (#2100); a prefill launch the device held gives no `W_launch` 2026-10-26 (#2256); TP above 1 2026-10-30 (#2490); a short output prefill's propose pass split off 2026-10-31 (#2492), at the device's lag 2026-11-01 (#2572); a forward's admissions priced apart, `admit` 2026-11-02 (#2620), its intercept once a forward 2026-11-03 (#2705); device, software stack and torch in place of the machine-spec digest 2026-11-03 (#2716); the propose pass unsplit on trace runs 2026-11-06 (#2072); a decode's host-paced `propose` label cut 2026-11-06 (#2917); line-searched alternation, each vector on the rows it prices, 2026-11-06 (#2904); host-law columns from a model's launch features, the recorded graph sets in the host key, 2026-11-09 (#3068); `W_launch` less the launch thread's blocking HIP calls, the held cut gone, 2026-11-09 (#3069); the lead carried across the clocks' drift 2026-11-10 (#3096); the launch bound read before its event 2026-11-10 (#3133); a launch column's held-out error per launch path 2026-11-12 (#3088); DeepSeek-V4's split launch a launch feature 2026-11-12 (#3114); a fit at the pass limit ends there with its vector 2026-11-13 (#2906); a run at a prefix of the capture ladder served, and records at one pooled, 2026-11-15 (#3275); host laws drop no sample 2026-11-15 (#3383); the host CPU taken from the laws, 2026-11-10 ([#2899](https://github.com/jgong5/ATOM/issues/2899)) |
+| D54.1 | A pipeline stage's step linear law and host laws price its own work, the receive and send of its handoff left to `15` D91: one entry per pipeline, a part per stage under `stages`, keyed above one stage by the pipeline width and each stage's layer span; prefill labelled from trace runs, each stage reduced on its own, the handoff in no pass; the draft law on the last stage alone; each stage's host `E` from its release. A stage's decode is cut. | 2026-11-24 ([#4050](https://github.com/jgong5/ATOM/issues/4050)) |
 | D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. A decode rung may add `rowmod(k)` (D61), and, given the model's routing, one MoE column, the step's real MoE tokens `n` or the experts `X` they reach, the step's DP dummy forwards counted in `X` as one token: the form of smallest step-weighted held-out error, no column among them, adopted with no bar. | 2026-09-18; revised 2026-10-14 (#941), 2026-11-01 (MoE column, #2493), 2026-11-03 (no bar, #2735; dummies in `X`, #2536) and 2026-11-06 (each form fitted on its own rows, #2904) |
 | D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
 | D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. MAD rejection drops no host-law sample; the JIT cut keeps it. | 2026-09-18; revised 2026-11-15 (#3383) |

@@ -335,9 +335,13 @@ def test_two_prefill_instances_join_by_index_behind_a_router_lp_choosing_among_t
         urls["prefill0"]: "frontend-P0",
         urls["prefill1"]: "frontend-P1",
     }
-    # The run file names no worker_order: the router LP sorts each side's
-    # workers by URL and rank, as under pd_sim.sh.
-    assert json.loads(router["env"]["ATOM_COMPASS_ROUTER_ORDER"]) == []
+    # The run file names no worker_order: the router LP lists each side's
+    # workers by instance, then rank, whichever ports the instances drew.
+    dp = run["prefill_data_parallel_size"], run["decode_data_parallel_size"]
+    instances = ("prefill0", dp[0]), ("prefill1", dp[0]), ("decode", dp[1])
+    assert json.loads(router["env"]["ATOM_COMPASS_ROUTER_ORDER"]) == [
+        [urls[name], r] for name, width in instances for r in range(width)
+    ]
 
     script.send_signal(signal.SIGTERM)
     out, _ = script.communicate(timeout=60)
