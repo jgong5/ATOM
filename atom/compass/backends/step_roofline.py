@@ -354,6 +354,10 @@ def _kda(m: Module, view: BatchView) -> Work:
     rank-1 update, and q against it. The chunked kernel also runs, in each
     chunk of `n` tokens, a head, Q and K against K, the inverse's products
     with K and V, and its intra-chunk output: `2 n^2 (3 K + 2 V)`.
+
+    Kimi-K3 Mono (`ATOM_MONO_ENABLE=1`, its default) runs a decode of at most
+    64 rows at TP8 in its own kernels (`atom/models/kimi_k3/mono/`), this
+    recurrence inside K1; the roofline still prices it module by module.
     """
     heads, dim, records = m.dims
     rows, act, fp32 = view.requests, ELEMENT_BYTES[ACT], ELEMENT_BYTES["fp32"]
