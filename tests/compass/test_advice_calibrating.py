@@ -17,7 +17,9 @@ and B, take one command each: A's fits both sides, and B's its decode alone
 into the store A's publishes into, naming A's calibration for its prefill side;
 once that store holds A's two sides and B's decode, both are searchable on it.
 A started calibration's command holds once one of its sides has published, and
-B, once A has ended in a store of its own, fits its decode alone there.
+B, once A has ended in a store of its own, fits its decode alone there. Where
+A's next calibration would take what its ended one took and refit both its
+sides' laws, A and B, for the prefill side it lends, print why none serves.
 
 The configuration, its stubbed resolution and starts are `test_advice_check`'s:
 the store holds readings of the configuration as the deployment resolves it,
@@ -27,6 +29,7 @@ and no law of it.
 import json
 import shlex
 import shutil
+from pathlib import Path
 from types import SimpleNamespace
 
 import platforms
@@ -74,12 +77,12 @@ def _env(found: dict, name: str) -> dict:
     return dict(w.split("=", 1) for w in words if "=" in w and w[0].isupper())
 
 
-def _fitted(directory, config, atom=None, platform=PLATFORM) -> None:
-    """The law the stub's fit wrote in `directory`, keyed as `compass fit steps`
-    keys it: `config`'s model and engine config, under this process's
-    environment, its records at the ATOM digest `atom`, else this tree's, on
-    `platform`."""
-    law = directory / check.FITTED
+def _fitted(directory, config, atom=None, platform=PLATFORM, law=check.FITTED) -> None:
+    """The law the stub's fit wrote in `directory`, at `law` under it, keyed as
+    `compass fit steps` keys it: `config`'s model and engine config, under
+    this process's environment, its records at the ATOM digest `atom`, else
+    this tree's, on `platform`."""
+    law = directory / law
     held = json.loads(law.read_text())
     held["key"] = {
         "model": compass_run._file_digest(config.model, "config.json"),
@@ -487,3 +490,63 @@ def test_an_ended_calibration_s_candidate_calibrates_anew_unless_that_refits_its
     served = [line.split(" --out ")[1] for line in log if line.startswith("record ")]
     assert served[0].startswith(f"{cal / 'b+2' / 'cal1-c'}")
     assert all(s.startswith(f"{cal / 'b+2'}/") for s in served)
+
+
+#: Where a 1P1D calibration fits each side's step linear law, as calibrate.sh
+#: writes it, and the variables that side's law is keyed under in `PAIR`'s A.
+SIDE_LAWS = [
+    (Path(f"fit_steps_{side}", "step_linear_law.json"), env)
+    for side, env in (("prefill", {}), ("decode", {"GPU_MAX_HW_QUEUES": "2"}))
+]
+
+
+@pytest.mark.parametrize(
+    "since", ["the tree moved", "a side's variables changed", "nothing"]
+)
+def test_an_ended_1p1d_calibration_s_candidate_calibrates_anew_unless_that_refits_its_laws(
+    tmp_path, sides, monkeypatch, since
+):
+    """A's printed calibration, run by `calibrate.sh` in `test_calibrate`'s
+    stub tree into its own store, as the shared one holds stale prefill
+    readings, ends, each side's law keyed as a fit keys it. That store holds
+    no platform readings, so the next search passes it by and finds both laws
+    missing: it prints why no calibration serves where the next would take
+    what A's took and both laws are at their sides' keys at the head's ATOM
+    digest, and B names that for the prefill side it shares; else A's next
+    calibration, into ``cal/A+2``."""
+    monkeypatch.setenv("AIPERF_PYTHON", "/real/python")
+    # The stub keys its store entries by the variable, as a law's key does.
+    monkeypatch.setenv("KEYED", "GPU_MAX_HW_QUEUES")
+    store, cal = tmp_path / "store", tmp_path / "out" / "cal"
+    _readings_at_another_digest(store, sides)
+    (first,) = advise(tmp_path, {"A": PAIR["A"]}, network=NETWORK)["A"]["made_by"]
+    assert "STORE=" not in first.split("\n")[0]
+    assert _calibrated(tmp_path, first)[0] == 0
+    atom = "0" * 64 if since == "the tree moved" else None
+    for law, env in SIDE_LAWS:
+        with check._env(env):
+            _fitted(cal / "A", sides, atom, law=law)
+    pair = {"A": PAIR["A"]}
+    if since == "a side's variables changed":
+        decode = PAIR["A"]["decode"] | {"env": {"GPU_MAX_HW_QUEUES": "3"}}
+        pair = {"A": PAIR["A"] | {"decode": decode}}
+    elif since == "nothing":
+        pair["B"] = PAIR["B"]
+
+    found = advise(tmp_path, pair, network=NETWORK)
+
+    reused = json.loads((tmp_path / "out" / "reuse.json").read_text())
+    assert reused["candidates"]["A"]["store"] == str(store)
+    assert found["A"]["state"] == "missing a law"
+    (command,) = found["A"]["made_by"]
+    if since != "nothing":
+        assert f" {lacking.CALIBRATE} {cal / 'A+2'} " in command
+        return
+    refits = check.REFITS.format(cal / "A", cal / "A" / "store")
+    assert command == refits
+    # B's prefill side is A's, which A's ended calibration fitted and measured;
+    # B fits its decode alone into the store it published into.
+    assert found["B"]["made_by"][0] == refits and len(found["B"]["made_by"]) == 2
+    env, words = _calibrate(found, "B")
+    assert words == [str(cal / "B"), *[f"{n} {FIRST_TURN}" for n in (1, 2, 4, 8)]]
+    assert (env["FIT"], env["STORE"]) == ("decode", str(cal / "A" / "store"))
