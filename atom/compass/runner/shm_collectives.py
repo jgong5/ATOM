@@ -155,6 +155,28 @@ def _fits(t) -> bool:
     )
 
 
+def gathered(group, values, dtype) -> np.ndarray | None:
+    """Every rank's `values` as `dtype`, a row each in rank order, as an
+    `all_gather` over `group` moves them on its segment, with no tensor built
+    around them; None where that call stays on gloo (`group` not attached, or
+    over `ROW` bytes a rank), and the caller makes it. The ranks of a group
+    make the same call, so each takes the same branch."""
+    segment = _GROUPS.get(group)
+    a = np.array(values, dtype)
+    if segment is None or a.nbytes > ROW:
+        return None
+    return segment.exchange(a)
+
+
+def maxed(rows: np.ndarray) -> list | None:
+    """The elementwise max of float `rows`, as `all_reduce(MAX)` takes it off
+    the segment; None where that call redoes it on gloo, a zero or a NaN among
+    them, and the caller makes it."""
+    if not (abs(rows) > 0).all():
+        return None
+    return rows.max(axis=0).tolist()
+
+
 def install() -> None:
     """Route `torch.distributed.all_reduce` and `all_gather` on an attached
     group to its segment, around whatever the two are now."""

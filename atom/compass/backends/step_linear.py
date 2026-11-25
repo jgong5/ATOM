@@ -214,10 +214,29 @@ EAGER = "eager"
 SOURCE = "step-linear"
 EXTRAPOLATED = "step-linear-extrapolated"
 UNIFORM_ROUTING = "uniform routing"
+#: The entries a vector keeps of what earlier steps priced (`_Vector.kept`).
+KEPT = 1024
+
+
+class _Kept(dict):
+    """What a vector's earlier steps priced, by the inputs it was priced from;
+    emptied once it holds `KEPT` entries, so a run's growing contexts do not
+    grow it without bound."""
+
+    def keep(self, key, value):
+        if len(self) >= KEPT:
+            self.clear()
+        self[key] = value
+        return value
 
 
 class _Vector:
-    """One kind's (and rung's) coefficients and the hull they were fitted on."""
+    """One kind's (and rung's) coefficients and the hull they were fitted on.
+
+    `verdicts` keeps the hulls' verdicts on each point a step priced, and
+    `kept` each term a step priced by its feature's count and those verdicts:
+    a later step whose inputs repeat them takes them back rather than
+    recomputing them (`StepLinearBackend._priced`)."""
 
     def __init__(self, name: str, features: tuple[str, ...], spec: Mapping) -> None:
         self.name = name
@@ -263,6 +282,7 @@ class _Vector:
                     f"the {name} vector carries padding and states no buckets, "
                     "the prefill token-graph buckets it pads to"
                 )
+        self.verdicts, self.kept = _Kept(), _Kept()
 
 
 def moe_tokens(view: BatchView) -> int | None:
@@ -605,30 +625,49 @@ class StepLinearBackend(CostBackend):
         return terms, kv
 
     def _priced(self, law, vector: _Vector, kind: str, counts: tuple, what: str):
-        """`vector`'s terms for a step of features `counts`."""
-        detail, source = law.fitted_on, SOURCE
+        """`vector`'s terms for a step of features `counts`. The hulls'
+        verdicts on a point, and a term from its count and those verdicts,
+        are what an earlier step got from the same inputs (`_Vector.kept`)."""
         point = tuple(counts[i] for i in vector.axes)
-        if not vector.hull.contains(point):
-            source = EXTRAPOLATED
-            detail = f"{detail}; outside the {what}{vector.name} hull"
-        validated = bool(vector.held_out and vector.held_out.contains(point))
-        method = Method.DECLARED if vector.declared else Method.ESTIMATED
-        return [
-            CostTerm(
-                f"{what.replace(' ', '.')}{kind}.{feature}",
-                count * coefficient,
-                Provenance(
-                    method,
-                    f"{coefficient:g} s x {count}; {detail}",
-                    source,
-                    validated=validated and not vector.declared,
-                    note=vector.declared,
-                ),
-            )
-            for feature, count, coefficient in zip(
-                vector.features, counts, vector.coefficients
-            )
-        ]
+        verdicts = vector.verdicts.get(point)
+        if verdicts is None:
+            inside = vector.hull.contains(point)
+            validated = bool(vector.held_out and vector.held_out.contains(point))
+            verdicts = vector.verdicts.keep(point, (inside, validated))
+        terms = []
+        for i, count in enumerate(counts):
+            # The count's type too: 1 and 1.0 price alike and read apart.
+            key = (what, kind, i, type(count), count, verdicts)
+            term = vector.kept.get(key)
+            if term is None:
+                term = vector.kept.keep(
+                    key, _term(law, vector, kind, what, i, count, verdicts)
+                )
+            terms.append(term)
+        return terms
 
     def describe(self) -> str:
         return f"step linear law; {self.law.fitted_on}"
+
+
+def _term(
+    law, vector: _Vector, kind: str, what: str, i: int, count, verdicts
+) -> CostTerm:
+    """`vector`'s term for feature `i` at `count`, under the hulls' verdicts
+    (inside the hull, inside the held-out hull) on the step's point."""
+    (inside, validated), detail, source = verdicts, law.fitted_on, SOURCE
+    if not inside:
+        source = EXTRAPOLATED
+        detail = f"{detail}; outside the {what}{vector.name} hull"
+    coefficient = vector.coefficients[i]
+    return CostTerm(
+        f"{what.replace(' ', '.')}{kind}.{vector.features[i]}",
+        count * coefficient,
+        Provenance(
+            Method.DECLARED if vector.declared else Method.ESTIMATED,
+            f"{coefficient:g} s x {count}; {detail}",
+            source,
+            validated=validated and not vector.declared,
+            note=vector.declared,
+        ),
+    )
