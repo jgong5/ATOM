@@ -507,7 +507,14 @@ class TrafficLP:
             for task in self._tasks:
                 if task.done():
                     task.result()
-            self._take_queued()
+            # Read the queued reports only when a released event or a body size
+            # lacks one: this loop turns several times between two clock calls,
+            # and a read that finds nothing costs a ZMQ call and its exception.
+            # The reader task (`_read_reports`) takes the others.
+            if not self._reports.keys() >= self.rt.released[self.stream] or (
+                self._unsized()
+            ):
+                self._take_queued()
             unreported, unreturned = [], []
             # A handled seq leaves the runtime's released set, so a pass scans
             # only the open events, not every event of the run. It stops at the

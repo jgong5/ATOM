@@ -1021,6 +1021,50 @@ def test_a_pass_scans_only_the_open_stream_events(tmp_path):
     assert held_at_call == [0] * (n + 1)
 
 
+def test_a_settle_whose_released_events_are_all_reported_reads_no_socket(tmp_path):
+    """Credit 0's twenty stream events, the last final, are all reported before
+    the first grant; each grant releases one. No settle reads the report socket,
+    as no released event lacks its report, and the return still passes."""
+    n = 20
+
+    async def main():
+        conn = ScriptedConn(n)
+        conn.rt = rt = LPRuntime(LpId("traffic"), TABLE, conn)
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        reads, take_queued = [], traffic._take_queued
+
+        def counted():
+            reads.append(len(rt.released[STREAM]))
+            take_queued()
+
+        traffic._take_queued = counted
+        passed = []
+
+        async def on_return(worker_id, ret):
+            passed.append(ret.credit.id)
+
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(str(tmp_path / "lp"))[1])
+        for seq in range(n):
+            push.send_pyobj((_key(0), seq, float(seq + 1), seq == n - 1))
+        while len(traffic._reports) < n:  # the reader takes them; no request is open
+            await asyncio.sleep(0.001)
+        traffic.send(_key(0))
+        await traffic.hold(on_return)(
+            "worker_0", SimpleNamespace(credit=_credit(0), error=None)
+        )
+        traffic.finish()
+        try:
+            await asyncio.wait_for(traffic.done, 10)
+        finally:
+            push.close(linger=0)
+        return passed, reads, rt
+
+    passed, reads, rt = _run(main())
+    assert passed == [0] and rt.now == INF
+    assert reads == []
+
+
 class ReportedDuringTheCall(ScriptedConn):
     """Grant ``k`` releases stream seq ``k - 1`` of request 0, the last one
     final; that event's report reaches the traffic LP's socket while the owner
