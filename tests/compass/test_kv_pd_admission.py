@@ -11,8 +11,8 @@ from types import SimpleNamespace
 import pytest
 from test_kv_remote_prefill import (
     PROMPT,
-    R,
     SEND,
+    R,
     admit,
     at,
     geometry,  # noqa: F401  a fixture
@@ -38,7 +38,7 @@ def _config(engine, **options):
     )
 
 
-def test_a_simulated_decode_admits_a_receive_and_prefill_does_not(pd):
+def test_a_simulated_decode_admits_a_receive_and_prefill_does_not(pd):  # noqa: F811
     assert pd.d.kv_connector.supports_pd_admission is True
     assert pd.p.kv_connector.supports_pd_admission is False
     made = PdAdmissionController.from_config(
@@ -51,7 +51,9 @@ def test_a_simulated_decode_admits_a_receive_and_prefill_does_not(pd):
         )
 
 
-def test_the_receive_range_is_the_prompt_less_a_lined_up_prefix(pd, seq_factory):
+def test_the_receive_range_is_the_prompt_less_a_lined_up_prefix(
+    pd, seq_factory  # noqa: F811
+):
     (x,) = prefilled(pd, 1, R)
     params = dict(x.kv_transfer_params_output)
     seq = seq_factory(PROMPT, kv_transfer_params=params)
@@ -67,7 +69,9 @@ def test_the_receive_range_is_the_prompt_less_a_lined_up_prefix(pd, seq_factory)
     assert d.pd_receive_block_offset(local, blocks, 1) is None
 
 
-def test_a_receive_past_the_byte_budget_waits_for_the_one_pending(pd, seq_factory):
+def test_a_receive_past_the_byte_budget_waits_for_the_one_pending(
+    pd, seq_factory  # noqa: F811
+):
     """Two prefilled requests reach decode together under a budget of one
     request's receive: the first is admitted and parked for its write, the
     second deferred, holding no blocks, until the first's credit is gone."""
