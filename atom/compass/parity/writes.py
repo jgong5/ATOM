@@ -115,6 +115,13 @@ class WriteRecord:
         c = connector
         if c.is_producer:
             c._serve_write = functools.partial(self.serve_write, c._serve_write)
+            # A listener that hands a write request to `_execute_transfer`
+            # itself (the 1P2D repro's) serves it there; the line is opened
+            # by whichever of the two runs first on the send worker.
+            if hasattr(c, "_execute_transfer"):
+                c._execute_transfer = functools.partial(
+                    self.serve_write, c._execute_transfer
+                )
             c._rdma_write = functools.partial(self.rdma_write, c._rdma_write)
             c._notify_transfer_result = functools.partial(
                 self.notify_transfer_result, c._notify_transfer_result
@@ -154,6 +161,8 @@ class WriteRecord:
         self.queued: dict = {}
 
     def serve_write(self, call, request_data):
+        if getattr(self.serving, "line", None) is not None:
+            return call(request_data)  # inside the serve that opened the line
         keys = ("request_id", "transfer_id", "write_nonce")
         line = {k: request_data.get(k) for k in keys}
         # The listener stamps the transfer deadline as it takes the request in.
