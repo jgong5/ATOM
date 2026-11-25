@@ -143,10 +143,14 @@ and the carried hidden state in one launch (`_dual_norm_cat`); its own
 embedding, whole on every rank (`ReplicatedEmbedding`), joins no collective;
 and where it carries its hidden state unnormed (`norm_output` off), its final
 norm runs in `compute_draft_ids`, on the rows its LM head samples alone. The
-target's aux capture and the concatenation `fc` reads are left out of this
-lower bound. Kimi-K2.6's EAGLE 3.1 MLA drafter is not built, and a step under
-it prices no draft, nor are GLM-5-Next's and Qwen4-Exp's MTP drafters, whose
-sparse attention no roofline class prices (#3984).
+target's aux capture, the concatenation `fc` reads and, with `norm_output`
+off, the plain residual add that ends its forward are left out of this lower
+bound. The `ReplicatedEmbedding` reading also classifies GLM-5.2's target and
+MTP embeddings (`use_replicated_vocab_embed`) and GLM-5.3-Flash's MTP one; no
+step of theirs prices for it, as their DSA layers stay unclassified (#4186).
+Kimi-K2.6's EAGLE 3.1 MLA drafter is not built, and a step under it prices no
+draft (#4190), nor are GLM-5-Next's and Qwen4-Exp's MTP drafters, whose sparse
+attention no roofline class prices (#4186, #4187).
 
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
