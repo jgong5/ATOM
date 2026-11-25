@@ -766,7 +766,9 @@ class CompassSelector(selectors.DefaultSelector):
                         t_daemon = min(t_daemon, h.when())
                     else:
                         t = min(t, h.when())
-                if not hasattr(rt.conn, "fileno"):
+                # Messages a TAR grant sent ahead are reached in an own step,
+                # which `next_event` takes without asking.
+                if not hasattr(rt.conn, "fileno") or rt.ahead:
                     end = rt.now
                     if self._granted(end, rt.next_event(t, t_daemon)):
                         return super().select(0)
