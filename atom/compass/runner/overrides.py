@@ -105,7 +105,7 @@ import os
 import pickle
 import sys
 from functools import partial, wraps
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -1114,8 +1114,98 @@ def process_weights_after_loading(tree: torch.nn.Module) -> None:
     if not isinstance(tree, torch.nn.Module):
         return
     loaded_whole(tree)
-    with gathers_by_shape(), mhc_packed_on_meta(), shared_mxfp8_fused_on_meta():
+    with (
+        gathers_by_shape(),
+        mhc_packed_on_meta(),
+        shared_mxfp8_fused_on_meta(),
+        ple_tables_loaded_on_meta(),
+    ):
         _run_post_load_hooks(tree)
+
+
+#: Qwen3.8's PLE layer, whose n-gram table ATOM places at build time.
+PLE = "atom.model_ops.qwen4_exp.ple_layer"
+
+
+@contextlib.contextmanager
+def ple_table_placed_on_device():
+    """Qwen3.8's PLE n-gram table is placed where a start on the simulated
+    device places it.
+
+    ATOM page-locks the table in host memory and reads it over UVA when
+    `_host_table_available` says so: a ROCm build whose factories make tensors
+    on the GPU, `ATOM_ENGRAM_UVA`, a validated arch, no plugin mode and no
+    dummy load. On a meta build the factories make meta tensors, so the check
+    would build the HBM table instead, the ~51 GB of FP8 a TP1 rank of
+    Qwen3.8-Flash-Next holds on the host on a gfx950 start, and the KV pool
+    would come out that much smaller. Here the check's own code runs with its
+    device probe answering the simulated device: `torch.version.hip` set and
+    `torch.empty(0)` on the GPU; its arch probe already answers the simulated
+    arch (`simulated_arch`), and the other conditions read ATOM's own. Without
+    the PLE module loaded nothing is swapped.
+    """
+    ple = sys.modules.get(PLE)
+    check = getattr(ple, "_host_table_available", None)
+    if check is None:
+        yield
+        return
+    on_device = SimpleNamespace(device=torch.device("cuda"))
+    probe = SimpleNamespace(
+        version=SimpleNamespace(hip=torch.version.hip or "simulated"),
+        empty=lambda *a, **k: on_device,
+    )
+
+    @wraps(check)
+    def placed():
+        # The check's globals as they are now, the arch probe swapped among
+        # them, with its torch answering the simulated device.
+        return FunctionType(check.__code__, {**check.__globals__, "torch": probe})()
+
+    ple._host_table_available = placed
+    try:
+        yield
+    finally:
+        ple._host_table_available = check
+
+
+@contextlib.contextmanager
+def ple_tables_loaded_on_meta():
+    """Qwen3.8's PLE n-gram tables run no post-load hook on the meta device.
+
+    An FP8 table's hook checks that the checkpoint's one global scale is
+    finite and positive (`Tensor.item()`), and a host table's then takes the
+    addresses of its page-locked shards into `shard_bases`. A meta tree loads
+    no checkpoint and stands for a start that loaded all of it
+    (`loaded_whole`): the scale is the checkpoint's and every shard is held, a
+    host table's rows in host memory, on no device. So on a meta table both
+    hooks are skipped; on any other they run as ATOM's. Without the PLE module
+    loaded nothing is swapped.
+    """
+    ple = sys.modules.get(PLE)
+    names = ("_Qwen4ExpFP8Embedding", "_Qwen4ExpHostEmbedding")
+    classes = [getattr(ple, n, None) for n in names] if ple is not None else []
+    hooks = {
+        cls: vars(cls)["process_weights_after_loading"]
+        for cls in classes
+        if cls is not None and "process_weights_after_loading" in vars(cls)
+    }
+
+    def skipped_on_meta(hook):
+        @wraps(hook)
+        def run(self):
+            if self.weight.is_meta:
+                return None
+            return hook(self)
+
+        return run
+
+    for cls, hook in hooks.items():
+        cls.process_weights_after_loading = skipped_on_meta(hook)
+    try:
+        yield
+    finally:
+        for cls, hook in hooks.items():
+            cls.process_weights_after_loading = hook
 
 
 #: Each module class whose loader records the checkpoint slices it took, and
@@ -1698,7 +1788,7 @@ class NonAllocatingRunner(
                 )
             drafts_on_meta()
         engram_tables_unread()
-        with FactoriesOnMeta(), simulated_arch():
+        with FactoriesOnMeta(), simulated_arch(), ple_table_placed_on_device():
             self.model.tree = model_class(self.config)
             process_weights_after_loading(self.model.tree)
         from atom.compass import run
