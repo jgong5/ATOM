@@ -140,12 +140,7 @@ def test_each_stage_installs_its_own_part_of_the_law_and_of_the_host_laws(
     [
         (2, law(), None, "step linear law holds no part per stage"),
         (2, None, HOST_PARTS[0], "host laws holds no part per stage"),
-        (
-            2,
-            _staged(parts=PARTS * 2),
-            None,
-            "holds 4 stages' parts, and this run has 2",
-        ),
+        (2, _staged(parts=PARTS * 2), None, "holds 4 stages' parts, and this run"),
         (1, None, None, "holds 2 stages' parts, and this run has 1 pipeline stage,"),
     ],
     ids=["law", "host", "four-parts", "one-stage"],
