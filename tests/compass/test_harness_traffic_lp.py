@@ -802,9 +802,7 @@ def test_a_task_parked_on_a_pending_future_is_read_once_whatever_the_clock_calls
     assert set(read) == {1}
 
 
-def test_tasks_parked_on_the_clock_stay_out_of_every_look_s_pass(
-    tmp_path, monkeypatch
-):
+def test_tasks_parked_on_the_clock_stay_out_of_every_look_s_pass(tmp_path, monkeypatch):
     """Hundreds of idle watchdogs wait on the clock past every time asked while
     a pacer waits on it twenty times: no look's pass over the kept futures
     reads their waits, so a look costs the same with them parked as without."""
@@ -888,9 +886,8 @@ def test_the_look_finds_a_task_on_a_clock_wait_however_the_wait_completes():
 
     looks, waits = _run(main())
     assert [ours for ours, _ in looks] == [theirs for _, theirs in looks]
-    assert [ready != [] for (ready, _), _ in looks] == [
-        False, True, False, True, False, False
-    ]
+    readies = [bool(ready) for (ready, _), _ in looks]
+    assert readies == [False, True, False, True, False, False]
     assert waits[3].cancelled()
 
 
