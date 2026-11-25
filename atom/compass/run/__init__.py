@@ -1798,6 +1798,9 @@ def frontend(config):
             config.runner_qualname = recording[config.runner_qualname]
         return contextlib.nullcontext()
     _refuse_unserved()
+    from atom.compass.run import fastjson
+
+    fastjson.install()
     pc = config.parallel_config
     rapid = config.enable_rapidserve
     if rapid != run.get(RAPIDSERVE, False):

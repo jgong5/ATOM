@@ -83,8 +83,9 @@ from functools import partial
 
 from atom.compass.carriers import (
     cancel_seq,
-    relay_service,
-    relay_stamp,
+    relay_params,
+    service_of,
+    stamp_of,
     stamp_events,
     tracestate_jitter,
     with_relay_stamp,
@@ -906,7 +907,8 @@ class HttpChannel:
             send = _stamping(send, rt, relay_out, self.relay, taken)
         if relay_in is not None:
             body, receive = await _read_body(receive)
-            got = relay_stamp(body)
+            params = relay_params(body)
+            got = stamp_of(params)
         else:
             got = self.stamp(scope) if scope["type"] == "http" else None
         if (
@@ -933,7 +935,7 @@ class HttpChannel:
             arrival, seq = got
             rt.check_arrival(ch, arrival, seq)
             jitter = 0.0 if relay_in is not None else _intake_jitter(scope)
-            service = relay_service(body) if relay_in is not None else 0.0
+            service = service_of(params) if relay_in is not None else 0.0
             wake, ready = loop.create_future(), loop.create_future()
             # Its body leaves the socket as it comes, not at its turn.
             reading = asyncio.ensure_future(_body_messages(receive))

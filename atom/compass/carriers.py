@@ -158,13 +158,23 @@ _MEMBERS = msgspec.json.Decoder(dict[str, msgspec.Raw])
 _ENCODE = msgspec.json.Encoder()
 
 
+def relay_params(body: bytes) -> "_Params | None":
+    """A JSON request body's ``kv_transfer_params`` as the relay carriers read
+    it, decoded once for `stamp_of` and `service_of`; None without one."""
+    try:
+        return _STAMP.decode(body).kv_transfer_params
+    except msgspec.DecodeError:
+        return None
+
+
 def relay_stamp(body: bytes) -> tuple[float, int] | None:
     """The ``(arrival, seq)`` a JSON request body's ``kv_transfer_params`` carries;
     None without one."""
-    try:
-        params = _STAMP.decode(body).kv_transfer_params
-    except msgspec.DecodeError:
-        return None
+    return stamp_of(relay_params(body))
+
+
+def stamp_of(params: "_Params | None") -> tuple[float, int] | None:
+    """`relay_stamp` of the body whose `relay_params` are `params`."""
     value = None if params is None else params.compass
     return None if value is None else _parse(_ENTRY, value, "kv_transfer_params entry")
 
@@ -172,10 +182,11 @@ def relay_stamp(body: bytes) -> tuple[float, int] | None:
 def relay_service(body: bytes) -> float:
     """The seconds a JSON request body's ``kv_transfer_params`` says its relay
     serves it on the receiving loop (`RELAY_SERVICE`); 0.0 without one."""
-    try:
-        params = _STAMP.decode(body).kv_transfer_params
-    except msgspec.DecodeError:
-        return 0.0
+    return service_of(relay_params(body))
+
+
+def service_of(params: "_Params | None") -> float:
+    """`relay_service` of the body whose `relay_params` are `params`."""
     value = None if params is None else params.compass_relay_s
     if value is None:
         return 0.0
