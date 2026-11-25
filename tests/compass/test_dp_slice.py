@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from capabilities import ROOFLINE, ROOFLINE_MACHINE, capability, cost_overrides
 from test_memory_readings import DOCUMENT
 from test_report_extrapolation import plant
 from test_vertical_slice import (
@@ -113,12 +114,19 @@ class Requests(Traffic):
 
 
 def run_dp_slice(
-    out: Path, seed: str, width=DP_WIDTH, dp=2, pp=1, machine=DP_MACHINE
+    out: Path,
+    seed: str,
+    width=DP_WIDTH,
+    dp=2,
+    pp=1,
+    machine=DP_MACHINE,
+    backend=CONSTANT,
 ) -> dict:
     """One run in its own process tree: its step table, summary, parity record.
 
     `width` is the server's parallelism flags, `dp` the DP ranks and `pp` the
-    pipeline stages they start; the parity record holds every stage's."""
+    pipeline stages they start, priced by `backend` on `machine`
+    (`cost_overrides`); the parity record holds every stage's."""
     out.mkdir()
     with held_ports(2) as (clock_port, port):
         run_file = _run_file(
@@ -126,8 +134,7 @@ def run_dp_slice(
             clock_endpoint=f"tcp://127.0.0.1:{clock_port}",
             data_parallel_size=dp,
             pipeline_parallel_size=pp,
-            step_stub=CONSTANT,
-            machine=machine,
+            **cost_overrides(backend, machine),
         )
         env = dict(
             os.environ,
@@ -179,6 +186,7 @@ def runs(tmp_path_factory):
 
 
 @NEEDS_A_RUN
+@capability("dp_attention")
 def test_four_requests_meet_every_scenario_check_on_both_ranks(runs):
     run = runs[0]
     print(f"\n{run['table']}")
@@ -195,6 +203,37 @@ def test_four_requests_meet_every_scenario_check_on_both_ranks(runs):
     # while the other ran its dummy batch.
     assert all(any(s["batch"] for s in steps[rank]) for rank in (0, 1))
     assert any(a["is_dummy_run"] != b["is_dummy_run"] for a, b in zip(*steps.values()))
+
+
+@pytest.fixture(scope="module")
+def roofline_runs(tmp_path_factory):
+    root = tmp_path_factory.mktemp("dp_slice_roofline")
+    return [
+        run_dp_slice(root / f"seed{s}", s, machine=ROOFLINE_MACHINE, backend=ROOFLINE)
+        for s in ("1", "2")
+    ]
+
+
+@NEEDS_A_RUN
+@capability("dp_attention", 1)
+def test_four_requests_meet_every_scenario_check_under_the_step_roofline(
+    roofline_runs,
+):
+    """The level-0 case's checks but those on step timing. The engine's
+    hand-computed timeline, `check_run`'s records, which it computes only for
+    a constant step stub, from that stub's prefill and decode costs. And the
+    first step's batch of two on each rank, both ranks serving, and a step
+    where one rank runs a request beside the other's dummy batch: which rank a
+    request lands on, and what each rank's step holds, follow when requests
+    arrive and finish against the steps, and so the step cost."""
+    run = roofline_runs[0]
+    print(f"\n{run['summary']['schedule']['seconds_by_method']}\n{run['table']}")
+    failed = check_run(
+        [r["out"] for r in roofline_runs],
+        MAX_TOKENS,
+        [line for _, line in run["events"]],
+    )
+    assert not failed, "\n".join(failed)
 
 
 # --- without a driver ---------------------------------------------------------

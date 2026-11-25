@@ -25,8 +25,9 @@ module's own per-rank parameter shapes and attributes:
   module that holds it.
 - `Attention` (not MLA), `LinearAttention`: attention over the step's rows,
   at their own heads and dims; neither is gone into. An `Attention` with a
-  sliding window is unclassified, and so is one whose model plugs in an impl
-  other than ATOM's dense `PagedAttentionImpl` (MiniMax-M3's sparse layers).
+  sliding window is refused by name (below), and one whose model plugs in an
+  impl other than ATOM's dense `PagedAttentionImpl` (MiniMax-M3's sparse
+  layers) is unclassified.
 - `Attention` over MLA: its attention kernels, at the rank's heads, the
   heads the decode kernel pads them to, and the latent, rope, no-rope and
   value widths, the KV at the cache's format. Its up-projection linear
@@ -134,8 +135,13 @@ serial drafters ATOM maps (#3984).
 A module of any other class is gone into when it has children. One without,
 or a listed one in a format or layout not priced here, is unclassified: the
 first of each class comes back as an `unclassified` module named by class
-and path, which the backend refuses. Each module carries the index of the
-decoder layer it sits in, read off its path.
+and path, which the backend refuses. Two are refused by name: Kimi-K3's
+`KimiKDAAttention`, not gone into, whose KDA recurrence runs inside its
+forward, in no module the walk reads, and an `Attention` with a sliding
+window, which no roofline class prices over its window. The first of each
+comes back as such a module whose name also says why and the issue that
+would price it. Each module carries the index of the decoder layer it sits
+in, read off its path.
 """
 
 import dataclasses
@@ -214,6 +220,11 @@ V41_SILENT = (
 HELD = tuple(f"w{w}_{p}" for w in (13, 2) for p in ("weight", "weight_scale", "bias"))
 #: The containers a serial drafter's model holds its MTP layers in.
 LISTS = (torch.nn.ModuleList, torch.nn.ModuleDict)
+#: Kimi-K3's KDA attention, and why the walk refuses it.
+KDA = "atom.models.kimi_k3.model.KimiKDAAttention"
+KDA_REFUSED = "Kimi-K3's KDA recurrence; no roofline class prices it before #3963"
+#: Why the walk refuses an `Attention` with a sliding window.
+WINDOW_REFUSED = "a sliding window; no roofline class prices it before #3965"
 LAYER = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
@@ -248,10 +259,10 @@ def walk(tree: torch.nn.Module, drafted=None) -> list[Module]:
                 inner = CONTEXT if _drafts_kv(sub, module) else draft
                 at = f"{name}.{child}" if name else child
                 visit(sub, at, module, inner, passes)
-        elif then is None and type(module) not in seen:
+        elif (then is None or isinstance(then, str)) and type(module) not in seen:
             seen.add(type(module))
             where = f"{type(module).__name__} at {name or 'the root'}"
-            found.append(Module(where, UNCLASSIFIED))
+            found.append(Module(f"{where} ({then})" if then else where, UNCLASSIFIED))
 
     visit(tree, "", None, 0)
     found[:] = [_dp_head(m) if m.kind == "lm_head" else m for m in found]
@@ -437,9 +448,12 @@ def _is(module, *names: str) -> bool:
 
 
 def _classify(module, name, parent):
-    """`module`'s `Module`, `NOTHING`, `DESCEND`, or None if unclassified."""
+    """`module`'s `Module`, `NOTHING`, `DESCEND`, None if unclassified, or why
+    it is refused."""
     if parent is not None and _inside(module, parent):
         return NOTHING
+    if _is(module, KDA):
+        return KDA_REFUSED
     weight = getattr(module, "weight", None)
     fmt = FORMATS.get(getattr(weight, "dtype", None))
     if _is(module, V4 + "Block"):
@@ -539,7 +553,7 @@ def _classify(module, name, parent):
         if f"{impl.__module__}.{impl.__qualname__}" != DENSE_MHA:
             return None
         if getattr(module.impl, "sliding_window", -1) > 0:
-            return None
+            return WINDOW_REFUSED
         dims = (module.num_heads, module.num_kv_heads, module.head_dim)
         return kv and Module(name, "attention", dims, kv) or None
     if _is(module, OPS + "base_attention.LinearAttention"):

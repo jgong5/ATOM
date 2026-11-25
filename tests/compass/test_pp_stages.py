@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from capabilities import capability
 from test_dp_slice import (  # noqa: F401
     DP_MACHINE,
     MAX_TOKENS,
@@ -80,6 +81,7 @@ def _model_sends():
 
 
 @NEEDS_A_RUN
+@capability("pp")
 def test_a_pipeline_meets_the_run_properties_and_uses_every_stage_channel(pipeline):
     pp, runs = pipeline
     print(f"\n{runs[0]['table']}")

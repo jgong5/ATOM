@@ -50,6 +50,15 @@ from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 from atom.utils.region_graph import ReqGraph
 
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "capability(name, level): the form a scenario case runs, at level 0 under "
+        "the step stub or 1 under the step roofline (tests/compass/capabilities.py)",
+    )
+
+
 # ── 3. MockConfig ──────────────────────────────────────────────────────────
 
 

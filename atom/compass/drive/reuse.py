@@ -21,9 +21,11 @@ ladder the config's is a prefix of; of several, reuse comes
 first, then refused, then calibrate. The requirement a verdict names:
 
 1. the same key: none there, a store law, or host laws beside it, at another
-   ATOM digest than the head's, or a law file whose host key states another
-   (calibrate); host laws fitted on another host CPU serve, predicting the
-   host they timed;
+   ATOM digest than the head's, or a law file whose host key states another,
+   or a law the runner refuses for the prefill token-graph buckets it records
+   whose records ran at another ATOM digest (`records_atom`) or state none,
+   since a calibration of the config records them (calibrate); host laws
+   fitted on another host CPU serve, predicting the host they timed;
 2. not invalidated: a store law the store refuses to load under the head's
    readings (calibrate);
 3. coverage: a decode rung the config schedules with no vector
@@ -39,7 +41,8 @@ A verdict on a law found names, as ``run``, the ``--step-linear`` and
 ``--host-laws`` values a run of it takes, and one on a store's own step linear
 law at the head's ATOM digest names that ``store``, whatever the verdict. A
 refusal the runner makes of the config under the law, as of context
-parallelism or of the prefill token-graph buckets it records, propagates.
+parallelism, propagates; so does one of the prefill token-graph buckets it
+records, on a law whose records ran at the head's ATOM digest.
 `readings` gives the config's memory readings in a
 store, or where it holds none and the config's law verdict is ``reuse`` the
 assumed ones carried by the law files it names as ``run``, as a run of it
@@ -239,13 +242,23 @@ def _law_file(where: str, held: dict, config, machine, atom: str) -> dict:
 def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> dict:
     """The verdict on the step linear law `law` and host laws `host` found at
     `where`, both at the head's key, on any host CPU, the one they timed being
-    the one predicted: requirements 3 and 4."""
+    the one predicted: requirement 1's prefill token-graph buckets, then
+    requirements 3 and 4."""
     compass_run.refuse_unfitted_law(
         {STEP_LINEAR: law, "machine": machine.echo()}, config
     )
     compass_run.refuse_unfitted_host(host, config, machine_platform(machine))
     buckets = lacking.recorded_buckets(config, machine.value("device.arch"))
-    compass_run.refuse_other_buckets(config, buckets, {STEP_LINEAR: law, "host": host})
+    try:
+        compass_run.refuse_other_buckets(
+            config, buckets, {STEP_LINEAR: law, "host": host}
+        )
+    except ValueError as refused:
+        if (ran := law.get("records_atom")) == atom:
+            raise
+        ran = f"from ATOM digest {ran}" if ran else "stating no ATOM digest"
+        why = f"{where}: {refused}, on records re-keyed {ran}"
+        return _verdict("calibrate", 1, why, law=where)
     if rungs := [str(r) for r in uncovered_rungs(law, config)]:
         why = (
             f"{where} has no decode vector for rung{'s' * (len(rungs) > 1)} "

@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 import test_kv_remote_prefill
+from capabilities import capability
 from test_dp_slice import DP_MACHINE, _deployment
 from test_kv_remote_prefill import (
     SEND,
@@ -295,6 +296,7 @@ def pipeline(request, tmp_path_factory):
 
 
 @NEEDS_A_PD_RUN
+@capability("pd_prefill_pp")
 def test_a_prefill_pipeline_meets_every_scenario_check(pipeline):
     _, runs = pipeline
     print(f"\n{runs[0]['table']}")

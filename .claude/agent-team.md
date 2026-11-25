@@ -132,8 +132,9 @@ own `gh` login. Ownership is the assignee:
   `adoption: advice`, `adoption: profiling`, `adoption: upstream`,
   `scale: scenarios`, `scale: models`, `scale: systems`, `quality: accuracy`,
   `quality: speed`, `quality: maintenance`); a PR copies both from the issue it
-  delivers. An issue in no current milestone or stage carries `backlog`, not a
-  title suffix.
+  delivers, and a PR that delivers no issue gets both from its opener, as an
+  issue does. An issue in no current milestone or stage carries `backlog`, not
+  a title suffix.
 - **Inline comments.** `pr_state.py` and the issue-comments endpoint do not
   show inline comments (`pulls/<n>/comments`), and owners review with them.
   Read both endpoints before acting on a PR, and answer every inline
