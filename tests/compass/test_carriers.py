@@ -195,6 +195,10 @@ class TestSseComment:
         with pytest.raises(ValueError, match="^malformed compass SSE comment"):
             sse_stamp(line)
 
+    def test_an_event_that_is_no_clock_message_reads_its_arrival_and_no_seq(self):
+        assert sse_stamp(": compass a=1.25 s=-") == (1.25, None)
+        assert sse_stamp(": compass a=1.25 s=3") == (1.25, 3)
+
 
 class TestTheStreamWriter:
     def test_compass_off_the_stream_is_unchanged(self):
@@ -235,8 +239,11 @@ class TestTheStreamWriter:
         text = "".join(_client_text(chat()))
         events = text.split("\n\n")[:-1]
         stamps = [sse_stamp(e.split("\n", 1)[0]) for e in events]
-        assert stamps == [(a, s) for _, s, a in rt.send_log]
-        assert rt.send_log == [(STREAM, s, 2.0 + STREAM_S) for s in range(len(events))]
+        # Only the [DONE] event is a clock message; every event carries its time.
+        assert stamps == [(2.0 + STREAM_S, None)] * (len(events) - 1) + [
+            (2.0 + STREAM_S, 0)
+        ]
+        assert rt.send_log == [(STREAM, 0, 2.0 + STREAM_S)]
         assert len(events) > len(sent) and events[-1].endswith("data: [DONE]")
         assert re.sub(r"(?m)^: compass .*\n", "", text) == "".join(sent)
 
@@ -266,11 +273,15 @@ class TestTheStreamWriter:
         if per_event is None:
             assert charged == []
         else:
-            # One charge per frame, before its stamps: a, b, then c beside [DONE].
-            assert charged == [(d, 0), (d, 1), (d, 2)]
+            # One charge per frame, before its stamps: a, b, then c beside [DONE];
+            # only [DONE] is a clock message, so nothing was logged before it.
+            assert charged == [(d, 0), (d, 0), (d, 0)]
         at = [2.0 + d + STREAM_S, 2.0 + 2 * d + STREAM_S, *[2.0 + 3 * d + STREAM_S] * 2]
-        assert [(ch, s) for ch, s, _ in rt.send_log] == [(STREAM, s) for s in range(4)]
-        assert [a for _, _, a in rt.send_log] == pytest.approx(at)
+        stamps = [sse_stamp(e.split("\n", 1)[0]) for e in text.split("\n\n")[:-1]]
+        assert [a for a, _ in stamps] == pytest.approx(at)
+        assert [seq for _, seq in stamps] == [None, None, None, 0]
+        assert [(ch, s) for ch, s, _ in rt.send_log] == [(STREAM, 0)]
+        assert [a for _, _, a in rt.send_log] == pytest.approx(at[-1:])
 
     def test_behind_the_router_lp_frontend_d_stamps_its_stream_to_the_router(
         self, installed
@@ -289,7 +300,17 @@ class TestTheStreamWriter:
         installed(rt)
         text = "".join(_client_text(_replay(FRAMES)))
         stamps = [sse_stamp(e.split("\n", 1)[0]) for e in text.split("\n\n")[:-1]]
-        assert rt.send_log == [
-            ("frontend-D->router:stream", s, 2.001) for s in range(len(stamps))
-        ]
+        assert rt.send_log == [("frontend-D->router:stream", 0, 2.001)]
+        assert stamps == [(2.001, None)] * (len(stamps) - 1) + [(2.001, 0)]
+
+    def test_with_every_event_on_the_clock_each_is_a_clock_message(
+        self, installed, monkeypatch
+    ):
+        from atom.compass import carriers
+
+        monkeypatch.setenv(carriers.STREAM_CLOCK_ENV, "all")
+        rt = installed(_runtime(2.0))
+        text = "".join(_client_text(_replay(FRAMES)))
+        stamps = [sse_stamp(e.split("\n", 1)[0]) for e in text.split("\n\n")[:-1]]
+        assert rt.send_log == [(STREAM, s, 2.0 + STREAM_S) for s in range(len(stamps))]
         assert stamps == [(a, s) for _, s, a in rt.send_log]
