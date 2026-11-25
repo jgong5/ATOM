@@ -1395,16 +1395,19 @@ def _transferred_slot(runner: Any) -> tuple[int, bool]:
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
     )
-    from atom.model_ops.attentions.deepseek_v41.backend import (
-        DeepseekV41MetadataBuilder,
-    )
     from atom.model_ops.attentions.gdn_attn import GDNStateMixin
     from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
 
     builder = runner.attn_metadata_builder
-    if isinstance(
-        builder, (DeepseekV4AttentionMetadataBuilder, DeepseekV41MetadataBuilder)
-    ):
+    # V4.1's builder, read where its module is loaded: a runner whose builder is
+    # V4.1's loaded it, and one that did not needs no import of it (on the 1P2D
+    # repro its Engram device runtime imports a host-memory helper the merged
+    # Engram lacks).
+    v41 = sys.modules.get("atom.model_ops.attentions.deepseek_v41.backend")
+    builders = (DeepseekV4AttentionMetadataBuilder,) + (
+        (v41.DeepseekV41MetadataBuilder,) if v41 is not None else ()
+    )
+    if isinstance(builder, builders):
         return runner.pool_plan.entry_bytes[STATE_SLOT_CLASS], False
     if isinstance(builder, _KimiMLAGDNCommon):
         cursor = torch.int32.itemsize if builder.replayssm else 0
