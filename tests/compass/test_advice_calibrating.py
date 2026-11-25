@@ -413,6 +413,42 @@ def test_a_1p1d_candidate_whose_sides_pass_one_node_gets_why_and_lends_no_side(
     }
 
 
+@pytest.mark.parametrize("started", [False, True], ids=["before A starts", "after"])
+def test_a_1p1d_borrower_whose_sides_pass_one_node_gets_why_waiting_or_not(
+    tmp_path, sides, capsys, started
+):
+    store, a = tmp_path / "store", tmp_path / "out" / "cal" / "A"
+    # The shared store refuses A's prefill readings: A fits into its own. A's
+    # sides take 4 and 4 cards; B's, the same prefill side as A's, 4 and 8.
+    _readings_at_another_digest(store, sides)
+    pair = {name: dict(PAIR[name], prefill=_tp(PREFILL, 4)) for name in PAIR}
+    pair["A"]["decode"] = _tp(PAIR["A"]["decode"], 4)
+    pair["B"]["decode"] = _tp(PAIR["B"]["decode"], 8)
+    if started:
+        a.mkdir(parents=True)
+        (a / "inputs").write_text("tree c0ffee\nfit prefill decode\n")
+
+    found = advise(tmp_path, pair, network=NETWORK)
+
+    node = DOCUMENT["device"]["count_per_node"]
+    why = (
+        "no calibrate.sh command: it records both sides on one node, and they "
+        f"take 12 cards, where a node holds {node}; a deployment across two "
+        "nodes is not one command"
+    )
+    # B names A's calibration for its prefill side, and why no command fits
+    # its decode side, in place of a wait on A for a command it never gets.
+    borrowed = check.BORROWED.format("A", a, a / "store")
+    assert found["B"]["made_by"] == [borrowed, why]
+    assert f"    made by: {why}\n" in capsys.readouterr().out
+    env, _ = _calibrate(found, "A")
+    assert (env["FIT"], env["PREFILL_GPU"], env["DECODE_GPU"]) == (
+        "prefill decode",
+        "0,1,2,3",
+        "4,5,6,7",
+    )
+
+
 def test_a_side_a_started_1p1d_calibration_leaves_out_and_none_lends_gets_why(
     tmp_path, sides
 ):

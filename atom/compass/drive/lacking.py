@@ -31,9 +31,11 @@ law's is the `calibrate.sh` command that records and fits one for this
 configuration (`calibration`), into `--out`, or `cal` in the current directory
 without one, naming each client variable it requires that this environment
 does not set, with its expected time, unknown, as no earlier calibration's
-status is read for it. Memory readings whose key holds a stale entry are
-measured into a new store beside that directory (`readings_store`), as the
-store refuses a second publish at the key.
+status is read for it; or, where none serves, why, as for a server that
+decodes above one pipeline stage, whose stages' decode steps the fit cuts.
+Memory readings whose key holds a stale entry are measured into a new store
+beside that directory (`readings_store`), as the store refuses a second
+publish at the key.
 
 A prefill or decode instance's run reads a network file across nodes, as
 `deploy.sh run` hands it one, and its readings command takes the ATOM
@@ -479,7 +481,10 @@ def calibrate_inputs(atom_args, config, env=None) -> dict:
     use; ``rungs``, a first-turn
     record of each decode rung it schedules (`step_linear_plan.records`); and
     ``untraced``, why `compass record --trace` refuses it, else None. Where
-    `calibrate.sh` cannot take its arguments, ``refused`` alone says why."""
+    `calibrate.sh` cannot take its arguments, or no law it fits prices the
+    server's decode, ``refused`` alone says why: a server above one pipeline
+    stage that decodes, unlike a producer (`_producer`), whose stages' decode
+    steps every fit cuts (`step_labels.PIPELINED`)."""
     from atom.compass.drive.record import refuse_trace
     from atom.compass.run.step_grid import keyed_env
 
@@ -487,6 +492,13 @@ def calibrate_inputs(atom_args, config, env=None) -> dict:
         server = _server_args(atom_args)
     except ValueError as refused:
         return {"refused": str(refused)}
+    if (stages := config.pipeline_parallel_size) > 1 and not _producer(config):
+        return {
+            "refused": f"it decodes on {stages} pipeline stages, and the fit cuts "
+            "each stage's decode steps, whose window holds the stream hold of the "
+            "stage's last send and its wait for the stage before, which no label "
+            "parts from its own work"
+        }
     try:
         refuse_trace(atom_args)
         untraced = None
@@ -515,7 +527,8 @@ def calibration(out, atom_args, config, store=None, env=None) -> str:
     many GPUs as ATOM's ranks use; under `env` and this process's environment
     as a law's key states it (`keyed_env`), and each of `CLIENT_ENV` it sets,
     then a line naming each it does not, which `calibrate.sh` refuses to run
-    without. Where `calibrate.sh` cannot take ATOM's arguments, why."""
+    without. Where `calibrate.sh` cannot take ATOM's arguments, or no law it
+    fits prices `config`'s decode (`calibrate_inputs`), why."""
     held = calibrate_inputs(atom_args, config, env)
     if "refused" in held:
         return f"no calibrate.sh command: {held['refused']}"
@@ -549,8 +562,9 @@ def deployment_calibration(out, sides: dict, fit, router, node: int, store=None)
     variables both sides run under alike are the command's, and each side's
     others its ``PREFILL_ENV`` or ``DECODE_ENV``. A ValueError says why no
     command serves: `calibrate.sh` cannot take a side's arguments or
-    variables, or the sides serve two models or take more cards than one node
-    holds, as a deployment across two nodes does."""
+    variables, or no law it fits prices a side's decode (`calibrate_inputs`),
+    or the sides serve two models or take more cards than one node holds, as a
+    deployment across two nodes does."""
     for side, held in sides.items():
         if "refused" in held:
             raise ValueError(f"the {side} side: {held['refused']}")
