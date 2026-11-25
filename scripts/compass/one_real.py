@@ -16,9 +16,13 @@ are `validate.curves.metrics`' (InferenceX's agentic ones, over the profiling
 records with no error) and, over the same records, TTFT p50 and p99, TPOT p50
 and p90 (aiperf's inter-token latency, per request) and E2E latency p50, in
 milliseconds, and the requests counted. Every run must have been given the
-same client arguments. Below the table it names REAL's stalled forwards over
-its graded window (`atom.compass.validate.stalls`): seconds the real run lost
-to one DP rank's slow launch, which a simulated run does not charge. Then
+same client arguments. REAL is refused, as `python -m atom.compass.validate`
+refuses it, when the run.json of a server of its names JIT compiles that server
+ran while it served (`step_labels.refusal`): a stall delays every later
+request, so the error is no longer the simulator's. Below the table it names
+REAL's stalled forwards over its graded window (`atom.compass.validate.stalls`):
+seconds the real run lost to one DP rank's slow launch, which a simulated run
+does not charge. Then
 REAL's own 95% interval of TTFT p99, p90 TTFT and TPOT p90 over resamples of
 its sends' 60 s blocks, and whether each SIM's error lies inside it
 (`tails`): a tail holds a few bursts' worth of requests. Then, per
@@ -42,6 +46,7 @@ import re
 import sys
 from pathlib import Path
 
+from atom.compass.backends import step_labels
 from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.validate import stalls
 from atom.compass.validate.curves import (
@@ -54,6 +59,7 @@ from atom.compass.validate.curves import (
     percentile,
     profiled,
 )
+from atom.compass.validate.runs import sides
 
 #: The latency percentiles added to `metrics`', aiperf field and percentile, in ms.
 LATENCIES = {
@@ -96,6 +102,9 @@ def main(argv: list[str]) -> int:
                 f"{sim} was given other client arguments than {real}", file=sys.stderr
             )
             return 2
+    if built := compiled(real):
+        print(built, file=sys.stderr)
+        return 1
     rows = {"real": run_metrics(real, False)}
     rows |= {sim.name: run_metrics(sim, True) for sim in sims}
     names = list(rows["real"])
@@ -321,6 +330,17 @@ def hits(real: Path, sim: Path) -> str:
         f"{cb / ib:.1%} against the real run's {ca / ia:.1%} "
         f"({100 * (cb / ib - ca / ia):+.1f} pt), their uncached input tokens {shift}"
     )
+
+
+def compiled(real: Path) -> str | None:
+    """Why REAL is not graded: the run.json of a server of its names JIT
+    compiles it ran while it served (`step_labels.refusal`); None when none
+    does."""
+    for side in sides(real):
+        path = side / "run.json"
+        if path.is_file() and (built := step_labels.refusal(read_json(path))):
+            return f"{side} is not graded: {built}"
+    return None
 
 
 def stalled(real: Path) -> str:

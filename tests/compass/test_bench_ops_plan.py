@@ -17,16 +17,15 @@ from unittest.mock import patch
 import pytest
 import torch
 from test_artifact_store import (
-    CONDITIONS,
-    GATES,
     clean_checkout,  # noqa: F401  autouse
     stanza,
 )
 from test_bench_ops import KEY, TREE, _graph, _leaf, _Runner, _t
 from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
+from test_op_graph_arch import run_readings
 
 from atom.compass import capture, cli, ir
-from atom.compass.artifacts import ArtifactStore, Topology, member_name
+from atom.compass.artifacts import ArtifactStore, GateState, Topology, member_name
 from atom.compass.bench import ops
 from atom.compass.capture import driverless, forward, graph_key
 from atom.compass.capture.forward import decode, prefill, structure
@@ -957,15 +956,16 @@ def test_an_integer_activation_indexes_a_dimension_of_one():
 
 
 def _publish_graph(store, config, arch, shape):
-    """A graph of `shape` keyed on `arch`, its one leaf named for the arch."""
+    """A graph of `shape` keyed on `arch`, its one leaf named for the arch,
+    handed off under this process's readings, as `trace ops` hands one off."""
     key = graph_key(structure(config, shape.phase, device=arch), str(shape))
     leaf = _leaf(f"aiter.{arch}", ("x", _t([shape.seqs, 8], "activation")))
     store.publish(
         key,
         provenance=stanza("compass trace ops"),
         topology=Topology(),
-        conditions=CONDITIONS,
-        gates=GATES,
+        conditions=run_readings(config.model),
+        gates=GateState.of(),
         members={
             member_name("graph", ops.RANK, "json"): json.dumps(
                 _graph(leaf, layers=1)
@@ -1318,8 +1318,8 @@ def test_a_plan_traces_a_missing_graph_under_atom_s_arguments_and_reads_it_back(
             key,
             provenance=stanza("compass trace ops"),
             topology=Topology(),
-            conditions=CONDITIONS,
-            gates=GATES,
+            conditions=run_readings(str(tmp_path / "model")),
+            gates=GateState.of(),
             members={
                 member_name("graph", ops.RANK, "json"): json.dumps(
                     _graph_at(store, None, at.shape)

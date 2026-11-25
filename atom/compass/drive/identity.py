@@ -195,3 +195,9 @@ def phase(phases: dict, name: str):
 
 def _now() -> dict:
     return {"wall": time.time(), "monotonic": time.monotonic()}
+
+
+def clock_ns() -> list[int]:
+    """This host's wall clock and monotonic nanoseconds, read together: the
+    pair that places a wall clock time on the clock a step record reads."""
+    return [time.time_ns(), time.monotonic_ns()]

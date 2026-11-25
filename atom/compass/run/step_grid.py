@@ -28,7 +28,8 @@ Its publisher states the readings `conditions` takes. The engine-config reading
 is `keyed`, as JSON: the ladder the runner replays (none under
 ``enforce_eager``), the KV block size and dtype, the quantization with its
 layer names as the model's runner remaps them (`quantization`), the TP and
-DP widths, DP attention, expert parallelism, TBO, the MoE backend, the
+DP widths, above one pipeline stage the stages and each one's layer span
+(`PP_LAYERS`), DP attention, expert parallelism, TBO, the MoE backend, the
 all-to-all backend, EPLB, DeepSeek-V4.1 decoder SWA bounded replay and the
 compilation level when off ATOM's default, the index cache's dtype where ATOM
 resolved it apart from the KV cache's, whether mori imports where it does not,
@@ -158,6 +159,10 @@ DCP_KNOBS = (
     "enable_project_before_merge",
     "comm_backend",
 )
+#: Each pipeline stage's ``[start, end)`` span of the model's layers, keyed above
+#: one stage: ``VLLM_PP_LAYER_PARTITION`` moves it, and an override naming the
+#: default split leaves it where it was.
+PP_LAYERS = "pp_layers"
 
 
 def keyed(config, ladder: bool = True) -> dict:
@@ -168,13 +173,21 @@ def keyed(config, ladder: bool = True) -> dict:
     when it states some, and the performance environment of this process less
     the client's and the device selection (`keyed_env`), and under speculation
     its method and draft width, and `DRAFT` (`_draft`); the ladder only with
-    `ladder`."""
+    `ladder`. Above one pipeline stage it states the stages and `PP_LAYERS`,
+    each stage's layer span as ATOM's `get_pp_indices` gives it; at one stage,
+    neither."""
     from atom.config import Config, DCPConfig
     from atom.model_engine.arg_utils import EngineArgs
 
     spec = getattr(config, "speculative_config", None)
     drafts = {"speculative": [spec.method, spec.num_speculative_tokens]} if spec else {}
     drafts |= _draft(config, spec) if spec else {}
+    if (pp := getattr(config, "pipeline_parallel_size", 1)) > 1:
+        from atom.models.utils import get_pp_indices
+
+        layers = config.hf_config.num_hidden_layers
+        drafts["pipeline_parallel_size"] = pp
+        drafts[PP_LAYERS] = [list(get_pp_indices(layers, k, pp)) for k in range(pp)]
     if ladder:
         drafts["ladder"] = [] if config.enforce_eager else schedulable_ladder(config)
     if importlib.util.find_spec("mori") is None:

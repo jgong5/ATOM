@@ -40,7 +40,7 @@ def test_a_later_stages_record_fits_its_launch_up_to_the_receive(tmp_path):
         kind = "decode" if s["rows"][0][2] else "prefill"
         x = (1, sum(r[0] for r in s["rows"]), len(s["rows"]))
         r0 = s["t_launch_ns"][0] + round(float(np.dot(RECV[kind], x)) * 1e9)
-        s["t_pp_recv_ns"] = [r0, r0 + 10**6]  # a 1 ms receive, its entry labels it
+        s["t_pp_recv_ns"] = [r0, r0]  # inside its launch; its entry labels it
     record.write_text("".join(json.dumps(s) + "\n" for s in lines))
     host, report = fit_host(label_records([record])[0])
     assert report["unfitted"] == {}

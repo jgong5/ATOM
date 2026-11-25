@@ -48,6 +48,7 @@ from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefill_delayer import PrefillDelayer
 from atom.model_engine.scheduler import ScheduledBatch, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
+from atom.model_engine.state_runtime import StateRuntime, StateTransfer
 from atom.sampling_params import SamplingParams
 from atom.utils import clock, forward_context
 from atom.utils.tbo import ubatching
@@ -71,7 +72,7 @@ def _key(tokens):
 
 
 def _config(dp_rank=0, pipeline_parallel_size=1, budget=BUDGET, blocks=4096, **extra):
-    return MockConfig(
+    config = MockConfig(
         **extra,
         max_num_seqs=8,
         num_kvcache_blocks=blocks,
@@ -90,6 +91,10 @@ def _config(dp_rank=0, pipeline_parallel_size=1, budget=BUDGET, blocks=4096, **e
         tensor_parallel_size=1,
         kv_transfer_config={},
     )
+    if pipeline_parallel_size > 1:
+        # A pipeline's record states each stage's span of the model's layers.
+        config.hf_config.num_hidden_layers = 4 * pipeline_parallel_size
+    return config
 
 
 class _Runner(NonAllocatingRunner):
@@ -602,6 +607,18 @@ def test_a_record_states_the_last_forwards_fewest_rows_only_above_0_and_keys_non
     engine = json.loads(_record(runner).path.with_suffix(".engine.json").read_text())
     assert engine.get("min_final_prefill_rows") == (rows or None)
     assert "min_final_prefill_rows" not in keyed_of(engine)
+
+
+@pytest.mark.parametrize("transfer", [StateTransfer.none(), StateTransfer.replay()])
+def test_a_record_states_a_replaying_state_transfer_only_and_keys_none(
+    tmp_path, monkeypatch, transfer
+):
+    monkeypatch.setenv(ENV, str(tmp_path))
+    state = StateRuntime(transfer=transfer)
+    runner = SimpleNamespace(rank=0, config=_config(), state_runtime=state)
+    engine = json.loads(_record(runner).path.with_suffix(".engine.json").read_text())
+    assert engine.get("replays_state") == (transfer.replays or None)
+    assert "replays_state" not in keyed_of(engine)
 
 
 def test_the_mixin_records_from_the_first_forward_after_construction(

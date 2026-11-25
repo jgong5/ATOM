@@ -162,8 +162,9 @@ def population_shapes(names, tbo=False):
     return [shape for shape, _ in population_steps(names, tbo, drafters=True)]
 
 
-def population_steps(names, tbo=False, drafters=False):
+def population_steps(names, tbo=False, drafters=False, stage=0):
     """Each step the record directories `names` hold, DP's dummy runs aside,
+    of pipeline stage `stage` (above 0, its records ``pp<k>.dp<r>.jsonl``),
     as its shape, the one the op-level backend prices it at
     (`op_graph.step_shape`), with the rows its DP group's MoE
     gathered (`moe_rows`), and its step-record line, marked with how many of
@@ -194,7 +195,8 @@ def population_steps(names, tbo=False, drafters=False):
         path = pathlib.Path(name)
         if not (path / "run.json").is_file():
             raise ValueError(f"{name} is not a record directory: it has no run.json")
-        paths = sorted((path / "steps").glob("dp*[0-9].jsonl"))
+        prefix = f"pp{stage}." if stage else ""
+        paths = sorted((path / "steps").glob(f"{prefix}dp*[0-9].jsonl"))
         ranks = [[json.loads(t) for t in p.read_text().splitlines()] for p in paths]
         dp, splits, dummies = len(ranks), {}, group_dummies(ranks)
         # a line that states no rows, as a bare dummy run's, runs none

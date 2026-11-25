@@ -484,6 +484,38 @@ def _bmm_mxfp8(op, view, tp, kv) -> Work:
     return sum([one] * groups, Work({}, _bytes(x_scale) + _bytes(w_scale)))
 
 
+def _mx_batched_gemm(op, view, tp, kv) -> Work:
+    """gfx1250's FlyDSL grouped MXFP8 GEMM, as `_batched_gemm` prices V4's:
+    `XQ [m, g, k]` through each group's `[n, k]` of `WQ`, both block scales
+    read once and the output's scales, `y_scale_out`, written once."""
+    args = op["args"]
+    x, w = args["XQ"], args["WQ"]
+    m, groups, k = x["shape"]
+    fmt = _fmt(x["dtype"])
+    one = gemm(m, w["shape"][1], k, fmt, _fmt(w["dtype"]), fmt)
+    scales = _only("x_scale", "w_scale", "y_scale_out")(op, view, tp, kv)
+    return sum([one] * groups, scales)
+
+
+def _quantize_taps(op, view, tp, kv) -> Work:
+    """`quantize_fp8` of the taps' concatenation, which it never builds: each
+    tap read once and written as `_quantize` writes it."""
+    return sum(
+        (_quantize({"args": {"x": tap}}, view, tp, kv) for tap in op["args"]["taps"]),
+        Work(),
+    )
+
+
+def _draft_src(op, view, tp, kv) -> Work:
+    """V4.1 DSpark's two-source draft indices from each row's anchor position:
+    the positions read once and, per row, its `width` positions' int32 indices
+    of every ring slot and of the block's rows up to each, and both indptrs."""
+    args = op["args"]
+    rows, ring, width = args["positions"]["shape"][0], args["ring"], args["width"]
+    each = width * (ring + width + 2) * _size("torch.int32")
+    return Work({}, _bytes(args["positions"]) + rows * each)
+
+
 def _v4_prefill(op, view, tp, kv) -> Work:
     """V4's prefill attention over the KV entries its index lists name, the
     cached prefix's and the chunk's own: each query against each of its
@@ -869,6 +901,9 @@ EXTRACTORS = {
     + "fused_compress_attn_hca_gfx1250:flydsl_hca_compress_attn_gfx1250": COMPRESS,
     "aiter._build_tiles_raw.default": _launch,
     "aiter._build_sched_raw.default": _launch,
+    # aiter's OPUS MXFP4 MQA-logits Table schedule, built once a step for V4's
+    # indexer layers
+    "aiter._build_schedule_raw.default": _launch,
     # The kernel reads only the kv and score rows write_plan names, at most
     # (1 + overlap) * ratio per sequence, so neither is counted.
     f"{V4}state_writes:update_compressor_states": _only("ape", "state_slot_mapping"),
@@ -879,6 +914,7 @@ EXTRACTORS = {
         "topk_local", "positions", "kv_indptr_csa", "batch_id_per_q_token"
     ),
     "aiter.topk_gating_fwd.default": _in_place(),
+    "aiter_routed.topk_gating.default": _in_place(),
     "atom.model_ops.triton_hash_topk:hash_topk_triton": _gather("tid2eid"),
     "aiter.fused_moe_.default": _fused_moe,
     "aiter.rocm_aiter_fused_moe.default": _fused_moe,
@@ -932,6 +968,8 @@ EXTRACTORS = {
     "aten.embedding.default": _gather("weight"),
     "aten.index.Tensor": _gather("self"),
     "aiter.all_reduce_.default": _all_reduce,
+    # the all-reduce with the residual add after it, `other` read once
+    "aiter.all_reduce_add_.default": _all_reduce,
     "aiter.fused_allreduce_rmsnorm_.default": _fused_all_reduce_norm,
     "_c10d_functional.all_gather_into_tensor.default": _all_gather,
     "_c10d_functional.broadcast.default": _broadcast,
@@ -957,15 +995,30 @@ EXTRACTORS = {
 V41 = "atom.model_ops.deepseek_v41."
 V41_INDICES = "atom.model_ops.attentions.deepseek_v41.indices:"
 TOPK = "aiter.ops.flydsl.topk.topk_per_row:"
+#: An aiter routed operator (`aiter_routed.<name>.default`) is the aiter
+#: operator of its name, which picks its kernel itself: priced as that one is.
+ROUTED_OP = "aiter_routed.{}.default"
 EXTRACTORS |= {
     "aten.index_fill_.int_Scalar": _index_fill,
-    "aiter.gemm_a8w8_blockscale.default": _gemm(
-        "XQ", "WQ", "dtype", ("x_scale", "w_scale")
+    **dict.fromkeys(
+        (
+            "aiter.gemm_a8w8_blockscale.default",
+            ROUTED_OP.format("gemm_a8w8_blockscale"),
+        ),
+        _gemm("XQ", "WQ", "dtype", ("x_scale", "w_scale")),
+    ),
+    "aiter.ops.flydsl.batched_gemm_a8w8_gfx1250:run_bmm_a8w8_mxfp8_32_gfx1250": (
+        _mx_batched_gemm
     ),
     "aiter.router_logits.default": _gemm("x", "weight"),
     "atom.model_ops.blockscale:quantize_fp8": _quantize,
-    "aiter.ops.triton.quant.fused_mxfp8_quant:fused_dual_rmsnorm_mxfp8_quant": _mx(
-        "q", "k", read=("q_weight", "k_weight")
+    "atom.model_ops.blockscale:quantize_fp8_taps": _quantize_taps,
+    **dict.fromkeys(
+        (
+            "aiter.ops.triton.quant.fused_mxfp8_quant:fused_dual_rmsnorm_mxfp8_quant",
+            ROUTED_OP.format("fused_dual_rmsnorm_mxfp8_quant"),
+        ),
+        _mx("q", "k", read=("q_weight", "k_weight")),
     ),
     "aiter.dynamic_per_token_scaled_quant.default": _only("input", "out", "scales"),
     "aiter.dynamic_per_group_scaled_quant.default": _only("input", "out", "scales"),
@@ -1000,28 +1053,19 @@ EXTRACTORS |= {
     f"{V41}indexer:_block_maxima": _only("visible", "maxima"),
     TOPK + "flydsl_radix_topk_one_block": _only("row_starts", "row_ends", "indices"),
     TOPK + "flydsl_top_k_per_row_decode": _only("seq_lens", "indices"),
-    "aiter._top_k_per_row_decode.default": _only("seqLens", "indices"),
-    # This aiter's batched GEMM, lifted at its FlyDSL runner or launch.
-    "aiter.ops.flydsl.batched_gemm_a8w8_gfx1250:run_bmm_a8w8_mxfp8_32_gfx1250": (
-        _bmm_mxfp8
+    **dict.fromkeys(
+        (
+            "aiter._top_k_per_row_decode.default",
+            ROUTED_OP.format("top_k_per_row_decode"),
+        ),
+        _only("seqLens", "indices"),
     ),
+    # This aiter's batched GEMM at its gfx950 FlyDSL launch (gfx1250's runner above).
     "aiter.ops.flydsl.batched_gemm_a8w8_gfx950:_launch": _bmm_mxfp8,
-    # The operators this aiter routes, which a capture records in place of
-    # the calls they wrap: each priced as the kind it routes.
-    "aiter_routed.gemm_a8w8_blockscale.default": _gemm(
-        "XQ", "WQ", "dtype", ("x_scale", "w_scale")
-    ),
-    "aiter_routed.fused_dual_rmsnorm_mxfp8_quant.default": _mx(
-        "q", "k", read=("q_weight", "k_weight")
-    ),
     # Its fp8 rows and their e8m0 scales, a byte an element each.
-    "aiter_routed.inverse_rope_group_quant.default": _only(
+    ROUTED_OP.format("inverse_rope_group_quant"): _only(
         "o", "positions", out="torch.float8_e4m3fn"
     ),
-    "aiter_routed.topk_gating.default": _in_place(),
-    "aiter_routed.top_k_per_row_decode.default": _only("seqLens", "indices"),
-    # An all-reduce of `tensor` fused with the add of `other`.
-    "aiter.all_reduce_add_.default": _all_reduce,
     "atom.model_ops.attentions.token_layout.gather:gather_rows": _gather_rows,
     **dict.fromkeys(
         (
@@ -1037,11 +1081,12 @@ EXTRACTORS |= {
 }
 #: DeepSeek-V4.1's DSpark drafter's kinds: its draft-KV pass and its block.
 DSPARK = "atom.model_ops.deepseek_v41.dspark:"
-MARKOV = "atom.model_ops.dspark_markov_sample:"
+MARKOV = "atom.model_ops.dspark_markov_argmax:"
 EXTRACTORS |= {
     DSPARK + "fused_draft_kv_tail": _draft_kv_tail,
     DSPARK + "gather_window_rows": _window_rows,
     DSPARK + "draft_step_indices": _draft_indices,
+    DSPARK + "draft_src_indices": _draft_src,
     DSPARK + "build_block_state": _block_state,
     "atom.model_ops.sparse_attn_v4:_sparse_attn_triton": _block_attention,
     MARKOV + "_launch": _markov,

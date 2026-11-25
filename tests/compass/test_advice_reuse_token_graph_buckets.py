@@ -8,9 +8,11 @@ where they ran at another ATOM digest or state none, it is ``calibrate``,
 requirement 1, naming the refusal, since a calibration of the config records
 the run's buckets (the Ruling on #3792). A law stating the run's buckets is
 reused; a model whose attention builder records no token graph keeps its
-verdicts. Buckets the check cannot work out, ATOM's attention builder failing
-to load in the child that reads it or the child dying, refuse by name; a defect
-of Compass's own code there fails `compass advice` with its traceback.
+verdicts. A pipeline's law is held so stage by stage, the stage stating others
+named, and its host laws, a part per stage, by their key's graph sets as one
+stage's are. Buckets the check cannot work out, ATOM's attention builder
+failing to load in the child that reads it or the child dying, refuse by name;
+a defect of Compass's own code there fails `compass advice` with its traceback.
 
 The candidate is `test_advice_reuse`'s, its config DeepSeek-V4.1's. No device:
 which attention builder records token graphs is stated, V4.1's alone, as
@@ -28,6 +30,7 @@ from test_advice_reuse import (  # noqa: F401  fixtures
     law,
     law_file,
     searched,
+    staged,
     stored,
     verdicts,
 )
@@ -56,6 +59,13 @@ OTHER_HOST = (
     f"the host laws' key states the prefill token-graph buckets {OTHERS}, and this "
     f"run's runner records {RECORDED}"
 )
+#: The runner's refusal of a pipeline's law one stage of which states others as
+#: its prefill vector's buckets, that stage formatted in.
+OTHER_STAGE = (
+    "the step linear law states no ATOM_TOKEN_GRAPH_SIZES in its engine config and "
+    f"{OTHERS} as pipeline stage {{}}'s prefill vector's buckets, and this run's "
+    f"runner records the prefill token-graph buckets {RECORDED}"
+)
 
 
 def held(r, prefill=None, host=None) -> dict:
@@ -66,9 +76,27 @@ def held(r, prefill=None, host=None) -> dict:
     if prefill is not None:
         stated["prefill"]["buckets"] = prefill
     if host is not None:
-        token = {"prefill": host, "decode": []}
-        graphs = {"architecture": V41, "token": token, "request": [], "decoder": None}
-        stated["host"]["key"]["engine"][GRAPHS] = graphs
+        stated["host"]["key"]["engine"][GRAPHS] = recorded(host)
+    return stated
+
+
+def recorded(prefill) -> dict:
+    """The graph sets of a V4.1 runner that recorded the prefill buckets
+    `prefill`."""
+    token = {"prefill": prefill, "decode": []}
+    return {"architecture": V41, "token": token, "request": [], "decoder": None}
+
+
+def pipelined(tmp_path, r, *prefill, host=None) -> dict:
+    """`staged`'s law on `r`'s config, graphed, on as many pipeline stages as
+    `prefill`, stage k's prefill vector stating the buckets `prefill[k]`, and
+    its host key the graph sets of a V4.1 runner that recorded the prefill
+    buckets `host`, or none."""
+    stated = staged(tmp_path, r, *[-0.02] * len(prefill), eager=False)
+    for part, buckets in zip(stated["stages"], prefill):
+        part["prefill"] = {**part["prefill"], "buckets": buckets}
+    if host is not None:
+        stated["host"]["key"]["engine"][GRAPHS] = recorded(host)
     return stated
 
 
@@ -164,6 +192,27 @@ def test_a_v41_law_stating_its_run_s_buckets_is_reused(
     found = verdicts(advise(tmp_path), "law")
 
     assert judged(found) == [("reuse", None, where)] * 2
+
+
+@pytest.mark.parametrize(
+    "prefill, host, refused",
+    [
+        ((RECORDED, RECORDED), None, None),
+        ((OTHERS, RECORDED), None, OTHER_STAGE.format(0)),
+        ((RECORDED, OTHERS), None, OTHER_STAGE.format(1)),
+        ((RECORDED, RECORDED), OTHERS, OTHER_HOST),
+    ],
+    ids=["every-stage-the-run-s", "stage-0-others", "stage-1-others", "host-others"],
+)
+def test_a_pipeline_s_v41_law_is_held_to_its_run_s_buckets_stage_by_stage(
+    tmp_path, v41, prefill, host, refused
+):
+    where = law_file(tmp_path, pipelined(tmp_path, v41, *prefill, host=host))
+
+    found = verdicts(advise(tmp_path), "law")
+
+    verdict = ("reuse", None, where) if refused is None else ("refused", None, refused)
+    assert judged(found) == [verdict] * 2
 
 
 def test_a_model_whose_builder_records_no_token_graph_keeps_its_verdict(
