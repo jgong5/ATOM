@@ -19,13 +19,16 @@ import pytest
 import test_backend_step_roofline_mla as mla
 import test_vertical_slice as vertical
 from capabilities import ROOFLINE, ROOFLINE_MACHINE, capability
-from test_vertical_slice import MAX_TOKENS, NEEDS_A_RUN, run_slice
+from test_vertical_slice import MAX_TOKENS, NEEDS_A_RUN, publish_entry, run_slice
 
 from atom.compass.detect.scenario import check_run
 
 #: Narrower than the request's prompt, so its later rows and every decode
 #: attend a window shorter than their context.
 WINDOW = 4
+#: What `ModelRunner.__init__` sets for a bf16 or fp16 Llama before the
+#: runner reads its memory readings' key, whose engine config holds it.
+RUNNER_ENV = {"AITER_QUICK_REDUCE_QUANTIZATION": "INT4"}
 
 
 def windowed(config: dict) -> dict:
@@ -65,11 +68,19 @@ def test_the_scenario_model_carries_its_window_on_its_odd_layers(monkeypatch):
     ]
 
 
+def _publish(store, machine, argv, env) -> None:
+    """`publish_entry`, keyed in the environment ATOM's runner holds when it
+    reads the key: this bf16 Llama's adds `RUNNER_ENV`, as `compass measure
+    memory`'s runner keys its entry."""
+    publish_entry(store, machine, argv, env | RUNNER_ENV)
+
+
 def _runs(root: Path, *pricing) -> list[dict]:
     """Two runs of the windowed model, priced by `pricing` (`run_slice`)."""
     model = _windowed(root)
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(vertical, "MODEL", str(model))
+        mp.setattr(vertical, "publish_entry", _publish)
         return [run_slice(root / f"seed{s}", s, *pricing) for s in ("1", "2")]
 
 
