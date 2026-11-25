@@ -4,8 +4,8 @@ its stamped frames OUT.frames and sample.py's stack samples OUT.spy.
 1. Phases. The client's aiperf.log, as the run's artifacts keep it, gives each phase's wall bounds and its
    simulated length: the warmup's elapsed, the profiling duration, and the drain to the phase's end.
 2. Critical path. The CA serves one request at a time, so every reply it writes was made due by the request it
-   is serving. In each SLICE_S (default 300) slice of the profiling window, from the slice's last request, the
-   walk goes back: LP x sent its request after it received its latest reply, which the request the CA was then
+   is serving. In each SLICE_S (default 300) slice of the profiling window, the last one partial, from the
+   slice's last request, the walk goes back: LP x sent its request after it received its latest reply, which the request the CA was then
    serving made due. A hop on x splits into x's own work (reply received -> request sent), CA queueing (the
    part of the request's way up during which the CA was serving others), transport to and from the CA and
    the CA's serve of the request that freed x. The Rust router stamps nothing: its own work, queueing and
@@ -20,6 +20,7 @@ import collections
 import datetime
 import glob
 import json
+import math
 import os
 import re
 import sys
@@ -84,12 +85,14 @@ for label, pa, ea, pb, eb, sim in phases:
 t0, t1 = marks[("profiling", "started")], marks[("profiling", "sending complete")]
 
 # 2. critical path, slice by slice
-n = int((t1 - t0) // slice_s)
+n = math.ceil((t1 - t0) / slice_s)  # the last slice may be partial
 os.makedirs(f"{out}.slices", exist_ok=True)
 files = [open(f"{out}.slices/{k}.txt", "w") for k in range(n)]
 for path in glob.glob(f"{out}.frames/*.trace"):
     for line in open(path):
         t = float(line[: line.find(" ")])
+        if t > t1:
+            continue
         k = int((t - t0) // slice_s)
         if 0 <= k < n:
             files[k].write(line)
@@ -168,6 +171,8 @@ for path in glob.glob(f"{out}.spy/*.raw"):
     g = group(os.path.basename(path).split(".")[0])
     for line in open(path):
         stack, _, count = line.rstrip("\n").rpartition(" ")
+        if not count.isdigit():  # a frame name torn by a newline (py-spy --nonblocking)
+            continue
         frames = stack.split(";")[1:][::-1]
         if frames and re.search(WAITING, frames[0]):
             waiting[g] += int(count)
