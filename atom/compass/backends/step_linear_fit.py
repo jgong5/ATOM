@@ -425,6 +425,15 @@ UNEVEN_ROWS_ENV = "COMPASS_FIT_UNEVEN_ROWS"
 #: Prefill `tail_peers` (`step_linear.tail_peers`): a rank's real-row peers at a
 #: step its group runs a finishing prompt's tail at.
 TAIL_PEERS_ENV = "COMPASS_FIT_TAIL_PEERS"
+#: The target prefill vector fitted under the runner's phase-wise group rule
+#: (`COMPASS_PREFILL_PHASE_MAX`, `runner.overrides.history_phase_wait`): a
+#: positive blend `k`, unset or 0 off. A step then costs the max over its ranks
+#: of each rank's price plus `k` x (the group's largest `PHASE_COLUMNS` seconds
+#: less the rank's own), as the runner charges it (`_fit_form`'s `phase`).
+PREFILL_PHASE_MAX_ENV = "COMPASS_FIT_PREFILL_PHASE_MAX"
+#: The prefill columns of a rank's attention over its rows' cached history,
+#: the runner's `HISTORY_TERMS`.
+PHASE_COLUMNS = ("query_cached", "history", "query_square")
 #: Prefill `GRAPH_COLUMNS`: `tokens` and `query_cached` on a step replaying a
 #: prefill token graph.
 GRAPH_TOKENS_ENV = "COMPASS_FIT_GRAPH_TOKENS"
@@ -738,6 +747,14 @@ def env_options(environ=None) -> dict:
             out[key] = MOE_MIN_SPREAD if spread is None else float(spread)
     if _switch(env, TAIL_PEERS_ENV):
         out["tail_peers"] = True
+    if (phase := env.get(PREFILL_PHASE_MAX_ENV)) not in (None, "", "0"):
+        try:
+            k = float(phase)
+        except ValueError:
+            k = -1.0
+        if not 0 < k < math.inf:
+            raise ValueError(f"{PREFILL_PHASE_MAX_ENV}={phase} is not a positive blend")
+        out["phase_max"] = k
     if spread is not None and not {"moe_imbalance", "uneven_rows"} & set(out):
         raise ValueError(
             f"{MOE_MIN_SPREAD_ENV} is moe_imbalance's and uneven_rows'; set "
@@ -2009,6 +2026,7 @@ def _fit_form(
     kept: str = "step",
     drops: bool = True,
     protect: np.ndarray | None = None,
+    phase: tuple | None = None,
 ) -> dict:
     """One form fitted by max-affine regression: step `i`'s label `y[i]` is the
     max over its ranks' rows `x[i, r]`, those `real[i, r]` holds, of their
@@ -2041,6 +2059,12 @@ def _fit_form(
     priced at no time, which no equation can be divided by, ends the
     reweighting, and a MAD round drops it.
 
+    With `phase`, (`k`, a mask over `names`), a rank's price is its row's plus
+    `k` x (the step's largest masked part over its ranks less its own), the
+    runner's phase-wise group rule (`PREFILL_PHASE_MAX_ENV`): each pass solves
+    on the row `x_b + k mask (x_a - x_b)` of the priced rank `b` and the rank
+    `a` holding the largest masked part, and settles only when both picks hold.
+
     Returns the solve's figures: `pick`, each step's rank, at a tie the rank
     of larger features (`priced_rank`, prices folded as a run folds them);
     `passes`, its start, the passes over every round, the last stop and `F`;
@@ -2069,8 +2093,21 @@ def _fit_form(
         coef[np.array(vary)[solved]] = nnls(cols, labels)[0] / norms[solved]
         return coef, cols
 
-    def price(c):
-        return np.where(real, (flat @ c).reshape(n, width), -np.inf)
+    if phase is not None:
+        blend, mask = phase[0], np.asarray(phase[1], dtype=np.float64)
+
+        def apart(c):
+            return np.where(real, (flat @ (c * mask)).reshape(n, width), -np.inf)
+
+        def price(c):
+            a = apart(c)
+            own = np.where(real, (flat @ c).reshape(n, width), -np.inf)
+            return np.where(real, own + blend * (a.max(axis=1, keepdims=True) - a), -np.inf)
+
+    else:
+
+        def price(c):
+            return np.where(real, (flat @ c).reshape(n, width), -np.inf)
 
     def priced(c):
         return price(c).max(axis=1) + offset
@@ -2101,9 +2138,16 @@ def _fit_form(
             if passes == FIT_PASSES:
                 return c, cols, on, passes, "limit"
             passes += 1
-            rows = x[steps, pick][keep] / scale[keep, None]
+            rows = x[steps, pick]
+            if phase is not None:
+                held = apart(c).argmax(axis=1)
+                rows = rows + blend * mask * (x[steps, held] - rows)
+            rows = rows[keep] / scale[keep, None]
             full, solved = solve(rows, ((y - offset) / scale)[keep])
-            if (price(full).argmax(axis=1)[keep] == pick[keep]).all():
+            same = (price(full).argmax(axis=1)[keep] == pick[keep]).all()
+            if phase is not None:
+                same = same and (apart(full).argmax(axis=1)[keep] == held[keep]).all()
+            if same:
                 c, cols, on = full, solved, picked
             else:
                 d, f, t = full - c, cost(c), 1.0
@@ -2163,7 +2207,9 @@ def _fit_form(
             break
         keep, on = moved, None
     pick = np.zeros(n, dtype=int)
-    if width > 1:
+    if width > 1 and phase is not None:
+        pick = price(c).argmax(axis=1)
+    elif width > 1:
         pick = [
             priced_rank(
                 {
@@ -2770,8 +2816,18 @@ def _groups(
     return groups, cut, spread
 
 
+def _phase(blend, names) -> tuple | None:
+    """`_fit_form`'s `phase` for a vector of `names` under the blend `blend`
+    (`PREFILL_PHASE_MAX_ENV`): None when off or when no `PHASE_COLUMNS` is
+    among them."""
+    if not blend:
+        return None
+    mask = [float(n in PHASE_COLUMNS) for n in names]
+    return (blend, mask) if any(mask) else None
+
+
 def _fit_steps(
-    steps: list[list[tuple]], names: list[str], design, protect=None
+    steps: list[list[tuple]], names: list[str], design, protect=None, phase=None
 ) -> dict:
     """`_fit_form` of `steps`, each its ranks' `fit` rows, on `design(row)`, the
     form's features of a row, with `protect`, a step's mark, as `_fit_form`
@@ -2786,7 +2842,7 @@ def _fit_steps(
             x[i, r], real[i, r] = design(row), True
     marks = None if protect is None else np.array([protect(s) for s in steps])
     y = np.array([s[0][3] for s in steps])
-    solved = _fit_form(x, real, y, names, protect=marks)
+    solved = _fit_form(x, real, y, names, protect=marks, phase=phase)
     solved["rows"] = [s[p] for s, p in zip(steps, solved["pick"])]
     return solved
 
@@ -2858,6 +2914,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     cold = not draft and _cold(options)
     share = not draft and _share(options)
     keep_tail = not draft and _keep_peer_tail(options)
+    blend = None if draft else (options or {}).get("phase_max")
     kda = not draft and _kda(options)
     cols = _columns(options, draft)
     select = (not draft and (options or {}).get("moe_select")) or MOE_SELECTS[0]
@@ -2963,7 +3020,10 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                 names,
                 lambda r: r[2],
                 lambda step, marks=marks: any(r[2][j] for r in step for j in marks),
+                phase=_phase(blend, names),
             )
+        elif key == "prefill":
+            solved = _fit_steps(steps, names, lambda r: r[2], phase=_phase(blend, names))
         else:
             solved = _fit_steps(steps, names, lambda r: r[2])
         rowmod_k = figures = folds = None
@@ -3059,6 +3119,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             if rowmod_vif:
                 vector["fit"]["rowmod_vif"] = rowmod_vif
             if k == "prefill":
+                if blend is not None:
+                    vector["fit"]["phase_max"] = blend
                 if buckets:
                     vector["buckets"] = list(buckets)
                 if cold:
