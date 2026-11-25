@@ -50,7 +50,11 @@ blocking-call tool (`blocked`): the nanoseconds its thread spent in each HIP
 call that blocked, from the launch's entry to its token read's, or to
 the launch's exit on a forward with no such wait. A simulated runner's line is
 written as its step is recorded, and flushed to the file the record keeps open
-from its start, so a killed simulated worker keeps every line. Under `kv` a line carries the lmcache offload loads
+from its start, so a killed simulated worker keeps every line. With `WRITER`
+set to 1, as `drive.serve` sets it for a simulated server, its lines go to a
+thread of the record's own instead (`LineWriter`), which encodes and writes
+them off the step's path, the file's bytes unchanged; a worker killed before
+its interpreter exits loses the lines that thread had not yet written. Under `kv` a line carries the lmcache offload loads
 and saves the scheduler handed the worker since the previous line
 (`StepRecord.note_kv`), where any were. `compare` reads two records and names, per DP rank,
 the first step where they part; timestamps are not part of a step's decision.
@@ -88,6 +92,7 @@ schedules them in the other order names them the other way round, and `compare`
 may then report a step where the twins' rows differ.
 """
 
+import atexit
 import collections
 import contextlib
 import copy
@@ -97,7 +102,9 @@ import importlib
 import json
 import os
 import pathlib
+import queue
 import sys
+import threading
 import time
 from itertools import pairwise, zip_longest
 
@@ -110,6 +117,9 @@ from atom.compass.backends.step_labels import DRAFT_PASSES, join_stamps
 ENV = "ATOM_COMPASS_PARITY_RECORD"
 #: Set to 1, a real runner's record is written as its lines finish, not at `exit`.
 WRITE_THROUGH = "ATOM_COMPASS_PARITY_WRITE_THROUGH"
+#: Set to 1, a simulated runner's record is written by its `LineWriter`, off the
+#: step's path, not as each step is recorded.
+WRITER = "ATOM_COMPASS_PARITY_WRITER"
 #: The file in a real run's record directory holding when its workload was sent
 #: and when the server admitted each request.
 ARRIVALS = "arrivals.json"
@@ -171,13 +181,74 @@ SENDS = ("commit_pp_send_work", "async_send_intermediate_tensors")
 BLOCKED_AT = ("t_launch_ns", "t_recv_ns", "t_read_ns")
 
 
+class LineWriter:
+    """Writes the lines handed to it to `file` from a daemon thread of its own:
+    in the order handed, each batch it finds queued encoded, written and
+    flushed at once, so the file holds the bytes a write at each step would.
+
+    `close`, which the interpreter's exit runs, writes what is still queued. A
+    write that fails ends the thread and is raised by the next `put` and by
+    `close`.
+    """
+
+    def __init__(self, file) -> None:
+        self.file = file
+        self.queue: queue.SimpleQueue = queue.SimpleQueue()
+        self.error: Exception | None = None
+        self.thread = threading.Thread(
+            target=self._run, name="parity-writer", daemon=True
+        )
+        self.thread.start()
+        atexit.register(self.close)
+
+    def put(self, line: dict) -> None:
+        if self.error is not None:
+            raise self.error
+        self.queue.put(line)
+
+    def close(self) -> None:
+        """Write every line handed so far, then end the thread."""
+        atexit.unregister(self.close)
+        if self.thread.is_alive():
+            self.queue.put(None)
+            self.thread.join()
+        if self.error is not None:
+            raise self.error
+
+    def _run(self) -> None:
+        while True:
+            lines = [self.queue.get()]
+            while not self.queue.empty():
+                lines.append(self.queue.get())
+            closed = lines[-1] is None
+            try:
+                self.file.write(
+                    "".join(
+                        json.dumps(line) + "\n" for line in lines if line is not None
+                    )
+                )
+                self.file.flush()
+            except Exception as error:  # noqa: BLE001 - raised on the recording thread
+                self.error = error
+                return
+            if closed:
+                return
+
+
 class StepRecord:
     """One DP rank's record: a JSON line per forward call. A real runner's
     line is written at `write`, or with `write_through` at the first forward
-    that finds it finished, as a simulated runner's always is."""
+    that finds it finished, as a simulated runner's always is; a simulated
+    runner's goes to the record's `writer` instead where it has one
+    (`WRITER`)."""
 
     def __init__(
-        self, directory, dp_rank: int, stage: int = 0, write_through: bool = False
+        self,
+        directory,
+        dp_rank: int,
+        stage: int = 0,
+        write_through: bool = False,
+        writer: bool = False,
     ) -> None:
         name = f"pp{stage}.dp{dp_rank}" if stage else f"dp{dp_rank}"
         self.path = pathlib.Path(directory) / f"{name}.jsonl"
@@ -193,6 +264,7 @@ class StepRecord:
         # a run outgrows that.
         self.lines: list[dict] = []
         self.write_through = write_through
+        self.writer = LineWriter(self.file) if writer else None
         self.dp_rank = dp_rank
         self.step = 0
         self.keys: dict[int, str] = {}  # request id -> key
@@ -245,7 +317,8 @@ class StepRecord:
         and `t_exit_ns` read off `runner.step_clock_ns()` around it and
         `runner.step_stamps()` added; a line with a device window waits in
         `pending` until the window closes, then in `lines` until `write`,
-        which a write-through record runs at each step. Returns `forward`'s reply, or
+        which a write-through record runs at each step. A simulated step's
+        line goes to the record's `writer` when it has one. Returns `forward`'s reply, or
         without one the mode the view was built from and the view, so a caller
         pricing the step need not run the collective or build the view again.
         """
@@ -351,12 +424,15 @@ class StepRecord:
                 line[field] = getattr(view, field)
         if view.group_needs_eager:
             line["group_needs_eager"] = True
-        self.pending.append((line, window))
+        if forward is None and self.writer is not None:
+            self.writer.put(line)
         # A simulated step is priced, not timed, and nothing grades a
         # write-through record's time: their finished lines are written now.
-        if forward is None or self.write_through:
+        elif forward is None or self.write_through:
+            self.pending.append((line, window))
             self.write(wait=False)
         else:
+            self.pending.append((line, window))
             self.flush()
         self.step += 1
         return (mode, view) if forward is None else reply
@@ -437,7 +513,10 @@ def _record(runner):
             pp = runner.config.pipeline_parallel_size > 1
             stage = pc.pipeline_parallel_rank if pp else 0
             through = os.environ.get(WRITE_THROUGH) == "1"
-            record = StepRecord(directory, pc.data_parallel_rank, stage, through)
+            writer = os.environ.get(WRITER) == "1"
+            record = StepRecord(
+                directory, pc.data_parallel_rank, stage, through, writer
+            )
             # By its first step the runner has resolved its engine.
             engine = keyed(runner.config) | {
                 name: getattr(runner.config, name) for name in UNKEYED

@@ -27,7 +27,8 @@ the directory, so the server's stop removes it (`drop_compiled`).
 The server runs this driver's tree in its own process group, so its engine
 processes stop with it, with the open-file soft limit raised as ATOM's own
 server raises it (`atom.utils.set_ulimit`), and writes ``<out>/server.log`` and its step record in
-``<out>/steps``. Once its ``/health`` first answers, ``<out>/server.json``
+``<out>/steps``, a simulated server's by a writer thread off its steps' path
+(`parity.WRITER`). Once its ``/health`` first answers, ``<out>/server.json``
 names its URL and process id, its host's wall clock and monotonic nanoseconds
 read together then (`step_labels.CLOCK`), for a simulated server its clock
 endpoint and run file, and, given an artifact store, the JIT cache library's
@@ -213,6 +214,8 @@ def serve(
         env["HIP_VISIBLE_DEVICES"] = hip_visible(gpus)
         env |= log_more(atom_args)
     else:
+        # Its record's lines are written off the step's path.
+        env[parity.WRITER] = "1"
         run_file = out / RUN_FILE
         if run.get(OP_GRAPH):
             run = {**run, ATOM_ARGS: list(atom_args)}
