@@ -155,7 +155,6 @@ SHORT = {
 REQUEST_COLS = [
     ("TTFT p50 ms", "TTFT p50"),
     ("p90 TTFT", "TTFT p90"),
-    ("TTFT p99 ms", "TTFT p99"),
     ("TPOT p50 ms", "TPOT p50"),
     ("TPOT p90 ms", "TPOT p90"),
     ("E2E p50 ms", "E2E p50"),
@@ -168,6 +167,8 @@ REQUEST_COLS = [
 #: one_real.py's rows the per-request table names otherwise: its InferenceX
 #: ``p90 TTFT`` is the TTFT P90, shown beside P50 and P99.
 REQUEST_NAMES = {"p90 TTFT": "TTFT p90 ms"}
+#: one_real.py's rows the page does not show.
+REQUEST_HIDDEN = {"TTFT p99 ms"}
 THRESHOLDS = (0.05, 0.15)
 CHART_JS = "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"
 
@@ -587,9 +588,9 @@ def merge_one_real(parsed: list[dict]) -> dict | None:
         out["tail_sims"].update(p["tail_sims"])
         out["paired"].update(p["paired"])
         out["notes"] += [n for n in p["notes"] if n not in out["notes"]]
-    metrics = list(out["real"])
+    metrics = [m for m in out["real"] if m not in REQUEST_HIDDEN]
     # one_real.py lists p90 TTFT among InferenceX's rows; the table shows it
-    # between TTFT p50 and p99.
+    # after TTFT p50.
     if "p90 TTFT" in metrics and "TTFT p50 ms" in metrics:
         metrics.remove("p90 TTFT")
         metrics.insert(metrics.index("TTFT p50 ms") + 1, "p90 TTFT")
