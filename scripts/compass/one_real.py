@@ -319,9 +319,7 @@ def hits(real: Path, sim: Path) -> str:
     1.2 points below the one real run's). A gap here beside `window`'s ~0%
     over the same requests is that draw, not the law."""
     a, b = _cached(real), _cached(sim)
-    both = [
-        k for k in set(a) & set(b) if a[k][1] is not None and b[k][1] is not None
-    ]
+    both = [k for k in set(a) & set(b) if a[k][1] is not None and b[k][1] is not None]
     if not both:
         return f"{sim.name}: prefix hits: no request both ran states its cached tokens"
     (ia, ca), (ib, cb) = (
@@ -370,9 +368,7 @@ def warmup_hits(real: Path, sim: Path) -> str:
     prefix survived was a draw of the order (warmup hits 15-35% over nine
     simulated runs, 18% real, beside profiled ones of 31-36% and 35%)."""
     a, b = _warmup_cached(real), _warmup_cached(sim)
-    both = [
-        k for k in set(a) & set(b) if a[k][1] is not None and b[k][1] is not None
-    ]
+    both = [k for k in set(a) & set(b) if a[k][1] is not None and b[k][1] is not None]
     if not both:
         return (
             f"{sim.name}: warmup prefix hits: no warmup request both ran states "
@@ -390,6 +386,7 @@ def warmup_hits(real: Path, sim: Path) -> str:
         f"({gap:+.1f} pt); the warmup holds {share:.0%} of the real run's prompt "
         f"tokens, so it moves the GPU hit rate by about {share * gap:+.1f} pt"
     )
+
 
 def stalled(real: Path) -> str:
     """REAL's stalled forwards (`validate.stalls`), which no simulated run

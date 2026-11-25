@@ -74,7 +74,9 @@ def test_the_phase_fit_recovers_the_coefficients_the_max_rule_misses():
     # the priced rank is the one the phase-wise price picks
     own = x @ phased["coef"]
     a = x[..., 2] * phased["coef"][2]
-    assert (phased["pick"] == (own + a.max(axis=1, keepdims=True) - a).argmax(axis=1)).all()
+    assert (
+        phased["pick"] == (own + a.max(axis=1, keepdims=True) - a).argmax(axis=1)
+    ).all()
 
 
 def test_without_phase_the_fit_is_the_max_affine_one():

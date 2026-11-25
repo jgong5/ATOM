@@ -2102,7 +2102,9 @@ def _fit_form(
         def price(c):
             a = apart(c)
             own = np.where(real, (flat @ c).reshape(n, width), -np.inf)
-            return np.where(real, own + blend * (a.max(axis=1, keepdims=True) - a), -np.inf)
+            return np.where(
+                real, own + blend * (a.max(axis=1, keepdims=True) - a), -np.inf
+            )
 
     else:
 
@@ -3023,7 +3025,9 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                 phase=_phase(blend, names),
             )
         elif key == "prefill":
-            solved = _fit_steps(steps, names, lambda r: r[2], phase=_phase(blend, names))
+            solved = _fit_steps(
+                steps, names, lambda r: r[2], phase=_phase(blend, names)
+            )
         else:
             solved = _fit_steps(steps, names, lambda r: r[2])
         rowmod_k = figures = folds = None

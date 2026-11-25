@@ -56,17 +56,28 @@ def test_each_rank_waits_for_the_group_s_longest_history(monkeypatch):
     monkeypatch.setattr(
         torch.distributed, "all_reduce", lambda t, op=None, group=None: t.fill_(top)
     )
-    priced = [h + r + overrides.history_phase_wait(_terms(h, r), object()) for h, r in ranks]
+    priced = [
+        h + r + overrides.history_phase_wait(_terms(h, r), object()) for h, r in ranks
+    ]
     assert max(priced) == pytest.approx(top + max(r for _, r in ranks))
     # a refused or dummy rank, no history of its own, waits the whole top; draft terms are not history
     monkeypatch.setenv("COMPASS_PREFILL_PHASE_MAX", "0.5")
     assert overrides.history_phase_wait((), object()) == pytest.approx(0.15)
 
 
-def test_a_dp_group_prices_longest_history_plus_largest_rest(dp2, monkeypatch):
-    ranks = [runner(Split(0.30, 0.10), dp_size=2, dp_rank=0), runner(Split(0.05, 0.40), dp_size=2, dp_rank=1)]
-    off = dp2(lambda: ranks[0].forward(prefill(40)), lambda: ranks[1].forward(prefill(8)))
+def test_a_dp_group_prices_longest_history_plus_largest_rest(
+    dp2, monkeypatch  # noqa: F811
+):
+    ranks = [
+        runner(Split(0.30, 0.10), dp_size=2, dp_rank=0),
+        runner(Split(0.05, 0.40), dp_size=2, dp_rank=1),
+    ]
+    off = dp2(
+        lambda: ranks[0].forward(prefill(40)), lambda: ranks[1].forward(prefill(8))
+    )
     assert [r.predicted_s for r in off] == pytest.approx([0.45, 0.45])
     monkeypatch.setenv("COMPASS_PREFILL_PHASE_MAX", "1")
-    on = dp2(lambda: ranks[0].forward(prefill(40)), lambda: ranks[1].forward(prefill(8)))
+    on = dp2(
+        lambda: ranks[0].forward(prefill(40)), lambda: ranks[1].forward(prefill(8))
+    )
     assert [r.predicted_s for r in on] == pytest.approx([0.70, 0.70])

@@ -2409,9 +2409,7 @@ def _group_step_seconds(
     # A prefilling group's history attention and the rest wait at different
     # collectives (`history_phase_wait`).
     prefilling = many and not mode.running_tokens_are_unified
-    phase_s = history_phase_wait(
-        terms[:target_terms], group if prefilling else None
-    )
+    phase_s = history_phase_wait(terms[:target_terms], group if prefilling else None)
     device_s += phase_s
     charge = getattr(host, "charge", None)
     if group is not None and isinstance(host, HostDeviceRecurrence):
