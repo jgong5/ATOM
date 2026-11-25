@@ -74,6 +74,7 @@ FORMS = {
     "hbm_prefix_hit": Form("a prefix hit in HBM", issue="#2669"),
     "deepseek_v4": Form("DeepSeek-V4 sparse attention", issue="#2671"),
     "mla": Form("MLA (DeepSeek-R1)", issue="#2671"),
+    "minimax_m3": Form("MiniMax-M3 sparse attention"),
     "router_cache_aware": Form(
         "the router LP's cache_aware, with and without timed eviction", issue="#2673"
     ),

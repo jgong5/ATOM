@@ -186,7 +186,10 @@ class Module:
     `linear_attention` (value heads, key heads, key dim, value dim), `mhc`
     (residual copies, width), `sparse_attention` (heads, head dim, window,
     compression ratio, top k, indexer heads and head dim, then optionally the
-    most compressed entries the indexer scores), `mla_attention`
+    most compressed entries the indexer scores), `block_sparse_attention`
+    (heads, KV heads, head dim, top-k blocks, block width, indexer heads and
+    head dim, no indexer heads where the layer reuses an earlier layer's
+    selection), `mla_attention`
     (heads, the decode kernel's padded heads, latent, rope, no-rope and value
     widths), `mla_up` (heads, no-rope and value widths, latent width), `moe`
     as `run.modules` reads it, `index_keys` (index dim, head dim, compression
@@ -196,7 +199,8 @@ class Module:
     collective it joins, 1 for none; `fused` that the collective runs in the
     module's kernel; `layer` the decoder layer it sits in, -1 outside them;
     `wire` the formats a `moe`'s all-to-all dispatch and combine send;
-    `index` the format a `sparse_attention`'s indexer scores at; `replay`
+    `index` the format a `sparse_attention`'s or `block_sparse_attention`'s
+    indexer scores at; `replay`
     the rows of each finishing request a replayed prefill runs it on, 0 for
     every row; `draft` a drafter's block width, `CONTEXT` for a drafter's
     module on the target's rows, 0 for the target's; `kv` the format of the
@@ -263,6 +267,8 @@ def _work(m: Module, view: BatchView, tokens: int, sampled: int) -> Work | None:
         return Work({ACT: 2 * tokens * mix * copies * width}, moved)
     if m.kind == "sparse_attention":
         return _sparse_attention(m, view.requests)
+    if m.kind == "block_sparse_attention":
+        return _block_sparse_attention(m, view)
     if m.kind == "index_keys":
         return _index_keys(m, view.requests)
     if m.kind == "block_attention":
@@ -526,6 +532,56 @@ def _index_keys(m: Module, rows) -> Work:
     return gemm(made, index_dim, head_dim) + elementwise(
         made * index_dim, reads=0, fmt=m.fmt
     )
+
+
+def _block_keys(n: np.ndarray, top: int, block: int) -> np.ndarray:
+    """The keys a query at each position `1..n` attends over its `top`
+    selected `block`-token blocks, summed, for each `n`: every key before it
+    while it has at most `top` blocks, else `top - 1` whole blocks and its own,
+    `(p - 1) % block + 1` keys. Exact where the selection pins each query's
+    own block, as MiniMax-M3's does; the least it can attend otherwise."""
+    past = np.maximum(n - top * block, 0)  # positions past the first top blocks
+    dropped = past + _prefix(np.maximum(past - 1, 0), block)  # blocks not attended
+    return n * (n + 1) // 2 - block * dropped
+
+
+def _block_sparse_attention(m: Module, view: BatchView) -> Work:
+    """MiniMax-M3's sparse attention (`SparseMHAPagedAttentionImpl`) over the
+    step's rows, a pad row holding no context.
+
+    Its indexer (`minimax_m3_index_topk`, `minimax_m3_index_topk_decode`)
+    scores each new query at each index head against every key before it,
+    one product of the index dim at the wider of the index query's format and
+    the cache's `index`: the prefill scorer casts the query to the cache's
+    format, the decode scorer lifts the key to the query's, which is bf16, or
+    e4m3 over an fp4 cache. It reads that query once and each request's index
+    keys once. A layer that reuses an earlier layer's selection scores none.
+    The top-`top` selection runs no product, and the block scores it reads are
+    the module's own (`10` D64): it adds no work.
+    The attention (`sparse_pa_per_row`) attends each query over its selected
+    blocks (`_block_keys`), two products of the head dim per head and key at
+    the wider of Q's format `act` and the KV's `fmt`. Each request reads K and
+    V of the blocks its last query selects once at each KV head, the least
+    any of its queries reads; Q is read at `act`, O written in bf16.
+    """
+    heads, kv_heads, dim, top, block, index_heads, index_dim = m.dims
+    rows = view.requests
+    seen = np.array([r.context_tokens for r in rows])
+    held = seen - np.array([r.query_tokens for r in rows])
+    upto = _block_keys(seen, top, block)
+    keys = int((upto - _block_keys(held, top, block)).sum())
+    last = int((upto - _block_keys(np.maximum(seen - 1, 0), top, block)).sum())
+    tokens = sum_tokens(rows)
+    moved = tokens * heads * dim * (ELEMENT_BYTES[m.act] + ELEMENT_BYTES[ACT])
+    moved += last * 2 * kv_heads * dim * ELEMENT_BYTES[m.fmt]
+    work = Work({_wider(m.act, m.fmt): 4 * heads * dim * keys}, moved)
+    if not index_heads:
+        return work
+    q = "fp8" if m.index == "fp4" else ACT
+    rate = _wider(m.index, "fp8" if view.prefill else q)
+    moved = tokens * index_heads * index_dim * ELEMENT_BYTES[q]
+    moved += sum_context(rows) * index_dim * ELEMENT_BYTES[m.index]
+    return work + Work({rate: 2 * index_heads * index_dim * _pairs(rows)}, moved)
 
 
 def _block_attention(m: Module, rows) -> Work:

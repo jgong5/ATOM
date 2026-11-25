@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 """MiniMax-M3's meta build: its dense attention layers are priced as dense
-attention, and the step roofline refuses its sparse ones by layer name, whose
-top-k kernel reads a few blocks of the cache rather than every token. Its MoE
-layers are priced as their routed experts with the shared one fused beside
-them, though its MoE block holds no TP width. Above TP1 each sub-layer's
-output is all-reduced once, inside the next norm.
+attention, and its sparse ones as attention over the blocks each query
+selects, with their indexer's scoring, so the step roofline prices an M3 step;
+the sparse attention is checked against a count by hand, once memory-bound
+and once compute-bound. Its MoE layers are priced as their routed experts with
+the shared one fused beside them, though its MoE block holds no TP width.
+Above TP1 each sub-layer's output is all-reduced once, inside the next norm.
 
 The build owns its process because the driverless declarations are
 process-global.
@@ -12,12 +13,17 @@ process-global.
 
 import json
 
+import numpy as np
 import pytest
 from test_backend_step_roofline_mla import MI355X, _build
-from test_backend_step_roofline_v4 import view
+from test_backend_step_roofline_v4 import BOUND, _module, _price, view
 
-from atom.compass.backends import CostRefused
-from atom.compass.backends.step_roofline import StepRooflineBackend
+from atom.compass.backends.step_roofline import (
+    Module,
+    StepRooflineBackend,
+    _block_keys,
+)
+from atom.compass.backends.work import Work
 from atom.compass.spec import MachineSpec
 
 #: The published MiniMax-M3 text config at its widths, cut to its first dense
@@ -57,21 +63,115 @@ M3 = {
 }
 
 
-def test_a_sparse_attention_layer_refuses_every_step_naming_it(monkeypatch):
+def _attended(p):
+    """The keys a query at position `p` attends over the top 2 blocks of 4
+    tokens: one whole block and its own, which holds `(p - 1) % 4 + 1`."""
+    return min(p, 4 + (p - 1) % 4 + 1)
+
+
+#: 4 heads over 2 KV heads of 8, the top 2 blocks of 4 tokens, 2 index heads
+#: of 4.
+DIMS = (4, 2, 8, 2, 4, 2, 4)
+PREFILL = [(3, 10, False), (5, 5, False)]
+DECODE = [(1, 11, True), (2, 6, True)]
+
+
+def _attention(rows):
+    """The attention over `rows`' selected blocks, by hand: two products of
+    8 a head and key in bf16; Q read and O written in bf16, and K and V of
+    the blocks each request's last query selects at each KV head, in fp8."""
+    new = [p for q, kv, _ in rows for p in range(kv - q + 1, kv + 1)]
+    keys, read = sum(map(_attended, new)), sum(_attended(kv) for _, kv, _ in rows)
+    tokens = sum(q for q, _, _ in rows)
+    return Work({"bf16": 4 * 4 * 8 * keys}, tokens * 4 * 8 * 4 + read * 2 * 2 * 8)
+
+
+def test_a_querys_keys_are_its_selected_blocks():
+    attended = [_attended(p) for p in range(1, 40)]
+    assert attended[7:12] == [8, 5, 6, 7, 8]  # one block, then its own
+    assert list(_block_keys(np.arange(40), 2, 4)) == list(np.cumsum([0] + attended))
+
+
+@BOUND
+def test_block_sparse_attention_and_its_indexer_by_hand(spec):
+    attn = Module("attn", "block_sparse_attention", DIMS, "fp8")
+    # Prefill: keys 8 + 5 + 6 and 1 + 2 + 3 + 4 + 5, its requests' last
+    # queries reading 6 and 5; 42 query-key pairs scored. Decode: keys 7 and
+    # 5 + 6, reading 7 and 6; 22 pairs.
+    for rows, keys, read, pairs, rate in [
+        (PREFILL, 34, 11, 42, "fp8"),
+        (DECODE, 18, 13, 22, "bf16"),
+    ]:
+        tokens, context = sum(r[0] for r in rows), sum(r[1] for r in rows)
+        work = Work({"bf16": 4 * 4 * 8 * keys}, tokens * 4 * 8 * 4 + read * 32)
+        assert work == _attention(rows)
+        # The prefill scorer casts the bf16 index query to the fp8 cache's
+        # format, the decode scorer lifts the fp8 keys to bf16: 2 products of
+        # 4 a head and pair; the query and each request's index keys read once.
+        work += Work({rate: 2 * 2 * 4 * pairs}, tokens * 2 * 4 * 2 + context * 4)
+        assert _price([attn], view(*rows), spec)[
+            "roofline.block_sparse_attention"
+        ] == pytest.approx(_module(work, spec))
+
+
+@BOUND
+def test_a_reused_selection_scores_nothing_and_an_fp4_index_scores_at_fp8(spec):
+    reuses = Module("attn", "block_sparse_attention", DIMS[:5] + (0, 4), "fp8")
+    fp4 = Module("attn", "block_sparse_attention", DIMS, "fp8", index="fp4")
+    for rows, pairs in [(PREFILL, 42), (DECODE, 22)]:
+        tokens, context = sum(r[0] for r in rows), sum(r[1] for r in rows)
+        assert _price([reuses], view(*rows), spec)[
+            "roofline.block_sparse_attention"
+        ] == pytest.approx(_module(_attention(rows), spec))
+        # An e4m3 index query against fp4 keys in either phase.
+        index = Work({"fp8": 2 * 2 * 4 * pairs}, tokens * 2 * 4 + context * 4 / 2)
+        assert _price([fp4], view(*rows), spec)[
+            "roofline.block_sparse_attention"
+        ] == pytest.approx(_module(_attention(rows) + index, spec))
+
+
+def test_a_sparse_attention_layer_prices_its_indexer_and_selected_blocks(
+    monkeypatch,
+):
     # A bare config leaves the CUDA graph mode unset, which M3's fused decode
     # path reads at build; it adds no module the walk sees.
     monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
     walked = _build("tp4", M3)
     machine = MachineSpec.from_mapping(json.loads(MI355X.read_text()))
 
+    assert not [m.name for m in walked if m.kind == "unclassified"]
     assert [(m.layer, m.dims) for m in walked if m.kind == "attention"] == [
         (0, (16, 1, 128))
     ]
-    assert [m.name for m in walked if m.kind == "unclassified"] == [
-        "Attention at model.layers.1.self_attn.attn"
+    # A rank's 16 heads over its one KV head, the top 16 blocks of 128 tokens,
+    # its one index head of 128, over the fp8 KV cache.
+    sparse = [m for m in walked if m.kind == "block_sparse_attention"]
+    assert [(m.layer, m.dims, m.fmt) for m in sparse] == [
+        (1, (16, 1, 128, 16, 128, 1, 128), "fp8")
     ]
-    with pytest.raises(CostRefused, match=r"Attention at model\.layers\.1\.self_attn"):
-        StepRooflineBackend(machine, walked).price(view((1, 64, True)))
+    for step in view((1, 4096, True)), view((2048, 2048, False)):
+        terms = StepRooflineBackend(machine, walked).price(step).terms
+        assert {"roofline.attention", "roofline.block_sparse_attention"} <= {
+            t.name for t in terms
+        }
+
+
+def test_a_layer_reusing_the_selection_runs_no_indexer(monkeypatch):
+    monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
+    # Both layers sparse, the second reusing the first's selection.
+    sparse = {**M3["sparse_attention_config"], "sparse_attention_freq": [1, 1]}
+    config = {**M3, "sparse_attention_config": sparse}
+    config.update(use_index_cache=True, index_topk_freq=2)
+    walked = _build("tp4", config)
+
+    assert [
+        (m.layer, m.dims[5]) for m in walked if m.kind == "block_sparse_attention"
+    ] == [(0, 1), (1, 0)]
+    index_norms = [m.name for m in walked if ".index_" in m.name]
+    assert index_norms == [
+        "model.layers.0.self_attn.index_q_norm",
+        "model.layers.0.self_attn.index_k_norm",
+    ]
 
 
 #: The published MXFP4 checkpoint's scheme: fp4 weights and activations, an
