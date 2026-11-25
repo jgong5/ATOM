@@ -950,15 +950,11 @@ def channel_table(run: dict):
     from atom.compass.kv import mooncake_store_server as store
 
     pd = "router_s" in run
-    for entry, why in (
-        ("lmcache", "ATOM's lmcache_mp does not run under PP"),
-        (store.ENTRY, "LP mooncake_store serves no pipelined prefill"),
-    ):
-        if entry in run and _pp(run, "P") > 1:
-            raise ValueError(
-                f"the run file's {entry} entry and a pipeline above one stage: "
-                f"{why}"
-            )
+    if "lmcache" in run and _pp(run, "P") > 1:
+        raise ValueError(
+            "the run file's lmcache entry and a pipeline above one stage: ATOM's "
+            "lmcache_mp does not run under PP"
+        )
     table = _engines_table(run)
     if "lmcache" in run:
         add_lmcache(
@@ -969,9 +965,10 @@ def channel_table(run: dict):
             envs.OFFLOAD_MP_LOOKUP_THREAD,
         )
     if store.ENTRY in run:
-        # Every engine LP of the prefill side, or the run's one engine.
+        # Every engine LP of the prefill side, or the run's one engine; of a
+        # pipeline, its head stage, the one that schedules.
         names = [lp.name for lp in table.registry.ids()]
-        engines = [n for n in names if re.fullmatch(r"engine(-P\d*)?", n)]
+        engines = [n for n in names if re.fullmatch(r"engine(-P\d*)?(-pp0)?", n)]
         store.check_entry(run[store.ENTRY])
         rpc_s = store.store_rpc_s(run[store.ENTRY])
         add_mooncake_store(table, engines, rpc_s, _dp(run, "P" if pd else None))
@@ -1414,12 +1411,6 @@ def _launch_mooncake_store(config, run: dict, side: str | None) -> None:
             "this decode side offloads KV to a Mooncake Store; LP mooncake_store "
             "serves the prefill side"
         )
-    if config.pipeline_parallel_size > 1:
-        raise ValueError(
-            f"this deployment runs {config.pipeline_parallel_size} pipeline stages "
-            "and offloads KV to a Mooncake Store; LP mooncake_store serves no "
-            "pipelined prefill"
-        )
     entry = run[store.ENTRY]
     store.check_entry(entry)
     cfg = parse_mooncake_store_config(sub.kv_transfer_config)
@@ -1428,19 +1419,32 @@ def _launch_mooncake_store(config, run: dict, side: str | None) -> None:
             f"mooncake_store.pools addresses {len(masters)} masters "
             f"({', '.join(m.master for m in masters)}); LP mooncake_store plays one"
         )
-    stride = _round_up(entry["chunk_bytes"], _SLOT_ALIGN)
+    # ATOM's writer ranks: a DP replica's TP ranks, of each pipeline stage
+    # (`pp_aware_rank_and_world`); each rank's slots from its own chunk.
+    tp = 1 if config.enable_dp_attention else config.tensor_parallel_size
+    world = tp * config.pipeline_parallel_size
     here = {
         "protocol": cfg.protocol,
         "chunk_tokens": cfg.chunk_tokens,
-        "world": 1 if config.enable_dp_attention else config.tensor_parallel_size,
-        "save_slots": cfg.save_pool_bytes // stride,
-        "load_slots": cfg.load_pool_bytes // stride,
+        "world": world,
         "save_workers": envs.OFFLOAD_COPY_WORKERS,
         "load_workers": envs.OFFLOAD_LOAD_WORKERS,
     }
-    if differ := [
+    differ = [
         f"{k} {v} (the entry's {entry[k]})" for k, v in here.items() if v != entry[k]
-    ]:
+    ]
+    for rank in range(world if world == entry["world"] else 0):
+        stride = _round_up(store.of_rank(entry, "chunk_bytes", rank), _SLOT_ALIGN)
+        for k, pool in (
+            ("save_slots", "save_pool_bytes"),
+            ("load_slots", "load_pool_bytes"),
+        ):
+            if (v := getattr(cfg, pool) // stride) != store.of_rank(entry, k, rank):
+                differ.append(
+                    f"rank {rank}'s {k} {v} (the entry's "
+                    f"{store.of_rank(entry, k, rank)})"
+                )
+    if differ:
         raise ValueError(
             f"this deployment's {', '.join(differ)}: the {store.ENTRY} entry's "
             "laws were fitted at its fields"
@@ -1475,7 +1479,13 @@ def mooncake_store(block_tokens: int) -> None:
     entry = run[store.ENTRY]
     rt = _runtime(MOONCAKE_STORE, run)
     served = {c.source.name for c in rt.table.channels_into(MOONCAKE_STORE)}
-    members = [n for n in _hand_ins(run) if n.partition(".")[0] in served]
+    # A pipeline's head stage is served; every stage's members plan a chunk.
+    heads = {re.sub(r"-pp0$", "", n) for n in served}
+    members = [
+        n
+        for n in _hand_ins(run)
+        if re.sub(r"-pp\d+$", "", n.partition(".")[0]) in heads
+    ]
 
     def check_plans() -> None:
         store.check_plans(entry, _published_plans(run, members), block_tokens)

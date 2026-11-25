@@ -1652,7 +1652,7 @@ OFFLOAD_PERF = "[OFFLOAD-PERF] "
 #: The Mooncake Store worker's start line, with the fields its entry matches
 #: against a deployment; ``nic`` names the protocol, or under rdma the NIC.
 STORE_WORKER = re.compile(
-    r"Mooncake Store offload worker rank=\d+ world=(?P<world>\d+): .*? "
+    r"Mooncake Store offload worker rank=(?P<rank>\d+) world=(?P<world>\d+): .*? "
     r"nic=(?P<nic>\S+) .*? chunk=(?P<chunk_tokens>\d+) chunk_bytes=(?P<chunk_bytes>\d+) "
     r".*? save_slots=(?P<save_slots>\d+) load_slots=(?P<load_slots>\d+) "
     r".*? save_workers=(?P<save_workers>\d+) load_workers=(?P<load_workers>\d+)"
@@ -1748,13 +1748,21 @@ def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
     Each law of `STORE_LAWS` is fitted by the host-law solver on its lines'
     seconds over ``(1, count)``: ``store_s`` and ``load_s`` on each copy with
     ``status=ok``, ``lookup_s`` on each lookup's call, per key it asked. The
-    report keeps each copy's parts apart, their p50 and p90 milliseconds."""
+    report keeps each copy's parts apart, their p50 and p90 milliseconds.
+
+    A pipelined prefill's ranks (``world`` of them, every stage's) differ in
+    the fields `mooncake_store_server.PER_RANK` names, as each stage holds
+    other layers: where they do, the entry states each such field a rank, in
+    rank order, and ``store_s`` and ``load_s`` each rank's own, fitted on its
+    copies' lines (``rank=``). Ranks that agree give the entry as before."""
     if master is None or capacity_bytes is None:
         raise ValueError(
             "no log states the Store master's flags or its owners' bytes: give "
             "--master-flags and --capacity-bytes"
         )
-    stated, rows, parts = {}, {}, {}
+    from atom.compass.kv.mooncake_store_server import PER_RANK
+
+    stated, rows, parts, ranked = {}, {}, {}, {}
     for log in logs:
         for line in Path(log).read_text(errors="replace").splitlines():
             if m := STORE_WORKER.search(line):
@@ -1767,20 +1775,61 @@ def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
                 # A failed copy is not priced; other lookup lines time no call.
                 if said.get("status", "ok") == "ok" and took in said:
                     seconds = float(said[took]) * 1e-3
-                    rows.setdefault(law, []).append((1, int(said[count]), seconds))
+                    row = (1, int(said[count]), seconds)
+                    rows.setdefault(law, []).append(row)
+                    if "rank" in said:
+                        ranked.setdefault((law, int(said["rank"])), []).append(row)
                     for part in kept:
                         parts.setdefault(part, []).append(float(said[part]))
-    matched = sorted(set().union(*stated.values()))
-    if len(matched) != 1 or len(stated) != len(logs):
+    # Each rank's fields, which every log must state alike.
+    by_rank = {}
+    for log, lines in stated.items():
+        for line in lines:
+            fields = dict(line)
+            by_rank.setdefault(fields.pop("rank"), set()).add(
+                tuple(sorted(fields.items()))
+            )
+    shared = {f for f in {f for fs in by_rank.values() for line in fs for f, _ in line}}
+    common = {
+        f: {dict(line)[f] for fs in by_rank.values() for line in fs} for f in shared
+    }
+    apart = sorted(f for f, values in common.items() if len(values) > 1)
+    world = common.get("world", set())
+    ranks = sorted(by_rank)
+    if (
+        len(stated) != len(logs)
+        or any(len(fs) != 1 for fs in by_rank.values())
+        or len(world) != 1
+        or set(apart) - set(PER_RANK)
+        or (apart and ranks != list(range(next(iter(world)))))
+    ):
+        matched = sorted({line for fs in by_rank.values() for line in fs})
         raise ValueError(
             f"the logs' Store workers state {[dict(s) for s in matched]}, "
             f"and {len(logs) - len(stated)} state none; an entry is fitted on one"
         )
-    [fields] = matched
-    entry, report = dict(fields), {}
+    entry = {f: next(iter(v)) for f, v in common.items() if f not in apart}
+    for f in apart:  # a pipelined prefill's: one a rank
+        entry[f] = [dict(next(iter(by_rank[r])))[f] for r in ranks]
+    report = {}
     for law, count, _, kept in STORE_LAWS.values():
         x = np.array(rows.get(law, []), dtype=np.float64).reshape(-1, 3)
         entry[law], report[law] = _host_law(x[:, :2], x[:, 2], ["fixed", count])
+        if apart and law in PER_RANK:
+            each = [
+                _host_law(
+                    np.array(ranked.get((law, r), []), dtype=np.float64).reshape(-1, 3)[
+                        :, :2
+                    ],
+                    np.array(ranked.get((law, r), []), dtype=np.float64).reshape(-1, 3)[
+                        :, 2
+                    ],
+                    ["fixed", count],
+                )
+                for r in ranks
+            ]
+            entry[law] = [term for term, _ in each]
+            report[law]["ranks"] = [rep for _, rep in each]
         for part in kept:
             p50, p90 = np.percentile(parts[part], [50, 90]).tolist()
             report[law][part] = {"p50": p50, "p90": p90}
