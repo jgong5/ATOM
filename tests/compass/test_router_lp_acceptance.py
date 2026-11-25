@@ -41,7 +41,7 @@ from test_vertical_slice import CONSTANT, TREE, _retry, _run_file
 
 from atom.compass import run as compass_run
 from atom.compass.carriers import (
-    relay_stamp,
+    relay_carried,
     stamp_events,
     tracestate_stamp,
     with_relay_stamp,
@@ -151,7 +151,7 @@ class Frontend:
                 stamp = (
                     tracestate_stamp(self.headers["tracestate"])
                     if fe.side == "P"
-                    else relay_stamp(raw)
+                    else relay_carried(raw)[0]
                 )
                 seq = stamp[1]
                 with fe.cv:

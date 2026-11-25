@@ -158,50 +158,29 @@ _MEMBERS = msgspec.json.Decoder(dict[str, msgspec.Raw])
 _ENCODE = msgspec.json.Encoder()
 
 
-def _relay_params(body: bytes) -> _Params | None:
-    try:
-        return _STAMP.decode(body).kv_transfer_params
-    except msgspec.DecodeError:
-        return None
-
-
-def relay_stamp(body: bytes) -> tuple[float, int] | None:
-    """The ``(arrival, seq)`` a JSON request body's ``kv_transfer_params`` carries;
-    None without one."""
-    return _stamp(_relay_params(body))
-
-
-def relay_service(body: bytes) -> float:
-    """The seconds a JSON request body's ``kv_transfer_params`` says its relay
-    serves it on the receiving loop (`RELAY_SERVICE`); 0.0 without one."""
-    return _service(_relay_params(body))
-
-
 def relay_carried(body: bytes) -> tuple[tuple[float, int] | None, float]:
-    """`relay_stamp` and `relay_service` of a JSON request body from one decode
-    of it, which reads past the prompt's ids a relayed body carries; a body
-    with no stamp gives 0.0, its service unread."""
-    params = _relay_params(body)
-    stamp = _stamp(params)
-    return stamp, 0.0 if stamp is None else _service(params)
-
-
-def _stamp(params: _Params | None) -> tuple[float, int] | None:
-    value = None if params is None else params.compass
-    return None if value is None else _parse(_ENTRY, value, "kv_transfer_params entry")
-
-
-def _service(params: _Params | None) -> float:
-    value = None if params is None else params.compass_relay_s
+    """The ``(arrival, seq)`` a JSON request body's ``kv_transfer_params``
+    carries, None without one, and the seconds it says its relay serves it on
+    the receiving loop (`RELAY_SERVICE`), 0.0 without them or without a stamp.
+    One decode reads both, past the prompt's ids a relayed body carries."""
+    try:
+        params = _STAMP.decode(body).kv_transfer_params
+    except msgspec.DecodeError:
+        return None, 0.0
+    entry = None if params is None else params.compass
+    if entry is None:
+        return None, 0.0
+    stamp = _parse(_ENTRY, entry, "kv_transfer_params entry")
+    value = params.compass_relay_s
     if value is None:
-        return 0.0
+        return stamp, 0.0
     # A JSON number, not a bool or a string of one.
     seconds = value if type(value) in (int, float) else math.nan
     if not (math.isfinite(seconds) and seconds >= 0):
         raise ValueError(
             f"malformed {RELAY_SERVICE} {value!r}; expected finite seconds >= 0"
         )
-    return float(seconds)
+    return stamp, float(seconds)
 
 
 def with_relay_stamp(body: bytes, stamp, service_s: float | None = None) -> bytes:
