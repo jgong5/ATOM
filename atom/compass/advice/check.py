@@ -51,7 +51,11 @@ on 1P1D each side's, is at that configuration's key at the head's ATOM digest
 (`_refits`), it would refit those laws, and the verdict says so in place of a
 command, as does a later candidate's at such a key, with the command measuring
 its readings into the store that law was published into, unless they are at
-their key there. A 1P1D point takes one `calibrate.sh` command, each
+their key there. Where the store such a calibration publishes into, once it has
+started or ended, holds a stale entry at the later candidate's readings key,
+which it refuses, the later candidate takes its own command, into its own
+store, as one no calibration lends to: a run reads one store. A 1P1D point
+takes one `calibrate.sh` command, each
 record a `deploy.sh record` of both sides, fitting each side sent to calibrate
 but one it borrows so: its store is that of a side's lender, where that holds
 nothing the sides it fits would publish, and, when it is the lender's own,
@@ -790,10 +794,13 @@ def _borrowing(
     (`_readings_by`), unless they are at their key there. Each other
     calibration joins `calibrations`, unless a verdict of the candidate is
     refused, whose state prints no command. A 1P1D point's sides take one
-    command into `made`'s calibration directory (`_deploying`). A calibration
-    that has not started joins `alone` where this candidate's readings, unless
-    refused, meet a stale entry at their key in the store it publishes into,
-    which refuses them."""
+    command into `made`'s calibration directory (`_deploying`). Where this
+    candidate's readings, unless refused, meet a stale entry at their key in
+    the store that calibration publishes into, which refuses them, one that has
+    not started joins `alone`; one that has started or ended keeps that store,
+    as a resume takes it and an ended one's law is there, so the candidate
+    keeps its own command, into its own store (`_publishing`), and joins
+    `calibrations` as one no calibration lends to: a run reads one store."""
     refused = any(v["verdict"] == "refused" for v in _each(held["points"]))
     for point in points:
         verdicts = held["points"][point["name"]]
@@ -806,18 +813,21 @@ def _borrowing(
                 continue
             key = json.dumps(mine["key"], sort_keys=True)
             lending = calibrations.get(key, mine)
+            lender, into = Path(lending["in"]), lending["into"]
+            there = Path(into).resolve() == Path(held["store"]).resolve()
+            readings = verdicts["readings"][side]
+            stale = there and readings.get("held") and not refused
+            if stale and (lender / INPUTS).is_file():
+                # A started or ended calibration keeps the store refusing them.
+                lending = mine
             if lending["in"] == mine["in"] and not refused:
                 calibrations[key] = mine
             elif lending["in"] != mine["in"]:
-                lender, into = Path(lending["in"]), lending["into"]
                 law["made_by"] = [_lent(lending)]
-                there = Path(into) == Path(held["store"])
-                readings = verdicts["readings"][side]
                 if readings["verdict"] != "reuse" or not there:
                     one = point["instances"][side]
                     law["made_by"].append(_readings_by(lender, into, one))
-                stale = there and readings.get("held") and not refused
-                if stale and not (lender / INPUTS).is_file():
+                if stale:
                     alone.add(lender)
             verdicts["law"][side] = law
 
