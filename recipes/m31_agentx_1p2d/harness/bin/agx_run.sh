@@ -18,10 +18,15 @@
 #           --build-mesh (build atomesh from the snapshot instead of the image's)  --dry-run
 #           --keep-model-cache  stop the launcher's model page-cache dropper once every Store pool counts its
 #                               owners (it re-evicts the weights every 45 s for 30 min; startup only)
+# AGX_LOCAL_RUNS=1: no run dir the nodes share. Run this ON node A (rank 0) with AGX_RUNS and AGX_REPO on its local
+#           disk: the harness, snapshot and run dir are copied to each peer at the same paths, its pid files fetched,
+#           and the run dir kept in step by a sync loop (peers' files pulled, STOP and rank-rc-0 pushed, every
+#           AGX_SYNC_S s, 15), with a last pull after the teardown. --dry-run copies and syncs once, starts nothing.
 set -euo pipefail
 H=${AGX_HARNESS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 REPO=${AGX_REPO:-$(git -C "${H}" rev-parse --show-toplevel)}
 RUNS=${AGX_RUNS:?set AGX_RUNS to a run-log dir that the nodes mount at the same path}
+LOCAL_RUNS=${AGX_LOCAL_RUNS:-0}
 LAUNCHER_REF=${AGX_LAUNCHER_REF:-bd78aa2f4bc6fc5d79201b6039306fcc2d52ae1f}
 LAUNCHER_BASE=${AGX_LAUNCHER_BASE:-49e3aee9a}
 GPOOL_STATE=${AGX_GPOOL_STATE:-}
@@ -102,6 +107,34 @@ mkdir -p "${RUN}" "${LOG_ROOT}" "${RUNS}/src"
 exec > >(tee -a "${RUN}/driver.log") 2>&1
 say() { echo "[$(date -u +%H:%M:%S)] $*"; }
 say "run ${RUN} tag=${TAG} topo=${TOPO} nodes=${HOSTS[*]} conc=${CONC} mode=${MODE} image=${IMAGE}"
+
+# AGX_LOCAL_RUNS=1: node A holds the run root; each peer gets the same paths by copy, and the sync loop keeps the
+# run dir in step (the launcher's ranks read each other's rank-rc-<r> there).
+PEERS=("${HOSTS[@]:1}")
+peer_copy() {  # DIR...: each dir to every peer at the same path
+  local d h
+  for h in "${PEERS[@]+"${PEERS[@]}"}"; do
+    for d in "$@"; do
+      ssh -o BatchMode=yes "${h}" "mkdir -p '${d}'" && rsync -a "${d}/" "${h}:${d}/" || return 1
+    done
+  done
+}
+sync_once() {  # pull every peer's run dir (its ranks' files), then push node A's control files
+  local h
+  for h in "${PEERS[@]+"${PEERS[@]}"}"; do
+    rsync -a --update "${h}:${RUN}/" "${RUN}/" 2>/dev/null || true
+    rsync -a --update --include='STOP' --include='logs/' --include='logs/slurm_job-*/' \
+      --include='logs/slurm_job-*/rank-rc-0' --exclude='*' "${RUN}/" "${h}:${RUN}/" 2>/dev/null || true
+  done
+}
+if [[ "${LOCAL_RUNS}" == 1 ]]; then
+  me=$(hostname -s)
+  [[ "${me}" == "${HOSTS[0]}" || "${HOST_PREFIX}${me}" == "${HOSTS[0]}" || "${me}" == "${NODE_SHORT[0]}" ]] ||
+    { say "AGX_LOCAL_RUNS=1 runs on node A (${HOSTS[0]}), not on ${me}"; exit 2; }
+  command -v rsync > /dev/null || { say "AGX_LOCAL_RUNS=1 needs rsync"; exit 2; }
+  peer_copy "${H}" || { say "AGX_LOCAL_RUNS: cannot copy the harness ${H} to ${PEERS[*]}"; exit 4; }
+  say "AGX_LOCAL_RUNS: run root ${RUNS} on ${HOSTS[0]}; harness copied to ${PEERS[*]:-no peer}"
+fi
 
 # 1. The leases must cover every GPU of every node; their est_end bounds the run.
 DEADLINE=0
@@ -274,6 +307,13 @@ json.dump({
   "keep_model_cache": ${KEEP_MODEL_CACHE},
 }, open(sys.argv[1] + "/run.json", "w"), indent=1)
 PY
+if [[ "${LOCAL_RUNS}" == 1 ]]; then
+  peer_copy "${SNAP}" "${RUN}" || { say "AGX_LOCAL_RUNS: cannot copy the snapshot and run dir to ${PEERS[*]}"; exit 4; }
+  sync_once
+  for h in "${PEERS[@]+"${PEERS[@]}"}"; do
+    say "AGX_LOCAL_RUNS: ${h} holds $(ssh -o BatchMode=yes "${h}" "ls ${RUN} | wc -l") run files, snapshot $(ssh -o BatchMode=yes "${h}" "git -C ${SNAP} rev-parse HEAD 2>/dev/null || cat ${SNAP}/.git 2>/dev/null | head -c 0; ls ${SNAP}/.github/scripts/atomesh/pd_slurm_job.sh > /dev/null && echo present")"
+  done
+fi
 if [[ "${DRY_RUN}" == 1 ]]; then
   say "dry run: cell ${CELL_ID}; nothing started"
   git -C "${REPO}" worktree remove --force "${SNAP}" || true
@@ -287,9 +327,19 @@ done
 for (( r = ${#HOSTS[@]} - 1; r >= 0; r-- )); do
   # Only the worker goes to the background (a backgrounded '&&' list would keep ssh's channel open).
   ssh -o BatchMode=yes "${HOSTS[r]}" "cd ${SNAP} && { setsid nohup bash -c 'source ${RUN}/rank-${r}.env.sh && exec bash .github/scripts/atomesh/pd_slurm_job.sh --spur-worker' > ${RUN}/rank-${r}.console 2>&1 < /dev/null & echo \$! > ${RUN}/rank-${r}.pid; }"
+  # A peer's pid file is on the peer: fetch it (the teardown reads each on its own node).
+  if [[ "${LOCAL_RUNS}" == 1 && "${r}" != 0 ]]; then
+    ssh -o BatchMode=yes "${HOSTS[r]}" "cat ${RUN}/rank-${r}.pid" > "${RUN}/rank-${r}.pid"
+  fi
   say "rank ${r} started on ${HOSTS[r]} (pid $(cat "${RUN}/rank-${r}.pid"))"
 done
 ssh -o BatchMode=yes "${HOSTS[0]}" "setsid nohup python3 ${H}/bin/scrape.py --run ${RUN} > ${RUN}/scrape.log 2>&1 < /dev/null & echo \$! > ${RUN}/scrape.pid"
+SYNC_PID=""
+if [[ "${LOCAL_RUNS}" == 1 ]]; then
+  ( while [[ ! -e "${RUN}/SYNC_STOP" ]]; do sync_once; sleep "${AGX_SYNC_S:-15}"; done ) > "${RUN}/sync.log" 2>&1 &
+  SYNC_PID=$!
+  say "AGX_LOCAL_RUNS: run dir sync with ${PEERS[*]:-no peer} every ${AGX_SYNC_S:-15} s (pid ${SYNC_PID})"
+fi
 
 # 8. Watch until every rank published its rc, or the watchdog stops the run.
 JOB_DIR="${LOG_ROOT}/slurm_job-${JID}"
@@ -382,7 +432,12 @@ for r in "${!HOSTS[@]}"; do
 done
 
 # 9. Teardown (samplers, scraper, any container left), summary, cleanup.
+[[ "${LOCAL_RUNS}" == 1 ]] && { touch "${RUN}/STOP"; sync_once; }
 bash "${H}/bin/agx_teardown.sh" "${RUN}" || true
+if [[ "${LOCAL_RUNS}" == 1 ]]; then
+  touch "${RUN}/SYNC_STOP"; [[ -n "${SYNC_PID}" ]] && wait "${SYNC_PID}" 2>/dev/null || true
+  sync_once; say "AGX_LOCAL_RUNS: last pull from ${PEERS[*]:-no peer} done"
+fi
 python3 "${H}/bin/summarize.py" --run "${RUN}" || say "summary failed"
 find "${JOB_DIR}" -name 'server_metrics_export.json' -size +1G -print -delete 2>/dev/null || true
 git -C "${REPO}" worktree remove --force "${SNAP}" || true
