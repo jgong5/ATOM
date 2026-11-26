@@ -47,7 +47,9 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   real rows; ``--local-grants``, on unless ``--no-local-grants``, which gives
   grants their ceilings; ``--wide-local-grants``, off unless given, which
   widens them; ``--stream-bypass``, off unless given, which takes a decode
-  stream's events but its last past LP ``router``.
+  stream's events but its last past LP ``router``; ``--ids-by-ref``, off
+  unless given, which hands a prefill-decode run's prompt ids from prefill
+  to decode by reference.
 - Not flags: `FIXED`, and ``data_parallel_size``, read from ATOM's arguments.
   The server serves client runs until it is stopped.
 
@@ -119,6 +121,7 @@ def add_arguments(parser) -> None:
     )
     parser.add_argument("--wide-local-grants", action="store_true")
     parser.add_argument("--stream-bypass", action="store_true")
+    parser.add_argument("--ids-by-ref", action="store_true")
 
 
 def spec(args, store: ArtifactStore, across: bool = False):
@@ -180,6 +183,7 @@ def build(args, atom_args, across: bool = False) -> dict:
         "step_roofline": args.step_roofline,
         run.LOCAL_GRANTS: args.local_grants,
         run.WIDE_LOCAL_GRANTS: args.wide_local_grants,
+        run.IDS_BY_REF: args.ids_by_ref,
     }
     if args.stream_bypass:  # part of the configuration, so written only when on
         out[run.STREAM_BYPASS] = True
