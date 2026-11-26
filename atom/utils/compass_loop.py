@@ -60,6 +60,9 @@ serves and raises a caught one again once it has shut down, raises it into that
 handler, so ``uvicorn.run`` returns. Closing the loop puts back the handlers it
 found.
 `HttpChannel` is the inline receive of HTTP requests.
+Building the loop installs `atom.compass.run.fe_fastpaths`: anyio's memory
+streams and uvicorn's h11 body send with the same awaits and bytes, at less
+CPU per streamed message.
 """
 
 import array
@@ -549,6 +552,9 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         super().__init__(CompassSelector(self))
         self.executor = SimExecutor(self)
         self.set_default_executor(self.executor)
+        from atom.compass.run import fe_fastpaths
+
+        fe_fastpaths.install()
         self.rt.loop = self
         self.stopped = None  # the signal that stopped the run, by name
         self.handlers_before = {}  # each stop signal's handler before this loop's
