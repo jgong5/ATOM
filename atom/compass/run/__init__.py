@@ -741,7 +741,7 @@ def spec() -> dict | None:
 def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time, or
     whose ``tokenizer`` or ``http_intake`` term the frontend would misread."""
-    from atom.compass.backends.launch_features import PATHS
+    from atom.compass.backends.launch_features import LONG_TOKENS, PATHS
     from atom.compass.backends.step_labels import FIRST_LAUNCH_KEY, STALLS, WAITS
     from atom.compass.runner.overrides import ADMISSION_IN_E, HOST_LAW_KINDS, SEGMENTS
 
@@ -760,6 +760,7 @@ def _check_host(path, host: dict) -> None:
             PATHS,
             STALLS,
             WAITS,
+            LONG_TOKENS,
             *HOST_TERMS,
             INGRESS,
             RELAY_TERM,
@@ -788,6 +789,9 @@ def _check_host(path, host: dict) -> None:
         )
         or not isinstance(waits, list)
         or set(waits) - set(HOST_LAW_KINDS)
+        or not (
+            isinstance(host.get(LONG_TOKENS, 1), int) and host.get(LONG_TOKENS, 1) > 0
+        )
     ):
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
@@ -798,6 +802,7 @@ def _check_host(path, host: dict) -> None:
             "non-negative first_s a first launch of a shape costs and the key "
             f"{FIRST_LAUNCH_KEY} it was counted on, {WAITS}, a list of the kinds "
             "whose launch waits for the device end of the forward before it, "
+            f"{LONG_TOKENS}, the positive context bound of the long_context feature, "
             "admit, three coefficients on a forward's admissions or null, "
             "key, the host key the laws were fitted under, hops, the terms "
             f"{' and '.join(HOST_TERMS)}, {RELAY_TERM}, {STREAM_TERM}, and {INGRESS}, "
@@ -2276,7 +2281,7 @@ def runner(model_runner, tree) -> None:
         return
     from atom.compass.artifacts import machine_platform
     from atom.compass.backends.geometry import Parallelism
-    from atom.compass.backends.launch_features import PATHS, stated
+    from atom.compass.backends.launch_features import LONG_TOKENS, PATHS, stated
     from atom.compass.backends.step_labels import STALLS, WAITS
     from atom.compass.backends.step_linear import StepLinearBackend, StepLinearLaw
     from atom.compass.backends.step_roofline import (
@@ -2439,7 +2444,7 @@ def runner(model_runner, tree) -> None:
         slot = np.memmap(now, np.float64, "r", shape=(1,))
         host = run.get("host", {})
         refuse_unfitted_host(host, config, platform)
-        launch = stated(host.get("key"))
+        launch = stated(host.get("key"), host.get(LONG_TOKENS))
         pp = getattr(config, "pipeline_parallel_size", 1)
         stage = (config.parallel_config.pipeline_parallel_rank, pp) if pp > 1 else None
         # A drafter's runner waits for the last output's MTP status when it
