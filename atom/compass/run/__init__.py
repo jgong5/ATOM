@@ -2912,7 +2912,7 @@ def tokenizer(tok, config) -> None:
             SegmentTokenizer._encode_cached, term["segment"]
         )
         if "chars_per_s" in term["segment"]:
-            _on_search(lambda n: charge(n / term["segment"]["chars_per_s"]))
+            _on_search(lambda n: charge(n / term["segment"]["chars_per_s"], gil=True))
 
 
 def tokenizer_term(run: dict, tok, config) -> tuple[dict, dict | None]:

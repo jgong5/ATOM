@@ -29,6 +29,20 @@ final decode of a non-streaming completion, advances the LP clock instead, once
 every open service job is placed: a job's result due inside the call runs when
 it ends, whatever wall time the job's thread takes.
 
+With ``COMPASS_TOKENIZER_GIL=1`` (`GIL_ENV`) the station also keeps one
+interpreter lock. The work a job is charged as holding it (`charge` with
+``gil``: the segment tokenizer's own work, `wrap_segment`, and its
+stored-prefix search) follows the job's other work, and the event loop's own
+charges hold it from the loop's clock; each such section takes the first gap
+in the lock that holds it. The law's encode terms stay parallel: the fast
+tokenizer's ``encode_batch``, which ``encode`` calls too, releases the lock.
+#752 DeepSeek-V4.1 Cell A v2: replaying the records' client against ATOM's API
+server with a fake engine, on CPU, takes a 485-request burst at 26-35 requests
+a second as the records do, mostly in the segment tokenizer's Python work
+(35 a second with it off); on the records' bursts, priced by the host law,
+this lock gives on average within -12..+9% of their ms a request where a
+prompt's history is not yet stored, against -60..-70% without it.
+
 `CompassEventLoop` is the frontend's event loop in a simulated run: its
 ``time()`` is the installed `LPRuntime`'s clock, so every timer is on LP time,
 timers due at one instant fire in the order they were set, and its selector is
@@ -63,6 +77,7 @@ found.
 """
 
 import asyncio
+import bisect
 import collections
 import contextlib
 import heapq
@@ -96,6 +111,15 @@ from atom.utils.clock import DIAG_S, job
 logger = logging.getLogger("atom")
 
 
+#: ``1``: a station keeps one interpreter lock (`Station`'s ``gil``); unset,
+#: empty or ``0``: none.
+GIL_ENV = "COMPASS_TOKENIZER_GIL"
+#: How long a station's lock remembers its sections behind the latest one taken,
+#: and how often (in sections taken) it forgets the older ones.
+GIL_KEEP_S = 60.0
+GIL_PRUNE_EVERY = 4096
+
+
 class Refused(Exception):
     """An operation the simulation declines; ``args[0]`` is ``(source, name)``."""
 
@@ -103,24 +127,64 @@ class Refused(Exception):
 class Station:
     """A FIFO with `width` servers, over the service time its jobs are charged."""
 
-    def __init__(self, width: int, diag_s: float = DIAG_S) -> None:
+    def __init__(self, width: int, diag_s: float = DIAG_S, gil: bool = False) -> None:
         if width < 1:
             raise ValueError(f"a station needs at least one server, got {width}")
         self.diag_s = diag_s
         self.cv = threading.Condition()
-        # One row per job: [submitted, charged, done, start, completion].
+        # One row per job: [submitted, charged, done, start, completion, of
+        # the charged the part that holds the interpreter lock].
         self.jobs: list[list] = []
         self.free = [float("-inf")] * width  # min-heap of server free times
         self.final = 0  # jobs[:final] are placed
+        # With `gil`: the one interpreter lock, as its busy intervals in time
+        # order; each locked section takes the first gap that fits it.
+        self.gil = gil
+        self.gil_busy: list[tuple[float, float]] = []
+        self.gil_sections = 0
 
     def enqueue(self, t: float) -> int:
         with self.cv:
-            self.jobs.append([t, 0.0, False, None, None])
+            self.jobs.append([t, 0.0, False, None, None, 0.0])
             return len(self.jobs) - 1
 
-    def charge(self, k: int, d: float) -> None:
+    def charge(self, k: int, d: float, gil: bool = False) -> None:
         with self.cv:
             self.jobs[k][1] += d
+            if gil:
+                self.jobs[k][5] += d
+
+    def hold(self, t: float, d: float) -> float:
+        """The event loop's own `d` seconds from `t` under the interpreter
+        lock; returns their end."""
+        with self.cv:
+            return self._locked(t, d)
+
+    def _locked(self, t: float, d: float) -> float:
+        """Take the lock for `d` seconds in its first gap from `t` that holds
+        them; returns their end. Touching sections merge. Every
+        `GIL_PRUNE_EVERY` sections, those that ended `GIL_KEEP_S` before `t`
+        are dropped: no section starts that long before the loop's clock."""
+        busy = self.gil_busy
+        self.gil_sections += 1
+        if self.gil_sections % GIL_PRUNE_EVERY == 0:
+            j = bisect.bisect_left(busy, (t - GIL_KEEP_S, -math.inf))
+            del busy[: max(j - 1, 0)]
+        i = bisect.bisect_left(busy, (t, -math.inf))
+        start = t
+        if i > 0 and busy[i - 1][1] > start:
+            start = busy[i - 1][1]
+        while i < len(busy) and busy[i][0] < start + d:
+            start = max(start, busy[i][1])
+            i += 1
+        lo, hi, end = i, i, start + d
+        section = (start, end)
+        if i > 0 and busy[i - 1][1] == start:
+            lo, section = i - 1, (busy[i - 1][0], end)
+        if i < len(busy) and busy[i][0] == end:
+            hi, section = i + 1, (section[0], busy[i][1])
+        busy[lo:hi] = [section]
+        return end
 
     def finish(self, k: int) -> range:
         """Job k is done; returns the jobs this placed, in submission order."""
@@ -131,6 +195,9 @@ class Station:
                 row = self.jobs[self.final]
                 row[3] = max(row[0], heapq.heappop(self.free))
                 row[4] = row[3] + row[1]
+                if self.gil and row[5] > 0:
+                    # Its own work first, then its locked share where it fits.
+                    row[4] = self._locked(row[4] - row[5], row[5])
                 heapq.heappush(self.free, row[4])
                 self.final += 1
             self.cv.notify_all()
@@ -249,7 +316,10 @@ class SimExecutor(ThreadPoolExecutor):
 
     def start_run(self) -> None:
         """Freeze the width: the pool's, less the wait jobs resident now."""
-        self.station = Station(self._max_workers - self.passthrough)
+        self.station = Station(
+            self._max_workers - self.passthrough,
+            gil=(os.environ.get(GIL_ENV) or "0") == "1",
+        )
 
     def submit(self, fn, /, *args, **kwargs) -> Future:
         kind = "wait" if self.station is None else classify(fn)
@@ -316,7 +386,7 @@ class SimExecutor(ThreadPoolExecutor):
         return True
 
 
-def charge(d: float) -> None:
+def charge(d: float, gil: bool = False) -> None:
     """Charge `d` to this thread's station job; with none open, in the run, the
     caller is the clock owner and advances the LP clock by `d`, on an event
     loop only once every open service job is placed, so one that completes
@@ -324,13 +394,17 @@ def charge(d: float) -> None:
     it places anything, so the loop's jobs are placed only on its own thread."""
     cur = getattr(job, "cur", None)
     if cur is not None:
-        cur[0].charge(cur[1], d)
+        cur[0].charge(cur[1], d, gil)
         return
     rt = clock.installed()
     if rt is not None and rt.in_run:
         loop = rt.loop if threading.current_thread() is rt.owner else None
-        if loop is not None and loop.executor.station is not None:
+        station = loop.executor.station if loop is not None else None
+        if station is not None:
             loop.executor.place(wait=True)
+            if station.gil:  # the loop's work holds the interpreter lock
+                rt.advance_to(station.hold(rt.now, d))
+                return
         rt.advance_to(rt.now + d)
 
 
@@ -393,7 +467,7 @@ def wrap_segment(encode_cached, rate):
     def charged(*args, **kwargs):
         _encoded.ids = 0
         got = encode_cached(*args, **kwargs)
-        charge(_price(rate, _encoded.ids))
+        charge(_price(rate, _encoded.ids), gil=True)
         return got
 
     return charged
