@@ -2,7 +2,7 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header.
-**Decisions D0–D119, with no gaps, and their sub-decisions** are indexed at the end of this
+**Decisions D0–D120, with no gaps, and their sub-decisions** are indexed at the end of this
 file. The TODOs are registered in **`12_open_items.md`**, with the load-bearing assumptions
 and the cross-cutting issues. Implementation follows the execution plan in `16`.
 
@@ -180,7 +180,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       +- op-level graph    +- weights               |
   |                       +- step-level: stub, +- KV (ATOM's arithmetic)|
   |                          linear, grid      +- activations           |
-  |                       +- step roofline, a fallback                  |
+  |                       +- step roofline, a fallback or alone         |
   |                       each term: analytical, declared, measured     |
   |                       or estimated                                  |
   |                       Cost IR: Seq/Repeat/Par, opaque leaves        |
@@ -246,7 +246,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L5 | Machine spec layers, their schema, `measure device` and `fit device` | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
 | L5 | `compass advice`, a user's configuration space searched with calibration kept apart; each run's per-request split and report; the dashboard | [`19_adoption.md`](19_adoption.md) | D108–D117 |
 | L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
-| — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D45.1, D50.1, D50.2, D50.3) |
+| — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D45.1, D50.1, D50.2, D50.3), D120 |
 | L5 | Configuration surface: flags, precedence, the `compass` commands with their inputs and outputs | [`13_configuration_surface.md`](13_configuration_surface.md) | D78–D81 |
 | L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 (+ D87.1, D87.2) |
 | L1/L3 | Parallelism: TP, DP, PP, EP | [`15_parallelism_support.md`](15_parallelism_support.md) | D88–D94 (+ D90.1, D92.1) |
@@ -619,7 +619,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D24 – D26 (+ D25.1) | `05` Machine Specification and its Probes |
 | D27 – D35 (+ D34.1, D35.1) | `06` Workload Harness Contract |
 | D36 – D43 (+ D38.1, D40.1), D106, D118, D119 | `07` Calibration and Benchmarking Toolchain |
-| D43.1, D44 – D52 (+ D45.1, D50.1, D50.2, D50.3) | `08` Validation Protocol |
+| D43.1, D44 – D52 (+ D45.1, D50.1, D50.2, D50.3), D120 | `08` Validation Protocol |
 | D53 – D62 (+ D54.1) | `09` Fitting and Law Selection |
 | D63 – D70 (+ D67.1) | `10` Analytical Laws |
 | D71 – D77 | `11` Engine Metrics under Virtual Time |

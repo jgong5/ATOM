@@ -497,8 +497,8 @@ with probability 0.78, never the third, on both sides; the summary names the inp
 [#3260](https://github.com/jgong5/ATOM/issues/3260) shows a fractional length holds through
 record, fit and simulated run.
 
-**It runs at level 0 by scenario**, the level
-[#2712](https://github.com/jgong5/ATOM/issues/2712) defines: a MiniMax-M3 scenario with its
+**It runs at level 0 by scenario**, the level `08` D120 defines
+([#2712](https://github.com/jgong5/ATOM/issues/2712)): a MiniMax-M3 scenario with its
 EAGLE3 drafter built on the meta device runs under the step stub and passes `check_run`.
 That closes the Eagle case of [#2672](https://github.com/jgong5/ATOM/issues/2672), which
 asked each such form to run or be refused. The step roofline lays out no Eagle3 pass, so an
