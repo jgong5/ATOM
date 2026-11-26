@@ -69,12 +69,14 @@ from aiperf.controller.system_controller import SystemController
 from aiperf.credit.sticky_router import StickyCreditRouter
 from aiperf.plugin.enums import PluginType, ServiceType
 from compass_harness.controller import CompassSystemController
-from compass_harness.router import CompassCreditRouter
+from compass_harness.router import CompassCreditRouter, send_rank
 from compass_harness.scheduler import ClockPacedLoopScheduler
 from compass_harness.strategy import ClockPhaseRunner
 from compass_harness.timesource import ClockTimer
 from compass_harness.traffic_lp import (
     HTTP,
+    INTAKE_JITTER_BYTES,
+    INTAKE_JITTER_SIGMA,
     PREFILL_URL_ENV,
     STREAM,
     SendAfterCancel,
@@ -93,6 +95,7 @@ from atom.compass.clock import (
     prefill_decode_table,
     single_engine_table,
 )
+from atom.compass.ingress import Ingress
 from atom.compass.run import ENV as RUN_ENV
 from atom.utils.clock import LPRuntime, Straggler
 from compass_harness import ADDRESS_ENV, fingerprint, traffic_lp
@@ -109,8 +112,17 @@ EVENTS = (0.5, 1.0)
 DELAY = 0.25  # the stand-in strategy's gap between a return and the next turn
 
 
-def _credit(num: int):
-    return SimpleNamespace(id=num, phase=CreditPhase.PROFILING, phase_index=0)
+def _credit(num: int, conversation: str | None = None, turn: int = 0):
+    """Credit `num`, as aiperf numbers them, sending `conversation`'s `turn`:
+    by default trace `num`'s first."""
+    return SimpleNamespace(
+        id=num,
+        phase=CreditPhase.PROFILING,
+        phase_index=0,
+        conversation_id=f"trace-{num}" if conversation is None else conversation,
+        turn_index=turn,
+        cache_bust_marker=None,
+    )
 
 
 def _key(num: int) -> tuple:
@@ -468,9 +480,9 @@ class ScriptedRuntime:
         self.stream, self.released = stream, {stream: set()}
         self.calls = []
 
-    def stamp_send(self, ch):
+    def stamp_send(self, ch, at=None):
         self.seq += 1
-        return self.now + ADMIT, self.seq - 1
+        return self.now + ADMIT if at is None else at, self.seq - 1
 
     def check_arrival(self, ch, arrival, seq) -> None:
         pass
@@ -661,6 +673,70 @@ def test_a_grant_resolves_only_the_clock_waits_it_makes_due(tmp_path):
     resolved, calls = _run(main())
     assert resolved == {2.0: 2.0, 5.0: 5.0}
     assert calls == [2.0, 2.0, 5.0]
+
+
+def test_due_waits_resolve_in_the_order_asked_and_a_withdrawn_one_asks_nothing(
+    tmp_path,
+):
+    """At 5, waits are asked for 4, then 3, then 2, the last withdrawn: the
+    first two are due at once and resolve in the order asked, not by time.
+    Then waits for 7 and 6, the 6 withdrawn: the clock is asked for 7 alone."""
+
+    async def main():
+        rt = ScriptedRuntime([])
+        rt.now = 5.0
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        order = []
+        first, second, dropped = traffic.wait(4.0), traffic.wait(3.0), traffic.wait(2.0)
+        for name, fut in (("4.0", first), ("3.0", second)):
+            fut.add_done_callback(lambda _, name=name: order.append(name))
+        traffic.withdraw(dropped)
+        await asyncio.wait_for(asyncio.gather(first, second), 5)
+        later, sooner = traffic.wait(7.0), traffic.wait(6.0)
+        traffic.withdraw(sooner)
+        await asyncio.wait_for(later, 5)
+        traffic.done.cancel()
+        return order, rt.calls, dict(traffic._waiters)
+
+    order, calls, left = _run(main())
+    assert order == ["4.0", "3.0"] and calls == [7.0] and left == {}
+
+
+def test_the_hold_s_look_finds_the_tasks_asyncio_all_tasks_finds():
+    """`_look` reads the loop's tasks in one pass; what it returns is what the
+    same look over `asyncio.all_tasks` returns: the ready tasks, those not
+    done, and whether one it saw last time has ended."""
+    from compass_harness.traffic_lp import _look
+
+    def reference(alive):
+        me = asyncio.current_task()
+        tasks = {t for t in asyncio.all_tasks() if t is not me and not t.done()}
+        ready = sorted(
+            t.get_name() for t in tasks if t._fut_waiter is None or t._fut_waiter.done()
+        )
+        return ready, tasks, alive is None or any(t.done() for t in alive)
+
+    async def main():
+        gate = asyncio.Event()
+        blocked = [asyncio.ensure_future(gate.wait()) for _ in range(50)]
+        await asyncio.sleep(0)
+        looks = []
+        ready, alive, ended = _look(None)
+        looks.append(((sorted(ready), alive, ended), reference(None)))
+        blocked[3].cancel()  # ends at its next step
+        fresh = asyncio.ensure_future(asyncio.sleep(0))  # ready, not yet run
+        ready, now_alive, ended = _look(alive)
+        looks.append(((sorted(ready), now_alive, ended), reference(alive)))
+        await asyncio.sleep(0)
+        ready, later, ended = _look(now_alive)
+        looks.append(((sorted(ready), later, ended), reference(now_alive)))
+        gate.set()
+        await asyncio.gather(*blocked, fresh, return_exceptions=True)
+        return looks
+
+    looks = _run(main())
+    assert [ours for ours, _ in looks] == [theirs for _, theirs in looks]
+    assert looks[1][0][2] is False and looks[2][0][2] is True  # the cancel ended one
 
 
 def test_a_task_ending_while_the_hold_waits_on_a_return_has_its_callbacks_run_first(
@@ -914,6 +990,7 @@ def test_a_1p1d_run_file_sends_to_frontend_p_and_reads_from_frontend_d(
         traffic = TrafficLP.from_env()
         try:
             traffic.send(_key(0))
+            traffic._stamp_sends()  # as the hold does once aiperf has caught up
             traffic.rt.check_arrival("frontend-D->traffic:stream", 1.0, 0)
             return traffic.rt.send_log, traffic.rt.unreleased
         finally:
@@ -1218,6 +1295,287 @@ def test_returns_whose_finals_share_a_grant_pass_in_stream_order(tmp_path):
     assert _run(main()) == [0, 1]
 
 
+def _stamped(tmp_path, instants, seed=None, **lp) -> list[tuple]:
+    """aiperf sends the turns ``instants[k]`` lists, each (conversation, turn),
+    at ``k`` s in the order listed, numbering each one's credit as it sends it.
+    Each stamp as a worker reads it, its turn in place of its key: (arrival,
+    seq, conversation, turn), then ``"jitter", <bytes>`` if it has one, by seq.
+    `lp`: more arguments for the traffic LP."""
+
+    async def main():
+        prefix = str(tmp_path / f"lp-{uuid.uuid4().hex[:8]}")
+        # A stream event released at 100 s that no worker reports holds the
+        # traffic LP there, its requests open, while the stamps are read.
+        traffic = TrafficLP(ScriptedRuntime([(100.0, {0})]), prefix, seed=seed, **lp)
+        sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+        sub.connect(addresses(prefix)[0])
+        sub.subscribe(b"")
+        await traffic.subscribed(1)
+        turns = {}
+        for at, sends in enumerate(instants):
+            while traffic.now() < at:
+                await traffic.wait(float(at))
+            for conversation, turn in sends:
+                credit = _credit(len(turns), conversation, turn)
+                turns[_key(credit.id)] = conversation, turn
+                traffic.send(_key(credit.id), send_rank(credit))
+        stamps = [await sub.recv_pyobj() for _ in turns]
+        traffic.done.cancel()
+        sub.close(linger=0)
+        return sorted(
+            (arrival, seq, *turns[key], *more) for key, arrival, seq, *more in stamps
+        )
+
+    return _run(main())
+
+
+#: Turns aiperf sends at one instant, as (conversation, turn): two sessions'
+#: next turns, a subagent's first and a new session's first.
+BURST = (("s2", 9), ("s1", 4), ("s1::sa:0", 0), ("s3", 0))
+
+
+def test_one_instant_s_turns_take_the_same_seqs_whatever_order_aiperf_sends_them_in(
+    tmp_path,
+):
+    """aiperf sends one instant's turns in the order its tasks happen to run,
+    which follows the wall clock, and numbers their credits in that order:
+    each turn's seq follows its conversation and turn instead."""
+    runs = [
+        _stamped(tmp_path, [sends])
+        for sends in (BURST, BURST[::-1], BURST[2:] + BURST[:2])
+    ]
+    assert runs[1] == runs[0] and runs[2] == runs[0]
+    assert runs[0] == [
+        (ADMIT, 0, "s1", 4),
+        (ADMIT, 1, "s1::sa:0", 0),
+        (ADMIT, 2, "s2", 9),
+        (ADMIT, 3, "s3", 0),
+    ]
+
+
+def test_a_seed_draws_one_instant_s_order_the_same_whatever_order_aiperf_sends_in(
+    tmp_path,
+):
+    """Seeds 1 and 2 each give the burst's turns an order of their own,
+    neither the one their ranks give, whatever order aiperf sends them in; the
+    seqs and their arrival stay as they were."""
+    plain = _stamped(tmp_path, [BURST])
+    one = [_stamped(tmp_path, [sends], "1") for sends in (BURST, BURST[::-1])]
+    two = _stamped(tmp_path, [BURST], "2")
+    assert one[0] == one[1]
+    assert len({tuple(s[2:] for s in run) for run in (plain, one[0], two)}) == 3
+    assert [s[:2] for s in plain] == [s[:2] for s in one[0]] == [s[:2] for s in two]
+
+
+def _jitters(stamps) -> dict[tuple, float]:
+    """Each turn's intake jitter in `_stamped`'s stamps, by (conversation, turn)."""
+    assert all(s[4] == "jitter" and len(s) == 6 for s in stamps)
+    return {(s[2], s[3]): s[5] for s in stamps}
+
+
+def test_a_seed_gives_each_turn_one_intake_jitter_whatever_order_aiperf_sends_in(
+    tmp_path,
+):
+    """Seed 1 gives each of the burst's turns an intake jitter its stamp
+    carries, drawn by its conversation and turn alone: the stamps are the same,
+    jitters and all, whichever order aiperf sends the turns in, and at
+    whichever instant."""
+    runs = [
+        _stamped(tmp_path, [sends], "1")
+        for sends in (BURST, BURST[::-1], BURST[2:] + BURST[:2])
+    ]
+    assert runs[1] == runs[0] and runs[2] == runs[0]
+    later = _jitters(_stamped(tmp_path, [[("x", 0)], BURST], "1"))
+    assert {k: later[k] for k in BURST} == _jitters(runs[0])
+    print(f"\n  seed 1 jitters (bytes): {_jitters(runs[0])}")
+    assert all(0 < j < math.inf for j in _jitters(runs[0]).values())
+
+
+def test_each_seed_draws_its_own_jitters_and_no_seed_draws_none(tmp_path):
+    """Seeds 1 and 2 give each turn a jitter of their own, so the frontend
+    orders the burst two ways; with no seed, or a median of 0, no stamp carries
+    one, and the frontend takes the exact intake order."""
+    one, two = (_jitters(_stamped(tmp_path, [BURST], seed)) for seed in ("1", "2"))
+    assert all(one[k] != two[k] for k in BURST)
+    assert sorted(BURST, key=one.get) != sorted(BURST, key=two.get)
+    for stamps in (
+        _stamped(tmp_path, [BURST]),
+        _stamped(tmp_path, [BURST], "1", jitter_median=0.0),
+    ):
+        assert [len(s) for s in stamps] == [4] * len(BURST)
+    with pytest.raises(ValueError, match="no count of bytes"):
+        TrafficLP(None, str(tmp_path / "lp-x"), seed="1", jitter_median=-1.0)
+
+
+def test_the_intake_jitter_is_log_normal_about_the_median_it_names():
+    """Over many turns a seed's jitters have the median asked for, 48 kB by
+    default, and the real burst's spread of send offsets in their logs; each
+    draw is the same every time, and apart from the seq order's draw."""
+    lp = SimpleNamespace(seed="7", jitter_median=INTAKE_JITTER_BYTES)
+    ranks = [(0, "profiling", f"t{i}", i % 5, "") for i in range(4000)]
+    draws = [TrafficLP.jitter(lp, rank) for rank in ranks]
+    assert draws == [TrafficLP.jitter(lp, rank) for rank in ranks]
+    logs = [math.log(d) for d in draws]
+    median = sorted(draws)[len(draws) // 2]
+    sigma = (sum((x - sum(logs) / len(logs)) ** 2 for x in logs) / len(logs)) ** 0.5
+    print(f"\n  median {median:.0f} B, log sigma {sigma:.3f}")
+    assert median == pytest.approx(INTAKE_JITTER_BYTES, rel=0.06)
+    assert sigma == pytest.approx(INTAKE_JITTER_SIGMA, rel=0.04)
+    halved = SimpleNamespace(seed="7", jitter_median=INTAKE_JITTER_BYTES / 2)
+    assert [TrafficLP.jitter(halved, r) for r in ranks[:5]] == pytest.approx(
+        [d / 2 for d in draws[:5]]
+    )
+    assert (
+        TrafficLP.jitter(SimpleNamespace(seed=None, jitter_median=1.0), ranks[0])
+        is None
+    )
+
+
+def test_turns_sent_at_a_later_instant_take_later_seqs_seeded_or_not(tmp_path):
+    """Traces z and y send a turn at 0 s, b and a at 1 s: each instant's turns
+    are stamped at the end of its own hold, so their ranks order them only
+    within it."""
+    instants = [[("z", 3), ("y", 1)], [("b", 0), ("a", 5)]]
+    assert _stamped(tmp_path, instants) == [
+        (ADMIT, 0, "y", 1),
+        (ADMIT, 1, "z", 3),
+        (1.0 + ADMIT, 2, "a", 5),
+        (1.0 + ADMIT, 3, "b", 0),
+    ]
+    seeded = _stamped(tmp_path, instants, "1")
+    assert [s[:2] for s in seeded] == [
+        (ADMIT, 0),
+        (ADMIT, 1),
+        (1.0 + ADMIT, 2),
+        (1.0 + ADMIT, 3),
+    ]
+    assert {s[2] for s in seeded[:2]} == {"y", "z"}
+
+
+def test_a_cancel_closes_one_instant_s_requests_in_their_seqs_order(tmp_path):
+    """aiperf sends trace b's turn, then trace a's, at 0 s, and cancels both
+    at the grace deadline, 2.0: a's request takes seq 0 and its cancel seq 2,
+    b's seq 1 and 3, whichever aiperf sent first."""
+
+    async def main():
+        prefix = str(tmp_path / "lp")
+        traffic = TrafficLP(ScriptedRuntime([(2.0, set())]), prefix)
+        stamps, reports = addresses(prefix)
+        sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+        sub.connect(stamps)
+        sub.subscribe(b"")
+        await traffic.subscribed(1)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(reports)
+
+        async def worker():
+            published = [await sub.recv_pyobj() for _ in range(4)]
+            for key, *_ in published[2:]:
+                push.send_pyobj((key,))
+            return published
+
+        worker = asyncio.ensure_future(worker())
+        for num, conversation in enumerate("ba"):
+            traffic.send(_key(num), send_rank(_credit(num, conversation)))
+        while traffic.now() < 2.0:
+            await traffic.wait(2.0)
+        await traffic.cancel()
+        published = await worker
+        traffic.done.cancel()  # the hold waits for their returns
+        push.close(linger=0)
+        sub.close(linger=0)
+        return published
+
+    a, b = _key(1), _key(0)
+    assert _run(main()) == [
+        (a, ADMIT, 0),
+        (b, ADMIT, 1),
+        (a, 2.0 + ADMIT, 2, "cancel"),
+        (b, 2.0 + ADMIT, 3, "cancel"),
+    ]
+
+
+def test_every_cancel_of_a_burst_reaches_a_worker_that_lags_behind_it(tmp_path):
+    """10,000 requests are open at the grace deadline, their send stamps read
+    as each instant's are published. The worker reads nothing while the cancel
+    burst is published, then reports each cancel it gets written: every one
+    reaches it and `cancel` returns. Two c=512 runs on a loaded node hung
+    there (#3819): PUB's high-water mark dropped the last 114 of 769 cancels
+    to every worker, whose cancels were never written, so `cancel`, the hold
+    and the clock waited forever."""
+    n, per_instant = 10_000, 400
+
+    async def main():
+        prefix = str(tmp_path / "lp")
+        traffic = TrafficLP(ScriptedRuntime([]), prefix)
+        stamps, reports = addresses(prefix)
+        # A blocking socket: while the worker reads, the loop, and with it the
+        # owner's clock calls, waits.
+        sub = zmq.Context.instance().socket(zmq.SUB)
+        sub.setsockopt(zmq.RCVTIMEO, 2000)
+        sub.connect(stamps)
+        sub.subscribe(b"")
+        await traffic.subscribed(1)
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.setsockopt(zmq.SNDHWM, 0)  # the reports wait for the loop, unread
+        push.connect(reports)
+        try:
+            for first in range(0, n, per_instant):
+                for num in range(first, first + per_instant):
+                    traffic.send(_key(num))
+                t = 1.0 + first // per_instant
+                while traffic.now() < t:
+                    await traffic.wait(t)
+                for _ in range(per_instant):
+                    sub.recv_pyobj()
+            cancelling = asyncio.ensure_future(traffic.cancel())
+            while not traffic.cancelled:  # the burst is out once they are closed
+                await asyncio.wait({cancelling}, timeout=0.05)
+            got = []
+            with contextlib.suppress(zmq.Again):
+                while len(got) < n:
+                    key, *_, kind = sub.recv_pyobj()
+                    got.append((key, kind))
+                    push.send_pyobj((key,))
+            # Not one lost, or `cancel` waits for its report forever.
+            assert got == [(_key(num), "cancel") for num in range(n)]
+            await asyncio.wait_for(cancelling, 10)
+        finally:
+            traffic.done.cancel()  # the hold waits for their returns
+            push.close(linger=0)
+            sub.close(linger=0)
+
+    _run(main())
+
+
+def test_a_cancel_not_written_is_named_while_it_waits(tmp_path, monkeypatch, caplog):
+    """A cancel its worker never reports written keeps `cancel` waiting, and
+    the log names it every ``DIAG_S`` wall seconds."""
+    monkeypatch.setattr(traffic_lp, "DIAG_S", 0.05)
+
+    async def main():
+        traffic = TrafficLP(ScriptedRuntime([]), str(tmp_path / "lp"))
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(str(tmp_path / "lp"))[1])
+        traffic.send(_key(0))
+        traffic.send(_key(1))
+        while traffic.now() < 2.0:
+            await traffic.wait(2.0)
+        cancelling = asyncio.ensure_future(traffic.cancel())
+        push.send_pyobj((_key(0),))
+        try:
+            await asyncio.wait({cancelling}, timeout=0.5)
+            return cancelling.done()
+        finally:
+            cancelling.cancel()
+            traffic.done.cancel()
+            push.close(linger=0)
+
+    assert not _run(main())
+    named = [r.getMessage() for r in caplog.records if "cancels of" in r.getMessage()]
+    assert named and f"cancels of [{_key(1)}] not reported written" in named[-1]
+
+
 def test_a_cancel_waits_for_a_released_final_s_return_before_it_stamps(tmp_path):
     """Credits 0 and 1 are open; the grant at the grace deadline, 2.0, releases
     credit 0's final, whose return reaches the hold 50 ms after aiperf cancels.
@@ -1275,6 +1633,152 @@ def test_a_cancel_waits_for_a_released_final_s_return_before_it_stamps(tmp_path)
     cancels, passed = _run(main())
     assert cancels == [_key(1)]
     assert passed == [0, 1]
+
+
+#: An encoding ingress of two threads, its terms dyadic so its sums are exact.
+INGRESS = {
+    "fixed_s": 0.5,
+    "per_byte_s": 2.0**-10,
+    "workers": 2,
+    "router_per_byte_s": 2.0**-13,
+}
+
+
+async def _behind_an_ingress(tmp_path, sizes, script, then=None):
+    """aiperf sends credits 0, 1, ... at 0 s, one a trace, behind `INGRESS`;
+    no stamp is published before every size is reported, which a worker does
+    for credit k once 0.1 s has passed, with `sizes[k]` bytes, None for an
+    errored return in its place. `then(traffic, sub, push)` runs after the
+    stamps are read. The stamps, by seq, and what `then` returns."""
+    prefix = str(tmp_path / f"lp-{uuid.uuid4().hex[:8]}")
+    rt = ScriptedRuntime(script)
+    traffic = TrafficLP(rt, prefix, ingress=Ingress(INGRESS, ADMIT))
+    stamps, reports = addresses(prefix)
+    sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+    sub.connect(stamps)
+    sub.subscribe(b"")
+    await traffic.subscribed(1)
+    push = zmq.Context.instance().socket(zmq.PUSH)
+    push.connect(reports)
+
+    async def on_return(worker_id, ret):
+        pass
+
+    held = traffic.hold(on_return)
+    for num in range(len(sizes)):
+        traffic.send(_key(num), send_rank(_credit(num)))
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(sub.recv_pyobj(), 0.1)
+        for num, size in enumerate(sizes):
+            if size is None:
+                await held("w", SimpleNamespace(credit=_credit(num), error="refused"))
+            else:
+                push.send_pyobj((_key(num), size))
+        published = sorted([await sub.recv_pyobj() for _ in sizes], key=lambda s: s[2])
+        more = then and await then(traffic, sub, push)
+    finally:
+        traffic.done.cancel()
+        push.close(linger=0)
+        sub.close(linger=0)
+    return published, more
+
+
+def test_behind_an_ingress_requests_reach_the_router_past_its_threads(tmp_path):
+    """Credits 0, 1 and 2 at 0 s with 1, 2 and 0.5 KiB bodies: none is
+    stamped before its worker reports its size; each reaches the ingress at the
+    channel's lookahead, where its record starts, and the receiver once a
+    thread has held it 0.5 s plus 1 s a KiB and the router has parsed it, 1/8 s
+    a KiB. The third waits for the first thread to come free."""
+    published, _ = _run(_behind_an_ingress(tmp_path, [1024, 2048, 512], [(100.0, {0})]))
+    first = ADMIT + 0.5 + 1.0  # the first thread comes free
+    expected = [first + 0.125, ADMIT + 0.5 + 2.0 + 0.25, first + 0.5 + 0.5 + 0.0625]
+    assert published == [
+        (_key(num), at, num, "start", ADMIT) for num, at in enumerate(expected)
+    ]
+
+
+def test_behind_an_ingress_a_request_that_failed_unsent_takes_no_thread(tmp_path):
+    """Credit 0's request failed before its worker sent it, so no size comes:
+    its return lets the hold stamp it at the lookahead, and credit 1 takes the
+    first thread."""
+    published, _ = _run(_behind_an_ingress(tmp_path, [None, 1024], [(100.0, {0})]))
+    assert published == [
+        (_key(0), ADMIT, 0, "start", ADMIT),
+        (_key(1), ADMIT + 0.5 + 1.0 + 0.125, 1, "start", ADMIT),
+    ]
+
+
+def test_behind_an_ingress_a_cancel_arrives_no_earlier_than_its_request(tmp_path):
+    """aiperf cancels credits 0 and 1 at its grace deadline, 2.0: credit 1,
+    with 4 KiB, reaches the router about 5.0 s, so its cancel does too, one seq
+    later; credit 0 was there by then, and its cancel takes the lookahead. The
+    grant at 2.0 releases an event of credit 0's, which holds the traffic LP at
+    2.0 until it is reported, once aiperf is cancelling."""
+
+    async def then(traffic, sub, push):
+        while traffic.now() < 2.0:
+            await asyncio.sleep(0.001)
+        cancelling = asyncio.ensure_future(traffic.cancel())
+        await asyncio.sleep(0)  # the cancel waits for the hold
+        push.send_pyobj((_key(0), 0, 2.0, False))
+        cancels = [await sub.recv_pyobj() for _ in range(2)]
+        for key, *_ in cancels:
+            push.send_pyobj((key,))
+        await cancelling
+        return cancels
+
+    published, cancels = _run(
+        _behind_an_ingress(tmp_path, [64, 4096], [(2.0, {0})], then)
+    )
+    last = ADMIT + 0.5 + 4.0 + 0.5
+    assert [at for _, at, *_ in published] == [ADMIT + 0.5 + 0.0625 + 2.0**-7, last]
+    assert cancels == [
+        (_key(0), 2.0 + ADMIT, 2, "cancel"),
+        (_key(1), last, 3, "cancel"),
+    ]
+
+
+def test_a_run_file_with_an_ingress_gives_the_traffic_lp_its_queue(
+    tmp_path, monkeypatch
+):
+    """Behind the router LP the ingress sits in front of it, its lookahead the
+    channel's into the router; the arrival the runtime logs is past the hop.
+    A run file with none builds none, and its send is the lookahead's."""
+    pd = {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10, "router_in_s": 2.0**-14}
+    table = prefill_decode_table(**RUN, **pd)
+    http = "traffic->router:http"
+    sent = {}
+    for name, more in (("plain", {}), ("ingress", {"ingress": INGRESS})):
+        endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
+        server = clock_transport.serve(ClockAuthority(table), endpoint)
+        run_file = tmp_path / f"{name}.json"
+        run = {"clock_endpoint": endpoint, "bound_s": 1e6, **RUN, **pd, **more}
+        run_file.write_text(json.dumps(run))
+        monkeypatch.setenv(RUN_ENV, str(run_file))
+        monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / f"lp-{name}"))
+
+        async def main():
+            traffic = TrafficLP.from_env()
+            try:
+                traffic.send(_key(0))
+                traffic._take((_key(0), 1024))  # its worker's report
+                traffic._stamp_sends()  # as the hold does once aiperf has caught up
+                return traffic.ingress, traffic.rt.send_log
+            finally:
+                for task in (*traffic._tasks, traffic.done):
+                    task.cancel()
+                traffic._pub.close(linger=0)
+                traffic._pull.close(linger=0)
+
+        try:
+            sent[name] = _run(main())
+        finally:
+            server.close()
+    assert sent["plain"] == (None, [(http, 0, table.lookahead(http))])
+    ingress, log = sent["ingress"]
+    assert ingress.lookahead_s == table.lookahead(http)
+    assert log == [(http, 0, table.lookahead(http) + 0.5 + 1.0 + 0.125)]
 
 
 class StragglerRuntime(ScriptedRuntime):

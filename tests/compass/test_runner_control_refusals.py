@@ -46,10 +46,12 @@ def _worker_method(cmd):
     handler = getattr(EngineUtilityHandler, EngineUtilityHandler._UTILITY_HANDLERS[cmd])
     tree = ast.parse(textwrap.dedent(inspect.getsource(handler)))
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    # A name is a literal, or a module constant (`RECEIVE_WEIGHTS_RDMA_CMD`).
     names = [
-        n.args[NAME_ARG[n.func.attr]].value
+        getattr(arg, "value", None) or handler.__globals__[arg.id]
         for n in calls
         if getattr(n.func, "attr", None) in NAME_ARG and _waits(n)
+        for arg in [n.args[NAME_ARG[n.func.attr]]]
     ]
     # The discard helper sends its one method by constant rather than literal.
     names += [
@@ -89,7 +91,7 @@ class Worker:
         func = getattr(self.runner, name, None)
         if func is None:
             return [RpcResult(payload.request_id, 0, error=f"no method {name!r}")]
-        out = func(*payload.args)
+        out = func(*payload.args, **(payload.kwargs or {}))
         self.calls.append((name, out))
         return [RpcResult(payload.request_id, 0, value=out)]
 
@@ -112,10 +114,22 @@ def _send(runner, *cmds, scheduler=None):
     """Run *cmds* through ATOM's handler; the worker calls and the responses."""
     pending, out = queue.Queue(), queue.Queue()
     for cmd in cmds:
-        # Read by abort_request and release_structured_requests alone.
-        pending.put((cmd, {"req_id": "r0", "request_ids": ["r0"]}))
+        # Read by abort_request and release_constraints, and the stream's
+        # group and version by receive_weights_rdma.
+        args = {"req_id": "r0", "request_ids": ["r0"], "group_name": "g", "version": 1}
+        pending.put((cmd, args))
     handler = EngineUtilityHandler(Worker(runner), out, scheduler=scheduler)
-    engine = SimpleNamespace(_has_pending_utility=True, _is_rl_weights_offloaded=False)
+    engine = SimpleNamespace(
+        _has_pending_utility=True,
+        _is_rl_weights_offloaded=False,
+        _weight_sync_fenced=False,
+        _rl_weights_inconsistent=False,
+        # A single idle stage: ATOM's own has nothing to wait for or preempt.
+        prepare_weight_sync=lambda deadline: None,
+        prepare_kv_change=lambda weights, deadline: None,
+        pause_generation=lambda deadline: None,
+        resume_generation=lambda: None,
+    )
     handler.process_queue(pending, engine)
     return handler.runner_mgr.calls, [out.get_nowait() for _ in range(out.qsize())]
 
@@ -131,7 +145,10 @@ def test_which_commands_reach_a_worker_is_read_off_atoms_handler():
         "get_weight_sync_status",
         "collective_rpc",
         # Sent without a wait: ATOM's own method answers it, with nothing.
-        "release_structured_requests",
+        "release_constraints",
+        # The engine's own: it schedules nothing, or again.
+        "pause_generation",
+        "resume_generation",
     }
     assert {REFUSED["update_weights_shm"], REFUSED["update_weights_ipc"]} == {
         "update_weights_from_shm",
@@ -185,7 +202,12 @@ def test_the_commands_that_reach_no_worker_run_as_in_atom():
         },
         {
             "cmd": "get_weight_sync_status",
-            "result": {"fenced": False, "in_progress": False, "failure": None},
+            "result": {
+                "fenced": False,
+                "in_progress": False,
+                "failure": None,
+                "whole": True,
+            },
         },
         {"cmd": "get_mtp_statistics", "result": {"enabled": False}},
         {"cmd": "get_cache_statistics", "result": {"enabled": False}},
@@ -195,6 +217,8 @@ def test_the_commands_that_reach_no_worker_run_as_in_atom():
             "error": "collective_rpc needs a method name and a request id, both "
             "non-empty strings",
         },
+        {"cmd": "pause_generation"},
+        {"cmd": "resume_generation"},
     ]
     # Nothing refused is still an answer, so the reader is never parked.
     assert Worker(runner).call_func("refused_commands", wait_out=True) == ()

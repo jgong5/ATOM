@@ -280,10 +280,13 @@ def test_a_rung_with_a_record_of_few_steps_adopts_its_column(tmp_path):
     assert vector["coefficients"] == pytest.approx(EXPERTS, rel=1e-6)
 
 
-def test_a_rung_of_one_record_has_no_held_out_error_and_adopts_none(cells):
+def test_a_rung_of_one_record_and_one_composition_has_no_held_out_error_and_adopts_none(
+    cells,
+):
     full, _ = cells
     vector = _routed(full)[0]["decode"][str(RUNG)]
     figures = vector["fit"]["moe_column"]
+    assert figures["held_out_by"] == "group_dummies"
     assert figures["picked"] is None and figures["adopted"] is None
     assert all(v == {"error": None, "folds": {}} for v in figures["held_out"].values())
     assert list(vector["coefficients"]) == list(BASE)
@@ -297,9 +300,9 @@ def test_a_routed_rung_fits_each_fold_of_the_form_it_adopts_once(cells, monkeypa
 
     folds, fitted = step_linear_fit._max_affine_folds, []
 
-    def counted(steps, vector, routing):
+    def counted(steps, vector, routing, cell=None):
         fitted.append(tuple(vector["coefficients"]))
-        return folds(steps, vector, routing)
+        return folds(steps, vector, routing, cell)
 
     monkeypatch.setattr(step_linear_fit, "_max_affine_folds", counted)
     full, sparse = cells
@@ -522,6 +525,25 @@ def test_a_group_s_dummy_forwards_reach_one_token_s_experts_in_the_fit(tmp_path)
     figures = vector["fit"]["moe_column"]
     assert figures["adopted"] == figures["picked"] == "moe_experts"
     assert figures["held_out"]["moe_experts"]["error"] == pytest.approx(0, abs=1e-6)
+    fitted = {f: vector["coefficients"][f] for f in EXPERTS}
+    assert fitted == pytest.approx(EXPERTS, rel=1e-6)
+
+
+def test_a_rung_of_one_record_holds_out_each_group_composition(tmp_path):
+    """One record whose steps run beside none to three dummy forwards: each
+    composition is held out of the others, as a run at another concurrency
+    moves it, and the experts column, which prices the held-out ones, is
+    adopted; without it the context column cannot."""
+    run = _dummy_records(tmp_path / "run0", _dummy_groups(0, 200))
+    law, samples, _ = _routed(run)
+    assert {s.view.group_dummies for s in samples} == {0, 1, 2, 3}
+    vector = law["decode"][str(RUNG)]
+    figures = vector["fit"]["moe_column"]
+    assert figures["held_out_by"] == "group_dummies"
+    assert set(figures["held_out"]["none"]["folds"]) == {"0", "1", "2", "3"}
+    assert figures["adopted"] == figures["picked"] == "moe_experts"
+    assert figures["held_out"]["moe_experts"]["error"] == pytest.approx(0, abs=1e-6)
+    assert figures["held_out"]["none"]["error"] > 0.01
     fitted = {f: vector["coefficients"][f] for f in EXPERTS}
     assert fitted == pytest.approx(EXPERTS, rel=1e-6)
 

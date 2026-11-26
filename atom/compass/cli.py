@@ -50,6 +50,10 @@ COMMANDS = {
         "a price_list from measure ops's measurements",
     ),
     "fit host": ("atom.compass.fit.host", "the host laws, fitted on real runs"),
+    "fit ingress": (
+        "atom.compass.fit.ingress",
+        "an encoding ingress's hop, fitted on its stamps",
+    ),
     "fit device": (
         "atom.compass.fit.device",
         "a platform's readings, from probe records or another device's",

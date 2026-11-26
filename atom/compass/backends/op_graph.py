@@ -107,6 +107,7 @@ from __future__ import annotations
 
 import functools
 import json
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 
@@ -379,6 +380,13 @@ class _Roofline(CostSource):
         return CostTerm(
             f"op.{kind}", unit[0], Provenance(method, note=note), by_bound=unit[2]
         )
+
+
+def counted_rows(rows) -> frozenset:
+    """`rows`, each its query and context tokens, with how many rows hold
+    each, as a set: a run hashes a step's bound once a leaf, and a set keeps
+    its hash."""
+    return frozenset(Counter(rows).items())
 
 
 def band(rows, decode: bool) -> tuple[int, int]:
@@ -703,7 +711,9 @@ class OpGraphBackend(CostBackend):
         states the real rows its MoE runs (`real_rows`), and any other None;
         a target at a step stating G then the most tokens a rank of its DP
         group scheduled (`group_max_tokens`), where its view states them,
-        which MORI's exchange there is priced by."""
+        which MORI's exchange there is priced by, and any other None; and
+        every bound its rows (`counted_rows`): a compressor's price reads how
+        they complete a compressed entry (`fit.ops.completion`)."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
@@ -725,8 +735,8 @@ class OpGraphBackend(CostBackend):
         own = sum(r.query_tokens for r in view.requests)
         real = real_rows(own, view.moe_rows, view.moe_tokens, view.group_dummies)
         bound += (real if phase == "decode" and not draft else None,)
-        if g is not None and not draft and view.group_max_tokens is not None:
-            bound += (view.group_max_tokens,)
+        stated = g is not None and not draft
+        bound += (view.group_max_tokens if stated else None, counted_rows(rows))
         if not width:
             return bound
         if ran == t:

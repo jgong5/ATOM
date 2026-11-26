@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from test_memory_readings import DOCUMENT
+from test_report_extrapolation import plant
 from test_vertical_slice import (
     CONSTANT,
     MODEL,
@@ -41,6 +42,7 @@ from atom.compass.carriers import tracestate_with
 from atom.compass.clock import NER, LpId
 from atom.compass.detect.scenario import check_run
 from atom.compass.parity import read
+from atom.compass.report import extrapolation
 from atom.compass.runner.overrides import start_on_host
 from atom.utils import CpuGpuBuffer, clock
 from atom.utils.clock import LPRuntime
@@ -342,6 +344,37 @@ def test_the_run_summary_sums_every_ranks_priced_steps(monkeypatch, tmp_path):
         "steps": 3,
         "fraction_of_predicted_seconds": 0.25,
     }
+
+
+def test_the_run_summary_reads_the_critical_ranks_extrapolation_off_its_record(
+    monkeypatch, tmp_path
+):
+    """Beside `extrapolated_steps`, which the ranks' priced steps count, the
+    critical rank's extrapolation, from the step record the ranks wrote in
+    the out_dir (`test_report_extrapolation.DP2`)."""
+    plant(tmp_path / "steps")
+    assert _finish(monkeypatch, tmp_path, (0, 1))
+
+    schedule = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())["schedule"]
+    assert schedule[extrapolation.REFUSED] is None
+    assert schedule[extrapolation.FIELD] == extrapolation.of_run(tmp_path)
+    critical = schedule[extrapolation.FIELD]["critical_rank"]["target_extrapolated"]
+    assert critical["fraction_of_device_seconds"] == pytest.approx(0.05 / 0.61)
+    every = schedule[extrapolation.FIELD]["every_rank"]["extrapolated"]
+    assert every["fraction_of_steps"] == 5 / 8
+
+
+def test_a_run_summary_with_no_step_record_says_why_it_has_no_extrapolation(
+    monkeypatch, tmp_path
+):
+    assert _finish(monkeypatch, tmp_path, (0, 1))
+
+    schedule = json.loads((tmp_path / compass_run.SUMMARY_FILE).read_text())["schedule"]
+    assert schedule[extrapolation.FIELD] is None
+    assert schedule[extrapolation.REFUSED] == (
+        f"{tmp_path} holds no step record with cost lines, in any of "
+        + ", ".join(extrapolation.RECORDS)
+    )
 
 
 def test_a_rank_that_wrote_no_refusal_record_fails_the_summary(monkeypatch, tmp_path):

@@ -40,10 +40,11 @@ from test_backend_step_grid import (
 )
 from test_dp_step_max import runner
 
-from atom.compass.backends import CostRefused, Method, RequestShape
+from atom.compass.backends import CostRefused, Method, RequestShape, step_linear_fit
 from atom.compass.backends.shape import sum_context
 from atom.compass.backends.step_grid import coordinates, equivalent_shape
 from atom.compass.backends.step_grid_residual import (
+    HELD_OUT,
     RECIPE,
     Recipe,
     Residual,
@@ -101,9 +102,10 @@ def test_decode_is_read_on_order_in_row_order_and_no_query_square_or_raggedness(
     assert RECIPE("decode", rows) == (Fraction(1, 32), Fraction(3, 128), order)
 
 
-def test_a_prefill_chunk_is_read_on_query_square_too():
+def test_a_prefill_chunk_is_read_on_query_square_and_its_longest_row_too():
     # Rows (N_Q, N_KV) of (3, 3) then (5, 15): 34 and 9 + 75 token pairs,
-    # a jump of 12 over 18 context tokens, and 2 x 15 / 18.
+    # a jump of 12 over 18 context tokens, 2 x 15 / 18, and the first row's 3
+    # tokens read 12 short of the longest row.
     rows = (RequestShape(3, 3, False), RequestShape(5, 15, False))
     for k in ("prefill_output", "prefill_no_output"):
         assert RECIPE(k, rows) == (
@@ -112,7 +114,14 @@ def test_a_prefill_chunk_is_read_on_query_square_too():
             Fraction(84, 2**20),
             Fraction(2, 3),
             Fraction(5, 3),
+            Fraction(36, 2**20),
         )
+    # One query token on the shorter row in place of 3: the same raggedness,
+    # and 1 x 12 tokens short of the longest row in place of 3 x 12.
+    fewer = RECIPE(
+        "prefill_output", (RequestShape(1, 3, False), RequestShape(5, 15, False))
+    )
+    assert fewer[4:] == (Fraction(5, 3), Fraction(12, 2**20))
     # 1 + 2 x tokens: 1.125 on a 64-token middle chunk, 1.015625 on the final 8.
     backend = eager(
         residual=residual(t=linear(tokens=2.0)),
@@ -171,7 +180,7 @@ def test_the_term_is_fitted_and_its_detail_holds_the_lookup_and_each_member():
         f"residual {factor!r} = 1.0 x o 1.2421875 + 1.0 x e {math.exp(0.484375)!r}"
     )
     assert backend.describe().endswith(
-        "; recipe step-grid-residual v3, members decode: o, e; "
+        "; recipe step-grid-residual v4, members decode: o, e; "
         "prefill_output: o, e; prefill_no_output: o, e"
     )
 
@@ -221,7 +230,7 @@ def test_a_step_outside_the_residuals_hull_is_priced_by_its_members_naming_how_f
 
 def test_only_the_steps_outside_the_hull_are_extrapolated_each_at_its_members_price():
     # tokens <= 1/32: the three 64-token middle chunks are outside, the final 8 in.
-    tokens = {"facets": [[1, 0, 0, 0, 0, -1 / 32]]}
+    tokens = {"facets": [[1, 0, 0, 0, 0, 0, -1 / 32]]}
     hulls = dict.fromkeys(("prefill_output", "prefill_no_output"), tokens)
 
     def backend(fitted):
@@ -482,6 +491,85 @@ def test_the_fit_recovers_a_planted_factor_within_1pc_on_held_out_views():
             )
 
 
+def on_the_longest_row(v):
+    """On prefill's longest row: up to about 1.9 on `triples_of`'s chunks."""
+    return math.exp(0.05 + 40 * features(v).get("longest_row", 0))
+
+
+def test_the_fit_recovers_a_factor_planted_on_the_prefill_longest_row():
+    triples = triples_of(on_the_longest_row)
+    mapping, report = fit(triples, seed=0)
+
+    loaded = Residual(mapping)
+    for k in ("prefill_output", "prefill_no_output"):
+        held = [triples[i][0] for i in report[k]["held_out"]]
+        assert max(features(v)["longest_row"] for v in held) > 0.002
+        ((_, _, member),) = loaded.kinds[k].members
+        for v in held:
+            assert member(v, tuple(features(v).values())) == pytest.approx(
+                on_the_longest_row(v), rel=0.01
+            )
+
+
+def runs_of(triples, n=8):
+    """`n` runs, each a contiguous `1/n` of `triples`."""
+    return [f"run {i * n // len(triples)}" for i in range(len(triples))]
+
+
+def test_whole_runs_are_held_out_each_kind_from_its_own_runs():
+    triples = triples_of(planted)
+    runs = runs_of(triples)
+    mapping, report = fit(triples, seed=0, runs=runs)
+    by_step = fit(triples, seed=0)[1]
+
+    load_and_price(mapping, planted)
+    for k, r in report.items():
+        own = [i for i, (v, _, _) in enumerate(triples) if kind(v) == k]
+        held = [i for i in own if runs[i] in r["held_out_runs"]]
+        assert r["split"] == "run" and r["held_out"] == held
+        assert HELD_OUT <= len(held) / len(own) <= 0.5
+        assert len(r["held_out_runs"]) < len({runs[i] for i in own})
+        assert by_step[k]["split"] == "step" and "held_out_runs" not in by_step[k]
+        for name, member in r["members"].items():
+            assert member["step_held_out_error"] == (
+                by_step[k]["members"][name]["held_out_error"]
+            )
+            assert "step_held_out_error" not in by_step[k]["members"][name]
+    # Triples of one run are held out as steps, as with no runs.
+    assert fit(triples, seed=0, runs=["one"] * len(triples)) == fit(triples, seed=0)
+    assert fit(triples, seed=1, runs=runs)[1] != report
+
+
+def test_a_band_member_that_learns_each_runs_band_is_not_selected_on_held_out_runs(
+    monkeypatch,
+):
+    """Four runs of one-row chunks producing output, each run's in its own token
+    band, timed at their lookup times 1.2 plus the run's offset. A quarter of
+    the steps held out at random lies in bands the band member learnt, so it
+    is selected; a run held out lies in a band it never saw, an error of 1,
+    and a linear member is selected."""
+    monkeypatch.setattr(step_linear_fit, "TOKEN_BANDS", (32, 64, 128))
+    rng, triples, runs = np.random.default_rng(6), [], []
+    for r, (lo, hi), offset in zip(
+        range(4), [(8, 30), (34, 60), (68, 120), (136, 250)], (0.0, 0.3, -0.2, 0.25)
+    ):
+        for q, c in zip(rng.integers(lo, hi, 40), rng.integers(0, 400, 40)):
+            v = view((int(q), int(q + c), False), produces_output=True)
+            noise = 1.0 + rng.uniform(-0.002, 0.002)
+            triples.append((v, 1e-3, 1e-3 * (1.2 + offset) * noise))
+            runs.append(f"run {r}")
+
+    by_step = fit(triples, seed=0)
+    by_run = fit(triples, seed=0, runs=runs)
+
+    assert by_step[0]["kinds"]["prefill_output"]["selected"] == {"band": 1.0}
+    (selected,) = by_run[0]["kinds"]["prefill_output"]["selected"]
+    assert selected != "band"
+    band_member = by_run[1]["prefill_output"]["members"]["band"]
+    assert band_member["held_out_error"] == 1.0
+    assert band_member["step_held_out_error"] < 0.01
+
+
 def test_a_fit_on_decode_triples_alone_prices_atoms_decode_batches_and_no_prefill():
     # On decode rows alone query_square would be tokens / 1024, and a hull
     # over both would span nothing.
@@ -712,3 +800,9 @@ def negated(triples):
 def test_a_fit_that_cannot_be_made_is_refused_naming_why(triples, match):
     with pytest.raises(ValueError, match=match):
         fit(triples(), seed=0)
+
+
+def test_runs_that_do_not_name_one_run_a_triple_refuse():
+    triples = triples_of(planted)
+    with pytest.raises(ValueError, match="399 runs name 400 triples"):
+        fit(triples, seed=0, runs=runs_of(triples)[1:])

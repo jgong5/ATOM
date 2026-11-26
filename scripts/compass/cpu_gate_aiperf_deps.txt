@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 #
-# The packages rocm/atom-dev:vllm-v0.31.0-nightly_20261026 held beside its
-# aiperf 0.12.0 install that rocm/atom-dev:vllm-v0.31.0-nightly_20261103 lacks,
-# at nightly 20261026's versions: what the aiperf wheel COMPASS_AGENTX_HARNESS
-# names needs in the CPU gate container. Install them into its /opt/venv with
-# `pip install --no-deps -r`, so no package the image ships changes
-# (scripts/compass/README.md, "The CPU gate container").
+# The packages the aiperf wheel COMPASS_AGENTX_HARNESS names needs in the CPU
+# gate container that rocm/atom-dev:nightly_202611240650 lacks: those
+# rocm/atom-dev:vllm-v0.31.0-nightly_20261026 held beside its aiperf 0.12.0
+# install, at its versions, and those nightly 20261103 still shipped, at that
+# image's. Install them into its /opt/venv with `pip install --no-deps -r`, so
+# no package the image ships changes version (scripts/compass/README.md, "The
+# CPU gate container").
 alembic==1.20.1
 brotli==1.2.1
 choreographer==1.4.0
@@ -14,8 +15,10 @@ crick==0.0.8
 cyclopts==4.25.3
 dash==3.1.1
 dash-bootstrap-components==2.0.4
+docstring-parser==0.18.0
 ffmpeg-python==0.2.0
 future==1.0.0
+jmespath==1.1.0
 kaleido==1.2.0
 linkify-it-py==2.2.0
 logistro==2.0.1
@@ -26,15 +29,20 @@ nvidia-ml-py==13.615.71
 optuna==5.0.0
 orjson==3.11.9
 platformdirs==4.13.5
+plotly==7.1.0
+pydantic-settings==2.16.2
 pytest-timeout==2.4.0
+python-dotenv==1.2.4
 retrying==1.4.2
 rich-rst==2.2.0
 ruamel.yaml==0.18.17
 ruamel.yaml.clib==0.2.15
 seaborn==0.13.2
+sentencepiece==0.2.2
 simplejson==4.2.0
 soundfile==0.13.1
 SQLAlchemy==2.1.6
 starlette-compress==1.8.0
 textual==5.3.0
 tzdata==2026.5
+zstandard==0.25.0

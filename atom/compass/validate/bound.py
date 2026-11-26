@@ -151,24 +151,19 @@ def steps(record, tbo=False, mtp=False):
 
 def _split(lines):
     """The two-batch-overlap split ATOM agrees over a DP group's step `lines`,
-    per micro-batch each rank's tokens, or None: each rank's prefill answer
-    (`local_tbo_precompute`), then `sync_dp_metadata`'s OR of the min-token
-    bar, AND of can-split and uniform prefill. A decoding rank, a dummy run
-    among them, cannot split."""
-    from atom.utils import envs
+    per micro-batch each rank's tokens, or None: each rank's vote on its
+    prefill tokens, cut at their midpoint (`prefill_tbo_vote`), then
+    `sync_dp_metadata`'s OR of the min-token bar, AND of can-split and uniform
+    prefill. A decoding rank, a dummy run among them, casts no prefill vote,
+    so the step does not split."""
     from atom.utils.tbo import ubatching
 
-    rule = (
-        ubatching._precompute_prefill_token_split
-        if envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
-        else ubatching._precompute_prefill_req_split
-    )
-    local, bar = [], envs.ATOM_TBO_PREFILL_MIN_TOKENS
+    local = []
     for s in lines:
         prefill = [q for q, _, d in s["rows"] if not d]
         if not prefill:
             return None
-        local.append(rule(np.array(prefill), len(prefill), bar))
+        local.append(ubatching.prefill_tbo_vote(sum(prefill)))
     meets, can, first, second = zip(*local)
     return (first, second) if any(meets) and all(can) else None
 
@@ -408,9 +403,7 @@ def _build(model: str, tp: int, atom_args, arch: str, tmpdir: str):
         config.tensor_parallel_size, config.parallel_config.data_parallel_size
     )
     set_current_atom_config(config)
-    from atom.model_engine.model_runner import (
-        support_model_arch_dict,
-    )  # needs the declared arch
+    from atom.models.registry import support_model_arch_dict
 
     model_class = support_model_arch_dict[config.hf_config.architectures[0]]
     torch.set_default_dtype(config.torch_dtype)

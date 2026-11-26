@@ -77,8 +77,12 @@ def test_a_shape_states_its_real_rows_and_its_graph_is_its_rung_s(monkeypatch):
         directory_for=lambda key: pathlib.Path("/"),
         read=lambda key: SimpleNamespace(read_member=lambda *a: '{"region": {}}'),
     )
+    monkeypatch.setattr("atom.compass.run.graph_readings", lambda model: {})
+    monkeypatch.setattr(
+        "atom.compass.run.load_graph", lambda store, key, readings: store.read(key)
+    )
 
-    ops.graph(store, None, shape)
+    ops.graph(store, SimpleNamespace(model=None), shape)
 
     assert str(shape) == "decode B=4 G=64 R=13"
     assert ops._shape(str(shape)) == shape
@@ -232,7 +236,7 @@ def test_a_step_is_asked_at_the_real_rows_its_moe_runs(view, dp, real):
 
     backend.price(view)
 
-    assert [b[-1] for b in asked.bounds] == [real]
+    assert [b[6] for b in asked.bounds] == [real]
 
 
 def _moe(dp, shape):
@@ -307,3 +311,43 @@ def test_a_point_stating_its_real_rows_routes_only_them_on_its_batch(
     for kwargs, _ in graphs[0]:
         assert (kwargs["topk_ids"][pad] == -1).all()
         assert (kwargs["topk_ids"][routed] >= 0).all()
+
+
+@pytest.mark.parametrize("rung, real, ladders", [(1, 1, {(0,)}), (2, 2, {(2,)})])
+def test_a_point_of_fewer_real_rows_than_a_row_verifies_holds_one_row(
+    monkeypatch, rung, real, ladders
+):
+    # One rank under three drafts, whose steps decode a token a row, as a TP
+    # MTP3 prefill side's do: its rung's routed leaf, four rows a sequence,
+    # is asked at fewer real rows than one row verifies. Its batch holds one
+    # row verifying its drafts, padded to the rung, and routes the real ones.
+    monkeypatch.setattr(fctx._forward_kv_cache_context, "kv_cache_data", {})
+    runner = _Padding()
+    runner.model.append(_Experts(16, 2))
+    runner.config.parallel_config = SimpleNamespace(data_parallel_size=1)
+    runner.ladders, batches, graphs = set(), [], []
+    rule = SimpleNamespace(
+        block_size=16,
+        drafts=3,
+        batch=lambda view, block, slot: batches.append(view["rows"]) or (block, slot),
+    )
+    ids = _t([4 * rung, 2], "activation", dtype="torch.int32")
+    found = ops.leaves(_graph(_leaf(FUSED, ("topk_ids", ids)), layers=1)["region"])
+    shape = decode(rung)._replace(real=real)
+
+    def replay(fn, calls, flush=None):
+        graphs.append(calls)
+        return [1.0] * ops.REPEATS
+
+    with (
+        patch.object(ops, "_function", return_value=lambda **kwargs: None),
+        patch.object(ops, "_kernels", return_value=(["k"], [None], 1.0)),
+        patch.object(ops, "_replay", side_effect=replay),
+    ):
+        [record] = ops.Stub(runner, 10_000).point(rule, shape, 20, found)
+
+    assert record["shape"] == f"decode B={rung} R={real}" and "refused" not in record
+    assert batches[0] == [[4, 23, True]] and runner.ladders == ladders
+    for kwargs, _ in graphs[0]:
+        assert (kwargs["topk_ids"][real:] == -1).all()
+        assert (kwargs["topk_ids"][:real] >= 0).all()

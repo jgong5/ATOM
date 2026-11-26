@@ -151,6 +151,7 @@ def test_decode_writes_to_the_prefill_rank_that_served_it_across_two_widths(
                     num_cached_tokens=0,
                 )
             )
+            half.device_done(None)  # the admission step's forward returns
             sent[rt_d.send_log[-1][0]] += 1
     assert sent == {KV.format(r, q): 1 for r in range(d) for q in range(p)}
     for q, (_, half) in enumerate(prefill):

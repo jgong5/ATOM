@@ -15,7 +15,13 @@ import re
 
 import pytest
 from test_artifact_store import AITER_ROOT, ATOM_ROOT
-from test_backend_step_linear_fit import _steps, _timed_record, platform_arg
+from test_backend_step_linear_fit import (
+    PREFILL,
+    _steps,
+    _timed_record,
+    platform_arg,
+    traced,
+)
 from test_fit_samples import DEVICE, SOURCE, edit, idle_rank
 from test_memory_readings import DOCUMENT, STACK
 from test_parity_served import SAMPLING
@@ -41,6 +47,7 @@ from atom.compass.artifacts import (
     keyed_platform,
     machine_platform,
 )
+from atom.compass.artifacts.store import ENTRY_FILE
 from atom.compass.backends import StepLinearLaw, step_linear_fit
 from atom.compass.backends.step_labels import digest
 from atom.compass.drive.aiter_jit import BUILDS
@@ -120,15 +127,20 @@ def fit(tmp_path, command, *args):
     cli.main([*command.split(), *map(str, args), *tail])
 
 
-def law_key(form="history", engine=ENGINE) -> Key:
-    return Key.of(
-        Kind.STEP_LINEAR_LAW,
-        model=HOST["model"],
-        engine_config=json.dumps(engine, sort_keys=True),
-        source_root="atom_py-" + HOST["atom"],
-        form=form,
+def law_key(store, form="history", engine=ENGINE) -> Key:
+    """The key of the one step linear law in `store` fitted at `form` and
+    `engine`: its ``fit_src`` is the digest of the law there."""
+    fields = {
+        "model": HOST["model"],
+        "engine_config": json.dumps(engine, sort_keys=True),
+        "source_root": "atom_py-" + HOST["atom"],
+        "form": form,
         **keyed_platform(Kind.STEP_LINEAR_LAW, PLATFORM),
-    )
+    }
+    entries = (store / Kind.STEP_LINEAR_LAW.value).glob(f"*/{ENTRY_FILE}")
+    keys = [json.loads(entry.read_text())["key"] for entry in entries]
+    (key,) = [k for k in keys if k.items() >= fields.items()]
+    return Key.of(Kind.STEP_LINEAR_LAW, **key)
 
 
 def member(store, key, stem):
@@ -144,7 +156,8 @@ def test_the_law_published_is_the_one_step_linear_fits_command_writes_less_its_h
     a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
     fit(tmp_path, "fit steps", *LINEAR, "--form", form, a, b, *clients(a, b))
 
-    law = member(tmp_path / "store", law_key(form), "params")
+    key = law_key(tmp_path / "store", form)
+    law = member(tmp_path / "store", key, "params")
     # The command names runs in argument order, the samples in digest order.
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     law_file = str(tmp_path / "law.json")
@@ -156,13 +169,14 @@ def test_the_law_published_is_the_one_step_linear_fits_command_writes_less_its_h
     assert law == {k: v for k, v in written.items() if k not in ("host", "host_fit")}
     StepLinearLaw(law)
     copy = json.loads((tmp_path / "out/step_linear_law.json").read_text())
-    report = member(tmp_path / "store", law_key(form), "report")
+    report = member(tmp_path / "store", key, "report")
     assert copy == {
-        "key": law_key(form).values,
-        "token": law_key(form).token(),
+        "key": key.values,
+        "token": key.token(),
         "params": law,
         "report": report,
     }
+    assert key.values["fit_src"] == step_linear_fit.fit_src(law)
 
 
 def test_a_routed_law_is_the_one_step_linear_fits_command_writes_with_the_routing(
@@ -179,7 +193,9 @@ def test_a_routed_law_is_the_one_step_linear_fits_command_writes_with_the_routin
     routing = ("--moe-routing", ",".join(map(str, ROUTING)))
     fit(tmp_path, "fit steps", *LINEAR, *routing, *runs, *clients(*runs))
 
-    law = member(tmp_path / "store", law_key(engine=key["engine"]), "params")
+    law = member(
+        tmp_path / "store", law_key(tmp_path / "store", engine=key["engine"]), "params"
+    )
     # The samples come in run order, a run named by its ranks' digests.
     ranks = sorted(
         (sorted((d / "steps").glob("dp*[0-9].jsonl")) for d in runs),
@@ -203,10 +219,16 @@ def test_step_linear_fits_the_history_form_unless_told_another(tmp_path):
         (tmp_path / name).mkdir()
         fit(tmp_path / name, "fit steps", *LINEAR, *form, a, b, *clients(a, b))
 
-    law = member(tmp_path / "default/store", law_key("history"), "params")
+    law = member(
+        tmp_path / "default/store",
+        law_key(tmp_path / "default/store", "history"),
+        "params",
+    )
     assert law["form"] == "history"
     assert list(law["prefill"]["coefficients"]) == list(step_linear_fit.HISTORY)
-    base = member(tmp_path / "base/store", law_key("base"), "params")
+    base = member(
+        tmp_path / "base/store", law_key(tmp_path / "base/store", "base"), "params"
+    )
     assert list(base["prefill"]["coefficients"]) == list(step_linear_fit.PREFILL)
 
 
@@ -245,7 +267,7 @@ def test_the_report_names_each_run_with_every_trace_its_steps_served(tmp_path):
     b = record(tmp_path / "b", 20, trace="trace-b")
     fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
 
-    report = member(tmp_path / "store", law_key(), "report")
+    report = member(tmp_path / "store", law_key(tmp_path / "store"), "report")
     assert report["provenance"] == served(HOST, {a: "trace-a", b: "trace-b"})
 
 
@@ -253,7 +275,7 @@ def test_the_entry_s_readings_are_the_ones_its_records_state(tmp_path):
     a = record(tmp_path / "a", 19)
     fit(tmp_path, "fit steps", *LINEAR, a, *clients(a))
 
-    entry = ArtifactStore(tmp_path / "store").read(law_key())
+    entry = ArtifactStore(tmp_path / "store").read(law_key(tmp_path / "store"))
     assert dict(entry.fingerprints[Row.STEP_LINEAR_LAW].cells) == {
         Axis.SOFTWARE_STACK: Reading(
             "stated", "rocm 7.2.4 / aiter f4e7c7509 / rccl 2.22.3"
@@ -343,8 +365,51 @@ def test_a_deployment_s_prefill_side_fits_from_the_deployment_s_export(tmp_path)
     (decode / TRANSFERS).write_text("".join(json.dumps(t) + "\n" for t in joined))
     fit(tmp_path, "fit steps", *LINEAR, p, "--client-run", p, export)
 
-    report = member(tmp_path / "store", law_key(), "report")
+    report = member(tmp_path / "store", law_key(tmp_path / "store"), "report")
     assert report["provenance"] == served(HOST, {p: "trace"})
+
+
+def test_each_prefill_instance_fits_from_the_export_through_its_own_transfers(
+    tmp_path,
+):
+    # Prefill instance k's record names each request `p<k>-<key>`; the export,
+    # `d<k>-<key>`, decode 1-k's response id. The two instances number their
+    # requests alike, so their transfer ids meet: a transfer names the instance
+    # it came from by the handshake port run.json states.
+    cell, export, prefills = tmp_path / "cell", {}, []
+    instances = [
+        {"name": f"prefill{k}", "handshake_port": 11 * (k + 1)} for k in (0, 1)
+    ]
+    for k, seed in enumerate((19, 20)):
+        p = record(cell / f"prefill{k}", seed, trace=f"trace-{k}")
+        path = p / "steps/dp0.jsonl"
+        lines = [json.loads(x) for x in path.read_text().splitlines()]
+        for line in lines:
+            line["named"] = [[r, key, f"p{k}-{key}"] for r, key in line["named"]]
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+        sent = json.loads((p / "client.json").read_text())["requests"]
+        export |= {f"d{k}-{key}": v for key, v in sent.items()}
+        joined = [
+            {
+                "response_id": f"d{k}-{key}",
+                "remote_dp_rank": 0,
+                "transfer_id": int(key[1:]),
+                "remote_handshake_port": instances[k]["handshake_port"],
+            }
+            for key in sent
+        ]
+        decode = cell / f"decode{1 - k}" / "steps"
+        decode.mkdir(parents=True)
+        (decode / TRANSFERS).write_text("".join(json.dumps(t) + "\n" for t in joined))
+        prefills.append(p)
+    (cell / "run.json").write_text(json.dumps({"instances": instances}))
+    (cell / "client_run.json").write_text(json.dumps({"requests": export}))
+    runs = [x for p in prefills for x in ("--client-run", p, cell / "client_run.json")]
+    fit(tmp_path, "fit steps", *LINEAR, *prefills, *runs)
+
+    report = member(tmp_path / "store", law_key(tmp_path / "store"), "report")
+    traced = {p: f"trace-{k}" for k, p in enumerate(prefills)}
+    assert report["provenance"] == served(HOST, traced)
 
 
 @pytest.mark.parametrize(
@@ -523,3 +588,159 @@ def test_a_record_whose_server_built_an_aiter_module_refuses_naming_it(tmp_path)
     with pytest.raises(SystemExit, match=re.escape(named)):
         fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
     assert not (tmp_path / "store").exists()
+
+
+def _rung_lines(directory, rungs) -> int:
+    """The decode lines of `directory`'s record at a rung of `rungs`."""
+    lines = (directory / "steps/dp0.jsonl").read_text().splitlines()
+    return sum(
+        1
+        for line in map(json.loads, lines)
+        if line["rows"] and all(r[2] for r in line["rows"]) and line["rung"] in rungs
+    )
+
+
+def _prefill_lines(directory, output: bool) -> int:
+    """The prefill lines of `directory`'s record that produce output (a final
+    chunk) when `output`, else its middle chunks."""
+    lines = (directory / "steps/dp0.jsonl").read_text().splitlines()
+    return sum(
+        1
+        for line in map(json.loads, lines)
+        if line["rows"]
+        and not all(r[2] for r in line["rows"])
+        and line["produces_output"] == output
+    )
+
+
+def test_a_ladder_run_s_decodes_join_only_the_rungs_it_calibrates_and_its_prefills_none(
+    tmp_path,
+):
+    a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
+    ladder = ("--ladder-run", b, b / "client.json", "4")
+    fit(tmp_path / "x", "fit steps", *LINEAR, a, b, *clients(a), *ladder)
+    fit(tmp_path / "y", "fit steps", *LINEAR, a, b, *clients(a, b))
+    fit(tmp_path / "z", "fit steps", *LINEAR, a, *clients(a))
+
+    laddered, report = (
+        member(tmp_path / "x/store", law_key(tmp_path / "x/store"), m)
+        for m in ("params", "report")
+    )
+    both = member(tmp_path / "y/store", law_key(tmp_path / "y/store"), "params")
+    alone = member(tmp_path / "z/store", law_key(tmp_path / "z/store"), "params")
+    StepLinearLaw(laddered)
+    # Rung 4 takes both records' decodes; rung 2 and the eager decodes a's alone.
+    assert _rung_lines(b, (2, None)) and _rung_lines(b, (4,))
+    assert (
+        laddered["decode"]["4"]["coefficients"] == both["decode"]["4"]["coefficients"]
+    )
+    for rung in ("2", step_linear_fit.EAGER):
+        coefficients = laddered["decode"][rung]["coefficients"]
+        assert coefficients == alone["decode"][rung]["coefficients"]
+        assert coefficients != both["decode"][rung]["coefficients"]
+    # The ladder's prefills, final and middle chunks, join no vector: a's alone.
+    assert _prefill_lines(b, True) and _prefill_lines(b, False)
+    prefill = laddered["prefill"]["coefficients"]
+    assert prefill == alone["prefill"]["coefficients"]
+    assert prefill != both["prefill"]["coefficients"]
+    run = digest(b / "steps/dp0.jsonl")
+    assert report["ladder"] == {
+        "runs": [[str(b), str(b / "client.json"), [4]]],
+        "left_out": {
+            run: {
+                "2": _rung_lines(b, (2,)),
+                step_linear_fit.EAGER: _rung_lines(b, (None,)),
+                "prefill": _prefill_lines(b, True),
+                "middle": _prefill_lines(b, False),
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "backend, rungs, named",
+    [
+        ("step-grid", "4", "--ladder-run is read by step-linear, not step-grid"),
+        ("step-linear", "4,x", "--ladder-run RUNGS '4,x': name the decode rungs"),
+        ("step-linear", "4,4", "--ladder-run RUNGS '4,4': name the decode rungs"),
+        ("step-linear", "0", "--ladder-run RUNGS '0': name the decode rungs"),
+    ],
+)
+def test_a_ladder_run_refuses_off_step_linear_and_naming_no_rungs(
+    tmp_path, backend, rungs, named
+):
+    a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
+    ladder = ("--ladder-run", b, b / "client.json", rungs)
+
+    with pytest.raises(SystemExit, match=re.escape(named)):
+        fit(tmp_path, "fit steps", "--backend", backend, a, b, *clients(a), *ladder)
+    assert not (tmp_path / "store").exists()
+
+
+#: A two-stage pipeline's engine config, its spans as ATOM splits 28 layers.
+PP2 = {**ENGINE, "pipeline_parallel_size": 2, "pp_layers": [[0, 14], [14, 28]]}
+
+
+def pipeline(directory, seed, trace="trace"):
+    """`directory`, a two-stage pipeline's record of `_steps(seed)`: stage 0's
+    lines as `record` writes them, and stage 1's, the same batches at twice
+    their price, a quarter of each step the drafter's, which only the last
+    stage runs, on stage 0's host stamps, so that each stage enters after its
+    release (`step_labels.released`).
+    Each prefill's busy time, as a trace run's, is its target's and its
+    draft's."""
+    key = {**HOST, "engine": PP2}
+    steps = directory / "steps"
+    steps.mkdir(parents=True)
+    head, _ = _timed_record(steps / "dp0.jsonl", _steps(seed), key=key)
+    doubled = [(rows, rung, 2 * seconds) for rows, rung, seconds in _steps(seed)]
+    last, _ = _timed_record(steps / "pp1.dp0.jsonl", doubled, key=key)
+    lines = [json.loads(x) for x in last.read_text().splitlines()]
+    for s, h in zip(lines, head.read_text().splitlines()):
+        for k in [k for k in s if k[:2] == "b_"]:
+            del s[k]
+        s["d_target_ns"] = s["d_busy_ns"] * 3 // 4
+        s.update((k, v) for k, v in json.loads(h).items() if k[:2] == "t_")
+    last.write_text("".join(json.dumps(traced(s)) + "\n" for s in lines))
+    return as_record(directory, key, trace=trace)
+
+
+def _decodes(directory, stage="") -> int:
+    lines = (directory / f"steps/{stage}dp0.jsonl").read_text().splitlines()
+    return sum(all(r[2] for r in json.loads(x)["rows"]) for x in lines)
+
+
+def test_a_pipeline_fits_one_law_a_part_per_stage_each_on_its_own_steps(tmp_path):
+    """Each stage's prefill vector is its own steps' price, and holds its
+    figures held out on the other run; only the last stage, whose steps carry
+    a draft, holds a draft law, and each stage's decode steps are cut."""
+    a, b = pipeline(tmp_path / "a", 19), pipeline(tmp_path / "b", 20)
+    fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
+
+    law = member(tmp_path / "store", law_key(tmp_path / "store", engine=PP2), "params")
+    report = member(
+        tmp_path / "store", law_key(tmp_path / "store", engine=PP2), "report"
+    )
+    assert law["engine_config"] == PP2 and law["platform"] == keyed_platform(
+        Kind.STEP_LINEAR_LAW, PLATFORM
+    )
+    assert law["records_atom"] == HOST["atom"] and "prefill" not in law
+    first, last = law["stages"]
+    for k, part in enumerate(law["stages"]):
+        StepLinearLaw(part)
+        runs = sorted(digest(d / f"steps/{'pp1.' * k}dp0.jsonl") for d in (a, b))
+        assert part["runs"] == runs and sorted(part["figures"]) == runs
+        assert "held_out" in part["prefill"]
+        assert part["decode"] == {}
+        assert part["cut"]["pipelined"] == _decodes(a) + _decodes(b)
+        assert [r["run"] for r in report["stages"][k]["provenance"]] == runs
+    got = [p["prefill"]["coefficients"] for p in law["stages"]]
+    for coefficients, times in zip(got, (1.0, 1.5)):
+        mine = {f: coefficients[f] for f in PREFILL}
+        assert mine == pytest.approx({f: c * times for f, c in PREFILL.items()}, 1e-3)
+    assert "seqs" not in got[0] and "seqs" in got[1]
+    assert "draft" not in first
+    draft = last["draft"]["prefill"]["coefficients"]
+    assert {f: draft[f] for f in PREFILL} == pytest.approx(
+        {f: c / 2 for f, c in PREFILL.items()}, 1e-3
+    )

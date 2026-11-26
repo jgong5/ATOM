@@ -29,16 +29,52 @@ to OUT/`FILE`, one JSON document, and no other file changes:
 - ``unsplit``: each other request aiperf recorded, by its ``request_id``, and why.
 - ``clock``: ``virtual`` for a simulated run; ``monotonic`` for a real one, the
   host clock its client shares with the server it reaches at 127.0.0.1. A real
-  deployment's decode side on another node (`run.json`'s ``kv_link``
-  ``inter_node``) is joined to it: ``decode_offset_s`` bounds what its times
-  take to land on this clock, at least each request's prefill return less its
-  decode entry and at most its first token less its hand-over's return; they
-  take the upper bound.
+  deployment across nodes (`run.json`'s ``across_nodes``, or, where an older
+  one states none, its ``kv_link`` ``inter_node``) has a monotonic clock a
+  node, each counting from its own boot; one whose KV crossed the network from
+  this node (`deploy.sh --kv-over-network`) shares this one. Across nodes, each
+  instance ran on the node its ``server.json`` URL names (`compass record
+  --host`), this one for a loopback or unspecified address, and each other
+  node's instances, prefill and decode alike, are joined to this clock by that
+  node's offset. Where OUT holds that node's clock paired with this one's
+  (`clock_pair.FILE`, which `deploy.sh` record writes), each of its events
+  takes the offset measured at it, piecewise linear between the pairs
+  (`clock_pair.Offsets`); else the node takes one offset, which the events of
+  each request that cross between this node and that one bound.
+  ``node_offsets_s`` gives each other node's, by its address, as ``offset_s``,
+  the one taken, and ``bounds_s``: at least each request's send less its
+  prefill entry there and its prefill return here less its decode entry there;
+  at most its first token less its hand-over's return there and its decode
+  entry here less its prefill return there; null where no request sets one. A
+  node holding a decode instance takes its upper bound, as though its fastest
+  first token reached the client the moment its forward handed it over; a node
+  of prefill instances alone its lower, as though its fastest request entered a
+  forward the moment it was sent. A node no request reached is null. A
+  request's hop between two other nodes bounds neither; its order is checked as
+  every request's is. A measured node's entry gives, with ``bounds_s``, then a
+  check, its ``source``, ``measured``, its pairs, ``samples``, the least and
+  the most of their offsets in the sign of ``offset_s``, ``measured_s``, the
+  largest error they state, ``error_s``, and ``order_violations``, the
+  requests that one of its events and one on another node, so joined, put out
+  of order by no more than the two offsets' errors: these are split as
+  joined, and a request out of order by more is refused, as on one clock.
+  Beside a measured node, each other one gives its ``source``, ``bounds``. Where
+  an instance's directory holds no ``server.json``, every prefill instance is
+  taken to run here and each decode instance on a node of its own, as before
+  nodes were read: ``decode_offset_s`` bounds what the decode side's times take
+  to land on this clock, as ``bounds_s`` does a node's, and they take the upper
+  bound.
 
 A real forward's entry and return are its step line's ``t_enter_ns`` and
 ``t_exit_ns``; a simulated one's are its cost line's ``t_s`` and that plus
 ``group_s``. A simulated client's stamps are `EPOCH_NS` past the virtual clock.
-A deployment's sides join through the decode side's `TRANSFERS`. In place of
+A deployment's sides join through the decode side's `TRANSFERS`. Above one
+instance of a side (`deploy.sh`'s ``prefill<k>/`` and ``decode<k>/``), each
+transfer names the prefill instance it came from (`parity.INSTANCE_FIELDS`): a
+simulated one by its engine id, a real one by the Mooncake handshake port
+`run.json`'s ``instances`` gives it; where the instances name no node, each
+real decode instance takes its own ``decode_offset_s``, listed by instance as
+``decode_offsets_s``, the first field then spanning them all. In place of
 the split, ``refused`` says why there is none: a file it reads is missing or
 holds no step times, a side is a pipeline's, whose first tokens leave a stage
 whose forwards it does not read, or a request's events are out of order, each of
@@ -55,22 +91,71 @@ import sys
 from pathlib import Path
 
 from atom.benchmarks.results.records import from_aiperf
-from atom.compass.backends.json_file import read_json
+from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.carriers import EPOCH_NS
-from atom.compass.parity import TRANSFERS, transfers
+from atom.compass.drive import clock_pair
+from atom.compass.parity import TRANSFERS
 from atom.compass.parity.client_run import RAW, response_id
 
 FILE = "request_split.json"
 RECORDS = "artifacts/profile_export.jsonl"
 STEPS = "steps"
+#: Where an instance names the URL it served at (`drive.serve.READY_FILE`).
+READY = "server.json"
 #: The clocks' resolution, a nanosecond stamp, in seconds.
 RESOLUTION_S = 1e-9
 
 
-def _sides(run: Path) -> list[Path]:
-    """Where `run`'s servers recorded: a deployment's `prefill/` and `decode/`,
-    as `deploy.sh` lays them out, else `run` itself."""
-    return [run / "prefill", run / "decode"] if (run / "prefill").is_dir() else [run]
+def _side(run: Path, side: str) -> list[Path]:
+    """A deployment's instances of `side` as `deploy.sh` lays them out: its one
+    `side/`, or `side0/`, `side1/`, ... above one; none on one server."""
+    if (run / side).is_dir():
+        return [run / side]
+    held = {p.name[len(side) :]: p for p in run.glob(f"{side}[0-9]*") if p.is_dir()}
+    return [held[k] for k in sorted(held, key=int) if k.isdigit()]
+
+
+def _instances(run: Path, meta: dict, simulated: bool) -> tuple[list, list]:
+    """Where `run`'s servers recorded: a deployment's prefill instances, each
+    its directory and the `parity.INSTANCE_FIELDS` its transfers name it by
+    (none where it is the only one), and its decode instances' directories;
+    else `run` itself, one server, and no decode side."""
+    prefills, decodes = _side(run, "prefill"), _side(run, "decode")
+    if not prefills:
+        return [(run, {})], []
+    if len(prefills) == 1:
+        return [(prefills[0], {})], decodes
+    held = {i["name"]: i for i in meta.get("instances", ())}
+    named = []
+    for k, path in enumerate(prefills):
+        if simulated:
+            from atom.compass.kv.connector import engine_id
+
+            named.append((path, {"remote_engine_id": engine_id(f"engine-P{k}")}))
+        elif "handshake_port" in held.get(path.name, {}):
+            named.append(
+                (path, {"remote_handshake_port": held[path.name]["handshake_port"]})
+            )
+        else:
+            raise ValueError(f"run.json names no handshake port of {path.name}")
+    return named, decodes
+
+
+def _sender(transfer: dict, prefills: list) -> int:
+    """The index of the prefill instance `transfer` came from."""
+    if len(prefills) == 1:
+        return 0
+    hits = [
+        k
+        for k, (_, fields) in enumerate(prefills)
+        if all(transfer.get(f) == v for f, v in fields.items())
+    ]
+    if len(hits) != 1:
+        raise ValueError(
+            f"transfer {transfer} names {len(hits)} of the {len(prefills)} "
+            "prefill instances"
+        )
+    return hits[0]
 
 
 def _client(run: Path, simulated: bool) -> tuple[dict, dict]:
@@ -174,32 +259,150 @@ def _record(side: Path, simulated: bool, every: bool) -> tuple[dict, dict, dict]
     return first, named, lmcache
 
 
+def _node(path: Path) -> str | None:
+    """The node the instance at `path` ran on: the host its `READY` URL names,
+    None for the client's (`clock_pair.node`)."""
+    return clock_pair.node(read_json(path / READY)["url"])
+
+
+def _join(
+    events: dict,
+    own: dict,
+    decoded_by: dict,
+    prefills: list,
+    decodes: list,
+    measured: dict,
+) -> tuple[dict, dict]:
+    """Move each request's `events` on a node other than its client's onto the
+    client's clock, by the offset `measured` holds for that node at each event
+    or else by that node's one offset, as the module says; the fields that say
+    how, and each event a measured offset moved, by request, its node and that
+    offset's error. Each request's prefill instance is the first of its key in
+    `own`, its decode instance its `decoded_by`."""
+    paths = [path for path, _ in prefills] + decodes
+    located = all((path / READY).exists() for path in paths)
+    if located:
+        nodes = [_node(path) for path in paths]
+    else:  # every prefill instance here, each decode instance a node of its own
+        nodes = [None] * len(prefills) + [("decode", j) for j in range(len(decodes))]
+    prefill_on, decode_on = nodes[: len(prefills)], nodes[len(prefills) :]
+    # Each request's events by the node they ran on, None for the client's.
+    where = {}
+    lows, highs = collections.defaultdict(list), collections.defaultdict(list)
+    for name, e in events.items():
+        p = prefill_on[own[name][0]]
+        d = decode_on[decoded_by[name]] if decodes else p
+        where[name] = {"prefill entry": p, "prefill return": p}
+        where[name] |= {"decode entry": d, "hand-over": d}
+        for (a, x), (b, y) in itertools.pairwise(e.items()):
+            here, there = where[name].get(a), where[name].get(b)
+            if here is None and there is not None:
+                lows[there].append(x - y)
+            elif there is None and here is not None:
+                highs[here].append(y - x)
+    bounds, taken = {}, {}
+    for node in dict.fromkeys(n for n in nodes if n is not None):
+        if node not in lows and node not in highs:
+            bounds[node] = None
+            continue
+        low, high = max(lows[node], default=None), min(highs[node], default=None)
+        bounds[node] = [low, high]
+        upper = high is not None and (node in decode_on or low is None)
+        taken[node] = high if upper else low
+    measured = {node: measured[node] for node in bounds if located and node in measured}
+    moved = collections.defaultdict(dict)
+    for name, e in events.items():
+        for event, node in where[name].items():
+            if node is None or event not in e:
+                continue
+            if node in measured:
+                offset, error = measured[node].at(e[event])
+                e[event] -= offset
+                moved[name][event] = (node, error)
+            else:
+                e[event] += taken[node]
+    if not located:
+        offsets = [bounds[node] for node in decode_on]
+        held = [o for o in offsets if o]
+        out = {"decode_offset_s": [min(o[0] for o in held), max(o[1] for o in held)]}
+        return out | ({"decode_offsets_s": offsets} if len(decodes) > 1 else {}), moved
+    joined = {node: None for node in bounds}
+    joined |= {
+        node: {"offset_s": taken[node], "bounds_s": bounds[node]} for node in taken
+    }
+    if measured:
+        joined = {
+            node: (
+                _measured(measured[node], bounds[node])
+                if node in measured
+                else held and {"source": "bounds"} | held
+            )
+            for node, held in joined.items()
+        }
+    return {"node_offsets_s": joined}, moved
+
+
+def _measured(offsets: clock_pair.Offsets, bounds: list | None) -> dict:
+    """A node's entry in ``node_offsets_s``, its clock measured as `offsets`
+    holds it and bounded by `bounds`; no request yet out of order."""
+    # The client's clock less that node's, as an offset the bounds hold is.
+    held = [-offset * 1e-9 for _, offset, _ in offsets.rows]
+    return {
+        "source": "measured",
+        "samples": len(held),
+        "measured_s": [min(held), max(held)],
+        "error_s": max(error for *_, error in offsets.rows) * 1e-9,
+        "bounds_s": bounds,
+        "order_violations": 0,
+    }
+
+
+def _slack(moved: dict, a: str, b: str) -> float:
+    """How far a request's event `b` may come before its `a` with no fault of
+    its own: the errors of the measured offsets that moved them, `moved`
+    holding each such event's node and error, where they ran on two nodes."""
+    (here, early), (there, late) = (moved.get(k, (None, 0.0)) for k in (a, b))
+    return 0.0 if here == there else early + late
+
+
 def split(run) -> dict:
     """`run`'s split, as the module says."""
     run = Path(run)
     meta = read_json(run / "run.json")
     simulated = "run_file" in meta
-    sides = _sides(run)
-    first, named, lmcache = _record(sides[0], simulated, every=True)
+    prefills, decodes = _instances(run, meta, simulated)
+    # Each prefill instance's forwards, by (instance, DP rank, request id).
+    first, named, lmcache = {}, {}, {}
+    for k, (path, _) in enumerate(prefills):
+        held = _record(path, simulated, every=True)
+        for into, got in zip((first, named, lmcache), held):
+            into |= {(k, *key): value for key, value in got.items()}
     done, unsplit = _client(run, simulated)
-    if len(sides) == 1:
+    # Each decode-side request's instance and forwards, by its response id.
+    own, decode = {}, {}
+    if not decodes:
         own = {name: key for key, (name, *_) in named.items()}
-    else:
-        if not (sides[1] / STEPS / TRANSFERS).exists():
-            raise ValueError(f"{sides[1] / STEPS} holds no {TRANSFERS}")
-        own = {name: key for key, name in transfers(sides[1] / STEPS).items()}
-        _, decoded, _ = _record(sides[1], simulated, every=False)
-        decode = {name: forwards for name, *forwards in decoded.values()}
-    events = {}
+    for j, path in enumerate(decodes):
+        if not (path / STEPS / TRANSFERS).exists():
+            raise ValueError(f"{path / STEPS} holds no {TRANSFERS}")
+        for t in read_jsonl(path / STEPS / TRANSFERS):
+            own[t["response_id"]] = (
+                _sender(t, prefills),
+                t["remote_dp_rank"],
+                t["transfer_id"],
+            )
+        _, decoded, _ = _record(path, simulated, every=False)
+        decode |= {name: (j, forwards) for name, *forwards in decoded.values()}
+    events, decoded_by = {}, {}
     for name, (record, (send, token, end)) in done.items():
         key = own.get(name)
-        if key not in named or (len(sides) == 2 and name not in decode):
+        if key not in named or (decodes and name not in decode):
             unsplit[record["request_id"]] = "no step names it on every side"
             continue
         e = {"send": send, "prefill entry": first[key]}
         e["prefill return"], forwards = named[key][2], named[key][1:]
-        if len(sides) == 2:
-            forwards = decode[name]
+        if decodes:
+            decoded_by[name], forwards = decode[name]
             e["decode entry"] = forwards[0]
         if len(forwards) < 3:
             unsplit[record["request_id"]] = (
@@ -210,21 +413,26 @@ def split(run) -> dict:
     if not events:
         raise ValueError("no request aiperf finished is named by its step records")
     clock = {"clock": "virtual" if simulated else "monotonic"}
-    if not simulated and meta.get("kv_link") == "inter_node":
-        low = max(e["prefill return"] - e["decode entry"] for e in events.values())
-        high = min(e["first token"] - e["hand-over"] for e in events.values())
-        for e in events.values():
-            e["decode entry"] += high
-            e["hand-over"] += high
-        clock["decode_offset_s"] = [low, high]
+    moved = {}
+    if not simulated and meta.get("across_nodes", meta.get("kv_link") == "inter_node"):
+        pairs = run / clock_pair.FILE
+        measured = clock_pair.read(pairs) if pairs.exists() else {}
+        joined, moved = _join(events, own, decoded_by, prefills, decodes, measured)
+        clock |= joined
+    # Each measured node's requests out of order within its offsets' errors.
+    violated = collections.defaultdict(set)
     requests = []
     for name, e in events.items():
         for (a, x), (b, y) in itertools.pairwise(e.items()):
-            if y < x - RESOLUTION_S:
+            if y >= x - RESOLUTION_S:
+                continue
+            if y < x - RESOLUTION_S - _slack(moved.get(name, {}), a, b):
                 raise ValueError(
                     f"request {name}'s {b} is {x - y:.9f} s before its {a}, "
                     "so its events are not on one clock"
                 )
+            for node, _ in (moved[name][k] for k in (a, b) if k in moved[name]):
+                violated[node].add(name)
         record, key = done[name][0], own[name]
         start = e.get("decode entry", e["prefill return"])
         record |= {
@@ -241,6 +449,8 @@ def split(run) -> dict:
         requests.append(
             record | {"lmcache_load_tokens": loaded, "lmcache_store_tokens": stored}
         )
+    for node, names in violated.items():
+        clock["node_offsets_s"][node]["order_violations"] = len(names)
     return clock | {"requests": requests, "unsplit": unsplit}
 
 

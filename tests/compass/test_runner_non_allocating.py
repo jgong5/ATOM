@@ -183,7 +183,7 @@ def test_construction_dispatches_no_operator_at_all():
     """The measured result: zero, against a base that reads a checkpoint."""
     runner = Runner()
     with Recorder() as recorded:
-        runner._build_and_load_model(SomeModel)
+        runner.model = runner._build_and_load_model(runner.config, SomeModel, None)
         runner._maybe_warmup()
         runner.allocate_kv_cache(2048)
     assert recorded.ops == []
@@ -198,7 +198,7 @@ def test_the_recorder_sees_an_allocation_when_there_is_one():
 
 def test_the_model_that_replaces_the_weights_owns_nothing():
     runner = Runner()
-    runner._build_and_load_model(SomeModel)
+    runner.model = runner._build_and_load_model(runner.config, SomeModel, None)
     assert isinstance(runner.model, UnbuiltModel)
     assert list(runner.model.parameters()) == []
     assert list(runner.model.buffers()) == []
@@ -232,7 +232,7 @@ def test_atoms_pool_walk_finds_the_model_tree_built_on_meta():
     """ATOM sizes the KV pool from the rows its walk over the model assigns."""
     runner = Runner()
     runner.draft_shares_kv_pool = lambda: False
-    runner._build_and_load_model(AttentionModel)
+    runner.model = runner._build_and_load_model(runner.config, AttentionModel, None)
     assert LinearRows(runner).row_counts() == {"kv": 1}
     tensors = [*runner.model.parameters(), *runner.model.buffers()]
     assert tensors and all(t.is_meta for t in tensors)
@@ -367,7 +367,8 @@ def test_what_that_ring_costs_is_the_batch_budget_by_the_hidden_size():
 def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
     """The half of the claim that is this package's own: it adds none.
 
-    `model` registers no parameter and no buffer, `_token_stream` is the
+    The model it builds, which registers no parameter and no buffer, is
+    returned for ATOM's `__init__` to bind. `_token_stream` is the
     deferral bookkeeping `forward` builds on first use, and `kv_pool_sizing`
     is a `SizedKVPool` -- a count, a name-to-count table and the readings --
     built in a package whose whole import closure `test_kv_budget.py` holds
@@ -380,7 +381,6 @@ def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
     overrides = _classes(PACKAGE / "overrides.py")["NonAllocatingRunner"]
     bound = {n for n, _ in _self_assigned(overrides)}
     assert bound == {
-        "model",
         "_token_stream",
         "kv_pool_sizing",
         "capture_sizes",

@@ -57,16 +57,19 @@ Beside the table, the command states how many of that client run's steps its
 backend extrapolated and a fallback below it priced.
 
 A deployment `deploy.sh` wrote holds a server's directory per side,
-`prefill/` and `decode/`, and its client's export beside them. Each side is
-checked and graded as a run `record` or `run` wrote, against that export, and
-the step families below are per side (`counts prefill`, `counts decode`, ...);
-end to end is the deployment's, once. The export names decode's response
-ids; prefill's record names a request by its own, so its side is split through
-decode's `transfers`, which joins prefill's DP rank and request id to the
-decode response id. A record of several DP ranks is graded
-over every rank's steps: counts summed over ranks, distributions over every
-rank's steps, and the warmup checks on its steps in step order, every rank's
-step k one forward.
+`prefill/` and `decode/`, or per instance above one of a side, `prefill0/`,
+`decode1/`, ..., and its client's export beside them. Each is checked and
+graded as a run `record` or `run` wrote, against that export, and the step
+families below are per side (`counts prefill`, `counts decode`, ...); end to
+end is the deployment's, once. The export names decode's response ids; a
+prefill instance's record names a request by its own, so it is split through
+every decode instance's `transfers`, which join prefill's DP rank and request
+id to the decode response id. Above one prefill instance, each numbers its
+request ids on its own, so only the transfers that name it by the instance
+fields `report.split` reads take part (`prefill_join`). A record of several
+DP ranks is graded over every rank's steps: counts summed over ranks,
+distributions over every rank's steps, and the warmup checks on its steps in
+step order, every rank's step k one forward.
 
 The tolerance of a metric is the real runs' own spread: its distance between
 every ordered pair of real runs, at most. A metric's result is its distance
@@ -105,6 +108,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import os
 from itertools import permutations
 from pathlib import Path
 
@@ -114,6 +118,7 @@ from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.drive import aiter_jit
 from atom.compass.parity import ARRIVALS, read, transfers
 from atom.compass.parity.served import served
+from atom.compass.report.split import _instances
 from atom.compass.run import (
     CLIENT_DIR,
     ENGINE,
@@ -143,9 +148,19 @@ END_TO_END = {
 
 def sides(run) -> list[Path]:
     """Where `run`'s servers wrote their records: the prefill/ and decode/ of a
-    deployment `deploy.sh` wrote, else `run` itself."""
+    deployment `deploy.sh` wrote, or, above one instance of a side, that side's
+    prefill<k>/ or decode<k>/, in index order, else `run` itself."""
     run = Path(run)
-    return [run / s for s in SIDES] if (run / SIDES[0]).is_dir() else [run]
+    found = []
+    for side in SIDES:
+        if (run / side).is_dir():
+            found.append(run / side)
+            continue
+        indexed = (p for p in run.glob(f"{side}*") if p.name[len(side) :].isdigit())
+        found += sorted(
+            (p for p in indexed if p.is_dir()), key=lambda p: int(p.name[len(side) :])
+        )
+    return found or [run]
 
 
 def _steps(cell) -> list[dict]:
@@ -235,12 +250,17 @@ def _end_to_end(export) -> dict:
     return {name: export[k][stat] for name, (k, stat) in END_TO_END.items()}
 
 
-def named_by_prefill(export, prefill, decode) -> dict:
+def named_by_prefill(export, prefill, decode, fields=None) -> dict:
     """`export`, whose names are decode's response ids, with each request
     renamed by the response id `prefill`'s record names it by: its prefill DP
     rank and request id join the decode response id in `decode`'s
-    `transfers`."""
-    sent = transfers(Path(decode) / "steps")
+    `transfers`. `decode` is one decode instance's directory or a list of
+    them; `fields`, the instance fields `prefill_join` gives, keeps only the
+    transfers that came from `prefill`."""
+    decodes = [decode] if isinstance(decode, (str, os.PathLike)) else decode
+    sent = {}
+    for d in decodes:
+        sent |= transfers(Path(d) / "steps", fields)
     names = {}
     for rank, steps in read(Path(prefill) / "steps").items():
         for step in steps:
@@ -254,6 +274,30 @@ def named_by_prefill(export, prefill, decode) -> dict:
     return export | {k: renamed(export.get(k)) for k in ("requests", "warmup")}
 
 
+def prefill_join(record) -> tuple[list[Path], dict] | None:
+    """The decode instances and the instance fields through which `record`, a
+    prefill instance of a deployment, joins its client's export
+    (`named_by_prefill`), as `report.split` reads them: a real instance's
+    handshake port, which the deployment's run.json states, a simulated one's
+    engine id, and none where it is its side's only instance. None for any
+    other record, and for a prefill side with no decode side."""
+    record = Path(record)
+    run = record.parent
+    if record not in sides(run) or not record.name.startswith(SIDES[0]):
+        return None
+    path = run / "run.json"
+    meta = read_json(path) if path.is_file() else {}
+    prefills, decodes = _instances(run, meta, simulated="run_file" in meta)
+    return (decodes, dict(prefills)[record]) if decodes else None
+
+
+def deployment_side(record) -> bool:
+    """Whether `record` is an instance of a side of a deployment with a prefill
+    side, behind its router: one of the directories `sides` finds beside it."""
+    found = sides(Path(record).parent)
+    return Path(record) in found and any(p.name.startswith(SIDES[0]) for p in found)
+
+
 def _client_run(cell, run, client, whole=False, simulated=False) -> tuple:
     """The steps of the client run `cell` grades, the traces its client was
     given, and its warmup: how many requests its export, in `client`, names as
@@ -264,8 +308,9 @@ def _client_run(cell, run, client, whole=False, simulated=False) -> tuple:
         raise ValueError(f"{cell} is not graded: its {ARRIVALS} renumbers its steps")
     steps = _steps(cell)
     export = read_json(Path(client) / CLIENT_RUN)
-    if Path(cell) == Path(client) / SIDES[0]:
-        export = named_by_prefill(export, cell, Path(client) / SIDES[1])
+    joined = prefill_join(cell) if Path(cell).parent == Path(client) else None
+    if joined is not None:
+        export = named_by_prefill(export, cell, *joined)
     warmup_names = set(export.get("warmup") or ())
     record = served(Path(cell) / "steps", [export["requests"]])
     split = [s for rank in record.values() for s in rank if not s["is_dummy_run"]]

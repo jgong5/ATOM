@@ -120,6 +120,21 @@ def prefill(tokens):
     return scheduler.schedule()[0]
 
 
+def decode(context):
+    """A decode batch of one request with `context` tokens, one row a step."""
+    seq = Sequence(list(range(5, 5 + context)), BLOCK, sampling_params=SamplingParams())
+    seq.status, seq.type = SequenceStatus.RUNNING, SequenceType.DECODE
+    seq.block_table = new_block_table(range(-(-context // BLOCK)))
+    return ScheduledBatch(
+        seqs={seq.id: seq},
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
+        total_tokens_num=1,
+        total_tokens_num_decode=1,
+        total_seqs_num=1,
+        total_seqs_num_decode=1,
+    )
+
+
 def priced(*rows, coefficients=None):
     return StepStubBackend(coefficients).price(BatchView(rows)).seconds
 
@@ -185,16 +200,51 @@ def test_both_ranks_report_the_larger_cost_and_the_group_token_count(dp2):
 
 
 def test_an_idle_rank_prices_its_dummy_batch_into_the_max(dp2):
-    # Decode dearer than prefill, so the dummy batch is the group's max.
-    coefficients = Coefficients.constant(prefill_seconds=0.001, decode_seconds=0.005)
+    """ATOM's `dummy_execution` hands an idle rank's forward a batch with no
+    request, which `ForwardMode.decide` runs as one padding request in the
+    group's phase: beside a prefilling peer, a one-token prefill."""
+    # Shape-blind, so the dummy and the 40-token prefill cost alike.
+    coefficients = Coefficients.constant(prefill_seconds=0.004, decode_seconds=0.001)
     backends = [Recording(coefficients), Recording(coefficients)]
     ranks = [runner(b, dp_size=2, dp_rank=r) for r, b in enumerate(backends)]
 
     busy, idle = dp2(lambda: ranks[0].forward(prefill(40)), ranks[1].dummy_execution)
 
-    assert backends[1].views[0].requests == (RequestShape(1, 1, True),)
-    assert [busy.predicted_s, idle.predicted_s] == [0.005, 0.005]
-    assert priced(RequestShape(40, 40, False), coefficients=coefficients) == 0.001
+    view = backends[1].views[0]
+    assert view.requests == (RequestShape(1, 1, False),)
+    assert view.dp_dummy and view.group_dummies == 1 and view.moe_tokens == 40
+    assert not backends[0].views[0].dp_dummy
+    assert [busy.predicted_s, idle.predicted_s] == [0.004, 0.004]
+    assert priced(RequestShape(40, 40, False), coefficients=coefficients) == 0.004
+
+
+def test_beside_a_decoding_peer_an_idle_rank_s_dummy_is_a_decode(dp2):
+    coefficients = Coefficients.constant(prefill_seconds=0.004, decode_seconds=0.001)
+    backends = [Recording(coefficients), Recording(coefficients)]
+    ranks = [runner(b, dp_size=2, dp_rank=r) for r, b in enumerate(backends)]
+
+    busy, idle = dp2(lambda: ranks[0].forward(decode(40)), ranks[1].dummy_execution)
+
+    view = backends[1].views[0]
+    assert view.requests == (RequestShape(1, 1, True),)
+    assert view.dp_dummy and view.group_dummies == 1 and view.moe_tokens == 1
+    assert [busy.predicted_s, idle.predicted_s] == [0.001, 0.001]
+
+
+def test_a_group_of_idle_ranks_steps_one_padding_request_each(dp2):
+    """A P/D producer's group steps while its sends finish with no rank
+    scheduling a token; each rank's padding request is the group's most."""
+    coefficients = Coefficients.constant(prefill_seconds=0.004, decode_seconds=0.001)
+    backends = [Recording(coefficients), Recording(coefficients)]
+    ranks = [runner(b, dp_size=2, dp_rank=r) for r, b in enumerate(backends)]
+
+    replies = dp2(ranks[0].dummy_execution, ranks[1].dummy_execution)
+
+    for view in (b.views[0] for b in backends):
+        assert view.requests == (RequestShape(1, 1, True),)
+        assert view.dp_dummy and view.group_dummies == 2
+        assert view.group_max_tokens == 1 and view.moe_tokens == 0
+    assert [r.predicted_s for r in replies] == [0.001, 0.001]
 
 
 def test_a_runner_with_no_backend_refuses_the_step():

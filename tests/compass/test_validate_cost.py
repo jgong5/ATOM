@@ -123,6 +123,7 @@ def test_the_step_that_moves_the_total_is_held_out_and_the_spread_reported(tmp_p
         "unsplit": 0,
         "untraced": 0,
         "traced": 0,
+        "paced": 0,
     }
     assert report["unvalidated"] == {} and report["refused"] == {}
     prefill = report["validated"]["prefill"]
@@ -160,6 +161,7 @@ def test_unvalidated_and_refused_steps_are_reported_apart(tmp_path):
         "unsplit": 0,
         "untraced": 0,
         "traced": 0,
+        "paced": 0,
     }
     (unvalidated,) = report["unvalidated"].values()
     assert unvalidated["steps"] == 1
@@ -265,6 +267,28 @@ def test_a_leading_slow_step_is_judged_by_the_law_s_scatter_not_the_record_s(
     assert [w["step"] for w in cost_accuracy(record, law)["warm"]] == [0]
 
 
+def test_a_record_the_law_prices_low_throughout_leads_no_warm_step(tmp_path):
+    # Every decode step ran 8% over its price, the law fitted on a 1% scatter:
+    # against the fit's centre each one leads slow, against this record's own
+    # median none does. Only a stretch slower than the rest still leads warm.
+    steps = _steps()
+    law = json.loads(json.dumps(LAW))
+    for vector in law["decode"].values():
+        vector["fit"] = {"centre": 0.0, "mad": 0.01}
+    decodes = [i for i, (rows, _) in enumerate(steps) if rows[0][2]]
+    record = _record(tmp_path / "steps", steps, dict.fromkeys(decodes, 1.08))
+    report = cost_accuracy(record, law)
+
+    assert report["warm"] == []
+    graded = report["graded"]["decode"]
+    assert graded["steps"] == len(decodes)
+    assert graded["on_totals"] == pytest.approx(1 / 1.08 - 1, rel=1e-6)
+
+    lead = dict.fromkeys(decodes, 1.08) | {decodes[0]: 1.3}
+    record = _record(tmp_path / "lead", steps, lead)
+    assert [w["step"] for w in cost_accuracy(record, law)["warm"]] == decodes[:1]
+
+
 def _grid(wrapped):
     """`_steps()`'s step grid, bare or the first backend of a fallback."""
     from test_validate_step_grid import _bundle  # it imports this module
@@ -362,6 +386,7 @@ def test_a_group_step_prices_as_its_slowest_rank_against_the_group_s_time(tmp_pa
         "unsplit": 0,
         "untraced": 0,
         "traced": 0,
+        "paced": 0,
         "ranks": 0,
     }
     assert report["warm"] == [] and report["refused"] == {}
@@ -494,6 +519,7 @@ def test_a_peer_s_dummy_forward_is_priced_0_s_and_its_step_graded(tmp_path):
         "unsplit": 0,
         "untraced": 0,
         "traced": 0,
+        "paced": 0,
         "ranks": 0,
     }
     assert report["unvalidated"] == {} and report["refused"] == {}
@@ -625,7 +651,7 @@ class _Listed(CostSource):
         self.method = method
 
     def price(self, request):
-        context = request[1][-2]
+        context = request[1][4]
         how = self.method(context)
         said = Provenance(how, note="stated" if how is Method.DECLARED else "")
         return CostTerm(f"op.{request[0]['op']}", 0.02 + 1e-7 * context, said)
@@ -718,3 +744,105 @@ def test_the_command_s_text_names_each_fallback_row(tmp_path):
     (row,) = report["fallback"].values()
     line = f"fallback decode rung 1: {declined_text(row)}"
     assert line in _text(report).splitlines()
+
+
+def _filled_law():
+    """`LAW` with rung 2 filled from rung 1, as `compass fit steps` fills a
+    captured rung no record reached."""
+    from atom.compass.backends.step_linear_fit import fill_rungs
+
+    law = json.loads(json.dumps(LAW))
+    fill_rungs(law, [1, 2])
+    return law
+
+
+def _at_rung_2(n, start=0):
+    """`n` decode steps of two requests, at rung 2."""
+    return [
+        ([(1, 3000 + 5000 * i, True), (1, 4000 + 5000 * i, True)], 2)
+        for i in range(start, start + n)
+    ]
+
+
+def test_every_priced_step_is_graded_again_with_the_filled_rungs_named(tmp_path):
+    # Ten rung-1 steps at their price, four at filled rung 2 at 1.5 times theirs
+    # (#3796): the graded total leaves the four out, the priced one holds them.
+    steps = _steps() + _at_rung_2(4)
+    stretch = {i: 1.5 for i in range(20, 24)}
+    report = cost_accuracy(_record(tmp_path / "steps", steps, stretch), _filled_law())
+
+    graded, declared = report["graded"]["decode"], report["declared"]["decode"]
+    every = report["priced"]["decode"]
+    assert (graded["steps"], declared["steps"], every["steps"]) == (10, 4, 14)
+    assert graded["on_totals"] == pytest.approx(0.0, abs=1e-9)
+    assert every["real_s"] == pytest.approx(graded["real_s"] + declared["real_s"])
+    assert every["priced_s"] == pytest.approx(graded["priced_s"] + declared["priced_s"])
+    assert every["on_totals"] == pytest.approx(
+        every["priced_s"] / every["real_s"] - 1, rel=1e-9
+    )
+    assert every["on_totals"] < -0.05 and set(every["bands"]) == {
+        "decode rung 1",
+        "decode rung 2",
+    }
+    assert report["priced"]["prefill"] == report["graded"]["prefill"]
+    filled = report["filled"]
+    assert set(filled) == {"decode"} and filled["decode"]["rungs"] == [2]
+    assert filled["decode"]["steps"] == 4
+    assert filled["decode"]["real_s"] == pytest.approx(declared["real_s"])
+    assert filled["decode"]["share"] == pytest.approx(
+        declared["real_s"] / every["real_s"]
+    )
+
+
+def test_the_priced_total_prints_on_the_line_after_the_graded_one(tmp_path):
+    steps = _steps() + _at_rung_2(4)
+    stretch = {i: 1.5 for i in range(20, 24)}
+    report = cost_accuracy(_record(tmp_path / "steps", steps, stretch), _filled_law())
+    lines = _text(report).splitlines()
+
+    # What `grep 'on totals' | head` reads: per kind, graded then priced, all.
+    totals = [x for x in lines if "on totals" in x][:4]
+    every, graded = report["priced"], report["graded"]
+    assert totals == [
+        f"  on totals              {graded['prefill']['on_totals']:+.2%}",
+        (
+            f"  priced, all on totals  {every['prefill']['on_totals']:+.2%}  (10 steps,"
+            f" real {every['prefill']['real_s']:.2f} s, priced"
+            f" {every['prefill']['priced_s']:.2f} s)"
+        ),
+        f"  on totals              {graded['decode']['on_totals']:+.2%}",
+        (
+            f"  priced, all on totals  {every['decode']['on_totals']:+.2%}  (14 steps,"
+            f" real {every['decode']['real_s']:.2f} s, priced"
+            f" {every['decode']['priced_s']:.2f} s)"
+        ),
+    ]
+    filled = report["filled"]["decode"]
+    header = next(x for x in lines if x.startswith("decode  10 steps"))
+    assert header.endswith(
+        f"; 4 steps / {filled['real_s']:.2f} s ({filled['share']:.0%}) on filled rungs 2"
+    )
+    assert "priced, all: graded and declared together" in lines
+    assert "declared, apart" in lines
+
+
+def test_a_kind_priced_only_on_filled_rungs_still_prints_its_priced_total(tmp_path):
+    steps = [s for s in _steps() if s[1] is None] + _at_rung_2(5)
+    report = cost_accuracy(_record(tmp_path / "steps", steps), _filled_law())
+    lines = _text(report).splitlines()
+
+    assert "decode" not in report["graded"]
+    assert report["priced"]["decode"]["steps"] == 5
+    at = lines.index(next(x for x in lines if x.startswith("decode  0 steps")))
+    assert lines[at].endswith("(100%) on filled rungs 2")
+    assert lines[at + 1] == "  on totals              -"
+    assert lines[at + 2].startswith("  priced, all on totals  +0.00%  (5 steps,")
+
+
+def test_a_law_with_no_filled_rung_names_none_and_prices_all_as_graded(tmp_path):
+    report = cost_accuracy(_record(tmp_path / "steps", _steps()), LAW)
+
+    assert report["filled"] == {} and report["declared"] == {}
+    assert report["priced"] == report["graded"]
+    header = next(x for x in _text(report).splitlines() if x.startswith("decode "))
+    assert header.endswith(" s") and "filled" not in header

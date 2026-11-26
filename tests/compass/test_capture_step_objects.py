@@ -185,7 +185,6 @@ def _forward(geometry, step):
         rope_head_dim=ROPE_DIM,
         quant_mode="none",
         latent_out=empty(rows, HEAD_DIM, dtype=bf16),
-        rotated_out=empty(rows, HEAD_DIM, dtype=bf16),
     )
     selected = empty(REQUESTS, geometry.batch_topk(RATIO))
     _, _, _, eptr = build_indices(

@@ -18,6 +18,17 @@ and then `moe_rows`, the rows the data-parallel group's MoE gather carries
 After `moe_rows` it may add `serial_moe_rows`: `moe_rows` on a step the group did
 not split for two-batch overlap (`BatchView.tbo_tokens` None), else 0, the MoE
 rows no second micro-batch overlaps.
+Then it may add `cold_peer_rows` (`cold_peer_rows`): the rows the group's MoE
+gather carries from the rank's peers, `moe_rows` less its own tokens, times one
+less its `BatchView.prefill_duty`, the share of the last seconds the rank spent
+in its group's prefill steps (`shape.PrefillDuty`, at `DUTY_TAU`). On cell A
+(DeepSeek-V4.1, DPA4-EP4) a prefill step that several ranks run right after
+decode steps costs more than the same step deep in a stretch of prefill steps,
+by about the peers' share of the gather: the prefill vector fitted without the
+column priced the stretches (the warmup's first turns, c=256's prefill queue)
+about 5% high and the isolated prefills of c=8 to c=128 2-4% low (#3747). A
+vector with the column states its `duty_tau`, which must be `DUTY_TAU`, and a
+step stating no `prefill_duty` is refused.
 Last, a prefill vector may add `padding`, the rows its token graph runs past
 the step's tokens (`token_padding`): ATOM replays a prefill's first layers at
 the smallest of the vector's `buckets`, the prefill token-graph buckets the
@@ -26,6 +37,15 @@ scheduled. A data-parallel step stating no `group_max_tokens` is refused unless
 its group split it for two-batch overlap or runs it eagerly for an attention
 backend (`token_padding`), and a vector with a `padding` coefficient states its
 `buckets`.
+After it a prefill vector may add `eager_dummy` and `eager_dummy_tail`
+(`eager_dummy`): 1 on a data-parallel rank's dummy forward in a prefill step
+its group runs eagerly, past the largest of `buckets` (or with none), and the
+second only where the group also runs a finishing prompt's tail, else 0. Such a
+dummy (`dummy_view`, the row a record's dummy line states) is priced by the
+prefill vector like any rank, and the group's step is the max over its ranks:
+on real DPA records it holds its peers for about as long as a full-budget
+prefill, whatever their tokens, which a one-token row's other features do not
+carry.
 
 A law prices one rank's step; the runner takes the group's step as the max
 over its ranks. Its parallel layout is its `engine_config`'s, which a run
@@ -59,19 +79,25 @@ A decode step that replays no graph (an eager runner, or a batch wider than
 the widest captured size) is the rung named `eager`, whose padding is zero.
 At that rung, under a law with no `eager` vector, a DP dummy forward and a decode
 while a peer prefills (`BatchView.dp_dummy`, `group_prefills`) cost 0 s, each
-under its treatment (`eager_beside_peer`), not refused.
+under its treatment (`eager_beside_peer`), not refused. So does, at any rung
+the law holds no vector for, a decode-phase dummy every rank of its group runs
+(`idle_group_dummy`): a P/D producer's, whose decodes are all such steps.
 
 Every term is `estimated`, but a vector's stating `declared`, the origin of one
 fitted on another subject: those are `declared`, with that note, never validated.
 Each vector carries the convex hull of the features
-it was fitted on. A step outside it is priced by the same vector, its terms'
+it was fitted on, the `EAGER_DUMMY` indicators left out (`hull_axes`). A step outside it is priced by the same vector, its terms'
 source is `EXTRAPOLATED` and their detail names the hull; it is not refused.
 A vector may also carry, under `held_out`, the hull of the steps
 `step_linear_fit` priced with a law fitted on the other records and their
 errors per band: a term is validated iff its step lies inside that hull, so a
 law without one prices every term unvalidated. A step the law has no vector for
 is refused: prefill when the law has no prefill vector, a decode rung with
-none, a step mixing prefill and decode rows, or one with image tokens.
+none, a step mixing prefill and decode rows, or one with image tokens. `compass
+fit steps` leaves no captured rung without one: a rung no record reached gets
+a declared vector filled from the fitted rungs beside it, under a hull holding
+no point (`step_linear_fit.fill_rungs`), named under the law's `filled` and, by
+law, its `filled_rungs`.
 
 A law fitted on an MTP record holds a draft law of its own form under `draft`.
 Its terms, named `draft.<kind>.<feature>`, are the step's `draft_terms`, priced from the
@@ -92,6 +118,8 @@ step it adds the drafter's draft-KV pass, which runs before
 `forward_done_event`, so its terms are the target's. A draft law with
 `output_prefill_kv` true prices that pass on a prefill step that produces
 output by its prefill vector, whose terms there are the target's too.
+A data-parallel rank's dummy forward (`BatchView.dp_dummy`) runs no draft-KV
+pass, so neither prices one there: its draft is the rest of the draft law's.
 A serial drafter's draft law may hold a `forward` vector over the prefill
 vector's base features, with `passes`, the draft forwards its `propose` runs.
 On a decode and on a prefill step that produces output it prices the draft
@@ -117,6 +145,7 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
     VECTOR = {"coefficients": {<feature>: seconds, ...},
               "hull": HULL,
               "rowmod": k,    # a decode vector with a `rowmod` coefficient only
+              "duty_tau": s,  # a prefill vector with a `cold_peer_rows` coefficient only
               "declared": "<where it was fitted>",  # optional
               "held_out": {"hull": HULL, "bands": {<band>: ERRORS, ...}}}  # optional
 
@@ -137,11 +166,17 @@ import math
 from collections.abc import Mapping
 
 from atom.compass.backends.base import CostBackend, Granularity
-from atom.compass.backends.cost import CostTerm, StepCost, eager_beside_peer
+from atom.compass.backends.cost import (
+    CostTerm,
+    StepCost,
+    eager_beside_peer,
+    idle_group_dummy,
+)
 from atom.compass.backends.hull import Hull
 from atom.compass.backends.provenance import Method, Provenance, Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.backends.shape import (
+    DUTY_TAU,
     IMAGES,
     BatchView,
     RequestShape,
@@ -160,10 +195,15 @@ PREFILL_EXTRA = (
     "cached_seqs",
     "moe_rows",
     "serial_moe_rows",
+    "cold_peer_rows",
     "seqs",
     "out",
     "padding",
+    "eager_dummy",
+    "eager_dummy_tail",
 )
+#: The prefill vector's columns over a DP dummy forward run eagerly (`eager_dummy`).
+EAGER_DUMMY = ("eager_dummy", "eager_dummy_tail")
 DECODE = ("step", "context", "graph_padding")
 #: The MoE columns a decode vector may add, over its step's real MoE tokens.
 MOE_COLUMNS = ("moe_tokens", "moe_experts")
@@ -194,17 +234,27 @@ class _Vector:
                     "is a non-negative duration"
                 )
         self.coefficients = tuple(float(coefficients[f]) for f in features)
-        # The intercept, first in `features`, is not a hull coordinate.
-        self.hull = Hull(f"the {name} hull", features[1:], spec["hull"])
+        # The intercept, first in `features`, is not a hull coordinate, nor is
+        # an `EAGER_DUMMY` column, an indicator (`hull_axes`).
+        self.axes = hull_axes(features)
+        axes = tuple(features[i] for i in self.axes)
+        self.hull = Hull(f"the {name} hull", axes, spec["hull"])
         held = spec.get("held_out")
-        self.held_out = held and Hull(
-            f"the {name} held-out hull", features[1:], held["hull"]
-        )
+        self.held_out = held and Hull(f"the {name} held-out hull", axes, held["hull"])
         self.features = features
         self.declared = str(spec.get("declared", "")).strip()
         self.rowmod = int(spec["rowmod"]) if "rowmod" in features else None
         if self.rowmod is not None and self.rowmod < 1:
             raise ValueError(f"the {name} vector's rowmod modulus is {self.rowmod}")
+        self.duty_tau = None
+        if "cold_peer_rows" in features:
+            self.duty_tau = spec.get("duty_tau")
+            if self.duty_tau != DUTY_TAU:
+                raise ValueError(
+                    f"the {name} vector carries cold_peer_rows over a duty of time "
+                    f"constant {self.duty_tau!r}; a view states its duty at "
+                    f"{DUTY_TAU} s"
+                )
         self.buckets = None
         if "padding" in features:
             self.buckets = tuple(sorted(int(b) for b in spec.get("buckets") or ()))
@@ -233,7 +283,12 @@ def moe_column(
     top-k) of `moe_routing`, counts the dummies' rows as one token, since
     every dummy runs the same row."""
     if feature == "moe_experts":
-        return activated_experts(*routing, tokens - max(dummies - 1, 0))
+        reached = tokens - max(dummies - 1, 0)
+        # An idle rank's dummy is an empty batch that adds no token to `tokens` (#3682), so with three idle ranks
+        # beside a one-token decode the subtraction passes below zero and the column, then its term, went negative
+        # (CostTerm refuses it). The step reaches at least the experts of one token; where `reached` was already
+        # one or more, nothing changes.
+        return activated_experts(*routing, max(reached, 1 if tokens or dummies else 0))
     return float(tokens)
 
 
@@ -252,6 +307,64 @@ def token_padding(view: BatchView, buckets: tuple[int, ...]) -> int | None:
     if peak is None:
         return None
     return next((b - tokens for b in buckets if b >= peak), 0)
+
+
+def hull_axes(features) -> tuple[int, ...]:
+    """The positions in `features` of a vector's hull coordinates: all but the
+    intercept, first, and the `EAGER_DUMMY` indicators, which a hull in their
+    extra dimensions would only split into its 0 and 1 faces, at a cost
+    qhull's facet count grows by."""
+    return tuple(i for i, f in enumerate(features) if i and f not in EAGER_DUMMY)
+
+
+def dummy_view(view: BatchView) -> BatchView:
+    """The view of a data-parallel rank's dummy forward at the prefill step a
+    peer's `view` states: the one-token row at position 0 a record's dummy
+    line holds (`ModelRunner.dummy_execution`), producing output as those
+    lines say, with the group's fields its peer states."""
+    import dataclasses
+
+    return dataclasses.replace(
+        view,
+        requests=(RequestShape(1, 1, False),),
+        capture_rung=None,
+        produces_output=True,
+        dp_dummy=True,
+        group_prefills=True,
+        draft_bs=None,
+        target_bs=None,
+        image_tokens=0,
+    )
+
+
+def eager_dummy(view: BatchView, buckets: tuple[int, ...]) -> tuple[int, int] | None:
+    """`EAGER_DUMMY`'s counts for `view`: (1, 1 where its group runs a
+    finishing prompt's tail, `group_tail`, else 0) on a data-parallel rank's
+    dummy forward in a prefill step whose body runs eagerly, past the largest
+    of `buckets` or with none (`token_padding`), else (0, 0); None on such a
+    dummy whose view states no `group_max_tokens`."""
+    if not (view.dp_dummy and view.prefill):
+        return 0, 0
+    if buckets:
+        padding = token_padding(view, buckets)
+        if padding is None:
+            return None
+        if padding:
+            return 0, 0
+    return 1, int(view.group_tail)
+
+
+def cold_peer_rows(view: BatchView) -> float | None:
+    """`view`'s `cold_peer_rows`: the rows its data-parallel group's MoE gather
+    carries from its peers, `moe_rows` less its own tokens (a dummy forward's
+    one row), times one less its `prefill_duty`; 0 on one rank, which has no
+    `moe_rows`. None for a data-parallel view stating no `prefill_duty`."""
+    if view.moe_rows is None:
+        return 0.0
+    if view.prefill_duty is None:
+        return None
+    peers = max(view.moe_rows - sum_tokens(view.requests), 0)
+    return peers * (1.0 - min(max(view.prefill_duty, 0.0), 1.0))
 
 
 def cached_seqs(rows) -> int:
@@ -343,6 +456,7 @@ class StepLinearBackend(CostBackend):
 
     def __init__(self, law: StepLinearLaw, dp: int = 1) -> None:
         self.law = law
+        self.dp = dp
         self.treatments = (UNIFORM_ROUTING,) if dp > 1 else ()
 
     @property
@@ -369,6 +483,9 @@ class StepLinearBackend(CostBackend):
         beside = eager_beside_peer(batch_view, SOURCE)
         if beside is not None and None not in self.law.decode:
             return beside
+        idle = idle_group_dummy(batch_view, self.dp, SOURCE)
+        if idle is not None and batch_view.capture_rung not in self.law.decode:
+            return idle
         terms, kv = self._terms(self.law, batch_view, "")
         drafts = []
         if self.law.draft is not None:
@@ -402,6 +519,15 @@ class StepLinearBackend(CostBackend):
                 counts += (batch_view.moe_rows,)
             if "serial_moe_rows" in vector.features:
                 counts += (0 if batch_view.tbo_tokens else batch_view.moe_rows,)
+            if "cold_peer_rows" in vector.features:
+                cold = cold_peer_rows(batch_view)
+                if cold is None:
+                    raise self._refuse(
+                        batch_view,
+                        "no prefill duty on this data-parallel step, which its "
+                        "peers' MoE rows are priced by",
+                    )
+                counts += (cold,)
             output = batch_view.produces_output
             by_output = {
                 "seqs": len(prefill) if output else 0,
@@ -424,6 +550,15 @@ class StepLinearBackend(CostBackend):
                         "its prefill token graph's bucket holds",
                     )
                 counts += (padding,)
+            if eager := [f for f in EAGER_DUMMY if f in vector.features]:
+                got = eager_dummy(batch_view, vector.buckets or ())
+                if got is None:
+                    raise self._refuse(
+                        batch_view,
+                        "no group_max_tokens on this data-parallel dummy forward, "
+                        "which says whether its group runs the step eagerly",
+                    )
+                counts += tuple(dict(zip(EAGER_DUMMY, got))[f] for f in eager)
         else:
             rung, kind = batch_view.capture_rung, "decode"
             vector = law.decode.get(rung)
@@ -444,15 +579,16 @@ class StepLinearBackend(CostBackend):
             if vector.rowmod:
                 counts += (rowmod([r.context_tokens for r in decode], vector.rowmod),)
         terms, kv = self._priced(law, vector, kind, counts, what), []
+        dummy = batch_view.dp_dummy
         if prefill and law.output_prefill_kv and batch_view.produces_output:
-            terms, kv = [], terms
+            terms, kv = [], ([] if dummy else terms)
         seqs = (1, len(batch_view.requests))
         if prefill and law.propose is not None and batch_view.produces_output:
             propose = law.propose
             if law.short_propose and sum_tokens(prefill) < law.below:
                 propose = law.short_propose
             terms += self._priced(law, propose, "propose", seqs, what)
-        if decode and law.draft_kv is not None:
+        if decode and law.draft_kv is not None and not dummy:
             kv = self._priced(law, law.draft_kv, "draft_kv", seqs, what)
         return terms, kv
 
@@ -471,10 +607,11 @@ class StepLinearBackend(CostBackend):
     def _priced(self, law, vector: _Vector, kind: str, counts: tuple, what: str):
         """`vector`'s terms for a step of features `counts`."""
         detail, source = law.fitted_on, SOURCE
-        if not vector.hull.contains(counts[1:]):
+        point = tuple(counts[i] for i in vector.axes)
+        if not vector.hull.contains(point):
             source = EXTRAPOLATED
             detail = f"{detail}; outside the {what}{vector.name} hull"
-        validated = bool(vector.held_out and vector.held_out.contains(counts[1:]))
+        validated = bool(vector.held_out and vector.held_out.contains(point))
         method = Method.DECLARED if vector.declared else Method.ESTIMATED
         return [
             CostTerm(

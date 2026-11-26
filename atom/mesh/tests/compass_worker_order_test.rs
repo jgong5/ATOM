@@ -55,7 +55,14 @@ async fn picks(seed: u64, order: [usize; 3], path: &str, body: Value) -> Vec<(us
         policy: PolicyConfig::DpSticky,
         ..Default::default()
     };
-    let context = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime =
+        mesh::core::prepare_pool::PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap())
+            .unwrap();
+    let context = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     let seen = Seen::default();
     // Server numbers follow URL order, so they name the same ranks in every run.
     let mut listeners = Vec::new();

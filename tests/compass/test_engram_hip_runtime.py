@@ -7,7 +7,8 @@ and memory it page-locks is pageable to torch's: a torch copy from it faulted
 on MI455. These tests put a copy of torch's `libamdhip64` first on
 `LD_LIBRARY_PATH`, a second file as that image's SDK directory is, and hold
 that the allocator maps no runtime beside torch's, and that with one already
-mapped it declines, so the shard is registered in place through torch.
+mapped it declines, so no shard is page-locked and the group takes the host
+path.
 
 CPU-only: nothing calls into the runtime, so no driver is needed. Each case
 runs in its own interpreter, since a mapped runtime cannot be unmapped.
@@ -56,7 +57,7 @@ def torch_hip(tmp_path):
 def child(lib_dir, body):
     """`body` run in a fresh interpreter, after `import torch` and with
     `lib_dir` first on `LD_LIBRARY_PATH`; the JSON it prints last."""
-    env = dict(os.environ, ATOM_ENGRAM_UVA_COPY="1")
+    env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = os.pathsep.join(
         p for p in (str(lib_dir), os.environ.get("LD_LIBRARY_PATH")) if p
     )
@@ -100,19 +101,17 @@ def test_the_allocator_binds_the_runtime_torch_maps_not_the_one_named_first(
     assert malloc_in == torch_hip
 
 
-def test_with_a_second_runtime_mapped_the_shard_is_registered_in_place(
-    torch_hip, tmp_path
-):
+def test_with_a_second_runtime_mapped_no_shard_is_page_locked(torch_hip, tmp_path):
     seen = child(
         tmp_path,
         """
         ctypes.CDLL("libamdhip64.so")
         loaded = hip_files()
-        host_memory._register = lambda sources, leases: "registered in place"
+        bound = host_memory._hip_runtime() is not None
         out = host_memory.pin_rows([torch.zeros(4096, dtype=torch.uint8)])
-        print(json.dumps([loaded, out]))
+        print(json.dumps([loaded, bound, out]))
         """,
     )
-    loaded, out = seen
+    loaded, bound, out = seen
     assert len(loaded) == 2 and torch_hip in loaded
-    assert out == "registered in place"
+    assert not bound and out is None

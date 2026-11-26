@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import Counter
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,7 +49,7 @@ from atom.compass.artifacts import (
     member_name,
 )
 from atom.compass.backends.step_grid_plan import plan
-from atom.compass.bench import measure, window
+from atom.compass.bench import measure, replay, window
 from atom.compass.drive import gpu, serve
 from atom.compass.drive import run as drive_run
 from atom.compass.fit.samples import load
@@ -58,26 +59,30 @@ from atom.config import Config
 
 
 class Bench:
-    """The bench, measuring each batch at its token count in microseconds."""
+    """The bench, measuring each batch at its token count in microseconds, every
+    burst alike, so a point keeps two bursts; `measured` holds each burst's
+    batch, `bursts` its token count and repeats."""
 
-    started, measured = [], []
+    started, measured, bursts = [], [], []
     refuse = None
 
     def __init__(self, config, num_blocks):
         config.num_kvcache_blocks = num_blocks
         Bench.started.append(config)
 
-    def measure(self, batch):
+    def measure(self, batch, repeats):
         Bench.measured.append(batch)
+        Bench.bursts.append((batch.total_tokens_num, repeats))
         if Bench.refuse and batch.total_tokens_num == Bench.refuse:
             return {"protocol": window.PROTOCOL, "refused": "a planted refusal"}
         ns = 1_000 * batch.total_tokens_num
         return {
             "protocol": window.PROTOCOL,
             "median_ns": ns,
-            "repeats": [[ns, 0, ns]] * 3,
+            "repeats": [[ns, 0, ns]] * repeats,
             "discarded": 0,
             "preload_ns": 5,
+            "group_needs_eager": False,
         }
 
     def exit(self):
@@ -105,6 +110,7 @@ def run(tmp_path, monkeypatch, model_dir):  # noqa: F811
     monkeypatch.setattr(measure, "start_bench", Bench)
     monkeypatch.setattr(Bench, "started", [])
     monkeypatch.setattr(Bench, "measured", [])
+    monkeypatch.setattr(Bench, "bursts", [])
 
     def run(*args, out="out"):
         args = list(args)
@@ -174,7 +180,7 @@ def test_measuring_one_record_twice_publishes_each_view_once_and_then_nothing(ru
     store = run(rec, "--sample", "all", *run.named(rec))
     lines, split = read(run.record / "steps")[0], served(run.record / "steps", RUNS)[0]
     held = by_view(store)
-    assert set(held) == views(lines) and len(Bench.measured) == len(held)
+    assert set(held) == views(lines) and len(Bench.measured) == 2 * len(held)
     assert Bench.started[-1] == "exit"
     for view, (key, member) in held.items():
         assert measure._digest({k: member[k] for k in measure.VIEW}) == view
@@ -185,9 +191,11 @@ def test_measuring_one_record_twice_publishes_each_view_once_and_then_nothing(ru
             else f"prefill {'with' if output else 'without'} output"
         )
         assert member["seconds"] == 1e-6 * sum(q for q, *_ in member["rows"])
-        assert member["repeats"] and member["statistic"] == "median"
+        assert member["statistic"] == "median"
+        assert len(member["repeats"]) == 2 * window.BURST
+        assert member["bursts"] == [window.BURST] * 2
         assert member["protocol"] == window.PROTOCOL
-        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 3}
+        assert member["replay_rule"] == {"name": "fresh-contiguous", "version": 4}
         assert member["origin"] == "replay"
         assert member["sources"] == [
             measure.file_digest(run.record / "steps/dp0.jsonl")
@@ -382,7 +390,7 @@ def test_grid_points_are_measured_with_origin_plan_and_new_shapes_add_only_their
     Bench.measured.clear()
     store = run("--grid", token, rec, *grid, *run.named(rec))
 
-    assert len(Bench.measured) == len(views(planned) - views(first))
+    assert len(Bench.measured) == 2 * len(views(planned) - views(first))
     plan_digest = measure._digest(json.loads((run.tmp / "out/plan.json").read_text()))
     record_source = measure.file_digest(run.record / "steps/dp0.jsonl")
     for view, (_, member) in by_view(store).items():
@@ -416,7 +424,7 @@ def test_a_view_both_replayed_and_planned_names_only_its_replay(run):
     held = by_view(store)
     assert views(planned["lines"]) & replayed
     assert set(held) == views(planned["lines"]) | replayed
-    assert len(Bench.measured) == len(held)
+    assert len(Bench.measured) == 2 * len(held)
     for view, (_, member) in held.items():
         if view in replayed:
             assert member["traces"] == [f"trace-{i}" for i in range(4)]
@@ -512,7 +520,9 @@ def test_a_point_planned_past_the_pool_is_measured_with_its_rows_sharing_blocks(
         view = measure._digest(measure.view_of(line))
         assert held[view][1]["shared"] == line["shared"] > 0
         assert view not in views([line])
-    tables = [[list(t) for t in batch.block_tables] for batch in Bench.measured]
+    # Each point's first burst, the first pass.
+    first = Bench.measured[: len(held)]
+    tables = [[list(t) for t in batch.block_tables] for batch in first]
     assert max(b for table in tables for row in table for b in row) < pool
     # The leading blocks every row of a batch holds alike.
     alike = [
@@ -673,7 +683,172 @@ def test_a_batch_the_bench_refuses_is_not_published_and_is_named_after_the_rest(
         Bench.refuse = None
     held = entries(ArtifactStore(run.tmp / "store"))
     assert refused not in {sum(q for q, *_ in m["rows"]) for _, m in held}
-    assert len(Bench.measured) == len(views(lines)) > len(held)
+    # A point refused in its first burst has no second.
+    refusals = len(views(lines)) - len(held)
+    assert len(Bench.measured) == 2 * len(held) + refusals and refusals > 0
+
+
+def test_every_point_has_its_first_burst_before_any_point_has_its_second(run):
+    """`17` D98: a point's two bursts are a pass of the bench apart, the passes
+    in one order. The fake bench's bursts agree, so each point keeps ten."""
+    rec = str(run.record)
+    store = run(rec, "--sample", "all", *run.named(rec))
+
+    n = len(entries(store))
+    assert Bench.bursts[:n] == Bench.bursts[n:]
+    assert {r for _, r in Bench.bursts} == {window.BURST} and len(Bench.bursts) == 2 * n
+
+
+def tag_batches(monkeypatch):
+    """Each batch the replay rule builds carries its line, as `line`."""
+    built = replay.ReplayRule.batch
+
+    def tagged(self, line, *rest):
+        batch = built(self, line, *rest)
+        batch.line = json.dumps(line, sort_keys=True)
+        return batch
+
+    monkeypatch.setattr(replay.ReplayRule, "batch", tagged)
+
+
+def test_a_point_whose_bursts_disagree_runs_on_to_45_repeats_at_once(run, monkeypatch):
+    """Every prefill point's later bursts run 0.3% slower than its first, past
+    the 0.23% two bursts are kept within: it runs on to 45 right after its
+    second burst, and its value is the median of all 45. Decode points keep 10."""
+    tag_batches(monkeypatch)
+    reply, seen, calls = Bench.measure, Counter(), []
+
+    def drifting(self, batch, repeats):
+        got = reply(self, batch, repeats)
+        seen[batch.line] += 1
+        calls.append((batch.line, repeats))
+        if seen[batch.line] > 1 and batch.total_tokens_num_prefill:
+            ns = round(got["median_ns"] * 1.003)
+            got |= {"median_ns": ns, "repeats": [[ns, 0, ns]] * repeats}
+        return got
+
+    monkeypatch.setattr(Bench, "measure", drifting)
+    rec = str(run.record)
+    store = run(rec, "--sample", "all", *run.named(rec))
+
+    held = by_view(store).values()
+
+    def prefill(line):
+        return not json.loads(line)["rows"][0][2]
+
+    first = calls[: len(held)]
+    rest = window.REPEATS - 2 * window.BURST
+    assert calls[len(held) :] == [
+        call
+        for line, _ in first
+        for call in [(line, window.BURST)] + [(line, rest)] * prefill(line)
+    ]
+    kinds = set()
+    for key, member in held:
+        tokens = sum(q for q, *_ in member["rows"])
+        if key.values["step_kind"].startswith("prefill"):
+            assert member["bursts"] == [window.BURST, window.BURST, rest]
+            assert member["seconds"] == round(1_000 * tokens * 1.003) / 1e9
+        else:
+            assert member["bursts"] == [window.BURST] * 2
+            assert member["seconds"] == 1e-6 * tokens
+        assert len(member["repeats"]) == sum(member["bursts"])
+        kinds.add(key.values["step_kind"].split()[0])
+    assert kinds == {"prefill", "decode"}
+
+
+def test_a_point_held_under_the_first_protocol_is_kept_not_measured_again(
+    run, monkeypatch
+):
+    rec = str(run.record)
+    with monkeypatch.context() as patch:
+        patch.setattr(window, "PROTOCOL", 1)
+        store = run(rec, "--sample", "all", *run.named(rec))
+    held = by_view(store)
+    assert {m["protocol"] for _, m in held.values()} == {1}
+
+    Bench.started.clear()
+    run(rec, "--sample", "all", *run.named(rec))
+    assert Bench.started == [] and by_view(store) == held
+
+
+def clock(monkeypatch, seconds: float = 30.0):
+    """Each burst on the fake bench takes `seconds` of the command's clock."""
+    ticks = itertools.count(0, seconds)
+    monkeypatch.setattr(measure, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+
+
+def test_an_estimate_reads_the_points_held_on_any_ladder_and_source_root_alone(
+    run, monkeypatch
+):
+    """At this model, platform, sampling and engine but its ladder, under this
+    protocol: each point's two 30 s bursts, by step kind."""
+    clock(monkeypatch)
+    rec = str(run.record)
+    store = run(rec, "--sample", "all", *run.named(rec))
+    held = entries(store)
+    values = held[0][0].values
+    own = ("engine_config", "sampling", "step_kind", "view")
+    configuration = {k: v for k, v in values.items() if k not in own}
+    engine, sampling = (json.loads(values[f]) for f in ("engine_config", "sampling"))
+    kinds = Counter(key.values["step_kind"] for key, _ in held)
+
+    past = measure._past(store, configuration, engine, sampling)
+
+    assert {kind: len(seconds) for kind, seconds in past.items()} == kinds
+    assert {s for seconds in past.values() for s in seconds} == {60.0}
+    elsewhere = configuration | {"source_root": "sha256:another"}
+    laddered = engine | {"ladder": [1, 2]}
+    assert measure._past(store, elsewhere, laddered, sampling) == past
+    for other in (
+        (configuration | {"model": "another"}, engine, sampling),
+        (configuration, engine | {"tensor_parallel_size": 8}, sampling),
+        (configuration, engine, sampling | {"temperature": 0.123}),
+    ):
+        assert measure._past(store, *other) == {}
+    monkeypatch.setattr(window, "PROTOCOL", window.PROTOCOL + 1)
+    assert measure._past(store, configuration, engine, sampling) == {}
+
+
+def test_measure_steps_states_each_kinds_points_and_hours_before_it_measures(
+    run, monkeypatch, capsys
+):
+    """The first run draws one view a stratum, with no estimate; the second,
+    every view, estimating each kind the first measured at 60 s a point, and
+    after measuring states the hours each kind took."""
+    clock(monkeypatch)
+    rec = str(run.record)
+    first = run(rec, "--sample", "1", "--seed", "0", *run.named(rec))
+    printed = capsys.readouterr().out.splitlines()
+    held = Counter(key.values["step_kind"] for key, _ in entries(first))
+    assert printed[0] == f"{sum(held.values())} distinct batches, 0 in the store"
+    for kind, n in held.items():
+        assert (
+            f"  {kind}: {n} points, {n} to measure, no estimate: the store holds "
+            "none of this kind measured under this protocol, model, platform and "
+            "engine"
+        ) in printed
+        assert f"bench hours, {kind}: {n * 60 / 3600:.3f} h" in printed
+
+    store = run(rec, "--sample", "all", *run.named(rec))
+    printed = capsys.readouterr().out.splitlines()
+    every = Counter(key.values["step_kind"] for key, _ in entries(store))
+    assert printed[0] == (
+        f"{sum(every.values())} distinct batches, {sum(held.values())} in the store"
+    )
+    hours = 0.0
+    for kind, n in every.items():
+        new = n - held[kind]
+        line = f"  {kind}: {n} points, "
+        if not new:
+            assert line + "all in the store" in printed
+        else:
+            hours += new * 60 / 3600
+            assert (
+                line + f"{new} to measure, about {new * 60 / 3600:.2f} h at 60.0 s a "
+                f"point, the median of {held[kind]} the store holds"
+            ) in printed
+    assert f"about {hours:.2f} h estimated for the kinds above that have one" in printed
 
 
 def test_ragged_measures_the_views_composed_from_each_drawn_decode_view(run):
@@ -690,7 +865,7 @@ def test_ragged_measures_the_views_composed_from_each_drawn_decode_view(run):
         (s["rung"], len(s["rows"]), sum(c for _, c, _ in s["rows"])) for s in decode
     }
     held = entries(store)
-    assert len(held) == len(Bench.measured) > 0
+    assert 2 * len(held) == len(Bench.measured) > 0
     for key, member in held:
         rows, n = member["rows"], len(member["rows"])
         total = sum(c for _, c, _ in rows)
@@ -714,7 +889,9 @@ def test_ragged_composes_across_the_rungs_of_the_ladder_the_record_states(
     ladder = json.loads((run.record / "steps/dp0.engine.json").read_text())["ladder"]
     given, compose = [], measure.ragged.compose
     monkeypatch.setattr(
-        measure.ragged, "compose", lambda *a: given.append(a[-1]) or compose(*a)
+        measure.ragged,
+        "compose",
+        lambda *a, **k: given.append(a[-1]) or compose(*a, **k),
     )
 
     run(rec, "--sample", "2", "--seed", "3", "--ragged", *run.named(rec))
@@ -732,7 +909,7 @@ def test_ragged_under_grid_also_plans_the_cells_of_the_views_it_composes(
     monkeypatch.setattr(
         measure.ragged,
         "compose",
-        lambda seed, *_: [{**seed, "rows": [[1, 1000, True], *seed["rows"][1:]]}],
+        lambda seed, *_, **__: [{**seed, "rows": [[1, 1000, True], *seed["rows"][1:]]}],
     )
     rec = str(run.record)
     definition = run.tmp / "definition.json"
@@ -883,7 +1060,7 @@ class Orphans(Leaves):
         super().__init__(rank, config)
         self.child = int(Path(config.child).read_text())
 
-    def bench_step(self, batch):
+    def bench_step(self, batch, repeats):
         os.kill(self.child, signal.SIGTERM)
         raise RuntimeError("HIP out of memory")
 

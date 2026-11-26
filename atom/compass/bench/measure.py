@@ -44,16 +44,26 @@ A measurement's key is the configuration (model, platform,
 `keyed` engine, source root, `--sampling`), the step kind and the view's
 digest, so a view the store holds is not measured again and a stopped
 invocation resumes; a held entry taken under other readings than this run's
-refuses, naming it. Its member `MEMBER` holds the view, `seconds` (the median
+refuses, naming it; one held under an earlier protocol is kept, not measured
+again. Its member `MEMBER` holds the view, `seconds` (the median
 of the bench's kept repeats, under a drafter of their target's parts, and
-`draft_seconds` that of their drafter's parts), the repeats, the protocol,
-the replay rule, the origin, the inputs it came from (`sources`) and the
+`draft_seconds` that of their drafter's parts), the repeats and how many each
+burst kept (`bursts`), the protocol, `bench_seconds`, the wall time the bench
+took on it, the replay rule, the origin, the inputs it came from (`sources`) and the
 `traces` their lines served, and `group_needs_eager`, true, where the bench
 ran the batch eagerly because an attention backend refused it a graph, as a
 step-record line states it. A batch the rule or the bench refuses is not
 published; the command measures the rest, then fails naming each. `<out>`
 also holds run.json, with the warm-up's and the measuring's boundaries, the
 engine file and the GPU checks.
+
+A point's repeats come in bursts (`window.py`): one pass gives every point its
+first, the next its second, and a point whose two disagree runs on to
+`window.REPEATS` at once; each is published after its last burst. Before
+measuring, the command states each step kind's points, how many it measures,
+and the hours they take at the median `bench_seconds` of the points of that
+kind the store holds under this protocol at this model, platform, sampling and
+engine on any ladder; after, the hours each kind took.
 
 The bench holds the largest KV pool its inputs' engines state, whatever this
 device's own budget gives, so every batch they ran, and every point planned
@@ -69,7 +79,10 @@ import hashlib
 import json
 import os
 import random
+import statistics
 import tempfile
+import time
+from collections import Counter
 from pathlib import Path
 
 from atom.compass.artifacts import (
@@ -136,8 +149,8 @@ def main(argv: list[str]) -> None:
     readings = conditions({**stated, "engine_config": engine})
     configuration |= keyed_platform(Kind.STEP_MEASUREMENT, platform(stated))
     todo = _todo(points, configuration, engine, sampling, store, readings)
-    held = len(points) - len(todo)
-    print(f"{len(points)} distinct batches, {held} in the store", flush=True)
+    past = _past(store, configuration, engine, sampling) if todo else {}
+    print(_statement(points, todo, past), flush=True)
     refused = []
     try:
         if todo:
@@ -188,6 +201,69 @@ def _todo(points, configuration, engine, sampling, store, readings) -> list:
             "entries named"
         )
     return todo
+
+
+def _past(store, configuration: dict, engine: dict, sampling: dict) -> dict:
+    """The `bench_seconds` of each point `store` holds measured under this
+    protocol at `configuration` on any source root, `sampling` and `engine` on
+    any ladder, by step kind: what an estimate reads."""
+    from atom.compass.artifacts.store import ENTRY_FILE
+    from atom.compass.bench.window import PROTOCOL
+
+    stated = {k: v for k, v in configuration.items() if k != "source_root"}
+    stated["sampling"] = json.dumps(sampling, sort_keys=True)
+    unladdered = {k: v for k, v in engine.items() if k != "ladder"}
+    past = {}
+    folder = store.root / Kind.STEP_MEASUREMENT.value
+    for path in sorted(folder.glob(f"*/{ENTRY_FILE}")):
+        try:
+            there = json.loads(path.read_bytes())["key"]
+            ran = json.loads(there["engine_config"])
+            if any(there.get(k) != v for k, v in stated.items()) or unladdered != {
+                k: v for k, v in ran.items() if k != "ladder"
+            }:
+                continue
+            key = Key.of(Kind.STEP_MEASUREMENT, **there)
+            member = json.loads(store.read(key).read_member(*MEMBER))
+        except (OSError, ValueError, KeyError, TypeError, ArtifactRefusal):
+            continue  # an entry an estimate cannot read is no estimate's
+        if member.get("protocol") == PROTOCOL and "bench_seconds" in member:
+            past.setdefault(there["step_kind"], []).append(member["bench_seconds"])
+    return past
+
+
+def _statement(points: dict, todo: list, past: dict) -> str:
+    """Each step kind's points, how many are measured and the hours they are
+    estimated at, the median of the kind's `past` seconds a point."""
+    kinds = Counter(_kind(point["view"]) for point in points.values())
+    measuring = Counter(key.values["step_kind"] for key, _ in todo)
+    held, hours = len(points) - len(todo), 0.0
+    lines = [f"{len(points)} distinct batches, {held} in the store"]
+    for kind in sorted(kinds, key=_in_order):
+        n, line = measuring[kind], f"  {kind}: {kinds[kind]} points, "
+        if not n:
+            lines.append(line + "all in the store")
+        elif seconds := past.get(kind):
+            each = statistics.median(seconds)
+            hours += n * each / 3600
+            lines.append(
+                line + f"{n} to measure, about {n * each / 3600:.2f} h at "
+                f"{each:.1f} s a point, the median of {len(seconds)} the store holds"
+            )
+        else:
+            lines.append(
+                line + f"{n} to measure, no estimate: the store holds none of "
+                "this kind measured under this protocol, model, platform and engine"
+            )
+    if hours:
+        lines.append(f"about {hours:.2f} h estimated for the kinds above that have one")
+    return "\n".join(lines)
+
+
+def _in_order(kind: str) -> tuple:
+    """A step kind's place in a statement, decode rungs by their width."""
+    *words, last = kind.split()
+    return (words, int(last)) if last.isdigit() else (kind.split(), 0)
 
 
 def measurement_key(configuration: dict, engine: dict, sampling, view: dict) -> Key:
@@ -376,6 +452,14 @@ def _points(args, store, engine: dict, sampling: dict, out: Path) -> tuple[dict,
         composed = [(v, p["view"]) for v, p in points.items()] if args.ragged else []
         grid = grid_plan(args, read, composed)
         (out / "plan.json").write_text(json.dumps(grid["plan"], indent=1))
+        planned = grid["plan"]
+        print(
+            f"the plan: {len(planned['lines'])} points, "
+            f"{len(planned['infeasible'])} past a limit and not measured, "
+            f"{len(planned['unplaced'])} steps outside the grid "
+            f"({out / 'plan.json'})",
+            flush=True,
+        )
         made = grid["provenance"]
         for line in grid["plan"]["lines"]:
             _add(points, line, "plan", made["inputs"], made["traces"], made["run"])
@@ -390,13 +474,21 @@ def _ragged(points: dict, read: list, seed) -> dict:
     engine = read[0][2]
     blocks = max(stated["num_kvcache_blocks"] for *_, stated in read)
     size, top = engine["kv_cache_block_size"], engine["max_model_len"]
+    block_drafter = (engine.get("speculative") or (None,))[0] == "dspark"
     sources, traces = [s for s, *_ in read], {t for x in lines for t in x["traces"]}
     out = {}
     for digest, point in sorted(points.items()):
         if _kind(point["view"]).startswith("decode"):
             rng = random.Random(f"{seed} {digest}")
             for view in ragged.compose(
-                point["view"], contexts, rng, blocks, size, top, engine["ladder"]
+                point["view"],
+                contexts,
+                rng,
+                blocks,
+                size,
+                top,
+                engine["ladder"],
+                block_drafter=block_drafter,
             ):
                 _add(out, view, "ragged", sources, traces)
     return out
@@ -549,48 +641,75 @@ def _stratum(view: dict) -> str:
 
 
 def _measure(bench, config, sampling, store, command, readings, todo) -> list[str]:
-    """Measure and publish each (key, point) of `todo`; what was refused, and why."""
+    """Measure and publish each (key, point) of `todo`, its repeats in bursts
+    (`window.py`): every point's first burst in one pass, then every point's
+    second, a point whose two disagree running on to `window.REPEATS` at once;
+    what was refused, and why. It prints the hours each step kind took."""
+    from atom.compass.bench import window
     from atom.compass.bench.replay import ReplayRule
 
     rule, roots, refused = ReplayRule(config, sampling), None, []
-    for key, point in todo:
-        try:
-            batch = rule.batch(point["view"])
-        except ValueError as error:
-            refused.append(f"{key}: {error}")
-            continue
-        got = bench.measure(batch)
-        if "refused" in got:
-            refused.append(f"{key}: {got['refused']}")
-            continue
-        drafter = got.get("draft_median_ns")
-        member = {
-            **point["view"],
-            "seconds": got["median_ns"] / 1e9,
-            **({} if drafter is None else {"draft_seconds": drafter / 1e9}),
-            "statistic": "median",
-            "repeats": got["repeats"],
-            "discarded": got["discarded"],
-            "preload_ns": got["preload_ns"],
-            "protocol": got["protocol"],
-            "replay_rule": batch.replay_rule,
-            "origin": point["origin"],
-            "sources": sorted(point["sources"]),
-            "traces": sorted(point["traces"]),
-        } | ({"plan": point["plan"]} if "plan" in point else {})
-        if got.get("group_needs_eager"):
-            member["group_needs_eager"] = True
-        roots = roots or roots_for({"atom": "atom", "aiter": "aiter"})
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        store.publish(
-            key,
-            provenance=Provenance(command, now, roots),
-            topology=Topology(),
-            conditions=readings,
-            gates=GateState.of(),
-            members={member_name(*MEMBER): json.dumps(member).encode()},
-        )
-        ms = got["median_ns"] / 1e6
-        named = f"{point['origin']} {key.values['step_kind']} {key.token()}"
-        print(f"measured {named}: {ms:.3f} ms", flush=True)
+    bursts, clock, hours = [[] for _ in todo], [0.0] * len(todo), Counter()
+    for second in (False, True):
+        for i, (key, point) in enumerate(todo):
+            if second and not bursts[i]:
+                continue  # refused in the first pass
+            try:
+                # Built again each pass: a row holds a token at each position.
+                batch = rule.batch(point["view"])
+            except ValueError as error:
+                refused.append(f"{key}: {error}")
+                continue
+            repeats = window.BURST
+            while repeats:
+                started = time.monotonic()
+                got = bench.measure(batch, repeats)
+                clock[i] += time.monotonic() - started
+                if "refused" in got:
+                    break
+                bursts[i].append(got)
+                repeats = window.more(bursts[i]) if second else 0
+            if "refused" in got:
+                refused.append(f"{key}: {got['refused']}")
+                bursts[i].clear()
+                continue
+            if not second:
+                continue
+            got = window.joined(bursts[i])
+            drafter = got.get("draft_median_ns")
+            member = {
+                **point["view"],
+                "seconds": got["median_ns"] / 1e9,
+                **({} if drafter is None else {"draft_seconds": drafter / 1e9}),
+                "statistic": "median",
+                "repeats": got["repeats"],
+                "bursts": got["bursts"],
+                "discarded": got["discarded"],
+                "preload_ns": got["preload_ns"],
+                "protocol": got["protocol"],
+                "bench_seconds": clock[i],
+                "replay_rule": batch.replay_rule,
+                "origin": point["origin"],
+                "sources": sorted(point["sources"]),
+                "traces": sorted(point["traces"]),
+            } | ({"plan": point["plan"]} if "plan" in point else {})
+            if got["group_needs_eager"]:
+                member["group_needs_eager"] = True
+            roots = roots or roots_for({"atom": "atom", "aiter": "aiter"})
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            store.publish(
+                key,
+                provenance=Provenance(command, now, roots),
+                topology=Topology(),
+                conditions=readings,
+                gates=GateState.of(),
+                members={member_name(*MEMBER): json.dumps(member).encode()},
+            )
+            kind = key.values["step_kind"]
+            hours[kind] += clock[i] / 3600
+            ms, n = got["median_ns"] / 1e6, len(got["repeats"])
+            named = f"{point['origin']} {kind} {key.token()}"
+            print(f"measured {named}: {ms:.3f} ms, {n} repeats", flush=True)
+    for kind in sorted(hours, key=_in_order):
+        print(f"bench hours, {kind}: {hours[kind]:.3f} h", flush=True)
     return refused

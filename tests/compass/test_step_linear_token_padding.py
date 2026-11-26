@@ -307,7 +307,7 @@ def test_the_published_law_pads_to_the_records_buckets_as_the_command_does(tmp_p
         engine.write_text(json.dumps({**held, "prefill_buckets": BUCKETS}))
     fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
 
-    law = member(tmp_path / "store", law_key(), "params")
+    law = member(tmp_path / "store", law_key(tmp_path / "store"), "params")
     assert law["prefill"]["buckets"] == BUCKETS
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     out = tmp_path / "law.json"
@@ -347,6 +347,7 @@ def test_a_record_states_the_prefill_buckets_its_runner_recorded(tmp_path, monke
 @pytest.mark.parametrize("dp", [1, 2])
 def test_the_projection_states_the_groups_largest_rank(dp):
     batch = SimpleNamespace(
+        total_seqs_num=1,
         total_seqs_num_prefill=1,
         num_scheduled_tokens=np.array([100]),
         context_lens=np.array([100]),
@@ -358,9 +359,12 @@ def test_the_projection_states_the_groups_largest_rank(dp):
         ub_tokens_across_dp=None,
         max_bs_across_dp=1,
         any_rank_needs_eager=False,
+        max_final_requests_across_dp=0,
     )
     mode = SimpleNamespace(
         use_cudagraph=False,
+        is_prefill=True,
+        tbo_collective_active=False,
         running_tokens_are_unified=dp == 1,
         running_bs=1,
         running_tokens=100,

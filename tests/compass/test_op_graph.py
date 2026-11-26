@@ -68,6 +68,7 @@ ATTENTION = "aiter.unified_attention_with_output_base.default"
 GATHER = "atom.model_ops.moe:all_gatherv"
 DECODE = view((1, 900, True), (1, 300, True), rung=2)
 PREFILLS = "--prefill 512 2 --prefill 300 3"
+QWEN3 = pathlib.Path(__file__).with_name("qwen3_0_6b_config.json")
 
 
 def g(m, n, k):
@@ -1389,9 +1390,10 @@ def test_a_run_file_price_list_without_op_graph_is_refused(monkeypatch, tmp_path
 # --- a shape no graph holds, traced in the run -----------------------------------
 
 
-def _reader(graph, model) -> SimpleNamespace:
-    """A run's config of the 27B at `model`, keyed as the capture keyed `graph`."""
-    hf = SimpleNamespace(architectures=json.loads(CONFIG.read_text())["architectures"])
+def _reader(graph, model, config=CONFIG) -> SimpleNamespace:
+    """A run's config of the 27B (or the model `config` describes) at `model`,
+    keyed as the capture keyed `graph`."""
+    hf = SimpleNamespace(architectures=json.loads(config.read_text())["architectures"])
     return SimpleNamespace(
         model=str(model),
         hf_config=hf,
@@ -1438,13 +1440,18 @@ def test_a_shape_no_graph_holds_is_traced_in_the_run_as_trace_ops_traces_it(
     assert lazy["lazy_traces"] == 1 and lazy["lazy_trace_wall_seconds"] > 0
 
 
-def _lazily(ahead, tmp_path_factory, root, *atom_args, **engine):
-    """The run's lookup of the 27B under `engine`'s config fields into the
-    store at `root`, tracing a missing shape from the server's `atom_args`, and
-    its counts."""
-    (graph, _), *_ = captured(ahead, PREFILLS).values()
-    model = next(tmp_path_factory.getbasetemp().glob("tp1*/model"))
-    config, lazy = _reader(graph, model), _counts()
+def _lazily(ahead, tmp_path_factory, root, *atom_args, model_config=CONFIG, **engine):
+    """The run's lookup of the 27B (or the model `model_config` describes)
+    under `engine`'s config fields into the store at `root`, tracing a missing
+    shape from the server's `atom_args`, and its counts."""
+    if model_config == CONFIG:
+        prefills = captured(ahead, PREFILLS)
+    else:
+        prefills = capture(1, PREFILLS, tmp_path_factory, model_config)
+    (graph, _), *_ = prefills.values()
+    stem = "tp1" if model_config == CONFIG else model_config.stem
+    model = next(tmp_path_factory.getbasetemp().glob(f"{stem}*/model"))
+    config, lazy = _reader(graph, model, model_config), _counts()
     vars(config).update(engine)
     args = ["--model", str(model), *atom_args]
     return _op_graphs(str(root), config, "gfx942", args, lazy), lazy
@@ -1453,10 +1460,17 @@ def _lazily(ahead, tmp_path_factory, root, *atom_args, **engine):
 def test_a_prefill_two_batch_overlap_would_split_is_traced_lazily_as_one_forward(
     ahead, tmp_path_factory, tmp_path, monkeypatch
 ):
-    # ATOM splits a prefill under --enable-tbo from this many tokens on.
+    # ATOM splits a prefill under --enable-tbo from this many tokens on, on a
+    # model whose attention a micro-batch can carry: it refuses TBO on a GDN
+    # model such as the 27B.
     monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "256")
     lookup, lazy = _lazily(
-        ahead, tmp_path_factory, tmp_path, "--enable-tbo", enable_tbo=True
+        ahead,
+        tmp_path_factory,
+        tmp_path,
+        "--enable-tbo",
+        model_config=QWEN3,
+        enable_tbo=True,
     )
 
     assert isinstance(lookup("prefill", 512, 2), dict)

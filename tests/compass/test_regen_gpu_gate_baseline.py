@@ -179,6 +179,19 @@ def test_the_gate_passes_against_the_baseline_it_regenerates(tmp_path):
     assert f"left out on {ARCH}: tests/test_stall.py (3 tests)" in gate.stdout
 
 
+def test_a_regen_run_by_a_relative_path_leaves_out_what_the_skip_list_names(
+    tmp_path,
+):
+    # It measures from inside the base's extraction, where the caller's
+    # relative path to the scripts names no skip list.
+    root, _ = _setup(tmp_path)
+    out = _run(tmp_path, root, f"{COMPASS}/regen_gpu_gate_baseline.sh ../base.tar")
+    assert out.returncode == 0, out.stdout
+    assert f"left out on {ARCH}: tests/test_stall.py (3 tests)" in out.stdout
+    env = (root / PAIRS / ARCH / WRITTEN[0]).read_text().splitlines()
+    assert "BASE_LEFT_OUT=3" in env and "BASE_FAILED=2" in env
+
+
 # id: (exit status, text the refusal carries, how the setup changes)
 REFUSALS = {
     "runs-disagree": (

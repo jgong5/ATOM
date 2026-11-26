@@ -40,7 +40,7 @@ from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.op_graph import OpGraphBackend
 from atom.compass.backends.op_work import work
-from atom.compass.backends.work import gemm, price
+from atom.compass.backends.work import Work, gemm, price
 from atom.compass.capture import graph_key, lookup, population_shapes
 from atom.compass.capture.forward import structure
 from atom.compass.run import _op_graphs
@@ -51,7 +51,8 @@ CONFIG = pathlib.Path(__file__).with_name("qwen3_5_35b_a3b_fp8_config.json")
 CONFIG_ARCHITECTURES = json.loads(CONFIG.read_text())["architectures"]
 MACHINE = TREE / "tests" / "compass" / "machines" / "mi308x-hjbog39.json"
 ATTENTION = "aiter.unified_attention_with_output_base.default"
-SAMPLER = "atom.model_ops.rejection_sampler:rejection_sample"
+#: The target's verify of its rows' drafts, from its verify head's ids.
+VERIFIER = "atom.model_ops.verify_ids:IdVerifier.launch"
 ARGMAX = "aiter.ops.flydsl.topk.topk_per_row_argmax:topk_per_row_argmax"
 MOE = "aiter.rocm_aiter_fused_moe.default"
 #: Two rows, each verifying one draft and its bonus token.
@@ -137,11 +138,12 @@ def test_a_verify_step_is_cut_at_forward_done_event_into_target_and_drafter(
     ours, theirs = (_ops(graphs[key]["region"]) for key in (target, f"{target} draft"))
     vocab = json.loads(CONFIG.read_text())["text_config"]["vocab_size"]
 
-    # The target verifies each row's drafts and its bonus token, and samples.
+    # The target runs each row's drafts and its bonus token, and verifies them
+    # from its head's ids.
     assert {op["args"]["q"]["shape"][0] for op in ours if op["op"] == ATTENTION} == {
         2 * (drafts + 1)
     }
-    assert SAMPLER in {op["op"] for op in ours} - {op["op"] for op in theirs}
+    assert VERIFIER in {op["op"] for op in ours} - {op["op"] for op in theirs}
     # The drafter runs its layer once per draft, each through the shared
     # embedding and LM head.
     names = [op["op"] for op in theirs]
@@ -171,10 +173,31 @@ def _priced(root, drafter, batch, ep=1, dp=1):
     cost = backend.price(batch)
 
     def drafted(width):
+        """Each leaf priced under its kind, and a resource_bound `Par` as one
+        roofline over its branches' summed work: the verify's ids, which the
+        drafter's graph opens by copying to the host on a side stream."""
         flat: dict = {}
-        for op in _ops(drafter["region"]):
-            if (w := work(op, batch, 1, "bf16", width)) is not None:
-                flat.setdefault(f"draft op.{op['op']}", []).append(price(w, machine))
+
+        def walk(region):
+            if "par" in region:
+                assert region["join"] == "resource_bound"
+                works = (work(op, batch, 1, "bf16", width) for op in _ops(region))
+                summed = sum((w for w in works if w is not None), Work())
+                flat.setdefault("draft par.resource_bound", []).append(
+                    price(summed, machine)
+                )
+            elif "op" in region:
+                if (w := work(region, batch, 1, "bf16", width)) is not None:
+                    name = f"draft op.{region['op']}"
+                    flat.setdefault(name, []).append(price(w, machine))
+            elif "repeat" in region:
+                for _ in range(region["count"]):
+                    walk(region["repeat"])
+            else:
+                for item in region["seq"]:
+                    walk(item)
+
+        walk(drafter["region"])
         return {name: fold_seconds(s) for name, s in flat.items()}
 
     return cost, drafted
@@ -190,7 +213,7 @@ def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(ep, tmp_path_fa
     # The drafter's experts run over the target's EP ranks, as ATOM builds them.
     moe = f"draft op.{MOE}"
     assert (drafted(ep)[moe] == drafted(1)[moe]) == (ep == 1)
-    assert f"op.{SAMPLER}" in {t.name for t in cost.terms}
+    assert f"op.{VERIFIER}" in {t.name for t in cost.terms}
 
 
 def test_a_middle_chunk_is_cut_where_its_draft_kv_pass_starts(tmp_path_factory):
@@ -298,6 +321,7 @@ def dp_view(width, rung, dp, counts=None):
     `rung`, every rank of `dp` alike or at its tokens in `counts`, as
     `batch_view` builds it from the step's mode."""
     batch = SimpleNamespace(
+        total_seqs_num=width,
         total_seqs_num_prefill=0,
         num_scheduled_tokens=[2] * width,
         context_lens=[90] * width,
@@ -313,7 +337,10 @@ def dp_view(width, rung, dp, counts=None):
             scheduled_tokens_per_dp_rank=counts,
             ub_tokens_across_dp=None,
             any_rank_needs_eager=False,
+            max_final_requests_across_dp=0,
         ),
+        is_prefill=False,
+        tbo_collective_active=False,
         running_tokens_are_unified=True,
         running_tokens=2 * rung,
         running_bs=rung,
@@ -471,6 +498,7 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
     assert attended[0] == attended[1]
 
     batch = SimpleNamespace(
+        total_seqs_num=1,
         total_seqs_num_prefill=1,
         num_scheduled_tokens=[64],
         context_lens=[64],
@@ -486,7 +514,10 @@ def test_a_dp_middle_chunk_is_cut_where_its_drafter_s_propose_starts(
             max_bs_across_dp=1,
             ub_tokens_across_dp=None,
             any_rank_needs_eager=False,
+            max_final_requests_across_dp=0,
         ),
+        is_prefill=True,
+        tbo_collective_active=False,
         running_tokens_are_unified=False,
         running_tokens=64,
         running_bs=1,
@@ -518,6 +549,7 @@ def verify_view(width, rung):
     """One rank's view of a decode of `width` rows, each verifying one draft,
     replaying `rung`, as `batch_view` builds it from the step's mode."""
     batch = SimpleNamespace(
+        total_seqs_num=width,
         total_seqs_num_prefill=0,
         num_scheduled_tokens=[2] * width,
         context_lens=[90] * width,
@@ -545,8 +577,9 @@ def test_a_decode_padded_to_its_rung_prices_its_drafter_at_its_rows(
     assert set(graphs) == {(False, "decode B=4"), (True, "decode B=4")} | {
         (True, "decode T=3 B=4")
     }
-    # Its first pass runs the rows' 6 tokens; the rung's traces 8.
-    for shape, tokens in (("decode T=3 B=4", 6), ("decode B=4", 8)):
+    # Its first pass runs the target's stream at the rung's 8 tokens, as
+    # ATOM's propose does since upstream b7b5ec3f2; so does the rung's.
+    for shape, tokens in (("decode T=3 B=4", 8), ("decode B=4", 8)):
         ops = _ops(graphs[True, shape]["region"])
         assert {op["args"]["q"]["shape"][0] for op in ops if op["op"] == ATTENTION} == {
             tokens

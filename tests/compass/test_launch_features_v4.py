@@ -28,8 +28,8 @@ from atom.compass.parity import ENV, read
 from atom.compass.runner.overrides import HostDeviceRecurrence
 from atom.compass.runner.projection import forward_mode
 from atom.utils.tbo import ubatch_wrapper
-from atom.utils.tbo.ubatch_splitting import maybe_create_ubatch_slices
-from atom.utils.tbo.ubatching import local_tbo_precompute
+from atom.utils.tbo.ubatch_splitting import cut_decode_ubatches, cut_prefill_ubatches
+from atom.utils.tbo.ubatching import prefill_tbo_vote
 
 ARCH = "DeepseekV4ForCausalLM"
 V4 = REGISTRY[ARCH]
@@ -54,27 +54,28 @@ def _record(tmp_path, monkeypatch, decode_graphs, split_from, captured=0):
 
     def run_model(self, input_ids, batch):
         """`prepare_model`'s split and `run_model`'s dispatch, as ATOM's."""
-        mode, prefill = forward_mode(batch, self), batch.total_seqs_num_prefill
+        mode = forward_mode(batch, self)
         if not mode.use_cudagraph:
             context.ubatch_slices = None
-            if mode.tbo_collective_active:
-                context.ubatch_slices = maybe_create_ubatch_slices(
-                    num_reqs=prefill or batch.total_seqs_num,
-                    scheduled_tokens=batch.total_tokens_num,
-                    is_prefill=bool(prefill),
-                    num_scheduled_tokens=(
-                        batch.num_scheduled_tokens if prefill else None
-                    ),
-                    force=True,
+            if mode.tbo_collective_active and mode.is_prefill:
+                context.ubatch_slices = cut_prefill_ubatches(
+                    batch.total_seqs_num_prefill,
+                    batch.num_scheduled_tokens,
+                    mode.running_tokens,
+                )
+            elif mode.tbo_collective_active:
+                context.ubatch_slices = cut_decode_ubatches(
+                    mode.running_bs,
+                    mode.running_tokens,
+                    np.asarray(batch.num_scheduled_tokens[: mode.scheduled_bs]),
                 )
             self.model(None, None)
         return "logits"
 
     def eligibility(self, batch):  # `_local_tbo_eligibility` off prefill CP
-        prefill = batch.total_tokens_num_prefill > 0
-        return local_tbo_precompute(
-            self.config, batch, prefill, batch.num_scheduled_tokens
-        )
+        if not batch.has_prefill:
+            return (False, False, 0, 0)
+        return prefill_tbo_vote(batch.total_tokens_num_prefill)
 
     base = recorded.__mro__[-2]
     monkeypatch.setattr(base, "run_model", run_model)

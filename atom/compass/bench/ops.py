@@ -122,7 +122,9 @@ that takes it, as its loader builds it before the runner's KV pool is sized,
 its runners' peer memory with it (`_comm_fused`), with the leaf's arguments,
 its stated group width and reduction aside, and, where it holds no shared
 expert's output, as under ATOM's dual-stream MoE, zeros at the rows its
-stage 2 asks for, built once (`Stub._comm_fused`).
+stage 2 asks for, built once (`Stub._comm_fused`). One DP rank alone builds
+no runtime, a drafter's load included, its layers keeping their backend with
+none (`_unbuilt_comm_fused`), and the leaf refuses as a collective does.
 MORI's dispatch and combine are methods of a handle no graph holds: each is
 called at MORI's entry point on the handle ATOM builds for the model's MoE,
 with the leaf's arguments, and, since neither runs twice in a row, timed
@@ -525,6 +527,9 @@ _TOPK = "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block"
 # aiter's other decode top-ks: FlyDSL's multi-CTA one (gfx950's) and HIP's
 _MULTI = "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode"
 _PICK = "aiter._top_k_per_row_decode.default"
+# aiter's decode top-k as its routed operator, which picks its kernel itself:
+# what DeepSeek-V4.1's scorer calls since upstream b7b5ec3f2
+_ROUTED = "aiter_routed.top_k_per_row_decode.default"
 _INDPTRS = "atom.model_ops.attentions.deepseek_v41.indices"
 _SCAN = f"{_INDPTRS}:_launch_indptr_scan"
 _INDICES = f"{_INDPTRS}:_launch_indices"
@@ -554,7 +559,11 @@ V41_NAMES = {
     (_MULTI, "row_starts", "packed"): _OFFSETS,
     (_MULTI, "seq_lens"): "step.visible.{ratio}",
     (_PICK, "seqLens"): "step.visible.{ratio}",
+    (_ROUTED, "seqLens"): "step.visible.{ratio}",
     (_FUSED, "plan_gpu"): _PLAN,
+    # the rows its pool write takes, a plan of the ratio's own since upstream
+    # b7b5ec3f2
+    (_FUSED, "write_plan"): "step.plans.{ratio}.write_plan_gpu",
     ("atom.model_ops.deepseek_v41.index_write:write_index_rows", "plan"): _PLAN,
     (_INDICES, "pptr"): f"{_CACHE}.0",
     (_INDICES, "eptr"): f"{_CACHE}.1",
@@ -587,6 +596,9 @@ V41_NAMES = {
     },
     ("aiter.fused_moe_.default", "num_local_tokens"): "scheduled_tokens_gpu",
     ("aiter.topk_gating_fwd.default", "num_valid_rows"): "scheduled_tokens_gpu",
+    # aiter's routed top-k gating, which V4.1's router calls since upstream
+    # b7b5ec3f2
+    ("aiter_routed.topk_gating.default", "num_valid_rows"): "scheduled_tokens_gpu",
 }
 #: DeepSeek-V4's arguments, keyed and bound as `V4_METADATA`'s, to operators
 #: other models run too, which a runner binds so only beside a DeepSeek-V4 CSA
@@ -631,6 +643,7 @@ PAGE_WIDE = {
     _TOPK: ("row_ends", "logits", "stride0"),
     _MULTI: ("seq_lens", "logits", "stride0"),
     _PICK: ("seqLens", "logits", "stride0"),
+    _ROUTED: ("seqLens", "logits", "stride0"),
     _MAXIMA: ("visible", "logits", "maxima", "blocks"),
     f"{_V41}.unit_table:unit_table": ("block_tables", "block_tables"),
 }
@@ -680,6 +693,7 @@ _WRITTEN = {
     (_MULTI, "row_starts"): "context",
     (_MULTI, "seq_lens"): "context",
     (_PICK, "seqLens"): "context",
+    (_ROUTED, "seqLens"): "context",
     (_MAXIMA, "packed.0"): "offsets",
     (_MAXIMA, "packed.1"): "block_offsets",
     **{
@@ -911,7 +925,9 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     runs its target's leaves less the LM head and the sampler, so the
     target's points at output cover both. A graph traced under this ATOM
     source and torch answers (`capture.graph_key`), else one whose files read
-    here as in its trace (`capture.lookup_by_files`). A miss where the store
+    here as in its trace (`capture.lookup_by_files`), loaded as a run loads it
+    (`run.load_graph`): one whose row states another torch, ATOM source or
+    model refuses, naming the axis. A miss where the store
     holds the shape under another engine config or torch, or of a file that
     reads otherwise, refuses naming what differs. A
     two-batch-overlap micro-batch's `shape` reads its own graph, and a shape
@@ -919,6 +935,7 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture import graph_key, lookup_by_files
     from atom.compass.capture.forward import missed, structure
+    from atom.compass.run import graph_readings, load_graph
 
     shape = shape._replace(real=None)
     at = structure(
@@ -942,7 +959,8 @@ def graph(store, config, shape, arch=None, output=True, draft=False) -> dict:
             f"source and torch{why}",
             "compass trace ops captures one under this process's environment",
         )
-    return json.loads(store.read(key).read_member("graph", RANK, "json"))
+    entry = load_graph(store, key, graph_readings(config.model))
+    return json.loads(entry.read_member("graph", RANK, "json"))
 
 
 def leaves_at(
@@ -955,8 +973,9 @@ def leaves_at(
     step's (`parts`), where a capture keeps a decode's drafter's graph alone:
     the leaves of the drafter's graphs there at each output (`graph`'s
     `output`) `own` holds, as its steps read them. With `drafter`, only the
-    leaves some graph of the drafter's holds, each as the whole shape has it."""
-    from atom.compass.artifacts import ArtifactRefusal
+    leaves some graph of the drafter's holds, each as the whole shape has it.
+    A drafter's graph the store holds that refuses here (`graph`) refuses."""
+    from atom.compass.artifacts import ArtifactRefusal, Rule
 
     if own:
         found, target = {}, set()
@@ -970,7 +989,9 @@ def leaves_at(
         for output, draft in DRAFTED if spec else ():
             try:
                 region = graph(store, config, shape, arch, output, draft)["region"]
-            except ArtifactRefusal:
+            except ArtifactRefusal as refused:
+                if refused.rule is not Rule.RESOLUTION:
+                    raise
                 continue
             held |= leaves(region).keys()
             leaves(region, None, found)
@@ -1106,7 +1127,8 @@ def _runner(config, rank: int):
     on the device and then freed for the weights each leaf builds, and with
     the MORI exchange ATOM's loader builds before it, MORI's heap with it, in
     its `mori` (`_prepare_finalize`) where its MoE exchanges through MORI, and
-    the runtime of aiter's comm-fused MoE in its `comm_fused` (`_comm_fused`);
+    the runtime of aiter's comm-fused MoE in its `comm_fused` (`_comm_fused`),
+    but for one DP rank run alone (`_unbuilt_comm_fused`);
     the runner attributes the allocation set are in its `kv_held`, and by path each
     tensor it bound on a metadata builder (`BUILDERS`, `_bound`) but a view the
     builder cut from one of the runner's (`_cut_from`); and, when
@@ -1117,13 +1139,14 @@ def _runner(config, rank: int):
     from torch.distributed import TCPStore
 
     from atom.compass.bench.ranks import agreed, cpu_group
-    from atom.model_engine.model_runner import ModelRunner, RapidServeModelRunner
+    from atom.model_engine.model_runner import ModelRunner
+    from atom.model_engine.model_setup import build_model
+    from atom.model_loader.weight_utils import params_on_meta
 
     class MetaRunner(ModelRunner):
-        def _build_and_load_model(self, model_class):
-            with RapidServeModelRunner._init_weight_params_on_meta():
-                self.model = model_class(self.config)
-            torch.set_default_device(None)
+        def _build_and_load_model(self, config, model_class, device):
+            with params_on_meta():
+                return build_model(config, model_class, device)
 
         def _maybe_warmup(self):
             pass
@@ -1144,7 +1167,9 @@ def _runner(config, rank: int):
             wait_for_workers=False,
         )
         pc.data_parallel_base_port, pc._managed_distributed_store = store.port, True
-    runner = MetaRunner(rank, config)
+    alone = getattr(config, "dp_logical_size", 0)
+    with _unbuilt_comm_fused(config) if alone else contextlib.nullcontext():
+        runner = MetaRunner(rank, config)
     runner.store = store
     nbytes = sum(p.nbytes for p in runner.model.parameters())
     held = torch.empty(nbytes, dtype=torch.uint8, device=runner.device)
@@ -1152,7 +1177,8 @@ def _runner(config, rank: int):
     # leaf instead, the heap took room the pool left the leaves' weights
     modules = dict(runner.model.named_modules())
     runner.mori = _prepare_finalize(modules, mori_only=True)
-    runner.comm_fused = _comm_fused(modules)
+    # one rank alone has no group to build it on, and `Stub` refuses its leaf
+    runner.comm_fused = None if alone else _comm_fused(modules)
     blocks = runner.get_num_blocks()["num_kvcache_blocks"]
     del held
     _release()  # the pool takes the room the hold had
@@ -1220,6 +1246,20 @@ def _comm_fused(modules: dict):
         return None
     layer._comm_fused_moe.initialize(layer)
     return layer._comm_fused_moe.runtime
+
+
+def _unbuilt_comm_fused(config):
+    """A context in which ATOM's runner for one DP rank alone loads its
+    drafter's weights with no runtime built for aiter's comm-fused MoE: ATOM's
+    loader builds one there (`init_prepare_finalize`), on a group of the
+    layout's ranks, which a rank alone holds none of, and refuses a group of
+    one. Each layer keeps the backend the layout gives it, with no runtime, as
+    the target's layers do, whose parameters on the meta device load nothing."""
+    if not getattr(config, "speculative_config", None):
+        return contextlib.nullcontext()
+    from atom.model_ops.fused_moe.comm_fused_moe import CommFusedMoeBackend
+
+    return patch.object(CommFusedMoeBackend, "initialize", lambda self, layer: None)
 
 
 class Stub:
@@ -1386,7 +1426,7 @@ class Stub:
         for rows, (step, _) in passes.items():
             if hasattr(step, "request_floors"):
                 split = np.maximum(step.request_positions, step.request_cached_until)
-                self.reach[rows or step.width] = split - step.request_floors
+                self.reach[rows or step.running_tokens] = split - step.request_floors
         # DeepSeek-V4's persistent HCA decode workspace, one per device: a slot
         # of `HCA_DECODE` named as one of its fields is a view of that field
         hca = sys.modules.get("atom.model_ops.v4_kernels.hca_persist")
@@ -1475,7 +1515,8 @@ class Stub:
                                 "cannot tell which ratio's compress plan holds its "
                                 f"{spec['shape'][-1]} rows: trace its shape again"
                             )
-                        top_k = op["op"] in (_TOPK, _MULTI, _PICK) and not index
+                        top_k = op["op"] in (_TOPK, _MULTI, _PICK, _ROUTED)
+                        top_k = top_k and not index
                         bound = V41_NAMES.get(key) == "step.visible.{ratio}"
                         if top_k and ratio is None and untold and bound:
                             raise ValueError(  # a row bound ATOM stages, its ratio's
@@ -1702,8 +1743,9 @@ class Stub:
             dp = self.alone or self.runner.config.parallel_config.data_parallel_size
             moe = shape.gathered or dp * shape.tokens * (drafts + 1)
             self.real = shape.real, dp, moe
-            if dp == 1:  # one rank's batch holds its real rows, padded to the rung
-                batch = shape._replace(tokens=shape.real // (drafts + 1))
+            if dp == 1:  # one rank's batch holds its real rows, padded to the
+                # rung: as few rows as hold them, each verifying its drafts
+                batch = shape._replace(tokens=-(-shape.real // (drafts + 1)))
         rows = point_rows(batch, context, pool, rule.block_size, bool(uncut), drafts)
         if rows is None:
             return refuse(f"its rows need more than the pool's {pool} KV blocks")
@@ -2202,7 +2244,10 @@ class Stub:
                 got = rebuild_object(value["object"], build(path, value["state"], None))
                 cache = getattr(snap.attn_metadata, "cache", None)
                 geometry = getattr(cache, "geometry", None)
-                if value["object"] == RING and hasattr(geometry, "window_bytes"):
+                # A V4.1 pool places its BF16 window rings after its pages; an
+                # FP8 window's ring is on planes of its own, whatever the pages.
+                placed = hasattr(geometry, "window") and not geometry.window_fp8
+                if value["object"] == RING and placed:
                     at = _captured(geometry, op.get("rings", ()))
                     return _ring(geometry, cache.num_pages, got, at)
                 return got
@@ -3078,12 +3123,12 @@ def _widest(shape, stride) -> int:
 def _layers(geometry, captured) -> dict:
     """By page count, the layer of DeepSeek-V4.1's pool `geometry` whose window
     ring a pool of that many pages starts where `captured` (`RING`) does, and
-    its build (`V41PoolGeometry.window`, or `window_bytes` in bytes)."""
+    its build (`V41PoolGeometry.window`)."""
     found = {}
-    for build in (geometry.window, geometry.window_bytes)[: 1 + geometry.window_fp8]:
+    for build in (geometry.window,):
         first = build(0, 0)
         if dataclasses.replace(first, ring_start=captured.ring_start) != captured:
-            continue  # counted in the other unit
+            continue  # not this pool's ring
         # a layer's ring starts this far past the last's, on any pool
         step = build(min(1, geometry.layers - 1), 0).ring_start - first.ring_start
         for layer in range(geometry.layers):
@@ -4177,14 +4222,15 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             want[at[tokens][0], None].add(fam)
     for point, fams in cached_ladder(top_only=True).items():
         want[point] |= fams
-    n = 1
+    n, spec = 1, config.speculative_config
+    drafts = spec.num_speculative_tokens if spec else 0
     while want:
         measure_round(want, n)
         n += 1
         want = cached_ladder(top_only=False) if n == 2 else {}
         dependent = _dependent(done.values())
         families = _families(done.values(), dependent)
-        want = want or _densify(families, tried, step_tokens, dependent)
+        want = want or _densify(families, tried, step_tokens, dependent, drafts)
         want = want or _filled(families, tried, config.max_model_len)
     kinds = Counter(r["op"] for r in done.values() if "refused" not in r)
     print(json.dumps({"points per leaf kind": dict(kinds.most_common())}, indent=1))
@@ -4252,7 +4298,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     `arch`'s; a part's graph
     the store does not hold leaves the step out, by its refusal."""
     from atom.compass.artifacts import ArtifactRefusal
-    from atom.compass.backends.op_graph import band
+    from atom.compass.backends.op_graph import band, counted_rows
     from atom.compass.backends.provenance import Refusal
     from atom.compass.capture.forward import decode
     from atom.compass.fit.ops import PriceList, fit, held_out, ran_counts
@@ -4288,7 +4334,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
         ]
 
     for line, reads in steps:
-        whys = {}
+        whys, rows = {}, counted_rows((q, c) for q, c, _ in line["rows"])
         for part, shape, output, draft in reads:
             by_part.setdefault(part, Counter())["steps"] += 1
             decoding, before = shape.phase == "decode", len(whys)
@@ -4314,7 +4360,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
                     bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
-                    bound += (None if part else _real(line), *tail[1:])
+                    bound += (None if part else _real(line), peak, rows)
                 elif asked:  # a prefill's drafter's leaf at each bound a run asks
                     each = [(*b, mean, top) for b, _ in asked]
                     bound = each if each[1:] else each[0]
@@ -4695,7 +4741,9 @@ def _band(ats, lo, hi) -> slice | None:
     return None if i < 0 or j == len(ats) else slice(min(i, j), max(i, j) + 1)
 
 
-def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
+def _densify(
+    families, tried: set, step_tokens=None, dependent=None, drafts: int = 0
+) -> dict:
     """The point halfway between each two neighbours of a family, or of a
     prefill leaf's token count over cached tokens (`_cut`), more than one
     apart, unless `tried`, that launched different kernels or, in a decode
@@ -4718,8 +4766,15 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
     state G (`exchange_at`): `trace ops` traces such a shape only at a record's
     step. Any other is `_bent` on its line as `fit ops` reads it, taking
     in a gap beside a bend each count of a step (`step_tokens`) at its rows, or
-    at any for a family stating none."""
+    at any for a family stating none. A compressor's decode family
+    (`_compressor`) is a line for each way its points' rows complete a
+    compressed entry, as `fit ops` reads it (`fit.ops.completion`), each
+    halved at the context nearest halfway at which a point's rows
+    (`point_rows`, a drafter of `drafts` verifying past each) complete one so,
+    and each reaching its family's least and most context at the nearest
+    context inside them that does."""
     from atom.compass.capture.forward import decode, prefill
+    from atom.compass.fit.ops import completion
 
     steps = {
         p[2]["op"]
@@ -4756,8 +4811,35 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
         if json.loads(fam)[0] == "prefill":
             lines[line(fam, points)] += points
 
-    want = defaultdict(set)
-    for fam, points in [*families.items(), *across.items()]:
+    # a compressor's decode family as its lines, each reaching its family's ends
+    want, lined, lines_of = defaultdict(set), [], {}
+    for fam, points in families.items():
+        if not (ratio := _compressor(points, moved)):
+            lined.append((fam, points))
+            continue
+        shape, ragged = _marked(points[0][2]), json.loads(fam)[2:]
+
+        def completing(m, shape=shape, ragged=ragged, ratio=ratio) -> tuple:
+            at = (m, *ragged) if ragged else m
+            return completion(
+                point_rows(shape, at, sys.maxsize, 1, False, drafts), ratio
+            )
+
+        lines_of[fam] = completing, ratio
+        least, most = min(p[0] for p in points), max(p[0] for p in points)
+        for done in sorted({completion(p[2]["rows"], ratio) for p in points}):
+            on = [p for p in points if completion(p[2]["rows"], ratio) == done]
+            lined.append((fam, on))
+            low, high = min(p[0] for p in on), max(p[0] for p in on)
+            for end, lo, hi in ((least, least, low - 1), (most, high + 1, most)):
+                if lo > hi or (fam, done, end) in tried:
+                    continue
+                tried.add((fam, done, end))
+                m = _nearest(end, lo, hi, completing, done)
+                if m is not None and (fam, m) not in tried:
+                    tried.add((fam, m))
+                    want[shape, (m, *ragged) if ragged else m].add(fam)
+    for fam, points in [*lined, *across.items()]:
         if isinstance(fam, str) and json.loads(fam)[0] == "exchange G":
             continue
         points = sorted(points, key=lambda p: p[0])
@@ -4787,8 +4869,14 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
                             tried.add((fam, t, r))
                             want[prefill(t, r), cut and cut[1] or None].add(fam)
                 continue
+            if ka == kb and a not in bent or b - a < 2:
+                continue
             mid = (a + b) // 2
-            if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
+            if fam in lines_of:  # a compressor's: the nearest halfway on its line
+                completing, ratio = lines_of[fam]
+                done = completion(record["rows"], ratio)
+                mid = _nearest(mid, a + 1, b - 1, completing, done)
+            if mid is None or (fam, mid) in tried:
                 continue
             if cut and moves(*cut, a, b):
                 continue
@@ -4846,9 +4934,6 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
         head, rows, _ = json.loads(base)
         tokens = [t for t, _ in at]
         for t in sorted(axis[skeletons[base]]):
-            shape = prefill(t, rows) if head == "prefill" else own.get((base, t))
-            if shape is None:
-                continue
             for c in sorted({c for u, c in at if ((base, u), c) not in tried}):
                 fam = json.dumps([*json.loads(base), c], sort_keys=True)
                 fam = base if c is None else fam
@@ -4858,6 +4943,11 @@ def _filled(families, tried: set, max_model_len: int) -> dict:
                     or (fam, t) in tried
                     or (c or 0) > max_model_len - -(-t // rows)
                 ):
+                    continue
+                # the axis holds other row counts' token counts, some fewer
+                # than these rows: a shape is built only inside this range
+                shape = prefill(t, rows) if head == "prefill" else own.get((base, t))
+                if shape is None:
                     continue
                 tried.add((fam, t))
                 want[shape, c or None].add(fam)
@@ -4888,6 +4978,28 @@ def _bent(points, steps=()) -> set:
     return ends
 
 
+def _compressor(points, dependent: dict) -> int:
+    """The compress ratio the leaf of a decode family's `points` takes, a
+    compressor's, of a kind that depends on context (`_dependent`), where its
+    points state their rows; else 0."""
+    record = points[0][2]
+    if not record["shape"].startswith("decode") or "rows" not in record:
+        return 0
+    if not dependent.get(record["op"], True):
+        return 0
+    return json.loads(record["leaf"])["args"].get("ratio") or 0
+
+
+def _nearest(around: int, lo: int, hi: int, of, value) -> int | None:
+    """The number nearest `around`, from `lo` to `hi`, the lower first, at
+    which `of` gives `value`; None where none is."""
+    for d in range(max(around - lo, hi - around) + 1):
+        for m in (around - d, around + d):
+            if lo <= m <= hi and of(m) == value:
+                return m
+    return None
+
+
 def _apart(p, q) -> bool:
     """Whether two points' cold times differ by more than `BENDS` of the
     lower: the line across them may then price a point between them more
@@ -4910,14 +5022,17 @@ def _load(
     """Each of `shapes`' leaves (`leaves_at`, a drafter's own at a shape `own`
     maps to its outputs) into `graphs`, its op_graph captured first when the
     store has none (`_capture`, naming the record directories `records` the
-    shapes are of)."""
-    from atom.compass.artifacts import ArtifactRefusal
+    shapes are of). One the store holds that refuses here (`graph`) refuses:
+    a capture of its shape would be keyed as it is."""
+    from atom.compass.artifacts import ArtifactRefusal, Rule
 
     own, missing = own or {}, []
     for shape in sorted(shapes - graphs.keys(), key=str):  # G and W: None or a count
         try:
             graphs[shape] = leaves_at(store, config, shape, arch, own.get(shape, ()))
-        except ArtifactRefusal:
+        except ArtifactRefusal as refused:
+            if refused.rule is not Rule.RESOLUTION:
+                raise
             missing.append(shape)
     if missing:
         _capture(config, missing, root, arch, atom_args, records)
@@ -5025,5 +5140,16 @@ def _child(fn, *args):
     """`fn(*args)` in a spawned process of its own: the device is free again
     at its end, and a capture's process-wide patches end with it."""
     spawn = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(1, mp_context=spawn) as child:
-        return child.submit(fn, *args).result()
+    # A script read on stdin (`python3 -`, as deploy.sh builds its run file) names itself `<stdin>`, a file spawn
+    # cannot re-import in the child (BrokenProcessPool); `fn` is imported by name, so the child needs no main module.
+    main = sys.modules["__main__"]
+    path = getattr(main, "__file__", None)
+    hidden = path is not None and not os.path.exists(path)
+    if hidden:
+        del main.__file__
+    try:
+        with ProcessPoolExecutor(1, mp_context=spawn) as child:
+            return child.submit(fn, *args).result()
+    finally:
+        if hidden:
+            main.__file__ = path

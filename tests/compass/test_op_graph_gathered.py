@@ -117,9 +117,12 @@ def view(batch, counts, split=None, unified=False, rung=None):
         scheduled_tokens_per_dp_rank=torch.tensor(counts),
         ub_tokens_across_dp=split,
         any_rank_needs_eager=False,
+        max_final_requests_across_dp=0,
     )
     mode = SimpleNamespace(
         sync=sync,
+        is_prefill=batch.has_prefill,
+        tbo_collective_active=split is not None,
         running_tokens_are_unified=unified,
         running_tokens=rung,
         running_bs=rung or 1,

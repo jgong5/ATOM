@@ -15,7 +15,9 @@ them the same way for every line:
   tokens and K drafts, each draft the row's filler, as the scheduler hands
   the batch K drafts a row.
 - No row holds more than `max_model_len` tokens: ATOM's scheduler admits no
-  such request, and its runner's block tables have no room for one.
+  such request, and its runner's block tables have no room for one. Nor does
+  a row hold more KV blocks, its draft round's positions included, than the
+  `ceil(max_model_len / block_size)` columns its runner gives a block table.
 - Each row is a new request, numbered by `Sequence`'s own counter, so no two
   replays share a request.
 - Row i holds `ceil(context / block_size)` KV blocks, contiguous, from a fresh
@@ -74,7 +76,7 @@ from atom.model_engine.sequence import (
 from atom.sampling_params import SamplingParams
 
 NAME = "fresh-contiguous"
-VERSION = 3
+VERSION = 4
 
 
 def state_slots_per_request(config) -> int:
@@ -93,7 +95,7 @@ def seat_states(builder, batch) -> None:
     other cache, and a dummy batch, which runs on scratch state, are left as
     they are."""
     cache = getattr(builder, "cache", None)
-    if cache is None or batch.is_dummy_run:
+    if cache is None or batch.is_dummy_run or not batch.total_seqs_num:
         return
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 
@@ -130,6 +132,7 @@ class ReplayRule:
         self.block_size = config.kv_cache_block_size
         self.num_blocks = config.num_kvcache_blocks
         self.max_model_len = config.max_model_len
+        self.columns = -(-config.max_model_len // self.block_size)
         self.stateful = (
             config.hf_config.model_type
             in InputOutputProcessor._per_req_cache_model_types()
@@ -137,8 +140,11 @@ class ReplayRule:
         self.slots_per_row = state_slots_per_request(config)
         spec = config.speculative_config
         self.drafts = spec.num_speculative_tokens if spec else 0
-        self.lookahead = draft_kv_lookahead(self.drafts)
-        self.successor = spec is not None and not spec.use_dspark()
+        # A block drafter writes its whole block past the anchor, one position
+        # more than a serial one, as the scheduler asks it.
+        block_drafter = spec is not None and spec.use_dspark()
+        self.lookahead = draft_kv_lookahead(self.drafts, block_drafter=block_drafter)
+        self.successor = spec is not None and not block_drafter
 
     def batch(self, line: dict, block: int = 0, slot: int = 0) -> ScheduledBatch:
         """The `ScheduledBatch` `line`'s `rows` and `produces_output` state, its
@@ -163,6 +169,12 @@ class ReplayRule:
             raise ValueError(
                 f"rows {rows} hold a row of {longest} tokens, past max_model_len "
                 f"{self.max_model_len}"
+            )
+        widest = -(-(longest + self.lookahead) // self.block_size)
+        if widest > self.columns:
+            raise ValueError(
+                f"rows {rows} hold a row of {widest} KV blocks, lookahead included, "
+                f"past the {self.columns} columns of ATOM's block table"
             )
         final = bool(line["produces_output"])
         shared = line.get("shared", 0)

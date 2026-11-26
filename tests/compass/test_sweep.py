@@ -172,7 +172,6 @@ def test_one_rank_under_tbo_runs_each_count_past_the_minimum_split_and_says_so(
     monkeypatch.setattr(sweep_plan, "PARKED_TOKENS", 32)
     # `send` copies the server's TBO variables into this process.
     monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "128")
-    monkeypatch.delenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", raising=False)
     library = tmp_path / "library"
     planned, missing, _ = _round(tmp_path, monkeypatch, 1, library, paced, tbo=True)
     # A group of one has no peer to veto a split: A's counts from the minimum
@@ -209,6 +208,26 @@ def test_a_steps_requests_park_decodes_reuse_prefixes_and_fill_before_a_cut():
         for group in groups
     ]
     assert lengths == [[(0, 37), (1, 3), (2, 24)], [(1, 9), (2, 45)]]
+    assert groups[0][0]["prompt_token_ids"][:32] == prefix["prompt_token_ids"]
+
+
+def test_a_prefix_row_a_replaying_engine_starts_a_hash_block_lower_reuses_its_hit():
+    engine = {
+        "max_num_batched_tokens": 64,
+        "enable_dp_attention": True,
+        "kv_cache_block_size": 16,
+        "replays_state": True,
+    }
+    body = {"ignore_eos": True, "max_tokens": 2}
+    tokens = iter(range(10**6))
+    first, _, groups = sweep._requests(
+        [Point(0, ((21, 37),), ("prefix",), 0, False, 7, body)],
+        engine,
+        lambda n: list(itertools.islice(tokens, n)),
+    )
+    # ATOM starts the row at 16, a block below the hit at 32.
+    (prefix,) = first
+    assert len(prefix["prompt_token_ids"]) == 32
     assert groups[0][0]["prompt_token_ids"][:32] == prefix["prompt_token_ids"]
 
 

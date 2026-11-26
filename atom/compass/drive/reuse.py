@@ -17,15 +17,21 @@ outside ATOM's Python passes.
 verdict, `reuse`, `calibrate` or `refused`, from each law file under `LAWS` and
 each step linear law in a store whose key states the config's model, engine
 config and platform, at any ATOM digest and form, the engine config at any
-ladder the config's is a prefix of; of several, reuse comes
-first, then refused, then calibrate. The requirement a verdict names:
+ladder the config's is a prefix of, and of those at one key but their law's
+digest (``fit_src``), the newest (``produced_at``): a refit whose law differs
+is another entry; of several, reuse comes
+first, then refused, then calibrate. A store entry whose key lacks a field its
+kind is keyed by, published before the kind gained it, is passed by. The
+requirement a verdict names:
 
 1. the same key: none there, a store law, or host laws beside it, at another
    ATOM digest than the head's, or a law file whose host key states another,
    or a law the runner refuses for the prefill token-graph buckets it records
    whose records ran at another ATOM digest (`records_atom`) or state none,
    since a calibration of the config records them (calibrate); host laws
-   fitted on another host CPU serve, predicting the host they timed;
+   fitted on another host CPU serve, predicting the host they timed, and of
+   several beside a law, those of this host CPU are taken first, then the
+   newest (``produced_at``): a refit whose laws differ is another entry;
 2. not invalidated: a store law the store refuses to load under the head's
    readings (calibrate);
 3. coverage: a decode rung the config schedules with no vector
@@ -35,7 +41,9 @@ first, then refused, then calibrate. The requirement a verdict names:
    (calibrate); a figure on totals, holding out the costliest step or per step
    at the median past `GATE`, on some held-out run and kind, refused when the
    law's records ran at the head's ATOM digest (`records_atom`), since a
-   calibration refits the same miss, else calibrate.
+   calibration refits the same miss, else calibrate. A law above one pipeline
+   stage is judged on each stage's part under ``stages`` as a law is, the
+   stage named.
 
 A verdict on a law found names, as ``run``, the ``--step-linear`` and
 ``--host-laws`` values a run of it takes, and one on a store's own step linear
@@ -54,6 +62,7 @@ are at their key, since the store refuses a second publish there. `stores`
 orders the stores a candidate is looked up in.
 """
 
+import datetime
 import json
 import subprocess
 from pathlib import Path
@@ -61,6 +70,7 @@ from pathlib import Path
 import atom
 from atom.compass import run as compass_run
 from atom.compass.artifacts import (
+    KEY_FIELDS,
     ArtifactRefusal,
     ArtifactStore,
     Axis,
@@ -149,8 +159,10 @@ def refuse_another_tree(taken: dict) -> None:
 
 
 def stores(shared: str, out: Path) -> list[ArtifactStore]:
-    """The stores a candidate is looked up in, in order: each calibration's own
-    under `out`'s ``cal/``, the latest published into first, then `shared`."""
+    """The stores a candidate is looked up in, in order: each under `out`'s
+    ``cal/``, a calibration's own or the one readings meeting a stale entry are
+    measured into (`check.READINGS`), the latest published into first, then
+    `shared`."""
 
     def latest(root: Path) -> float:
         entries = root.glob(f"*/*/{ENTRY_FILE}")
@@ -175,7 +187,8 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
         if at == (stated, model) and _same(held.get("engine_config"), engine):
             found.append(_law_file(str(path), held, config, machine, atom))
             found[-1]["run"] = [str(path)] * 2
-    for key in _keyed(store, Kind.STEP_LINEAR_LAW, engine, model=model, **stated):
+    laws = _keyed(store, Kind.STEP_LINEAR_LAW, engine, model=model, **stated)
+    for key in _newest(store, laws):
         where = f"{key.kind} {key.token()} in {store.root}"
         if (ran := key.values["source_root"]) != compass_run.source_root(atom):
             why = f"ran at {ran}, and a store entry is never re-keyed"
@@ -193,17 +206,22 @@ def law(store: ArtifactStore, config, machine, atom_args, atom: str) -> dict:
         here |= keyed_platform(Kind.HOST_LAWS, platform)
         hosts = _keyed(store, Kind.HOST_LAWS, engine, **here)
         if not hosts:
-            why = f"{where} has no host laws beside it at the head's ATOM digest"
+            why = (
+                f"{where} has no host laws beside it at the head's ATOM digest "
+                "keyed by fit_src, their laws' own digest"
+            )
             found.append(_verdict("calibrate", 1, why, **read))
             continue
-        hosts.sort(key=lambda k: k.values["host_cpu"] != compass_run.host_cpu())
+        cpu = compass_run.host_cpu()
+        hosts.sort(key=lambda k: (k.values["host_cpu"] != cpu, -_produced(store, k)))
         host = runfile._member(store.read(hosts[0]), "params")
         found.append(_judged(where, step[0], host, config, machine, atom) | read)
         found[-1]["run"] = [key.token(), hosts[0].token()]
     if not found:
         why = (
             f"no step linear law at its key, model {model}, this engine config and "
-            f"platform {stated}, in {store.root} or {LAWS}"
+            f"platform {stated}, in {store.root}, keyed by fit_src, its law's own "
+            f"digest, or in {LAWS}"
         )
         return _verdict("calibrate", 1, why)
     return min(found, key=lambda v: PREFERRED.index(v["verdict"]))
@@ -266,8 +284,7 @@ def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> di
         )
         return _verdict("calibrate", 3, why, law=where, rungs=rungs)
     past = []
-    for name, held in _folded(law).items():
-        of = f" of source {name}" if name else ""
+    for of, held in _folded(law):
         if not held.get("figures"):
             why = f"{where} states no cost-accuracy figures{of}"
             return _verdict("calibrate", 4, why, law=where)
@@ -288,31 +305,66 @@ def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> di
     return _verdict("calibrate", 4, f"{worst}, on records re-keyed {ran}", law=where)
 
 
-def _folded(law: dict) -> dict:
-    """What of `law` states cost-accuracy figures, by source name: each of its
-    `sources` with a vector that prices a step, the prefill one or a decode one
-    (`step_linear_fit._vector_of`), as ``step_linear_fit figures`` folds no
-    other, such as one of host laws alone; else the law itself, named ``""``."""
+def _folded(law: dict) -> list[tuple[str, dict]]:
+    """What of `law` states cost-accuracy figures, each with the words naming
+    it: above one pipeline stage, what of each stage's part under ``stages``
+    does, as of a law, ``of pipeline stage <k>`` added (`fit.steps`); of a
+    law, each of its `sources` with a vector that prices a step, the prefill
+    one or a decode one (`step_linear_fit._vector_of`), as ``step_linear_fit
+    figures`` folds no other, such as one of host laws alone, ``of source
+    <name>``; else the law itself, named by nothing."""
+    if stages := law.get("stages"):
+        return [
+            (f"{of} of pipeline stage {k}", held)
+            for k, part in enumerate(stages)
+            for of, held in _folded(part)
+        ]
     sources = (law.get("sources") or {}).items()
-    priced = {
-        name: source
+    priced = [
+        (f" of source {name}", source)
         for name, source in sources
         if any(v == "prefill" or v.startswith("decode ") for v in source["vectors"])
-    }
-    return priced or {"": law}
+    ]
+    return priced or [("", law)]
 
 
 def _keyed(store: ArtifactStore, kind: Kind, engine: dict, **fields) -> list[Key]:
-    """The keys of `store`'s `kind` entries that state each of `fields` as
-    given, and `engine` as their engine config, less its graph sets."""
+    """The keys of `store`'s `kind` entries at `fields` and `engine`
+    (`at_key`)."""
     keys = []
     for path in sorted((store.root / kind.value).glob(f"*/{ENTRY_FILE}")):
         key = json.loads(path.read_text())["key"]
-        theirs = json.loads(key["engine_config"])
-        theirs.pop(GRAPHS, None)
-        if all(key.get(f) == v for f, v in fields.items()) and _same(theirs, engine):
+        if at_key(kind, key, engine, **fields):
             keys.append(Key.of(kind, **key))
     return keys
+
+
+def _newest(store: ArtifactStore, keys: list[Key]) -> list[Key]:
+    """Of `keys`, `store`'s, in their order, the newest (`_produced`) of those
+    at one key but ``fit_src``, the digest of what was fitted."""
+    newest = {}
+    for key in sorted(keys, key=lambda k: _produced(store, k)):
+        newest[tuple(f for f in key.fields if f[0] != "fit_src")] = key
+    return [key for key in keys if key in newest.values()]
+
+
+def _produced(store: ArtifactStore, key: Key) -> float:
+    """When `store`'s entry at `key` was published, its ``produced_at``, in
+    seconds since the epoch."""
+    entry = json.loads((store.directory_for(key) / ENTRY_FILE).read_text())
+    when = entry["provenance"]["produced_at"]
+    return datetime.datetime.fromisoformat(when).timestamp()
+
+
+def at_key(kind: Kind, key: dict, engine: dict, **fields) -> bool:
+    """Whether `key`, a `kind` key's values, states each of `fields` as given,
+    and `engine` as its engine config, less its graph sets; a key lacking a
+    field `kind` is keyed by, published before the kind gained it, is not."""
+    if not set(KEY_FIELDS[kind]) <= key.keys():
+        return False
+    theirs = json.loads(key["engine_config"])
+    theirs.pop(GRAPHS, None)
+    return all(key.get(f) == v for f, v in fields.items()) and _same(theirs, engine)
 
 
 def _same(there, here: dict) -> bool:

@@ -22,8 +22,8 @@ Two detectors:
     Parses every file under ``atom/`` outside :data:`UNSCANNED_ROOTS` and
     reports calls whose shape can park a thread -- sleeps, socket receives,
     pollers, queue operations, joins, lock and event waits, collectives,
-    device synchronization, sends, device-event polling loops -- and calls
-    that start a thread or process.
+    device synchronization, sends, device-event polling loops, a child
+    process run to its exit -- and calls that start a thread or process.
     Shapes are matched on the call's own text and argument form, never on what
     a name happens to be bound to at runtime, so the match is local and stable.
 
@@ -91,7 +91,6 @@ UNSCANNED_ROOTS: tuple[tuple[str, str], ...] = (
             "atom_lmcache_staging.py",
             "dense/",
             "hybrid/",
-            "mooncake_store/",
         )
     ),
     (
@@ -249,6 +248,20 @@ def _worker_rpc_form(node: ast.Call) -> bool:
     )
 
 
+def _subprocess_form(node: ast.Call) -> bool:
+    """``subprocess.run(cmd)`` waits for its child; ``asyncio.run(main())`` does not.
+
+    ``run`` and ``call`` name unrelated functions and methods all over the
+    tree, so the subprocess module's helpers count only when the call names
+    the module. ``communicate`` is a started process's own method, on whatever
+    name holds the process.
+    """
+    func = node.func
+    if isinstance(func, ast.Attribute) and func.attr == "communicate":
+        return True
+    return ast.unparse(func).startswith("subprocess.")
+
+
 def _starts_one(node: ast.Call) -> bool:
     """``psutil.Process(pid)`` attaches to a running process; it starts none."""
     return not ast.unparse(node.func).startswith("psutil.")
@@ -379,6 +392,23 @@ SHAPES: tuple[Shape, ...] = (
         lambda node: not node.args and not node.keywords,
         in_loop=True,
         parks=False,
+    ),
+    Shape(
+        "subprocess_wait",
+        frozenset(
+            {
+                "run",
+                "call",
+                "check_call",
+                "check_output",
+                "getoutput",
+                "getstatusoutput",
+                "communicate",
+            }
+        ),
+        "starts a process and parks until it exits, or parks until a started "
+        "one exits and its pipes close",
+        _subprocess_form,
     ),
     Shape(
         "thread_start",

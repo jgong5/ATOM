@@ -155,7 +155,7 @@ node's value and stated no band across the others.
 | 1. device datasheet | the SKU | a file, `atom/compass/devices/<sku>.json`, named by SKU or by path | a person, from the vendor's datasheet | `fit device --assume-from` and every command that prices |
 | 2. platform readings | device, stack, PTL and torch, its key | a `platform_readings` store entry, one per key, never replaced, or a shipped law's platform's committed copy (below) | `compass fit device`, from the probe records `compass measure device` publishes per node, or from another device's entry, assumed (D26) | every command that prices |
 | 3. network file | the scale-out network | a file, `atom/compass/networks/<name>.json`, named by name or by path | a person, or the class 3 probe (D26) | a run across nodes |
-| 4. host block | the host CPU, ATOM source, model, engine config, device, stack and torch, the host laws' key | the `host_laws` entry's `tokenizer` and `http_intake` terms (D25); the router's hop its `hops`' `router_s` | `compass fit host`, from `compass record`'s records (`07` D38); `router_s` stated, an assumed 1.5 ms ([#3009](https://github.com/jgong5/ATOM/issues/3009)) | `run`'s tokenizer and HTTP intake charges (`06` D33) |
+| 4. host block | the host CPU, ATOM source, model, engine config, the laws' own digest, device, stack and torch, the host laws' key | the `host_laws` entry's `tokenizer` and `http_intake` terms (D25); the router's hop its `hops`' `router_s` | `compass fit host`, from `compass record`'s records (`07` D38); `router_s` stated, an assumed 1.5 ms ([#3009](https://github.com/jgong5/ATOM/issues/3009)) | `run`'s tokenizer and HTTP intake charges (`06` D33) |
 | 5. keys | — | the platform fields of every artifact key (`07` D41) | every publisher, from what its inputs read | every reader |
 
 **Stack** here is ROCm's version, aiter's commit and RCCL's version, the matrix's
@@ -456,7 +456,8 @@ compass measure device --gpu G... [--pp] --store S --out D     [GPU, every card 
     -> one probe record per node
 compass fit device     RECORD... --store S --out D   [no GPU]
     -> one platform_readings entry per (device, stack, PTL, torch)
-compass fit device     --device DATASHEET --assume-from DEVICE --ptl P --store S --out D
+compass fit device     --device DATASHEET --assume-from DEVICE --ptl P [--stack STACK] \
+                       --store S --out D
     -> one platform_readings entry, every field assumed
 ```
 
@@ -478,8 +479,9 @@ are immutable (`07` D41 rule 4). A node probed after the fit adds a record and l
 entry as it is.
 
 **A device never run gets an assumed entry.** `fit device --assume-from DEVICE` takes the
-one readings entry the store holds for DEVICE at `--ptl`, divides it by DEVICE's
-datasheet, and states the ratios for the device `--device` names, every field assumed:
+one readings entry the store holds for DEVICE at `--ptl`, and at `--stack` when given,
+divides it by DEVICE's datasheet, and states the ratios for the device `--device` names,
+every field assumed:
 each derate, the bandwidth curve over DEVICE's bandwidth, and the kernel floor and the
 link and carrier terms as they are; a compute format the source states no rate for is
 left out, so the composition leaves its peak out (D25 rule 2). This is the rule `compass

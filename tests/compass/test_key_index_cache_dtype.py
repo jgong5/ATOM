@@ -54,6 +54,8 @@ def served(tmp_path, monkeypatch, gfx, config_json, *args):
     """ATOM's config of a server of the model `config_json` describes, under
     ATOM's arguments `args`, on a `gfx` device, as `compass run` builds it."""
     monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx", lambda: gfx)
+    # The index cache's layout reads the device's own arch (upstream b7b5ec3f2).
+    monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx_runtime", lambda: gfx)
     model = tmp_path / config_json.stem
     model.mkdir(exist_ok=True)
     (model / "config.json").write_bytes(config_json.read_bytes())
@@ -103,18 +105,22 @@ def test_a_step_law_fitted_on_one_side_refuses_the_other_naming_it(
     assert named in str(e.value)
 
 
-@pytest.mark.parametrize(
-    "gfx, config_json, args",
-    [("gfx942", V4_PRO, DPA_TP8), ("gfx950", QWEN, [])],
-    ids=["v4-pro-gfx942", "qwen3"],
-)
-def test_an_index_cache_that_follows_the_kv_cache_keys_as_before(
-    tmp_path, monkeypatch, gfx, config_json, args
-):
-    config = served(tmp_path, monkeypatch, gfx, config_json, *args)
+def test_an_index_cache_that_follows_the_kv_cache_keys_as_before(tmp_path, monkeypatch):
+    config = served(tmp_path, monkeypatch, "gfx950", QWEN)
 
     assert config.index_cache_dtype == config.kv_cache_dtype
     assert "index_cache_dtype" not in keyed(config)
+
+
+def test_v4_pro_at_gfx942_keys_its_fp8_index_apart_from_the_kv_it_falls_back_to(
+    tmp_path, monkeypatch
+):
+    # Since upstream b7b5ec3f2 V4's FP8 KV falls back to BF16 off gfx950 and
+    # gfx1250, and its index cache stays FP8 there.
+    config = served(tmp_path, monkeypatch, "gfx942", V4_PRO, *DPA_TP8)
+
+    assert (config.kv_cache_dtype, config.index_cache_dtype) == ("bf16", "fp8")
+    assert keyed(config)["index_cache_dtype"] == "fp8"
 
 
 @pytest.mark.parametrize("ep", [[], ["--enable-expert-parallel"]], ids=["tp4", "ep4"])

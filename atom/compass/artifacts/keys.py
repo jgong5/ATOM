@@ -88,10 +88,14 @@ OWN_FIELDS: Mapping[Kind, tuple[str, ...]] = {
         "step_kind",
         "view",
     ),
-    Kind.STEP_LINEAR_LAW: ("model", "engine_config", "source_root", "form"),
+    # `fit_src` the digest of the law (`step_linear_fit.fit_src`), so a refit
+    # whose law differs is another entry.
+    Kind.STEP_LINEAR_LAW: ("model", "engine_config", "source_root", "form", "fit_src"),
     # The values `run.host_key` reads, the engine config as its sorted JSON
-    # since a key holds only strings and numbers.
-    Kind.HOST_LAWS: ("host_cpu", "atom_src", "model", "engine_config"),
+    # since a key holds only strings and numbers; `fit_src` the digest of the
+    # laws without their key (`step_linear_fit.fit_src`), so a refit whose laws differ
+    # is another entry.
+    Kind.HOST_LAWS: ("host_cpu", "atom_src", "model", "engine_config", "fit_src"),
     # `engine_config` names the one the grid was planned for; `grid` names
     # the grid definition with its margin.
     Kind.STEP_GRID_BUNDLE: ("model", "engine_config", "grid", "source_root"),

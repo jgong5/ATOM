@@ -256,9 +256,6 @@ def install(tmpdir: str, arch: str, read: dict | None = None) -> dict:
     flags = {
         # The default custom vocab gather needs the device communicator.
         "ATOM_USE_CUSTOM_ALL_GATHER": "0",
-        # The packed H2D transport reads `.numpy()` and device pointers off one
-        # staging block; direct copies each buffer with its own `copy_`.
-        "ATOM_H2D_BACKEND": "direct",
         # aiter's CU count, which it would otherwise ask rocminfo for.
         "CU_NUM": str(props.multi_processor_count),
         # aiter's check that every rank sets it all-reduces over a group whose
@@ -480,12 +477,19 @@ def group(tp: int, dp: int) -> dict:
     dist.all_gather_into_tensor, dist.broadcast = all_gather_into_tensor, broadcast
     dist.all_to_all_single = all_to_all_single
     dist.barrier = lambda *args, **kwargs: None  # no shape, nobody to wait for
+    # A rank-local verdict every rank of a CPU group takes alike (the agreed KV
+    # budget among them): every rank of a capture is this one, so the group's
+    # most is this rank's own value, with no all-reduce on a fake tensor.
+    from atom.distributed import group_agreement
+
+    group_agreement.group_max = lambda value, group: value
     return {
         "world_size": parallel_state.get_tp_group().world_size,
         "dp": parallel_state.get_dp_group().world_size,
         "declined": ["device_communicator", "message_queue_broadcaster", "barrier"],
         "functional": ["all_gather_into_tensor", "broadcast", "all_to_all_single"],
         "communicator_checked_only": ["fused_allreduce_rmsnorm_quant_per_group"],
+        "own_verdict": ["group_max"],
     }
 
 
@@ -494,6 +498,33 @@ def uncached_bytes(nbytes, device):
     declared device: a plain tensor, since a capture reads no value through
     it and every rank of a capture is this one."""
     return torch.empty(nbytes, dtype=torch.uint8, device=device)
+
+
+def scratch_word(scratch, area, name=""):
+    """A mono runner's copy word for its dual area, as a capture declares it:
+    0, every XCD reading each page's copy 0, the word ATOM falls back to when
+    its NUMA calibration finds no home rule. The calibration times round trips
+    on the device; the word is a kernel argument, not a build's constant, so
+    the kernels a capture records are the same whatever it is."""
+    return 0
+
+
+class PeerView(peer_memory.PeerView):
+    """Every rank's address of a device allocation this rank holds, on the
+    declared device: no IPC handle exchange, since every rank of a capture is
+    this one, so every peer's address is this rank's. Closing it unmaps
+    nothing."""
+
+    def __init__(self, make_local, rank=0, npes=1, group=None, what="peer memory"):
+        if not 0 <= rank < npes:
+            raise ValueError(f"rank must be in [0, {npes}), got {rank}")
+        self.rank, self.npes, self.group = rank, npes, group
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        self._remote_bases, self._safety_barrier_complete = [], True
+        self.local_address = make_local()
+        self.addresses = torch.full(
+            (npes,), self.local_address, dtype=torch.int64, device=self.device
+        )
 
 
 class PeerBuffer(peer_memory.PeerBuffer):

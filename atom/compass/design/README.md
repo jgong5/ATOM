@@ -234,7 +234,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L3 | `CostBackend` interface, granularity, the method vocabulary | [`02`](02_model_runner_and_cost_backend.md) | D11 |
 | L3 | Memory model, KV pool reuse, the `lmcache_offload` tier | [`03_memory_and_kv_model.md`](03_memory_and_kv_model.md) | D13–D16 (+ D13.1) |
 | L3 | Model capture, Cost IR | [`04_model_capture_and_cost_ir.md`](04_model_capture_and_cost_ir.md) | D17–D23 (+ D18.1) |
-| L3 | Fitting, law selection, hull guard | [`09_fitting_and_law_selection.md`](09_fitting_and_law_selection.md) | D53–D62 |
+| L3 | Fitting, law selection, hull guard; a pipeline stage's law | [`09_fitting_and_law_selection.md`](09_fitting_and_law_selection.md) | D53–D62 (+ D54.1) |
 | L3 | Analytical laws, the step roofline; host time on a host no record ran on | [`10_analytical_laws.md`](10_analytical_laws.md) | D63–D70, D121 |
 | L3 | Step grid backend (step-level), a stage-2 candidate | [`17`](17_step_grid_backend.md) | D96–D105 |
 | L3 | The pass record and the one label rule for host-paced device time | [`18`](18_pass_record_and_host_paced_time.md) | D107 |
@@ -604,7 +604,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`19`](19_adoption.md) | Adoption | One `compass advice` command checks a space the user provides, simulates every candidate whose law exists and recommends a configuration; calibration stays apart, reached through the store, and calibrated data is reused only under the reuse requirements. Every run writes its per-request split and a report. Developed on DeepSeek-V4-Pro, shown on MiniMax-M3. |
+| [`19`](19_adoption.md) | Adoption | One `compass advice` command checks a space the user provides, simulates every candidate whose law exists and recommends a configuration; calibration stays apart, reached through the store, and calibrated data is reused only under the reuse requirements. Every run writes its per-request split and a report. Developed on MiniMax-M3.1-Flash's 1P1D recipe on pit2's MI355X, shown on MiniMax-M3. |
 
 ---
 
@@ -620,7 +620,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D27 – D35 (+ D34.1, D35.1) | `06` Workload Harness Contract |
 | D36 – D43 (+ D38.1, D40.1), D106, D118, D119 | `07` Calibration and Benchmarking Toolchain |
 | D43.1, D44 – D52 (+ D45.1, D50.1, D50.2, D50.3) | `08` Validation Protocol |
-| D53 – D62 | `09` Fitting and Law Selection |
+| D53 – D62 (+ D54.1) | `09` Fitting and Law Selection |
 | D63 – D70 (+ D67.1), D121 | `10` Analytical Laws |
 | D71 – D77 | `11` Engine Metrics under Virtual Time |
 | D78 – D81 | `13` The Configuration Surface |

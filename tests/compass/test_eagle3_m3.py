@@ -260,7 +260,7 @@ def _publish_remapped(store, machine, argv, env) -> None:
     from test_memory_readings import publish_readings
 
     from atom.compass.drive import run as drive_run
-    from atom.model_engine.model_runner import support_model_arch_dict
+    from atom.models.registry import support_model_arch_dict
     from atom.utils import resolve_obj_by_qualname
 
     with mock.patch.dict(os.environ, env, clear=True):

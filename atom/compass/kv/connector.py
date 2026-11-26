@@ -7,9 +7,17 @@ prompt's KV into decode's blocks, and both learn when the write is done. Only
 the scheduler half takes part, on the engine's step loop and the LP clock of
 the `LPRuntime` installed in the engine's process:
 
-- Decode, in `update_state_after_alloc`, sends the write request on the
-  ``kv_write_req`` channel (arrival ``a``) and is ready at ``c + notify``,
-  where the notify latency is that channel's lookahead.
+- Decode, in `update_state_after_alloc`, queues the write request, and
+  sends it on the ``kv_write_req`` channel (arrival ``a``) once the device
+  has run the forward its engine dispatches next, the admission step's or,
+  above DP width one, the group's dummy that follows an admission step with
+  nothing to run (`device_done`); with no forward to follow, at its KV
+  poll, once the last forward's device work is done. Mooncake's
+  write-request thread synchronizes the device before it posts what was
+  queued (`_post_queued_write_requests`), and the engine has launched the
+  admission step's forward by then, so under deferred output the request
+  leaves as the step after the admission step returns. Decode is ready at
+  ``c + notify``, where the notify latency is that channel's lookahead.
 - Prefill records a finished request's data-ready time ``r`` in
   `request_finished`, takes the write requests inline in `process_completions`
   and is done at ``c``. A write request for a request that has not
@@ -54,7 +62,9 @@ from __future__ import annotations
 
 import collections
 import logging
+import math
 import pickle
+import weakref
 
 from atom.compass.kv.handoff import SIMULATED_ENGINE_ID, transfer_params, whole_number
 from atom.compass.kv.transfer import Link, TransferModel
@@ -81,6 +91,22 @@ def engine_id(lp: str) -> str:
     lp = lp.partition("-pp")[0]
     index = lp.removeprefix("engine-P") if lp.startswith("engine-P") else ""
     return f"{SIMULATED_ENGINE_ID}-p{index}" if index else SIMULATED_ENGINE_ID
+
+
+#: The consumers built in this process, each told of every forward its
+#: engine's workers return (`forward_returned`).
+_CONSUMERS: weakref.WeakSet[SimulatedKVConnectorScheduler] = weakref.WeakSet()
+
+
+def forward_returned(reply) -> None:
+    """Tell each consumer built in this process that its engine's workers
+    returned the forward, or the DP group's dummy, whose reply is `reply`: its
+    device work ends at the reply's ``device_end``, the runner's
+    `HostDeviceRecurrence` end, or with none at its return.
+    `atom.compass.run.engine` has the engine's `call_func` call this."""
+    end = getattr(reply, "device_end", None)
+    for consumer in list(_CONSUMERS):
+        consumer.device_done(end)
 
 
 class UnboundSeam(RuntimeError):
@@ -172,6 +198,13 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         self._awaiting_send: set[str] = set()
         # Requests aborted while claimed and before any write request.
         self._aborted: set = set()
+        # Decode: (request, blob, blocks) of each write request queued for
+        # the device, and when the last forward's device work ends.
+        self._queued: list = []
+        self._device_end = -math.inf
+        # Above DP width one an admission step with nothing to run is followed
+        # by the group's dummy forward.
+        self._dummies = getattr(parallel, "data_parallel_size", 1) > 1
         self._socks: dict[tuple[str, int], clock.WrappedSocket] = {}
         if getattr(parallel, "pipeline_parallel_rank", 0):
             return  # Mooncake reports a send on the head stage only.
@@ -218,6 +251,8 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         self._peers = {engine_id(peer): peer for peer, _ in self._socks}
         # The write request's latency, and the write-done notice's.
         self._latency_s = table.lookahead(pairs[0])
+        if not self.is_producer:
+            _CONSUMERS.add(self)
 
     def _written(self, pair, a: float, blocks: int) -> float:
         """When the last prefill stage's write of `blocks`, arriving at `a` on
@@ -253,7 +288,8 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         )
 
     def update_state_after_alloc(self, seq) -> None:
-        """Decode: send the write request and clear the flag, as Mooncake does.
+        """Decode: queue the write request for the device and clear the flag,
+        as Mooncake does; it leaves at `device_done` or at the KV poll.
 
         The engine parks the request right after this call, so every write
         request has a parked request waiting for it.
@@ -283,13 +319,32 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         ):
             computed = seq.num_cached_tokens // self._hash_block_size
         blocks = len(seq.block_table) - computed
-        key, a = self._send(params, blocks)
-        self._due[seq.id] = self._written(key, a, blocks) + self._latency_s
+        self._queued.append((seq.id, params, blocks))
 
-    def _send(self, params, blocks) -> tuple[tuple[str, int], float]:
+    def device_done(self, end: float | None) -> None:
+        """Decode: the forward the engine dispatched last returned, its device
+        work ending at `end`, or with None at its return: every write request
+        queued before it leaves then, no earlier than now. Mooncake's
+        write-request thread synchronizes the device, and with it this
+        forward, which the engine launched first, before it posts them."""
+        now = self._rt.now
+        self._device_end = max(self._device_end, now if end is None else end)
+        self._post(self._device_end)
+
+    def _post(self, t: float) -> None:
+        """Decode: send every queued write request, leaving at `t`, no earlier
+        than now, and time its write from its arrival."""
+        a = max(t, self._rt.now) + self._latency_s
+        for req_id, params, blocks in self._queued:
+            key, _ = self._send(params, blocks, a)
+            self._due[req_id] = self._written(key, a, blocks) + self._latency_s
+        self._queued.clear()
+
+    def _send(self, params, blocks, a=None) -> tuple[tuple[str, int], float]:
         """Decode: send the request's write request, or with `blocks` None its
         notice that none will come, to the prefill deployment and rank that
-        served it; its rank pair and its arrival there."""
+        served it, arriving at `a`, by default after the channel's latency;
+        its rank pair and its arrival there."""
         peers = self._peers
         peer = (
             peers[params["remote_engine_id"]]
@@ -297,9 +352,9 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             else next(iter(peers.values()))
         )
         key = peer, params["dp_rank"] if self._wide else 0
-        # The arrival `stamp_send` gives this send.
-        a = self._rt.now + self._latency_s
-        self._socks[key].send(pickle.dumps((params["transfer_id"], blocks, a, key[1])))
+        a = self._rt.now + self._latency_s if a is None else a
+        message = pickle.dumps((params["transfer_id"], blocks, a, key[1]))
+        self._socks[key].send(message, at=a)
         return key, a
 
     def request_finished(self, seq) -> None:
@@ -399,9 +454,16 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             )
 
     def process_completions(self, output):
-        """Take the write requests released so far; report what the clock had
-        reached at the previous call."""
+        """Take the write requests released so far; post the ones queued with
+        no forward to follow, at width one; report what the clock had reached
+        at the previous call.
+
+        Write requests still queued here were queued by a step that
+        dispatched no forward: at DP width one none follows, and the device
+        has only the last forward's work to finish."""
         self._take_write_requests()
+        if self._queued and not self._dummies:
+            self._post(self._device_end)
         # The engine's aggregation keeps one poll in flight, so a poll returns
         # the snapshot the workers took at the previous poll: report that one.
         now = self._rt.read_clock()
@@ -418,4 +480,4 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
 
     def has_pending_work(self) -> bool:
         """Keeps an idle decode engine polling until its parked requests are ready."""
-        return bool(self._due or self._snapshot)
+        return bool(self._due or self._snapshot or self._queued)

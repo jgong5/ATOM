@@ -28,7 +28,8 @@ Its publisher states the readings `conditions` takes. The engine-config reading
 is `keyed`, as JSON: the ladder the runner replays (none under
 ``enforce_eager``), the KV block size and dtype, the quantization with its
 layer names as the model's runner remaps them (`quantization`), the TP and
-DP widths, DP attention, expert parallelism, TBO, the MoE backend, the
+DP widths, above one pipeline stage the stages and each one's layer span
+(`PP_LAYERS`), DP attention, expert parallelism, TBO, the MoE backend, the
 all-to-all backend, EPLB, DeepSeek-V4.1 decoder SWA bounded replay and the
 compilation level when off ATOM's default, the index cache's dtype where ATOM
 resolved it apart from the KV cache's, whether mori imports where it does not,
@@ -66,9 +67,11 @@ summary records the digest of the bundle it priced with.
 
 import functools
 import importlib.util
+import io
 import json
 import os
 import pickle
+import sys
 import tempfile
 from collections.abc import Mapping
 from types import FunctionType, SimpleNamespace
@@ -141,6 +144,10 @@ REMAP_ARCH = "gfx950"
 #: The digest of a drafter's config.json, keyed only where it is not the
 #: target's, which every key already holds as its model's.
 DRAFT = "draft_model"
+#: Each pipeline stage's ``[start, end)`` span of the model's layers, keyed above
+#: one stage: ``VLLM_PP_LAYER_PARTITION`` moves it, and an override naming the
+#: default split leaves it where it was.
+PP_LAYERS = "pp_layers"
 
 
 def keyed(config, ladder: bool = True) -> dict:
@@ -150,13 +157,21 @@ def keyed(config, ladder: bool = True) -> dict:
     model config's overrides only when it states some, and the performance
     environment of this process less the client's and the device selection
     (`keyed_env`), and under speculation its method and draft width, and
-    `DRAFT` (`_draft`); the ladder only with `ladder`."""
+    `DRAFT` (`_draft`); the ladder only with `ladder`. Above one pipeline stage
+    it states the stages and `PP_LAYERS`, each stage's layer span as ATOM's
+    `get_pp_indices` gives it; at one stage, neither."""
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
 
     spec = getattr(config, "speculative_config", None)
     drafts = {"speculative": [spec.method, spec.num_speculative_tokens]} if spec else {}
     drafts |= _draft(config, spec) if spec else {}
+    if (pp := getattr(config, "pipeline_parallel_size", 1)) > 1:
+        from atom.models.utils import get_pp_indices
+
+        layers = config.hf_config.num_hidden_layers
+        drafts["pipeline_parallel_size"] = pp
+        drafts[PP_LAYERS] = [list(get_pp_indices(layers, k, pp)) for k in range(pp)]
     if ladder:
         drafts["ladder"] = [] if config.enforce_eager else schedulable_ladder(config)
     if importlib.util.find_spec("mori") is None:
@@ -208,15 +223,35 @@ def quantization(config) -> str:
     them before it builds: by `remapped` where the runner has not, and as it is
     where the packed modules the remap leaves on it say it has, since a second
     remap can rename a name again. A config naming no layer, or with no remap,
-    has none to apply."""
+    has none to apply. Both reach the remap pickled by `_ByName`."""
     held = config.quant_config
     if (
         hasattr(held, "remap_layer_name")
         and not hasattr(held, "packed_modules_mapping")
         and any(getattr(held, name) for name in LAYERS)
     ):
-        return remapped(pickle.dumps((held, config.hf_config)))
+        out = io.BytesIO()
+        _ByName(out).dump((held, config.hf_config))
+        return remapped(out.getvalue())
     return held.compute_hash()
+
+
+class _ByName(pickle.Pickler):
+    """Pickles a class its module no longer binds as the class its module now
+    binds by that name. A tokenizer load runs a remote-code config module again
+    where it was imported by name, as `drive.run._config` imports it unpickling
+    its child's config, so the config holds a class pickle refuses; the remap's
+    own process reads either class by its name."""
+
+    def reducer_override(self, obj):
+        if isinstance(obj, type):
+            name = obj.__qualname__
+            now = getattr(sys.modules.get(obj.__module__), name, obj)
+            if isinstance(now, type) and now is not obj and now.__qualname__ == name:
+                from atom.utils import resolve_obj_by_qualname
+
+                return resolve_obj_by_qualname, (f"{obj.__module__}.{name}",)
+        return NotImplemented
 
 
 @functools.cache
@@ -236,7 +271,7 @@ def _remapped(pickled: bytes) -> str:
     with tempfile.TemporaryDirectory(prefix="compass-remap-") as tmpdir:
         driverless.install(tmpdir, REMAP_ARCH)  # before anything imports aiter
         quant, hf_config = pickle.loads(pickled)
-        from atom.model_engine.model_runner import support_model_arch_dict
+        from atom.models.registry import support_model_arch_dict
         from atom.utils import resolve_obj_by_qualname
 
         arch = hf_config.architectures[0]

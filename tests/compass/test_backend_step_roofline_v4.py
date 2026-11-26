@@ -318,9 +318,12 @@ def test_the_batch_view_states_the_real_tokens_among_the_gathered_rows():
         scheduled_tokens_per_dp_rank=torch.tensor([3, 2]),
         ub_tokens_across_dp=None,
         any_rank_needs_eager=False,
+        max_final_requests_across_dp=0,
     )
     mode = SimpleNamespace(
         sync=sync,
+        is_prefill=False,
+        tbo_collective_active=False,
         running_tokens_are_unified=True,
         running_tokens=4,
         use_cudagraph=True,
@@ -339,9 +342,15 @@ def test_a_rank_s_view_names_its_own_slot_of_the_split():
         scheduled_tokens_per_dp_rank=torch.tensor([7, 7]),
         ub_tokens_across_dp=((4, 3), (3, 4)),
         any_rank_needs_eager=False,
+        max_final_requests_across_dp=0,
     )
     mode = SimpleNamespace(
-        sync=sync, running_tokens_are_unified=False, use_cudagraph=False, running_bs=1
+        sync=sync,
+        is_prefill=True,
+        tbo_collective_active=True,
+        running_tokens_are_unified=False,
+        use_cudagraph=False,
+        running_bs=1,
     )
     view = projection.batch_view(prefill(7), mode, r)
 
@@ -459,7 +468,7 @@ config = Config(model=str(root / "model"), tensor_parallel_size=1, load_dummy="e
                 enable_dp_attention=True, dp_logical_size=8, enable_expert_parallel=ep,
                 kv_cache_dtype="fp8")
 set_current_atom_config(config)
-from atom.model_engine.model_runner import support_model_arch_dict
+from atom.models.registry import support_model_arch_dict
 from atom.utils import resolve_obj_by_qualname
 from atom.compass.runner.overrides import FactoriesOnMeta, process_weights_after_loading
 from atom.compass.run.modules import walk

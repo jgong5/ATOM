@@ -82,7 +82,7 @@ def run(tmp_path, command, *records, flags=()):
 
 @pytest.mark.parametrize("stated", [False, True], ids=["own", "--engine"])
 def test_records_at_a_prefix_fit_one_law_and_host_entry_keyed_at_the_longest(
-    tmp_path, stated
+    tmp_path, stated, capsys
 ):
     a, b = point(tmp_path / "a", 19, at(SHORT)), point(tmp_path / "b", 20, at(LONG))
     flags = ("--engine", engine_file(tmp_path, LONG)) if stated else ()
@@ -90,13 +90,26 @@ def test_records_at_a_prefix_fit_one_law_and_host_entry_keyed_at_the_longest(
         run(tmp_path, command, a, b, flags=flags)
 
     keyed = at(LONG)["engine"]
-    law = member(tmp_path / "store", law_key(engine=keyed), "params")
-    host = member(tmp_path / "store", host_laws_key(at(LONG)), "params")
+    law = member(
+        tmp_path / "store", law_key(tmp_path / "store", engine=keyed), "params"
+    )
+    host = member(tmp_path / "store", host_laws_key(at(LONG), tmp_path), "params")
     written = json.loads((tmp_path / "law.json").read_text())
     assert law["engine_config"] == written["engine_config"] == keyed
     assert host["key"]["engine"] == written["host"]["key"]["engine"] == keyed
-    # Rung 4 from b's steps alone; a ran those batches eager.
-    assert sorted(law["decode"]) == sorted(written["decode"]) == ["2", "4", "eager"]
+    # Rung 4 from b's steps alone; a ran those batches eager. The ladder's other
+    # rungs, which no record reached, are filled (`step_linear_fit.fill_rungs`).
+    for got in (law, written):
+        fitted = sorted(k for k, v in got["decode"].items() if "filled" not in v)
+        assert fitted == ["2", "4", "eager"]
+        assert sorted(got["filled"]) == ["1", "3", "5", "6", "7", "8"]
+        assert got["filled_rungs"]["decode"] == [1, 3, 5, 6, 7, 8]
+    # Each law-writing command names the rungs it filled on stderr (#3796).
+    warning = step_linear_fit.filled_warning(law)
+    assert warning.startswith(
+        "WARNING: no record reached decode rungs 1, 3, 5, 6, 7, 8"
+    )
+    assert capsys.readouterr().err.splitlines().count(warning) == 2
     assert len(law["runs"]) == 2
 
 

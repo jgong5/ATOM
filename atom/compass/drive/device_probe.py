@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
-"""The probes of one GPU host's attainable peaks, on visible cards 0 and 1, and
-the readings their samples give. SPEC is the machine spec the peaks belong to.
-Every sample is device time between two events queued behind a spin kernel, so
-no host time is in it.
+"""The probes of one GPU host's attainable rates, on visible cards 0 and 1, and
+the readings their samples give. No datasheet is read here, so no reading is
+a derate: `spec.layers.composed` divides each rate by the datasheet peak it
+attains. Every sample is device time between two events queued behind a spin
+kernel, so no host time is in it.
 
-- Compute: per format, the median of `REPS` GEMMs ``x @ w.T``, x m by k and
-  w n by k, at each of `SHAPES`, BF16 through `torch.matmul`, FP8 through
-  `torch._scaled_mm`, and FP4 where SPEC states ``fp4_flops``: MXFP4, two
+- Compute: per format of `FORMATS` asked for, the median of `REPS` GEMMs
+  ``x @ w.T``, x m by k and w n by k, at each of `SHAPES`, BF16 through
+  `torch.matmul`, FP8 through `torch._scaled_mm`, and FP4 as MXFP4, two
   values a byte and a power-of-two scale per 32 along k, through each of
   `torch._scaled_mm` (hipBLASLt) and `aiter.gemm_a4w4` with w pre-shuffled,
   as aiter's own tests call it, that runs on the card; one that raises is
@@ -15,10 +16,9 @@ no host time is in it.
   `TILES` that ran fastest at the first shape with an output within 1% of
   torch's; a format no tile passes is named in the record. On a card whose
   stack ships untuned libraries it is the faster.
-  The best rate over shapes and libraries, over
-  SPEC's ``*_flops``, is the format's derate. Each GEMM follows a spin, so the
-  rate is a burst's: with PTL enabled a sustained GEMM slows within a second
-  or two.
+  The best median rate over shapes and libraries, flops a second, is the
+  format's reading. Each GEMM follows a spin, so the rate is a burst's: with
+  PTL enabled a sustained GEMM slows within a second or two.
 - Bandwidth: per kind in `KINDS` (read-only, write-only, copy) and per size
   in `SIZES` of bytes moved, a graph of up to `GRAPH` kernels through
   consecutive slices of one zeroed `2 * POOL`-byte buffer (a copy reads one
@@ -27,8 +27,7 @@ no host time is in it.
   from HBM. The kernels are Triton: `copy_` reaches about 2 TB/s on MI308X, a
   kernel about 3.6. At each size the fastest kind's median rate bounds any mix
   of reads and writes; the running maximum of it over sizes is
-  ``memory.bandwidth_curve``, so noise on the plateau keeps it monotone, and
-  its largest point over SPEC's bandwidth is ``memory.derate``.
+  ``bandwidth_curve``, so noise on the plateau keeps it monotone.
 - Kernel floor: `GRAPH` empty kernels captured in one graph, replayed `REPS`
   times; ``kernel_floor_s`` is the median per kernel, with its p10 and p90.
 - Profiler floor: `GRAPH` empty kernels launched one after another behind a
@@ -40,15 +39,15 @@ no host time is in it.
   run back to back at their own length.
 - Link: one kernel per card passes a counter `ROUNDS` times through the other
   card's memory; half a round trip is ``link_latency_s``, with its p10 and p90
-  over `REPS` runs. A `LINK_BYTES` copy from card 0 to card 1 over SPEC's link
-  bandwidth is ``intra_node.derate``.
+  over `REPS` runs. The median rate of a `LINK_BYTES` copy from card 0 to card
+  1, bytes a second, is ``link``.
 
 
 `refuse_unfit` refuses cards unless every card is idle (under `IDLE_BYTES` of
-VRAM used, and no other process KFD charges memory of it) and reads SPEC's
-``device.ptl`` from ``ptl/ptl_enable`` under its sysfs device (`NO_PTL` where it
-has none). ``gpu_busy_percent`` is no test of idle: a gfx1250 card with no
-process reads 100.
+VRAM used, and no other process KFD charges memory of it) and its
+``ptl/ptl_enable``, under its sysfs device, reads the PTL state it is given
+(`NO_PTL` where it has none). ``gpu_busy_percent`` is no test of idle: a
+gfx1250 card with no process reads 100.
 """
 
 import itertools
@@ -87,8 +86,8 @@ TILES = {
     for fp4, k in ((False, 64), (True, 128))
 }
 GROUP = tl.constexpr(8)  # rows of tiles a program group walks, w's tiles in cache
-#: Each format's derate, by the spec-peak number it is taken over.
-FORMATS = {"bf16": "bf16_flops", "fp8": "fp8_flops", "fp4": "fp4_flops"}
+#: The GEMM formats `probe` can time.
+FORMATS = ("bf16", "fp8", "fp4")
 #: The fields read with a band, and each one's sample list in the record.
 BANDED = {
     "device.kernel_floor_s": "floor",
@@ -213,7 +212,7 @@ def _charged(path: Path) -> int:
 
 
 def refuse_unfit(read: list[dict], ptl: str) -> None:
-    """Refuse cards that hold other work or disagree with the spec's PTL."""
+    """Refuse cards that hold other work or read a PTL state other than `ptl`."""
     wrong = [
         f"{c['bdf']} (ptl {c['ptl']}, {c['vram_used']} B used, "
         f"processes {c['processes']})"
@@ -224,9 +223,9 @@ def refuse_unfit(read: list[dict], ptl: str) -> None:
         raise SpecRefusal(
             Rule.MEASURED,
             f"cards {', '.join(wrong)} are not idle cards with PTL {ptl}",
-            "pick idle cards whose ptl_enable is the spec's `device.ptl`; a peak "
-            "read beside a neighbour or under another PTL state is not this "
-            "machine's",
+            f"probe idle cards and keep their ptl_enable at {ptl} until the "
+            "command ends; a rate read beside a neighbour or under another PTL "
+            "state is not this platform's",
         )
 
 
@@ -323,7 +322,7 @@ def _running(fp4: dict, failed: dict) -> list:
             Rule.MEASURED,
             "no MXFP4 GEMM runs on these cards: "
             + "; ".join(f"{name} {error}" for name, error in failed.items()),
-            "probe where one of them runs, or drop `fp4_flops` from the spec",
+            "probe without fp4, or on cards where one of them runs",
         )
     return found
 

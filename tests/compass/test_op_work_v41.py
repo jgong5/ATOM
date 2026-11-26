@@ -187,6 +187,67 @@ def test_a_block_scaled_fp8_gemm_reads_its_scales_once():
     assert work(op, rows(*[(1, 9)] * 16), TP, "bf16") == want
 
 
+@pytest.mark.parametrize("width, fill", [(1, None), (3, t([1, 64]))])
+def test_the_stream_state_writes_each_row_s_streams_and_pre_mix_from_its_anchor(
+    width, fill
+):
+    op = leaf(
+        "atom.model_ops.deepseek_v41.mhc:write_stream_state",
+        residual=t([6, 4, 64]),
+        pre_mix=t([6, 4], F32),
+        anchors=t([6 // width, 64]),
+        block_h=64,
+        width=width,
+        fill=fill,
+    )
+
+    # 6 rows of 4 streams written, and their fp32 pre-mix; the anchors and a
+    # DSpark block's fill read.
+    read = (6 // width) * 64 * 2 + (64 * 2 if fill else 0)
+    assert work(op, rows((1, 9)), TP, "bf16") == Work(
+        {}, 6 * 4 * 64 * 2 + 6 * 4 * 4 + read
+    )
+
+
+def test_the_mxfp8_batched_gemm_prices_each_group_at_either_lift():
+    out, x = t([16, 2, 1024], FP8), t([16, 2, 4096], FP8)
+    w = t([2, 1024, 4096], FP8, role="weight")
+    x_scale, w_scale = t([16, 2, 128], E8M0), t([2, 32, 128], E8M0, role="weight")
+    runner = leaf(
+        "aiter.ops.flydsl.batched_gemm_a8w8_gfx1250:run_bmm_a8w8_mxfp8_32_gfx1250",
+        XQ=x,
+        WQ=w,
+        x_scale=x_scale,
+        w_scale=w_scale,
+        Out=out,
+    )
+    launch = leaf(
+        "aiter.ops.flydsl.batched_gemm_a8w8_gfx950:_launch",
+        tensors=[out, x, w, x_scale, w_scale, t([4], F32), t([4], I32)],
+        m=16,
+    )
+
+    one = gemm(16, 1024, 4096, "fp8", "fp8", "fp8")
+    want = one + one + Work({}, 16 * 2 * 128 + 2 * 32 * 128)
+    assert work(runner, rows((1, 9)), TP, "bf16") == want
+    assert work(launch, rows((1, 9)), TP, "bf16") == want
+
+
+def test_a_routed_operator_prices_as_the_kind_it_routes():
+    args = {
+        "XQ": t([16, 5120], FP8),
+        "WQ": t([1792, 5120], FP8, role="weight"),
+        "x_scale": t([16, 160], E8M0),
+        "w_scale": t([56, 160], E8M0, role="weight"),
+        "dtype": BF16,
+    }
+    routed = leaf("aiter_routed.gemm_a8w8_blockscale.default", [[16, 1792]], **args)
+    native = leaf("aiter.gemm_a8w8_blockscale.default", [[16, 1792]], **args)
+
+    view = rows((1, 9))
+    assert work(routed, view, TP, "bf16") == work(native, view, TP, "bf16")
+
+
 def test_a_row_gather_moves_each_row_of_each_tensor_in_and_out():
     op = leaf(
         "atom.model_ops.attentions.token_layout.gather:gather_rows",

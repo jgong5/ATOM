@@ -41,7 +41,7 @@ def _laws(tmp_path, a, b, *args) -> tuple[dict, dict]:
     """The law `compass fit steps` publishes on `a` and `b`, and the one
     `step_linear_fit`'s command writes, less its host laws."""
     fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
-    published = member(tmp_path / "store", law_key(), "params")
+    published = member(tmp_path / "store", law_key(tmp_path / "store"), "params")
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     out = tmp_path / "law.json"
     step_linear_fit.main(

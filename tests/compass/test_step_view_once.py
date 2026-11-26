@@ -44,6 +44,8 @@ def test_a_recorded_step_prices_the_view_its_record_built(
     assert built == {0: 1, 1: 1}
     assert [b.views[0].group_dummies for b in backends] == [1, 1]
     assert backends[0].views[0].requests == (RequestShape(40, 40, False),)
-    assert backends[1].views[0].requests == (RequestShape(1, 1, True),)
+    # The idle rank's dummy runs the group's phase: beside a prefill, a
+    # one-token prefill (`projection._dummy_row`).
+    assert backends[1].views[0].requests == (RequestShape(1, 1, False),)
     lines = [(tmp_path / f"dp{r}.jsonl").read_text().splitlines() for r in (0, 1)]
     assert [len(rank) for rank in lines] == [1, 1]

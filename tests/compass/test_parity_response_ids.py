@@ -28,6 +28,7 @@ from atom.entrypoints.openai.protocol import CompletionRequest
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.scheduler import ScheduledBatch, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
+from atom.sampling_params import SamplingParams
 
 SAMPLING = {"temperature": 0.0, "top_p": 1.0}
 
@@ -42,7 +43,9 @@ def engine(monkeypatch):
         params = kwargs.get("kv_transfer_params")
         seq = Sequence(list(tokens), BLOCK, sampling_params, kv_transfer_params=params)
         stream_callback(
-            SimpleNamespace(output_tokens=[5], finished=True, finish_reason="length")
+            SimpleNamespace(
+                output_tokens=[5], finished=True, finish_reason="length", logprobs=None
+            )
         )
         return seq
 
@@ -111,12 +114,15 @@ def test_a_recording_server_s_sequences_carry_their_response_ids(
     engine.core(cls)
     ids = [_complete(_prompt(0))]
     # The streaming and multimodal paths hand their sequences over in the same way.
-    dispatcher = SimpleNamespace(new_state=lambda: None, enqueue=lambda **_: None)
+    dispatcher = SimpleNamespace(new_state=lambda **_: None, enqueue=lambda **_: None)
     monkeypatch.setattr(api_server, "_stream_batch_dispatcher", dispatcher)
     for name in ("_stream_loops", "_request_start_times", "_seq_id_to_request_id"):
         monkeypatch.setattr(api_server, name, {})
     ids.append("cmpl-stream")
-    asyncio.run(api_server.setup_streaming_request(_prompt(1), None, ids[-1]))
+    # Upstream's streaming setup reads `sampling_params.logprobs`.
+    asyncio.run(
+        api_server.setup_streaming_request(_prompt(1), SamplingParams(), ids[-1])
+    )
 
     async def multimodal():
         async for _ in api_server.generate_async_multimodal(

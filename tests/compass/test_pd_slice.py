@@ -96,15 +96,16 @@ class PdTraffic(Traffic):
     http, stream = "traffic->frontend-P:http", STREAM
 
 
-def publish_pd_entries(store, machine, env) -> None:
-    """`publish_entry` for each side `pd_sim.sh` starts under `env`, on its
-    ``MODEL``, its server flags composed as the script composes them."""
+def publish_pd_entries(store, machine, env, publish=publish_entry) -> None:
+    """`publish`, `publish_entry` by default, for each side `pd_sim.sh` starts
+    under `env`, on its ``MODEL``, its server flags composed as the script
+    composes them."""
     flags = env.get("SERVER_ARGS", "--enforce-eager --max-model-len 2048").split()
     for side, role in (("PREFILL", "kv_producer"), ("DECODE", "kv_consumer")):
         kv = json.dumps({"kv_role": role, "kv_connector": "compass"})
         model = env.get("MODEL", MODEL)
         argv = ["--model", model, *flags, *env.get(f"{side}_ARGS", "").split()]
-        publish_entry(store, machine, [*argv, "--kv-transfer-config", kv], env)
+        publish(store, machine, [*argv, "--kv-transfer-config", kv], env)
 
 
 def run_pd(out: Path, seed: str) -> dict:
