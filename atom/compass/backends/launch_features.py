@@ -15,7 +15,9 @@ those sets, for a fit to check and a run to price (`HostDeviceRecurrence`).
 """
 
 import collections
+import dataclasses
 import functools
+import os
 
 from atom.compass.backends.shape import sum_tokens
 
@@ -198,10 +200,83 @@ def architecture(config) -> str | None:
     return (getattr(hf, "architectures", None) or [None])[0]
 
 
-def stated(key: dict | None) -> tuple[LaunchFeatures, dict | None]:
-    """The provider and graph sets the host key `key` states, if any."""
+def stated(
+    key: dict | None, long_tokens: int | None = None
+) -> tuple[LaunchFeatures, dict | None]:
+    """The provider and graph sets the host key `key` states, if any; with
+    `long_tokens`, a host entry's `LONG_TOKENS`, the provider with the
+    `LONG_CONTEXT` feature at that bound (`LongContext`)."""
     graphs = ((key or {}).get("engine") or {}).get(GRAPHS)
-    return provider(graphs and graphs["architecture"]), graphs
+    base = provider(graphs and graphs["architecture"])
+    return (LongContext(base, long_tokens) if long_tokens else base), graphs
+
+
+#: The variable that, set to a token count, has a host fit price a forward whose
+#: longest prefill row reaches that much context with the `LONG_CONTEXT` feature
+#: (`LongContext`), a launch column its laws may adopt; unset or ``0``, no
+#: feature is added, and a fit is as before.
+LONG_ENV = "COMPASS_FIT_HOST_LONG_CONTEXT"
+#: The feature: 1 on a forward whose longest prefill row's context reaches the
+#: bound, else 0.
+LONG_CONTEXT = "long_context"
+#: A host entry's bound for `LONG_CONTEXT`, in tokens, which a run's provider
+#: then predicts it at (`stated`).
+LONG_TOKENS = "long_context_tokens"
+
+
+def long_tokens_fit() -> int | None:
+    """`LONG_ENV`'s bound, None unset or ``0``; anything not a whole number of
+    tokens is refused."""
+    value = os.environ.get(LONG_ENV) or "0"
+    if not value.isdigit():
+        raise ValueError(f"{LONG_ENV}={value!r} is not a whole number of tokens")
+    return int(value) or None
+
+
+def long_context(view, tokens: int) -> float:
+    """`LONG_CONTEXT` of a step of the `BatchView` `view` at the bound `tokens`."""
+    return float(any(r.context_tokens >= tokens for r in view.prefill))
+
+
+def long_samples(samples: list, tokens: int) -> list:
+    """`samples` (`step_labels.Sample`), each one's recorded launch features
+    with its `LONG_CONTEXT` at the bound `tokens`, as `LongContext` predicts
+    it."""
+    return [
+        dataclasses.replace(
+            s, launch={**s.launch, LONG_CONTEXT: long_context(s.view, tokens)}
+        )
+        for s in samples
+    ]
+
+
+class LongContext(LaunchFeatures):
+    """A provider, `base`, with one more feature, `LONG_CONTEXT` at `tokens`,
+    read off a step's view alone: a record states none, so a fit adds it to
+    each sample's recorded features (`fit.host`) and a run predicts it. On
+    #752's Kimi-K3.1 (TP8 DCP8) a prefill's or middle chunk's pre-launch host
+    time (`W_pre`) steps from 2-4 ms to 45-55 ms where its context passes
+    about 128k tokens (16384 a DCP rank), on the calibration record and on the
+    c=1 and c=8 targets alike, which ``(1, tokens, seqs)`` cannot state."""
+
+    def __init__(self, base: LaunchFeatures, tokens: int) -> None:
+        self.base, self.tokens = base, int(tokens)
+        self.features = (*base.features, LONG_CONTEXT)
+
+    def install(self, runner) -> None:
+        self.base.install(runner)
+
+    def recorded(self, runner) -> dict:
+        return self.base.recorded(runner)
+
+    def observe(self, runner) -> dict[str, float]:
+        return self.base.observe(runner)
+
+    def predict(self, view, graphs: dict) -> dict[str, float]:
+        return {
+            **self.base.predict(view, graphs),
+            LONG_CONTEXT: long_context(view, self.tokens),
+        }
 
 
 #: The host entry's key holding launch-path constants: per kind and segment,

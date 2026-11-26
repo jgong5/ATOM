@@ -64,6 +64,7 @@ from collections import Counter
 from pathlib import Path
 
 from atom.compass.artifacts import Key, Kind, keyed_platform
+from atom.compass.backends import launch_features
 from atom.compass.backends.step_labels import (
     STALLS,
     WAITS,
@@ -136,6 +137,9 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
                     f"its lines; steps/{name + LOCAL} names the file that holds "
                     f"them, {named.read_text().strip()}"
                 )
+    if long := launch_features.long_tokens_fit():
+        # `launch_features.LONG_ENV`: each sample's `LONG_CONTEXT`, as a run predicts it.
+        samples = launch_features.long_samples(samples, long)
     waits = None
     if launch_wait_on():
         # `step_labels.WAIT_ENV`: launch labels less their wait on earlier work.

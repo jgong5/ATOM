@@ -1065,7 +1065,11 @@ def fit_host(samples) -> tuple[dict, dict]:
             f"the records carry {len(keys)} host keys ({' / '.join(keys)}); "
             "host laws are fitted under one"
         )
-    launch, graphs = launch_features.stated(json.loads(keys[0]))
+    long = launch_features.long_tokens_fit()
+    launch, graphs = launch_features.stated(json.loads(keys[0]), long)
+    if long:
+        # `launch_features.LONG_ENV`: a record states no `LONG_CONTEXT`.
+        samples = launch_features.long_samples(samples, long)
     for s in samples:
         if (predicted := launch.predict(s.view, graphs)) != s.launch:
             raise ValueError(
@@ -1081,6 +1085,8 @@ def fit_host(samples) -> tuple[dict, dict]:
     one = len({s.provenance["run"] for s in kept}) == 1
     rows = _host_rows(kept, RUN_BLOCKS if one else 0)
     host = {"key": json.loads(keys[0]), "laws": {}}
+    if long:
+        host[launch_features.LONG_TOKENS] = long
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
     report["blocked"], report["unstamped"] = _blocked(samples)
     report["jit_steps"] = {}
