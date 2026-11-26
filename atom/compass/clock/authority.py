@@ -294,13 +294,12 @@ class ClockAuthority:
                 default=math.inf,
             )
 
-        self._split = {
-            i: tuple(
-                (j, d, first_hop(j, i, True), first_hop(j, i, False))
-                for j, d in self._from[i]
-            )
-            for i in self._ids
-        }
+        # i -> {j: (D over j's covered first hop, D over its others)}, for each
+        # j whose covered first hop is the shorter: the terms a floor can raise.
+        self._floored = {}
+        for i in self._ids:
+            pairs = ((j, first_hop(j, i, True), first_hop(j, i, False)) for j, _ in self._from[i])
+            self._floored[i] = {j: (dc, du) for j, dc, du in pairs if dc < du}
         self.timeline = timeline
         self._sent = {i: [] for i in self._ids}  # logged since its last reply
         self.grants = {i.name: 0 for i in self._ids}
@@ -714,17 +713,21 @@ class ClockAuthority:
 
     def _row(self, i: LpId) -> tuple[tuple[LpId, float], ...]:
         nv = self._nv
-        if not self._floor:
+        floor, refined = self._floor, self._floored[i]
+        if not (floor and refined):
             return tuple((j, nv[j] + d) for j, d in self._from[i])
-        floor, out = self._floor, []
-        for j, d, dc, du in self._split[i]:
-            h = floor.get(j)
-            if h is None or dc == math.inf:
-                out.append((j, nv[j] + d))
-                continue
-            n = nv[j]
-            reacts = min(max(n, h), self._trigger_pending(j))
-            out.append((j, min(reacts + dc, n + du)))
+        out = []
+        for j, d in self._from[i]:
+            n = term = nv[j]
+            term += d
+            if j in refined and (h := floor.get(j)) is not None and h > n:
+                # j sends into an engine no earlier than its floor or its
+                # earliest trigger, and never below its N.
+                reacts = min(h, self._trigger_pending(j))
+                if reacts > n:
+                    dc, du = refined[j]
+                    term = min(reacts + dc, n + du)
+            out.append((j, term))
         return tuple(out)
 
     def _trigger_pending(self, j: LpId) -> float:
