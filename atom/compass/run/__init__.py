@@ -125,6 +125,11 @@ run with ``false`` records ``ARRIVAL`` and ``TAR``),
 needs local grants: a ceiling's cycle term counts only the LPs that can react
 to the LP's sends before their own next grant, and a TAR's grant sends the
 messages below its ceiling ahead, `ClockAuthority`'s ``wide_ceilings``),
+``ids_by_ref`` (optional, ``false``, the default, or ``true`` in a
+prefill-decode run: its prefill frontends hand a prompt's ids to its decode
+frontends by reference, through `ids_dir`, which the run's authority makes
+and removes, and every count of a body's bytes counts them as if inline,
+`handoff`),
 ``select_serve`` (optional, ``false``, the default, or ``true``: the authority's
 ``tcp`` serve side reads every LP's connection on one selector thread, in place
 of a reader thread a connection, `clock_transport.serve`'s ``select``; it
@@ -388,6 +393,10 @@ WORKER_ORDER = "worker_order"
 LOCAL_GRANTS = "local_grants"
 #: The run-file key that widens those ceilings.
 WIDE_LOCAL_GRANTS = "wide_local_grants"
+#: The run-file key that hands a prompt's ids from prefill to decode by reference.
+IDS_BY_REF = "ids_by_ref"
+#: The tmpfs root of a run's `ids_dir`.
+IDS_ROOT = "/dev/shm"
 #: The run-file key that serves the authority's connections on one thread.
 SELECT_SERVE = "select_serve"
 ATOM_RUNNER = "atom.model_engine.model_runner.ModelRunner"
@@ -407,6 +416,7 @@ PER_RUN = (
     WORKER_ORDER,
     LOCAL_GRANTS,
     WIDE_LOCAL_GRANTS,
+    IDS_BY_REF,
     SELECT_SERVE,
 )
 LP_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
@@ -741,6 +751,13 @@ def spec() -> dict | None:
         raise ValueError(
             f"{path}: client_runs is {count!r}; a server serves a positive number "
             "of client runs, or null for no limit"
+        )
+    by_ref = run.get(IDS_BY_REF, False)
+    if type(by_ref) is not bool or (by_ref and "router_s" not in run):
+        raise ValueError(
+            f"{path}: {IDS_BY_REF} is {by_ref!r}; it is true only in a "
+            "prefill-decode run, whose prefill frontends hand ids to its decode "
+            "frontends, or false"
         )
     for host in entries(run, "host"):
         _check_host(path, host)
@@ -1873,7 +1890,7 @@ def frontend(config):
     _price_images(run.get(IMAGE_PREPROCESS))
     from atom.compass.run import handoff
 
-    handoff.install(side)
+    handoff.install(side, ids_dir(run))
     lp = _frontend_lp(config, run)
     authority = None
     if not standalone:
@@ -4118,9 +4135,38 @@ def authority(endpoint: str) -> None:
     """Name `endpoint` in the out_dir's `AUTHORITY_FILE`, then serve the run
     file's authority there until the finish or an early
     end, then write its step table, and the run summary once the server LPs
-    have handed in."""
+    have handed in. The run's `ids_dir`, where it has one, is there that long."""
     run = spec()
     a = _RecordingAuthority(run)
-    _write_whole(Path(run["out_dir"]) / AUTHORITY_FILE, endpoint)
-    serve(a, endpoint, run.get(SELECT_SERVE, False))
-    _write_summary(run, a, _until_end(run, a))
+    with _owning_ids_dir(run):
+        _write_whole(Path(run["out_dir"]) / AUTHORITY_FILE, endpoint)
+        serve(a, endpoint, run.get(SELECT_SERVE, False))
+        _write_summary(run, a, _until_end(run, a))
+
+
+def ids_dir(run: dict) -> str | None:
+    """The directory through which `run`'s prefill frontends hand a prompt's
+    ids to its decode frontends by reference, on tmpfs and named by its
+    out_dir; None unless its `IDS_BY_REF` is true."""
+    if not run.get(IDS_BY_REF, False):
+        return None
+    out = str(Path(run["out_dir"]).resolve()).encode()
+    return f"{IDS_ROOT}/compass-ids-{hashlib.sha256(out).hexdigest()[:16]}"
+
+
+@contextlib.contextmanager
+def _owning_ids_dir(run: dict):
+    """`ids_dir(run)` made empty for the run, the files a killed run at the
+    same out_dir left gone, and removed after it with any file still in it:
+    the router answers a hand-off cancelled before its relay, whose file no
+    decode frontend reads."""
+    path = ids_dir(run)
+    if path is None:
+        yield
+        return
+    shutil.rmtree(path, ignore_errors=True)
+    os.mkdir(path, 0o700)
+    try:
+        yield
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
