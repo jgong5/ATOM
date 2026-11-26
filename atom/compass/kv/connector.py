@@ -98,6 +98,7 @@ from __future__ import annotations
 import collections
 import logging
 import math
+import os
 import pickle
 import weakref
 from typing import ClassVar
@@ -216,6 +217,14 @@ class SimulatedKVConnector(KVConnectorBase):
         return set(), set()
 
 
+#: Set to N (opt-in; unset or 1: one poll behind), a decode connector reports a
+#: finished receive N polls after the first whose clock reached it
+#: (`SimulatedKVConnectorScheduler.process_completions`): MiniMax-M3.1's D ran a
+#: request about two of its steps after its KV arrived on CAL c24, the sim one
+#: (#3720).
+RECV_POLLS = "COMPASS_KV_RECV_POLLS"
+
+
 class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler side: Mooncake's write request, and both ends' completion times."""
 
@@ -233,6 +242,8 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
 
         kv_config = _kv_config(config)
         self.is_producer = _is_producer(kv_config)
+        self._recv_polls = whole_number(RECV_POLLS, int(os.environ.get(RECV_POLLS, "1") or 1))
+        self._held: list = []
         # Checked here so a malformed width refuses the connector before any
         # request is served, not at the first request_finished.
         parallel = config.parallel_config
@@ -941,11 +952,17 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             self._heard()
         if self._shared:
             self._settle(now)
-        done, self._snapshot = self._snapshot, [
-            req_id for req_id, t in self._due.items() if t <= now
-        ]
-        for req_id in self._snapshot:
+        reached = [req_id for req_id, t in self._due.items() if t <= now]
+        for req_id in reached:
             del self._due[req_id]
+        if self.is_producer or self._recv_polls <= 1:
+            done, self._snapshot = self._snapshot, reached
+        else:
+            # `RECV_POLLS`: a receive reported that many polls after the first
+            # that reached it, the older snapshots held in `_held`.
+            done = self._snapshot
+            self._held.append(reached)
+            self._snapshot = self._held.pop(0) if len(self._held) > self._recv_polls - 1 else []
         if self.is_producer:
             output.finished_sending.update(done)
         else:
@@ -957,6 +974,7 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         return bool(
             self._due
             or self._snapshot
+            or any(self._held)
             or self._queued
             or self._sends
             or self._notices
