@@ -278,7 +278,11 @@ def test_a_step_reads_its_drafter_s_graph_as_draft_terms(batch, shape):
 @pytest.mark.parametrize(
     "batch,drafted,named",
     [
-        (view((1, 9, True)), g(1, 8, 8), "a step that decodes a row of other than 2"),
+        (
+            view((1, 9, True), (2, 9, True)),
+            g(1, 8, 8),
+            "a step that decodes a row of other than 2",
+        ),
         (VERIFY, None, "over 2 sequences for its drafter"),
         (
             replace(VERIFY, tbo_tokens=((2,), (2,))),

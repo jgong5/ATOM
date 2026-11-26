@@ -4414,7 +4414,9 @@ def parts(names, config) -> list:
     from atom.compass.capture import population_steps
 
     spec, steps = getattr(config, "speculative_config", None), []
-    for shape, line in population_steps(names, config.enable_tbo, drafters=True):
+    drafts = spec.num_speculative_tokens if spec else 0
+    held = population_steps(names, config.enable_tbo, drafters=True, run_drafts=drafts)
+    for shape, line in held:
         if steps and line is steps[-1][0]:  # the drafter's own shape, past its step's
             reads = steps[-1][1]
             reads[1:2] = [(DRAFT, shape, *reads[1][2:])] if spec else []
@@ -4458,10 +4460,12 @@ def _drafter_at(shape, op: dict, line: dict, config) -> list:
     dp = config.parallel_config.data_parallel_size
     later = rows or dp * width
     t, wide, counts = shape.tokens, shape._replace(gathered=later), {shape.tokens, n}
+    # a decode of one token a row under the drafter verifies none (`verifies`)
+    verifies = drafts if shape.verifies is None else shape.verifies
     if shape.phase == "decode":
-        t, wide = n, decode(width, later)
-        counts = {n} if width == n else {n * j for j in range(1, drafts + 2)}
-    low = gathered_off_default(shape.phase, t, min(gathered, later), dp, drafts)
+        t, wide = n, decode(width, later)._replace(verifies=shape.verifies)
+        counts = {n} if width == n else {n * j for j in range(1, verifies + 2)}
+    low = gathered_off_default(shape.phase, t, min(gathered, later), dp, verifies)
     sets = frozenset(counts | {gathered}), frozenset({width, dp * width, later})
     both = shape._replace(tokens=t, gathered=low)
     # a prefill's later passes run on its own shape, asked at their batch

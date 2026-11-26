@@ -155,14 +155,16 @@ def main(argv: list[str]) -> None:
             began = time.perf_counter()
 
 
-def population_shapes(names, tbo=False):
+def population_shapes(names, tbo=False, run_drafts=0):
     """The shape of each step the record directories `names` hold, DP's dummy
     runs aside; under two-batch overlap (`tbo`) a split step's two
-    micro-batches' (`population_steps`); each drafter's too."""
-    return [shape for shape, _ in population_steps(names, tbo, drafters=True)]
+    micro-batches' (`population_steps`); each drafter's too, under a drafter
+    of `run_drafts` tokens."""
+    steps = population_steps(names, tbo, drafters=True, run_drafts=run_drafts)
+    return [shape for shape, _ in steps]
 
 
-def population_steps(names, tbo=False, drafters=False, stage=0):
+def population_steps(names, tbo=False, drafters=False, stage=0, run_drafts=0):
     """Each step the record directories `names` hold, DP's dummy runs aside,
     of pipeline stage `stage` (above 0, its records ``pp<k>.dp<r>.jsonl``),
     as its shape, the one the op-level backend prices it at
@@ -182,7 +184,10 @@ def population_steps(names, tbo=False, drafters=False, stage=0):
     `drafters`, a drafter's shape follows it where they differ: a decode's
     at its rows padded to `draft_bs`, else to its rung, a sampling prefill's
     or a DP middle chunk's with `draft_bs` as its `width`. A target that
-    replays no graph yet pads past its rows takes `target_bs` as its `width`."""
+    replays no graph yet pads past its rows takes `target_bs` as its `width`.
+    Under a drafter of `run_drafts` tokens a decode step whose rows each
+    decode one token verifies none (`op_graph.verified`), its shapes and its
+    drafter's marked so (`forward.Shape.verifies`)."""
     from atom.compass.backends import BatchView, RequestShape
     from atom.compass.backends.op_graph import step_shape
     from atom.compass.backends.step_labels import group_dummies, group_peaks
@@ -224,11 +229,15 @@ def population_steps(names, tbo=False, drafters=False, stage=0):
                 raise ValueError(f"{name} step {line['step']} {exc}") from None
             width, padded = line.get("draft_bs"), line.get("target_bs")
             if phase == "decode":
-                target = decode(tokens, line.get("moe_rows"))._replace(width=padded)
-                target = target.at(dp, drafts)
+                # a decode of one token a row under a drafter verifies none
+                none = {"verifies": 0} if run_drafts and not drafts else {}
+                target = decode(tokens, line.get("moe_rows"))
+                target = target._replace(width=padded, **none).at(dp, drafts)
                 yield target, line
                 draft = decode(width or tokens, line.get("draft_moe_rows"), len(rows))
-                if drafters and drafts and (draft := draft.at(dp, drafts)) != target:
+                draft = draft._replace(**none)
+                ran = drafts or none
+                if drafters and ran and (draft := draft.at(dp, drafts)) != target:
                     yield draft, line
             elif not split:
                 yield prefill(tokens, seqs, line.get("moe_rows"), padded).at(dp), line
