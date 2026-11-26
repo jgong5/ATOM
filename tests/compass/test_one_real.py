@@ -323,3 +323,108 @@ def test_a_warmup_switch_other_than_0_or_1_exits_2(tmp_path):
 
     assert done.returncode == 2
     assert one_real.WARMUP_HITS_ENV in done.stderr
+
+
+def _timed(d, sends):
+    """A run at c=8 of profiling requests `sends`, each (send s, TTFT ms, TPOT
+    ms), one conversation each, and one with no send time."""
+    run = _run(d, 8, server=False)
+    records = [
+        {
+            "metadata": {
+                "benchmark_phase": "profiling",
+                "conversation_id": f"c{i}",
+                "turn_index": 0,
+                "request_start_ns": B + round(start * 1e9),
+                "request_end_ns": B + round((start + 1) * 1e9),
+            },
+            "metrics": {
+                "time_to_first_token": {"value": ttft, "unit": "ms"},
+                "inter_token_latency": {"value": tpot, "unit": "ms"},
+                "request_latency": {"value": 1000.0, "unit": "ms"},
+                "input_sequence_length": {"value": 1000, "unit": "tokens"},
+                "output_sequence_length": {"value": 10, "unit": "tokens"},
+            },
+        }
+        for i, (start, ttft, tpot) in enumerate(sends)
+    ] + [
+        {
+            "metadata": {"benchmark_phase": "profiling"},
+            "metrics": {"inter_token_latency": {"value": 99.0, "unit": "ms"}},
+        }
+    ]
+    (run / curves.RECORDS).write_text("".join(json.dumps(r) + "\n" for r in records))
+    return run
+
+
+def _thirds_runs(tmp_path):
+    # sends 0..8 s: the first third holds 0-2 s, the second 3-5 s, the last 6-8 s
+    real = _timed(
+        tmp_path / "real1", [(t, 100.0 * (1 + t), 10.0 + t) for t in range(9)]
+    )
+    sim = _timed(
+        tmp_path / "step_linear",
+        [(t, 100.0 * (1 + t), (10.0 + t) * (0.5 if t < 3 else 1.0)) for t in range(9)],
+    )
+    return real, sim
+
+
+def test_thirds_are_each_run_s_latencies_over_the_thirds_of_its_send_span(tmp_path):
+    real, sim = _thirds_runs(tmp_path)
+
+    done = _one_real_env({one_real.THIRDS_ENV: "1"}, real, sim)
+
+    assert done.returncode == 0, done.stderr
+    rows = json.loads(done.stdout.splitlines()[-1])
+    r, s = rows["real"], rows["step_linear"]
+    assert [r[f"requests {k}"] for k in ("t1", "t2", "t3", "t23")] == [3, 3, 3, 6]
+    assert r["TPOT p50 ms t1"] == 11.0 and r["TPOT p90 ms t1"] == pytest.approx(11.8)
+    assert r["TPOT p90 ms t3"] == pytest.approx(17.8)
+    assert r["TPOT p90 ms t23"] == pytest.approx(17.5)
+    assert r["TTFT p90 ms t2"] == pytest.approx(580.0)
+    # the record with no send time is in no third
+    assert max(r[f"TPOT p90 ms {k}"] for k in ("t1", "t2", "t3", "t23")) < 99
+    assert s["TPOT p90 ms t1"] == pytest.approx(0.5 * r["TPOT p90 ms t1"])
+    assert s["TPOT p90 ms t23"] == r["TPOT p90 ms t23"]
+    table = {line[:34].strip(): line for line in done.stdout.splitlines()[1:-1]}
+    assert table["TPOT p90 ms t1"].split()[-1] == "-50.0%"
+    assert table["TPOT p90 ms t23"].split()[-1] == "+0.0%"
+
+
+def test_a_run_sent_at_one_instant_holds_every_request_in_its_first_third(tmp_path):
+    run = _timed(tmp_path / "real1", [(5.0, 100.0, 10.0), (5.0, 300.0, 30.0)])
+
+    split = one_real.thirds(run)
+
+    assert split["requests t1"] == 2 and split["requests t23"] == 0
+    assert split["TPOT p50 ms t1"] == 20.0 and split["TPOT p90 ms t23"] is None
+
+
+def test_without_the_thirds_switch_the_output_is_unchanged(tmp_path):
+    real, sim = _thirds_runs(tmp_path)
+
+    off = _one_real_env({}, real, sim)
+    zero = _one_real_env({one_real.THIRDS_ENV: "0"}, real, sim)
+    on = _one_real_env({one_real.THIRDS_ENV: "1"}, real, sim)
+
+    assert off.returncode == zero.returncode == on.returncode == 0, off.stderr
+    assert off.stdout == zero.stdout
+    before, after = off.stdout.splitlines(), on.stdout.splitlines()
+    # every line but the JSON is kept, in order; the switch adds table rows only
+    kept = [x for x in after if x in before[:-1]]
+    assert kept == before[:-1]
+    extra = [x for x in after[:-1] if x not in before]
+    assert len(extra) == 5 * len(one_real.PARTS)
+    assert all(x[:34].split()[-1] in one_real.PARTS for x in extra)
+    old, new = json.loads(before[-1]), json.loads(after[-1])
+    for name in old:
+        assert {k: new[name][k] for k in old[name]} == old[name]
+
+
+def test_a_thirds_switch_other_than_0_or_1_exits_2(tmp_path):
+    real, sim = _thirds_runs(tmp_path)
+
+    done = _one_real_env({one_real.THIRDS_ENV: "on"}, real, sim)
+
+    assert done.returncode == 2
+    assert one_real.THIRDS_ENV in done.stderr

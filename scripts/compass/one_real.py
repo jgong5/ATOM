@@ -36,7 +36,12 @@ REAL's (`hits`): which DP rank a follow-up lands on, and so whether it finds
 its conversation's prefix, is a draw of the schedule. With
 COMPASS_ONE_REAL_WARMUP_HITS=1 (`WARMUP_HITS_ENV`), then per SIM its prefix
 hits over the warmup requests both runs sent and the warmup's share of REAL's
-prompt tokens (`warmup_hits`): the GPU hit rate counts the warmup too.
+prompt tokens (`warmup_hits`): the GPU hit rate counts the warmup too. With
+COMPASS_ONE_REAL_THIRDS=1 (`THIRDS_ENV`), the table also holds each run's
+TTFT and TPOT p50 and p90 over the requests it sent in each third of its
+profiled send span and in the last two (`thirds`): a tail is set where the
+window opens on a transient, the warm-up or the client's idle-cap burst, and
+these rows say which part of the window holds a tail's error.
 """
 
 import json
@@ -98,6 +103,10 @@ def main(argv: list[str]) -> int:
         print(f"{WARMUP_HITS_ENV} is {switch!r}: 1 on, 0 or unset off", file=sys.stderr)
         return 2
     warmup = switch == "1"
+    split = os.environ.get(THIRDS_ENV) or "0"
+    if split not in ("0", "1"):
+        print(f"{THIRDS_ENV} is {split!r}: 1 on, 0 or unset off", file=sys.stderr)
+        return 2
     given = arguments(real)
     for sim in sims:
         if arguments(sim) != given:
@@ -107,6 +116,9 @@ def main(argv: list[str]) -> int:
             return 2
     rows = {"real": run_metrics(real, False)}
     rows |= {sim.name: run_metrics(sim, True) for sim in sims}
+    if split == "1":
+        for name, run in (("real", real), *((sim.name, sim) for sim in sims)):
+            rows[name] |= thirds(run)
     names = list(rows["real"])
     print(
         f"{'metric':34}"
@@ -386,6 +398,52 @@ def warmup_hits(real: Path, sim: Path) -> str:
         f"({gap:+.1f} pt); the warmup holds {share:.0%} of the real run's prompt "
         f"tokens, so it moves the GPU hit rate by about {share * gap:+.1f} pt"
     )
+
+
+#: Set to 1, `main` adds each run's `thirds` to its table and JSON; unset or 0,
+#: nothing more (the output is unchanged); any other value is refused.
+THIRDS_ENV = "COMPASS_ONE_REAL_THIRDS"
+#: The latencies `thirds` gives each part of a run's window, aiperf field and
+#: percentile, in ms.
+THIRD_LATENCIES = {
+    "TTFT p50 ms": ("time_to_first_token", 50),
+    "TTFT p90 ms": ("time_to_first_token", 90),
+    "TPOT p50 ms": ("inter_token_latency", 50),
+    "TPOT p90 ms": ("inter_token_latency", 90),
+}
+#: The parts `thirds` names, by the thirds of the send span each holds.
+PARTS = {"t1": (0,), "t2": (1,), "t3": (2,), "t23": (1, 2)}
+
+
+def thirds(run: Path) -> dict:
+    """`THIRD_LATENCIES` and the requests counted over the profiled records of
+    `run` sent in each of `PARTS`: a record's third is where its send
+    (``request_start_ns``) falls between the first and the last send. A
+    window opens on transients a tail is made of: #752 cell A v2 DPA4 c=8, the
+    first third's TPOT p90 5.27 ms real against 3.65-3.90 in three simulated
+    runs, the last two thirds' 4.29 against 3.98-4.19, where a few
+    100k-260k-token prefills chunk against the warm-up's decodes; at c=64 the
+    first third holds the client's 300 s idle-cap burst, TPOT p90 +12.1%
+    against -4.6% after it. A record with no send time is left out; with no
+    send at all, nothing is named."""
+    records = profiled(read_jsonl(run / RECORDS))
+    sent = [r.get("metadata", {}).get("request_start_ns") for r in records]
+    known = [int(s) for s in sent if s is not None]
+    if not known:
+        return {}
+    first, span = min(known), max(known) - min(known)
+    part = [
+        None if s is None else min(3 * (int(s) - first) // span, 2) if span else 0
+        for s in sent
+    ]
+    out = {}
+    for name, held in PARTS.items():
+        mine = [r for r, k in zip(records, part) if k in held]
+        out[f"requests {name}"] = len(mine)
+        for metric, (field, p) in THIRD_LATENCIES.items():
+            values = _positive(_metric(r, field) for r in mine)
+            out[f"{metric} {name}"] = percentile(values, p)
+    return out
 
 
 def stalled(real: Path) -> str:
