@@ -38,11 +38,13 @@ from atom.entrypoints.openai import api_server
 from atom.utils import clock
 from atom.utils.clock import LPRuntime
 from atom.utils.compass_loop import (
+    INTAKE_ORDER_ENV,
     CompassEventLoop,
     CompassSelector,
     HttpChannel,
     Station,
     charge,
+    intake_order,
     wrap_decode,
     wrap_encode,
 )
@@ -1324,6 +1326,79 @@ def test_an_intake_jitter_orders_a_burst_as_if_each_body_were_that_much_longer(
     print(f"\n  {draw}: app entered {entered}")
     assert [seq for seq, _ in entered] == order
     assert [t for _, t in entered] == pytest.approx(at)
+
+
+def _entered_in_turns(run, monkeypatch, tmp_path, sizes, jitters=None):
+    """The (seq, LP time) each request of a same-instant burst of bodies of
+    `sizes` bytes enters the app at, its larger bodies read first on the wall,
+    under an intake of 2 ms + 1 us a byte; and that arrival."""
+    _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-6))
+    entered = []
+
+    async def app(scope, receive, send):
+        seq = api_server._tracestate_stamp(scope)[1]
+        entered.append((seq, asyncio.get_running_loop().time()))
+
+    def receives(seq):
+        async def receive():
+            for _ in range(seq):  # a later seq's body takes more socket reads
+                await asyncio.sleep(0)
+            return {"type": "http.request", "body": b"x" * sizes[seq]}
+
+        return receive
+
+    arrival = _burst(
+        run, monkeypatch, len(sizes), app, receives=receives, jitters=jitters
+    )
+    return entered, arrival
+
+
+@pytest.mark.parametrize("draw", list(JITTERS))
+def test_under_send_order_a_burst_reaches_the_app_as_sent_whatever_its_bodies(
+    run, monkeypatch, tmp_path, draw
+):
+    # COMPASS_HTTP_INTAKE_ORDER=send: neither the bodies (3000, 1000, 2000 and
+    # 1500 bytes, which smallest-first takes as 1, 3, 2, 0) nor a seed's
+    # jitters order the turns; the burst enters in seq order, the traffic LP's
+    # send order, each request still charged its own body's intake.
+    monkeypatch.setenv(INTAKE_ORDER_ENV, "send")
+    sizes = [3000, 1000, 2000, 1500]
+    entered, arrival = _entered_in_turns(
+        run, monkeypatch, tmp_path, sizes, JITTERS[draw]
+    )
+    at, t = [], arrival
+    for seq in range(4):
+        t += 2e-3 + 1e-6 * sizes[seq]
+        at.append(t)
+    print(f"\n  {draw}: app entered {entered}")
+    assert [seq for seq, _ in entered] == [0, 1, 2, 3]
+    assert [t for _, t in entered] == pytest.approx(at)
+
+
+@pytest.mark.parametrize("value", [None, "", "body"])
+def test_body_order_is_the_default_order(run, monkeypatch, tmp_path, value):
+    # Unset, empty or ``body``: smallest body first, as with no switch at all.
+    if value is None:
+        monkeypatch.delenv(INTAKE_ORDER_ENV, raising=False)
+    else:
+        monkeypatch.setenv(INTAKE_ORDER_ENV, value)
+    sizes = [3000, 1000, 2000, 1000]
+    entered, arrival = _entered_in_turns(run, monkeypatch, tmp_path, sizes)
+    at, t = [], arrival
+    for seq in [1, 3, 2, 0]:
+        t += 2e-3 + 1e-6 * sizes[seq]
+        at.append(t)
+    assert [seq for seq, _ in entered] == [1, 3, 2, 0]
+    assert [t for _, t in entered] == pytest.approx(at)
+
+
+@pytest.mark.parametrize("value", ["fifo", "Send", "size"])
+def test_an_unknown_intake_order_is_refused(monkeypatch, value):
+    monkeypatch.setenv(INTAKE_ORDER_ENV, value)
+    with pytest.raises(ValueError, match=INTAKE_ORDER_ENV):
+        intake_order()
+    with pytest.raises(ValueError, match="body, send"):
+        HttpChannel(None, lambda scope: None)
 
 
 def test_a_request_released_inside_an_intake_takes_its_place_among_those_waiting(
