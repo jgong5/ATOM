@@ -239,5 +239,5 @@ EOF
     for s in "${sims[@]%/}"; do ln -s "$s" "$cell/sims/${s##*/}"; done
   python3 "$DASH_TREE/scripts/compass/compare_dashboard.py" --scan "$DATA/dash" --out "$DATA/dashboard.html" --window 900
   ;;
-*) sed -n '2,25p' "$0"; exit 2 ;;
+*) sed -n '2,26p' "$0"; exit 2 ;;
 esac
