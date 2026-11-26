@@ -113,13 +113,14 @@ $T/scripts/compass/compass run "${RUN[@]}" --check decode -- "${DECODE[@]}"
 ```
 
 Each lists what its side's run lacks, with the command that makes it, and exits 1
-when anything is lacking. Both lack one thing, `step linear law: stale (coverage)`:
-no decode vector for some rungs this configuration schedules, each a captured batch
-size or eager (8, 16 and 48 up on the prefill side, 32 up and eager on the decode
-side). Each side's calibration recorded no decode step at the rungs it lacks, except
-the decode side's eager ones, which the fit leaves out, as each ran beside a DP
-peer's prefill. A step at such a rung is refused, which the run reports; at
-concurrency 16 none is. Any other line is a trap (below).
+when anything is lacking. The prefill side lacks nothing: a prefill-decode producer
+schedules no decode rung (`lacking.uncovered_rungs`). The decode side lacks one thing,
+`step linear law: stale (coverage)`: no decode vector for rungs 32 up and eager,
+each a captured batch size or eager, that this configuration schedules. Its
+calibration recorded no decode step at those rungs but eager ones, which the fit
+leaves out, as each ran beside a DP peer's prefill. A step at such a rung is
+refused, which the run reports; at concurrency 16 none is. Any other line is a trap
+(below).
 
 **2. Run** (11 min: a minute to start, then 1875 simulated seconds in 490 wall seconds):
 
@@ -165,7 +166,13 @@ jq -r '(.memory.readings[][], .memory.predicts[]?) | [.name, .method, .nbytes] |
   `estimated`, by a fitted vector inside the region its fit validated by holding out
   each record; `unvalidated`, by a fitted vector outside that region; `declared`,
   below. A step outside a vector's fitted hull is priced by it all the same, and
-  counted among the trust table's steps extrapolated.
+  counted among the trust table's steps extrapolated. The prefill law's records
+  ran before ATOM's upstream merge of `b7b5ec3f2`
+  ([#3936](https://github.com/jgong5/ATOM/pull/3936)). Since it, a DP rank with no
+  request forwards an empty batch at its group's phase, which no longer vetoes a
+  two-batch-overlap split, so most prefill steps split, a shape few records held.
+  That idle forward is priced by the prefill vector beside a peer's prefill. Both
+  read `unvalidated` until the law is refitted on records of this ATOM.
 - **`treatments`** names what the steps assume: `uniform routing`, every step's MoE
   priced as if routing spread tokens evenly over the experts, and the treatments the
   table below names.
@@ -180,7 +187,6 @@ A `declared` term is stated, not fitted on this configuration's records.
 
 | Term | Where | Why |
 |---|---|---|
-| `dp_dummy`, treatment `eager DP dummy` | the prefill side's steps that prefill nothing, 0 s | a DP rank with no request runs a dummy forward beside its peers, replaying no graph; real DP records give it its busiest peer's device time, which the DP group's step already waits on |
 | `decode_beside_prefill`, treatment `eager decode beside prefill` | the prefill side's steps that prefill nothing, 0 s | a decode that replays no graph while a DP peer prefills ends before that peer; unchecked |
 | `load residue`, `persistent`, `activations`, `driver and collective reserve`, the graph `pool` | each engine's `memory`, in `$OUT/lp-engine-<P or D>.dp<rank>.json` | the readings the law file carries, stating `assumed`: `compass measure memory` on crsuse2-m2m-v3-005 for [#3498](https://github.com/jgong5/ATOM/issues/3498), at an earlier ATOM digest; a host with no GPU cannot start the engine to take its own. `prefill/run.json` and `decode/run.json` state that note at `.provenance.memory_readings_assumed` |
 | `0.2 x peak activations` | each engine's `memory`, as `cudagraph_overhead` | ATOM's coefficient for the CUDA graph overhead it reserves (`ModelRunner._estimate_cudagraph_overhead`), times the `activations` reading above, whose method it takes (`atom/compass/memory/graph_pool.py`: `reserves`); the law carries that reading `assumed` |
