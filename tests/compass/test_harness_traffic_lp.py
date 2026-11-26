@@ -95,7 +95,7 @@ from atom.compass.clock import (
     prefill_decode_table,
     single_engine_table,
 )
-from atom.compass.ingress import Ingress
+from atom.compass.ingress import ClientPrep, Ingress
 from atom.compass.run import ENV as RUN_ENV
 from atom.utils.clock import LPRuntime, Straggler
 from compass_harness import ADDRESS_ENV, fingerprint, traffic_lp
@@ -1580,7 +1580,7 @@ INGRESS = {
 }
 
 
-async def _behind_an_ingress(tmp_path, sizes, script, then=None):
+async def _behind_an_ingress(tmp_path, sizes, script, then=None, station=None):
     """aiperf sends credits 0, 1, ... at 0 s, one a trace, behind `INGRESS`;
     no stamp is published before every size is reported, which a worker does
     for credit k once 0.1 s has passed, with `sizes[k]` bytes, None for an
@@ -1588,7 +1588,7 @@ async def _behind_an_ingress(tmp_path, sizes, script, then=None):
     stamps are read. The stamps, by seq, and what `then` returns."""
     prefix = str(tmp_path / f"lp-{uuid.uuid4().hex[:8]}")
     rt = ScriptedRuntime(script)
-    traffic = TrafficLP(rt, prefix, ingress=Ingress(INGRESS, ADMIT))
+    traffic = TrafficLP(rt, prefix, ingress=station or Ingress(INGRESS, ADMIT))
     stamps, reports = addresses(prefix)
     sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
     sub.connect(stamps)
@@ -1631,6 +1631,22 @@ def test_behind_an_ingress_requests_reach_the_router_past_its_threads(tmp_path):
     expected = [first + 0.125, ADMIT + 0.5 + 2.0 + 0.25, first + 0.5 + 0.5 + 0.0625]
     assert published == [
         (_key(num), at, num, "start", ADMIT) for num, at in enumerate(expected)
+    ]
+
+
+def test_behind_a_client_prep_a_burst_lands_as_its_shares_finish(tmp_path):
+    """Credits 0, 1 and 2 at 0 s with 2, 1 and 0.5 KiB bodies, the client
+    preparing two at once at 1 KiB/s: credit 1 is done at 2 s, credit 2 then
+    shares with credit 0's last KiB, done at 3 s, and credit 0 alone at 3.5 s.
+    Each reaches the channel its lookahead later; every record starts at the
+    send."""
+    station = ClientPrep({"rate": 1024.0, "workers": 2, "fixed": 0.0}, ADMIT)
+    published, _ = _run(
+        _behind_an_ingress(tmp_path, [2048, 1024, 512], [(100.0, {0})], station=station)
+    )
+    expected = [3.5 + ADMIT, 2.0 + ADMIT, 3.0 + ADMIT]
+    assert published == [
+        (_key(num), at, num, "start", 0.0) for num, at in enumerate(expected)
     ]
 
 

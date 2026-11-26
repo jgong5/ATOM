@@ -81,7 +81,9 @@ class CompassTransport(AioHttpTransport):
         self._push = ctx.socket(zmq.PUSH)
         self._push.connect(reports)
         # Behind an encoding ingress each request's body size goes ahead of it.
-        self._sizes = ingress.stated_here() is not None
+        self._sizes = (
+            ingress.stated_here() is not None or ingress.client_prep_spec() is not None
+        )
         self._reader = asyncio.create_task(self._read_stamps())
 
     @on_stop

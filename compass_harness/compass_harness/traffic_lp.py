@@ -49,6 +49,13 @@ frontend takes the exact intake order. A frontend under
 ``COMPASS_HTTP_INTAKE_ORDER=send`` takes one instant's requests in seq order,
 its bodies and their jitters ordering nothing (`atom.utils.compass_loop`).
 
+With ``COMPASS_HARNESS_CLIENT_PREP`` (`atom.compass.ingress.ClientPrep`) the
+client's own preparation of each request sits in front of the HTTP channel in
+the same way, sizes reported and the hold waiting for them alike: the requests
+of one instant, in seq order, share its rate, at most its workers at once, and
+each reaches the channel its lookahead after it is prepared, its record
+starting at its send. A run file that also states an ingress is refused.
+
 A run file that states an encoding ingress (``ingress``, `atom.compass.ingress`)
 puts it in front of the HTTP channel's receiver, and the traffic LP prices its
 hop: each worker reports its request's body size before the request is sent,
@@ -225,6 +232,12 @@ class TrafficLP:
         # (frontend-D, or the router LP).
         (http,), (stream,) = table.channels_from(TRAFFIC), table.channels_into(TRAFFIC)
         entry = compass_ingress.stated(run)
+        prep = compass_ingress.client_prep_spec()
+        if entry is not None and prep is not None:
+            raise ValueError(
+                f"the run file states an ingress and {compass_ingress.CLIENT_PREP_ENV} "
+                "a client preparation in front of the same channel; take one"
+            )
         return cls(
             LPRuntime(TRAFFIC, table, conn),
             os.environ[ADDRESS_ENV],
@@ -234,9 +247,13 @@ class TrafficLP:
             os.environ.get(SEND_ORDER_SEED_ENV) or None,
             float(os.environ.get(INTAKE_JITTER_ENV) or INTAKE_JITTER_BYTES),
             (
-                None
-                if entry is None
-                else compass_ingress.Ingress(entry, table.lookahead(http.name))
+                compass_ingress.ClientPrep(prep, table.lookahead(http.name))
+                if prep is not None
+                else (
+                    None
+                    if entry is None
+                    else compass_ingress.Ingress(entry, table.lookahead(http.name))
+                )
             ),
         )
 
@@ -301,11 +318,19 @@ class TrafficLP:
         at the ingress, which takes them in that order (`Ingress.admit`), each
         with the body size its worker reported.
         """
-        for rank, key in sorted(self._unstamped, key=lambda sent: self._place(sent[0])):
+        order = sorted(self._unstamped, key=lambda sent: self._place(sent[0]))
+        batch = None
+        if isinstance(self.ingress, compass_ingress.ClientPrep):
+            sizes = [self._bodies.pop(key) for _, key in order]
+            batch = iter(self.ingress.admit_batch(self.rt.now, sizes))
+        for rank, key in order:
             if self.ingress is None:
                 arrival, seq = self.rt.stamp_send(self.http)
             else:
-                start, at = self.ingress.admit(self.rt.now, self._bodies.pop(key))
+                if batch is not None:
+                    start, at = next(batch)
+                else:
+                    start, at = self.ingress.admit(self.rt.now, self._bodies.pop(key))
                 arrival, seq = self.rt.stamp_send(self.http, at)
                 self._arrivals[key] = arrival
             self.open[key] = None

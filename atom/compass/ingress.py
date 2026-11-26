@@ -38,6 +38,7 @@ imports nothing of ATOM's, so an aiperf worker reads it without loading the
 engine.
 """
 
+import collections
 import heapq
 import json
 import math
@@ -47,6 +48,10 @@ import os
 KEY = "ingress"
 #: The variable naming a simulated run's run file (`atom.compass.run.ENV`).
 RUN_ENV = "ATOM_COMPASS_RUN"
+#: The client's own preparation of each request before its head reaches the
+#: channel (`ClientPrep`): ``rate=<bytes a second>,workers=<W>``, optionally
+#: ``,fixed=<seconds>``; unset or empty, none.
+CLIENT_PREP_ENV = "COMPASS_HARNESS_CLIENT_PREP"
 #: The terms an ``ingress`` entry requires, and those it may state.
 REQUIRED = ("fixed_s", "per_byte_s", "workers")
 OPTIONAL = ("router_per_byte_s", "bytes")
@@ -125,3 +130,89 @@ class Ingress:
         done = start + self.fixed_s + self.per_byte_s * body_bytes
         heapq.heappush(self._free, done)
         return at, done + self.router_per_byte_s * body_bytes
+
+
+def client_prep_spec() -> dict | None:
+    """`CLIENT_PREP_ENV`'s terms as ``{"rate": bytes/s, "workers": W, "fixed":
+    s}``, None when unset or empty: ``rate`` a positive number, ``workers`` a
+    positive int, ``fixed`` a number >= 0 (0 when absent); anything else is
+    refused."""
+    raw = os.environ.get(CLIENT_PREP_ENV) or ""
+    if not raw:
+        return None
+    terms, bad = {"fixed": 0.0}, False
+    for part in raw.split(","):
+        name, _, value = part.partition("=")
+        try:
+            terms[name] = int(value) if name == "workers" else float(value)
+        except ValueError:
+            bad = True
+    rate, workers, fixed = terms.get("rate"), terms.get("workers"), terms["fixed"]
+    if (
+        bad
+        or set(terms) != {"rate", "workers", "fixed"}
+        or not (_number(rate) and rate > 0)
+        or not (type(workers) is int and workers >= 1)
+        or not _number(fixed)
+    ):
+        raise ValueError(
+            f"{CLIENT_PREP_ENV}={raw!r}; it takes rate=<bytes a second, > 0>,"
+            "workers=<a positive count>[,fixed=<seconds >= 0>]"
+        )
+    return terms
+
+
+class ClientPrep:
+    """The client's preparation of each request before its head reaches the
+    channel, on the traffic LP's clock: processor sharing.
+
+    The client prepares at most ``workers`` requests at once and shares
+    ``rate`` bytes a second equally among those it prepares; a request's work
+    is its body's bytes plus ``fixed`` seconds' worth (``fixed x rate``). The
+    requests sent at one instant are taken in the order the traffic LP stamps
+    them, its first ``workers`` at once and each of the rest as one finishes,
+    so a burst of no more than ``workers`` finishes smallest first and a larger
+    one mostly in that order, spread over its bytes / ``rate``. Requests sent
+    later start once every earlier one is prepared: what was stamped stays
+    stamped. A request reaches the channel its lookahead after it is
+    prepared, and its record starts at its send, where the client's does.
+
+    #752 DeepSeek-V4.1 Cell A v2 and M3.1 records: a burst whose heads reach
+    the frontend within ~0.3 s is received about smallest first (engine
+    receipt against input size +0.42..+0.89), and the c=512 300 s burst,
+    287 MB whose heads arrive over 15 s, in head order (-0.24..+0.27); a lone
+    request's head follows its send by tens of milliseconds.
+    """
+
+    def __init__(self, spec: dict, lookahead_s: float) -> None:
+        self.rate, self.workers = spec["rate"], spec["workers"]
+        self.fixed_work = spec.get("fixed", 0.0) * self.rate
+        self.lookahead_s = lookahead_s
+        self._free = -math.inf  # when every request admitted so far is prepared
+
+    def admit_batch(
+        self, now: float, sizes: list[int | None]
+    ) -> list[tuple[float, float]]:
+        """The requests sent at `now` with bodies of `sizes` bytes, None for a
+        request with none, in stamp order: each one's record start, `now`, and
+        its arrival at the channel. One with no body takes no preparation."""
+        at = now + self.lookahead_s
+        out: list[tuple[float, float]] = [(now, at)] * len(sizes)
+        queue = collections.deque(i for i, b in enumerate(sizes) if b is not None)
+        if not queue:
+            return out
+        t = max(now, self._free)
+        left: dict[int, float] = {}
+        while queue or left:
+            while queue and len(left) < self.workers:
+                i = queue.popleft()
+                left[i] = sizes[i] + self.fixed_work
+            least = min(left.values())
+            t += least * len(left) / self.rate
+            for i in list(left):
+                left[i] -= least
+                if left[i] <= 1e-9 * (sizes[i] + self.fixed_work + 1):
+                    del left[i]
+                    out[i] = (now, t + self.lookahead_s)
+        self._free = t
+        return out

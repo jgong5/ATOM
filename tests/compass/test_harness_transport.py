@@ -500,3 +500,28 @@ def test_a_cancel_naming_a_url_is_posted_there_on_its_request_s_path(
         ("/v1/chat/completions", "compass=a:11.0;s:3"),
         cancel_body(SENDS[0][1]),
     ]
+
+
+def test_under_a_client_prep_a_worker_reports_its_body_and_times_from_its_send(
+    tmp_path, monkeypatch
+):
+    """COMPASS_HARNESS_CLIENT_PREP and a run file with no ingress: the worker
+    reports its body's bytes before it has its stamp, as behind an ingress, and
+    its record starts at the stamp's ``start``, its send."""
+    (tmp_path / "run.json").write_text(json.dumps({"bound_s": 1.0}))
+    monkeypatch.setenv(RUN_ENV, str(tmp_path / "run.json"))
+    monkeypatch.setenv("COMPASS_HARNESS_CLIENT_PREP", "rate=1e6,workers=4")
+    start = 1.5
+
+    async def run():
+        async with Harness(tmp_path, monkeypatch) as h:
+            sending = asyncio.ensure_future(h.send(0))
+            size = await h.pull.recv_pyobj()
+            assert not sending.done()
+            await h.pub.send_pyobj((_key(0), *SENDS[0], "start", start))
+            return h, size, await sending
+
+    h, size, record = _run(run())
+    assert record.error is None
+    assert size == (_key(0), h.body_bytes[0])
+    assert record.start_perf_ns == record.timestamp_ns == _ns(start)

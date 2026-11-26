@@ -347,3 +347,82 @@ def test_compass_fit_ingress_writes_the_term_a_host_entry_states(tmp_path, capsy
     (tmp_path / "other.json").write_text(json.dumps({"host": {}}))
     with pytest.raises(ValueError, match="holds no ingress term"):
         stated_ingress(str(tmp_path / "other.json"))
+
+
+# ---- the client's preparation (`ClientPrep`, COMPASS_HARNESS_CLIENT_PREP) ----
+
+#: 1 KiB a second over two workers, dyadic so the sums are exact.
+PREP = {"rate": 1024.0, "workers": 2, "fixed": 0.0}
+
+
+@pytest.mark.parametrize("raw", [None, ""])
+def test_no_client_prep_unless_set(monkeypatch, raw):
+    if raw is None:
+        monkeypatch.delenv(compass_ingress.CLIENT_PREP_ENV, raising=False)
+    else:
+        monkeypatch.setenv(compass_ingress.CLIENT_PREP_ENV, raw)
+    assert compass_ingress.client_prep_spec() is None
+
+
+def test_a_client_prep_spec_states_rate_workers_and_fixed(monkeypatch):
+    monkeypatch.setenv(compass_ingress.CLIENT_PREP_ENV, "rate=1024,workers=2")
+    assert compass_ingress.client_prep_spec() == PREP
+    monkeypatch.setenv(compass_ingress.CLIENT_PREP_ENV, "rate=2e7,workers=8,fixed=0.01")
+    assert compass_ingress.client_prep_spec() == {
+        "rate": 2e7,
+        "workers": 8,
+        "fixed": 0.01,
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "rate=1024",
+        "workers=2",
+        "rate=0,workers=2",
+        "rate=1e6,workers=0",
+        "rate=1e6,workers=2.5",
+        "rate=1e6,workers=2,fixed=-1",
+        "rate=1e6,workers=2,lag=1",
+        "rate=fast,workers=2",
+    ],
+)
+def test_a_bad_client_prep_spec_is_refused(monkeypatch, raw):
+    monkeypatch.setenv(compass_ingress.CLIENT_PREP_ENV, raw)
+    with pytest.raises(ValueError, match=compass_ingress.CLIENT_PREP_ENV):
+        compass_ingress.client_prep_spec()
+
+
+def test_a_lone_request_takes_its_bytes_over_the_rate():
+    prep = compass_ingress.ClientPrep(PREP, L)
+    assert prep.admit_batch(3.0, [512]) == [(3.0, 3.5 + L)]
+
+
+def test_a_burst_no_larger_than_the_workers_shares_the_rate_smallest_first():
+    # 2 and 1 KiB at once, sharing 1 KiB/s: the 1 KiB one is done at 2 s, the
+    # other has 1 KiB left, alone, done at 3 s.
+    prep = compass_ingress.ClientPrep(PREP, L)
+    assert prep.admit_batch(0.0, [2048, 1024]) == [(0.0, 3.0 + L), (0.0, 2.0 + L)]
+
+
+def test_a_larger_burst_takes_the_rest_in_order_as_workers_free():
+    # 1, 1, 0.5 KiB: the first two share until both are done at 2 s, then the
+    # third alone, done at 2.5 s; a body-less request takes nothing.
+    prep = compass_ingress.ClientPrep(PREP, L)
+    got = prep.admit_batch(0.0, [1024, 1024, None, 512])
+    assert got == [(0.0, 2.0 + L), (0.0, 2.0 + L), (0.0, L), (0.0, 2.5 + L)]
+
+
+def test_a_later_send_starts_once_the_earlier_ones_are_prepared():
+    prep = compass_ingress.ClientPrep(PREP, L)
+    assert prep.admit_batch(0.0, [2048]) == [(0.0, 2.0 + L)]
+    # sent at 1 s while the client is busy until 2 s: done at 2 + 0.5 s
+    assert prep.admit_batch(1.0, [512]) == [(1.0, 2.5 + L)]
+    # sent once it is free: at its own send
+    assert prep.admit_batch(4.0, [1024]) == [(4.0, 5.0 + L)]
+
+
+def test_fixed_seconds_count_as_work_at_the_rate():
+    prep = compass_ingress.ClientPrep({**PREP, "fixed": 0.25}, L)
+    assert prep.admit_batch(0.0, [256]) == [(0.0, 0.5 + L)]
