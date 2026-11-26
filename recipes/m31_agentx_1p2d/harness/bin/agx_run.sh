@@ -127,6 +127,28 @@ sync_once() {  # pull every peer's run dir (its ranks' files), then push node A'
       --include='logs/slurm_job-*/rank-rc-0' --exclude='*' "${RUN}/" "${h}:${RUN}/" 2>/dev/null || true
   done
 }
+peer_alive() {  # R HOST: rank R's containers running on HOST and its launcher worker alive, as one line
+  local cs pid
+  cs=$(ssh -o BatchMode=yes "$2" "docker ps --format '{{.Names}}' | grep -E '^atomesh-${CELL_ID//./\\.}-${JID}-$1(-benchmark|-eval)?\$' | paste -sd, -" 2>/dev/null)
+  pid=$(ssh -o BatchMode=yes "$2" "p=\$(cat ${RUN}/rank-$1.pid 2>/dev/null); [ -n \"\$p\" ] && [ -d /proc/\$p ] && echo \$p" 2>/dev/null)
+  [[ -n "${cs}" && -n "${pid}" ]] && echo "containers ${cs}, worker pid ${pid}"
+}
+sync_verify() {  # every file a peer wrote since the copy is on node A at its size; RUN/sync_verify.txt
+  local h r try bad list
+  for try in 1 2 3 4; do
+    bad=0; : > "${RUN}/sync_verify.txt"
+    for r in "${!PEERS[@]}"; do
+      h=${PEERS[r]}
+      list=$(ssh -o BatchMode=yes "${h}" "cd ${RUN} && find . -type f -newer .copied_at -printf '%P\t%s\n'" 2>/dev/null) ||
+        { echo "MISMATCH ${h}: cannot list its run dir" >> "${RUN}/sync_verify.txt"; bad=1; continue; }
+      python3 "${RUN}/.sync_check.py" "${RUN}" "${h}" <<<"${list}" >> "${RUN}/sync_verify.txt" || bad=1
+    done
+    (( bad == 0 )) && break
+    (( try < 4 )) && { sleep 5; sync_once; }
+  done
+  say "AGX_LOCAL_RUNS: sync check (${try} pass(es)): $(paste -sd'; ' "${RUN}/sync_verify.txt")"
+  return ${bad}
+}
 if [[ "${LOCAL_RUNS}" == 1 ]]; then
   me=$(hostname -s)
   [[ "${me}" == "${HOSTS[0]}" || "${HOST_PREFIX}${me}" == "${HOSTS[0]}" || "${me}" == "${NODE_SHORT[0]}" ]] ||
@@ -308,7 +330,25 @@ json.dump({
 }, open(sys.argv[1] + "/run.json", "w"), indent=1)
 PY
 if [[ "${LOCAL_RUNS}" == 1 ]]; then
+  cat > "${RUN}/.sync_check.py" <<'PY'
+import os, sys
+run, host = sys.argv[1], sys.argv[2]
+want = [l.split("\t") for l in sys.stdin.read().splitlines() if "\t" in l]
+missing, size = [], []
+for rel, n in want:
+    p = os.path.join(run, rel)
+    if not os.path.isfile(p):
+        missing.append(rel)
+    elif os.path.getsize(p) != int(n):
+        size.append(f"{rel} {os.path.getsize(p)}!={n}")
+total = sum(int(n) for _, n in want)
+if missing or size:
+    print(f"MISMATCH {host}: {len(missing)} missing {missing[:5]}, {len(size)} sized apart {size[:5]} of {len(want)} files")
+    sys.exit(1)
+print(f"OK {host}: {len(want)} files, {total} bytes, each on node A at its size")
+PY
   peer_copy "${SNAP}" "${RUN}" || { say "AGX_LOCAL_RUNS: cannot copy the snapshot and run dir to ${PEERS[*]}"; exit 4; }
+  for h in "${PEERS[@]+"${PEERS[@]}"}"; do ssh -o BatchMode=yes "${h}" "touch ${RUN}/.copied_at"; done
   sync_once
   for h in "${PEERS[@]+"${PEERS[@]}"}"; do
     say "AGX_LOCAL_RUNS: ${h} holds $(ssh -o BatchMode=yes "${h}" "ls ${RUN} | wc -l") run files, snapshot $(ssh -o BatchMode=yes "${h}" "git -C ${SNAP} rev-parse HEAD 2>/dev/null || cat ${SNAP}/.git 2>/dev/null | head -c 0; ls ${SNAP}/.github/scripts/atomesh/pd_slurm_job.sh > /dev/null && echo present")"
@@ -409,7 +449,19 @@ PY
   (( done_ranks == ${#HOSTS[@]} )) && break
   if reason=$(python3 "${H}/bin/watchdog.py" --run "${RUN}"); then
     :
+  elif [[ "${LOCAL_RUNS}" == 1 ]] && { sync_once; reason2=$(python3 "${H}/bin/watchdog.py" --run "${RUN}"); }; then
+    say "AGX_LOCAL_RUNS: the watchdog's stop (${reason}) cleared after a fresh pull from ${PEERS[*]}"
+    echo "$(date -u +%FT%TZ) watchdog stop '${reason}' cleared after a fresh pull (sync lag)" >> "${RUN}/LOCAL_RUNS_NOTES"
   else
+    if [[ "${LOCAL_RUNS}" == 1 ]]; then
+      reason=${reason2:-${reason}}
+      for r in "${!PEERS[@]}"; do
+        if alive=$(peer_alive $((r + 1)) "${PEERS[r]}"); then
+          say "AGX_LOCAL_RUNS: the watchdog stops the run (${reason}) while rank $((r + 1)) on ${PEERS[r]} is alive (${alive})"
+          echo "$(date -u +%FT%TZ) watchdog stop '${reason}' while rank $((r + 1)) on ${PEERS[r]} was alive (${alive}): the local-runs fallback's stop, not a run failure" >> "${RUN}/LOCAL_RUNS_NOTES"
+        fi
+      done
+    fi
     say "watchdog: ${reason}"; echo "${reason}" > "${RUN}/stopped_by_watchdog"
     bash "${H}/bin/agx_teardown.sh" "${RUN}" || true
     break
@@ -437,6 +489,7 @@ bash "${H}/bin/agx_teardown.sh" "${RUN}" || true
 if [[ "${LOCAL_RUNS}" == 1 ]]; then
   touch "${RUN}/SYNC_STOP"; [[ -n "${SYNC_PID}" ]] && wait "${SYNC_PID}" 2>/dev/null || true
   sync_once; say "AGX_LOCAL_RUNS: last pull from ${PEERS[*]:-no peer} done"
+  sync_verify || say "AGX_LOCAL_RUNS: WARNING node A lacks some of a peer's files (RUN/sync_verify.txt)"
 fi
 python3 "${H}/bin/summarize.py" --run "${RUN}" || say "summary failed"
 find "${JOB_DIR}" -name 'server_metrics_export.json' -size +1G -print -delete 2>/dev/null || true
