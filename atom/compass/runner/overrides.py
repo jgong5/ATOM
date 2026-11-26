@@ -98,6 +98,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import hashlib
 import json
 import logging
 import math
@@ -105,6 +106,7 @@ import os
 import pickle
 import sys
 from functools import partial, wraps
+from statistics import NormalDist
 from types import SimpleNamespace
 from typing import Any
 
@@ -117,6 +119,8 @@ from atom.compass.backends.base import CostBackend
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
 from atom.compass.memory.readings import PAGE_BOUND
 from atom.compass.runner.step_output import DeferredTokenStream, filler_token_ids
+
+_JITTER_NORMAL = NormalDist()
 
 logger = logging.getLogger(__name__)
 
@@ -2201,6 +2205,76 @@ HISTORY_TERMS = frozenset(
 )
 
 
+#: Per-step multiplicative noise on each rank's priced device time
+#: (`step_jitter`): ``decode=S,prefill=S,output=S``, each S the standard
+#: deviation of ln(label / price) a step of that kind has from one step to the
+#: next at one shape; unset or empty, none. Its seed: `STEP_JITTER_SEED_ENV`,
+#: else the client's send-order seed (``COMPASS_HARNESS_SEND_ORDER_SEED``), else 0.
+STEP_JITTER_ENV = "COMPASS_STEP_JITTER"
+STEP_JITTER_SEED_ENV = "COMPASS_STEP_JITTER_SEED"
+STEP_JITTER_KINDS = ("decode", "prefill", "output")
+
+
+def step_jitter_spec() -> dict | None:
+    """`STEP_JITTER_ENV`'s sigma per kind, None when unset or empty; refuses a
+    kind other than `STEP_JITTER_KINDS` or a sigma that is not a finite number
+    >= 0. A kind it does not name has none."""
+    raw = os.environ.get(STEP_JITTER_ENV) or ""
+    if not raw:
+        return None
+    spec = {}
+    for part in raw.split(","):
+        kind, _, value = part.partition("=")
+        try:
+            sigma = float(value)
+        except ValueError:
+            sigma = math.nan
+        if kind not in STEP_JITTER_KINDS or not (math.isfinite(sigma) and sigma >= 0):
+            raise ValueError(
+                f"{STEP_JITTER_ENV}={raw!r}; it takes kind=sigma pairs, the kinds "
+                f"{', '.join(STEP_JITTER_KINDS)}, each sigma a number >= 0"
+            )
+        spec[kind] = sigma
+    return spec
+
+
+def step_jitter(kind: str | None, rank: int, step: int, spec: dict | None) -> float:
+    """The factor a rank's priced device time for its `step`-th forward of
+    `kind` is multiplied by under `spec` (`step_jitter_spec`): 1.0 with no spec,
+    no kind or a kind it does not name; else exp(sigma z - sigma^2 / 2), z a
+    standard normal drawn from a digest of the seed, `rank` and `step`, so a
+    seed gives the same factors in every run and the factor's mean is 1, as the
+    law's least squares price is a mean.
+
+    Real steps of one shape vary from one to the next (#752 Cell A v2
+    calibration records, same-shape neighbours: decode 0.5%, prefill 0.2-0.7%,
+    output prefill 0.4-0.7% sd of ln(label / price)); a priced step does not, so
+    simulated ranks finish their steps, and the events those ends order, in a
+    lockstep no real group keeps."""
+    sigma = 0.0 if spec is None or kind is None else spec.get(kind, 0.0)
+    if sigma == 0:
+        return 1.0
+    seed = (
+        os.environ.get(STEP_JITTER_SEED_ENV)
+        or os.environ.get("COMPASS_HARNESS_SEND_ORDER_SEED")
+        or "0"
+    )
+    digest = hashlib.sha256(repr((seed, "step", rank, step)).encode()).digest()
+    u = (int.from_bytes(digest[:8], "big") + 0.5) / 2**64
+    z = _JITTER_NORMAL.inv_cdf(u)
+    return math.exp(sigma * z - sigma * sigma / 2)
+
+
+def _jitter_kind(view: Any, batch: Any) -> str | None:
+    """The `step_jitter` kind of a priced forward: ``decode``, ``output`` (a
+    prefill that produces output), ``prefill``; None for a dummy."""
+    if view is None or getattr(batch, "is_dummy_run", False):
+        return None
+    if view.prefill:
+        return "output" if batch.produces_output() else "prefill"
+    return "decode" if view.decode else None
+
+
 def history_phase_wait(terms: Any, group: Any) -> float:
     """The seconds this rank's prefill step waits, beyond its own price, for its
     DP group's longest attention over cached history.
@@ -2411,6 +2485,18 @@ def _group_step_seconds(
     prefilling = many and not mode.running_tokens_are_unified
     phase_s = history_phase_wait(terms[:target_terms], group if prefilling else None)
     device_s += phase_s
+    spec = vars(runner).get("_step_jitter", False)
+    if spec is False:
+        spec = vars(runner)["_step_jitter"] = step_jitter_spec()
+    jitter = 1.0
+    if spec is not None and not refused:
+        counts = vars(runner).setdefault("_jitter_steps", collections.Counter())
+        kind = _jitter_kind(view, batch)
+        rank = (getattr(view, "dp_rank", None) or 0) if view is not None else 0
+        jitter = step_jitter(kind, rank, counts[rank], spec)
+        counts[rank] += 1
+        device_s *= jitter
+        draft_s *= jitter
     charge = getattr(host, "charge", None)
     if group is not None and isinstance(host, HostDeviceRecurrence):
 
@@ -2495,6 +2581,7 @@ def _group_step_seconds(
         **({"replayed_stall_s": stall_s} if stall_s else {}),
         **({"phase_wait_s": phase_s} if phase_s else {}),
         **({"launch_stall_s": first_s} if first_s else {}),
+        **({"jitter": jitter} if jitter != 1.0 else {}),
         "charge_s": charge_s,
         "group_s": group_s,
         "terms": [
