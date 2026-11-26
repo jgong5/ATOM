@@ -162,9 +162,10 @@ def _stacks(args, store) -> dict:
     return stated
 
 
-def build(args, atom_args, across: bool = False) -> dict:
+def build(args, atom_args, across: bool = False, env=None) -> dict:
     """The run file of `args`, parsed with `add_arguments`, for a server
-    started with ATOM's arguments `atom_args`, across nodes when `across`."""
+    started with ATOM's arguments `atom_args`, across nodes when `across`; its
+    host entry picked in the environment `env()` gives, else this process's."""
     store = ArtifactStore(Path(args.store).resolve())
     out = {
         **FIXED,
@@ -216,7 +217,7 @@ def build(args, atom_args, across: bool = False) -> dict:
             resolve(store, "host", k, machine, atom_args)[0] for k in args.host_laws
         ]
         out["host"] = hosts if len(hosts) > 1 else hosts[0]
-        picked = _picked(hosts, atom_args, machine.value("device.arch"))
+        picked = _picked(hosts, atom_args, machine.value("device.arch"), env)
         # A run file's router_s makes it prefill-decode: `prefill_decode` writes it.
         out |= {k: v for k, v in picked.get("hops", {}).items() if k != "router_s"}
         if run.INGRESS in picked:
@@ -268,7 +269,9 @@ def resolve(store, name: str, token: str, machine, atom_args) -> tuple:
     return law, _backend(entry)
 
 
-def prefill_decode(args, prefill_args, decode_args, kv_link, decode_env=None) -> dict:
+def prefill_decode(
+    args, prefill_args, decode_args, kv_link, decode_env=None, prefill_env=None
+) -> dict:
     """The run file `build` builds from `args` for one prefill and one decode
     instance, started with ATOM's arguments `prefill_args` and `decode_args`:
     each side's DP width read from its own, the router's per-request forward
@@ -290,7 +293,7 @@ def prefill_decode(args, prefill_args, decode_args, kv_link, decode_env=None) ->
 
     prefill_args = side_args("prefill", prefill_args, SIMULATED)
     decode_args = side_args("decode", decode_args, SIMULATED)
-    out = build(args, prefill_args, across=kv_link == "inter_node")
+    out = build(args, prefill_args, across=kv_link == "inter_node", env=prefill_env)
     if run.PRICE_LIST in out:
         decode = _price_list_key(decode_args, run._machine(out)).values
         if decode != out[run.PRICE_LIST]:
@@ -308,7 +311,9 @@ def prefill_decode(args, prefill_args, decode_args, kv_link, decode_env=None) ->
         arch = run._machine(out).value("device.arch")
         out[run.DECODE_HOPS] = _hops(hosts, decode_args, arch, decode_env)
     return out | {
-        "router_s": _hops(hosts, prefill_args, arch).get("router_s") if hosts else None,
+        "router_s": _hops(hosts, prefill_args, arch, prefill_env).get("router_s")
+        if hosts
+        else None,
         "kv_link": kv_link,
     }
 

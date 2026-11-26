@@ -322,7 +322,17 @@ parser = argparse.ArgumentParser(prog="deploy.sh run")
 runfile.add_arguments(parser)
 args = parser.parse_args(flags)
 try:
-    run = runfile.prefill_decode(args, prefill, decode, kv_link, decode_env if on else None)
+    # A side's host laws are picked in the environment its instances start in:
+    # its side's words (PREFILL_ENV, DECODE_ENV) over this process's.
+    def words(name):
+        return dict(w.split("=", 1) for w in os.environ.get(name, "").split())
+    def prefill_env():
+        return dict(os.environ) | words("PREFILL_ENV")
+    def local_decode_env():
+        return dict(os.environ) | words("DECODE_ENV")
+    run = runfile.prefill_decode(
+        args, prefill, decode, kv_link, decode_env if on else local_decode_env, prefill_env
+    )
     chunked = os.environ.get("DEPLOY_KV_CHUNKED") == "1"
     if chunked:
         run[compass_run.KV_CHUNKED] = True

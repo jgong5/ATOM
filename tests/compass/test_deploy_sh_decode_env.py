@@ -108,3 +108,30 @@ def test_a_prefix_that_cannot_show_the_decode_s_environment_fails_naming_it(
         done.stderr
     )
     assert not (tmp_path / "d" / "run_file.json").exists()
+
+
+def test_a_local_pair_takes_each_side_s_hops_under_its_side_s_words(
+    tmp_path, planted  # noqa: F811
+):
+    # No --on: the script's own environment holds neither side's variables, and
+    # PREFILL_ENV states the prefill's, as a line whose sides run apart does.
+    words, env, hops = pair(tmp_path, planted, ON)
+    on = words.index("--on")
+    words = words[:on] + words[on + 2 :]
+    net = words.index("--network")  # one node: no network file
+    words = words[:net] + words[net + 2 :]
+    env = {k: v for k, v in env.items() if k not in SIDES["prefill"][1]}
+    env["PREFILL_ENV"] = " ".join(f"{k}={v}" for k, v in SIDES["prefill"][1].items())
+    d = tmp_path / "d"
+    script = subprocess.Popen(words, env=env, cwd=tmp_path, stdout=subprocess.PIPE)
+    _until(d / "server.json", script)
+
+    run = json.loads((d / "run_file.json").read_text())
+
+    assert {k: run[k] for k in hops["prefill"]} == hops["prefill"]
+    assert run[compass_run.DECODE_HOPS] == hops["decode"] != hops["prefill"]
+
+    script.send_signal(signal.SIGTERM)
+    out, _ = script.communicate(timeout=60)
+
+    assert script.returncode == 0, out
