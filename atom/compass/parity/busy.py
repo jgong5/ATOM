@@ -61,7 +61,7 @@ from bisect import bisect_right
 from collections import defaultdict
 from pathlib import Path
 
-from atom.compass.backends.json_file import read_jsonl
+from atom.compass.backends.json_file import read_json, read_jsonl
 from atom.compass.backends.step_labels import TRACE
 from atom.compass.parity import MARK, PP_RECV, PP_SEND, TARGET_DONE
 
@@ -392,8 +392,8 @@ def floored(record, floor) -> list[dict]:
     each rank, at its largest rank, by its busy line field; and under
     ``floor`` why a term is not known, per field. A kernel's shape is its
     pass's, as `capture.population_steps` places the step in the record's
-    stage: the draft-KV pass at the step's, the rest of the draft at its
-    drafter's."""
+    stage under the run's drafter: the draft-KV pass at the step's, the rest
+    of the draft at its drafter's."""
     from atom.compass.capture import population_steps
 
     run = Path(record).parent.parent
@@ -403,7 +403,10 @@ def floored(record, floor) -> list[dict]:
             f"{TRACE}/, from which the profiler's floor reads each drafter kernel"
         )
     shapes, stage = defaultdict(list), _stage(record)
-    for shape, line in population_steps([run], drafters=True, stage=stage):
+    engine = read_json(run / "run.json").get("host_key", {}).get("engine", {})
+    drafts = (engine.get("speculative") or (None, 0))[1]
+    held = population_steps([run], drafters=True, stage=stage, run_drafts=drafts)
+    for shape, line in held:
         shapes[line["step"]].append(str(shape))
     rows = []
     for s, ranks in zip(read_jsonl(record), drafter(run, stage)):

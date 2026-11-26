@@ -2010,7 +2010,9 @@ class Tracer:
         it; per prefill shape, the middle chunk's and then the final one's.
         Under a drafter each step is two graphs, its target's and then its
         drafter's (`_drafter`), and a decode step verifies the drafter's tokens
-        in each row. A prefill of `unsplit` runs as one forward, this rank
+        in each row, or the `verifies` its shape states, which only a P/D
+        producer's decode does, so only a producer traces such a shape. A
+        prefill of `unsplit` runs as one forward, this rank
         answering that it cannot split it. The KV pool is the one a capture of
         `shapes` alone allocates: the blocks the widest of them takes,
         `KV_BLOCKS` at the fewest.
@@ -2020,12 +2022,20 @@ class Tracer:
         keyed by `symbolic_shape` and holds the guards the trace installed on
         G (`_guards`). Unless `warm`, no step runs before a traced one: the
         caller has just stepped the runner at that shape."""
+        from atom.kv_transfer.disaggregation.types import kv_config_has_producer
+
         config = self.config
         dp = config.parallel_config.data_parallel_size
         if dp == 1 and (gathering := [s for s in shapes if s.gathered is not None]):
             raise ValueError(f"{gathering[0]} gathers a DP group's rows on one rank")
         if symbolic and (dp == 1 or any(s.phase != "prefill" for s in shapes)):
             raise ValueError("only a DP prefill's graph holds the rows it gathers")
+        fewer = [s for s in shapes if s.verifies is not None]
+        if fewer and not kv_config_has_producer(config.kv_transfer_config):
+            raise ValueError(
+                f"{fewer[0]} verifies fewer drafts than its drafter's, as only a P/D "
+                "producer's decode does: trace it under its --kv-transfer-config"
+            )
         if self.runner is None:
             self._build()
         declared, drafts = self.declared, self.drafts
