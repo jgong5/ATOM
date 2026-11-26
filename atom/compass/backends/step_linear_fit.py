@@ -1948,6 +1948,67 @@ def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
     return entry, report
 
 
+#: Per copy line of `STORE_LINE`, for `fit_stream_floors`: the floor it fits,
+#: its count, the copy it stages on its stage's stream, and the windows that
+#: enqueue one there (a save's packed segments, a load's windows).
+STREAM_COPIES = {
+    "SAVE-PROF": ("store_floor_s", "chunks", "pack_ms", ("segments",)),
+    "LOAD-PROF": ("load_floor_s", "chunks", "unpack_ms", ("in_place_windows", "windows")),
+}
+
+
+def fit_stream_floors(logs, ranks, stream_wait: float = 1.0) -> tuple[dict, dict]:
+    """The ``mooncake_store`` entry's `STREAM_FIELDS`
+    (`atom.compass.kv.mooncake_store_server`), fitted on the Store logs
+    `logs`, each rank of `ranks` its own floors: what each copy takes off its
+    stage's stream, which ``COMPASS_STORE_ON_STREAM=1`` prices with the wait
+    apart.
+
+    ATOM's worker stages each window's pack or unpack on its stage's forward
+    stream and waits for it there, so a line's ``pack_ms`` or ``unpack_ms``
+    is that copy and the device work queued ahead of it. A rank's copy floor
+    a window is the 10th percentile of its lines' copy milliseconds over
+    their windows; a line's floor seconds are its ``total_ms`` with its copy
+    replaced by that floor times its windows, fitted by the host-law solver on
+    ``(1, chunks)`` as ``store_s`` and ``load_s`` are. ``stream_wait``, the
+    share of a stage's backlog a window waits for, is stated, not fitted: all
+    of it, as the copy is ordered after every kernel its host enqueued."""
+    if not 0.0 <= stream_wait <= 1.0:
+        raise ValueError(f"stream_wait is a fraction, got {stream_wait}")
+    lines: dict = {}
+    for log in logs:
+        for line in Path(log).read_text(errors="replace").splitlines():
+            m = STORE_LINE.search(line)
+            if not m or m[1] not in STREAM_COPIES:
+                continue
+            law, count, copy, windows = STREAM_COPIES[m[1]]
+            said = dict(re.findall(r"(\w+)=(\S+)", m[2].split(" draft_")[0]))
+            if said.get("status", "ok") != "ok" or "rank" not in said:
+                continue
+            n = next((int(said[w]) for w in windows if int(said.get(w, 0))), 0)
+            lines.setdefault((law, int(said["rank"])), []).append(
+                (int(said[count]), n, float(said[copy]), float(said["total_ms"]))
+            )
+    entry, report = {}, {}
+    for law in ("store_floor_s", "load_floor_s"):
+        each = []
+        for r in ranks:
+            rows = np.array(lines.get((law, r), []), dtype=np.float64).reshape(-1, 4)
+            staged = rows[rows[:, 1] > 0]
+            if not len(staged):
+                raise ValueError(f"no copy line of rank {r} stages a window for {law}")
+            floor = float(np.percentile(staged[:, 2] / staged[:, 1], 10))
+            seconds = (rows[:, 3] - rows[:, 2] + floor * rows[:, 1]) * 1e-3
+            x = np.column_stack([np.ones(len(rows)), rows[:, 0]])
+            term, rep = _host_law(x, seconds, ["fixed", "chunks"])
+            rep["copy_floor_ms_a_window"] = floor
+            each.append((term, rep))
+        entry[law] = [t for t, _ in each] if len(ranks) > 1 else each[0][0]
+        report[law] = {"ranks": [rep for _, rep in each]}
+    entry["stream_wait"] = float(stream_wait)
+    return entry, report
+
+
 def _alone(sent, got, returned=None) -> tuple[np.ndarray, np.ndarray]:
     """The arrival and ``got - sent`` of each message alone on its hop: sent
     once every message ahead of it arrived, and arrived before the next was
@@ -4029,8 +4090,27 @@ def offload_main(argv) -> None:
         type=int,
         help="the bytes a Mooncake Store's owners mounted, summed",
     )
+    parser.add_argument(
+        "--stream-floors",
+        action="store_true",
+        help="also fit a Mooncake Store entry's store_floor_s and load_floor_s "
+        "and state its stream_wait (`fit_stream_floors`), which a run reads "
+        "only under COMPASS_STORE_ON_STREAM=1",
+    )
+    parser.add_argument(
+        "--stream-wait",
+        type=float,
+        default=1.0,
+        help="with --stream-floors, the share of its stage's backlog a window waits for",
+    )
     args = parser.parse_args(argv)
     entry, report = fit_offload(args.logs, args.master_flags, args.capacity_bytes)
+    if args.stream_floors:
+        world = entry.get("world", 1)
+        floors, more = fit_stream_floors(args.logs, list(range(world)), args.stream_wait)
+        entry |= floors
+        entry["fit"] |= more
+        report |= more
     Path(args.out).write_text(json.dumps(entry) + "\n")
     for name, fit in report.items():
         print(f"{name}: {json.dumps(entry.get(name))} {json.dumps(fit)}")

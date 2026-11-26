@@ -50,6 +50,21 @@ run whose ``on_refusal`` is ``abort``.
 the TP group, gave at the previous call, as the engine's aggregation answers
 one poll behind.
 
+``COMPASS_STORE_ON_STREAM=1`` prices each copy as ATOM's worker runs it on its
+stage's forward stream (`STAGES_ON_FORWARD_STREAM`): it packs or unpacks a
+window there and waits for it (`fence_submitted_work`), so each window waits
+for the device work its stage's host had enqueued, then copies and puts or
+gets. A copy then takes the entry's floor, ``store_floor_s`` or
+``load_floor_s`` over its chunks, in place of ``store_s`` or ``load_s``, whose
+fits hold the record's mean wait, plus ``stream_wait`` x the backlog
+(`DeviceQueue.reached`) once a window, over the windows ATOM cuts
+(`pool.window`): a load's every window, a save's those holding a chunk its
+request's last reply did not find. The backlog is the head stage's queue, its
+forwards' launches and device runs (`connector.DEVICE_WATCHERS`): the shell
+keeps every stage's ranks, and a later stage's queue lives in its own
+process. Without the three fields the run is refused
+(`mooncake_store_server.stream_terms`); unset, nothing changes.
+
 Under a pipelined prefill the writer ranks are every stage's (``world`` =
 stages x TP, ATOM's `pp_aware_rank_and_world`), all kept by the head stage's
 shell, the one that schedules: a request's lookup asks every rank's keys, a
@@ -69,6 +84,7 @@ import functools
 import itertools
 import logging
 import math
+import os
 import pickle
 import threading
 from concurrent.futures import Future
@@ -449,7 +465,18 @@ class StoreShell:
             rank._gpu_connector = StandInCopies(safe)
             self._ranks.append(rank)
         terms = {name: entry[name] for name in store.TERMS}
-        self._lanes = Lanes(rt, self._ranks, terms, ENTRY)
+        stream = None
+        if os.environ.get("COMPASS_STORE_ON_STREAM", "0") == "1":
+            from atom.compass.kv import connector
+            from atom.compass.kv.transfer import DeviceQueue
+
+            stated = store.stream_terms(entry)
+            terms |= {"store_s": stated["store_s"], "load_s": stated["load_s"]}
+            self._stream_wait = stated["stream_wait"]
+            self._device = DeviceQueue()
+            connector.DEVICE_WATCHERS.add(self)
+            stream = (self._stream_windows, self._stream_backlog)
+        self._lanes = Lanes(rt, self._ranks, terms, ENTRY, stream)
         self._tp = KVOutputAggregator(world_size=self._world)
         self._held = None  # what the ranks reported at the previous call
         self._socks: dict = {}  # channel -> its DEALER
@@ -691,6 +718,43 @@ class StoreShell:
             self._client.answer = {}
 
     # -- the ranks' copies ---------------------------------------------------
+
+    # -- COMPASS_STORE_ON_STREAM=1 -------------------------------------------
+
+    def device_forward(self, window) -> None:
+        """The head stage's forward returned: its launch and device run,
+        `window` (`HostDeviceRecurrence.window`), join its queue. No copy
+        starts before now, so the forwards launched before this one's start
+        are dropped."""
+        if window is not None:
+            self._device.add(*window)
+            self._device.forget_before(window[0])
+
+    def _stream_backlog(self, k: int, t: float) -> float:
+        """The seconds a window enqueued at `t` waits on its stage's stream."""
+        return self._stream_wait * (self._device.reached(t) - t)
+
+    def _stream_windows(self, k: int, kind: str, req, chunks: int) -> int:
+        """The windows of rank `k`'s copy of `req` that enqueue a copy on its
+        stage's stream: a load's every window, as ATOM's worker cuts them
+        (`pool.window`), a save's those holding a chunk its request's last
+        lookup or renewal reply did not find, whose windows it packs."""
+        from atom.kv_transfer.offload.mooncake_store.keys import chunk_keys
+
+        rank = self._ranks[k]
+        workers = rank.load_workers if kind == "load" else rank.save_workers
+        size = rank._pool.window(kind, workers)
+        if kind == "load":
+            return -(-chunks // size)
+        first, end = self._chunks(kind, req)
+        _, present = self._leases.get(str(req.req_id), (-math.inf, {}))
+        if not present:
+            return -(-chunks // size)
+        keys = chunk_keys(self._namespace, k, self._world, req.chunk_hashes, first, end)
+        return sum(
+            any(key not in present for key in keys[i : i + size])
+            for i in range(0, len(keys), size)
+        )
 
     def _chunks(self, kind: str, req) -> tuple[int, int]:
         """The chunks ``[first, end)`` ATOM's worker copies for `req`."""
