@@ -64,6 +64,9 @@ Each graph's prices in run order fall into segments that alternate streams: an
 MoE exchange of activations rides the comm stream, everything else the compute
 stream. Both micro-batches' segments go on the two streams in ATOM's order
 (`step_roofline.overlap`); the finish time is the one term ``op.tbo``.
+Under a drafter, its propose and a block drafter's draft-KV pass run after both
+micro-batches on the step's whole rows, as ATOM runs them: their terms are
+a step's that does not split.
 
 With a `price_list`, a source named `LISTED` (`fit.ops.PriceList` in a run),
 each leaf resolves through a `Resolver`: the
@@ -92,8 +95,7 @@ two-batch-overlap step on MoRI's split send and receive (`split_send_recv`),
 whose transfer in flight lies on no stream, whose split names no pair for
 this rank, whose micro-batches' graphs exchange a different number of times
 or run an exchange beside a second stream (the dual-stream MoE, which ATOM
-turns off under overlap), or that runs under a drafter, whose draft pass no
-graph places on the overlapped streams; a decode step whose rows do not each
+turns off under overlap); a decode step whose rows do not each
 verify the drafter's tokens and one; a step that samples on one rank whose
 MTP drafter's graph does not run its routed leaves as its passes alike, each
 its own; a prefill step whose view
@@ -524,17 +526,32 @@ class OpGraphBackend(CostBackend):
     def price(self, batch_view: BatchView) -> StepCost:
         refused: list[Refusal] = []
         self._step, self._passes, self._read = {}, {}, set()
-        if batch_view.tbo_tokens is not None and not batch_view.image_tokens:
-            at, priced = self._overlapped(batch_view, refused)
-            if refused:
-                raise CostRefused(batch_view, list(dict.fromkeys(refused)))
-            return StepCost([_term(priced[0][0], priced, at)])
-        at, region = self._region(batch_view)
+        if batch_view.tbo_tokens is None or batch_view.image_tokens:
+            return self._graphs(batch_view, *self._region(batch_view))
+        at, priced = self._overlapped(batch_view, refused)
+        if refused:
+            raise CostRefused(batch_view, list(dict.fromkeys(refused)))
+        tbo = _term(priced[0][0], priced, at)
+        if not self.drafts:
+            return StepCost([tbo])
+        # ATOM runs the drafter past both micro-batches, on the step's whole
+        # rows (`ModelRunner` wraps the target alone in `UBatchWrapper`).
+        cost = self._graphs(batch_view, None, None)
+        return StepCost((tbo, *cost.terms), cost.treatments, cost.draft_terms)
+
+    def _graphs(self, batch_view: BatchView, at, region) -> StepCost:
+        """A step at its target's graph `region`, from the graph at `at`, and
+        its drafter's graphs; with no `region`, its drafter's alone."""
         drafted_at, drafted = (
             self._region(batch_view, draft=True) if self.drafts else (None, None)
         )
         samples = batch_view.decode or batch_view.produces_output
-        kv = self.block and samples and self._region(batch_view, draft=KV)[1]
+        kv_at, kv = (
+            self._region(batch_view, draft=KV)
+            if self.block and samples
+            else (None, None)
+        )
+        at = at or kv_at  # a split step's draft-KV pass, at its whole shape
         graph = (at, id(region), drafted_at, id(drafted), id(kv))
         # A graph's first step keeps only the graphs, whose ids `graph` names,
         # and prices them whole: a graph a run reads once, as most prefill
@@ -832,11 +849,6 @@ class OpGraphBackend(CostBackend):
                     "a two-batch-overlap step on MoRI's split send and receive "
                     "(--all2all-backend low-latency): its transfer in flight "
                     "lies on no stream"
-                )
-            if self.drafts:
-                raise ValueError(
-                    "a two-batch-overlap step under a drafter: no graph places its "
-                    "draft pass on the overlapped streams"
                 )
             halves = micro_batches(view)
         except ValueError as exc:

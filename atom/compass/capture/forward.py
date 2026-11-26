@@ -1802,7 +1802,8 @@ def capture(
 
     The steps of the record directories `population` are shapes too
     (`population_shapes`), under two-batch overlap a split one's two
-    micro-batches, each keyed as one (`structure`); each of their prefills
+    micro-batches, each keyed as one (`structure`), and under a drafter its
+    whole step, where its drafter runs; each of their prefills
     runs as one forward, as it ran, this rank answering that it cannot split
     it; with `whole`, each prefill of
     `shapes` too. With `symbolic`, each prefill's (T, B) of a DP group with no
@@ -1819,7 +1820,8 @@ def capture(
         config.parallel_config.data_parallel_size == 1 or config.speculative_config
     ):
         raise ValueError("--symbolic: only a DP prefill with no drafter holds G")
-    ran = population_shapes(population, tracer.config.enable_tbo)
+    drafted = bool(config.speculative_config)
+    ran = population_shapes(population, config.enable_tbo, drafted)
     shapes = list(dict.fromkeys([*shapes, *ran]))
     if not shapes:
         raise ValueError(f"{', '.join(population)} hold no step to trace")
