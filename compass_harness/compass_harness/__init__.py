@@ -26,12 +26,25 @@ that clock too. Where aiperf mints a session's id, ``uuid`` becomes
 real run's client draws it.
 """
 
+import gc
 import importlib
 import importlib.util
+import json
 import os
 import sys
+from pathlib import Path
 
 from compass_harness import fingerprint, session_ids
+
+# Under its run file's ``rare_full_gc``, every aiperf process, which plugin
+# discovery imports this package into, raises its generation-2 collection
+# threshold as `atom.compass.run.rare_full_gc` has the run's other processes
+# do, each name here that module's. Not by importing that module: it is heavy,
+# and discovery runs in every aiperf process.
+_run_file = os.environ.get("ATOM_COMPASS_RUN")  # `atom.compass.run.ENV`
+if _run_file and json.loads(Path(_run_file).read_text()).get("rare_full_gc") is True:
+    _t0, _t1, _ = gc.get_threshold()
+    gc.set_threshold(_t0, _t1, 1_000_000)  # `atom.compass.run.RARE_FULL_GC_GEN2`
 
 RUNNER = "aiperf.timing.phase.runner"
 STRATEGY = "compass_harness.strategy:CompassAgenticReplay"

@@ -141,6 +141,9 @@ and removes, and every count of a body's bytes counts them as if inline,
 of a reader thread a connection, `clock_transport.serve`'s ``select``; it
 serves the same frames, each connection's in their order, so the schedule and
 the sends are the same),
+``rare_full_gc`` (optional, ``false``, the default, or ``true``: every
+process of the run, aiperf's in ``compass_harness`` included, raises CPython's
+generation-2 threshold to `RARE_FULL_GC_GEN2`, `rare_full_gc`),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -404,6 +407,10 @@ WIDE_LOCAL_GRANTS = "wide_local_grants"
 STREAM_BYPASS = "stream_bypass"
 #: The run-file key that hands a prompt's ids from prefill to decode by reference.
 IDS_BY_REF = "ids_by_ref"
+#: The run-file key that makes CPython's full collections rare in every
+#: process of the run, and the generation-2 threshold it sets: CPython counts
+#: one per generation-1 collection, and a full one waits for this many.
+RARE_FULL_GC, RARE_FULL_GC_GEN2 = "rare_full_gc", 1_000_000
 #: The tmpfs root of a run's `ids_dir`.
 IDS_ROOT = "/dev/shm"
 #: The run-file key that serves the authority's connections on one thread.
@@ -427,6 +434,7 @@ PER_RUN = (
     WIDE_LOCAL_GRANTS,
     IDS_BY_REF,
     SELECT_SERVE,
+    RARE_FULL_GC,
 )
 LP_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
     "lp-{}.json",  # by LP name, or <lp>.<member> for a member
@@ -738,6 +746,33 @@ LOCAL = ".local"
 _frontend_host: dict | None = None
 
 
+def rare_full_gc(run: dict | None) -> None:
+    """Where `run` states ``rare_full_gc``, raise this process's generation-2
+    threshold to `RARE_FULL_GC_GEN2`; generations 0 and 1 collect as before.
+
+    A full collection walks every object the run allocated since the startup
+    freeze (`gc_utils.freeze_gc_heap`) and still holds, while its LP's clock
+    stands still. With the option, a cycle that has reached generation 2 stays
+    until the process exits, and with it one event can go: a streamed response
+    cancelled while its task waits in ``BaseHTTPMiddleware``'s send leaves its
+    generator at ``yield``, only that generator's finalizer aborts its request
+    (jgong5/ATOM#4243), and its engine then decodes it to its end.
+
+    A process the run spawns inherits `ENV` and takes the option as it imports
+    this module; the API server and the standalone authority, which set `ENV`
+    from their command line after that import, take it in `frontend` and
+    `authority`. aiperf's processes take it in ``compass_harness``. ATOM's
+    `tune_gc`, which runs later in a serving process, overrides it there when
+    ``ATOM_GC_THRESHOLD`` is set."""
+    if run is not None and run.get(RARE_FULL_GC) is True:
+        t0, t1, _ = gc.get_threshold()
+        gc.set_threshold(t0, t1, RARE_FULL_GC_GEN2)
+
+
+if os.environ.get(ENV):
+    rare_full_gc(json.loads(Path(os.environ[ENV]).read_text()))
+
+
 def spec() -> dict | None:
     """The run file's mapping, or None on a real run."""
     path = os.environ.get(ENV)
@@ -768,6 +803,8 @@ def spec() -> dict | None:
             "prefill-decode run, whose prefill frontends hand ids to its decode "
             "frontends, or false"
         )
+    if type(rare := run.get(RARE_FULL_GC, False)) is not bool:
+        raise ValueError(f"{path}: {RARE_FULL_GC} is {rare!r}; it is true or false")
     for host in entries(run, "host"):
         _check_host(path, host)
     stated_ingress(run)
@@ -1840,6 +1877,7 @@ def frontend(config):
                 )
             config.runner_qualname = recording[config.runner_qualname]
         return contextlib.nullcontext()
+    rare_full_gc(run)
     _refuse_unserved()
     pc = config.parallel_config
     rapid = config.enable_rapidserve
@@ -4157,6 +4195,7 @@ def authority(endpoint: str) -> None:
     end, then write its step table, and the run summary once the server LPs
     have handed in. The run's `ids_dir`, where it has one, is there that long."""
     run = spec()
+    rare_full_gc(run)
     a = _RecordingAuthority(run)
     with _owning_ids_dir(run):
         _write_whole(Path(run["out_dir"]) / AUTHORITY_FILE, endpoint)

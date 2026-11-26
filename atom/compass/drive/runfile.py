@@ -50,7 +50,9 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   stream's events but its last past LP ``router``; ``--ids-by-ref``, off
   unless given, which hands a prefill-decode run's prompt ids from prefill
   to decode by reference; ``--select-serve``, off unless given, which
-  serves the authority's connections on one selector thread.
+  serves the authority's connections on one selector thread;
+  ``--rare-full-gc``, off unless given, which raises every simulated
+  process's generation-2 collection threshold (`run.rare_full_gc`).
 - Not flags: `FIXED`, and ``data_parallel_size``, read from ATOM's arguments.
   The server serves client runs until it is stopped.
 
@@ -124,6 +126,7 @@ def add_arguments(parser) -> None:
     parser.add_argument("--stream-bypass", action="store_true")
     parser.add_argument("--ids-by-ref", action="store_true")
     parser.add_argument("--select-serve", action="store_true")
+    parser.add_argument("--rare-full-gc", action="store_true")
 
 
 def spec(args, store: ArtifactStore, across: bool = False):
@@ -187,6 +190,7 @@ def build(args, atom_args, across: bool = False) -> dict:
         run.WIDE_LOCAL_GRANTS: args.wide_local_grants,
         run.IDS_BY_REF: args.ids_by_ref,
         run.SELECT_SERVE: args.select_serve,
+        run.RARE_FULL_GC: args.rare_full_gc,
     }
     if args.stream_bypass:  # part of the configuration, so written only when on
         out[run.STREAM_BYPASS] = True
