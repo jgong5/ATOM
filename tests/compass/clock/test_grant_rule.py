@@ -81,6 +81,10 @@ class _Recorded(ClockAuthority):
 class _NowForWaitingTar(_Recorded):
     """The rejected rule: a peer waiting in TAR bounds the others by its clock."""
 
+    def __init__(self, channels):
+        super().__init__(channels)
+        self._cut = False  # a rejected row stands alone, without the refined LBTS
+
     def _row(self, i):
         return tuple(
             (
@@ -95,6 +99,10 @@ class _NowForWaitingTar(_Recorded):
 
 class _NeighbourRow(_Recorded):
     """The rejected rule: only direct channels bound a peer, not paths."""
+
+    def __init__(self, channels):
+        super().__init__(channels)
+        self._cut = False  # a rejected row stands alone, without the refined LBTS
 
     def _row(self, i):
         return tuple(

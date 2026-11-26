@@ -89,6 +89,13 @@ def _engine_lbts(ca):
     return min(term for _, term in row.row)
 
 
+@pytest.fixture(autouse=True)
+def _distance_rule_unless_asked(monkeypatch, request):
+    """The floor tests read the distance rule's terms; the TAR-cut tests set their own."""
+    if "cut" not in request.node.name and "refined" not in request.node.name and "offering" not in request.node.name:
+        monkeypatch.setenv("COMPASS_CA_TAR_CUT", "0")
+
+
 def _started(floor, engine_at=7.0):
     ca = ClockAuthority(_loop_table())
     assert ca.on_request(R, TAR, 100.0, []) == []
@@ -152,3 +159,53 @@ def test_the_floor_rides_the_wire_and_its_absence_changes_nothing():
     body = wire._request_out(TAR, 1.0, [], math.inf, floor=2.5)
     assert wire._request_in(body)[-1] == 2.5
     assert wire._request_in(body)[:4] == wire._request_in(plain)[:4]
+
+
+# --- the refined LBTS: an LP waiting in TAR passes nothing on before its target
+
+
+def _chain_abc():
+    registry = LpRegistry()
+    for lp in ("a", "b", "c"):
+        registry.register(LpId(lp))
+    table = ChannelTable(registry)
+    table.declare("a->b:m", LpId("a"), LpId("b"), 0.1, "inline")
+    table.declare("b->c:m", LpId("b"), LpId("c"), 0.1, "inline")
+    return table
+
+
+@pytest.mark.parametrize("middle, cut, granted", [
+    (TAR, "1", True),   # b sends at 10 at the earliest, whatever reaches it
+    (NER, "1", False),  # b may send the instant a's message lands, at 1.1
+    (TAR, "0", False),  # the distance rule alone
+])
+def test_a_tar_lp_in_the_middle_cuts_the_path_behind_it(monkeypatch, middle, cut, granted):
+    monkeypatch.setenv("COMPASS_CA_TAR_CUT", cut)
+    a, b, c = LpId("a"), LpId("b"), LpId("c")
+    ca = ClockAuthority(_chain_abc())
+    assert ca.on_request(c, TAR, 5.0, []) == []
+    # a runs at 0: its message reaches b at 0.1 at the earliest.
+    got = [(str(i), g) for i, g, _ in ca.on_request(b, middle, 10.0, [])]
+    assert (("c", 5.0) in got) is granted
+
+
+def test_an_offering_channel_lets_a_tar_lp_pass_on_at_its_arrival(monkeypatch):
+    monkeypatch.setenv("COMPASS_CA_TAR_CUT", "1")
+    table = _chain_abc()
+    table.mark_offering("a->b:m")
+    a, b, c = LpId("a"), LpId("b"), LpId("c")
+    ca = ClockAuthority(table)
+    ca.on_request(c, TAR, 5.0, [])
+    got = [(str(i), g) for i, g, _ in ca.on_request(b, TAR, 10.0, [])]
+    assert ("c", 5.0) not in got
+
+
+def test_the_refined_lbts_is_never_below_the_distance_rules(monkeypatch):
+    monkeypatch.setenv("COMPASS_CA_TAR_CUT", "1")
+    ca = ClockAuthority(_loop_table())
+    ca.on_request(R, TAR, 4.0, [])
+    ca.on_request(E, TAR, 7.5, [])
+    ca.on_request(F, TAR, 5.0, [], floor=20.0)
+    eit = ca._refined_eit()
+    for i in (R, F, E):
+        assert eit[ca._index[i]] >= ca._lbts(i) - 1e-12

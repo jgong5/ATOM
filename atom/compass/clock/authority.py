@@ -123,7 +123,9 @@ Nothing here reads a clock, opens a socket or starts a thread. The caller
 carries requests in and replies out.
 """
 
+import heapq
 import math
+import os
 from dataclasses import dataclass, field
 
 from .channels import ChannelTable
@@ -300,6 +302,29 @@ class ClockAuthority:
         for i in self._ids:
             pairs = ((j, first_hop(j, i, True), first_hop(j, i, False)) for j, _ in self._from[i])
             self._floored[i] = {j: (dc, du) for j, dc, du in pairs if dc < du}
+        # The refined LBTS (`_refined_eit`): each LP's channels out, by
+        # whether they go into an engine, as (target index, lookahead,
+        # offering at the target, a trigger at the target), the least
+        # lookahead of each such kind.
+        self._cut = os.environ.get("COMPASS_CA_TAR_CUT", "1") != "0"
+        self._index = {i: k for k, i in enumerate(self._ids)}
+        self._edges = []
+        for i in self._ids:
+            least = {}
+            for c in channels.channels_from(i):
+                t = c.target
+                key = (
+                    c.name in self._covered[i],
+                    self._index[t],
+                    c.name in self._offering[t],
+                    c.name in self._triggers[t],
+                )
+                least[key] = min(least.get(key, math.inf), c.lookahead_s)
+            by = ([], [])
+            for (covered, t, off, trig), la in sorted(least.items()):
+                by[covered].append((t, la, off, trig))
+            self._edges.append((tuple(by[0]), tuple(by[1])))
+        self._hint = None  # (LP, its refined EIT) for the grant being made
         self.timeline = timeline
         self._sent = {i: [] for i in self._ids}  # logged since its last reply
         self.grants = {i.name: 0 for i in self._ids}
@@ -741,10 +766,74 @@ class ClockAuthority:
     def _lbts(self, i: LpId) -> float:
         return min((term for _, term in self._row(i)), default=math.inf)
 
+    def _lbts_granted(self, i: LpId) -> float:
+        """LBTS(i) for the grant being made: the refined one it was made on."""
+        lbts = self._lbts(i)
+        hint = self._hint
+        return max(lbts, hint[1]) if hint is not None and hint[0] == i else lbts
+
+    def _refined_eit(self) -> list:
+        """EIT of each LP, by index: see `tarcut.py`'s rule."""
+        ids, state, nv, floor = self._ids, self._state, self._nv, self._floor
+        inf = math.inf
+        k = len(ids)
+        e_all, e_off, e_trig = [inf] * k, [inf] * k, [inf] * k
+        pending = {}
+
+        def labels(x):
+            j = ids[x]
+            n = nv[j]
+            base = min(n, e_off[x] if state[j] == TAR else e_all[x])
+            h = floor.get(j)
+            if h is None:
+                return base, base
+            p = pending.get(x)
+            if p is None:
+                p = pending[x] = self._trigger_pending(j)
+            return base, max(n, min(h, p, e_trig[x]))
+
+        eot, heap = [], []
+        for x in range(k):
+            u, c = labels(x)
+            eot.append([u, c])
+            heap.append((u, 0, x))
+            heap.append((c, 1, x))
+        heapq.heapify(heap)
+        edges = self._edges
+        while heap:
+            v, cls, x = heapq.heappop(heap)
+            if v == inf:
+                break
+            if v != eot[x][cls]:
+                continue
+            for y, la, off, trig in edges[x][cls]:
+                a = v + la
+                changed = False
+                if a < e_all[y]:
+                    e_all[y] = a
+                    changed = True
+                if off and a < e_off[y]:
+                    e_off[y] = a
+                    changed = True
+                if trig and a < e_trig[y]:
+                    e_trig[y] = a
+                    changed = True
+                if changed:
+                    u, c = labels(y)
+                    old = eot[y]
+                    if u < old[0]:
+                        old[0] = u
+                        heapq.heappush(heap, (u, 0, y))
+                    if c < old[1]:
+                        old[1] = c
+                        heapq.heappush(heap, (c, 1, y))
+        return e_all
+
     def _grant_due(self) -> list:
         replies = []
         state, nv = self._state, self._nv
         while True:
+            self._hint = None
             # `state` iterates in name order and the sort is stable, so equal
             # N stay in name order without comparing two LpIds.
             waiting = sorted(
@@ -753,6 +842,13 @@ class ClockAuthority:
             )
             grantable = [(n, i) for n, i in waiting if n <= self._horizon]
             due = next(((i, n) for n, i in grantable if n < self._lbts(i)), None)
+            if due is None and self._cut and grantable:
+                eit = self._refined_eit()
+                due = next(
+                    ((i, n) for n, i in grantable if n < eit[self._index[i]]), None
+                )
+                if due is not None:
+                    self._hint = (due[0], eit[self._index[due[0]]])
             if due is not None:
                 short = state[due[0]] == TAR and due[1] < self._target[due[0]]
                 replies.append(self._grant(*due))
@@ -872,7 +968,7 @@ class ClockAuthority:
         """The ceiling of `i`'s grant to `g`: `released` takes every message
         below it when `i` asked for them ahead. An LP with members takes none:
         the rounds granted below it release them."""
-        ceiling = min(self._lbts(i), g + self._cycle[i], self._bound)
+        ceiling = min(self._lbts_granted(i), g + self._cycle[i], self._bound)
         if i in self._members:
             return ceiling
         for name in self._into[i] if self._asks.get(i) else ():
@@ -890,7 +986,7 @@ class ClockAuthority:
         """The ceiling of `i`'s grant to `g` less its cycle term: LBTS(i), the
         bound and every message still unreleased to it, those sent ahead gone."""
         rest = [a for n in self._into[i] for a in self._undelivered[n].values()]
-        return max(g, min([self._lbts(i), self._bound, *rest]))
+        return max(g, min([self._lbts_granted(i), self._bound, *rest]))
 
     def _catch_up(self, lp: LpId, steps, log, member) -> list:
         """Register the sends `lp` logged before each of its own `steps`, and
