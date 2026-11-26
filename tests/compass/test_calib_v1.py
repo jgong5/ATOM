@@ -1001,6 +1001,69 @@ def test_the_prefill_kinds_shape_their_turns_from_the_deployment():
     assert one == 800  # `out1` of a thousand requests
 
 
+def _phase(**over) -> dict:
+    seg = {
+        "name": "P-ph",
+        "kind": "phase",
+        "deep": {
+            "ranks": [0],
+            "base": [{"len_share": 0.25}],
+            "deltas": [256, 512, 1024],
+            "turns": 5,
+        },
+        "shallow": {
+            "ranks": [1],
+            "prompt": [{"budget_share": 0.5}, {"budget_share": 1.0}],
+            "turns": 2,
+            "sessions": 4,
+        },
+    }
+    for part, fields in over.items():
+        seg[part] = {**seg[part], **fields}
+    return seg
+
+
+def test_a_phase_segment_puts_history_work_and_token_work_on_different_ranks():
+    cfg = deploy.parse(_config(segments=[_phase()]))
+    dep = cfg.deployment
+    deep, shallow = design.generate(cfg)[0].lanes
+    # the deep rank: one pinned session, a cold base then short deltas on it
+    assert (deep.pin, deep.concurrency, len(deep.sessions)) == (0, 1, 1)
+    (s,) = deep.sessions
+    assert s.turns[0].prompt == 16384 and len(s.turns) == 6
+    delta = [
+        b.prompt - a.prompt - 64 * design.blocks(a.out, dep)
+        for a, b in zip(s.turns, s.turns[1:])
+    ]
+    assert delta == [256, 512, 1024, 256, 512]
+    assert {t.out for t in s.turns} == {1} and {t.gap for t in s.turns} == {0.0}
+    # the shallow rank: a pinned queue of short sessions, one at a time
+    assert (shallow.pin, shallow.concurrency, len(shallow.sessions)) == (1, 1, 4)
+    for s in shallow.sessions:
+        assert len(s.turns) == 3 and {t.out for t in s.turns} == {1}
+        assert 2048 <= s.turns[0].prompt <= 4096
+        assert s.turns[-1].prompt <= 3 * 4096 + 2 * 64
+    # a second deep rank starts one delta further along the cycle
+    raw = _config(
+        segments=[
+            _phase(deep={"ranks": [0, 1], "base": [8192, 8192]}, shallow={"ranks": [2]})
+        ]
+    )
+    raw["deployment"]["dp"] = 3
+    two = design.generate(deploy.parse(raw))[0].lanes[1].sessions[0].turns
+    assert two[1].prompt - two[0].prompt - 64 == 512
+
+
+def test_a_phase_segment_refuses_shared_ranks_and_unmatched_bases():
+    def refused(match, **over):
+        with pytest.raises(ValueError, match=match):
+            design.generate(deploy.parse(_config(segments=[_phase(**over)])))
+
+    refused("repeat or pass dp", shallow={"ranks": [0]})
+    refused("repeat or pass dp", shallow={"ranks": [2]})
+    refused("one deep base a deep rank", deep={"base": [8192, 8192]})
+
+
 def test_a_design_follows_a_doubled_max_num_seqs():
     cfg, made = _made(max_num_seqs=16, rungs=[1, 2, 4, 8, 16])
     busy, half = made["D-k"].lanes

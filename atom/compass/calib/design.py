@@ -59,6 +59,15 @@ Kinds (`GENERATORS`):
 - ``rows``: many short single-turn requests at high concurrency (`out1` of
   them one output token): prefill steps of many rows and every token-graph
   bucket.
+- ``phase``: a prefill group whose history work and token work peak on
+  different ranks. Each `deep` rank holds one pinned session: a cold `base`
+  prompt, then `turns` short `deltas` (cycled, each rank starting further
+  along) on that history. Each `shallow` rank runs a pinned queue of
+  `sessions` short sessions one at a time, each a cold prompt and `turns` more
+  of the same size range, so its history stays short. Every turn has one
+  output token and the next follows at once, so the ranks prefill side by
+  side: the deep rank's history terms beside the shallow rank's full step
+  budget (the phase premium the group's price rule is judged on).
 
 A ``copy`` segment is the segment it names (`of`) again under its own name,
 an anchor: its traces are new, so it hits none of the original's cache. A
@@ -408,12 +417,46 @@ def rows(seg: dict, cfg: Config) -> Segment:
     return Segment(seg["name"], "rows", seg.get("purpose", ""), [lane], plan)
 
 
+def phase(seg: dict, cfg: Config) -> Segment:
+    dep = cfg.deployment
+    deep, shallow = seg["deep"], seg["shallow"]
+    taken = list(deep["ranks"]) + list(shallow["ranks"])
+    if len(set(taken)) != len(taken) or not all(0 <= r < dep.dp for r in taken):
+        raise ValueError(f"{seg['name']}: ranks {taken} repeat or pass dp {dep.dp}")
+    if len(deep["base"]) != len(deep["ranks"]):
+        raise ValueError(f"{seg['name']}: one deep base a deep rank")
+    lanes, plan = [], {"deep": {}, "shallow": {}}
+    deltas = [tokens(d, dep) for d in deep["deltas"]]
+    for i, r in enumerate(deep["ranks"]):
+        base = tokens(deep["base"][i], dep)
+        ds = deltas[i % len(deltas) :] + deltas[: i % len(deltas)]
+        follow = [(0.0, ds[j % len(ds)], 1) for j in range(deep["turns"])]
+        lanes.append(
+            Lane(f"d{r}", r, 1, [session(f"d{r}", base, follow, dep, 1, "deep")])
+        )
+        plan["deep"][str(r)] = {"base": base, "turns": deep["turns"]}
+    lo, hi = (tokens(x, dep) for x in shallow["prompt"])
+    n, turns = shallow["sessions"], shallow["turns"]
+    for i, r in enumerate(shallow["ranks"]):
+        sizes = interleave(spread(lo, hi, n * (turns + 1), dep))
+        sizes = sizes[i:] + sizes[:i]
+        sessions = []
+        for k in range(n):
+            p = sizes[k * (turns + 1) : (k + 1) * (turns + 1)]
+            follow = [(0.0, x, 1) for x in p[1:]]
+            sessions.append(session(f"s{r}k{k:03d}", p[0], follow, dep, 1, "shallow"))
+        lanes.append(Lane(f"s{r}", r, 1, sessions))
+        plan["shallow"][str(r)] = {"sessions": n, "turns": turns, "prompt": [lo, hi]}
+    return Segment(seg["name"], "phase", seg.get("purpose", ""), lanes, plan)
+
+
 GENERATORS = {
     "drain": drain,
     "quads": quads,
     "backlog": backlog,
     "trickle": trickle,
     "rows": rows,
+    "phase": phase,
 }
 
 
