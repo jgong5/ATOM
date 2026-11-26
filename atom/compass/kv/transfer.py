@@ -45,6 +45,12 @@ D rank's NIC moved 7.9 GB/s and two to five at once 5.7 to 3.1 GB/s each,
 whatever the prefill rank's other writes or forwards did: one write is held
 to the link's rate, several share a NIC's ~12 GB/s.
 
+A link that states the ``serve_*`` fields (opt-in, `ServeModel`) prices a
+pipelined prefill's writes where they are served: each stage times its own
+layers' writes on its own device's queue (`StageServe`, `DeviceQueue`), each
+write's calls gathered behind the forwards its host had enqueued, and tells
+decode when they are done; nothing then rides a `Link`.
+
 Nothing in this module imports the engine or a tensor library. Reaching it
 through the package around it is not the same import: `atom.compass.kv` loads
 the connector beside it, and that brings the engine's connector interface, its
@@ -56,6 +62,7 @@ having, and it is not a bare import of this file.
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import enum
 import math
@@ -71,6 +78,175 @@ class Scope(enum.Enum):
 
     INTRA_NODE = "intra_node"
     INTER_NODE = "inter_node"
+
+
+#: The link fields of `ServeModel`, every one stated or none (opt-in).
+SERVE_FIELDS = (
+    "serve_chunk_bytes",
+    "serve_call_bandwidth_bytes_per_s",
+    "serve_call_s",
+    "serve_gather_s",
+    "serve_gather_one_s",
+    "serve_stagger_s",
+    "serve_device_wait",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ServeModel:
+    """How a prefill stage serves its share of one transfer under load: the
+    link's ``serve_*`` fields (opt-in), fitted on a recorded run's KV writes.
+
+    Each pipeline stage writes its own layers' KV, one write a decode rank
+    (`writes`, decode's TP: TP1 prefill landing on TP4 decode), as Mooncake's
+    stage workers do. A write moves its bytes in calls of `chunk_bytes`, each
+    gathered on the stage's device before its RDMA call. A call asked at `e`
+    is gathered once the stage's device has run `device_wait` of the work its
+    host had enqueued by then (`DeviceQueue.reached`), then moves its bytes at
+    `call_bandwidth_bytes_per_s`, `call_s` after; the next is asked as it
+    ends. A write's first call waits `gather_s + gather_one_s / calls` more,
+    and write ``j`` of a transfer is asked ``j x stagger_s / calls`` after the
+    first. On MiniMax-M3.1's CAL record (#3720) a write of one call waited
+    ~11 ms before its first RDMA post and one of 25 or more ~2.5 ms, a
+    stage's single-call writes started ~1.4 ms apart, the calls moved 8 MiB
+    each at ~8-11 GB/s, and under load a write's calls came in bursts at its
+    stage's forwards' device ends: at c120, transfers over 2 GB took 1.05 s at
+    p50 where a lone write's rate prices ~0.15 s.
+    """
+
+    chunk_bytes: int
+    call_bandwidth_bytes_per_s: float
+    call_s: float
+    gather_s: float
+    gather_one_s: float
+    stagger_s: float
+    device_wait: float
+    writes: int = 1
+
+    def __post_init__(self) -> None:
+        if self.chunk_bytes < 1 or self.writes < 1:
+            raise ValueError(
+                f"a serve model moves calls of {self.chunk_bytes} bytes over "
+                f"{self.writes} writes; both must be at least 1"
+            )
+        if self.call_bandwidth_bytes_per_s <= 0:
+            raise ValueError("serve_call_bandwidth_bytes_per_s must be positive")
+        if min(self.call_s, self.gather_s, self.gather_one_s, self.stagger_s) < 0:
+            raise ValueError("a serve model's seconds must not be negative")
+        if not 0.0 <= self.device_wait <= 1.0:
+            raise ValueError(
+                f"serve_device_wait is a fraction of the device's backlog, got "
+                f"{self.device_wait}"
+            )
+
+    @classmethod
+    def from_spec(cls, spec, scope: Scope) -> ServeModel | None:
+        """The *scope* link's serve model, None where it states no
+        ``serve_*`` field; refused where it states some and not all."""
+        link = f"interconnect.{scope.value}"
+        got = {f: spec.values.get(f"{link}.{f}") for f in SERVE_FIELDS}
+        if all(v is None for v in got.values()):
+            return None
+        if missing := [f for f, v in got.items() if v is None]:
+            raise ValueError(
+                f"the {scope.value} link states some serve fields and not "
+                f"{', '.join(missing)}: a stage's serving is priced from all of them"
+            )
+        return cls(
+            chunk_bytes=int(got["serve_chunk_bytes"]),
+            call_bandwidth_bytes_per_s=float(got["serve_call_bandwidth_bytes_per_s"]),
+            call_s=float(got["serve_call_s"]),
+            gather_s=float(got["serve_gather_s"]),
+            gather_one_s=float(got["serve_gather_one_s"]),
+            stagger_s=float(got["serve_stagger_s"]),
+            device_wait=float(got["serve_device_wait"]),
+        )
+
+    def calls(self, nbytes: float) -> int:
+        """The calls one write of *nbytes* takes, at least one."""
+        return max(1, math.ceil(nbytes / self.chunk_bytes))
+
+
+class DeviceQueue:
+    """One prefill stage's forwards, as its host enqueued them and its device
+    ran them: each forward's launch ``[l0, l1]``, over which its host enqueues
+    its work, and its device's ``[d0, d1]``, added in launch order.
+
+    `reached(e)` is when the device has run the work the host had enqueued by
+    `e`: the last forward launched by then, all of it once its launch has
+    ended, inside its launch the share enqueued so far; `e` itself where the
+    device has caught up, or before any forward."""
+
+    def __init__(self) -> None:
+        self._starts: list[float] = []
+        self._windows: list[tuple[float, float, float, float]] = []
+
+    def add(self, l0: float, l1: float, d0: float, d1: float) -> None:
+        if self._starts and l0 < self._starts[-1]:
+            raise ValueError(
+                f"a forward launched at {l0}, before one launched at "
+                f"{self._starts[-1]}: a stage launches its forwards in order"
+            )
+        self._starts.append(l0)
+        self._windows.append((l0, l1, d0, d1))
+
+    def reached(self, e: float) -> float:
+        i = bisect.bisect_right(self._starts, e) - 1
+        if i < 0:
+            return e
+        l0, l1, d0, d1 = self._windows[i]
+        at = d1 if e >= l1 or l1 <= l0 else d0 + (e - l0) / (l1 - l0) * (d1 - d0)
+        return max(at, e)
+
+    def forget_before(self, e: float) -> None:
+        """Drop the forwards no ask at `e` or later reads: all but the last
+        launched by `e`."""
+        i = bisect.bisect_right(self._starts, e) - 1
+        if i > 0:
+            del self._starts[:i], self._windows[:i]
+
+
+class StageServe:
+    """One prefill stage's writes of one transfer of `nbytes`, arriving at
+    `a`, served by `ServeModel` on the stage's `DeviceQueue`.
+
+    `advance(now, queue)` decides every call asked by `now`, whose gather
+    depends only on the forwards launched by then, and returns the transfer's
+    end on this stage once its last call is decided: its time is then fixed,
+    though it may lie past `now`."""
+
+    def __init__(self, serve: ServeModel, a: float, nbytes: int) -> None:
+        self.serve, self.a = serve, a
+        per = nbytes / serve.writes
+        self.n = serve.calls(per)
+        # Each write's [next ask, bytes left, first call yet to go].
+        self.writes = [
+            [a + j * serve.stagger_s / self.n, float(per), True]
+            for j in range(serve.writes)
+        ]
+        self.done: float | None = a if nbytes <= 0 else None
+
+    def next_ask(self) -> float:
+        """The earliest call not yet decided."""
+        return min(w[0] for w in self.writes if w[1] > 0)
+
+    def advance(self, now: float, queue: DeviceQueue) -> float | None:
+        s = self.serve
+        if self.done is not None:
+            return self.done
+        for w in self.writes:
+            while w[1] > 0 and w[0] <= now:
+                e = w[0]
+                wait = s.device_wait * (queue.reached(e) - e)
+                first = s.gather_s + s.gather_one_s / self.n if w[2] else 0.0
+                moved = min(float(s.chunk_bytes), w[1])
+                w[0] = e + wait + first + s.call_s + moved / s.call_bandwidth_bytes_per_s
+                w[1] -= moved
+                w[2] = False
+        if any(w[1] > 0 for w in self.writes):
+            return None
+        self.done = max(w[0] for w in self.writes)
+        return self.done
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +272,10 @@ class TransferModel:
     #: What the writes into one NIC reach together, 0 when the link states no
     #: NIC: each write is then priced alone on its rank pair's `Link`.
     nic_bandwidth_bytes_per_s: float = 0.0
+    #: How a prefill stage serves its writes under load (`ServeModel`), None
+    #: when the link states no ``serve_*`` field: each write is then priced on
+    #: its rank pair's `Link`, or a shared NIC.
+    serve: ServeModel | None = None
 
     def __post_init__(self) -> None:
         if self.latency_s < 0:
@@ -147,7 +327,7 @@ class TransferModel:
         link = f"interconnect.{scope.value}"
         peak = spec.value(f"{link}.link_bandwidth_bytes_per_s")
         derate = spec.value(f"{link}.derate")
-        return cls(
+        model = cls(
             latency_s=spec.value(f"{link}.link_latency_s"),
             bandwidth_bytes_per_s=peak * derate,
             bytes_per_block=bytes_per_block,
@@ -159,6 +339,8 @@ class TransferModel:
                 f"{link}.nic_bandwidth_bytes_per_s", 0.0
             ),
         )
+        serve = ServeModel.from_spec(spec, scope)
+        return model if serve is None else dataclasses.replace(model, serve=serve)
 
     def bytes_moved(self, blocks: int) -> int:
         """The bytes a transfer of *blocks* moves: its blocks, the state slot

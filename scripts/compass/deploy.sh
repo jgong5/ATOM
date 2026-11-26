@@ -126,7 +126,10 @@
 # A prefill's `enable_chunked_transfer` true makes a simulated run's KV
 # transfer chunked: the run file's `kv_chunked`, and each instance's
 # write-done notice address (`compass_kv_write_done`), from a port block of
-# its own.
+# its own. A --network file whose KV link states a stage's serving
+# (`serve_*`, opt-in) makes each stage of a pipelined prefill serve its own
+# writes: the run file's `kv_serve`, a write-request and a write-done port a
+# stage.
 # Each instance runs its
 # command, OUT/<name>.sh, which first writes its process id to OUT/<name>.pid;
 # one given --on as `PREFIX bash OUT/<name>.sh`, stopped as `PREFIX kill -TERM
@@ -336,6 +339,12 @@ try:
     chunked = os.environ.get("DEPLOY_KV_CHUNKED") == "1"
     if chunked:
         run[compass_run.KV_CHUNKED] = True
+    # A KV link that states a stage's serving (kv/transfer.py ServeModel): each
+    # prefill stage serves its own writes, a write-request and a write-done
+    # channel each (`kv_serve`).
+    serving = compass_run.kv_serves(run)
+    if serving:
+        run[compass_run.KV_SERVE] = True
     for side, count in (("prefill_instances", np_), ("decode_instances", nd)):
         if count > 1:
             run[side] = count
@@ -351,9 +360,11 @@ clock = block(1)
 # One write-request port a (prefill instance, decode instance, prefill rank,
 # decode rank), from one base every instance is given (`kv.connector`).
 pairs = np_ * nd * run["prefill_data_parallel_size"] * run["decode_data_parallel_size"]
-base = block(pairs)
+# Serving stages: one a pair and prefill stage, for both blocks.
+stages = run.get(compass_run.PREFILL_PP, 1) if serving else 1
+base = block(pairs * stages)
 # Chunked: one write-done port a pair, which decode binds and prefill connects to.
-done = [block(pairs)] * (np_ + nd) if chunked else []
+done = [block(pairs * stages)] * (np_ + nd) if chunked or serving else []
 run |= {"out_dir": str(Path(run_file).parent), "clock_endpoint": f"tcp://127.0.0.1:{clock}"}
 Path(run_file).write_text(json.dumps(run))
 hand(router, prometheus, clock, lookaheads, *[base] * (np_ + nd), *done)
@@ -414,7 +425,7 @@ instance() { # I: write instance I's command, OUT/<name>.sh, and run it
     [[ ${sides[i]} == decode ]] || role=kv_producer several=$NP
     local kv="{\"kv_role\":\"$role\",\"kv_connector\":\"compass\",\"compass_kv_write_req\":\"tcp://127.0.0.1:${KV_PORTS[i]}\""
     ((several == 1)) || kv+=",\"compass_instance\":${index[i]}"
-    [[ $cmd != run ]] || ((!KV_CHUNKED)) || kv+=",\"compass_kv_write_done\":\"tcp://127.0.0.1:${DONE_PORTS[i]}\""
+    [[ $cmd != run || -z ${DONE_PORTS[i]:-} ]] || kv+=",\"compass_kv_write_done\":\"tcp://127.0.0.1:${DONE_PORTS[i]}\""
     kv+="}"
     if [[ $cmd == record ]]; then
         command=("$cmd" "${flags[@]}")

@@ -186,6 +186,22 @@ FIELDS = (
         Kind.QUANTITY,
         required=False,
     ),
+    # How a pipelined prefill stage serves its KV writes under load (attained,
+    # fitted on a record's writes; kv/transfer.py `ServeModel`): stated, all of
+    # them, each stage times its own writes on its device's queue; absent, the
+    # writes ride the link's lone-write law.
+    Field("interconnect.inter_node.serve_chunk_bytes", Kind.COUNT, required=False),
+    *(
+        Field(f"interconnect.inter_node.serve_{name}", Kind.QUANTITY, required=False)
+        for name in (
+            "call_bandwidth_bytes_per_s",
+            "call_s",
+            "gather_s",
+            "gather_one_s",
+            "stagger_s",
+        )
+    ),
+    Field("interconnect.inter_node.serve_device_wait", Kind.DERATE, required=False),
     # The device-to-host copy an lmcache server's stores and loads ride, as a
     # copy reaches it (not a peak); a run with an lmcache server requires it.
     Field(

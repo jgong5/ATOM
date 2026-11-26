@@ -90,6 +90,18 @@ write-request channel), whose blocks are freed then, as Mooncake's head frees
 the shared page table on the consumer's release. On a `Link`; a shared NIC is
 refused.
 
+Under a link that states a stage's serving (opt-in, `transfer.ServeModel`,
+the run file's ``kv_serve``), a pipelined prefill's writes are timed where
+they are served, as Mooncake's stage workers serve theirs: decode posts its
+write request to every stage, each stage times its own layers' writes on its
+own device's queue (`StageServe` on `DeviceQueue`, the windows its forwards
+return, `served_forward`) and sends decode a write-done notice on
+``kv_write_done`` once its last call is decided, and decode is ready once
+every stage's is in, then releases the head's blocks as under a chunked
+transfer. A later stage, which runs no step loop's poll, takes its write
+requests and decides its writes at its forwards and at each pass of its idle
+loop (`has_pending_work`), polling at the head's idle cadence.
+
 The worker half reports nothing. The engine still builds and polls it.
 """
 
@@ -106,8 +118,10 @@ from typing import ClassVar
 from atom.compass.kv.handoff import SIMULATED_ENGINE_ID, transfer_params, whole_number
 from atom.compass.kv.transfer import (
     ChunkedSend,
+    DeviceQueue,
     Link,
     SharedNic,
+    StageServe,
     TransferModel,
     chunk_writes,
 )
@@ -133,6 +147,10 @@ WRITE_DONE_KEY = "compass_kv_write_done"
 #: Mooncake's default for ``chunked_admission_timeout_s``.
 CHUNKED_ADMISSION_TIMEOUT_S = 300.0
 
+#: How far back a serving stage keeps its forwards before its earliest
+#: undecided call: a write request is taken well within it of its arrival.
+SERVE_HORIZON_S = 5.0
+
 
 def engine_id(lp: str) -> str:
     """The engine id a producer that is engine LP `lp` gives: one label, with
@@ -143,20 +161,31 @@ def engine_id(lp: str) -> str:
     return f"{SIMULATED_ENGINE_ID}-p{index}" if index else SIMULATED_ENGINE_ID
 
 
+def _later_stage(lp: str) -> bool:
+    """Whether engine LP `lp` is a pipeline stage after the head."""
+    stage = lp.partition("-pp")[2]
+    return bool(stage) and stage != "0"
+
+
 #: The consumers built in this process, each told of every forward its
 #: engine's workers return (`forward_returned`).
 _CONSUMERS: weakref.WeakSet[SimulatedKVConnectorScheduler] = weakref.WeakSet()
 #: The chunked producers built in this process, each told of every forward and
 #: the batch it ran.
 _CHUNKED: weakref.WeakSet[SimulatedKVConnectorScheduler] = weakref.WeakSet()
+#: The producer stages built in this process that serve their own writes (the
+#: link's `ServeModel`), each told of every forward's launch and device run.
+_SERVING: weakref.WeakSet[SimulatedKVConnectorScheduler] = weakref.WeakSet()
 
 
 def forward_returned(reply, batch=None) -> None:
     """Tell each consumer built in this process that its engine's workers
     returned the forward, or the DP group's dummy, whose reply is `reply`: its
     device work ends at the reply's ``device_end``, the runner's
-    `HostDeviceRecurrence` end, or with none at its return; and each chunked
-    producer which prompts the forward's `batch` computed, by then.
+    `HostDeviceRecurrence` end, or with none at its return; each chunked
+    producer which prompts the forward's `batch` computed, by then; and each
+    serving stage the forward's launch and device run, the reply's
+    ``device_window``.
     `atom.compass.run.engine` has the engine's `call_func` call this."""
     end = getattr(reply, "device_end", None)
     for consumer in list(_CONSUMERS):
@@ -164,6 +193,8 @@ def forward_returned(reply, batch=None) -> None:
     if batch is not None:
         for producer in list(_CHUNKED):
             producer.prefill_done(end, batch)
+    for stage in list(_SERVING):
+        stage.served_forward(getattr(reply, "device_window", None))
 
 
 class UnboundSeam(RuntimeError):
@@ -313,7 +344,24 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         self._released: dict = (
             {}
         )  # prefill head: request -> its send, done, awaiting release
-        if self._stage:
+        # Opt-in (the link's `ServeModel`): each prefill stage serves its own
+        # layers' writes on its device's queue and tells decode when they are
+        # done, as a chunked transfer's stages do; decode posts its write
+        # request to every stage and waits for each one's notice.
+        self._serve = self._transfer[self._stage if self.is_producer else 0].serve
+        self._queue = DeviceQueue()  # a serving stage's forwards
+        self._jobs: list = []  # a serving stage's (StageServe, pair, transfer id)
+        if self._serve is not None and self._chunked:
+            raise ValueError(
+                "the link states a stage's serving and this producer runs a "
+                "chunked transfer, whose reads run beside its prefill"
+            )
+        if self._serve is not None and self.is_producer:
+            # A later stage then polls at the head's idle cadence, as a chunked
+            # producer's does (`PPEngineCoreProc._downstream_busy_loop`), so its
+            # writes' notices leave on time.
+            self.enable_chunked_transfer = True
+        if self._stage and not (self.is_producer and self._serve is not None):
             # Mooncake reports a send on the head stage only; under a chunked
             # transfer a later stage writes its own layers (`relayed`).
             if self.is_producer and self._chunked:
@@ -368,7 +416,11 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                 f"channel; its table declares {pairs}"
             )
         self._wide = "#" in pairs[0]
-        self._peers = {engine_id(peer): peer for peer, _ in self._socks}
+        # Each producer deployment's head: a write request served by every
+        # stage (`_serve`) goes to each, a notice of none or a release to it.
+        self._peers = {
+            engine_id(peer): peer for peer, _ in self._socks if not _later_stage(peer)
+        }
         # The write request's latency, and the write-done notice's.
         self._latency_s = table.lookahead(pairs[0])
         if not self.is_producer:
@@ -381,6 +433,19 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                     "deployment's link states a shared NIC"
                 )
             _CHUNKED.add(self)
+        if self._serve is not None:
+            if self._shared:
+                raise ValueError(
+                    "the link states a stage's serving and a shared NIC; a "
+                    "serving stage times its writes on its device's queue"
+                )
+            if not self._done_socks:
+                raise UnboundSeam(
+                    f"the link states a stage's serving and {me} has no "
+                    "kv_write_done channel: the run file's kv_serve is unset"
+                )
+            if self.is_producer:
+                _SERVING.add(self)
 
     def _bind_write_done(self, kv_config: dict, table, me) -> None:
         """Each rank pair's write-done notice socket, where the run declares
@@ -533,6 +598,9 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                 params.get("remote_pp_size", 1),
                 -math.inf,
             ]
+        elif self._serve is not None:
+            # Each stage serves its own writes and tells decode (`_heard`).
+            self._listening[params["transfer_id"]] = [seq, stages, -math.inf]
         self._queued.append((seq.id, params, blocks))
 
     def device_done(self, end: float | None) -> None:
@@ -552,9 +620,19 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         a = max(t, self._rt.now) + self._latency_s
         for req_id, params, blocks in self._queued:
             key, _ = self._send(params, blocks, a)
-            if not params.get("chunked_transfer"):
+            if self._serve is not None and not params.get("chunked_transfer"):
+                # Every later stage serves its own layers' writes too, on the
+                # same request (Mooncake's consumer posts it to each stage).
+                for peer, rank in self._socks:
+                    if rank == key[1] and _later_stage(peer) and (
+                        engine_id(peer) == engine_id(key[0])
+                    ):
+                        said = (params["transfer_id"], blocks, a, key[1])
+                        self._socks[peer, rank].send(pickle.dumps(said), at=a)
+            elif not params.get("chunked_transfer"):
                 self._write(key, req_id, a, blocks, self._latency_s)
-            # A chunked transfer's write-done comes from prefill (`_heard`).
+            # A chunked or served transfer's write-done comes from prefill
+            # (`_heard`).
         self._queued.clear()
 
     def _send(self, params, blocks, a=None) -> tuple[tuple[str, int], float]:
@@ -790,7 +868,8 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
 
     def _heard(self) -> None:
         """Decode: each write-done notice released so far: its request is
-        ready at the notice's arrival, its first token the prompt's last."""
+        ready once every stage's is in, at the latest's arrival; a chunked
+        one's first token is the prompt's last."""
         for sock in self._done_socks.values() if not self.is_producer else ():
             while sock.poll(0):
                 transfer_id, at = pickle.loads(sock.recv())
@@ -804,8 +883,9 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                     continue
                 del self._listening[transfer_id]
                 params = seq.kv_transfer_params
-                params.setdefault("first_token_id", int(seq.prompt_token_ids[-1]))
-                params.setdefault("draft_token_ids", [])
+                if params.get("chunked_transfer") or self._serve is None:
+                    params.setdefault("first_token_id", int(seq.prompt_token_ids[-1]))
+                    params.setdefault("draft_token_ids", [])
                 self._due[seq.id] = latest
                 if params.get("remote_pp_size", 1) > 1:
                     # Mooncake's release: the head may reuse its page table.
@@ -903,10 +983,19 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                 # Decode finished the request before asking for its write.
                 self._drop_claim(req_id, a)
                 continue
+            if self._serve is not None and self._stage:
+                # A later stage serves its own layers' writes; the head holds
+                # the request's blocks.
+                self._serve_take(other, req_id, a, blocks)
+                continue
             if req_id in self._aborted:
                 # Mooncake refuses it. Decode, which cannot learn that, timed
-                # the write on its end of the link, and this end keeps in step.
-                self._write(other, None, a, blocks, 0.0)
+                # the write on its end of the link, and this end keeps in step;
+                # under a stage's serving it waits for this stage's notice.
+                if self._serve is not None:
+                    self._serve_take(other, req_id, a, blocks)
+                else:
+                    self._write(other, None, a, blocks, 0.0)
                 logger.info("compass: a write request for aborted %s", req_id)
                 continue
             r = self._ready.pop(req_id, None)
@@ -916,6 +1005,12 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                     f"its prefill finished (at {r}); the router sends a request "
                     "to decode only after prefill has returned"
                 )
+            if self._serve is not None:
+                # Its blocks go back on decode's release, once every stage's
+                # notice is in (`_heard`).
+                self._released[req_id] = req_id
+                self._serve_take(other, req_id, a, blocks)
+                continue
             # Above one stage, decode's write-done notice and its release back.
             release = 2 * self._latency_s if len(self._transfer) > 1 else 0.0
             self._write(other, req_id, a, blocks, release)
@@ -936,6 +1031,8 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         dispatched no forward: at DP width one none follows, and the device
         has only the last forward's work to finish."""
         self._take_write_requests()
+        if self._jobs:
+            self._serve_settle(self._rt.now)
         if self._queued and not self._dummies:
             self._post(self._device_end)
         elif self._queued and self._polled_queued:
@@ -970,7 +1067,13 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         return output
 
     def has_pending_work(self) -> bool:
-        """Keeps an idle decode engine polling until its parked requests are ready."""
+        """Keeps an idle decode engine polling until its parked requests are ready.
+
+        A later stage that serves its writes runs no step loop's poll: its
+        idle loop asks this at each pass, so it takes its write requests and
+        decides its writes here too (`_serve_poll`)."""
+        if self._serve is not None and self._stage and self.is_producer:
+            self._serve_poll()
         return bool(
             self._due
             or self._snapshot
@@ -983,4 +1086,68 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             # A chunked request's write request is in: its admission is due.
             or bool(self._reads)
             or any(nic.busy() for nic in self._nics.values())
+            or self._jobs
+        )
+
+    # -- a stage's serving of its own writes (the link's `ServeModel`) --------
+
+    def served_forward(self, window) -> None:
+        """A serving stage's forward returned: its launch and device run,
+        `window` (`HostDeviceRecurrence.window`), join the stage's queue, and
+        its writes are decided up to now. The last stage keeps no queue: on
+        MiniMax-M3.1's CAL record (#3720) its writes moved at the link's pace
+        however far its host had run ahead (49 GB in 0.67 s at c120, where
+        the middle stages' took 9.3 s), so its calls wait for no forward."""
+        if window is not None and self._stage < self._pp_size - 1:
+            self._queue.add(*window)
+        if self._stage:
+            self._serve_poll()
+        elif self._jobs:
+            self._serve_settle(self._rt.now)
+
+    def _serve_poll(self) -> None:
+        """A later stage: take its write requests, then decide its writes."""
+        self._take_write_requests()
+        if self._jobs:
+            self._serve_settle(self._rt.now)
+
+    def _serve_take(self, pair, transfer_id, a: float, blocks: int) -> None:
+        """This stage serves its layers' share of a write of `blocks` that
+        arrived at `a` from decode rank pair `pair`."""
+        nbytes = self._transfer[self._stage].bytes_moved(blocks)
+        self._jobs.append((StageServe(self._serve, a, nbytes), pair, transfer_id, blocks))
+        self._serve_settle(self._rt.now)
+
+    def _serve_settle(self, now: float) -> None:
+        """Decide this stage's writes up to `now`; each whose last call is
+        decided is done then, and its notice leaves for decode, to arrive
+        the write-done latency after, no earlier than that after now."""
+        left = []
+        for job, pair, transfer_id, blocks in self._jobs:
+            c = job.advance(now, self._queue)
+            if c is None:
+                left.append((job, pair, transfer_id, blocks))
+                continue
+            sock = self._done_socks.get(pair)
+            if sock is None:
+                raise UnboundSeam(
+                    f"no kv_write_done channel to {pair}: a serving stage cannot "
+                    "tell decode its write is done"
+                )
+            at = max(c, now) + self._latency_s
+            sock.send(pickle.dumps((transfer_id, at)), at=at)
+            logger.info(
+                "compass: KV transfer %s served on stage %d, %d blocks, from %r "
+                "to %r simulated s",
+                transfer_id,
+                self._stage,
+                blocks,
+                job.a,
+                c,
+            )
+        self._jobs = left
+        # A write request is taken at a poll after its arrival, well within
+        # `SERVE_HORIZON_S`: its asks read no forward launched before that.
+        self._queue.forget_before(
+            min((job.next_ask() for job, *_ in left), default=now) - SERVE_HORIZON_S
         )

@@ -424,6 +424,8 @@ class HostDeviceRecurrence:
         self.output_end = -math.inf  # target end of the last output forward
         self.mtp = mtp
         self.own_draft = not defer
+        # The last forward's (launch start, launch end, device start, device end).
+        self.window = None
 
     def charge(
         self, batch: Any, device_s: float, draft_s: float, refuse: bool = True
@@ -502,9 +504,15 @@ class HostDeviceRecurrence:
         self.target_end = max(queued_end, host, release) + device_s
         self._held = now, launch_end, output, post
         if not draft_s:
-            return max(self.target_end, launch_end)
-        queued = launch_end if self.sync else self._exit(self.target_end)
-        return max(self.target_end, queued) + draft_s
+            end = max(self.target_end, launch_end)
+        else:
+            queued = launch_end if self.sync else self._exit(self.target_end)
+            end = max(self.target_end, queued) + draft_s
+        # Its launch, over which the host enqueues its work, and its device's
+        # run: what a stage serving its KV writes queues their gathers behind
+        # (`kv.transfer.DeviceQueue`).
+        self.window = (launch_end - launch, launch_end, self.target_end - device_s, end)
+        return end
 
     def _law(self, kind: str) -> dict:
         """`kind`'s laws by segment, `DUMMY_KIND`'s over `decode`'s."""
@@ -2172,6 +2180,7 @@ class NonAllocatingRunner(
         out.out_s = getattr(self, "_out_s", None)
         out.group_out = getattr(self, "_group_out", None)
         out.device_end = getattr(self, "_device_end", None)
+        out.device_window = getattr(self, "_device_window", None)
         out.pp_send = self._pp_send(batch, seconds)
         if out.pp_send is not None:
             out.predicted_s -= out.pp_send[1]
@@ -2494,6 +2503,11 @@ def _group_step_seconds(
     # under DP; None with no recurrence, whose forward returns at its end.
     device_end = host.ends[-1] if isinstance(host, HostDeviceRecurrence) else None
     vars(runner)["_device_end"] = device_end
+    # Its launch and device run (`HostDeviceRecurrence.window`), None with no
+    # recurrence: a stage serving its KV writes queues them on it.
+    vars(runner)["_device_window"] = (
+        host.window if isinstance(host, HostDeviceRecurrence) else None
+    )
     group_s, targets, pulls = charge_s, None, None
     out_s = getattr(host, "out_s", None)
     waited = lookup_s, pricing_s
@@ -2623,7 +2637,14 @@ class RapidServeRpcs:
         out = super().forward(batch)
         ids = self._token_stream.token_ids
         sampled = SampledIds(ids[int(r) % len(ids)] for r in batch.req_ids)
-        names = ("predicted_s", "out_s", "group_targets", "group_out", "device_end")
+        names = (
+            "predicted_s",
+            "out_s",
+            "group_targets",
+            "group_out",
+            "device_end",
+            "device_window",
+        )
         for name in names:
             setattr(sampled, name, getattr(out, name, None))
         return sampled
