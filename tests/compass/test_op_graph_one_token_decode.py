@@ -17,7 +17,7 @@ from atom.compass.backends import CostRefused
 from atom.compass.backends.op_graph import OpGraphBackend, step_shape, verified
 from atom.compass.backends.work import gemm, price
 from atom.compass.capture import population_shapes
-from atom.compass.capture.forward import decode
+from atom.compass.capture.forward import _batch, decode
 
 #: Two rows decoding one token each, replayed at rung 2.
 ONE_A_ROW = view((1, 90, True), (1, 9, True), rung=2)
@@ -100,3 +100,13 @@ def test_a_population_under_a_drafter_traces_a_one_token_decode_verifying_none(
 def test_a_population_with_no_drafter_traces_a_one_token_decode_as_before(tmp_path):
     record = _record(tmp_path, [{"rows": [[1, 90, True]] * 3, "rung": 4}])
     assert list(map(str, population_shapes([record]))) == ["decode B=4"]
+
+
+def test_a_trace_at_a_shape_verifying_none_schedules_one_token_a_row_as_a_drafter_s():
+    verify, _ = _batch(decode(4), 16, 100, True, 3)
+    one, _ = _batch(decode(4)._replace(verifies=0), 16, 100, True, 3)
+
+    assert list(verify.num_scheduled_tokens) == [4] * 4 and verify.num_spec_step == 3
+    assert list(one.num_scheduled_tokens) == [1] * 4 and one.num_spec_step == 0
+    # still a drafter's step, which ATOM scores and drafts after, not a dummy run
+    assert not one.is_dummy_run
