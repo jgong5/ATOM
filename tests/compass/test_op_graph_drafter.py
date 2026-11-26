@@ -38,7 +38,7 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.cost import fold_seconds
-from atom.compass.backends.op_graph import OpGraphBackend
+from atom.compass.backends.op_graph import DRAFT_KV, KV, OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import Work, gemm, price
 from atom.compass.capture import graph_key, lookup, population_shapes
@@ -669,3 +669,23 @@ def test_a_split_step_prices_its_drafter_after_both_micro_batches_whole(
     assert [a[-2:] for a in asked] == [(False, True), (False, True), (True, False)]
     assert asked[-1] == (*shape, True, False)
     assert cost.draft_seconds == price(gemm(16, 64, 64), SPEC)
+
+
+def test_a_split_step_prices_its_block_drafter_s_draft_kv_pass_whole():
+    # The draft-KV pass runs after both micro-batches too, on the step's whole
+    # rows, from its graph at the step's shape, among the target's terms.
+    asked = []
+
+    def graph(*at, draft=False, micro_batch=False):
+        asked.append((*at, draft, micro_batch))
+        return g(8, 32, 32) if draft == KV else g(16, 64, 64) if draft else g(4, 8, 8)
+
+    split = replace(FINAL, tbo_tokens=((5,), (4,)))
+    cost = OpGraphBackend(SPEC, graph, kv="bf16", drafts=1, block=True).price(split)
+
+    terms = {t.name: t for t in cost.terms}
+    assert list(terms) == ["op.tbo", f"{DRAFT_KV}op.{GEMM}"]
+    assert ("prefill", 9, 1, True, KV, False) in asked
+    kv = terms[f"{DRAFT_KV}op.{GEMM}"]
+    assert kv.seconds == price(gemm(8, 32, 32), SPEC)
+    assert kv.provenance.detail.endswith("of the graph at prefill T=9 B=1")

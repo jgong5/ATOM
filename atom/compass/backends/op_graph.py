@@ -530,7 +530,7 @@ class OpGraphBackend(CostBackend):
             at, priced = self._overlapped(batch_view, refused)
             terms = {priced[0][0]: _term(priced[0][0], priced, at)}
             if self.drafts:
-                terms |= self._drafted(batch_view, refused, at)
+                terms |= self._drafted(batch_view, refused)
             if refused:
                 raise CostRefused(batch_view, list(dict.fromkeys(refused)))
             return _cost(terms)
@@ -881,14 +881,17 @@ class OpGraphBackend(CostBackend):
         price = (name, overlap([zip(*runs)]), notes, Work(), False, (origins, why), {})
         return " and ".join(at), [price]
 
-    def _drafted(self, view: BatchView, refused: list, target_at: str) -> dict:
+    def _drafted(self, view: BatchView, refused: list) -> dict:
         """A split step's drafter's terms: ATOM runs a block drafter's
         draft-KV pass and its drafter's propose after both micro-batches, on
         the step's whole rows (`ModelRunner` wraps the target alone in
-        `UBatchWrapper`), so each prices as on a step that does not split."""
+        `UBatchWrapper`), so each prices from its graph at the step's shape,
+        as on a step that does not split."""
         drafted_at, drafted = self._region(view, draft=True)
         samples = view.decode or view.produces_output
-        kv = self.block and samples and self._region(view, draft=KV)[1]
+        kv_at, kv = (
+            self._region(view, draft=KV) if self.block and samples else (None, None)
+        )
         if samples and view.moe_rows is None:
             self._passes = self._pass_views(drafted, view)
         bound = self.resolver and self._bound(view)
@@ -902,7 +905,7 @@ class OpGraphBackend(CostBackend):
         for p in priced:
             names.setdefault(p[0], []).append(p)
         return {
-            n: _term(n, ps, drafted_at if n.startswith(DRAFT) else target_at)
+            n: _term(n, ps, drafted_at if n.startswith(DRAFT) else kv_at)
             for n, ps in names.items()
         }
 
