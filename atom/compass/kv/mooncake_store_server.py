@@ -90,6 +90,18 @@ TERMS = ("lookup_s", "store_s", "load_s")
 #: ``capacity_by_client_run``: the owners' bytes for client run ``k``, the
 #: last repeating, its first ``capacity_bytes``'s.
 CLIENT_RUN_FIELDS = ("clear_between_client_runs", "capacity_by_client_run")
+#: Optional fields, all or none, which only a run under
+#: ``COMPASS_STORE_ON_STREAM=1`` reads (`stream_terms`): ATOM's Store worker
+#: stages each window's pack or unpack on its stage's forward stream and waits
+#: for it there (`STAGES_ON_FORWARD_STREAM`, `fence_submitted_work`), so a
+#: copy's seconds are its floor, ``store_floor_s`` or ``load_floor_s``
+#: (``[fixed, per chunk]``, one a rank where `PER_RANK`), plus, a window,
+#: ``stream_wait`` x the stage device's backlog when the window is enqueued.
+#: Under the switch they price the copies in place of ``store_s`` and
+#: ``load_s``, whose fits hold the record's mean wait.
+STREAM_FIELDS = ("store_floor_s", "load_floor_s", "stream_wait")
+#: The entry's ``[fixed, per item]`` laws.
+LAWS = (*TERMS, "store_floor_s", "load_floor_s")
 #: The entry's fields a pipelined prefill's writer ranks may each state apart:
 #: a list of one value per rank, ``world`` of them in ATOM's rank order
 #: (``pp_rank x tp + tp_rank``, `pp_aware_rank_and_world`). Its stages hold
@@ -102,6 +114,8 @@ PER_RANK = (
     "load_slots",
     "store_s",
     "load_s",
+    "store_floor_s",
+    "load_floor_s",
     # Per-NIC pools (`mooncake_store.pools`): a master a pool, the writer
     # rank on the pool's NIC putting there (`Pools`).
     "capacity_bytes",
@@ -199,7 +213,9 @@ def check_entry(entry) -> argparse.Namespace:
         raise MooncakeStoreRefusal(
             f"the run file's {ENTRY} entry lacks {', '.join(missing)}"
         )
-    if extra := sorted(entry.keys() - need - {"fit", *CLIENT_RUN_FIELDS}):
+    if extra := sorted(
+        entry.keys() - need - {"fit", *CLIENT_RUN_FIELDS, *STREAM_FIELDS}
+    ):
         raise MooncakeStoreRefusal(
             f"the run file's {ENTRY} entry has unknown {', '.join(extra)}"
         )
@@ -222,6 +238,27 @@ def check_entry(entry) -> argparse.Namespace:
                 f"{ENTRY}.{name} is {term!r}, not [fixed, per item] seconds, or "
                 f"one such a rank of world {world!r} (a pipelined prefill's)"
             )
+    stated = [f for f in STREAM_FIELDS if f in entry]
+    if stated and len(stated) < len(STREAM_FIELDS):
+        raise MooncakeStoreRefusal(
+            f"{ENTRY} states {', '.join(stated)} and not all of "
+            f"{', '.join(STREAM_FIELDS)}: a copy on its stage's stream is priced "
+            "from all of them"
+        )
+    for name in stated[:2]:
+        if not (law(entry[name]) or _ranked(entry, name, law)):
+            raise MooncakeStoreRefusal(
+                f"{ENTRY}.{name} is {entry[name]!r}, not [fixed, per item] "
+                f"seconds, or one such a rank of world {world!r}"
+            )
+    if stated and not (
+        isinstance(entry["stream_wait"], (int, float))
+        and 0.0 <= entry["stream_wait"] <= 1.0
+    ):
+        raise MooncakeStoreRefusal(
+            f"{ENTRY}.stream_wait is {entry['stream_wait']!r}, not a fraction of "
+            "the stage device's backlog"
+        )
     if not entry["lookup_s"][0] > 0:
         raise MooncakeStoreRefusal(
             f"{ENTRY}.lookup_s's fixed term is {entry['lookup_s'][0]!r}: each hop "
@@ -287,9 +324,28 @@ def of_rank(entry: dict, name: str, rank: int):
     rank's own where it states one a rank (`PER_RANK`)."""
     value = entry[name]
     ranked = isinstance(value, list) and (
-        name not in TERMS or isinstance(value[0], list)
+        name not in LAWS or isinstance(value[0], list)
     )
     return value[rank] if ranked else value
+
+
+def stream_terms(entry: dict) -> dict:
+    """The copy laws a run under ``COMPASS_STORE_ON_STREAM=1`` prices
+    (`STREAM_FIELDS`): ``store_s`` and ``load_s`` as the entry's floors, and
+    ``stream_wait``; refused for an entry fitted without them, whose
+    ``store_s`` and ``load_s`` already hold the record's mean wait."""
+    if missing := [f for f in STREAM_FIELDS if f not in entry]:
+        raise MooncakeStoreRefusal(
+            f"COMPASS_STORE_ON_STREAM=1 prices each copy's window on its stage's "
+            f"stream, and the run file's {ENTRY} entry lacks {', '.join(missing)}: "
+            "its store_s and load_s hold the record's waits already (fit the "
+            "floors with step_linear_fit's --stream-floors)"
+        )
+    return {
+        "store_s": entry["store_floor_s"],
+        "load_s": entry["load_floor_s"],
+        "stream_wait": float(entry["stream_wait"]),
+    }
 
 
 def client_run_capacity(entry: dict, k: int) -> int:
