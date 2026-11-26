@@ -971,22 +971,24 @@ def leaves_at(
     the capture having kept no other; one of a drafter's graphs alone is
     marked ``drafted``. With `own`, `shape` is a drafter's own shape past its
     step's (`parts`), where a capture keeps a decode's drafter's graph alone:
-    the leaves of the drafter's graphs there at each output (`graph`'s
-    `output`) `own` holds, as its steps read them. With `drafter`, only the
+    the leaves of the drafter's graphs there at each `(output, draft)`
+    (`graph`'s) `own` holds, as its steps read them. With `drafter`, only the
     leaves some graph of the drafter's holds, each as the whole shape has it.
-    A drafter's graph the store holds that refuses here (`graph`) refuses."""
+    A two-batch-overlap micro-batch's are its target's alone: its drafter
+    runs past both, at the whole step. A drafter's graph the store holds that
+    refuses here (`graph`) refuses."""
     from atom.compass.artifacts import ArtifactRefusal, Rule
 
     if own:
         found, target = {}, set()
-        for output in sorted(own):
-            region = graph(store, config, shape, arch, output, True)["region"]
+        for output, draft in sorted(own, key=str):
+            region = graph(store, config, shape, arch, output, draft)["region"]
             leaves(region, None, found)
     else:
         found = leaves(graph(store, config, shape, arch)["region"])
         target, held = set(found), set()
         spec = getattr(config, "speculative_config", None)
-        for output, draft in DRAFTED if spec else ():
+        for output, draft in DRAFTED if spec and not shape.micro_batch else ():
             try:
                 region = graph(store, config, shape, arch, output, draft)["region"]
             except ArtifactRefusal as refused:
@@ -4043,18 +4045,19 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     from atom.compass.runner.overrides import schedulable_ladder
 
     steps = parts(args.plan, config)
-    # a drafter's own shapes, past their steps', and the outputs its graph is
-    # read at: a leaf a decode's width's graphs hold is that width's point,
+    # a drafter's own shapes, past their steps' or a split step's whole one,
+    # and the outputs and parts its graphs are read at: a leaf a decode's width's graphs hold is that width's point,
     # and a prefill's family (`_family`) states no W, so a leaf its step's
     # graphs hold is the step's. G and W are None or a count
     own, draft_lines = defaultdict(set), {}
     for line, reads in steps:
-        for part, shape, output, _ in reads[1:]:
-            if part == DRAFT and shape != reads[0][1]:
-                own[shape].add(output)
+        target = None if reads[0][0] else reads[0][1]
+        for part, shape, output, draft in reads:
+            if part and shape != target:
+                own[shape].add((output, draft))
             if part == DRAFT:
                 draft_lines.setdefault(shape, (line, set()))[1].add(output)
-    steps = [(reads[0][1], line) for line, reads in steps]
+    steps = [(reads[0][1], line) for line, reads in steps if not reads[0][0]]
     contexts = [
         c for s, line in steps if s.phase == "decode" for c in _rows(line, s.seqs)
     ]
@@ -4100,7 +4103,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         if line.get("draft_moe_rows") is None:  # no DP gather, no other G
             continue
         try:  # a step whose drafter's graph is missing is refused by a run too
-            drafter = leaves_at(store, config, s, None, outputs)
+            drafter = leaves_at(store, config, s, None, {(o, True) for o in outputs})
         except ArtifactRefusal:
             continue
         held = {} if s in rungs else graphs.get(s, {})
@@ -4283,7 +4286,8 @@ def _eager(config) -> None:
 def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     """How the measured points among `records` cover the steps of the record
     directories `names`, each micro-batch of a step its DP group split under
-    two-batch overlap a step: the steps and those covered by phase and by part
+    two-batch overlap a step, and under a drafter its drafter's parts at the
+    whole step another (`parts`): the steps and those covered by phase and by part
     (`parts`), and per leaf kind, a drafter's prefixed as a run names its
     terms, the steps it left out by why. A step is covered when each leaf of
     each of its parts' `op_graph`s lies on a point or between two of one
@@ -4416,7 +4420,9 @@ def parts(names, config) -> list:
     part as the run prefixes its terms: its target's; under a speculative
     drafter its drafter's at the shape `trace ops --population` traces it, of
     a step that samples or not; and a block drafter's draft-KV pass's on a
-    step that samples, at the step's shape."""
+    step that samples, at the step's shape. A two-batch-overlap micro-batch
+    reads its target alone; under a drafter its step, listed before both,
+    reads no target, only the drafter's parts at the whole step."""
     from atom.compass.capture import population_steps
 
     spec, steps = getattr(config, "speculative_config", None), []
@@ -4428,8 +4434,10 @@ def parts(names, config) -> list:
             reads[1:2] = [(DRAFT, shape, *reads[1][2:])] if spec else []
             continue
         samples = shape.phase == "decode" or bool(line.get("produces_output"))
+        if spec and shape.micro_batch and not steps[-1][1][0][1].micro_batch:
+            del steps[-1][1][0]  # the whole step, listed before it
         reads = [("", shape, True, False)]
-        if spec:
+        if spec and not shape.micro_batch:
             reads.append((DRAFT, shape, samples, True))
             reads += [(DRAFT_KV, shape, True, KV)] * (samples and spec.use_dspark())
         steps.append((line, reads))

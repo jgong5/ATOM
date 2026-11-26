@@ -158,8 +158,8 @@ def main(argv: list[str]) -> None:
 def population_shapes(names, tbo=False, run_drafts=0):
     """The shape of each step the record directories `names` hold, DP's dummy
     runs aside; under two-batch overlap (`tbo`) a split step's two
-    micro-batches' (`population_steps`); each drafter's too, under a drafter
-    of `run_drafts` tokens."""
+    micro-batches' (`population_steps`), and its whole step's under a drafter
+    of `run_drafts` tokens; each drafter's too."""
     steps = population_steps(names, tbo, drafters=True, run_drafts=run_drafts)
     return [shape for shape, _ in steps]
 
@@ -185,9 +185,12 @@ def population_steps(names, tbo=False, drafters=False, stage=0, run_drafts=0):
     at its rows padded to `draft_bs`, else to its rung, a sampling prefill's
     or a DP middle chunk's with `draft_bs` as its `width`. A target that
     replays no graph yet pads past its rows takes `target_bs` as its `width`.
-    Under a drafter of `run_drafts` tokens a decode step whose rows each
-    decode one token verifies none (`op_graph.verified`), its shapes and its
-    drafter's marked so (`forward.Shape.verifies`)."""
+    Under a drafter of `run_drafts` tokens, which ATOM runs past both
+    micro-batches on the step's whole rows, a split step's shapes as an
+    unsplit step's, where its drafter is read, come before its micro-batches;
+    and a decode step whose rows each decode one token verifies none
+    (`op_graph.verified`), its shapes and its drafter's marked so
+    (`forward.Shape.verifies`)."""
     from atom.compass.backends import BatchView, RequestShape
     from atom.compass.backends.op_graph import step_shape
     from atom.compass.backends.step_labels import group_dummies, group_peaks
@@ -239,12 +242,12 @@ def population_steps(names, tbo=False, drafters=False, stage=0, run_drafts=0):
                 ran = drafts or none
                 if drafters and ran and (draft := draft.at(dp, drafts)) != target:
                     yield draft, line
-            elif not split:
+            elif not split or run_drafts:
                 yield prefill(tokens, seqs, line.get("moe_rows"), padded).at(dp), line
                 draft = prefill(tokens, seqs, line.get("draft_moe_rows"), width)
                 if drafters and (line.get("produces_output") or dp > 1) and draft.width:
                     yield draft.at(dp), line
-            else:
+            if split and phase == "prefill":
                 for half, each in zip(halves, split):
                     rows = [(r.query_tokens, r.decode) for r in half.requests]
                     _, tokens, seqs = step_shape(rows, None)

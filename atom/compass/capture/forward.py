@@ -1810,7 +1810,8 @@ def capture(
 
     The steps of the record directories `population` are shapes too
     (`population_shapes`), under two-batch overlap a split one's two
-    micro-batches, each keyed as one (`structure`); each of their prefills
+    micro-batches, each keyed as one (`structure`), and under a drafter its
+    whole step, where its drafter runs; each of their prefills
     runs as one forward, as it ran, this rank answering that it cannot split
     it; with `whole`, each prefill of
     `shapes` too. With `symbolic`, each prefill's (T, B) of a DP group with no
