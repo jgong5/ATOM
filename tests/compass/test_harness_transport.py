@@ -71,12 +71,12 @@ from compass_harness.transport import (
 from atom.compass.carriers import (
     cancel_body,
     stamp_split_events,
+    stream_channels,
     tracestate_jitter,
     tracestate_stamp,
 )
 from atom.compass.clock import LpId, single_engine_table
 from atom.compass.ingress import RUN_ENV
-from atom.utils.clock import channel_of
 from compass_harness import fingerprint
 
 # Per request: its send stamp, then the arrival of each token event; [DONE]
@@ -124,7 +124,7 @@ class Harness:
         self.body_bytes[num] = len(await request.read())
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await resp.prepare(request)
-        stream = channel_of(self.frontend, "stream")
+        stream, final = stream_channels(self.frontend)
         for i, arrival in enumerate(TOKENS[num]):
             self.frontend.arrival = arrival
             text = _chunk(f"t{i}")
@@ -134,7 +134,7 @@ class Harness:
             if i == len(TOKENS[num]) - 1 and num not in self.undone:
                 text += "data: [DONE]\n\n"
             *events, tail = text.split("\n\n")
-            stamped = stamp_split_events(events, tail, self.frontend, stream)
+            stamped = stamp_split_events(events, tail, self.frontend, stream, final)
             await resp.write(stamped.encode())
             await asyncio.sleep(0.01)
         await resp.write_eof()

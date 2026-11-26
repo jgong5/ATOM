@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from atom.compass import run as compass_run
-from atom.compass.carriers import sse_stamp, tracestate_with
+from atom.compass.carriers import sse_channel, sse_stamp, tracestate_with
 from atom.compass.clock_transport import connect
 from atom.compass.parity import ARRIVALS
 from atom.utils.clock import LPRuntime
@@ -177,18 +177,23 @@ def real(
 
 
 class Traffic:
-    """The traffic LP of a simulated run: request k at `offsets[k]` on its clock."""
+    """The traffic LP of a simulated run: request k at `offsets[k]` on its clock.
+
+    Under a stream bypass an event comes in on the channel its stamp names,
+    and one that names none on the router's ``final``."""
 
     def __init__(self, run: dict, port: int, requests: list, offsets: list) -> None:
         table = compass_run.channel_table(run)
         (http,) = table.channels_from(compass_run.TRAFFIC)
-        (stream,) = table.channels_into(compass_run.TRAFFIC)
-        self.http, self.stream, self.port = http.name, stream.name, port
+        into = [c.name for c in table.channels_into(compass_run.TRAFFIC)]
+        (self.stream,) = [n for n in into if n.endswith(":final")] or into
+        self.http, self.streams, self.port = http.name, into, port
         conn = connect(compass_run.TRAFFIC, run["clock_endpoint"])
         self.rt = LPRuntime(compass_run.TRAFFIC, table, conn)
         self.requests, self.offsets = requests, offsets
         self.cv = threading.Condition()
-        self.frames: dict[int, str] = {}  # stream seq -> its data line, read, not taken
+        # (channel, seq) -> its data line, read, not taken
+        self.frames: dict[tuple[str, int], str] = {}
         self.errors: list[BaseException] = []
         self.done = 0
 
@@ -212,11 +217,12 @@ class Traffic:
         try:
             stamp = None
             for line in post(self.port, body, {"tracestate": tracestate}):
-                stamp = sse_stamp(line) or stamp
+                if (read := sse_stamp(line)) is not None:
+                    stamp, ch = read, sse_channel(line) or self.stream
                 if line.startswith("data:") and stamp is not None:
                     with self.cv:  # read and held as one, as `_take` sees them
-                        self.rt.check_arrival(self.stream, *stamp)
-                        self.frames[stamp[1]] = line
+                        self.rt.check_arrival(ch, *stamp)
+                        self.frames[ch, stamp[1]] = line
                         self.cv.notify_all()
                     if first is not None:
                         first.set()
@@ -228,21 +234,23 @@ class Traffic:
 
     def _take(self) -> None:
         """Take every released stream event, waiting for any not read yet."""
-        rt, ch = self.rt, self.stream
+        rt = self.rt
         with self.cv, rt.lock:  # released and not taken: read and held, or unread
-            held = (seq for seq in self.frames if rt.is_released(ch, seq))
-            due = sorted(rt.unread[ch].union(held))
-        for seq in due:
+            held = {e for e in self.frames if rt.is_released(*e)}
+            due = sorted(
+                held.union((ch, s) for ch in self.streams for s in rt.unread[ch])
+            )
+        for event in due:
             with self.cv:
                 if not self.cv.wait_for(
-                    lambda seq=seq: seq in self.frames or self.errors, WALL_S
+                    lambda e=event: e in self.frames or self.errors, WALL_S
                 ):
-                    raise RuntimeError(f"stream seq {seq} released and never read")
+                    raise RuntimeError(f"stream event {event} released and never read")
                 if self.errors:
                     raise self.errors[0]
-                self.done += self.frames.pop(seq) == DONE
+                self.done += self.frames.pop(event) == DONE
             with self.rt.lock:
-                self.rt.count_done_locked(self.stream, seq)
+                self.rt.count_done_locked(*event)
 
 
 if __name__ == "__main__":

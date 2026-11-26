@@ -125,11 +125,22 @@ run with ``false`` records ``ARRIVAL`` and ``TAR``),
 needs local grants: a ceiling's cycle term counts only the LPs that can react
 to the LP's sends before their own next grant, and a TAR's grant sends the
 messages below its ceiling ahead, `ClockAuthority`'s ``wide_ceilings``),
+``stream_bypass`` (optional, ``false``, the default, or ``true``, which needs
+LP ``router``: a decode stream's events but its last go straight to traffic,
+and its last through the router, `prefill_decode_table`; each event arrives
+at the path's lookahead, within a rounding of the router's two hops, and the
+channel table, and so the step table, differ, so the key is part of the
+configuration),
 ``ids_by_ref`` (optional, ``false``, the default, or ``true`` in a
 prefill-decode run: its prefill frontends hand a prompt's ids to its decode
 frontends by reference, through `ids_dir`, which the run's authority makes
 and removes, and every count of a body's bytes counts them as if inline,
 `handoff`),
+``select_serve`` (optional, ``false``, the default, or ``true``: the authority's
+``tcp`` serve side reads every LP's connection on one selector thread, in place
+of a reader thread a connection, `clock_transport.serve`'s ``select``; it
+serves the same frames, each connection's in their order, so the schedule and
+the sends are the same),
 ``rare_full_gc`` (optional, ``false``, the default, or ``true``: every
 process of the run, aiperf's in ``compass_harness`` included, raises CPython's
 generation-2 threshold to `RARE_FULL_GC_GEN2`, `rare_full_gc`),
@@ -391,6 +402,9 @@ WORKER_ORDER = "worker_order"
 LOCAL_GRANTS = "local_grants"
 #: The run-file key that widens those ceilings.
 WIDE_LOCAL_GRANTS = "wide_local_grants"
+#: The run-file key that takes a decode stream's events but its last past LP
+#: ``router``.
+STREAM_BYPASS = "stream_bypass"
 #: The run-file key that hands a prompt's ids from prefill to decode by reference.
 IDS_BY_REF = "ids_by_ref"
 #: The run-file key that makes CPython's full collections rare in every
@@ -399,6 +413,8 @@ IDS_BY_REF = "ids_by_ref"
 RARE_FULL_GC, RARE_FULL_GC_GEN2 = "rare_full_gc", 1_000_000
 #: The tmpfs root of a run's `ids_dir`.
 IDS_ROOT = "/dev/shm"
+#: The run-file key that serves the authority's connections on one thread.
+SELECT_SERVE = "select_serve"
 ATOM_RUNNER = "atom.model_engine.model_runner.ModelRunner"
 RAPIDSERVE_RUNNER = "atom.model_engine.model_runner.RapidServeModelRunner"
 #: The run-file key that says the deployment runs RapidServe.
@@ -417,6 +433,7 @@ PER_RUN = (
     LOCAL_GRANTS,
     WIDE_LOCAL_GRANTS,
     IDS_BY_REF,
+    SELECT_SERVE,
     RARE_FULL_GC,
 )
 LP_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
@@ -1015,6 +1032,11 @@ def _lmcache_engine(run: dict) -> str:
 
 
 def _engines_table(run: dict):
+    bypass = run.get(STREAM_BYPASS, False)
+    if not isinstance(bypass, bool):
+        raise TypeError(
+            f"the run file's {STREAM_BYPASS} is {bypass!r}; it is true or false"
+        )
     common = {k: hop(run, k) for k in HOPS[:3]}
     pp, links = _pp(run, "P"), ()
     if pp > 1:
@@ -1034,6 +1056,12 @@ def _engines_table(run: dict):
             decode=run.get(INSTANCES["D"], 1),
             prefill_pp=pp,
             pp_links=links,
+            stream_bypass=bypass,
+        )
+    if bypass:
+        raise ValueError(
+            f"the run file's {STREAM_BYPASS} takes a decode stream past LP router, "
+            "and a run of one deployment has none"
         )
     return single_engine_table(
         **common,
@@ -1662,7 +1690,12 @@ class _RecordingAuthority(ClockAuthority):
         count = run.get("client_runs", 1)
         local = run.get(LOCAL_GRANTS, True)
         wide = run.get(WIDE_LOCAL_GRANTS, False)
-        for key, value in ((LOCAL_GRANTS, local), (WIDE_LOCAL_GRANTS, wide)):
+        select = run.get(SELECT_SERVE, False)
+        for key, value in (
+            (LOCAL_GRANTS, local),
+            (WIDE_LOCAL_GRANTS, wide),
+            (SELECT_SERVE, select),
+        ):
             if not isinstance(value, bool):
                 raise TypeError(
                     f"the run file's {key} is {value!r}; it is true or false"
@@ -1917,7 +1950,7 @@ def frontend(config):
     authority = None
     if not standalone:
         _authority = authority = _RecordingAuthority(run)
-        serve(_authority, run["clock_endpoint"])
+        serve(_authority, run["clock_endpoint"], run.get(SELECT_SERVE, False))
         # Not a daemon: the API server's main thread may die of the early end
         # before this thread has written the summary.
         _early_end = threading.Thread(
@@ -4163,7 +4196,7 @@ def authority(endpoint: str) -> None:
     a = _RecordingAuthority(run)
     with _owning_ids_dir(run):
         _write_whole(Path(run["out_dir"]) / AUTHORITY_FILE, endpoint)
-        serve(a, endpoint)
+        serve(a, endpoint, run.get(SELECT_SERVE, False))
         _write_summary(run, a, _until_end(run, a))
 
 

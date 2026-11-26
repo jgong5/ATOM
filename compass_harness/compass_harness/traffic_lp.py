@@ -78,6 +78,12 @@ c=512 runs on a loaded node lost the last 114 of 769 cancels to every worker
 (the burst's 655th took each pipe to 9,000 messages written, the last report
 8,000 read).
 
+Under a stream bypass (the run file's ``stream_bypass``) each decode
+frontend's stream comes straight in on a channel of its own, and only each
+stream's last event through the router, on ``final``: a worker's report of an
+event names the channel its stamp names, and one that names none is on the
+router's. The hold reads each channel in its own seq order.
+
 A request that errors mid-stream never reports the events after its last read.
 When released events stay unreported for ``DIAG_S`` wall seconds while an
 errored request is still open, the hold fails, naming those requests.
@@ -154,12 +160,17 @@ class TrafficLP:
         seed: str | None = None,
         jitter_median: float = INTAKE_JITTER_BYTES,
         ingress: compass_ingress.Ingress | None = None,
+        bypass: tuple[str, ...] = (),
     ) -> None:
         # cancel_url: where each cancel goes, if not to its request's URL.
         # seed: the send order's (`SEND_ORDER_SEED_ENV`), or None.
         # jitter_median: of a seeded request's intake jitter, in bytes.
         # ingress: the encoding ingress in front of the HTTP channel, or None.
+        # bypass: the channels a stream bypass takes decode streams in on;
+        # `stream` then carries each one's last event, and a report that names
+        # no channel.
         self.rt, self.http, self.stream = rt, http, stream
+        self.streams = (stream, *bypass)
         self.cancel_url, self.seed = cancel_url, seed
         self.ingress = ingress
         # Behind an ingress: each sent request's body bytes, None for none, as
@@ -193,7 +204,8 @@ class TrafficLP:
         self.closed: dict[tuple, None] = {}  # cancelled, return not yet passed
         self._written: set[tuple] = set()  # cancels a worker has written
         self._caught_up: list[asyncio.Future] = []
-        self._reports: dict[int, tuple] = {}  # stream seq -> (key, final)
+        # channel in -> its seq -> (key, final)
+        self._reports: dict[str, dict[int, tuple]] = {ch: {} for ch in self.streams}
         # key -> its return, for aiperf; None once passed
         self._held: dict[tuple, object] = {}
         self._returns: asyncio.Queue = asyncio.Queue()  # passed in order, as upstream
@@ -232,8 +244,10 @@ class TrafficLP:
         table = compass_run.channel_table(run)
         # One channel each way: into the frontend (frontend-P, or the router
         # LP, behind a PD router) and back from the one that streams
-        # (frontend-D, or the router LP).
-        (http,), (stream,) = table.channels_from(TRAFFIC), table.channels_into(TRAFFIC)
+        # (frontend-D, or the router LP); under a stream bypass, the router's
+        # `final` and each decode frontend's own.
+        (http,), into = table.channels_from(TRAFFIC), table.channels_into(TRAFFIC)
+        (stream,) = [c for c in into if c.name.endswith(":final")] or into
         entry = compass_ingress.stated(run)
         return cls(
             LPRuntime(TRAFFIC, table, conn),
@@ -248,6 +262,7 @@ class TrafficLP:
                 if entry is None
                 else compass_ingress.Ingress(entry, table.lookahead(http.name))
             ),
+            tuple(c.name for c in into if c != stream),
         )
 
     # ---- the clock ClockPacedLoopScheduler paces on ----
@@ -456,11 +471,12 @@ class TrafficLP:
             key, nbytes = report
             self._bodies[key] = nbytes
             return
-        key, seq, arrival, final = report
+        key, seq, arrival, final, *named = report
+        ch = named[0] if named else self.stream
         # A cancelled request's seq may be dropped already, before its report.
         if key not in self.cancelled:
-            self.rt.check_arrival(self.stream, arrival, seq)
-        self._reports[seq] = (key, final)
+            self.rt.check_arrival(ch, arrival, seq)
+        self._reports[ch][seq] = (key, final)
 
     async def _pass_returns(self) -> None:
         while True:
@@ -511,30 +527,34 @@ class TrafficLP:
             # lacks one: this loop turns several times between two clock calls,
             # and a read that finds nothing costs a ZMQ call and its exception.
             # The reader task (`_read_reports`) takes the others.
-            if not self._reports.keys() >= self.rt.released[self.stream] or (
-                self._unsized()
+            reports, released = self._reports, self.rt.released
+            if (
+                any(not reports[ch].keys() >= released[ch] for ch in self.streams)
+                or self._unsized()
             ):
                 self._take_queued()
             unreported, unreturned = [], []
             # A handled seq leaves the runtime's released set, so a pass scans
-            # only the open events, not every event of the run. It stops at the
-            # first event it cannot handle yet, so returns pass in stream order
-            # whatever order they reach the hold in.
-            for seq in sorted(self.rt.released[self.stream]):
-                key, final = self._reports.get(seq, (None, False))
-                if key is None and self.open:
-                    unreported.append(seq)
-                    break
-                # With no request open, an unreported event is a closed one's.
-                if final and key not in self.cancelled:
-                    if key not in self._held:
-                        unreturned.append(key)
+            # only the open events, not every event of the run. On each channel
+            # it stops at the first event it cannot handle yet, so returns pass
+            # in stream order whatever order they reach the hold in.
+            for ch in self.streams:
+                for seq in sorted(released[ch]):
+                    key, final = reports[ch].get(seq, (None, False))
+                    if key is None and self.open:
+                        # Named by its seq on `stream`, as `ch#seq` on another.
+                        unreported.append(seq if ch == self.stream else f"{ch}#{seq}")
                         break
-                    self.open.pop(key, None)
-                    self._arrivals.pop(key, None)
-                    if (ret := self._held.pop(key)) is not None:
-                        self._returns.put_nowait(ret)
-                self.rt.released[self.stream].discard(seq)
+                    # With no request open, an unreported event is a closed one's.
+                    if final and key not in self.cancelled:
+                        if key not in self._held:
+                            unreturned.append(key)
+                            break
+                        self.open.pop(key, None)
+                        self._arrivals.pop(key, None)
+                        if (ret := self._held.pop(key)) is not None:
+                            self._returns.put_nowait(ret)
+                    released[ch].discard(seq)
             unreturned += [key for key in self.closed if key not in self._held]
             if self.closed and not unreturned:
                 for key in self.closed:

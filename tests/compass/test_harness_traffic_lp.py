@@ -534,7 +534,7 @@ def test_a_return_before_or_after_its_final_release_schedules_from_the_final(
                 await asyncio.sleep(0.001)
         push.send_pyobj((_key(0), 0, 1.0, True))
         if order == "after":
-            while 0 not in traffic._reports:  # the owner holds for the return
+            while 0 not in traffic._reports[STREAM]:  # the owner holds for the return
                 await asyncio.sleep(0.001)
             await asyncio.sleep(0.01)
         await held("worker_0", SimpleNamespace(credit=_credit(0), error=None))
@@ -573,7 +573,7 @@ def test_an_errored_return_counts_its_released_final_as_returned(order, tmp_path
         traffic.send(_key(0))
         push.send_pyobj((_key(0), 0, 1.0, True))
         if order == "after":
-            while rt.now < 1.0 or 0 not in traffic._reports:
+            while rt.now < 1.0 or 0 not in traffic._reports[STREAM]:
                 await asyncio.sleep(0.001)
         error = SimpleNamespace(credit=_credit(0), error="ClientPayloadError")
         await held("worker_0", error)
@@ -1047,7 +1047,7 @@ def test_a_settle_whose_released_events_are_all_reported_reads_no_socket(tmp_pat
         push.connect(addresses(str(tmp_path / "lp"))[1])
         for seq in range(n):
             push.send_pyobj((_key(0), seq, float(seq + 1), seq == n - 1))
-        while len(traffic._reports) < n:  # the reader takes them; no request is open
+        while len(traffic._reports[STREAM]) < n:  # the reader takes them; none is open
             await asyncio.sleep(0.001)
         traffic.send(_key(0))
         await traffic.hold(on_return)(
@@ -1494,7 +1494,7 @@ def test_returns_whose_finals_share_a_grant_pass_in_stream_order(tmp_path):
         push.send_pyobj((_key(0), 0, 1.0, True))
         push.send_pyobj((_key(1), 1, 1.0, True))
         await held("w", SimpleNamespace(credit=_credit(1), error=None))
-        while rt.now < 1.0 or 1 not in traffic._reports:
+        while rt.now < 1.0 or 1 not in traffic._reports[STREAM]:
             await asyncio.sleep(0.001)
         await asyncio.sleep(0.05)
         await held("w", SimpleNamespace(credit=_credit(0), error=None))

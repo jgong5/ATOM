@@ -9,7 +9,11 @@
 //! message sends exactly one on, on the outbound channel of its kind (`http`,
 //! `relay` or `stream`) to the frontend it goes to, stamped at its arrival plus
 //! that channel's lookahead, from `ATOM_COMPASS_ROUTER_LOOKAHEADS`
-//! (`{"<channel>": seconds}`); a request is sent on once it is placed. Where
+//! (`{"<channel>": seconds}`); a request is sent on once it is placed. Under a
+//! stream bypass, which those name as `router->traffic:final`, a decode
+//! stream's events but its last go straight to traffic, each naming its
+//! channel in its stamp (`c=`), and pass as they are; its last is held and
+//! sent on as `final`. Where
 //! several frontends take one kind, `ATOM_COMPASS_ROUTER_WORKERS`
 //! (`{"<worker base url>": "<frontend LP>"}`) names each worker's. The
 //! policies draw from the run's seed, `ATOM_COMPASS_SEED`. With
@@ -561,7 +565,7 @@ where
     let (request, pair) =
         (REQUEST.try_with(|h| (Some(h.borrow().seq), h.borrow().pair.clone()))).unwrap_or_default();
     let decode = pair.map_or_else(|| lp.frontend(None, "relay"), |(_, d)| d);
-    let from = format!("{decode}->router:stream");
+    let from = format!("{decode}->router:{}", lp.held_stream_kind());
     let events = futures_util::stream::unfold(
         (upstream.boxed(), Vec::new(), Some(guard)),
         move |(mut upstream, mut buf, mut guard)| {
@@ -602,8 +606,19 @@ where
 }
 
 impl Lp {
+    /// The kind of the hops a stream's held events take: `final` where a stream
+    /// bypass takes its other events straight to traffic, else `stream`.
+    fn held_stream_kind(&self) -> &'static str {
+        if self.lookaheads.contains_key("router->traffic:final") {
+            "final"
+        } else {
+            "stream"
+        }
+    }
+
     /// Hold one event of the stream from `from` until it is released, and
-    /// send it on to traffic; the terminal event ends `request`.
+    /// send it on to traffic; the terminal event ends `request`. An event
+    /// whose stamp names its channel went straight to traffic, and passes.
     async fn restamp<G>(
         &self,
         event: Vec<u8>,
@@ -615,9 +630,12 @@ impl Lp {
         let Some(text) = line.strip_prefix(b": compass ") else {
             return event;
         };
+        if memmem::find(text, b" c=").is_some() {
+            return event;
+        }
         let seq = stamp(&String::from_utf8_lossy(text)).1;
         let mut turn = self.hold(from, seq).await;
-        let (arrival, seq) = turn.send("router->traffic:stream");
+        let (arrival, seq) = turn.send(&format!("router->traffic:{}", kind(from)));
         let mut out = format!(": compass a={arrival:?} s={seq}").into_bytes();
         out.extend_from_slice(&event[line.len()..]);
         if memmem::find(&out, b"data: [DONE]").is_some() {
