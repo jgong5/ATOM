@@ -457,3 +457,12 @@ def test_a_scaled_stage_is_stage_0s_vector_times_its_long_steps_median_ratio():
     for k, v in vector["coefficients"].items():
         assert scaled["coefficients"][k] == pytest.approx(1.1 * v)
     assert StepLinearLaw(dict(law(), stage_prefill={"3": scaled})).at_stage(3).prefill
+
+
+def test_a_law_with_stage_vectors_prices_a_stage_and_one_without_does_not(monkeypatch, tmp_path):
+    staged = law()
+    staged["stage_prefill"] = {"1": staged["prefill"]}
+    for sub in ("a", "b"):
+        (tmp_path / sub).mkdir()
+    assert _installed(monkeypatch, tmp_path / "a", step_linear=staged).stage_share == (1.0, 1.0)
+    assert getattr(_installed(monkeypatch, tmp_path / "b", step_linear=law()), "stage_share", None) is None

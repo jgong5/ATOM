@@ -2380,7 +2380,13 @@ def runner(model_runner, tree) -> None:
         # A pipeline stage prices its prefill by its own stage's vector, where
         # the law states one (`StepLinearLaw.at_stage`).
         stage = getattr(config.parallel_config, "pipeline_parallel_rank", 0)
-        backend = StepLinearBackend(StepLinearLaw(run[STEP_LINEAR]).at_stage(stage), dp)
+        law = StepLinearLaw(run[STEP_LINEAR])
+        backend = StepLinearBackend(law.at_stage(stage), dp)
+        if law.stage_prefill:
+            # A law fitted on a pipelined prefill's stage records (`compass fit
+            # steps --stage-record`) prices each stage's own layers: the whole
+            # of this stage's work, which the runner's stage check asks for.
+            backend.stage_share = (1.0, 1.0)
     elif STEP_STUB in run:
         # A pipeline stage is priced for its own span of the stack, the span
         # ATOM's `make_layers` builds it from.
