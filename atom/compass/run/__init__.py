@@ -753,7 +753,10 @@ def rare_full_gc(run: dict | None) -> None:
     A full collection walks every object the run allocated since the startup
     freeze (`gc_utils.freeze_gc_heap`) and still holds, while its LP's clock
     stands still. With the option, a cycle that has reached generation 2 stays
-    until the process exits.
+    until the process exits, and with it one event can go: a streamed response
+    cancelled while its task waits in ``BaseHTTPMiddleware``'s send leaves its
+    generator at ``yield``, only that generator's finalizer aborts its request
+    (jgong5/ATOM#4243), and its engine then decodes it to its end.
 
     A process the run spawns inherits `ENV` and takes the option as it imports
     this module; the API server and the standalone authority, which set `ENV`
