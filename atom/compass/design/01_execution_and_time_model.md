@@ -1107,6 +1107,44 @@ per request: ~23k requests/s at 3 LPs, ~1.7k/s at 82, against the ~19k/s the 82-
 scan per request must stop growing with the square of the LPs, or the CA must split as
 Option B below describes.
 
+**Measured again on 2026-11-26, after the in-place LBTS
+([#4231](https://github.com/jgong5/ATOM/issues/4231)).** `ca_grant_cost.py` on pit2-p03-g27
+(AMD EPYC 9575F, Python 3.12 in `rocm/atom-dev:nightly_202611240650`, CPUs 0-63, shared with
+other runs: load 46 to 207, those CPUs 15% to 72% busy), at `a0d1ad600` and with #4231
+reverted: `a0d1ad600` with `_lbts` back to its body before #4231, the minimum over
+`_row(i)`, whose terms still include #4144's declared ones, which this table never declares.
+`tcp` is the CA process, every thread, as above; `direct` serves the same requests through
+the authority's `on_request` alone, in one thread with no carrier. Each figure is the median
+of three runs, each paired with the other arm's in the same window; per run is the request
+figure times 4,450 per LP. The host and the Python differ from hjbog-srdc-18's, so the two
+tables compare only within themselves.
+
+| LPs | `direct`, in place / reverted | `tcp`, in place / reverted | CA CPU per run, `tcp` in place / reverted | `direct` per run, in place / reverted |
+|---|---|---|---|---|
+| 3 | 5.6 / 6.7 us | 28 / 31 us | 0.4 / 0.4 s | 0.07 / 0.09 s |
+| 34 | 58 / 89 us | 110 / 130 us | 17 / 20 s | 8.7 / 13 s |
+| 82 | 133 / 264 us | 257 / 444 us | 94 / 162 s | 49 / 96 s |
+
+`direct`'s replies have one sha256 in both arms at each size (`f4d4a332...` at 3 LPs,
+`7005c7df...` at 34, `9971910d...` at 82), so the in-place LBTS grants what the row minimum
+did, call for call. In `direct` at 82 LPs, cProfile puts `_lbts` at 49% of `on_request`'s
+time in place and 88% reverted, and `_grant_due`, which calls it, at 96% and 99%. In place,
+`_grant`, whose reply names each of the LP's 81 inbound channels, takes 31%, and the sort and
+lists `_grant_due` builds on each pass take 15%. cProfile charges each call, so it weighs
+`_lbts`'s 41 calls a request above `_grant`'s one.
+
+The in-place LBTS halves the authority's own work at 82 LPs, and the run still takes 94 s of
+CA CPU beside ~19 s of pricing: 257 us a request against the 52 us that pricing allows. The
+pricing is the 4.3 ms a step above, measured on a host this section does not name, so the
+gap mixes hosts; the authority alone, 133 us, exceeds the 52 us either way. The carrier is
+the largest part of the gap, 257 - 133 = 124 us. The selector serve side, which the run-file
+option `select_serve` turns on, takes most of it. In a later window at load 152 to 179, three
+runs each, medians: this probe's `serve` with `clock_transport.serve`'s `select` on, set by a
+wrapper since the probe has no option for it, took 187 us a request, with reader threads
+289 us, and `direct` 142 us, a carrier of about 45 us against 147 us.
+[#4249](https://github.com/jgong5/ATOM/issues/4249) makes the selector the default. Behind it
+the authority alone still exceeds 52 us, its LBTS scan first.
+
 ### Options
 
 **A. Single CA with a hierarchy-ready interface.** One instance. Deployed as a thread in

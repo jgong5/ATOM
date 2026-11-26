@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""Time a Clock Authority grant over the ``tcp`` carrier, with N synthetic LPs.
+"""Time a Clock Authority grant, with N synthetic LPs, over the ``tcp`` carrier
+or on the authority alone.
 
     python3 scripts/compass/ca_grant_cost.py serve N tcp://HOST:PORT [--lookahead L]
     python3 scripts/compass/ca_grant_cost.py lps N tcp://HOST:PORT [--rounds R]
+    python3 scripts/compass/ca_grant_cost.py direct N [--lookahead L] [--rounds R]
 
 ``serve`` builds an authority over N LPs, every one joined to every other by a
 channel of lookahead L, serves it at the endpoint (port 0 binds a free one),
@@ -11,7 +13,11 @@ seconds per request served, all its threads counted, as JSON. ``lps`` runs the
 N LPs, one process each: each binds, asks ``TAR`` one second past its clock R
 times, waiting for each grant, then ``NER(+inf)``, and the last of those
 finishes the run. It prints the round trip of a ``TAR``, from its send to its
-grant, as p10, median and p90 over every LP's rounds, as JSON.
+grant, as p10, median and p90 over every LP's rounds, as JSON. ``direct`` runs
+the same requests through the authority's ``on_request`` in one thread, with no
+carrier: each LP asks once its last reply is in, in the order replies come. It
+prints the CPU seconds per request of those calls, and the sha256 of every
+reply as the carrier would frame it, which is the same in every process.
 
 With the default lookahead of one second, an LP's ``TAR`` is granted only once
 every other LP has asked for the same time: each round is a barrier, every
@@ -21,6 +27,8 @@ ahead of the slowest.
 """
 
 import argparse
+import collections
+import hashlib
 import json
 import math
 import multiprocessing
@@ -33,7 +41,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from atom.compass.clock import NER, TAR, ChannelTable, ClockAuthority, LpId, LpRegistry
-from atom.compass.clock_transport import connect, serve
+from atom.compass.clock_transport import connect, encode, serve
+from atom.compass.clock_transport.wire import GRANT
 
 
 def _name(k: int) -> LpId:
@@ -100,15 +109,53 @@ def lps(n: int, endpoint: str, rounds: int = 1000) -> dict:
     }
 
 
+def direct(n: int, lookahead: float = 1.0, rounds: int = 1000) -> dict:
+    """`lps`'s requests on `n` LPs, served by the authority alone in this
+    thread; the CPU they took and the replies' sha256."""
+    clock = authority(n, lookahead)
+    left = {_name(k): rounds for k in range(n)}  # TARs each LP has still to ask
+    ready = collections.deque((lp, clock.on_bind(lp)[0]) for lp in left)
+    replies = []
+    cpu = time.process_time()
+    while ready:
+        lp, now = ready.popleft()
+        ask = (TAR, now + 1.0) if left[lp] else (NER, math.inf)
+        left[lp] -= 1
+        got = clock.on_request(lp, *ask, [])
+        replies += got
+        ready.extend((i, g) for i, g, *_ in got if g < math.inf)
+    cpu = time.process_time() - cpu
+    if clock.final_clocks is None:
+        raise SystemExit(f"the run did not finish: {clock.lp_table()}")
+    digest = hashlib.sha256()
+    for i, *reply in replies:
+        digest.update(i.name.encode() + encode((GRANT, *reply)) + b"\n")
+    requests = sum(clock.requests_served.values())
+    return {
+        "host": socket.gethostname(),
+        "lps": n,
+        "lookahead_s": lookahead,
+        "requests": requests,
+        "replies": len(replies),
+        "cpu_s": cpu,
+        "cpu_per_request_s": cpu / requests,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("mode", choices=("serve", "lps"))
+    parser.add_argument("mode", choices=("serve", "lps", "direct"))
     parser.add_argument("n", type=int, help="how many LPs")
-    parser.add_argument("endpoint", help="tcp://HOST:PORT")
+    parser.add_argument("endpoint", nargs="?", help="tcp://HOST:PORT, not for direct")
     parser.add_argument("--lookahead", type=float, default=1.0)
     parser.add_argument("--rounds", type=int, default=1000)
-    args = parser.parse_args()
-    if args.mode == "serve":
+    args = parser.parse_intermixed_args()
+    if (args.endpoint is None) != (args.mode == "direct"):
+        parser.error(f"{args.mode} takes {'no' if args.endpoint else 'an'} endpoint")
+    if args.mode == "direct":
+        result = direct(args.n, args.lookahead, args.rounds)
+    elif args.mode == "serve":
         result = ca(args.n, args.endpoint, args.lookahead)
     else:
         result = lps(args.n, args.endpoint, args.rounds)
