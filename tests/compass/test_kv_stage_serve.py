@@ -116,10 +116,10 @@ def test_a_network_file_states_the_serve_fields(tmp_path):
 def test_the_device_reaches_what_its_host_enqueued_by_then():
     q = DeviceQueue()
     assert q.reached(1.0) == 1.0  # no forward: nothing to wait for
-    q.add(1.0, 2.0, 1.5, 4.0)  # enqueued over [1, 2], run over [1.5, 4]
+    q.add(1.0, 2.0, 1.0, 3.5)  # enqueued over [1, 2], run over [1, 3.5]
     assert q.reached(0.5) == 0.5
-    assert q.reached(1.5) == pytest.approx(1.5 + 0.5 * 2.5)  # half enqueued
-    assert q.reached(3.0) == 4.0  # all of it
+    assert q.reached(1.5) == pytest.approx(1.0 + 0.5 * 2.5)  # half enqueued
+    assert q.reached(3.0) == 3.5  # all of it
     assert q.reached(5.0) == 5.0  # the device has caught up
     q.add(6.0, 6.0, 6.0, 7.0)  # a launch of no length enqueues it all
     assert q.reached(6.0) == 7.0
@@ -127,6 +127,18 @@ def test_the_device_reaches_what_its_host_enqueued_by_then():
         q.add(5.0, 5.5, 7.0, 8.0)
     q.forget_before(6.5)
     assert q.reached(3.0) == 3.0 and q.reached(6.2) == 7.0
+
+
+def test_the_queue_holds_the_device_s_work_not_its_waits():
+    """A forward whose device start waited 3 s for the stage before's
+    tensors runs, in the queue, its own 1 s right after the forward before:
+    a gather queues behind work, not behind that wait."""
+    q = DeviceQueue()
+    q.add(0.0, 1.0, 0.0, 2.0)
+    q.add(1.0, 2.0, 5.0, 6.0)  # its device waited until 5 for its input
+    assert q.reached(2.5) == pytest.approx(3.0)
+    q.add(4.0, 4.5, 4.0, 4.5)  # launched once the device is idle: from 4
+    assert q.reached(4.5) == pytest.approx(4.5)
 
 
 def test_a_stage_s_writes_on_an_idle_device():

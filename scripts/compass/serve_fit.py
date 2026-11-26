@@ -26,7 +26,10 @@ record whose stage's device had caught up at their receipt (within
   ``gather_s + (gather_one_s + j x stagger_s) / calls`` over the medians of
   each (calls, j);
 
-and ``serve_device_wait``, the share of its device's backlog a call waits,
+and ``serve_device_wait``, the share of its device's backlog a call waits
+(with --sim POINT=DIR, scored on that simulated run of the point instead:
+its transfers replayed on its own stages' queues from its cost records, which
+is what a full simulation prices, against the record's),
 with the constant the gather's least squares
 under-reads (a transfer waits for the slowest of its stages' writes), the
 grid values whose replay of the POINTS' transfers comes closest to them:
@@ -47,6 +50,7 @@ import gzip
 import hashlib
 import json
 import math
+import re
 import statistics
 import sys
 from pathlib import Path
@@ -213,6 +217,100 @@ def replay(found, qs, window, serve, lone):
     return out
 
 
+SERVED = re.compile(
+    r"compass: KV transfer (\S+) served on stage (\d+), (\d+) blocks, from (\S+) to (\S+) simulated s"
+)
+LAW = re.compile(r"compass: KV transfer (\S+), (\d+) blocks, from (\S+) to (\S+) simulated s")
+
+
+def sim_queues(dep: Path):
+    """A simulated prefill's stages' queues, from its cost records: a stage
+    before the last launches over the W_launch before its exit (t_s +
+    charge_s) less W_post, and its device runs device_s + draft_s (the
+    queue chains them, `DeviceQueue.add`); the last stage's queue is empty."""
+    from atom.compass.kv.transfer import DeviceQueue
+
+    stages = len(list(dep.glob("now-engine-P-pp*.kv_block")))
+    out = []
+    for k in range(stages):
+        q = DeviceQueue()
+        if k < stages - 1:
+            name = "dp0" if k == 0 else f"pp{k}.dp0"
+            rows = []
+            for line in (dep / f"prefill/steps/{name}.cost.jsonl").open():
+                d = json.loads(line)
+                if "step" not in d:
+                    continue
+                l1 = d["t_s"] + d["charge_s"] - d.get("W_post", 0.0)
+                l0 = l1 - d.get("W_launch", 0.0)
+                rows.append((l0, l1, d.get("device_s", 0.0) + d.get("draft_s", 0.0)))
+            for l0, l1, busy in sorted(rows):
+                q.add(l0, l1, l0, l0 + busy)
+        out.append(q)
+    return out
+
+
+def sim_transfers(sim: Path, point):
+    """A simulated run's transfers in its point's profiling window: (arrival
+    s, [(stage, bytes)]), from its transfer lines (a stage's served or the
+    link law's), each stage's bytes its planned block at the decode landing."""
+    dep = sim / "deploy"
+    stages = len(list(dep.glob("now-engine-P-pp*.kv_block")))
+    pb = [json.loads((dep / f"now-engine-P-pp{k}.kv_block").read_text())["block_bytes"] for k in range(stages)]
+    db = json.loads((dep / "now-engine-D.kv_block").read_text())
+    landing = db["tp"] * db["block_bytes"] / sum(pb)
+    seen = {}
+    for line in (dep / "prefill/server.log").open(errors="replace"):
+        m = SERVED.search(line)
+        if m:
+            seen[m[1]] = (int(m[3]), float(m[4]))
+            continue
+        m = LAW.search(line)
+        if m and m[1] not in seen:
+            seen[m[1]] = (int(m[2]), float(m[3]))
+    starts = []
+    for line in gzip.open(sim / point / "artifacts" / "profile_export_raw.jsonl.gz", "rt"):
+        d = json.loads(line)
+        if d["metadata"].get("benchmark_phase") == "profiling":
+            starts.append(d["metadata"]["request_start_ns"] / 1e9)
+    lo, hi = min(starts), max(starts)
+    return [
+        (a, [(k, blocks * round(pb[k] * landing)) for k in range(stages)])
+        for blocks, a in seen.values()
+        if lo <= a <= hi
+    ]
+
+
+def sim_replay(sim, qs, serve):
+    """Each simulated transfer: (bytes, served s) on the sim's own queues."""
+    from atom.compass.kv.transfer import StageServe
+
+    return [
+        (
+            sum(b for _, b in per),
+            max(StageServe(serve, a, b).advance(math.inf, qs[k]) for k, b in per) - a,
+        )
+        for a, per in sim
+    ]
+
+
+def score_sim(real_rows, sim_rows):
+    """`score`'s form over a simulated run's replay against the record's."""
+    errs, table = [], []
+    for lo, hi, name in BANDS:
+        r = [x[1] for x in real_rows if lo <= x[0] < hi]
+        m = [x[1] for x in sim_rows if lo <= x[0] < hi]
+        if len(r) < 5 or len(m) < 5:
+            continue
+        line = [name, len(m)]
+        for p in (50, 90):
+            a, b = pct(r, p), pct(m, p)
+            errs.append(abs(math.log(b / a)))
+            line += [a, b, math.nan]
+        table.append(line)
+    return (statistics.fmean(errs) if errs else math.inf), table
+
+
 def score(rows):
     """Mean |log(model / real)| over the bands' p50 and p90, and the table."""
     errs, table = [], []
@@ -239,6 +337,14 @@ def main(argv=None) -> int:
     parser.add_argument("--points", default="c24:600,c64:600,c120:600")
     parser.add_argument("--writes", type=int, default=4, help="decode's TP: writes a stage")
     parser.add_argument("--out", help="NETWORK with the fitted serve fields added")
+    parser.add_argument(
+        "--sim",
+        action="append",
+        default=[],
+        metavar="POINT=DIR",
+        help="score device_wait and the gather on a simulated run of POINT (its "
+        "probe dir) replayed on its own stages' queues, not on the record's",
+    )
     args = parser.parse_args(argv)
     record = Path(args.record)
     net = network(args.network)
@@ -278,6 +384,23 @@ def main(argv=None) -> int:
     )
     points = [p for p in args.points.split(",") if p]
     wins = windows(record, points)
+    sims = dict(x.split("=", 1) for x in args.sim)
+    if missing := sorted(set(sims) - set(points)):
+        raise SystemExit(f"--sim names {missing}, not among --points {points}")
+    simdata = {
+        p: (sim_queues(Path(d) / "deploy"), sim_transfers(Path(d), p)) for p, d in sims.items()
+    }
+
+    def point_score(p, serve):
+        """Point `p`'s score: on its simulated run's queues where --sim names one."""
+        if p in simdata:
+            qs_p, sim = simdata[p]
+            real = [(r[0], r[1]) for r in replay(found, qs, wins[p], serve, lone)]
+            return score_sim(real, sim_replay(sim, qs_p, serve))
+        return score(replay(found, qs, wins[p], serve, lone))
+
+    if sims:
+        print(f"device_wait and the gather scored on simulated runs: {sims}")
     best, per_point = None, {}
     for extra in GATHER_GRID:
         for wait in WAIT_GRID:
@@ -288,7 +411,7 @@ def main(argv=None) -> int:
             )
             total = []
             for p in points:
-                s, _ = score(replay(found, qs, wins[p], serve, lone))
+                s, _ = point_score(p, serve)
                 total.append(s)
                 if p not in per_point or s < per_point[p][0]:
                     per_point[p] = (s, wait)
@@ -307,7 +430,7 @@ def main(argv=None) -> int:
     )
     print(f"{'point':10s} {'band':8s} {'n':>5s}  p50 real/served/law ms     p90 real/served/law ms")
     for p in points:
-        _, table = score(replay(found, qs, wins[p], serve, lone))
+        _, table = point_score(p, serve)
         for name, n, r5, m5, l5, r9, m9, l9 in table:
             print(
                 f"{p:10s} {name:8s} {n:5d}  {r5 * 1e3:8.1f} {m5 * 1e3:8.1f} ({(m5 / r5 - 1) * 100:+4.0f}%) "
@@ -338,7 +461,14 @@ def main(argv=None) -> int:
             f"{prov.get('notes', '')} serve_*: `serve_fit.py` over the {len(found)} "
             f"transfers of {record} ({len(idle)} writes on a caught-up device for the "
             f"calls and the gather; serve_device_wait the grid value whose replay of "
-            f"{', '.join(points)} comes closest, the band the points' own)."
+            f"{', '.join(points)} comes closest, the band the points' own"
+            + (
+                f"; scored on the simulated runs {sims} replayed on their own "
+                "stages' queues"
+                if sims
+                else ""
+            )
+            + ")."
         ).strip()
         Path(args.out).write_text(json.dumps(doc, indent=2) + "\n")
         network(args.out)  # the schema reads it back, or refuses
