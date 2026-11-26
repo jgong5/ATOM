@@ -280,13 +280,8 @@ def test_a_step_reads_its_drafter_s_graph_as_draft_terms(batch, shape):
     [
         (view((1, 9, True)), g(1, 8, 8), "a step that decodes a row of other than 2"),
         (VERIFY, None, "over 2 sequences for its drafter"),
-        (
-            replace(VERIFY, tbo_tokens=((2,), (2,))),
-            g(1, 8, 8),
-            "a two-batch-overlap step under a drafter",
-        ),
     ],
-    ids=["unverified-row", "uncaptured-drafter", "two-batch-overlap"],
+    ids=["unverified-row", "uncaptured-drafter"],
 )
 def test_a_step_under_a_drafter_with_no_draft_to_price_is_refused_by_name(
     batch, drafted, named
@@ -646,3 +641,31 @@ def test_a_padded_drafter_s_later_pass_runs_and_dispatches_at_the_rung(tmp_path)
         if op["op"] == f"{MORI}.dispatch"
     ]
     assert dispatched == [(9, 93), (4, 32)]
+
+
+@pytest.mark.parametrize(
+    "batch,halves,shape",
+    [
+        (VERIFY, ((2,), (2,)), ("decode", 2, 2, True)),
+        (FINAL, ((5,), (4,)), ("prefill", 9, 1, True)),
+    ],
+    ids=["verify", "final-chunk"],
+)
+def test_a_split_step_prices_its_drafter_after_both_micro_batches_whole(
+    batch, halves, shape
+):
+    # ATOM wraps the target alone in UBatchWrapper: its drafter proposes after
+    # both micro-batches, on the step's whole rows.
+    asked = []
+
+    def graph(*at, draft=False, micro_batch=False):
+        asked.append((*at, draft, micro_batch))
+        return g(16, 64, 64) if draft else g(4, 8, 8)
+
+    split = replace(batch, tbo_tokens=halves)
+    cost = OpGraphBackend(SPEC, graph, kv="bf16", drafts=1).price(split)
+
+    assert [t.name for t in cost.terms] == ["op.tbo"]
+    assert [a[-2:] for a in asked] == [(False, True), (False, True), (True, False)]
+    assert asked[-1] == (*shape, True, False)
+    assert cost.draft_seconds == price(gemm(16, 64, 64), SPEC)

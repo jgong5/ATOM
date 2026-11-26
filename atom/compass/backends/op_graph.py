@@ -64,6 +64,9 @@ Each graph's prices in run order fall into segments that alternate streams: an
 MoE exchange of activations rides the comm stream, everything else the compute
 stream. Both micro-batches' segments go on the two streams in ATOM's order
 (`step_roofline.overlap`); the finish time is the one term ``op.tbo``.
+Under a drafter, its propose and a block drafter's draft-KV pass run after both
+micro-batches on the step's whole rows, as ATOM runs them: their terms are
+a step's that does not split.
 
 With a `price_list`, a source named `LISTED` (`fit.ops.PriceList` in a run),
 each leaf resolves through a `Resolver`: the
@@ -92,8 +95,7 @@ two-batch-overlap step on MoRI's split send and receive (`split_send_recv`),
 whose transfer in flight lies on no stream, whose split names no pair for
 this rank, whose micro-batches' graphs exchange a different number of times
 or run an exchange beside a second stream (the dual-stream MoE, which ATOM
-turns off under overlap), or that runs under a drafter, whose draft pass no
-graph places on the overlapped streams; a decode step whose rows do not each
+turns off under overlap); a decode step whose rows do not each
 verify the drafter's tokens and one; a step that samples on one rank whose
 MTP drafter's graph does not run its routed leaves as its passes alike, each
 its own; a prefill step whose view
@@ -526,9 +528,12 @@ class OpGraphBackend(CostBackend):
         self._step, self._passes, self._read = {}, {}, set()
         if batch_view.tbo_tokens is not None and not batch_view.image_tokens:
             at, priced = self._overlapped(batch_view, refused)
+            terms = {priced[0][0]: _term(priced[0][0], priced, at)}
+            if self.drafts:
+                terms |= self._drafted(batch_view, refused, at)
             if refused:
                 raise CostRefused(batch_view, list(dict.fromkeys(refused)))
-            return StepCost([_term(priced[0][0], priced, at)])
+            return _cost(terms)
         at, region = self._region(batch_view)
         drafted_at, drafted = (
             self._region(batch_view, draft=True) if self.drafts else (None, None)
@@ -833,11 +838,6 @@ class OpGraphBackend(CostBackend):
                     "(--all2all-backend low-latency): its transfer in flight "
                     "lies on no stream"
                 )
-            if self.drafts:
-                raise ValueError(
-                    "a two-batch-overlap step under a drafter: no graph places its "
-                    "draft pass on the overlapped streams"
-                )
             halves = micro_batches(view)
         except ValueError as exc:
             raise CostRefused(view, [Refusal(SOURCE, str(exc))]) from None
@@ -880,6 +880,31 @@ class OpGraphBackend(CostBackend):
         name = TBO + ".price_list" if listed else TBO
         price = (name, overlap([zip(*runs)]), notes, Work(), False, (origins, why), {})
         return " and ".join(at), [price]
+
+    def _drafted(self, view: BatchView, refused: list, target_at: str) -> dict:
+        """A split step's drafter's terms: ATOM runs a block drafter's
+        draft-KV pass and its drafter's propose after both micro-batches, on
+        the step's whole rows (`ModelRunner` wraps the target alone in
+        `UBatchWrapper`), so each prices as on a step that does not split."""
+        drafted_at, drafted = self._region(view, draft=True)
+        samples = view.decode or view.produces_output
+        kv = self.block and samples and self._region(view, draft=KV)[1]
+        if samples and view.moe_rows is None:
+            self._passes = self._pass_views(drafted, view)
+        bound = self.resolver and self._bound(view)
+        draft = self.resolver and self._bound(view, draft=True)
+        priced = []
+        for part, region, at in ((1, kv, bound), (2, drafted, draft)):
+            if region:
+                got = self._priced(region, view, refused, at)
+                priced += [(PREFIXES[part] + p[0], *p[1:]) for p in got]
+        names: dict[str, list] = {}
+        for p in priced:
+            names.setdefault(p[0], []).append(p)
+        return {
+            n: _term(n, ps, drafted_at if n.startswith(DRAFT) else target_at)
+            for n, ps in names.items()
+        }
 
     def _priced(
         self, region: dict, view: BatchView, refused: list, bound, pooled=False
