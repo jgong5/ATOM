@@ -435,3 +435,25 @@ def test_a_run_file_step_linear_stating_no_engine_config_is_refused(monkeypatch)
     )
     with pytest.raises(ValueError, match="the step linear law states no engine_config"):
         run.runner(tp1, META_8B)
+
+
+def test_a_scaled_stage_is_stage_0s_vector_times_its_long_steps_median_ratio():
+    from types import SimpleNamespace
+
+    from atom.compass.fit.steps import _scaled_stage
+
+    def sample(step, seconds):
+        rows = (RequestShape(64, 64, False),)
+        return SimpleNamespace(step=step, device_s=seconds, view=BatchView(rows))
+
+    # stage 0's labels are 1..10 s; the stage runs its long steps 10% above and
+    # its short ones, which wait on the stage before, far above
+    first = [sample(n, float(n)) for n in range(1, 11)]
+    mine = [sample(n, n * (1.1 if n >= 5 else 3.0)) for n in range(1, 11)]
+    vector = law()["prefill"]
+    scaled, figures = _scaled_stage(3, first, mine, vector)
+    assert figures["scale"] == pytest.approx(1.1)
+    assert figures["steps"] == 5  # at or above the 5.5 s median
+    for k, v in vector["coefficients"].items():
+        assert scaled["coefficients"][k] == pytest.approx(1.1 * v)
+    assert StepLinearLaw(dict(law(), stage_prefill={"3": scaled})).at_stage(3).prefill

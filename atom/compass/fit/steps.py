@@ -256,11 +256,16 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
     return {**grid_key, "grid": grid["grid"]}, bundle, report
 
 
-def _stage_prefill(args, sources, fit, config, stage, record) -> tuple[dict, dict]:
-    """Stage `stage`'s prefill vector and its fit figures: the fit of the prefill
-    inputs of `args` with `record` in place of the first prefill RECORD, its
-    client runs the same; refused unless that stage ran stage 0's engine config
-    and gives a prefill vector."""
+def _stage_prefill(
+    args, sources, fit, config, stage, record, first=(), law=None
+) -> tuple[dict, dict]:
+    """Stage `stage`'s prefill vector and its figures, from the prefill inputs of
+    `args` with `record` in place of the first prefill RECORD, its client runs
+    the same; refused unless that stage ran stage 0's engine config. Under
+    ``--stage-form scaled``, stage 0's vector in `law` times the median ratio of
+    the stage's device labels to stage 0's (`first`, its samples) on the
+    prefill steps both label at or above stage 0's median label; under
+    ``fitted``, the stage's own fit."""
     prefill = [i for i in args.inputs if Path(i).name == "prefill"]
     if not prefill:
         raise ValueError("--stage-record replaces a prefill RECORD, and no RECORD is one")
@@ -279,10 +284,50 @@ def _stage_prefill(args, sources, fit, config, stage, record) -> tuple[dict, dic
         raise ValueError(
             f"stage {stage}'s record ran another engine config than stage 0's"
         )
+    if getattr(args, "stage_form", "fitted") == "scaled":
+        return _scaled_stage(stage, first, samples, (law or {}).get("prefill"))
     _, params, report = fit(samples, got, staged)
     if params.get("prefill") is None:
         raise ValueError(f"stage {stage}'s record gives no prefill vector")
     return params["prefill"], report.get("vectors", {}).get("prefill", {})
+
+
+def _scaled_stage(stage, first, samples, vector) -> tuple[dict, dict]:
+    """Stage 0's prefill `vector` times the median ratio of stage `stage`'s
+    device labels (`samples`) to stage 0's (`first`) on the prefill steps both
+    label at or above stage 0's median label, and its figures."""
+    import numpy as np
+
+    if vector is None:
+        raise ValueError("--stage-form scaled scales stage 0's prefill vector, and it has none")
+
+    def labelled(got):
+        return {
+            s.step: s.device_s
+            for s in got
+            if s.device_s is not None and s.view.prefill and not s.view.decode
+        }
+
+    mine, base = labelled(samples), labelled(first)
+    both = sorted(set(mine) & set(base))
+    if not both:
+        raise ValueError(f"stage {stage} labels none of stage 0's prefill steps")
+    floor = float(np.median([base[n] for n in both]))
+    long = [n for n in both if base[n] >= floor]
+    ratios = np.array([mine[n] / base[n] for n in long])
+    scale = float(np.median(ratios))
+    p10, p90 = np.percentile(ratios, [10, 90]).tolist()
+    scaled = dict(vector, coefficients={k: v * scale for k, v in vector["coefficients"].items()})
+    figures = {
+        "form": "scaled",
+        "scale": scale,
+        "p10": p10,
+        "p90": p90,
+        "steps": len(long),
+        "at_or_above_s": floor,
+    }
+    scaled["fit"] = dict(vector.get("fit", {}), stage=figures)
+    return scaled, figures
 
 
 def _rungs(word: str) -> tuple[int, ...]:
@@ -394,6 +439,15 @@ def main(argv: list[str]) -> None:
         "were served with); its prefill vector is fitted on it, the client runs "
         "named for the first prefill RECORD, and stated under stage_prefill",
     )
+    parser.add_argument(
+        "--stage-form",
+        choices=("scaled", "fitted"),
+        default="scaled",
+        help="a --stage-record's vector: stage 0's times the median ratio of the "
+        "stage's device labels to stage 0's on the prefill steps both label at or "
+        "above stage 0's median (scaled), or the stage's own fit (fitted), whose "
+        "short steps hold the wait on the stage before",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--ops",
@@ -440,7 +494,9 @@ def main(argv: list[str]) -> None:
     for stage, record in args.stage_record or ():
         params.setdefault("stage_prefill", {})[str(int(stage))], report.setdefault(
             "stage_prefill", {}
-        )[str(int(stage))] = _stage_prefill(target_args, sources, fit, config, stage, record)
+        )[str(int(stage))] = _stage_prefill(
+            target_args, sources, fit, config, stage, record, samples, params
+        )
     if args.ops:
         refused = [
             f"{f}: {w}" for s in samples for f, ws in s.floor.items() for w in ws
