@@ -23,8 +23,12 @@ from .wire import MalformedMessage, decode, encode
 _CARRIERS = {service.IN_PROCESS_SCHEME: service, stream.STREAM_SCHEME: stream}
 
 
-def serve(authority, endpoint: str = DEFAULT_ENDPOINT):
-    """Serve `authority` at `endpoint`. `close()` on the result stops it."""
+def serve(authority, endpoint: str = DEFAULT_ENDPOINT, select: bool = False):
+    """Serve `authority` at `endpoint`. `close()` on the result stops it. With
+    `select`, a ``tcp`` endpoint reads every connection on one selector thread
+    (`stream`); an in-process one has no reader thread to replace."""
+    if _carrier(endpoint) is stream:
+        return stream.serve(authority, endpoint, select)
     return _carrier(endpoint).serve(authority, endpoint)
 
 
