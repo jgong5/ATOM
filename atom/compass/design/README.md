@@ -604,7 +604,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`19`](19_adoption.md) | Adoption | One `compass advice` command checks a space the user provides, simulates every candidate whose law exists and recommends a configuration; calibration stays apart, reached through the store, and calibrated data is reused only under the reuse requirements. Every run writes its per-request split and a report. Developed on MiniMax-M3.1-Flash's 1P1D recipe on pit2's MI355X, shown on MiniMax-M3. |
+| [`19`](19_adoption.md) | Adoption | One `compass advice` command checks a space the user provides, simulates every candidate whose law exists and recommends a configuration; calibration stays apart, reached through the store, and calibrated data is reused only under the reuse requirements. Every run writes its per-request split and a report. Developed on MiniMax-M3.1-Flash's 1P1D recipe on pit2's MI355X, its answer there checked against held-out real runs, and shown on MiniMax-M3. |
 
 ---
 
