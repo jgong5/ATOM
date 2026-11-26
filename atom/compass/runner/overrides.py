@@ -98,6 +98,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import hashlib
 import json
 import logging
 import math
@@ -2230,6 +2231,67 @@ HISTORY_TERMS = frozenset(
 )
 
 
+#: Rare slow prefill steps (`step_outlier`): ``rate=R,excess_s=X``, unset or
+#: empty none. Its seed: `STEP_OUTLIERS_SEED_ENV`, else the client's send-order
+#: seed (``COMPASS_HARNESS_SEND_ORDER_SEED``), else 0.
+STEP_OUTLIERS_ENV = "COMPASS_STEP_OUTLIERS"
+STEP_OUTLIERS_SEED_ENV = "COMPASS_STEP_OUTLIERS_SEED"
+
+
+def step_outliers_spec() -> dict | None:
+    """`STEP_OUTLIERS_ENV`'s ``rate`` (0 to 1) and ``excess_s`` (>= 0), None
+    when unset or empty; anything else is refused."""
+    raw = os.environ.get(STEP_OUTLIERS_ENV) or ""
+    if not raw:
+        return None
+    spec = {}
+    for part in raw.split(","):
+        key, _, value = part.partition("=")
+        try:
+            spec[key] = float(value)
+        except ValueError:
+            spec[key] = math.nan
+    rate, excess = spec.get("rate", math.nan), spec.get("excess_s", math.nan)
+    if set(spec) != {"rate", "excess_s"} or not (
+        0 <= rate <= 1 and math.isfinite(excess) and excess >= 0
+    ):
+        raise ValueError(
+            f"{STEP_OUTLIERS_ENV}={raw!r}; it takes rate=R,excess_s=X, R from 0 "
+            "to 1 and X seconds >= 0"
+        )
+    return {"rate": rate, "excess_s": excess}
+
+
+def step_outlier(view: Any, ranks: int, count: int, spec: dict | None) -> float:
+    """The seconds a rank's priced step `count` (its group's step index) runs
+    slow under `spec` (`step_outliers_spec`): ``excess_s`` with probability
+    ``rate`` at a step where some rank of the data-parallel group finishes a
+    prompt's prefill (`BatchView.group_tail`) and at least two of its `ranks`
+    run real rows; else 0, also with no spec or view. The draw, a uniform
+    from a digest of the seed and `count`, is the same on every rank of the
+    group, so the group's step takes the excess, and the same in every run.
+
+    #752 Cell A v2 (DPA4): about 1-2.5% of the real records' prefill steps run
+    >= 20% over the law's price (its phase-wise group rule), on calibration
+    and targets alike and on a record with no KFD queue eviction near them;
+    of the calibration's steps with a finishing tail on >= 2 real ranks, 4.6%
+    ran 0.24 s over on average, which the law's fit, a bulk fit, leaves out:
+    its calibration steps cost 2.3% more in sum than it prices them, 0.2% more
+    without these."""
+    if spec is None or view is None or not getattr(view, "group_tail", False):
+        return 0.0
+    if ranks - getattr(view, "group_dummies", 0) < 2 or spec["rate"] <= 0:
+        return 0.0
+    seed = (
+        os.environ.get(STEP_OUTLIERS_SEED_ENV)
+        or os.environ.get("COMPASS_HARNESS_SEND_ORDER_SEED")
+        or "0"
+    )
+    digest = hashlib.sha256(repr((seed, "outlier", count)).encode()).digest()
+    u = (int.from_bytes(digest[:8], "big") + 0.5) / 2**64
+    return spec["excess_s"] if u < spec["rate"] else 0.0
+
+
 def history_phase_wait(terms: Any, group: Any) -> float:
     """The seconds this rank's prefill step waits, beyond its own price, for its
     DP group's longest attention over cached history.
@@ -2440,6 +2502,15 @@ def _group_step_seconds(
     prefilling = many and not mode.running_tokens_are_unified
     phase_s = history_phase_wait(terms[:target_terms], group if prefilling else None)
     device_s += phase_s
+    outliers = vars(runner).get("_step_outliers", False)
+    if outliers is False:
+        outliers = vars(runner)["_step_outliers"] = step_outliers_spec()
+    if outliers is not None:
+        steps = vars(runner).get("_outlier_steps", 0)
+        vars(runner)["_outlier_steps"] = steps + 1
+        if many and not refused:
+            ranks = len(mode.sync.scheduled_tokens_per_dp_rank)
+            device_s += step_outlier(view, ranks, steps, outliers)
     charge = getattr(host, "charge", None)
     if group is not None and isinstance(host, HostDeviceRecurrence):
 
