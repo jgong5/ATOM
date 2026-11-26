@@ -100,6 +100,24 @@ Fitted on the paced spans, the prefill vector's intercept held the launch
 (42 ms) and priced such a tail at 50 ms, and with the launch priced again by
 the host's recurrence a lone prefill of 1-2k tokens 13-18% over the real one.
 
+With `PREFILL_EXPOSED_ENV` set to a token count N, an opt-in, a windowed
+prefill line of at most N prefill tokens of its own that is launch-exposed,
+its device start before its host launch's end as a decode's above, is cut as
+`exposed` too and keeps its host labels: its device ran behind the launch, so
+its window holds the launch's pace however far past the launch's end it
+ends, and the host laws' `W_launch` prices that pace, as a paced line's. A
+larger line keeps its window: past the launch's end its device runs its own
+work. On #734's cell B (DeepSeek-V4.1 1P1D, P at DP2 EP2, eager) the output
+prefills of 512 tokens or fewer whose device started after their launch had
+ended (a busy device's next step) ran 24-25 ms at every load from c=8 to
+c=307, while the exposed ones the paced cut misses (ending a few ms past the
+launch, or held by a slow launch) took the launch's 55-60 ms, and more of
+them at high load: fitted with them, the prefill vector's intercept (21 ms)
+priced the device-bound ones 36-37% high at every load. Exposed lines of
+2048-8192 tokens end 36 ms past their launch at the median, mostly device
+work; N=2048, chosen on the calibration records, priced the device-bound
+short lines within 2-3% and kept the larger bands within 2-4%.
+
 Given `floored`, a trace run's drafter labels, the draft's and its passes',
 lose what the profiler added to each drafter kernel shorter than the profiler's
 floor (`parity.busy.floored` under a `Floor`): queued behind another, such a
@@ -210,9 +228,10 @@ from atom.compass.backends.shape import BatchView, PrefillDuty, RequestShape
 #: window: token copy wait exits for the launch-exposed cut, MTP status-wait
 #: returns for the lead.
 ANCHORS = 32
-#: Why a device label is cut: a launch-exposed decode, mixed rows, no MTP target
-#: end, a prefill with no traced busy time, a trace run's decode, a windowed
-#: prefill its launch paced.
+#: Why a device label is cut: a launch-exposed decode (or, under
+#: `PREFILL_EXPOSED_ENV`, a launch-exposed windowed prefill of at most its
+#: tokens), mixed rows, no MTP target end, a prefill with no traced busy time,
+#: a trace run's decode, a windowed prefill its launch paced.
 CUTS = ("exposed", "mixed", "unsplit", "untraced", "traced", "paced")
 #: The directory beside a trace run's `steps` its traces are in (`parity.busy`).
 TRACE = "trace"
@@ -229,6 +248,11 @@ PREFILL_LABEL_ENV = "COMPASS_PREFILL_LABEL"
 #: How near its host launch's end a windowed prefill's device work ends, either
 #: side, to have run at the launch's pace (`_paced`), in seconds.
 PACED_S = 2e-3
+#: The variable that, set to a positive whole number N, cuts as `exposed` each
+#: launch-exposed windowed prefill line of at most N prefill tokens of its own
+#: (`prefill_exposed_max`; module docstring); unset or empty, no prefill line
+#: is, and a fit is as before.
+PREFILL_EXPOSED_ENV = "COMPASS_FIT_PREFILL_EXPOSED_MAX_TOKENS"
 #: The variable that, set to ``1``, cuts as `STALLED` each rank's line of a step
 #: some rank's host stalled issuing a prefill forward at (`launch_stalls`);
 #: unset or ``0``, no step is, and a fit is as before.
@@ -263,6 +287,24 @@ def launch_stall_on() -> bool:
     if value not in ("0", "1"):
         raise ValueError(f"{STALL_ENV}={value!r} is not 0 or 1")
     return value == "1"
+
+
+def prefill_exposed_max() -> int | None:
+    """`PREFILL_EXPOSED_ENV`'s token count, None unset or empty; any value but a
+    positive whole number is refused."""
+    value = (os.environ.get(PREFILL_EXPOSED_ENV) or "").strip()
+    if not value:
+        return None
+    if not value.isdigit() or int(value) < 1:
+        raise ValueError(
+            f"{PREFILL_EXPOSED_ENV}={value!r} is not a positive whole number of tokens"
+        )
+    return int(value)
+
+
+def _prefill_tokens(line: dict) -> int:
+    """The prefill tokens of a line's own rows (its decode rows left out)."""
+    return sum(r[0] for r in line["rows"] if not r[2])
 
 
 def launch_stalls(
@@ -952,6 +994,7 @@ def _label(
     mtp = any("d_target_ns" in s for s in steps)
     window_prefill = _prefill_label() == "record" and not traced
     paced = _paced(lines, mtp) if window_prefill else set()
+    exposed_max = prefill_exposed_max() if window_prefill else None
     key = path.with_suffix(".key.json")
     config = read_json(key) if key.exists() else None
     tbo = (config or {}).get("engine", {}).get("enable_tbo")
@@ -1031,6 +1074,13 @@ def _label(
             cut = "untraced"
         elif windowed and s["step"] in paced:
             cut = "paced"
+        elif (
+            windowed
+            and exposed_max is not None
+            and s["step"] in exposed
+            and _prefill_tokens(s) <= exposed_max
+        ):
+            cut = "exposed"
         elif stalled and s["step"] in stalled:
             cut = STALLED
         elif mtp and "d_target_ns" not in s:
