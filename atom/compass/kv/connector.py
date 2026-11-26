@@ -598,6 +598,23 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             dcp_size=self._dcp_size,
             engine_id=engine_id(self._rt.me.name),
         )
+        # Under ATOM_MOONCAKE_STORE_DRAFT_WINDOW a Store load leaves blocks with
+        # no draft rows; Mooncake's producer tells the decode up to where
+        # (``draft_rows_from``), and the decode marks its received blocks below
+        # it (`BlockManager.register_received_prefix`), which cuts its later
+        # prefix hits in a draft read window: as here. Unset with no marks.
+        manager = self.__dict__.get("_block_manager")
+        if (
+            self.is_producer
+            and manager is not None
+            and (draft_rows_from := manager.draft_rows_from(seq))
+        ):
+            seq.kv_transfer_params_output["draft_rows_from"] = draft_rows_from
+
+    def bind_block_manager(self, block_manager) -> None:
+        """The scheduler's block manager, which a producer reads a request's
+        draft-row marks off (Mooncake's connector takes it alike)."""
+        self._block_manager = block_manager
 
     # -- Mooncake's chunked transfer ------------------------------------------
 
