@@ -1812,8 +1812,14 @@ def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
     for f in apart:  # a pipelined prefill's: one a rank
         entry[f] = [dict(next(iter(by_rank[r])))[f] for r in ranks]
     report = {}
-    for law, count, _, kept in STORE_LAWS.values():
+    for line, (law, count, _, kept) in STORE_LAWS.items():
         x = np.array(rows.get(law, []), dtype=np.float64).reshape(-1, 3)
+        if not len(x):
+            # No line fits it: the scheduler's lookup lines are DEBUG-only, so a
+            # run at INFO states none. The entry leaves the law out, and a run
+            # refuses it until it is stated.
+            report[law] = {"samples": 0, "missing": f"no [OFFLOAD-{line}] line in the logs"}
+            continue
         entry[law], report[law] = _host_law(x[:, :2], x[:, 2], ["fixed", count])
         if apart and law in PER_RANK:
             each = [
@@ -3920,7 +3926,7 @@ def offload_main(argv) -> None:
     entry, report = fit_offload(args.logs, args.master_flags, args.capacity_bytes)
     Path(args.out).write_text(json.dumps(entry) + "\n")
     for name, fit in report.items():
-        print(f"{name}: {json.dumps(entry[name])} {json.dumps(fit)}")
+        print(f"{name}: {json.dumps(entry.get(name))} {json.dumps(fit)}")
 
 
 def _records_parser(prog: str, description: str) -> argparse.ArgumentParser:

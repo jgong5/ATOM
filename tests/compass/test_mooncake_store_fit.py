@@ -209,6 +209,26 @@ def test_store_logs_give_the_entry_on_ok_copies_and_timed_lookups(
         assert fit[law][part] == pytest.approx({"p50": p50, "p90": p90}), part
 
 
+def test_store_logs_at_info_leave_the_lookup_law_out_and_say_so(
+    tmp_path, monkeypatch, caplog
+):
+    logs = store_logs(tmp_path, monkeypatch, caplog, nic="rdma7")
+    for log in logs:  # an INFO run's: the scheduler's DEBUG lookup lines are not there
+        kept = [l for l in log.read_text().splitlines() if "[OFFLOAD-LOOKUP]" not in l]
+        log.write_text("\n".join(kept) + "\n")
+    out = tmp_path / "entry.json"
+    argv = [*map(str, logs), "--out", str(out), "--master-flags", FLAGS]
+    offload_main([*argv, "--capacity-bytes", str(CAPACITY)])
+
+    entry = json.loads(out.read_text())
+    assert "lookup_s" not in entry
+    assert entry["store_s"] == pytest.approx([1e-3, 2e-3], rel=1e-6)
+    assert entry["fit"]["lookup_s"] == {
+        "samples": 0,
+        "missing": "no [OFFLOAD-LOOKUP] line in the logs",
+    }
+
+
 @pytest.mark.parametrize(
     "changed",
     [
