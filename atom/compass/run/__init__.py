@@ -311,6 +311,7 @@ import functools
 import gc
 import hashlib
 import io
+import collections
 import json
 import math
 import os
@@ -2994,6 +2995,16 @@ def _record_routes(record: Path) -> None:
 
     add, select = CoreManager.add_request, CoreManager._select_dp_rank_for_seq_locked
     lines = []
+    # DIAGNOSTIC ONLY (#752 c512fix T2, never to land): COMPASS_DIAG_ROUTE_PIN
+    # names a real record's routes.jsonl; a request whose prompt digest that
+    # record routed goes to the rank it went to there, in order per digest;
+    # any other is placed as the router would.
+    pin: dict[str, collections.deque] = {}
+    if path := os.environ.get("COMPASS_DIAG_ROUTE_PIN"):
+        with open(path) as f:
+            for ln in f:
+                d = json.loads(ln)
+                pin.setdefault(d["key"], collections.deque()).append(d["rank"])
 
     def add_request(self, seqs):
         if self.pp_size > 1 or self._routable_engine_count == 1:
@@ -3007,6 +3018,9 @@ def _record_routes(record: Path) -> None:
 
         def routed(seq, explicit_rank):
             load = {"reqs": list(self._rank_reqs), "tokens": list(self._rank_tokens)}
+            ranks = pin.get(keys[seq.id])
+            if explicit_rank is None and ranks:
+                explicit_rank = ranks.popleft()
             route = select(self, seq, explicit_rank)
             line = {"key": keys[seq.id], "rank": route.rank} | load
             lines[0].write(json.dumps(line) + "\n")
