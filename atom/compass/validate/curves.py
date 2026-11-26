@@ -191,11 +191,17 @@ def profiled(sent: list[dict]) -> list[dict]:
 
 def gpus(run) -> int:
     """The GPUs of the run directory `run`: each side's engine record's
-    ``tensor_parallel_size`` times ``data_parallel_size``, summed."""
-    return sum(
-        e["tensor_parallel_size"] * (e.get("data_parallel_size") or 1)
-        for e in (read_json(side / ENGINE_RECORD) for side in sides(run))
-    )
+    ``tensor_parallel_size`` times ``data_parallel_size`` times its pipeline
+    stages, summed. A pipelined side's later stages each write their own
+    record beside it (``pp<k>.dp0.engine.json``), and its head's states no
+    ``pipeline_parallel_size``."""
+    total = 0
+    for side in sides(run):
+        record = side / ENGINE_RECORD
+        e = read_json(record)
+        stages = 1 + sum(1 for _ in record.parent.glob(f"pp*.{record.name}"))
+        total += e["tensor_parallel_size"] * (e.get("data_parallel_size") or 1) * stages
+    return total
 
 
 def metrics(run, simulated: bool = False) -> dict:

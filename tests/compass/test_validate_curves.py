@@ -361,6 +361,18 @@ def _deployment(d, concurrency, scale=1.0, server=True, prefill=(1, 8), decode=(
     return d
 
 
+def test_a_pipelined_side_counts_each_stage_s_gpus(tmp_path):
+    # M3.1's 1P1D: P PP4 x TP1 (stage records pp1..pp3 beside the head's) and
+    # D TP4: 4 + 4 GPUs, not 1 + 4.
+    d = _deployment(tmp_path / "pd", 64, prefill=(1, 1), decode=(4, 1))
+    steps = d / "prefill" / "steps"
+    for k in (1, 2, 3):
+        (steps / f"pp{k}.dp0.engine.json").write_text(
+            json.dumps({"tensor_parallel_size": 1, "data_parallel_size": 1})
+        )
+    assert curves.gpus(d) == 8
+
+
 def test_a_deployment_counts_its_prefill_side_s_gpus_plus_its_decode_side_s(
     tmp_path, capsys
 ):
