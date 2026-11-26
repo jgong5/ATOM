@@ -2,6 +2,7 @@
 """`scripts/compass/one_real.py`: one real run against its simulated runs, each
 metric's relative error, and a refusal of runs given other client arguments."""
 
+import gzip
 import importlib.util
 import json
 import subprocess
@@ -543,3 +544,155 @@ def test_a_transient_switch_other_than_two_positive_seconds_exits_2(tmp_path, va
 
     assert done.returncode == 2
     assert one_real.TRANSIENT_ENV in done.stderr
+
+
+def _chunk(t0, ms, delta):
+    """One SSE chunk of a raw record sent at `t0` ns, `ms` after it, holding
+    `delta`."""
+    value = json.dumps({"choices": [{"index": 0, "delta": delta}]})
+    return {"perf_ns": t0 + round(ms * 1e6), "packets": [{"value": value}]}
+
+
+def _streamed(d, responses):
+    """A run at c=8 of profiling requests `responses`, each (first token ms,
+    first text ms, E2E ms, output tokens): its export records and its raw
+    records, gzipped, whose stream holds a role chunk at the first token, the
+    text at the first text and the last chunk at E2E."""
+    run = _run(d, 8, server=False)
+    records, raw = [], []
+    for i, (first, text, e2e, out) in enumerate(responses):
+        rid, t0 = f"r{i}", B + i * 10**9
+        records.append(
+            {
+                "metadata": {
+                    "benchmark_phase": "profiling",
+                    "x_request_id": rid,
+                    "conversation_id": f"c{i}",
+                    "turn_index": 0,
+                    "request_start_ns": t0,
+                    "request_end_ns": t0 + round(e2e * 1e6),
+                },
+                "metrics": {
+                    "time_to_first_token": {"value": text, "unit": "ms"},
+                    "inter_token_latency": {
+                        "value": (e2e - text) / (out - 1),
+                        "unit": "ms",
+                    },
+                    "request_latency": {"value": e2e, "unit": "ms"},
+                    "input_sequence_length": {"value": 1000, "unit": "tokens"},
+                    "output_sequence_length": {"value": out, "unit": "tokens"},
+                },
+            }
+        )
+
+        raw.append(
+            {
+                "metadata": {"x_request_id": rid, "benchmark_phase": "profiling"},
+                "start_perf_ns": t0,
+                "responses": [
+                    _chunk(t0, first, {"role": "assistant", "content": ""}),
+                    _chunk(t0, text, {"content": "a"}),
+                    _chunk(t0, e2e, {"content": "b"}),
+                    {
+                        "perf_ns": t0 + round(e2e * 1e6),
+                        "packets": [{"value": "[DONE]"}],
+                    },
+                ],
+            }
+        )
+    (run / curves.RECORDS).write_text("".join(json.dumps(r) + "\n" for r in records))
+    with gzip.open(run / "artifacts" / "profile_export_raw.jsonl.gz", "wt") as f:
+        f.write("".join(json.dumps(r) + "\n" for r in raw))
+    return run
+
+
+def _first_token_runs(tmp_path):
+    # real: two of four open on framing, their text 100 and 400 ms after the
+    # first token; the simulated run's text always comes with its first token
+    real = _streamed(
+        tmp_path / "real1",
+        [
+            (500.0, 500.0, 2500.0, 11),
+            (600.0, 700.0, 2600.0, 11),
+            (700.0, 700.0, 2700.0, 11),
+            (800.0, 1200.0, 2800.0, 11),
+        ],
+    )
+    sim = _streamed(
+        tmp_path / "step_linear",
+        [
+            (550.0, 550.0, 2550.0, 11),
+            (660.0, 660.0, 2660.0, 11),
+            (770.0, 770.0, 2770.0, 11),
+            (880.0, 880.0, 2880.0, 11),
+        ],
+    )
+    return real, sim
+
+
+def test_first_token_latencies_read_each_stream_s_first_chunk(tmp_path):
+    real, sim = _first_token_runs(tmp_path)
+
+    done = _one_real_env({one_real.FIRST_TOKEN_ENV: "1"}, real, sim)
+
+    assert done.returncode == 0, done.stderr
+    rows = json.loads(done.stdout.splitlines()[-1])
+    r, s = rows["real"], rows["step_linear"]
+    # aiperf's TTFT is the first text: real p50 of (500, 700, 700, 1200)
+    assert r["TTFT p50 ms"] == 700.0
+    # at the first token: real (500, 600, 700, 800), sim 1.1 times as long
+    assert r["TTFT1 p50 ms"] == pytest.approx(650.0)
+    assert s["TTFT1 p50 ms"] == pytest.approx(715.0)
+    assert r["TTFT1 p99 ms"] == pytest.approx(797.0)
+    # TPOT from the first token: (E2E - TTFT1) / 10 = 200 ms on every request
+    assert r["TPOT1 p50 ms"] == pytest.approx(200.0)
+    assert r["TPOT1 p90 ms"] == pytest.approx(200.0)
+    table = {line[:34].strip(): line for line in done.stdout.splitlines()[1:-1]}
+    assert table["TTFT1 p50 ms"].split()[-1] == "+10.0%"
+    lines = done.stdout.splitlines()
+    assert (
+        "real: 2 of 4 profiled responses carry no text in their first token's "
+        "chunk; their text came 250 ms later at p50, 370 ms at p90"
+    ) in lines
+    assert (
+        "step_linear: 0 of 4 profiled responses carry no text in their first "
+        "token's chunk"
+    ) in lines
+
+
+def test_without_the_first_token_switch_the_output_is_unchanged(tmp_path):
+    real, sim = _first_token_runs(tmp_path)
+
+    off = _one_real_env({}, real, sim)
+    zero = _one_real_env({one_real.FIRST_TOKEN_ENV: "0"}, real, sim)
+    on = _one_real_env({one_real.FIRST_TOKEN_ENV: "1"}, real, sim)
+
+    assert off.returncode == zero.returncode == on.returncode == 0, off.stderr
+    assert off.stdout == zero.stdout
+    before, after = off.stdout.splitlines(), on.stdout.splitlines()
+    kept = [x for x in after if x in before[:-1]]
+    assert kept == before[:-1]
+    extra = [x for x in after[:-1] if x not in before]
+    assert len(extra) == len(one_real.FIRST_TOKEN_LATENCIES) + 2
+    old, new = json.loads(before[-1]), json.loads(after[-1])
+    for name in old:
+        assert {k: new[name][k] for k in old[name]} == old[name]
+
+
+def test_a_run_with_no_raw_records_has_no_first_token_latency(tmp_path):
+    run = _run(tmp_path / "real1", 8, server=False)
+
+    rows, line = one_real.first_token(run)
+
+    assert set(rows) == set(one_real.FIRST_TOKEN_LATENCIES)
+    assert all(v is None for v in rows.values())
+    assert line.startswith("no raw record")
+
+
+def test_a_first_token_switch_other_than_0_or_1_exits_2(tmp_path):
+    real, sim = _first_token_runs(tmp_path)
+
+    done = _one_real_env({one_real.FIRST_TOKEN_ENV: "yes"}, real, sim)
+
+    assert done.returncode == 2
+    assert one_real.FIRST_TOKEN_ENV in done.stderr

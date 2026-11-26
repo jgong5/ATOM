@@ -48,8 +48,16 @@ share of the requests sent before W whose TTFT is under FAST seconds, their
 median TTFT, and the median TTFT of those sent from W on, each against REAL's:
 where a burst at W (the client's idle cap) queues every later request, TTFT
 p50 is a mixture of the two modes and moves with their weights.
+COMPASS_ONE_REAL_FIRST_TOKEN=1 (`FIRST_TOKEN_ENV`) adds each run's TTFT
+p50, p90 and p99 measured at its first token, the first chunk of its stream
+that holds a choice, and its TPOT over the tokens after it (`first_token`),
+then per run how many responses carry no text in that chunk: aiperf's TTFT is
+the first chunk carrying text, so a response whose first tokens are framing
+the server strips gets a later token's TTFT, where a simulated run, whose
+filler ids all decode to text, gets its first token's.
 """
 
+import gzip
 import json
 import os
 import random
@@ -113,6 +121,10 @@ def main(argv: list[str]) -> int:
     if split not in ("0", "1"):
         print(f"{THIRDS_ENV} is {split!r}: 1 on, 0 or unset off", file=sys.stderr)
         return 2
+    first = os.environ.get(FIRST_TOKEN_ENV) or "0"
+    if first not in ("0", "1"):
+        print(f"{FIRST_TOKEN_ENV} is {first!r}: 1 on, 0 or unset off", file=sys.stderr)
+        return 2
     try:
         tsplit = transient_split(os.environ.get(TRANSIENT_ENV))
     except ValueError as e:
@@ -130,6 +142,11 @@ def main(argv: list[str]) -> int:
     if split == "1":
         for name, run in (("real", real), *((sim.name, sim) for sim in sims)):
             rows[name] |= thirds(run)
+    opening = {}
+    if first == "1":
+        for name, run in (("real", real), *((sim.name, sim) for sim in sims)):
+            got, opening[name] = first_token(run)
+            rows[name] |= got
     names = list(rows["real"])
     print(
         f"{'metric':34}"
@@ -155,6 +172,8 @@ def main(argv: list[str]) -> int:
     if tsplit:
         for sim in sims:
             print(transient(real, sim, *tsplit))
+    for name, line in opening.items():
+        print(f"{name}: {line}")
     print(json.dumps(rows))
     return 0
 
@@ -536,6 +555,105 @@ def transient(real: Path, sim: Path, w: float, fast: float) -> str:
         f"{error(a['fast'], b['fast'])}; TTFT median of those sent from {w:g} s "
         f"on {error(a['late'], b['late'])}"
     )
+
+
+#: Set to ``1``, `main` adds `first_token`'s rows to the table and its line per
+#: run below it; unset or ``0``, nothing more (the output is unchanged); any
+#: other value is refused.
+FIRST_TOKEN_ENV = "COMPASS_ONE_REAL_FIRST_TOKEN"
+#: How much later than its first token's chunk a response's first text comes
+#: for `first_token` to count it a later token's, in ms: a decode step takes
+#: 10 ms or more on #752's records, and the role chunk and the text of the
+#: same token come within 0.1 ms of each other.
+LATER_MS = 1.0
+#: The rows `first_token` adds: TTFT at the first token and TPOT over the
+#: tokens after it, their percentiles, in ms.
+FIRST_TOKEN_LATENCIES = {
+    "TTFT1 p50 ms": ("ttft", 50),
+    "TTFT1 p90 ms": ("ttft", 90),
+    "TTFT1 p99 ms": ("ttft", 99),
+    "TPOT1 p50 ms": ("tpot", 50),
+    "TPOT1 p90 ms": ("tpot", 90),
+}
+
+
+def _first_chunks(run: Path) -> dict:
+    """Per request of `run`'s raw records (`client_run.RAW`, gzipped or not),
+    by `x_request_id`: the milliseconds from its send to the first chunk of
+    its stream that holds a choice, its first token's, and to the first that
+    carries text, ``content`` or ``reasoning_content``, aiperf's TTFT; None
+    for one it never reached."""
+    from atom.compass.parity.client_run import RAW
+
+    path = run / "artifacts" / RAW
+    if not path.is_file():
+        path = path.with_name(RAW + ".gz")
+    if not path.is_file():
+        return {}
+    out = {}
+    with (gzip.open if path.suffix == ".gz" else open)(path, "rt") as lines:
+        for r in map(json.loads, lines):
+            rid, t0 = r.get("metadata", {}).get("x_request_id"), r.get("start_perf_ns")
+            first = text = None
+            for chunk in r.get("responses") or ():
+                for packet in chunk.get("packets") or ():
+                    try:
+                        choices = json.loads(packet.get("value") or "").get("choices")
+                    except (ValueError, AttributeError):
+                        continue
+                    if not choices:
+                        continue
+                    first = chunk["perf_ns"] if first is None else first
+                    delta = choices[0].get("delta") or {}
+                    if delta.get("content") or delta.get("reasoning_content"):
+                        text = chunk["perf_ns"]
+                        break
+                if text is not None:
+                    break
+            if rid is not None and t0 is not None:
+                out[rid] = tuple(
+                    None if t is None else (t - t0) / 1e6 for t in (first, text)
+                )
+    return out
+
+
+def first_token(run: Path) -> tuple[dict, str]:
+    """`FIRST_TOKEN_LATENCIES` over `run`'s profiled records, each joined to
+    its raw record (`_first_chunks`) by `x_request_id`: TTFT at its first
+    token, and TPOT as aiperf takes it, (E2E - TTFT) / (output tokens - 1),
+    from that TTFT; and a line naming how many of them carry no text in their
+    first token's chunk and how much later their text came. On #752's
+    Kimi-K3.1, 27-46% of the real responses open with the answer, behind six
+    tokens of channel framing (`<|close|>think<|sep|><|open|>response<|sep|>`)
+    the server strips: their text comes 62-83 ms after their first token at
+    c=1 and c=8, and at c=32, where prefills held the decode off, up to 349 s.
+    A record without its raw record is left out."""
+    chunks = _first_chunks(run)
+    ttft, tpot, late = [], [], []
+    for r in profiled(read_jsonl(run / RECORDS)):
+        got = chunks.get(r.get("metadata", {}).get("x_request_id"))
+        if not got or got[0] is None:
+            continue
+        ttft.append(got[0])
+        e2e = _metric(r, "request_latency")
+        out = _metric(r, "output_sequence_length", int)
+        if e2e is not None and out and out > 1:
+            tpot.append((e2e - got[0]) / (out - 1))
+        if got[1] is not None and got[1] - got[0] > LATER_MS:
+            late.append(got[1] - got[0])
+    rows = {
+        name: percentile(_positive({"ttft": ttft, "tpot": tpot}[k]), p)
+        for name, (k, p) in FIRST_TOKEN_LATENCIES.items()
+    }
+    if not ttft:
+        return rows, "no raw record joins a profiled one: no first-token latency"
+    line = f"{len(late)} of {len(ttft)} profiled responses carry no text in their first token's chunk"
+    if late:
+        line += (
+            f"; their text came {percentile(late, 50):.4g} ms later at p50, "
+            f"{percentile(late, 90):.4g} ms at p90"
+        )
+    return rows, line
 
 
 def stalled(real: Path) -> str:
