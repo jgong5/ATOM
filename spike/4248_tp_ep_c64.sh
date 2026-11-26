@@ -121,7 +121,7 @@ calibrate() {  # the design's segments on one server under its server_env, each 
   kill -TERM "$cmd" && wait "$SERVER"; [ -s "$C/real/run.json" ] || die "calibration: no run.json"
 }
 
-lanes() { find "$C" -path "$C/real" -prune -o -name client_run.json -print | sort | while read -r e; do echo --client-run "$C/real" "$e"; done; }
+lanes() { find -H "$C" -path "$C/real" -prune -o -name client_run.json -print | sort | while read -r e; do echo --client-run "$C/real" "$e"; done; }
 
 case $CMD in
 design)
@@ -196,6 +196,20 @@ EOF
   ;;
 score)
   sims=("$DATA"/sim[0-9]*/)
+  # one_real.py refuses a real run whose server JIT-compiled while it served: taken when every compile ended
+  # before the run's first graded send, so no graded request waited on one
+  accept=$(python3 - "$DATA/target" <<'EOF'
+import json, sys
+from pathlib import Path
+run = Path(sys.argv[1])
+sent = (json.loads(l)["metadata"] for l in open(run / "artifacts/profile_export.jsonl"))
+first = min(int(m["request_start_ns"]) for m in sent if m.get("benchmark_phase") == "profiling")
+compiles = json.load(open(run / "run.json")).get("jit_compiles") or []
+print(sum(c["last_ns"] >= first for c in compiles), f"of {len(compiles)} compiles end after the first graded send")
+EOF
+)
+  echo "target: $accept"
+  [ "${accept%% *}" = 0 ] && export COMPASS_ACCEPT_JIT_BUILDS=1
   python3 "$T/scripts/compass/one_real.py" "$DATA/target" "${sims[@]%/}" | tee "$DATA/one_real.txt"
   tail -1 "$DATA/one_real.txt" | python3 -c '
 import json, sys
@@ -205,6 +219,16 @@ for m in ("p90 TTFT", "TPOT p90 ms", "throughput per GPU"):
     e = [rows[s][m] / real[m] - 1 for s in rows]
     print(f"{m}: " + ", ".join(f"{s} {x:+.1%}" for s, x in zip(rows, e))
           + f"; mean {sum(e) / len(e):+.1%}, mean absolute {sum(map(abs, e)) / len(e):.1%}")'
+  if [ -d "$DATA/target1" ]; then  # the first target record, refused for its JIT compiles, beside it as a real-vs-real figure
+    COMPASS_ACCEPT_JIT_BUILDS=1 python3 - "$DATA/target" "$DATA/target1" "$T/scripts/compass" <<'EOF'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[3])
+from one_real import run_metrics
+a, b = (run_metrics(Path(r), False) for r in sys.argv[1:3])
+print("target1 against target: " + ", ".join(f"{m} {b[m] / a[m] - 1:+.1%}" for m in ("p90 TTFT", "TPOT p90 ms", "throughput per GPU")))
+EOF
+  fi
   [ -n "$DASH_TREE" ] || exit 0
   cell="$DATA/dash/DeepSeek-V4.1-Flash/aggregated/TP4 EP4/c64"
   rm -rf "$DATA/dash" && mkdir -p "$cell/prom" "$cell/sims" && ln -s "$DATA/target" "$cell/real" &&
