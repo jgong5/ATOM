@@ -3462,6 +3462,17 @@ own process with the policy code untouched. It is (owner ruling on
   with no decode request. The clock owes that response no send: an LP's `N` is bounded
   by its own target and the messages still to reach it, never by a send it has yet to
   make (`authority.py`), as a frontend's 204 to a cancel already shows.
+- **Stream bypass** ([#4228](https://github.com/jgong5/ATOM/issues/4228); off by default,
+  `compass run --stream-bypass` turns it on, run-file key `stream_bypass`). The router
+  does no work on a stream event but the last, yet holding each one puts the router's turn
+  on every token's path. Under the key a decode stream's events but its last go straight
+  to traffic, on `frontend-D<k>->traffic:stream` at the path's whole lookahead, each
+  naming that channel in its stamp (`c=`), and the router passes them on as they are. The
+  last, `[DONE]`, whose turn drops decode's load, takes the router's two hops as `final`
+  (`channels.py::prefill_decode_table`); the router reads the bypass off its lookaheads,
+  which then name `router->traffic:final`. Each event arrives when it would through the
+  router, but the channel table differs, so the key is part of the configuration the step
+  table names. A run file with the key and no `router_in_s` refuses.
 - **Unchanged.** A clock error ends the router process.
 - **Periodic tasks.** Under the LP, `PeriodicTask` (cache_aware's tree eviction) starts
   no thread: the task's next deadline is the daemon deadline of each NER, and it runs
@@ -3752,7 +3763,7 @@ Ordered by how much they could cost.
 | D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only; a rank pair's writes queue on its link | 2026-09-18; revised 2026-09-28; link sharing 2026-10-16 (#1157); first-write setup 2026-10-16 (#1172); per-pair links kept under RDMA 2026-11-09 (#1179) |
 | D6.1 | The lmcache MP server is LP `lmcache`, a Compass stand-in on the real ZMQ channels with a content index and two stations; a store or load completes as a stamped reply that the step loop takes in timestamp order; a blocking lookup is a request and reply whose wait is an idle point; inside a DP group each member parks before its forward, amending member join rules 1, 2 and 5, and the last park releases every member at the group's time; it sizes a chunk and the state image from its deployment's published plan before its first job, and its transfer channels are one per DP rank | 2026-10-16 (#1087, #1162); revised 2026-11-17 (#3687) |
 | D6.2 | A shared Mooncake Store's master is LP `mooncake_store`, a Compass stand-in holding objects, leases and Mooncake's eviction, its loop LP `lmcache`'s factored; each rank's lookups and renewals are requests and replies on its lookup channel, a renewal's wait an idle point with D6.1's park in a DP group; each rank's saves and loads are priced on its own lanes (`03` D13.1), a put sent as the save is queued carrying its priced start and end; ATOM's scheduler half runs as real code; the code is `dsv41/dev`'s | 2026-11-19 (#3762); revised 2026-11-24 (#3799) |
-| D7 | Atomesh gets no virtual clock: mesh-only mode; in 1P1D the router is one segment of a channel, not an LP, and its relay latency is that channel's lookahead; its bounds are configured (health check and circuit breaker off, `--worker-request-timeout-secs` set large); timestamps ride carriers it already relays; under `--dp-aware`, or with several instances per role, the router is LP `router`, handling requests, prefill responses and stream events in timestamp order (#449, #1085) | 2026-09-18; revised 2026-09-30, 2026-10-15, 2026-10-16 |
+| D7 | Atomesh gets no virtual clock: mesh-only mode; in 1P1D the router is one segment of a channel, not an LP, and its relay latency is that channel's lookahead; its bounds are configured (health check and circuit breaker off, `--worker-request-timeout-secs` set large); timestamps ride carriers it already relays; under `--dp-aware`, or with several instances per role, the router is LP `router`, handling requests, prefill responses and stream events in timestamp order (#449, #1085), and under a stream bypass of a stream's events only its last (#4228) | 2026-09-18; revised 2026-09-30, 2026-10-15, 2026-10-16, 2026-11-26 |
 | D8 | Arrivals are messages in transit, covered by the send and receive counts for closed and open workloads alike; the arrival timestamp rides the `tracestate` header | 2026-09-18; revised 2026-09-28 |
 | D9 | The ATOM diff is enumerated (~1,980 lines with tests) and completeness enforced by test rather than by review; ATOM's own suite is the gate (`08` D43.1) | 2026-09-18; revised 2026-09-28 |
 

@@ -90,6 +90,7 @@ from atom.compass.carriers import (
     cancel_seq,
     decode_relayed,
     stamp_split_events,
+    stream_channels,
     tracestate_jitter,
     with_relay_stamp,
 )
@@ -920,7 +921,9 @@ class HttpChannel:
 
     During the run, each event of a ``text/event-stream`` response body leaves
     with a comment line carrying its stamp on the LP's stream channel, looked
-    up once a response (`atom.compass.carriers.stamp_split_events`). Each body
+    up once a response (`atom.compass.carriers.stamp_split_events`); under a
+    stream bypass, a ``[DONE]`` on the channel through the router
+    (`atom.compass.carriers.stream_channels`). Each body
     message is one frame the app's stream yielded, so it must end in a blank
     line. With an
     ``http_stream`` term in its host entry (`atom.compass.run.http_stream`),
@@ -1161,10 +1164,10 @@ def _stamping_events(send, rt, per_event=None):
     the traffic LP only asks for once the return is in, and the run hangs.
     """
     events = ended = False
-    stream = None  # the LP's stream channel, looked up at the first event
+    stream = final = None  # the LP's stream channels, looked up at the first event
 
     async def stamping(message):
-        nonlocal events, ended, stream
+        nonlocal events, ended, stream, final
         if ended:
             return
         if message["type"] == "http.response.start":
@@ -1177,8 +1180,8 @@ def _stamping_events(send, rt, per_event=None):
                 if n:
                     charge(per_event * n)
             if stream is None:
-                stream = clock.channel_of(rt, "stream")
-            text = stamp_split_events(sent, tail, rt, stream)
+                stream, final = stream_channels(rt)
+            text = stamp_split_events(sent, tail, rt, stream, final)
             message = {**message, "body": text.encode()}
             if text.endswith("\ndata: [DONE]\n\n"):
                 ended, message["more_body"] = True, False

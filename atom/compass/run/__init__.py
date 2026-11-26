@@ -125,6 +125,11 @@ run with ``false`` records ``ARRIVAL`` and ``TAR``),
 needs local grants: a ceiling's cycle term counts only the LPs that can react
 to the LP's sends before their own next grant, and a TAR's grant sends the
 messages below its ceiling ahead, `ClockAuthority`'s ``wide_ceilings``),
+``stream_bypass`` (optional, ``false``, the default, or ``true``, which needs
+LP ``router``: a decode stream's events but its last go straight to traffic,
+and its last through the router, `prefill_decode_table`; each event arrives
+at the lookahead the router's hops sum to, but the channel table, and so the
+step table, differ, so the key is part of the configuration),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -383,6 +388,9 @@ WORKER_ORDER = "worker_order"
 LOCAL_GRANTS = "local_grants"
 #: The run-file key that widens those ceilings.
 WIDE_LOCAL_GRANTS = "wide_local_grants"
+#: The run-file key that takes a decode stream's events but its last past LP
+#: ``router``.
+STREAM_BYPASS = "stream_bypass"
 ATOM_RUNNER = "atom.model_engine.model_runner.ModelRunner"
 RAPIDSERVE_RUNNER = "atom.model_engine.model_runner.RapidServeModelRunner"
 #: The run-file key that says the deployment runs RapidServe.
@@ -964,6 +972,11 @@ def _lmcache_engine(run: dict) -> str:
 
 
 def _engines_table(run: dict):
+    bypass = run.get(STREAM_BYPASS, False)
+    if not isinstance(bypass, bool):
+        raise TypeError(
+            f"the run file's {STREAM_BYPASS} is {bypass!r}; it is true or false"
+        )
     common = {k: hop(run, k) for k in HOPS[:3]}
     pp, links = _pp(run, "P"), ()
     if pp > 1:
@@ -983,6 +996,12 @@ def _engines_table(run: dict):
             decode=run.get(INSTANCES["D"], 1),
             prefill_pp=pp,
             pp_links=links,
+            stream_bypass=bypass,
+        )
+    if bypass:
+        raise ValueError(
+            f"the run file's {STREAM_BYPASS} takes a decode stream past LP router, "
+            "and a run of one deployment has none"
         )
     return single_engine_table(
         **common,

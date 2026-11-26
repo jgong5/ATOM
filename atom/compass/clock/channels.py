@@ -403,6 +403,7 @@ def prefill_decode_table(
     decode: int = 1,
     prefill_pp: int = 1,
     pp_links=(),
+    stream_bypass: bool = False,
 ) -> ChannelTable:
     """`prefill` prefill and `decode` decode deployments behind the router,
     each with the channels of its data-parallel ranks: `dp` of them on each
@@ -417,9 +418,13 @@ def prefill_decode_table(
     `router_in_s`, and a hop out, which keeps the rest of the path's lookahead;
     both are positive, so `router_in_s` lies strictly between 0 and `router_s`.
     The router receives each hop in on a thread and handles it before the next.
-    Decode posts the KV write request to prefill engine to engine, above width
-    one on either side on a channel per decode and prefill rank pair,
-    ``kv_write_req#dp<decode rank>.dp<prefill rank>``.
+    Under `stream_bypass`, which needs LP ``router``, a decode stream's events
+    but its last go straight to traffic, on ``stream`` at the path's whole
+    lookahead, since the router does no work on them; its last, ``[DONE]``,
+    which ends the request in the router, takes the path's two hops as
+    ``final``. Decode posts the KV write request to prefill engine to engine,
+    above width one on either side on a channel per decode and prefill rank
+    pair, ``kv_write_req#dp<decode rank>.dp<prefill rank>``.
 
     Above one deployment of a role, deployment ``k`` of it is the LPs
     ``frontend-P<k>`` and ``engine-P<k>`` (``-D<k>`` for decode), each with its
@@ -449,6 +454,11 @@ def prefill_decode_table(
             f"{prefill} prefill and {decode} decode deployments put a choice in "
             "the router, which makes it an LP: set router_in_s"
         )
+    if stream_bypass and router_in_s is None:
+        raise ValueError(
+            "a stream bypass takes a decode stream past the router LP, and with "
+            "no router_in_s there is none: each path is one channel already"
+        )
     ps = [f"P{k}" if prefill > 1 else "P" for k in range(prefill)]
     ds = [f"D{k}" if decode > 1 else "D" for k in range(decode)]
     paths = [("traffic", f"frontend-{p}", "http", admission_s + router_s) for p in ps]
@@ -473,15 +483,19 @@ def prefill_decode_table(
         hops = [(src, dst, kind, total, "inline") for src, dst, kind, total in paths]
     elif 0.0 < router_in_s < router_s:
         lps += ("router",)
+        straight = [p for p in paths if stream_bypass and p[2] == "stream"]
+        routed = [p for p in paths if p not in straight]
+        routed += [(src, dst, "final", total) for src, dst, _, total in straight]
         # Paths sharing an end share that end's hop.
         hops = dict.fromkeys(
             hop
-            for src, dst, kind, total in paths
+            for src, dst, kind, total in routed
             for hop in (
                 (src, "router", kind, router_in_s, "thread"),
                 ("router", dst, kind, total - router_in_s, "inline"),
             )
         )
+        hops.update(dict.fromkeys((*path, "inline") for path in straight))
     else:
         raise ValueError(
             f"router_in_s is {router_in_s!r} and router_s {router_s!r}; each hop "

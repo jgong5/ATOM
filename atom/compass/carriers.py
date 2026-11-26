@@ -7,10 +7,12 @@ entries already there, as W3C Trace Context adds a new entry. A request the
 traffic LP sends with a send-order seed adds its intake jitter, the bytes its
 body is read as if it were longer, ``compass=a:<arrival>;s:<seq>;j:<bytes>``
 (`compass_harness.traffic_lp`). A streamed response carries one comment line before
-each SSE event, ``: compass a=<arrival> s=<seq>``; SSE clients skip lines that
-start with a colon. Both pass a router that forwards headers and the stream
-unchanged. A prefill response the router relays to decode carries its stamp as
-the ``compass`` field of its ``kv_transfer_params``, ``a:<arrival>;s:<seq>``,
+each SSE event, ``: compass a=<arrival> s=<seq>``, which names the event's
+channel, ``c=<channel>``, after the seq where a stream bypass takes it past the
+router (`stamp_split_events`); SSE clients skip lines that start with a colon.
+Both pass a router that forwards headers and the stream unchanged. A prefill
+response the router relays to decode carries its stamp as the ``compass``
+field of its ``kv_transfer_params``, ``a:<arrival>;s:<seq>``,
 which the router copies onto the decode request. The arrival is written as
 ``repr(float)``, so it parses back exactly. Beside it, ``compass_relay_s``
 holds the seconds the relay serves the response on decode's API server loop
@@ -40,7 +42,7 @@ _NUM = r"(inf|\d[\d.e+-]*)"
 RELAY_SERVICE = "compass_relay_s"
 _ENTRY = re.compile(rf"a:{_NUM};s:(\d+)")
 _TRACE_ENTRY = re.compile(rf"a:{_NUM};s:(\d+)(?:;j:{_NUM})?")
-_COMMENT = re.compile(rf": compass a={_NUM} s=(\d+)")
+_COMMENT = re.compile(rf": compass a={_NUM} s=(\d+)(?: c=(\S+))?")
 _MAX_ENTRIES = 32
 #: Added to every simulated ns stamp a client records. Simulated time starts at
 #: 0, and aiperf reads a 0 start stamp as missing.
@@ -110,22 +112,45 @@ def tracestate_with(
     return ",".join([entry, *others][:_MAX_ENTRIES])
 
 
-def stamp_split_events(events: list[str], tail: str, rt, ch: str) -> str:
+def stamp_split_events(
+    events: list[str], tail: str, rt, ch: str, final: str | None = None
+) -> str:
     """The SSE events of a text its caller split on blank lines into
     ``[*events, tail]``, each with a stamped comment line before it.
 
     Each event is one send on `ch`, the runtime's stream channel, to the
-    traffic LP or to the router LP in front of it.
+    traffic LP or to the router LP in front of it. With `final`, the channel
+    a stream bypass takes a stream's last event on through the router
+    (`atom.compass.clock.prefill_decode_table`), a ``[DONE]`` is sent on
+    `final` and every other event names `ch` in its stamp, which the router
+    passes on as it is.
     A write must end its last frame in a blank line: a `tail` is refused,
     since the next write's comment would land inside that frame.
     """
     if tail:
         raise ValueError(f"unterminated SSE frame {tail!r}: no blank line after it")
-    out = []
+    out, named = [], "" if final is None else f" c={ch}"
     for event in events:
-        arrival, seq = rt.stamp_send(ch)
-        out.append(f": compass a={arrival!r} s={seq}\n{event}\n\n")
+        if final is not None and event.endswith("data: [DONE]"):
+            arrival, seq = rt.stamp_send(final)
+            out.append(f": compass a={arrival!r} s={seq}\n{event}\n\n")
+        else:
+            arrival, seq = rt.stamp_send(ch)
+            out.append(f": compass a={arrival!r} s={seq}{named}\n{event}\n\n")
     return "".join(out)
+
+
+def stream_channels(rt) -> tuple[str, str | None]:
+    """The stream channel of `rt`'s LP, and the channel a stream bypass takes
+    its streams' last events on through the router, ``final``; None without
+    one."""
+    # Imported here: `atom.utils` loads torch, which a client of this module
+    # need not have.
+    from atom.utils.clock import channel_of
+
+    out = rt.table.channels_from(rt.me)
+    (final,) = [c.name for c in out if c.name.endswith(":final")] or [None]
+    return channel_of(rt, "stream"), final
 
 
 def sse_stamp(line: str) -> tuple[float, int] | None:
@@ -134,6 +159,13 @@ def sse_stamp(line: str) -> tuple[float, int] | None:
     if not line.startswith(": compass "):
         return None
     return _parse(_COMMENT, line, "SSE comment")
+
+
+def sse_channel(line: str) -> str | None:
+    """The channel a compass comment line names, ``c=<channel>``; None for one
+    that names none, and for any other line."""
+    m = _COMMENT.fullmatch(line.rstrip("\r\n"))
+    return None if m is None else m[3]
 
 
 class _Params(msgspec.Struct):

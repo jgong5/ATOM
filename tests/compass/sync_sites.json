@@ -3181,11 +3181,11 @@
    "mechanism_why": "real() runs only with no simulated run configured; a simulated run's traffic LP sends from Traffic.run on the run's clock"
   },
   {
-   "id": "atom/compass/parity/traffic.py::Traffic._take::self.cv.wait_for( lambda seq=seq: seq in self.frames or self.errors, WALL_S )::event_wait#0",
+   "id": "atom/compass/parity/traffic.py::Traffic._take::self.cv.wait_for( lambda e=event: e in self.frames or self.errors, WALL_S )::event_wait#0",
    "file": "atom/compass/parity/traffic.py",
    "symbol": "Traffic._take",
    "call": "self.cv.wait_for",
-   "expr": "self.cv.wait_for( lambda seq=seq: seq in self.frames or self.errors, WALL_S )",
+   "expr": "self.cv.wait_for( lambda e=event: e in self.frames or self.errors, WALL_S )",
    "shape": "event_wait",
    "peer": "thread",
    "why": "the traffic LP's clock owner waits for its reader thread to have read a stream frame the clock authority already released to it, up to a real bound that reports a frame never read",

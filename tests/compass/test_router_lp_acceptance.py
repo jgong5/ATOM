@@ -43,6 +43,7 @@ from atom.compass import run as compass_run
 from atom.compass.carriers import (
     relay_carried,
     stamp_split_events,
+    stream_channels,
     tracestate_stamp,
     with_relay_stamp,
 )
@@ -193,7 +194,10 @@ class Frontend:
             conn = connect(self.lp, run["clock_endpoint"])
             rt = LPRuntime(self.lp, compass_run.channel_table(run), conn)
             inbound = channel_of(rt, "http" if self.side == "P" else "relay")
-            out = channel_of(rt, "relay" if self.side == "P" else "stream")
+            # Prefill's relay; decode's stream, and its `final` under a bypass.
+            out = (
+                (channel_of(rt, "relay"),) if self.side == "P" else stream_channels(rt)
+            )
             rt.start_run()
             due = []  # (time, inbound seq, part) of each send not made yet
             while (G := rt.next_event(due[0][0] if due else math.inf)) != math.inf:
@@ -218,18 +222,18 @@ class Frontend:
         except BaseException as e:  # noqa: BLE001 - the test raises it
             self.errors.append(e)
 
-    def _reply(self, rt, out: str, body: dict, k: int) -> str:
+    def _reply(self, rt, out: tuple, body: dict, k: int) -> str:
         if self.side == "P":
             params = {"kv_transfer_params": {"dp_rank": body["data_parallel_rank"]}}
             raw = json.dumps(params).encode()
-            return with_relay_stamp(raw, lambda: rt.stamp_send(out)).decode()
+            return with_relay_stamp(raw, lambda: rt.stamp_send(out[0])).decode()
         n = body["max_tokens"]
         events = [{"choices": [{"index": 0, "text": "x"}]}]
         if k == n - 1:
             events.append({"choices": [], "usage": {"completion_tokens": n}})
         text = "".join(f"data: {json.dumps(e)}\n\n" for e in events)
         *frames, tail = (text + "data: [DONE]\n\n" * (k == n - 1)).split("\n\n")
-        return stamp_split_events(frames, tail, rt, out)
+        return stamp_split_events(frames, tail, rt, *out)
 
 
 def _idle(run: dict, lp: str, member: str, errors: list) -> None:
@@ -265,9 +269,10 @@ def _launch(out: Path, name: str, args: list, **env) -> subprocess.Popen:
 
 
 def run_router_lp(
-    atomesh: Path, out: Path, hash_seed: str, delay, policy: str = "dp_sticky"
+    atomesh: Path, out: Path, hash_seed: str, delay, policy: str = "dp_sticky", **keys
 ) -> list:
-    """One run in `out`; each request's (prefill, decode) rank, in order."""
+    """One run in `out`, its run file with `keys` too; each request's (prefill,
+    decode) rank, in order."""
     out.mkdir()
     with held_ports(3) as (clock_port, router_port, metrics_port):
         run_file = _run_file(
@@ -277,6 +282,7 @@ def run_router_lp(
             step_stub=CONSTANT,
             router_in_s=2.0**-14,
             **PD,
+            **keys,
         )
         run = json.loads(run_file.read_text())
         table = compass_run.channel_table(run)

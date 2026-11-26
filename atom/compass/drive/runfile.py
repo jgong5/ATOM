@@ -46,7 +46,8 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   ``--step-roofline``; ``--padding none``, which prices a replayed graph's
   real rows; ``--local-grants``, on unless ``--no-local-grants``, which gives
   grants their ceilings; ``--wide-local-grants``, off unless given, which
-  widens them.
+  widens them; ``--stream-bypass``, off unless given, which takes a decode
+  stream's events but its last past LP ``router``.
 - Not flags: `FIXED`, and ``data_parallel_size``, read from ATOM's arguments.
   The server serves client runs until it is stopped.
 
@@ -117,6 +118,7 @@ def add_arguments(parser) -> None:
         "--local-grants", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--wide-local-grants", action="store_true")
+    parser.add_argument("--stream-bypass", action="store_true")
 
 
 def spec(args, store: ArtifactStore, across: bool = False):
@@ -179,6 +181,8 @@ def build(args, atom_args, across: bool = False) -> dict:
         run.LOCAL_GRANTS: args.local_grants,
         run.WIDE_LOCAL_GRANTS: args.wide_local_grants,
     }
+    if args.stream_bypass:  # part of the configuration, so written only when on
+        out[run.STREAM_BYPASS] = True
     # Read back as the runner reads it, so a spec it would refuse refuses
     # before a server starts.
     machine = run._machine(out)
