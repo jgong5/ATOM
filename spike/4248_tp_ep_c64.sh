@@ -180,7 +180,10 @@ EOF
 sim)
   K=${3:?K, the send order seed} OUT=$DATA/sim$K
   [ ! -e "$OUT" ] || die "$OUT exists"
-  venv "$DATA/venv-sim" harness || die "venv"
+  # Sims started at once share one venv: the first builds it under the lock, the rest wait; a failed build is removed
+  exec 9>"$DATA/venv-sim.lock" && flock 9 || die "venv lock"
+  venv "$DATA/venv-sim" harness || { rm -rf "$DATA/venv-sim"; die "venv"; }
+  exec 9>&-
   SIM_LAWS="--step-linear $(token "$DATA/fit/steps/step_linear_law.json") --host-laws $(token "$DATA/fit/host/host_laws.json")"
   serve "$OUT"
   COMPASS_HARNESS_SEND_ORDER_SEED=$K HARNESS_PYTHON=$DATA/venv-sim/bin/python "$T/scripts/compass/client.sh" "$OUT" \
