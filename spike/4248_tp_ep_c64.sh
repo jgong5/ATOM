@@ -22,8 +22,8 @@
 # (/models/dsv41) and TRACES (/cc/traces.jsonl, sha256 29b6a19e...) as client.sh reads them; GPU the
 # rocm-smi indices (0,1,2,3); WHEEL the agentx-harness 56a0cf70 aiperf wheel; PROM a Prometheus 3.5.0
 # binary; CAL_TREE a 752/dev snapshot (07deefe54) holding the #739 v1.1 tools; LAW the law a design is
-# rehearsed on (this tree's gpu40 law at TP4 EP4, bf16 KV); DASH_TREE a snapshot of #3939's head. The cards
-# hold no ptl_enable: every fit and run states PTL disabled, as DSV41_MI355.md's.
+# rehearsed on (this tree's gpu40 law at TP4 EP4, bf16 KV); DASH_TREE a snapshot of #3939's head. A record
+# reads the cards' PTL state, disabled on pit2's MI355X; every simulated run states it, as DSV41_MI355.md's.
 set -uo pipefail
 T=$(cd "$(dirname "$0")/.." && pwd)
 CMD=${1:?design, gpu, fit, sim or score}
@@ -167,8 +167,8 @@ EOF
 fit)
   mapfile -t runs < <(lanes | tr ' ' '\n')
   COMPASS_PREFILL_LABEL=record compass fit steps --backend step-linear --form history --model "$MODEL" "$C/real" \
-    "${runs[@]}" --ptl disabled --store "$S" --out "$DATA/fit/steps" >"$DATA/logs/fit_steps.log" 2>&1 || die "fit steps; see $DATA/logs/fit_steps.log"
-  compass fit host "$C/real" "${runs[@]}" --ptl disabled --store "$S" --out "$DATA/fit/host" >"$DATA/logs/fit_host.log" 2>&1 ||
+    "${runs[@]}" --store "$S" --out "$DATA/fit/steps" >"$DATA/logs/fit_steps.log" 2>&1 || die "fit steps; see $DATA/logs/fit_steps.log"
+  compass fit host "$C/real" "${runs[@]}" --store "$S" --out "$DATA/fit/host" >"$DATA/logs/fit_host.log" 2>&1 ||
     die "fit host; see $DATA/logs/fit_host.log"
   python3 - "$DATA/fit/steps/step_linear_law.json" <<'EOF'
 import json, sys
