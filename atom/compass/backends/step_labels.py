@@ -157,8 +157,10 @@ less the draft copy wait, and a middle chunk has none. With an MTP status wait
 before the launch, `W_pre` ends at it and `W_inputs` runs from it to the launch;
 one stamped after the launch (MiniMax-M3.1's DSpark prefill forward waits on it
 after its launch) is no part of the window before it: `W_pre` then runs to the
-launch, and `W_inputs` is 0. On a later
-pipeline stage, `W_recv` runs from the launch to the receive of its input.
+launch, and `W_inputs` is 0. Under `PREFILL_WAIT_ENV` a prefill forward's
+wait for the previous forward's device work leaves the label it sat in: a
+middle chunk's `W_pre`, an output prefill's `W_inputs` (`prefill_wait_ns`).
+On a later pipeline stage, `W_recv` runs from the launch to the receive of its input.
 Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
 pull after the previous exit, and `E_out` from the exit to the pull after it.
 `L_mtp` is `mtp_copy`'s time on a forward whose MTP status wait began before
@@ -247,6 +249,17 @@ STALLS = "stalls"
 #: The shape `first_launch_key` reads: a forward's prefill tokens, up to the
 #: next power of 2.
 FIRST_LAUNCH_KEY = "pow2_prefill_tokens"
+#: The variable that, set to ``1``, labels and simulates a prefill forward as
+#: ATOM runs it: its host waits for the PREVIOUS forward's device work before
+#: it launches, a middle chunk past its staging gate and an MTP output prefill
+#: past its MTP status wait (`prefill_wait_ns`), then does the rest of its
+#: host part. Its labels (`take_prefill_wait`) then hold only that rest, and
+#: the simulated host (`runner.overrides.HostDeviceRecurrence.prepare_end`)
+#: runs it after the previous forward's device end. Unset or ``0``, those
+#: labels hold the wait and the simulation has none, as before. Read by the
+#: labels and the simulated host alike, so a law fitted under it and a run
+#: priced under it agree.
+PREFILL_WAIT_ENV = "COMPASS_PREFILL_WAITS_PREVIOUS"
 
 
 def _prefill_label() -> str:
@@ -263,6 +276,54 @@ def launch_stall_on() -> bool:
     if value not in ("0", "1"):
         raise ValueError(f"{STALL_ENV}={value!r} is not 0 or 1")
     return value == "1"
+
+
+def prefill_waits() -> bool:
+    """Whether `PREFILL_WAIT_ENV` is on: ``1`` on, ``0`` or unset off, any
+    other refused."""
+    value = os.environ.get(PREFILL_WAIT_ENV) or "0"
+    if value not in ("0", "1"):
+        raise ValueError(f"{PREFILL_WAIT_ENV}={value!r} is not 0 or 1")
+    return value == "1"
+
+
+def prefill_wait_ns(prev: dict | None, s: dict, middle: bool) -> int:
+    """The part of prefill forward `s`'s pre-launch host time its host spent
+    waiting for the previous forward `prev`'s device work, whose end is
+    estimated as `prev`'s launch start plus its device busy time: from a
+    `middle` chunk's staging gate end (in its `W_pre`), or from an output
+    prefill's MTP status wait end (in its `W_inputs`), to that end, and none
+    past `s`'s own launch. 0 without `prev`'s stamps, or on an output prefill
+    with no MTP status wait before its launch, which has no `W_inputs`.
+
+    On the step B records, a prefill forward that waited launched 0.3-0.4 ms
+    (Qwen3.8-Flash-Next, TP1) and 2.6-3.7 ms (GLM-5.3-Flash, TP4) after that
+    end (p50), about the host part the same kind of forward takes when it does
+    not wait, while the wait itself ran from a few ms to 0.5 s."""
+    if prev is None or "t_launch_ns" not in prev or "d_busy_ns" not in prev:
+        return 0
+    l0 = s["t_launch_ns"][0]
+    if middle:
+        since = s.get("t_gate_ns", (l0, l0))[1]
+    elif "t_mtp_ns" in s and s["t_mtp_ns"][0] < l0:
+        since = s["t_mtp_ns"][1]
+    else:
+        return 0
+    end = min(prev["t_launch_ns"][0] + prev["d_busy_ns"], l0)
+    return max(0, end - since)
+
+
+def take_prefill_wait(host: dict, prev: dict | None, s: dict, kind: str) -> dict:
+    """`host`, line `s`'s segments (`_segments`) of a forward of `host_kind`
+    `kind`, less its `prefill_wait_ns` behind `prev`: once, from the one
+    segment it sat in, a middle chunk's `W_pre` or an output prefill's
+    `W_inputs`; a decode forward's, and a forward's without that segment, as
+    they are."""
+    segment = {"middle": "W_pre", "prefill": "W_inputs"}.get(kind)
+    if segment not in host:
+        return host
+    wait = prefill_wait_ns(prev, s, kind == "middle")
+    return {**host, segment: max(0, host[segment] - wait)}
 
 
 def launch_stalls(
@@ -1058,6 +1119,8 @@ def _label(
             propose = s.get("b_propose_ns") if view.produces_output else None
         enter, blocked = s["t_enter_ns"], s.get("blocked_ns")
         host = _segments(s, host_kind(view) != "middle")
+        if prefill_waits():
+            host = take_prefill_wait(host, prev, s, host_kind(view))
         if copy.get(s["step"], (0, False))[1]:
             host["L_mtp"] = copy[s["step"]][0]
         idle = prev is not None and not busy[i]

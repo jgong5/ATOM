@@ -585,9 +585,20 @@ class HostDeviceRecurrence:
             * (s not in self.skip)
             for s in SEGMENTS
         }
-        host = max(called + seg["E"], self.ends[0]) + seg["W_pre"]
+        start = max(called + seg["E"], self.ends[0])
+        waits = _prefill_waits()
+        if waits and kind == "middle":
+            # ATOM's middle chunk, past its staging gate, waits for the
+            # previous forward's device work; its W_pre labels hold only the
+            # host part after that (step_labels.take_prefill_wait)
+            start = max(start, self.ends[-1])
+        host = start + seg["W_pre"]
         if self.mtp and kind != "middle":  # output_end stays -inf on a PP stage
             host = max(host, self.output_end + seg[MTP_COPY])
+        if waits and self.mtp and kind == "prefill":
+            # an MTP output prefill, past its MTP status wait, waits for it
+            # too; its W_inputs labels hold only the host part after that
+            host = max(host, self.ends[-1])
         return host + seg[MTP_SEGMENT], seg
 
     def release(self, end: float, target_end: float) -> float:
@@ -619,6 +630,13 @@ class HostDeviceRecurrence:
             if self.own_draft:  # its own draft ids, read once its draft ends
                 return max(released + post, end)
         return released + post
+
+
+def _prefill_waits() -> bool:
+    """`step_labels.prefill_waits`, imported where it is read."""
+    from atom.compass.backends.step_labels import prefill_waits
+
+    return prefill_waits()
 
 
 def schedulable_bound(config: Any) -> int:
