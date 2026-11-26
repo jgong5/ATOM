@@ -4063,7 +4063,10 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     ragged = any(
         _mean(line, s.seqs) < PERMILLE for s, line in steps if s.phase == "decode"
     )
-    rungs = [decode(r) for r in schedulable_ladder(config)]
+    # the ladder at the drafts each decode step verifies: a producer's, none
+    verifies = dict.fromkeys(s.verifies for s, _ in steps if s.phase == "decode")
+    ladder = schedulable_ladder(config)
+    rungs = [decode(r)._replace(verifies=v) for v in verifies for r in ladder]
     graphs, done, tried = {}, {}, set()
     prefills, cached, step_tokens = set(), defaultdict(list), defaultdict(set)
     for s, line in steps:
@@ -4075,14 +4078,16 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     own = {s: outputs for s, outputs in own.items() if s not in prefills}
     # first, so a graph only `trace ops --population` traces refuses before any
     # point; the rungs too, which a decode's drafter's leaf below may join
-    widths = {decode(s.seqs) for s in own if s.phase == "decode"}
+    widths = {
+        decode(s.seqs)._replace(verifies=s.verifies) for s in own if s.phase == "decode"
+    }
     shapes = prefills | set(own) | widths | set(rungs)
     _load(store, config, args.store, shapes, graphs, None, atom_args, args.plan, own)
     for s in own:
         if s.phase == "prefill":
             prefills.add(s)
             continue
-        width = graphs[decode(s.seqs)]
+        width = graphs[decode(s.seqs)._replace(verifies=s.verifies)]
         graphs[s] = {sig: leaf for sig, leaf in graphs[s].items() if sig not in width}
     # a leaf of a drafter's graphs is a point at each shape a run asks it at
     # (`_drafter_at`), its later passes' under DP among them: a prefill's at
@@ -4179,13 +4184,14 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                 real[s].add(n)
         for (text, context, sig), r in routed:
             shape = _shape(text)
-            full = dp * shape.tokens * row
+            tokens = row if shape.verifies is None else shape.verifies + 1
+            full = dp * shape.tokens * tokens
             op = shape in real and graphs[shape][sig][0]
             if not op or routed_rows(op) != full or op.get("drafted"):
                 continue
             if context != min(contexts) and not dependent.get(r["op"], True):
                 continue
-            for n in sorted({row, *real[shape]}):
+            for n in sorted({tokens, *real[shape]}):
                 if n < full:
                     at = shape._replace(real=n)
                     graphs.setdefault(at, {})[sig] = graphs[shape][sig]
@@ -4323,7 +4329,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
             region = graph(store, config, shape, arch, *which)["region"]
             width, held = shape, {}
             if own:  # a drafter's own decode shape, past its step's
-                width = decode(shape.seqs)
+                width = decode(shape.seqs)._replace(verifies=shape.verifies)
                 held = leaves_at(store, config, width, arch)
         except ArtifactRefusal as refused:
             return refused.what
@@ -4554,7 +4560,7 @@ def _shape(text: str):
     if text.startswith("prefill"):
         return prefill(n["T"], n["B"], None, n.get("W"))._replace(gathered=n.get("G"))
     shape = decode(n["B"], n.get("G"), n.get("T"))
-    return shape._replace(width=n.get("W"), real=n.get("R"))
+    return shape._replace(width=n.get("W"), real=n.get("R"), verifies=n.get("V"))
 
 
 #: Leaf kinds that exchange rows between ranks (`exchange`).

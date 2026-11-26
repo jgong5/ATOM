@@ -217,8 +217,8 @@ class Shape(NamedTuple):
     rows that route to no expert, None at all of them: a `measure ops` point
     states it, and a graph is read at its shape without it. `verifies` is
     the drafts each row of a decode under a drafter verifies where fewer
-    than its drafter's, None at its drafter's: a prefill instance's decode
-    step decodes one token a row (`op_graph.verified`)."""
+    than its drafter's, None at its drafter's: a P/D producer's decode step
+    decodes one token a row (`op_graph.verified`)."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
