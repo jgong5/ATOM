@@ -32,7 +32,8 @@ A config is a JSON document:
         "trace_block": 64},              # tokens a trace hash id stands for
      "columns": {"decode": [...], "decode_variants": [[...], ...],
                  "prefill": [...], "prefill_variants": [[...], ...],
-                 "min_spread": 0.2},
+                 "min_spread": 0.2,
+                 "ctx_knot": 131072},            # with a ctx_hinge column only
      "noise": {"decode": s, "prefill": s},       # relative hardware noise a step
      "acceptance": {"vif": 10, "g": {"decode": 0.01, "prefill": 0.02},
                     "g_z": 2.0, "rung_steps": 60, "levels": 3},
@@ -44,7 +45,9 @@ A config is a JSON document:
 decode rung fits and `prefill` the prefill vector's, each starting with the
 intercept `step`; `<kind>_variants` the additions the form-selection rule
 chooses among (a decode rung's MoE column, an opt-in column), each checked on
-its own; `min_spread` the fit's `moe_imbalance` floor. A
+its own; `min_spread` the fit's `moe_imbalance` floor; `ctx_knot`, given
+where a decode column set lists `ctx_hinge`, the knot in tokens its rows'
+context is counted past (`COMPASS_FIT_CTX_HINGE`). A
 column this tree's step linear backend prices is counted by it (`columns`);
 a newer opt-in column plugs in by name.
 

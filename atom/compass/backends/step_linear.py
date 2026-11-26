@@ -158,6 +158,14 @@ rows' own rectangle less their context, `len.max N_KV - Sum N_KV`: how uneven
 the requests the step decodes are, apart from the slots its rung adds past them,
 which `graph_padding` also holds. At one data-parallel rank the two follow each
 other within a rung; a step whose rung a wider peer set separates them.
+After it, still before the MoE column, a decode vector may add `ctx_hinge`
+(`ctx_hinge`), its rows' context past the vector's knot `ctx_knot`, in tokens,
+`Sum max(0, N_KV - ctx_knot)`: a context slope that bends at the knot, which
+`context`'s one slope over every row does not carry. On #752's cell A
+(DeepSeek-V4.1, DPA4) the calibration record's decode law, fitted without it,
+priced its rung 1-2 steps, by their rows' mean context, 0.2% high below 32k
+tokens, 0.4% low at 32k-131k, 0.8% low at 131k-524k and level from 524k. A
+vector with the column states its `ctx_knot`, a positive token count.
 After the MoE column it may add `peer_tokens` (`peer_tokens`), the real MoE
 tokens its data-parallel peers bring to the gather, `moe_tokens` less its own
 decode rows' tokens, 0 on one rank: at a rung whose `moe_experts` reaches
@@ -238,6 +246,7 @@ The law is a mapping, as a run file holds it, `prefill` and `draft` optional:
     VECTOR = {"coefficients": {<feature>: seconds, ...},
               "hull": HULL,
               "rowmod": k,    # a decode vector with a `rowmod` coefficient only
+              "ctx_knot": K,  # a decode vector with a `ctx_hinge` coefficient only
               "duty_tau": s,  # a prefill vector with a `cold_peer_rows` coefficient only
               "kda_chunk": c, # a prefill vector with `KDA` coefficients only
               "ranks": n,     # a prefill vector with a `GATHER_COLUMNS` column only
@@ -328,8 +337,11 @@ PEER_SMALL = 0.25
 DECODE = ("step", "context", "graph_padding")
 #: The MoE columns a decode vector may add, over its step's real MoE tokens.
 MOE_COLUMNS = ("moe_tokens", "moe_experts")
-#: The decode vector's optional features, in the order they follow `DECODE`.
-DECODE_EXTRA = ("row_padding",) + MOE_COLUMNS + ("peer_tokens", "rowmod")
+#: The decode vector's optional features, in the order they follow `DECODE`:
+#: first those `step_linear_fit` counts with the base columns on each rank's row,
+#: `row_padding` then `ctx_hinge`; then those it adds over a step's group and
+#: rows, the MoE column, `peer_tokens`, and `rowmod` last.
+DECODE_EXTRA = ("row_padding", "ctx_hinge") + MOE_COLUMNS + ("peer_tokens", "rowmod")
 #: The prefill vector's columns over its data-parallel group's MoE gather that
 #: state the group's width, `ranks`.
 GATHER_COLUMNS = (
@@ -378,6 +390,16 @@ class _Vector:
         self.rowmod = int(spec["rowmod"]) if "rowmod" in features else None
         if self.rowmod is not None and self.rowmod < 1:
             raise ValueError(f"the {name} vector's rowmod modulus is {self.rowmod}")
+        self.ctx_knot = None
+        if "ctx_hinge" in features:
+            self.ctx_knot = spec.get("ctx_knot")
+            knot = self.ctx_knot
+            if isinstance(knot, bool) or not isinstance(knot, int) or knot < 1:
+                raise ValueError(
+                    f"the {name} vector carries ctx_hinge past a knot of {knot!r} "
+                    "tokens; it states its knot, a positive token count, under "
+                    "ctx_knot"
+                )
         self.duty_tau = None
         if "cold_peer_rows" in features:
             self.duty_tau = spec.get("duty_tau")
@@ -628,6 +650,13 @@ def row_padding(rows) -> int:
     if not rows:
         return 0
     return len(rows) * max(r.context_tokens for r in rows) - sum_context(rows)
+
+
+def ctx_hinge(rows, knot: int) -> int:
+    """`rows`' context past `knot` tokens, `Sum max(0, N_KV - knot)`: the KV
+    the decode rows read beyond the knot, which a vector's `ctx_hinge` prices
+    at a slope of its own."""
+    return sum(max(0, r.context_tokens - knot) for r in rows)
 
 
 def peer_tokens(view: BatchView) -> int | None:
@@ -958,6 +987,8 @@ class StepLinearBackend(CostBackend):
             counts = (1, sum_context(decode), batch_view.graph_padding)
             if "row_padding" in vector.features:
                 counts += (row_padding(decode),)
+            if "ctx_hinge" in vector.features:
+                counts += (ctx_hinge(decode, vector.ctx_knot),)
             if moe := [f for f in MOE_COLUMNS if f in vector.features]:
                 tokens = moe_tokens(batch_view)
                 if tokens is None:

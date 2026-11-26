@@ -222,7 +222,10 @@ target's do.
 Opt-in columns and rules (`env_options`, each off unless asked for, so a fit
 without them writes the law it wrote before them), each column counted by the
 `step_linear` function the backend prices it with: `row_padding` adds the decode
-column of that name to every rung (`ROW_PADDING_ENV`); `gather_rows` and
+column of that name to every rung (`ROW_PADDING_ENV`); `ctx_hinge` adds the
+decode column of that name, its rows' context past a knot, after it to every
+target rung, each vector stating the knot as `ctx_knot` (`CTX_HINGE_ENV`, the
+knot in tokens); `gather_rows` and
 `moe_imbalance` add the prefill columns of those names above `dp` 1, the vector
 stating `ranks` and `moe_imbalance`'s `min_spread`, `gather_rows` ``pad`` the
 column `gather_pad_rows` in its place, the gather's pad rows alone, and
@@ -247,7 +250,7 @@ experts (`_peer_rung`, `PEER_TOKENS_ENV`); `draft_peer_tokens` adds it to the
 draft law's decode rungs above `dp` 1, every one as ``all``
 (`DRAFT_PEER_TOKENS_ENV`): a draft's MoE runs on its group's rows too. The draft
 law takes none of the others but `moe_folds`. The `shared` form, whose one decode solve shares
-the base columns over rungs, refuses `row_padding` and `peer_tokens`. A vector carrying one of these columns states,
+the base columns over rungs, refuses `row_padding`, `ctx_hinge` and `peer_tokens`. A vector carrying one of these columns states,
 under `fit.vif`, each one's variance inflation factor over the rows it was
 fitted on (`_vif`), how far the other columns already hold it.
 
@@ -321,6 +324,7 @@ from atom.compass.backends.step_linear import (
     SPREAD_COLUMNS,
     cached_seqs,
     cold_peer_rows,
+    ctx_hinge,
     dummy_view,
     eager_dummy,
     gather_column,
@@ -422,6 +426,10 @@ ROW_PADDING_ENV = "COMPASS_FIT_ROW_PADDING"
 GATHER_ROWS_ENV = "COMPASS_FIT_GATHER_ROWS"
 MOE_IMBALANCE_ENV = "COMPASS_FIT_MOE_IMBALANCE"
 UNEVEN_ROWS_ENV = "COMPASS_FIT_UNEVEN_ROWS"
+#: Decode `ctx_hinge` (`step_linear.ctx_hinge`) on every target rung: its value
+#: is the knot in tokens, a positive integer such as ``131072``; unset, empty or
+#: ``0`` off, and any other value refused.
+CTX_HINGE_ENV = "COMPASS_FIT_CTX_HINGE"
 #: Prefill `tail_peers` (`step_linear.tail_peers`): a rank's real-row peers at a
 #: step its group runs a finishing prompt's tail at.
 TAIL_PEERS_ENV = "COMPASS_FIT_TAIL_PEERS"
@@ -484,7 +492,13 @@ DRAFT_PEER_TOKENS_ENV = "COMPASS_FIT_DRAFT_PEER_TOKENS"
 #: group's tokens.
 SATURATED = 0.9
 #: The opt-in columns whose variance inflation factor a vector states (`_vif`).
-OPT_IN = ("row_padding", "peer_tokens", *GATHER_COLUMNS, *GRAPH_COLUMNS)
+OPT_IN = (
+    "row_padding",
+    "ctx_hinge",
+    "peer_tokens",
+    *GATHER_COLUMNS,
+    *GRAPH_COLUMNS,
+)
 
 
 def _rung_key(rung: int | None) -> str:
@@ -633,7 +647,8 @@ def _min_spread(cols) -> float | None:
 
 def _columns(options, draft: bool = False) -> dict:
     """The opt-in columns `options` asks a law's vectors to add (`env_options`):
-    `row_padding` on decode, True or False, and on prefill `gather_rows` and
+    `row_padding` on decode, True or False, `ctx_hinge` on decode, its knot
+    in tokens or None (the option 0 or unset), and on prefill `gather_rows` and
     `gather_pad_rows`, True or None (the `gather_rows` option True, or
     ``pad`` for `gather_pad_rows`), `moe_imbalance` and `uneven_rows`, their
     one `min_spread` or None, and `GRAPH_COLUMNS`, True or False; none on a
@@ -641,15 +656,21 @@ def _columns(options, draft: bool = False) -> dict:
     `dp` 1 refuses it, and `gather_rows`, `gather_pad_rows` and
     `GRAPH_COLUMNS`, which read which steps replay a token graph, refuse
     records stating no prefill buckets; a `min_spread` below 0, which
-    `StepLinearLaw` refuses, is refused, as are two; the `shared` form
-    refuses `row_padding`, whose decode solve shares the base columns over
-    rungs."""
+    `StepLinearLaw` refuses, is refused, as are two, and so is a knot that
+    is not a positive integer; the `shared` form refuses `row_padding` and
+    `ctx_hinge`, whose decode solve shares the base columns over rungs."""
     options = options or {}
     gather = options.get("gather_rows") or None
     if gather not in (None, True, "pad"):
         raise ValueError(f"gather_rows is {gather!r}, not True or 'pad'")
+    knot = options.get("ctx_hinge") or None
+    if knot is not None and (
+        isinstance(knot, bool) or not isinstance(knot, int) or knot < 1
+    ):
+        raise ValueError(f"ctx_hinge's knot is a positive token count, not {knot!r}")
     cols = {
         "row_padding": bool(options.get("row_padding")),
+        "ctx_hinge": knot,
         "gather_rows": True if gather is True else None,
         "gather_pad_rows": True if gather == "pad" else None,
         "moe_imbalance": options.get("moe_imbalance"),
@@ -693,6 +714,8 @@ def _columns(options, draft: bool = False) -> dict:
             )
     if cols["row_padding"] and form == "shared":
         raise ValueError("the shared form fits no row_padding column")
+    if cols["ctx_hinge"] and form == "shared":
+        raise ValueError("the shared form fits no ctx_hinge column")
     return cols
 
 
@@ -714,18 +737,32 @@ def _switch(env, name: str) -> bool:
 
 def env_options(environ=None) -> dict:
     """The `fit` options the opt-in column switches in `environ`, the process's
-    environment by default, set: `ROW_PADDING_ENV`, `GATHER_ROWS_ENV` (or at
+    environment by default, set: `ROW_PADDING_ENV`, `CTX_HINGE_ENV` at its
+    knot, `GATHER_ROWS_ENV` (or at
     ``pad``), `MOE_IMBALANCE_ENV` and `UNEVEN_ROWS_ENV` at ``1`` (the last two
     with `MOE_MIN_SPREAD_ENV`'s share), `GRAPH_TOKENS_ENV` and
     `GRAPH_QUERY_CACHED_ENV` at ``1``, the
     `MOE_SELECT_ENV` rule, `MOE_BOTH_ENV` and `ROWMOD_VIF_ENV` at ``1``, the
     `MOE_FOLDS_ENV` cells, and the `PEER_TOKENS_ENV` and
     `DRAFT_PEER_TOKENS_ENV` rungs; none set, none.
-    A switch set to anything but ``0`` or ``1`` is refused (`_switch`)."""
+    A switch set to anything but ``0`` or ``1`` is refused (`_switch`), and
+    `CTX_HINGE_ENV` set to anything but a non-negative integer."""
     env = os.environ if environ is None else environ
     out = {}
     if _switch(env, ROW_PADDING_ENV):
         out["row_padding"] = True
+    if knot := env.get(CTX_HINGE_ENV):
+        try:
+            k = int(knot)
+        except ValueError:
+            k = -1
+        if k < 0:
+            raise ValueError(
+                f"{CTX_HINGE_ENV}={knot} is not a knot, a positive token count "
+                "(0 off)"
+            )
+        if k:
+            out["ctx_hinge"] = k
     if (gather := env.get(GATHER_ROWS_ENV)) == "pad":
         out["gather_rows"] = "pad"
     elif gather not in (None, "", "0", "1"):
@@ -872,7 +909,8 @@ def _features(
     under `serial` `serial_moe_rows`, under `cold` `cold_peer_rows`, and under `draft` or on a step with a draft
     label `seqs` and `out` on prefill, under `share` its `PEER_SHARE`, under `kda` its `KDA` columns, with
     `buckets` its `padding`, and under `eager` its `EAGER_DUMMY`, as `StepLinearBackend` counts them;
-    `cols` (`_columns`) adds `row_padding` on decode and `GATHER_COLUMNS` on prefill;
+    `cols` (`_columns`) adds `row_padding`, then `ctx_hinge` at its knot, on decode
+    and `GATHER_COLUMNS` on prefill;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill;
     `tokens` a decode step's real MoE tokens under `routing`, the model's
     (experts, top-k), which its MoE column reads, else None; `dummies` its
@@ -903,6 +941,8 @@ def _features(
                 counts = (1, sum_context(view.decode), view.graph_padding)
                 if cols and cols["row_padding"]:
                     counts += (row_padding(view.decode),)
+                if cols and cols.get("ctx_hinge"):
+                    counts += (ctx_hinge(view.decode, cols["ctx_hinge"]),)
                 peers = peer_tokens(view)
                 if routing and (tokens := moe_tokens(view)) is None:
                     raise ValueError(
@@ -2997,6 +3037,7 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         )
     else:
         base = list(DECODE) + ["row_padding"] * cols["row_padding"]
+        base += ["ctx_hinge"] * bool(cols["ctx_hinge"])
         solves += [(k, base) for k in rungs]
     for key, names in solves:
         steps = [
@@ -3122,6 +3163,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                 vector["fit"]["rowmod"] = evidence
             if rowmod_vif:
                 vector["fit"]["rowmod_vif"] = rowmod_vif
+            if k != "prefill" and cols["ctx_hinge"]:
+                vector["ctx_knot"] = cols["ctx_hinge"]
             if k == "prefill":
                 if blend is not None:
                     vector["fit"]["phase_max"] = blend
@@ -3507,8 +3550,9 @@ def fill_rungs(law: dict, ladder) -> dict:
     A line through the two nearest rungs on one side multiplies their
     slopes' noise by the distance (#3796: rung 64 from rungs 24 and 32 priced
     the steps it filled +56%), and a copy is off by the rungs' own spread only.
-    Two vectors under different `rowmod` moduli combine to no vector: the
-    nearer one's is taken, ties to the wider. The law names the rungs filled
+    Two vectors under different `rowmod` moduli, or different `ctx_hinge`
+    knots, combine to no vector: the nearer one's is taken, ties to the
+    wider; a filled vector states its `ctx_knot`. The law names the rungs filled
     under `filled`, each to its rule, and under `FILLED_RUNGS` by law
     (`filled_rungs`)."""
     filled = {}
@@ -3528,7 +3572,8 @@ def fill_rungs(law: dict, ladder) -> dict:
                 pair = ((below[-1:] or above[:1])[0],) * 2
             a, b = (decode[str(r)] for r in pair)
             w = 0.0 if pair[0] == pair[1] else (rung - pair[0]) / (pair[1] - pair[0])
-            if a.get("rowmod") != b.get("rowmod"):
+            mixed = a.get("rowmod") != b.get("rowmod")
+            if mixed or a.get("ctx_knot") != b.get("ctx_knot"):
                 near = min(pair, key=lambda r: (abs(r - rung), -r))
                 a = b = decode[str(near)]
                 pair, w = (near, near), 0.0
@@ -3561,6 +3606,8 @@ def fill_rungs(law: dict, ladder) -> dict:
             }
             if a.get("rowmod"):
                 vector["rowmod"] = a["rowmod"]
+            if a.get("ctx_knot"):
+                vector["ctx_knot"] = a["ctx_knot"]
             decode[str(rung)] = vector
             filled[("draft " if of is not law else "") + str(rung)] = rule
     if filled:

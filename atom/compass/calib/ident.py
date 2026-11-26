@@ -338,15 +338,16 @@ def vectors(cfg: Config, steps, law: Law, target=()) -> list[dict]:
         for label, names in variants(cfg, kind):
             try:
                 spread = cfg.columns.get("min_spread", 0.0)
+                knot = cfg.columns.get("ctx_knot")
                 X = np.array(
-                    [cols.values(s.view, kind, names, dep, spread) for s in got]
+                    [cols.values(s.view, kind, names, dep, spread, knot) for s in got]
                 )
                 V = np.array(
-                    [cols.values(v, kind, names, dep, spread) for v, _ in priced]
+                    [cols.values(v, kind, names, dep, spread, knot) for v, _ in priced]
                 )
                 aim = aimed[(kind, rung)]
                 T = np.array(
-                    [cols.values(s.view, kind, names, dep, spread) for s in aim]
+                    [cols.values(s.view, kind, names, dep, spread, knot) for s in aim]
                 )
                 X, V, T = (a.reshape(-1, len(names)) for a in (X, V, T))
             except ValueError as e:

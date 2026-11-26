@@ -25,7 +25,9 @@ the fit labels whose label keeps that kernel's recorded length.
 `--keep-peer-tail` the MAD rounds keeping the slower steps they mark
 (`step_linear_fit._keep_peer_tail`), and the opt-in columns and rules
 `step_linear_fit.env_options` reads from the environment, each off unless set:
-`COMPASS_FIT_ROW_PADDING=1` (decode `row_padding`), `COMPASS_FIT_GATHER_ROWS=1`
+`COMPASS_FIT_ROW_PADDING=1` (decode `row_padding`), `COMPASS_FIT_CTX_HINGE=K`
+(decode `ctx_hinge`, the rows' context past a knot of K tokens, e.g. 131072),
+`COMPASS_FIT_GATHER_ROWS=1`
 (prefill `gather_rows`; ``pad``, its pad rows alone, `gather_pad_rows`),
 `COMPASS_FIT_MOE_IMBALANCE=1` (prefill
 `moe_imbalance`, over `COMPASS_FIT_MOE_MIN_SPREAD`, 0.2 by default),

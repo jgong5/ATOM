@@ -219,7 +219,10 @@ def residuals(cfg, steps, measured) -> list[dict]:
         if len(rows) <= len(names):
             continue
         spread = cfg.columns.get("min_spread", 0.0)
-        X = np.array([cols.values(s.view, kind, names, dep, spread) for s, _ in rows])
+        knot = cfg.columns.get("ctx_knot")
+        X = np.array(
+            [cols.values(s.view, kind, names, dep, spread, knot) for s, _ in rows]
+        )
         y = np.array([m for _, m in rows])
         coef, *_ = np.linalg.lstsq(X / y[:, None], np.ones(len(y)), rcond=None)
         rel = X @ coef / y - 1.0

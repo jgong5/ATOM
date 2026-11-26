@@ -115,8 +115,10 @@ def _ones(
     routing,
     dp: int = 2,
     min_spread: float = 0.0,
+    ctx_knot: int | None = None,
 ) -> StepLinearBackend:
-    """A backend whose law prices `kind` at `names`, every coefficient 1 s."""
+    """A backend whose law prices `kind` at `names`, every coefficient 1 s,
+    `ctx_hinge` past `ctx_knot`."""
     extra = {}
     if kind == "prefill":
         if "cold_peer_rows" in names:
@@ -132,8 +134,11 @@ def _ones(
     else:
         key = EAGER if rung is None else str(rung)
         # rowmod counts at its vector's modulus; one probes that it is priced
-        modulus = {"rowmod": 1} if "rowmod" in names else None
-        law = {"provenance": "ones", "decode": {key: _vector(names, modulus)}}
+        extra = {"rowmod": 1} if "rowmod" in names else {}
+        if "ctx_hinge" in names:
+            # ctx_hinge counts past the config's knot (`values`); a probe's is 1
+            extra["ctx_knot"] = ctx_knot or 1
+        law = {"provenance": "ones", "decode": {key: _vector(names, extra)}}
     if routing:
         law["moe_routing"] = {"experts": routing[0], "top_k": routing[1]}
     return StepLinearBackend(StepLinearLaw(law), dp=dp)
@@ -159,17 +164,30 @@ def provisional(kind: str, names) -> list[str]:
 
 
 def values(
-    view: BatchView, kind: str, names, deployment, min_spread: float = 0.0
+    view: BatchView,
+    kind: str,
+    names,
+    deployment,
+    min_spread: float = 0.0,
+    ctx_knot: int | None = None,
 ) -> tuple[float, ...]:
     """`view`'s value of each of `names`, a `kind` vector's columns, in order;
     `min_spread` the share of the gather's rows below which `moe_imbalance`
-    reads 0, the floor the law's fit took. `rowmod` refuses: its count is
-    over the modulus a fitted law's vector states, which a config does not."""
+    reads 0, the floor the law's fit took; `ctx_knot` the knot, in tokens,
+    decode `ctx_hinge` counts the rows' context past, a config's
+    `columns.ctx_knot`, without which `ctx_hinge` refuses. `rowmod` refuses:
+    its count is over the modulus a fitted law's vector states, which a
+    config does not."""
     names = tuple(names)
     if kind == "decode" and "rowmod" in names:
         raise ValueError(
             "decode column rowmod is counted at its law's modulus, which a "
             "config does not state"
+        )
+    if kind == "decode" and "ctx_hinge" in names and not ctx_knot:
+        raise ValueError(
+            "decode column ctx_hinge is counted past a knot, which a config "
+            "states under columns.ctx_knot"
         )
     known = tuple(n for n in names if backend_prices(kind, n))
     other = [n for n in names if n not in known]
@@ -194,6 +212,7 @@ def values(
             deployment.moe_routing,
             deployment.dp,
             min_spread,
+            ctx_knot if "ctx_hinge" in known else None,
         )
         try:
             cost = backend.price(view)
