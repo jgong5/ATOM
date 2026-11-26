@@ -16,6 +16,9 @@
 #           --common-args/--p-args/--d-args "..."  --p-seqs N --d-seqs N --mem 0.9 --router-policy P
 #           --gsm8k-limit N (50) --gsm8k-conc C (32)  --stall-min M (25)  --cq-max K (3)  --label L
 #           --build-mesh (build atomesh from the snapshot instead of the image's)  --dry-run
+# AGX_PORT_OFFSET=K|auto (default 0): every launcher port + K (the recipe's combined_port_offset.patch for the combined/
+#           benchmark phase, K + 1000 for an eval phase); auto takes the first K of 0, 100, ..., 2900 that every node's
+#           probe finds free (the eval phase's ports only when the cell runs one). run.json states port_offset.
 #           --keep-model-cache  stop the launcher's model page-cache dropper once every Store pool counts its
 #                               owners (it re-evicts the weights every 45 s for 30 min; startup only)
 # AGX_LOCAL_RUNS=1: no run dir the nodes share. Run this ON node A (rank 0) with AGX_RUNS and AGX_REPO on its local
@@ -214,13 +217,15 @@ if p["containers"] is None:
 elif p["containers"]:
     # Another user's idle container is left alone; GPUs in use or our ports taken refuse the run.
     print(f"  {host}: WARNING foreign containers present (left untouched): " + ", ".join(c["name"] for c in p["containers"]))
+# The launcher's ports at offset 0 (an eval phase's 1000 up): reported here, chosen around after every probe
+# (AGX_PORT_OFFSET), which refuses only when no offset is free on every node.
 ours = {8000, 8010, 8011, 8020, 8021, 8022, 29100, 29500, 29600, 29700, 29800, 26051, 26052, 26053, 26054, 26055,
         26056, 26057, 26058, 26059, 26080, 26090, 26151, 26180, 26190, 26251, 26280, 26290, 26351, 26380, 26390}
 ours |= set(range(6301, 6310))
-ours |= {port + 1000 for port in ours}  # the eval phase restarts every service 1000 ports up
+ours |= {port + 1000 for port in ours}
 taken = sorted(ours & set(p.get("listening", [])))
 if taken:
-    bad.append(f"ports already listening: {taken}")
+    print(f"  {host}: launcher ports listening at offset 0 (AGX_PORT_OFFSET chooses around them): {taken}")
 busy = [g["gpu"] for g in p["gpus"] if (g["vram_used_mb"] or 0) > 2048]
 if busy:
     bad.append(f"GPUs {busy} hold VRAM")
@@ -281,6 +286,39 @@ if moved:
     print("  copied into the job dir for the containers: " + ", ".join(sorted(set(moved))))
 PY
 
+# 5b. The port offset (AGX_PORT_OFFSET): every launcher port + K on every node, the first free K under auto.
+PORT_OFFSET=$(python3 - "${RUN}" "${AGX_PORT_OFFSET:-0}" "${NODE_SHORT[@]}" <<'PY'
+import json, sys
+run, want, nodes = sys.argv[1], sys.argv[2], sys.argv[3:]
+cell = json.load(open(f"{run}/cell.json"))
+base = {8000, 8010, 8011, 8020, 8021, 8022, 29100, 29500, 29600, 29700, 29800, 26051, 26052, 26053, 26054, 26055,
+        26056, 26057, 26058, 26059, 26080, 26090, 26151, 26180, 26190, 26251, 26280, 26290, 26351, 26380, 26390}
+base |= set(range(6301, 6310))
+phases = [0] + ([1000] if cell.get("run_eval") or cell.get("eval_only") else [])
+listen = {n: set(json.load(open(f"{run}/probe-{n}.json")).get("listening", [])) for n in nodes}
+need = lambda k: {q + k + ph for q in base for ph in phases}  # noqa: E731
+for k in (range(0, 2901, 100) if want == "auto" else [int(want)]):
+    if max(need(k)) >= 32768:  # the ephemeral range: an outgoing connection may hold one
+        continue
+    hit = {n: sorted(need(k) & ports) for n, ports in listen.items() if need(k) & ports}
+    if not hit:
+        print(k)
+        sys.exit(0)
+    print(f"  offset {k}: taken {hit}", file=sys.stderr)
+sys.exit(f"no port offset ({want}) leaves the launcher's ports free on {nodes}")
+PY
+) || { say "port choice failed (AGX_PORT_OFFSET=${AGX_PORT_OFFSET:-0})"; exit 4; }
+if (( PORT_OFFSET > 0 )); then
+  offset_patch="$(cd "${H}/.." && pwd)/patches/combined_port_offset.patch"
+  if git -C "${SNAP}" apply --check "${offset_patch}" 2>/dev/null; then
+    git -C "${SNAP}" apply "${offset_patch}"; cp "${offset_patch}" "${RUN}/"
+    git -C "${SNAP}" diff > "${RUN}/snapshot.diff"
+  elif ! git -C "${SNAP}" apply --check -R "${offset_patch}" 2>/dev/null; then
+    say "port offset ${PORT_OFFSET}: ${offset_patch} applies neither way to the snapshot"; exit 4
+  fi
+fi
+say "ports: offset ${PORT_OFFSET} (AGX_PORT_OFFSET=${AGX_PORT_OFFSET:-0}; router $((8000 + PORT_OFFSET)), P $((8010 + PORT_OFFSET)), D $((8020 + PORT_OFFSET)))"
+
 # 6. Rank env: the CI export block of pd_submit.sh, the Spur worker's job env, overlays.
 cell_json=$(cat "${RUN}/cell.json")
 {
@@ -289,6 +327,7 @@ cell_json=$(cat "${RUN}/cell.json")
   cat <<EOV
 export ATOMESH_BUILD_MESH=${BUILD_MESH} ATOMESH_MESH_BUILD_PROFILE=release ATOMESH_DASHBOARD_HARDWARE=MI355X
 export ATOMESH_HOST_CACHE_DROP_TIMEOUT=900
+export ATOMESH_COMBINED_PORT_OFFSET=${PORT_OFFSET} ATOMESH_RESTART_PORT_OFFSET=$((PORT_OFFSET + 1000))
 export ATOMESH_RUN_TOKEN=$(python3 -c 'import uuid;print(uuid.uuid4().hex)')
 export LOG_ROOT=${LOG_ROOT}
 export GITHUB_WORKSPACE=${SNAP}
@@ -326,7 +365,7 @@ json.dump({
   "node_overlays": "${NODE_OVERLAYS[*]+${NODE_OVERLAYS[*]}}", "p_env": "${P_ENV}", "d_env": "${D_ENV}",
   "common_env": "${C_ENV}", "store_caps": "${STORE_CAPS}", "store_pools": "${STORE_POOLS}",
   "log_root": "${LOG_ROOT}", "job_dir": "${LOG_ROOT}/slurm_job-${JID}", "stall_min": ${STALL_MIN}, "cq_max": ${CQ_MAX},
-  "keep_model_cache": ${KEEP_MODEL_CACHE},
+  "keep_model_cache": ${KEEP_MODEL_CACHE}, "port_offset": ${PORT_OFFSET},
 }, open(sys.argv[1] + "/run.json", "w"), indent=1)
 PY
 if [[ "${LOCAL_RUNS}" == 1 ]]; then
