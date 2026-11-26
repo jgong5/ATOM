@@ -92,12 +92,30 @@ class _PromptIds:
         return getattr(self._adapter, name)
 
 
+def _settling(add_request):
+    """`add_request`, which settles the trigger of the request it sends."""
+    from atom.utils.compass_loop import settle_trigger
+
+    def added(self, *args, **kwargs):
+        out = add_request(self, *args, **kwargs)
+        settle_trigger()
+        return out
+
+    return added
+
+
 def install() -> None:
-    """Install the three replacements in this process, once."""
+    """Install the three replacements in this process, once, and the
+    settling of a request's trigger at its engine send."""
     global _installed
     if _installed:
         return
     _installed = True
+    from atom.model_engine import engine_core_mgr
+
+    for cls in vars(engine_core_mgr).values():
+        if isinstance(cls, type) and "add_request" in vars(cls):
+            cls.add_request = _settling(cls.add_request)
     from starlette.requests import Request
     from starlette.responses import JSONResponse
 

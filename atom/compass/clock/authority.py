@@ -265,6 +265,42 @@ class ClockAuthority:
             i: tuple((j, channels.distance(j, i)) for j in self._ids if j != i)
             for i in self._ids
         }
+        # A send floor (`on_request`'s `floor`) covers an LP's channels into an
+        # engine LP; a message on a channel into it from no engine LP voids it.
+        self._covered = {
+            i: frozenset(
+                c.name for c in channels.channels_from(i)
+                if c.target.name.startswith("engine")
+            )
+            for i in self._ids
+        }
+        self._triggers = {
+            i: frozenset(
+                c.name for c in channels.channels_into(i)
+                if not c.source.name.startswith("engine")
+            )
+            for i in self._ids
+        }
+        self._floor = {}  # LP -> its send floor in force
+        # i -> (j, D(j->i), D over a covered first hop, D over any other)
+
+        def first_hop(j, i, covered):
+            return min(
+                (
+                    c.lookahead_s + (0.0 if c.target == i else channels.distance(c.target, i))
+                    for c in channels.channels_from(j)
+                    if (c.name in self._covered[j]) == covered
+                ),
+                default=math.inf,
+            )
+
+        self._split = {
+            i: tuple(
+                (j, d, first_hop(j, i, True), first_hop(j, i, False))
+                for j, d in self._from[i]
+            )
+            for i in self._ids
+        }
         self.timeline = timeline
         self._sent = {i: [] for i in self._ids}  # logged since its last reply
         self.grants = {i.name: 0 for i in self._ids}
@@ -346,6 +382,7 @@ class ClockAuthority:
         steps=(),
         ahead: bool = False,
         rounds=(),
+        floor=None,
     ) -> list:
         """Register `lp`'s send log, record its request, and grant what is due.
 
@@ -436,6 +473,11 @@ class ClockAuthority:
             self._refuse_unjoinable(lp, member, kind, t)
         for name, seq, arrival in log:
             self._register(lp, name, seq, arrival, member)
+        if member is None and kind in (TAR, NER):
+            if floor is None:
+                self._floor.pop(lp, None)
+            else:
+                self._floor[lp] = _seconds(floor, False, "the send floor of {}", lp)
         if self.timeline is not None:
             self._sent[lp] += map(tuple, log)
         if owing is not None:  # its sends are logged: N may rise
@@ -617,6 +659,17 @@ class ClockAuthority:
                 f"{name} seq {seq} arrives at {a}, before {lp}'s clock "
                 f"{clock} plus the channel's lookahead {channel.lookahead_s}"
             )
+        elif (
+            member is None
+            and name in self._covered[lp]
+            and (h := self._floor.get(lp)) is not None
+            and a < h + channel.lookahead_s
+        ):
+            raise ClockAbort(
+                f"{name} seq {seq} arrives at {a}, below {lp}'s send floor {h} "
+                f"plus the lookahead {channel.lookahead_s}",
+                self.lp_table(),
+            )
         else:
             self._undelivered[name][seq] = a
             self._horizon = max(self._horizon, a)
@@ -661,7 +714,26 @@ class ClockAuthority:
 
     def _row(self, i: LpId) -> tuple[tuple[LpId, float], ...]:
         nv = self._nv
-        return tuple((j, nv[j] + d) for j, d in self._from[i])
+        if not self._floor:
+            return tuple((j, nv[j] + d) for j, d in self._from[i])
+        floor, out = self._floor, []
+        for j, d, dc, du in self._split[i]:
+            h = floor.get(j)
+            if h is None or dc == math.inf:
+                out.append((j, nv[j] + d))
+                continue
+            n = nv[j]
+            reacts = min(max(n, h), self._trigger_pending(j))
+            out.append((j, min(reacts + dc, n + du)))
+        return tuple(out)
+
+    def _trigger_pending(self, j: LpId) -> float:
+        """The earliest unreleased message on a channel into `j` that voids its floor."""
+        pending = self._undelivered
+        return min(
+            (a for n in self._triggers[j] for a in pending[n].values()),
+            default=math.inf,
+        )
 
     def _lbts(self, i: LpId) -> float:
         return min((term for _, term in self._row(i)), default=math.inf)
@@ -754,6 +826,10 @@ class ClockAuthority:
             released.ceiling = self._ceiling[i] = self._ceiling_of(i, g, released)
             if not self._offering[i]:
                 released.wide = self._wide[i] = self._wide_of(i, g)
+        if i in self._floor and any(
+            msgs for name, msgs in released.items() if name in self._triggers[i]
+        ):
+            del self._floor[i]  # a trigger it is given voids its floor
         target = self._target[i]
         short = self._state[i] == TAR and g < target
         if self.timeline is not None:
@@ -918,6 +994,7 @@ class ClockAuthority:
         end, k = max(self._now.values()), len(self.ended)
         self._ceiling.clear()  # no LP runs below one now
         self._wide.clear()
+        self._floor.clear()
         clocks, grants = tuple(self._now.items()), dict(self.grants)
         diagnostics = self.diagnostics - self._diagnosed
         served = dict(self.requests_served)

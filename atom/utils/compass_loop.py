@@ -65,11 +65,13 @@ found.
 import asyncio
 import collections
 import contextlib
+import contextvars
 import heapq
 import itertools
 import json
 import logging
 import math
+import os
 import queue
 import select
 import selectors
@@ -500,12 +502,39 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         self.executor = SimExecutor(self)
         self.set_default_executor(self.executor)
         self.rt.loop = self
+        # Trigger messages released whose sends to the engine may still come:
+        # a request's, until it reaches the engine or its handler ends; a
+        # cancel's, until its request's handler ends (`send_floor`).
+        self.unsettled: set = set()
+        self.cancel_waits: dict = {}
+        if os.environ.get(SEND_FLOOR_ENV, "1") != "0":
+            self.rt.on_trigger = lambda ch, seq: self.unsettled.add((ch, seq))
+            self.rt.floor_fn = self.send_floor
         self.stopped = None  # the signal that stopped the run, by name
         self.handlers_before = {}  # each stop signal's handler before this loop's
         if threading.current_thread() is threading.main_thread():
             for sig in STOP_SIGNALS:
                 self.handlers_before[sig] = signal.getsignal(sig)
                 self.add_signal_handler(sig, self.stop_run, sig)
+
+    def send_floor(self) -> float:
+        """The earliest LP time this frontend may send to its engine without a
+        trigger message released to it first: its clock while a trigger is
+        unsettled or a station job unplaced, else its earliest timer, the
+        output posts aside (handling an engine's output sends it nothing)."""
+        now = self.rt.now
+        station = self.executor.station
+        if self.unsettled or (station is not None and station.unresolved()):
+            return now
+        post = CompassEventLoop._post
+        t = math.inf
+        for h in self._scheduled:
+            if not h._cancelled and getattr(h._callback, "__func__", None) is not post:
+                t = min(t, h._when)
+        return max(now, t)
+
+    def settle(self, key) -> None:
+        self.unsettled.discard(key)
 
     def time(self) -> float:
         if self.ended is None:
@@ -934,6 +963,7 @@ class HttpChannel:
             )
             arrival, seq = got
             rt.check_arrival(ch, arrival, seq)
+            trigger = _TRIGGER.set((ch, seq))
             jitter = 0.0 if relay_in is not None else _intake_jitter(scope)
             service = service_of(params) if relay_in is not None else 0.0
             wake, ready = loop.create_future(), loop.create_future()
@@ -975,6 +1005,11 @@ class HttpChannel:
             if cancelled is not None:
                 if (hangup := self.hangups.get(cancelled)) is not None:
                     hangup.set()
+                    # Settled once the cancelled request's handler has ended.
+                    loop.cancel_waits.setdefault(cancelled, []).append((ch, seq))
+                else:
+                    loop.settle((ch, seq))
+                _TRIGGER.reset(trigger)
                 await send({"type": "http.response.start", "status": 204})
                 await send({"type": "http.response.body", "body": b""})
                 return
@@ -994,6 +1029,10 @@ class HttpChannel:
         finally:
             if hangup is not None:
                 del self.hangups[seq]
+            if got is not None and rt is not None and rt.loop is not None:
+                rt.loop.settle((ch, seq))
+                for key in rt.loop.cancel_waits.pop(seq, ()):
+                    rt.loop.settle(key)
 
     def _ready(
         self,
@@ -1018,6 +1057,21 @@ class HttpChannel:
             fixed, per_byte, _ = self.intake or (0.0, 0.0, 0.0)
             nbytes = sum(len(m.get("body", b"")) for m in reading.result())
             ready.set_result(arrival + service + fixed + per_byte * (nbytes + jitter))
+
+
+#: ``0`` states no send floor (`CompassEventLoop.send_floor`).
+SEND_FLOOR_ENV = "COMPASS_SEND_FLOOR"
+#: The trigger message of the request this task serves, ``(channel, seq)``.
+_TRIGGER = contextvars.ContextVar("compass_trigger", default=None)
+
+
+def settle_trigger() -> None:
+    """The request this task serves has reached its engine: its trigger is settled."""
+    rt = clock.installed()
+    key = _TRIGGER.get()
+    if key is not None and rt is not None and rt.loop is not None:
+        if threading.current_thread() is rt.owner:
+            rt.loop.settle(key)
 
 
 def _intake_jitter(scope) -> float:

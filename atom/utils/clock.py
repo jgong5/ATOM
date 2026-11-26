@@ -232,6 +232,15 @@ class LPRuntime:
         self.before_inf: float | None = None
         # Sends offered off the owner (`offer`), in order, not yet made.
         self.offers: list = []
+        # The send floor stated with each TAR and NER (`floor_fn`, None for
+        # none), and the trigger messages it is told of as they are released:
+        # those on a channel from no engine LP (`on_trigger`).
+        self.floor_fn = None
+        self.on_trigger = None
+        self.trigger_chs = frozenset(
+            c.name for c in table.channels_into(me)
+            if not c.source.name.startswith("engine")
+        )
 
     def start_run(self) -> None:
         self.in_run = True
@@ -476,6 +485,10 @@ class LPRuntime:
         extra = (steps, ahead) if steps or ahead or rounds else ()
         if rounds:
             extra += (list(rounds),)
+        if self.floor_fn is not None and kind in ("TAR", "NER"):
+            floor = self.floor_fn()
+            if floor is not None:
+                extra = (steps, ahead, list(rounds), floor)
         self.conn.send((kind, t, log, t_daemon, *extra))
 
     def _own_step(self, kind: str, t: float, G: float) -> None:
@@ -531,6 +544,8 @@ class LPRuntime:
                 self.now = max(self.now, a)
                 if seq not in self.released[ch]:
                     self.released[ch].add(seq)
+                    if self.on_trigger is not None and ch in self.trigger_chs:
+                        self.on_trigger(ch, seq)
                     if seq not in self.arrived[ch]:
                         self.unread[ch].add(seq)
                     if seq not in self.handled[ch]:

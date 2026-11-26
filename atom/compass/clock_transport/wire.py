@@ -134,7 +134,9 @@ def _row_in(fields: list) -> LpRow:
     )
 
 
-def _request_out(kind, t, log, t_daemon, steps=(), ahead=False, rounds=()) -> dict:
+def _request_out(
+    kind, t, log, t_daemon, steps=(), ahead=False, rounds=(), floor=None
+) -> dict:
     body = {
         "kind": kind,
         "t": _out(t),
@@ -147,6 +149,8 @@ def _request_out(kind, t, log, t_daemon, steps=(), ahead=False, rounds=()) -> di
         body["ahead"] = True
     if rounds:
         body["rounds"] = [_out(r) for r in rounds]
+    if floor is not None:
+        body["floor"] = _out(floor)
     return body
 
 
@@ -157,13 +161,16 @@ def _request_in(body) -> tuple:
         [_entry(*e) for e in body["log"]],
         _in(body["t_daemon"]),
     )
-    if not {"steps", "ahead", "rounds"} & body.keys():
+    if not {"steps", "ahead", "rounds", "floor"} & body.keys():
         return request
     steps = [_step(*s) for s in body.get("steps", ())]
     request += (steps, body.get("ahead") is True)
-    if "rounds" not in body:
+    if not {"rounds", "floor"} & body.keys():
         return request
-    return (*request, [_in(r) for r in body["rounds"]])
+    request += ([_in(r) for r in body.get("rounds", ())],)
+    if "floor" not in body:
+        return request
+    return (*request, _in(body["floor"]))
 
 
 def _step(kind, t, g, n) -> tuple[str, float, float, int]:
