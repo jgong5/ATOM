@@ -38,7 +38,10 @@ their own next grant, and send a TAR's messages below its ceiling ahead.
 
 **Revised 2026-11-25 by [#4135](https://github.com/jgong5/ATOM/issues/4135):** D3.6 lets an
 LP declare which outbound channels a message can provoke, so LBTS and the local-grant
-cycle follow the router's declared reactions; not built.
+cycle follow the router's declared reactions.
+
+**Revised 2026-11-26 by [#4144](https://github.com/jgong5/ATOM/issues/4144):** D3.6 is
+built, under D3's wide local grants.
 
 **Scope of this document.** The execution architecture: what a simulated run *is*,
 which processes exist, how virtual time advances, and what contract the rest of the
@@ -626,6 +629,8 @@ PDES term: Ayani's distance-between-objects LBTS (Fujimoto, ch. 3). Each part ma
   `LBTS(frontend-D) = min(9.0 + 0.6, inf, inf, inf) = 9.6`: correct.
 - **Strict.** A message not yet reported to the CA has arrival `>=` its sender's
   `now + L`, so a strict grant never reaches it.
+- **With wide local grants, `D` follows the declared channel reactions**, and an LP that
+  declares them has a term of its own (*Wide local grants*, below; D3.6).
 
 **Messages in transit are counted, not assumed away.** `min(now + L)` alone only
 guarantees that no *future* message is earlier. ATOM's sends are asynchronous (ZMQ PUSH,
@@ -730,7 +735,7 @@ aborts the run.
 
 **Wide local grants** (off by default, `compass run --wide-local-grants` turns them on,
 with local grants;
-[#3968](https://github.com/jgong5/ATOM/issues/3968)). Two changes raise a ceiling:
+[#3968](https://github.com/jgong5/ATOM/issues/3968)). Three changes raise a ceiling:
 
 - **The cycle term counts only the LPs that can react.** It is the least, over each
   channel `c` out of `i` to an LP `j` that is running, waits in NER, or is reached on an
@@ -762,6 +767,15 @@ with local grants;
   arrival there would have its offered sends registered only at the LP's next call,
   after other LPs may have moved past them. The TAR is granted that arrival first, as
   without a ceiling, and the step table is that of a run without local grants.
+- **The distances follow the declared channel reactions** (D3.6,
+  [#4144](https://github.com/jgong5/ATOM/issues/4144)). `D(j->i)`, and the cycle term's
+  return past its first hop `c`, D3.6's `reach(c, i)`, are taken over the sends each LP's
+  declaration allows (`ChannelTable.reaction_distance`, `ChannelTable.reach`), and LP
+  `router`, which declares its own
+  (`channels.py::prefill_decode_table`), has its term in `LBTS(i)` split by the kind of its
+  undelivered messages while it waits in NER (`ClockAuthority._declared_term`). A stream
+  event pending at the router then holds a decode frontend at the event's way back through
+  traffic, not at the router's relay hop.
 
 #### Invariants
 
@@ -1347,18 +1361,20 @@ Client runs), and carried in the run artifact:
 ## D3.6. Overlapping LPs' wall work: channel reactions
 
 **Status:** designed 2026-11-25 for [#4135](https://github.com/jgong5/ATOM/issues/4135);
-not built.
+built under `--wide-local-grants` by [#4144](https://github.com/jgong5/ATOM/issues/4144).
 
 ### Problem
 
 A conservative protocol overlaps LPs' wall work only as far as their ceilings and LBTS
 let them run apart in simulated time. [#4029](https://github.com/jgong5/ATOM/issues/4029)'s
 run 2 of the 8P16D C1228 recipe (4 P instances at DP2, 4 D instances at DP4, LP `router`,
-LP `mooncake_store`; tree a5691dd27 with #3996, #3997 and #4004) spends 6.07 wall seconds
-per simulated second in its profiling window: 3,713 critical-path hops at 1.64 ms each,
-while the LPs' own work averages 1.6 cores
+LP `mooncake_store`; tree a5691dd27 with #3996, #3997 and #4004) spends 6.03 wall seconds
+per simulated second in its profiling window
 ([#4029's table](https://github.com/jgong5/ATOM/issues/4029#issuecomment-7151883313)).
-The decode frontends hold 2,846 of the hops. Their ceiling is the local-grant rule's
+#4029's walk of that window, cut into 300 s slices, counts 3,713 critical-path hops per
+simulated second at 1.64 ms each, while the LPs' own work averages 1.6 cores, and puts
+2,846 of the hops on the decode frontends
+([the breakdown](https://github.com/wuhuikx/LLM-Booster/issues/596#issuecomment-7153595726)). Their ceiling is the local-grant rule's
 `G + cycle` (D3, *Local grants*), and their shortest cycle runs through their engine,
 `request` 9.57 us plus `output` 61 us. [#3968](https://github.com/jgong5/ATOM/issues/3968)
 drops that cycle while the engine waits in TAR, which leaves the cycle through LP `router`:
@@ -1440,7 +1456,8 @@ LBTS, which a ceiling never passes.
    `relay`. Rejected: counting the router unable to react while it waits in NER: it
    answers a relay or a cancel at once.
 3. **Only the router declares**: `http` to `http` and `relay`, `relay` to `relay`, `stream`
-   to `stream`. Basis: code. Traffic receives only `stream` and sends only `http`, so its
+   to `stream`, and `final`, a stream's last event under the stream bypass
+   ([#4228](https://github.com/jgong5/ATOM/issues/4228)), to `final`. Basis: code. Traffic receives only `stream` and sends only `http`, so its
    declaration would be every reaction. A frontend sends to its engine on an output: the
    output thread re-feeds held requests
    (`engine_core_mgr.py::CoreManager._bp_dispatch_or_refill`). Rejected: a decode
@@ -1452,8 +1469,9 @@ LBTS, which a ceiling never passes.
    from LP names, a second source for one fact.
 5. **LBTS keeps one term per LP that reacts on every channel, and splits a declaring LP's
    by reaction class.** For `j` without a declaration the term stays `N[j] + D(j->i)`, its
-   undelivered messages each provoking what `j` itself can. For the router it is the least
-   of its own events' term, `min(t, t_daemon) + D(router->i)`, and, per class, the
+   undelivered messages each provoking what `j` itself can. While the router runs or waits
+   in TAR, its term stays `N[router] + D(router->i)`. While it waits in NER, it is the
+   least of its own events' term, `min(t, t_daemon) + D(router->i)`, and, per class, the
    earliest undelivered arrival on the class's channels plus that class's `reach`. Basis: code,
    `ClockAuthority._row` and `_n` keep `N[j]` per LP; for an LP without a declaration
    every class has the same distance. Rejected: per-channel terms for every LP: the same

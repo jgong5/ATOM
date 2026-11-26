@@ -123,8 +123,10 @@ own step walking an arrival on an offering channel: one ``TAR`` row where a
 run with ``false`` records ``ARRIVAL`` and ``TAR``),
 ``wide_local_grants`` (optional, ``false``, the default, or ``true``, which
 needs local grants: a ceiling's cycle term counts only the LPs that can react
-to the LP's sends before their own next grant, and a TAR's grant sends the
-messages below its ceiling ahead, `ClockAuthority`'s ``wide_ceilings``),
+to the LP's sends before their own next grant, a TAR's grant sends the
+messages below its ceiling ahead, and LBTS and that cycle follow the channel
+reactions the table declares, LP ``router``'s in a prefill-decode run,
+`ClockAuthority`'s ``wide_ceilings``),
 ``stream_bypass`` (optional, ``false``, the default, or ``true``, which needs
 LP ``router``: a decode stream's events but its last go straight to traffic,
 and its last through the router, `prefill_decode_table`; each event arrives

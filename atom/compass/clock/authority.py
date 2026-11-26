@@ -125,6 +125,21 @@ asking for them does, and any grant that sends messages ahead has its ceiling
 at or below the LP's earliest unreleased arrival on an offering channel, so
 that its TAR is granted that arrival first, as without a ceiling.
 
+With `wide_ceilings`, the distances also follow the reactions the channel
+table declares (`ChannelTable.mark_reactions`). ``reach(c, i)`` is the least
+lookahead from a message on ``c``, at its receiver, to a message arriving at
+``i``, over the sends each receiver's declaration allows; ``D(j->i)`` is the
+least ``L(c) + reach(c, i)`` over ``j``'s channels out, and the cycle term's
+``L(c) + D(j->i)`` is ``L(c) + reach(c, i)``. An LP that declares its
+reactions has its own term in another LP's ``LBTS``: ``N[j] + D(j->i)`` while
+it runs or waits in TAR, and while it waits in NER the least of its target
+and daemon deadline plus ``D(j->i)`` and, per kind of its inbound channels,
+the earliest unreleased arrival there plus the least ``reach`` of that kind's
+channels. A message not yet registered into ``i`` ends a chain of sends,
+which starts at an LP's own event or at a registered message, each later
+link a send its sender's declaration allows in reaction to the one before,
+so it arrives at or past that term.
+
 A channel the table marks offering carries messages whose handler may offer a
 send, which the LP's owner makes at the message's arrival (#3767). An LP
 waiting in TAR past such a message is granted that arrival first, releasing
@@ -145,7 +160,7 @@ carries requests in and replies out.
 import math
 from dataclasses import dataclass, field
 
-from .channels import ChannelTable
+from .channels import ChannelTable, kind_of
 from .identity import LpId
 
 TAR, NER, PARK, REPORT = "TAR", "NER", "PARK", "REPORT"
@@ -166,7 +181,9 @@ class LpRow:
     target: float | None
     n: float  # the earliest time it could still produce a message
     undelivered: tuple[tuple[str, int, float], ...]  # (channel, seq, arrival)
-    row: tuple[tuple[LpId, float], ...]  # (j, N[j] + D(j->lp)), every other LP
+    # (j, j's term in LBTS(lp)), every other LP: N[j] + D(j->lp), but for an
+    # LP that declares its reactions, which comes last (`ClockAuthority`)
+    row: tuple[tuple[LpId, float], ...]
     binding: LpId | None  # the first least term of `row`, None if none is finite
 
 
@@ -283,8 +300,39 @@ class ClockAuthority:
         # recomputing them.
         self._nv = dict.fromkeys(self._ids, 0.0)
         self._lp = {i: i for i in self._ids}
+        # With wide ceilings the distances follow the declared reactions, and
+        # an LP that declares them takes its terms from `_from_declared`.
+        far = channels.reaction_distance if wide_ceilings else channels.distance
+        declaring = dict.fromkeys(
+            j for j in self._ids if wide_ceilings and channels.declares(j)
+        )
         self._from = {
-            i: tuple((j, channels.distance(j, i)) for j in self._ids if j != i)
+            i: tuple((j, far(j, i)) for j in self._ids if j != i and j not in declaring)
+            for i in self._ids
+        }
+        # Each LP j that declares its reactions: its classes, a class being
+        # the names of its inbound channels of one kind; each such channel's
+        # (j, class); each class's earliest unreleased arrival; and, for each
+        # other LP i, (j, D(j->i), the least reach(c, i) over each class).
+        self._classes, self._class_of, self._cfirst = {}, {}, {}
+        for j in declaring:
+            kinds = {}
+            for c in channels.channels_into(j):
+                kinds.setdefault(kind_of(c.name), []).append(c.name)
+            self._classes[j] = tuple(tuple(names) for _, names in sorted(kinds.items()))
+            for k, names in enumerate(self._classes[j]):
+                self._class_of.update(dict.fromkeys(names, (j, k)))
+            self._cfirst[j] = [math.inf] * len(self._classes[j])
+        self._from_declared = {
+            i: tuple(
+                (
+                    j,
+                    channels.reaction_distance(j, i),
+                    tuple(min(channels.reach(n, i) for n in names) for names in kinds),
+                )
+                for j, kinds in self._classes.items()
+                if j != i
+            )
             for i in self._ids
         }
         self.timeline = timeline
@@ -313,21 +361,27 @@ class ClockAuthority:
         self._ceiling = {}  # LP -> the ceiling of its latest grant
         self._ahead = {}  # LP -> channel -> {seq: arrival} sent ahead, not yet reached
         self._asks = {}  # LP -> whether its pending NER asked for messages ahead
-        self._cycle = {}  # LP -> its shortest cycle, min over j of D(i->j) + D(j->i)
+        # Without wide ceilings: LP -> its shortest cycle, min over j of
+        # D(i->j) + D(j->i).
+        self._cycle = {}
         self._wide = wide_ceilings
-        # LP -> (L(c) + D(j->i), j, whether c is offering) for each channel c
-        # out of it, to LP j, least first: its cycles by their first hop.
+        # With them: LP -> (L(c) + reach(c, i), j, whether c is offering) for
+        # each channel c out of it, to LP j, least first: its cycles by their
+        # first hop.
         self._returns = {}
         for i in self._ids if ceilings else ():
-            back = [channels.distance(i, j) + d for j, d in self._from[i]]
-            self._cycle[i] = min(back, default=math.inf)
             if not wide_ceilings:
+                back = [channels.distance(i, j) + d for j, d in self._from[i]]
+                self._cycle[i] = min(back, default=math.inf)
                 continue
-            home = dict(self._from[i])
             hops = [(c, self._lp[c.target]) for c in channels.channels_from(i)]
             self._returns[i] = sorted(
                 [
-                    (c.lookahead_s + home[j], j, channels.offering(c.name))
+                    (
+                        c.lookahead_s + channels.reach(c.name, i),
+                        j,
+                        channels.offering(c.name),
+                    )
                     for c, j in hops
                 ],
                 key=lambda hop: hop[0],
@@ -646,6 +700,10 @@ class ClockAuthority:
             )
         else:
             self._undelivered[name][seq] = a
+            declared = self._class_of.get(name)
+            if declared is not None:
+                j, k = declared
+                self._cfirst[j][k] = min(self._cfirst[j][k], a)
             self._horizon = max(self._horizon, a)
             self._next_seq[name] = seq + 1
             state = self._state[channel.target]
@@ -688,7 +746,27 @@ class ClockAuthority:
 
     def _row(self, i: LpId) -> tuple[tuple[LpId, float], ...]:
         nv = self._nv
-        return tuple((j, nv[j] + d) for j, d in self._from[i])
+        row = tuple((j, nv[j] + d) for j, d in self._from[i])
+        declared = self._from_declared[i]
+        if not declared:
+            return row
+        return row + tuple(
+            (j, self._declared_term(j, d, reach)) for j, d, reach in declared
+        )
+
+    def _declared_term(self, j: LpId, d: float, reach: tuple[float, ...]) -> float:
+        """The term in another LP's LBTS of `j`, which declares its reactions,
+        `d` being its distance to that LP and `reach` its classes' least reach
+        to it: ``N[j] + d`` while `j` runs or waits in TAR; in NER, the least
+        of its target and daemon deadline plus `d`, and of each class's
+        earliest unreleased arrival plus that class's reach."""
+        if self._state[j] != NER:
+            return self._nv[j] + d
+        term = min(self._target[j], self._daemon[j]) + d
+        for first, back in zip(self._cfirst[j], reach):
+            if first + back < term:  # noqa: PLR1730 - as in `_lbts`
+                term = first + back
+        return term
 
     def _lbts(self, i: LpId) -> float:
         """The least of `_row(i)`'s terms, summed in place without building
@@ -701,6 +779,10 @@ class ClockAuthority:
         for j, d in self._from[i]:
             term = nv[j] + d
             if term < least:  # noqa: PLR1730 - a min() call per term costs more
+                least = term
+        for j, d, reach in self._from_declared[i]:
+            term = self._declared_term(j, d, reach)
+            if term < least:  # noqa: PLR1730
                 least = term
         return least
 
@@ -795,6 +877,12 @@ class ClockAuthority:
         self._ceiling.pop(i, None)
         if self._ceilings and not recovered and g < math.inf and i not in self._members:
             released.ceiling = self._ceiling[i] = self._ceiling_of(i, g, released)
+        if i in self._cfirst:  # what the grant released or sent ahead is gone
+            pending = self._undelivered
+            self._cfirst[i] = [
+                min((a for n in names for a in pending[n].values()), default=math.inf)
+                for names in self._classes[i]
+            ]
         target = self._target[i]
         short = self._state[i] == TAR and g < target
         if self.timeline is not None:
