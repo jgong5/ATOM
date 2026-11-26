@@ -1667,7 +1667,8 @@ def _build_runner(config, fake_mode):
     honest width with its transport declined, and ATOM's own path would rebuild
     it through `init_dist_env` and then reach for `apply_simulated_tp`.
     """
-    from atom.model_engine.model_runner import ModelRunner, support_model_arch_dict
+    from atom.model_engine.model_runner import ModelRunner
+    from atom.models.registry import support_model_arch_dict
     from atom.utils import h2d, resolve_obj_by_qualname
 
     architecture = config.hf_config.architectures[0]

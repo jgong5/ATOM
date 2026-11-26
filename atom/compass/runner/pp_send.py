@@ -214,7 +214,13 @@ class StageSends:
         if is_rendezvous(self.models, gloo):
             ack = {"seq": seq, "tensors_done": self.tensors_done, "gloo_done": sent}
             self.call("send_pp_frame", "pp_ack", ack, wait_out=True)
-            self.rt.stamp_send(self.ack_out, sent)
+            # The ack says when the parts completed (`gloo_done`), and reaches the
+            # sender no earlier than this stage's clock and the channel's lookahead
+            # allow: a receive this stage posted late (the 1P2D repro at C240, a
+            # threshold of bytes left before it) completes before its own clock,
+            # and the sender, granted up to that promise, may already be past it.
+            lookahead = self.rt.table.lookahead(self.ack_out)
+            self.rt.stamp_send(self.ack_out, max(sent, self.rt.now + lookahead))
         return (called, meta), end
 
     def send(self, ready: float, parts) -> None:

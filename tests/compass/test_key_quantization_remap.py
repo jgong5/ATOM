@@ -81,7 +81,7 @@ def as_its_runner(quant, hf_config):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         driverless.install(tmpdir, "gfx950")
-        from atom.model_engine.model_runner import support_model_arch_dict
+        from atom.models.registry import support_model_arch_dict
         from atom.utils import resolve_obj_by_qualname
 
         model_class = resolve_obj_by_qualname(

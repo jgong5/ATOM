@@ -4123,7 +4123,9 @@ def _summary(
     # the prompt tokens its prefix cache counted.
     offload = {}
     for n, h in hand_ins.items():
-        if "offload" in h:
+        # A later pipeline stage's Store shell is inert and counts nothing: the
+        # head's holds the stages' tier (`StoreShell.offload_statistics`).
+        if h.get("offload"):
             seen = _counted_since(h["offload"], since.get(n, {}).get("offload", {}))
             full = seen["cache"]["full_tokens"]
             gpu, cpu = (
