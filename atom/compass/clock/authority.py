@@ -117,7 +117,8 @@ what arrives up to it, and asks again; the step table records that grant as
 that grant and asks again, the rest staying in the round; no grant holds such
 a message for its member: one whose call named later rounds gets its reply at
 that grant, and a parked member leaves its park there and parks again. No round
-is granted ahead past such a message.
+is granted ahead past such a message, and none is sent ahead of an LP that asks
+for messages ahead: its ceiling stops at the earliest.
 
 Nothing here reads a clock, opens a socket or starts a thread. The caller
 carries requests in and replies out.
@@ -779,6 +780,11 @@ class ClockAuthority:
         ceiling = min(self._lbts(i), g + self._cycle[i], self._bound)
         if i in self._members:
             return ceiling
+        # No message on an offering channel goes ahead: its handler may offer
+        # a send, which the owner makes at its arrival, and the grant of a TAR
+        # past it that walks it would leave that arrival behind the LP's
+        # clock. Its TAR is granted the arrival first, as without a ceiling.
+        ceiling = min(ceiling, self._offered(i))
         for name in self._into[i] if self._asks.get(i) else ():
             pending = self._undelivered[name]
             early = [(seq, a) for seq, a in pending.items() if a < ceiling]
