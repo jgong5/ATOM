@@ -349,14 +349,16 @@ TOKENS_PER_S = (127300 + 693) / 11.65
 def _deployment(d, concurrency, scale=1.0, server=True, prefill=(1, 8), decode=(1, 8)):
     """`_run` laid out as `deploy.sh` writes a deployment: the client's
     `artifacts/` beside `prefill/` and `decode/`, each side's engine record at
-    its (tensor parallel, data parallel) in its own `steps/`, and none beside
-    them."""
+    its (tensor parallel, data parallel[, pipeline parallel]) in its own
+    `steps/`, and none beside them."""
     _run(d, concurrency, scale, server)
     (d / curves.ENGINE_RECORD).unlink()
     (d / "steps").rmdir()
-    for side, (tp, dp) in (("prefill", prefill), ("decode", decode)):
+    for side, (tp, dp, *pp) in (("prefill", prefill), ("decode", decode)):
         (d / side / "steps").mkdir(parents=True)
         engine = {"tensor_parallel_size": tp, "data_parallel_size": dp}
+        if pp:
+            engine["pipeline_parallel_size"] = pp[0]
         (d / side / curves.ENGINE_RECORD).write_text(json.dumps(engine))
     return d
 
@@ -383,6 +385,15 @@ def test_a_deployment_differs_from_a_single_node_run_only_by_its_gpus(tmp_path):
     got = curves.metrics(_deployment(tmp_path / "real1", 256, prefill=(8, 1)))
     assert got["throughput per GPU"] == pytest.approx(TOKENS_PER_S / 16, rel=1e-12)
     assert got == curves.metrics(_run(tmp_path / "tp16", 256, tp=16))
+
+
+def test_a_pipelined_side_counts_every_stage_s_gpus(tmp_path):
+    """MiniMax-M3.1's PP4 x TP1 prefill beside a TP4 decode runs on 4 + 4
+    GPUs: its engine record states TP 1 and PP 4."""
+    got = curves.metrics(
+        _deployment(tmp_path / "real1", 256, prefill=(1, 1, 4), decode=(4, 1))
+    )
+    assert got["throughput per GPU"] == pytest.approx(TOKENS_PER_S / 8, rel=1e-12)
 
 
 def _sent() -> float:

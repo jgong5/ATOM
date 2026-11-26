@@ -191,9 +191,13 @@ def profiled(sent: list[dict]) -> list[dict]:
 
 def gpus(run) -> int:
     """The GPUs of the run directory `run`: each side's engine record's
-    ``tensor_parallel_size`` times ``data_parallel_size``, summed."""
+    ``tensor_parallel_size`` times ``data_parallel_size`` times
+    ``pipeline_parallel_size``, summed: a pipelined side runs each stage on
+    its own cards."""
     return sum(
-        e["tensor_parallel_size"] * (e.get("data_parallel_size") or 1)
+        e["tensor_parallel_size"]
+        * (e.get("data_parallel_size") or 1)
+        * (e.get("pipeline_parallel_size") or 1)
         for e in (read_json(side / ENGINE_RECORD) for side in sides(run))
     )
 
