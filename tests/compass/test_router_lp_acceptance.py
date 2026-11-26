@@ -41,8 +41,8 @@ from test_vertical_slice import CONSTANT, TREE, _retry, _run_file
 
 from atom.compass import run as compass_run
 from atom.compass.carriers import (
-    relay_stamp,
-    stamp_events,
+    relay_carried,
+    stamp_split_events,
     tracestate_stamp,
     with_relay_stamp,
 )
@@ -151,7 +151,7 @@ class Frontend:
                 stamp = (
                     tracestate_stamp(self.headers["tracestate"])
                     if fe.side == "P"
-                    else relay_stamp(raw)
+                    else relay_carried(raw)[0]
                 )
                 seq = stamp[1]
                 with fe.cv:
@@ -228,7 +228,8 @@ class Frontend:
         if k == n - 1:
             events.append({"choices": [], "usage": {"completion_tokens": n}})
         text = "".join(f"data: {json.dumps(e)}\n\n" for e in events)
-        return stamp_events(text + "data: [DONE]\n\n" * (k == n - 1), rt)
+        *frames, tail = (text + "data: [DONE]\n\n" * (k == n - 1)).split("\n\n")
+        return stamp_split_events(frames, tail, rt, out)
 
 
 def _idle(run: dict, lp: str, member: str, errors: list) -> None:

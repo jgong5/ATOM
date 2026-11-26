@@ -117,6 +117,7 @@ from torch.utils._device import _device_constructors
 from atom.compass.backends.base import CostBackend
 from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
 from atom.compass.memory.readings import PAGE_BOUND
+from atom.compass.runner import shm_collectives
 from atom.compass.runner.step_output import DeferredTokenStream, filler_token_ids
 
 logger = logging.getLogger(__name__)
@@ -295,6 +296,9 @@ HOST_LAW_KINDS = (*FORWARD_KINDS, DUMMY_KIND)
 #: `admit` for a host entry fitted before admissions were priced apart, whose
 #: `E` laws hold them: they cost nothing on top.
 ADMISSION_IN_E = (0.0, 0.0, 0.0)
+#: How many results of earlier forwards a cache here keeps, by the inputs they
+#: came from, before it empties and starts again.
+KEPT = 1024
 #: The format of a simulated run's `dp<r>.cost.jsonl`, its first line.
 COST_TABLE_VERSION = 1
 
@@ -408,6 +412,9 @@ class HostDeviceRecurrence:
         self.output_end = -math.inf  # target end of the last output forward
         self.mtp = mtp
         self.own_draft = not defer
+        # `prepare_end`'s segment seconds, by what they are priced from, and
+        # the laws, columns and skip they were priced under.
+        self._kept, self._kept_for = {}, (None, None, None)
 
     def charge(
         self, batch: Any, device_s: float, draft_s: float, refuse: bool = True
@@ -519,18 +526,40 @@ class HostDeviceRecurrence:
     ) -> tuple[float, dict]:
         """A forward's prepare end, with `MTP_SEGMENT`, and each segment's seconds,
         `PP_RECV_SEGMENT`'s too; `admit_s` joins `E`, and each column a segment
-        adopts prices `features`' value of its feature, 0 where absent."""
-        law, columns = self._law(kind), self._columns(kind)
+        adopts prices `features`' value of its feature, 0 where absent. The
+        seconds are those an earlier forward of the same kind, `x`, `admit_s`
+        and `features` got, kept for `KEPT` of them while `laws`, `columns`
+        and `skip` stay the same objects: one assigned anew, as a record's
+        grading assigns an idle forward's measured `E`, starts them again,
+        and none is changed in place. The dict is shared, so no caller
+        changes it."""
+        laws, columns, skip = self._kept_for
+        if (
+            laws is not self.laws
+            or columns is not self.columns
+            or skip is not self.skip
+        ):
+            self._kept.clear()
+            self._kept_for = self.laws, self.columns, self.skip
         features = features or {}
-        seg = {
-            s: (
-                float(np.dot(law.get(s, (0, 0, 0)), x))
-                + admit_s * (s == "E")
-                + sum(c * features.get(f, 0.0) for f, c in columns.get(s, {}).items())
-            )
-            * (s not in self.skip)
-            for s in SEGMENTS
-        }
+        key = (kind, x, admit_s, tuple(features.items()))
+        seg = self._kept.get(key)
+        if seg is None:
+            law, columns = self._law(kind), self._columns(kind)
+            seg = {
+                s: (
+                    float(np.dot(law.get(s, (0, 0, 0)), x))
+                    + admit_s * (s == "E")
+                    + sum(
+                        c * features.get(f, 0.0) for f, c in columns.get(s, {}).items()
+                    )
+                )
+                * (s not in self.skip)
+                for s in SEGMENTS
+            }
+            if len(self._kept) >= KEPT:
+                self._kept.clear()
+            self._kept[key] = seg
         host = max(called + seg["E"], self.ends[0]) + seg["W_pre"]
         if self.mtp and kind != "middle":  # output_end stays -inf on a PP stage
             host = max(host, self.output_end + seg[MTP_COPY])
@@ -912,8 +941,6 @@ def start_on_host(runner: Any, rank: int, config: Any) -> None:
 
     if pc.data_parallel_size > 1 and run.spec() is not None:
         from aiter.dist.parallel_state import get_dp_group
-
-        from atom.compass.runner import shm_collectives
 
         shm_collectives.install()
         shm_collectives.attach(get_dp_group().cpu_group)
@@ -2208,7 +2235,10 @@ def _group_step_seconds(
 
     if mode is None:
         mode = forward_mode(batch, runner)
-    mix = vars(runner).setdefault("_priced", ProvenanceMix())
+    # Built on a runner's first step only, as `setdefault` would build one each step.
+    mix = vars(runner).get("_priced") or vars(runner).setdefault(
+        "_priced", ProvenanceMix()
+    )
     spec = getattr(runner.config, "speculative_config", None)
     terms, target_terms, refused = (), 0, None
     host = getattr(runner, "compass_host", None)
@@ -2222,16 +2252,21 @@ def _group_step_seconds(
     dummies = dummy_ranks(batch, mode)
     clock = getattr(host, "now", None)
     entered = None if clock is None else clock()
-    duty = vars(runner).setdefault("_prefill_duty", PrefillDuty())
+    duty = vars(runner).get("_prefill_duty") or vars(runner).setdefault(
+        "_prefill_duty", PrefillDuty()
+    )
     lazy = vars(runner).get("compass_lazy", {})
     walls = [lazy.get(k, 0) for k in WALLS]
     try:
+        stated = {}  # what the record's view, or a new one, does not state yet
         if view is None:
             view = batch_view(batch, mode, runner, dummies)
         elif view.dp_rank is not None:
-            view = dataclasses.replace(view, group_dummies=dummies)
+            stated["group_dummies"] = dummies
         if entered is not None:
-            view = dataclasses.replace(view, prefill_duty=duty.at(entered))
+            stated["prefill_duty"] = duty.at(entered)
+        if stated:
+            view = dataclasses.replace(view, **stated)
         if isinstance(host, HostDeviceRecurrence):
             batch.compass_launch = host.predicted(view)
             batch.compass_dummy = bool(view.dp_dummy and view.prefill)
@@ -2270,9 +2305,13 @@ def _group_step_seconds(
             # The output end: the device end, or with MTP or a draft the target end.
             mark = host.target_end if host.mtp or draft_s else end
             own = host.target_end
-            t = torch.tensor([end, mark, own], dtype=torch.float64)
-            torch.distributed.all_reduce(t, torch.distributed.ReduceOp.MAX, group)
-            end, mark, last = t.tolist()
+            rows = shm_collectives.gathered(group, (end, mark, own), np.float64)
+            got = None if rows is None else shm_collectives.maxed(rows)
+            if got is None:  # on gloo, or redone there
+                t = torch.tensor([end, mark, own], dtype=torch.float64)
+                torch.distributed.all_reduce(t, torch.distributed.ReduceOp.MAX, group)
+                got = t.tolist()
+            end, mark, last = got
             # A real rank's target waits at its collectives for the group's last.
             vars(runner)["_lockstep_s"] = last - own
             return host.release(end, mark)
@@ -2302,9 +2341,11 @@ def _group_step_seconds(
         waits = host is None and batch.produces_output() and not dummy
         out = math.nan if out_s is None else out_s
         mine = [charge_s, waits, out, lookup_s, pricing_s]
-        mine = torch.tensor(mine, dtype=torch.float64)
-        rows = [torch.empty_like(mine) for _ in range(group.size())]
-        torch.distributed.all_gather(rows, mine, group=group)
+        rows = shm_collectives.gathered(group, mine, np.float64)
+        if rows is None:  # on gloo
+            mine = torch.tensor(mine, dtype=torch.float64)
+            rows = [torch.empty_like(mine) for _ in range(group.size())]
+            torch.distributed.all_gather(rows, mine, group=group)
         rows = [r.tolist() for r in rows]
         top = max(s for s, *_ in rows)
         targets = tuple(top if w else s for s, w, *_ in rows)
@@ -2337,7 +2378,7 @@ def _group_step_seconds(
         skipped = [s for s in host.segments if s in host.skip]
         segments = {**host.segments, "skipped": skipped}
     now = getattr(host, "now", None)
-    line = {
+    head = {
         "step": step,
         "t_s": None if now is None else now(),
         **segments,
@@ -2346,22 +2387,39 @@ def _group_step_seconds(
         **({"replayed_stall_s": stall_s} if stall_s else {}),
         "charge_s": charge_s,
         "group_s": group_s,
-        "terms": [
-            {
-                "name": t.name,
-                "seconds": t.seconds,
-                "method": t.provenance.method.value,
-                "validated": t.provenance.validated,
-                "source": t.provenance.source,
-            }
-            for t in terms
-        ],
-        "target_terms": target_terms,
-        "refused": refused,
     }
-    runner._cost_table.write(json.dumps(line) + "\n")
+    tail = {"target_terms": target_terms, "refused": refused}
+    # One JSON object, `head`, then `terms`, then `tail`, as `json.dumps` writes
+    # it; each term's text is the one an earlier line held for it.
+    listed = ", ".join(_term_text(runner, t) for t in terms)
+    line = f'{json.dumps(head)[:-1]}, "terms": [{listed}], {json.dumps(tail)[1:]}'
+    runner._cost_table.write(line + "\n")
     runner._cost_table.flush()
     return group_s
+
+
+def _term_text(runner: Any, term: Any) -> str:
+    """`term`'s entry in a cost line, as JSON text. A term is immutable and a
+    backend may hand back one an earlier step priced, so the text an earlier
+    line wrote for that same object is taken back, `KEPT` of them."""
+    kept = vars(runner).setdefault("_term_texts", {})
+    hit = kept.get(id(term))
+    if hit is not None and hit[0] is term:  # held, so its id is not reused
+        return hit[1]
+    said = term.provenance
+    text = json.dumps(
+        {
+            "name": term.name,
+            "seconds": term.seconds,
+            "method": said.method.value,
+            "validated": said.validated,
+            "source": said.source,
+        }
+    )
+    if len(kept) >= KEPT:
+        kept.clear()
+    kept[id(term)] = (term, text)
+    return text
 
 
 class SampledIds(list):

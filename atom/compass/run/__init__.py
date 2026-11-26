@@ -121,6 +121,10 @@ clock calls and reports them with its next one, a DP member at its settle,
 `ClockAuthority`; the sends are the same, and so is the step table but for an
 own step walking an arrival on an offering channel: one ``TAR`` row where a
 run with ``false`` records ``ARRIVAL`` and ``TAR``),
+``wide_local_grants`` (optional, ``false``, the default, or ``true``, which
+needs local grants: a ceiling's cycle term counts only the LPs that can react
+to the LP's sends before their own next grant, and a TAR's grant sends the
+messages below its ceiling ahead, `ClockAuthority`'s ``wide_ceilings``),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -377,6 +381,8 @@ INSTANCE_KEY = "compass_instance"
 WORKER_ORDER = "worker_order"
 #: The run-file key that gives grants their ceilings.
 LOCAL_GRANTS = "local_grants"
+#: The run-file key that widens those ceilings.
+WIDE_LOCAL_GRANTS = "wide_local_grants"
 ATOM_RUNNER = "atom.model_engine.model_runner.ModelRunner"
 RAPIDSERVE_RUNNER = "atom.model_engine.model_runner.RapidServeModelRunner"
 #: The run-file key that says the deployment runs RapidServe.
@@ -393,6 +399,7 @@ PER_RUN = (
     "store",
     WORKER_ORDER,
     LOCAL_GRANTS,
+    WIDE_LOCAL_GRANTS,
 )
 LP_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
     "lp-{}.json",  # by LP name, or <lp>.<member> for a member
@@ -948,24 +955,6 @@ def channel_table(run: dict):
         rpc_s = store.store_rpc_s(run[store.ENTRY])
         add_mooncake_store(table, engines, rpc_s, _dp(run, "P" if pd else None))
     return table
-
-
-#: Prototype switch for #4135: wide local grants, read by the authority's host.
-WIDE_GRANTS_ENV = "COMPASS_WIDE_GRANTS"
-_WIDE = {"": 0, "tar": 1, "reactions": 2}
-
-
-def _wide_grants(local: bool) -> int:
-    """``COMPASS_WIDE_GRANTS``: empty for none, ``tar`` for #3968's TAR ahead
-    and state-aware cycle, ``reactions`` for those over the declared
-    reactions (#4135). Refused without local grants."""
-    value = os.environ.get(WIDE_GRANTS_ENV, "")
-    if value not in _WIDE or _WIDE[value] and not local:
-        raise ValueError(
-            f"{WIDE_GRANTS_ENV}={value!r}: one of {', '.join(map(repr, _WIDE))}, "
-            "and not empty only with local grants"
-        )
-    return _WIDE[value]
 
 
 def _lmcache_engine(run: dict) -> str:
@@ -1621,11 +1610,12 @@ class _RecordingAuthority(ClockAuthority):
         table = channel_table(run)
         count = run.get("client_runs", 1)
         local = run.get(LOCAL_GRANTS, True)
-        if not isinstance(local, bool):
-            raise TypeError(
-                f"the run file's {LOCAL_GRANTS} is {local!r}; it is true, which "
-                "gives grants their ceilings, or false"
-            )
+        wide = run.get(WIDE_LOCAL_GRANTS, False)
+        for key, value in ((LOCAL_GRANTS, local), (WIDE_LOCAL_GRANTS, wide)):
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"the run file's {key} is {value!r}; it is true or false"
+                )
         super().__init__(
             table,
             timeline=self,
@@ -1634,7 +1624,7 @@ class _RecordingAuthority(ClockAuthority):
             client=TRAFFIC,
             client_runs=math.inf if count is None else count,
             ceilings=local,
-            wide=_wide_grants(local),
+            wide_ceilings=wide,
         )
 
     def record(self, lp, time_from, time_to, kind, recovered, released=(), *_):
