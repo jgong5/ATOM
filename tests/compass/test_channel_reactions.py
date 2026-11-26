@@ -13,8 +13,9 @@ What each group defends:
   back through traffic, about 3.06 ms, where #3968 alone holds it at the
   relay hop, 1.49 ms; a relay or a cancel pending there holds it at the relay
   hop. While the router runs or waits in TAR, and for its own events in NER,
-  its term is its ``N`` plus the relay hop. Without wide ceilings the
-  declaration changes nothing.
+  its term is its ``N`` plus the relay hop. A waiting frontend is granted
+  only short of that term, so the grant scan reads it. Without wide ceilings
+  the declaration changes nothing.
 * **The cycle.** A decode frontend whose engine waits in TAR has its ceiling
   at its grant plus the stream's way back, 3.06 ms past it, not 1.5 ms.
 * **Nothing else changes, on generated runs.** LPs whose sends follow a
@@ -170,6 +171,35 @@ def test_the_earliest_of_each_kind_counts_until_it_is_released():
     [(lp, g, released)] = ca.on_request(ROUTER, NER, INF, [])
     assert (lp, g, released[STREAM]) == (ROUTER, 0.002, [(0, 0.002)])
     assert ca._cfirst[ROUTER] == [INF, 0.003, INF]  # http, relay, stream
+
+
+@pytest.mark.parametrize(
+    "pending, reactions, target, granted",
+    [
+        ([(RELAY_IN, 0, ROUTER_IN)], None, 0.00149, True),
+        ([(RELAY_IN, 0, ROUTER_IN)], None, 0.00151, False),
+        ([(STREAM, 0, ROUTER_IN)], None, 0.0016, True),
+        ([(STREAM, 0, ROUTER_IN)], {}, 0.0016, False),
+    ],
+    ids=["relay-short", "relay-past", "stream", "stream-#3968"],
+)
+def test_a_waiting_frontend_is_granted_only_short_of_the_router_s_term(
+    pending, reactions, target, granted
+):
+    """frontend-D1, running at 0, holds the router in NER with `pending`
+    registered for it, and reaches frontend-D0 itself only at 1.62 ms, through
+    its engine and a prefill deployment; every other LP idles. frontend-D0's
+    TAR is granted while it lies short of the router's term: a relay's
+    arrival plus the relay hop, 1.5 ms, or a stream event's way back, 3.06 ms,
+    which #3968 alone puts at the relay hop."""
+    ca = ClockAuthority(_table(reactions), ceilings=True, wide_ceilings=True)
+    mine = lambda lp: [p for p in pending if p[0].startswith(f"{lp.name}->")]
+    for lp in ca._ids:
+        if lp not in (FD1, FD):
+            assert ca.on_request(lp, NER, INF, mine(lp)) == []
+    replies = ca.on_request(FD, TAR, target, mine(FD))
+    assert [(lp, g) for lp, g, _ in replies] == ([(FD, target)] if granted else [])
+    assert next(r for r in ca.lp_table() if r.lp == ROUTER).state == NER
 
 
 @pytest.mark.parametrize("state", ["running", TAR, NER])
