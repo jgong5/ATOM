@@ -1814,13 +1814,15 @@ def capture(
     whole step, where its drafter runs; each of their prefills
     runs as one forward, as it ran, this rank answering that it cannot split
     it; with `whole`, each prefill of
-    `shapes` too. With `symbolic`, each prefill's (T, B) of a DP group with no
+    `shapes` too. Under a P/D producer's drafter each decode of `shapes`
+    verifies none, as its decode does. With `symbolic`, each prefill's (T, B) of a DP group with no
     drafter, at its width, is then traced with G a symbol, as a run's lookup
     traces it (`Tracer.symbolic`); one whose two ends differ is named on
     stderr. Without DP, or under a drafter, `symbolic` is refused before any
     trace.
     """
     from atom.compass.capture import population_shapes
+    from atom.kv_transfer.disaggregation.types import kv_config_has_producer
 
     tracer = Tracer(model, tp, tmpdir, atom_args, arch, read)
     config = tracer.config
@@ -1830,6 +1832,9 @@ def capture(
         raise ValueError("--symbolic: only a DP prefill with no drafter holds G")
     spec = config.speculative_config
     drafts = spec.num_speculative_tokens if spec else 0
+    if drafts and kv_config_has_producer(config.kv_transfer_config):
+        # a P/D producer's decode verifies no draft (`Tracer.trace`)
+        shapes = [s._replace(verifies=0) if s.phase == "decode" else s for s in shapes]
     ran = population_shapes(population, config.enable_tbo, drafts)
     shapes = list(dict.fromkeys([*shapes, *ran]))
     if not shapes:

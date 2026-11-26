@@ -217,7 +217,9 @@ group split as its two micro-batches, as `trace ops --population` traces it
 (`population_steps`), capturing each `op_graph` S lacks on the run's first GPU
 as it reads, a prefill as one forward (`_capture`), or, before any point,
 refusing one only that call traces:
-every leaf at every rung of ATOM's decode ladder, and under a speculative
+every leaf at every rung of ATOM's decode ladder, at the drafts the steps'
+decode rows verify, none for a P/D producer's (`forward.Shape.verifies`), a
+producer's width captured at none too, and under a speculative
 drafter each leaf of its own decode shape past a step's (`parts`) that the
 graphs at its width, its B, do not hold, at its rows padded to that width,
 and under DP each leaf of a decode's drafter's graphs a run asks at its
@@ -5065,12 +5067,14 @@ def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
     stepping and compute units pick kernels as they do on the card. A shape
     its `--prefill` and `--width` cannot name, a DP group's gathered rows or a
     padded width, refuses before any is traced, naming the `trace ops
-    --population` of the record directories `records` that traces it. Under
+    --population` of the record directories `records` that traces it; under a
+    P/D producer's drafter, `--width` names a decode verifying none. Under
     `--enable-tbo` a prefill is traced as one forward (`--whole`), where ATOM
     would split a step of its tokens: a point times a leaf at its own shape."""
     from atom.compass import capture
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture.forward import decode, device_arch, prefill
+    from atom.kv_transfer.disaggregation.types import kv_config_has_producer
     from atom.model_engine.arg_utils import EngineArgs
 
     engine = EngineArgs.add_cli_args(FlexibleArgumentParser()).parse_args(atom_args)
@@ -5078,8 +5082,12 @@ def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
     argv += ["--arch", arch or device_arch()]
     if not arch:  # the card read by its HIP ordinal, which ROCm indexes alike
         argv += ["--gpu", os.environ.get("HIP_VISIBLE_DEVICES", "0").split(",")[0]]
+    # under a P/D producer's drafter `--width` traces a decode verifying none
+    producer = kv_config_has_producer(json.loads(engine.kv_transfer_config or "{}"))
+    verifies = 0 if producer and getattr(config, "speculative_config", None) else None
     for s in shapes:
-        if s != (prefill(s.tokens, s.seqs) if s.phase == "prefill" else decode(s.seqs)):
+        width = decode(s.seqs)._replace(verifies=verifies)
+        if s != (prefill(s.tokens, s.seqs) if s.phase == "prefill" else width):
             population = [a for r in records for a in ("--population", r)]
             call = ["compass", "trace", "ops", *argv, *population, "--store", str(root)]
             raise ArtifactRefusal(

@@ -192,7 +192,7 @@ def population_steps(names, tbo=False, drafters=False, stage=0, run_drafts=0):
     (`op_graph.verified`), its shapes and its drafter's marked so
     (`forward.Shape.verifies`)."""
     from atom.compass.backends import BatchView, RequestShape
-    from atom.compass.backends.op_graph import step_shape
+    from atom.compass.backends.op_graph import step_shape, verified
     from atom.compass.backends.step_labels import group_dummies, group_peaks
     from atom.compass.backends.step_roofline import micro_batches
     from atom.compass.validate.bound import _split
@@ -232,15 +232,14 @@ def population_steps(names, tbo=False, drafters=False, stage=0, run_drafts=0):
                 raise ValueError(f"{name} step {line['step']} {exc}") from None
             width, padded = line.get("draft_bs"), line.get("target_bs")
             if phase == "decode":
-                # a decode of one token a row under a drafter verifies none
-                none = {"verifies": 0} if run_drafts and not drafts else {}
+                # under a drafter a decode of one token a row verifies none
+                verifies = 0 if run_drafts and not verified(rows, run_drafts) else None
                 target = decode(tokens, line.get("moe_rows"))
-                target = target._replace(width=padded, **none).at(dp, drafts)
+                target = target._replace(width=padded, verifies=verifies).at(dp, drafts)
                 yield target, line
                 draft = decode(width or tokens, line.get("draft_moe_rows"), len(rows))
-                draft = draft._replace(**none)
-                ran = drafts or none
-                if drafters and ran and (draft := draft.at(dp, drafts)) != target:
+                draft = draft._replace(verifies=verifies).at(dp, drafts)
+                if drafters and (drafts or run_drafts) and draft != target:
                     yield draft, line
             elif not split or run_drafts:
                 yield prefill(tokens, seqs, line.get("moe_rows"), padded).at(dp), line

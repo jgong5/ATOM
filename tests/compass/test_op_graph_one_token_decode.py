@@ -17,29 +17,46 @@ import os
 import re
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
-from test_artifact_store import clean_checkout  # noqa: F401  autouse
+from test_artifact_store import (
+    clean_checkout,  # noqa: F401  autouse
+    stanza,
+)
 from test_backend_step_linear import view
+from test_bench_ops_drafter import _mtp
 from test_bench_ops_drafter_dp_decode import DP, DRAFTER, _plan, _staging
+from test_bench_ops_plan import CONFIG as PLAN
 from test_bench_ops_plan import bench  # noqa: F401  a fixture
+from test_bench_ops_real_rows import FUSED, _routed_bench, _routed_graph, _steps
 from test_capture_ir import MAIN, TREE, _ops, _record
 from test_op_graph import g
+from test_op_graph_arch import ENGINE, run_readings
 from test_op_graph_drafter import ATTENTION, CONFIG, VERIFIER
 from test_parity_recurrence import MS, line
 from test_step_labels_floor import FLOOR, KERNELS, MARKS, OWN, POINTS, _ranks
 from test_work import SPEC
 
-from atom.compass.artifacts import ArtifactStore, Kind, Topology
+from atom.compass.artifacts import (
+    ArtifactRefusal,
+    ArtifactStore,
+    GateState,
+    Kind,
+    Topology,
+    member_name,
+)
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.op_graph import OpGraphBackend, step_shape, verified
 from atom.compass.backends.provenance import Method
 from atom.compass.backends.step_labels import Floor
 from atom.compass.backends.work import gemm, price
-from atom.compass.capture import population_shapes
-from atom.compass.capture.forward import _batch, decode
+from atom.compass.bench import ops
+from atom.compass.capture import graph_key, population_shapes
+from atom.compass.capture.forward import _batch, decode, structure
 from atom.compass.fit import ops as fit_ops
 from atom.compass.parity import busy
+from atom.compass.run import _op_graphs
 
 #: Two rows decoding one token each, replayed at rung 2.
 ONE_A_ROW = view((1, 90, True), (1, 9, True), rung=2)
@@ -139,17 +156,19 @@ PRODUCER = '{"kv_role":"kv_producer","kv_connector":"mooncake"}'
 
 
 def _trace(tmp_path, *atom_args):
-    """`compass trace ops --population` under an MTP drafter of one token, on
-    Qwen3.5-35B-A3B-FP8's config and ATOM's arguments `atom_args`, of a
-    record whose one step decodes 3 rows of one token each at rung 4: the
-    process, and its graphs by shape and whether a drafter's."""
+    """`compass trace ops` under an MTP drafter of one token, on
+    Qwen3.5-35B-A3B-FP8's config and ATOM's arguments `atom_args`, of the
+    width 2 and the `--population` of a record whose one step decodes 3 rows
+    of one token each at rung 4: the process, and its graphs by shape and
+    whether a drafter's."""
     (tmp_path / "model").mkdir()
     (tmp_path / "model" / "config.json").write_bytes(CONFIG.read_bytes())
     (tmp_path / "record").mkdir()
     step = {"rows": [[1, 90, True]] * 3, "rung": 4, "draft_bs": 4}
     record = _record(tmp_path / "record", [step | {"produces_output": True}])
-    argv = ["trace", "ops", "--model", str(tmp_path / "model"), "--population"]
-    argv += [record, "--store", str(tmp_path / "store"), "--", "--method", "mtp"]
+    argv = ["trace", "ops", "--model", str(tmp_path / "model"), "--width", "2"]
+    argv += ["--population", record, "--store", str(tmp_path / "store")]
+    argv += ["--", "--method", "mtp"]
     argv += ["--num-speculative-tokens", "1", *atom_args]
     done = subprocess.run(
         [sys.executable, "-c", MAIN, *argv],
@@ -191,6 +210,9 @@ def test_a_producer_traces_a_one_token_decode_verifying_none_and_its_drafter(
     assert VERIFIER not in {op["op"] for op in target}
     # its drafter proposes after it
     assert [op["op"] for op in drafter].count(ATTENTION) == 1
+    # a producer's width verifies none too
+    width = _ops(graphs["decode B=2 V=0", False]["region"])
+    assert {op["args"]["q"]["shape"][0] for op in width if op["op"] == ATTENTION} == {2}
 
 
 def test_a_dp_drafter_s_later_pass_on_a_one_token_decode_is_measured_where_asked(
@@ -245,3 +267,90 @@ def test_the_floor_reads_a_one_token_decode_s_drafter_kernels_at_its_shape(tmp_p
     [row] = busy.floored(steps / "dp0.jsonl", floor)
 
     assert row["floor"] == {}
+
+
+def test_measure_ops_captures_a_producer_s_width_verifying_none(monkeypatch):
+    argvs = []
+    monkeypatch.setattr(ops, "_child", lambda fn, argv: argvs.append(argv))
+    config = SimpleNamespace(model="m", speculative_config=SimpleNamespace())
+    args = ["--method", "mtp", "--num-speculative-tokens", "1", "--kv-transfer-config"]
+    one = decode(4)._replace(verifies=0)
+
+    ops._capture(config, [one], "store", "gfx942", [*args, PRODUCER])
+
+    [argv] = argvs
+    assert argv[argv.index("--width") + 1] == "4"
+    # off a producer no width traces it
+    with pytest.raises(ArtifactRefusal, match="no op_graph holds decode B=4 V=0"):
+        ops._capture(config, [one], "store", "gfx942", [*args, "{}"])
+
+
+def test_a_run_reads_a_dp_decode_verifying_none_from_its_own_graph(tmp_path):
+    # DPA DP8 under MTP1: 2 rows of one token each gather 16 rows, the default
+    # there, beside the verify graph of the same width, which gathers 32.
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_text("{}")
+    config = SimpleNamespace(
+        model=str(tmp_path / "model"),
+        hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        tensor_parallel_size=1,
+        parallel_config=SimpleNamespace(data_parallel_size=8),
+        enable_expert_parallel=True,
+        enforce_eager=True,
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=1),
+        **ENGINE | {"enable_dp_attention": True},
+    )
+    store, at = ArtifactStore(str(tmp_path / "store")), structure(
+        config, "decode", True, "gfx950"
+    )
+    for shape in ("decode B=2", "decode B=2 V=0"):
+        graph = json.dumps({"region": {"op": shape}}).encode()
+        store.publish(
+            graph_key(at, shape),
+            provenance=stanza("compass trace ops"),
+            topology=Topology(),
+            conditions=run_readings(config.model),
+            gates=GateState.of(),
+            members={member_name("graph", Topology().ranks()[0], "json"): graph},
+        )
+
+    lookup = _op_graphs(store.root, config, "gfx950")
+
+    assert lookup("decode", 2, 2, True, 16, verifies=0) == {"op": "decode B=2 V=0"}
+    assert lookup("decode", 2, 2, True, 32) == {"op": "decode B=2"}
+
+
+def test_a_producer_s_plan_measures_its_routed_leaf_at_its_steps_real_rows(
+    bench, tmp_path, monkeypatch  # noqa: F811
+):
+    # DP 4 under MTP1, each step's rows one token each: the rung's MoE gathers
+    # 16 rows, one a row on each rank, and its steps' MoE ran 5 and 8 real
+    # ones of them, as `test_bench_ops_real_rows` plans them with no drafter.
+    routed = _routed_graph(4)
+
+    def graph(store, config, shape, arch=None, output=True, draft=False):
+        if draft:
+            return _mtp(store, config, shape, arch, output, draft)
+        return routed(store, config, shape, arch)
+
+    monkeypatch.setattr(ops, "graph", graph)
+    monkeypatch.setattr(ops, "_child", _routed_bench)
+    spec = SimpleNamespace(num_speculative_tokens=1, use_dspark=lambda: False)
+    parallel = SimpleNamespace(data_parallel_size=4)
+    config = SimpleNamespace(**vars(PLAN), parallel_config=parallel)
+    config.speculative_config = spec
+    store, root, key, run = bench
+    steps = [([1000, 3000], 5, 0), ([2000] * 3, 9, 2)]
+    population = _steps(tmp_path / "plan", 4, *steps)
+    args = SimpleNamespace(plan=[population], store=root, llc_mib=256)
+    (out := tmp_path / "out").mkdir()
+
+    ops.plan(store, key, config, run, args, "compass measure ops --plan", out)
+
+    records = [json.loads(x) for x in (out / "plan.jsonl").read_text().splitlines()]
+    stated = {(r["op"], r["shape"]) for r in records if " R=" in r["shape"]}
+    assert stated == {(FUSED, f"decode B=4 V=0 R={n}") for n in (1, 5, 8)}
+
+
+def test_a_point_s_counts_leave_out_the_drafts_its_rows_verify():
+    assert fit_ops.ran_counts("decode B=4 G=16 V=0 R=3", {}) == [{"B": 4, "G": 16}]

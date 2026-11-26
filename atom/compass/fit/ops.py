@@ -295,9 +295,10 @@ def ran_counts(shape: str, leaf: dict) -> list[dict]:
     that leads with W and not with its T or B, as `OpGraphBackend` asks such a
     leaf (`op_graph._ran_at`). Where W is the prefill's T too, a leaf that
     leads with it ran at either B (`op_graph._ran_at_each`). The real MoE rows
-    ``R`` a point states are none of its counts."""
+    ``R`` and the drafts ``V`` a decode's rows verify that a point states are
+    none of its counts."""
     n = shape_counts(shape)
-    width, _ = n.pop("W", None), n.pop("R", None)
+    width, _, _ = n.pop("W", None), n.pop("R", None), n.pop("V", None)
     if width is None or shape.startswith("decode"):
         return [n]
     rows, sets = ("prefill", n["T"], n["B"]), ({n["T"], n["B"]}, {width})
