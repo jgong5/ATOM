@@ -247,6 +247,19 @@ STALLS = "stalls"
 #: The shape `first_launch_key` reads: a forward's prefill tokens, up to the
 #: next power of 2.
 FIRST_LAUNCH_KEY = "pow2_prefill_tokens"
+#: The variable that, set to ``1``, takes out of each `W_launch` label of a line
+#: with no `blocked_ns` the launch's wait on earlier device work, in the host
+#: kinds whose launches wait for it (`launch_waits`, `wait_labels`); unset or
+#: ``0``, no label moves, and a fit is as before.
+WAIT_ENV = "COMPASS_FIT_LAUNCH_WAIT"
+#: A host entry's host kinds whose launch waits for the device end of the
+#: forward before it, under `WAIT_ENV`, which a run's recurrence keeps
+#: (`runner.overrides.HostDeviceRecurrence`).
+WAITS = "launch_waits"
+#: The share of a host kind's forwards whose launch began before the device
+#: finished the forward before it, and that outlasted that end, for the kind's
+#: launches to wait for it (`wait_kinds`).
+WAIT_SHARE = 0.5
 
 
 def _prefill_label() -> str:
@@ -367,6 +380,109 @@ def record_ranks(record) -> list[list[dict]]:
     """The lines of each DP rank record of the run in the directory `record`,
     its ``steps/dp<r>.jsonl`` (`_peers`)."""
     return [read_jsonl(p) for p in _peers(Path(record) / "steps" / "dp0.jsonl")]
+
+
+def launch_wait_on() -> bool:
+    """Whether `WAIT_ENV` is on: ``1`` on, ``0`` or unset off, any other refused."""
+    value = os.environ.get(WAIT_ENV) or "0"
+    if value not in ("0", "1"):
+        raise ValueError(f"{WAIT_ENV}={value!r} is not 0 or 1")
+    return value == "1"
+
+
+def _line_kind(s: dict) -> str:
+    """A line's `host_kind`: ``middle`` for a forward that produces no output,
+    ``prefill`` for one holding a prefill row, else ``decode``."""
+    if not s["produces_output"]:
+        return "middle"
+    return "prefill" if any(not d for _, _, d in s.get("rows") or ()) else "decode"
+
+
+def launch_waits(
+    lines: list[dict],
+) -> tuple[dict[int, tuple[str, int]], Counter, Counter]:
+    """One rank's `lines`: per step whose line, not a dummy run, stamps its
+    launch and no `blocked_ns`, and whose launch began before the device
+    finished the forward before it, that forward's device end placed on the
+    host clock by `_timed`'s lead, and ended after that end, ``(host kind, ns
+    from the launch's start to that end)``: the part of its `W_launch` window
+    its host spent waiting for earlier device work, which a line's
+    `blocked_ns` states where the blocking-call tool ran. Also per host kind,
+    the forwards whose launch began before that end, and those of them that
+    outlasted it (`wait_kinds`). A CUDA-graph decode's launch of a millisecond
+    or less ends long before the forward queued ahead of it does; on #752's
+    Kimi-K3.1 (TP8 DCP8, eager prefill) a prefill's or middle chunk's launch
+    takes 175-185 ms of host work once the device has finished the forward
+    before it, every token count alike, on the calibration record and the c=1
+    and c=8 targets, and its window holds that forward's rest besides."""
+    waits, began, outlasted = {}, Counter(), Counter()
+    end = None
+    for s, start, lead, _ in _timed(lines):
+        if (
+            end is not None
+            and not s["is_dummy_run"]
+            and "t_launch_ns" in s
+            and "blocked_ns" not in s
+        ):
+            l0, l1 = s["t_launch_ns"][:2]
+            if l0 < end:
+                kind = _line_kind(s)
+                began[kind] += 1
+                if l1 > end:
+                    outlasted[kind] += 1
+                    waits[s["step"]] = (kind, end - l0)
+        end = start + s["d_busy_ns"] + lead
+    return waits, began, outlasted
+
+
+def wait_kinds(began: Counter, outlasted: Counter) -> list[str]:
+    """The host kinds whose launches wait for the device end of the forward
+    before them: those whose launches that began before it outlasted it in
+    `WAIT_SHARE` of the forwards or more (`launch_waits`' counts)."""
+    return sorted(k for k, n in began.items() if n and outlasted[k] >= WAIT_SHARE * n)
+
+
+def wait_labels(samples: list, records) -> tuple[list, dict, list[str]]:
+    """`samples` of the run records in the directories `records`, each
+    `W_launch` label of a forward `launch_waits` finds waiting, in a kind
+    `wait_kinds` names, less that wait; the report, per host kind, the
+    forwards whose launch began before the previous forward's device end,
+    those that outlasted it and, in the waiting kinds, the labels moved and
+    their median wait in seconds; and those kinds. A sample is found by its
+    run, the `digest`s of its record's rank files as `fit.samples` names it,
+    and its DP rank."""
+    found, began, outlasted = {}, Counter(), Counter()
+    for record in records:
+        files = _peers(Path(record) / "steps" / "dp0.jsonl")
+        name = ", ".join(map(digest, files))
+        for path in files:
+            lines = read_jsonl(path)
+            got, b, o = launch_waits(lines)
+            rank = next((s.get("dp_rank", 0) for s in lines), 0)
+            found[(name, rank)] = got
+            began.update(b)
+            outlasted.update(o)
+    kinds = wait_kinds(began, outlasted)
+    moved, out = defaultdict(list), []
+    for s in samples:
+        wait = found.get((s.provenance["run"], s.rank), {}).get(s.step)
+        kind = host_kind(s.view)
+        if wait and kind in kinds and wait[0] == kind and "W_launch" in s.host:
+            moved[kind].append(wait[1] / 1e9)
+            s = dataclasses.replace(
+                s, host={**s.host, "W_launch": s.host["W_launch"] - wait[1] / 1e9}
+            )
+        out.append(s)
+    report = {
+        k: {
+            "began": began[k],
+            "outlasted": outlasted[k],
+            "moved": len(moved[k]),
+            "wait_s": statistics.median(moved[k]) if moved[k] else 0.0,
+        }
+        for k in sorted(began)
+    }
+    return out, report, kinds
 
 
 #: The variable that, set to ``1``, takes a record whose run.json names
