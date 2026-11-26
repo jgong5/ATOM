@@ -102,7 +102,8 @@ members return while others still ask later rounds: the least of ``LBTS(i)``,
 the grant plus the LP's shortest cycle, and the bound. Each later round below
 it is granted at once, each its own grant, the members that returned standing
 in it, since they owe it; what a round releases to such a member goes ahead in
-that member's reply, which carries the ceiling. The member steps its own clock
+that member's reply, which carries the ceiling, or the round they stop at when
+an offered arrival stops them (below). The member steps its own clock
 through those rounds and reports its steps with its send log: in a ``REPORT``,
 which gets no reply, or in its call for the rounds left. Until it has, the LP's
 ``N`` is no later than that member's clock, so no LP is granted past a send it
@@ -132,7 +133,10 @@ what arrives up to it, and asks again; the step table records that grant as
 that grant and asks again, the rest staying in the round; no grant holds such
 a message for its member: one whose call named later rounds gets its reply at
 that grant, and a parked member leaves its park there and parks again. No round
-is granted ahead past such a message.
+is granted ahead past such a message: the rounds granted ahead stop at the
+first one it reaches, and each returned member's held reply carries that round
+as its ceiling, so the member steps on its own through the rounds granted ahead
+and no further.
 
 Nothing here reads a clock, opens a socket or starts a thread. The caller
 carries requests in and replies out.
@@ -717,13 +721,20 @@ class ClockAuthority:
         others ask later rounds: each later round below that grant's ceiling is
         granted now, the members that returned standing in it, as they owe it.
         Each such member's reply is held until the last of them, to carry
-        what they release to it ahead, beside the ceiling."""
+        what they release to it ahead, beside the ceiling. The rounds stop at
+        the first one an offered arrival reaches, and each held reply's ceiling
+        is then that round."""
         joined = self._round.get(i)
         if not (self._ceilings and joined) or len(joined) == len(self._members[i]):
             return []
         ceiling, replies = self._ceiling_of(i, self._now[i]), []
         while joined and (t := next(iter(joined.values()))[1]) < ceiling:
             if self._offered(i) <= t:  # its member gets that arrival's grant
+                # No member steps on its own past the rounds granted ahead:
+                # a held reply's ceiling stops at this one.
+                for _, held, _ in self._held[i].values():
+                    if held.ceiling is not None and held.ceiling > t:
+                        held.ceiling = t
                 break
             for m in self._members[i]:
                 if m not in joined:
