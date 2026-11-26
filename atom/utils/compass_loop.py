@@ -160,6 +160,12 @@ class Station:
         with self.cv:
             return self._locked(t, d)
 
+    def held_at(self, t: float) -> bool:
+        """Whether a locked section covers `t`."""
+        with self.cv:
+            i = bisect.bisect_right(self.gil_busy, (t, math.inf))
+            return i > 0 and self.gil_busy[i - 1][1] > t
+
     def _locked(self, t: float, d: float) -> float:
         """Take the lock for `d` seconds in its first gap from `t` that holds
         them; returns their end. Touching sections merge. Every
@@ -745,7 +751,7 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         try:
             while self.turns:
                 await self.executor.placed()
-                _, turn = heapq.heappop(self.turns)
+                _, turn = self.next_turn()
                 if turn.done():  # its request was cancelled waiting
                     continue
                 self.turn_over = self.create_future()
@@ -753,6 +759,28 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
                 await self.turn_over
         finally:
             self.giving = None
+
+    def next_turn(self) -> tuple:
+        """Take the next waiting turn off `turns`: the first in order, or under
+        ``COMPASS_HTTP_INTAKE_ORDER=lock`` (`INTAKE_ORDER_ENV`), while the
+        station's interpreter lock is held at this instant
+        (`Station.held_at`), the first as sent, by ``(arrival, seq)``, of those
+        not ordered after every other (a cancel's)."""
+        station = self.executor.station
+        if (
+            intake_order() == "lock"
+            and station is not None
+            and station.gil
+            and station.held_at(self.time())
+        ):
+            sent = [i for i, (order, _) in enumerate(self.turns) if order[0] < math.inf]
+            if sent:
+                i = min(sent, key=lambda j: self.turns[j][0][1:3])
+                got, self.turns[i] = self.turns[i], self.turns[-1]
+                self.turns.pop()
+                heapq.heapify(self.turns)
+                return got
+        return heapq.heappop(self.turns)
 
     def handing_over(self) -> bool:
         """Whether a released request waits to be woken: the loop is not idle
@@ -868,9 +896,11 @@ GENERATION_PATHS = frozenset(
     ("/v1/completions", "/v1/chat/completions", "/v1/messages", "/v1/responses")
 )
 #: The order released requests take their turns in (`HttpChannel`): ``body``,
-#: the default, smallest body (plus intake jitter) first; ``send``, as sent.
+#: the default, smallest body (plus intake jitter) first; ``send``, as sent;
+#: ``lock``, ``body``'s while the interpreter lock is free at a turn and as sent
+#: while it is held (`CompassEventLoop.next_turn`).
 INTAKE_ORDER_ENV = "COMPASS_HTTP_INTAKE_ORDER"
-INTAKE_ORDERS = ("body", "send")
+INTAKE_ORDERS = ("body", "send", "lock")
 
 
 def intake_order() -> str:
@@ -938,6 +968,18 @@ class HttpChannel:
     smallest-first gives about +0.94. Each request is still charged its own
     body's intake, at its turn.
 
+    With ``COMPASS_HTTP_INTAKE_ORDER=lock`` and the station's interpreter lock
+    (``COMPASS_TOKENIZER_GIL=1``), each turn goes in ``body``'s order while
+    the lock is free at its instant and as sent, by ``(arrival, seq)``, while
+    a locked section holds it (`CompassEventLoop.next_turn`): a frontend whose
+    loop keeps up reads a burst's bodies at once and takes the smallest first,
+    one starved of the lock by the segment tokenizer takes requests in as
+    their heads reached it. In the #752 Cell A v2 records a tight burst at
+    c64-c256 reaches the engine smallest first (Spearman against size +0.58 to
+    +0.70) and the c512 300 s burst, over 13 s in head order, does not (-0.06);
+    ``send`` everywhere costs c128's TPOT P90 5 points. With no lock it is
+    ``body``. No term of its own: when the lock is held is the station's.
+
     A stamped request whose body is a cancel
     (`atom.compass.carriers.cancel_seq`) goes to no app: it is answered 204,
     and the request it names, if the app is still serving it, reads
@@ -995,7 +1037,7 @@ class HttpChannel:
         self.app, self.stamp = app, stamp
         self.intake, self.hull = http_intake(), http_intake_hull()
         # Whether bodies (and jitters) order the turns (`INTAKE_ORDER_ENV`).
-        self.by_body = intake_order() == "body"
+        self.by_body = intake_order() in ("body", "lock")
         self.relay, self.per_event = relay(), http_stream()
         self.intake_end = -math.inf  # the LP time the last intake ended
         # http seq -> its hang-up, for each stamped request the app is serving

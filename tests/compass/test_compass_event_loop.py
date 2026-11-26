@@ -1392,6 +1392,106 @@ def test_body_order_is_the_default_order(run, monkeypatch, tmp_path, value):
     assert [t for _, t in entered] == pytest.approx(at)
 
 
+@pytest.mark.parametrize("gil", [None, "1"], ids=["no lock", "lock never held"])
+def test_lock_order_is_body_order_while_the_lock_is_free(
+    run, monkeypatch, tmp_path, gil
+):
+    # COMPASS_HTTP_INTAKE_ORDER=lock with no interpreter lock, or with one no
+    # tokenizer job holds: smallest body first, as ``body``.
+    from atom.utils.compass_loop import GIL_ENV
+
+    monkeypatch.setenv(INTAKE_ORDER_ENV, "lock")
+    if gil is None:
+        monkeypatch.delenv(GIL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(GIL_ENV, gil)
+    sizes = [3000, 1000, 2000, 1000]
+    entered, arrival = _entered_in_turns(run, monkeypatch, tmp_path, sizes)
+    at, t = [], arrival
+    for seq in [1, 3, 2, 0]:
+        t += 2e-3 + 1e-6 * sizes[seq]
+        at.append(t)
+    assert [seq for seq, _ in entered] == [1, 3, 2, 0]
+    assert [t for _, t in entered] == pytest.approx(at)
+
+
+def test_lock_order_takes_a_burst_as_sent_while_the_lock_is_held(
+    run, monkeypatch, tmp_path
+):
+    # The lock held at every turn's instant: (arrival, seq) order, as ``send``,
+    # each request charged its own body's intake.
+    from atom.utils.compass_loop import GIL_ENV
+
+    monkeypatch.setenv(INTAKE_ORDER_ENV, "lock")
+    monkeypatch.setenv(GIL_ENV, "1")
+    monkeypatch.setattr(Station, "held_at", lambda self, t: True)
+    sizes = [3000, 1000, 2000, 1500]
+    entered, arrival = _entered_in_turns(run, monkeypatch, tmp_path, sizes)
+    at, t = [], arrival
+    for seq in range(4):
+        t += 2e-3 + 1e-6 * sizes[seq]
+        at.append(t)
+    assert [seq for seq, _ in entered] == [0, 1, 2, 3]
+    assert [t for _, t in entered] == pytest.approx(at)
+
+
+def _turns_loop(held):
+    """A stand-in loop for `CompassEventLoop.next_turn`: a station whose lock
+    is `held`, three requests and a cancel waiting."""
+    import heapq
+
+    station = Station(1, gil=True)
+    station.held_at = lambda t: held
+    turns = [
+        ((1.0, 0.3, 0, "c"), "a"),  # smallest body, sent last
+        ((2.0, 0.1, 1, "c"), "b"),
+        ((3.0, 0.2, 2, "c"), "c"),
+        ((math.inf, 0.0, 3, "c"), "cancel"),  # a cancel: after every other
+    ]
+    heapq.heapify(turns)
+    return SimpleNamespace(
+        executor=SimpleNamespace(station=station), turns=turns, time=lambda: 5.0
+    )
+
+
+@pytest.mark.parametrize(
+    "held, want",
+    [(False, ["a", "b", "c", "cancel"]), (True, ["b", "c", "a", "cancel"])],
+    ids=["lock free", "lock held"],
+)
+def test_next_turn_takes_the_first_sent_while_the_lock_is_held(monkeypatch, held, want):
+    monkeypatch.setenv(INTAKE_ORDER_ENV, "lock")
+    fake = _turns_loop(held)
+    got = [CompassEventLoop.next_turn(fake)[1] for _ in range(4)]
+    assert got == want
+
+
+def test_next_turn_is_the_heap_s_first_outside_lock_order(monkeypatch):
+    monkeypatch.delenv(INTAKE_ORDER_ENV, raising=False)
+    fake = _turns_loop(True)
+    assert [CompassEventLoop.next_turn(fake)[1] for _ in range(4)] == [
+        "a",
+        "b",
+        "c",
+        "cancel",
+    ]
+
+
+def test_a_station_lock_is_held_inside_its_sections_only():
+    station = Station(1, gil=True)
+    station.hold(1.0, 1.0)
+    station.hold(3.0, 0.5)
+    assert [station.held_at(t) for t in (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5)] == [
+        False,
+        True,
+        True,
+        False,
+        False,
+        True,
+        False,
+    ]
+
+
 @pytest.mark.parametrize("value", ["fifo", "Send", "size"])
 def test_an_unknown_intake_order_is_refused(monkeypatch, value):
     monkeypatch.setenv(INTAKE_ORDER_ENV, value)
