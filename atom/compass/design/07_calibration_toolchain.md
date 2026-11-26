@@ -652,9 +652,11 @@ source, model, engine config, device, stack and torch.
 
 The tokenizer is not split off: one record yields all three terms at no extra cost, the
 engine config exposes contention at high concurrency, and a tokenizer-only key needs a
-store kind of its own, which the Ruling excludes. A tokenizer estimate for a
-configuration no record ran on is [#2483](https://github.com/jgong5/ATOM/issues/2483)'s.
-The host CPU in the key retires T53: a rate fitted on one host answers for no other.
+store kind of its own, which the Ruling excludes. A tokenizer for a host CPU no record
+ran on is fitted from a simulated run on that CPU, which runs the served tokenizer with no
+device, or else carried from a measured host by the CPU ratio, declared (`10` D121,
+[#2483](https://github.com/jgong5/ATOM/issues/2483)). The host CPU in the key retires T53:
+a rate fitted on one host answers for no other, save by D121's declared carry.
 
 **Plus one full-engine run at TP2**, not to calibrate but to **test whether 1c transfers**.
 It is the cheapest possible test of the one term with no transfer evidence: between TP=1

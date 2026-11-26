@@ -2,7 +2,7 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header.
-**Decisions D0–D119, with no gaps, and their sub-decisions** are indexed at the end of this
+**Decisions D0–D121, with no gaps, and their sub-decisions** are indexed at the end of this
 file. The TODOs are registered in **`12_open_items.md`**, with the load-bearing assumptions
 and the cross-cutting issues. Implementation follows the execution plan in `16`.
 
@@ -235,7 +235,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L3 | Memory model, KV pool reuse, the `lmcache_offload` tier | [`03_memory_and_kv_model.md`](03_memory_and_kv_model.md) | D13–D16 (+ D13.1) |
 | L3 | Model capture, Cost IR | [`04_model_capture_and_cost_ir.md`](04_model_capture_and_cost_ir.md) | D17–D23 (+ D18.1) |
 | L3 | Fitting, law selection, hull guard; a pipeline stage's law | [`09_fitting_and_law_selection.md`](09_fitting_and_law_selection.md) | D53–D62 (+ D54.1) |
-| L3 | Analytical laws, the step roofline | [`10_analytical_laws.md`](10_analytical_laws.md) | D63–D70 |
+| L3 | Analytical laws, the step roofline; host time on a host no record ran on | [`10_analytical_laws.md`](10_analytical_laws.md) | D63–D70, D121 |
 | L3 | Step grid backend (step-level), a stage-2 candidate | [`17`](17_step_grid_backend.md) | D96–D105 |
 | L3 | The pass record and the one label rule for host-paced device time | [`18`](18_pass_record_and_host_paced_time.md) | D107 |
 | L4 | Harness contract, wire fields, adapter | [`06_workload_harness_contract.md`](06_workload_harness_contract.md) | D27–D35 (+ D35.1) |
@@ -561,7 +561,7 @@ The documents use these precisely; a reader will bounce off without them.
 | [`05`](05_machine_spec_and_probes.md) | Machine Specification and its Probes | A value lives in the layer that names what it varies with: a device datasheet per SKU, platform readings per device, stack, PTL state and torch, folded from each node's probe record, and a network file per scale-out network for a run across nodes, composed into one machine spec for a run; the host's tokenizer and HTTP intake terms are host laws, fitted from served records; every artifact keys the platform its row depends on. Read this before `03` and `04`, both of which consume it. Probe tools and their contamination refusals. |
 | [`03`](03_memory_and_kv_model.md) | Memory Model and the KV Pool | **Do not simulate the KV pool** — ATOM's real one is pure arithmetic. Substitute the five device readings, never the arithmetic. How a prefix-cache hit reaches the cost model. Validate per term, never as a sum. |
 | [`04`](04_model_capture_and_cost_ir.md) | Model Capture and the Cost IR | Capture with `TorchDispatchMode` + `FakeTensorMode`, concrete, one graph per decode width and prefill (T, B). A hierarchical, stream-annotated IR whose leaves carry their call contract and whose `Repeat` nests and tolerates non-contiguous layer patterns. **Opaque leaves** are priced, not decomposed. |
-| [`10`](10_analytical_laws.md) | Analytical Laws | Cost and memory from device parameters and model geometry, with no observation of the subject. Three classes: exact from geometry, device-parameterised, policy-determined. The analytical fallback, the step roofline and the MI455 projection. Its gate is a **bound**, at most the measured time on every measured step; ranking is reported. **The most speculative document here.** |
+| [`10`](10_analytical_laws.md) | Analytical Laws | Cost and memory from device parameters and model geometry, with no observation of the subject. Three classes: exact from geometry, device-parameterised, policy-determined. The analytical fallback, the step roofline and the MI455 projection. Its gate is a **bound**, at most the measured time on every measured step; ranking is reported. Host time on a host no record ran on: its terms outside the forward fitted from a simulated run on that CPU, its forward segments carried from a recorded host by probed CPU ratios, declared. **The most speculative document here.** |
 | [`17`](17_step_grid_backend.md) | Step Grid Backend | A measured grid of whole forwards, answered only from complete cells, plus a residual fitted on real-run step times, bench replays or both. A stage-2 candidate, graded by stage 2's protocol and off the stage-2 path for now (#627). |
 
 ### Part III — How the data is made
@@ -621,7 +621,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D36 – D43 (+ D38.1, D40.1), D106, D118, D119 | `07` Calibration and Benchmarking Toolchain |
 | D43.1, D44 – D52 (+ D45.1, D50.1, D50.2, D50.3) | `08` Validation Protocol |
 | D53 – D62 (+ D54.1) | `09` Fitting and Law Selection |
-| D63 – D70 (+ D67.1) | `10` Analytical Laws |
+| D63 – D70 (+ D67.1), D121 | `10` Analytical Laws |
 | D71 – D77 | `11` Engine Metrics under Virtual Time |
 | D78 – D81 | `13` The Configuration Surface |
 | D82 – D87 (+ D87.1, D87.2) | `14` Speculative Decoding and MTP |
