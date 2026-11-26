@@ -201,7 +201,7 @@ def test_a_relayed_request_s_stamp_and_service_are_read_from_one_decode(monkeypa
             return self.decoder.decode(body)
 
     monkeypatch.setattr(carriers, "_STAMP", Counted(carriers._STAMP))
-    monkeypatch.setattr(carriers, "_JSON", Counted(carriers._JSON))
+    monkeypatch.setattr(carriers, "JSON_DECODER", Counted(carriers.JSON_DECODER))
 
     def bodies(k, arrival):
         params = {"compass": f"a:{arrival!r};s:{k}", "prompt_token_ids": [7] * 1000}

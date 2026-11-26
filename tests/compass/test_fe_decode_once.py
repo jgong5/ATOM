@@ -93,8 +93,10 @@ def _counted(monkeypatch) -> list[str]:
         return SimpleNamespace(decode=lambda b: calls.append(name) or decoder.decode(b))
 
     monkeypatch.setattr(carriers, "_STAMP", counted("stamp", carriers._STAMP))
-    monkeypatch.setattr(carriers, "_JSON", counted("json", carriers._JSON))
-    monkeypatch.setattr(handoff, "_DECODE", counted("app", handoff._DECODE))
+    monkeypatch.setattr(
+        carriers, "JSON_DECODER", counted("json", carriers.JSON_DECODER)
+    )
+    monkeypatch.setattr(handoff, "JSON_DECODER", counted("app", handoff.JSON_DECODER))
     monkeypatch.setattr(
         starlette.requests,
         "json",

@@ -33,7 +33,7 @@ from typing import Annotated
 
 import msgspec
 
-from atom.compass.carriers import RELAYED_JSON
+from atom.compass.carriers import JSON_DECODER, RELAYED_JSON
 
 #: The response key whose integers the prefill side writes with msgspec.
 KEY = "prompt_token_ids"
@@ -42,7 +42,6 @@ _STAND_IN = "\0compass:prompt_token_ids\0"
 #: The attribute marking a function this module installed.
 _INSTALLED = "compass_handoff"
 _IDS = list[Annotated[int, msgspec.Meta(ge=0)]]
-_DECODE = msgspec.json.Decoder()
 _ENCODE = msgspec.json.Encoder()
 
 
@@ -92,7 +91,7 @@ def _reading(json_of):
                 with contextlib.suppress(
                     msgspec.DecodeError, ValueError, RecursionError
                 ):
-                    request._json = _DECODE.decode(body)
+                    request._json = JSON_DECODER.decode(body)
         return await json_of(request)
 
     return json

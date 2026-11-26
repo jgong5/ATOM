@@ -110,27 +110,15 @@ def tracestate_with(
     return ",".join([entry, *others][:_MAX_ENTRIES])
 
 
-def stamp_events(text: str, rt) -> str:
-    """`text` with a stamped comment line before each SSE event in it.
+def stamp_split_events(events: list[str], tail: str, rt, ch: str) -> str:
+    """The SSE events of a text its caller split on blank lines into
+    ``[*events, tail]``, each with a stamped comment line before it.
 
-    Each event is one send on the runtime's stream channel, to the traffic LP
-    or to the router LP in front of it.
-    A write must end its last frame in a blank line: text after it is refused,
+    Each event is one send on `ch`, the runtime's stream channel, to the
+    traffic LP or to the router LP in front of it.
+    A write must end its last frame in a blank line: a `tail` is refused,
     since the next write's comment would land inside that frame.
     """
-    # Here, not at the top: the harness reads EPOCH_NS while aiperf imports its
-    # phase runner, and `atom.utils` would load torch there.
-    from atom.utils.clock import channel_of
-
-    ch = channel_of(rt, "stream")
-    *events, tail = text.split("\n\n")
-    return stamp_split_events(events, tail, rt, ch)
-
-
-def stamp_split_events(events: list[str], tail: str, rt, ch: str) -> str:
-    """`stamp_events` of a text its caller already split on blank lines into
-    ``[*events, tail]``, each event one send on `ch`, the runtime's stream
-    channel, which the caller looked up."""
     if tail:
         raise ValueError(f"unterminated SSE frame {tail!r}: no blank line after it")
     out = []
@@ -163,9 +151,10 @@ class _Relayed(msgspec.Struct):
 _STAMP = msgspec.json.Decoder(_Relayed)
 _MEMBERS = msgspec.json.Decoder(dict[str, msgspec.Raw])
 _ENCODE = msgspec.json.Encoder()
-#: msgspec's decoding of JSON with no type, the one a simulated decode
-#: frontend's ``Request.json`` returns (`atom.compass.run.handoff`).
-_JSON = msgspec.json.Decoder()
+#: msgspec's decoder of JSON with no type: `decode_relayed` decodes a relayed
+#: body with it, and a simulated decode frontend's ``Request.json`` every body
+#: (`atom.compass.run.handoff`), so a decoding handed on is the app's own.
+JSON_DECODER = msgspec.json.Decoder()
 #: The ASGI scope key under which `atom.utils.compass_loop.HttpChannel` hands a
 #: relayed request's body and its `decode_relayed` decoding on to the app's
 #: ``Request.json``, as ``(body, decoding)``.
@@ -196,7 +185,7 @@ def decode_relayed(body: bytes) -> tuple[Any, tuple[float, int] | None, float]:
     ``kv_transfer_params`` is no object; a router's JSON object holds a key
     once."""
     try:
-        doc = _JSON.decode(body)
+        doc = JSON_DECODER.decode(body)
     except (msgspec.DecodeError, ValueError, RecursionError):
         return (None, *relay_carried(body))
     params = doc.get("kv_transfer_params") if type(doc) is dict else None
