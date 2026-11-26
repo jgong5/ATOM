@@ -72,7 +72,7 @@ def test_decode_takes_the_ids_prefill_handed_by_reference_and_removes_their_file
     assert os.listdir(by_ref) == [] and not handoff._READ_BACK
 
 
-def test_a_reference_is_read_once_and_one_body_holds_one(by_ref):
+def test_a_reference_is_read_once_and_a_malformed_or_second_one_is_refused(by_ref):
     _, ref = _prefill(LONG)
     client, body = _client(), _hand_off(_text(ref))
     assert client.post("/v1/chat/completions", content=body, headers=JSON).json() == {
@@ -82,6 +82,10 @@ def test_a_reference_is_read_once_and_one_body_holds_one(by_ref):
     assert again.status_code == 400
     with pytest.raises(ValueError, match="read already"):
         handoff._take(json.loads(body), body)
+    # Its fields name the file to read and remove: only ints are taken.
+    bad = _hand_off(_text([handoff.REF, "../x", 0, 5]))
+    with pytest.raises(ValueError, match="malformed"):
+        handoff._take(json.loads(bad), bad)
     with pytest.raises(ValueError, match="two hand-off references"):
         handoff.inline_extra(_hand_off(_text(ref), f'"prompt_token_ids":{_text(ref)}'))
 
