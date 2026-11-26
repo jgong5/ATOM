@@ -58,6 +58,11 @@ lists adoption (`19`) and the order its work runs in.
 points of ATOM's DeepSeek-V4.1-Flash AgentX submission on MI355X and grades them as
 M3-Agentic does (D95.2).
 
+**Revised 2026-11-24 by the owner's
+[ruling on #3423](https://github.com/jgong5/ATOM/issues/3423#issuecomment-7121059292):**
+*Stage DSv41-DPEP* moves from mi355-gpu-40 to the pit2 MI355X pool, at a frozen commit of
+its own taken after [#3936](https://github.com/jgong5/ATOM/pull/3936) lands (D95.2).
+
 **Scope.** How the work is organised, allocated and gated; what happens first; and what
 each stage must produce. It is **detailed through M2**. Work after v1 is listed, not
 planned — see *After v1*. Phase 0b's answers can still reshape Waves 4–6, and the plan
@@ -206,8 +211,9 @@ stage is named for the model; it is not the retired milestone M3 of D95.
 ## D95.2. The DSv41-DPEP stage: DeepSeek-V4.1-Flash's DP points on MI355X
 
 Owner ruling of 2026-11-14 on [#3423](https://github.com/jgong5/ATOM/issues/3423), for the
-stage and its design ([#3424](https://github.com/jgong5/ATOM/issues/3424)). The stage is
-named for the model and the parallelism of its arms.
+stage and its design ([#3424](https://github.com/jgong5/ATOM/issues/3424)), and of
+[2026-11-24](https://github.com/jgong5/ATOM/issues/3423#issuecomment-7121059292) for its
+platform and tree. The stage is named for the model and the parallelism of its arms.
 
 - **Target.** Compass reproduces the DP points of ATOM's DeepSeek-V4.1-Flash AgentX
   submission to InferenceX on MI355X, entry `dsv41flash-fp4-mi355x-atom-agentic-dspark`
@@ -217,14 +223,21 @@ named for the model and the parallelism of its arms.
   with expert parallelism) at 128 and 256. #3423 holds their arguments and InferenceX's
   values; this document does not copy them. The entry's nine plain-TP points stay with
   [#3126](https://github.com/jgong5/ATOM/issues/3126).
-- **The real curve is this branch's ATOM**, as D95.1 rules for M3-Agentic. Its ATOM
-  base is ROCm/ATOM `e893780f4`, 120 commits behind the submission's `e5b74bc86`. Every
-  DP change the submission names is in the base; later ones change a DP point
-  (ROCm/ATOM#2456, ROCm/ATOM#2727, ROCm/ATOM#3106, ROCm/ATOM#3098 and
-  ROCm/ATOM#2912), so each registration states the gap
-  [#3425](https://github.com/jgong5/ATOM/issues/3425) measures.
-- **Platform and freeze as D95.1's:** gpu-40 on nightly 20261026, and the commit #3266
-  freezes, or this stage's first registration if it comes first.
+- **The real curve is this branch's ATOM**, as D95.1 rules for M3-Agentic, at the
+  stage's frozen commit. Its ATOM base is ROCm/ATOM `b7b5ec3f2`, which
+  [#3936](https://github.com/jgong5/ATOM/pull/3936) merges: it holds the submission's
+  `e5b74bc86` and 96 upstream commits after it, so the tree runs ahead of the submission,
+  not behind it. Each registration states that gap and where the real curve sits against
+  InferenceX's, as [#3425](https://github.com/jgong5/ATOM/issues/3425) measures it on
+  this platform.
+- **Platform and freeze.** The pit2 MI355X pool, GPUs leased through the team pool, on
+  `rocm/atom-dev:nightly_202611151511` (ROCm 7.2.4, aiter `95d211284`), the image the
+  frozen commit's gate uses, not InferenceX's nightly 20261110. The frozen commit is a
+  `feature/atomcompass_new` commit at or after #3936's merge, which the stage's first
+  registration names; calibration and every graded run use it. A point's records and
+  graded rounds run on one node, and each registration names the node, its cards and the
+  image digest. Nothing the stage took on gpu-40 is reused: records, readings, laws and
+  stores are taken again.
 - **What Compass adds for it:** a V4.1 engine's DP routing and prefill scheduling checked
   against a real record (`15` D90.1), MoE over TP and over EP2 keyed apart (`15` D92.1)
   and DSpark5 under DP attention (`14` D87.2). The client, the overlap criterion and the
@@ -877,13 +890,12 @@ coordination on gpu-40 and the work outside the stage that it waits on.
 
 Tracked on [#3423](https://github.com/jgong5/ATOM/issues/3423) and ruled there on 2026-11-14
 (D95.2). Every issue carries `scale: agentic` and `M3`; #3423 holds the stage's
-coordination on gpu-40, which it shares with M3-Agentic, and the work outside the stage
-that it waits on.
+coordination on the pit2 MI355X pool and the work outside the stage that it waits on.
 
 | ID | Task | Module | Effort | Depends on |
 |---|---|---|---|---|
 | **DPEP.1** | The design text ([#3424](https://github.com/jgong5/ATOM/issues/3424)) | design | 120–200 design text | — |
-| **DPEP.2** | DeepSeek-V4.1-Flash served on gpu-40 at DTP2 and DEP2 with the submission's arguments ([#3425](https://github.com/jgong5/ATOM/issues/3425)) | none, results on the issue | 0 | GPU queue |
+| **DPEP.2** | DeepSeek-V4.1-Flash served on MI355X at DTP2 and DEP2 with the submission's arguments ([#3425](https://github.com/jgong5/ATOM/issues/3425)) | none, results on the issue | 0 | GPU queue |
 | **DPEP.3** | `compass run --check` lacking only the stage's own records ([#3426](https://github.com/jgong5/ATOM/issues/3426)) | none, results on the issue | 0 | — |
 | **DPEP.4** | The submission's session header, and each request's rank compared real against simulated (`15` D90.1; [#3427](https://github.com/jgong5/ATOM/issues/3427)) | `scripts/compass/` | 20–60 | DPEP.1 |
 | **DPEP.5** | A simulated V4.1 DP run's prefill scheduling against a real record (`15` D90.1; [#3428](https://github.com/jgong5/ATOM/issues/3428)) | `runner/` | 50–150 | DPEP.1 |
