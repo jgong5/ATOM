@@ -330,7 +330,9 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     admit = law["host"].get("admit", ADMISSION_IN_E)
     columns = law["host"].get("columns") or {}
     launch = launch_features.stated(
-        law["host"].get("key"), law["host"].get(launch_features.LONG_TOKENS)
+        law["host"].get("key"),
+        law["host"].get(launch_features.LONG_TOKENS),
+        law["host"].get(launch_features.SMALL_TOKENS),
     )
     defer = not any("t_read_ns" in s for s in steps)
     rec = HostDeviceRecurrence(

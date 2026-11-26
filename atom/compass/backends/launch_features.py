@@ -201,14 +201,20 @@ def architecture(config) -> str | None:
 
 
 def stated(
-    key: dict | None, long_tokens: int | None = None
+    key: dict | None, long_tokens: int | None = None, small_tokens: int | None = None
 ) -> tuple[LaunchFeatures, dict | None]:
     """The provider and graph sets the host key `key` states, if any; with
     `long_tokens`, a host entry's `LONG_TOKENS`, the provider with the
-    `LONG_CONTEXT` feature at that bound (`LongContext`)."""
+    `LONG_CONTEXT` feature at that bound (`LongContext`), and with
+    `small_tokens`, a host entry's `SMALL_TOKENS`, with the `SMALL_CHUNK`
+    feature at that bound (`SmallChunk`)."""
     graphs = ((key or {}).get("engine") or {}).get(GRAPHS)
     base = provider(graphs and graphs["architecture"])
-    return (LongContext(base, long_tokens) if long_tokens else base), graphs
+    if long_tokens:
+        base = LongContext(base, long_tokens)
+    if small_tokens:
+        base = SmallChunk(base, small_tokens)
+    return base, graphs
 
 
 #: The variable that, set to a token count, has a host fit price a forward whose
@@ -276,6 +282,78 @@ class LongContext(LaunchFeatures):
         return {
             **self.base.predict(view, graphs),
             LONG_CONTEXT: long_context(view, self.tokens),
+        }
+
+
+#: The variable that, set to a token count, has a host fit price a forward
+#: whose prefill rows compute fewer new tokens than that with the `SMALL_CHUNK`
+#: feature (`SmallChunk`), a launch column its laws may adopt; unset or ``0``,
+#: no feature is added, and a fit is as before.
+SMALL_ENV = "COMPASS_FIT_HOST_SMALL_CHUNK"
+#: The feature: 1 on a forward holding prefill rows whose new tokens sum to
+#: less than the bound, else 0.
+SMALL_CHUNK = "small_chunk"
+#: A host entry's bound for `SMALL_CHUNK`, in tokens, which a run's provider
+#: then predicts it at (`stated`).
+SMALL_TOKENS = "small_chunk_tokens"
+
+
+def small_tokens_fit() -> int | None:
+    """`SMALL_ENV`'s bound, None unset or ``0``; anything not a whole number of
+    tokens is refused."""
+    value = os.environ.get(SMALL_ENV) or "0"
+    if not value.isdigit():
+        raise ValueError(f"{SMALL_ENV}={value!r} is not a whole number of tokens")
+    return int(value) or None
+
+
+def small_chunk(view, tokens: int) -> float:
+    """`SMALL_CHUNK` of a step of the `BatchView` `view` at the bound `tokens`:
+    a decode step, holding no prefill row, takes 0."""
+    new = sum(r.query_tokens for r in view.prefill)
+    return float(0 < new < tokens)
+
+
+def small_samples(samples: list, tokens: int) -> list:
+    """`samples` (`step_labels.Sample`), each one's recorded launch features
+    with its `SMALL_CHUNK` at the bound `tokens`, as `SmallChunk` predicts
+    it."""
+    return [
+        dataclasses.replace(
+            s, launch={**s.launch, SMALL_CHUNK: small_chunk(s.view, tokens)}
+        )
+        for s in samples
+    ]
+
+
+class SmallChunk(LaunchFeatures):
+    """A provider, `base`, with one more feature, `SMALL_CHUNK` at `tokens`,
+    read off a step's view alone: a record states none, so a fit adds it to
+    each sample's recorded features (`fit.host`) and a run predicts it. On
+    #752's Kimi-K3.1 (TP8 DCP8) a prefill's host launch, less its wait on the
+    forward before it (`step_labels.WAIT_ENV`), takes 177-180 ms on the
+    calibration record's prefills of fewer than 2048 new tokens and 170 ms on
+    those of 2048-8192, which a law linear in tokens prices at 170 ms both,
+    5.5% and 3.7% short in-sample; the c=1 and c=8 targets' TTFT p50 sits on
+    two such chunks a request."""
+
+    def __init__(self, base: LaunchFeatures, tokens: int) -> None:
+        self.base, self.tokens = base, int(tokens)
+        self.features = (*base.features, SMALL_CHUNK)
+
+    def install(self, runner) -> None:
+        self.base.install(runner)
+
+    def recorded(self, runner) -> dict:
+        return self.base.recorded(runner)
+
+    def observe(self, runner) -> dict[str, float]:
+        return self.base.observe(runner)
+
+    def predict(self, view, graphs: dict) -> dict[str, float]:
+        return {
+            **self.base.predict(view, graphs),
+            SMALL_CHUNK: small_chunk(view, self.tokens),
         }
 
 

@@ -140,6 +140,9 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
     if long := launch_features.long_tokens_fit():
         # `launch_features.LONG_ENV`: each sample's `LONG_CONTEXT`, as a run predicts it.
         samples = launch_features.long_samples(samples, long)
+    if small := launch_features.small_tokens_fit():
+        # `launch_features.SMALL_ENV`: each sample's `SMALL_CHUNK`, as a run predicts it.
+        samples = launch_features.small_samples(samples, small)
     waits = None
     if launch_wait_on():
         # `step_labels.WAIT_ENV`: launch labels less their wait on earlier work.

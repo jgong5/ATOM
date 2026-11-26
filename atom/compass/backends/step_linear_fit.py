@@ -1087,7 +1087,11 @@ def fit_host(samples) -> tuple[dict, dict]:
             "host laws are fitted under one"
         )
     long = launch_features.long_tokens_fit()
-    launch, graphs = launch_features.stated(json.loads(keys[0]), long)
+    small = launch_features.small_tokens_fit()
+    launch, graphs = launch_features.stated(json.loads(keys[0]), long, small)
+    if small:
+        # `launch_features.SMALL_ENV`: a record states no `SMALL_CHUNK`.
+        samples = launch_features.small_samples(samples, small)
     if long:
         # `launch_features.LONG_ENV`: a record states no `LONG_CONTEXT`.
         samples = launch_features.long_samples(samples, long)
@@ -1108,6 +1112,8 @@ def fit_host(samples) -> tuple[dict, dict]:
     host = {"key": json.loads(keys[0]), "laws": {}}
     if long:
         host[launch_features.LONG_TOKENS] = long
+    if small:
+        host[launch_features.SMALL_TOKENS] = small
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
     report["blocked"], report["unstamped"] = _blocked(samples)
     report["jit_steps"] = {}
