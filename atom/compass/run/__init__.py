@@ -433,6 +433,9 @@ DECODE_HOPS = "decode_hops"
 #: A hop's lookahead where the run file states none: not 0 s, which puts a
 #: serving run on deadlock recovery.
 HOP_FLOOR_S = 2.0**-14
+#: Fast mode's pads of the request's and the relay's paths through the router
+#: (`channels.prefill_decode_table`), run-file keys; absent, none.
+PAD_HTTP, PAD_RELAY = "pad_http_s", "pad_relay_s"
 #: Compass source the host-law key leaves out, by path under the package: all
 #: of it (None), or the top-level names (def, class or assigned) only a simulated
 #: run reaches, with the comments above each and the module docstring.
@@ -992,6 +995,8 @@ def _engines_table(run: dict):
             decode=run.get(INSTANCES["D"], 1),
             prefill_pp=pp,
             pp_links=links,
+            pad_http_s=run.get(PAD_HTTP, 0.0),
+            pad_relay_s=run.get(PAD_RELAY, 0.0),
         )
     return single_engine_table(
         **common,
@@ -3351,7 +3356,7 @@ def relay() -> tuple[float, float, float] | None:
         return None
     if (term := _host_term(RELAY_TERM)) is None:
         return None
-    return term["fixed_s"], term["per_byte_s"], hop(run, "router_s")
+    return term["fixed_s"], term["per_byte_s"], hop(run, "router_s") + run.get(PAD_RELAY, 0.0)
 
 
 def http_stream() -> float | None:

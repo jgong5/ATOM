@@ -403,6 +403,8 @@ def prefill_decode_table(
     decode: int = 1,
     prefill_pp: int = 1,
     pp_links=(),
+    pad_http_s: float = 0.0,
+    pad_relay_s: float = 0.0,
 ) -> ChannelTable:
     """`prefill` prefill and `decode` decode deployments behind the router,
     each with the channels of its data-parallel ranks: `dp` of them on each
@@ -435,6 +437,9 @@ def prefill_decode_table(
     output to its frontend, which takes `ipc_out_s` (`ipc_s` when None); a
     decode deployment's take `decode_ipc`, decode's ``(ipc_s, ipc_out_s)``,
     the prefill side's when None.
+
+    Fast mode pads the request's path by `pad_http_s` and the relay's by
+    `pad_relay_s` (a model change; 0, the default, is none).
     """
     out_s = ipc_s if ipc_out_s is None else ipc_out_s
     ipc = {"P": (ipc_s, out_s), "D": decode_ipc or (ipc_s, out_s)}
@@ -451,10 +456,15 @@ def prefill_decode_table(
         )
     ps = [f"P{k}" if prefill > 1 else "P" for k in range(prefill)]
     ds = [f"D{k}" if decode > 1 else "D" for k in range(decode)]
-    paths = [("traffic", f"frontend-{p}", "http", admission_s + router_s) for p in ps]
+    paths = [
+        ("traffic", f"frontend-{p}", "http", admission_s + router_s + pad_http_s)
+        for p in ps
+    ]
     paths += [(f"frontend-{d}", "traffic", "stream", stream_s + router_s) for d in ds]
     paths += [
-        (f"frontend-{p}", f"frontend-{d}", "relay", router_s) for p in ps for d in ds
+        (f"frontend-{p}", f"frontend-{d}", "relay", router_s + pad_relay_s)
+        for p in ps
+        for d in ds
     ]
     # Each deployment's engine LPs and their channels to its frontend.
     engines, rows = {}, []

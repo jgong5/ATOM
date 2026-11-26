@@ -301,6 +301,11 @@ def prefill_decode(args, prefill_args, decode_args, kv_link, decode_env=None) ->
     if hosts := run.entries(out, "host"):
         arch = run._machine(out).value("device.arch")
         out[run.DECODE_HOPS] = _hops(hosts, decode_args, arch, decode_env)
+    for key, env in ((run.PAD_HTTP, "COMPASS_FAST_PAD_HTTP_S"), (run.PAD_RELAY, "COMPASS_FAST_PAD_RELAY_S")):
+        if pad := float(os.environ.get(env) or 0.0):
+            if pad < 0:
+                raise ValueError(f"{env} is {pad}: a pad is no shorter than none")
+            out[key] = pad
     return out | {
         "router_s": _hops(hosts, prefill_args, arch).get("router_s") if hosts else None,
         "kv_link": kv_link,
