@@ -104,8 +104,10 @@ def test_a_network_file_states_the_serve_fields(tmp_path):
     layer = network(_written(tmp_path, _document(**extra)))
     assert layer.values["interconnect.inter_node.serve_device_wait"] == 0.7
     with pytest.raises(Exception, match="serve_device_wait"):
-        bad = {**extra, "interconnect.inter_node.serve_device_wait": 1.5}
+        bad = {**extra, "interconnect.inter_node.serve_device_wait": -0.5}
         network(_written(tmp_path, _document(**bad)))
+    with pytest.raises(ValueError, match="share of the device's backlog|fraction"):
+        ServeModel(4, 1.0, 0.0, 0.0, 0.0, 0.0, 1.5)
 
 
 # -- the device queue and a stage's writes -----------------------------------

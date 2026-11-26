@@ -265,6 +265,8 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
     _shared = False
     _nics: ClassVar[dict] = {}
     _extra: ClassVar[dict] = {}
+    _serve = None  # no stage serves its own writes
+    _jobs: ClassVar[tuple] = ()
 
     def __init__(self, config) -> None:
         import zmq

@@ -201,7 +201,8 @@ FIELDS = (
             "stagger_s",
         )
     ),
-    Field("interconnect.inter_node.serve_device_wait", Kind.DERATE, required=False),
+    # A share in (0, 1] of a device backlog, not a peak's derate.
+    Field("interconnect.inter_node.serve_device_wait", Kind.QUANTITY, required=False),
     # The device-to-host copy an lmcache server's stores and loads ride, as a
     # copy reaches it (not a peak); a run with an lmcache server requires it.
     Field(
