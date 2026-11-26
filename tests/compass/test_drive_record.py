@@ -213,6 +213,8 @@ def planted_gpu(tmp_path, monkeypatch):
     monkeypatch.setattr(serve, "SERVER", (sys.executable, str(tmp_path / "server.py")))
     bindir = tmp_path / "bin"
     bindir.mkdir()
+    # The planted rocm-smi's GPUs, whatever ROCm mask the session runs under.
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
     (bindir / "listing").write_text(FREE)
     (bindir / "cards.json").write_text(json.dumps({"card7": CARD}))
     (bindir / "showhw").write_text(SHOWHW)
