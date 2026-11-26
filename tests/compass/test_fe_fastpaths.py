@@ -6,9 +6,10 @@ A Starlette streaming response behind a ``BaseHTTPMiddleware``, which hands
 each body message on through an anyio memory object stream, is served by
 uvicorn's H11 protocol to several connections at once on one loop, over
 transports that log what is written to them. The app logs each event as it
-yields it into the same log, so a fast path that added or dropped an await
-reorders the log, and one that framed a chunk otherwise changes its bytes. One
-connection is lost part way through its stream.
+yields it into the same log, and the callbacks the loop runs are counted: a
+fast path that added or dropped an await reorders the log or changes the
+count, and one that framed a chunk otherwise changes its bytes. One connection
+is lost part way through its stream.
 """
 
 import asyncio
@@ -120,9 +121,10 @@ def _app(log: list) -> Starlette:
     )
 
 
-def _served(loop) -> list:
-    """`CONNS` streams served on `loop`: the log of every write and event."""
-    log = []
+def _served(loop) -> tuple[list, int]:
+    """`CONNS` streams served on `loop`: the log of every write and event,
+    and how many callbacks the loop ran, task steps included."""
+    log, ran = [], 0
     config = uvicorn.Config(_app(log), lifespan="off", log_level="warning")
     state = ServerState()
     for conn in range(CONNS):
@@ -132,23 +134,35 @@ def _served(loop) -> list:
             lose = lambda p=protocol: loop.call_soon(p.connection_lost, None)
         protocol.connection_made(_Wire(conn, log, lose))
         protocol.data_received(b"GET /events/%d HTTP/1.1\r\nHost: t\r\n\r\n" % conn)
-    loop.run_until_complete(asyncio.wait(list(state.tasks)))
-    return log
+    run_handle = asyncio.Handle._run
+
+    def counted_run(handle):
+        nonlocal ran
+        ran += 1
+        run_handle(handle)
+
+    asyncio.Handle._run = counted_run
+    try:
+        loop.run_until_complete(asyncio.wait(list(state.tasks)))
+    finally:
+        asyncio.Handle._run = run_handle
+    return log, ran
 
 
-def _own_code_served(calls) -> list:
+def _own_code_served(calls) -> tuple[list, int]:
     loop = asyncio.new_event_loop()
-    log = _served(loop)
+    served = _served(loop)
     loop.close()
     assert calls["chunks"] > 0 and calls["receivers"] > 0
     calls.update(chunks=0, receivers=0)
-    return log
+    return served
 
 
 def test_the_fast_paths_write_the_same_bytes_after_the_same_awaits(own_code):
     """Installed, the fast paths serve the streams with the writes and events
-    of the libraries' own code, in the same order; no streamed chunk reaches
-    uvicorn's own send, and anyio's own receive builds no receiver."""
+    of the libraries' own code, in the same order and in as many loop
+    callbacks; no streamed chunk reaches uvicorn's own send, and anyio's own
+    receive builds no receiver."""
     own = _own_code_served(own_code)
     fe_fastpaths.install()
     loop = asyncio.new_event_loop()
