@@ -181,6 +181,13 @@ output prefill's fits the draft law's prefill vector in place of its draft
 label, which, all after `forward_done_event`, fits the `propose` vector, and
 sets the draft law's `output_prefill_kv`. The target's vectors fit the device
 label less the draft-KV label.
+Under `SHORT_PROPOSE_ENV` set to a token count, at `data_parallel_size` 1
+without a serial drafter, an output prefill of fewer prefill tokens fits the
+draft law's `short_propose` vector, with that count as its `below`, in place of
+`propose`, which the rest fit (`_pass_samples`): a drafter whose propose pass
+runs over the chunk's tokens (Qwen3.8-Flash-Next's MTP: 3.8 ms p50 under 2,048
+tokens, 20.4 ms at 16k) otherwise fits one constant near the long passes' and
+drops the short ones as outliers. Either side without samples fits as unset.
 On an MTP record both prefill vectors, the target's and the draft's, add
 `seqs` and `out` (`StepLinearLaw`).
 Records whose decodes time an EAGLE3 drafter's passes (`passes_s`) fit the
@@ -479,6 +486,10 @@ PEER_TOKENS_ENV = "COMPASS_FIT_PEER_TOKENS"
 #: The draft law's decode rungs that add `peer_tokens` above `dp` 1: ``1`` for
 #: every rung, else the rungs, comma separated.
 DRAFT_PEER_TOKENS_ENV = "COMPASS_FIT_DRAFT_PEER_TOKENS"
+#: The prefill token count under which an output prefill's propose pass fits
+#: the draft law's `short_propose` vector (`_pass_samples`): a positive integer,
+#: unset or ``0`` off, any other value refused.
+SHORT_PROPOSE_ENV = "COMPASS_FIT_SHORT_PROPOSE_BELOW"
 #: The share of the routed experts past which a rung's median step's
 #: `moe_experts` count is saturated: past it the column barely moves with the
 #: group's tokens.
@@ -719,8 +730,9 @@ def env_options(environ=None) -> dict:
     with `MOE_MIN_SPREAD_ENV`'s share), `GRAPH_TOKENS_ENV` and
     `GRAPH_QUERY_CACHED_ENV` at ``1``, the
     `MOE_SELECT_ENV` rule, `MOE_BOTH_ENV` and `ROWMOD_VIF_ENV` at ``1``, the
-    `MOE_FOLDS_ENV` cells, and the `PEER_TOKENS_ENV` and
-    `DRAFT_PEER_TOKENS_ENV` rungs; none set, none.
+    `MOE_FOLDS_ENV` cells, the `PEER_TOKENS_ENV` and
+    `DRAFT_PEER_TOKENS_ENV` rungs, and the `SHORT_PROPOSE_ENV` token count;
+    none set, none.
     A switch set to anything but ``0`` or ``1`` is refused (`_switch`)."""
     env = os.environ if environ is None else environ
     out = {}
@@ -780,6 +792,10 @@ def env_options(environ=None) -> dict:
         out["draft_peer_tokens"] = (
             "all" if peers == "1" else tuple(int(r) for r in peers.split(","))
         )
+    if (below := env.get(SHORT_PROPOSE_ENV)) not in (None, "", "0"):
+        if not below.isdigit():
+            raise ValueError(f"{SHORT_PROPOSE_ENV}={below} is not a token count")
+        out["short_propose_below"] = int(below)
     return out
 
 
@@ -2924,6 +2940,14 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     gated = bool((options or {}).get("rowmod_vif"))
     moe_folds = (options or {}).get("moe_folds") or MOE_FOLDS[0]
     peers = (options or {}).get("draft_peer_tokens" if draft else "peer_tokens")
+    below = None if draft else (options or {}).get("short_propose_below")
+    proposes = any(s.propose_s is not None or s.passes_s for s in samples)
+    if below and proposes and (dp > 1 or any(s.passes_s for s in samples)):
+        raise ValueError(
+            f"{SHORT_PROPOSE_ENV} splits an output prefill's propose pass at "
+            "data_parallel_size 1 without a serial drafter; these records run "
+            + (f"{dp} ranks" if dp > 1 else "a serial drafter")
+        )
     if peers and dp == 1:
         raise ValueError(
             "peer_tokens counts a data-parallel group's peers' tokens, and these "
@@ -3165,11 +3189,13 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         law["draft"]["forward"] = _forward(serial)
         law["draft"]["propose"] = _propose(_rest(serial))
     elif drafts:
-        for name, mine in _pass_samples(samples).items():
+        for name, mine in _pass_samples(samples, below).items():
             width = dp if name in GROUPED else 1
             vector = mine and _propose(mine, PASSES[name], width, samples)
             if vector:
                 law["draft"][name] = vector
+                if name == "short_propose":
+                    vector["below"] = below
             elif mine:
                 why = "no step every rank of which ran it or a dummy forward"
                 law["draft"]["unfitted"][name] = why
@@ -3245,17 +3271,23 @@ def _draft_kv(s) -> float:
 
 
 #: The draft law's vectors on `PROPOSE`, each with the label it is fitted on.
-PASSES = {"propose": "propose_s", "draft_kv": "draft_kv_s"}
+PASSES = {
+    "propose": "propose_s",
+    "short_propose": "propose_s",
+    "draft_kv": "draft_kv_s",
+}
 #: Those of `PASSES` whose pass waits on the rank's data-parallel peers, fitted
 #: over the group's steps (`_pass_steps`); the others on each rank's own label.
 GROUPED = ("propose",)
 
 
-def _pass_samples(samples) -> dict:
+def _pass_samples(samples, below: int | None = None) -> dict:
     """The samples each of `PASSES` is fitted on: under `propose` those with a
     propose label, an output prefill's being its whole draft label, all after
-    `forward_done_event`; under `draft_kv` the decodes with a draft-KV label."""
-    return {
+    `forward_done_event`; under `draft_kv` the decodes with a draft-KV label.
+    With `below` (`SHORT_PROPOSE_ENV`), and samples on both sides of it, those
+    of `propose` with fewer prefill tokens are `short_propose`'s instead."""
+    passes = {
         "propose": [
             s if s.draft_kv_s is None else dataclasses.replace(s, propose_s=s.draft_s)
             for s in samples
@@ -3265,6 +3297,14 @@ def _pass_samples(samples) -> dict:
             s for s in samples if s.draft_kv_s is not None and not s.view.prefill
         ],
     }
+    if below:
+        short = [s for s in passes["propose"] if sum_tokens(s.view.prefill) < below]
+        if short and len(short) < len(passes["propose"]):
+            passes["short_propose"] = short
+            passes["propose"] = [
+                s for s in passes["propose"] if sum_tokens(s.view.prefill) >= below
+            ]
+    return passes
 
 
 def _pass_steps(samples, label: str, dp: int, every) -> tuple[list, int]:
