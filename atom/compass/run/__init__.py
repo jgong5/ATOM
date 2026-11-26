@@ -373,6 +373,11 @@ PREFILL_PP = "prefill_pipeline_parallel_size"
 #: `deploy.sh run` sets from PREFILL_KV_EXTRA): `prefill_decode_table`'s
 #: `chunked`.
 KV_CHUNKED = "kv_chunked"
+#: The run-file key that each stage of a pipelined prefill serves its own KV
+#: writes (opt-in, `kv_serves`: the KV link states a stage's serving,
+#: `kv.transfer.ServeModel`; `deploy.sh run` sets it from the network file):
+#: `prefill_decode_table`'s `serve`.
+KV_SERVE = "kv_serve"
 #: The kv_transfer_config key a deployment names its index among them by.
 INSTANCE_KEY = "compass_instance"
 #: The run-file key of each side's worker order in the router, a per-run outcome.
@@ -1007,6 +1012,7 @@ def _engines_table(run: dict):
             prefill_pp=pp,
             pp_links=links,
             chunked=run.get(KV_CHUNKED, False),
+            serve=run.get(KV_SERVE, False),
         )
     return single_engine_table(
         **common,
@@ -1041,6 +1047,24 @@ def _machine(run: dict):
     from atom.compass.spec import MachineSpec
 
     return MachineSpec.from_mapping(run["machine"])
+
+
+def kv_serves(run: dict) -> bool:
+    """Whether a prefill-decode run's KV link states a stage's serving
+    (`kv.transfer.ServeModel`), which `KV_SERVE` then turns on; refused on a
+    prefill side of one stage, whose head serves every layer's writes."""
+    from atom.compass.kv.transfer import Scope, ServeModel
+
+    if "router_s" not in run or "kv_link" not in run:
+        return False
+    if ServeModel.from_spec(_machine(run), Scope(run["kv_link"])) is None:
+        return False
+    if _pp(run, "P") < 2:
+        raise ValueError(
+            "the KV link states a stage's serving and the prefill side runs one "
+            "stage: a stage's serving prices a pipelined prefill's writes"
+        )
+    return True
 
 
 def _members(table, dp: int | tuple[int, int]) -> dict | None:
@@ -1184,6 +1208,8 @@ def _planned_transfer() -> tuple:
     Refused unless every deployment plans one block, one slot and one row,
     each summed over its stages, and every prefill deployment splits them
     alike: both ends of a write price it, each from its own copy."""
+    import dataclasses
+
     from atom.compass.kv import Scope, TransferModel
 
     run = spec()
@@ -1242,7 +1268,7 @@ def _planned_transfer() -> tuple:
                 )
     machine, scope = _machine(run), Scope(run["kv_link"])
     stages = planned[prefill[0]]
-    return tuple(
+    models = tuple(
         TransferModel.from_spec(
             machine,
             round(s["block_bytes"] * landing),
@@ -1252,6 +1278,22 @@ def _planned_transfer() -> tuple:
             s["slot_after_blocks"],
         )
         for _, s in sorted(stages.items())
+    )
+    if (models[0].serve is not None) != bool(run.get(KV_SERVE, False)):
+        raise ValueError(
+            f"the KV link {'states' if models[0].serve else 'states no'} stage "
+            f"serving and the run file's {KV_SERVE} is "
+            f"{run.get(KV_SERVE, False)!r}: deploy.sh sets one from the other"
+        )
+    if models[0].serve is None:
+        return models
+    # A stage writes one write a decode rank (Mooncake's TP landing): the first
+    # decode deployment's TP.
+    decode = [u for u in planned if u not in prefill]
+    writes = planned[decode[0]][0]["tp"] if decode else 1
+    return tuple(
+        dataclasses.replace(m, serve=dataclasses.replace(m.serve, writes=writes))
+        for m in models
     )
 
 
@@ -2099,10 +2141,15 @@ def engine(config):
     if side is not None:
         _bind_transfer(config, run)
     if side == "D" or (
-        side == "P" and (_pd_kv(config) or {}).get("enable_chunked_transfer")
+        side == "P"
+        and (
+            (_pd_kv(config) or {}).get("enable_chunked_transfer")
+            or run.get(KV_SERVE, False)
+        )
     ):
         # Decode posts its write requests at a forward's device end; a chunked
-        # producer publishes its prompts' blocks at each forward's.
+        # producer publishes its prompts' blocks at each forward's, and a stage
+        # that serves its writes (`KV_SERVE`) queues each forward on its device.
         _watch_forwards()
     if "lmcache" in run:
         from atom.compass.kv.lmcache_mp import substitute

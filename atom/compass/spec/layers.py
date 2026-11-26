@@ -94,6 +94,13 @@ NETWORK = (
     "interconnect.inter_node.link_setup_s",
     "interconnect.inter_node.nic_bandwidth_bytes_per_s",
     "interconnect.inter_node.derate",
+    "interconnect.inter_node.serve_chunk_bytes",
+    "interconnect.inter_node.serve_call_bandwidth_bytes_per_s",
+    "interconnect.inter_node.serve_call_s",
+    "interconnect.inter_node.serve_gather_s",
+    "interconnect.inter_node.serve_gather_one_s",
+    "interconnect.inter_node.serve_stagger_s",
+    "interconnect.inter_node.serve_device_wait",
 )
 
 

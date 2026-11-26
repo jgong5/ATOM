@@ -404,6 +404,7 @@ def prefill_decode_table(
     prefill_pp: int = 1,
     pp_links=(),
     chunked: bool = False,
+    serve: bool = False,
 ) -> ChannelTable:
     """`prefill` prefill and `decode` decode deployments behind the router,
     each with the channels of its data-parallel ranks: `dp` of them on each
@@ -441,6 +442,13 @@ def prefill_decode_table(
     write request's lookahead), from each stage of a pipelined prefill. One
     deployment of a side, with no router LP.
 
+    With `serve` (opt-in: the KV link states a stage's serving,
+    `kv.transfer.ServeModel`), each stage of a pipelined prefill serves its
+    own layers' writes, as Mooncake's stage workers do: decode posts its write
+    request to every stage, on a ``kv_write_req`` channel each, and each stage
+    tells decode its writes are done on ``kv_write_done``, as under `chunked`.
+    Not beside `chunked`.
+
     A prefill deployment's ZMQ messages each take `ipc_s`, but an engine's
     output to its frontend, which takes `ipc_out_s` (`ipc_s` when None); a
     decode deployment's take `decode_ipc`, decode's ``(ipc_s, ipc_out_s)``,
@@ -464,6 +472,11 @@ def prefill_decode_table(
             "a chunked transfer is simulated for one prefill and one decode "
             "deployment behind a router that is no LP; the router LP's concurrent "
             "sends are not modeled"
+        )
+    if serve and chunked:
+        raise ValueError(
+            "a stage's serving prices a write request taken after the prefill; "
+            "a chunked transfer's reads run beside it"
         )
     ps = [f"P{k}" if prefill > 1 else "P" for k in range(prefill)]
     ds = [f"D{k}" if decode > 1 else "D" for k in range(decode)]
@@ -521,13 +534,14 @@ def prefill_decode_table(
         + [
             (
                 f"engine-{d}",
-                engines[p][0],
+                stage,
                 "kv_write_req" + pair,
                 kv_write_req_s,
                 "inline",
             )
             for d in ds
             for p in ps
+            for stage in (engines[p] if serve else engines[p][:1])
             for pair in pairs
         ]
         + [
@@ -535,7 +549,7 @@ def prefill_decode_table(
             for p in ps
             for stage in engines[p]
             for d in ds
-            for pair in (done if chunked else ())
+            for pair in (done if chunked or serve else ())
         ]
         + rows,
     )
