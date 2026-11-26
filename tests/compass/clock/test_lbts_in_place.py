@@ -10,10 +10,15 @@ What the groups below defend:
   LPs, LPs below ceilings, and a DP group whose members are granted ahead.
 * **A subclass that redefines `_row`** is bounded by its own row, not by the
   in-place sum.
+* **No term source `_row` reads is left out of `_lbts`**: every attribute the
+  row's code loads, its nested code's included, `_lbts` loads too. A source
+  added to the row alone fails here, naming `_lbts`, at no grant-scan cost.
 """
 
+import dis
 import math
 import random
+import types
 
 import pytest
 
@@ -99,3 +104,25 @@ def test_a_subclass_that_redefines_the_row_is_bounded_by_its_own_row():
     assert ClockAuthority(table)._lbts(LpId("a")) == INF
     assert _Constant(table)._lbts(LpId("b")) == 42.0
     assert _Constant(table)._lbts(LpId("a")) == 42.0
+
+
+def _attributes(function):
+    """Every attribute `function`'s code loads, its nested code's included."""
+    names, codes = set(), [function.__code__]
+    while codes:
+        code = codes.pop()
+        names |= {
+            ins.argval
+            for ins in dis.get_instructions(code)
+            if ins.opname in ("LOAD_ATTR", "LOAD_METHOD")
+        }
+        codes += [c for c in code.co_consts if isinstance(c, types.CodeType)]
+    return names
+
+
+def test_lbts_loads_every_attribute_the_row_loads():
+    missing = _attributes(ClockAuthority._row) - _attributes(ClockAuthority._lbts)
+    assert not missing, (
+        f"ClockAuthority._lbts loads none of {sorted(missing)}, which _row loads "
+        "for its terms: its in-place loop must take those terms too"
+    )
