@@ -249,7 +249,7 @@ def test_the_run_s_authority_makes_its_ids_directory_and_removes_it_after(
         seen.append(ended)
 
     monkeypatch.setattr(
-        compass_run, "serve", lambda a, e: seen.append(os.listdir(path))
+        compass_run, "serve", lambda a, e, select: seen.append(os.listdir(path))
     )
     monkeypatch.setattr(compass_run, "_until_end", lambda run, a: False)
     monkeypatch.setattr(compass_run, "_write_summary", summary)
