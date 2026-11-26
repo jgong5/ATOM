@@ -4,10 +4,9 @@ streams and uvicorn's h11 send, with less generic machinery per call.
 
 Starlette's ``BaseHTTPMiddleware`` hands each body message of a response on
 through an anyio memory object stream, and uvicorn's H11 protocol frames each
-one through h11's state machine. Late in the 8P16D C1228 full window these
-held 18.4% and 1.8% of a decode frontend's own work (jgong5/ATOM#4214). A
-simulated frontend does that work while its LP's clock stands still, so every
-other LP waits on its wall time.
+one through h11's state machine; jgong5/ATOM#4214 measures their share of a
+decode frontend's own work. A simulated frontend does that work while its
+LP's clock stands still, so every other LP waits on its wall time.
 
 `install` replaces, once a process:
 
