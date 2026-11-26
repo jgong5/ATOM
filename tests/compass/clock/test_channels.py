@@ -334,8 +334,8 @@ def _us_a_stream_lookup(others: int) -> float:
 
 
 def test_an_lps_lookup_costs_the_same_whatever_else_the_table_holds():
-    """A frontend looks its stream channel up for every event it streams
-    (`atom.compass.carriers.stamp_events`), so a lookup must not cost more as
+    """A frontend looks its stream channel up for every response it streams
+    (`atom.utils.compass_loop.HttpChannel`), so a lookup must not cost more as
     the run's table grows."""
     alone, among = _us_a_stream_lookup(0), _us_a_stream_lookup(2000)
     assert among < 5 * alone + 5, (

@@ -459,11 +459,13 @@ class LPRuntime:
         with self.lock:
             self._make_offers()
         self.calls += 1
-        cut = next((k for k, m in enumerate(self.ahead) if m[0] > G), len(self.ahead))
-        reached, self.ahead = self.ahead[:cut], self.ahead[cut:]
         walk = {}
-        for a, ch, seq in reached:
-            walk.setdefault(ch, []).append((seq, a))
+        ahead = self.ahead
+        if ahead and ahead[0][0] <= G:  # else the step reaches none of them
+            cut = next((k for k, m in enumerate(ahead) if m[0] > G), len(ahead))
+            for a, ch, seq in ahead[:cut]:
+                walk.setdefault(ch, []).append((seq, a))
+            del ahead[:cut]
         self._step_through(G, walk)
         with self.lock:
             sent = len(self.send_log)

@@ -14,8 +14,12 @@ on its wall time: the standard library's JSON and pydantic held 14.4% of the
 
 - A decode frontend's request body that msgspec decodes is that decoding,
   which for every body it decodes is ``json.loads``'s; ``json.loads`` reads or
-  refuses any other. A list of ids msgspec takes as non-negative ints is those
-  ints, as pydantic returns them; pydantic coerces or refuses any other.
+  refuses any other. A relayed body is decoded once: the decoding
+  `atom.utils.compass_loop.HttpChannel` made of it to read its stamp
+  (`atom.compass.carriers.decode_relayed`) comes in the request's scope, and
+  the first reading of the same bytes takes it. A list of ids msgspec takes as
+  non-negative ints is those ints, as pydantic returns them; pydantic coerces
+  or refuses any other.
 - That decoding holds a ``kv_transfer_params["prompt_token_ids"]`` list as a
   tuple of its items. Starlette keeps a request's decoding until its response
   ends, so an in-flight stream holds its prompt's ids all along, and every
@@ -37,6 +41,8 @@ from typing import Annotated
 
 import msgspec
 
+from atom.compass.carriers import JSON_DECODER, RELAYED_JSON
+
 #: The response key whose integers the prefill side writes with msgspec.
 KEY = "prompt_token_ids"
 #: Takes the integers' place while the original renders the rest.
@@ -44,7 +50,6 @@ _STAND_IN = "\0compass:prompt_token_ids\0"
 #: The attribute marking a function this module installed.
 _INSTALLED = "compass_handoff"
 _IDS = list[Annotated[int, msgspec.Meta(ge=0)]]
-_DECODE = msgspec.json.Decoder()
 _ENCODE = msgspec.json.Encoder()
 
 
@@ -79,15 +84,22 @@ def _once(owner, name: str, wrapper) -> None:
 
 def _reading(json_of):
     """`json_of`, Starlette's ``Request.json``, with a body msgspec decodes
-    taken as that decoding."""
+    taken as that decoding: for a relayed body, the one its scope hands on
+    under `RELAYED_JSON`, taken once and for the same bytes."""
 
     @functools.wraps(json_of)
     async def json(request):
         if not hasattr(request, "_json"):
             body = await request.body()
-            # A body msgspec refuses, json_of reads or refuses as it always has.
-            with contextlib.suppress(msgspec.DecodeError, ValueError, RecursionError):
-                request._json = _held(_DECODE.decode(body))
+            relayed = request.scope.pop(RELAYED_JSON, None)
+            if relayed is not None and relayed[0] == body:
+                request._json = _held(relayed[1])
+            else:
+                # A body msgspec refuses, json_of reads or refuses as it always has.
+                with contextlib.suppress(
+                    msgspec.DecodeError, ValueError, RecursionError
+                ):
+                    request._json = _held(JSON_DECODER.decode(body))
         return await json_of(request)
 
     return json
@@ -97,7 +109,8 @@ def _held(doc):
     """`doc` with the list its ``kv_transfer_params`` holds under `KEY`, where
     it holds one, as a tuple of the same items: a request holds its decoding
     while its response streams, and the collector walks a list on every full
-    collection but stops tracking a tuple of ints."""
+    collection but stops tracking a tuple of ints. In place, as `HttpChannel`
+    holds a relayed body's decoding while it serves the request."""
     params = doc.get("kv_transfer_params") if type(doc) is dict else None
     ids = params.get(KEY) if type(params) is dict else None
     if type(ids) is list:

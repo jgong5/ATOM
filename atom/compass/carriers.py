@@ -110,20 +110,15 @@ def tracestate_with(
     return ",".join([entry, *others][:_MAX_ENTRIES])
 
 
-def stamp_events(text: str, rt) -> str:
-    """`text` with a stamped comment line before each SSE event in it.
+def stamp_split_events(events: list[str], tail: str, rt, ch: str) -> str:
+    """The SSE events of a text its caller split on blank lines into
+    ``[*events, tail]``, each with a stamped comment line before it.
 
-    Each event is one send on the runtime's stream channel, to the traffic LP
-    or to the router LP in front of it.
-    A write must end its last frame in a blank line: text after it is refused,
+    Each event is one send on `ch`, the runtime's stream channel, to the
+    traffic LP or to the router LP in front of it.
+    A write must end its last frame in a blank line: a `tail` is refused,
     since the next write's comment would land inside that frame.
     """
-    # Here, not at the top: the harness reads EPOCH_NS while aiperf imports its
-    # phase runner, and `atom.utils` would load torch there.
-    from atom.utils.clock import channel_of
-
-    ch = channel_of(rt, "stream")
-    *events, tail = text.split("\n\n")
     if tail:
         raise ValueError(f"unterminated SSE frame {tail!r}: no blank line after it")
     out = []
@@ -156,6 +151,14 @@ class _Relayed(msgspec.Struct):
 _STAMP = msgspec.json.Decoder(_Relayed)
 _MEMBERS = msgspec.json.Decoder(dict[str, msgspec.Raw])
 _ENCODE = msgspec.json.Encoder()
+#: msgspec's decoder of JSON with no type: `decode_relayed` decodes a relayed
+#: body with it, and a simulated decode frontend's ``Request.json`` every body
+#: (`atom.compass.run.handoff`), so a decoding handed on is the app's own.
+JSON_DECODER = msgspec.json.Decoder()
+#: The ASGI scope key under which `atom.utils.compass_loop.HttpChannel` hands a
+#: relayed request's body and its `decode_relayed` decoding on to the app's
+#: ``Request.json``, as ``(body, decoding)``.
+RELAYED_JSON = "compass.relayed_json"
 
 
 def relay_carried(body: bytes) -> tuple[tuple[float, int] | None, float]:
@@ -167,11 +170,37 @@ def relay_carried(body: bytes) -> tuple[tuple[float, int] | None, float]:
         params = _STAMP.decode(body).kv_transfer_params
     except msgspec.DecodeError:
         return None, 0.0
-    entry = None if params is None else params.compass
+    if params is None:
+        return None, 0.0
+    return _relay_entry(params.compass, params.compass_relay_s)
+
+
+def decode_relayed(body: bytes) -> tuple[Any, tuple[float, int] | None, float]:
+    """`body` decoded once, as JSON with no type, and the stamp and relay
+    service `relay_carried` reads, read from that decoding; for a body msgspec
+    does not decode so, None and `relay_carried`'s reading of it.
+
+    A body naming a key twice is read as its decoding holds it, the last value
+    of each, where `relay_carried` reads no stamp from one whose earlier
+    ``kv_transfer_params`` is no object; a router's JSON object holds a key
+    once."""
+    try:
+        doc = JSON_DECODER.decode(body)
+    except (msgspec.DecodeError, ValueError, RecursionError):
+        return (None, *relay_carried(body))
+    params = doc.get("kv_transfer_params") if type(doc) is dict else None
+    if type(params) is not dict:
+        return doc, None, 0.0
+    return (doc, *_relay_entry(params.get("compass"), params.get(RELAY_SERVICE)))
+
+
+def _relay_entry(entry, value) -> tuple[tuple[float, int] | None, float]:
+    """The ``(arrival, seq)`` of `entry`, a ``kv_transfer_params`` object's
+    ``compass`` value, None for none, and the seconds of `value`, its
+    `RELAY_SERVICE` value, 0.0 for none or without a stamp."""
     if entry is None:
         return None, 0.0
     stamp = _parse(_ENTRY, entry, "kv_transfer_params entry")
-    value = params.compass_relay_s
     if value is None:
         return stamp, 0.0
     # A JSON number, not a bool or a string of one.

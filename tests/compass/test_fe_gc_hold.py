@@ -4,9 +4,11 @@ cyclic garbage collector does not walk them (`atom.compass.run.handoff`).
 
 ATOM's API server takes a relayed chat request on its own route, behind its
 own middleware: FastAPI reads the body through Starlette's ``Request.json``,
-and the request keeps that decoding until its response ends. Only the
-engine's setup and the stream's chunks are stood in for; the stream stays
-open while the test looks at what the request holds.
+and the request keeps that decoding until its response ends. The app decodes
+the body itself, or, behind frontend-D's `HttpChannel`, takes the decoding
+the channel made to read its stamp and holds while it serves the request.
+Only the engine's setup and the stream's chunks are stood in for; the stream
+stays open while the test looks at what the server holds.
 """
 
 import asyncio
@@ -17,9 +19,14 @@ from types import SimpleNamespace
 import pytest
 from starlette.requests import Request
 from test_handoff_codec import _client, _hand_off, pristine  # noqa: F401  fixture
+from test_stream_events import TABLE
 
+from atom.compass.clock import LpId
 from atom.compass.run import handoff
 from atom.entrypoints.openai import api_server, protocol
+from atom.utils import clock
+from atom.utils.clock import LPRuntime
+from atom.utils.compass_loop import HttpChannel
 
 IDS = list(range(70_000, 120_000))
 KV = {"do_remote_prefill": True, "remote_engine_id": "p0", "remote_block_ids": [4, 5]}
@@ -66,10 +73,11 @@ def server(monkeypatch):
     return seen
 
 
-def _stream_held(seen) -> tuple[list, dict]:
-    """Stream `BODY` through ATOM's app; return the response's messages, and
-    the ids the request's decoding holds once the response has started, with
-    whether the collector tracks them after a full collection then."""
+def _stream_held(seen, app) -> tuple[list, dict]:
+    """Stream `BODY` through `app`; return the response's messages, and, once
+    the response has started and a full collection has run, the type of the
+    ids the request's decoding holds, whether they are `IDS`, and how many
+    containers of the ids the server holds that the collector still tracks."""
     held = {}
 
     async def run():
@@ -93,7 +101,16 @@ def _stream_held(seen) -> tuple[list, dict]:
                     if isinstance(o, Request) and hasattr(o, "_json")
                 ]
                 ids = request._json["kv_transfer_params"]["prompt_token_ids"]
-                held.update(ids=ids, tracked=gc.is_tracked(ids))
+                # The test's own: `IDS`, and each prompt the engine was handed.
+                own = [IDS, *(prompt for prompt, _ in seen.engine)]
+                tracked = [
+                    o
+                    for o in gc.get_objects()
+                    if type(o) in (list, tuple)
+                    and len(o) == len(IDS)
+                    and not any(o is x for x in own)
+                ]
+                held.update(kind=type(ids), same=list(ids) == IDS, tracked=len(tracked))
                 seen.release.set()
 
         path = "/v1/chat/completions"
@@ -112,27 +129,49 @@ def _stream_held(seen) -> tuple[list, dict]:
             "server": ("127.0.0.1", 80),
             "state": {},
         }
-        await asyncio.wait_for(api_server.app(scope, receive, send), 30)
+        await asyncio.wait_for(app(scope, receive, send), 30)
         return sent
 
     sent = asyncio.run(run())
     return [(m["type"], m.get("status"), m.get("body")) for m in sent], held
 
 
+@pytest.mark.parametrize("relayed", [False, True], ids=["app", "relayed"])
 def test_a_streaming_hand_offs_held_ids_are_untracked_and_reach_the_engine_as_before(
-    pristine, server  # noqa: F811
+    pristine, server, monkeypatch, relayed  # noqa: F811
 ):
-    before, held_before = _stream_held(server)
+    app = api_server.app
+    if relayed:
+        # frontend-D, outside its run: the channel decodes the relayed body
+        # for its stamp and hands that decoding to the app in the scope.
+        monkeypatch.setattr(
+            clock, "_installed", LPRuntime(LpId("frontend-D"), TABLE, None)
+        )
+        app = HttpChannel(api_server.app, lambda scope: None)
+    before, held_before = _stream_held(server, app)
     handoff.install("D")
-    after, held_after = _stream_held(server)
+    decodes = []
+    decoder = handoff.JSON_DECODER
+    monkeypatch.setattr(
+        handoff,
+        "JSON_DECODER",
+        SimpleNamespace(
+            decode=lambda body: decodes.append(body) or decoder.decode(body)
+        ),
+    )
+    after, held_after = _stream_held(server, app)
 
     assert after == before
     assert before[0][:2] == ("http.response.start", 200)
-    # Starlette held the decoding's ids all along the stream: a list the
-    # collector walks on every full collection; now a tuple it stops tracking.
-    assert type(held_before["ids"]) is list and held_before["tracked"]
-    assert type(held_after["ids"]) is tuple and not held_after["tracked"]
-    assert list(held_after["ids"]) == held_before["ids"] == IDS
+    # The app decoded the body itself only where no channel handed it one.
+    assert decodes == ([] if relayed else [BODY])
+    # The request held the decoding's ids all along the stream: a list the
+    # collector walks on every full collection; now a tuple it stops
+    # tracking, and the server holds no other container of them.
+    # Before, a relayed body's two decodings each hold a list.
+    assert held_before["kind"] is list and held_before["same"]
+    assert held_before["tracked"] == (2 if relayed else 1)
+    assert held_after == {"kind": tuple, "same": True, "tracked": 0}
     # The engine is handed the same prompt, a list, and the same metadata.
     (prompt_before, kv_before), (prompt_after, kv_after) = server.engine
     assert type(prompt_after) is list and prompt_after == prompt_before == IDS
