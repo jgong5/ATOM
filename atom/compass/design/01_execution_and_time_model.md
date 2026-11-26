@@ -38,7 +38,10 @@ their own next grant, and send a TAR's messages below its ceiling ahead.
 
 **Revised 2026-11-25 by [#4135](https://github.com/jgong5/ATOM/issues/4135):** D3.6 lets an
 LP declare which outbound channels a message can provoke, so LBTS and the local-grant
-cycle follow the router's declared reactions; not built.
+cycle follow the router's declared reactions.
+
+**Revised 2026-11-26 by [#4144](https://github.com/jgong5/ATOM/issues/4144):** D3.6 is
+built, under D3's wide local grants.
 
 **Scope of this document.** The execution architecture: what a simulated run *is*,
 which processes exist, how virtual time advances, and what contract the rest of the
@@ -626,6 +629,8 @@ PDES term: Ayani's distance-between-objects LBTS (Fujimoto, ch. 3). Each part ma
   `LBTS(frontend-D) = min(9.0 + 0.6, inf, inf, inf) = 9.6`: correct.
 - **Strict.** A message not yet reported to the CA has arrival `>=` its sender's
   `now + L`, so a strict grant never reaches it.
+- **With wide local grants, `D` follows the declared channel reactions**, and an LP that
+  declares them has a term of its own (*Wide local grants*, below; D3.6).
 
 **Messages in transit are counted, not assumed away.** `min(now + L)` alone only
 guarantees that no *future* message is earlier. ATOM's sends are asynchronous (ZMQ PUSH,
@@ -730,7 +735,7 @@ aborts the run.
 
 **Wide local grants** (off by default, `compass run --wide-local-grants` turns them on,
 with local grants;
-[#3968](https://github.com/jgong5/ATOM/issues/3968)). Two changes raise a ceiling:
+[#3968](https://github.com/jgong5/ATOM/issues/3968)). Three changes raise a ceiling:
 
 - **The cycle term counts only the LPs that can react.** It is the least, over each
   channel `c` out of `i` to an LP `j` that is running, waits in NER, or is reached on an
@@ -762,6 +767,15 @@ with local grants;
   arrival there would have its offered sends registered only at the LP's next call,
   after other LPs may have moved past them. The TAR is granted that arrival first, as
   without a ceiling, and the step table is that of a run without local grants.
+- **The distances follow the declared channel reactions** (D3.6,
+  [#4144](https://github.com/jgong5/ATOM/issues/4144)). `D(j->i)`, and the cycle term's
+  return past its first hop `c`, D3.6's `reach(c, i)`, are taken over the sends each LP's
+  declaration allows (`ChannelTable.reaction_distance`, `ChannelTable.reach`), and LP
+  `router`, which declares its own
+  (`channels.py::prefill_decode_table`), has its term in `LBTS(i)` split by the kind of its
+  undelivered messages while it waits in NER (`ClockAuthority._declared_term`). A stream
+  event pending at the router then holds a decode frontend at the event's way back through
+  traffic, not at the router's relay hop.
 
 #### Invariants
 
@@ -1347,7 +1361,7 @@ Client runs), and carried in the run artifact:
 ## D3.6. Overlapping LPs' wall work: channel reactions
 
 **Status:** designed 2026-11-25 for [#4135](https://github.com/jgong5/ATOM/issues/4135);
-not built.
+built under `--wide-local-grants` by [#4144](https://github.com/jgong5/ATOM/issues/4144).
 
 ### Problem
 
