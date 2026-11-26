@@ -36,6 +36,12 @@ above the IPC hop it borrows for ``router_in_s``, and ``kv_write_req_s``,
 Mooncake's write request (`STATED_HOPS`). The report's ``stated_hops`` names
 each, so the entry says which hops were stated rather than fitted.
 
+`--stated-recv SECONDS` states ``W_recv``, the part of a later pipeline
+stage's launch before it posts its input's receive, for each forward kind the
+entry fits, as ``[SECONDS, 0, 0]``, where no record stamps that receive
+(``t_pp_recv_ns``) and so none fits it: a run's later stage refuses a law with
+none. The report's ``stated_segments`` names it; refused where a kind fits one.
+
 `--ingress FILE` states the encoding ingress in front of the deployment as the
 entry's ``ingress`` term (`atom.compass.ingress`): FILE's ``ingress``, as
 `compass fit ingress` writes it from the ingress's stamps, which no record
@@ -287,6 +293,24 @@ def stated_hops(words: list[str], fitted: dict) -> dict:
     return out
 
 
+def stated_recv(word, laws: dict) -> dict:
+    """``W_recv`` at `word` seconds, 0 or more, for each kind of `laws` (the
+    entry's), `{}` with `word` None; refused for a kind that fits one."""
+    if word is None:
+        return {}
+    try:
+        seconds = float(word)
+    except ValueError:
+        seconds = math.nan
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(f"--stated-recv {word}: not a number of seconds, 0 or more")
+    if fitted := [k for k, segs in laws.items() if "W_recv" in segs]:
+        raise ValueError(
+            f"--stated-recv {word}: {', '.join(fitted)} fit W_recv from the records already"
+        )
+    return {kind: [seconds, 0.0, 0.0] for kind in laws}
+
+
 def stated_ingress(path: str) -> dict:
     """The ``ingress`` term `--ingress path` states: the file's ``ingress``,
     refused unless it is one (`atom.compass.ingress.check`)."""
@@ -305,6 +329,13 @@ def main(argv: list[str]) -> None:
         metavar="NAME=SECONDS",
         help=f"a hop no record times, one of {', '.join(STATED_HOPS)}, written "
         "into the entry's hops and named under the report's stated_hops",
+    )
+    parser.add_argument(
+        "--stated-recv",
+        metavar="SECONDS",
+        help="W_recv, a later pipeline stage's launch before it posts its input's "
+        "receive, for each forward kind, where no record stamps the receive; named "
+        "under the report's stated_segments",
     )
     parser.add_argument(
         "--decode-client-run",
@@ -347,6 +378,10 @@ def main(argv: list[str]) -> None:
     if stated := stated_hops(args.stated_hop, host.get("hops", {})):
         host["hops"] = {**host.get("hops", {}), **stated}
         report["stated_hops"] = stated
+    if recv := stated_recv(args.stated_recv, host.get("laws", {})):
+        for kind, coefficients in recv.items():
+            host["laws"][kind]["W_recv"] = coefficients
+        report["stated_segments"] = {f"{k}.W_recv": c for k, c in recv.items()}
     if ingress is not None:
         host[INGRESS] = ingress
         report["stated_ingress"] = {"file": args.ingress, INGRESS: ingress}
