@@ -303,7 +303,9 @@ class ClockAuthority:
         # With wide ceilings the distances follow the declared reactions, and
         # an LP that declares them takes its terms from `_from_declared`.
         far = channels.reaction_distance if wide_ceilings else channels.distance
-        declaring = {j for j in self._ids if wide_ceilings and channels.declares(j)}
+        declaring = dict.fromkeys(
+            j for j in self._ids if wide_ceilings and channels.declares(j)
+        )
         self._from = {
             i: tuple((j, far(j, i)) for j in self._ids if j != i and j not in declaring)
             for i in self._ids
@@ -313,7 +315,7 @@ class ClockAuthority:
         # (j, class); each class's earliest unreleased arrival; and, for each
         # other LP i, (j, D(j->i), the least reach(c, i) over each class).
         self._classes, self._class_of, self._cfirst = {}, {}, {}
-        for j in (j for j in self._ids if j in declaring):
+        for j in declaring:
             kinds = {}
             for c in channels.channels_into(j):
                 kinds.setdefault(kind_of(c.name), []).append(c.name)
