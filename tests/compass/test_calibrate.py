@@ -77,6 +77,8 @@ def main():
     at.mkdir(parents=True)
     at.joinpath("stub_entry.json").write_text(json.dumps(entry))
     law = {"unfitted": {}, "decode": {"1": {"held_out": {"bands": BAND}}}}
+    if os.environ.get("STAGED") and out.name == "fit_steps_prefill":
+        law = {"stages": [{"unfitted": {}, "prefill": {"held_out": {"bands": BAND}}}] * 2}
     copy = {"token": "tok-" + argv[1], "params": law}
     out.joinpath(COPY[argv[1]] + ".json").write_text(json.dumps(copy))
 """
@@ -428,6 +430,18 @@ def test_a_1p1d_calibration_records_deployments_and_fits_each_side_on_its_own(
     assert "calibrate: the decode side's law\nheld out | steps" in r.stdout
     assert "a run priced by the law" not in r.stdout
     assert "on GPUs 0,1,2,3" in r.stdout
+
+
+def test_a_pipelined_side_s_held_out_bands_are_reported_a_stage_each(tmp_path):
+    """A pipelined prefill's law holds a part a stage (`stages`), with no
+    `unfitted` of its own: the report reads each part's."""
+    r, _ = _calibrate(tmp_path, "1", "trace 4", STAGED="1", **ONE_P_ONE_D)
+    assert r.returncode == 0, r.stderr
+    band = "decode rung 1 | 9 | -1.2% | +0.1% | +2.0%"
+    assert (
+        "calibrate: the prefill side's law\nheld out | steps | p10 | p50 | p90\n"
+        f"stage 0 {band}\nstage 1 {band}\n"
+    ) in r.stdout
 
 
 def test_two_1p1d_calibrations_sharing_a_prefill_side_publish_each_key_once(

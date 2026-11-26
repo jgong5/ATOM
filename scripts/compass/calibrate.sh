@@ -323,13 +323,18 @@ for side, path in zip(laws[::2], laws[1::2]):
     law = json.load(open(path))["params"]
     if side:
         print(f"calibrate: the {side} side's law")
-    if law["unfitted"]:
-        print(f"calibrate: unfitted, so refusing every step they price: {law['unfitted']}")
-    rows = [
-        f"{band} | {e['steps']} | " + " | ".join(f"{e[p]:+.1%}" for p in ("p10", "p50", "p90"))
-        for vector in (law.get("prefill"), *law["decode"].values())
-        for band, e in (vector or {}).get("held_out", {}).get("bands", {}).items()
-    ]
+    # A pipelined side's law holds a part a stage (`stages`), each fitted alone.
+    parts = law.get("stages") or [law]
+    rows = []
+    for k, part in enumerate(parts):
+        at = f"stage {k} " if len(parts) > 1 else ""
+        if part.get("unfitted"):
+            print(f"calibrate: {at}unfitted, so refusing every step they price: {part['unfitted']}")
+        rows += [
+            f"{at}{band} | {e['steps']} | " + " | ".join(f"{e[p]:+.1%}" for p in ("p10", "p50", "p90"))
+            for vector in (part.get("prefill"), *(part.get("decode") or {}).values())
+            for band, e in (vector or {}).get("held_out", {}).get("bands", {}).items()
+        ]
     print("\n".join(["held out | steps | p10 | p50 | p90", *rows]) if rows else
           "calibrate: no held-out errors: fit steps holds out each of two or more records")
 # Each step's wall seconds as its last end states them; the node-hours, every
