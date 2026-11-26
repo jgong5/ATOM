@@ -17,9 +17,9 @@ traffic LP prices the ingress's hop on before it stamps the request.
 
 When the traffic LP closes a request aiperf is cancelling, it publishes a
 stamp for the cancel; the worker that sent the request POSTs it to the
-request's URL, or on the request's path to the URL the stamp names, with the
-request's own seq in its body, reports it written, and reads the frontend's
-answer before it stops.
+request's URL, or on the request's path to each URL the stamp names, with the
+request's own seq in its body, reports it written once every one is, and reads
+each frontend's answer before it stops.
 
 The two sockets live under the path prefix in ``COMPASS_HARNESS_IPC``.
 """
@@ -109,24 +109,28 @@ class CompassTransport(AioHttpTransport):
                 start = named.get("start", arrival)
                 fut.set_result((arrival, seq, named.get("jitter"), start))
 
-    async def _cancel(self, key: tuple, arrival: float, seq: int, to=None) -> None:
+    async def _cancel(self, key: tuple, arrival: float, seq: int, *to) -> None:
         """Write `key`'s stamped cancel, to its request's URL or on that URL's
-        path to `to`, report it, and read the answer."""
+        path to each of `to`, report it once every one is written, and read
+        each answer."""
         url, cancelled = self._sent[key]
         u, body = urlsplit(url), cancel_body(cancelled)
-        at = urlsplit(to or url)
-        reader, writer = await asyncio.open_connection(at.hostname, at.port or 80)
-        writer.write(
-            f"POST {u.path} HTTP/1.1\r\nHost: {at.netloc}\r\n"
-            f"tracestate: {tracestate_with(None, arrival, seq)}\r\n"
-            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
-            "Connection: close\r\n\r\n".encode() + body
-        )
-        await writer.drain()
+        opened = []
+        for at in map(urlsplit, to or (url,)):
+            reader, writer = await asyncio.open_connection(at.hostname, at.port or 80)
+            writer.write(
+                f"POST {u.path} HTTP/1.1\r\nHost: {at.netloc}\r\n"
+                f"tracestate: {tracestate_with(None, arrival, seq)}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n".encode() + body
+            )
+            await writer.drain()
+            opened.append((reader, writer))
         await self._push.send_pyobj((key,))
         # Closing first would let the frontend read a hang-up instead of the body.
-        await asyncio.wait_for(reader.read(), self.model_endpoint.endpoint.timeout)
-        writer.close()
+        for reader, writer in opened:
+            await asyncio.wait_for(reader.read(), self.model_endpoint.endpoint.timeout)
+            writer.close()
 
     def _stamp(self, key: tuple) -> asyncio.Future:
         if key not in self._stamps:

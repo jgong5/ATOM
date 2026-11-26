@@ -500,3 +500,50 @@ def test_a_cancel_naming_a_url_is_posted_there_on_its_request_s_path(
         ("/v1/chat/completions", "compass=a:11.0;s:3"),
         cancel_body(SENDS[0][1]),
     ]
+
+
+def test_a_cancel_naming_two_urls_is_posted_to_each_and_reported_once(
+    tmp_path, monkeypatch
+):
+    """Under a chunked transfer the traffic LP publishes credit 0's cancel with
+    frontend-P's and frontend-D's URLs, as it stamped the request on both
+    channels: the worker posts it to each, on credit 0's path, and reports it
+    written once."""
+
+    async def run():
+        taken = {"P": [], "D": []}
+        runners, urls = [], []
+        for side in ("P", "D"):
+
+            async def take(request: web.Request, side=side) -> web.Response:
+                taken[side].append(
+                    (request.headers["tracestate"], await request.read())
+                )
+                return web.Response(status=204)
+
+            app = web.Application()
+            app.router.add_post("/v1/chat/completions", take)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            await web.TCPSite(runner, "127.0.0.1", 0).start()
+            runners.append(runner)
+            urls.append(f"http://127.0.0.1:{runner.addresses[0][1]}")
+        try:
+            async with CancelHarness(tmp_path, monkeypatch) as h:
+                await h.stamp(0)
+                await h.send(0)
+                for _ in range(len(TOKENS[0]) + 1):
+                    await h.pull.recv_pyobj()
+                await h.pub.send_pyobj((_key(0), 11.0, 3, "cancel", *urls))
+                written = await h.pull.recv_pyobj()
+                more = await h.pull.poll(200)
+        finally:
+            for runner in runners:
+                await runner.cleanup()
+        return written, more, h.cancels, taken
+
+    written, more, routed, taken = _run(run())
+    assert written == (_key(0),) and not more
+    assert routed == []
+    cancel = ("compass=a:11.0;s:3", cancel_body(SENDS[0][1]))
+    assert taken == {"P": [cancel], "D": [cancel]}

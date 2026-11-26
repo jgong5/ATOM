@@ -65,8 +65,13 @@ cancelled request up at the cancel's arrival. Behind a PD router the router LP
 answers it and hands it on to the frontend that holds the request. A PD router
 that is no LP answers a cancel 400, as a chat request it cannot read, so behind
 one, where the HTTP channel leads to frontend-P, each cancel goes to
-frontend-P's own URL, from ``PREFILL_URL_ENV``. A cancel its worker has not
-reported written after ``DIAG_S`` wall seconds is named in the log.
+frontend-P's own URL, from ``PREFILL_URL_ENV``. Under a chunked transfer the
+router sends each request to frontend-D at once too, stamped alike there
+(`also`), so its cancel goes to frontend-D's URL as well, from the run's
+``decode/server.json`` (`frontend_url`): a cancel stamped on a channel no
+worker writes leaves that frontend waiting for it, and the run with it. A
+cancel its worker has not reported written after ``DIAG_S`` wall seconds is
+named in the log.
 
 Every stamp, a send's or a cancel's, goes to every worker, and none may be
 lost: a worker that never gets its request's stamp never sends it, and one that
@@ -87,6 +92,7 @@ import asyncio
 import hashlib
 import heapq
 import itertools
+import json
 import logging
 import math
 import os
@@ -145,6 +151,27 @@ class SendAfterCancel(RuntimeError):
     """A request sent after `TrafficLP.cancel` closed others."""
 
 
+def frontend_url(run: dict, channel: str) -> str:
+    """The URL of the frontend LP `channel` leads to, ``traffic->frontend-D:http``
+    or ``traffic->frontend-D<i>:http``, as the `deploy.sh` instance in the run
+    file's ``out_dir`` that serves it states it: ``decode/`` or ``decode<i>/``'s
+    ``server.json``. Refused, naming it, where it states none."""
+    lp = channel.split("->", 1)[1].split(":", 1)[0]
+    if not lp.startswith("frontend-D"):
+        raise ValueError(f"{channel} leads to {lp}, no decode frontend")
+    path = os.path.join(
+        run["out_dir"], "decode" + lp[len("frontend-D") :], "server.json"
+    )
+    try:
+        with open(path) as f:
+            return json.load(f)["url"]
+    except (OSError, ValueError, KeyError) as e:
+        raise RuntimeError(
+            f"{path} states no URL for {lp}: under a chunked transfer each cancel "
+            f"goes to every frontend its request reached ({e})"
+        ) from e
+
+
 class TrafficLP:
     def __init__(
         self,
@@ -165,6 +192,9 @@ class TrafficLP:
         # The other frontends each request goes to at once (`from_env`).
         self.also: tuple[str, ...] = ()
         self.cancel_url, self.seed = cancel_url, seed
+        # Where each cancel is posted, if not to its request's URL: `cancel_url`,
+        # and under a chunked transfer each `also` frontend's too (`from_env`).
+        self.cancel_to: tuple[str, ...] = (cancel_url,) if cancel_url else ()
         self.ingress = ingress
         # Behind an ingress: each sent request's body bytes, None for none, as
         # its worker reported it; and each open one's arrival past the ingress.
@@ -258,6 +288,10 @@ class TrafficLP:
             ),
         )
         lp.also = tuple(c.name for c in also)
+        if lp.cancel_to and lp.also:
+            # Each cancel is stamped on every channel its request was (`_stamp`),
+            # so each frontend that took the request reads its own.
+            lp.cancel_to += tuple(frontend_url(run, ch) for ch in lp.also)
         return lp
 
     def _stamp(self, at: float | None = None) -> tuple[float, int]:
@@ -398,7 +432,7 @@ class TrafficLP:
         self.open.clear()
         self.cancelled.update(keys)
         self.closed.update(dict.fromkeys(keys))
-        to = (self.cancel_url,) if self.cancel_url else ()
+        to = self.cancel_to
         for key in keys:
             if self.ingress is None:
                 arrival, seq = self._stamp()
