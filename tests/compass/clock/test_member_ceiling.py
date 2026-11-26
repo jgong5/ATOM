@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Rounds granted ahead stop at an offered arrival, and so does the ceiling
 of each held member reply: a member steps on its own through the rounds
-granted ahead of it and no further. (Under bounded slack a late message is
-delivered at the engine's clock, a round just granted, so the stop is common.)"""
+granted ahead of it and no further. (With the Mooncake Store an engine's
+request channels are offering, so a request arriving below the ceiling stops
+them.)"""
 
 import pytest
 
