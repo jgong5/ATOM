@@ -107,7 +107,7 @@ def test_the_standalone_authority_takes_it_as_it_starts(
     monkeypatch.setenv(compass_run.ENV, str(_run_file(tmp_path, rare_full_gc=on)))
     seen = []
     monkeypatch.setattr(
-        compass_run, "serve", lambda a, e: seen.append(gc.get_threshold())
+        compass_run, "serve", lambda a, e, select: seen.append(gc.get_threshold())
     )
     monkeypatch.setattr(compass_run, "_until_end", lambda run, a: False)
     monkeypatch.setattr(compass_run, "_write_summary", lambda *_: None)
