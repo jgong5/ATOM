@@ -277,3 +277,23 @@ def install(engine, spec) -> None:
     )
     mgr.call_func = sends
     rt.holds_work = lambda: sends.pending is not None or engine.has_pending_kv_work()
+    transport = getattr(engine, "pp_transport", None)
+    if engine.pp_rank > 0 and transport is not None:
+        transport.recv_metadata = _looks_again(rt, transport.recv_metadata)
+
+
+def _looks_again(rt, recv_metadata):
+    """`recv_metadata` such that a batch it returns counts as the loop pass's
+    work. `clock.idle` waits for the next event only after a pass that made no
+    clock call; a later stage's pass that takes an empty, connector-only batch
+    makes none, and its idle point then waits with the head's later batches
+    already released and unread, while the head waits on this stage's ack: the
+    1P2D C240 sim's client run ended at ~367 s, every LP waiting."""
+
+    def taken(*args, **kwargs):
+        batch = recv_metadata(*args, **kwargs)
+        if batch is not None:
+            rt.calls += 1
+        return batch
+
+    return taken

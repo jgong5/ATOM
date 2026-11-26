@@ -187,6 +187,33 @@ def test_a_stage_holds_work_from_its_send_to_the_flush_and_while_kv_work_is_pend
     assert held + [rt.holds_work()] == [False, True, False, True]
 
 
+def test_a_later_stage_that_took_a_batch_looks_again_before_its_idle_point_waits(
+    monkeypatch,
+):
+    rt, run, stub, _ = _stage(1, (C, {}), parts=EAGER)
+    batches = [SimpleNamespace(req_ids=[]), None]
+    engine = SimpleNamespace(
+        runner_mgr=SimpleNamespace(call_func=stub.call),
+        pp_rank=1,
+        pp_size=2,
+        has_pending_kv_work=lambda: False,
+        pp_transport=SimpleNamespace(recv_metadata=lambda timeout_ms=None: batches.pop(0)),
+    )
+    monkeypatch.setattr(clock, "_installed", rt)
+    spec = SimpleNamespace(
+        value=lambda key: getattr(CARRIER, key.rsplit(".", 1)[1], 1.0)
+    )
+    pp_send.install(engine, spec)
+    rt.idle_calls = rt.calls  # a loop pass's idle point, as `clock.idle` leaves it
+    # An empty, connector-only batch: the pass makes no clock call, yet took a
+    # frame, so the next idle point looks again rather than waits.
+    assert engine.pp_transport.recv_metadata(timeout_ms=0).req_ids == []
+    assert rt.calls == rt.idle_calls + 1
+    rt.idle_calls = rt.calls
+    assert engine.pp_transport.recv_metadata(timeout_ms=0) is None
+    assert rt.calls == rt.idle_calls
+
+
 def test_a_stage_waits_for_its_own_ring_and_only_the_last_for_its_device_work():
     decode = SimpleNamespace(
         total_seqs_num_prefill=0, total_tokens_num=1, total_seqs_num=1
