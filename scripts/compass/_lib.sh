@@ -507,6 +507,42 @@ COMPASS_SIM_REQUEST_TIMEOUT_S=31536000
 COMPASS_SIM_ROUTER_BOUNDS=(--request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S"
     --prepare-queue-timeout-ms "${COMPASS_SIM_REQUEST_TIMEOUT_S}000"
     --prepare-timeout-ms "${COMPASS_SIM_REQUEST_TIMEOUT_S}000")
+# The prepare pool flags a recorded router's log states (`compass_router_pool`).
+COMPASS_ROUTER_POOL_FLAGS=(--prepare-workers --prepare-queue-capacity --prepare-max-tokenize-bytes)
+
+# compass_router_pool LOG: the `atomesh launch` flags of the request-preparation
+# pool a recorded router ran, from the last "Request preparation pool started"
+# line of its LOG (atom/mesh/src/server.rs: workers, queue_capacity,
+# max_tokenize_bytes; the line's ANSI colours stripped), one word a line;
+# nothing, and a note on stderr, for a LOG with no such line. A simulated router
+# otherwise sizes its own pool from its host's CPUs, half of them, 10 queued a
+# thread: on a CPU node 4 and 40, where the recorded router ran 64 and 640 and
+# answered none of a c=120 warmup's bursts with 503, which the simulated one
+# did, leaving its frontend waiting on requests the traffic LP had released
+# (MiniMax-M3.1 Cell B, #3720).
+compass_router_pool() {
+    local line
+    line=$(grep -a 'Request preparation pool started' "$1" 2>/dev/null | tail -1 | sed 's/\x1b\[[0-9;]*m//g')
+    if [[ -z $line ]]; then
+        echo "compass_router_pool: $1 states no request-preparation pool; the router sizes its own" >&2
+        return 0
+    fi
+    local key flag value
+    for key in workers:--prepare-workers queue_capacity:--prepare-queue-capacity \
+        max_tokenize_bytes:--prepare-max-tokenize-bytes; do
+        flag=${key#*:} key=${key%%:*}
+        value=$(grep -oE "(^| )$key=[0-9]+" <<<"$line" | tail -1 | cut -d= -f2)
+        [[ -n $value ]] && printf '%s\n%s\n' "$flag" "$value"
+    done
+}
+
+# COMPASS_SIM_ROUTER_LOG: a recorded router.log, whose prepare pool a simulated
+# router then runs (`compass_router_pool`); unset, its own.
+if [[ -n ${COMPASS_SIM_ROUTER_LOG:-} ]]; then
+    mapfile -t _compass_pool < <(compass_router_pool "$COMPASS_SIM_ROUTER_LOG")
+    COMPASS_SIM_ROUTER_BOUNDS+=("${_compass_pool[@]}")
+    unset _compass_pool
+fi
 
 # compass_sim_router_refusal LP WORD...: why a simulated router refuses its
 # `atomesh launch` arguments WORD..., or nothing. LP is 1 where the router runs
@@ -525,6 +561,11 @@ compass_sim_router_refusal() {
         --request-timeout-secs | --prepare-queue-timeout-ms | --prepare-timeout-ms)
             echo "the router's arguments carry ${word%%=*}, a wall-clock bound the script sets for a simulated router"
             return ;;
+        --prepare-workers | --prepare-queue-capacity | --prepare-max-tokenize-bytes)
+            if [[ -n ${COMPASS_SIM_ROUTER_LOG:-} ]]; then
+                echo "the router's arguments carry ${word%%=*}, the recorded router's prepare pool COMPASS_SIM_ROUTER_LOG sets"
+                return
+            fi ;;
         esac
     done
     if ((lp)) && [[ " $* " != *" --disable-retries "* ]]; then

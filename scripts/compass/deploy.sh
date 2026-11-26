@@ -46,7 +46,11 @@
 #                  --rate-limit-tokens-per-second, a limiter on the wall
 #                  clock; it sets --request-timeout-secs,
 #                  --prepare-queue-timeout-ms and --prepare-timeout-ms
-#                  (`_lib.sh`: COMPASS_SIM_ROUTER_BOUNDS) and refuses the
+#                  (`_lib.sh`: COMPASS_SIM_ROUTER_BOUNDS; with
+#                  COMPASS_SIM_ROUTER_LOG, a recorded router.log, also that
+#                  router's prepare pool: --prepare-workers,
+#                  --prepare-queue-capacity, --prepare-max-tokenize-bytes)
+#                  and refuses the
 #                  caller's (compass_sim_router_refusal, which pd_sim.sh's
 #                  ROUTER_ARGS meets too); the caller switches the router's
 #                  wall-clock detectors off, as pd_sim.sh does:
