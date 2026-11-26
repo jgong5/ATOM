@@ -12,9 +12,11 @@ from test_speculative_step import _speculative
 from test_step_linear_draft import _fit, _mtp_record, _output
 
 from atom.compass.backends import StepLinearBackend, StepLinearLaw
+from atom.compass.validate.cost import cost_accuracy
 
 
 def _producer_law(tmp_path):
+    tmp_path.mkdir(exist_ok=True)
     law = _fit([_mtp_record(tmp_path / "dp0.jsonl", _steps(3))])
     law["draft"]["output_prefill_kv"] = True
     for k in ("propose", "short_propose", "forward"):
@@ -40,3 +42,21 @@ def test_a_law_with_no_draft_at_all_is_still_refused(tmp_path):
     plain = _speculative(runner(StepLinearBackend(StepLinearLaw(law))))
     assert plain.forward(prefill(8)).predicted_s == 0.0
     assert plain.refused_commands() == ("cost:StepLinearBackend: prices no draft",)
+
+
+def test_a_draft_the_law_prices_among_the_target_is_graded_with_it_not_apart(tmp_path):
+    """The figures grade a step's draft only where the law prices one apart: an
+    output prefill's draft-KV pass is priced among its target's terms, and its
+    draft label holds only the rest of the drafter's time, which no vector
+    prices (MiniMax-M3.1's PP4 prefill, stage 3: a 22 us residual graded against
+    0 s, a median -100%)."""
+    record = _mtp_record(tmp_path / "dp0.jsonl", _steps(3))
+    law = _producer_law(tmp_path / "fit")
+    backend = StepLinearBackend(StepLinearLaw(law))
+    report = cost_accuracy(record.parent, law)
+
+    draft, decode = report["graded"]["draft"], report["graded"]["decode"]
+    # Each decode prices its draft apart; no output prefill here does.
+    assert backend.price(_output([(8, 8, False)])).draft_terms == ()
+    assert draft["steps"] == decode["steps"] > 0
+    assert draft["median"] > -0.5
