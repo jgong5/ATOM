@@ -31,13 +31,45 @@ The ``rccl`` parts hold the sender's stream, not its host: its
 forwards after that wait start their device work no earlier. An idle
 flush waits for the previous send the same way. The frames move between the
 stages' TP-rank-0 workers over the PP CPU group.
+
+Under `PP_IPC` a boundary is ATOM's HIP IPC one (`atom.distributed.pp_ipc`,
+``ATOM_PP_IPC``) in place of the above. The sender's copy stream, not its
+compute stream, copies the tensors into a ring of ``SLOTS`` slots on the
+receiver, at the ``rccl`` carrier's ``overhead_s`` and ``per_byte_s`` a part
+and its ``latency_s`` once: the first two (``hidden_states``, ``residual``)
+from ``t_ready``, the previous frame's copies and the slot's release, whichever
+is latest, then the rest (DSpark's aux block). The receiver's stream waits for
+the first two only, posting nothing; a later stage's own send waits for its
+input's rest too, as ATOM packs the aux it relays after its forward. The
+metadata is a non-blocking ``gloo`` send: the receiver's host takes it as
+before, and the sender waits for no ack of it. Neither stream is held by a
+send. The receiver frees each slot at its forward's end, on ``pp_ack`` with
+that forward's device end; a sender waits for the ack of the frame ``SLOTS``
+sends back before it sends, its copy for that slot's device end.
 """
 
 import math
+import os
 from dataclasses import dataclass, fields
 
 CARRIERS = ("rccl", "gloo")
 PREFIX = "interconnect.intra_node.pp"
+#: Set to 1 (opt-in; unset or 0: the gloo and RCCL boundary above), every stage
+#: boundary is priced as ATOM's HIP IPC one (the module text): MiniMax-M3.1's P
+#: (PP4 x TP1, ATOM_PP_IPC=1) on #3720's CAL ran it, and its last stage's input
+#: waited for 24 KiB a token, where RCCL's three tensors held the next stage's
+#: device for 36-72 KiB a token and its sender's stream for the rendezvous.
+PP_IPC = "COMPASS_PP_IPC"
+#: The ring's slots, `atom.distributed.pp_ipc.SLOTS`; held here so a stage loop
+#: imports no torch for it (tests/compass/test_pp_ipc.py checks it).
+SLOTS = 3
+#: The leading tensor parts the receiver's forward waits for (pp_ipc._KEYS).
+IPC_LEAD = 2
+
+
+def ipc_on() -> bool:
+    """`PP_IPC` set to anything but 0."""
+    return os.environ.get(PP_IPC, "0") not in ("", "0")
 
 
 @dataclass(frozen=True)
@@ -53,6 +85,17 @@ class CarrierModel:
 
     def rendezvous_s(self, nbytes: int) -> float:
         return self.rendezvous_fixed_s + nbytes * self.per_byte_s
+
+
+def ipc_copies(model: CarrierModel, start: float, tensors) -> tuple[float, float]:
+    """``(lead, end)``: the end of the copy of `tensors`' first `IPC_LEAD`
+    parts and of all of them, on one copy stream from `start`, each part
+    ``overhead_s + bytes x per_byte_s`` and the stream's ``latency_s`` once."""
+    lead = end = start + model.latency_s
+    for i, (_, n, *_) in enumerate(tensors):
+        end += model.overhead_s + n * model.per_byte_s
+        lead = end if i < IPC_LEAD else lead
+    return lead, end
 
 
 def carrier_models(spec) -> dict[str, CarrierModel]:
@@ -157,6 +200,11 @@ class StageSends:
         self.tensors_done = -math.inf  # the previous frame received's rccl parts
         self.held = -math.inf  # the rccl parts' end of the send last waited for
         self.acked = -math.inf  # the gloo parts' end of the send last acked
+        self.ipc = ipc_on()
+        self.copy_free = -math.inf  # under PP_IPC: the copy stream's last copy's end
+        self.slot_free = [-math.inf] * SLOTS  # each slot's release, device side
+        self.acks = 0  # the acks read
+        self.aux_in = -math.inf  # the rest of the input last received
 
     def __call__(self, name, *args, wait_out=False):
         if not self.rt.in_run or name not in ("forward", "flush_pp_send"):
@@ -164,6 +212,8 @@ class StageSends:
         if name == "flush_pp_send":
             self.settle()
             return self.call(name, *args, wait_out=wait_out)
+        if self.ipc:
+            return self._ipc_forward(name, *args, wait_out=wait_out)
         if self.held is None:  # an eager send's rendezvous rccl part
             raise RuntimeError(
                 f"{self.data_out}: no ack says when the last send's rccl parts end"
@@ -258,6 +308,91 @@ class StageSends:
                 self.rt.advance_to(self.rt.now + late)
         elif at > self.rt.now:
             self.rt.advance_to(at)
+
+    # ---- under PP_IPC ----
+
+    def _ipc_forward(self, name, *args, wait_out=False):
+        """`__call__`'s forward under `PP_IPC`: the input's metadata holds the
+        host and its first `IPC_LEAD` tensors' copy the device; the slot is
+        freed at the forward's end, then the output is sent, its copy waiting
+        for the input's rest as well as the device work."""
+        if self.data_in:
+            args[0].compass_pp_host, release = self._ipc_receive(args[0])
+            args[0].compass_pp_release = release
+        t0 = self.rt.now
+        reply = self.call(name, *args, wait_out=wait_out)
+        if self.data_in:
+            self._ipc_free(reply)
+        if self.data_out:
+            ready_s, post_s, parts = reply.pp_send
+            self._ipc_send(max(t0 + ready_s, self.aux_in), parts)
+            if post_s > 0:
+                self.rt.advance_to(self.rt.now + post_s)
+        return reply
+
+    def _ipc_receive(self, batch) -> tuple:
+        """``(called, meta)``, the metadata taken at `batch`'s prepare end as
+        `receive` takes it, and the end of the copy of the input's first
+        `IPC_LEAD` tensors into this stage's ring, which posts nothing."""
+        from atom.compass.runner.overrides import forward_shape
+
+        seq, called = self.received, self.rt.now
+        self.received += 1
+        frame = self._frame("pp_data", self.data_in, seq)
+        shape = forward_shape(batch)
+        posted, _ = self.call("pp_recv_posted", called, *shape, wait_out=True)
+        gloo, tensors = split(frame["parts"])
+        if any(len(p) > 2 for p in tensors):
+            raise RuntimeError(
+                f"{self.data_in}: a sharded tensor crosses an IPC boundary, which "
+                "ATOM runs at TP 1 only"
+            )
+        meta = recv_done(self.models, frame["t_send"], posted, gloo)[1]
+        lead, self.aux_in = frame["ipc"]
+        return (called, meta), lead
+
+    def _ipc_free(self, reply) -> None:
+        """Free the slot the forward just run read, at its device end, on ``pp_ack``."""
+        end = getattr(reply, "device_end", None)
+        ack = {"seq": self.received - 1, "freed": self.rt.now if end is None else end}
+        self.call("send_pp_frame", "pp_ack", ack, wait_out=True)
+        self.rt.stamp_send(self.ack_out)
+
+    def _ipc_send(self, ready: float, parts) -> None:
+        """Send the metadata now, after the ack freeing this frame's slot, and
+        the tensors' copies, from `ready`, the previous copies' end and the slot's
+        release, whichever is latest, as the frame's ``ipc``: ``(lead, end)``."""
+        seq = self.sent
+        self.sent += 1
+        self._read_acks(seq - SLOTS)
+        tensors = split(parts)[1]
+        start = max(ready, self.copy_free, self.slot_free[seq % SLOTS])
+        lead, self.copy_free = ipc_copies(self.models["rccl"], start, tensors)
+        t_send = self.rt.now
+        frame = {
+            "seq": seq,
+            "t_send": t_send,
+            "t_ready": ready,
+            "parts": parts,
+            "ipc": (lead, self.copy_free),
+        }
+        self.call("send_pp_frame", "pp_data", frame, wait_out=True)
+        self.rt.stamp_send(
+            self.data_out, t_send + self.rt.table.lookahead(self.data_out)
+        )
+
+    def _read_acks(self, upto: int) -> None:
+        """Read every ack released so far and each one through `upto`, waiting
+        for those; an ack's slot is free from its ``freed``."""
+        while True:
+            seq = self.acks
+            if seq > upto:
+                with self.rt.lock:
+                    if not self.rt.is_released(self.ack_in, seq):
+                        return
+            ack = self._frame("pp_ack", self.ack_in, seq)
+            self.acks += 1
+            self.slot_free[seq % SLOTS] = ack["freed"]
 
 
 def install(engine, spec) -> None:
