@@ -1,20 +1,9 @@
 {
  "name": "tpep_v1",
- "about": "DeepSeek-V4.1-Flash on 4 MI355X at TP4 with expert parallelism and ONE DP rank (no DP attention), fp8 KV, block 128, DSpark 5 drafts at acceptance 3.51, prefix caching (jgong5/ATOM#4248). cellA_v1's columns and segments less those of two or more DP ranks; at one rank the MoE gather columns read zero and graph_padding and row_padding alias (#739 2.4 rule 6). kv_tokens: num_kvcache_blocks 560723 x 128 of #4247's real start of this configuration at --gpu-memory-utilization 0.85 on pit2-p03-g27.",
+ "about": "DeepSeek-V4.1-Flash on 4 MI355X at TP4 with expert parallelism and ONE DP rank (no DP attention), fp8 KV, block 128, DSpark 5 drafts at acceptance 3.51, prefix caching (jgong5/ATOM#4248). cellA_v1's columns and segments less those of two or more DP ranks; at one rank the MoE gather columns read zero, and graph_padding and row_padding take the same values within a rung. kv_tokens: num_kvcache_blocks 560723 x 128 of #4247's real start of this configuration at --gpu-memory-utilization 0.85 on pit2-p03-g27.",
  "deployment": {
   "dp": 1,
-  "rungs": [
-   1,
-   2,
-   4,
-   8,
-   16,
-   24,
-   32,
-   40,
-   48,
-   64
-  ],
+  "rungs": [1, 2, 4, 8, 16, 24, 32, 40, 48, 64],
   "max_num_seqs": 64,
   "max_num_batched_tokens": 32768,
   "chunk": 65536,
@@ -24,55 +13,18 @@
   "drafts": 5,
   "acceptance": 3.51,
   "prefix_unit": 128,
-  "prefill_buckets": [
-   256,
-   512,
-   1024,
-   2048,
-   3072,
-   4096,
-   5120,
-   6144,
-   7168
-  ],
-  "moe_routing": [
-   384,
-   6
-  ],
+  "prefill_buckets": [256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 7168],
+  "moe_routing": [384, 6],
   "trace_model": "deepseek-v4.1-flash",
   "trace_block": 64,
   "tp": 4,
   "dcp": 1
  },
  "columns": {
-  "decode": [
-   "step",
-   "context",
-   "graph_padding",
-   "row_padding"
-  ],
-  "decode_variants": [
-   [],
-   [
-    "moe_tokens"
-   ],
-   [
-    "moe_experts"
-   ]
-  ],
-  "prefill": [
-   "step",
-   "tokens",
-   "query_square",
-   "query_cached",
-   "history",
-   "seqs",
-   "out",
-   "padding"
-  ],
-  "prefill_variants": [
-   []
-  ],
+  "decode": ["step", "context", "graph_padding", "row_padding"],
+  "decode_variants": [[], ["moe_tokens"], ["moe_experts"]],
+  "prefill": ["step", "tokens", "query_square", "query_cached", "history", "seqs", "out", "padding"],
+  "prefill_variants": [[]],
   "min_spread": 0.2
  },
  "noise": {
@@ -81,10 +33,7 @@
  },
  "acceptance": {
   "vif": 10,
-  "g": {
-   "decode": 0.01,
-   "prefill": 0.02
-  },
+  "g": {"decode": 0.01, "prefill": 0.02},
   "g_z": 2.0,
   "rung_steps": 60,
   "levels": 3
@@ -99,254 +48,14 @@
   "segment_overhead_s": 35
  },
  "segments": [
-  {
-   "name": "D-v1",
-   "kind": "drain",
-   "purpose": "each rung's fixed cost at small context",
-   "lanes": [
-    {
-     "pin": 0,
-     "groups": [
-      {
-       "rows": {
-        "seqs_share": 1.0
-       },
-       "prompt": 4096
-      }
-     ]
-    }
-   ]
-  },
-  {
-   "name": "D-v2",
-   "kind": "drain",
-   "purpose": "row padding at low context: one long anchor among short rows",
-   "lanes": [
-    {
-     "pin": 0,
-     "groups": [
-      {
-       "rows": {
-        "seqs_share": 1.0,
-        "minus": 1
-       },
-       "prompt": 4096,
-       "then": 512
-      },
-      {
-       "rows": 1,
-       "prompt": {
-        "len_share": 0.8583
-       },
-       "last": true,
-       "then": 512
-      }
-     ]
-    }
-   ]
-  },
-  {
-   "name": "D-v3",
-   "kind": "drain",
-   "purpose": "long context at the high rungs",
-   "lanes": [
-    {
-     "pin": 0,
-     "groups": [
-      {
-       "rows": {
-        "seqs_share": 1.0
-       },
-       "prompt": {
-        "kv_share": 0.2402
-       },
-       "then": 512
-      }
-     ]
-    }
-   ]
-  },
-  {
-   "name": "D-v3low",
-   "kind": "drain",
-   "purpose": "long context at the low rungs: nine anchors leave last",
-   "lanes": [
-    {
-     "pin": 0,
-     "groups": [
-      {
-       "rows": {
-        "seqs_share": 1.0,
-        "minus": 9
-       },
-       "prompt": 7168,
-       "then": 512
-      },
-      {
-       "rows": 9,
-       "prompt": {
-        "len_share": 0.8583
-       },
-       "last": true,
-       "then": 512
-      }
-     ]
-    }
-   ]
-  },
-  {
-   "name": "P-quads",
-   "kind": "quads",
-   "purpose": "imbalance x density x scale; graph and eager",
-   "scales": [
-    1024,
-    2048,
-    4096,
-    {
-     "bucket_share": 1.0
-    },
-    {
-     "budget_share": 0.375
-    },
-    {
-     "budget_share": 0.5
-    },
-    {
-     "budget_share": 0.75
-    },
-    {
-     "budget_share": 1.0
-    }
-   ],
-   "shares": [
-    0.0,
-    0.5,
-    1.0
-   ],
-   "sparse_steps": [
-    0,
-    150,
-    0,
-    0,
-    300,
-    0
-   ]
-  },
-  {
-   "name": "P-backlog",
-   "kind": "backlog",
-   "purpose": "unbalanced dense prefill: long prompts beside short ones",
-   "long": [
-    {
-     "len_share": 0.28613
-    },
-    {
-     "len_share": 0.5625
-    },
-    {
-     "len_share": 0.8496
-    }
-   ],
-   "short": [
-    512,
-    {
-     "budget_share": 0.75
-    }
-   ],
-   "short_turns": 40
-  },
-  {
-   "name": "P-trickle",
-   "kind": "trickle",
-   "purpose": "short prefills and middle chunks on long histories, two sessions a rank",
-   "firsts": [
-    {
-     "len_share": 0.1914
-    },
-    {
-     "len_share": 0.38184
-    },
-    {
-     "len_share": 0.57227
-    },
-    {
-     "len_share": 0.76294
-    },
-    {
-     "len_share": 0.0957
-    },
-    {
-     "len_share": 0.28613
-    },
-    {
-     "len_share": 0.47754
-    },
-    {
-     "len_share": 0.81067
-    }
-   ],
-   "deltas": [
-    4096,
-    8192,
-    16384,
-    32768,
-    2048
-   ],
-   "outs": [
-    16,
-    64,
-    1
-   ],
-   "gaps": [
-    0.5,
-    1.0,
-    2.0
-   ],
-   "turns": 11
-  },
-  {
-   "name": "P-rows-a",
-   "kind": "rows",
-   "purpose": "prefill steps of many rows, every token-graph bucket",
-   "requests": 2742,
-   "prompt": [
-    64,
-    4096
-   ],
-   "out1": 0.8,
-   "outs": [
-    1,
-    4,
-    16
-   ],
-   "concurrency": {
-    "seqs_share": 1.0,
-    "dp": true
-   }
-  },
-  {
-   "name": "P-rows-b",
-   "kind": "rows",
-   "purpose": "single-row prompts of 8-32k on every rank at once: query_square apart from tokens at output steps",
-   "requests": 320,
-   "prompt": [
-    {
-     "budget_share": 0.5
-    },
-    {
-     "budget_share": 1.0
-    }
-   ],
-   "out1": 0.8,
-   "outs": [
-    1,
-    8,
-    32
-   ],
-   "concurrency": {
-    "per_rank": 1,
-    "dp": true
-   }
-  }
+  {"name": "D-v1", "kind": "drain", "purpose": "each rung's fixed cost at small context", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": 4096}]}]},
+  {"name": "D-v2", "kind": "drain", "purpose": "row padding at low context: one long anchor among short rows", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0, "minus": 1}, "prompt": 4096, "then": 512}, {"rows": 1, "prompt": {"len_share": 0.8583}, "last": true, "then": 512}]}]},
+  {"name": "D-v3", "kind": "drain", "purpose": "long context at the high rungs", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0}, "prompt": {"kv_share": 0.2402}, "then": 512}]}]},
+  {"name": "D-v3low", "kind": "drain", "purpose": "long context at the low rungs: nine anchors leave last", "lanes": [{"pin": 0, "groups": [{"rows": {"seqs_share": 1.0, "minus": 9}, "prompt": 7168, "then": 512}, {"rows": 9, "prompt": {"len_share": 0.8583}, "last": true, "then": 512}]}]},
+  {"name": "P-quads", "kind": "quads", "purpose": "imbalance x density x scale; graph and eager", "scales": [1024, 2048, 4096, {"bucket_share": 1.0}, {"budget_share": 0.375}, {"budget_share": 0.5}, {"budget_share": 0.75}, {"budget_share": 1.0}], "shares": [0.0, 0.5, 1.0], "sparse_steps": [0, 150, 0, 0, 300, 0]},
+  {"name": "P-backlog", "kind": "backlog", "purpose": "unbalanced dense prefill: long prompts beside short ones", "long": [{"len_share": 0.28613}, {"len_share": 0.5625}, {"len_share": 0.8496}], "short": [512, {"budget_share": 0.75}], "short_turns": 40},
+  {"name": "P-trickle", "kind": "trickle", "purpose": "short prefills and middle chunks on long histories, two sessions a rank", "firsts": [{"len_share": 0.1914}, {"len_share": 0.38184}, {"len_share": 0.57227}, {"len_share": 0.76294}, {"len_share": 0.0957}, {"len_share": 0.28613}, {"len_share": 0.47754}, {"len_share": 0.81067}], "deltas": [4096, 8192, 16384, 32768, 2048], "outs": [16, 64, 1], "gaps": [0.5, 1.0, 2.0], "turns": 11},
+  {"name": "P-rows-a", "kind": "rows", "purpose": "prefill steps of many rows, every token-graph bucket", "requests": 2742, "prompt": [64, 4096], "out1": 0.8, "outs": [1, 4, 16], "concurrency": {"seqs_share": 1.0, "dp": true}},
+  {"name": "P-rows-b", "kind": "rows", "purpose": "single-row prompts of 8-32k on every rank at once: query_square apart from tokens at output steps", "requests": 320, "prompt": [{"budget_share": 0.5}, {"budget_share": 1.0}], "out1": 0.8, "outs": [1, 8, 32], "concurrency": {"per_rank": 1, "dp": true}}
  ]
 }
