@@ -209,3 +209,30 @@ def test_the_refined_lbts_is_never_below_the_distance_rules(monkeypatch):
     eit = ca._refined_eit()
     for i in (R, F, E):
         assert eit[ca._index[i]] >= ca._lbts(i) - 1e-12
+
+
+def test_a_trigger_reaching_an_idle_floored_lp_before_its_n_bounds_its_engine(monkeypatch):
+    """F waits in NER at N 5.0 (an engine output due then) under a floor of 20; P runs at 0 and can send a trigger
+    through the router that reaches F at 1.01, so F may send into its engine at 1.01 and E's EIT is 1.11, not 5.1."""
+    monkeypatch.setenv("COMPASS_CA_TAR_CUT", "1")
+    registry = LpRegistry()
+    names = ("engine", "frontend", "prefill", "router")
+    for lp in names:
+        registry.register(LpId(lp))
+    table = ChannelTable(registry)
+    for name, src, dst, la in (
+        ("prefill->router:m", "prefill", "router", 0.01),
+        ("router->frontend:m", "router", "frontend", 1.0),
+        ("frontend->engine:m", "frontend", "engine", 0.1),
+        ("engine->frontend:m", "engine", "frontend", 0.1),
+    ):
+        table.declare(name, LpId(src), LpId(dst), la, "inline")
+    ca = ClockAuthority(table)
+    e, f, p, r = (LpId(n) for n in names)
+    ca._state.update({e: TAR, f: NER, p: "running", r: NER})
+    ca._nv.update({e: 3.0, f: 5.0, p: 0.0, r: math.inf})
+    ca._now.update({e: 0.5, f: 0.5, p: 0.0, r: 0.0})
+    ca._floor[f] = 20.0
+    eit = ca._refined_eit()
+    assert eit[ca._index[e]] == pytest.approx(0.01 + 1.0 + 0.1)
+    assert eit[ca._index[e]] >= ca._lbts(e) - 1e-12

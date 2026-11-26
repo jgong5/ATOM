@@ -790,7 +790,9 @@ class ClockAuthority:
             p = pending.get(x)
             if p is None:
                 p = pending[x] = self._trigger_pending(j)
-            return base, max(n, min(h, p, e_trig[x]))
+            # A trigger may land before N (an NER's N bounds no future
+            # arrival): only the floor stands under the max.
+            return base, min(max(n, h), p, e_trig[x])
 
         eot, heap = [], []
         for x in range(k):
