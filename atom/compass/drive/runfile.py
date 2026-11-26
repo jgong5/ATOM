@@ -12,7 +12,9 @@ then sets ``out_dir`` and ``clock_endpoint`` and hands it to the server.
   ``--step-grid KEY``, the store's root and a `step_grid_bundle` entry's key;
   ``--op-graph``, ``true``, and as ``price_list`` the fields of the
   `price_list` key this run's model, parallel layout, platform and ATOM
-  source name, when ``--store`` holds one there.
+  source name, when ``--store`` holds one there. Or none of them and
+  ``--step-roofline`` alone: the step roofline prices every step, its
+  ``backend`` stated (`named_backend`).
   A KEY is the token `Key.token` prints, resolved under ``--store``; for
   ``--step-linear`` and ``--host-laws`` a law file `step_linear_fit` writes
   may stand in: its law less ``host``, ``host_fit`` and ``memory_readings``,
@@ -91,7 +93,8 @@ NOT_STEP_LAW = ("host", "host_fit", memory.LAW_MEMBER)
 
 def add_arguments(parser) -> None:
     """Add the run file's flags to `parser`."""
-    backend = parser.add_mutually_exclusive_group(required=True)
+    # None of them names the step roofline alone, which `named_backend` checks.
+    backend = parser.add_mutually_exclusive_group()
     for key in (run.STEP_STUB, *KINDS):
         flag, stub = "--" + key.replace("_", "-"), key == run.STEP_STUB
         many = {"action": "append"} if key == run.STEP_LINEAR else {}
@@ -162,9 +165,27 @@ def _stacks(args, store) -> dict:
     return stated
 
 
+def named_backend(args) -> str:
+    """The run-file key of the backend `args`, parsed with `add_arguments`,
+    name: its backend flag's, else `run.STEP_ROOFLINE` for ``--step-roofline``
+    alone; with neither it refuses, naming all five."""
+    flags = (run.STEP_STUB, *KINDS, run.OP_GRAPH)
+    named = [k for k in flags if getattr(args, k)]
+    if named:
+        return named[0]
+    if args.step_roofline:
+        return run.STEP_ROOFLINE
+    each = ", ".join("--" + k.replace("_", "-") for k in flags)
+    raise ValueError(
+        f"a run prices its steps from one of {each}, or from --step-roofline "
+        "alone, and these flags name none"
+    )
+
+
 def build(args, atom_args, across: bool = False) -> dict:
     """The run file of `args`, parsed with `add_arguments`, for a server
     started with ATOM's arguments `atom_args`, across nodes when `across`."""
+    named = named_backend(args)
     store = ArtifactStore(Path(args.store).resolve())
     out = {
         **FIXED,
@@ -179,7 +200,9 @@ def build(args, atom_args, across: bool = False) -> dict:
     # Read back as the runner reads it, so a spec it would refuse refuses
     # before a server starts.
     machine = run._machine(out)
-    if stub := getattr(args, run.STEP_STUB):
+    if named == run.STEP_ROOFLINE:
+        out["backend"] = _stated({run.STEP_ROOFLINE: True})
+    elif stub := getattr(args, run.STEP_STUB):
         out[run.STEP_STUB] = json.loads(Path(stub).read_text())
         out["backend"] = _stated(out[run.STEP_STUB])
     elif getattr(args, run.OP_GRAPH):
@@ -191,7 +214,7 @@ def build(args, atom_args, across: bool = False) -> dict:
         else:
             out["backend"] = _stated({run.OP_GRAPH: True})
     else:
-        name = next(k for k in KINDS if getattr(args, k))
+        name = named
         tokens = getattr(args, name)
         tokens = [tokens] if isinstance(tokens, str) else tokens
         resolved = [resolve(store, name, t, machine, atom_args) for t in tokens]
