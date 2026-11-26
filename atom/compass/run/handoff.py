@@ -20,6 +20,14 @@ on its wall time: the standard library's JSON and pydantic held 14.4% of the
   the first reading of the same bytes takes it. A list of ids msgspec takes as
   non-negative ints is those ints, as pydantic returns them; pydantic coerces
   or refuses any other.
+- That decoding holds a ``kv_transfer_params["prompt_token_ids"]`` list as a
+  tuple of its items. Starlette keeps a request's decoding until its response
+  ends, so an in-flight stream holds its prompt's ids all along, and every
+  full collection of the cyclic garbage collector walked each id of a list;
+  a tuple of ints leaves the collector's tracking at the first collection
+  that meets it. No reader of the decoding mutates the ids, and only
+  `resolve_prompt_token_ids` tells a tuple from a list, in its check, which
+  takes the tuple as the list it was; JSON writes a tuple as that list.
 - A prefill frontend's response whose top-level ``prompt_token_ids`` holds
   ints alone is the original rendering of the rest with msgspec's text of
   them in their place; the original renders any other.
@@ -85,30 +93,46 @@ def _reading(json_of):
             body = await request.body()
             relayed = request.scope.pop(RELAYED_JSON, None)
             if relayed is not None and relayed[0] == body:
-                request._json = relayed[1]
+                request._json = _held(relayed[1])
             else:
                 # A body msgspec refuses, json_of reads or refuses as it always has.
                 with contextlib.suppress(
                     msgspec.DecodeError, ValueError, RecursionError
                 ):
-                    request._json = JSON_DECODER.decode(body)
+                    request._json = _held(JSON_DECODER.decode(body))
         return await json_of(request)
 
     return json
 
 
+def _held(doc):
+    """`doc` with the list its ``kv_transfer_params`` holds under `KEY`, where
+    it holds one, as a tuple of the same items: a request holds its decoding
+    while its response streams, and the collector walks a list on every full
+    collection but stops tracking a tuple of ints. In place, as `HttpChannel`
+    holds a relayed body's decoding while it serves the request."""
+    params = doc.get("kv_transfer_params") if type(doc) is dict else None
+    ids = params.get(KEY) if type(params) is dict else None
+    if type(ids) is list:
+        params[KEY] = tuple(ids)
+    return doc
+
+
 class CheckedIds:
     """`adapter`, a pydantic ``TypeAdapter`` of a list of non-negative ints,
     taking a list that msgspec checks as one: strict, so a bool, a float or a
-    string goes to `adapter`, which coerces or refuses it as before."""
+    string goes to `adapter`, which coerces or refuses it as before. A tuple
+    is the list `_held` made one of, and is taken as that list."""
 
     def __init__(self, adapter) -> None:
         self.adapter = adapter
 
     def validate_python(self, ids, *args, **kwargs):
-        if type(ids) is list and not args and not kwargs:
+        if type(ids) in (list, tuple) and not args and not kwargs:
             with contextlib.suppress(msgspec.ValidationError):
                 return msgspec.convert(ids, _IDS)
+            if type(ids) is tuple:
+                ids = list(ids)
         return self.adapter.validate_python(ids, *args, **kwargs)
 
 
