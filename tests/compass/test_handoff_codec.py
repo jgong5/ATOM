@@ -251,4 +251,5 @@ def test_a_prefill_or_decode_frontends_bootstrap_installs_its_own_side(
         "P": hasattr(JSONResponse.render, "__wrapped__"),
     }
     assert installed == {"P": side == "P", "D": side == "D"}
-    assert hasattr(Request.json, "__wrapped__") == (side == "D")
+    # Each side reads its request bodies (`test_prefill_body_read`).
+    assert hasattr(Request.json, "__wrapped__")

@@ -28,6 +28,9 @@ on its wall time: the standard library's JSON and pydantic held 14.4% of the
   that meets it. No reader of the decoding mutates the ids, and only
   `resolve_prompt_token_ids` tells a tuple from a list, in its check, which
   takes the tuple as the list it was; JSON writes a tuple as that list.
+- A prefill frontend reads its request bodies, each a conversation of about
+  0.5 MB of messages at 110k prompt tokens, as decode's are read, and holds
+  their ids as they are.
 - A prefill frontend's response whose top-level ``prompt_token_ids`` holds
   ints alone is the original rendering of the rest with msgspec's text of
   them in their place; the original renders any other.
@@ -70,6 +73,8 @@ _ENCODE = msgspec.json.Encoder()
 #: The run's directory through which ids go by reference, which `install`
 #: sets (`atom.compass.run.ids_dir`); None for none.
 _DIR: str | None = None
+#: Whether this process reads a hand-off: a decode side's, which `install` sets.
+_TAKING = False
 #: A reference's first item: no id, so a decode side reading ids inline refuses it.
 REF = "compass:ids"
 _PACK = msgspec.msgpack.Encoder()
@@ -149,15 +154,16 @@ def install(side: str | None, ids_dir: str | None = None) -> None:
     """Install the decode side's reading of the hand-off (``D``) or the
     prefill side's writing of it (``P``), once a process; nothing for any
     other side. With `ids_dir`, the run's directory, which its authority
-    made, ids go by reference through it."""
-    global _DIR
+    made, ids go by reference through it. Either side reads its request
+    bodies with msgspec (`_reading`)."""
+    global _DIR, _TAKING
     if ids_dir is not None and not os.path.isdir(ids_dir):
         raise ValueError(
             f"the run's ids directory {ids_dir} is missing: the run's authority "
             "makes it on its own host, and a prefill or decode frontend of the "
             "run with ids_by_ref runs on that host"
         )
-    _DIR = ids_dir
+    _DIR, _TAKING = ids_dir, side == "D"
     if side == "D":
         from starlette.requests import Request
 
@@ -169,8 +175,10 @@ def install(side: str | None, ids_dir: str | None = None) -> None:
                 protocol._PROMPT_TOKEN_IDS_ADAPTER
             )
     elif side == "P":
+        from starlette.requests import Request
         from starlette.responses import JSONResponse
 
+        _once(Request, "json", _reading)
         _once(JSONResponse, "render", _writing)
 
 
@@ -188,7 +196,7 @@ def _reading(json_of):
     taken as that decoding: for a relayed body, the one its scope hands on
     under `RELAYED_JSON`, taken once and for the same bytes. The ids a hand-off
     reference in it stands for take its place, and its ids are held as
-    `_held` holds them."""
+    `_held` holds them, on a decode side."""
 
     @functools.wraps(json_of)
     async def json(request):
@@ -197,19 +205,26 @@ def _reading(json_of):
             relayed = request.scope.pop(RELAYED_JSON, None)
             if relayed is not None and relayed[0] == body:
                 request._json = relayed[1]
-            else:
-                # A body msgspec refuses, json_of reads or refuses as it always has.
-                with contextlib.suppress(
-                    msgspec.DecodeError, ValueError, RecursionError
-                ):
-                    request._json = JSON_DECODER.decode(body)
-            if hasattr(request, "_json"):
+            elif (held := _read(body)) is not None:
+                request._json = held[0]
+            if _TAKING and hasattr(request, "_json"):
                 if _DIR is not None:
                     _take(request._json, body)
                 _held(request._json)
         return await json_of(request)
 
     return json
+
+
+def _read(body: bytes) -> list | None:
+    """A list holding `body`'s decoding by msgspec; None for a body it refuses,
+    which ``json.loads`` reads or refuses as it always has. Alone, msgspec
+    decodes a body nested one level deeper than ``json.loads`` does."""
+    with contextlib.suppress(msgspec.DecodeError, ValueError, RecursionError):
+        held = JSON_DECODER.decode(b"".join((b"[", body, b"]")))
+        if len(held) == 1:  # else `body` is no one JSON value, as ``1,2`` is not
+            return held
+    return None
 
 
 def _held(doc):
