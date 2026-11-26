@@ -8,7 +8,8 @@ the worker in either order. The request carries its stamp in ``tracestate``,
 with its intake jitter when the traffic LP drew one (a seeded run).
 Each SSE event ATOM streams back carries its own stamp in a comment line; the
 transport reports each one to the traffic LP as it arrives, ``[DONE]`` marked
-final, and rewrites the record's times from the stamps, so aiperf's TTFT, ITL
+final and with the channel a stamp names when it names one (a stream bypass),
+and rewrites the record's times from the stamps, so aiperf's TTFT, ITL
 and latency read simulated time measured from the send: the request's arrival,
 or behind an encoding ingress the start its stamp names, its arrival at the
 ingress. When the run file states an ingress (`atom.compass.ingress`), the
@@ -36,7 +37,12 @@ from aiperf.common.models import ErrorDetails
 from aiperf.transports.aiohttp_transport import AioHttpTransport
 
 from atom.compass import ingress
-from atom.compass.carriers import cancel_body, sse_stamp, tracestate_with
+from atom.compass.carriers import (
+    cancel_body,
+    sse_channel,
+    sse_stamp,
+    tracestate_with,
+)
 from compass_harness import ADDRESS_ENV
 from compass_harness.timesource import sim_ns as _ns
 
@@ -169,14 +175,15 @@ class CompassTransport(AioHttpTransport):
         async def on_event(_wall_ttft_ns, message) -> bool:
             # aiperf calls this for each SSE event until it returns True.
             nonlocal done, first_token
-            stamp = next(
+            comment = next(
                 (
-                    sse_stamp(f": {p.value}")
+                    f": {p.value}"
                     for p in message.packets
                     if p.name == "comment" and p.value.startswith("compass ")
                 ),
                 None,
             )
+            stamp = None if comment is None else sse_stamp(comment)
             if stamp is None:
                 raise ValueError(
                     f"request {request_info.x_request_id} (credit {key}): SSE event "
@@ -186,7 +193,9 @@ class CompassTransport(AioHttpTransport):
             done = any(
                 p.name == "data" and p.value == "[DONE]" for p in message.packets
             )
-            await self._push.send_pyobj((key, seq, arrival, done))
+            ch = sse_channel(comment)
+            report = (key, seq, arrival, done) + (() if ch is None else (ch,))
+            await self._push.send_pyobj(report)
             message.perf_ns = _ns(arrival)
             stamped.append(message)
             if first_token is not None and await first_token(

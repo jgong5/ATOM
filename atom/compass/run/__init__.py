@@ -127,6 +127,12 @@ to the LP's sends before their own next grant, a TAR's grant sends the
 messages below its ceiling ahead, and LBTS and that cycle follow the channel
 reactions the table declares, LP ``router``'s in a prefill-decode run,
 `ClockAuthority`'s ``wide_ceilings``),
+``stream_bypass`` (optional, ``false``, the default, or ``true``, which needs
+LP ``router``: a decode stream's events but its last go straight to traffic,
+and its last through the router, `prefill_decode_table`; each event arrives
+at the path's lookahead, within a rounding of the router's two hops, and the
+channel table, and so the step table, differ, so the key is part of the
+configuration),
 ``ids_by_ref`` (optional, ``false``, the default, or ``true`` in a
 prefill-decode run: its prefill frontends hand a prompt's ids to its decode
 frontends by reference, through `ids_dir`, which the run's authority makes
@@ -395,6 +401,9 @@ WORKER_ORDER = "worker_order"
 LOCAL_GRANTS = "local_grants"
 #: The run-file key that widens those ceilings.
 WIDE_LOCAL_GRANTS = "wide_local_grants"
+#: The run-file key that takes a decode stream's events but its last past LP
+#: ``router``.
+STREAM_BYPASS = "stream_bypass"
 #: The run-file key that hands a prompt's ids from prefill to decode by reference.
 IDS_BY_REF = "ids_by_ref"
 #: The tmpfs root of a run's `ids_dir`.
@@ -991,6 +1000,11 @@ def _lmcache_engine(run: dict) -> str:
 
 
 def _engines_table(run: dict):
+    bypass = run.get(STREAM_BYPASS, False)
+    if not isinstance(bypass, bool):
+        raise TypeError(
+            f"the run file's {STREAM_BYPASS} is {bypass!r}; it is true or false"
+        )
     common = {k: hop(run, k) for k in HOPS[:3]}
     pp, links = _pp(run, "P"), ()
     if pp > 1:
@@ -1010,6 +1024,12 @@ def _engines_table(run: dict):
             decode=run.get(INSTANCES["D"], 1),
             prefill_pp=pp,
             pp_links=links,
+            stream_bypass=bypass,
+        )
+    if bypass:
+        raise ValueError(
+            f"the run file's {STREAM_BYPASS} takes a decode stream past LP router, "
+            "and a run of one deployment has none"
         )
     return single_engine_table(
         **common,
