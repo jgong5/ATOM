@@ -15,8 +15,10 @@ changes.
 import collections
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
+import starlette.requests
 from starlette.responses import JSONResponse
 from test_fe_decode_once import RELAY, _in_the_run
 from test_handoff_codec import (
@@ -105,7 +107,8 @@ def test_decode_s_intake_and_turn_order_count_a_reference_s_ids_inline(
 ):
     """Two hand-offs relayed at one instant, 60,000 ids by reference and
     1,000 inline: counted inline, the first body is the longer, so it takes
-    the second turn, and each intake is charged for its bytes inline."""
+    the second turn, and each intake is charged for its bytes inline. Each
+    body is decoded once: the app takes the decoding its stamp was read from."""
     intake = (1e-4, 1e-8, 1e-4)
     monkeypatch.delenv(compass_run.ENV, raising=False)
     monkeypatch.setattr(compass_run, "http_intake", lambda: intake)
@@ -123,10 +126,27 @@ def test_decode_s_intake_and_turn_order_count_a_reference_s_ids_inline(
 
     short = _text(LONG[:1000])
     inline = relayed([_text(LONG), short])
-    replies = _in_the_run(_client().app, relayed([_text(_prefill(LONG)[1]), short]))
+    bodies = relayed([_text(_prefill(LONG)[1]), short])
+    decoded = []  # the bytes of each decode
+
+    def sized(decode):
+        return lambda b: decoded.append(len(b)) or decode(b)
+
+    monkeypatch.setattr(
+        carriers, "_JSON", SimpleNamespace(decode=sized(carriers._JSON.decode))
+    )
+    monkeypatch.setattr(
+        handoff, "_DECODE", SimpleNamespace(decode=sized(handoff._DECODE.decode))
+    )
+    monkeypatch.setattr(
+        starlette.requests, "json", SimpleNamespace(loads=sized(json.loads))
+    )
+    replies = _in_the_run(_client().app, bodies)
     assert replies == [(200, {"ids": LONG}), (200, {"ids": LONG[:1000]})]
     fixed, per_byte, _ = intake
     assert charged == [pytest.approx(fixed + per_byte * len(b)) for b in inline[::-1]]
+    # Beside a reference's own few bytes, which `inline_extra` decodes.
+    assert sorted(n for n in decoded if n > 100) == sorted(map(len, bodies))
 
 
 @pytest.mark.parametrize("ids", [[5, -1], [True, 2], [1.0, 2], [2**64, 1], []])
