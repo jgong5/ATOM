@@ -70,6 +70,7 @@ import itertools
 import json
 import logging
 import math
+import os
 import queue
 import select
 import selectors
@@ -792,6 +793,21 @@ class CompassSelector(selectors.DefaultSelector):
 GENERATION_PATHS = frozenset(
     ("/v1/completions", "/v1/chat/completions", "/v1/messages", "/v1/responses")
 )
+#: The order released requests take their turns in (`HttpChannel`): ``body``,
+#: the default, smallest body (plus intake jitter) first; ``send``, as sent.
+INTAKE_ORDER_ENV = "COMPASS_HTTP_INTAKE_ORDER"
+INTAKE_ORDERS = ("body", "send")
+
+
+def intake_order() -> str:
+    """`INTAKE_ORDER_ENV`'s order, ``body`` when unset or empty; any other
+    value than `INTAKE_ORDERS` is refused."""
+    order = os.environ.get(INTAKE_ORDER_ENV) or "body"
+    if order not in INTAKE_ORDERS:
+        raise ValueError(
+            f"{INTAKE_ORDER_ENV}={order!r}; it takes one of {', '.join(INTAKE_ORDERS)}"
+        )
+    return order
 
 
 class HttpChannel:
@@ -832,6 +848,21 @@ class HttpChannel:
     wall spread of sends gives, and the same seed gives the same order. The
     jitter orders requests only: their intake charge is their own bodies'.
     With none, as with no seed, they take the exact intake order.
+
+    With ``COMPASS_HTTP_INTAKE_ORDER=send`` (`INTAKE_ORDER_ENV`; unset or
+    ``body``, the default, as above) released requests take their turns by
+    ``(arrival, seq)`` alone, their bodies and jitters ordering nothing: a
+    burst sent at one instant reaches the app in the order the traffic LP
+    sent it, a seeded run's being its seed's draw. That is the order of a
+    real frontend whose loop takes a burst in as its heads reach it: in the
+    DeepSeek-V4.1 Cell A v2 records (#752) every burst's bodies finish their
+    reads in the order their heads reached the app (Spearman +1.00, in the
+    calibration records' 64- and 128-request bursts as in the targets' 300 s
+    ones), and the engines receive a burst in an order whose Spearman against
+    input size is +0.07 to +0.69 in those calibration bursts, -0.16 to +0.30
+    in the targets', with the tokenizer pool's own reordering, where
+    smallest-first gives about +0.94. Each request is still charged its own
+    body's intake, at its turn.
 
     A stamped request whose body is a cancel
     (`atom.compass.carriers.cancel_seq`) goes to no app: it is answered 204,
@@ -889,6 +920,8 @@ class HttpChannel:
 
         self.app, self.stamp = app, stamp
         self.intake, self.hull = http_intake(), http_intake_hull()
+        # Whether bodies (and jitters) order the turns (`INTAKE_ORDER_ENV`).
+        self.by_body = intake_order() == "body"
         self.relay, self.per_event = relay(), http_stream()
         self.intake_end = -math.inf  # the LP time the last intake ended
         # http seq -> its hang-up, for each stamped request the app is serving
@@ -1004,7 +1037,8 @@ class HttpChannel:
         """Resolve `ready` with when the request's body, read at once with the
         others', is in: its arrival plus its relay's `service` and its own
         intake, ``fixed_s + (body bytes + jitter) x per_byte_s``, which depends
-        on nothing the wall decides; a cancel's after every request it can
+        on nothing the wall decides, or under ``COMPASS_HTTP_INTAKE_ORDER=send``
+        its arrival plus `service` alone; a cancel's after every request it can
         name. A body never read is in at once."""
         if ready.done():
             return
@@ -1014,6 +1048,8 @@ class HttpChannel:
             ready.set_result(math.inf)
         else:
             fixed, per_byte, _ = self.intake or (0.0, 0.0, 0.0)
+            if not self.by_body:  # COMPASS_HTTP_INTAKE_ORDER=send: as sent
+                fixed = per_byte = 0.0
             nbytes = sum(len(m.get("body", b"")) for m in reading.result())
             ready.set_result(arrival + service + fixed + per_byte * (nbytes + jitter))
 

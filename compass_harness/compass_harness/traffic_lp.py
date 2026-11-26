@@ -45,7 +45,9 @@ bodies' sizes. Each is a draw per seed and rank, its phase, conversation and
 turn, log-normal with median ``INTAKE_JITTER_ENV`` bytes (by default
 `INTAKE_JITTER_BYTES`) and the spread `INTAKE_JITTER_SIGMA` of the real burst's
 send offsets. With no seed, or a median of 0, no request carries one and the
-frontend takes the exact intake order.
+frontend takes the exact intake order. A frontend under
+``COMPASS_HTTP_INTAKE_ORDER=send`` takes one instant's requests in seq order,
+its bodies and their jitters ordering nothing (`atom.utils.compass_loop`).
 
 A run file that states an encoding ingress (``ingress``, `atom.compass.ingress`)
 puts it in front of the HTTP channel's receiver, and the traffic LP prices its
