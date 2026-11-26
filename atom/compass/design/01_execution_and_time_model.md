@@ -1456,7 +1456,8 @@ LBTS, which a ceiling never passes.
    `relay`. Rejected: counting the router unable to react while it waits in NER: it
    answers a relay or a cancel at once.
 3. **Only the router declares**: `http` to `http` and `relay`, `relay` to `relay`, `stream`
-   to `stream`. Basis: code. Traffic receives only `stream` and sends only `http`, so its
+   to `stream`, and `final`, a stream's last event under the stream bypass
+   ([#4228](https://github.com/jgong5/ATOM/issues/4228)), to `final`. Basis: code. Traffic receives only `stream` and sends only `http`, so its
    declaration would be every reaction. A frontend sends to its engine on an output: the
    output thread re-feeds held requests
    (`engine_core_mgr.py::CoreManager._bp_dispatch_or_refill`). Rejected: a decode

@@ -5,9 +5,9 @@ What each group defends:
 
 * **The router's declaration.** On the 8P16D C1228 table, as
   `prefill_decode_table` builds it, LP router declares that each message goes
-  on as one of its own kind and a cancel on ``http`` as ``http`` or
-  ``relay``; the distances follow that, and a kind left undeclared reacts on
-  every channel.
+  on as one of its own kind, a stream's last event under a stream bypass
+  included, and a cancel on ``http`` as ``http`` or ``relay``; the distances
+  follow that, and a kind left undeclared reacts on every channel.
 * **The router's term in a decode frontend's LBTS.** While the router waits
   in NER, a stream event pending there holds the frontend at the event's way
   back through traffic, about 3.06 ms, where #3968 alone holds it at the
@@ -53,10 +53,11 @@ STREAM, RELAY_IN = "frontend-D0->router:stream", "frontend-P0->router:relay"
 HTTP_IN = "traffic->router:http"
 
 
-def _table(reactions=None):
+def _table(reactions=None, stream_bypass=False):
     """The 8P16D C1228 table: 4 prefill deployments at DP 2 and 4 decode ones
-    at DP 4 behind LP router. `reactions` replaces the router's declaration
-    when given; ``{}`` declares that every kind reacts on every channel."""
+    at DP 4 behind LP router, with `stream_bypass` as the run file gives it.
+    `reactions` replaces the router's declaration when given; ``{}`` declares
+    that every kind reacts on every channel."""
     table = prefill_decode_table(
         admission_s=FLOOR,
         ipc_s=1e-5,
@@ -68,6 +69,7 @@ def _table(reactions=None):
         router_in_s=ROUTER_IN,
         prefill=4,
         decode=4,
+        stream_bypass=stream_bypass,
     )
     if reactions is not None:
         table.mark_reactions(ROUTER, reactions)
@@ -92,6 +94,21 @@ def test_the_router_declares_its_own_kind_and_a_cancels_relay():
     assert table.distance(FD1, FD) == pytest.approx(ROUTER_IN + RELAY)
     via_prefill = DECODE_IPC + 1e-4 + 1e-5 + ROUTER_S
     assert table.reaction_distance(FD1, FD) == pytest.approx(via_prefill)
+
+
+@pytest.mark.parametrize(
+    "reactions, back", [(None, STREAM_BACK), ({}, RELAY)], ids=["declared", "#3968"]
+)
+def test_under_a_stream_bypass_a_stream_s_last_event_goes_on_as_its_own_kind(
+    reactions, back
+):
+    """Its other events go straight to traffic, at the router path's whole
+    lookahead; its last, ``final``, still crosses the router."""
+    table = _table(reactions, stream_bypass=True)
+    direct = "frontend-D0->traffic:stream"
+    assert table.reach("frontend-D0->router:final", FD) == pytest.approx(back)
+    assert table.reach(direct, FD) == pytest.approx(ROUTER_IN + RELAY)
+    assert table.lookahead(direct) == pytest.approx(FLOOR + ROUTER_S)
 
 
 def test_an_undeclared_kind_counts_as_able_to_react_on_every_channel():

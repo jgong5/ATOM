@@ -233,12 +233,13 @@ def kind_of(name: str) -> str:
 
 
 #: LP ``router``'s reactions: each message it handles goes on as one of its own
-#: kind, and a cancel on ``http`` goes on as ``http`` or as ``relay``
-#: (``atom/mesh/src/compass_router.rs``).
+#: kind, ``final`` a stream's last event under a stream bypass, and a cancel on
+#: ``http`` goes on as ``http`` or as ``relay`` (``atom/mesh/src/compass_router.rs``).
 ROUTER_REACTIONS = {
     "http": ("http", "relay"),
     "relay": ("relay",),
     "stream": ("stream",),
+    "final": ("final",),
 }
 
 
