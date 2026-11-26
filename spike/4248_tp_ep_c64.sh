@@ -94,8 +94,10 @@ drained() {  # URL: until the server holds no request, as cal_v1.sh waits betwee
   done
 }
 
-calibrate() {  # the design's segments on one server under its server_env, each lane a client.sh run of its traces
-  local plan=$DATA/design/plan.json url k lane file pin c n seed extra pids
+calibrate() {  # the design's segments on one server under its server_env, each lane a client.sh run of its traces.
+  # No lane is pinned: at one DP rank each lands on rank 0, and a pin's data_parallel_rank would give the record a
+  # second set of request parameters, which compass fit refuses
+  local plan=$DATA/design/plan.json url k lane file c n seed extra pids
   plan() { python3 -c "import json, sys; p = json.load(open('$plan')); $1" "${@:2}"; }
   rm -rf "$C" && mkdir -p "$C/logs" && cp "$plan" "$C/"
   serve "$C/real" $(plan 'print(" ".join(f"{k}={v}" for k, v in p["server_env"].items()))')
@@ -103,15 +105,14 @@ calibrate() {  # the design's segments on one server under its server_env, each 
   for k in $(seq 0 $(($(plan 'print(len(p["sequence"]))') - 1))); do
     seg=$(plan 'print(p["sequence"][int(sys.argv[1])]["segment"])' "$k") pids=()
     say "$seg: start"
-    while read -r lane file pin c n seed; do
+    while read -r lane file c n seed; do
       mkdir -p "$C/$seg/$lane" && cp "$C/real/server.json" "$C/$seg/$lane/"
       extra="--apply-chat-template --trajectory-start-min-ratio 0 --trajectory-start-max-ratio 0 --random-seed $seed --num-conversations $n"
-      [ "$pin" = None ] || extra+=" --extra-inputs data_parallel_rank:$pin"
       TRACES=$DATA/design/$file AIPERF_EXTRA_ARGS=$extra HARNESS_PYTHON=$DATA/venv-real/bin/python \
         "$T/scripts/compass/client.sh" "$C/$seg/$lane" --traces "0-$((n - 1))" --concurrency "$c" --duration 3600 \
         >"$C/logs/client_${seg}_$lane.log" 2>&1 &
       pids+=($!)
-    done < <(plan 'print("\n".join(" ".join(str(x[f]) for f in ("name", "file", "pin", "concurrency", "traces", "seed")) for x in p["sequence"][int(sys.argv[1])]["lanes"]))' "$k")
+    done < <(plan 'print("\n".join(" ".join(str(x[f]) for f in ("name", "file", "concurrency", "traces", "seed")) for x in p["sequence"][int(sys.argv[1])]["lanes"]))' "$k")
     for p in "${pids[@]}"; do wait "$p" || { stop "$C/real"; die "a client of $seg failed; see $C/logs"; }; done
     drained "$url" && say "$seg: drained"
     sleep 15
@@ -189,7 +190,8 @@ sim)
 import json, sys
 s = json.load(open(sys.argv[1]))["schedule"]
 r = s["refusals"]
-print(f"steps {r['steps']}, refused {round(r['fraction_of_steps'] * r['steps'])}, extrapolated {s.get('extrapolated')}")
+m = {k: round(v["fraction_of_predicted_seconds"], 4) for k, v in s["seconds_by_method"].items() if v["fraction_of_predicted_seconds"]}
+print(f"steps {r['steps']}, refused {r['count']}, extrapolated {s['extrapolated_steps']}, seconds by method {m}")
 EOF
   ;;
 score)
