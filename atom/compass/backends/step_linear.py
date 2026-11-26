@@ -246,6 +246,7 @@ another over the fit to it.
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Mapping
 
@@ -729,6 +730,16 @@ class StepLinearLaw:
             prefill = law["prefill"]
             extra = [f for f in PREFILL_EXTRA if f in prefill["coefficients"]]
             self.prefill = _Vector("prefill", PREFILL + tuple(extra), prefill)
+        # A pipelined prefill's later stages, each its own prefill vector fitted on
+        # its own record (`compass fit steps --stage-record`); `prefill` is stage 0's.
+        self.stage_prefill = {
+            int(stage): _Vector(
+                f"stage {stage} prefill",
+                PREFILL + tuple(f for f in PREFILL_EXTRA if f in spec["coefficients"]),
+                spec,
+            )
+            for stage, spec in (law.get("stage_prefill") or {}).items()
+        }
         self.decode = {
             None if rung == EAGER else int(rung): _Vector(
                 f"decode rung {rung}",
@@ -769,6 +780,20 @@ class StepLinearLaw:
         self.passes = self.forward and int(law["forward"]["passes"])
         if self.forward and self.passes < 1:
             raise ValueError(f"the forward vector states {self.passes} passes")
+
+
+def _at_stage(self, stage: int) -> "StepLinearLaw":
+    """This law at pipeline stage `stage`: that stage's prefill vector where the
+    law states one (`stage_prefill`), else this law as it stands."""
+    vector = self.stage_prefill.get(int(stage or 0))
+    if vector is None:
+        return self
+    staged = copy.copy(self)
+    staged.prefill = vector
+    return staged
+
+
+StepLinearLaw.at_stage = _at_stage
 
 
 class StepLinearBackend(CostBackend):

@@ -2377,7 +2377,10 @@ def runner(model_runner, tree) -> None:
         # Under DP-attention every rank runs at TP 1, and experts shard over the group.
         dpa = config.enable_dp_attention
         dp = config.parallel_config.data_parallel_size if dpa else 1
-        backend = StepLinearBackend(StepLinearLaw(run[STEP_LINEAR]), dp)
+        # A pipeline stage prices its prefill by its own stage's vector, where
+        # the law states one (`StepLinearLaw.at_stage`).
+        stage = getattr(config.parallel_config, "pipeline_parallel_rank", 0)
+        backend = StepLinearBackend(StepLinearLaw(run[STEP_LINEAR]).at_stage(stage), dp)
     elif STEP_STUB in run:
         # A pipeline stage is priced for its own span of the stack, the span
         # ATOM's `make_layers` builds it from.

@@ -113,6 +113,23 @@ def test_a_step_in_its_hull_prices_as_the_stub_with_one_estimated_term_per_featu
     assert not cost.fell_back
 
 
+def test_a_pipelined_prefill_stage_prices_by_its_own_stage_vector():
+    staged = law()
+    stage3 = dict(staged["prefill"], coefficients=dict(staged["prefill"]["coefficients"]))
+    stage3["coefficients"]["step"] = 2 * staged["prefill"]["coefficients"]["step"]
+    staged["stage_prefill"] = {"3": stage3}
+    read = StepLinearLaw(staged)
+    batch = view((40, 40, False))
+
+    first = StepLinearBackend(read.at_stage(0)).price(batch).seconds
+    third = StepLinearBackend(read.at_stage(3)).price(batch).seconds
+    # stage 3's vector moves its step term only; stages it states none of keep stage 0's
+    assert third - first == pytest.approx(STAGE1.prefill_step)
+    assert StepLinearBackend(read.at_stage(2)).price(batch).seconds == first
+    assert read.at_stage(3).decode is read.decode
+    assert StepLinearLaw(law()).at_stage(3).prefill is not None
+
+
 def test_a_term_is_its_count_times_its_coefficient():
     step, context, padding = backend().price(view((1, 400, True), rung=2)).terms
 

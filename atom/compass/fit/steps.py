@@ -256,6 +256,35 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
     return {**grid_key, "grid": grid["grid"]}, bundle, report
 
 
+def _stage_prefill(args, sources, fit, config, stage, record) -> tuple[dict, dict]:
+    """Stage `stage`'s prefill vector and its fit figures: the fit of the prefill
+    inputs of `args` with `record` in place of the first prefill RECORD, its
+    client runs the same; refused unless that stage ran stage 0's engine config
+    and gives a prefill vector."""
+    prefill = [i for i in args.inputs if Path(i).name == "prefill"]
+    if not prefill:
+        raise ValueError("--stage-record replaces a prefill RECORD, and no RECORD is one")
+    if Path(record).name != "prefill":
+        raise ValueError(
+            f"--stage-record {stage} {record}: a stage's record is a prefill/ "
+            "directory, beside the decode/ its client runs were served with"
+        )
+    swap = {Path(prefill[0]): str(record)}
+    staged = copy.copy(args)
+    staged.inputs = [swap.get(Path(i), i) for i in args.inputs if Path(i) in swap]
+    staged.client_run = [(swap[Path(r)], e) for r, e in args.client_run if Path(r) in swap]
+    staged.ladder_run = None
+    samples, got = publish.inputs(staged, sources)
+    if got["engine_config"] != config["engine_config"]:
+        raise ValueError(
+            f"stage {stage}'s record ran another engine config than stage 0's"
+        )
+    _, params, report = fit(samples, got, staged)
+    if params.get("prefill") is None:
+        raise ValueError(f"stage {stage}'s record gives no prefill vector")
+    return params["prefill"], report.get("vectors", {}).get("prefill", {})
+
+
 def _rungs(word: str) -> tuple[int, ...]:
     """The decode rungs `--ladder-run`'s RUNGS names, comma separated, each a
     positive whole number, once."""
@@ -355,6 +384,16 @@ def main(argv: list[str]) -> None:
         "export, and the decode rungs it calibrates (comma separated); its decode "
         "steps at any other rung give no sample",
     )
+    parser.add_argument(
+        "--stage-record",
+        nargs=2,
+        action="append",
+        metavar=("STAGE", "RECORD"),
+        help="a pipelined prefill's later stage STAGE, its record a prefill/ "
+        "directory of that stage's step file (beside the decode/ its client runs "
+        "were served with); its prefill vector is fitted on it, the client runs "
+        "named for the first prefill RECORD, and stated under stage_prefill",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--ops",
@@ -398,6 +437,10 @@ def main(argv: list[str]) -> None:
     target_args.client_run = [c for c in args.client_run if Path(c[0]) not in grid_only]
     samples, config = publish.inputs(target_args, sources, args.ops)
     fields, params, report = fit(samples, config, args)
+    for stage, record in args.stage_record or ():
+        params.setdefault("stage_prefill", {})[str(int(stage))], report.setdefault(
+            "stage_prefill", {}
+        )[str(int(stage))] = _stage_prefill(target_args, sources, fit, config, stage, record)
     if args.ops:
         refused = [
             f"{f}: {w}" for s in samples for f, ws in s.floor.items() for w in ws
