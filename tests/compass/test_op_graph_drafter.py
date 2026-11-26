@@ -38,11 +38,12 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.cost import fold_seconds
-from atom.compass.backends.op_graph import OpGraphBackend
+from atom.compass.backends.op_graph import DRAFT, DRAFT_KV, KV, OpGraphBackend
 from atom.compass.backends.op_work import work
-from atom.compass.backends.work import gemm, price
+from atom.compass.backends.work import Work, gemm, price
+from atom.compass.bench.ops import parts
 from atom.compass.capture import graph_key, lookup, population_shapes
-from atom.compass.capture.forward import structure
+from atom.compass.capture.forward import Shape, structure
 from atom.compass.run import _op_graphs
 from atom.compass.runner import projection
 from atom.compass.spec import MachineSpec
@@ -51,7 +52,8 @@ CONFIG = pathlib.Path(__file__).with_name("qwen3_5_35b_a3b_fp8_config.json")
 CONFIG_ARCHITECTURES = json.loads(CONFIG.read_text())["architectures"]
 MACHINE = TREE / "tests" / "compass" / "machines" / "mi308x-hjbog39.json"
 ATTENTION = "aiter.unified_attention_with_output_base.default"
-SAMPLER = "atom.model_ops.rejection_sampler:rejection_sample"
+#: The target's verify of its rows' drafts, from its verify head's ids.
+VERIFIER = "atom.model_ops.verify_ids:IdVerifier.launch"
 ARGMAX = "aiter.ops.flydsl.topk.topk_per_row_argmax:topk_per_row_argmax"
 MOE = "aiter.rocm_aiter_fused_moe.default"
 #: Two rows, each verifying one draft and its bonus token.
@@ -137,11 +139,12 @@ def test_a_verify_step_is_cut_at_forward_done_event_into_target_and_drafter(
     ours, theirs = (_ops(graphs[key]["region"]) for key in (target, f"{target} draft"))
     vocab = json.loads(CONFIG.read_text())["text_config"]["vocab_size"]
 
-    # The target verifies each row's drafts and its bonus token, and samples.
+    # The target runs each row's drafts and its bonus token, and verifies them
+    # from its head's ids.
     assert {op["args"]["q"]["shape"][0] for op in ours if op["op"] == ATTENTION} == {
         2 * (drafts + 1)
     }
-    assert SAMPLER in {op["op"] for op in ours} - {op["op"] for op in theirs}
+    assert VERIFIER in {op["op"] for op in ours} - {op["op"] for op in theirs}
     # The drafter runs its layer once per draft, each through the shared
     # embedding and LM head.
     names = [op["op"] for op in theirs]
@@ -171,10 +174,31 @@ def _priced(root, drafter, batch, ep=1, dp=1):
     cost = backend.price(batch)
 
     def drafted(width):
+        """Each leaf priced under its kind, and a resource_bound `Par` as one
+        roofline over its branches' summed work: the verify's ids, which the
+        drafter's graph opens by copying to the host on a side stream."""
         flat: dict = {}
-        for op in _ops(drafter["region"]):
-            if (w := work(op, batch, 1, "bf16", width)) is not None:
-                flat.setdefault(f"draft op.{op['op']}", []).append(price(w, machine))
+
+        def walk(region):
+            if "par" in region:
+                assert region["join"] == "resource_bound"
+                works = (work(op, batch, 1, "bf16", width) for op in _ops(region))
+                summed = sum((w for w in works if w is not None), Work())
+                flat.setdefault("draft par.resource_bound", []).append(
+                    price(summed, machine)
+                )
+            elif "op" in region:
+                if (w := work(region, batch, 1, "bf16", width)) is not None:
+                    name = f"draft op.{region['op']}"
+                    flat.setdefault(name, []).append(price(w, machine))
+            elif "repeat" in region:
+                for _ in range(region["count"]):
+                    walk(region["repeat"])
+            else:
+                for item in region["seq"]:
+                    walk(item)
+
+        walk(drafter["region"])
         return {name: fold_seconds(s) for name, s in flat.items()}
 
     return cost, drafted
@@ -190,7 +214,7 @@ def test_a_run_prices_a_verify_step_s_drafter_from_its_own_graph(ep, tmp_path_fa
     # The drafter's experts run over the target's EP ranks, as ATOM builds them.
     moe = f"draft op.{MOE}"
     assert (drafted(ep)[moe] == drafted(1)[moe]) == (ep == 1)
-    assert f"op.{SAMPLER}" in {t.name for t in cost.terms}
+    assert f"op.{VERIFIER}" in {t.name for t in cost.terms}
 
 
 def test_a_middle_chunk_is_cut_where_its_draft_kv_pass_starts(tmp_path_factory):
@@ -255,15 +279,14 @@ def test_a_step_reads_its_drafter_s_graph_as_draft_terms(batch, shape):
 @pytest.mark.parametrize(
     "batch,drafted,named",
     [
-        (view((1, 9, True)), g(1, 8, 8), "a step that decodes a row of other than 2"),
-        (VERIFY, None, "over 2 sequences for its drafter"),
         (
-            replace(VERIFY, tbo_tokens=((2,), (2,))),
+            view((1, 9, True), (2, 9, True)),
             g(1, 8, 8),
-            "a two-batch-overlap step under a drafter",
+            "a step that decodes a row of other than 2",
         ),
+        (VERIFY, None, "over 2 sequences for its drafter"),
     ],
-    ids=["unverified-row", "uncaptured-drafter", "two-batch-overlap"],
+    ids=["unverified-row", "uncaptured-drafter"],
 )
 def test_a_step_under_a_drafter_with_no_draft_to_price_is_refused_by_name(
     batch, drafted, named
@@ -623,3 +646,88 @@ def test_a_padded_drafter_s_later_pass_runs_and_dispatches_at_the_rung(tmp_path)
         if op["op"] == f"{MORI}.dispatch"
     ]
     assert dispatched == [(9, 93), (4, 32)]
+
+
+@pytest.mark.parametrize(
+    "batch,halves,shape",
+    [
+        (VERIFY, ((2,), (2,)), ("decode", 2, 2, True)),
+        (FINAL, ((5,), (4,)), ("prefill", 9, 1, True)),
+    ],
+    ids=["verify", "final-chunk"],
+)
+def test_a_split_step_prices_its_drafter_after_both_micro_batches_whole(
+    batch, halves, shape
+):
+    # ATOM wraps the target alone in UBatchWrapper: its drafter proposes after
+    # both micro-batches, on the step's whole rows.
+    asked = []
+
+    def graph(*at, draft=False, micro_batch=False):
+        asked.append((*at, draft, micro_batch))
+        return g(16, 64, 64) if draft else g(4, 8, 8)
+
+    split = replace(batch, tbo_tokens=halves)
+    cost = OpGraphBackend(SPEC, graph, kv="bf16", drafts=1).price(split)
+
+    assert [t.name for t in cost.terms] == ["op.tbo"]
+    assert [a[-2:] for a in asked] == [(False, True), (False, True), (True, False)]
+    assert asked[-1] == (*shape, True, False)
+    assert cost.draft_seconds == price(gemm(16, 64, 64), SPEC)
+
+
+def test_a_split_step_prices_its_block_drafter_s_draft_kv_pass_whole():
+    # The draft-KV pass runs after both micro-batches too, on the step's whole
+    # rows, from its graph at the step's shape, among the target's terms.
+    asked = []
+
+    def graph(*at, draft=False, micro_batch=False):
+        asked.append((*at, draft, micro_batch))
+        return g(8, 32, 32) if draft == KV else g(16, 64, 64) if draft else g(4, 8, 8)
+
+    split = replace(FINAL, tbo_tokens=((5,), (4,)))
+    cost = OpGraphBackend(SPEC, graph, kv="bf16", drafts=1, block=True).price(split)
+
+    terms = {t.name: t for t in cost.terms}
+    assert list(terms) == ["op.tbo", f"{DRAFT_KV}op.{GEMM}"]
+    assert ("prefill", 9, 1, True, KV, False) in asked
+    kv = terms[f"{DRAFT_KV}op.{GEMM}"]
+    assert kv.seconds == price(gemm(8, 32, 32), SPEC)
+    assert kv.provenance.detail.endswith("of the graph at prefill T=9 B=1")
+
+
+def test_a_split_step_s_listed_shapes_hold_every_graph_its_drafter_is_priced_from(
+    tmp_path, monkeypatch
+):
+    # One rank splits 9000 tokens in two rows into micro-batches of 4500; its
+    # block drafter and draft-KV pass run past both, on the step's whole rows.
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
+    rows = [[6000, 6000, False], [3000, 3000, False]]
+    line = {"step": 0, "is_dummy_run": False, "rows": rows, "rung": None}
+    (tmp_path / "steps").mkdir()
+    (tmp_path / "run.json").write_text("{}")
+    line |= {"produces_output": True}
+    (tmp_path / "steps" / "dp0.jsonl").write_text(json.dumps(line) + "\n")
+    asked = set()
+
+    def graph(phase, t, b, output, gathered=None, draft=False, width=None, **micro):
+        part = {True: DRAFT, KV: DRAFT_KV}.get(draft, "")
+        shape = Shape(phase, t, b, gathered, width, **micro).at(1)
+        asked.add((part, shape, output or not part, draft))
+        return g(4, 8, 8)
+
+    split = BatchView(
+        tuple(RequestShape(*r) for r in rows),
+        produces_output=True,
+        tbo_tokens=((4500,), (4500,)),
+    )
+    OpGraphBackend(SPEC, graph, kv="bf16", drafts=1, block=True).price(split)
+
+    spec = SimpleNamespace(use_dspark=lambda: True, num_speculative_tokens=1)
+    config = SimpleNamespace(enable_tbo=True, speculative_config=spec)
+    read = {r for _, reads in parts([str(tmp_path)], config) for r in reads}
+    assert asked == read
+    whole = Shape("prefill", 9000, 2)
+    assert (DRAFT, whole, True, True) in asked
+    listed = population_shapes([str(tmp_path)], tbo=True, run_drafts=1)
+    assert {shape for _, shape, *_ in asked} == set(listed)

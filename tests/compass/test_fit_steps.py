@@ -47,6 +47,7 @@ from atom.compass.artifacts import (
     keyed_platform,
     machine_platform,
 )
+from atom.compass.artifacts.store import ENTRY_FILE
 from atom.compass.backends import StepLinearLaw, step_linear_fit
 from atom.compass.backends.step_labels import digest
 from atom.compass.drive.aiter_jit import BUILDS
@@ -126,15 +127,20 @@ def fit(tmp_path, command, *args):
     cli.main([*command.split(), *map(str, args), *tail])
 
 
-def law_key(form="history", engine=ENGINE) -> Key:
-    return Key.of(
-        Kind.STEP_LINEAR_LAW,
-        model=HOST["model"],
-        engine_config=json.dumps(engine, sort_keys=True),
-        source_root="atom_py-" + HOST["atom"],
-        form=form,
+def law_key(store, form="history", engine=ENGINE) -> Key:
+    """The key of the one step linear law in `store` fitted at `form` and
+    `engine`: its ``fit_src`` is the digest of the law there."""
+    fields = {
+        "model": HOST["model"],
+        "engine_config": json.dumps(engine, sort_keys=True),
+        "source_root": "atom_py-" + HOST["atom"],
+        "form": form,
         **keyed_platform(Kind.STEP_LINEAR_LAW, PLATFORM),
-    )
+    }
+    entries = (store / Kind.STEP_LINEAR_LAW.value).glob(f"*/{ENTRY_FILE}")
+    keys = [json.loads(entry.read_text())["key"] for entry in entries]
+    (key,) = [k for k in keys if k.items() >= fields.items()]
+    return Key.of(Kind.STEP_LINEAR_LAW, **key)
 
 
 def member(store, key, stem):
@@ -150,7 +156,8 @@ def test_the_law_published_is_the_one_step_linear_fits_command_writes_less_its_h
     a, b = record(tmp_path / "a", 19), record(tmp_path / "b", 20)
     fit(tmp_path, "fit steps", *LINEAR, "--form", form, a, b, *clients(a, b))
 
-    law = member(tmp_path / "store", law_key(form), "params")
+    key = law_key(tmp_path / "store", form)
+    law = member(tmp_path / "store", key, "params")
     # The command names runs in argument order, the samples in digest order.
     paths = sorted((d / "steps/dp0.jsonl" for d in (a, b)), key=digest)
     law_file = str(tmp_path / "law.json")
@@ -162,13 +169,14 @@ def test_the_law_published_is_the_one_step_linear_fits_command_writes_less_its_h
     assert law == {k: v for k, v in written.items() if k not in ("host", "host_fit")}
     StepLinearLaw(law)
     copy = json.loads((tmp_path / "out/step_linear_law.json").read_text())
-    report = member(tmp_path / "store", law_key(form), "report")
+    report = member(tmp_path / "store", key, "report")
     assert copy == {
-        "key": law_key(form).values,
-        "token": law_key(form).token(),
+        "key": key.values,
+        "token": key.token(),
         "params": law,
         "report": report,
     }
+    assert key.values["fit_src"] == step_linear_fit.fit_src(law)
 
 
 def test_a_routed_law_is_the_one_step_linear_fits_command_writes_with_the_routing(
@@ -185,7 +193,9 @@ def test_a_routed_law_is_the_one_step_linear_fits_command_writes_with_the_routin
     routing = ("--moe-routing", ",".join(map(str, ROUTING)))
     fit(tmp_path, "fit steps", *LINEAR, *routing, *runs, *clients(*runs))
 
-    law = member(tmp_path / "store", law_key(engine=key["engine"]), "params")
+    law = member(
+        tmp_path / "store", law_key(tmp_path / "store", engine=key["engine"]), "params"
+    )
     # The samples come in run order, a run named by its ranks' digests.
     ranks = sorted(
         (sorted((d / "steps").glob("dp*[0-9].jsonl")) for d in runs),
@@ -209,10 +219,16 @@ def test_step_linear_fits_the_history_form_unless_told_another(tmp_path):
         (tmp_path / name).mkdir()
         fit(tmp_path / name, "fit steps", *LINEAR, *form, a, b, *clients(a, b))
 
-    law = member(tmp_path / "default/store", law_key("history"), "params")
+    law = member(
+        tmp_path / "default/store",
+        law_key(tmp_path / "default/store", "history"),
+        "params",
+    )
     assert law["form"] == "history"
     assert list(law["prefill"]["coefficients"]) == list(step_linear_fit.HISTORY)
-    base = member(tmp_path / "base/store", law_key("base"), "params")
+    base = member(
+        tmp_path / "base/store", law_key(tmp_path / "base/store", "base"), "params"
+    )
     assert list(base["prefill"]["coefficients"]) == list(step_linear_fit.PREFILL)
 
 
@@ -251,7 +267,7 @@ def test_the_report_names_each_run_with_every_trace_its_steps_served(tmp_path):
     b = record(tmp_path / "b", 20, trace="trace-b")
     fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
 
-    report = member(tmp_path / "store", law_key(), "report")
+    report = member(tmp_path / "store", law_key(tmp_path / "store"), "report")
     assert report["provenance"] == served(HOST, {a: "trace-a", b: "trace-b"})
 
 
@@ -259,7 +275,7 @@ def test_the_entry_s_readings_are_the_ones_its_records_state(tmp_path):
     a = record(tmp_path / "a", 19)
     fit(tmp_path, "fit steps", *LINEAR, a, *clients(a))
 
-    entry = ArtifactStore(tmp_path / "store").read(law_key())
+    entry = ArtifactStore(tmp_path / "store").read(law_key(tmp_path / "store"))
     assert dict(entry.fingerprints[Row.STEP_LINEAR_LAW].cells) == {
         Axis.SOFTWARE_STACK: Reading(
             "stated", "rocm 7.2.4 / aiter f4e7c7509 / rccl 2.22.3"
@@ -349,7 +365,7 @@ def test_a_deployment_s_prefill_side_fits_from_the_deployment_s_export(tmp_path)
     (decode / TRANSFERS).write_text("".join(json.dumps(t) + "\n" for t in joined))
     fit(tmp_path, "fit steps", *LINEAR, p, "--client-run", p, export)
 
-    report = member(tmp_path / "store", law_key(), "report")
+    report = member(tmp_path / "store", law_key(tmp_path / "store"), "report")
     assert report["provenance"] == served(HOST, {p: "trace"})
 
 
@@ -391,7 +407,7 @@ def test_each_prefill_instance_fits_from_the_export_through_its_own_transfers(
     runs = [x for p in prefills for x in ("--client-run", p, cell / "client_run.json")]
     fit(tmp_path, "fit steps", *LINEAR, *prefills, *runs)
 
-    report = member(tmp_path / "store", law_key(), "report")
+    report = member(tmp_path / "store", law_key(tmp_path / "store"), "report")
     traced = {p: f"trace-{k}" for k, p in enumerate(prefills)}
     assert report["provenance"] == served(HOST, traced)
 
@@ -607,10 +623,11 @@ def test_a_ladder_run_s_decodes_join_only_the_rungs_it_calibrates_and_its_prefil
     fit(tmp_path / "z", "fit steps", *LINEAR, a, *clients(a))
 
     laddered, report = (
-        member(tmp_path / "x/store", law_key(), m) for m in ("params", "report")
+        member(tmp_path / "x/store", law_key(tmp_path / "x/store"), m)
+        for m in ("params", "report")
     )
-    both = member(tmp_path / "y/store", law_key(), "params")
-    alone = member(tmp_path / "z/store", law_key(), "params")
+    both = member(tmp_path / "y/store", law_key(tmp_path / "y/store"), "params")
+    alone = member(tmp_path / "z/store", law_key(tmp_path / "z/store"), "params")
     StepLinearLaw(laddered)
     # Rung 4 takes both records' decodes; rung 2 and the eager decodes a's alone.
     assert _rung_lines(b, (2, None)) and _rung_lines(b, (4,))
@@ -700,8 +717,10 @@ def test_a_pipeline_fits_one_law_a_part_per_stage_each_on_its_own_steps(tmp_path
     a, b = pipeline(tmp_path / "a", 19), pipeline(tmp_path / "b", 20)
     fit(tmp_path, "fit steps", *LINEAR, a, b, *clients(a, b))
 
-    law = member(tmp_path / "store", law_key(engine=PP2), "params")
-    report = member(tmp_path / "store", law_key(engine=PP2), "report")
+    law = member(tmp_path / "store", law_key(tmp_path / "store", engine=PP2), "params")
+    report = member(
+        tmp_path / "store", law_key(tmp_path / "store", engine=PP2), "report"
+    )
     assert law["engine_config"] == PP2 and law["platform"] == keyed_platform(
         Kind.STEP_LINEAR_LAW, PLATFORM
     )

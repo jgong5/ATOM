@@ -816,23 +816,28 @@ def simulated_arch():
     the meta device. Each probe bound by name in a loaded module is swapped,
     the probes' own module among them, so a module imported inside the block
     binds the swapped one. On the way out every module holding the swapped one
-    gets the probe back, one imported inside the block too: a test process
+    gets its own probe back, and one imported inside the block the probes'
+    module's: a test process
     builds many runners and runs other tests on the host's arch after. Without
     a run file nothing is swapped, nor without aiter loaded, as where there is
     no driver.
     """
     arch = _simulated_device_arch()
-    real = {}
+    # each swapped module's own probe, and the probe module's, by name
+    own, real = {}, {}
+    chip_info = "aiter.jit.utils.chip_info"
 
     def simulated():
         return arch
 
     if arch is not None:
-        for module in list(sys.modules.values()):
+        for name, module in list(sys.modules.items()):
             for n in ("get_gfx", "get_gfx_runtime"):
                 probe = getattr(module, "__dict__", {}).get(n)
-                if getattr(probe, "__module__", None) == "aiter.jit.utils.chip_info":
-                    real.setdefault(n, probe)
+                if getattr(probe, "__module__", None) == chip_info:
+                    own[(id(module), n)] = probe
+                    if name == chip_info or n not in real:
+                        real[n] = probe
                     setattr(module, n, simulated)
     try:
         yield
@@ -840,7 +845,7 @@ def simulated_arch():
         for module in list(sys.modules.values()):
             for n, probe in real.items():
                 if getattr(module, "__dict__", {}).get(n) is simulated:
-                    setattr(module, n, probe)
+                    setattr(module, n, own.get((id(module), n), probe))
 
 
 def start_on_host(runner: Any, rank: int, config: Any) -> None:
@@ -1132,7 +1137,8 @@ def drafts_on_meta() -> None:
     worker process.
 
     `ModelRunner.__init__` builds the drafter on this rank's device and loads it
-    right after `_build_and_load_model`, with no override point between. The
+    (`_build_and_load_drafter`) right after `_build_and_load_model`, the
+    building in each flavor's `_build_draft_model`. The
     drafter's own buffers stay on the host; only the draft model is meta. Every
     subclass of `Drafter` is patched, at any depth; a hook `Drafter` no longer
     defines is refused by name, since the flavors would then build on this
@@ -1194,6 +1200,13 @@ class UnbuiltModel(torch.nn.Module):
     def __init__(self, model_class: Any) -> None:
         super().__init__()
         self.model_class_name = getattr(model_class, "__name__", repr(model_class))
+
+    @property
+    def model(self) -> Any:
+        """The tree, where ATOM finds a model's decoder layers through its
+        `.model` wrappers: a pipeline stage's drafter relay (`PPAuxRelay`)
+        reads which taps it holds there."""
+        return self.tree
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         raise RunnerRefusal(
@@ -1341,7 +1354,7 @@ def _staging_row_bytes(runner: Any) -> int:
 def _refused(method: str):
     """A worker method that answers with its refusal instead of doing its work."""
 
-    def refuse(self, *args: Any) -> str:
+    def refuse(self, *args: Any, **kwargs: Any) -> str:
         reason = f"command:{method}"
         vars(self).setdefault("_refused_commands", []).append(reason)
         logger.warning(
@@ -1371,6 +1384,7 @@ class RefusedControlCommands:
     update_weights = _refused("update_weights")
     update_weights_from_shm = _refused("update_weights_from_shm")
     update_weights_from_ipc = _refused("update_weights_from_ipc")
+    receive_weights_rdma = _refused("receive_weights_rdma")
     discard_failed_weight_sync = _refused("discard_failed_weight_sync")
     release_memory = _refused("release_memory")
     resume_memory = _refused("resume_memory")
@@ -1594,11 +1608,11 @@ class NonAllocatingRunner(
 ):
     """Overrides that construct a model runner without touching device memory."""
 
-    def _build_and_load_model(self, model_class: Any) -> None:
+    def _build_and_load_model(self, config: Any, model_class: Any, device: Any) -> Any:
         """Build the module tree on the meta device and read no checkpoint.
 
-        The base class constructs the model with the default device set to this
-        rank's GPU and then fills it from disk. Here it is built on the meta
+        The base class constructs the model on this rank's GPU and then fills
+        it from disk, and `__init__` keeps what it returns. Here it is built on the meta
         device, shapes and no bytes, a factory function's tensor on a named
         device included, because ATOM sizes the KV pool by walking its attention
         modules; the load is skipped, so no checkpoint is read. The tree is
@@ -1606,19 +1620,20 @@ class NonAllocatingRunner(
         host's.
 
         Under a speculative config the base goes on to build the drafter and
-        load it from the checkpoint; `drafts_on_meta` makes that build meta and
-        skips the load. A predicted step's accepted drafts are drawn from the
-        config's forced acceptance (`DeferredTokenStream`), so a config that
-        declares none is refused, as is one over more than one pipeline stage,
-        on which ATOM's `prepare_input_ids` raises `NotImplementedError`.
+        load it from the checkpoint, on the last pipeline stage alone, and
+        refuses a drafter whose taps its PP relay cannot carry
+        (`_refuse_unrelayed_pp_taps`); `drafts_on_meta` makes that build meta
+        and skips the load. A predicted step's accepted drafts are drawn from
+        the config's forced acceptance (`DeferredTokenStream`), so a config
+        that declares none is refused.
 
         What stands in for the model is installed here instead, on a simulated
         run: the cost backend and the device readings its run file declares.
         """
-        self.model = UnbuiltModel(model_class)
-        # Cleared on the way out, as both of ATOM's own implementations do: the
-        # caller set the default device to this rank's GPU before calling, and
-        # the code that runs next is written against a cleared default.
+        model = UnbuiltModel(model_class)
+        # Cleared on the way out, as ATOM's own `build_model` does: the caller
+        # set the default device to this rank's GPU before calling, and the
+        # code that runs next is written against a cleared default.
         torch.set_default_device(None)
         spec = _config_field(self, "speculative_config")
         if spec is not None:
@@ -1628,23 +1643,19 @@ class NonAllocatingRunner(
                     "acceptance, and this speculative config declares none; pass "
                     "--spec-decode-acceptance-length, -rate or -rates"
                 )
-            if int(_config_field(self, "pipeline_parallel_size") or 1) > 1:
-                raise RunnerRefusal(
-                    "ATOM's prepare_input_ids raises NotImplementedError for "
-                    "pipeline parallel + speculative decode"
-                )
             drafts_on_meta()
         engram_tables_unread()
         with FactoriesOnMeta(), simulated_arch():
-            self.model.tree = model_class(self.config)
-            process_weights_after_loading(self.model.tree)
+            model.tree = model_class(config)
+            process_weights_after_loading(model.tree)
         from atom.compass import run
 
-        run.runner(self, self.model.tree)
+        run.runner(self, model.tree)
         logger.info(
             "%s built on meta and no checkpoint read; no weight bytes on a device.",
-            self.model.model_class_name,
+            model.model_class_name,
         )
+        return model
 
     def _maybe_warmup(self) -> None:
         """Skip warmup.
@@ -1908,7 +1919,7 @@ class NonAllocatingRunner(
 
         What a replacement owes its callers. These sites broadcast this name --
         `EngineCore._process_engine_step_inner` and
-        `DecodeEngineCore._process_engine_step` in
+        `DecodeEngineCore._process_engine_step_inner` in
         `atom/model_engine/engine_core.py`, and
         `PPEngineCoreProc._pp_head_step` (which waits and discards the reply)
         and `PPEngineCoreProc._downstream_busy_loop` in
@@ -2182,7 +2193,9 @@ def _group_step_seconds(
     a speculative config, a step whose price holds no `draft_terms` is
     refused the same way, since the drafter runs after every target forward,
     unless it is priced under the `eager DP dummy` treatment, whose 0 s the
-    group's max already covers. A forward `compass_host` refuses takes the
+    group's max already covers. ATOM builds the drafter on the last pipeline
+    stage alone, so an earlier stage needs no draft term and charges none
+    its price holds. A forward `compass_host` refuses takes the
     same path, charged with each segment it named at 0; a step both refuse
     has one reason.
 
@@ -2228,6 +2241,7 @@ def _group_step_seconds(
         EAGER_DP_DUMMY,
         IDLE_DP_GROUP,
         ProvenanceMix,
+        StepCost,
         fold_seconds,
     )
     from atom.compass.backends.resolver import CostRefused, Refusal
@@ -2240,6 +2254,8 @@ def _group_step_seconds(
         "_priced", ProvenanceMix()
     )
     spec = getattr(runner.config, "speculative_config", None)
+    # ATOM builds the drafter on the last pipeline stage alone.
+    drafts = pp == 1 or runner.config.parallel_config.pipeline_parallel_rank == pp - 1
     terms, target_terms, refused = (), 0, None
     host = getattr(runner, "compass_host", None)
     if isinstance(host, HostDeviceRecurrence) and host.admit != ADMISSION_IN_E:
@@ -2271,12 +2287,14 @@ def _group_step_seconds(
             batch.compass_launch = host.predicted(view)
             batch.compass_dummy = bool(view.dp_dummy and view.prefill)
         cost = backend.price(view)
+        if not drafts:
+            cost = StepCost(cost.terms, cost.treatments)
         dummy = {EAGER_DP_DUMMY, IDLE_DP_GROUP} & set(cost.treatments)
         # A draft whose work on this step is only its draft-KV pass (a producer's output prefill under a draft law
         # with output_prefill_kv, step_linear's module text) is priced among the target's terms, as `draft.` terms,
         # and states no draft_terms: that is a priced draft, not a missing one.
         in_kv = any(t.name.startswith("draft.") for t in cost.terms)
-        if spec and not cost.draft_terms and not in_kv and not dummy:
+        if spec and drafts and not cost.draft_terms and not in_kv and not dummy:
             name = type(backend).__name__
             raise CostRefused(batch, [Refusal(name, "prices no draft")])
     except CostRefused as refusal:

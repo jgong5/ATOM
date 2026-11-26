@@ -114,7 +114,7 @@ def test_each_hop_is_the_p10_of_its_messages_alone_on_it_and_a_run_takes_it(
     hopped(a, raw=raw)
     fit(tmp_path, "fit host", a, *clients(a))
 
-    key = host_laws_key(HOST)
+    key = host_laws_key(HOST, tmp_path)
     host = member(tmp_path / "store", key, "params")
     report = member(tmp_path / "store", key, "report")
     assert host["hops"] == pytest.approx({h: ns * 1e-9 for h, ns in PLANTED.items()})
@@ -141,7 +141,7 @@ def test_a_hop_the_records_cannot_give_is_left_out_and_listed_unfitted(tmp_path)
     (a / "steps/dp0.handoff.jsonl").write_text("")
     fit(tmp_path, "fit host", a, *clients(a))
 
-    key = host_laws_key(HOST)
+    key = host_laws_key(HOST, tmp_path)
     host = member(tmp_path / "store", key, "params")
     report = member(tmp_path / "store", key, "report")
     stamps = a / "steps" / compass_run.INTAKE_RECORD
@@ -160,7 +160,7 @@ def test_a_deployment_side_fits_its_engine_hops_and_not_its_client_s(tmp_path):
     hopped(d)
     fit(tmp_path, "fit host", d, *clients(d))
 
-    key = host_laws_key(HOST)
+    key = host_laws_key(HOST, tmp_path)
     host = member(tmp_path / "store", key, "params")
     report = member(tmp_path / "store", key, "report")
     assert set(host["hops"]) == {"ipc_s", "ipc_out_s"}
@@ -184,7 +184,7 @@ def test_an_instance_of_a_deployment_s_side_fits_no_hop_of_its_client(tmp_path, 
     hopped(d)
     fit(tmp_path, "fit host", d, *clients(d))
 
-    key = host_laws_key(HOST)
+    key = host_laws_key(HOST, tmp_path)
     host = member(tmp_path / "store", key, "params")
     report = member(tmp_path / "store", key, "report")
     assert set(host["hops"]) == {"ipc_s", "ipc_out_s"}

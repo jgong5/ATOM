@@ -10,8 +10,12 @@
 #   OUT            the deployment's directory, absent or empty
 #   <flags>        run: `compass run`'s run-file flags: the backend, --device,
 #                  --ptl, --network across nodes,
-#                  --store, ... (atom/compass/drive/runfile.py); record: the
-#                  `compass record` flags both instances take, e.g. --gpu
+#                  --store, ... (atom/compass/drive/runfile.py), and
+#                  --acceptance-record, a speculative decode record such as a
+#                  real deployment's OUT/decode, whose rates the decode
+#                  instance, and a drafting prefill, are given as `compass run`
+#                  gives them; record: the `compass record` flags both
+#                  instances take, e.g. --gpu
 #   <own>          that instance's own `compass record` flags, e.g. --gpu, or
 #                  --host, an address the router reaches; --on PREFIX
 #                  (below); and --env NAME=VALUE, repeated, a variable that
@@ -302,6 +306,7 @@ def decode_env():
     return env | side_env(env)
 parser = argparse.ArgumentParser(prog="deploy.sh run")
 runfile.add_arguments(parser)
+parser.add_argument("--acceptance-record", metavar="RECORD")
 args = parser.parse_args(flags)
 try:
     run = runfile.prefill_decode(args, prefill, decode, kv_link, decode_env if on else None)

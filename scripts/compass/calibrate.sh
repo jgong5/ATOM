@@ -299,7 +299,7 @@ for r; do
     [[ $r == trace\ * ]] && name=trace$k-c$c done_file=("$BUSY") flag=--trace d=$TRACE_S
     if todo "$name" "${done_file[@]}"; then
         for f in "$OUT"/fit_steps*/step_linear_law.json "$OUT"/fit_host*/host_laws.json; do
-            [[ -e $f ]] && fail "$name" "$f was fitted without it, and the store refuses a second fit of its key; calibrate into a new OUT"
+            [[ -e $f ]] && fail "$name" "$f was fitted without it, and a resume keeps that fit; calibrate into a new OUT"
         done
         serve "$name" "$CAL" "$c" "$d" "$scenario" ${flag:+"$flag"}
     fi

@@ -217,7 +217,9 @@ group split as its two micro-batches, as `trace ops --population` traces it
 (`population_steps`), capturing each `op_graph` S lacks on the run's first GPU
 as it reads, a prefill as one forward (`_capture`), or, before any point,
 refusing one only that call traces:
-every leaf at every rung of ATOM's decode ladder, and under a speculative
+every leaf at every rung of ATOM's decode ladder, at the drafts the steps'
+decode rows verify, none for a P/D producer's (`forward.Shape.verifies`), a
+producer's width captured at none too, and under a speculative
 drafter each leaf of its own decode shape past a step's (`parts`) that the
 graphs at its width, its B, do not hold, at its rows padded to that width,
 and under DP each leaf of a decode's drafter's graphs a run asks at its
@@ -561,6 +563,9 @@ V41_NAMES = {
     (_PICK, "seqLens"): "step.visible.{ratio}",
     (_ROUTED, "seqLens"): "step.visible.{ratio}",
     (_FUSED, "plan_gpu"): _PLAN,
+    # the rows its pool write takes, a plan of the ratio's own since upstream
+    # b7b5ec3f2
+    (_FUSED, "write_plan"): "step.plans.{ratio}.write_plan_gpu",
     ("atom.model_ops.deepseek_v41.index_write:write_index_rows", "plan"): _PLAN,
     (_INDICES, "pptr"): f"{_CACHE}.0",
     (_INDICES, "eptr"): f"{_CACHE}.1",
@@ -593,6 +598,9 @@ V41_NAMES = {
     },
     ("aiter.fused_moe_.default", "num_local_tokens"): "scheduled_tokens_gpu",
     ("aiter.topk_gating_fwd.default", "num_valid_rows"): "scheduled_tokens_gpu",
+    # aiter's routed top-k gating, which V4.1's router calls since upstream
+    # b7b5ec3f2
+    ("aiter_routed.topk_gating.default", "num_valid_rows"): "scheduled_tokens_gpu",
 }
 #: DeepSeek-V4's arguments, keyed and bound as `V4_METADATA`'s, to operators
 #: other models run too, which a runner binds so only beside a DeepSeek-V4 CSA
@@ -965,22 +973,24 @@ def leaves_at(
     the capture having kept no other; one of a drafter's graphs alone is
     marked ``drafted``. With `own`, `shape` is a drafter's own shape past its
     step's (`parts`), where a capture keeps a decode's drafter's graph alone:
-    the leaves of the drafter's graphs there at each output (`graph`'s
-    `output`) `own` holds, as its steps read them. With `drafter`, only the
+    the leaves of the drafter's graphs there at each `(output, draft)`
+    (`graph`'s) `own` holds, as its steps read them. With `drafter`, only the
     leaves some graph of the drafter's holds, each as the whole shape has it.
-    A drafter's graph the store holds that refuses here (`graph`) refuses."""
+    A two-batch-overlap micro-batch's are its target's alone: its drafter
+    runs past both, at the whole step. A drafter's graph the store holds that
+    refuses here (`graph`) refuses."""
     from atom.compass.artifacts import ArtifactRefusal, Rule
 
     if own:
         found, target = {}, set()
-        for output in sorted(own):
-            region = graph(store, config, shape, arch, output, True)["region"]
+        for output, draft in sorted(own, key=str):
+            region = graph(store, config, shape, arch, output, draft)["region"]
             leaves(region, None, found)
     else:
         found = leaves(graph(store, config, shape, arch)["region"])
         target, held = set(found), set()
         spec = getattr(config, "speculative_config", None)
-        for output, draft in DRAFTED if spec else ():
+        for output, draft in DRAFTED if spec and not shape.micro_batch else ():
             try:
                 region = graph(store, config, shape, arch, output, draft)["region"]
             except ArtifactRefusal as refused:
@@ -1133,13 +1143,14 @@ def _runner(config, rank: int):
     from torch.distributed import TCPStore
 
     from atom.compass.bench.ranks import agreed, cpu_group
-    from atom.model_engine.model_runner import ModelRunner, RapidServeModelRunner
+    from atom.model_engine.model_runner import ModelRunner
+    from atom.model_engine.model_setup import build_model
+    from atom.model_loader.weight_utils import params_on_meta
 
     class MetaRunner(ModelRunner):
-        def _build_and_load_model(self, model_class):
-            with RapidServeModelRunner._init_weight_params_on_meta():
-                self.model = model_class(self.config)
-            torch.set_default_device(None)
+        def _build_and_load_model(self, config, model_class, device):
+            with params_on_meta():
+                return build_model(config, model_class, device)
 
         def _maybe_warmup(self):
             pass
@@ -4036,18 +4047,19 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     from atom.compass.runner.overrides import schedulable_ladder
 
     steps = parts(args.plan, config)
-    # a drafter's own shapes, past their steps', and the outputs its graph is
-    # read at: a leaf a decode's width's graphs hold is that width's point,
+    # a drafter's own shapes, past their steps' or a split step's whole one,
+    # and the outputs and parts its graphs are read at: a leaf a decode's width's graphs hold is that width's point,
     # and a prefill's family (`_family`) states no W, so a leaf its step's
     # graphs hold is the step's. G and W are None or a count
     own, draft_lines = defaultdict(set), {}
     for line, reads in steps:
-        for part, shape, output, _ in reads[1:]:
-            if part == DRAFT and shape != reads[0][1]:
-                own[shape].add(output)
+        target = None if reads[0][0] else reads[0][1]
+        for part, shape, output, draft in reads:
+            if part and shape != target:
+                own[shape].add((output, draft))
             if part == DRAFT:
                 draft_lines.setdefault(shape, (line, set()))[1].add(output)
-    steps = [(reads[0][1], line) for line, reads in steps]
+    steps = [(reads[0][1], line) for line, reads in steps if not reads[0][0]]
     contexts = [
         c for s, line in steps if s.phase == "decode" for c in _rows(line, s.seqs)
     ]
@@ -4056,7 +4068,10 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     ragged = any(
         _mean(line, s.seqs) < PERMILLE for s, line in steps if s.phase == "decode"
     )
-    rungs = [decode(r) for r in schedulable_ladder(config)]
+    # the ladder at the drafts each decode step verifies: a producer's, none
+    verifies = dict.fromkeys(s.verifies for s, _ in steps if s.phase == "decode")
+    ladder = schedulable_ladder(config)
+    rungs = [decode(r)._replace(verifies=v) for v in verifies for r in ladder]
     graphs, done, tried = {}, {}, set()
     prefills, cached, step_tokens = set(), defaultdict(list), defaultdict(set)
     for s, line in steps:
@@ -4068,14 +4083,16 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     own = {s: outputs for s, outputs in own.items() if s not in prefills}
     # first, so a graph only `trace ops --population` traces refuses before any
     # point; the rungs too, which a decode's drafter's leaf below may join
-    widths = {decode(s.seqs) for s in own if s.phase == "decode"}
+    widths = {
+        decode(s.seqs)._replace(verifies=s.verifies) for s in own if s.phase == "decode"
+    }
     shapes = prefills | set(own) | widths | set(rungs)
     _load(store, config, args.store, shapes, graphs, None, atom_args, args.plan, own)
     for s in own:
         if s.phase == "prefill":
             prefills.add(s)
             continue
-        width = graphs[decode(s.seqs)]
+        width = graphs[decode(s.seqs)._replace(verifies=s.verifies)]
         graphs[s] = {sig: leaf for sig, leaf in graphs[s].items() if sig not in width}
     # a leaf of a drafter's graphs is a point at each shape a run asks it at
     # (`_drafter_at`), its later passes' under DP among them: a prefill's at
@@ -4088,7 +4105,7 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
         if line.get("draft_moe_rows") is None:  # no DP gather, no other G
             continue
         try:  # a step whose drafter's graph is missing is refused by a run too
-            drafter = leaves_at(store, config, s, None, outputs)
+            drafter = leaves_at(store, config, s, None, {(o, True) for o in outputs})
         except ArtifactRefusal:
             continue
         held = {} if s in rungs else graphs.get(s, {})
@@ -4172,13 +4189,14 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                 real[s].add(n)
         for (text, context, sig), r in routed:
             shape = _shape(text)
-            full = dp * shape.tokens * row
+            tokens = row if shape.verifies is None else shape.verifies + 1
+            full = dp * shape.tokens * tokens
             op = shape in real and graphs[shape][sig][0]
             if not op or routed_rows(op) != full or op.get("drafted"):
                 continue
             if context != min(contexts) and not dependent.get(r["op"], True):
                 continue
-            for n in sorted({row, *real[shape]}):
+            for n in sorted({tokens, *real[shape]}):
                 if n < full:
                     at = shape._replace(real=n)
                     graphs.setdefault(at, {})[sig] = graphs[shape][sig]
@@ -4215,14 +4233,15 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
             want[at[tokens][0], None].add(fam)
     for point, fams in cached_ladder(top_only=True).items():
         want[point] |= fams
-    n = 1
+    n, spec = 1, config.speculative_config
+    drafts = spec.num_speculative_tokens if spec else 0
     while want:
         measure_round(want, n)
         n += 1
         want = cached_ladder(top_only=False) if n == 2 else {}
         dependent = _dependent(done.values())
         families = _families(done.values(), dependent)
-        want = want or _densify(families, tried, step_tokens, dependent)
+        want = want or _densify(families, tried, step_tokens, dependent, drafts)
         want = want or _filled(families, tried, config.max_model_len)
     kinds = Counter(r["op"] for r in done.values() if "refused" not in r)
     print(json.dumps({"points per leaf kind": dict(kinds.most_common())}, indent=1))
@@ -4269,7 +4288,8 @@ def _eager(config) -> None:
 def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     """How the measured points among `records` cover the steps of the record
     directories `names`, each micro-batch of a step its DP group split under
-    two-batch overlap a step: the steps and those covered by phase and by part
+    two-batch overlap a step, and under a drafter its drafter's parts at the
+    whole step another (`parts`): the steps and those covered by phase and by part
     (`parts`), and per leaf kind, a drafter's prefixed as a run names its
     terms, the steps it left out by why. A step is covered when each leaf of
     each of its parts' `op_graph`s lies on a point or between two of one
@@ -4290,7 +4310,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
     `arch`'s; a part's graph
     the store does not hold leaves the step out, by its refusal."""
     from atom.compass.artifacts import ArtifactRefusal
-    from atom.compass.backends.op_graph import band
+    from atom.compass.backends.op_graph import band, counted_rows
     from atom.compass.backends.provenance import Refusal
     from atom.compass.capture.forward import decode
     from atom.compass.fit.ops import PriceList, fit, held_out, ran_counts
@@ -4315,7 +4335,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
             region = graph(store, config, shape, arch, *which)["region"]
             width, held = shape, {}
             if own:  # a drafter's own decode shape, past its step's
-                width = decode(shape.seqs)
+                width = decode(shape.seqs)._replace(verifies=shape.verifies)
                 held = leaves_at(store, config, width, arch)
         except ArtifactRefusal as refused:
             return refused.what
@@ -4326,7 +4346,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
         ]
 
     for line, reads in steps:
-        whys = {}
+        whys, rows = {}, counted_rows((q, c) for q, c, _ in line["rows"])
         for part, shape, output, draft in reads:
             by_part.setdefault(part, Counter())["steps"] += 1
             decoding, before = shape.phase == "decode", len(whys)
@@ -4352,7 +4372,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
                 if decoding:  # its max, then its mean over T, as `OpGraphBackend` asks
                     total = sum(r[1] for r in line["rows"])
                     bound = (*at[:2], at.tokens, at.gathered, top, total / at.tokens)
-                    bound += (None if part else _real(line), *tail[1:])
+                    bound += (None if part else _real(line), peak, rows)
                 elif asked:  # a prefill's drafter's leaf at each bound a run asks
                     each = [(*b, mean, top) for b, _ in asked]
                     bound = each if each[1:] else each[0]
@@ -4402,18 +4422,24 @@ def parts(names, config) -> list:
     part as the run prefixes its terms: its target's; under a speculative
     drafter its drafter's at the shape `trace ops --population` traces it, of
     a step that samples or not; and a block drafter's draft-KV pass's on a
-    step that samples, at the step's shape."""
+    step that samples, at the step's shape. A two-batch-overlap micro-batch
+    reads its target alone; under a drafter its step, listed before both,
+    reads no target, only the drafter's parts at the whole step."""
     from atom.compass.capture import population_steps
 
     spec, steps = getattr(config, "speculative_config", None), []
-    for shape, line in population_steps(names, config.enable_tbo, drafters=True):
+    drafts = spec.num_speculative_tokens if spec else 0
+    held = population_steps(names, config.enable_tbo, drafters=True, run_drafts=drafts)
+    for shape, line in held:
         if steps and line is steps[-1][0]:  # the drafter's own shape, past its step's
             reads = steps[-1][1]
             reads[1:2] = [(DRAFT, shape, *reads[1][2:])] if spec else []
             continue
         samples = shape.phase == "decode" or bool(line.get("produces_output"))
+        if spec and shape.micro_batch and not steps[-1][1][0][1].micro_batch:
+            del steps[-1][1][0]  # the whole step, listed before it
         reads = [("", shape, True, False)]
-        if spec:
+        if spec and not shape.micro_batch:
             reads.append((DRAFT, shape, samples, True))
             reads += [(DRAFT_KV, shape, True, KV)] * (samples and spec.use_dspark())
         steps.append((line, reads))
@@ -4450,10 +4476,12 @@ def _drafter_at(shape, op: dict, line: dict, config) -> list:
     dp = config.parallel_config.data_parallel_size
     later = rows or dp * width
     t, wide, counts = shape.tokens, shape._replace(gathered=later), {shape.tokens, n}
+    # a decode of one token a row under the drafter verifies none (`verifies`)
+    verifies = drafts if shape.verifies is None else shape.verifies
     if shape.phase == "decode":
-        t, wide = n, decode(width, later)
-        counts = {n} if width == n else {n * j for j in range(1, drafts + 2)}
-    low = gathered_off_default(shape.phase, t, min(gathered, later), dp, drafts)
+        t, wide = n, decode(width, later)._replace(verifies=shape.verifies)
+        counts = {n} if width == n else {n * j for j in range(1, verifies + 2)}
+    low = gathered_off_default(shape.phase, t, min(gathered, later), dp, verifies)
     sets = frozenset(counts | {gathered}), frozenset({width, dp * width, later})
     both = shape._replace(tokens=t, gathered=low)
     # a prefill's later passes run on its own shape, asked at their batch
@@ -4542,7 +4570,7 @@ def _shape(text: str):
     if text.startswith("prefill"):
         return prefill(n["T"], n["B"], None, n.get("W"))._replace(gathered=n.get("G"))
     shape = decode(n["B"], n.get("G"), n.get("T"))
-    return shape._replace(width=n.get("W"), real=n.get("R"))
+    return shape._replace(width=n.get("W"), real=n.get("R"), verifies=n.get("V"))
 
 
 #: Leaf kinds that exchange rows between ranks (`exchange`).
@@ -4733,7 +4761,9 @@ def _band(ats, lo, hi) -> slice | None:
     return None if i < 0 or j == len(ats) else slice(min(i, j), max(i, j) + 1)
 
 
-def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
+def _densify(
+    families, tried: set, step_tokens=None, dependent=None, drafts: int = 0
+) -> dict:
     """The point halfway between each two neighbours of a family, or of a
     prefill leaf's token count over cached tokens (`_cut`), more than one
     apart, unless `tried`, that launched different kernels or, in a decode
@@ -4756,8 +4786,15 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
     state G (`exchange_at`): `trace ops` traces such a shape only at a record's
     step. Any other is `_bent` on its line as `fit ops` reads it, taking
     in a gap beside a bend each count of a step (`step_tokens`) at its rows, or
-    at any for a family stating none."""
+    at any for a family stating none. A compressor's decode family
+    (`_compressor`) is a line for each way its points' rows complete a
+    compressed entry, as `fit ops` reads it (`fit.ops.completion`), each
+    halved at the context nearest halfway at which a point's rows
+    (`point_rows`, a drafter of `drafts` verifying past each) complete one so,
+    and each reaching its family's least and most context at the nearest
+    context inside them that does."""
     from atom.compass.capture.forward import decode, prefill
+    from atom.compass.fit.ops import completion
 
     steps = {
         p[2]["op"]
@@ -4794,8 +4831,35 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
         if json.loads(fam)[0] == "prefill":
             lines[line(fam, points)] += points
 
-    want = defaultdict(set)
-    for fam, points in [*families.items(), *across.items()]:
+    # a compressor's decode family as its lines, each reaching its family's ends
+    want, lined, lines_of = defaultdict(set), [], {}
+    for fam, points in families.items():
+        if not (ratio := _compressor(points, moved)):
+            lined.append((fam, points))
+            continue
+        shape, ragged = _marked(points[0][2]), json.loads(fam)[2:]
+
+        def completing(m, shape=shape, ragged=ragged, ratio=ratio) -> tuple:
+            at = (m, *ragged) if ragged else m
+            return completion(
+                point_rows(shape, at, sys.maxsize, 1, False, drafts), ratio
+            )
+
+        lines_of[fam] = completing, ratio
+        least, most = min(p[0] for p in points), max(p[0] for p in points)
+        for done in sorted({completion(p[2]["rows"], ratio) for p in points}):
+            on = [p for p in points if completion(p[2]["rows"], ratio) == done]
+            lined.append((fam, on))
+            low, high = min(p[0] for p in on), max(p[0] for p in on)
+            for end, lo, hi in ((least, least, low - 1), (most, high + 1, most)):
+                if lo > hi or (fam, done, end) in tried:
+                    continue
+                tried.add((fam, done, end))
+                m = _nearest(end, lo, hi, completing, done)
+                if m is not None and (fam, m) not in tried:
+                    tried.add((fam, m))
+                    want[shape, (m, *ragged) if ragged else m].add(fam)
+    for fam, points in [*lined, *across.items()]:
         if isinstance(fam, str) and json.loads(fam)[0] == "exchange G":
             continue
         points = sorted(points, key=lambda p: p[0])
@@ -4825,8 +4889,14 @@ def _densify(families, tried: set, step_tokens=None, dependent=None) -> dict:
                             tried.add((fam, t, r))
                             want[prefill(t, r), cut and cut[1] or None].add(fam)
                 continue
+            if ka == kb and a not in bent or b - a < 2:
+                continue
             mid = (a + b) // 2
-            if ka == kb and a not in bent or b - a < 2 or (fam, mid) in tried:
+            if fam in lines_of:  # a compressor's: the nearest halfway on its line
+                completing, ratio = lines_of[fam]
+                done = completion(record["rows"], ratio)
+                mid = _nearest(mid, a + 1, b - 1, completing, done)
+            if mid is None or (fam, mid) in tried:
                 continue
             if cut and moves(*cut, a, b):
                 continue
@@ -4928,6 +4998,28 @@ def _bent(points, steps=()) -> set:
     return ends
 
 
+def _compressor(points, dependent: dict) -> int:
+    """The compress ratio the leaf of a decode family's `points` takes, a
+    compressor's, of a kind that depends on context (`_dependent`), where its
+    points state their rows; else 0."""
+    record = points[0][2]
+    if not record["shape"].startswith("decode") or "rows" not in record:
+        return 0
+    if not dependent.get(record["op"], True):
+        return 0
+    return json.loads(record["leaf"])["args"].get("ratio") or 0
+
+
+def _nearest(around: int, lo: int, hi: int, of, value) -> int | None:
+    """The number nearest `around`, from `lo` to `hi`, the lower first, at
+    which `of` gives `value`; None where none is."""
+    for d in range(max(around - lo, hi - around) + 1):
+        for m in (around - d, around + d):
+            if lo <= m <= hi and of(m) == value:
+                return m
+    return None
+
+
 def _apart(p, q) -> bool:
     """Whether two points' cold times differ by more than `BENDS` of the
     lower: the line across them may then price a point between them more
@@ -4975,12 +5067,14 @@ def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
     stepping and compute units pick kernels as they do on the card. A shape
     its `--prefill` and `--width` cannot name, a DP group's gathered rows or a
     padded width, refuses before any is traced, naming the `trace ops
-    --population` of the record directories `records` that traces it. Under
+    --population` of the record directories `records` that traces it; under a
+    P/D producer's drafter, `--width` names a decode verifying none. Under
     `--enable-tbo` a prefill is traced as one forward (`--whole`), where ATOM
     would split a step of its tokens: a point times a leaf at its own shape."""
     from atom.compass import capture
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture.forward import decode, device_arch, prefill
+    from atom.kv_transfer.disaggregation.types import kv_config_has_producer
     from atom.model_engine.arg_utils import EngineArgs
 
     engine = EngineArgs.add_cli_args(FlexibleArgumentParser()).parse_args(atom_args)
@@ -4988,8 +5082,12 @@ def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
     argv += ["--arch", arch or device_arch()]
     if not arch:  # the card read by its HIP ordinal, which ROCm indexes alike
         argv += ["--gpu", os.environ.get("HIP_VISIBLE_DEVICES", "0").split(",")[0]]
+    # under a P/D producer's drafter `--width` traces a decode verifying none
+    producer = kv_config_has_producer(json.loads(engine.kv_transfer_config or "{}"))
+    verifies = 0 if producer and getattr(config, "speculative_config", None) else None
     for s in shapes:
-        if s != (prefill(s.tokens, s.seqs) if s.phase == "prefill" else decode(s.seqs)):
+        width = decode(s.seqs)._replace(verifies=verifies)
+        if s != (prefill(s.tokens, s.seqs) if s.phase == "prefill" else width):
             population = [a for r in records for a in ("--population", r)]
             call = ["compass", "trace", "ops", *argv, *population, "--store", str(root)]
             raise ArtifactRefusal(

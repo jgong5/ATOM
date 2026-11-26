@@ -6,8 +6,8 @@ Each model's stage 0 is built driverless at ``-pp 2`` in a process of its own,
 as `test_qwen3_pp_stages` builds a stage, on the simulated connector's config,
 and plans its pool with ATOM's `get_num_blocks`, as a simulated run does. Its
 runner then publishes what its connector prices, or refuses; its fake KV cache
-is allocated and ATOM's own `get_kv_transfer_tensors` is asked for the regions
-on Mooncake's config. DeepSeek-V4-Pro's pool plan refuses the stage;
+is allocated on Mooncake's config, and ATOM's own `get_kv_transfer_tensors` is
+asked for the regions there. DeepSeek-V4-Pro's pool plan refuses the stage;
 DeepSeek-R1-0528's MLA regions take it, and so, since upstream b7b5ec3f2
 places a stage's MLA rows and KDA slots by layer, do Kimi-K3's.
 """
@@ -102,8 +102,8 @@ except RunnerRefusal as e:
 try:
     with forward._patches(recorder), fake, torch.inference_mode():
         runner.attn_metadata_builder.warmup_per_req_cache = lambda: None
-        runner.allocate_kv_cache(runner.pool_plan.paged_entries)
         config.kv_transfer_config = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+        runner.allocate_kv_cache(runner.pool_plan.paged_entries)
         runner.attn_metadata_builder.get_kv_transfer_tensors()
 except NotImplementedError as e:
     refused["atom"] = str(e)

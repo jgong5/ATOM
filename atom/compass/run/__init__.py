@@ -639,6 +639,13 @@ def refuse_unfitted_law(run: dict, config) -> None:
         )
 
 
+def _holds_laws(host: dict) -> bool:
+    """Whether the host laws `host` hold laws that price a step: at their top,
+    or, above one pipeline stage, in a stage's part under ``stages``
+    (`fit.host`), all under the one key at their top."""
+    return any(part.get("laws") for part in [host, *(host.get("stages") or ())])
+
+
 def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     """Refuse the run file's step linear law on a runner that records the
     prefill token-graph buckets `buckets`, ascending, where the law states none
@@ -648,8 +655,10 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     between a fit and a run, so one stating none says nothing of them; one
     stating them states ATOM's list, which a runner records only up to
     `warmup_max_tokens`, a bound no engine config keys, so a prefill vector's
-    are held to `buckets` either way. Host laws refuse where their key's graph
-    sets state others; `run` replaces `spec()`."""
+    are held to `buckets` either way. Above one pipeline stage, each stage's
+    part under ``stages`` (`fit.steps`) is held so, the first that fails
+    named. Host laws refuse where their key's graph sets state others; `run`
+    replaces `spec()`."""
     if not buckets or (run := spec() if run is None else run) is None:
         return
     from atom.compass.backends import launch_features
@@ -657,7 +666,7 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
 
     pick_fitted(run, "host", config)
     host = run.get("host") or {}
-    graphs = host.get("laws") and launch_features.stated(host.get("key"))[1]
+    graphs = _holds_laws(host) and launch_features.stated(host.get("key"))[1]
     if graphs and (theirs := graphs["token"]["prefill"]) != list(buckets):
         raise ValueError(
             f"the host laws' key states the prefill token-graph buckets {theirs}, "
@@ -667,15 +676,18 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
         return
     pick_fitted(run, STEP_LINEAR, config)
     law = run[STEP_LINEAR]
-    stated = sorted((law.get("prefill") or {}).get("buckets") or ())
     env = law["engine_config"]["env"]
-    if (stated or BUCKETS not in env) and stated != list(buckets):
-        said = f"{BUCKETS}={env[BUCKETS]}" if BUCKETS in env else f"no {BUCKETS}"
-        raise ValueError(
-            f"the step linear law states {said} in its engine config and "
-            f"{stated or 'none'} as its prefill vector's buckets, and this run's "
-            f"runner records the prefill token-graph buckets {list(buckets)}"
-        )
+    stages = law.get("stages")
+    for k, part in enumerate(stages) if stages else [(None, law)]:
+        stated = sorted((part.get("prefill") or {}).get("buckets") or ())
+        if (stated or BUCKETS not in env) and stated != list(buckets):
+            said = f"{BUCKETS}={env[BUCKETS]}" if BUCKETS in env else f"no {BUCKETS}"
+            whose = "its" if k is None else f"pipeline stage {k}'s"
+            raise ValueError(
+                f"the step linear law states {said} in its engine config and "
+                f"{stated or 'none'} as {whose} prefill vector's buckets, and this "
+                f"run's runner records the prefill token-graph buckets {list(buckets)}"
+            )
 
 
 def refuse_context_parallel(name: str, config) -> None:
@@ -696,14 +708,15 @@ def refuse_context_parallel(name: str, config) -> None:
 
 def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     """Refuse the run file's host laws `host` when fitted under another host
-    key than this run's, on `platform` (`machine_platform`), the host CPU and
-    graph sets their key states taken as this run's, which records none, and
-    its engine config read at their ladder where this run's is a prefix of it."""
+    key than this run's, on `platform` (`machine_platform`), the host CPU,
+    graph sets and digest of what was fitted (``fit_src``) their key states
+    taken as this run's, which records none, and its engine config read at
+    their ladder where this run's is a prefix of it."""
     from atom.compass.artifacts import Kind, keyed_platform
     from atom.compass.backends.launch_features import GRAPHS, stated
     from atom.compass.backends.step_grid_plan import at_ladder
 
-    ours = host.get("laws") and {
+    ours = _holds_laws(host) and {
         **host_key(config),
         **keyed_platform(Kind.HOST_LAWS, platform),
     }
@@ -712,6 +725,9 @@ def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     if ours and "host_cpu" in theirs:
         # The host they timed is the host the run predicts, from any CPU.
         ours["host_cpu"] = theirs["host_cpu"]
+    if ours and "fit_src" in theirs:
+        # The digest of the laws themselves, which says nothing of the run.
+        ours["fit_src"] = theirs["fit_src"]
     if ours:
         ours["engine"] = at_ladder(ours["engine"], theirs.get("engine"))
     if ours and launch[1] is not None:
@@ -1454,10 +1470,10 @@ def _launch_mooncake_store(config, run: dict, side: str | None) -> None:
     widths differ from those the entry was fitted at."""
     from atom.compass.kv import mooncake_store_server as store
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+    from atom.kv_transfer.offload.kv_store.pool import _SLOT_ALIGN, _round_up
     from atom.kv_transfer.offload.mooncake_store.config import (
         parse_mooncake_store_config,
     )
-    from atom.kv_transfer.offload.mooncake_store.pool import _SLOT_ALIGN, _round_up
     from atom.utils import envs
 
     leaves = KVConnectorFactory.leaf_connectors(config) or ()
@@ -2247,10 +2263,11 @@ def refuse_offload_tier(config, run: dict) -> None:
 def _store_shell(config, run: dict) -> None:
     """Have the connector factory build ``mooncake_store`` as Compass's
     (`atom.compass.kv.mooncake_store`) when this deployment offloads to a
-    Mooncake Store; refuse one whose run file has no ``mooncake_store`` entry.
-    Its frontend checked the rest against the entry
-    (`_launch_mooncake_store`)."""
+    Mooncake Store; refuse one whose run file has no ``mooncake_store`` entry,
+    or under ``ATOM_STORE_ASYNC_RENEW``. Its frontend checked the rest against
+    the entry (`_launch_mooncake_store`)."""
     from atom.compass.kv import mooncake_store
+    from atom.utils import envs
 
     if not _offloads(config.kv_transfer_config, ENTRY_STORE):
         return
@@ -2258,6 +2275,12 @@ def _store_shell(config, run: dict) -> None:
         raise ValueError(
             "this deployment offloads KV to a Mooncake Store and the run file "
             f"has no {ENTRY_STORE} entry"
+        )
+    if envs.ATOM_STORE_ASYNC_RENEW:
+        raise ValueError(
+            "ATOM_STORE_ASYNC_RENEW renews a load's prebuilt keys and polls the "
+            "renewal on the wall clock; the simulated Store renews a sequence's "
+            "range on LP mooncake_store"
         )
     mooncake_store.substitute()
 
@@ -2735,8 +2758,10 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         draft=False,
         width=None,
         micro_batch=False,
+        verifies=None,
     ) -> dict | str | None:
-        shape = Shape(phase, tokens, seqs, gathered, width, micro_batch).at(dp, drafts)
+        shape = Shape(phase, tokens, seqs, gathered, width, micro_batch)
+        shape = shape._replace(verifies=verifies).at(dp, drafts)
         at = structure(config, phase, True, arch, output, draft, env, micro_batch)
         key = lookup(store, at, str(shape))
         missing = key is None

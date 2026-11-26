@@ -403,9 +403,7 @@ def _build(model: str, tp: int, atom_args, arch: str, tmpdir: str):
         config.tensor_parallel_size, config.parallel_config.data_parallel_size
     )
     set_current_atom_config(config)
-    from atom.model_engine.model_runner import (
-        support_model_arch_dict,
-    )  # needs the declared arch
+    from atom.models.registry import support_model_arch_dict
 
     model_class = support_model_arch_dict[config.hf_config.architectures[0]]
     torch.set_default_dtype(config.torch_dtype)

@@ -67,11 +67,13 @@ def test_both_fits_key_their_entries_by_the_stated_engine_as_step_linear_fit_doe
     graphs = json.loads((a / "steps/dp0.key.json").read_text())["engine"][GRAPHS]
     keyed = {**STATED, GRAPHS: graphs}
     assert written["host"]["key"]["engine"] == keyed
-    host_key = host_laws_key({**HOST, "engine": keyed})
+    host_key = host_laws_key({**HOST, "engine": keyed}, tmp_path)
     assert member(tmp_path / "store", host_key, "params")["key"]["engine"] == keyed
     report = member(tmp_path / "store", host_key, "report")
     assert report["stated_engine"] == json.loads(engine.read_text())
-    law = member(tmp_path / "store", law_key(engine=STATED), "params")
+    law = member(
+        tmp_path / "store", law_key(tmp_path / "store", engine=STATED), "params"
+    )
     assert law["engine_config"] == written["engine_config"] == STATED
     assert [(d / "steps/dp0.engine.json").read_bytes() for d in (a, b)] == owns
 

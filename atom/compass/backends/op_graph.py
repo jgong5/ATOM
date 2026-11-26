@@ -17,7 +17,9 @@ row does, and a prefill step when the view says so, which it does when any row
 is a final chunk.
 
 Under a drafter of `drafts` tokens a decode step verifies `drafts` and one in
-each row, and a step also reads its drafter's graph, `graph(..., draft=True)`,
+each row, or decodes one token in each, as a prefill instance's does, read at
+its shape verifying no draft (`verifies`, ``V=0``), and a step also reads its
+drafter's graph, `graph(..., draft=True)`,
 the work ATOM queues after `forward_done_event` on a step that samples, else
 from its first draft pass on: its prices are its `draft_terms`, named
 ``draft op.<kind>``. Sampling is the target's. A decode's drafter is read at its
@@ -64,6 +66,9 @@ Each graph's prices in run order fall into segments that alternate streams: an
 MoE exchange of activations rides the comm stream, everything else the compute
 stream. Both micro-batches' segments go on the two streams in ATOM's order
 (`step_roofline.overlap`); the finish time is the one term ``op.tbo``.
+Under a drafter, its propose and a block drafter's draft-KV pass run after both
+micro-batches on the step's whole rows, as ATOM runs them: their terms are
+a step's that does not split.
 
 With a `price_list`, a source named `LISTED` (`fit.ops.PriceList` in a run),
 each leaf resolves through a `Resolver`: the
@@ -92,9 +97,8 @@ two-batch-overlap step on MoRI's split send and receive (`split_send_recv`),
 whose transfer in flight lies on no stream, whose split names no pair for
 this rank, whose micro-batches' graphs exchange a different number of times
 or run an exchange beside a second stream (the dual-stream MoE, which ATOM
-turns off under overlap), or that runs under a drafter, whose draft pass no
-graph places on the overlapped streams; a decode step whose rows do not each
-verify the drafter's tokens and one; a step that samples on one rank whose
+turns off under overlap); a decode step whose rows do not each
+verify the drafter's tokens and one, or each decode one token; a step that samples on one rank whose
 MTP drafter's graph does not run its routed leaves as its passes alike, each
 its own; a prefill step whose view
 does not say whether it produces output; a shape with no graph, a
@@ -107,6 +111,7 @@ from __future__ import annotations
 
 import functools
 import json
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 
@@ -381,11 +386,26 @@ class _Roofline(CostSource):
         )
 
 
+def counted_rows(rows) -> frozenset:
+    """`rows`, each its query and context tokens, with how many rows hold
+    each, as a set: a run hashes a step's bound once a leaf, and a set keeps
+    its hash."""
+    return frozenset(Counter(rows).items())
+
+
 def band(rows, decode: bool) -> tuple[int, int]:
     """The mean and max context of `rows`, each ``[query, context, ...]``: a
     decode row's context, a prefill row's cached tokens."""
     c = [row[1] - (0 if decode else row[0]) for row in rows]
     return sum(c) // len(c), max(c)
+
+
+def verified(rows: Sequence[tuple[int, bool]], drafts: int) -> int:
+    """The drafts each row of a decode step of `rows`, each its query tokens
+    and whether it decodes, verifies under a drafter of `drafts`: none where
+    every row decodes one token, as a prefill instance's decode step under an
+    MTP drafter does, else `drafts`."""
+    return 0 if drafts and all(q == 1 for q, _ in rows) else drafts
 
 
 def step_shape(
@@ -395,10 +415,11 @@ def step_shape(
     decodes, runs at, ``(phase, tokens, seqs)``: a decode step at `rung` when it
     replayed one, else at its width, and any other step as a prefill of its
     query tokens over its rows. A decode step whose rows do not each verify a
-    drafter's `drafts` tokens and one is refused."""
+    drafter's `drafts` tokens and one, or each decode one token (`verified`),
+    is refused."""
     if not all(decode for _, decode in rows):
         return "prefill", sum(q for q, _ in rows), len(rows)
-    if any(q != drafts + 1 for q, _ in rows):
+    if any(q != verified(rows, drafts) + 1 for q, _ in rows):
         raise ValueError(
             f"decodes a row of other than {drafts + 1} tokens, which a drafter "
             f"of {drafts} verifies"
@@ -516,17 +537,32 @@ class OpGraphBackend(CostBackend):
     def price(self, batch_view: BatchView) -> StepCost:
         refused: list[Refusal] = []
         self._step, self._passes, self._read = {}, {}, set()
-        if batch_view.tbo_tokens is not None and not batch_view.image_tokens:
-            at, priced = self._overlapped(batch_view, refused)
-            if refused:
-                raise CostRefused(batch_view, list(dict.fromkeys(refused)))
-            return StepCost([_term(priced[0][0], priced, at)])
-        at, region = self._region(batch_view)
+        if batch_view.tbo_tokens is None or batch_view.image_tokens:
+            return self._graphs(batch_view, *self._region(batch_view))
+        at, priced = self._overlapped(batch_view, refused)
+        if refused:
+            raise CostRefused(batch_view, list(dict.fromkeys(refused)))
+        tbo = _term(priced[0][0], priced, at)
+        if not self.drafts:
+            return StepCost([tbo])
+        # ATOM runs the drafter past both micro-batches, on the step's whole
+        # rows (`ModelRunner` wraps the target alone in `UBatchWrapper`).
+        cost = self._graphs(batch_view, None, None)
+        return StepCost((tbo, *cost.terms), cost.treatments, cost.draft_terms)
+
+    def _graphs(self, batch_view: BatchView, at, region) -> StepCost:
+        """A step at its target's graph `region`, from the graph at `at`, and
+        its drafter's graphs; with no `region`, its drafter's alone."""
         drafted_at, drafted = (
             self._region(batch_view, draft=True) if self.drafts else (None, None)
         )
         samples = batch_view.decode or batch_view.produces_output
-        kv = self.block and samples and self._region(batch_view, draft=KV)[1]
+        kv_at, kv = (
+            self._region(batch_view, draft=KV)
+            if self.block and samples
+            else (None, None)
+        )
+        at = at or kv_at  # a split step's draft-KV pass, at its whole shape
         graph = (at, id(region), drafted_at, id(drafted), id(kv))
         # A graph's first step keeps only the graphs, whose ids `graph` names,
         # and prices them whole: a graph a run reads once, as most prefill
@@ -703,10 +739,13 @@ class OpGraphBackend(CostBackend):
         states the real rows its MoE runs (`real_rows`), and any other None;
         a target at a step stating G then the most tokens a rank of its DP
         group scheduled (`group_max_tokens`), where its view states them,
-        which MORI's exchange there is priced by."""
+        which MORI's exchange there is priced by, and any other None; and
+        every bound its rows (`counted_rows`): a compressor's price reads how
+        they complete a compressed entry (`fit.ops.completion`)."""
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
+        drafts = verified(rows, self.drafts) if phase == "decode" else self.drafts
         width = self.padded and (view.draft_bs if draft else view.target_bs)
         block = draft and self.block and phase == "decode"
         if block:
@@ -716,7 +755,7 @@ class OpGraphBackend(CostBackend):
         ran = phase == "decode" and width or t
         gathered = view.draft_moe_rows if draft else view.moe_rows
         at = t if draft else ran
-        g = gathered_off_default(phase, at, gathered, self.dp, self.drafts)
+        g = gathered_off_default(phase, at, gathered, self.dp, drafts)
         rows = [(r.query_tokens, r.context_tokens) for r in view.requests]
         mean, top = band(rows, phase == "decode")
         bound = (phase, t, b, g, mean, top)
@@ -725,14 +764,14 @@ class OpGraphBackend(CostBackend):
         own = sum(r.query_tokens for r in view.requests)
         real = real_rows(own, view.moe_rows, view.moe_tokens, view.group_dummies)
         bound += (real if phase == "decode" and not draft else None,)
-        if g is not None and not draft and view.group_max_tokens is not None:
-            bound += (view.group_max_tokens,)
+        stated = g is not None and not draft
+        bound += (view.group_max_tokens if stated else None, counted_rows(rows))
         if not width:
             return bound
         if ran == t:
             counts, wides = {t, b}, {width}
         else:
-            k = range(1, self.drafts + 2)
+            k = range(1, drafts + 2)
             counts = {b * j for j in k}
             wides = {width * j for j in k} | {self.dp * width * k[-1]}
         wide, both = (phase, ran, width, *bound[3:]), bound
@@ -745,7 +784,7 @@ class OpGraphBackend(CostBackend):
             counts, wides = counts | {gathered}, {width, padded, later}
             wide = (phase, ran, width, gathered and later, *bound[4:])
             low = gathered and min(gathered, later)
-            g = gathered_off_default(phase, t, low, self.dp, self.drafts)
+            g = gathered_off_default(phase, t, low, self.dp, drafts)
             both = (phase, t, b, g, *bound[4:])
         if phase == "decode":
             wide = (*wide[:5], wide[5] * b / width, *wide[6:])
@@ -780,12 +819,17 @@ class OpGraphBackend(CostBackend):
                 gathered = view.draft_moe_rows if own else view.moe_rows
                 g = () if gathered is None else (gathered,)
                 drafted = {"draft": draft} if draft else {}
+                # A decode whose rows verify fewer drafts than its drafter's.
+                drafts = verified(rows, self.drafts)
+                if shape[0] == "decode" and drafts != self.drafts:
+                    drafted["verifies"] = drafts
                 micro = {"micro_batch": True} if micro_batch else {}
                 # A DP middle chunk runs its drafter's propose too.
                 if (output or self.dp > 1) and width and width != shape[2]:
                     drafted["width"] = width
                 at = f" W={width}" * ("width" in drafted)
                 at += "".join(f" G={n}" for n in g)
+                at += f" V={drafts}" * ("verifies" in drafted)
                 if output is None:
                     reason = (
                         "a prefill step whose view does not say whether it "
@@ -799,9 +843,11 @@ class OpGraphBackend(CostBackend):
                 else:
                     reason = (
                         "no op_graph holds a {} step of {} tokens over {} sequences"
-                        "{}{}{}{}; compass trace ops captures one".format(
+                        "{}{}{}{}{}; compass trace ops captures one".format(
                             *shape,
                             "".join(f" gathering {n} rows" for n in g),
+                            f" verifying {drafts} drafts a row"
+                            * ("verifies" in drafted),
                             none,
                             " as a two-batch-overlap micro-batch" * micro_batch
                             + " for its drafter" * bool(draft)
@@ -822,11 +868,6 @@ class OpGraphBackend(CostBackend):
                     "a two-batch-overlap step on MoRI's split send and receive "
                     "(--all2all-backend low-latency): its transfer in flight "
                     "lies on no stream"
-                )
-            if self.drafts:
-                raise ValueError(
-                    "a two-batch-overlap step under a drafter: no graph places its "
-                    "draft pass on the overlapped streams"
                 )
             halves = micro_batches(view)
         except ValueError as exc:

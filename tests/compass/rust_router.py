@@ -147,6 +147,9 @@ _KEPT = (
     ("policies/power_of_two.rs", "rand::", LATENCY, "imports the trait the routed draws call", 1),
     ("policies/power_of_two.rs", "RandomState", LATENCY, _LOOKUP, 1),
     ("policies/random.rs", "rand::", LATENCY, "imports the trait the routed draw calls", 1),
+    ("policies/round_robin.rs", "rand::", LATENCY,
+     "imports the trait the routed draw calls", 1),
+    ("policies/round_robin.rs", "RandomState", LATENCY, "positions by candidate set; " + _LOOKUP, 1),
     ("policies/registry.rs", "RandomState", LATENCY, _LOOKUP, 2),
     ("policies/tree.rs", "RandomState", LATENCY,
      "per-tenant sizes read by key, and a debug dump", 2),
@@ -160,7 +163,8 @@ _KEPT = (
     ("routers/grpc/engine/worker_client_cache.rs", "RandomState", LATENCY, _LOOKUP, 1),
     ("routers/grpc/pipeline.rs", "Instant::now", LATENCY, _TIMING, 2),
     ("routers/http_pd_router.rs", "Instant::now", LATENCY, _TIMING, 1),
-    ("routers/http_pd_router.rs", "RandomState", LATENCY, "startup bootstrap tables; " + _LOOKUP, 6),
+    ("routers/http_pd_router.rs", "RandomState", LATENCY,
+     "startup bootstrap tables, and a warn-once set of prefills; " + _LOOKUP, 7),
     ("routers/http_pd_router.rs", "tokio::time", BOUND, (
         "aborts a prefill after 5 wall seconds and drops its load guard, on the "
         "vLLM backend only; pd_sim.sh passes --backend atom"), 1),
@@ -195,6 +199,9 @@ _KEPT = (
     ("routers/ingress.rs", "RandomState", LATENCY,
      "a warn-once set of models the KV event index cannot tokenize for", 1),
     ("routers/prepare/thread_tokenizer.rs", "RandomState", LATENCY, _LOOKUP, 1),
+    *((f"routers/atom_bridge/{name}", "Instant::now", OFF_LP, (
+        "the Rust frontend (--frontend rust), which a simulated launch does not "
+        "start; it times a request's tokens"), 1) for name in ("events.rs", "py_bridge.rs")),
 )
 # fmt: on
 

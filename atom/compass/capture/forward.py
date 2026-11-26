@@ -57,6 +57,7 @@ import enum
 import functools
 import gc
 import importlib
+import importlib.util
 import inspect
 import json
 import logging
@@ -214,7 +215,10 @@ class Shape(NamedTuple):
     micro-batch, which its structure names (`structure`), not its text.
     `real` is how many of a padded decode's MoE rows are real, the rest pad
     rows that route to no expert, None at all of them: a `measure ops` point
-    states it, and a graph is read at its shape without it."""
+    states it, and a graph is read at its shape without it. `verifies` is
+    the drafts each row of a decode under a drafter verifies where fewer
+    than its drafter's, None at its drafter's: a P/D producer's decode step
+    decodes one token a row (`op_graph.verified`)."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
@@ -223,6 +227,7 @@ class Shape(NamedTuple):
     width: int | None = None
     micro_batch: bool = False
     real: int | None = None
+    verifies: int | None = None
 
     def __str__(self) -> str:
         text = f"{self.phase} T={self.tokens} B={self.seqs}"
@@ -230,11 +235,14 @@ class Shape(NamedTuple):
             text = f"decode B={self.seqs}"
         text += f" W={self.width}" * bool(self.width)
         text += "" if self.gathered is None else f" G={self.gathered}"
+        text += "" if self.verifies is None else f" V={self.verifies}"
         return text + ("" if self.real is None else f" R={self.real}")
 
     def at(self, dp: int, drafts: int = 0) -> "Shape":
         """This shape in a DP group of `dp` under a drafter of `drafts`:
-        `gathered` only off its default (`gathered_off_default`)."""
+        `gathered` only off its default (`gathered_off_default`), its rows
+        verifying `verifies` drafts where it states them."""
+        drafts = drafts if self.verifies is None else self.verifies
         padded = self.phase == "decode" and self.width or self.tokens
         g = gathered_off_default(self.phase, padded, self.gathered, dp, drafts)
         return self._replace(gathered=g)
@@ -1043,6 +1051,8 @@ def _patches(recorder):
     * aiter's top-k scratch sizes are host queries into a module built for a
       device, which a capture cannot load: each answers 0, and the scratch
       the call allocates holds one byte.
+    * aiter's scratch caches key a buffer by the graph capture its stream is
+      in, which they ask HIP: a capture's streams are in none.
     * A mono runner binds and builds its widths as its deployment does
       (`_mono`).
     * A forced acceptance (`--spec-decode-acceptance-length`) draws with a
@@ -1068,8 +1078,18 @@ def _patches(recorder):
     from atom.utils.tbo import ubatching
     from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
-    recorder.languages = tuple(
-        f"{pathlib.Path(m.__file__).parent}/" for m in (triton, flydsl)
+    # aiter launches a FlyDSL kernel through generic launchers of its own:
+    # `_run_compiled`, then, where its AOT cache is on, `aot_launch`'s binding
+    # and `FlyDSLAotCache.launch`, which hold the kernel in their entries.
+    # Their frames are the launch's, as FlyDSL's own are.
+    launchers = (
+        "aiter.ops.flydsl.kernels.tensor_shim",
+        "aiter.ops.flydsl.aot_launch",
+        "aiter.ops.flydsl.aot_cache",
+    )
+    recorder.languages = (
+        *(f"{pathlib.Path(m.__file__).parent}/" for m in (triton, flydsl)),
+        *(spec.origin for spec in map(importlib.util.find_spec, launchers) if spec),
     )
 
     def run(kernel, *args, grid=None, warmup=False, **kwargs):
@@ -1082,8 +1102,11 @@ def _patches(recorder):
     def jit_call(jit, *args, **kwargs):
         recorder.launch(f"flydsl.{jit.func.__name__}", jit)
 
-    def compile_impl(jit, *args):
-        jit(*args)  # flyc.compile launches the kernel as it compiles it
+    def compile_impl(jit, *args, compile_only=False, **kwargs):
+        # flyc.compile launches the kernel as it compiles it, unless asked
+        # to compile only; a call of what it returns launches it then.
+        if not compile_only:
+            jit(*args, **kwargs)
         return fly.CompiledFunction(None, jit)
 
     def compiled_call(compiled, *args):
@@ -1219,7 +1242,11 @@ def _patches(recorder):
         (UBatchWrapper, "_run_ubatches", micro_batches),
         (topk, "topk_ob_workspace_size", lambda *a: 0),
         (topk, "topk_mb_workspace_size", lambda *a: 0),
-        (torch.ops.aiter, "moe_forward", moe_forward),
+        *_in_no_graph_capture(),
+        # Where FusedMoE.forward calls it: the op's eager caller, which holds
+        # the op itself, so replacing `torch.ops.aiter.moe_forward` reaches no
+        # call and breaks the op's own dispatch.
+        (moe, "moe_forward_op", moe_forward),
         (
             torch.ops.aiter,
             "maybe_dual_stream_forward",
@@ -1238,6 +1265,16 @@ def _patches(recorder):
     return stack
 
 
+def _in_no_graph_capture():
+    """aiter's query of the graph capture a stream is in, answering none, as
+    `(owner, name, value)` patches: none where aiter asks no such question."""
+    if importlib.util.find_spec("aiter.utility.graph_alloc") is None:
+        return ()
+    from aiter.utility import graph_alloc
+
+    return ((graph_alloc, "_capture_id", lambda stream: None),)
+
+
 def _mono(recorder, unpatched):
     """What a mono runner's bind and width builds run under the capture, as
     `(owner, name, value)` patches; `unpatched` are FlyDSL's entries before
@@ -1247,7 +1284,9 @@ def _mono(recorder, unpatched):
     outside the fake mode and the recorder, and agrees with this rank, and the
     peer buffer is one of the sizes the runner asks for on the declared device
     (`driverless.PeerBuffer`), as is each uncached scratch a bind or a build
-    takes (`driverless.uncached_bytes`). A width's kernels compile for real,
+    takes (`driverless.uncached_bytes`); a peer embedding's every shard address
+    is this rank's (`driverless.PeerView`), and a dual area's copy word is
+    declared (`driverless.scratch_word`). A width's kernels compile for real,
     compile-only at the declared arch through `unpatched`, so their scratch is
     read off their binaries. A refusal the deployment makes too, a bind check's
     `MonoUnsupported` or a kernel that needs scratch, leaves the original path
@@ -1257,27 +1296,41 @@ def _mono(recorder, unpatched):
     from torch.utils._python_dispatch import _disable_current_modes
 
     from atom.distributed import group_agreement
-    from atom.mono.runtime import consensus, lifecycle, route, uncached, widths
+    from atom.model_ops import peer_embedding
+    from atom.mono.runtime import consensus, lifecycle, numa, route, uncached, widths
     from atom.mono.runtime.compile import compile_kernels, scratch_bytes
 
     agree, init = group_agreement.group_agree, route.LazyRunner.__init__
     ready, prepare = route.LazyRunner.ready, widths.WidthBuilds.prepare
+    spilled_anywhere = widths.WidthBuilds._spilled_anywhere
     refused = {}  # each refusal, by its runner and width (None for a bind)
 
     def host_agree(ok, group):
         with _disable_current_modes():
             return agree(ok, group)
 
+    def spilled_here(self, scratch):
+        """Where any rank's build spilled: where this rank's did, since every
+        rank of a capture is this one and its fake group gathers nothing."""
+        with patch.object(self, "_group", None):
+            return spilled_anywhere(self, scratch)
+
     def driverless_scratch():
         """Each loaded module's `uncached_bytes`, ATOM's ctypes HIP allocation,
-        as `driverless.uncached_bytes`: a runner module binds the name at its
-        import, so the name is replaced where each one holds it."""
-        held, real = contextlib.ExitStack(), uncached.uncached_bytes
-        for module in list(sys.modules.values()):
-            if getattr(module, "__dict__", {}).get("uncached_bytes") is real:
-                held.enter_context(
-                    patch.object(module, "uncached_bytes", driverless.uncached_bytes)
-                )
+        as `driverless.uncached_bytes`, and its `scratch_word`, the NUMA
+        calibration of a dual area, as `driverless.scratch_word`: a runner
+        module binds each name at its import, so the name is replaced where
+        each one holds it."""
+        held = contextlib.ExitStack()
+        for name, real in (
+            ("uncached_bytes", uncached.uncached_bytes),
+            ("scratch_word", numa.scratch_word),
+        ):
+            for module in list(sys.modules.values()):
+                if getattr(module, "__dict__", {}).get(name) is real:
+                    held.enter_context(
+                        patch.object(module, name, getattr(driverless, name))
+                    )
         return held
 
     def bound(create, lazy):
@@ -1363,9 +1416,11 @@ def _mono(recorder, unpatched):
         (widths, "group_agree", host_agree),
         (group_agreement, "group_agree", host_agree),
         (lifecycle, "PeerBuffer", driverless.PeerBuffer),
+        (peer_embedding, "PeerView", driverless.PeerView),
         (route.LazyRunner, "__init__", lazy),
         (route.LazyRunner, "ready", turned_away),
         (widths.WidthBuilds, "prepare", built),
+        (widths.WidthBuilds, "_spilled_anywhere", spilled_here),
     )
 
 
@@ -1615,7 +1670,8 @@ def _batch(
     first `tokens % seqs` one longer, each in blocks of its own; and the
     blocks they take. A decode sequence holds `context` tokens, and under a
     drafter of `drafts` tokens verifies that many more, as ATOM's scheduler
-    schedules it. Unless `output`, every prefill sequence is a middle chunk,
+    schedules it, or the `verifies` its shape states. Unless `output`,
+    every prefill sequence is a middle chunk,
     so the step samples nothing. Under a drafter a prefill row states its next
     token, -1 where the step samples it, as ATOM's scheduler states it. A
     `stateful` model's sequence holds a state slot of its own, as ATOM's block
@@ -1625,7 +1681,7 @@ def _batch(
     from atom.model_engine.scheduler import ScheduledBatch
 
     drafter, prefill = bool(drafts), shape.phase == "prefill"
-    drafts = 0 if prefill else drafts
+    drafts = 0 if prefill else drafts if shape.verifies is None else shape.verifies
     shape = shape if prefill else shape._replace(seqs=shape.tokens)
     per, extra = divmod(shape.tokens, shape.seqs)
     counts = [per + (i < extra) + drafts for i in range(shape.seqs)]
@@ -1703,9 +1759,10 @@ def _affine(shape: str, first, second):
     return out
 
 
-def _config(model, tp, atom_args):
+def _config(model, tp, atom_args, real_kv=False):
     """ATOM's `Config` for its engine arguments `atom_args`, eager, at level 0,
-    the checkpoint an empty dummy.
+    the checkpoint an empty dummy; with `real_kv`, its simulated KV connector
+    the real one (`drive.run.real_kv`).
 
     Under `--enable-dp-attention` each TP rank is a DP rank of TP 1, as
     `CoreManager` rewrites it.
@@ -1719,6 +1776,10 @@ def _config(model, tp, atom_args):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog="trace ops --"))
     forced = ["--enforce-eager", "--level", "0", "--load_dummy", "empty"]
     args = parser.parse_args(["--model", model, "-tp", str(tp), *atom_args, *forced])
+    if real_kv:
+        from atom.compass.drive.run import real_kv as real
+
+        args.kv_transfer_config = real(args.kv_transfer_config)
     engine = EngineArgs.from_cli_args(args)
     names = {field.name for field in dataclasses.fields(Config)}
     kwargs = engine._get_engine_kwargs().items()
@@ -1749,16 +1810,19 @@ def capture(
 
     The steps of the record directories `population` are shapes too
     (`population_shapes`), under two-batch overlap a split one's two
-    micro-batches, each keyed as one (`structure`); each of their prefills
+    micro-batches, each keyed as one (`structure`), and under a drafter its
+    whole step, where its drafter runs; each of their prefills
     runs as one forward, as it ran, this rank answering that it cannot split
     it; with `whole`, each prefill of
-    `shapes` too. With `symbolic`, each prefill's (T, B) of a DP group with no
+    `shapes` too. Under a P/D producer's drafter each decode of `shapes`
+    verifies none, as its decode does. With `symbolic`, each prefill's (T, B) of a DP group with no
     drafter, at its width, is then traced with G a symbol, as a run's lookup
     traces it (`Tracer.symbolic`); one whose two ends differ is named on
     stderr. Without DP, or under a drafter, `symbolic` is refused before any
     trace.
     """
     from atom.compass.capture import population_shapes
+    from atom.kv_transfer.disaggregation.types import kv_config_has_producer
 
     tracer = Tracer(model, tp, tmpdir, atom_args, arch, read)
     config = tracer.config
@@ -1766,7 +1830,12 @@ def capture(
         config.parallel_config.data_parallel_size == 1 or config.speculative_config
     ):
         raise ValueError("--symbolic: only a DP prefill with no drafter holds G")
-    ran = population_shapes(population, tracer.config.enable_tbo)
+    spec = config.speculative_config
+    drafts = spec.num_speculative_tokens if spec else 0
+    if drafts and kv_config_has_producer(config.kv_transfer_config):
+        # a P/D producer's decode verifies no draft (`Tracer.trace`)
+        shapes = [s._replace(verifies=0) if s.phase == "decode" else s for s in shapes]
+    ran = population_shapes(population, config.enable_tbo, drafts)
     shapes = list(dict.fromkeys([*shapes, *ran]))
     if not shapes:
         raise ValueError(f"{', '.join(population)} hold no step to trace")
@@ -1787,12 +1856,17 @@ class Tracer:
     `trace`, once, and every later one steps the same runner. The capture's
     patches hold until `close`; the declared device, for the process. Each
     graph states the files its process ran and read up to its step
-    (`capture.files_of`), from the reads watched since this one was made."""
+    (`capture.files_of`), from the reads watched since this one was made.
+
+    A P/D side's simulated connector is traced as Mooncake's, as `deploy.sh
+    record` starts that side (`drive.run.real_kv`): ATOM's attention builders
+    publish their transfer regions by connector name, and Kimi's MLA+GDN
+    builder refuses any but Mooncake and MoRI-IO as it allocates."""
 
     def __init__(self, model, tp, tmpdir, atom_args=(), arch="gfx942", read=None):
         self.reads = watch_reads()
         self.declared = driverless.install(tmpdir, arch, read)
-        self.config = _config(model, tp, atom_args)
+        self.config = _config(model, tp, atom_args, real_kv=True)
         self.stack, self.runner, self.blocks = contextlib.ExitStack(), None, 0
 
     def close(self):
@@ -1942,7 +2016,9 @@ class Tracer:
         it; per prefill shape, the middle chunk's and then the final one's.
         Under a drafter each step is two graphs, its target's and then its
         drafter's (`_drafter`), and a decode step verifies the drafter's tokens
-        in each row. A prefill of `unsplit` runs as one forward, this rank
+        in each row, or the `verifies` its shape states, which only a P/D
+        producer's decode does, so only a producer traces such a shape. A
+        prefill of `unsplit` runs as one forward, this rank
         answering that it cannot split it. The KV pool is the one a capture of
         `shapes` alone allocates: the blocks the widest of them takes,
         `KV_BLOCKS` at the fewest.
@@ -1952,12 +2028,20 @@ class Tracer:
         keyed by `symbolic_shape` and holds the guards the trace installed on
         G (`_guards`). Unless `warm`, no step runs before a traced one: the
         caller has just stepped the runner at that shape."""
+        from atom.kv_transfer.disaggregation.types import kv_config_has_producer
+
         config = self.config
         dp = config.parallel_config.data_parallel_size
         if dp == 1 and (gathering := [s for s in shapes if s.gathered is not None]):
             raise ValueError(f"{gathering[0]} gathers a DP group's rows on one rank")
         if symbolic and (dp == 1 or any(s.phase != "prefill" for s in shapes)):
             raise ValueError("only a DP prefill's graph holds the rows it gathers")
+        fewer = [s for s in shapes if s.verifies is not None]
+        if fewer and not kv_config_has_producer(config.kv_transfer_config):
+            raise ValueError(
+                f"{fewer[0]} verifies fewer drafts than its drafter's, as only a P/D "
+                "producer's decode does: trace it under its --kv-transfer-config"
+            )
         if self.runner is None:
             self._build()
         declared, drafts = self.declared, self.drafts
