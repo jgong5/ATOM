@@ -527,3 +527,23 @@ def test_a_dp_view_counts_its_step_s_dummy_forwards_from_every_rank_s_line(tmp_p
     (single / "dp1.jsonl").write_text("not a record\n")
     one = _record(single / "dp0.jsonl", _steps(5, n=12))
     assert {s.view.group_dummies for s in label(one)[0]} == {0}
+
+
+def test_a_pipeline_stage_before_the_last_reads_no_tokens_and_only_it(tmp_path):
+    from atom.compass.backends.step_labels import _reads_no_tokens, _stage
+
+    for name in ("dp0.jsonl", "pp1.dp0.jsonl", "pp2.dp0.jsonl", "pp3.dp0.jsonl"):
+        (tmp_path / name).write_text("")
+    unread = [{"step": 1, "is_dummy_run": False}]
+    read = [{"step": 1, "is_dummy_run": False, "t_recv_ns": [1, 2]}]
+    assert _stage(tmp_path / "pp2.dp0.jsonl") == (2, "dp0.jsonl")
+    assert _stage(tmp_path / "dp0.jsonl") == (0, "dp0.jsonl")
+    # stages 0-2 of four read no tokens; the last, and a record of one stage, must
+    assert _reads_no_tokens(tmp_path / "dp0.jsonl", unread)
+    assert _reads_no_tokens(tmp_path / "pp2.dp0.jsonl", unread)
+    assert not _reads_no_tokens(tmp_path / "pp3.dp0.jsonl", unread)
+    assert not _reads_no_tokens(tmp_path / "pp1.dp0.jsonl", read)
+    alone = tmp_path / "one"
+    alone.mkdir()
+    (alone / "dp0.jsonl").write_text("")
+    assert not _reads_no_tokens(alone / "dp0.jsonl", unread)

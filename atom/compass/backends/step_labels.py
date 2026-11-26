@@ -691,6 +691,29 @@ def _paced(lines, mtp: bool = True) -> set[int]:
     return paced
 
 
+def _stage(path: Path) -> tuple[int, str]:
+    """A step record's pipeline stage and its name less the stage prefix:
+    ``pp<k>.dp<r>.jsonl`` is stage k's, an unprefixed ``dp<r>.jsonl`` stage 0's."""
+    head, _, rest = path.name.partition(".")
+    if head.startswith("pp") and head[2:].isdigit():
+        return int(head[2:]), rest
+    return 0, path.name
+
+
+def _reads_no_tokens(path: Path, lines) -> bool:
+    """Whether `path` is a pipeline stage before the last (a later stage's
+    record lies beside it) whose lines hold no token read exit: only the last
+    stage reads the sampled tokens (`t_recv_ns`), so `_host_cut` has nothing to
+    tie the earlier stages' host and device clocks with. Their steps get no
+    launch-exposed cut: a prefill stage's device work is its chunk's layers, and
+    the paced cut (`_paced`) still applies. A record of one stage, or the last,
+    still refuses without an anchor."""
+    k, rest = _stage(path)
+    if not (path.parent / f"pp{k + 1}.{rest}").exists():
+        return False
+    return not any("t_recv_ns" in s or "t_read_ns" in s for s in lines)
+
+
 def _host_cut(lines) -> tuple[set[int], set[int]]:
     """The steps whose device start precedes their host launch end, and the
     MTP decodes whose device reached the propose pass before the host's draft
@@ -942,7 +965,10 @@ def _label(
             f"{record} has no device windows (`d_busy_ns`); a fit labels a step "
             "by its device time"
         )
-    (exposed, early), traced = _host_cut(lines), _traced(path)
+    if _reads_no_tokens(path, lines):
+        (exposed, early), traced = (set(), set()), _traced(path)
+    else:
+        (exposed, early), traced = _host_cut(lines), _traced(path)
     copy = mtp_copy(lines)
     mtp = any("d_target_ns" in s for s in steps)
     window_prefill = _prefill_label() == "record" and not traced
