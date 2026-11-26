@@ -1902,6 +1902,16 @@ class NonAllocatingRunner(
             )
         readings = _installed_readings(self)
         reply = super().get_num_blocks()
+        if pinned := int(os.environ.get(KV_BLOCKS, "0") or 0):
+            sized = int(reply["num_kvcache_blocks"])
+            if not 0 < pinned <= sized:
+                raise RunnerRefusal(
+                    f"{KV_BLOCKS}={pinned}: the readings size the pool at {sized} "
+                    "blocks; a pin may only lower it to the real record's count"
+                )
+            logger.info("%s=%d: the KV pool at %d blocks, not the %d sized", KV_BLOCKS, pinned, pinned, sized)
+            entries = {k: pinned if int(v) == sized else v for k, v in dict(reply.get("pool_entries") or {}).items()}
+            reply = {**reply, "num_kvcache_blocks": pinned, "pool_entries": entries}
         self.kv_pool_sizing = SizedKVPool(
             num_kvcache_blocks=int(reply["num_kvcache_blocks"]),
             entries=dict(reply["pool_entries"]),
@@ -2199,6 +2209,13 @@ def _time_target(runner: Any, batch: Any) -> None:
     with metrics.measure(batch):
         runner._timed_s = timed_s + target_s
     metrics.poll()
+
+
+#: Set to N (opt-in; unset or 0: off), the engine's KV pool is N blocks, the real
+#: record's, in place of the count its readings size, which may only be lower
+#: (`CompassModelRunner.get_num_blocks`): MiniMax-M3.1's P sized 122,863 against
+#: the record's 113,530 (#3720).
+KV_BLOCKS = "COMPASS_KV_BLOCKS"
 
 
 #: A file of a real record's stalled forwards and whole-group pauses a simulated
