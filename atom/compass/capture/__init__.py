@@ -155,14 +155,16 @@ def main(argv: list[str]) -> None:
             began = time.perf_counter()
 
 
-def population_shapes(names, tbo=False):
+def population_shapes(names, tbo=False, drafted=False):
     """The shape of each step the record directories `names` hold, DP's dummy
     runs aside; under two-batch overlap (`tbo`) a split step's two
-    micro-batches' (`population_steps`); each drafter's too."""
-    return [shape for shape, _ in population_steps(names, tbo, drafters=True)]
+    micro-batches' (`population_steps`), and its whole step's under a drafter
+    (`drafted`); each drafter's too."""
+    steps = population_steps(names, tbo, drafters=True, drafted=drafted)
+    return [shape for shape, _ in steps]
 
 
-def population_steps(names, tbo=False, drafters=False, stage=0):
+def population_steps(names, tbo=False, drafters=False, stage=0, drafted=False):
     """Each step the record directories `names` hold, DP's dummy runs aside,
     of pipeline stage `stage` (above 0, its records ``pp<k>.dp<r>.jsonl``),
     as its shape, the one the op-level backend prices it at
@@ -182,7 +184,10 @@ def population_steps(names, tbo=False, drafters=False, stage=0):
     `drafters`, a drafter's shape follows it where they differ: a decode's
     at its rows padded to `draft_bs`, else to its rung, a sampling prefill's
     or a DP middle chunk's with `draft_bs` as its `width`. A target that
-    replays no graph yet pads past its rows takes `target_bs` as its `width`."""
+    replays no graph yet pads past its rows takes `target_bs` as its `width`.
+    Under a drafter (`drafted`), which ATOM runs past both micro-batches on
+    the step's whole rows, a split step's micro-batches are followed by its
+    shapes as an unsplit step's, where its drafter is read."""
     from atom.compass.backends import BatchView, RequestShape
     from atom.compass.backends.op_graph import step_shape
     from atom.compass.backends.step_labels import group_dummies, group_peaks
@@ -230,19 +235,20 @@ def population_steps(names, tbo=False, drafters=False, stage=0):
                 draft = decode(width or tokens, line.get("draft_moe_rows"), len(rows))
                 if drafters and drafts and (draft := draft.at(dp, drafts)) != target:
                     yield draft, line
-            elif not split:
+                continue
+            if split:
+                for half, each in zip(halves, split):
+                    rows = [(r.query_tokens, r.decode) for r in half.requests]
+                    _, ran, b = step_shape(rows, None)
+                    own = {"rows": [dataclasses.astuple(r) for r in half.requests]}
+                    own |= {"group_max_tokens": max(each)} if dp > 1 else {}
+                    shape = prefill(ran, b, half.moe_rows).at(dp)
+                    yield shape._replace(micro_batch=True), line | own
+            if not split or drafted:
                 yield prefill(tokens, seqs, line.get("moe_rows"), padded).at(dp), line
                 draft = prefill(tokens, seqs, line.get("draft_moe_rows"), width)
                 if drafters and (line.get("produces_output") or dp > 1) and draft.width:
                     yield draft.at(dp), line
-            else:
-                for half, each in zip(halves, split):
-                    rows = [(r.query_tokens, r.decode) for r in half.requests]
-                    _, tokens, seqs = step_shape(rows, None)
-                    own = {"rows": [dataclasses.astuple(r) for r in half.requests]}
-                    own |= {"group_max_tokens": max(each)} if dp > 1 else {}
-                    shape = prefill(tokens, seqs, half.moe_rows).at(dp)
-                    yield shape._replace(micro_batch=True), line | own
 
 
 @functools.cache

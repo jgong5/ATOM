@@ -38,11 +38,12 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends import BatchView, CostRefused, RequestShape
 from atom.compass.backends.cost import fold_seconds
-from atom.compass.backends.op_graph import DRAFT_KV, KV, OpGraphBackend
+from atom.compass.backends.op_graph import DRAFT, DRAFT_KV, KV, OpGraphBackend
 from atom.compass.backends.op_work import work
 from atom.compass.backends.work import Work, gemm, price
+from atom.compass.bench.ops import parts
 from atom.compass.capture import graph_key, lookup, population_shapes
-from atom.compass.capture.forward import structure
+from atom.compass.capture.forward import Shape, structure
 from atom.compass.run import _op_graphs
 from atom.compass.runner import projection
 from atom.compass.spec import MachineSpec
@@ -689,3 +690,40 @@ def test_a_split_step_prices_its_block_drafter_s_draft_kv_pass_whole():
     kv = terms[f"{DRAFT_KV}op.{GEMM}"]
     assert kv.seconds == price(gemm(8, 32, 32), SPEC)
     assert kv.provenance.detail.endswith("of the graph at prefill T=9 B=1")
+
+
+def test_a_split_step_s_listed_shapes_hold_every_graph_its_drafter_is_priced_from(
+    tmp_path, monkeypatch
+):
+    # One rank splits 9000 tokens in two rows into micro-batches of 4500; its
+    # block drafter and draft-KV pass run past both, on the step's whole rows.
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
+    rows = [[6000, 6000, False], [3000, 3000, False]]
+    line = {"step": 0, "is_dummy_run": False, "rows": rows, "rung": None}
+    (tmp_path / "steps").mkdir()
+    (tmp_path / "run.json").write_text("{}")
+    line |= {"produces_output": True}
+    (tmp_path / "steps" / "dp0.jsonl").write_text(json.dumps(line) + "\n")
+    asked = set()
+
+    def graph(phase, t, b, output, gathered=None, draft=False, width=None, **micro):
+        part = {True: DRAFT, KV: DRAFT_KV}.get(draft, "")
+        shape = Shape(phase, t, b, gathered, width, **micro).at(1)
+        asked.add((part, shape, output or not part, draft))
+        return g(4, 8, 8)
+
+    split = BatchView(
+        tuple(RequestShape(*r) for r in rows),
+        produces_output=True,
+        tbo_tokens=((4500,), (4500,)),
+    )
+    OpGraphBackend(SPEC, graph, kv="bf16", drafts=1, block=True).price(split)
+
+    spec = SimpleNamespace(use_dspark=lambda: True)
+    config = SimpleNamespace(enable_tbo=True, speculative_config=spec)
+    read = {r for _, reads in parts([str(tmp_path)], config) for r in reads}
+    assert asked == read
+    whole = Shape("prefill", 9000, 2)
+    assert (DRAFT, whole, True, True) in asked
+    listed = population_shapes([str(tmp_path)], tbo=True, drafted=True)
+    assert {shape for _, shape, *_ in asked} == set(listed)
