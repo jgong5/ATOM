@@ -26,8 +26,9 @@ on its wall time: the standard library's JSON and pydantic held 14.4% of the
 
 What a run is charged is unchanged: no charge reads the wall time these take.
 
-With `DIR_ENV` naming a directory, the prefill side hands ids an int32 array
-holds to decode by reference: it writes them to a file there and puts
+With `DIR_ENV` naming a directory, the prefill side hands ids that are
+non-negative ints within 64 bits to decode by reference: it writes them to a
+file there in msgpack, which writes and reads them faster than JSON, and puts
 ``[REF, pid, n, bytes]`` in their place, the file's name and the bytes of the
 ids' text, which the router carries as it carries the ids. The decode side
 puts the same ids back, removes the file and skips their check, so a
@@ -39,7 +40,6 @@ run's own, on tmpfs, and whoever starts the run removes it afterwards. Unset,
 every id goes inline, and a decode side without it refuses a reference.
 """
 
-import array
 import collections
 import contextlib
 import functools
@@ -66,8 +66,8 @@ DIR_ENV = "COMPASS_IDS_BY_REF_DIR"
 _DIR = os.environ.get(DIR_ENV) or None
 #: A reference's first item: no id, so a decode side reading ids inline refuses it.
 REF = "compass:ids"
-#: Ids that may go by reference: what an int32 array holds, >= 0.
-_IDS32 = list[Annotated[int, msgspec.Meta(ge=0, lt=2**31)]]
+_PACK = msgspec.msgpack.Encoder()
+_UNPACK = msgspec.msgpack.Decoder()
 _FILES = itertools.count()
 _KEY_TEXT = b'"' + KEY.encode() + b'":'
 #: A reference's start, as msgspec and the router write it.
@@ -97,12 +97,17 @@ def _checked(ref: list) -> list:
     return ref
 
 
-def _keep(ids: list, nbytes: int) -> bytes:
-    """Write `ids`, checked as `_IDS32`, to a file and return the text of the
-    reference that takes the place of their text, `nbytes` bytes."""
+def _keep(ids: list, nbytes: int) -> bytes | None:
+    """Write `ids`, checked as `_IDS`, to a file and return the text of the
+    reference that takes the place of their text, `nbytes` bytes; None for
+    ids past 64 bits, which msgpack does not write."""
+    try:
+        packed = _PACK.encode(ids)
+    except OverflowError:
+        return None
     n = next(_FILES)
     with open(f"{_DIR}/{os.getpid()}_{n}", "wb") as f:
-        f.write(array.array("i", ids))
+        f.write(packed)
     return _ENCODE.encode([REF, os.getpid(), n, nbytes])
 
 
@@ -126,9 +131,7 @@ def _take(doc, body: bytes) -> None:
             f"written to another directory than {_DIR}"
         ) from None
     os.unlink(path)
-    ids = array.array("i")
-    ids.frombytes(data)
-    ids = kv[KEY] = ids.tolist()
+    ids = kv[KEY] = _UNPACK.decode(data)
     _READ_BACK[id(ids)] = ids
     while len(_READ_BACK) > _READ_BACK_HELD:
         _READ_BACK.popitem(last=False)
@@ -218,10 +221,10 @@ def _writing(render):
     def write(response, content):
         ids = content.get(KEY) if type(content) is dict else None
         if type(ids) is list:
-            held = None  # the ids checked once as `_IDS32`, to go by reference
+            held = None  # the ids checked once as `_IDS`, to go by reference
             if _DIR is not None:
                 with contextlib.suppress(msgspec.ValidationError):
-                    held = msgspec.convert(ids, _IDS32)
+                    held = msgspec.convert(ids, _IDS)
             # Ints alone are written alike; anything else, render writes or
             # refuses as it always has.
             try:
@@ -234,8 +237,8 @@ def _writing(render):
                 stand_in = render(response, _STAND_IN)
                 rest = render(response, {**content, KEY: _STAND_IN})
                 if rest.count(stand_in) == 1:
-                    if held:
-                        text = _keep(held, len(text))
+                    if held and (ref := _keep(held, len(text))) is not None:
+                        text = ref
                     return rest.replace(stand_in, text)
         return render(response, content)
 

@@ -7,8 +7,9 @@ in place of the ids and leaves them in a file; ATOM's chat endpoint on
 decode's side resolves the same ids from it and removes the file, so a
 reference is read once. Every count of a body's bytes sees the ids inline:
 the relay service prefill stamps on its response, and decode's intake
-charges and turn order behind `HttpChannel` in its run. Ids an int32 array
-does not hold go inline, and with no directory nothing changes.
+charges and turn order behind `HttpChannel` in its run. Ids that are not
+non-negative ints within 64 bits go inline, and with no directory nothing
+changes.
 """
 
 import collections
@@ -128,8 +129,10 @@ def test_decode_s_intake_and_turn_order_count_a_reference_s_ids_inline(
     assert charged == [pytest.approx(fixed + per_byte * len(b)) for b in inline[::-1]]
 
 
-@pytest.mark.parametrize("ids", [[1, 2**31], [5, -1], [True, 2], []])
-def test_ids_an_int32_array_does_not_hold_go_inline_as_before(by_ref, monkeypatch, ids):
+@pytest.mark.parametrize("ids", [[5, -1], [True, 2], [1.0, 2], [2**64, 1], []])
+def test_ids_other_than_non_negative_64_bit_ints_go_inline_as_before(
+    by_ref, monkeypatch, ids
+):
     content = {**_response([1]), handoff.KEY: ids}
     body = JSONResponse(content).body
     assert os.listdir(by_ref) == [] and handoff.inline_extra(body) == 0
