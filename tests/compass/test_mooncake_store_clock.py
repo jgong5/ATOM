@@ -60,6 +60,16 @@ def clk(request, monkeypatch):
     )
     for module in (scheduler_mod, chunked_scheduler, _offload_common):
         monkeypatch.setattr(module, "time", host)
+    try:  # the Store's common scheduler, where a tree split it out (kv_store)
+        from atom.kv_transfer.offload.kv_store import scheduler as kv_store_scheduler
+    except ImportError:
+        kv_store_scheduler = None
+    if kv_store_scheduler is not None:
+        # Its `time.monotonic()` reads the LP clock in a simulated process as
+        # compass's Store shell installs it (`_ClockedTime`), the host's here.
+        from atom.compass.kv.mooncake_store import _ClockedTime
+
+        monkeypatch.setattr(kv_store_scheduler, "time", _ClockedTime() if lp else host)
     if lp:
         clock.install(_LP(state))
     yield state

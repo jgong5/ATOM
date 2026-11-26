@@ -103,10 +103,44 @@ PAST_LEASE = "mooncake_store:a load starts past its lease"
 ENDPOINT_WAIT_S, ENDPOINT_LOOK_S = 300.0, 0.05
 
 
+class _ClockedTime:
+    """`time` as a module reads it, its `monotonic` the LP clock's
+    (`clock.now`): the 1P2D repro's kv_store scheduler, the Store's common
+    scheduler, reads `time.monotonic()` for its lookup pins, its save backoff
+    and its loads' dispatch stamps, where mooncake_store's own sites read
+    `clock.now`. Everything else is `time`'s."""
+
+    def __getattr__(self, name):
+        import time
+
+        return getattr(time, name)
+
+    @staticmethod
+    def monotonic() -> float:
+        import time
+
+        from atom.utils import clock
+
+        return clock.now(time.monotonic)
+
+
+def _clock_kv_store_scheduler() -> None:
+    """Have the kv_store scheduler's `time.monotonic()` read the LP clock in a
+    simulated process, where the tree's core reads the wall clock there."""
+    try:
+        from atom.kv_transfer.offload.kv_store import scheduler
+    except ImportError:  # a tree with no kv_store split
+        return
+    if not isinstance(scheduler.time, _ClockedTime):
+        scheduler.time = _ClockedTime()
+
+
 def substitute() -> None:
     """Build this module's halves for every `mooncake_store` connector from now
     on, and `MultiShell` for a `multi`."""
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    _clock_kv_store_scheduler()
 
     registry = KVConnectorFactory._registry
     registry["mooncake_store"] = registry["mooncake_store"] | {
