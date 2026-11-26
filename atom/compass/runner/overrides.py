@@ -2201,6 +2201,35 @@ def _time_target(runner: Any, batch: Any) -> None:
     metrics.poll()
 
 
+#: Set to 1 (opt-in; unset or 0: off), a P/D producer's step that its law
+#: prices with no draft term is charged its target's price and a draft of 0 s,
+#: where it would be refused as one that "prices no draft" and charged no
+#: device time (`producer_target_only`).
+PRODUCER_TARGET_ONLY = "COMPASS_PRODUCER_TARGET_ONLY"
+
+
+def producer_target_only(runner: Any) -> bool:
+    """Whether `PRODUCER_TARGET_ONLY` is set and `runner` is a P/D producer.
+
+    A producer never speculates: its drafter writes context K/V alone
+    (`Drafter.context_kv_only`), on a pipeline on its last stage only, and
+    runs no `propose` pass. A law fitted on a record whose lines carry no
+    drafter window, as a pipelined producer's stage 0 (MiniMax-M3.1 P PP4 on
+    cal2: no `d_target_ns` on stages 0-2), holds no draft law, so each step it
+    prices is refused and charged no device time: every stage of the
+    simulated producer ran on its host time alone, an 8192-token chunk 42 ms
+    where stage 0's device ran 60-68 ms (cellb1 c16, #3720). Under the switch
+    such a step is charged its target's price; on the last stage the draft-K/V
+    pass stays unpriced (its `d_draft_kv_ns`: 2.8 ms of a 64-71 ms 8192-token
+    chunk, 0.8 ms on an output prefill under 2048 tokens). A law with a draft
+    law prices as it does without the switch."""
+    if os.environ.get(PRODUCER_TARGET_ONLY, "0") in ("", "0"):
+        return False
+    from atom.kv_transfer.disaggregation import kv_config_has_producer
+
+    return kv_config_has_producer(_config_field(runner, "kv_transfer_config"))
+
+
 #: A file of a real record's stalled forwards and whole-group pauses a simulated
 #: run replays (`replayed_stall`), as `python -m atom.compass.validate.stalls RUN OUT` writes it.
 REPLAY_STALLS = "COMPASS_REPLAY_STALLS"
@@ -2422,7 +2451,8 @@ def _group_step_seconds(
         # with output_prefill_kv, step_linear's module text) is priced among the target's terms, as `draft.` terms,
         # and states no draft_terms: that is a priced draft, not a missing one.
         in_kv = any(t.name.startswith("draft.") for t in cost.terms)
-        if spec and not cost.draft_terms and not in_kv and not dummy:
+        alone = spec and producer_target_only(runner)
+        if spec and not cost.draft_terms and not in_kv and not dummy and not alone:
             name = type(backend).__name__
             raise CostRefused(batch, [Refusal(name, "prices no draft")])
     except CostRefused as refusal:

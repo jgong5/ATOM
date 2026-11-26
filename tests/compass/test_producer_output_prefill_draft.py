@@ -40,3 +40,34 @@ def test_a_law_with_no_draft_at_all_is_still_refused(tmp_path):
     plain = _speculative(runner(StepLinearBackend(StepLinearLaw(law))))
     assert plain.forward(prefill(8)).predicted_s == 0.0
     assert plain.refused_commands() == ("cost:StepLinearBackend: prices no draft",)
+
+
+def test_a_producer_s_law_with_no_draft_is_charged_its_target_under_the_switch(
+    tmp_path, monkeypatch
+):
+    """COMPASS_PRODUCER_TARGET_ONLY=1: a P/D producer's drafter writes context
+    K/V alone, so a law fitted where no drafter ran (a pipelined producer's
+    stage 0) is charged its target, not refused and charged 0 s; a runner that
+    is no producer is still refused, and off, the producer is too."""
+    law = _producer_law(tmp_path)
+    del law["draft"]
+    target = StepLinearBackend(StepLinearLaw(law)).price(_output([(8, 8, False)]))
+    producer = {"kv_role": "kv_producer", "kv_connector": "mooncake"}
+
+    def run(kv):
+        r = _speculative(runner(StepLinearBackend(StepLinearLaw(law))))
+        if kv is not None:
+            r.config.kv_transfer_config = kv
+        return r, r.forward(prefill(8)).predicted_s
+
+    off, got = run(producer)
+    assert got == 0.0
+    assert off.refused_commands() == ("cost:StepLinearBackend: prices no draft",)
+    monkeypatch.setenv("COMPASS_PRODUCER_TARGET_ONLY", "1")
+    plain, got = run(None)
+    assert got == 0.0
+    assert plain.refused_commands() == ("cost:StepLinearBackend: prices no draft",)
+    alone, got = run(producer)
+    assert alone.refused_commands() == ()
+    assert got == pytest.approx(target.seconds)
+    assert got > 0
