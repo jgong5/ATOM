@@ -234,6 +234,26 @@ def test_no_round_is_granted_ahead_past_an_offering_arrival():
     assert _grants(replies)[:2] == [("dp0", 1.5), ("dp1", 1.5)]
 
 
+def test_no_offering_arrival_is_sent_ahead_of_an_lp_that_asks_for_messages_ahead():
+    """An engine asking for messages ahead (local grants) gets a control
+    message at 1.25 but not the request at 1.5: its ceiling stops there. Its
+    TAR(2.0) past it is granted 1.5 first, and the lookup sent at the request's
+    arrival registers. Sent ahead and walked by the TAR's grant to 2.0, the
+    request's lookup would be stamped at 1.5, behind the engine's clock 2.0
+    (#3720: M3.1's 1P2D sim, P's head stage, a Store lookup)."""
+    ca = _ca(ipc=1.0, ceilings=True)
+    ctl = "frontend->engine:control#dp0"
+    ca.on_request(FRONTEND, TAR, 5.0, [(ctl, 0, 1.25), (req(), 0, 1.5)])
+    [(lp, g, released)] = ca.on_request(ENGINE, NER, INF, [], ahead=True)
+    assert (lp, g) == (ENGINE, 1.25)
+    assert released[ctl] == [(0, 1.25)] and not released[req()]
+    assert released.ceiling == 1.5
+    [(lp, g, released)] = ca.on_request(ENGINE, TAR, 2.0, [])
+    assert (lp, g, released[req()]) == (ENGINE, 1.5, [(0, 1.5)])
+    replies = ca.on_request(ENGINE, TAR, 2.0, [(look(), 0, 1.5 + 1.0)])
+    assert ("lmcache", 2.5) in _grants(replies)
+
+
 # --- the LP's side ------------------------------------------------------------
 
 
