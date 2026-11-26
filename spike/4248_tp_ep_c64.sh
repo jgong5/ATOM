@@ -15,8 +15,8 @@
 #   spike/4248_tp_ep_c64.sh fit DATA     the step law and host laws from the calibration record alone
 #   spike/4248_tp_ep_c64.sh sim DATA K   simulated run K of the target's client, send order seed K
 #   spike/4248_tp_ep_c64.sh score DATA   one_real.py on the target and every sim<K>; each metric's error per
-#                                        send order, their mean and mean absolute value; DASH_TREE's
-#                                        compare_dashboard.py page
+#                                        send order, their mean and mean absolute value, the brief's three
+#                                        first; DASH_TREE's compare_dashboard.py page
 #
 # DATA is a directory every node reaches. A gpu step whose output is complete is skipped. MODEL
 # (/models/dsv41) and TRACES (/cc/traces.jsonl, sha256 29b6a19e...) as client.sh reads them; GPU the
@@ -215,7 +215,10 @@ EOF
 import json, sys
 rows = json.load(sys.stdin)
 real = rows.pop("real")
-for m in ("p90 TTFT", "TPOT p90 ms", "throughput per GPU"):
+first = ["p90 TTFT", "TPOT p90 ms", "throughput per GPU"]
+for m in first + [m for m in real if m not in first and m != "concurrency"]:
+    if not real[m] or any(rows[s][m] is None for s in rows):
+        continue
     e = [rows[s][m] / real[m] - 1 for s in rows]
     print(f"{m}: " + ", ".join(f"{s} {x:+.1%}" for s, x in zip(rows, e))
           + f"; mean {sum(e) / len(e):+.1%}, mean absolute {sum(map(abs, e)) / len(e):.1%}")'
@@ -236,5 +239,5 @@ EOF
     for s in "${sims[@]%/}"; do ln -s "$s" "$cell/sims/${s##*/}"; done
   python3 "$DASH_TREE/scripts/compass/compare_dashboard.py" --scan "$DATA/dash" --out "$DATA/dashboard.html" --window 900
   ;;
-*) sed -n '2,25p' "$0"; exit 2 ;;
+*) sed -n '2,26p' "$0"; exit 2 ;;
 esac
