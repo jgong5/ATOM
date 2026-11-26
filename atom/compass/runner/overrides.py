@@ -539,6 +539,12 @@ class HostDeviceRecurrence:
         host = start + seg["W_pre"]
         if self.mtp and kind != "middle":  # output_end stays -inf on a PP stage
             host = max(host, self.output_end + seg[MTP_COPY])
+        if self.mtp and kind == "prefill" and _inputs_waits():
+            # ATOM's MTP output prefill, past its MTP status wait, launches once
+            # the previous forward's device work is done
+            # (step_labels.inputs_wait_ns), whose W_inputs labels then hold only
+            # the host's own part
+            host = max(host, self.ends[-1])
         return host + seg[MTP_SEGMENT], seg
 
     def release(self, end: float, target_end: float) -> float:
@@ -577,6 +583,13 @@ def _middle_waits() -> bool:
     from atom.compass.backends.step_labels import middle_waits
 
     return middle_waits()
+
+
+def _inputs_waits() -> bool:
+    """`step_labels.inputs_waits`, imported where it is read."""
+    from atom.compass.backends.step_labels import inputs_waits
+
+    return inputs_waits()
 
 
 def schedulable_bound(config: Any) -> int:

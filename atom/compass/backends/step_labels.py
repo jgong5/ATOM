@@ -238,6 +238,40 @@ def middle_wait_ns(prev: dict | None, s: dict) -> int:
     return max(0, end - g1)
 
 
+#: The variable that, set to ``1``, labels and simulates an MTP output prefill
+#: (a forward of prefill rows that produces output) as one whose host, past its
+#: MTP status wait, waits for the PREVIOUS forward's device work before it
+#: launches, as ATOM's does (`inputs_wait_ns`). Off, `W_inputs` holds that wait
+#: and the simulation has none, as before. Read by the labels and by the
+#: simulated host (`runner.overrides.HostDeviceRecurrence`) alike, so a law
+#: fitted under it and a run priced under it agree.
+INPUTS_WAIT_ENV = "COMPASS_PREFILL_INPUTS_WAIT_PREVIOUS"
+
+
+def inputs_waits() -> bool:
+    """Whether `INPUTS_WAIT_ENV` is ``1``."""
+    return os.environ.get(INPUTS_WAIT_ENV) == "1"
+
+
+def inputs_wait_ns(prev: dict | None, s: dict) -> int:
+    """The part of an MTP output prefill `s`'s `W_inputs` its host spent
+    waiting for the previous forward `prev`'s device work: from its MTP status
+    wait's end to that work's end, estimated as `prev`'s launch start plus its
+    device busy time, and none past `s`'s own launch. On GLM-5.3-Flash's step B
+    record (g52, 11-25) an output prefill's `W_inputs` less this was 1.6-5.3 ms
+    (p10-p90) on all 2,363 of them, where `W_inputs` itself ran 12 ms (median,
+    the 1,183 whose MTP status wait held the previous forward's end) to 214 ms
+    (median, the 1,180 behind a middle chunk, which leaves no MTP status to
+    wait for). 0 without `prev`'s stamps or `s`'s MTP status wait."""
+    if prev is None or "t_launch_ns" not in prev or "d_busy_ns" not in prev:
+        return 0
+    if "t_mtp_ns" not in s:
+        return 0
+    l0 = s["t_launch_ns"][0]
+    end = min(prev["t_launch_ns"][0] + prev["d_busy_ns"], l0)
+    return max(0, end - s["t_mtp_ns"][1])
+
+
 #: The variable that, set to ``1``, takes a record whose run.json names
 #: `BUILDS` anyway, with a warning naming them: for a one-real-run fit whose
 #: server met kernel shapes no sweep had compiled (Triton specializes per
@@ -892,6 +926,8 @@ def _label(
         host = _segments(s, host_kind(view) != "middle")
         if middle_waits() and host_kind(view) == "middle":
             host["W_pre"] = max(0, host["W_pre"] - middle_wait_ns(prev, s))
+        if inputs_waits() and host_kind(view) == "prefill" and "W_inputs" in host:
+            host["W_inputs"] = max(0, host["W_inputs"] - inputs_wait_ns(prev, s))
         if copy.get(s["step"], (0, False))[1]:
             host["L_mtp"] = copy[s["step"]][0]
         idle = prev is not None and not busy[i]
