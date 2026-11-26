@@ -23,6 +23,7 @@
  "slo": {},
  "common": {
   "deployment": "1p1d",
+  "mooncake_store": "/share_nfs/xingjche/m31pd/store_entry/mooncake_store.json",
   "args": {
    "--trust-remote-code": true,
    "--kv_cache_dtype": "nvfp4",
