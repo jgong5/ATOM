@@ -22,6 +22,7 @@ arrival (`atom.utils.clock.LPRuntime.offer`), so the authority grants an LP
 waiting in TAR such a message's arrival first (`ClockAuthority`, #3767).
 """
 
+import heapq
 import math
 from dataclasses import dataclass
 from enum import StrEnum
@@ -58,6 +59,11 @@ class ChannelTable:
         self._into: dict[LpId, tuple[Channel, ...]] = {}
         # The offering channels' names, an ordered set.
         self._offering: dict[str, None] = {}
+        # LP -> inbound channel kind -> the outbound kinds a message there can
+        # provoke; an LP not here reacts on every outbound channel.
+        self._reactions: dict[LpId, dict[str, tuple[str, ...]]] = {}
+        # target LP -> channel name -> reach(name, target)
+        self._reach: dict[LpId, dict[str, float]] = {}
 
     def declare(
         self,
@@ -90,6 +96,7 @@ class ChannelTable:
         channel = Channel(name, source, target, lookahead, ReceiveMode(receive))
         self._channels[name] = channel
         self._distances = None
+        self._reach.clear()
         self._from.clear()
         self._into.clear()
         return channel
@@ -130,6 +137,62 @@ class ChannelTable:
         """Whether the handler of a message on `name` may offer a send."""
         return name in self._offering
 
+    def mark_reactions(self, lp: LpId, reactions: dict) -> None:
+        """Declare, for each kind of channel into `lp`, the kinds of channel out
+        of it that a message there can provoke. A kind left out can provoke a
+        send on every channel out of `lp`."""
+        self.registry.require(lp)
+        self._reactions[lp] = {k: tuple(v) for k, v in reactions.items()}
+        self._reach.clear()
+
+    def declares(self, lp: LpId) -> bool:
+        """Whether `lp` declared its reactions."""
+        return lp in self._reactions
+
+    def reacts(self, into: str, out: str) -> bool:
+        """Whether a message on `into` can provoke its receiver's send on `out`."""
+        declared = self._reactions.get(self.channel(into).target, {})
+        provoked = declared.get(kind_of(into))
+        return provoked is None or kind_of(out) in provoked
+
+    def reach(self, name: str, target: LpId) -> float:
+        """The least lookahead from a message on `name`, at its receiver, to a
+        message arriving at `target`, over the sends each receiver's reactions
+        allow: zero when `name` goes into `target`."""
+        self.registry.require(target)
+        if target not in self._reach:
+            self._reach[target] = self._reach_into(target)
+        return self._reach[target].get(self.channel(name).name, math.inf)
+
+    def reaction_distance(self, source: LpId, target: LpId) -> float:
+        """``D(source->target)`` over the reactions: the least lookahead of a
+        channel out of `source` plus its reach; zero to itself."""
+        if source == target:
+            return 0.0
+        return min(
+            (
+                c.lookahead_s + self.reach(c.name, target)
+                for c in self.channels_from(source)
+            ),
+            default=math.inf,
+        )
+
+    def _reach_into(self, target: LpId) -> dict[str, float]:
+        dist = {c.name: 0.0 for c in self._channels.values() if c.target == target}
+        heap = [(0.0, name) for name in sorted(dist)]
+        while heap:
+            d, out = heapq.heappop(heap)
+            if d > dist[out]:
+                continue
+            via = d + self._channels[out].lookahead_s
+            for into in self.channels_into(self._channels[out].source):
+                if into.target == target or not self.reacts(into.name, out):
+                    continue
+                if via < dist.get(into.name, math.inf):
+                    dist[into.name] = via
+                    heapq.heappush(heap, (via, into.name))
+        return dist
+
     def lookahead(self, name: str) -> float:
         return self.channel(name).lookahead_s
 
@@ -161,6 +224,23 @@ class ChannelTable:
                     if via < d.get((j, i), math.inf):
                         d[j, i] = via
         return d
+
+
+def kind_of(name: str) -> str:
+    """A channel name's kind: ``http`` of ``traffic->router:http``, ``request``
+    of ``frontend->engine:request#dp0``."""
+    return name.rpartition(":")[2].partition("#")[0]
+
+
+#: LP ``router``'s reactions: each message it handles goes on as one of its own
+#: kind, ``final`` a stream's last event under a stream bypass, and a cancel on
+#: ``http`` goes on as ``http`` or as ``relay`` (``atom/mesh/src/compass_router.rs``).
+ROUTER_REACTIONS = {
+    "http": ("http", "relay"),
+    "relay": ("relay",),
+    "stream": ("stream",),
+    "final": ("final",),
+}
 
 
 def _table(lps: tuple[str, ...], rows: list) -> ChannelTable:
@@ -403,6 +483,7 @@ def prefill_decode_table(
     decode: int = 1,
     prefill_pp: int = 1,
     pp_links=(),
+    stream_bypass: bool = False,
 ) -> ChannelTable:
     """`prefill` prefill and `decode` decode deployments behind the router,
     each with the channels of its data-parallel ranks: `dp` of them on each
@@ -417,9 +498,14 @@ def prefill_decode_table(
     `router_in_s`, and a hop out, which keeps the rest of the path's lookahead;
     both are positive, so `router_in_s` lies strictly between 0 and `router_s`.
     The router receives each hop in on a thread and handles it before the next.
-    Decode posts the KV write request to prefill engine to engine, above width
-    one on either side on a channel per decode and prefill rank pair,
-    ``kv_write_req#dp<decode rank>.dp<prefill rank>``.
+    Under `stream_bypass`, which needs LP ``router``, a decode stream's events
+    but its last go straight to traffic, on ``stream`` at the path's whole
+    lookahead, since the router does no work on them; its last, ``[DONE]``,
+    which ends the request in the router, takes the path's two hops as
+    ``final``. The one sum and the two round apart by an ulp or two, so a
+    ``[DONE]`` can reach traffic just before or after its stream's events. Decode posts the KV write request to prefill engine to engine,
+    above width one on either side on a channel per decode and prefill rank
+    pair, ``kv_write_req#dp<decode rank>.dp<prefill rank>``.
 
     Above one deployment of a role, deployment ``k`` of it is the LPs
     ``frontend-P<k>`` and ``engine-P<k>`` (``-D<k>`` for decode), each with its
@@ -449,6 +535,11 @@ def prefill_decode_table(
             f"{prefill} prefill and {decode} decode deployments put a choice in "
             "the router, which makes it an LP: set router_in_s"
         )
+    if stream_bypass and router_in_s is None:
+        raise ValueError(
+            "a stream bypass takes a decode stream past the router LP, and with "
+            "no router_in_s there is none: each path is one channel already"
+        )
     ps = [f"P{k}" if prefill > 1 else "P" for k in range(prefill)]
     ds = [f"D{k}" if decode > 1 else "D" for k in range(decode)]
     paths = [("traffic", f"frontend-{p}", "http", admission_s + router_s) for p in ps]
@@ -473,15 +564,19 @@ def prefill_decode_table(
         hops = [(src, dst, kind, total, "inline") for src, dst, kind, total in paths]
     elif 0.0 < router_in_s < router_s:
         lps += ("router",)
+        straight = [p for p in paths if stream_bypass and p[2] == "stream"]
+        routed = [p for p in paths if p not in straight]
+        routed += [(src, dst, "final", total) for src, dst, _, total in straight]
         # Paths sharing an end share that end's hop.
         hops = dict.fromkeys(
             hop
-            for src, dst, kind, total in paths
+            for src, dst, kind, total in routed
             for hop in (
                 (src, "router", kind, router_in_s, "thread"),
                 ("router", dst, kind, total - router_in_s, "inline"),
             )
         )
+        hops.update(dict.fromkeys((*path, "inline") for path in straight))
     else:
         raise ValueError(
             f"router_in_s is {router_in_s!r} and router_s {router_s!r}; each hop "
@@ -490,7 +585,7 @@ def prefill_decode_table(
         )
     pairs = [f"#dp{d}.dp{p}" for d in range(dp_d) for p in range(dp_p)]
     pairs = [""] if pairs == ["#dp0.dp0"] else pairs
-    return _table(
+    table = _table(
         lps,
         [*hops]
         + [
@@ -507,3 +602,6 @@ def prefill_decode_table(
         ]
         + rows,
     )
+    if "router" in lps:
+        table.mark_reactions(LpId("router"), ROUTER_REACTIONS)
+    return table

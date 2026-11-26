@@ -38,6 +38,7 @@ import numpy as np
 import torch
 
 from atom.compass.backends.shape import BatchView, RequestShape
+from atom.compass.runner import shm_collectives
 from atom.compass.runner.overrides import RunnerRefusal
 from atom.utils.forward_context import ForwardMode
 
@@ -102,8 +103,12 @@ def dummy_ranks(batch: Any, mode: ForwardMode) -> int:
     """
     if mode.sync is None or len(mode.sync.scheduled_tokens_per_dp_rank) < 2:
         return 0
-    flag = torch.tensor([int(is_dummy(batch))], dtype=torch.int32)
-    torch.distributed.all_reduce(flag, group=dp_group())
+    group, mine = dp_group(), int(is_dummy(batch))
+    rows = shm_collectives.gathered(group, (mine,), np.int32)
+    if rows is not None:  # the rows the integer SUM is taken off on the segment
+        return int(rows.sum())
+    flag = torch.tensor([mine], dtype=torch.int32)
+    torch.distributed.all_reduce(flag, group=group)
     return int(flag.item())
 
 

@@ -25,7 +25,9 @@ member, the frontend's included, connects to.
   Atomesh entrypoints, and makes a sync utility command on the frontend's
   clock owner refuse. Each image a chat request's media preparation loads
   charges that tokenizer-station job the run file's ``image_preprocess_s``;
-  an image named by a remote URL is refused. After each metrics refresh
+  an image named by a remote URL is refused. A prefill or decode frontend
+  writes or reads the prompt token ids it hands off with msgspec, the same
+  bytes and the same ids (`handoff`). After each metrics refresh
   the frontend samples its Prometheus series (`metrics.sample_frontend`).
   On a worker node of a multi-node DP group it only selects the simulated
   runner.
@@ -119,6 +121,31 @@ clock calls and reports them with its next one, a DP member at its settle,
 `ClockAuthority`; the sends are the same, and so is the step table but for an
 own step walking an arrival on an offering channel: one ``TAR`` row where a
 run with ``false`` records ``ARRIVAL`` and ``TAR``),
+``wide_local_grants`` (optional, ``false``, the default, or ``true``, which
+needs local grants: a ceiling's cycle term counts only the LPs that can react
+to the LP's sends before their own next grant, a TAR's grant sends the
+messages below its ceiling ahead, and LBTS and that cycle follow the channel
+reactions the table declares, LP ``router``'s in a prefill-decode run,
+`ClockAuthority`'s ``wide_ceilings``),
+``stream_bypass`` (optional, ``false``, the default, or ``true``, which needs
+LP ``router``: a decode stream's events but its last go straight to traffic,
+and its last through the router, `prefill_decode_table`; each event arrives
+at the path's lookahead, within a rounding of the router's two hops, and the
+channel table, and so the step table, differ, so the key is part of the
+configuration),
+``ids_by_ref`` (optional, ``false``, the default, or ``true`` in a
+prefill-decode run: its prefill frontends hand a prompt's ids to its decode
+frontends by reference, through `ids_dir`, which the run's authority makes
+and removes, and every count of a body's bytes counts them as if inline,
+`handoff`),
+``select_serve`` (optional, ``false``, the default, or ``true``: the authority's
+``tcp`` serve side reads every LP's connection on one selector thread, in place
+of a reader thread a connection, `clock_transport.serve`'s ``select``; it
+serves the same frames, each connection's in their order, so the schedule and
+the sends are the same),
+``rare_full_gc`` (optional, ``false``, the default, or ``true``: every
+process of the run, aiperf's in ``compass_harness`` included, raises CPython's
+generation-2 threshold to `RARE_FULL_GC_GEN2`, `rare_full_gc`),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -375,6 +402,21 @@ INSTANCE_KEY = "compass_instance"
 WORKER_ORDER = "worker_order"
 #: The run-file key that gives grants their ceilings.
 LOCAL_GRANTS = "local_grants"
+#: The run-file key that widens those ceilings.
+WIDE_LOCAL_GRANTS = "wide_local_grants"
+#: The run-file key that takes a decode stream's events but its last past LP
+#: ``router``.
+STREAM_BYPASS = "stream_bypass"
+#: The run-file key that hands a prompt's ids from prefill to decode by reference.
+IDS_BY_REF = "ids_by_ref"
+#: The run-file key that makes CPython's full collections rare in every
+#: process of the run, and the generation-2 threshold it sets: CPython counts
+#: one per generation-1 collection, and a full one waits for this many.
+RARE_FULL_GC, RARE_FULL_GC_GEN2 = "rare_full_gc", 1_000_000
+#: The tmpfs root of a run's `ids_dir`.
+IDS_ROOT = "/dev/shm"
+#: The run-file key that serves the authority's connections on one thread.
+SELECT_SERVE = "select_serve"
 ATOM_RUNNER = "atom.model_engine.model_runner.ModelRunner"
 RAPIDSERVE_RUNNER = "atom.model_engine.model_runner.RapidServeModelRunner"
 #: The run-file key that says the deployment runs RapidServe.
@@ -391,6 +433,10 @@ PER_RUN = (
     "store",
     WORKER_ORDER,
     LOCAL_GRANTS,
+    WIDE_LOCAL_GRANTS,
+    IDS_BY_REF,
+    SELECT_SERVE,
+    RARE_FULL_GC,
 )
 LP_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
     "lp-{}.json",  # by LP name, or <lp>.<member> for a member
@@ -718,6 +764,33 @@ LOCAL = ".local"
 _frontend_host: dict | None = None
 
 
+def rare_full_gc(run: dict | None) -> None:
+    """Where `run` states ``rare_full_gc``, raise this process's generation-2
+    threshold to `RARE_FULL_GC_GEN2`; generations 0 and 1 collect as before.
+
+    A full collection walks every object the run allocated since the startup
+    freeze (`gc_utils.freeze_gc_heap`) and still holds, while its LP's clock
+    stands still. With the option, a cycle that has reached generation 2 stays
+    until the process exits, and with it one event can go: a streamed response
+    cancelled while its task waits in ``BaseHTTPMiddleware``'s send leaves its
+    generator at ``yield``, only that generator's finalizer aborts its request
+    (jgong5/ATOM#4243), and its engine then decodes it to its end.
+
+    A process the run spawns inherits `ENV` and takes the option as it imports
+    this module; the API server and the standalone authority, which set `ENV`
+    from their command line after that import, take it in `frontend` and
+    `authority`. aiperf's processes take it in ``compass_harness``. ATOM's
+    `tune_gc`, which runs later in a serving process, overrides it there when
+    ``ATOM_GC_THRESHOLD`` is set."""
+    if run is not None and run.get(RARE_FULL_GC) is True:
+        t0, t1, _ = gc.get_threshold()
+        gc.set_threshold(t0, t1, RARE_FULL_GC_GEN2)
+
+
+if os.environ.get(ENV):
+    rare_full_gc(json.loads(Path(os.environ[ENV]).read_text()))
+
+
 def spec() -> dict | None:
     """The run file's mapping, or None on a real run."""
     path = os.environ.get(ENV)
@@ -741,6 +814,15 @@ def spec() -> dict | None:
             f"{path}: client_runs is {count!r}; a server serves a positive number "
             "of client runs, or null for no limit"
         )
+    by_ref = run.get(IDS_BY_REF, False)
+    if type(by_ref) is not bool or (by_ref and "router_s" not in run):
+        raise ValueError(
+            f"{path}: {IDS_BY_REF} is {by_ref!r}; it is true only in a "
+            "prefill-decode run, whose prefill frontends hand ids to its decode "
+            "frontends, or false"
+        )
+    if type(rare := run.get(RARE_FULL_GC, False)) is not bool:
+        raise ValueError(f"{path}: {RARE_FULL_GC} is {rare!r}; it is true or false")
     for host in entries(run, "host"):
         _check_host(path, host)
     stated_ingress(run)
@@ -971,6 +1053,11 @@ def _lmcache_engine(run: dict) -> str:
 
 
 def _engines_table(run: dict):
+    bypass = run.get(STREAM_BYPASS, False)
+    if not isinstance(bypass, bool):
+        raise TypeError(
+            f"the run file's {STREAM_BYPASS} is {bypass!r}; it is true or false"
+        )
     common = {k: hop(run, k) for k in HOPS[:3]}
     pp, links = _pp(run, "P"), ()
     if pp > 1:
@@ -990,6 +1077,12 @@ def _engines_table(run: dict):
             decode=run.get(INSTANCES["D"], 1),
             prefill_pp=pp,
             pp_links=links,
+            stream_bypass=bypass,
+        )
+    if bypass:
+        raise ValueError(
+            f"the run file's {STREAM_BYPASS} takes a decode stream past LP router, "
+            "and a run of one deployment has none"
         )
     return single_engine_table(
         **common,
@@ -1617,11 +1710,17 @@ class _RecordingAuthority(ClockAuthority):
         table = channel_table(run)
         count = run.get("client_runs", 1)
         local = run.get(LOCAL_GRANTS, True)
-        if not isinstance(local, bool):
-            raise TypeError(
-                f"the run file's {LOCAL_GRANTS} is {local!r}; it is true, which "
-                "gives grants their ceilings, or false"
-            )
+        wide = run.get(WIDE_LOCAL_GRANTS, False)
+        select = run.get(SELECT_SERVE, False)
+        for key, value in (
+            (LOCAL_GRANTS, local),
+            (WIDE_LOCAL_GRANTS, wide),
+            (SELECT_SERVE, select),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"the run file's {key} is {value!r}; it is true or false"
+                )
         super().__init__(
             table,
             timeline=self,
@@ -1630,6 +1729,7 @@ class _RecordingAuthority(ClockAuthority):
             client=TRAFFIC,
             client_runs=math.inf if count is None else count,
             ceilings=local,
+            wide_ceilings=wide,
         )
 
     def record(self, lp, time_from, time_to, kind, recovered, released=(), *_):
@@ -1795,6 +1895,7 @@ def frontend(config):
                 )
             config.runner_qualname = recording[config.runner_qualname]
         return contextlib.nullcontext()
+    rare_full_gc(run)
     _refuse_unserved()
     pc = config.parallel_config
     rapid = config.enable_rapidserve
@@ -1863,11 +1964,14 @@ def frontend(config):
         return contextlib.nullcontext()
     _refuse_sync_utility_commands()
     _price_images(run.get(IMAGE_PREPROCESS))
+    from atom.compass.run import handoff
+
+    handoff.install(side, ids_dir(run))
     lp = _frontend_lp(config, run)
     authority = None
     if not standalone:
         _authority = authority = _RecordingAuthority(run)
-        serve(_authority, run["clock_endpoint"])
+        serve(_authority, run["clock_endpoint"], run.get(SELECT_SERVE, False))
         # Not a daemon: the API server's main thread may die of the early end
         # before this thread has written the summary.
         _early_end = threading.Thread(
@@ -4116,9 +4220,39 @@ def authority(endpoint: str) -> None:
     """Name `endpoint` in the out_dir's `AUTHORITY_FILE`, then serve the run
     file's authority there until the finish or an early
     end, then write its step table, and the run summary once the server LPs
-    have handed in."""
+    have handed in. The run's `ids_dir`, where it has one, is there that long."""
     run = spec()
+    rare_full_gc(run)
     a = _RecordingAuthority(run)
-    _write_whole(Path(run["out_dir"]) / AUTHORITY_FILE, endpoint)
-    serve(a, endpoint)
-    _write_summary(run, a, _until_end(run, a))
+    with _owning_ids_dir(run):
+        _write_whole(Path(run["out_dir"]) / AUTHORITY_FILE, endpoint)
+        serve(a, endpoint, run.get(SELECT_SERVE, False))
+        _write_summary(run, a, _until_end(run, a))
+
+
+def ids_dir(run: dict) -> str | None:
+    """The directory through which `run`'s prefill frontends hand a prompt's
+    ids to its decode frontends by reference, on tmpfs and named by its
+    out_dir; None unless its `IDS_BY_REF` is true."""
+    if not run.get(IDS_BY_REF, False):
+        return None
+    out = str(Path(run["out_dir"]).resolve()).encode()
+    return f"{IDS_ROOT}/compass-ids-{hashlib.sha256(out).hexdigest()[:16]}"
+
+
+@contextlib.contextmanager
+def _owning_ids_dir(run: dict):
+    """`ids_dir(run)` made empty for the run, the files a killed run at the
+    same out_dir left gone, and removed after it with any file still in it:
+    the router answers a hand-off cancelled before its relay, whose file no
+    decode frontend reads."""
+    path = ids_dir(run)
+    if path is None:
+        yield
+        return
+    shutil.rmtree(path, ignore_errors=True)
+    os.mkdir(path, 0o700)
+    try:
+        yield
+    finally:
+        shutil.rmtree(path, ignore_errors=True)

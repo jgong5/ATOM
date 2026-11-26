@@ -7,10 +7,12 @@ entries already there, as W3C Trace Context adds a new entry. A request the
 traffic LP sends with a send-order seed adds its intake jitter, the bytes its
 body is read as if it were longer, ``compass=a:<arrival>;s:<seq>;j:<bytes>``
 (`compass_harness.traffic_lp`). A streamed response carries one comment line before
-each SSE event, ``: compass a=<arrival> s=<seq>``; SSE clients skip lines that
-start with a colon. Both pass a router that forwards headers and the stream
-unchanged. A prefill response the router relays to decode carries its stamp as
-the ``compass`` field of its ``kv_transfer_params``, ``a:<arrival>;s:<seq>``,
+each SSE event, ``: compass a=<arrival> s=<seq>``, which names the event's
+channel, ``c=<channel>``, after the seq where a stream bypass takes it past the
+router (`stamp_split_events`); SSE clients skip lines that start with a colon.
+Both pass a router that forwards headers and the stream unchanged. A prefill
+response the router relays to decode carries its stamp as the ``compass``
+field of its ``kv_transfer_params``, ``a:<arrival>;s:<seq>``,
 which the router copies onto the decode request. The arrival is written as
 ``repr(float)``, so it parses back exactly. Beside it, ``compass_relay_s``
 holds the seconds the relay serves the response on decode's API server loop
@@ -40,7 +42,7 @@ _NUM = r"(inf|\d[\d.e+-]*)"
 RELAY_SERVICE = "compass_relay_s"
 _ENTRY = re.compile(rf"a:{_NUM};s:(\d+)")
 _TRACE_ENTRY = re.compile(rf"a:{_NUM};s:(\d+)(?:;j:{_NUM})?")
-_COMMENT = re.compile(rf": compass a={_NUM} s=(\d+)")
+_COMMENT = re.compile(rf": compass a={_NUM} s=(\d+)(?: c=(\S+))?")
 _MAX_ENTRIES = 32
 #: Added to every simulated ns stamp a client records. Simulated time starts at
 #: 0, and aiperf reads a 0 start stamp as missing.
@@ -110,27 +112,45 @@ def tracestate_with(
     return ",".join([entry, *others][:_MAX_ENTRIES])
 
 
-def stamp_events(text: str, rt) -> str:
-    """`text` with a stamped comment line before each SSE event in it.
+def stamp_split_events(
+    events: list[str], tail: str, rt, ch: str, final: str | None = None
+) -> str:
+    """The SSE events of a text its caller split on blank lines into
+    ``[*events, tail]``, each with a stamped comment line before it.
 
-    Each event is one send on the runtime's stream channel, to the traffic LP
-    or to the router LP in front of it.
-    A write must end its last frame in a blank line: text after it is refused,
+    Each event is one send on `ch`, the runtime's stream channel, to the
+    traffic LP or to the router LP in front of it. With `final`, the channel
+    a stream bypass takes a stream's last event on through the router
+    (`atom.compass.clock.prefill_decode_table`), a ``[DONE]`` is sent on
+    `final` and every other event names `ch` in its stamp, which the router
+    passes on as it is.
+    A write must end its last frame in a blank line: a `tail` is refused,
     since the next write's comment would land inside that frame.
     """
-    # Here, not at the top: the harness reads EPOCH_NS while aiperf imports its
-    # phase runner, and `atom.utils` would load torch there.
-    from atom.utils.clock import channel_of
-
-    ch = channel_of(rt, "stream")
-    *events, tail = text.split("\n\n")
     if tail:
         raise ValueError(f"unterminated SSE frame {tail!r}: no blank line after it")
-    out = []
+    out, named = [], "" if final is None else f" c={ch}"
     for event in events:
-        arrival, seq = rt.stamp_send(ch)
-        out.append(f": compass a={arrival!r} s={seq}\n{event}\n\n")
+        if final is not None and event.endswith("data: [DONE]"):
+            arrival, seq = rt.stamp_send(final)
+            out.append(f": compass a={arrival!r} s={seq}\n{event}\n\n")
+        else:
+            arrival, seq = rt.stamp_send(ch)
+            out.append(f": compass a={arrival!r} s={seq}{named}\n{event}\n\n")
     return "".join(out)
+
+
+def stream_channels(rt) -> tuple[str, str | None]:
+    """The stream channel of `rt`'s LP, and the channel a stream bypass takes
+    its streams' last events on through the router, ``final``; None without
+    one."""
+    # Imported here: `atom.utils` loads torch, which a client of this module
+    # need not have.
+    from atom.utils.clock import channel_of
+
+    out = rt.table.channels_from(rt.me)
+    (final,) = [c.name for c in out if c.name.endswith(":final")] or [None]
+    return channel_of(rt, "stream"), final
 
 
 def sse_stamp(line: str) -> tuple[float, int] | None:
@@ -139,6 +159,13 @@ def sse_stamp(line: str) -> tuple[float, int] | None:
     if not line.startswith(": compass "):
         return None
     return _parse(_COMMENT, line, "SSE comment")
+
+
+def sse_channel(line: str) -> str | None:
+    """The channel a compass comment line names, ``c=<channel>``; None for one
+    that names none, and for any other line."""
+    m = _COMMENT.fullmatch(line.rstrip("\r\n"))
+    return None if m is None else m[3]
 
 
 class _Params(msgspec.Struct):
@@ -156,36 +183,65 @@ class _Relayed(msgspec.Struct):
 _STAMP = msgspec.json.Decoder(_Relayed)
 _MEMBERS = msgspec.json.Decoder(dict[str, msgspec.Raw])
 _ENCODE = msgspec.json.Encoder()
+#: msgspec's decoder of JSON with no type: `decode_relayed` decodes a relayed
+#: body with it, and a simulated decode frontend's ``Request.json`` every body
+#: (`atom.compass.run.handoff`), so a decoding handed on is the app's own.
+JSON_DECODER = msgspec.json.Decoder()
+#: The ASGI scope key under which `atom.utils.compass_loop.HttpChannel` hands a
+#: relayed request's body and its `decode_relayed` decoding on to the app's
+#: ``Request.json``, as ``(body, decoding)``.
+RELAYED_JSON = "compass.relayed_json"
 
 
-def relay_stamp(body: bytes) -> tuple[float, int] | None:
-    """The ``(arrival, seq)`` a JSON request body's ``kv_transfer_params`` carries;
-    None without one."""
+def relay_carried(body: bytes) -> tuple[tuple[float, int] | None, float]:
+    """The ``(arrival, seq)`` a JSON request body's ``kv_transfer_params``
+    carries, None without one, and the seconds it says its relay serves it on
+    the receiving loop (`RELAY_SERVICE`), 0.0 without them or without a stamp.
+    One decode reads both, past the prompt's ids a relayed body carries."""
     try:
         params = _STAMP.decode(body).kv_transfer_params
     except msgspec.DecodeError:
-        return None
-    value = None if params is None else params.compass
-    return None if value is None else _parse(_ENTRY, value, "kv_transfer_params entry")
+        return None, 0.0
+    if params is None:
+        return None, 0.0
+    return _relay_entry(params.compass, params.compass_relay_s)
 
 
-def relay_service(body: bytes) -> float:
-    """The seconds a JSON request body's ``kv_transfer_params`` says its relay
-    serves it on the receiving loop (`RELAY_SERVICE`); 0.0 without one."""
+def decode_relayed(body: bytes) -> tuple[Any, tuple[float, int] | None, float]:
+    """`body` decoded once, as JSON with no type, and the stamp and relay
+    service `relay_carried` reads, read from that decoding; for a body msgspec
+    does not decode so, None and `relay_carried`'s reading of it.
+
+    A body naming a key twice is read as its decoding holds it, the last value
+    of each, where `relay_carried` reads no stamp from one whose earlier
+    ``kv_transfer_params`` is no object; a router's JSON object holds a key
+    once."""
     try:
-        params = _STAMP.decode(body).kv_transfer_params
-    except msgspec.DecodeError:
-        return 0.0
-    value = None if params is None else params.compass_relay_s
+        doc = JSON_DECODER.decode(body)
+    except (msgspec.DecodeError, ValueError, RecursionError):
+        return (None, *relay_carried(body))
+    params = doc.get("kv_transfer_params") if type(doc) is dict else None
+    if type(params) is not dict:
+        return doc, None, 0.0
+    return (doc, *_relay_entry(params.get("compass"), params.get(RELAY_SERVICE)))
+
+
+def _relay_entry(entry, value) -> tuple[tuple[float, int] | None, float]:
+    """The ``(arrival, seq)`` of `entry`, a ``kv_transfer_params`` object's
+    ``compass`` value, None for none, and the seconds of `value`, its
+    `RELAY_SERVICE` value, 0.0 for none or without a stamp."""
+    if entry is None:
+        return None, 0.0
+    stamp = _parse(_ENTRY, entry, "kv_transfer_params entry")
     if value is None:
-        return 0.0
+        return stamp, 0.0
     # A JSON number, not a bool or a string of one.
     seconds = value if type(value) in (int, float) else math.nan
     if not (math.isfinite(seconds) and seconds >= 0):
         raise ValueError(
             f"malformed {RELAY_SERVICE} {value!r}; expected finite seconds >= 0"
         )
-    return float(seconds)
+    return stamp, float(seconds)
 
 
 def with_relay_stamp(body: bytes, stamp, service_s: float | None = None) -> bytes:

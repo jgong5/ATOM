@@ -510,12 +510,25 @@ def carry_response_ids() -> None:
     A sequence whose `kv_transfer_params` carry a `transfer_id`, a decode
     instance's request, also gets a line ``{response_id, remote_dp_rank,
     transfer_id}``, with each of `INSTANCE_FIELDS` the parameters hold, in
-    `TRANSFERS` of the record directory, which this replaces."""
+    `TRANSFERS` of the record directory, which this replaces. A process opens
+    that file at its first line and keeps it, each line flushed as written."""
     from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 
     path = pathlib.Path(os.environ[ENV]) / TRANSFERS
     path.parent.mkdir(parents=True, exist_ok=True)
     path.unlink(missing_ok=True)
+    opened = {}  # pid: the file that process appends its lines to
+
+    def append(line: dict) -> None:
+        # A forked child opens its own file, never writing through its
+        # parent's buffer. Binary, whose buffer takes a lock where text's does
+        # not: a structured request calls `add_request` on its own thread.
+        pid = os.getpid()
+        if pid not in opened:
+            opened.setdefault(pid, path.open("ab"))
+        opened[pid].write(json.dumps(line).encode() + b"\n")
+        opened[pid].flush()
+
     for cls in (CoreManager, DisaggCoreManager):
 
         def add_request(self, seqs, add=cls.add_request):
@@ -533,8 +546,7 @@ def carry_response_ids() -> None:
                 for field in INSTANCE_FIELDS:
                     if params.get(field) is not None:
                         line[field] = params[field]
-                with path.open("a") as f:
-                    f.write(json.dumps(line) + "\n")
+                append(line)
             return add(self, seqs)
 
         cls.add_request = add_request

@@ -1058,7 +1058,7 @@ def _relayed_to_decode(sends, bodies):
 
     async def app(scope, receive, send):
         body = (await receive())["body"]
-        entered.append((carriers.relay_stamp(body)[1], loop.time()))
+        entered.append((carriers.relay_carried(body)[0][1], loop.time()))
 
     def wire(body: bytes):
         parts = [{"type": "http.request", "body": body, "more_body": False}]

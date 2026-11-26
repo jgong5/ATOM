@@ -55,6 +55,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 
 
 def _refuse_shadowing(owner: type, cls: type) -> None:
@@ -354,15 +355,17 @@ class BatchView:
                 "padding negative"
             )
 
-    @property
+    # The rows never change, so neither do these: each is computed on its
+    # first read and kept, where a step's pricing reads them many times.
+    @cached_property
     def prefill(self) -> tuple[RequestShape, ...]:
         return tuple(row for row in self.requests if not row.decode)
 
-    @property
+    @cached_property
     def decode(self) -> tuple[RequestShape, ...]:
         return tuple(row for row in self.requests if row.decode)
 
-    @property
+    @cached_property
     def graph_padding(self) -> int:
         """`rung.max N_KV - Sum N_KV` over the decode rows; 0 with no rung."""
         rows = self.decode

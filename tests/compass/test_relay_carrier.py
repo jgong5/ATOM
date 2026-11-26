@@ -10,14 +10,16 @@ request's ``kv_transfer_params`` and restamps it there, where decode reads it.
 import asyncio
 import json
 import math
+import re
 
+import msgspec
 import pytest
 from starlette.responses import JSONResponse
 
 from atom.compass.carriers import (
     RELAY_SERVICE,
-    relay_service,
-    relay_stamp,
+    decode_relayed,
+    relay_carried,
     with_relay_stamp,
 )
 from atom.compass.clock import LpId, prefill_decode_table
@@ -100,7 +102,7 @@ class TestPrefillResponse:
         expected["kv_transfer_params"]["compass"] = f"a:{arrival!r};s:0"
         assert json.loads(body) == expected
         assert list(json.loads(body)["kv_transfer_params"])[-1] == "compass"
-        assert relay_stamp(body) == (arrival, 0)
+        assert relay_carried(body) == ((arrival, 0), 0.0)
         assert dict(start["headers"])[b"content-length"] == str(len(body)).encode()
 
     def test_every_value_but_kv_transfer_params_keeps_the_text_it_was_rendered_as(
@@ -129,7 +131,7 @@ class TestPrefillResponse:
             "kv_transfer_params": {"compass": "a:inf;s:4", "dp_rank": 1}
         }
         assert len(calls) == 1
-        assert relay_stamp(out) == (math.inf, 4)
+        assert relay_carried(out) == ((math.inf, 4), 0.0)
 
     @pytest.mark.parametrize(
         "body",
@@ -151,7 +153,7 @@ class TestPrefillResponse:
             raise AssertionError("stamped")
 
         assert with_relay_stamp(body, stamp) is body
-        assert relay_stamp(body) is None
+        assert relay_carried(body) == (None, 0.0)
 
 
 class TestDecodeRequest:
@@ -160,15 +162,15 @@ class TestDecodeRequest:
         self, arrival
     ):
         body = _decode_request(compass=f"a:{arrival!r};s:17")
-        assert relay_stamp(body) == (arrival, 17)
+        assert relay_carried(body) == ((arrival, 17), 0.0)
 
     @pytest.mark.parametrize("params", [{}, {"compass": None}])
     def test_no_entry_reads_as_none(self, params):
-        assert relay_stamp(_decode_request(**params)) is None
+        assert relay_carried(_decode_request(**params)) == (None, 0.0)
 
     def test_a_malformed_entry_is_refused_by_name(self):
         with pytest.raises(ValueError, match="malformed compass kv_transfer_params"):
-            relay_stamp(_decode_request(compass="a:1.5"))
+            relay_carried(_decode_request(compass="a:1.5"))
 
 
 class TestRelayService:
@@ -181,28 +183,35 @@ class TestRelayService:
         body = json.dumps(_response()).encode()
         out = with_relay_stamp(body, lambda: (2.5, 3), service)
         params = json.loads(out)["kv_transfer_params"]
-        assert params[RELAY_SERVICE] == service and relay_stamp(out) == (2.5, 3)
-        assert relay_service(out) == service
+        assert params[RELAY_SERVICE] == service
+        assert relay_carried(out) == ((2.5, 3), service)
         # The router restamps `compass` and keeps the field.
         params["compass"] = "a:3.0;s:9"
         decode = _decode_request(**params)
-        assert relay_service(decode) == service and relay_stamp(decode) == (3.0, 9)
+        assert relay_carried(decode) == ((3.0, 9), service)
 
     def test_no_service_writes_no_field_and_reads_as_none_charged(self):
         body = json.dumps(_response()).encode()
         out = with_relay_stamp(body, lambda: (2.5, 3))
         assert RELAY_SERVICE not in json.loads(out)["kv_transfer_params"]
-        assert relay_service(out) == 0.0
-        assert relay_service(_decode_request()) == 0.0
-        assert relay_service(b"not json") == 0.0
+        assert relay_carried(out) == ((2.5, 3), 0.0)
+        assert relay_carried(_decode_request(compass="a:2.5;s:3")) == ((2.5, 3), 0.0)
+        assert relay_carried(b"not json") == (None, 0.0)
 
     @pytest.mark.parametrize("value", ["1e-3", True, -1e-3, None])
     def test_a_malformed_service_is_refused_by_name(self, value):
+        body = _decode_request(compass="a:2.5;s:3", compass_relay_s=value)
         if value is None:  # null: no service stated
-            assert relay_service(_decode_request(compass_relay_s=None)) == 0.0
+            assert relay_carried(body) == ((2.5, 3), 0.0)
             return
         with pytest.raises(ValueError, match=RELAY_SERVICE):
-            relay_service(_decode_request(compass_relay_s=value))
+            relay_carried(body)
+
+    @pytest.mark.parametrize("value", ["1e-3", -1e-3, 2e-3])
+    def test_an_unstamped_body_s_service_is_unread(self, value):
+        """An unstamped relayed request passes through or is refused unstamped;
+        `HttpChannel` charges it no relay, so its service is not read."""
+        assert relay_carried(_decode_request(compass_relay_s=value)) == (None, 0.0)
 
     @pytest.mark.parametrize("service", [-1e-3, math.inf, math.nan])
     def test_a_service_that_is_no_seconds_is_refused_before_anything_is_stamped(
@@ -213,3 +222,60 @@ class TestRelayService:
 
         with pytest.raises(ValueError, match="relay service"):
             with_relay_stamp(json.dumps(_response()).encode(), stamp, service)
+
+
+class TestDecodedOnce:
+    """A decode frontend decodes a relayed body once, with no type, and reads
+    the stamp and service from that decoding: what `relay_carried` reads, the
+    decoding ``json.loads``'s, and a body msgspec does not decode so read as
+    `relay_carried` reads it."""
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b"",
+            b"not json",
+            b"[1, 2]",
+            b'{"dp_rank": 1}',
+            b'{"kv_transfer_params": null}',
+            b'{"kv_transfer_params": [1]}',
+            b'{"kv_transfer_params": "a:1.5;s:4"}',
+            b'{"kv_transfer_params": {}, "prompt_token_ids": [1, 2,]}',
+            b'{"kv_transfer_params": {}} trailing',
+            b'{"compass_cancel": 3, "kv_transfer_params": {"compass": "a:1.5;s:4"}}',
+            # A number msgspec decodes with no type only as out of range.
+            b'{"ids": [1e400], "kv_transfer_params": {"compass": "a:1.5;s:4"}}',
+            _decode_request(),
+            _decode_request(compass=None),
+            _decode_request(compass=f"a:{0.1 + 0.2!r};s:17"),
+            _decode_request(compass="a:inf;s:2", compass_relay_s=1e-3),
+            _decode_request(compass="a:2.5;s:3", compass_relay_s=None),
+            _decode_request(compass_relay_s="1e-3"),
+        ],
+    )
+    def test_its_stamp_and_service_are_relay_carried_s(self, body):
+        decoded, *read = decode_relayed(body)
+        assert tuple(read) == relay_carried(body)
+        try:
+            msgspec.json.decode(body)
+        except msgspec.DecodeError:
+            assert decoded is None
+        else:
+            assert decoded == json.loads(body)
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {"compass": "a:1.5"},
+            {"compass": 5},
+            {"compass": "a:2.5;s:3", "compass_relay_s": "1e-3"},
+            {"compass": "a:2.5;s:3", "compass_relay_s": True},
+            {"compass": "a:2.5;s:3", "compass_relay_s": -1e-3},
+        ],
+    )
+    def test_a_malformed_entry_or_service_is_refused_alike(self, params):
+        body = _decode_request(**params)
+        with pytest.raises((ValueError, TypeError)) as carried:
+            relay_carried(body)
+        with pytest.raises(carried.type, match=f"^{re.escape(str(carried.value))}$"):
+            decode_relayed(body)

@@ -102,12 +102,43 @@ members return while others still ask later rounds: the least of ``LBTS(i)``,
 the grant plus the LP's shortest cycle, and the bound. Each later round below
 it is granted at once, each its own grant, the members that returned standing
 in it, since they owe it; what a round releases to such a member goes ahead in
-that member's reply, which carries the ceiling. The member steps its own clock
+that member's reply, which carries the ceiling, or the round they stop at when
+an offered arrival stops them (below). The member steps its own clock
 through those rounds and reports its steps with its send log: in a ``REPORT``,
 which gets no reply, or in its call for the rounds left. Until it has, the LP's
 ``N`` is no later than that member's clock, so no LP is granted past a send it
 has yet to log. A request from such a member that does not report exactly
 those rounds, each with its own target, aborts the run.
+
+With `wide_ceilings` as well, a ceiling's cycle term is the least, over each
+channel ``c`` out of the LP to an LP ``j`` that runs, waits in NER or is
+reached on an offering channel, of ``L(c) + D(j->i)``. An LP waiting in TAR
+sends nothing before its own next grant, at or past its ``N`` unless an
+arrival on an offering channel comes first. A chain of sends bringing one
+starts at another LP's own event or a registered message, at or past
+``LBTS(i)`` back at the LP, or at the LP's own send, at or past the grant plus
+the term over that send's first hop, or ``LBTS(i)`` again where that hop waits
+in TAR. So whatever a message to it provokes reaches the LP at or past the
+ceiling. A grant
+answering a TAR then sends every message below its ceiling ahead, as an NER
+asking for them does, and any grant that sends messages ahead has its ceiling
+at or below the LP's earliest unreleased arrival on an offering channel, so
+that its TAR is granted that arrival first, as without a ceiling.
+
+With `wide_ceilings`, the distances also follow the reactions the channel
+table declares (`ChannelTable.mark_reactions`). ``reach(c, i)`` is the least
+lookahead from a message on ``c``, at its receiver, to a message arriving at
+``i``, over the sends each receiver's declaration allows; ``D(j->i)`` is the
+least ``L(c) + reach(c, i)`` over ``j``'s channels out, and the cycle term's
+``L(c) + D(j->i)`` is ``L(c) + reach(c, i)``. An LP that declares its
+reactions has its own term in another LP's ``LBTS``: ``N[j] + D(j->i)`` while
+it runs or waits in TAR, and while it waits in NER the least of its target
+and daemon deadline plus ``D(j->i)`` and, per kind of its inbound channels,
+the earliest unreleased arrival there plus the least ``reach`` of that kind's
+channels. A message not yet registered into ``i`` ends a chain of sends,
+which starts at an LP's own event or at a registered message, each later
+link a send its sender's declaration allows in reaction to the one before,
+so it arrives at or past that term.
 
 A channel the table marks offering carries messages whose handler may offer a
 send, which the LP's owner makes at the message's arrival (#3767). An LP
@@ -117,7 +148,10 @@ what arrives up to it, and asks again; the step table records that grant as
 that grant and asks again, the rest staying in the round; no grant holds such
 a message for its member: one whose call named later rounds gets its reply at
 that grant, and a parked member leaves its park there and parks again. No round
-is granted ahead past such a message.
+is granted ahead past such a message: the rounds granted ahead stop at the
+first one it reaches, and each returned member's held reply carries that round
+as its ceiling, so the member steps on its own through the rounds granted ahead
+and no further.
 
 Nothing here reads a clock, opens a socket or starts a thread. The caller
 carries requests in and replies out.
@@ -126,7 +160,7 @@ carries requests in and replies out.
 import math
 from dataclasses import dataclass, field
 
-from .channels import ChannelTable
+from .channels import ChannelTable, kind_of
 from .identity import LpId
 
 TAR, NER, PARK, REPORT = "TAR", "NER", "PARK", "REPORT"
@@ -147,7 +181,9 @@ class LpRow:
     target: float | None
     n: float  # the earliest time it could still produce a message
     undelivered: tuple[tuple[str, int, float], ...]  # (channel, seq, arrival)
-    row: tuple[tuple[LpId, float], ...]  # (j, N[j] + D(j->lp)), every other LP
+    # (j, j's term in LBTS(lp)), every other LP: N[j] + D(j->lp), but for an
+    # LP that declares its reactions, which comes last (`ClockAuthority`)
+    row: tuple[tuple[LpId, float], ...]
     binding: LpId | None  # the first least term of `row`, None if none is finite
 
 
@@ -214,7 +250,8 @@ class ClockAuthority:
     ``{member: names of the channels into or out of it that the member owns}``;
     an LP not in it is its own single caller. `bound_s` is the simulated-time
     bound, ``+inf`` for none. `client` names the LP that joins and resigns for
-    each of `client_runs` client runs. `ceilings` gives grants their ceilings.
+    each of `client_runs` client runs. `ceilings` gives grants their ceilings,
+    and `wide_ceilings` widens them as the module docstring says.
     """
 
     def __init__(
@@ -226,11 +263,16 @@ class ClockAuthority:
         client: LpId | None = None,
         client_runs: float = 1,
         ceilings: bool = False,
+        wide_ceilings: bool = False,
     ) -> None:
         if not client_runs >= 1 or client is None and client_runs != 1:
             raise ValueError(
                 f"{client_runs} client runs over client {client}: a client LP "
                 "serves one or more"
+            )
+        if wide_ceilings and not ceilings:
+            raise ValueError(
+                "wide ceilings widen the ceilings grants carry, and none do"
             )
         self._channels = channels
         self._bound = _seconds(bound_s, False, "the simulated-time bound")
@@ -258,8 +300,39 @@ class ClockAuthority:
         # recomputing them.
         self._nv = dict.fromkeys(self._ids, 0.0)
         self._lp = {i: i for i in self._ids}
+        # With wide ceilings the distances follow the declared reactions, and
+        # an LP that declares them takes its terms from `_from_declared`.
+        far = channels.reaction_distance if wide_ceilings else channels.distance
+        declaring = dict.fromkeys(
+            j for j in self._ids if wide_ceilings and channels.declares(j)
+        )
         self._from = {
-            i: tuple((j, channels.distance(j, i)) for j in self._ids if j != i)
+            i: tuple((j, far(j, i)) for j in self._ids if j != i and j not in declaring)
+            for i in self._ids
+        }
+        # Each LP j that declares its reactions: its classes, a class being
+        # the names of its inbound channels of one kind; each such channel's
+        # (j, class); each class's earliest unreleased arrival; and, for each
+        # other LP i, (j, D(j->i), the least reach(c, i) over each class).
+        self._classes, self._class_of, self._cfirst = {}, {}, {}
+        for j in declaring:
+            kinds = {}
+            for c in channels.channels_into(j):
+                kinds.setdefault(kind_of(c.name), []).append(c.name)
+            self._classes[j] = tuple(tuple(names) for _, names in sorted(kinds.items()))
+            for k, names in enumerate(self._classes[j]):
+                self._class_of.update(dict.fromkeys(names, (j, k)))
+            self._cfirst[j] = [math.inf] * len(self._classes[j])
+        self._from_declared = {
+            i: tuple(
+                (
+                    j,
+                    channels.reaction_distance(j, i),
+                    tuple(min(channels.reach(n, i) for n in names) for names in kinds),
+                )
+                for j, kinds in self._classes.items()
+                if j != i
+            )
             for i in self._ids
         }
         self.timeline = timeline
@@ -288,10 +361,31 @@ class ClockAuthority:
         self._ceiling = {}  # LP -> the ceiling of its latest grant
         self._ahead = {}  # LP -> channel -> {seq: arrival} sent ahead, not yet reached
         self._asks = {}  # LP -> whether its pending NER asked for messages ahead
-        self._cycle = {}  # LP -> its shortest cycle, min over j of D(i->j) + D(j->i)
+        # Without wide ceilings: LP -> its shortest cycle, min over j of
+        # D(i->j) + D(j->i).
+        self._cycle = {}
+        self._wide = wide_ceilings
+        # With them: LP -> (L(c) + reach(c, i), j, whether c is offering) for
+        # each channel c out of it, to LP j, least first: its cycles by their
+        # first hop.
+        self._returns = {}
         for i in self._ids if ceilings else ():
-            back = [channels.distance(i, j) + d for j, d in self._from[i]]
-            self._cycle[i] = min(back, default=math.inf)
+            if not wide_ceilings:
+                back = [channels.distance(i, j) + d for j, d in self._from[i]]
+                self._cycle[i] = min(back, default=math.inf)
+                continue
+            hops = [(c, self._lp[c.target]) for c in channels.channels_from(i)]
+            self._returns[i] = sorted(
+                [
+                    (
+                        c.lookahead_s + channels.reach(c.name, i),
+                        j,
+                        channels.offering(c.name),
+                    )
+                    for c, j in hops
+                ],
+                key=lambda hop: hop[0],
+            )
         for lp, owned in (members or {}).items():
             channels.registry.require(lp)
             if not owned:
@@ -606,6 +700,10 @@ class ClockAuthority:
             )
         else:
             self._undelivered[name][seq] = a
+            declared = self._class_of.get(name)
+            if declared is not None:
+                j, k = declared
+                self._cfirst[j][k] = min(self._cfirst[j][k], a)
             self._horizon = max(self._horizon, a)
             self._next_seq[name] = seq + 1
             state = self._state[channel.target]
@@ -648,10 +746,45 @@ class ClockAuthority:
 
     def _row(self, i: LpId) -> tuple[tuple[LpId, float], ...]:
         nv = self._nv
-        return tuple((j, nv[j] + d) for j, d in self._from[i])
+        row = tuple((j, nv[j] + d) for j, d in self._from[i])
+        declared = self._from_declared[i]
+        if not declared:
+            return row
+        return row + tuple(
+            (j, self._declared_term(j, d, reach)) for j, d, reach in declared
+        )
+
+    def _declared_term(self, j: LpId, d: float, reach: tuple[float, ...]) -> float:
+        """The term in another LP's LBTS of `j`, which declares its reactions,
+        `d` being its distance to that LP and `reach` its classes' least reach
+        to it: ``N[j] + d`` while `j` runs or waits in TAR; in NER, the least
+        of its target and daemon deadline plus `d`, and of each class's
+        earliest unreleased arrival plus that class's reach."""
+        if self._state[j] != NER:
+            return self._nv[j] + d
+        term = min(self._target[j], self._daemon[j]) + d
+        for first, back in zip(self._cfirst[j], reach):
+            if first + back < term:  # noqa: PLR1730 - as in `_lbts`
+                term = first + back
+        return term
 
     def _lbts(self, i: LpId) -> float:
-        return min((term for _, term in self._row(i)), default=math.inf)
+        """The least of `_row(i)`'s terms, summed in place without building
+        the row: the grant scan asks it of every waiting LP on every request.
+        A subclass that redefines `_row` gets its own rule."""
+        if type(self)._row is not ClockAuthority._row:
+            return min((term for _, term in self._row(i)), default=math.inf)
+        nv = self._nv
+        least = math.inf
+        for j, d in self._from[i]:
+            term = nv[j] + d
+            if term < least:  # noqa: PLR1730 - a min() call per term costs more
+                least = term
+        for j, d, reach in self._from_declared[i]:
+            term = self._declared_term(j, d, reach)
+            if term < least:  # noqa: PLR1730
+                least = term
+        return least
 
     def _grant_due(self) -> list:
         replies = []
@@ -681,13 +814,20 @@ class ClockAuthority:
         others ask later rounds: each later round below that grant's ceiling is
         granted now, the members that returned standing in it, as they owe it.
         Each such member's reply is held until the last of them, to carry
-        what they release to it ahead, beside the ceiling."""
+        what they release to it ahead, beside the ceiling. The rounds stop at
+        the first one an offered arrival reaches, and each held reply's ceiling
+        is then that round."""
         joined = self._round.get(i)
         if not (self._ceilings and joined) or len(joined) == len(self._members[i]):
             return []
         ceiling, replies = self._ceiling_of(i, self._now[i]), []
         while joined and (t := next(iter(joined.values()))[1]) < ceiling:
             if self._offered(i) <= t:  # its member gets that arrival's grant
+                # No member steps on its own past the rounds granted ahead:
+                # a held reply's ceiling stops at this one.
+                for _, held, _ in self._held[i].values():
+                    if held.ceiling is not None and held.ceiling > t:
+                        held.ceiling = t
                 break
             for m in self._members[i]:
                 if m not in joined:
@@ -737,6 +877,12 @@ class ClockAuthority:
         self._ceiling.pop(i, None)
         if self._ceilings and not recovered and g < math.inf and i not in self._members:
             released.ceiling = self._ceiling[i] = self._ceiling_of(i, g, released)
+        if i in self._cfirst:  # what the grant released or sent ahead is gone
+            pending = self._undelivered
+            self._cfirst[i] = [
+                min((a for n in names for a in pending[n].values()), default=math.inf)
+                for names in self._classes[i]
+            ]
         target = self._target[i]
         short = self._state[i] == TAR and g < target
         if self.timeline is not None:
@@ -774,12 +920,16 @@ class ClockAuthority:
 
     def _ceiling_of(self, i: LpId, g: float, released: Released | None = None) -> float:
         """The ceiling of `i`'s grant to `g`: `released` takes every message
-        below it when `i` asked for them ahead. An LP with members takes none:
-        the rounds granted below it release them."""
-        ceiling = min(self._lbts(i), g + self._cycle[i], self._bound)
+        below it when `i` asked for them ahead, or, with wide ceilings, when
+        the grant answers a TAR. An LP with members takes none: the rounds
+        granted below it release them."""
+        ceiling = min(self._lbts(i), g + self._cycle_of(i), self._bound)
         if i in self._members:
             return ceiling
-        for name in self._into[i] if self._asks.get(i) else ():
+        ahead = self._asks.get(i) or self._wide and self._state[i] == TAR
+        if ahead and self._wide:  # a TAR past an offering arrival stops there
+            ceiling = min(ceiling, self._offered(i))
+        for name in self._into[i] if ahead else ():
             pending = self._undelivered[name]
             early = [(seq, a) for seq, a in pending.items() if a < ceiling]
             for seq, _ in early:
@@ -789,6 +939,21 @@ class ClockAuthority:
                 released[name] += early
         rest = [a for n in self._into[i] for a in self._undelivered[n].values()]
         return min([ceiling, *rest])
+
+    def _cycle_of(self, i: LpId) -> float:
+        """`i`'s shortest cycle, or with wide ceilings the least over its
+        channels out whose receiver can react before its own next grant."""
+        if not self._wide:
+            return self._cycle[i]
+        state = self._state
+        return next(
+            (
+                back
+                for back, j, offering in self._returns[i]
+                if offering or state[j] != TAR
+            ),
+            math.inf,
+        )
 
     def _catch_up(self, lp: LpId, steps, log, member) -> list:
         """Register the sends `lp` logged before each of its own `steps`, and

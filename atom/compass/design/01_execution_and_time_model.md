@@ -32,6 +32,17 @@ D3 grants a TAR an arrival on an offering channel first, and I4 lets a handler o
 answers a put of a key in flight as Mooncake does; the allocator flags are accepted, not
 modelled.
 
+**Revised 2026-11-25 by [#3968](https://github.com/jgong5/ATOM/issues/3968):** D3's wide
+local grants, behind a flag, count in a ceiling's cycle only the LPs that can react before
+their own next grant, and send a TAR's messages below its ceiling ahead.
+
+**Revised 2026-11-25 by [#4135](https://github.com/jgong5/ATOM/issues/4135):** D3.6 lets an
+LP declare which outbound channels a message can provoke, so LBTS and the local-grant
+cycle follow the router's declared reactions.
+
+**Revised 2026-11-26 by [#4144](https://github.com/jgong5/ATOM/issues/4144):** D3.6 is
+built, under D3's wide local grants.
+
 **Scope of this document.** The execution architecture: what a simulated run *is*,
 which processes exist, how virtual time advances, and what contract the rest of the
 system must honour. It does **not** cover the cost model, the memory model, model
@@ -618,6 +629,8 @@ PDES term: Ayani's distance-between-objects LBTS (Fujimoto, ch. 3). Each part ma
   `LBTS(frontend-D) = min(9.0 + 0.6, inf, inf, inf) = 9.6`: correct.
 - **Strict.** A message not yet reported to the CA has arrival `>=` its sender's
   `now + L`, so a strict grant never reaches it.
+- **With wide local grants, `D` follows the declared channel reactions**, and an LP that
+  declares them has a term of its own (*Wide local grants*, below; D3.6).
 
 **Messages in transit are counted, not assumed away.** `min(now + L)` alone only
 guarantees that no *future* message is earlier. ATOM's sends are asynchronous (ZMQ PUSH,
@@ -719,6 +732,50 @@ waits for no reply. Until it has, the LP's `N` is no later than that member's cl
 its sends are stamped there and not yet logged. No step is replayed, since each round was
 granted, and a request from such a member that does not report exactly those rounds
 aborts the run.
+
+**Wide local grants** (off by default, `compass run --wide-local-grants` turns them on,
+with local grants;
+[#3968](https://github.com/jgong5/ATOM/issues/3968)). Three changes raise a ceiling:
+
+- **The cycle term counts only the LPs that can react.** It is the least, over each
+  channel `c` out of `i` to an LP `j` that is running, waits in NER, or is reached on an
+  offering channel, of `L(c) + D(j->i)`; with every LP able to react, it is the static
+  cycle. A message `i` sends on a channel that is not offering to `j` waiting in
+  `TAR(T_j)` provokes nothing from `j` before `j`'s next grant: `j`'s owner is inside its
+  call (I1), and its handlers send nothing (I4). That grant is at `N[j]` or later, and
+  what `j` then sends reaches `i` at or past `N[j] + D(j->i)`, at least `LBTS(i)`, unless
+  an arrival on an offering channel lowers `N[j]` first. Such an arrival ends a chain of
+  sends. A chain starting at another LP's own event, or at a message already registered,
+  lands at or past `LBTS(i)`. A chain starting at a send of `i`'s after its grant `G`, over
+  a channel `c` to an LP `k`, lands back at `i` at or past `G + L(c) + D(k->i)` when `k`
+  can react, a term the cycle counts, `j` reached on an offering channel included; when
+  `k` waits in TAR on a channel that is not offering, this argument bounds it by
+  `LBTS(i)` in turn. Every return through `j` therefore lands at or past the ceiling. An
+  LP with members counts as unable to react only while it waits in TAR as a whole, every
+  member in the round. The decode frontends of the 8P16D C1228 cell are the case: the
+  static cycle runs through each one's engine and caps each grant near one SSE event's
+  charge ([#3968](https://github.com/jgong5/ATOM/issues/3968), from
+  [#4029](https://github.com/jgong5/ATOM/issues/4029)'s ranking).
+- **A grant answering a TAR sends every message below its ceiling ahead**, as one
+  answering an NER that asks for them does, so the next message to arrive no longer caps
+  a TAR's ceiling. The owner releases each in the own step that reaches it
+  (`LPRuntime._own_step`), and a frontend's event loop, which asks its NER without
+  waiting on the reply, walks messages sent ahead by its own NER step instead
+  (`compass_loop.py::CompassSelector.select`). A grant that sends messages ahead has its
+  ceiling at or below the LP's earliest unreleased arrival on an offering channel, so no
+  such message goes ahead: a TAR past a message sent ahead is granted its target, and an
+  arrival there would have its offered sends registered only at the LP's next call,
+  after other LPs may have moved past them. The TAR is granted that arrival first, as
+  without a ceiling, and the step table is that of a run without local grants.
+- **The distances follow the declared channel reactions** (D3.6,
+  [#4144](https://github.com/jgong5/ATOM/issues/4144)). `D(j->i)`, and the cycle term's
+  return past its first hop `c`, D3.6's `reach(c, i)`, are taken over the sends each LP's
+  declaration allows (`ChannelTable.reaction_distance`, `ChannelTable.reach`), and LP
+  `router`, which declares its own
+  (`channels.py::prefill_decode_table`), has its term in `LBTS(i)` split by the kind of its
+  undelivered messages while it waits in NER (`ClockAuthority._declared_term`). A stream
+  event pending at the router then holds a decode frontend at the event's way back through
+  traffic, not at the router's relay hop.
 
 #### Invariants
 
@@ -1298,6 +1355,230 @@ Client runs), and carried in the run artifact:
 - The timeline log's volume at PP degree > 1 is unestimated. Grants scale with PP stages
   and with the microsecond lookahead between them, so the log could be very large exactly
   where it is most wanted. Recorded as **T70**.
+
+---
+
+## D3.6. Overlapping LPs' wall work: channel reactions
+
+**Status:** designed 2026-11-25 for [#4135](https://github.com/jgong5/ATOM/issues/4135);
+built under `--wide-local-grants` by [#4144](https://github.com/jgong5/ATOM/issues/4144).
+
+### Problem
+
+A conservative protocol overlaps LPs' wall work only as far as their ceilings and LBTS
+let them run apart in simulated time. [#4029](https://github.com/jgong5/ATOM/issues/4029)'s
+run 2 of the 8P16D C1228 recipe (4 P instances at DP2, 4 D instances at DP4, LP `router`,
+LP `mooncake_store`; tree a5691dd27 with #3996, #3997 and #4004) spends 6.03 wall seconds
+per simulated second in its profiling window
+([#4029's table](https://github.com/jgong5/ATOM/issues/4029#issuecomment-7151883313)).
+#4029's walk of that window, cut into 300 s slices, counts 3,713 critical-path hops per
+simulated second at 1.64 ms each, while the LPs' own work averages 1.6 cores, and puts
+2,846 of the hops on the decode frontends
+([the breakdown](https://github.com/wuhuikx/LLM-Booster/issues/596#issuecomment-7153595726)). Their ceiling is the local-grant rule's
+`G + cycle` (D3, *Local grants*), and their shortest cycle runs through their engine,
+`request` 9.57 us plus `output` 61 us. [#3968](https://github.com/jgong5/ATOM/issues/3968)
+drops that cycle while the engine waits in TAR, which leaves the cycle through LP `router`:
+`stream` in at 10.3 us, `relay` out at 1,490 us, 1.5 ms, about 22 of the frontend's
+66.8 us stream events. The same 1.5 ms also bounds LBTS, as `N[router] + D(router->i)`:
+the router waits in NER with the frontend's own stream events undelivered, so its `N` is
+their arrival. Yet the router never answers a stream event with a relay.
+
+### Scenarios
+
+**A decode frontend streams one engine step's events while the router waits in NER**
+(the requirement's second mechanism). `r` is a member's release, `T'` the engine's next
+round:
+
+```text
+engine-D0 (waits in TAR(T'))   frontend-D0                    router (NER)
+output at r ----------------->  NER grant at r+61us; its ceiling:
+                                 today    G + 70.6us   (cycle through the engine)
+                                 #3968    G + 1.5ms    (cycle through the router)
+                                 D3.6     min(T'+61us, G + 3.06ms)
+                                events e1..en: TARs of 66.8us,
+                                own steps below the ceiling
+                                stream e_k at t_k -----------> pending at t_k+10us:
+                                                               bounds frontend-D0 at
+                                                               t_k+3,061us, not +1,500us
+                                ceiling reached: one CA call
+                                reports the steps, sends logged
+```
+
+**A cancel through the router.** aiperf's hang-up at the end of its duration (D7,
+*Cancels*) is why the router keeps `http` in, `relay` out:
+
+```text
+traffic                      router (NER)                    frontend-D0
+cancel on http at c ------>  pending at c+10us: bounds
+                             frontend-D0 at c+1,500us
+                             its turn: relay at c+1.5ms -->  takes the cancel at c+1.5ms
+```
+
+Before traffic sends it, traffic's own term, `N[traffic] + 10us + 1,490us`, holds the same
+bound.
+
+**A DP group's step** (the requirement's first mechanism). Each member asks its step's
+rounds up to its pull in one call (D3, member rule 1):
+
+```text
+engine-D0 (4 members)          CA                                 frontend-D0
+each: TAR(end, releases,
+      its pull), one call ---> `end` granted once LBTS > end;
+                               LBTS: frontend-D0's reported
+                               clock + 9.57us
+                               a release below LBTS: granted
+                               the next one waits .............> takes the output, steps
+                                                                 its events, calls at its
+                                                                 ceiling, that round + 61us
+                               granted; the rounds a returned
+                               member owes, below the ceiling:
+                               granted ahead (#2993)
+the next step's `end`, about 28 ms on: past any ceiling (cycle 70.6us)
+```
+
+A ceiling at every DP group grant would not move a round: a round that waits, waits on
+LBTS, which a ceiling never passes.
+
+### Decisions
+
+1. **Builds on #3968, and rides its flag.** #3968's TAR ships messages ahead and its cycle
+   counts only first hops that can react; this section changes the distances both use.
+   Basis: code, `authority.py::ClockAuthority._ceiling_of` ships only for an NER that
+   asked. Rejected: a flag of its own, a mode nobody runs: without #3968 the engine's
+   70.6 us cycle still binds (principle: no generality for speculative needs).
+2. **Channel reactions.** An LP may declare, per inbound channel kind, the outbound kinds a
+   message there can provoke; an LP that declares none reacts on every outbound channel.
+   `reach(c, i)` is the least lookahead from a message on `c`, at its receiver, to a
+   message arriving at `i`, over the declared reactions; `D(j->i)` is the least
+   `L(c) + reach(c, i)` over `j`'s outbound channels `c`. Basis: code,
+   `atom/mesh/src/compass_router.rs` (module doc, `Lp::restamp`): each released message
+   sends exactly one on, of its own kind, and a cancel on `http` goes on as `http` or
+   `relay`. Rejected: counting the router unable to react while it waits in NER: it
+   answers a relay or a cancel at once.
+3. **Only the router declares**: `http` to `http` and `relay`, `relay` to `relay`, `stream`
+   to `stream`, and `final`, a stream's last event under the stream bypass
+   ([#4228](https://github.com/jgong5/ATOM/issues/4228)), to `final`. Basis: code. Traffic receives only `stream` and sends only `http`, so its
+   declaration would be every reaction. A frontend sends to its engine on an output: the
+   output thread re-feeds held requests
+   (`engine_core_mgr.py::CoreManager._bp_dispatch_or_refill`). Rejected: a decode
+   frontend's `output` to `stream` only, which that send breaks.
+4. **Declared in the channel table**, by `ChannelTable.mark_reactions`, which
+   `channels.py::prefill_decode_table` calls where it declares LP `router`. Basis:
+   principle, follow the project's conventions: `mark_offering` declares offering
+   channels the same way, alike in every process. Rejected: the authority inferring it
+   from LP names, a second source for one fact.
+5. **LBTS keeps one term per LP that reacts on every channel, and splits a declaring LP's
+   by reaction class.** For `j` without a declaration the term stays `N[j] + D(j->i)`, its
+   undelivered messages each provoking what `j` itself can. While the router runs or waits
+   in TAR, its term stays `N[router] + D(router->i)`. While it waits in NER, it is the
+   least of its own events' term, `min(t, t_daemon) + D(router->i)`, and, per class, the
+   earliest undelivered arrival on the class's channels plus that class's `reach`. Basis: code,
+   `ClockAuthority._row` and `_n` keep `N[j]` per LP; for an LP without a declaration
+   every class has the same distance. Rejected: per-channel terms for every LP: the same
+   LBTS at more CA work per request.
+6. **The cycle term is #3968's over `reach`**: the least `L(c) + reach(c, i)` over `i`'s
+   outbound channels `c` whose receiver runs, waits in NER or takes `c` as offering.
+   Basis: #3968's cycle rule, taken over decision 2's `reach`; code,
+   `ClockAuthority._ceiling_of` adds the cycle to the grant. Rejected: `D` as today in the
+   cycle, which keeps 1.5 ms through the router.
+7. **No ceiling for an LP with members.** Run 2's later window (simulated 1890 s to
+   1920 s): an `engine-D` LP takes 236 rounds per simulated second, and each of its members
+   makes about 59 requests (the 16 decode members about 950 together), so one call already
+   covers about 4 rounds. Basis: data, run 2's step table and frames; code,
+   `ClockAuthority._grant_ahead`. Rejected: a ceiling at every
+   grant of a DP group, a member-protocol change that saves no call (scenario above).
+8. **No input points.** Letting an engine's rounds that read no input pass without LBTS
+   would remove the ping-pong between a decode engine's releases and its frontend's reports.
+   It relaxes D3's safety invariant and the straggler check on the request channels, and
+   its gain is bounded by the engines' on-path hops, 247 of 3,793 per simulated second
+   in run 2's later window. Basis: data, #4029's per-slice walk. Rejected for that cost.
+
+The soundness argument. A message not yet registered into `i` ends a chain of sends. The
+chain starts at an LP's own event, no earlier than that LP's own term (its clock while it
+runs, its target in TAR, `min(t, t_daemon)` in NER), or at a message already registered.
+Each later link is a send its sender makes in reaction to the link before, since I4 keeps
+a receiver or handler from sending: it offers, and the owner sends at that message's
+arrival. A reaction the sender's declaration rules out does not occur. So the chain
+arrives no earlier than its start plus the least lookahead over chains the declarations
+allow: `D(j->i)` from `j`'s own event, `reach(c, i)` from a registered message on `c`.
+The cycle term covers chains starting at `i`'s own sends after its grant the same way,
+and #3968's argument drops a first hop into an LP waiting in TAR. A stream event that
+`BackdatedEvent` or the straggler check catches still aborts the run.
+
+### Predictions on run 2
+
+Low confidence (below). From run 2's step table and frames over simulated 1890 s to
+1920 s, the later, slower part of its profiling window (6.72 wall s per simulated s,
+3,793 hops, parallelism 1.55). A replay of the decode frontends' steps under each ceiling
+rule gives their CA calls; it gives 7,979 per simulated second for today's rule, where
+the frames count 8,251. The decode frontends' on-path hops are taken as the same share
+of their calls as measured (0.358); the other groups' 837 on-path hops are kept. Wall is
+the sum, over windows of the rule's frontend cycle, of the busiest LP's own work, plus
+81 us per window, the figure that fits today's 6.72.
+
+| rule | decode frontends' CA calls per sim s | critical-path hops per sim s | wall s per sim s | LPs' parallelism |
+|---|---|---|---|---|
+| today, measured | 8,251 | 3,793 | 6.72 | 1.55 |
+| #3968 | 869 | 1,150 | 4.0 | 2.6 |
+| #3968 and D3.6 | 543 | 1,030 | 3.5 | 3.0 |
+| any protocol: traffic's own work | | | 1.73 | 6.0 |
+
+Under D3.6 the decode frontends' calls left are 397 at the 3.06 ms cycle, 131 at their
+engine's next round and 15 idle waits. The last row is a floor no protocol passes:
+traffic, one LP, does 1.73 s of own work per simulated second, which
+[#4116](https://github.com/jgong5/ATOM/issues/4116) cuts.
+
+### Simpler alternative
+
+#3968 alone. It leaves a decode frontend's ceiling and LBTS at the router's 1.5 ms, which
+the requirement's second mechanism asks to pass.
+
+### Low confidence
+
+The predictions above bound the gain from above. The replay restarts a decode frontend's
+ceiling a full cycle past each of its calls. The protocol holds its LBTS at the first
+stream event of its last window plus 3.06 ms, or 1.5 ms while the router runs, until
+the router and traffic have taken that window. A frontend, router and traffic chain per
+window adds calls and puts the router's and traffic's turns on the path; today's 70.6 us
+cycle hides the gap, so the replay's fit to today does not test it. The flagged
+prototype ([#4140](https://github.com/jgong5/ATOM/pull/4140)) grades them on a short
+cell of the recipe: #3968 alone against #3968 with channel reactions, each against its
+lane's base. No decision here rests on the figures: decisions 2 to 6 follow from the
+bound they lift, decisions 7 and 8 from run 2's measured rounds and hops.
+
+### Dependencies
+
+No spike and no sync issue: the clock is Compass's own. #3968's flag and rule come first;
+its PR lands before this one's. The router's per-event turns, 13,041 stream releases
+per simulated second in run 2, wait for [#4117](https://github.com/jgong5/ATOM/issues/4117)'s
+split of its share into its own work and transport.
+
+### Summary
+
+The deliverable: channel reactions on #3968's flag, the router's declared. Out of scope:
+a ceiling for an LP with members, input points, the router's per-event turns (#4117),
+and every per-step cost (#4114, #4115, #4116, #4134).
+
+One code task, after #3968:
+
+- `clock/channels.py`: `ChannelTable.mark_reactions`, `reach`, `D` over the reactions;
+  `prefill_decode_table` marks the router's.
+- `clock/authority.py`: under the flag, the router's LBTS term per class and the cycle
+  over `reach`.
+- This document: D3's grant rule and *Local grants* say the distances follow the
+  reactions.
+- `tests/compass/test_channel_reactions.py`: the router's classes and the distances on
+  the 8P16D table, which the CPU tests build through `prefill_decode_table`; a stream
+  event pending at the router does not cap a decode frontend's ceiling, a relay and a
+  cancel do.
+
+Acceptance, on a short cell of the recipe, the flag on against off: client metrics
+identical; `atom.compass.detect.scenario` raises no `BackdatedEvent`; the decode
+frontends' CA calls, the window's critical-path hops and wall per simulated second, as the
+prototype's short cell measures them.
+
+---
+
 ## D4. The interception contract: which waits must be touched
 
 ### Problem
@@ -3199,6 +3480,24 @@ own process with the policy code untouched. It is (owner ruling on
   with no decode request. The clock owes that response no send: an LP's `N` is bounded
   by its own target and the messages still to reach it, never by a send it has yet to
   make (`authority.py`), as a frontend's 204 to a cancel already shows.
+- **Stream bypass** ([#4228](https://github.com/jgong5/ATOM/issues/4228); off by default,
+  `compass run --stream-bypass` turns it on, run-file key `stream_bypass`). The router
+  does no work on a stream event but the last, yet holding each one puts the router's turn
+  on every token's path. Under the key a decode stream's events but its last go straight
+  to traffic, on `frontend-D<k>->traffic:stream` at the path's whole lookahead, each
+  naming that channel in its stamp (`c=`), and the router passes them on as they are. The
+  last, `[DONE]`, whose turn drops decode's load, takes the router's two hops as `final`
+  (`channels.py::prefill_decode_table`); the router reads the bypass off its lookaheads,
+  which then name `router->traffic:final`. Each event arrives within a rounding of when it
+  would through the router: `t + (stream_s + router_s)` and the two hops'
+  `(t + router_in_s) + (stream_s + router_s - router_in_s)` round apart by an ulp or two,
+  so a `[DONE]` can reach traffic a grant before or after the events written with it
+  ([#4238's review](https://github.com/jgong5/ATOM/pull/4238#issuecomment-7191663937)
+  counts them), and the traffic LP takes either order. A straight event is not stamped
+  with the two hops' sum: for some `t` it rounds below `t` plus the channel's lookahead,
+  which the authority refuses as backdated. The channel table differs, so the key is part
+  of the configuration the step table names. A run file with the key and no `router_in_s`
+  refuses.
 - **Unchanged.** A clock error ends the router process.
 - **Periodic tasks.** Under the LP, `PeriodicTask` (cache_aware's tree eviction) starts
   no thread: the task's next deadline is the daemon deadline of each NER, and it runs
@@ -3476,19 +3775,20 @@ Ordered by how much they could cost.
 | D0 | Fresh design; prior branches referenced at the design level only, not as a code-port plan | 2026-09-17 |
 | D1 | Keep ATOM's multi-process / multi-thread topology; additive changes only | 2026-09-17 |
 | D2 | "Two nodes" means true PD disaggregation, realised as two containers on one physical node | 2026-09-17 |
-| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP a round only after every rank has asked it or, under local grants below a ceiling, owes it; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a TAR holding an arrival on an offering channel is granted that arrival first, so the clock owner makes the send a handler offered at its message's arrival; a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares | 2026-09-18; revised 2026-09-28, 2026-10-02, 2026-10-14 (#966), 2026-11-08 (#2820), 2026-11-09 (#2993) and 2026-11-20 (#3767) |
+| D3 | Central Clock Authority acting as the HLA RTI (`advance_to` = TAR, idle point = NER, grant = TAG); an LP is a process group with one clock owner per process, and zero-lookahead couplings collapse into one LP; the CA grants a DP group's LP a round only after every rank has asked it or, under local grants below a ceiling, owes it; a grant is strictly below the lookahead-distance LBTS and waits for the messages already in transit (Fujimoto counters); a TAR holding an arrival on an offering channel is granted that arrival first, so the clock owner makes the send a handler offered at its message's arrival; a run finishes when no essential work is left; on a server open to clients that test ends a client run, as HLA's join, resign and synchronization point frame it, and the finish comes after the client runs the run file declares; under wide local grants a ceiling's cycle counts only the LPs that can react, and a TAR's grant sends its messages below the ceiling ahead | 2026-09-18; revised 2026-09-28, 2026-10-02, 2026-10-14 (#966), 2026-11-08 (#2820), 2026-11-09 (#2993), 2026-11-20 (#3767) and 2026-11-25 (#3968) |
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
 | D3.2 | Always-on causality detectors: a straggler check against the receiver's last drain (fails the run); a stall the CA cannot see prints one diagnostic after 30 wall seconds and keeps waiting, never aborting; clock-source CI lint | 2026-09-19; revised 2026-09-28 |
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for multi-container runs (1P+1D in M1 and M2) | 2026-09-19 |
 | D3.4 | Wall-clock interleaving may vary between runs; the `(LP, virtual time, event)` sequence may not. Thread scheduling inside an LP is irrelevant only under in-transit counting and TSO delivery; ties break by **(time, LP id, channel, sequence number), never arrival order**; the cost backend is a pure function of its batch view; **no `set` iteration on the simulated path** - string ids are hashed under `PYTHONHASHSEED` randomisation, so a set of request ids iterates differently in every process. Test is a byte-diff of two step tables, CPU-only, in CI. | 2026-09-20; revised 2026-09-28 |
 | D3.5 | The CA owns three outputs: an opt-in timeline log, a stall diagnostic (a stall the CA can see is resolved by deadlock detection and recovery; one it cannot see gets a diagnostic, never an abort), and a run summary written always, an early end included, carrying grants, speed ratio, lazy-trace cost, detector state, the refusals with their reasons, the predicted seconds by method, and `coverage_report` (`08` D50.1). Each quantity is counted in one place, which the summary, the step table and the timeline read; the simulated system's latency and throughput (TTFT, ITL, request counts) stay in the benchmark's output and ATOM's metrics, not the summary. | 2026-09-20; revised 2026-09-28, 2026-10-11 and 2026-10-14 (#952) |
+| D3.6 | On #3968's flag, an LP may declare which outbound channel kinds a message on each inbound kind can provoke; LBTS and the local-grant cycle follow the declarations, and the router declares its own kind, and a cancel's relay; an LP with members takes no ceiling past its rounds, and no round passes without LBTS | 2026-11-25 (#4135) |
 | D4 | Every synchronization site maps to one of the PDES mechanisms K1-K9, none undecided; the boundary is the LP, not the process; a DP member's step is one TAR at its own release from the group's device end, the `max` over ranks by an `all_reduce(MAX)` (with no host time, an output rank's at the `max` of the step seconds), exchanged inside the forward by K6 waits with no cost, and the lockstep `all_reduce` is K1 for its own cost; handler threads stay and TSO delivery runs them at their message's timestamp. A forward's K1 charge is one recurrence per runner over the backend's device busy time and host segments (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs` after R1), with wait rules R1, R4 and R6 to R8; after the return the engine LP advances the host's `out_s` (`E_out`) to its input pull, a DP member's pull joining the group rounds; `host.skip` makes a what-if; ATOM's bugs, its sync stalls included, are fixed in ATOM and listed under the `atom-issue` label | 2026-09-18; revised 2026-09-28, 2026-10-01, 2026-10-11 (#815), 2026-10-16 (#829, #1267), 2026-10-18 (#1345), 2026-10-19 (#1409) and 2026-10-21 (#1859) |
 | D5 | Every timer and clock read the CA can reach runs on the LP clock, except the out-of-band control-command reply deadline; only what it cannot reach is configured or left real; metric cadence is virtual time (revising `11` D72); the profiler and RL control commands are refused by the simulated runner with a reply, counted, and make the run a coverage report; a synchronous command from the frontend's clock owner is refused by the frontend | 2026-09-18; revised 2026-09-28, 2026-10-09, 2026-10-14, 2026-10-15 |
 | D5.1 | The simulated run uses stdlib asyncio, not uvloop: only a Python event loop can host virtual time | 2026-09-28 |
 | D6 | KV transfer is simulated through a connector registered in the existing factory, reproducing Mooncake (what ATOM's PD CI deploys) through scheduler-side hooks only; a rank pair's writes queue on its link | 2026-09-18; revised 2026-09-28; link sharing 2026-10-16 (#1157); first-write setup 2026-10-16 (#1172); per-pair links kept under RDMA 2026-11-09 (#1179) |
 | D6.1 | The lmcache MP server is LP `lmcache`, a Compass stand-in on the real ZMQ channels with a content index and two stations; a store or load completes as a stamped reply that the step loop takes in timestamp order; a blocking lookup is a request and reply whose wait is an idle point; inside a DP group each member parks before its forward, amending member join rules 1, 2 and 5, and the last park releases every member at the group's time; it sizes a chunk and the state image from its deployment's published plan before its first job, and its transfer channels are one per DP rank | 2026-10-16 (#1087, #1162); revised 2026-11-17 (#3687) |
 | D6.2 | A shared Mooncake Store's master is LP `mooncake_store`, a Compass stand-in holding objects, leases and Mooncake's eviction, its loop LP `lmcache`'s factored; each rank's lookups and renewals are requests and replies on its lookup channel, a renewal's wait an idle point with D6.1's park in a DP group; each rank's saves and loads are priced on its own lanes (`03` D13.1), a put sent as the save is queued carrying its priced start and end; ATOM's scheduler half runs as real code; the code is `dsv41/dev`'s | 2026-11-19 (#3762); revised 2026-11-24 (#3799) |
-| D7 | Atomesh gets no virtual clock: mesh-only mode; in 1P1D the router is one segment of a channel, not an LP, and its relay latency is that channel's lookahead; its bounds are configured (health check and circuit breaker off, `--worker-request-timeout-secs` set large); timestamps ride carriers it already relays; under `--dp-aware`, or with several instances per role, the router is LP `router`, handling requests, prefill responses and stream events in timestamp order (#449, #1085) | 2026-09-18; revised 2026-09-30, 2026-10-15, 2026-10-16 |
+| D7 | Atomesh gets no virtual clock: mesh-only mode; in 1P1D the router is one segment of a channel, not an LP, and its relay latency is that channel's lookahead; its bounds are configured (health check and circuit breaker off, `--worker-request-timeout-secs` set large); timestamps ride carriers it already relays; under `--dp-aware`, or with several instances per role, the router is LP `router`, handling requests, prefill responses and stream events in timestamp order (#449, #1085), and under a stream bypass of a stream's events only its last (#4228) | 2026-09-18; revised 2026-09-30, 2026-10-15, 2026-10-16, 2026-11-26 |
 | D8 | Arrivals are messages in transit, covered by the send and receive counts for closed and open workloads alike; the arrival timestamp rides the `tracestate` header | 2026-09-18; revised 2026-09-28 |
 | D9 | The ATOM diff is enumerated (~1,980 lines with tests) and completeness enforced by test rather than by review; ATOM's own suite is the gate (`08` D43.1) | 2026-09-18; revised 2026-09-28 |
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """compass_harness's transport times aiperf's records on the stamps ATOM writes.
 
-A stub server streams SSE events stamped by ``stamp_events`` with known
+A stub server streams SSE events stamped by ``stamp_split_events`` with known
 arrivals; a stand-in traffic LP publishes each request's send stamp and collects
 the stream reports on the adapter sockets. Requests go through aiperf's own
 ``InferenceClient``, which looks the ``http`` transport up in aiperf's plugin
@@ -70,7 +70,8 @@ from compass_harness.transport import (
 
 from atom.compass.carriers import (
     cancel_body,
-    stamp_events,
+    stamp_split_events,
+    stream_channels,
     tracestate_jitter,
     tracestate_stamp,
 )
@@ -123,6 +124,7 @@ class Harness:
         self.body_bytes[num] = len(await request.read())
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await resp.prepare(request)
+        stream, final = stream_channels(self.frontend)
         for i, arrival in enumerate(TOKENS[num]):
             self.frontend.arrival = arrival
             text = _chunk(f"t{i}")
@@ -131,7 +133,9 @@ class Harness:
                 continue
             if i == len(TOKENS[num]) - 1 and num not in self.undone:
                 text += "data: [DONE]\n\n"
-            await resp.write(stamp_events(text, self.frontend).encode())
+            *events, tail = text.split("\n\n")
+            stamped = stamp_split_events(events, tail, self.frontend, stream, final)
+            await resp.write(stamped.encode())
             await asyncio.sleep(0.01)
         await resp.write_eof()
         return resp

@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from atom.compass import run as compass_run
-from atom.compass.carriers import RELAY_SERVICE, relay_service
+from atom.compass.carriers import RELAY_SERVICE, relay_carried
 from atom.utils.compass_loop import _stamping
 
 TERM = {"fixed_s": 1.5e-3, "per_byte_s": 1e-6, "bytes": [100, 10**7]}
@@ -105,10 +105,10 @@ def test_a_relayed_response_carries_its_relay_time_past_router_s_as_its_service(
     took = 1.5e-3 + (4000 + len(body)) * 1e-6
     at, sent = stamped(body, (1.5e-3, 1e-6, 2e-3), 4000)
     assert at is None
-    assert relay_service(sent) == pytest.approx(took - 2e-3)
+    assert relay_carried(sent)[1] == pytest.approx(took - 2e-3)
     assert json.loads(sent)["kv_transfer_params"]["x"] == 1
     # Shorter than router_s, or no term: no service, and the body as before.
     for relay in ((1e-4, 1e-9, 2e-3), None):
         at, sent = stamped(body, relay)
-        assert at is None and relay_service(sent) == 0.0
+        assert at is None and relay_carried(sent)[1] == 0.0
         assert RELAY_SERVICE.encode() not in sent

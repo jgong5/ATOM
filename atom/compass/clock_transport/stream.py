@@ -13,6 +13,15 @@ reader waits for no reply, so when a bound connection ends, however it ends and
 even while its LP waits for a grant, it tells the serve side then, which ends
 the run.
 
+``serve(authority, endpoint, select=True)`` reads every connection on one
+thread instead, through a selector, and serves each frame there as soon as it
+is whole, the way a reader serves it, so no request waits for the serve side's
+lock behind another connection's reader. Each connection's frames are still
+served in the order they were sent, each after it arrived and one at a time,
+so the order it serves two connections' frames in is one their readers could
+also take the lock in; frames that end a connection, or that the serve side
+refuses, end or refuse it as a reader does.
+
 ``connect(lp, "tcp://host:port")`` returns the in-process carrier's connection
 with a socket in place of the serve side: the same ``send``, ``recv`` and ``close``,
 and the same frames, each preceded by its length as four big-endian bytes, plus
@@ -23,11 +32,15 @@ here and at ``send`` in-process, with the same reason, and reaches no authority.
 """
 
 import contextlib
+import logging
+import selectors
 import socket
 import threading
 
 from .service import _Connection, _HereConnection, _refusal, _reply, _Server
 from .wire import JOINED, MalformedMessage, encode
+
+logger = logging.getLogger("atom")
 
 STREAM_SCHEME = "tcp"
 #: The servers this process runs, by the endpoint each bound and the one it was
@@ -68,6 +81,17 @@ def _end(sock: socket.socket) -> None:
     sock.close()
 
 
+class _Incoming:
+    """A connection as the serve side reads it: the bytes of a frame not yet
+    whole, and once its first frame has bound it, its address and reply slot."""
+
+    __slots__ = ("address", "buffer", "slot")
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self.address = self.slot = None
+
+
 class _StreamServer:
     """A serve side that LPs reach over TCP."""
 
@@ -97,41 +121,119 @@ class _StreamServer:
             threading.Thread(target=self._read, args=(sock,), daemon=True).start()
 
     def _read(self, sock: socket.socket) -> None:
-        slot = None
+        incoming = _Incoming()
         try:
             with sock.makefile("rb") as stream:
                 while (frame := _receive(stream)) is not None:
-                    try:
-                        if slot is None:
-                            # Bound and answered under the serve side's lock,
-                            # so no reply reaches the socket before the bind's.
-                            with self._server._lock:
-                                address, slot, joined = self._server.bind(
-                                    frame, _SocketSlot(sock)
-                                )
-                                try:
-                                    reply = encode((JOINED, *joined))
-                                except MalformedMessage as refused:
-                                    reply = encode(_refusal(refused))
-                                slot.put(reply)
-                        else:
-                            self._server.submit(address, frame)
-                    except (KeyError, ValueError) as refused:
-                        reply = encode(_refusal(refused))
-                        if slot is None:
-                            sock.sendall(_framed(reply))
-                        else:
-                            slot.put(reply)
+                    self._take(sock, incoming, frame)
         except (MalformedMessage, OSError):
             pass
         finally:
-            if slot is None:
-                _end(sock)
+            self._ended(sock, incoming)
+
+    def _take(self, sock: socket.socket, incoming: _Incoming, frame: bytes) -> None:
+        """Serve `frame`, the next one `sock` sent: its first binds it."""
+        try:
+            if incoming.slot is None:
+                # Bound and answered under the serve side's lock, so no reply
+                # reaches the socket before the bind's.
+                with self._server._lock:
+                    incoming.address, incoming.slot, joined = self._server.bind(
+                        frame, _SocketSlot(sock)
+                    )
+                    try:
+                        reply = encode((JOINED, *joined))
+                    except MalformedMessage as refused:
+                        reply = encode(_refusal(refused))
+                    incoming.slot.put(reply)
             else:
-                # Ended first: the peer has gone, so the end of the run its
-                # close makes is for every other LP.
-                slot.put(None)
-                self._server._closed(address, slot)
+                self._server.submit(incoming.address, frame)
+        except (KeyError, ValueError) as refused:
+            reply = encode(_refusal(refused))
+            if incoming.slot is None:
+                sock.sendall(_framed(reply))
+            else:
+                incoming.slot.put(reply)
+
+    def _ended(self, sock: socket.socket, incoming: _Incoming) -> None:
+        """`sock` ended, however it did: end it, and a bound one's run."""
+        if incoming.slot is None:
+            _end(sock)
+        else:
+            # Ended first: the peer has gone, so the end of the run its
+            # close makes is for every other LP.
+            incoming.slot.put(None)
+            self._server._closed(incoming.address, incoming.slot)
+
+
+class _SelectServer(_StreamServer):
+    """A serve side whose one thread accepts and reads every connection through
+    a selector, in place of a reader thread a connection; each frame is served
+    with `_take` once whole, and each end with `_ended`, as a reader does. A
+    fault no reader expects ends its connection alone, as it would end that
+    connection's reader."""
+
+    def __init__(self, authority, host: str, port: int) -> None:
+        self._selector = selectors.DefaultSelector()
+        # Written once by `close`, so the selector's thread leaves.
+        self._wake, self._woken = socket.socketpair()
+        self._selector.register(self._woken, selectors.EVENT_READ, self._woken)
+        super().__init__(authority, host, port)
+
+    def close(self) -> None:
+        super().close()
+        with contextlib.suppress(OSError):
+            self._wake.send(b"\0")
+
+    def _admit(self) -> None:
+        self._selector.register(self._listener, selectors.EVENT_READ, self._listener)
+        try:
+            while True:
+                for key, _ in self._selector.select():
+                    if key.data is self._woken:
+                        return
+                    if key.data is not self._listener:
+                        self._readable(key.fileobj, key.data)
+                        continue
+                    try:
+                        sock, _ = self._listener.accept()
+                    except OSError:  # admits no more, as a reader's server
+                        self._selector.unregister(self._listener)
+                        continue
+                    self._open.append(sock)
+                    self._selector.register(sock, selectors.EVENT_READ, _Incoming())
+        finally:
+            self._selector.close()
+            for sock in (self._wake, self._woken):
+                sock.close()
+
+    def _readable(self, sock: socket.socket, incoming: _Incoming) -> None:
+        """Serve, in order, every frame `sock`'s next bytes complete; end it
+        when it ends or sends what is not a frame."""
+        try:
+            data = sock.recv(1 << 16)
+            buffer = incoming.buffer
+            buffer += data
+            while len(buffer) >= 4:
+                size = int.from_bytes(buffer[:4], "big")
+                if size > LARGEST_FRAME:
+                    raise MalformedMessage(
+                        f"a {size}-byte frame is over {LARGEST_FRAME}"
+                    )
+                if len(buffer) < 4 + size:
+                    break
+                frame = bytes(buffer[4 : 4 + size])
+                del buffer[: 4 + size]
+                self._take(sock, incoming, frame)
+            if data:
+                return
+        except Exception as ended:  # ends this connection alone
+            if not isinstance(ended, (MalformedMessage, OSError)):
+                logger.exception(
+                    "the clock's serve side ends a connection it failed on"
+                )
+        self._selector.unregister(sock)
+        self._ended(sock, incoming)
 
 
 class _SocketSlot:
@@ -202,10 +304,11 @@ class _StreamConnection(_Connection):
         self._server.close()
 
 
-def serve(authority, endpoint: str) -> _StreamServer:
-    """Serve `authority` at ``tcp://host:port``."""
+def serve(authority, endpoint: str, select: bool = False) -> _StreamServer:
+    """Serve `authority` at ``tcp://host:port``, every connection on one
+    selector thread with `select`, else each on a reader thread of its own."""
     host, port = _address(endpoint)
-    server = _StreamServer(authority, host, port)
+    server = (_SelectServer if select else _StreamServer)(authority, host, port)
     _SERVED[server.endpoint] = server
     if port:  # port 0 names no one server
         _SERVED[endpoint] = server
