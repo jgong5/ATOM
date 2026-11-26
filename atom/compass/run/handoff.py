@@ -49,7 +49,7 @@ from typing import Annotated
 
 import msgspec
 
-from atom.compass.carriers import RELAYED_JSON
+from atom.compass.carriers import JSON_DECODER, RELAYED_JSON
 
 #: The response key whose integers the prefill side writes with msgspec.
 KEY = "prompt_token_ids"
@@ -58,7 +58,6 @@ _STAND_IN = "\0compass:prompt_token_ids\0"
 #: The attribute marking a function this module installed.
 _INSTALLED = "compass_handoff"
 _IDS = list[Annotated[int, msgspec.Meta(ge=0)]]
-_DECODE = msgspec.json.Decoder()
 _ENCODE = msgspec.json.Encoder()
 
 #: Names the directory through which ids go by reference; unset or empty, none do.
@@ -87,7 +86,7 @@ def inline_extra(body: bytes) -> int:
         raise ValueError("a body carries two hand-off references")
     start = k + len(_KEY_TEXT)
     end = body.index(b"]", start) + 1
-    return _checked(_DECODE.decode(body[start:end]))[3] - (end - start)
+    return _checked(JSON_DECODER.decode(body[start:end]))[3] - (end - start)
 
 
 def _checked(ref: list) -> list:
@@ -186,7 +185,7 @@ def _reading(json_of):
                 with contextlib.suppress(
                     msgspec.DecodeError, ValueError, RecursionError
                 ):
-                    request._json = _DECODE.decode(body)
+                    request._json = JSON_DECODER.decode(body)
             if _DIR is not None and hasattr(request, "_json"):
                 _take(request._json, body)
         return await json_of(request)

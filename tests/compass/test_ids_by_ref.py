@@ -136,12 +136,9 @@ def test_decode_s_intake_and_turn_order_count_a_reference_s_ids_inline(
     def sized(decode):
         return lambda b: decoded.append(len(b)) or decode(b)
 
-    monkeypatch.setattr(
-        carriers, "_JSON", SimpleNamespace(decode=sized(carriers._JSON.decode))
-    )
-    monkeypatch.setattr(
-        handoff, "_DECODE", SimpleNamespace(decode=sized(handoff._DECODE.decode))
-    )
+    decoder = SimpleNamespace(decode=sized(carriers.JSON_DECODER.decode))
+    monkeypatch.setattr(carriers, "JSON_DECODER", decoder)
+    monkeypatch.setattr(handoff, "JSON_DECODER", decoder)
     monkeypatch.setattr(
         starlette.requests, "json", SimpleNamespace(loads=sized(json.loads))
     )
