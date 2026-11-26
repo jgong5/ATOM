@@ -204,6 +204,7 @@ def test_producer_advertises_remote_pp_size():
     seq = SimpleNamespace(
         output_tokens=[7],
         spec_token_ids=None,
+        num_prompt_tokens=130,
         block_table=[1, 2, 3],
         id=99,
         state_slot=7,
@@ -217,6 +218,102 @@ def test_producer_advertises_remote_pp_size():
     assert seq.kv_transfer_params_output["dcp_size"] == 1
     assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2, 3]
     assert seq.kv_transfer_params_output["remote_slot_index"] == 7
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2])
+@pytest.mark.parametrize(
+    "extra_tokens, prompt_blocks",
+    [(0, [1, 2]), (1, [1, 2, 3])],
+    ids=["fills-last-block", "one-token-into-a-block"],
+)
+def test_producer_publishes_only_the_prompt_blocks(
+    dcp_size, extra_tokens, prompt_blocks
+):
+    """With deferred output a finished prefill is scheduled for one more step,
+    and a prompt that fills its last block gets a block for the first token
+    there; MTP lookahead adds blocks too. The consumer allocates the prompt's
+    blocks only."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = object.__new__(mc.MooncakeConnectorScheduler)
+    sched.pp_size = 1
+    sched.tp_size = 1
+    sched.hash_block_size = 16
+    sched.block_size = 16
+    sched.dcp_size = dcp_size
+    sched.dp_rank = 0
+    sched.engine_id = "eng"
+    sched.host_ip = "10.0.0.1"
+    sched.handshake_port = 40000
+    sched.base_handshake_port = 6301
+    sched.is_producer = True
+    sched._awaiting_send = set()
+    sched._reqs_need_save = {}
+
+    seq = SimpleNamespace(
+        kv_transfer_params={"do_remote_decode": True},
+        output_tokens=[7],
+        spec_token_ids=None,
+        num_prompt_tokens=2 * 16 * dcp_size + extra_tokens,
+        block_table=[1, 2, 3, 4],
+        id=99,
+        state_slot=-1,
+        state_slots=[],
+        kv_transfer_params_output=None,
+    )
+    mc.MooncakeConnectorScheduler.request_finished(sched, seq)
+    assert seq.kv_transfer_params_output["remote_block_ids"] == prompt_blocks
+    assert sched._reqs_need_save[seq.id][1] == prompt_blocks
+
+
+@pytest.mark.parametrize("is_producer", [True, False], ids=["producer", "consumer"])
+def test_finished_block_ids_are_lists_of_their_own(is_producer):
+    """`seq.block_table` is a live `BlockTable`, an `array`. What
+    `request_finished` publishes or queues must be a list of its own: a slice
+    of the table is an `array`, and the table itself follows later changes."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.model_engine.sequence import new_block_table
+
+    sched = object.__new__(mc.MooncakeConnectorScheduler)
+    sched.pp_size = 1
+    sched.tp_size = 1
+    sched.hash_block_size = 16
+    sched.block_size = 16
+    sched.dcp_size = 1
+    sched.dp_rank = 0
+    sched.engine_id = "eng"
+    sched.host_ip = "10.0.0.1"
+    sched.handshake_port = 40000
+    sched.base_handshake_port = 6301
+    sched.is_producer = is_producer
+    sched._awaiting_send = set()
+    sched._reqs_need_save = {}
+    sched.request_id_to_transfer_id = {}
+
+    seq = SimpleNamespace(
+        kv_transfer_params={"do_remote_decode": is_producer},
+        output_tokens=[7],
+        spec_token_ids=None,
+        num_prompt_tokens=2 * 16,
+        block_table=new_block_table([1, 2, 3]),
+        id=99,
+        state_slot=-1,
+        state_slots=[],
+        kv_transfer_params_output=None,
+    )
+    mc.MooncakeConnectorScheduler.request_finished(sched, seq)
+    finished = [seq.kv_transfer_params_output["remote_block_ids"]]
+    if is_producer:
+        finished.append(sched._reqs_need_save[seq.id][1])
+    seq.block_table[0] = 9
+    seq.block_table.append(4)
+
+    for block_ids in finished:
+        assert type(block_ids) is list
+        assert block_ids == ([1, 2] if is_producer else [1, 2, 3])
 
 
 @pytest.mark.parametrize(
@@ -270,6 +367,7 @@ def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
     sched.transfer_id_to_request_id = {}
     sched._reqs_need_recv = {}
     sched._reqs_need_save = {}
+    sched._producer_admission_undo = {}
     sched._pending_chunked_admissions = {}
     sched._chunked_waiting = {}
     sched._chunked_ready = set()
@@ -287,6 +385,7 @@ def _remote_prefill_seq(remote_hash_block_size):
         per_req_cache_group=-1,
         has_per_req_cache=False,
         num_cached_tokens=128,
+        state_slot=-1,
     )
 
 
@@ -332,6 +431,26 @@ def test_symmetric_dcp_keeps_incremental_transfer():
 
     assert seq.kv_transfer_params["num_computed_blocks"] == 2
     assert seq.kv_transfer_params["src_block_skip_factor"] == 1
+
+
+def test_per_request_state_keeps_the_dcp_block_ratio_on_a_full_transfer():
+    # Kimi-K3 from a PP prefill (dcp=1) to a DCP decode. Its KDA state rules
+    # out a block-only delta, so the transfer is full -- but the producer still
+    # pairs dcp_size source blocks with each destination block, and rejects
+    # the transfer outright if told the ratio is one.
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc, block_size=16, dcp_size=4)
+    seq = _remote_prefill_seq(remote_hash_block_size=16)
+    seq.kv_transfer_params["block_size"] = 16
+    seq.kv_transfer_params["dcp_size"] = 1
+    seq.has_per_req_cache = True
+
+    sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["num_computed_blocks"] == 0
+    assert seq.kv_transfer_params["src_block_skip_factor"] == 4
 
 
 def test_mismatched_producer_block_size_disables_incremental_transfer():
@@ -393,6 +512,14 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2,3")
     monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
+    pci_lookups = []
+
+    def no_pci_tree(ordinal):
+        pci_lookups.append(ordinal)
+        raise ValueError("no PCI tree in this test")
+
+    # So the HCA falls back to its name, rdma<physical GPU>.
+    monkeypatch.setattr(mc, "gpu_pci_bdf", no_pci_tree)
     monkeypatch.setattr(
         mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=8)
     )
@@ -449,6 +576,8 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
     engine.initialize.assert_called_once_with(
         host_ip, "P2PHANDSHAKE", protocol, expected_device
     )
+    # The PCI lookup reads the rank's torch ordinal, not its physical index.
+    assert pci_lookups == ([0] if protocol == "rdma" and not configured_device else [])
     assert conn.engine_id == f"{host_ip}:16578"
     assert conn.request_address == f"{host_ip}:8000"
     assert conn.ib_devices == (expected_device.split(",") if expected_device else [])
@@ -516,6 +645,7 @@ def _one_row_staging_consumer(monkeypatch, send):
     monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: None)
     monkeypatch.setattr(mc.torch.cuda, "set_device", lambda *a: None)
     monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
+    monkeypatch.setattr(mc, "gpu_pci_bdf", MagicMock(side_effect=ValueError("no PCI")))
     monkeypatch.setattr(
         mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
     )
@@ -882,6 +1012,159 @@ def test_mooncake_rdma_requires_gpu_index_without_explicit_device():
 
 
 # ---------------------------------------------------------------------------
+# The HCA a rank registers on, from its GPU's PCI tree (#3833)
+# ---------------------------------------------------------------------------
+
+# pit2-p03-g08 (MI355X), as its sysfs reads: rdmaN and one GPU behind each PCIe
+# switch, under host bridge pci0000:<top>0 with top = _G08_TOP[N]. HIP numbers
+# the GPUs in KFD order, so HIP GPU i is the one on bus _G08_GPU_BUS[i].
+_G08_TOP = ["0", "1", "6", "7", "8", "9", "e", "f"]
+_G08_GPU_BUS = ["75", "05", "65", "15", "f5", "85", "e5", "95"]
+# The HCA on each HIP GPU's switch; before #3833 HIP GPU i took rdma<i>.
+_G08_RAIL = [3, 0, 2, 1, 7, 4, 6, 5]
+
+
+def _plant_hca(ib, name, pci_node, state="4: ACTIVE"):
+    port = ib / name / "ports/1"
+    port.mkdir(parents=True)
+    (port / "state").write_text(state + "\n")
+    (ib / name / "device").symlink_to(pci_node)
+
+
+def _g08_sysfs(root, names="rdma{}"):
+    """Plant pit2-p03-g08's GPUs and HCAs (named ``names.format(N)``) under root."""
+    pci = root / "sys/bus/pci/devices"
+    ib = root / "sys/class/infiniband"
+    pci.mkdir(parents=True)
+    ib.mkdir(parents=True)
+    for n, top in enumerate(_G08_TOP):
+        # Root port 01.1, then the switch's upstream port: GPU N and rdmaN
+        # part below it, on downstream ports 00.0 and 01.0.
+        switch = root / "sys/devices" / f"pci0000:{top}0/0000:{top}0:01.1"
+        switch = switch / f"0000:{top}1:00.0"
+        gpu = switch / f"0000:{top}2:00.0/0000:{top}3:00.0/0000:{top}4:00.0"
+        gpu = gpu / f"0000:{top}5:00.0"
+        nic = switch / f"0000:{top}2:01.0/0000:{top}6:00.0/0000:{top}7:01.0"
+        nic = nic / f"0000:{top}9:00.0"
+        for node in (gpu, nic):
+            node.mkdir(parents=True)
+            (pci / node.name).symlink_to(node)
+        _plant_hca(ib, names.format(n), nic)
+    return pci, ib
+
+
+@pytest.fixture
+def g08(tmp_path, monkeypatch):
+    """The connector reading a planted pit2-p03-g08 sysfs, GPUs unmasked."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.kv_transfer import rdma_nic
+
+    def plant(names="rdma{}"):
+        pci, ib = _g08_sysfs(tmp_path, names)
+        monkeypatch.setattr(mc, "_IB_SYSFS_ROOT", ib)
+        monkeypatch.setattr(rdma_nic, "PCI_SYSFS_ROOT", pci)
+        return pci, ib
+
+    monkeypatch.setattr(
+        mc, "gpu_pci_bdf", lambda ordinal: f"0000:{_G08_GPU_BUS[ordinal]}:00.0"
+    )
+    return mc, plant
+
+
+def test_mooncake_rdma_takes_each_gpus_hca_from_its_pci_switch(g08, caplog):
+    mc, plant = g08
+    plant()
+    with caplog.at_level(logging.INFO, logger="atom"):
+        picked = [mc._select_ib_devices("rdma", "", i, gpu_ordinal=i) for i in range(8)]
+    assert picked == [[f"rdma{n}"] for n in _G08_RAIL]
+    assert (
+        "physical GPU 0: rdma3, the ACTIVE HCA closest to its PCI address "
+        "0000:75:00.0 (GPU ordinal 0)" in caplog.text
+    )
+
+
+def test_mooncake_rdma_pci_lookup_reads_the_visible_gpu(g08, monkeypatch):
+    # HIP_VISIBLE_DEVICES=4,5,6,7: torch ordinal j is physical GPU 4 + j.
+    mc, plant = g08
+    plant()
+    monkeypatch.setattr(
+        mc, "gpu_pci_bdf", lambda ordinal: f"0000:{_G08_GPU_BUS[4 + ordinal]}:00.0"
+    )
+    picked = [mc._select_ib_devices("rdma", "", 4 + j, gpu_ordinal=j) for j in range(4)]
+    assert picked == [[f"rdma{n}"] for n in _G08_RAIL[4:]]
+
+
+def test_mooncake_rdma_configured_hca_wins_over_the_pci_tree(g08, monkeypatch):
+    mc, plant = g08
+    plant()
+    lookup = MagicMock(side_effect=AssertionError("must not look up"))
+    monkeypatch.setattr(mc, "gpu_pci_bdf", lookup)
+    assert mc._select_ib_devices("rdma", " rdma0 ", None, gpu_ordinal=0) == ["rdma0"]
+    assert mc._select_ib_devices("tcp", "", None, gpu_ordinal=0) == []
+    lookup.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "unresolved",
+    ["no-infiniband", "gpu-not-in-sysfs", "nic-down", "tie", "no-pci-properties"],
+)
+def test_mooncake_rdma_falls_back_to_the_hca_name_when_pci_cannot_tell(
+    g08, monkeypatch, caplog, unresolved
+):
+    mc, plant = g08
+    pci, ib = plant()
+    if unresolved == "no-infiniband":  # a container without the class
+        monkeypatch.setattr(mc, "_IB_SYSFS_ROOT", ib / "not-mounted")
+    elif unresolved == "gpu-not-in-sysfs":
+        (pci / "0000:75:00.0").unlink()
+    elif unresolved == "nic-down":  # and no other ACTIVE HCA on its host bridge
+        (ib / "rdma3/ports/1/state").write_text("1: DOWN\n")
+    elif unresolved == "tie":
+        _plant_hca(ib, "rdma8", (ib / "rdma3/device").resolve())
+    else:  # a torch whose device properties carry no PCI address
+        lookup = MagicMock(side_effect=AttributeError("pci_domain_id"))
+        monkeypatch.setattr(mc, "gpu_pci_bdf", lookup)
+    with caplog.at_level(logging.INFO, logger="atom"):
+        assert mc._select_ib_devices("rdma", "", 0, gpu_ordinal=0) == ["rdma0"]
+    assert "physical GPU 0: rdma0 by name" in caplog.text
+
+
+def test_mooncake_rdma_spur_ionic_hcas_by_pci_then_by_index(g08):
+    mc, plant = g08
+    pci, _ = plant(names="ionic_{}")
+    picked = [mc._select_ib_devices("rdma", "", i, gpu_ordinal=i) for i in range(8)]
+    assert picked == [[f"ionic_{n}"] for n in _G08_RAIL]
+    # Without a PCI match, ionic_N for physical GPU N, as rdmaN is absent.
+    (pci / "0000:75:00.0").unlink()
+    assert mc._select_ib_devices("rdma", "", 0, gpu_ordinal=0) == ["ionic_0"]
+
+
+@pytest.mark.parametrize("names", ["rdma{}", "ionic_{}"])
+def test_mooncake_matched_rails_auto_start_from_the_pci_primary(g08, names):
+    # A decode rank advertises its primary, and a producer writes through its
+    # own rail engine of that name: the rail family is the same as before.
+    mc, plant = g08
+    plant(names)
+    for i, n in enumerate(_G08_RAIL):
+        primary = mc._select_ib_devices("rdma", "", i, gpu_ordinal=i)
+        assert primary == [names.format(n)]
+        assert mc._resolve_matched_rails("rdma", primary, "auto") == [
+            names.format(rail) for rail in range(8)
+        ]
+
+
+def test_mooncake_rdma_alternate_hcas_follow_the_pci_primary(g08):
+    mc, plant = g08
+    plant()
+    devices = mc._select_ib_devices(
+        "rdma", "", 0, gpu_ordinal=0, enable_alternate_hca=True, hca_count=8
+    )
+    assert devices == ["rdma3"] + [f"rdma{n}" for n in (0, 1, 2, 4, 5, 6, 7)]
+
+
+# ---------------------------------------------------------------------------
 # Producer per-layer region mapping (consumer_region_indices)
 # ---------------------------------------------------------------------------
 
@@ -1148,6 +1431,46 @@ def test_stateful_transfer_without_final_source_slot_fails_closed(caplog, invali
     assert "missing the producer's final source slot" in caplog.text
 
 
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_only_a_pp_stage_past_0_drops_its_producer_entry_once_served(pp_rank):
+    captured = []
+    conn = _make_transfer_connector({}, captured)
+    conn.pp_size = 2
+    conn.pp_rank = pp_rank
+    conn._completed_prefills["prefill-1"] = {"block_ids": [3], "slot_index": 7}
+
+    conn._execute_transfer(_stateful_write_request(src_block_ids=[3]))
+
+    assert len(captured) == 1
+    # Stage 0 keeps its entry for the release, which only it receives.
+    assert ("prefill-1" in conn._completed_prefills) == (pp_rank == 0)
+    assert conn.done_sending == set()
+
+
+@pytest.mark.parametrize(
+    ("producer_dcp", "consumer_dcp", "sent"),
+    [(1, 2, True), (1, 8, True), (2, 4, False)],
+    ids=["dcp1-to-dcp2", "dcp1-to-dcp8", "dcp2-to-dcp4"],
+)
+def test_slot_transfer_refuses_only_a_sharded_producer_of_another_dcp(
+    caplog, producer_dcp, consumer_dcp, sent
+):
+    captured = []
+    conn = _make_transfer_connector({}, captured)
+    conn.pp_size = 2
+    conn.dcp_size = producer_dcp
+
+    conn._execute_transfer(
+        _stateful_write_request(
+            src_block_ids=list(range(3, 3 + consumer_dcp)),
+            consumer_dcp_size=consumer_dcp,
+        )
+    )
+
+    assert len(captured) == int(sent)
+    assert ("does not support asymmetric DCP" in caplog.text) != sent
+
+
 def test_write_done_correct_nonce_accepted():
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 1
@@ -1267,7 +1590,7 @@ def test_silent_producer_ranks_fail_the_receive_after_their_window():
     conn = _make_connector(
         _release_targets={"old": ("stage0", "t1", 1)},
         _send_on_socket=lambda addr, parts, repeat=1: sent.append((addr, parts[0])),
-        _mla_landing=None,
+        _landing=None,
     )
     for req_id in ("old", "new"):
         conn._pending_recv_expected[req_id] = 2
@@ -1294,7 +1617,7 @@ def test_silent_producer_ranks_fail_the_receive_after_their_window():
 def test_a_rank_that_never_acknowledged_keeps_the_receive_open():
     """It may still get the request and write, however long that takes."""
     pytest.importorskip("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")
-    conn = _make_connector(_mla_landing=None)
+    conn = _make_connector(_landing=None)
     conn._pending_recv_expected["r1"] = 2
     conn._pending_recv.add("r1")
     assert not conn._record_write_done("r1", 1, 0, 0, success=False)
@@ -1309,7 +1632,7 @@ def test_a_rank_that_never_acknowledged_keeps_the_receive_open():
 @pytest.mark.parametrize("window", [None, -1, 0, float("inf"), True, "60"])
 def test_an_ack_without_a_usable_window_starts_no_deadline(window):
     pytest.importorskip("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")
-    conn = _make_connector(_mla_landing=None)
+    conn = _make_connector(_landing=None)
     conn._pending_recv_expected["r1"] = 1
     conn._record_write_ack(
         {"request_id": "r1", "pp_rank": 0, "tp_rank": 0, "write_window_s": window}
@@ -1376,7 +1699,7 @@ def test_a_failed_receive_is_reported_only_after_its_hold(monkeypatch):
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
-    conn = _make_connector(_staging_slots=mc.SlotPool(), _mla_landing=None)
+    conn = _make_connector(_staging_slots=mc.SlotPool(), _landing=None)
     conn._pending_recv_expected["r1"] = 1
     conn._pending_recv.add("r1")
     conn._pending_recv_slots["r1"] = (7, 3)
@@ -1399,7 +1722,7 @@ def test_a_stalled_receive_is_logged_once(monkeypatch, caplog, acked):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
-    conn = _make_connector(_mla_landing=None)
+    conn = _make_connector(_landing=None)
     conn._pending_recv_expected["r1"] = 2
     conn._pending_recv_stall_watch["r1"] = time.monotonic()
     assert not conn._record_write_done("r1", 0, 0, 0, success=False)
@@ -1504,13 +1827,14 @@ def _pp_engine_core_cls():
     return PPEngineCoreProc
 
 
-def _fake_head(batch):
+def _fake_head(batch, *, launches=1, pp_size=4, pp_max_inflight=4):
     PPEngineCoreProc = _pp_engine_core_cls()
 
     head = SimpleNamespace(
         _in_flight=deque(),
         _defer_prefix_hash=False,
-        pp_size=4,
+        pp_size=pp_size,
+        pp_max_inflight=pp_max_inflight,
         kv_transfer_enabled=True,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -1523,7 +1847,7 @@ def _fake_head(batch):
         # never sleeps, so it must go through `_advance_idle_kv_transfer`.
         _next_idle_kv_drain=0.0,
     )
-    head.scheduler.schedule.side_effect = [(batch, {}), None]
+    head.scheduler.schedule.side_effect = [(batch, {})] * launches + [None]
     head.scheduler.take_rejected.return_value = None
     head.scheduler.dynamic_chunking_active = False
     head.pp_transport.recv_completion.return_value = None
@@ -1532,6 +1856,12 @@ def _fake_head(batch):
     )
     head._dispatch_connector_only_batch = (
         PPEngineCoreProc._dispatch_connector_only_batch.__get__(head)
+    )
+    head._queue_or_flush_prefill_hashes = (
+        PPEngineCoreProc._queue_or_flush_prefill_hashes.__get__(head)
+    )
+    head._collect_pp_completions = PPEngineCoreProc._collect_pp_completions.__get__(
+        head
     )
     PPEngineCoreProc._pp_head_step(head)
     return head
@@ -1543,6 +1873,28 @@ def _dispatched_metas(head):
         for c in head.runner_mgr.call_func.call_args_list
         if c.args and c.args[0] == "process_kvconnector_output"
     ]
+
+
+def test_the_head_fills_its_inflight_cap_past_the_stage_count():
+    """Middle chunks count against the cap as output batches do, and a cap
+    above the stage count keeps the head issuing until it is reached."""
+    chunk = SimpleNamespace(
+        req_ids=["r1"], connector_meta_output=None, produces_output=lambda: False
+    )
+    head = _fake_head(chunk, launches=8, pp_size=2, pp_max_inflight=4)
+    assert len(head._in_flight) == 4
+    assert head.scheduler.schedule.call_count == 4
+
+
+@pytest.mark.parametrize("env, cap", [("0", 2), ("16", 16), ("-1", None)])
+def test_pp_max_inflight_defaults_to_the_stage_count(monkeypatch, env, cap):
+    pp_engine_core = sys.modules[_pp_engine_core_cls().__module__]
+    monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", env)
+    if cap is None:
+        with pytest.raises(ValueError, match="must be >= 0"):
+            pp_engine_core.pp_max_inflight(2)
+    else:
+        assert pp_engine_core.pp_max_inflight(2) == cap
 
 
 def test_pp_head_dispatches_meta_of_request_less_batch():
@@ -1627,7 +1979,7 @@ def test_pp_downstream_skips_forward_for_request_less_batch():
         scheduler=MagicMock(),
         utility_handler=MagicMock(),
         utility_queue=MagicMock(),
-        _is_idle_rl_weights_offloaded=lambda: False,
+        _is_engine_held=lambda: False,
         _poll_and_send_kv_status=MagicMock(),
     )
     # One pass over the loop body, then shut down.
@@ -1653,7 +2005,7 @@ def _downstream_stage(**overrides):
         scheduler=MagicMock(),
         utility_handler=MagicMock(),
         utility_queue=MagicMock(),
-        _is_idle_rl_weights_offloaded=lambda: False,
+        _is_engine_held=lambda: False,
         _poll_and_send_kv_status=MagicMock(),
     )
     for key, value in overrides.items():
@@ -1669,6 +2021,28 @@ def _run_last_stage(batch):
     stage.runner_mgr.call_func.return_value = "fwd-out"
     PPEngineCoreProc._downstream_busy_loop(stage)
     return stage
+
+
+@pytest.mark.parametrize("weights_offloaded", [False, True])
+def test_a_held_stage_still_reports_its_kv_transfers(weights_offloaded):
+    """The head waits for every stage's report before a KV change. A stage
+    fenced by a weight sync stopped reporting, so the change waited out its
+    deadline and refused a sync that had already written. With its weights,
+    and so its KV pool, released, the stage runs nothing."""
+    PPEngineCoreProc = _pp_engine_core_cls()
+    stage = _downstream_stage(
+        kv_transfer_enabled=True,
+        _is_engine_held=lambda: True,
+        _is_rl_weights_offloaded=weights_offloaded,
+    )
+    stage.pull_and_process_input_queue = MagicMock(side_effect=[False, True])
+
+    PPEngineCoreProc._downstream_busy_loop(stage)
+
+    stage.pp_transport.recv_metadata.assert_not_called()
+    # The last call is the report every stage makes as it shuts down.
+    held_reports = stage._poll_and_send_kv_status.call_count - 1
+    assert held_reports == (0 if weights_offloaded else 1)
 
 
 def test_pp_downstream_skips_the_middle_chunk_ack_by_default():
@@ -1705,6 +2079,7 @@ def _head_for_batch(batch, *, dynamic_chunking_active=False):
         _in_flight=deque(),
         _defer_prefix_hash=False,
         pp_size=2,
+        pp_max_inflight=2,
         kv_transfer_enabled=False,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -1720,54 +2095,38 @@ def _head_for_batch(batch, *, dynamic_chunking_active=False):
     head.scheduler.take_rejected.return_value = None
     head.scheduler.dynamic_chunking_active = dynamic_chunking_active
     head._dispatch_connector_only_batch = MagicMock()
+    head._queue_or_flush_prefill_hashes = (
+        PPEngineCoreProc._queue_or_flush_prefill_hashes.__get__(head)
+    )
+    head._collect_pp_completions = PPEngineCoreProc._collect_pp_completions.__get__(
+        head
+    )
     return PPEngineCoreProc, head
 
 
-def test_pp_head_retires_a_middle_chunk_without_a_completion_ack():
+@pytest.mark.parametrize("dynamic_chunking_active", [False, True])
+def test_pp_head_waits_for_the_ack_of_a_middle_chunk(dynamic_chunking_active):
+    # Retired unacked, the chunk could still be in stage 1's queue when the
+    # head took its pipeline for empty and let a pause or a KV change go on.
     batch = _fake_batch([7], None)
     batch.produces_output = lambda: False
-    PPEngineCoreProc, head = _head_for_batch(batch)
-
-    PPEngineCoreProc._pp_head_step(head)
-
-    assert batch.pp_completion_ack is False
-    head.pp_transport.recv_completion.assert_not_called()
-    head.scheduler.release_pp_inflight.assert_called_once_with(batch)
-    assert len(head._in_flight) == 0
-
-
-def test_pp_head_waits_for_a_middle_chunk_ack_while_dynamic_chunking_is_active():
-    batch = _fake_batch([7], None)
-    batch.produces_output = lambda: False
-    PPEngineCoreProc, head = _head_for_batch(batch, dynamic_chunking_active=True)
-    head.pp_transport.recv_completion.return_value = ([7], None)
+    PPEngineCoreProc, head = _head_for_batch(
+        batch, dynamic_chunking_active=dynamic_chunking_active
+    )
+    head.pp_transport.recv_completion.return_value = None
 
     PPEngineCoreProc._pp_head_step(head)
 
     # Set before the metadata goes out, so the last stage reads the same flag.
     assert head.pp_transport.send_metadata.call_args.args[0].pp_completion_ack is True
-    head.pp_transport.recv_completion.assert_called()
-    head.scheduler.release_pp_inflight.assert_called_once_with(batch)
+    assert len(head._in_flight) == 1
+    head.scheduler.release_pp_inflight.assert_not_called()
 
-
-def test_pp_head_stops_asking_for_acks_once_dynamic_chunking_ends():
-    # Calibration gave up, or the fit was rejected: middle chunks go back to
-    # retiring locally rather than paying the ack for the life of the process.
-    first, second = _fake_batch([7], None), _fake_batch([8], None)
-    for batch in (first, second):
-        batch.produces_output = lambda: False
-    PPEngineCoreProc, head = _head_for_batch(first, dynamic_chunking_active=True)
     head.pp_transport.recv_completion.return_value = ([7], None)
-    PPEngineCoreProc._pp_head_step(head)
+    PPEngineCoreProc._collect_pp_completions(head, 0)
 
-    head.scheduler.dynamic_chunking_active = False
-    head.scheduler.schedule.side_effect = [(second, {8: SimpleNamespace(id=8)}), None]
-    head.pp_transport.recv_completion.reset_mock()
-    PPEngineCoreProc._pp_head_step(head)
-
-    assert first.pp_completion_ack is True
-    assert second.pp_completion_ack is False
-    head.pp_transport.recv_completion.assert_not_called()
+    assert len(head._in_flight) == 0
+    head.scheduler.release_pp_inflight.assert_called_once_with(batch)
 
 
 def test_pp_head_rejects_a_final_chunk_whose_tokens_are_out_of_order():
@@ -1797,6 +2156,9 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
     connector._per_block_bytes_list = [bytes_per_block, bytes_per_block]
     connector._block_region_roles = [MLA_KV_ROLE, MLA_KV_ROLE]
     connector._block_region_consumer_indices = None
+    connector._block_unit_specs = None
+    connector._block_head_major_runs = ()
+    connector._unit_layout = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
 
     batch_sizes = []
@@ -1848,11 +2210,204 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
     assert transferred_bytes == 2 * descriptors_per_region * 576
 
 
-def test_dcp_index_staging_waits_for_request_ready_event():
+# ---------------------------------------------------------------------------
+# Stateful P/D from an unsharded PP stage to a DCP x TP decode (Kimi-K3:
+# PP8xTP1 prefill, TP8 DCP8 decode). The stub NIC copies bytes within one
+# address space, so each case checks what lands, not just what was asked for.
+# ---------------------------------------------------------------------------
+
+_TOKEN_BYTES = 8
+_BLOCK = 4
+_BPB = _BLOCK * _TOKEN_BYTES
+_CONV_ROWS = 2
+_CONV_RUN = 4  # one of q, k, v in a conv row, at producer TP
+_CONV_BPS = _CONV_ROWS * 3 * _CONV_RUN
+_SSM_BPS = 16
+_CURSOR_BPS = 4
+_SRC_SLOTS = 8
+# Producer regions, then the consumer's: two MLA layers, three KDA layers and
+# ReplaySSM's cursor.
+_MLA_SRC = 0
+_CONV_SRC = _MLA_SRC + 4 * _BPB
+_SSM_SRC = _CONV_SRC + _SRC_SLOTS * _CONV_BPS
+_CURSOR_SRC = _SSM_SRC + _SRC_SLOTS * _SSM_BPS
+_DST_MLA = [4096 + i * 4 * _BPB for i in range(2)]
+_DST_SLOT = [8192 + i * 1024 for i in range(7)]
+
+
+class _ByteNic:
+    def __init__(self):
+        np = pytest.importorskip("numpy")
+        self.mem = np.zeros(16384, dtype=np.uint8)
+
+    def write(
+        self, _target, src, dst, sizes, _req_id, _label, *, engine=None, deadline=None
+    ):
+        for s, d, n in zip(src, dst, sizes):
+            self.mem[d : d + n] = self.mem[s : s + n].copy()
+        return True
+
+
+def _pp_stage_connector(mc, nic, *, tp_size=1, tp_rank=0, ssm_segments=True):
+    from atom.kv_transfer.disaggregation.types import MLA_KV_ROLE
+
+    connector = object.__new__(mc.MooncakeConnector)
+    connector.dcp_size = 1
+    connector.block_size = _BLOCK
+    connector.tp_size = tp_size
+    connector.tp_rank = tp_rank
+    connector.pp_size = 2
+    connector._num_local_layers = 2
+    connector._start_layer = 4
+    connector._fp4_index_layout = False
+    connector._block_unit_specs = None
+    connector._block_regions = [(_MLA_SRC, _BPB)]
+    connector._per_block_bytes_list = [_BPB]
+    connector._block_region_roles = [MLA_KV_ROLE]
+    connector._block_head_major_runs = [None]
+    # This stage's one MLA layer is the peer's second, its one KDA layer the
+    # peer's third (conv region 2, SSM region 5), then the shared cursor.
+    connector._block_region_consumer_indices = [1]
+    connector._swa_block_regions = []
+    connector._slot_regions = [
+        (_CONV_SRC, _CONV_BPS),
+        (_SSM_SRC, _SSM_BPS),
+        (_CURSOR_SRC, _CURSOR_BPS),
+    ]
+    connector._slot_region_consumer_indices = [2, 5, 6]
+    connector._slot_region_tp_segments = [
+        (_CONV_RUN,) * (3 * _CONV_ROWS),
+        (_SSM_BPS,) if ssm_segments else None,
+        None,
+    ]
+    connector._slot_region_tp_replicated = [False, False, True]
+    connector._gather_slot = None
+    connector._rdma_write = nic.write
+    return connector
+
+
+def _dcp_tp_request(consumer_tp_size=2, consumer_tp_rank=1, ratio=2):
+    from atom.kv_transfer.disaggregation.types import MLA_KV_ROLE
+
+    return {
+        "consumer_block_base_addrs": _DST_MLA,
+        "consumer_block_bpb": [_BPB, _BPB],
+        "consumer_region_roles": [MLA_KV_ROLE, MLA_KV_ROLE],
+        "consumer_slot_base_addrs": _DST_SLOT,
+        "consumer_slot_bps": [_CONV_BPS // ratio] * 3
+        + [_SSM_BPS // ratio] * 3
+        + [_CURSOR_BPS],
+        "dst_slot_index": 3,
+        "consumer_dcp_size": 2,
+        "consumer_dcp_rank": 1,
+        "consumer_dcp_interleave": 1,
+        "consumer_tp_size": consumer_tp_size,
+        "consumer_tp_rank": consumer_tp_rank,
+    }
+
+
+def _run_slot_transfer(mc, connector, request_data):
+    return mc.MooncakeConnector._execute_block_slot_transfer(
+        connector,
+        request_data,
+        "consumer:1234",
+        [0, 1, 2, 3],
+        [1, 2],
+        {"slot_index": 5},
+        "req-1",
+    )
+
+
+def test_pp_stage_relayouts_kv_and_splits_kda_state_for_a_dcp_tp_consumer():
+    np = pytest.importorskip("numpy")
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
+    nic = _ByteNic()
+    # Token t of the prompt (block t // 4) is eight bytes of t + 1; every
+    # state byte is distinct.
+    for t in range(4 * _BLOCK):
+        nic.mem[_MLA_SRC + t * _TOKEN_BYTES : _MLA_SRC + (t + 1) * _TOKEN_BYTES] = t + 1
+    nic.mem[_CONV_SRC : _CURSOR_SRC + _SRC_SLOTS * _CURSOR_BPS] = np.arange(
+        _CURSOR_SRC + _SRC_SLOTS * _CURSOR_BPS - _CONV_SRC, dtype=np.uint8
+    )
+    before = nic.mem.copy()
+
+    assert _run_slot_transfer(mc, _pp_stage_connector(mc, nic), _dcp_tp_request())
+
+    conv = before[_CONV_SRC + 5 * _CONV_BPS : _CONV_SRC + 6 * _CONV_BPS]
+    ssm = before[_SSM_SRC + 5 * _SSM_BPS : _SSM_SRC + 6 * _SSM_BPS]
+    cursor = before[_CURSOR_SRC + 5 * _CURSOR_BPS : _CURSOR_SRC + 6 * _CURSOR_BPS]
+    landed = [
+        # DCP rank 1 of 2 at interleave 1 owns the odd tokens, packed in order
+        # into destination blocks 1 and 2 of the peer's second MLA layer.
+        (
+            _DST_MLA[1] + _BPB,
+            np.repeat(np.arange(2, 17, 2, dtype=np.uint8), _TOKEN_BYTES),
+        ),
+        # TP rank 1 of 2 holds the second half of every q, k and v run in each
+        # conv row and the second half of the SSM heads; the cursor lands whole.
+        (
+            _DST_SLOT[2] + 3 * (_CONV_BPS // 2),
+            conv.reshape(_CONV_ROWS, 3, 2, _CONV_RUN // 2)[:, :, 1].ravel(),
+        ),
+        (_DST_SLOT[5] + 3 * (_SSM_BPS // 2), ssm[_SSM_BPS // 2 :]),
+        (_DST_SLOT[6] + 3 * _CURSOR_BPS, cursor),
+    ]
+    written = np.zeros_like(nic.mem, dtype=bool)
+    for dst, want in landed:
+        assert (nic.mem[dst : dst + want.size] == want).all()
+        written[dst : dst + want.size] = True
+    assert (nic.mem[~written] == before[~written]).all()
+
+
+@pytest.mark.parametrize(
+    "producer_tp, consumer_tp, consumer_rank, ssm_segments, match",
+    [
+        # Consumer rank 2 of 4 holds heads [H/2, 3H/4), none of producer rank
+        # 0's [0, H/2): the `tp_rank % remote_tp_size` pairing, which is right
+        # for replicated KV and wrong for sharded state.
+        (2, 4, 2, True, "holds no part"),
+        (2, 3, 1, True, "not a multiple"),
+        (1, 2, 1, False, "cannot split"),
+    ],
+)
+def test_a_tp_split_the_state_cannot_take_is_refused(
+    producer_tp, consumer_tp, consumer_rank, ssm_segments, match
+):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    nic = _ByteNic()
+    nic.mem[_MLA_SRC : _MLA_SRC + 4 * _BPB] = 1
+    connector = _pp_stage_connector(
+        mc, nic, tp_size=producer_tp, ssm_segments=ssm_segments
+    )
+    request = _dcp_tp_request(consumer_tp, consumer_rank, consumer_tp // producer_tp)
+
+    with pytest.raises(RuntimeError, match=match):
+        _run_slot_transfer(mc, connector, request)
+    # Refused before Phase 1: no MLA page reached the peer.
+    assert not nic.mem[_DST_MLA[0] : _DST_SLOT[0]].any()
+
+
+def test_dcp_index_staging_waits_for_request_ready_event(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from contextlib import contextmanager
+
     from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE, MLA_KV_ROLE
+
+    current = []
+
+    @contextmanager
+    def on_stream(stream):
+        current.append(stream)
+        yield
+        current.pop()
+
+    monkeypatch.setattr(mc.torch.cuda, "stream", on_stream)
 
     connector = object.__new__(mc.MooncakeConnector)
     connector.dcp_size = 1
@@ -1863,10 +2418,16 @@ def test_dcp_index_staging_waits_for_request_ready_event():
     connector._per_block_bytes_list = [mla_block_bytes, index_block_bytes]
     connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
     connector._block_region_consumer_indices = None
+    connector._block_unit_specs = None
+    connector._block_head_major_runs = ()
+    connector._unit_layout = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
     connector._index_staging_chunk_pages = 256
     gather_indices = object()
-    connector._prepare_sharded_index = MagicMock(return_value=gather_indices)
+    prepared_on = []
+    connector._prepare_sharded_index = lambda _plan: (
+        prepared_on.append(list(current)) or gather_indices
+    )
     connector._gather_sharded_index = MagicMock()
     staging_stream = MagicMock()
     connector._send_worker_stream = MagicMock(return_value=staging_stream)
@@ -1894,6 +2455,8 @@ def test_dcp_index_staging_waits_for_request_ready_event():
         engine=ready_event,
     )
     staging_stream.wait_event.assert_called_once_with(ready_event)
+    # The gathers read these indices on the staging stream, so it builds them.
+    assert prepared_on == [[staging_stream]]
     connector._execute_staged_index_layer_chunk.assert_called_once_with(
         "consumer:1234",
         1,
@@ -1924,6 +2487,9 @@ def test_dcp_index_staging_rejects_missing_request_ready_event():
     connector._per_block_bytes_list = [16 * 576, 16 * 144]
     connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
     connector._block_region_consumer_indices = None
+    connector._block_unit_specs = None
+    connector._block_head_major_runs = ()
+    connector._unit_layout = None
     connector._consumer_region_map = lambda *_args, **_kwargs: [0, 1]
     connector._index_staging_chunk_pages = 256
     connector._prepare_sharded_index = MagicMock(return_value=object())

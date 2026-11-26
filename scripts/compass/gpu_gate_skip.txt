@@ -15,6 +15,20 @@
 gfx942 tests/attentions/deepseek_v41/test_tbo.py
 # #2631: the V4 paged-decode kernel returns a different output on each call at head dim 96.
 gfx942 tests/model_ops/test_v4_fused_decode.py
+# #3940: on nightly_202611151511 these pass and fail at random between two runs.
+gfx950 tests/model_ops/test_indexer_opus.py
+gfx950 tests/test_atomesh_spur_dispatch.py
+gfx950 tests/test_indexer_topk_row_window.py
+gfx950 tests/test_ratio_verify.py
+gfx950 tests/test_upload_numpy.py
+# #4076: aborts the pytest process on gfx950 under nightly_202611240650.
+gfx950 tests/test_deepseek_v41_gfx1250.py
+# #4087: every test errors at setup; the test's stand-in lacks runs_bf16.
+gfx950 tests/model_ops/test_native_1x32_scale.py
+# #4104: on nightly_202611240650 these pass and fail, or hang, at random between two runs.
+gfx950 tests/test_gc_utils.py
+gfx950 tests/test_rdma_weight_stream_multiprocess.py
+gfx950 tests/test_triton_inductor_pairing.py
 # #2914: FlyDSL 0.4.0's compile aborts the process on gfx1250.
 gfx1250 tests/models/deepseek_v41/test_index_fp4.py
 gfx1250 tests/models/glm52/kernels/test_glm5_tp4_index_fp8.py

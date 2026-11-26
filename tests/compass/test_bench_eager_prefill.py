@@ -29,6 +29,7 @@ from test_filler_tokens import model_dir  # noqa: F401  the model_dir fixture
 
 from atom.compass.backends import step_linear_fit
 from atom.compass.backends.step_linear import token_padding
+from atom.compass.bench import window
 from atom.compass.bench.window import BenchWindow
 from atom.compass.fit.samples import load
 from atom.compass.parity import StepRecording
@@ -51,6 +52,7 @@ def settled(refused: bool) -> ForwardMode:
         total_seqs_num=1,
         total_tokens_num=300,
         total_tokens_num_prefill=300,
+        has_prefill=True,
         final_prefill_requests=lambda: 1,
     )
     return ForwardMode.decide(
@@ -78,7 +80,7 @@ def test_the_bench_states_whether_the_mode_its_forwards_settled_runs_eagerly(
     )
     bench = Bench(itertools.repeat(MS), itertools.repeat(BUSY))
 
-    result = bench.bench_step(batch())
+    result = bench.bench_step(batch(), window.BURST)
 
     assert result["group_needs_eager"] is refused
     assert result["repeats"]
@@ -89,9 +91,9 @@ def test_a_prefill_the_bench_ran_eagerly_is_measured_so_and_pads_nothing_in_a_fi
 ):
     reply = FakeBench.measure
 
-    def eager(self, batch):
+    def eager(self, batch, repeats):
         prefill = batch.total_tokens_num_prefill > 0
-        return reply(self, batch) | {"group_needs_eager": prefill}
+        return reply(self, batch, repeats) | {"group_needs_eager": prefill}
 
     monkeypatch.setattr(FakeBench, "measure", eager)
     rec = str(run.record)

@@ -37,6 +37,7 @@ from transformers import PretrainedConfig
 from atom.compass.backends import KvGeometry
 from atom.compass.clock import LpId, prefill_decode_table
 from atom.compass.kv import TRANSFER_KEY, WRITE_REQ_KEY
+from atom.compass.kv import connector as connector_module
 from atom.compass.kv.connector import SimulatedKVConnector
 from atom.compass.kv.handoff import (
     SIMULATED_ENGINE_ID,
@@ -179,6 +180,14 @@ def engine_step(engine, rt, t, *released):
         )
 
 
+def admit(engine):
+    """An admission step that runs no forward, as `EngineCore` steps one: the
+    schedule, then the KV poll at the same time, where decode posts the write
+    requests it queued, the device having no forward of this step to run."""
+    engine.schedule()
+    engine._update_from_kv_xfer_finished(KVConnectorOutput())
+
+
 #: What the router attaches to a request it sends to prefill.
 TO_PREFILL = {"do_remote_decode": True}
 
@@ -209,7 +218,7 @@ def admitted(pd, seqs, seq_factory, t):
     ]
     for seq in out:
         pd.d.add(seq)
-    pd.d.schedule()
+    admit(pd.d)
     return out
 
 
@@ -221,6 +230,144 @@ def free_blocks(engine):
 
 #: Prefill's forward ends at R; decode is busy until SEND, so admits late.
 R, SEND = 1.0, 2.0
+
+
+def queued(pd, seqs, seq_factory, t):
+    """Decode requests for the prefilled `seqs`, queued by engine-D's admission
+    schedule at `t` and not yet posted: no forward has returned since."""
+    at(pd.rt_d, t)
+    out = [
+        seq_factory(PROMPT, kv_transfer_params=dict(seq.kv_transfer_params_output))
+        for seq in seqs
+    ]
+    for seq in out:
+        pd.d.add(seq)
+    pd.d.schedule()
+    return out
+
+
+def returned(pd, t, device_end):
+    """Engine-D's forward returns at `t`, its device work ending at
+    `device_end`, as `run.engine`'s watch of `call_func` tells the connector."""
+    at(pd.rt_d, t)
+    connector_module.forward_returned(
+        SimpleNamespace(predicted_s=0.0, device_end=device_end)
+    )
+
+
+def test_a_write_request_leaves_once_the_forward_after_its_admission_ends_on_the_device(
+    pd, seq_factory
+):
+    """Mooncake's write-request thread synchronizes the device before it posts:
+    the request queued by the admission step leaves when the device work of
+    the forward the engine dispatched next is done, not at the admission, and
+    decode is ready a write and a notice after that."""
+    (x,) = prefilled(pd, 1, R)
+    (y,) = queued(pd, [x], seq_factory, SEND)
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert pd.rt_d.send_log == [], "posted before the device ran the forward"
+    assert pd.d.kv_connector.has_pending_work() is True, "an idle decode stops polling"
+
+    end = SEND + 3 * TICK  # the forward returns at SEND + TICK; its device later
+    returned(pd, SEND + TICK, end)
+    a = end + L
+    assert pd.rt_d.send_log == [(KV, 0, a)], "the write request's arrival"
+
+    ready = a + pd.model.duration_s(len(y.block_table)) + L
+    engine_step(pd.p, pd.rt_p, a, (0, a))
+    engine_step(pd.d, pd.rt_d, ready)
+    pd.d.schedule()
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS, "one poll early"
+    engine_step(pd.d, pd.rt_d, ready + TICK)
+    pd.d.schedule()
+    assert y.status is SequenceStatus.RUNNING
+
+
+def test_a_device_already_done_posts_at_the_return_and_a_later_forward_posts_nothing(
+    pd, seq_factory
+):
+    """A forward whose device work ended before its return, or one with no
+    device end (no host recurrence), posts at the return: a send is never
+    stamped before the clock. Each request is posted once."""
+    xs = prefilled(pd, 2, R)
+    queued(pd, xs[:1], seq_factory, SEND)
+    returned(pd, SEND + TICK, SEND)
+    # The log holds the sends since the last clock call.
+    assert pd.rt_d.send_log == [(KV, 0, SEND + TICK + L)]
+    queued(pd, xs[1:], seq_factory, SEND + 2 * TICK)
+    returned(pd, SEND + 3 * TICK, None)
+    assert pd.rt_d.send_log == [(KV, 1, SEND + 3 * TICK + L)]
+    returned(pd, SEND + 4 * TICK, SEND + 9 * TICK)
+    assert pd.rt_d.send_log == []
+
+
+def test_an_admission_step_with_no_forward_posts_at_its_poll_once_the_device_is_done(
+    pd, seq_factory
+):
+    """At DP width one an admission step that runs no forward is followed by
+    none: its KV poll posts, once the last forward's device work is done."""
+    xs = prefilled(pd, 2, R)
+    returned(pd, SEND - TICK, SEND + 2 * TICK)  # a forward still on the device
+    queued(pd, xs[:1], seq_factory, SEND)
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert pd.rt_d.send_log == [(KV, 0, SEND + 2 * TICK + L)]
+    queued(pd, xs[1:], seq_factory, SEND + 3 * TICK)
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert pd.rt_d.send_log == [(KV, 1, SEND + 3 * TICK + L)]
+
+
+def test_a_dp_rank_waits_for_the_group_dummy_after_an_admission_step_with_no_forward(
+    pd, geometry, monkeypatch, seq_factory
+):
+    """Above DP width one the rank's KV poll comes before the group's dummy
+    forward, which the device runs before the sync returns: the poll posts
+    nothing, the dummy's device end posts it."""
+    half = connector(
+        pd.rt_d,
+        monkeypatch,
+        pd.model,
+        kv_role="kv_consumer",
+        address=pd.address,
+        parallel_config=SimpleNamespace(data_parallel_rank=0, data_parallel_size=2),
+    )
+    pd.d = scheduler_with(half)
+    (x,) = prefilled(pd, 1, R)
+    queued(pd, [x], seq_factory, SEND)
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert pd.rt_d.send_log == [], "posted before the group's dummy ran"
+    returned(pd, SEND + TICK, SEND + 2 * TICK)
+    assert pd.rt_d.send_log == [(KV, 0, SEND + 2 * TICK + L)]
+
+
+def test_the_engine_tells_the_connector_of_each_priced_forward_it_dispatches(
+    monkeypatch,
+):
+    """`run.engine` wraps `call_func` once: a forward's or the DP dummy's
+    priced reply reaches `forward_returned`; any other call's does not."""
+    from aiter_stub import stubbed_aiter
+
+    from atom.compass import run
+
+    replies = {
+        "forward": SimpleNamespace(predicted_s=0.1, device_end=2.0),
+        "dummy_execution": SimpleNamespace(predicted_s=0.1, device_end=3.0),
+        "process_kvconnector_output": None,
+        "unpriced": SimpleNamespace(predicted_s=None, device_end=4.0),
+    }
+    told = []
+    monkeypatch.setattr(connector_module, "forward_returned", told.append)
+    with stubbed_aiter():  # the class the engine's import finds is this one
+        from atom.model_engine.async_proc import AsyncIOProcManager
+
+        monkeypatch.setattr(
+            AsyncIOProcManager, "call_func", lambda self, name, *a, **k: replies[name]
+        )
+        run._watch_forwards()
+        run._watch_forwards()
+        mgr = object.__new__(AsyncIOProcManager)
+        for name, reply in replies.items():
+            assert mgr.call_func(name) is reply
+    assert told == [replies["forward"], replies["dummy_execution"]]
 
 
 def test_prefill_frees_at_max_a_r_plus_t_and_decode_is_ready_at_a_t_notify(
@@ -326,7 +473,7 @@ def test_writes_posted_together_queue_on_the_link_on_both_ends(pd, seq_factory):
     ]
     for y in ys:
         pd.d.add(y)
-    pd.d.schedule()
+    admit(pd.d)
 
     a = SEND + L
     small, large = (len(y.block_table) * pd.model.bytes_per_block for y in ys)
@@ -547,11 +694,11 @@ def test_a_request_the_cap_bounced_parks_on_a_later_step(pd, seq_factory):
     bounced = seq_factory(PROMPT, kv_transfer_params=dict(blob, transfer_id=1))
     pd.d.add(first)
     pd.d.add(bounced)
-    pd.d.schedule()
+    admit(pd.d)
     assert first.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert bounced.status is SequenceStatus.WAITING, "the cap did not bounce it"
     pd.d.max_num_seqs = 4
-    pd.d.schedule()
+    admit(pd.d)
     assert bounced.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert [seq for _, seq, _ in pd.rt_d.send_log] == [0, 1]
 

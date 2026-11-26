@@ -57,6 +57,7 @@ import enum
 import functools
 import gc
 import importlib
+import importlib.util
 import inspect
 import json
 import logging
@@ -149,6 +150,9 @@ V41_TOPKS = (
     "aiter.ops.flydsl.topk.topk_per_row:flydsl_top_k_per_row_decode",
     "aiter.ops.flydsl.topk.topk_per_row:flydsl_radix_topk_one_block",
     "aiter._top_k_per_row_decode.default",
+    # aiter's routed operator, which picks its kernel itself: what V4.1's
+    # scorer calls since upstream b7b5ec3f2
+    "aiter_routed.top_k_per_row_decode.default",
 )
 #: DeepSeek-V4.1's RoPE, which its index keys take at their ratio's compress
 #: plan's positions: with no drafter both ratios' plans hold as many rows.
@@ -1040,6 +1044,8 @@ def _patches(recorder):
     * aiter's top-k scratch sizes are host queries into a module built for a
       device, which a capture cannot load: each answers 0, and the scratch
       the call allocates holds one byte.
+    * aiter's scratch caches key a buffer by the graph capture its stream is
+      in, which they ask HIP: a capture's streams are in none.
     * A mono runner binds and builds its widths as its deployment does
       (`_mono`).
     * A forced acceptance (`--spec-decode-acceptance-length`) draws with a
@@ -1065,8 +1071,18 @@ def _patches(recorder):
     from atom.utils.tbo import ubatching
     from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
-    recorder.languages = tuple(
-        f"{pathlib.Path(m.__file__).parent}/" for m in (triton, flydsl)
+    # aiter launches a FlyDSL kernel through generic launchers of its own:
+    # `_run_compiled`, then, where its AOT cache is on, `aot_launch`'s binding
+    # and `FlyDSLAotCache.launch`, which hold the kernel in their entries.
+    # Their frames are the launch's, as FlyDSL's own are.
+    launchers = (
+        "aiter.ops.flydsl.kernels.tensor_shim",
+        "aiter.ops.flydsl.aot_launch",
+        "aiter.ops.flydsl.aot_cache",
+    )
+    recorder.languages = (
+        *(f"{pathlib.Path(m.__file__).parent}/" for m in (triton, flydsl)),
+        *(spec.origin for spec in map(importlib.util.find_spec, launchers) if spec),
     )
 
     def run(kernel, *args, grid=None, warmup=False, **kwargs):
@@ -1079,8 +1095,11 @@ def _patches(recorder):
     def jit_call(jit, *args, **kwargs):
         recorder.launch(f"flydsl.{jit.func.__name__}", jit)
 
-    def compile_impl(jit, *args):
-        jit(*args)  # flyc.compile launches the kernel as it compiles it
+    def compile_impl(jit, *args, compile_only=False, **kwargs):
+        # flyc.compile launches the kernel as it compiles it, unless asked
+        # to compile only; a call of what it returns launches it then.
+        if not compile_only:
+            jit(*args, **kwargs)
         return fly.CompiledFunction(None, jit)
 
     def compiled_call(compiled, *args):
@@ -1216,7 +1235,11 @@ def _patches(recorder):
         (UBatchWrapper, "_run_ubatches", micro_batches),
         (topk, "topk_ob_workspace_size", lambda *a: 0),
         (topk, "topk_mb_workspace_size", lambda *a: 0),
-        (torch.ops.aiter, "moe_forward", moe_forward),
+        *_in_no_graph_capture(),
+        # Where FusedMoE.forward calls it: the op's eager caller, which holds
+        # the op itself, so replacing `torch.ops.aiter.moe_forward` reaches no
+        # call and breaks the op's own dispatch.
+        (moe, "moe_forward_op", moe_forward),
         (
             torch.ops.aiter,
             "maybe_dual_stream_forward",
@@ -1235,6 +1258,16 @@ def _patches(recorder):
     return stack
 
 
+def _in_no_graph_capture():
+    """aiter's query of the graph capture a stream is in, answering none, as
+    `(owner, name, value)` patches: none where aiter asks no such question."""
+    if importlib.util.find_spec("aiter.utility.graph_alloc") is None:
+        return ()
+    from aiter.utility import graph_alloc
+
+    return ((graph_alloc, "_capture_id", lambda stream: None),)
+
+
 def _mono(recorder, unpatched):
     """What a mono runner's bind and width builds run under the capture, as
     `(owner, name, value)` patches; `unpatched` are FlyDSL's entries before
@@ -1244,7 +1277,9 @@ def _mono(recorder, unpatched):
     outside the fake mode and the recorder, and agrees with this rank, and the
     peer buffer is one of the sizes the runner asks for on the declared device
     (`driverless.PeerBuffer`), as is each uncached scratch a bind or a build
-    takes (`driverless.uncached_bytes`). A width's kernels compile for real,
+    takes (`driverless.uncached_bytes`); a peer embedding's every shard address
+    is this rank's (`driverless.PeerView`), and a dual area's copy word is
+    declared (`driverless.scratch_word`). A width's kernels compile for real,
     compile-only at the declared arch through `unpatched`, so their scratch is
     read off their binaries. A refusal the deployment makes too, a bind check's
     `MonoUnsupported` or a kernel that needs scratch, leaves the original path
@@ -1253,27 +1288,42 @@ def _mono(recorder, unpatched):
     """
     from torch.utils._python_dispatch import _disable_current_modes
 
-    from atom.mono.runtime import consensus, lifecycle, route, uncached, widths
+    from atom.distributed import group_agreement
+    from atom.model_ops import peer_embedding
+    from atom.mono.runtime import consensus, lifecycle, numa, route, uncached, widths
     from atom.mono.runtime.compile import compile_kernels, scratch_bytes
 
-    agree, init = consensus.tp_agree, route.LazyRunner.__init__
+    agree, init = group_agreement.group_agree, route.LazyRunner.__init__
     ready, prepare = route.LazyRunner.ready, widths.WidthBuilds.prepare
+    spilled_anywhere = widths.WidthBuilds._spilled_anywhere
     refused = {}  # each refusal, by its runner and width (None for a bind)
 
     def host_agree(ok, group):
         with _disable_current_modes():
             return agree(ok, group)
 
+    def spilled_here(self, scratch):
+        """Where any rank's build spilled: where this rank's did, since every
+        rank of a capture is this one and its fake group gathers nothing."""
+        with patch.object(self, "_group", None):
+            return spilled_anywhere(self, scratch)
+
     def driverless_scratch():
         """Each loaded module's `uncached_bytes`, ATOM's ctypes HIP allocation,
-        as `driverless.uncached_bytes`: a runner module binds the name at its
-        import, so the name is replaced where each one holds it."""
-        held, real = contextlib.ExitStack(), uncached.uncached_bytes
-        for module in list(sys.modules.values()):
-            if getattr(module, "__dict__", {}).get("uncached_bytes") is real:
-                held.enter_context(
-                    patch.object(module, "uncached_bytes", driverless.uncached_bytes)
-                )
+        as `driverless.uncached_bytes`, and its `scratch_word`, the NUMA
+        calibration of a dual area, as `driverless.scratch_word`: a runner
+        module binds each name at its import, so the name is replaced where
+        each one holds it."""
+        held = contextlib.ExitStack()
+        for name, real in (
+            ("uncached_bytes", uncached.uncached_bytes),
+            ("scratch_word", numa.scratch_word),
+        ):
+            for module in list(sys.modules.values()):
+                if getattr(module, "__dict__", {}).get(name) is real:
+                    held.enter_context(
+                        patch.object(module, name, getattr(driverless, name))
+                    )
         return held
 
     def bound(create, lazy):
@@ -1353,12 +1403,17 @@ def _mono(recorder, unpatched):
         return held
 
     return (
-        (consensus, "tp_agree", host_agree),
-        (widths, "tp_agree", host_agree),
+        # Upstream's `group_agree` (was `consensus.tp_agree`), where the mono
+        # runtime binds it and where a caller imports it at its call.
+        (consensus, "group_agree", host_agree),
+        (widths, "group_agree", host_agree),
+        (group_agreement, "group_agree", host_agree),
         (lifecycle, "PeerBuffer", driverless.PeerBuffer),
+        (peer_embedding, "PeerView", driverless.PeerView),
         (route.LazyRunner, "__init__", lazy),
         (route.LazyRunner, "ready", turned_away),
         (widths.WidthBuilds, "prepare", built),
+        (widths.WidthBuilds, "_spilled_anywhere", spilled_here),
     )
 
 
@@ -1519,12 +1574,24 @@ def _build_runner(config, fake_mode):
             total = torch.cuda.get_device_properties(0).total_memory
             return DeviceMemoryReadings(total, total, 0, 0)
 
+    from atom.utils import packed_h2d
+
     # A fake tensor has no address: the alias check sees each buffer empty.
-    # Built in the inference mode its steps run in, so their views of its
-    # weights and buffers keep the keys of what they view.
+    # Nor host bytes: packed H2D (upstream's `packed_h2d.PackedCopy`) maps its
+    # pinned staging as numpy, so each group keeps the direct transport it
+    # falls back to on any device packing cannot serve. Built in the inference
+    # mode its steps run in, so their views of its weights and buffers keep
+    # the keys of what they view.
     with (
         fake_mode,
         patch.object(h2d, "_range", lambda t: (0, 0)),
+        patch.object(
+            packed_h2d.PackedCopy,
+            "create",
+            classmethod(
+                lambda cls, members, device: (None, "a capture packs no bytes")
+            ),
+        ),
         torch.inference_mode(),
     ):
         return _CapturedRunner(0, config)
@@ -1684,9 +1751,10 @@ def _affine(shape: str, first, second):
     return out
 
 
-def _config(model, tp, atom_args):
+def _config(model, tp, atom_args, real_kv=False):
     """ATOM's `Config` for its engine arguments `atom_args`, eager, at level 0,
-    the checkpoint an empty dummy.
+    the checkpoint an empty dummy; with `real_kv`, its simulated KV connector
+    the real one (`drive.run.real_kv`).
 
     Under `--enable-dp-attention` each TP rank is a DP rank of TP 1, as
     `CoreManager` rewrites it.
@@ -1700,6 +1768,10 @@ def _config(model, tp, atom_args):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(prog="trace ops --"))
     forced = ["--enforce-eager", "--level", "0", "--load_dummy", "empty"]
     args = parser.parse_args(["--model", model, "-tp", str(tp), *atom_args, *forced])
+    if real_kv:
+        from atom.compass.drive.run import real_kv as real
+
+        args.kv_transfer_config = real(args.kv_transfer_config)
     engine = EngineArgs.from_cli_args(args)
     names = {field.name for field in dataclasses.fields(Config)}
     kwargs = engine._get_engine_kwargs().items()
@@ -1768,12 +1840,17 @@ class Tracer:
     `trace`, once, and every later one steps the same runner. The capture's
     patches hold until `close`; the declared device, for the process. Each
     graph states the files its process ran and read up to its step
-    (`capture.files_of`), from the reads watched since this one was made."""
+    (`capture.files_of`), from the reads watched since this one was made.
+
+    A P/D side's simulated connector is traced as Mooncake's, as `deploy.sh
+    record` starts that side (`drive.run.real_kv`): ATOM's attention builders
+    publish their transfer regions by connector name, and Kimi's MLA+GDN
+    builder refuses any but Mooncake and MoRI-IO as it allocates."""
 
     def __init__(self, model, tp, tmpdir, atom_args=(), arch="gfx942", read=None):
         self.reads = watch_reads()
         self.declared = driverless.install(tmpdir, arch, read)
-        self.config = _config(model, tp, atom_args)
+        self.config = _config(model, tp, atom_args, real_kv=True)
         self.stack, self.runner, self.blocks = contextlib.ExitStack(), None, 0
 
     def close(self):

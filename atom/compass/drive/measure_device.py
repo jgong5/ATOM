@@ -211,7 +211,7 @@ def child(task: str, path: str) -> None:
         return
     import torch
 
-    formats, absent = tuple(device_probe.FORMATS), {}
+    formats, absent = device_probe.FORMATS, {}
     try:
         found = device_probe.probe(torch, formats)
     except SpecRefusal as refused:  # no MXFP4 GEMM runs; the rest are timed

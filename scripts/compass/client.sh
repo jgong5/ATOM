@@ -22,13 +22,15 @@
 #                    request longer than the server's context aborts aiperf's
 #                    run, so a shorter context takes the 256k-capped copy), seed
 #                    42, a trajectory start between 0.25 and 0.75 of each
-#                    trace, 10 warmup requests per lane with 1800 s grace, a
+#                    trace, 10 warmup requests per lane (--warmup-per-lane N)
+#                    with 1800 s grace, a
 #                    per-trace idle cap of 300 s, a system idle cap of 10 s,
 #                    the chat template applied, and against a real server
 #                    aiperf's scrape of its /metrics, which InferenceX takes
 #                    hit rates from
 #   --stop           then SIGTERM the command that started the server, wait
-#                    WAIT_S (default 600) for it to write OUT/run.json and leave,
+#                    WAIT_S (default 600) for it to write OUT/run.json and leave
+#                    (as a client run that fails once aiperf has run does too),
 #                    a trace run's (OUT/trace) serve.TRACE_STOP_S more, set
 #                    the export's server_stopped and, for an instance, write
 #                    each request's split, OUT/request_split.json
@@ -55,6 +57,14 @@
 #                    or --extra-inputs there to client.sh's, and refuses any
 #                    other option given twice. aiperf reads its AIPERF_* settings,
 #                    its timeouts among them, from client.sh's environment
+#   COMPASS_HARNESS_SEND_ORDER_SEED  against a simulated server, the order its
+#                    traffic LP numbers the requests aiperf sends at one
+#                    instant in, which its router places them in: unset, by
+#                    each one's phase, conversation and turn, so a run repeats;
+#                    set, by a digest of the seed and those, one draw of that
+#                    order per seed, the same in every run. The client run's
+#                    export names it, send_order_seed; the workload does not,
+#                    as a real run has no such order (compass_harness/traffic_lp.py)
 #
 # A simulated server's client paces aiperf on the server's clock through this
 # tree's compass-harness; a real one's pins aiperf's benchmark id as
@@ -74,7 +84,7 @@
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
-USAGE="usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop] | OUT --agentx --concurrency C [--duration S] [--stop] | OUT --sweep --traces A-B --stop"
+USAGE="usage: client.sh OUT --traces A-B --concurrency C [--duration S] [--stop] | OUT --agentx --concurrency C [--duration S] [--warmup-per-lane N] [--stop] | OUT --sweep --traces A-B --stop"
 bad() { echo "client: $1; $USAGE" >&2; exit 2; }
 fail() { echo "client: $1" >&2; exit 1; }
 ROOT=$(compass_tree_root) || exit $?
@@ -93,10 +103,12 @@ while (($#)); do
     --stop) stop=1 ;;
     --sweep) sweep=1 ;;
     --agentx) agentx=1 ;;
+    --warmup-per-lane) [[ ${2-} =~ ^(0|[1-9][0-9]*)$ ]] || bad "--warmup-per-lane takes a whole number"; warmup=$2; shift ;;
     *) bad "unknown argument $1" ;;
     esac
     shift
 done
+[[ -z ${warmup-} ]] || ((agentx)) || bad "--warmup-per-lane is the agentx scenario's warmup, and takes --agentx"
 if ((agentx)); then
     ((!sweep)) && [[ -z ${first-} ]] || bad "--agentx takes every trace, and neither --traces nor --sweep"
     [[ -n ${c-} ]] || bad "--concurrency is required"
@@ -117,7 +129,7 @@ if ((agentx)); then
     ((last >= 0)) || fail "traces: $TRACES holds no trace"
     first=0 duration=${duration:-3600} random_seed=42
     agentx_args=(--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75
-        --warmup-requests-per-lane 10 --agentic-warmup-grace-period 1800
+        --warmup-requests-per-lane "${warmup:-10}" --agentic-warmup-grace-period 1800
         --trace-idle-gap-cap-seconds 300 --system-idle-gap-cap-seconds 10 --apply-chat-template)
 fi
 duration=${duration:-1800}
@@ -195,10 +207,7 @@ print(json.load(open(sys.argv[1]))["url"])' "$OUT/prefill/server.json") ||
     aiperf=(-m aiperf)
 else
     [[ $plugins != *compass_harness* ]] || fail "harness: the server is real, and $HARNESS_PYTHON has compass-harness installed"
-    aiperf=(-c 'import uuid, aiperf.cli_runner as r
-r.uuid4 = lambda: uuid.UUID(int=0)
-from aiperf.cli import app
-app()')
+    aiperf=(-c "$COMPASS_REAL_AIPERF" "$ROOT/compass_harness/compass_harness/session_ids.py")
 fi
 
 mkdir "$OUT/client" 2>/dev/null || fail "out: $OUT/client exists; one client run per server --out"
@@ -229,18 +238,27 @@ args=(--endpoint-type chat --custom-dataset-type weka_trace
     --streaming --use-server-token-count --extra-inputs ignore_eos:true
     "${hashed_scrape[@]}" --no-gpu-telemetry --ui none "${agentx_args[@]}" "${extra[@]}")
 
-# Each request carries X-Session-ID, as the nightly's agentic cell sends it: a
-# dp_sticky router keys off it, and a server alone ignores it. The raw records
+# Each request carries X-Session-ID, as the nightly's agentic cell sends it, or
+# in its place the Dynamo session header where the arm sets it, as ATOM's DP
+# submissions do, which workload.json then names. The raw records
 # leave out each request's payload, its prompt, and are compressed once the
 # export is written. aiperf runs as a job, so that any exit of this script,
 # a SIGTERM's included, stops it.
+dynamo=$(compass_dynamo_header) session=true
+[[ -z $dynamo ]] || session=false
 trap 'set +e; kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
-(cd "$OUT/client" && AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true \
+(cd "$OUT/client" && AIPERF_DATASET_MMAP_BASE_PATH=$OUT/client AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=$session \
     AIPERF_RECORD_STRIP_PAYLOAD_BYTES=true exec "$HARNESS_PYTHON" "${aiperf[@]}" \
     profile --url "${url#http://}" --model "$MODEL" --tokenizer "$MODEL" \
     --input-file "$OUT/client/traces" --artifact-dir "$OUT/artifacts" "${scrape[@]}" \
     --export-level raw "${args[@]}") \
     >"$OUT/client/aiperf.log" 2>&1 &
+# A failure from here on stops a --stop server first: a caller waiting on the
+# command that started it, as a driver does, would otherwise wait for ever.
+stop_and_fail() {
+    ((stop)) && (stop_server)
+    fail "$1"
+}
 # The coverage check wants a first token or a request's end in the duration's
 # last 5%. A request in flight across that window, which aiperf cancels at the
 # cutoff and records nothing of, fails it with the export whole; and every run
@@ -248,22 +266,33 @@ trap 'set +e; kill -TERM $(jobs -p) 2>/dev/null; wait' EXIT
 wait $! || {
     rc=$? log=$OUT/client/aiperf.log
     errors=$(sed -n '/AIPerf System Exit Errors/,/╰/s/^│    Error: \([^ ]*\).*/\1/p' "$log" | sort -u)
-    ((rc == 1)) && [[ $errors == ProfileMetricCoverageError ]] || fail "aiperf: exited $rc; see $log"
+    ((rc == 1)) && [[ $errors == ProfileMetricCoverageError ]] || stop_and_fail "aiperf: exited $rc; see $log"
     echo "client: aiperf failed its coverage check alone: $(grep -om1 'Profiling metric coverage below .* duration' "$log")"
 }
 (cd / && python3 -m atom.compass.parity.client_run "$OUT/artifacts") ||
-    fail "export: atom.compass.parity.client_run exited $? on $OUT/artifacts"
-gzip "$OUT/artifacts/profile_export_raw.jsonl" || fail "export: cannot compress $OUT/artifacts/profile_export_raw.jsonl"
-python3 - "$OUT" "$TRACES" "${args[@]}" <<'EOF' || fail "workload: cannot write $OUT/artifacts/workload.json"
+    stop_and_fail "export: atom.compass.parity.client_run exited $? on $OUT/artifacts"
+if [[ -n $run_file && -n ${COMPASS_HARNESS_SEND_ORDER_SEED-} ]]; then
+    python3 - "$OUT/artifacts/client_run.json" <<'EOF' || stop_and_fail "export: cannot name the send order seed in $OUT/artifacts/client_run.json"
+import json, os, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+seed = {"send_order_seed": os.environ["COMPASS_HARNESS_SEND_ORDER_SEED"]}
+path.write_text(json.dumps(json.loads(path.read_text()) | seed, sort_keys=True))
+EOF
+fi
+gzip "$OUT/artifacts/profile_export_raw.jsonl" || stop_and_fail "export: cannot compress $OUT/artifacts/profile_export_raw.jsonl"
+python3 - "$OUT" "$TRACES" "$dynamo" "${args[@]}" <<'EOF' || stop_and_fail "workload: cannot write $OUT/artifacts/workload.json"
 import hashlib, json, sys
 from pathlib import Path
 
-out, traces, *args = sys.argv[1:]
+out, traces, header, *args = sys.argv[1:]
 sha256 = lambda p: hashlib.file_digest(open(p, "rb"), "sha256").hexdigest()
 export = json.loads(Path(out, "artifacts/profile_export_aiperf.json").read_text())
 given = sorted(Path(out, "client/traces").iterdir())
 workload = {"dataset_sha256": sha256(traces), "traces_sha256": [*map(sha256, given)]}
 workload |= {"aiperf_args": args, "benchmark_id": export["benchmark_id"]}
+workload |= {"session_header": header} if header else {}
 Path(out, "artifacts/workload.json").write_text(json.dumps(workload))
 EOF
 

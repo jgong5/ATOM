@@ -19,7 +19,8 @@ counts, per kernel the floor could not place and per label field, the steps
 the fit labels whose label keeps that kernel's recorded length.
 
 `step-linear` takes real runs only and fits `step_linear_fit.FORMS`' `--form`,
-`history` by default, joining each step's ranks at the engine config's
+`history` by default, with `--cold-peer-rows` its prefill vector's
+`cold_peer_rows` (`step_linear_fit._cold`), joining each step's ranks at the engine config's
 `data_parallel_size`, so a record with a
 rank that gave no sample refuses; it pads prefill to the records'
 `prefill_buckets`, naming under `unfitted` records stating none, and holds
@@ -31,12 +32,37 @@ the law states them as `moe_routing`, and each decode rung may adopt a MoE
 column over them, as that command's `--moe-routing` fits it. `--model DIR`
 reads them from the model directory the records served, as ATOM loads its
 config, and refuses one whose config.json is not the records'; a model that
-names no routed experts gives none. The law states,
+names no routed experts gives none. It reads a block drafter's own routing too
+(`DRAFT_ROUTING`), over which a draft law fitted above data-parallel width 1
+may adopt a MoE column. The law states,
 as `platform`, the platform fields of its key,
 and `engine_config`, as that command's does, and the key holds them, and
-`records_atom` as that command's states it. The report's
+`records_atom` as that command's states it; the key holds ``fit_src`` too, the
+law's own digest (`step_linear_fit.fit_src`), so a refit whose law differs,
+on other records or by other code, is another entry. Each rung of the capture ladder
+no record reached gets a declared vector, filled from the fitted rungs beside
+it (`step_linear_fit.fill_rungs`), and the law and the report name each under
+`filled`; the law also lists them by law under `filled_rungs`, and the command
+warns on stderr naming them (`step_linear_fit.filled_warning`). The report's
 provenance names each run with every trace its steps served. A step stub's
 coefficients are stated, not fitted, so `step-stub` refuses.
+
+Above one pipeline stage, as the records' engine config states
+(`pipeline_parallel_size`), `step-linear` fits each stage's samples
+(`Sample.stage`) apart, as it fits one stage's: held out, filled and named
+alike. The law holds each stage's under `stages`, in stage order, with its
+own `provenance`, and states `platform`, `engine_config` and `records_atom`
+once, at its top, beside a `provenance` naming the stages; the report holds
+each stage's under `stages`. Only the last stage runs the drafter, so only
+its part holds a draft law, and every stage's decode steps are cut
+(`step_labels.PIPELINED`), so no part holds a decode vector.
+
+`--ladder-run RECORD EXPORT RUNGS` names one more client run RECORD's server
+served, a calibration ladder that calibrates the decode rungs RUNGS (comma
+separated): it is served and graded as a `--client-run` is, and its decode
+steps at any other rung give no sample, nor do its prefill steps
+(`step_linear_fit.ladder_cut`); the report counts them, per run and rung or
+step kind, under `ladder`. Only `step-linear` reads it.
 
 `step-grid` plans again over `--grid`'s inputs, record directories and
 `shape_population` tokens, and over its ragged targets, with the nodes and
@@ -63,6 +89,7 @@ targets', naming the targets'. `--sessions A:B` keeps the `--grid` lines
 import copy
 import dataclasses
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -82,13 +109,18 @@ TARGETS = ("the targets'", "the targets' sampling is")
 #: ATOM's models read them, the first one set taken.
 EXPERTS = ("n_routed_experts", "num_local_experts", "num_experts")
 TOP_K = ("num_experts_per_tok", "num_experts_per_token")
+#: The names a block drafter's config gives its own routed experts and top-k by.
+DRAFT_ROUTING = (("dspark_n_routed_experts",), ("dspark_num_experts_per_tok",))
 
 
-def _model_routing(model: str, served: str) -> tuple[int, int] | None:
-    """The routed experts and top-k the model directory `model` states, read
-    from its config as ATOM's `Config` loads it, in its text config where it
-    has one; None for a model naming no routed experts. Refused unless its
-    config.json is `served`, the records' digest of theirs."""
+def _model_routing(
+    model: str, served: str, names=(EXPERTS, TOP_K)
+) -> tuple[int, int] | None:
+    """The routed experts and top-k the model directory `model` states under
+    `names`, the target's by default, read from its config as ATOM's `Config`
+    loads it, in its text config where it has one; None for a model naming no
+    routed experts. Refused unless its config.json is `served`, the records'
+    digest of theirs."""
     from atom.config import _normalize_minimax_m3_text_config, get_hf_config
 
     if (digest := _file_digest(model, "config.json")) != served:
@@ -99,35 +131,69 @@ def _model_routing(model: str, served: str) -> tuple[int, int] | None:
     _normalize_minimax_m3_text_config(config)
     config = getattr(config, "text_config", config)
     experts, top_k = (
-        next((v for v in (getattr(config, n, None) for n in names) if v), None)
-        for names in (EXPERTS, TOP_K)
+        next((v for v in (getattr(config, n, None) for n in kind) if v), None)
+        for kind in names
     )
     if experts and not top_k:
         raise ValueError(
             f"--model {model} names {experts} routed experts and no top-k "
-            f"({', '.join(TOP_K)})"
+            f"({', '.join(names[1])})"
         )
     return (experts, top_k) if experts else None
 
 
 def _step_linear(samples, config, args) -> tuple[dict, dict, dict]:
     form = args.form or "history"
+    samples, ladder = step_linear_fit.ladder_cut(samples)
     options = {"form": form, "dp": step_linear_fit.join_width(config["engine_config"])}
     options["moe_routing"] = args.moe_routing or (
         args.model and _model_routing(args.model, config["model"])
     )
+    if args.model:
+        drafter = _model_routing(args.model, config["model"], DRAFT_ROUTING)
+        options["draft_moe_routing"] = drafter
     options["buckets"] = config.get("prefill_buckets")
-    law, report = step_linear_fit.fit(samples, options, args.seed)
-    if options["buckets"] is None:
-        law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
-    if len({s.provenance["run"] for s in samples}) > 1:
-        step_linear_fit.mark_held_out(law, report, samples, options, args.seed)
-    report["provenance"] = publish.runs(samples)
+    options["cold"] = bool(args.cold_peer_rows)
+    engine = config["engine_config"]
+    parts = [
+        _part([s for s in samples if s.stage == k], options, args.seed, engine)
+        for k in range(engine.get("pipeline_parallel_size", 1))
+    ]
+    law, report = parts[0]
+    if len(parts) > 1:
+        law = {
+            "provenance": f"step_linear_fit {form} on {len(parts)} pipeline "
+            "stages, each part on its own stage's records",
+            "stages": [p[0] for p in parts],
+        }
+        report = {"stages": [p[1] for p in parts]}
+    if args.ladder_run:
+        report["ladder"] = {
+            "runs": [[r, e, list(rungs)] for r, e, rungs in args.ladder_run],
+            "left_out": ladder,
+        }
     law["platform"] = keyed_platform(Kind.STEP_LINEAR_LAW, config["platform"])
     law["engine_config"] = config["engine_config"]
     if atom := step_linear_fit.records_atom(samples):
         law["records_atom"] = atom
-    return {"form": form, **law["platform"]}, law, report
+    fit_src = step_linear_fit.fit_src(law)
+    return {"form": form, **law["platform"], "fit_src": fit_src}, law, report
+
+
+def _part(samples, options, seed: int, engine: dict) -> tuple[dict, dict]:
+    """The law fitted on `samples`, one pipeline stage's, under `options` and
+    `seed`, held out when they hold two runs or more, its rungs filled at
+    `engine`'s ladder; and its report, naming each run it was fitted on."""
+    law, report = step_linear_fit.fit(samples, options, seed)
+    if options["buckets"] is None:
+        law["unfitted"]["padding"] = step_linear_fit.NO_BUCKETS
+    if len({s.provenance["run"] for s in samples}) > 1:
+        step_linear_fit.mark_held_out(law, report, samples, options, seed)
+    report["filled"] = step_linear_fit.fill_rungs(law, engine.get("ladder"))
+    if warning := step_linear_fit.filled_warning(law):
+        print(warning, file=sys.stderr)
+    report["provenance"] = publish.runs(samples)
+    return law, report
 
 
 def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
@@ -186,6 +252,21 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
     return {**grid_key, "grid": grid["grid"]}, bundle, report
 
 
+def _rungs(word: str) -> tuple[int, ...]:
+    """The decode rungs `--ladder-run`'s RUNGS names, comma separated, each a
+    positive whole number, once."""
+    try:
+        rungs = [int(w) for w in word.split(",")]
+    except ValueError:
+        rungs = []
+    if not rungs or min(rungs) < 1 or len(set(rungs)) != len(rungs):
+        raise ValueError(
+            f"--ladder-run RUNGS {word!r}: name the decode rungs it calibrates, "
+            "comma separated, e.g. 24,32,48,64"
+        )
+    return tuple(sorted(rungs))
+
+
 #: Each backend's name, to the kind it publishes, its label sources and its fit.
 BACKENDS = {
     "step-linear": (Kind.STEP_LINEAR_LAW, ("record",), _step_linear),
@@ -194,8 +275,10 @@ BACKENDS = {
 #: The flags only one backend reads, each to that backend.
 OWN = {
     "form": "step-linear",
+    "cold_peer_rows": "step-linear",
     "moe_routing": "step-linear",
     "model": "step-linear",
+    "ladder_run": "step-linear",
     "grid": "step-grid",
     "grid_definition": "step-grid",
     "sessions": "step-grid",
@@ -235,6 +318,22 @@ def main(argv: list[str]) -> None:
         metavar="A:B",
         help="the --grid lines measure steps --sessions A:B keeps",
     )
+    parser.add_argument(
+        "--cold-peer-rows",
+        action="store_const",
+        const=True,
+        help="the prefill vector adds cold_peer_rows: its peers' MoE rows on a "
+        "step outside a stretch of prefill steps (data-parallel records only)",
+    )
+    parser.add_argument(
+        "--ladder-run",
+        nargs=3,
+        action="append",
+        metavar=("RECORD", "EXPORT", "RUNGS"),
+        help="a client run RECORD's server served as a calibration ladder, by its "
+        "export, and the decode rungs it calibrates (comma separated); its decode "
+        "steps at any other rung give no sample",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--ops",
@@ -256,6 +355,10 @@ def main(argv: list[str]) -> None:
             raise ValueError(
                 f"--{flag.replace('_', '-')} is read by {owner}, not {args.backend}"
             )
+    if args.ladder_run:
+        args.ladder_run = [
+            (record, export, _rungs(rungs)) for record, export, rungs in args.ladder_run
+        ]
     if args.backend == "step-grid" and not (args.grid and args.grid_definition):
         raise ValueError(
             "step-grid plans over --grid INPUT... with the nodes and margin "

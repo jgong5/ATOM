@@ -4,13 +4,14 @@
 """The step linear law fitted from real step records.
 
     python -m atom.compass.backends.step_linear_fit RECORD... --out LAW --platform JSON [--form FORM] [--moe-routing E,K] [--engine FILE]
-    python -m atom.compass.backends.step_linear_fit offload LOG... --out ENTRY
+    python -m atom.compass.backends.step_linear_fit offload LOG... --out ENTRY [--master-flags FLAGS --capacity-bytes BYTES]
     python -m atom.compass.backends.step_linear_fit figures RECORD... --law LAW [--source NAME] [--form FORM] [--moe-routing E,K] [--engine FILE]
     python -m atom.compass.backends.step_linear_fit pack PATH...
 
 The second form fits a run file's ``lmcache_offload`` entry, beside the law of
 an arm whose records ran the connector, on those runs' server logs
-(`fit_offload`). The third writes the held-out figures (below) of the records
+(`fit_offload`), or a shared Mooncake Store's ``mooncake_store`` entry on its
+workers' logs. The third writes the held-out figures (below) of the records
 into an existing law fitted on them (`figures_main`). The fourth stores law
 files xz-compressed, as the checked-in ones are (`pack_main`). A law is read
 and written by `json_file`, xz-compressed when its name ends in ``.xz``.
@@ -20,7 +21,8 @@ Each RECORD is a real run's step record (`steps/dp0.jsonl`, written with
 states the labels; the command writes each record's per-step table beside it.
 A record refuses, before any table is written, when the run.json beside the
 `steps` directory its path resolves into names JIT compiles its server ran
-(`step_labels.refusal`).
+that it does not time, or that cut too many of its steps
+(`step_labels.cut_refusal`); else the steps they overlap are cut.
 A step whose device label is cut is counted under its reason and not fitted.
 Prefill labels come from trace runs alone (`step_labels`); given none, the
 prefill vector is left out and named under `unfitted`. A trace run gives no
@@ -41,8 +43,14 @@ N, each run's `dp0.jsonl` to `dp<N-1>.jsonl`. A step is its ranks' lines
 joined on step index, labelled with the smallest rank label (the others wait
 for the last rank to enter), and a prefill row adds the line's `moe_rows` and,
 when some prefill step of the samples the group split for two-batch overlap,
-`serial_moe_rows` (`StepLinearLaw`). A
-rank that ran the step as a dummy forward adds no row. A step that some rank
+`serial_moe_rows` (`StepLinearLaw`), and when asked (`compass fit steps
+--cold-peer-rows`), `cold_peer_rows`, read off the view's `prefill_duty`, the
+vector then stating its `duty_tau`. A
+rank that ran a decode step as a dummy forward adds no row; one that ran a
+prefill step so adds its dummy's row (`step_linear.dummy_view`), labelled as
+the step, which a run prices as a rank of the group the step waits for, and
+when some such dummy ran eagerly, the prefill vector adds `EAGER_DUMMY`
+(`StepLinearLaw`); a draft law takes no dummy row. A step that some rank
 lacks otherwise or cut, or whose ranks' rows fall to different vectors, is
 counted under `ranks` and not fitted. The law reports each step's rank label
 spread, `max / min - 1`, as its p50 and p90 under `spread`. The group's step
@@ -62,6 +70,22 @@ and the squared error `F`; a fit at the limit keeps the vector it reached, the
 lowest `F` its passes found. A held-out
 step is priced and banded as its costliest rank.
 
+A calibration ladder's samples (`Sample.ladder`, the rungs its client run
+calibrates) join the decode vectors of those rungs only (`ladder_cut`): a
+ladder runs a decode instance under a load no deployment serves, so at a
+rung the other client runs fill, its steps would set the rung's price at the
+ladder's. On #3720's cell B the long-context ladder (`ldl` and `ldl2`: 252
+subagents on 18 shared prefixes, admitted at once and decoded down with no
+arrival) ran D's rung-16 steps 5-6% under the same deployment's c=64 point at
+the same summed context and MoE tokens; pooled with it, rung 16's vector
+priced the c=128 record's steps 7% low, and its TPOT 6.5% low. A ladder's
+prefills, final and middle chunks, join no vector: a ladder admits its
+requests at once on a few shared prefixes, a prefill load no deployment
+serves. Cell B's `ldl` / `ldl2` prefills (162 steps of 8192+ tokens, 113 s)
+ran 11-14% under the law fitted on its live points; pooled into the one
+prefill vector they priced r256's c=256 prefill steps 4.1% low (1.2% without
+them), and its simulated TTFT p50 3 points lower.
+
 Records with a host key (`dp0.key.json`, from the real runner) also give the
 host laws as a run file's `host` entry: `key`, and `laws[kind][segment]`,
 seconds on `(1, tokens, seqs)`, fitted on the samples' host labels. They take
@@ -71,7 +95,9 @@ each row computes its drafts too) gets zero. Two keys refuse, ladders pooled
 first. The law, as
 `platform`, and the host key state the platform fields `--platform` gives for
 their kinds, `step_linear_law` and `host_laws`, which a run's spec must match,
-and the host key's `engine` is the law's `engine_config`. A segment outside `HOST_SEGMENTS` is
+and the host key's `engine` is the law's `engine_config`; the host key's
+``fit_src`` is the laws' own digest (`fit_src`), as `compass fit host` keys
+them. A segment outside `HOST_SEGMENTS` is
 fitted for a kind whose samples carry it: `W_inputs` and `L_mtp`, on an MTP
 record, and `W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
 solve drops above the law paid a first-use JIT compile (`_jit`): it and the
@@ -81,6 +107,11 @@ label leaves out the time its launch spent in HIP's blocking calls, which the
 report states per run and kind under `blocked` (`_blocked`); it names under
 `unstamped` the runs whose records state none, so their `W_launch` labels are
 wall times.
+A DP rank's dummy forward at a step its group prefills gives no sample, but its
+`W_pre`, `W_inputs`, `W_launch` and `W_post` (`step_labels.Sample.dummy_host`)
+fit the host laws' `dummy` kind (`_fit_dummy`), every launch feature a column,
+which a run prices such a dummy by, its other segments by `decode`'s
+(`HostDeviceRecurrence`).
 A forward's `E` that admits requests (`step_labels.admissions`) is left out of
 its kind's law: the law then prices the engine loop alone, and `admit`, seconds
 on `step_labels.admit_x`, prices what the forwards of every kind that admit spend
@@ -93,13 +124,19 @@ Under a launch provider that declares features (`launch_features`), a step it
 predicts otherwise than its line observed refuses, naming it; each host law
 adopts features as columns on their held-out error per launch path
 (`_launch_columns`), their coefficients under the entry's
-`columns[kind][segment]`, and `_jit` solves `W_launch` with every one.
+`columns[kind][segment]`, and `_jit` solves `W_launch` with every one. A fit of
+one run holds out `RUN_BLOCKS` contiguous spans of its steps in place of runs.
 
 The same solver fits the host entry's ``tokenizer`` term on a recorded
 server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
 HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
 requests, ``fixed_s`` from the bursts or else ``idle_s``, and ``bytes`` over every
-request's body.
+request's body. On a prefill-decode deployment's two sides' stamps it fits the
+prefill host entry's ``relay`` term (`fit_relay`): what carrying a prefill's
+response through the router to decode's app call costs per request and per
+byte. On a streaming server's stamps it fits the ``http_stream`` term
+(`fit_stream`): its API loop's CPU per SSE event its streamed responses send,
+from the loop thread's CPU clock over windows of the record.
 
 Each equation is divided by its price, from its label until no price moves
 (`_fit_form`), and the coefficients are bound to be
@@ -108,7 +145,9 @@ from the median are dropped and the rest refitted, until the kept set settles.
 The dropped steps that lead a record's steps of one vector, each slower than
 the law, are its warm steps (shape compiles and first touches), and so is a
 dropped step anywhere that ran more than `WARM_FACTOR` times its price, such as
-the first short chunk on a deep history: counted with their seconds apart from
+the first short chunk on a deep history, or more than `PAUSE_S` seconds past
+it, a whole-group pause (`validate.stalls`) on a step of any price: counted
+with their seconds apart from
 the dropped ones, never charged, and listed per run under `warm_steps`, in the
 order the law's `runs` names the runs. A feature with no variance gets coefficient
 zero and is named. Each vector reports its samples,
@@ -123,12 +162,21 @@ out and named under `unfitted`; `StepLinearBackend` refuses its steps.
 On an MTP record a step also carries a draft label (`step_labels`). `fit` fits
 the steps that carry one on their draft labels the same way, and writes that law
 under the law's `draft`; it holds no `held_out` unless its records time a
-EAGLE3 drafter's passes (below). A step with a propose label
-(`step_labels`) is fitted there on its draft label less that label, the
-draft-KV pass a middle chunk runs too, and left out when nothing remains; the
-propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`,
+EAGLE3 drafter's passes (below) or run at `data_parallel_size` above 1. A step
+with a propose label (`step_labels`) is fitted there on its draft label less
+that label, the draft-KV pass a middle chunk runs too, and left out when
+nothing remains; the propose labels fit the draft law's `propose` vector, seconds on `[1, seqs]`,
 whatever lag the device ran at.
-A decode's draft-KV label fits the draft law's `draft_kv` vector alike. An
+A decode's draft-KV label fits the draft law's `draft_kv` vector alike. At
+`data_parallel_size` above 1 `propose`, whose drafter forward waits on its
+group, is fitted as the law's vectors are: a step is its ranks' labelled rows,
+labelled with the smallest, and priced as their max (`_pass_steps`); a step
+some rank neither labels nor ran as a dummy forward is left out, counted under
+the vector's `fit.ranks`. `draft_kv` is fitted there on each rank's own label,
+as at width 1: each rank writes its own draft context and waits on no peer
+(`GROUPED`). There `mark_held_out` gives the draft law's vectors `held_out` as
+it gives the law's, on the steps each is fitted on, `propose` priced as the max
+over each step's ranks and `draft_kv` at each rank's own (`_mark_dp_passes`). An
 output prefill's fits the draft law's prefill vector in place of its draft
 label, which, all after `forward_done_event`, fits the `propose` vector, and
 sets the draft law's `output_prefill_kv`. The target's vectors fit the device
@@ -165,7 +213,11 @@ the law states `moe_routing` and, outside `shared`, a decode rung may adopt one
 MoE column (`StepLinearLaw`), `moe_tokens` or `moe_experts`, by the rule
 `_moe_column` states; the vector records under `fit.moe_column` the figures the
 rule read.
-An MTP record's draft law adopts none.
+An MTP record's draft law adopts none at `data_parallel_size` 1; above it,
+given the drafter's own routed experts and top-k (`compass fit steps --model`
+reads a block drafter's), its decode rungs adopt one by the same rule, as a
+drafter's routed experts run on its group's rows in the arm's layout, as the
+target's do.
 
 Outside `shared`, a decode rung may adopt a `rowmod(k)` column (`StepLinearLaw`),
 read from its rows in scheduled order, by the rule `_rowmod` states; the
@@ -195,11 +247,14 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import itertools
 import json
 import math
 import re
+import shlex
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -207,6 +262,7 @@ import numpy as np
 from atom.compass.backends import json_file, launch_features, step_labels
 from atom.compass.backends.cost import fold_seconds
 from atom.compass.backends.shape import (
+    DUTY_TAU,
     sum_context,
     sum_query_cached,
     sum_query_square,
@@ -217,11 +273,16 @@ from atom.compass.backends.step_labels import CUTS, HOST_SEGMENTS, host_kind
 from atom.compass.backends.step_linear import (
     DECODE,
     EAGER,
+    EAGER_DUMMY,
     HISTORY,
     MOE_COLUMNS,
     PREFILL,
     PROPOSE,
     cached_seqs,
+    cold_peer_rows,
+    dummy_view,
+    eager_dummy,
+    hull_axes,
     moe_column,
     moe_tokens,
     rowmod,
@@ -243,6 +304,11 @@ MAD_PASSES = 20
 FIT_PASSES = 10_000
 #: A step that ran this many times its price is a one-off first touch, not scatter.
 WARM_FACTOR = 5.0
+#: A step that ran this many seconds past its price held a whole-group pause, the
+#: least `validate.stalls` names (#3778): every rank's device stopped, which no
+#: law prices, so it is warm too, on a prefill of a second or more as well,
+#: whose pause is less than `WARM_FACTOR` times its price.
+PAUSE_S = 3.0
 TOKEN_BANDS = (512, 2048, 8192)
 #: Steps at its rung a record needs before a `rowmod` choice holds it out.
 ROWMOD_CELL_STEPS = 100
@@ -251,10 +317,30 @@ ROWMOD_CELL_STEPS = 100
 ROWMOD_GAIN = 0.1
 #: Seeded shuffles of each step's rows whose mean MAD the `rowmod` column must not beat.
 ROWMOD_SHUFFLES = 8
+#: The free features up to which `_hull` is qhull's exact hull; past them it
+#: is the intersection of each pair's 2-D hull, whose facets the pairs' edges
+#: bound (#3720: real_pw_c128's prefill points, 8 features, hulled exactly to
+#: 430k facets; pooled with real_pw_c1's, joggled, to 2.9M, a 1.8 GB law
+#: whose runs advanced about 3x slower).
+HULL_EXACT_FREE = 6
 HOST_KINDS = ("decode", "prefill", "middle")
 HOST_FEATURES = ("step", "tokens", "seqs")
 #: What a lone HTTP request's intake costs: per request, and per body byte.
 INTAKE_FEATURES = ("idle", "bytes")
+#: What a prefill-decode relay costs a request: per request, and per byte of
+#: the request decode takes in.
+RELAY_FEATURES = ("fixed", "bytes")
+#: Output rows one output thread takes in within this of the row before are
+#: one burst's, the rows of the requests one prefill step finished.
+RELAY_BURST_S = 0.05
+#: What a streaming server's API loop spends in a window: the window's seconds,
+#: and per SSE event, per request taken in and per body byte read there.
+STREAM_FEATURES = ("seconds", "events", "requests", "bytes")
+#: The windows `fit_stream` reads the loop's CPU over, and the share of each
+#: the loop thread's stamps must span for it to be read.
+STREAM_WINDOW_S, STREAM_SPAN = 10.0, 0.8
+#: The intake stamps the loop thread makes (`atom.compass.run._stamp_intake`).
+LOOP_KINDS = frozenset(("app", "body", "send", "recv", "wait", "head"))
 #: What a lone tokenizer call costs: per call, per token, and for a segment
 #: tokenizer call per character its stored-prefix search compared.
 TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
@@ -278,6 +364,94 @@ def _rung_key(rung: int | None) -> str:
     return EAGER if rung is None else str(rung)
 
 
+def _prefill_counts(
+    view,
+    where: str,
+    form: str,
+    dp: int,
+    serial: bool,
+    out: bool,
+    buckets,
+    eager,
+    cold: bool = False,
+) -> tuple:
+    """The prefill vector's features of `view`'s step, `where` naming it in a
+    refusal, as `_features` states them; under `eager` its `EAGER_DUMMY`,
+    under `cold` its `cold_peer_rows`."""
+    r = view.prefill
+    counts = (1, sum_tokens(r), sum_query_square(r), sum_query_cached(r))
+    if form == "history":
+        counts += (sum_context(r) - sum_tokens(r),)
+    if form == "cached_seqs":
+        counts += (cached_seqs(r),)
+    if dp > 1:
+        if view.moe_rows is None:
+            raise ValueError(
+                f"{where} has no moe_rows, which a data-parallel law prices "
+                "prefill from"
+            )
+        counts += (view.moe_rows,)
+        if serial:
+            counts += (0 if view.tbo_tokens else view.moe_rows,)
+        if cold:
+            if (peers := cold_peer_rows(view)) is None:
+                raise ValueError(
+                    f"{where} has no prefill_duty, which its peers' MoE rows "
+                    "are priced by"
+                )
+            counts += (peers,)
+    if out:
+        output = bool(view.produces_output)
+        counts += (len(r) if output else 0, int(output))
+    if buckets:
+        if (padding := token_padding(view, buckets)) is None:
+            raise ValueError(
+                f"{where} has no group_max_tokens, which its prefill token "
+                "graph's bucket holds"
+            )
+        counts += (padding,)
+    if eager:
+        if (got := eager_dummy(view, buckets)) is None:
+            raise ValueError(
+                f"{where} has no group_max_tokens, which says whether its group "
+                "runs it eagerly"
+            )
+        counts += got
+    return counts
+
+
+def _cold(options) -> bool:
+    """Whether the prefill vector adds `cold_peer_rows`: as `options`' `cold`
+    states, False by default. It prices a data-parallel group's peers' rows,
+    so `dp` 1 refuses it; a fitted prefill step whose view states no
+    `prefill_duty` refuses (`_prefill_counts`)."""
+    if not (options or {}).get("cold"):
+        return False
+    if _options(options)[1] == 1:
+        raise ValueError(
+            "cold_peer_rows prices the rows a data-parallel group's peers bring "
+            "to its MoE gather, and these records run one rank"
+        )
+    return True
+
+
+def _eager_dummies(samples, options) -> bool:
+    """Whether the prefill vector adds `EAGER_DUMMY`: as `options` states, else
+    above `dp` 1 when some prefill step of `samples` had a dummy peer and ran
+    eagerly (`eager_dummy` of its dummy's view), under `options`' buckets."""
+    if "eager_dummies" in (options or {}):
+        return options["eager_dummies"]
+    buckets = _buckets(options)
+    return _options(options)[1] > 1 and any(
+        s.view.prefill
+        and s.view.group_dummies
+        and s.view.group_max_tokens is not None
+        and eager_dummy(dummy_view(s.view), buckets)[0]
+        for s in samples
+        if not s.cut
+    )
+
+
 def _features(
     samples,
     form: str,
@@ -286,56 +460,41 @@ def _features(
     serial: bool = False,
     routing: tuple[int, int] | None = None,
     buckets: tuple[int, ...] = (),
+    eager: bool = False,
+    cold: bool = False,
 ) -> tuple[list[tuple], dict]:
     """One rank's fittable samples as (vector, features, seconds, step, context,
-    tokens, dummies), and how many were cut, per reason.
+    tokens, dummies, dummy), and how many were cut, per reason.
 
     `vector` is `prefill` or a decode rung's key; features are in `StepLinearLaw`'s
     order, plus `history` or `cached_seqs` in its form, above `dp` 1 `moe_rows` on prefill and
-    under `serial` `serial_moe_rows`, and under `draft` or on a step with a draft
-    label `seqs` and `out` on prefill, with `buckets` its `padding`, as
-    `StepLinearBackend` counts them;
+    under `serial` `serial_moe_rows`, under `cold` `cold_peer_rows`, and under `draft` or on a step with a draft
+    label `seqs` and `out` on prefill, with `buckets` its `padding`, and under
+    `eager` its `EAGER_DUMMY`, as `StepLinearBackend` counts them;
     `context` is the decode rows' N_KV in scheduled order, empty for prefill;
     `tokens` a decode step's real MoE tokens under `routing`, the model's
     (experts, top-k), which its MoE column reads, else None; `dummies` its
     group's dummy forwards (`BatchView.group_dummies`), which the column's
-    `moe_experts` counts as one token.
+    `moe_experts` counts as one token; `dummy`, on a prefill step above `dp` 1
+    and not under `draft`, the features of a peer's dummy forward at that step
+    (`dummy_view`), as the backend prices that rank, else None.
     """
     cut, rows = dict.fromkeys(CUTS, 0), []
     for s in samples:
         view = s.view
-        if s.cut:
-            cut[s.cut] += 1
+        if s.cut:  # a `JIT` cut is counted only where it cuts a step
+            cut[s.cut] = cut.get(s.cut, 0) + 1
         else:
-            tokens = None
+            tokens = dummy = None
             if view.prefill:
-                r = view.prefill
                 key = "prefill"
-                counts = (1, sum_tokens(r), sum_query_square(r), sum_query_cached(r))
-                if form == "history":
-                    counts += (sum_context(r) - sum_tokens(r),)
-                if form == "cached_seqs":
-                    counts += (cached_seqs(r),)
-                if dp > 1:
-                    if view.moe_rows is None:
-                        raise ValueError(
-                            f"{s.provenance['run']} step {s.step} has no moe_rows, which "
-                            "a data-parallel law prices prefill from"
-                        )
-                    counts += (view.moe_rows,)
-                    if serial:
-                        counts += (0 if view.tbo_tokens else view.moe_rows,)
-                if draft or s.draft_s is not None:
-                    output = bool(view.produces_output)
-                    counts += (len(r) if output else 0, int(output))
-                if buckets:
-                    if (padding := token_padding(view, buckets)) is None:
-                        raise ValueError(
-                            f"{s.provenance['run']} step {s.step} has no "
-                            "group_max_tokens, which its prefill token graph's "
-                            "bucket holds"
-                        )
-                    counts += (padding,)
+                where = f"{s.provenance['run']} step {s.step}"
+                shape = (form, dp, serial, draft or s.draft_s is not None, buckets)
+                counts = _prefill_counts(view, where, *shape, eager, cold)
+                if dp > 1 and not draft:
+                    dummy = _prefill_counts(
+                        dummy_view(view), where, *shape, eager, cold
+                    )
             else:
                 key = _rung_key(view.capture_rung)
                 counts = (1, sum_context(view.decode), view.graph_padding)
@@ -346,7 +505,9 @@ def _features(
                     )
             context = tuple(r.context_tokens for r in view.decode)
             dummies = view.group_dummies
-            rows.append((key, counts, s.device_s, s.step, context, tokens, dummies))
+            rows.append(
+                (key, counts, s.device_s, s.step, context, tokens, dummies, dummy)
+            )
     return rows, cut
 
 
@@ -354,13 +515,26 @@ def _host_x(s) -> tuple[int, int, int]:
     return 1, sum_tokens(s.view.requests), len(s.view.requests)
 
 
-def _host_rows(samples) -> list[tuple]:
+#: The spans of its steps a host fit on one run holds out in turn to choose
+#: launch columns (`_launch_columns`), each a contiguous part of its time.
+RUN_BLOCKS = 5
+
+
+def _host_rows(samples, blocks: int = 0) -> list[tuple]:
     """(kind, segment, (1, tokens, seqs), seconds, run, launch) per host label
-    of each sample, but the `E` of one that admits requests."""
-    rows = []
+    of each sample, but the `E` of one that admits requests. With `blocks`,
+    `run` is ``(run, block)``, the sample's step's block of `blocks` contiguous
+    spans of its run's steps."""
+    rows, last = [], {}
     for s in samples:
+        run = s.provenance["run"]
+        last[run] = max(last.get(run, 0), s.step + 1)
+    for s in samples:
+        run = s.provenance["run"]
+        if blocks:
+            run = (run, s.step * blocks // last[run])
         rows += [
-            (host_kind(s.view), k, _host_x(s), v, s.provenance["run"], s.launch)
+            (host_kind(s.view), k, _host_x(s), v, run, s.launch)
             for k, v in s.host.items()
             if k != "E" or not s.admitted[0]
         ]
@@ -389,6 +563,24 @@ def _admit_rows(samples, host) -> list[tuple]:
     ]
 
 
+def ladder_cut(samples) -> tuple[list, dict]:
+    """`samples` less each of a calibration ladder's client run (`Sample.ladder`)
+    but its decodes at the rungs it calibrates: its decodes at any other rung
+    and its prefills, middle chunks too; and the report of what was left out:
+    per run, rung (`EAGER` for an eager step) or `host_kind` of a step that
+    is no decode, to the samples left out."""
+    kept, cut = [], {}
+    for s in samples:
+        rung, kind = s.view.capture_rung, host_kind(s.view)
+        if s.ladder is not None and (kind != "decode" or rung not in s.ladder):
+            at = cut.setdefault(s.provenance["run"], {})
+            key = _rung_key(rung) if kind == "decode" else kind
+            at[key] = at.get(key, 0) + 1
+            continue
+        kept.append(s)
+    return kept, cut
+
+
 def records_atom(samples) -> str | None:
     """The ATOM digest `samples`' records ran at, their host keys' ``atom``;
     None when no record has a host key. Records at two refuse."""
@@ -400,14 +592,18 @@ def records_atom(samples) -> str | None:
     return atoms[0] if atoms else None
 
 
-def label_records(records, dp: int = 1) -> tuple[list, dict]:
+def label_records(records, dp: int = 1, spans=None) -> tuple[list, dict]:
     """`records`, runs of `dp` ranks in rank order, as `step_labels` samples, each
-    run named by its records' digests; and each record's table rows."""
+    run named by its records' digests and cut by the compile spans `spans`
+    holds for its first record (`step_labels.cut_spans`), none where it holds
+    none; and each record's table rows."""
     samples, tables = [], {}
     for i in range(0, len(records), dp):
         run = records[i : i + dp]
         name = ", ".join(map(step_labels.digest, run))
-        for record, (got, table) in zip(run, step_labels.label_run(run, name)):
+        cut = (spans or {}).get(run[0], ())
+        labelled = step_labels.label_run(run, name, spans=cut)
+        for record, (got, table) in zip(run, labelled):
             samples += got
             tables[record] = table
     return samples, tables
@@ -422,6 +618,14 @@ def _runs(samples, dp: int) -> dict[str, list[list]]:
         n = sum(map(len, runs.values()))
         raise ValueError(f"{n} records are not runs of {dp} ranks")
     return {run: [ranks[r] for r in sorted(ranks)] for run, ranks in runs.items()}
+
+
+def fit_src(laws: dict) -> str:
+    """The sha256 of the fitted `laws`, a run file's `host` entry or a step
+    linear law, without a ``key``: of what was fitted, so it moves exactly
+    when the laws do."""
+    fitted = {term: value for term, value in laws.items() if term != "key"}
+    return hashlib.sha256(json.dumps(fitted, sort_keys=True).encode()).hexdigest()
 
 
 def fit_host(samples) -> tuple[dict, dict]:
@@ -453,7 +657,9 @@ def fit_host(samples) -> tuple[dict, dict]:
     kept = [
         s for s in samples if (s.provenance["run"], s.rank, s.step) not in jit | after
     ]
-    rows = _host_rows(kept)
+    # One run holds out spans of its own steps to choose its launch columns.
+    one = len({s.provenance["run"] for s in kept}) == 1
+    rows = _host_rows(kept, RUN_BLOCKS if one else 0)
     host = {"key": json.loads(keys[0]), "laws": {}}
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
     report["blocked"], report["unstamped"] = _blocked(samples)
@@ -481,6 +687,7 @@ def fit_host(samples) -> tuple[dict, dict]:
                 c = dict(zip(adopted, coef[len(HOST_FEATURES) :]))
                 host.setdefault("columns", {}).setdefault(kind, {})[segment] = c
             report[f"{kind}.{segment}"] = fitted | figures
+    _fit_dummy(samples, launch, graphs, host, report)
     a, base, labels = list(zip(*_admit_rows(kept, host))) or [(), (), ()]
     try:
         host["admit"], report["admit"] = _host_law(a, labels, ADMIT_FEATURES, base)
@@ -488,6 +695,63 @@ def fit_host(samples) -> tuple[dict, dict]:
         host["admit"] = None  # a run refuses a forward that admits a request
         report["unfitted"]["admit"] = str(e).splitlines()[0]
     return host, report
+
+
+#: The host-law kind of a DP rank's dummy forward at a step its group
+#: prefills (`step_labels.Sample.dummy_host`).
+DUMMY = "dummy"
+
+
+def _fit_dummy(samples, launch, graphs, host, report) -> None:
+    """Fit `DUMMY`'s laws into `host`, each of `step_labels.DUMMY_SEGMENTS` on
+    the dummy forwards' labels the samples' `dummy_host` holds, one set per
+    run and rank, as `_host_law` fits a kind's, its `report` entry under
+    ``dummy.<segment>``, and every launch feature of `launch` a column: a
+    dummy runs its group's launch path, which sets its `W_launch` (DeepSeek-V4.1:
+    about 2 ms replayed, 27 ms past the largest prefill token graph or on an
+    eager tail, 51 ms on both), so no held-out choice is made. A dummy whose
+    features `launch` predicts otherwise than its line states refuses, as a
+    sample does; a segment too few dummies give is named under `unfitted`."""
+    from scipy.spatial import QhullError
+
+    held = {}
+    for s in samples:
+        held.setdefault((s.provenance["run"], s.rank), s.dummy_host)
+    rows = [row for hosts in held.values() for row in hosts]
+    if not rows:
+        return
+    for step, view, _, observed in rows:
+        if (predicted := launch.predict(view, graphs)) != observed:
+            raise ValueError(
+                f"a dummy forward at step {step} launched {observed}, and its "
+                f"launch provider predicts {predicted}"
+            )
+    for segment in step_labels.DUMMY_SEGMENTS:
+        members = [
+            (_host_x_view(view), h[segment], observed)
+            for _, view, h, observed in rows
+            if h.get(segment, 0) > 0
+        ]
+        columns = [(f, [m[2][f] for m in members]) for f in launch.features]
+        try:
+            coef, fitted = _host_law(
+                [m[0] for m in members],
+                [m[1] for m in members],
+                HOST_FEATURES,
+                columns=columns,
+            )
+        except (ValueError, QhullError) as e:
+            report["unfitted"][f"{DUMMY}.{segment}"] = str(e).splitlines()[0]
+            continue
+        host["laws"].setdefault(DUMMY, {})[segment] = coef[: len(HOST_FEATURES)]
+        if columns:
+            c = dict(zip(launch.features, coef[len(HOST_FEATURES) :]))
+            host.setdefault("columns", {}).setdefault(DUMMY, {})[segment] = c
+        report[f"{DUMMY}.{segment}"] = fitted | {"forwards": len(members)}
+
+
+def _host_x_view(view) -> tuple[int, int, int]:
+    return 1, sum_tokens(view.requests), len(view.requests)
 
 
 def _blocked(samples) -> tuple[dict, list[str]]:
@@ -601,22 +865,24 @@ def _span(fitted: dict, name: str) -> list:
 
 def _stamps(path) -> list[tuple]:
     """The HTTP intake stamps `path` holds (`atom.compass.run.INTAKE_RECORD`),
-    each ``(start ns, end ns, kind, size, start cpu ns, end cpu ns)``, in order
-    of start."""
+    each ``(start ns, end ns, kind, size, start cpu ns, end cpu ns, thread)``,
+    in order of start."""
     rows = [line.split() for line in Path(path).read_text().splitlines()]
     return sorted(
-        (int(r[3]), int(r[0]), r[2], int(r[4]), int(r[6]), int(r[5])) for r in rows
+        (int(r[3]), int(r[0]), r[2], int(r[4]), int(r[6]), int(r[5]), int(r[1]))
+        for r in rows
     )
 
 
 def _requests(ev) -> tuple[list, np.ndarray]:
     """Each request's app call among the stamps `ev`, in order, and every
     engine send's end, sorted."""
-    apps = [e[0] for e in ev if e[2] == "app"]
+    # An array, searched once per body: a list is converted on every search.
+    apps = np.array([e[0] for e in ev if e[2] == "app"], dtype=np.int64)
     # A request's app call is the last before its body's first read; any
     # other, such as a health probe's, has no body.
     calls = sorted(
-        {apps[np.searchsorted(apps, e[0]) - 1] for e in ev if e[2] == "body"}
+        {int(apps[np.searchsorted(apps, e[0]) - 1]) for e in ev if e[2] == "body"}
     )
     return calls, np.array(sorted(e[1] for e in ev if e[2] == "send"))
 
@@ -660,47 +926,87 @@ def _own_work(calls: list[dict], intake) -> list[tuple[int, int | None, float]]:
     ]
 
 
-def _intakes(path) -> tuple[list, list, list]:
+def _tokenizing(calls) -> dict:
+    """Each thread's tokenizer calls other than a decode, as sorted start and
+    end ns arrays, from the tokenizer record at `calls`; none when it names no
+    file."""
+    if calls is None or not Path(calls).is_file():
+        return {}
+    spans: dict = {}
+    _, *lines = Path(calls).read_text().splitlines()
+    for c in map(json.loads, lines):
+        if c["call"] != "decode":
+            spans.setdefault(c["thread"], []).append((c["t_start_ns"], c["t_end_ns"]))
+    return {t: np.array(sorted(v), dtype=np.int64).T for t, v in spans.items()}
+
+
+def _intakes(path, calls=None) -> tuple[list, list, list]:
     """The HTTP intake stamps `path` holds as each lone request's ``(body
     bytes, CPU seconds)``, each burst's ``(body bytes, mark ns, mark CPU
     ns)`` per request, and every request's body bytes.
 
     A request is its app call and the body, template, pool job and engine send
-    that follow it; a server that renders no chat template, such as a
-    prefill-decode deployment's decode side, stamps none. A lone one found
-    every earlier request sent and its own sent before the next app call, with
-    nothing else stamped between: its seconds are the CPU time the loop's
-    thread spent from the app call to the send's end, less what it spent from
-    its pool job's submit to its resume (``wait``), the job's and other
-    requests' work. A request's mark is its template's start or, on a server
-    that renders none, its pool job's submit: either follows its body's parse.
-    A burst is a run of requests each of whose app call came before the mark of
-    the one ahead of it, the loop taking them in one after another."""
+    that follow it; one given its prompt's token ids, a prefill-decode decode
+    side's, renders no template. A lone one found every request whose body was read before
+    its app call sent, and its own sent before the next app call, with nothing
+    else stamped between: its seconds are the CPU time the loop's thread spent
+    from the app call to the send's end, less what it spent from its pool job's
+    submit to its resume (``wait``), the job's and other requests' work; and,
+    where its template was rendered on another thread, that render's wall
+    time, which the loop awaits and the template job, charging only its encode
+    calls, does not price. The pool job of a request given its token ids,
+    during which its thread made no tokenizer call other than a decode by the
+    tokenizer record at `calls` (none where there is none), is priced by no
+    tokenizer law: its wall time, which the loop awaits, joins the request's
+    seconds. A request's mark is its template's start or, on a server that
+    renders none, its pool job's submit: either follows its body's parse. A
+    burst is a run of requests each of whose app call came before the mark of
+    the one ahead of it, the loop taking them in one after another, its marks
+    on the loop's thread, the only one whose CPU clock their gaps read."""
     ev = _stamps(path)
-    at = [e[0] for e in ev]
-    cpu = {e[0]: e[4] for e in ev if e[2] == "app"}
+    tokenized = _tokenizing(calls)
+    # Arrays, searched once per request: np.searchsorted converts a list on
+    # every call, which over a c=128 agentic record's two million stamps (an
+    # `out` per streamed row) made this loop O(requests x stamps).
+    at = np.array([e[0] for e in ev], dtype=np.int64)
+    cpu = {e[0]: (e[4], e[6]) for e in ev if e[2] == "app"}
     calls, sends = _requests(ev)
+    called = np.array(calls, dtype=np.int64)
+    # Requests are counted by their bodies: two whose app calls both precede
+    # either's body share one in `calls`, so a count of `calls` falls behind
+    # the sends for the rest of the record and no later request is lone.
+    read = np.array(sorted(e[0] for e in ev if e[2] == "body"), dtype=np.int64)
     lone = []
-    for i, (call, after) in enumerate(zip(calls, calls[1:] + [math.inf])):
+    for call, after in zip(calls, calls[1:] + [math.inf]):
         span = ev[np.searchsorted(at, call, "right") : np.searchsorted(at, after)]
         # An output taken in or a head sent is the output's or the response's.
         skip = ("app", "recv", "wait", "out", "head")
         between = [e for e in span if e[2] not in skip]
         waits = sum(e[5] - e[4] for e in span if e[2] == "wait")
-        if np.searchsorted(sends, call) != i or [e[2] for e in between] not in (
+        kinds = [e[2] for e in between]
+        if np.searchsorted(sends, call) != np.searchsorted(read, call) or kinds not in (
             ["body", "tmpl", "prep", "send"],
             ["body", "prep", "send"],
         ):
             continue
-        body, *_, send = between
-        lone.append((body[3], (send[5] - cpu[call] - waits) * 1e-9))
+        body, *rendered, prep, send = between
+        start, loop = cpu[call]
+        seconds = send[5] - start - waits
+        for tmpl in rendered:
+            seconds += (tmpl[1] - tmpl[0]) * (tmpl[6] != loop)
+        starts = np.asarray(tokenized.get(prep[6], ((), ()))[0])
+        if not rendered and not np.any((prep[0] <= starts) & (starts <= prep[1])):
+            seconds += prep[1] - prep[0]
+        lone.append((body[3], seconds * 1e-9))
     # The loop parses each request's body as soon as it is read, then renders
-    # its template, if the server renders one, and submits its pool job.
+    # its template, if the server renders one, and submits its pool job; since
+    # the API server hands a template to a thread, no gap of theirs is the loop's.
+    loops = {e[6] for e in ev if e[2] == "app"}
     mark = "tmpl" if any(e[2] == "tmpl" for e in ev) else "wait"
-    marks = [e for e in ev if e[2] == mark]
+    marks = [e for e in ev if e[2] == mark and e[6] in loops]
     sizes = [e[3] for e in sorted(ev, key=lambda e: e[1]) if e[2] == "body"]
     # A mark that finds a later request arrived and not yet marked.
-    queued = [np.searchsorted(calls, m[0]) > k + 1 for k, m in enumerate(marks)]
+    queued = [np.searchsorted(called, m[0]) > k + 1 for k, m in enumerate(marks)]
     bursts, run = [], []
     for k, m in enumerate(marks):
         run.append((sizes[k], m[0], m[4]))
@@ -711,9 +1017,10 @@ def _intakes(path) -> tuple[list, list, list]:
     return lone, bursts, sizes
 
 
-def fit_intake(paths) -> tuple[dict, dict]:
+def fit_intake(paths, calls=None) -> tuple[dict, dict]:
     """The ``http_intake`` term over the intake stamps each record in `paths`
-    holds (`_intakes`), and its report: ``idle_s`` and ``per_byte_s`` by the
+    holds (`_intakes`), each beside the tokenizer record `calls` names in the
+    same order (none where `calls` is None), and its report: ``idle_s`` and ``per_byte_s`` by the
     host-law solver on the lone requests' CPU seconds over their body bytes;
     ``bytes`` spans every request's body; ``fixed_s`` the mean, over every
     burst's later requests, of the loop's CPU time from the mark before each
@@ -723,8 +1030,8 @@ def fit_intake(paths) -> tuple[dict, dict]:
     report's ``fixed_s_is_idle_s`` saying which. Raises on too few lone
     requests."""
     lone, bursts, bodies = [], [], []
-    for path in paths:
-        got = _intakes(path)
+    for path, made in zip(paths, calls or [None] * len(paths)):
+        got = _intakes(path, made)
         lone += got[0]
         bursts += got[1]
         bodies += got[2]
@@ -757,6 +1064,125 @@ def fit_intake(paths) -> tuple[dict, dict]:
         "p90_s": p90,
     }
     return {"fixed_s": fixed, **term}, report
+
+
+def fit_relay(pairs) -> tuple[dict, dict]:
+    """The prefill host entry's ``relay`` term over `pairs`, each a
+    prefill-decode deployment's prefill and decode intake stamps
+    (`atom.compass.run.INTAKE_RECORD`), stamped on one host's clock, and its
+    report.
+
+    A relayed request leaves prefill's server once its output thread has
+    taken in the last of its output rows, its response carrying the prompt's
+    token ids, and reaches decode's server at the app call of the request the
+    router builds from it, the body that call reads holding those ids. A
+    request's rows come in a burst, its thread taking each within
+    `RELAY_BURST_S` of the one before, and a burst holds every request one
+    prefill step finished: it is sent from its last row's return. On each
+    request alone on the relay (`_alone`), one burst's, the host-law solver
+    fits ``fixed_s + body bytes x per_byte_s`` on the time from that return
+    to its app call over that body's bytes, which ``bytes`` spans. Raises on
+    too few requests alone on it."""
+    took, sizes = [], []
+    for prefill, decode in pairs:
+        threads: dict = {}
+        for e in _stamps(prefill):
+            if e[2] == "out":
+                threads.setdefault(e[6], []).append(e)
+        # Each burst's last row, (start, end), thread by thread.
+        lasts = sorted(
+            (a[0], a[1])
+            for rows in threads.values()
+            for a, b in zip(rows, rows[1:] + [None])
+            if b is None or b[0] - a[1] > RELAY_BURST_S * 1e9
+        )
+        ev = _stamps(decode)
+        calls, _ = _requests(ev)
+        bodies = sorted((e[0], e[3]) for e in ev if e[2] == "body")
+        starts = np.array([b[0] for b in bodies], dtype=np.int64)
+        if not lasts or not calls:
+            continue
+        got, seconds = _alone([a for a, _ in lasts], calls, [b for _, b in lasts])
+        for arrival, ns in zip(got, seconds):
+            # The body its app call reads, the first read after the call.
+            k = int(np.searchsorted(starts, arrival))
+            if k < len(bodies):
+                took.append(ns * 1e-9)
+                sizes.append(bodies[k][1])
+    x = np.column_stack([np.ones(len(sizes)), sizes])
+    (fixed, per_byte), report = _host_law(x, np.array(took), RELAY_FEATURES)
+    term = {"fixed_s": fixed, "per_byte_s": per_byte, "bytes": [min(sizes), max(sizes)]}
+    return term, report
+
+
+def streams(path) -> bool:
+    """Whether the server whose intake stamps `path` holds sent an SSE
+    response head (``head``): it streamed its responses."""
+    with open(path) as lines:
+        return any(line.split(maxsplit=3)[2:3] == ["head"] for line in lines)
+
+
+def _loop_windows(path) -> list[tuple]:
+    """The intake stamps at `path` (`atom.compass.run.INTAKE_RECORD`) as one row
+    per `STREAM_WINDOW_S` window: ``(seconds, events, requests, bytes, CPU
+    seconds)``. CPU seconds are the API loop thread's, the one stamping app
+    calls, read off its stamps' thread CPU clock between its first and last
+    stamp in the window and scaled to the window, which they must span
+    `STREAM_SPAN` of; events are the output rows its output threads took in
+    (``out``), one SSE event each on a streamed response; requests and bytes
+    are the bodies read and their sizes. None for a server that sent no SSE
+    response head (``head``): its outputs stream nothing."""
+    if not streams(path):
+        return []
+    rows = [line.split() for line in Path(path).read_text().splitlines()]
+    loop = next((r[1] for r in rows if len(r) >= 7 and r[2] == "app"), None)
+    width = STREAM_WINDOW_S * 1e9
+    counts: dict = {}
+    clock = []
+    for r in rows:
+        if len(r) < 7:
+            continue
+        end, kind = int(r[0]), r[2]
+        at = counts.setdefault(int(end // width), [0, 0, 0])
+        if kind == "out":
+            at[0] += 1
+        elif kind == "body":
+            at[1] += 1
+            at[2] += int(r[4])
+        if kind in LOOP_KINDS and r[1] == loop:
+            clock.append((end, int(r[5])))
+    clock.sort()
+    ends = np.array([e for e, _ in clock], dtype=np.float64)
+    cpu = np.array([c for _, c in clock], dtype=np.float64)
+    out = []
+    for w, (events, requests, nbytes) in sorted(counts.items()):
+        i = int(np.searchsorted(ends, w * width))
+        j = int(np.searchsorted(ends, (w + 1) * width)) - 1
+        if j <= i or ends[j] - ends[i] < STREAM_SPAN * width:
+            continue
+        busy = (cpu[j] - cpu[i]) / (ends[j] - ends[i]) * STREAM_WINDOW_S
+        out.append((STREAM_WINDOW_S, events, requests, nbytes, busy))
+    return out
+
+
+def fit_stream(paths) -> tuple[dict, dict]:
+    """The ``http_stream`` term over the intake stamps each record in `paths`
+    holds, and its report: ``per_event_s``, the API loop's CPU seconds per SSE
+    event its streamed responses send, by the host-law solver on the loop's
+    CPU over every window of the streaming records (`_loop_windows`) on
+    `STREAM_FEATURES`. The window's seconds and its requests and bytes stand
+    for the loop's idle polling and its intakes, which ``http_intake`` prices,
+    and stay in the report. Raises where no record streamed."""
+    rows = [w for path in paths for w in _loop_windows(path)]
+    if not rows:
+        raise ValueError("no record streamed an SSE response, so none times its events")
+    x = np.array([w[:4] for w in rows], dtype=np.float64)
+    y = np.array([w[4] for w in rows], dtype=np.float64)
+    coef, report = _host_law(x, y, STREAM_FEATURES)
+    report["coefficients"] = dict(zip(STREAM_FEATURES, coef))
+    report["windows"] = len(rows)
+    report["loop_busy"] = float(y.sum() / x[:, 0].sum())
+    return {"per_event_s": coef[1]}, report
 
 
 #: The host entry's ``hops`` `fit_hops` fits (`atom.compass.run.HOPS`).
@@ -808,9 +1234,27 @@ OFFLOAD_COPY = re.compile(
     r"\[OFFLOAD-(SAVE|LOAD)-PROF\] .*? chunks=(\d+) .*? total_ms=([\d.]+)"
 )
 OFFLOAD_PERF = "[OFFLOAD-PERF] "
+#: The Mooncake Store worker's start line, with the fields its entry matches
+#: against a deployment; ``nic`` names the protocol, or under rdma the NIC.
+STORE_WORKER = re.compile(
+    r"Mooncake Store offload worker rank=\d+ world=(?P<world>\d+): .*? "
+    r"nic=(?P<nic>\S+) .*? chunk=(?P<chunk_tokens>\d+) chunk_bytes=(?P<chunk_bytes>\d+) "
+    r".*? save_slots=(?P<save_slots>\d+) load_slots=(?P<load_slots>\d+) "
+    r".*? save_workers=(?P<save_workers>\d+) load_workers=(?P<load_workers>\d+)"
+)
+#: The Store worker's per-copy lines under `OFFLOAD_PROFILE` and its
+#: scheduler's per-lookup line at DEBUG, each of ``name=value`` fields.
+STORE_LINE = re.compile(r"\[OFFLOAD-(SAVE-PROF|LOAD-PROF|LOOKUP)\] (.*)")
+#: Per line of `STORE_LINE`: the law it fits, its count, its milliseconds and
+#: the parts of them the report keeps apart.
+STORE_LAWS = {
+    "SAVE-PROF": ("store_s", "chunks", "total_ms", ("pack_ms", "put_ms")),
+    "LOAD-PROF": ("load_s", "chunks", "total_ms", ("get_ms", "unpack_ms")),
+    "LOOKUP": ("lookup_s", "keys", "elapsed_ms", ()),
+}
 
 
-def fit_offload(logs) -> tuple[dict, dict]:
+def fit_offload(logs, master=None, capacity_bytes=None) -> tuple[dict, dict]:
     """The run file's ``lmcache_offload`` entry, fitted on the server logs of
     real runs `logs`, each at `OFFLOAD_PROFILE` (`atom.compass.kv.lmcache_offload`),
     and its report.
@@ -823,7 +1267,15 @@ def fit_offload(logs) -> tuple[dict, dict]:
     it logs a minute apart: per minute with a lookup, the seconds its lookups
     took on ``(lookups, chunks)``, chunks counted as the prompt tokens they
     asked over the chunk size. The entry's ``fit`` holds the logs and the
-    report."""
+    report.
+
+    Logs of the Mooncake Store's workers give its ``mooncake_store`` entry
+    instead (`_fit_store`), with the master's flags `master`, as argv, and the
+    owners' mounted bytes `capacity_bytes`, which no log states."""
+    if any(STORE_WORKER.search(Path(log).read_text(errors="replace")) for log in logs):
+        return _fit_store(logs, master, capacity_bytes)
+    if master is not None or capacity_bytes is not None:
+        raise ValueError("lmcache_offload's logs state no Store master or owners")
     workers, copies, lookups = {}, {"SAVE": [], "LOAD": []}, []
     for log in logs:
         perf = []
@@ -868,6 +1320,56 @@ def fit_offload(logs) -> tuple[dict, dict]:
     entry["lookup_s"], report["lookup_s"] = _host_law(
         x, rows[:, 2] * 1e-6, ["lookups", "chunks"]
     )
+    entry["fit"] = {"logs": [str(log) for log in logs], **report}
+    return entry, report
+
+
+def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
+    """`fit_offload`'s ``mooncake_store`` entry and report on the Store logs
+    `logs`, at `OFFLOAD_PROFILE` and ``ATOM_LOG_LEVEL=DEBUG``.
+
+    The fields `STORE_WORKER` matches are what each worker logs at its start,
+    ``protocol`` ``rdma`` where it names a NIC; logs that differ in any refuse.
+    Each law of `STORE_LAWS` is fitted by the host-law solver on its lines'
+    seconds over ``(1, count)``: ``store_s`` and ``load_s`` on each copy with
+    ``status=ok``, ``lookup_s`` on each lookup's call, per key it asked. The
+    report keeps each copy's parts apart, their p50 and p90 milliseconds."""
+    if master is None or capacity_bytes is None:
+        raise ValueError(
+            "no log states the Store master's flags or its owners' bytes: give "
+            "--master-flags and --capacity-bytes"
+        )
+    stated, rows, parts = {}, {}, {}
+    for log in logs:
+        for line in Path(log).read_text(errors="replace").splitlines():
+            if m := STORE_WORKER.search(line):
+                fields = {k: int(v) for k, v in m.groupdict().items() if k != "nic"}
+                fields["protocol"] = "tcp" if m["nic"] == "tcp" else "rdma"
+                stated.setdefault(log, set()).add(tuple(sorted(fields.items())))
+            elif m := STORE_LINE.search(line):
+                law, count, took, kept = STORE_LAWS[m[1]]
+                said = dict(re.findall(r"(\w+)=(\S+)", m[2]))
+                # A failed copy is not priced; other lookup lines time no call.
+                if said.get("status", "ok") == "ok" and took in said:
+                    seconds = float(said[took]) * 1e-3
+                    rows.setdefault(law, []).append((1, int(said[count]), seconds))
+                    for part in kept:
+                        parts.setdefault(part, []).append(float(said[part]))
+    matched = sorted(set().union(*stated.values()))
+    if len(matched) != 1 or len(stated) != len(logs):
+        raise ValueError(
+            f"the logs' Store workers state {[dict(s) for s in matched]}, "
+            f"and {len(logs) - len(stated)} state none; an entry is fitted on one"
+        )
+    [fields] = matched
+    entry, report = dict(fields), {}
+    for law, count, _, kept in STORE_LAWS.values():
+        x = np.array(rows.get(law, []), dtype=np.float64).reshape(-1, 3)
+        entry[law], report[law] = _host_law(x[:, :2], x[:, 2], ["fixed", count])
+        for part in kept:
+            p50, p90 = np.percentile(parts[part], [50, 90]).tolist()
+            report[law][part] = {"p50": p50, "p90": p90}
+    entry |= {"master": master, "capacity_bytes": capacity_bytes}
     entry["fit"] = {"logs": [str(log) for log in logs], **report}
     return entry, report
 
@@ -1032,13 +1534,17 @@ def _launch_columns(members, features) -> tuple[list[str], dict]:
     launch path, its members of one value of every feature). One p50 over all
     of a run's members is its commonest path's, which a column a rarer path
     needs barely moves. A round adds the feature of least error while it is
-    below the last design's. Members of one run adopt none."""
+    below the last design's. A member's run is its `_host_rows` cell: on a
+    fit of one run, a span of its steps (`RUN_BLOCKS`), so a single record,
+    whose launch-path mix moves with its load over time, adopts the columns
+    its spans need too."""
     if not features:
         return [], {}
     x = np.array([r[2] for r in members], dtype=np.float64).reshape(-1, 3)
     if np.linalg.matrix_rank(x[:, 1:]) < 2:
         x[:, 2] = 0.0
-    y, cell = np.array([r[3] for r in members]), np.array([r[4] for r in members])
+    y = np.array([r[3] for r in members])
+    cell = np.unique([repr(r[4]) for r in members], return_inverse=True)[1]
     paths = [[r[5][f] for f in features] for r in members]
     path = np.unique(paths, axis=0, return_inverse=True)[1]
 
@@ -1286,11 +1792,13 @@ def _folds(design, y, cell, names, path=None) -> dict:
     return out
 
 
-def _max_affine_folds(steps, vector: dict, routing) -> dict:
-    """Per record beside which another holds steps, (its steps, the p50 error
+def _max_affine_folds(steps, vector: dict, routing, cell=None) -> dict:
+    """Per cell beside which another holds steps, (its steps, the p50 error
     on them, each priced as the max over its ranks, of `_fit_vector` of
-    `vector` on the other records' steps)."""
-    cell = np.array([s[0][0] for s in steps])
+    `vector` on the other cells' steps). `cell` is each step's cell, its
+    record when None."""
+    if cell is None:
+        cell = np.array([s[0][0] for s in steps])
     out = {}
     for c in sorted(set(cell.tolist())):
         other = cell != c
@@ -1326,21 +1834,31 @@ def _moe_column(steps, routing) -> tuple:
     `moe_experts` under `routing` and with each step's group dummies as one
     token (`moe_column`). Each form is fitted with each record held out of the
     rung's steps (`_max_affine_folds`), its held-out error `_held_out_error`'s.
-    The form of smallest held-out error is picked, no column on a tie, and a
-    picked column is adopted, returned as the vector `_counts` reads. A rung of
-    one record has no held-out error and adopts none.
+    A rung of one record holds out each group composition instead, the steps
+    with as many dummy forwards beside them (`BatchView.group_dummies`): what a
+    run at another concurrency changes at a rung is how many of its ranks are
+    busy, which the column states and the context column would otherwise take
+    up (#3720 c=1: a c=128 record's rung 1, its steps at 1-4 busy ranks, fitted
+    context at 25x its slope). The form of smallest held-out error is picked,
+    no column on a tie, and a picked column is adopted, returned as the vector
+    `_counts` reads. A rung of one record and one composition has no held-out
+    error and adopts none.
     """
     forms = {"none": {"coefficients": list(DECODE)}}
     forms |= {f: {"coefficients": [*DECODE, f]} for f in MOE_COLUMNS}
+    cell, by = np.array([s[0][0] for s in steps]), "record"
+    if len(set(cell.tolist())) == 1:
+        cell, by = np.array([s[0][7] for s in steps]), "group_dummies"
     held, error = {}, {}
     for form, vector in forms.items():
-        held[form] = _max_affine_folds(steps, vector, routing)
+        held[form] = _max_affine_folds(steps, vector, routing, cell)
         error[form] = _held_out_error(held[form])
     picked = min(error, key=error.get) if held["none"] else None
     adopted = None if picked in (None, "none") else picked
     figures = {
         "picked": picked,
         "adopted": adopted,
+        "held_out_by": by,
         "held_out": {
             form: {
                 "error": error[form],
@@ -1417,8 +1935,12 @@ def _rowmod(steps, rung: int, vector: dict, base: dict, seed: int, routing, fold
 def _hull(points: np.ndarray, names: tuple[str, ...], affine: bool = True) -> dict:
     """`StepLinearLaw`'s hull over the non-intercept features of the fitted steps.
     qhull's precision checks depend on the order the points come in: where it
-    refuses them, it hulls their distinct points in sorted order, the same hull.
-    A set that spans none still raises. A feature affine in an earlier one on
+    refuses them, it hulls their distinct points in sorted order, the same hull,
+    and where it refuses those too and they span every free feature, it hulls
+    them joggled (`QJ`), each facet then moved out to hold every point. A set
+    that spans none still raises. Past `HULL_EXACT_FREE` free features it is
+    no qhull hull of the set but `_pair_hull`'s, bounded in facets, which
+    holds every point and may hold more. A feature affine in an earlier one on
     the set is held to it by two opposed facets, as a constant one is by
     `equal`, unless `affine` is false: then qhull refuses that flat set."""
     from scipy.spatial import ConvexHull, QhullError
@@ -1445,11 +1967,26 @@ def _hull(points: np.ndarray, names: tuple[str, ...], affine: bool = True) -> di
         free = [j for j in range(len(vary)) if j not in tied]
         if len(free) == 1:
             hulled = np.array([[-1.0, 0.0], [1.0, -1.0]])
+        elif len(free) > HULL_EXACT_FREE:
+            hulled = _pair_hull(unit[:, free])
         else:
             try:
                 hulled = ConvexHull(unit[:, free]).equations
             except QhullError:
-                hulled = ConvexHull(np.unique(unit[:, free], axis=0)).equations
+                distinct = np.unique(unit[:, free], axis=0)
+                try:
+                    hulled = ConvexHull(distinct).equations
+                except QhullError:
+                    # #3720: real_pw_c128 + real_pw_c1's prefill points, 8
+                    # features, failed both orders on a precision check.
+                    spans = distinct - distinct.mean(axis=0)
+                    if np.linalg.matrix_rank(spans) < len(free):
+                        raise
+                    hulled = ConvexHull(distinct, qhull_options="QJ").equations
+                    # A joggled facet may cut a point by the joggle: each moves
+                    # out by its largest cut, so the hull holds every point.
+                    cut = (distinct @ hulled[:, :-1].T + hulled[:, -1]).max(axis=0)
+                    hulled[:, -1] -= np.maximum(cut, 0.0)
         eq = np.zeros((len(hulled), len(vary) + 1))
         eq[:, free], eq[:, -1] = hulled[:, :-1], hulled[:, -1]
         for j, (i, sign) in tied.items():  # u_j = u_i, or u_j = 1 - u_i
@@ -1463,6 +2000,36 @@ def _hull(points: np.ndarray, names: tuple[str, ...], affine: bool = True) -> di
     return {"equal": equal, "facets": facets}
 
 
+def _pair_hull(unit: np.ndarray) -> np.ndarray:
+    """The facets, as qhull's `equations`, of the intersection of the unit box
+    and each pair of `unit`'s columns' 2-D hull: a convex set that holds every
+    point of `unit`, points in the unit box, and is no smaller than their hull,
+    with at most the box's faces and the pairs' hull edges. A pair whose
+    distinct points qhull refuses (on a line, or one point) adds no facet: the
+    box bounds it. Each facet moves out by its largest cut of a point, so the
+    set holds every point under rounding too."""
+    from scipy.spatial import ConvexHull, QhullError
+
+    d = unit.shape[1]
+    box = np.zeros((2 * d, d + 1))
+    box[np.arange(d), np.arange(d)], box[d + np.arange(d), np.arange(d)] = -1.0, 1.0
+    box[d:, -1] = -1.0
+    rows = [box]
+    for i, j in itertools.combinations(range(d), 2):
+        pair = np.unique(unit[:, [i, j]], axis=0)
+        try:
+            edges = ConvexHull(pair).equations
+        except QhullError:
+            continue
+        eq = np.zeros((len(edges), d + 1))
+        eq[:, [i, j, d]] = edges
+        rows.append(eq)
+    hulled = np.vstack(rows)
+    cut = (unit @ hulled[:, :-1].T + hulled[:, -1]).max(axis=0)
+    hulled[:, -1] -= np.maximum(cut, 0.0)
+    return hulled
+
+
 def _groups(
     run,
     form: str,
@@ -1472,41 +2039,56 @@ def _groups(
     routing: tuple[int, int] | None = None,
     dummies: list[frozenset] | None = None,
     buckets: tuple[int, ...] = (),
+    eager: bool = False,
+    cold: bool = False,
 ) -> tuple[list[dict[int, tuple]], dict, list[float]]:
     """One run's steps, each {rank: its `_features` row} labelled with the
-    smallest rank label, a rank that ran the step as a dummy forward holding
-    none; what was cut; and each step's rank label spread. With `steps`, only
-    the steps numbered in it; `serial`, `routing` and `buckets` as
-    `_features` reads them;
+    smallest rank label; what was cut; and each step's rank label spread. A
+    rank that ran a prefill step as a dummy forward holds the row of its
+    dummy (`_features`' `dummy`), labelled the same, since the backend prices
+    it as a rank of the group and the step waits for it; one that ran a decode
+    step or, under `draft`, any step so holds none. With `steps`, only the
+    steps numbered in it; `serial`, `routing`, `buckets`, `eager` and `cold`
+    as `_features` reads them;
     `dummies`, each rank's steps run as dummy forwards, read from its samples
     when None: a rank that gave no sample needs them given."""
     if dummies is None:
         dummies = [rank[0].dummies for rank in run]
     run = [[s for s in rank if steps is None or s.step in steps] for rank in run]
     got = [
-        _features(rank, form, len(run), draft, serial, routing, buckets) for rank in run
+        _features(rank, form, len(run), draft, serial, routing, buckets, eager, cold)
+        for rank in run
     ]
-    cut = {k: sum(c[k] for _, c in got) for k in got[0][1]}
+    named = dict.fromkeys(k for _, c in got for k in c)
+    cut = {k: sum(c.get(k, 0) for _, c in got) for k in named}
     if len(run) == 1:
-        return [{0: r} for r in got[0][0]], cut, []
+        return [{0: r[:7]} for r in got[0][0]], cut, []
     ranks = [{r[3]: r for r in rows} for rows, _ in got]
     groups, spread, cut["ranks"] = [], [], 0
     for step in sorted(set().union(*ranks)):
         group = {i: rank[step] for i, rank in enumerate(ranks) if step in rank}
-        ran = len(group) + sum(step in d for d in dummies)
-        if ran < len(ranks) or len({r[0] for r in group.values()}) > 1:
+        idle = [i for i, d in enumerate(dummies) if step in d]
+        if (
+            len(group) + len(idle) < len(ranks)
+            or len({r[0] for r in group.values()}) > 1
+        ):
             cut["ranks"] += 1
             continue
         labels = [r[2] for r in group.values()]
         spread.append(max(labels) / min(labels) - 1.0)
-        groups.append({i: (*r[:2], min(labels), *r[3:]) for i, r in group.items()})
+        rows = {i: (*r[:2], min(labels), *r[3:7]) for i, r in group.items()}
+        peer = next(iter(group.values()))
+        if peer[7] is not None:
+            rows |= {i: (peer[0], peer[7], min(labels), *peer[3:7]) for i in idle}
+        groups.append(dict(sorted(rows.items())))
     return groups, cut, spread
 
 
 def _fit_steps(steps: list[list[tuple]], names: list[str], design) -> dict:
     """`_fit_form` of `steps`, each its ranks' `fit` rows, on `design(row)`, the
     form's features of a row; with `rows`, each step's row at the rank picked.
-    A rank that ran the step as a dummy forward holds no row."""
+    A rank that ran the step as a dummy forward holds its dummy's row, or none
+    (`_groups`)."""
     width = max(map(len, steps))
     x = np.zeros((len(steps), width, len(names)))
     real = np.zeros((len(steps), width), dtype=bool)
@@ -1559,8 +2141,10 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     `options` takes `form` (`base` by default), `dp`, the ranks each run
     holds (1 by default), `moe_routing`, the model's (routed experts,
     top-k), under which each decode rung but the draft law's may adopt a MoE
-    column (`_moe_column`), and `buckets`, the records' prefill token-graph
-    buckets, under which the prefill vector adds `padding`; `seed` fixes the
+    column (`_moe_column`), `draft_moe_routing`, the drafter's, under which
+    above `dp` 1 the draft law's may (`_draft_options`), and `buckets`, the records' prefill token-graph
+    buckets, under which the prefill vector adds `padding`, and `cold`, under
+    which above `dp` 1 it adds `cold_peer_rows` (`_cold`); `seed` fixes the
     `rowmod` shuffles; `draft`, or a sample with a draft label, adds `seqs` and
     `out` to the prefill vector.
     """
@@ -1570,7 +2154,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     routing = _routing(options)
     serial = _serial(samples, options)
     buckets = _buckets(options)
-    kvs = [s for s in samples if s.draft_kv_s is not None and not s.view.prefill]
+    eager = not draft and _eager_dummies(samples, options)
+    cold = not draft and _cold(options)
     samples = [
         (
             s
@@ -1583,7 +2168,14 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     groups, cut, spread = [], {"warm": 0, "warm_s": 0.0}, []
     for i, run in enumerate(runs.values()):
         got, c, s = _groups(
-            run, form, draft, serial=serial, routing=routing, buckets=buckets
+            run,
+            form,
+            draft,
+            serial=serial,
+            routing=routing,
+            buckets=buckets,
+            eager=eager,
+            cold=cold,
         )
         groups += [[(i, *r) for r in g.values()] for g in got]
         spread += s
@@ -1591,9 +2183,9 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             cut[k] = cut.get(k, 0) + v
     prefill = list(HISTORY if form == "history" else PREFILL)
     prefill += ["cached_seqs"] * (form == "cached_seqs") + ["moe_rows"] * (dp > 1)
-    prefill += ["serial_moe_rows"] * serial
+    prefill += ["serial_moe_rows"] * serial + ["cold_peer_rows"] * cold
     prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
-    prefill += ["padding"] * bool(buckets)
+    prefill += ["padding"] * bool(buckets) + list(EAGER_DUMMY) * eager
     law = {
         "provenance": f"step_linear_fit {form} on {len(runs) * dp} real records "
         f"({', '.join(runs)})",
@@ -1653,7 +2245,10 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             names = [*vector["coefficients"], *["rowmod"] * bool(rowmod_k)]
         members = solved["rows"]
         slow = ~solved["keep"] & (solved["residual"] < 0)
-        once = solved["residual"] < 1 - WARM_FACTOR
+        # A residual r = (price - label) / price, so price = label / (1 - r).
+        label = np.array([r[3] for r in members], dtype=np.float64)
+        past = label - label / np.maximum(1 - solved["residual"], 1e-12)
+        once = (solved["residual"] < 1 - WARM_FACTOR) | (past > PAUSE_S)
         warm = np.zeros(len(members), dtype=bool)
         for rec in range(len(runs)):
             leading = True
@@ -1686,8 +2281,10 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     for r, keep in zip(members, kept)
                     if keep
                 ]
+                axes = list(hull_axes(features))
                 hull = _hull(
-                    np.array(points, dtype=np.float64)[:, 1:], tuple(features[1:])
+                    np.array(points, dtype=np.float64)[:, axes],
+                    tuple(features[i] for i in axes),
                 )
             except (ValueError, QhullError) as e:
                 law["unfitted"][k] = str(e).splitlines()[0]
@@ -1716,6 +2313,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
             if k == "prefill":
                 if buckets:
                     vector["buckets"] = list(buckets)
+                if cold:
+                    vector["duty_tau"] = DUTY_TAU
                 law["prefill"] = vector
             else:
                 law["decode"][k] = vector
@@ -1742,25 +2341,30 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         law["draft"]["forward"] = _forward(serial)
         law["draft"]["propose"] = _propose(_rest(serial))
     elif drafts:
-        if proposes := [
-            s if s.draft_kv_s is None else dataclasses.replace(s, propose_s=s.draft_s)
-            for s in samples
-            if s.propose_s is not None
-        ]:
-            law["draft"]["propose"] = _propose(proposes)
-        if kvs:
-            law["draft"]["draft_kv"] = _propose(kvs, "draft_kv_s")
+        for name, mine in _pass_samples(samples).items():
+            width = dp if name in GROUPED else 1
+            vector = mine and _propose(mine, PASSES[name], width, samples)
+            if vector:
+                law["draft"][name] = vector
+            elif mine:
+                why = "no step every rank of which ran it or a dummy forward"
+                law["draft"]["unfitted"][name] = why
         if any(s.view.prefill and s.draft_kv_s is not None for s in samples):
             law["draft"]["output_prefill_kv"] = True
     return law, report
 
 
 def _draft_options(options, serial: bool) -> dict:
-    """`options` for the draft law, which adopts no MoE column and no padding;
-    under an EAGLE3 drafter whose records time its passes, the `base` form: its
+    """`options` for the draft law, which adds no padding, and adopts no MoE
+    column at `dp` 1; above it, over `draft_moe_routing`, the drafter's own
+    routed experts and top-k where `options` state them, its decode rungs pick
+    one as the target's do.
+    Under an EAGLE3 drafter whose records time its passes, the `base` form: its
     prefill vector fits the middle chunks alone, each one request's chunk at
     the step's token budget, whose `history` is its `query_cached` over it."""
-    drafted = {**(options or {}), "moe_routing": None, "buckets": None}
+    dp, options = _options(options)[1], options or {}
+    routing = options.get("draft_moe_routing") if dp > 1 else None
+    drafted = {**options, "moe_routing": routing, "buckets": None}
     return {**drafted, "form": "base"} if serial else drafted
 
 
@@ -1816,9 +2420,76 @@ def _draft_kv(s) -> float:
     return s.draft_s - (s.propose_s or 0.0)
 
 
-def _propose(samples, label: str = "propose_s") -> dict:
+#: The draft law's vectors on `PROPOSE`, each with the label it is fitted on.
+PASSES = {"propose": "propose_s", "draft_kv": "draft_kv_s"}
+#: Those of `PASSES` whose pass waits on the rank's data-parallel peers, fitted
+#: over the group's steps (`_pass_steps`); the others on each rank's own label.
+GROUPED = ("propose",)
+
+
+def _pass_samples(samples) -> dict:
+    """The samples each of `PASSES` is fitted on: under `propose` those with a
+    propose label, an output prefill's being its whole draft label, all after
+    `forward_done_event`; under `draft_kv` the decodes with a draft-KV label."""
+    return {
+        "propose": [
+            s if s.draft_kv_s is None else dataclasses.replace(s, propose_s=s.draft_s)
+            for s in samples
+            if s.propose_s is not None
+        ],
+        "draft_kv": [
+            s for s in samples if s.draft_kv_s is not None and not s.view.prefill
+        ],
+    }
+
+
+def _pass_steps(samples, label: str, dp: int, every) -> tuple[list, int]:
+    """`samples` of `dp` ranks joined on run and step, each step its ranks'
+    rows `(run, None, (1, seqs), seconds, step)`, `seconds` the smallest of
+    their `label`s, in the order `every`'s runs first appear, then by step;
+    and how many steps were left out, at which a rank gave no sample here and
+    ran no dummy forward, as its samples in `every` state."""
+    runs = list(dict.fromkeys(s.provenance["run"] for s in every))
+    dummies = {(s.provenance["run"], s.rank): s.dummies for s in every}
+    joined: dict = {}
+    for s in samples:
+        joined.setdefault((runs.index(s.provenance["run"]), s.step), {})[s.rank] = s
+    steps, cut = [], 0
+    for (i, step), ranks in sorted(joined.items()):
+        idle = [step in dummies.get((runs[i], r), ()) for r in range(dp)]
+        if sum(r in ranks or idle[r] for r in range(dp)) < dp:
+            cut += 1
+            continue
+        seconds = min(getattr(s, label) for s in ranks.values())
+        rows = [(1, len(s.view.requests)) for _, s in sorted(ranks.items())]
+        steps.append([(i, None, x, seconds, step) for x in rows])
+    return steps, cut
+
+
+def _propose(samples, label: str = "propose_s", dp: int = 1, every=()) -> dict:
     """The draft law's `propose` vector over `samples`' propose labels, or
-    another `label`, on `PROPOSE`, solved and hulled as a step vector is."""
+    another `label`, on `PROPOSE`, solved and hulled as a step vector is; above
+    `dp` 1 by max-affine regression over `_pass_steps` of them, whose dummy
+    forwards `every` states, hulled at each step's priced rank, the steps it
+    left out under its fit's `ranks`; None when it left out every step."""
+    if dp > 1:
+        steps, cut = _pass_steps(samples, label, dp, every)
+        if not steps:
+            return None
+        s = _fit_steps(steps, list(PROPOSE), lambda r: r[2])
+        x = np.array([r[2] for r in s["rows"]], dtype=np.float64)
+        return {
+            "coefficients": dict(zip(PROPOSE, map(float, s["coef"]))),
+            "hull": _hull(x[s["keep"]][:, 1:], PROPOSE[1:]),
+            "fit": {
+                "samples": int(s["keep"].sum()),
+                "dropped": int((~s["keep"]).sum()),
+                "ranks": cut,
+                **{k: s[k] for k in ("condition", "centre", "mad", "zero")},
+                "all_rows": s["all_rows"],
+                "passes": s["passes"],
+            },
+        }
     x = np.array([(1, len(s.view.requests)) for s in samples], dtype=np.float64)
     return _vector(x, np.array([getattr(s, label) for s in samples]), PROPOSE)
 
@@ -1862,7 +2533,12 @@ def _fold_laws(samples, options, seed, draft: bool = False):
     """Each run of `samples`, in the order runs first appear, with its ranks'
     samples and the law `fit` gives on the other runs, under `draft` as `fit`
     fits a draft law."""
-    options = {**(options or {}), "serial": _serial(samples, options)}
+    options = {
+        **(options or {}),
+        "serial": _serial(samples, options),
+        "eager_dummies": _eager_dummies(samples, options),
+        "cold": _cold(options),
+    }
     for run, ranks in _runs(samples, _options(options)[1]).items():
         others = [s for s in samples if s.provenance["run"] != run]
         yield run, ranks, fit(others, options, seed, draft)[0]
@@ -1875,7 +2551,12 @@ def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None
     band, that rank's (counts, context, tokens, dummies), relative error), the
     error nan where that law has no vector."""
     form = _options(options)[0]
-    options = {**(options or {}), "serial": _serial(samples, options)}
+    options = {
+        **(options or {}),
+        "serial": _serial(samples, options),
+        "eager_dummies": _eager_dummies(samples, options),
+        "cold": _cold(options),
+    }
     if warm is None:
         warm = fit(samples, options, seed, draft)[0]["warm_steps"]
     folds = _fold_laws(samples, options, seed, draft) if folds is None else folds
@@ -1888,6 +2569,8 @@ def _held_out(samples, options, seed, warm=None, draft: bool = False, folds=None
             serial=options["serial"],
             routing=_routing(options),
             buckets=_buckets(options),
+            eager=not draft and options["eager_dummies"],
+            cold=not draft and options["cold"],
         )[0]:
             key, _, seconds, step, *_ = next(iter(group.values()))
             if step in warm[i]:
@@ -1967,6 +2650,136 @@ def fold_figures(folds, vectors=None) -> dict:
     return {run: _figures(ranks, law, vectors) for run, ranks, law in folds}
 
 
+#: A filled vector's hull: it bounds the first hull coordinate to x >= 1 and
+#: x <= 0, a set holding no point, so every step it prices is extrapolated.
+NO_POINT = ((-1.0, 1.0), (1.0, 0.0))
+
+
+def fill_rungs(law: dict, ladder) -> dict:
+    """Give each rung of `ladder`, the captured decode widths, that `law` (and
+    its draft law) holds no decode vector for a declared one, and return the
+    rungs filled, each to its rule. No record reaching a rung leaves it with no
+    vector, and a run's step at it would be refused for want of one; a filled vector
+    prices it instead, `declared` and never validated, and outside its hull.
+
+    The rule: between two fitted rungs, coefficient by coefficient, a
+    coefficient a vector lacks read as 0, linear in the rung between the
+    nearest fitted rungs on either side; a step's cost at a rung is its
+    graph's, whose padded width the rung is, so a rung between two fitted ones
+    costs between theirs. Past the fitted rungs, the nearest fitted rung's
+    vector as it is: the widest fitted one's above them, the narrowest's below.
+    A line through the two nearest rungs on one side multiplies their
+    slopes' noise by the distance (#3796: rung 64 from rungs 24 and 32 priced
+    the steps it filled +56%), and a copy is off by the rungs' own spread only.
+    Two vectors under different `rowmod` moduli combine to no vector: the
+    nearer one's is taken, ties to the wider. The law names the rungs filled
+    under `filled`, each to its rule, and under `FILLED_RUNGS` by law
+    (`filled_rungs`)."""
+    filled = {}
+    for of in (law, law.get("draft")):
+        if not of or "decode" not in of:
+            continue
+        decode = of["decode"]
+        fitted = sorted(int(k) for k in decode if k.isdigit())
+        for rung in sorted(int(r) for r in ladder or ()):
+            if str(rung) in decode or not fitted:
+                continue
+            below = [r for r in fitted if r < rung]
+            above = [r for r in fitted if r > rung]
+            if below and above:
+                pair = (below[-1], above[0])
+            else:
+                pair = ((below[-1:] or above[:1])[0],) * 2
+            a, b = (decode[str(r)] for r in pair)
+            w = 0.0 if pair[0] == pair[1] else (rung - pair[0]) / (pair[1] - pair[0])
+            if a.get("rowmod") != b.get("rowmod"):
+                near = min(pair, key=lambda r: (abs(r - rung), -r))
+                a = b = decode[str(near)]
+                pair, w = (near, near), 0.0
+            names = [*a["coefficients"]]
+            names += [f for f in b["coefficients"] if f not in names]
+            coefficients = {
+                f: max(
+                    0.0,
+                    (1 - w) * a["coefficients"].get(f, 0.0)
+                    + w * b["coefficients"].get(f, 0.0),
+                )
+                for f in names
+            }
+            free = len(hull_axes(tuple(coefficients)))
+            lo, hi = pair
+            if lo != hi:
+                how = f"interpolated in the rung between rungs {lo} and {hi}"
+                how += f" (weight {w:.4g} on rung {hi}), clipped at 0"
+            elif not (below and above):
+                side = "widest" if lo < rung else "narrowest"
+                how = f"rung {lo}'s vector, the {side} fitted rung"
+            else:
+                how = f"rung {lo}'s vector"
+            rule = f"rung {rung} filled, no record reached it: {how}"
+            vector = {
+                "coefficients": coefficients,
+                "hull": {"facets": [[x, *[0.0] * (free - 1), c] for x, c in NO_POINT]},
+                "declared": rule,
+                "filled": {"from": list(pair), "weight": w},
+            }
+            if a.get("rowmod"):
+                vector["rowmod"] = a["rowmod"]
+            decode[str(rung)] = vector
+            filled[("draft " if of is not law else "") + str(rung)] = rule
+    if filled:
+        law["filled"] = {k: v for k, v in sorted(filled.items(), key=lambda kv: kv[0])}
+        law[FILLED_RUNGS] = filled_rungs(law)
+    return filled
+
+
+#: The law's key naming its filled rungs by law, `{"decode": [...], "draft": [...]}`.
+FILLED_RUNGS = "filled_rungs"
+
+
+def filled_rungs(law: dict) -> dict[str, list[int]]:
+    """The decode rungs `fill_rungs` filled in `law`, by law: the target's under
+    ``decode`` and its draft law's under ``draft``, each ascending and each
+    empty when none was; a law written before `FILLED_RUNGS` is read from its
+    `filled` names. A preflight compares them with the rungs a target record's
+    steps ran at (`filled_share`)."""
+    out: dict[str, list[int]] = {"decode": [], "draft": []}
+    for name in law.get("filled") or {}:
+        of, _, rung = name.rpartition(" ")
+        out["draft" if of == "draft" else "decode"].append(int(rung))
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def filled_share(law: dict, rungs: Mapping) -> dict:
+    """The part of `rungs`, a target record's decode steps or seconds by the
+    rung they ran at, that `law` prices on a filled vector: its ``steps`` (or
+    seconds) there, the ``share`` of the whole and the filled ``rungs`` it ran
+    at, ascending; a share of 0 when `rungs` holds none."""
+    filled = set(filled_rungs(law)["decode"])
+    on = {int(r): v for r, v in rungs.items() if str(r).isdigit() and int(r) in filled}
+    total = sum(rungs.values())
+    return {
+        "steps": sum(on.values()),
+        "share": sum(on.values()) / total if total else 0.0,
+        "rungs": sorted(r for r, v in on.items() if v),
+    }
+
+
+def filled_warning(law: dict) -> str | None:
+    """A warning naming the rungs `fill_rungs` filled in `law`, or None: a step
+    a run takes at one is priced by a vector no record's step was fitted on."""
+    named = filled_rungs(law)
+    if not any(named.values()):
+        return None
+    parts = [f"{k} rungs {', '.join(map(str, v))}" for k, v in named.items() if v]
+    return (
+        f"WARNING: no record reached {'; '.join(parts)}: each is filled from the "
+        "fitted rungs beside it, declared and never validated, so a run whose "
+        "steps reach them is priced off its records; compare a target record's "
+        "rung histogram with the law's filled_rungs (step_linear_fit.filled_share)"
+    )
+
+
 def mark_held_out(
     law: dict, report: dict, samples, options=None, seed: int = 0, draft=False
 ):
@@ -1974,9 +2787,9 @@ def mark_held_out(
     the hull of the rank rows `_held_out` priced its steps by, their errors per
     band; under `report`'s `held_out`, each run's errors per band; and, unless
     `draft`, under both's `figures`, `fold_figures`' on the same folds. A draft
-    law fitted on an EAGLE3 drafter's passes, its vectors alike, on the steps
-    each is fitted on, their bands named `draft` (`_mark_passes`); `draft`
-    says `law` is a draft law."""
+    law fitted on an EAGLE3 drafter's passes (`_mark_passes`), or above `dp` 1
+    (`_mark_dp_passes`), its vectors alike, on the steps each is fitted on,
+    their bands named `draft`; `draft` says `law` is a draft law."""
     from scipy.spatial import QhullError
 
     folds = list(_fold_laws(samples, options, seed, draft))
@@ -1995,23 +2808,28 @@ def mark_held_out(
         if vector is None or not mine:
             continue
         points = [_counts(vector, routing, *r[3]) for r in mine]
+        names = tuple(vector["coefficients"])
+        axes = list(hull_axes(names))
         try:
             hull = _hull(
-                np.array(points, dtype=np.float64)[:, 1:],
-                tuple(vector["coefficients"])[1:],
+                np.array(points, dtype=np.float64)[:, axes],
+                tuple(names[i] for i in axes),
             )
         except (ValueError, QhullError):
             continue
         vector["held_out"] = {"hull": hull, "bands": _bands(mine)}
-    if "forward" not in law.get("draft", {}):
+    dp, serial = _options(options)[1], "forward" in law.get("draft", {})
+    if "draft" not in law or not (serial or dp > 1):
         return
-    serial = [s for s in samples if s.passes_s]
+    passes = [s for s in samples if s.passes_s]
     drafts, mine = _draft_samples(samples), {"held_out": {}}
     if len({s.provenance["run"] for s in drafts}) > 1:
-        drafted = _draft_options(options, True)
+        drafted = _draft_options(options, serial)
         mark_held_out(law["draft"], mine, drafts, drafted, seed, True)
-    if len({s.provenance["run"] for s in serial}) > 1:
-        _mark_passes(law["draft"], mine, serial)
+    if serial and len({s.provenance["run"] for s in passes}) > 1:
+        _mark_passes(law["draft"], mine, passes)
+    elif not serial:
+        _mark_dp_passes(law["draft"], mine, samples, dp)
     for run, bands in mine["held_out"].items():
         named = {f"draft {b}": v for b, v in bands.items()}
         report["held_out"].setdefault(run, {}).update(named)
@@ -2048,6 +2866,50 @@ def _mark_passes(law: dict, report: dict, samples) -> None:
         except (ValueError, QhullError):
             continue
         law[key]["held_out"] = {"hull": hull, "bands": _bands(got)}
+
+
+def _mark_dp_passes(law: dict, report: dict, samples, dp: int) -> None:
+    """`mark_held_out` for a data-parallel draft law's `PASSES` vectors: each
+    run's steps priced by the vector fitted on the other runs, banded by
+    vector; a `GROUPED` vector's step is its ranks' (`_pass_steps`), priced as
+    the max over them, another's each rank's sample at its own label."""
+    from scipy.spatial import QhullError
+
+    for name, mine in _pass_samples(samples).items():
+        runs = list(dict.fromkeys(s.provenance["run"] for s in mine))
+        if name not in law or len(runs) < 2:
+            continue
+        label, width, rows = PASSES[name], dp if name in GROUPED else 1, []
+        for run in runs:
+            others = [s for s in mine if s.provenance["run"] != run]
+            fold = _propose(others, label, width, samples)
+            if fold is None:
+                continue
+            c = list(fold["coefficients"].values())
+            held = [s for s in mine if s.provenance["run"] == run]
+            if width > 1:
+                steps = _pass_steps(held, label, dp, samples)[0]
+            else:
+                steps = [
+                    [(run, None, (1, len(s.view.requests)), getattr(s, label))]
+                    for s in held
+                ]
+            for step in steps:
+                price = {j: (float(np.dot(c, r[2])), r[2]) for j, r in enumerate(step)}
+                top = priced_rank(price)
+                error = price[top][0] / step[top][3] - 1.0
+                rows.append((run, "", name, step[top][2], error))
+        for run in dict.fromkeys(r[0] for r in rows):
+            bands = _bands([r for r in rows if r[0] == run])
+            report["held_out"].setdefault(run, {}).update(bands)
+        if not rows:
+            continue
+        try:
+            points = np.array([r[3] for r in rows], dtype=np.float64)
+            hull = _hull(points[:, 1:], PROPOSE[1:])
+        except (ValueError, QhullError):
+            continue
+        law[name]["held_out"] = {"hull": hull, "bands": _bands(rows)}
 
 
 def host_held_out(samples) -> dict:
@@ -2214,16 +3076,32 @@ def _platform_arg(value: str) -> dict:
 
 
 def offload_main(argv) -> None:
-    """``offload LOG... --out ENTRY``: write `fit_offload`'s entry, and print
-    each term with its fit."""
+    """``offload LOG... --out ENTRY [--master-flags FLAGS --capacity-bytes
+    BYTES]``: write `fit_offload`'s entry, and print each term with its fit."""
     parser = argparse.ArgumentParser(
         prog="python -m atom.compass.backends.step_linear_fit offload",
         description=fit_offload.__doc__.split("\n\n")[0],
     )
-    parser.add_argument("logs", nargs="+", help="real server logs at OFFLOAD_PROFILE")
+    parser.add_argument(
+        "logs",
+        nargs="+",
+        help="real server logs at OFFLOAD_PROFILE, a Mooncake Store's also at "
+        "ATOM_LOG_LEVEL=DEBUG",
+    )
     parser.add_argument("--out", required=True, help="where the entry is written")
+    parser.add_argument(
+        "--master-flags",
+        type=shlex.split,
+        help="a Mooncake Store's mooncake_master flags, as one string; the entry "
+        "keeps them as argv",
+    )
+    parser.add_argument(
+        "--capacity-bytes",
+        type=int,
+        help="the bytes a Mooncake Store's owners mounted, summed",
+    )
     args = parser.parse_args(argv)
-    entry, report = fit_offload(args.logs)
+    entry, report = fit_offload(args.logs, args.master_flags, args.capacity_bytes)
     Path(args.out).write_text(json.dumps(entry) + "\n")
     for name, fit in report.items():
         print(f"{name}: {json.dumps(entry[name])} {json.dumps(fit)}")
@@ -2253,14 +3131,19 @@ def _records_parser(prog: str, description: str) -> argparse.ArgumentParser:
 def _labelled(args) -> tuple[list, dict, dict, dict]:
     """`args.records`' samples, each record's table, the options `fit` takes
     on them and the engine config they ran under. A record whose server built
-    an aiter JIT module refuses, and so does an engine file that contradicts
-    `--engine` at the records' longest ladder."""
+    an aiter JIT module refuses as `step_labels.cut_refusal` says, and so does
+    an engine file that contradicts
+    `--engine` at the records' longest ladder. A record's steps are cut by the
+    compiles the run.json it was checked on times."""
+    spans = {}
     for record in args.records:
         run = Path(record).resolve().parent.parent / "run.json"
-        if run.is_file() and (
-            built := step_labels.refusal(json.loads(run.read_text()))
+        identity = json.loads(run.read_text()) if run.is_file() else None
+        if identity is not None and (
+            built := step_labels.cut_refusal(identity, [json_file.read_jsonl(record)])
         ):
             raise ValueError(f"{record} is not fitted: {built}")
+        spans[record] = step_labels.cut_spans(identity)
     owns = {Path(r).with_suffix(".engine.json"): r for r in args.records}
     stated = {r: stated_buckets(r) for r in args.records}
     if args.engine:
@@ -2279,7 +3162,7 @@ def _labelled(args) -> tuple[list, dict, dict, dict]:
     dp = join_width(engine)
     options = {"form": args.form, "dp": dp, "moe_routing": args.moe_routing}
     options["buckets"] = recorded_buckets(stated)
-    samples, tables = label_records(args.records, dp)
+    samples, tables = label_records(args.records, dp, spans)
     return samples, tables, options, engine
 
 
@@ -2354,6 +3237,7 @@ def figures_main(argv) -> None:
     if runs is None:
         raise ValueError(f"{args.law} states no runs to hold the records to")
     samples, _, options, _ = _labelled(args)
+    options["draft_moe_routing"] = _law_routing(law.get("draft", {}))
     given = {s.provenance["run"] for s in samples}
     if differ := sorted(given ^ set(runs)):
         raise ValueError(
@@ -2452,16 +3336,20 @@ def main(argv=None) -> None:
             **args.platform["host_laws"],
             "engine": engine | graphs,
         }
+        law["host"]["key"]["fit_src"] = fit_src(law["host"])
     if len(args.records) > dp:
         mark_held_out(law, report, samples, options)
+    fill_rungs(law, engine.get("ladder"))
+    if warning := filled_warning(law):
+        print(warning, file=sys.stderr)
     json_file.write_json(law, args.out)
     print(f"cut: {json.dumps(law['cut'])}")
     print(f"unfitted: {json.dumps(law['unfitted'])}")
+    print(f"filled: {json.dumps(law.get('filled', {}))}")
     for name, vector in [("prefill", law.get("prefill"))] + list(law["decode"].items()):
         if vector:
-            print(
-                f"{name}: {json.dumps(vector['coefficients'])} {json.dumps(vector['fit'])}"
-            )
+            fitted = vector.get("fit", vector.get("declared"))
+            print(f"{name}: {json.dumps(vector['coefficients'])} {json.dumps(fitted)}")
     for name, vector in law.get("draft", {}).items():
         if isinstance(vector, dict) and "coefficients" in vector:
             held = vector.get("held_out", {}).get("bands", {})

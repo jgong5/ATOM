@@ -224,7 +224,7 @@ def ranks(geometry, monkeypatch):  # noqa: F811
     def rank(lp, role, r):
         rt = LPRuntime(LpId(lp), TABLE, Script())
         rt.start_run()
-        parallel = SimpleNamespace(data_parallel_rank=r)
+        parallel = SimpleNamespace(data_parallel_rank=r, data_parallel_size=DP)
         half = connector(
             rt,
             monkeypatch,
@@ -244,7 +244,8 @@ def ranks(geometry, monkeypatch):  # noqa: F811
 
 def _transfer(ranks, served_by: int, taken_by: int):
     """A request prefill rank `served_by` finished at 0: decode rank 1 sends its
-    write request, and prefill rank `taken_by` takes it at 1.0."""
+    write request, once its admission step's forward returns with its device
+    work done, and prefill rank `taken_by` takes it at 1.0."""
     rt_d, d = ranks.d
     params = {"do_remote_prefill": True, "transfer_id": 9, "dp_rank": served_by}
     d.update_state_after_alloc(
@@ -256,6 +257,7 @@ def _transfer(ranks, served_by: int, taken_by: int):
             num_cached_tokens=0,
         )
     )
+    d.device_done(None)
     channel, seq, arrival = rt_d.send_log[-1]
     rt_p, p = ranks.p[taken_by]
     p.request_finished(
@@ -305,6 +307,7 @@ def test_both_ends_of_each_rank_pair_queue_the_same_writes(ranks):
                 num_cached_tokens=0,
             )
         )
+        d.device_done(None)
         channel, seq, arrival = rt_d.send_log[-1]
         released[p].setdefault(channel, []).append((seq, arrival))
         ranks.p[p][1].request_finished(

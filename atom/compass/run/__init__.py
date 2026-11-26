@@ -46,7 +46,8 @@ member, the frontend's included, connects to.
   each HTTP request's intake, beside the step record instead.
 - `http_intake()` is what `atom.utils.compass_loop.HttpChannel` charges the
   frontend's event loop for each request it takes in, from the ``host``
-  entry's ``http_intake`` term.
+  entry's ``http_intake`` term; `http_stream()`, for each SSE event a
+  streamed response sends, from its ``http_stream`` term.
 - `engine_done(engine)` and `frontend_done(engine)` close each side after the
   finish, each handing in its LP's refusals; the frontend's, when it co-hosts
   the authority, then writes the step table and the run summary. A SIGINT or
@@ -83,7 +84,7 @@ priced by `StepLinearBackend`; its ``platform``, the platform fields of its key,
 and its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run under
 any other, a run whose ladder is a prefix of the law's read at the law's, and a
 law missing either refuses; a runner that records prefill token-graph buckets
-refuses a law whose engine config, or else prefill vector, states none or others
+refuses a law whose prefill vector, or else engine config, states none or others
 (`refuse_other_buckets`); a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
@@ -115,11 +116,15 @@ essential work is left, and the last one's end finishes the run),
 ``local_grants`` (optional, ``true``, the default, or ``false``: with ``true``
 the authority gives each grant a ceiling, below which the LP answers its own
 clock calls and reports them with its next one, a DP member at its settle,
-`ClockAuthority`; the step table is the same),
+`ClockAuthority`; the sends are the same, and so is the step table but for an
+own step walking an arrival on an offering channel: one ``TAR`` row where a
+run with ``false`` records ``ARRIVAL`` and ``TAR``),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
-on ``(1, tokens, seqs)``; with any laws, a forward whose kind has none for a
+on ``(1, tokens, seqs)``, and per segment of ``dummy``, a DP rank's dummy
+forward at a step its group prefills, priced by ``decode``'s where it states
+none; with any laws, a forward whose kind has none for a
 segment it runs and ``skip`` does not name is refused, that segment costing 0 s
 (`HostDeviceRecurrence.device_end`); ``key``, the `host_key` they were
 fitted under and the platform fields of their store key, which a run with
@@ -142,7 +147,13 @@ the characters its stored-prefix search compared, and a ``decode`` in their plac
 token counts outside which a decode is refused and charged 0 s; ``http_intake``,
 ``fixed_s`` and ``per_byte_s``, with ``idle_s`` optional and ``bytes``, the
 ``[lo, hi]`` body bytes it was fitted over, outside which an intake is refused
-and charged 0 s; a term an entry lacks, or every term with no entry, is
+and charged 0 s; a prefill-decode run's prefill entry's ``relay``,
+``fixed_s`` and ``per_byte_s``, with ``bytes`` optional, the time a response
+takes from prefill's server to decode's app call through the router, whose
+part past ``router_s`` decode's API server loop serves each relayed response,
+queued with the others in flight there (`relay`), and which a
+prefill-decode run with no entry stating it names under
+``uncharged_host_terms``; a term an entry lacks, or every term with no entry, is
 charged 0 s and the run summary names it, a kind of tokenizer call as
 ``tokenizer.<kind>`` and a ``segment`` without ``chars_per_s`` as
 ``tokenizer.segment.chars_per_s``, under ``uncharged_host_terms``; ``hops``, the
@@ -218,8 +229,8 @@ its ``kv_transfer_config`` as ``compass_instance``; above one, its LPs carry
 the index (``engine-P1``), and the router is the ``router`` LP, which chooses
 among them. An optional ``worker_order`` gives, by side (``P`` or ``D``), the
 (instance, DP rank) pairs in the order that LP's policies list the side's
-workers, each once (`worker_order`); a side it does not name is sorted by URL
-and rank. `frontend(config)` refuses such a
+workers, each once (`worker_order`); a side it does not name lists them by
+instance, then rank. `frontend(config)` refuses such a
 deployment unless the authority is standalone: a prefill-decode run spans two
 API servers that must share one.
 
@@ -237,10 +248,29 @@ first stamped request LP ``lmcache`` sizes a chunk and a rank's state image
 from what each member of the engine it serves planned (`_lmcache_plan`), as a
 prefill-decode connector prices its transfer. The copy engine
 prices on the machine's ``interconnect.host_link``. Its channels' lookahead is
-``lmcache_ipc_s``, the run's ``ipc_s`` when absent (`add_lmcache`). `engine(config)`
+``lmcache_ipc_s``, the run's ``ipc_s`` when absent (`add_lmcache`); with
+``OFFLOAD_MP_LOOKUP_THREAD`` set, in the authority's process as in each
+engine's, the channels whose handlers offer a lookup are offering. `engine(config)`
 has the connector factory build ``lmcache_mp`` as Compass's
 (`atom.compass.kv.lmcache_mp`), whose scheduler half sends each transfer to LP
 ``lmcache`` from the step loop.
+
+A deployment that offloads KV to a shared Mooncake Store (``mooncake_store``),
+the prefill side of a prefill-decode run or the run's one deployment, needs a
+``mooncake_store`` entry (`atom.compass.kv.mooncake_store_server`), and a run
+file with one needs such a deployment. Each such frontend checks its
+deployment against the entry, and the first prefill deployment's, or the one
+deployment's, starts LP ``mooncake_store`` (`mooncake_store`) in a process of
+its own. Its channels to each DP rank of each engine it serves take half the
+entry's fixed lookup term, and each such engine's request channels are
+offering, as its input thread offers an arrival's lookup
+(`add_mooncake_store`); the run file alone sets both, so the authority's
+process marks them as each engine's does. Each such engine has the
+connector factory build ``mooncake_store`` as Compass's
+(`atom.compass.kv.mooncake_store`), whose scheduler half sends the Store's
+lookups and renewals to LP ``mooncake_store`` and prices its copies on each
+rank's lanes, and a DP member of one parks before its forward, as one
+offloading to ``lmcache_mp`` does.
 
 A deployment that offloads KV through ATOM's in-process ``lmcache_offload``
 needs an ``lmcache_offload`` entry, which `atom.compass.kv.lmcache_offload`
@@ -251,6 +281,11 @@ lookups and copies from the entry. Each such engine's hand-in holds
 ``offload``, and the summary carries it over the client run's steps, with the
 GPU and CPU hit rates: prefix-cache hits and tier loads over the prompt tokens
 the prefix cache counted.
+
+An optional ``ingress`` states an encoding ingress in front of the run's
+first server, or its router (`atom.compass.ingress`), which a ``host`` entry
+may state as a term of its own: the traffic LP prices its hop on the HTTP
+channel, so no server LP reads it and the channel table is the same.
 
 The API server's ``--compass-clock-endpoint`` sets `CLOCK_ENV`: the authority
 is not co-hosted but served by `authority`, its own process started before the
@@ -309,11 +344,14 @@ from atom.compass.clock import (
     prefill_decode_table,
     single_engine_table,
 )
-from atom.compass.clock.channels import add_lmcache
+from atom.compass.clock.channels import add_lmcache, add_mooncake_store
 from atom.compass.clock_transport import connect, connect_here, serve
 from atom.compass.detect.determinism import StepTable
+from atom.compass.ingress import KEY as INGRESS
+from atom.compass.ingress import check as check_ingress
+from atom.compass.ingress import stated as stated_ingress
 from atom.compass.runner import COMPASS_RAPIDSERVE_QUALNAME, COMPASS_RUNNER_QUALNAME
-from atom.utils import clock
+from atom.utils import clock, envs
 
 ENV = "ATOM_COMPASS_RUN"
 CLOCK_ENV = "ATOM_COMPASS_CLOCK_ENDPOINT"
@@ -322,6 +360,9 @@ CLOCK_ENV = "ATOM_COMPASS_CLOCK_ENDPOINT"
 NOW_ENV, NOW_FILE = "ATOM_COMPASS_NOW", "now-{}.bin"
 FRONTEND, ENGINE, TRAFFIC = LpId("frontend"), LpId("engine"), LpId("traffic")
 ROUTER, LMCACHE = LpId("router"), LpId("lmcache")
+MOONCAKE_STORE = LpId("mooncake_store")
+#: The run-file key, and the connector name, of a shared Mooncake Store.
+ENTRY_STORE = MOONCAKE_STORE.name
 #: Run-file keys for how many deployments of each prefill-decode side run.
 INSTANCES = {"P": "prefill_instances", "D": "decode_instances"}
 #: Run-file keys for each prefill-decode side's DP width.
@@ -366,16 +407,22 @@ ACCEPTANCE_RECORD = "acceptance_record"
 AUTHORITY_FILE = "authority_endpoint.txt"
 #: Wall seconds the summary's writer waits for the server LPs' refusals.
 HAND_IN_WAIT_S = 300.0
-#: Wall seconds a prefill-decode engine, or LP lmcache, waits for every engine's
-#: planned block.
+#: Wall seconds a prefill-decode engine, LP lmcache or LP mooncake_store waits
+#: for every engine's planned block.
 PLANNED_BLOCK_WAIT_S = 300.0
 #: The format of the run summary; raise it when a field is added, changes
 #: meaning or goes.
-SUMMARY_SCHEMA_VERSION = 14
+SUMMARY_SCHEMA_VERSION = 15
 #: The reading kind of ATOM's source as `atom_digest` reads it.
 ATOM_PY = "atom_py"
 #: The terms of a ``host`` entry the frontend charges, each 0 s where it is absent.
 HOST_TERMS = ("http_intake", "tokenizer")
+#: A prefill-decode run's prefill host entry's term pricing the relay of its
+#: response through the router to decode (`relay`).
+RELAY_TERM = "relay"
+#: A streaming server's host entry's term pricing its API loop's work per SSE
+#: event it sends (`http_stream`).
+STREAM_TERM = "http_stream"
 #: The kinds of call a ``tokenizer`` term prices, each 0 s where it is absent.
 TOKENIZER_KINDS = ("encode", "encode_batch", "decode", "segment")
 #: A ``host`` entry's ``hops``, each optional and the run-file key of its name:
@@ -402,6 +449,13 @@ COMPASS_ONLY = {
     },
     "utils/zmq_shim.py": {"_Socket", "_ChannelSocket", "_Context"},
 }
+#: A simulated server's tokenizer environment. The segment tokenizer encodes a
+#: long prompt's uncached segments in one ``encode_batch`` call, and while its
+#: station job is open the frontend's clock stands still, so every other LP
+#: waits on its wall time; the C1228 recipe's environment turns the backend's
+#: parallelism off, which jgong5/ATOM#3992 measured. In parallel the ids are
+#: the same.
+_PARALLEL_TOKENIZER = {"TOKENIZERS_PARALLELISM": "true"}
 #: The module `pip install -e .` writes (setuptools_scm) and git ignores: no
 #: commit holds it, so the host-law key leaves it out.
 INSTALL_WRITTEN = Path("_version.py")
@@ -539,14 +593,26 @@ def refuse_unfitted_law(run: dict, config) -> None:
         )
 
 
+def _holds_laws(host: dict) -> bool:
+    """Whether the host laws `host` hold laws that price a step: at their top,
+    or, above one pipeline stage, in a stage's part under ``stages``
+    (`fit.host`), all under the one key at their top."""
+    return any(part.get("laws") for part in [host, *(host.get("stages") or ())])
+
+
 def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     """Refuse the run file's step linear law on a runner that records the
     prefill token-graph buckets `buckets`, ascending, where the law states none
-    or others: in its engine config, which `refuse_unfitted_law` held to
-    `config`'s, or else in its prefill vector, those its records' runner
-    recorded. An engine config states them only off ATOM's default, which can
-    move between a fit and a run, so one stating none says nothing of them. Host
-    laws refuse where their key's graph sets state others; `run` replaces `spec()`."""
+    or others: in its prefill vector, those its records' runner recorded, or
+    else in its engine config, which `refuse_unfitted_law` held to `config`'s.
+    An engine config states them only off ATOM's default, which can move
+    between a fit and a run, so one stating none says nothing of them; one
+    stating them states ATOM's list, which a runner records only up to
+    `warmup_max_tokens`, a bound no engine config keys, so a prefill vector's
+    are held to `buckets` either way. Above one pipeline stage, each stage's
+    part under ``stages`` (`fit.steps`) is held so, the first that fails
+    named. Host laws refuse where their key's graph sets state others; `run`
+    replaces `spec()`."""
     if not buckets or (run := spec() if run is None else run) is None:
         return
     from atom.compass.backends import launch_features
@@ -554,7 +620,7 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
 
     pick_fitted(run, "host", config)
     host = run.get("host") or {}
-    graphs = host.get("laws") and launch_features.stated(host.get("key"))[1]
+    graphs = _holds_laws(host) and launch_features.stated(host.get("key"))[1]
     if graphs and (theirs := graphs["token"]["prefill"]) != list(buckets):
         raise ValueError(
             f"the host laws' key states the prefill token-graph buckets {theirs}, "
@@ -564,13 +630,18 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
         return
     pick_fitted(run, STEP_LINEAR, config)
     law = run[STEP_LINEAR]
-    stated = sorted((law.get("prefill") or {}).get("buckets") or ())
-    if BUCKETS not in law["engine_config"]["env"] and stated != list(buckets):
-        raise ValueError(
-            f"the step linear law states no {BUCKETS} in its engine config and "
-            f"{stated or 'none'} as its prefill vector's buckets, and this run's "
-            f"runner records the prefill token-graph buckets {list(buckets)}"
-        )
+    env = law["engine_config"]["env"]
+    stages = law.get("stages")
+    for k, part in enumerate(stages) if stages else [(None, law)]:
+        stated = sorted((part.get("prefill") or {}).get("buckets") or ())
+        if (stated or BUCKETS not in env) and stated != list(buckets):
+            said = f"{BUCKETS}={env[BUCKETS]}" if BUCKETS in env else f"no {BUCKETS}"
+            whose = "its" if k is None else f"pipeline stage {k}'s"
+            raise ValueError(
+                f"the step linear law states {said} in its engine config and "
+                f"{stated or 'none'} as {whose} prefill vector's buckets, and this "
+                f"run's runner records the prefill token-graph buckets {list(buckets)}"
+            )
 
 
 def refuse_context_parallel(name: str, config) -> None:
@@ -591,14 +662,15 @@ def refuse_context_parallel(name: str, config) -> None:
 
 def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     """Refuse the run file's host laws `host` when fitted under another host
-    key than this run's, on `platform` (`machine_platform`), the host CPU and
-    graph sets their key states taken as this run's, which records none, and
-    its engine config read at their ladder where this run's is a prefix of it."""
+    key than this run's, on `platform` (`machine_platform`), the host CPU,
+    graph sets and digest of what was fitted (``fit_src``) their key states
+    taken as this run's, which records none, and its engine config read at
+    their ladder where this run's is a prefix of it."""
     from atom.compass.artifacts import Kind, keyed_platform
     from atom.compass.backends.launch_features import GRAPHS, stated
     from atom.compass.backends.step_grid_plan import at_ladder
 
-    ours = host.get("laws") and {
+    ours = _holds_laws(host) and {
         **host_key(config),
         **keyed_platform(Kind.HOST_LAWS, platform),
     }
@@ -607,6 +679,9 @@ def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
     if ours and "host_cpu" in theirs:
         # The host they timed is the host the run predicts, from any CPU.
         ours["host_cpu"] = theirs["host_cpu"]
+    if ours and "fit_src" in theirs:
+        # The digest of the laws themselves, which says nothing of the run.
+        ours["fit_src"] = theirs["fit_src"]
     if ours:
         ours["engine"] = at_ladder(ours["engine"], theirs.get("engine"))
     if ours and launch[1] is not None:
@@ -668,6 +743,7 @@ def spec() -> dict | None:
         )
     for host in entries(run, "host"):
         _check_host(path, host)
+    stated_ingress(run)
     run["clock_endpoint"] = os.environ.get(CLOCK_ENV, run.get("clock_endpoint"))
     return run
 
@@ -675,25 +751,40 @@ def spec() -> dict | None:
 def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time, or
     whose ``tokenizer`` or ``http_intake`` term the frontend would misread."""
-    from atom.compass.runner.overrides import ADMISSION_IN_E, FORWARD_KINDS, SEGMENTS
+    from atom.compass.runner.overrides import ADMISSION_IN_E, HOST_LAW_KINDS, SEGMENTS
 
     laws, columns = host.get("laws", {}), host.get("columns", {})
     if (
-        set(host) - {"laws", "skip", "key", "admit", "hops", "columns", *HOST_TERMS}
+        set(host)
+        - {
+            "laws",
+            "skip",
+            "key",
+            "admit",
+            "hops",
+            "columns",
+            *HOST_TERMS,
+            INGRESS,
+            RELAY_TERM,
+            STREAM_TERM,
+        }
         or set(host.get("skip", ())) - set(SEGMENTS)
-        or {*laws, *columns} - set(FORWARD_KINDS)
+        or {*laws, *columns} - set(HOST_LAW_KINDS)
         or {s for v in (*laws.values(), *columns.values()) for s in v} - set(SEGMENTS)
         or {len(c) for v in laws.values() for c in v.values()} - {3}
         or len(host.get("admit") or ADMISSION_IN_E) != 3
     ):
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
-            f"laws, mapping {FORWARD_KINDS} to segments to three coefficients, "
+            f"laws, mapping {HOST_LAW_KINDS} to segments to three coefficients, "
             "columns, mapping them to segments to launch features' coefficients, "
             "admit, three coefficients on a forward's admissions or null, "
-            "key, the host key the laws were fitted under, hops, and the terms "
-            f"{' and '.join(HOST_TERMS)}"
+            "key, the host key the laws were fitted under, hops, the terms "
+            f"{' and '.join(HOST_TERMS)}, {RELAY_TERM}, {STREAM_TERM}, and {INGRESS}, "
+            "the encoding ingress in front of the deployment (atom.compass.ingress)"
         )
+    if INGRESS in host:
+        check_ingress(host[INGRESS], f"{path}: host's {INGRESS}")
     hops = host.get("hops", {})
     if not (_seconds(hops, set(), set(HOPS)) and all(v > 0 for v in hops.values())):
         raise ValueError(
@@ -733,6 +824,28 @@ def _check_host(path, host: dict) -> None:
             "per_byte_s, and idle_s optional, each a non-negative number, and "
             "bytes optional, the body bytes it was fitted over, [lo, hi]"
         )
+    term = host.get(RELAY_TERM)
+    hull = term.get("bytes", [0, 0]) if isinstance(term, dict) else None
+    if term is not None and not (
+        _seconds(
+            {k: v for k, v in term.items() if k != "bytes"},
+            {"fixed_s", "per_byte_s"},
+        )
+        and isinstance(hull, list)
+        and _seconds(dict(enumerate(hull)), {0, 1})
+        and hull[0] <= hull[1]
+    ):
+        raise ValueError(
+            f"{path}: host's relay is {term!r}; it takes fixed_s and per_byte_s, "
+            "each a non-negative number, and bytes optional, the bytes of the "
+            "requests it was fitted over, [lo, hi]"
+        )
+    term = host.get(STREAM_TERM)
+    if term is not None and not _seconds(term, {"per_event_s"}):
+        raise ValueError(
+            f"{path}: host's {STREAM_TERM} is {term!r}; it takes per_event_s, a "
+            "non-negative number"
+        )
 
 
 def _rate(term, kind: str) -> bool:
@@ -771,19 +884,24 @@ def _dp(run: dict, side: str | None = None) -> int:
 
 
 def worker_order(run: dict) -> dict:
-    """The run file's ``worker_order``, ``{}`` when absent. Refuses a side
-    other than ``P`` and ``D``, and a list that is not each of the side's
-    (instance, DP rank) pairs once."""
-    order = run.get(WORKER_ORDER, {})
-    for side, pairs in order.items():
-        known = side in INSTANCES
-        n, dp = (run.get(INSTANCES[side], 1), _dp(run, side)) if known else (0, 0)
-        if not n or sorted(pairs) != [[k, r] for k in range(n) for r in range(dp)]:
+    """Each side's (instance, DP rank) pairs, ``P`` then ``D``, in the order
+    the router LP lists that side's workers: the run file's ``worker_order``
+    where it names the side, else by instance, then rank, never by the
+    workers' URLs, whose ports deploy.sh draws afresh each run. Refuses a
+    side other than ``P`` and ``D``, and a list that is not each of the
+    side's (instance, DP rank) pairs once."""
+    named = run.get(WORKER_ORDER, {})
+    order = {
+        side: [[k, r] for k in range(run.get(key, 1)) for r in range(_dp(run, side))]
+        for side, key in INSTANCES.items()
+    }
+    for side, pairs in named.items():
+        if not order.get(side) or sorted(pairs) != order[side]:
             raise ValueError(
                 f"{WORKER_ORDER}[{side!r}] is {pairs}: name side P or D, and list "
                 "each of its deployments' (instance, DP rank) pairs once"
             )
-    return order
+    return order | named
 
 
 def _widths(run: dict) -> int | tuple[int, int]:
@@ -815,20 +933,34 @@ def _pp(run: dict, side: str | None = None) -> int:
 
 
 def channel_table(run: dict):
+    from atom.compass.kv import mooncake_store_server as store
+
+    pd = "router_s" in run
+    for entry, why in (
+        ("lmcache", "ATOM's lmcache_mp does not run under PP"),
+        (store.ENTRY, "LP mooncake_store serves no pipelined prefill"),
+    ):
+        if entry in run and _pp(run, "P") > 1:
+            raise ValueError(
+                f"the run file's {entry} entry and a pipeline above one stage: "
+                f"{why}"
+            )
     table = _engines_table(run)
-    if "lmcache" in run and _pp(run, "P") > 1:
-        raise ValueError(
-            "the run file has an lmcache entry and a pipeline above one stage: "
-            "ATOM's lmcache_mp does not run under PP"
-        )
     if "lmcache" in run:
-        pd = "router_s" in run
         add_lmcache(
             table,
             _lmcache_engine(run),
             run.get("lmcache_ipc_s", hop(run, "ipc_s")),
             _dp(run, "P" if pd else None),
+            envs.OFFLOAD_MP_LOOKUP_THREAD,
         )
+    if store.ENTRY in run:
+        # Every engine LP of the prefill side, or the run's one engine.
+        names = [lp.name for lp in table.registry.ids()]
+        engines = [n for n in names if re.fullmatch(r"engine(-P\d*)?", n)]
+        store.check_entry(run[store.ENTRY])
+        rpc_s = store.store_rpc_s(run[store.ENTRY])
+        add_mooncake_store(table, engines, rpc_s, _dp(run, "P" if pd else None))
     return table
 
 
@@ -1163,9 +1295,26 @@ def _launch_lmcache(config, run: dict, side: str | None) -> None:
             f"number of this deployment's {block}-token KV blocks "
             "(kv_cache_block_size), which ATOM's lmcache_mp workers refuse"
         )
+    _start_lp(LMCACHE_MAIN, str(block))
+
+
+def _outlive_the_group_stop() -> None:
+    """A shared server's LP ignores SIGTERM. `compass run` stops its server's
+    whole process group (`drive/serve.py::_stop`), the LPs its frontend started
+    among it, while the frontend's stop is what finishes the run: an LP that
+    took the SIGTERM died before the ``+inf`` grant that ends it, its hand-in
+    unwritten, and the run summary waited `HAND_IN_WAIT_S` for it and failed.
+    The grant ends it, and the group's SIGKILL after the stop's grace one that
+    never gets the grant."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
+def _start_lp(main: str, *args: str) -> None:
+    """Start a shared server's LP in a process of its own: `main` run with
+    `args`, importing this tree's ATOM."""
     paths = [str(Path(atom.__file__).parents[1]), os.environ.get("PYTHONPATH")]
     subprocess.Popen(
-        [sys.executable, "-c", LMCACHE_MAIN, str(block)],
+        [sys.executable, "-c", main, *args],
         env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, paths))},
     )
 
@@ -1185,6 +1334,7 @@ def lmcache(block_tokens: int) -> None:
     from atom.compass.kv import TransferModel
     from atom.compass.kv.lmcache_server import LMCacheLP, LMCacheServer
 
+    _outlive_the_group_stop()
     run = spec()
     rt = _runtime(LMCACHE, run)
     rt.client_run_ended = lambda k: _hand_in(run, LMCACHE.name, rt.refusals, k)
@@ -1201,6 +1351,10 @@ def lmcache(block_tokens: int) -> None:
         return TransferModel(*link, server.chunk_bytes)
 
     sock = zmq.Context.instance().socket(zmq.ROUTER)
+    # No high-water mark: past one, ROUTER drops a reply to an engine that lags
+    # behind, whose future then never resolves, as PUB dropped the traffic LP's
+    # cancels (compass_harness/traffic_lp.py). Set before the bind.
+    sock.setsockopt(zmq.SNDHWM, 0)
     sock.bind(server.url)
     ended = []
     try:
@@ -1211,6 +1365,145 @@ def lmcache(block_tokens: int) -> None:
     finally:
         _hand_in(run, LMCACHE.name, rt.refusals + ended)
         sock.close(linger=0)
+
+
+def _launch_mooncake_store(config, run: dict, side: str | None) -> None:
+    """Check a deployment that offloads KV to a shared Mooncake Store against
+    the run file's entry, and on the first prefill deployment, or the run's
+    one, start LP `mooncake_store` in a process of its own, given its KV block
+    tokens. Refuse a deployment and a run file that disagree on whether the
+    Store runs, a decode side or a pipeline that offloads to it, pools that
+    address several masters, and a deployment whose Store settings or worker
+    widths differ from those the entry was fitted at."""
+    from atom.compass.kv import mooncake_store_server as store
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+    from atom.kv_transfer.offload.kv_store.pool import _SLOT_ALIGN, _round_up
+    from atom.kv_transfer.offload.mooncake_store.config import (
+        parse_mooncake_store_config,
+    )
+    from atom.utils import envs
+
+    leaves = KVConnectorFactory.leaf_connectors(config) or ()
+    sub = next((c for name, c in leaves if name == store.ENTRY), None)
+    offloads = sub is not None
+    if offloads != (store.ENTRY in run) and (offloads or side != "D"):
+        raise ValueError(
+            f"this deployment {'offloads' if offloads else 'offloads no'} KV to a "
+            f"Mooncake Store and the run file {'has no' if offloads else 'has a'} "
+            f"{store.ENTRY} entry; LP mooncake_store runs exactly when the "
+            "prefill or only deployments offload to one"
+        )
+    if not offloads:
+        return
+    if side == "D":
+        raise ValueError(
+            "this decode side offloads KV to a Mooncake Store; LP mooncake_store "
+            "serves the prefill side"
+        )
+    if config.pipeline_parallel_size > 1:
+        raise ValueError(
+            f"this deployment runs {config.pipeline_parallel_size} pipeline stages "
+            "and offloads KV to a Mooncake Store; LP mooncake_store serves no "
+            "pipelined prefill"
+        )
+    entry = run[store.ENTRY]
+    store.check_entry(entry)
+    cfg = parse_mooncake_store_config(sub.kv_transfer_config)
+    if len(masters := cfg.store_masters()) > 1:
+        raise ValueError(
+            f"mooncake_store.pools addresses {len(masters)} masters "
+            f"({', '.join(m.master for m in masters)}); LP mooncake_store plays one"
+        )
+    stride = _round_up(entry["chunk_bytes"], _SLOT_ALIGN)
+    here = {
+        "protocol": cfg.protocol,
+        "chunk_tokens": cfg.chunk_tokens,
+        "world": 1 if config.enable_dp_attention else config.tensor_parallel_size,
+        "save_slots": cfg.save_pool_bytes // stride,
+        "load_slots": cfg.load_pool_bytes // stride,
+        "save_workers": envs.OFFLOAD_COPY_WORKERS,
+        "load_workers": envs.OFFLOAD_LOAD_WORKERS,
+    }
+    if differ := [
+        f"{k} {v} (the entry's {entry[k]})" for k, v in here.items() if v != entry[k]
+    ]:
+        raise ValueError(
+            f"this deployment's {', '.join(differ)}: the {store.ENTRY} entry's "
+            "laws were fitted at its fields"
+        )
+    if (_pd_kv(config) or {}).get(INSTANCE_KEY, 0) == 0:
+        _start_lp(MOONCAKE_STORE_MAIN, str(config.kv_cache_block_size))
+
+
+#: LP `mooncake_store`'s process, given the deployment's KV block tokens.
+MOONCAKE_STORE_MAIN = (
+    "import sys; from atom.compass import run; run.mooncake_store(int(sys.argv[1]))"
+)
+
+
+def mooncake_store(block_tokens: int) -> None:
+    """LP `mooncake_store`: a shared Mooncake Store's master on the run's clock
+    until its ``+inf`` grant, then its hand-in, which carries its counts
+    (`mooncake_store_server.COUNTS`) as ``store``. It serves at a port on the
+    clock endpoint's host and names that endpoint in the out_dir's
+    `ENDPOINT_FILE`. At its first stamped request, once every member of the
+    engines it serves has planned its pool, it checks their plans against the
+    entry (`check_plans`), each chunk `block_tokens` KV blocks of tokens. At
+    the end of each client run, after its hand-in, an entry stating
+    ``clear_between_client_runs`` has it empty the Store and mount it at the
+    next client run's size (`MooncakeStoreLP.clear`)."""
+    import zmq
+
+    from atom.compass.kv import mooncake_store_server as store
+
+    _outlive_the_group_stop()
+    run = spec()
+    entry = run[store.ENTRY]
+    rt = _runtime(MOONCAKE_STORE, run)
+    served = {c.source.name for c in rt.table.channels_into(MOONCAKE_STORE)}
+    members = [n for n in _hand_ins(run) if n.partition(".")[0] in served]
+
+    def check_plans() -> None:
+        store.check_plans(entry, _published_plans(run, members), block_tokens)
+
+    sock = zmq.Context.instance().socket(zmq.ROUTER)
+    host = run["clock_endpoint"].rpartition(":")[0]
+    port = sock.bind_to_random_port(host)
+    _write_whole(Path(run["out_dir"]) / store.ENDPOINT_FILE, f"{host}:{port}")
+    lp = store.MooncakeStoreLP(
+        rt,
+        sock,
+        store.Master(entry),
+        lookup_s=entry["lookup_s"],
+        check_plans=check_plans,
+    )
+    name = MOONCAKE_STORE.name
+    rt.client_run_ended = _store_client_run_ended(run, rt, lp)
+    ended = []
+    try:
+        lp.serve()
+    except BaseException as e:
+        ended = [f"ended:{name} raised {e!r}"]
+        raise
+    finally:
+        _hand_in(run, name, rt.refusals + ended, store=lp.counts)
+        sock.close(linger=0)
+
+
+def _store_client_run_ended(run: dict, rt, lp):
+    """LP `mooncake_store`'s `client_run_ended`: at the end of client run ``k``
+    its hand-in, then, where the entry states ``clear_between_client_runs``, an
+    empty Store mounted at client run ``k + 1``'s size (`MooncakeStoreLP.clear`)."""
+    from atom.compass.kv import mooncake_store_server as store
+
+    entry = run[store.ENTRY]
+
+    def ended(k: int) -> None:
+        _hand_in(run, MOONCAKE_STORE.name, rt.refusals, k, store=lp.counts)
+        if entry.get("clear_between_client_runs"):
+            lp.clear(store.client_run_capacity(entry, k + 1))
+
+    return ended
 
 
 def configuration(run: dict) -> dict:
@@ -1481,12 +1774,14 @@ def frontend(config):
     A real run with the parity record's variable set runs ATOM's runner
     through the recording one, and refuses any other runner, which would
     record nothing. With it set, real or simulated, each request's sequence
-    carries its response id (`parity.carry_response_ids`).
+    carries its response id (`parity.carry_response_ids`), and each request
+    routed across DP ranks is recorded (`_record_routes`).
     """
     global _authority, _early_end
     from atom.compass import parity
 
     if os.environ.get(parity.ENV):
+        _record_routes(Path(os.environ[parity.ENV]))
         parity.carry_response_ids()
     run = spec()
     if run is None:
@@ -1580,6 +1875,7 @@ def frontend(config):
         )
         _early_end.start()
     _launch_lmcache(config, run, side)
+    _launch_mooncake_store(config, run, side)
     # A co-hosting frontend reaches the authority in-process, with no socket.
     rt = _runtime(lp, run, cls=_StoppingClock, here=authority is not None)
     rt.client_run_ended = lambda k: _frontend_hand_in(run, rt, k)
@@ -1665,10 +1961,24 @@ def _price_images(price: float | None) -> None:
     """Make `MediaLoader.load_image` charge `price` seconds to the station job
     loading the image. Refuse an image named by an http(s) URL, which the real
     server fetches on wall time, and any image when the run file states no
-    price."""
+    price. The server fetches a chat's URLs itself before its media loader
+    sees them (`images.load_chat_images`), so its download refuses too."""
+    from atom.entrypoints.openai import images
     from atom.multimodal.media import MediaLoader
     from atom.utils.compass_loop import Refused, charge
 
+    download = images._download
+
+    @functools.wraps(download)
+    def refusing(url):
+        rt = clock.installed()
+        if rt is None:  # no LP clock in this process: a load outside any run
+            return download(url)
+        why = "an image named by a remote URL"
+        rt.refusals.append(f"media:{why}")
+        raise Refused(("media", why))
+
+    images._download = refusing
     load = MediaLoader.load_image
 
     @functools.wraps(load)
@@ -1732,11 +2042,14 @@ def engine(config):
         lp = LpId(f"{lp.name}-pp{pc.pipeline_parallel_rank}")
     if side is not None:
         _bind_transfer(config, run)
+    if side == "D":
+        _watch_forwards()
     if "lmcache" in run:
         from atom.compass.kv.lmcache_mp import substitute
 
         substitute()
     _offload_tier(config, run)
+    _store_shell(config, run)
     utils.LP_OF_RANK = dict.fromkeys(range(pc.data_parallel_size), lp)
     _member = f"dp{pc.data_parallel_rank}" if pc.data_parallel_size > 1 else None
     name = lp.name if _member is None else f"{lp.name}.{_member}"
@@ -1745,7 +2058,9 @@ def engine(config):
         # Under the clock's wrap, so a call settles before it waits on its peers.
         shm_collectives.install()
     clock.settle_before_collectives()
-    if _member is not None and _offloads(config.kv_transfer_config, "lmcache_mp"):
+    if _member is not None and any(
+        _offloads(config.kv_transfer_config, c) for c in ("lmcache_mp", ENTRY_STORE)
+    ):
         _park_before_dispatch()
     rt = _runtime(lp, run, _member, _PublishedClock)
     rt.sampler = metrics.Sampler(
@@ -1841,13 +2156,44 @@ def refuse_offload_tier(config, run: dict) -> None:
     lmcache_offload.check_entry(run[lmcache_offload.ENTRY])
 
 
+def _store_shell(config, run: dict) -> None:
+    """Have the connector factory build ``mooncake_store`` as Compass's
+    (`atom.compass.kv.mooncake_store`) when this deployment offloads to a
+    Mooncake Store; refuse one whose run file has no ``mooncake_store`` entry,
+    or under ``ATOM_STORE_ASYNC_RENEW``. Its frontend checked the rest against
+    the entry (`_launch_mooncake_store`)."""
+    from atom.compass.kv import mooncake_store
+    from atom.utils import envs
+
+    if not _offloads(config.kv_transfer_config, ENTRY_STORE):
+        return
+    if ENTRY_STORE not in run:
+        raise ValueError(
+            "this deployment offloads KV to a Mooncake Store and the run file "
+            f"has no {ENTRY_STORE} entry"
+        )
+    if envs.ATOM_STORE_ASYNC_RENEW:
+        raise ValueError(
+            "ATOM_STORE_ASYNC_RENEW renews a load's prebuilt keys and polls the "
+            "renewal on the wall clock; the simulated Store renews a sequence's "
+            "range on LP mooncake_store"
+        )
+    mooncake_store.substitute()
+
+
+#: The engine's worker calls that run a forward, real or the DP dummy, and
+#: reply with its price.
+FORWARD_CALLS = ("forward", "dummy_execution")
+
+
 def _park_before_dispatch() -> None:
     """A DP member parks as its last clock call before it dispatches a forward,
     real or the DP dummy, and asks no TAR from its DP state sync to that park.
 
-    A member waiting on the lmcache MP server asks for time alone while its
-    peers, their forwards dispatched, wait on it in the predicted forward's
-    gather and make no clock call; a park stands in for each of them."""
+    A member waiting on the lmcache MP server, or on a Mooncake Store
+    renewal, asks for time alone while its peers, their forwards dispatched,
+    wait on it in the predicted forward's gather and make no clock call; a
+    park stands in for each of them."""
     from atom.model_engine.async_proc import AsyncIOProcManager
     from atom.model_engine.engine_core import DPEngineCoreProc
 
@@ -1856,7 +2202,7 @@ def _park_before_dispatch() -> None:
     @functools.wraps(call)
     def parking(self, func_name, *args, **kwargs):
         rt = clock.installed()
-        if func_name in ("forward", "dummy_execution") and rt and rt.in_run:
+        if func_name in FORWARD_CALLS and rt and rt.in_run:
             cpu, at = time.thread_time(), rt.now
             rt.park()
             parks = rt.__dict__.setdefault("parks", [])
@@ -1873,6 +2219,29 @@ def _park_before_dispatch() -> None:
 
     AsyncIOProcManager.call_func = parking
     DPEngineCoreProc._sync_dp_state = synced
+
+
+def _watch_forwards() -> None:
+    """Have the engine's `call_func` tell the simulated KV connector's
+    consumer of each forward, the DP group's dummy too, whose priced reply
+    it returns (`atom.compass.kv.connector.forward_returned`), once in a
+    process."""
+    from atom.compass.kv import connector
+    from atom.model_engine.async_proc import AsyncIOProcManager
+
+    call = AsyncIOProcManager.call_func
+    if getattr(call, "compass_watched", False):
+        return
+
+    @functools.wraps(call)
+    def watched(self, func_name, *args, **kwargs):
+        out = call(self, func_name, *args, **kwargs)
+        if func_name in FORWARD_CALLS and getattr(out, "predicted_s", None) is not None:
+            connector.forward_returned(out)
+        return out
+
+    watched.compass_watched = True
+    AsyncIOProcManager.call_func = watched
 
 
 @contextlib.contextmanager
@@ -2046,9 +2415,11 @@ def runner(model_runner, tree) -> None:
     if NOW_ENV in os.environ:
         now = Path(os.environ[NOW_ENV])
         model_runner.compass_raised_file = _raised_file(now, model_runner.rank)
-        # What it planned prices a prefill-decode transfer and sizes LP lmcache.
-        planned = _pd_side(config) is not None or _offloads(
-            config.kv_transfer_config, "lmcache_mp"
+        # What it planned prices a prefill-decode transfer and sizes LP lmcache,
+        # and LP mooncake_store checks it.
+        kv = config.kv_transfer_config
+        planned = _pd_side(config) is not None or any(
+            _offloads(kv, c) for c in ("lmcache_mp", "mooncake_store")
         )
         if planned and model_runner.rank == 0:
             model_runner.compass_block_file = _block_file(now)
@@ -2196,20 +2567,9 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     files each read here as they did in its trace (`capture.lookup`), so one
     traced under another torch, or that ran a file since edited, is a miss
     like any other. One the store holds, at a shape or holding G, is
-    loaded through `ArtifactStore.load` under this process's `graph_readings`,
-    its files' reading here (`capture.source_of`),
-    and its engine config as it records it: that cell holds the tracer's own
-    ATOM arguments, which no reader restates, and the key's structure names
-    the engine config in their place."""
-    from atom.compass.artifacts import (
-        ArtifactStore,
-        Axis,
-        Conditions,
-        GateState,
-        Row,
-        Topology,
-    )
-    from atom.compass.capture import graph_key, lookup, peers, source_of
+    loaded under this process's `graph_readings` (`load_graph`)."""
+    from atom.compass.artifacts import ArtifactStore, Topology
+    from atom.compass.capture import graph_key, lookup, peers
     from atom.compass.capture.forward import (
         PerG,
         Shape,
@@ -2251,16 +2611,13 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         return graph_readings(config.model)
 
     def parsed(key) -> dict:
-        """The graph the store holds at `key`, loaded under `here` and the
-        engine config it records, parsed and frozen with the rest of the live
-        heap, a collection first so no garbage is kept, as
-        `gc_utils.freeze_gc_heap` freezes the startup heap and under the same
-        `ATOM_GC_FREEZE`: this lookup's caches keep what it parses alive, and
-        every full collection walked all of it."""
-        cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
-        readings = here() | {"atom_src": source_of(store, key)}
-        conditions = Conditions.of(**readings, engine_config=cells[Axis.ENGINE_CONFIG])
-        entry = store.load(key, conditions=conditions, gates=GateState.of())
+        """The graph the store holds at `key`, loaded under `here`
+        (`load_graph`), parsed and frozen with the rest of the live heap, a
+        collection first so no garbage is kept, as `gc_utils.freeze_gc_heap`
+        freezes the startup heap and under the same `ATOM_GC_FREEZE`: this
+        lookup's caches keep what it parses alive, and every full collection
+        walked all of it."""
+        entry = load_graph(store, key, here())
         graph = json.loads(entry.read_member("graph", rank, "json"))
         if envs.ATOM_GC_FREEZE:
             gc.collect()
@@ -2350,6 +2707,23 @@ def graph_readings(model: str) -> dict:
         **traced_under(),
         "model": _file_digest(model, "config.json"),
     }
+
+
+def load_graph(store, key, readings: dict):
+    """The `op_graph` entry at `key` in `store`, loaded through
+    `ArtifactStore.load` under `readings` (`graph_readings`), its files'
+    reading here (`capture.source_of`), and its engine config as it records
+    it: that cell holds the tracer's own ATOM arguments, which no reader
+    restates, and the key's structure names the engine config in their place.
+    An entry whose row states another torch, ATOM source or model refuses,
+    naming the axis."""
+    from atom.compass.artifacts import Axis, Conditions, GateState, Row
+    from atom.compass.capture import source_of
+
+    cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
+    readings = readings | {"atom_src": source_of(store, key)}
+    conditions = Conditions.of(**readings, engine_config=cells[Axis.ENGINE_CONFIG])
+    return store.load(key, conditions=conditions, gates=GateState.of())
 
 
 def _trace_process():
@@ -2480,11 +2854,19 @@ def tokenizer(tok, config) -> None:
     entry, its engine config's among several: a term fitted on another backend
     is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
     ends the run before the server serves (`_end_before_serving`). With no
-    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer,
+    term, `tok` is charged 0 s; ``segment`` wraps the segment tokenizer,
     and its ``chars_per_s`` charges each comparison of its stored-prefix search.
+    Beneath those charges, a segment text any frontend of the deployment has
+    encoded is read back rather than encoded again (`token_ids`), charged the
+    same.
 
     On a real run recording its steps (`parity.ENV`), it records instead
-    (`_record_host`); with neither, `tok` is left as it is."""
+    (`_record_host`); with neither, `tok` is left as it is.
+
+    A simulated server's Rust backend encodes a batch's texts in parallel
+    (`_PARALLEL_TOKENIZER`), whatever ``TOKENIZERS_PARALLELISM`` its
+    environment sets: what tokenization costs is the term's charge, never its
+    wall time, and the ids are the same either way."""
     global _frontend_host
     run = spec()
     if run is None:
@@ -2493,6 +2875,8 @@ def tokenizer(tok, config) -> None:
         if record := os.environ.get(parity.ENV):
             _record_host(tok, Path(record))
         return
+    # Read by the tokenizers library at each call, so it holds from here on.
+    os.environ.update(_PARALLEL_TOKENIZER)
     from tokenizers import Tokenizer
 
     from atom.compass.spec.rules import FingerprintMismatch
@@ -2505,6 +2889,11 @@ def tokenizer(tok, config) -> None:
         raise
     if isinstance(run.get("host"), list):
         _frontend_host = host
+    from atom.compass.run import token_ids
+
+    backend = getattr(tok, "_tokenizer", None)
+    if isinstance(backend, Tokenizer) and (where := token_ids.directory(run)):
+        token_ids.install(backend, where)
     if term is None:
         return
     if (loaded := _fingerprint(tok)) not in (None, term["fingerprint"]):
@@ -2601,6 +2990,43 @@ def _record_host(tok, record: Path) -> None:
         ),
     )
     _stamp_intake(_LineFile(record / INTAKE_RECORD))
+
+
+def _record_routes(record: Path) -> None:
+    """Write `parity.ROUTES` into `record` from the first request `CoreManager`
+    routes across DP ranks, a line as each is routed; its key, as `parity.read`
+    keys an uncached prompt, is digested before the router's lock. Installed
+    beneath `parity.carry_response_ids`, which reads its caller's frame."""
+    from atom.compass import parity
+    from atom.model_engine.engine_core_mgr import CoreManager
+
+    add, select = CoreManager.add_request, CoreManager._select_dp_rank_for_seq_locked
+    lines = []
+
+    def add_request(self, seqs):
+        if self.pp_size > 1 or self._routable_engine_count == 1:
+            return add(self, seqs)
+        if not lines:
+            lines.append(_LineFile(record / parity.ROUTES))
+        keys = {}
+        for seq in seqs:
+            prompt = memoryview(seq.token_ids)[: seq.num_prompt_tokens]
+            keys[seq.id] = hashlib.blake2b(prompt, digest_size=8).hexdigest()
+
+        def routed(seq, explicit_rank):
+            load = {"reqs": list(self._rank_reqs), "tokens": list(self._rank_tokens)}
+            route = select(self, seq, explicit_rank)
+            line = {"key": keys[seq.id], "rank": route.rank} | load
+            lines[0].write(json.dumps(line) + "\n")
+            return route
+
+        self._select_dp_rank_for_seq_locked = routed
+        try:
+            return add(self, seqs)
+        finally:
+            del self._select_dp_rank_for_seq_locked
+
+    CoreManager.add_request = add_request
 
 
 class _LineFile:
@@ -2786,6 +3212,7 @@ def _stamp_intake(out: _LineFile) -> None:
     from starlette.applications import Starlette
     from starlette.requests import Request
 
+    from atom.compass import parity
     from atom.entrypoints.openai import chat_encoders
     from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
     from atom.model_engine.llm_engine import InputOutputProcessor
@@ -2861,8 +3288,11 @@ def _stamp_intake(out: _LineFile) -> None:
         def add_request(*args, **kwargs):
             # `parity.carry_response_ids`, installed beneath this as the engine
             # was built, reads the API server's `request_id` off its caller's
-            # frame, which is now this one.
-            request_id = sys._getframe(1).f_locals.get("request_id")  # noqa: F841
+            # frame, which is now this one. Found as it finds it, up to
+            # `parity.CALLER_DEPTH` frames above: since the upstream merge the
+            # caller is `_submit_engine_requests`, which holds none, and a
+            # `request_id = None` here hid the handler's from it.
+            request_id = parity._caller_request_id()  # noqa: F841
             start, cpu = time.monotonic_ns(), time.thread_time_ns()
             got = add(*args, **kwargs)
             stamp("send", start, 0, cpu)
@@ -2924,6 +3354,37 @@ def http_intake() -> tuple[float, float, float] | None:
     return term["fixed_s"], term["per_byte_s"], term.get("idle_s", term["fixed_s"])
 
 
+def relay() -> tuple[float, float, float] | None:
+    """``(fixed_s, per_byte_s, router_s)``: the relay's time to carry one of
+    this prefill server's responses to decode's app call, from the ``relay``
+    term of its ``host`` entry, the one `tokenizer` resolved among several,
+    and the lookahead of the relay's path through the router, which the
+    channels price already; None on a real run or with no term.
+    `atom.utils.compass_loop.HttpChannel` writes ``fixed_s + n x per_byte_s -
+    router_s``, where that is positive, on a relayed response of `n` bytes as
+    its relay's service time, and decode's `HttpChannel` charges it on its
+    loop at the request's turn, queued with the relays and intakes in flight
+    there. A run that is not prefill-decode relays nothing: None."""
+    run = spec()
+    if run is None or "router_s" not in run:
+        return None
+    if (term := _host_term(RELAY_TERM)) is None:
+        return None
+    return term["fixed_s"], term["per_byte_s"], hop(run, "router_s")
+
+
+def http_stream() -> float | None:
+    """``per_event_s``: the frontend loop's time to send one SSE event of a
+    streamed response, from the ``http_stream`` term of this server's ``host``
+    entry, the one `tokenizer` resolved among several; None on a real run or
+    with no term. `atom.utils.compass_loop.HttpChannel` charges it on the loop
+    before it stamps each event, queued with the requests it takes in, as a
+    decode server's loop at c=256 (#3720, r256) spends ~50 us an event, a
+    fifth of its wall time."""
+    term = _host_term(STREAM_TERM)
+    return None if term is None else term["per_event_s"]
+
+
 def http_intake_hull() -> tuple[float, float] | None:
     """The body bytes, ``(lo, hi)``, the ``http_intake`` term `http_intake`
     reads was fitted over, outside which `HttpChannel` refuses a request's
@@ -2933,6 +3394,12 @@ def http_intake_hull() -> tuple[float, float] | None:
 
 
 def _intake_term() -> dict | None:
+    return _host_term("http_intake")
+
+
+def _host_term(name: str) -> dict | None:
+    """The term `name` of this server's ``host`` entry, the one `tokenizer`
+    resolved among several; None on a real run or with no term."""
     run = spec()
     if run is None:
         return None
@@ -2944,7 +3411,7 @@ def _intake_term() -> dict | None:
                 "resolved for this server's: compass_run.tokenizer resolves it"
             )
         host = _frontend_host
-    return host.get("http_intake")
+    return host.get(name)
 
 
 def _fingerprint(tok) -> str | None:
@@ -3125,8 +3592,9 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     scheduler keeps lookup counters hands in ``lookups``: its tier lookups,
     the prefetches among them, and the deferred prefetches it stopped
     waiting for. A speculative engine hands in ``speculative``, `_acceptance`.
-    An engine whose ``lmcache_offload`` is simulated hands in ``offload``:
-    `OffloadShell.offload_statistics`, and under ``cache`` its prefix cache's
+    An engine whose ``lmcache_offload`` or ``mooncake_store`` is simulated
+    hands in ``offload``: `OffloadShell.offload_statistics` or
+    `StoreShell.offload_statistics`, and under ``cache`` its prefix cache's
     counters (`EngineStats.cache_statistics`)."""
     said = _workers_say(engine_core)
     rt = clock.installed()
@@ -3530,6 +3998,18 @@ def _summary(
     schedule["treatments"] = dict(sorted(counted("treatments").items()))
     # Each reason a source declined a step a fallback then priced, with its steps.
     schedule["fallback_reasons"] = dict(counted("fallback_reasons").most_common())
+    # The steps extrapolated on each DP group step's critical rank, apart from
+    # every rank's, off the step records in out_dir, over a client run's own
+    # span; or why there are none.
+    from atom.compass.report import extrapolation
+
+    span = None if record is a else (record.start, record.end)
+    try:
+        schedule[extrapolation.FIELD] = extrapolation.of_run(run["out_dir"], span)
+        schedule[extrapolation.REFUSED] = None
+    except (OSError, ValueError) as refused:
+        schedule[extrapolation.FIELD] = None
+        schedule[extrapolation.REFUSED] = str(refused)
     # An engine whose workers died, or that never handed in, priced steps no
     # one counted: they are absent, not 0.
     if any(
@@ -3556,6 +4036,12 @@ def _summary(
             if "segment" in h.get("tokenizer", {})
             and "chars_per_s" not in h["tokenizer"]["segment"]
         }
+        | (
+            {RELAY_TERM}
+            if "router_s" in run
+            and not any(RELAY_TERM in h for h in entries(run, "host"))
+            else set()
+        )
     )
     summary["unmeasured_hops"] = sorted(k for k, v in hops(run).items() if v is None)
     summary["schema_version"] = SUMMARY_SCHEMA_VERSION

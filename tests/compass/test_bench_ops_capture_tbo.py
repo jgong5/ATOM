@@ -2,20 +2,23 @@
 """`compass measure ops` traces a graph its store lacks under two-batch overlap
 as one forward, a prefill ATOM would split too: a point times a leaf at its own
 shape. The capture runs `trace ops` as the bench starts it, in a process of its
-own, on the Qwen3.8-27B at TP1.
+own, on Qwen3-0.6B at TP1: ATOM refuses TBO on a GDN model such as the 27B.
 """
 
 import os
+import pathlib
 import re
 import subprocess
 import sys
 from types import SimpleNamespace
 
-from test_capture_ir import CONFIG, MAIN, TREE
+from test_capture_ir import MAIN, TREE
 
 from atom.compass import capture
 from atom.compass.bench import ops
 from atom.compass.capture.forward import prefill
+
+CONFIG = pathlib.Path(__file__).with_name("qwen3_0_6b_config.json")
 
 
 def test_a_prefill_point_two_batch_overlap_would_split_is_traced_as_one_forward(

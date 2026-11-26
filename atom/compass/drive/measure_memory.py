@@ -95,6 +95,7 @@ FRONTEND = {
     "--chat-template": {},
     "--default-chat-template-kwargs": {},
     "--request-log": {},
+    "--api-server-count": {"type": int},
 }
 #: Where in `READINGS` a RapidServe decode engine writes its readings.
 DECODE = "decode"

@@ -183,14 +183,15 @@ def test_a_population_is_a_record_directory_not_a_token():
 _CAPTURES: dict = {}
 
 
-def capture(tp, shapes, tmp_path_factory):
+def capture(tp, shapes, tmp_path_factory, config=CONFIG):
     """`compass trace ops` at TP `tp` over the `shapes` arguments, in one
-    process: each shape's published graph and declarations, by shape."""
-    if (tp, shapes) in _CAPTURES:
-        return _CAPTURES[tp, shapes]
-    root = tmp_path_factory.mktemp(f"tp{tp}")
+    process: each shape's published graph and declarations, by shape. Of the
+    27B, or of the model `config` describes, under a directory of its stem."""
+    if (tp, shapes, config) in _CAPTURES:
+        return _CAPTURES[tp, shapes, config]
+    root = tmp_path_factory.mktemp(f"tp{tp}" if config == CONFIG else config.stem)
     (root / "model").mkdir()
-    (root / "model" / "config.json").write_bytes(CONFIG.read_bytes())
+    (root / "model" / "config.json").write_bytes(config.read_bytes())
     argv = ["trace", "ops", "--model", str(root / "model"), "--tp", str(tp)]
     argv += [*shapes.split(), "--store", str(root / "store")]
     done = subprocess.run(
@@ -220,7 +221,7 @@ def capture(tp, shapes, tmp_path_factory):
         )
         assert entry.key.values["shape"] == graph["shape"]
         graphs[graph["shape"]] = graph, declared
-    _CAPTURES[tp, shapes] = graphs
+    _CAPTURES[tp, shapes, config] = graphs
     return graphs
 
 

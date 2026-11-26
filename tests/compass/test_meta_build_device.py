@@ -38,8 +38,7 @@ class NamedDevices(torch.nn.Module):
 
 def test_a_factory_tensor_on_a_named_device_is_built_on_meta():
     runner = Runner()
-    runner._build_and_load_model(NamedDevices)
-    tree = runner.model.tree
+    tree = runner._build_and_load_model(runner.config, NamedDevices, None).tree
     assert [t.device.type for t in (tree.kv_scale, tree.weight, tree.rope)] == [
         "meta"
     ] * 3

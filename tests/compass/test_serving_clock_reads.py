@@ -12,7 +12,6 @@ import pytest
 from prometheus_client import CollectorRegistry
 
 import atom
-from atom.entrypoints.atomesh.atom_standalone_service import SingleRequestState
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import ModelCard
 from atom.entrypoints.openai.request_timing import (
@@ -152,26 +151,6 @@ class TestASubstitutedReadTakesTheLpClock:
     def test_the_model_card_stamp(self, lp_clock):
         assert ModelCard(id="m").created == int(lp_clock.t)
 
-    def test_the_standalone_request_timings(self, lp_clock):
-        """TTFT, TPOT and latency the Atomesh standalone service reports."""
-        result = []
-        future = SimpleNamespace(done=lambda: bool(result), set_result=result.extend)
-        tokenizer = SimpleNamespace(decode=lambda ids, skip_special_tokens: "")
-        lp_clock.t = 1.0
-        state = SingleRequestState("r", tokenizer, future)
-        for t, finished in ((3.0, False), (6.0, True)):
-            lp_clock.t = t
-            state.record(
-                SimpleNamespace(
-                    output_tokens=[5], finished=finished, finish_reason="stop"
-                )
-            )
-        assert (result[0]["ttft"], result[0]["tpot"], result[0]["latency"]) == (
-            2.0,
-            3.0,
-            5.0,
-        )
-
     def test_the_request_ttft(self, lp_clock):
         """The middleware's start stamp and the first output's."""
         seen = []
@@ -187,11 +166,12 @@ class TestASubstitutedReadTakesTheLpClock:
 
     def test_the_responses_endpoint_created_at(self, lp_clock, monkeypatch):
         async def nonstream(generator, raw_request, request_id):
-            return {"text": "hi"}
+            return {"text": "hi", "num_tokens_input": 1, "num_tokens_output": 1}
 
         for name, value in {
             "engine": SimpleNamespace(
-                config=SimpleNamespace(generation_config=None, max_model_len=4096)
+                config=SimpleNamespace(generation_config=None, max_model_len=4096),
+                io_processor=SimpleNamespace(encode_prompt=lambda prompt: [1]),
             ),
             "tokenizer": SimpleNamespace(encode=lambda text: [1]),
             "apply_chat_template": lambda *args, **kwargs: "prompt",
@@ -274,7 +254,6 @@ class TestASubstitutedReadTakesTheLpClock:
 #: takes the LP clock.
 ON_THE_TIME_SHIM = (
     "atom.distributed.kv_events",
-    "atom.entrypoints.atomesh.atom_standalone_service",
     "atom.entrypoints.openai.api_server",
     "atom.entrypoints.openai.protocol",
     "atom.entrypoints.openai.request_timing",

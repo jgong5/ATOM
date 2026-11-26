@@ -91,12 +91,16 @@ class _IdleRank(DPEngineCoreProc):
     def __init__(self, schedule, reply):
         self._shutting_down, self.dp_group = False, None
         self.kv_transfer_enabled, self._next_idle_kv_drain = True, 0.0
+        self._kv_progress_event = threading.Event()
         self.polled = []
         self.scheduler = SimpleNamespace(
             schedule=schedule,
             dummy_prefill=False,
+            running=[],
             take_rejected=list,
             publish_kv_events=lambda: None,
+            _publish_state_loads=lambda: None,
+            _publish_state_stores=lambda: None,
             kv_connector=SimpleNamespace(
                 is_offload=True, build_connector_meta=lambda: None
             ),

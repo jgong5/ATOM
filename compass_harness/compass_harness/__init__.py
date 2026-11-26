@@ -21,7 +21,9 @@ phase lifecycle, the credit issuer and the strategy reads the clock, so phase
 stamps and windows, ``issued_at_ns`` and the system idle cap are simulated; the
 CLI's ``uuid4`` is fixed, so prompt token counts repeat from run to run. The
 runner's ``asyncio`` becomes ``ClockAsyncio``, so its cancel drain times out on
-that clock too.
+that clock too. Where aiperf mints a session's id, ``uuid`` becomes
+``session_ids``, so the id is drawn from the session's trace and branch, as a
+real run's client draws it.
 """
 
 import importlib
@@ -29,14 +31,15 @@ import importlib.util
 import os
 import sys
 
-from compass_harness import fingerprint
+from compass_harness import fingerprint, session_ids
 
 RUNNER = "aiperf.timing.phase.runner"
 STRATEGY = "compass_harness.strategy:CompassAgenticReplay"
 #: The path prefix of the adapter's two sockets, shared by every aiperf process.
 ADDRESS_ENV = "COMPASS_HARNESS_IPC"
 SIM_TIME = (("time", "compass_harness.timesource:SimTime"),)
-#: aiperf module -> ((a global to rebind, the replacement as module:qualname), ...).
+#: aiperf module -> ((a global to rebind, the replacement as module:qualname, or
+#: module: for the module itself), ...).
 REBIND = {
     RUNNER: (
         ("LoopScheduler", "compass_harness.scheduler:ClockPacedLoopScheduler"),
@@ -57,6 +60,8 @@ REBIND = {
     "aiperf.timing.strategies.agentic_replay": SIM_TIME,
     "aiperf.cli_runner": (("uuid4", "compass_harness.timesource:fixed_uuid4"),),
 }
+for _module in session_ids.MODULES:  # as a real run's aiperf binds it
+    REBIND[_module] = REBIND.get(_module, ()) + (("uuid", session_ids.__name__ + ":"),)
 
 
 def check_registered() -> None:
@@ -91,7 +96,8 @@ class _RebindHook:
             execute(module)
             for attr, replacement in rebinds:
                 path, _, qualname = replacement.partition(":")
-                setattr(module, attr, getattr(importlib.import_module(path), qualname))
+                value = importlib.import_module(path)
+                setattr(module, attr, getattr(value, qualname) if qualname else value)
             if name == RUNNER:
                 check_registered()
 

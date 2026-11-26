@@ -61,6 +61,9 @@ def _run(monkeypatch, callback, token_counts) -> None:
     loop = CompassEventLoop()
     mgr = CoreManager.__new__(CoreManager)
     mgr.ctx, mgr.label, mgr._lb_lock, mgr._seq_load = ctx, "fe", threading.Lock(), {}
+    # The router state a first token releases: none, the plain load policy.
+    mgr._prefix_router = mgr._backlog = mgr._dp_policy = None
+    mgr._dp_session_affinity_enabled = False
     mgr._seq_id_to_callback = {7: callback(loop)}
     mgr._flush_stream_batch_fn = api_server.flush_stream_batch
     thread = mgr._create_output_thread(
@@ -273,6 +276,9 @@ def test_a_frame_from_before_the_run_decoded_on_an_output_thread_is_a_summary_re
     collector = SimpleNamespace(put_nowait=lambda c: None)
     mgr = CoreManager.__new__(CoreManager)
     mgr.ctx, mgr.label, mgr._lb_lock, mgr._seq_load = ctx, "fe", threading.Lock(), {}
+    # The router state a first token releases: none, the plain load policy.
+    mgr._prefix_router = mgr._backlog = mgr._dp_policy = None
+    mgr._dp_session_affinity_enabled = False
     mgr._seq_id_to_callback = {
         7: lambda out: api_server._send_stream_chunk_direct(
             out, "r", collector, loop, state

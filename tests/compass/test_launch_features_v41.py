@@ -87,7 +87,7 @@ def _run_decoder(decoder, mode):
         ),
     )
     plan = SimpleNamespace(
-        tail=SimpleNamespace(width=1, requests=(object(),)),
+        tail=SimpleNamespace(running_tokens=1, requests=(object(),)),
         tail_rows=None,
         last=torch.zeros(mode.running_bs),
     )
@@ -101,6 +101,7 @@ def _prefill(lengths, output=True):
         total_seqs_num_prefill=len(lengths),
         total_tokens_num=int(lengths.sum()),
         total_tokens_num_prefill=int(lengths.sum()),
+        has_prefill=True,
         num_scheduled_tokens=lengths,
         context_lens=lengths,
         num_spec_step=0,

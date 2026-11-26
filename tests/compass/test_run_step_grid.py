@@ -199,7 +199,7 @@ def test_a_run_file_bundle_prices_the_runs_steps_and_the_summary_names_it(
             "digest": entry.digest,
             "describe": (
                 f"step grid, bundle {entry.key}; replay decode grid, "
-                "timing scope forward; recipe step-grid-residual v3, members "
+                "timing scope forward; recipe step-grid-residual v4, members "
                 "decode: unit; prefill_output: unit; prefill_no_output: unit; "
                 "below it, step roofline; 1 modules"
             ),
@@ -400,14 +400,15 @@ PLATFORM = machine_platform(MachineSpec.from_mapping(DOCUMENT))
 
 
 def host_laws_key(r) -> dict:
-    """A `host_laws` key from the values `run.host_key` reads and the spec's
-    platform."""
+    """A `host_laws` key from the values `run.host_key` reads, a digest of the
+    laws, which a run takes as stated, and the spec's platform."""
     host = compass_run.host_key(r.config)
     return {
         "host_cpu": host["host_cpu"],
         "atom_src": host["atom"],
         "model": host["model"],
         "engine_config": json.dumps(host["engine"], sort_keys=True),
+        "fit_src": "5eed" * 16,
         **keyed_platform(Kind.HOST_LAWS, PLATFORM),
     }
 
@@ -428,6 +429,7 @@ NEW_KINDS = {
         **MEASURED,
         **keyed_platform(Kind.STEP_LINEAR_LAW, PLATFORM),
         "form": "fixed+tokens+seqs",
+        "fit_src": "5eed" * 16,
     },
     Kind.HOST_LAWS: None,
 }

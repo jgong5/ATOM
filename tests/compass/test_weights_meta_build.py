@@ -88,7 +88,9 @@ def _built(monkeypatch, tmp_path, model_class=TiedPacked):
         ),
     )
     with_readings(runner, tmp_path / "store")
-    NonAllocatingRunner._build_and_load_model(runner, model_class)
+    runner.model = NonAllocatingRunner._build_and_load_model(
+        runner, runner.config, model_class, None
+    )
     return runner
 
 
@@ -184,6 +186,29 @@ def _probe(name, arch):
 
     probe.__name__, probe.__module__ = name, CHIP_INFO
     return probe
+
+
+def test_each_module_gets_its_own_arch_probe_back(monkeypatch, tmp_path):
+    """A module still bound to another probe, as one bound to a chip_info module
+    a stub dropped from `sys.modules` is, gets that one back after the build,
+    and the modules holding the loaded chip_info's probe get that one."""
+    held = types.ModuleType("held_an_older_probe")
+    held.get_gfx = _probe("get_gfx", "gfx90a")
+    monkeypatch.setitem(sys.modules, held.__name__, held)
+    chip = types.ModuleType(CHIP_INFO)
+    chip.get_gfx = _probe("get_gfx", "gfx942")
+    chip.get_gfx_runtime = _probe("get_gfx_runtime", "gfx942")
+    monkeypatch.setitem(sys.modules, CHIP_INFO, chip)
+    seen = []
+
+    class ArchProbing(TiedPacked):
+        def __init__(self, config):
+            super().__init__(config)
+            seen.append((held.get_gfx(), chip.get_gfx()))
+
+    _built(monkeypatch, tmp_path, ArchProbing)
+    assert seen == [("gfx950", "gfx950")]
+    assert (held.get_gfx(), chip.get_gfx()) == ("gfx90a", "gfx942")
 
 
 def test_a_meta_build_sees_the_simulated_arch_and_reads_no_engram_table(

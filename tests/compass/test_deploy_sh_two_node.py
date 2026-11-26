@@ -155,6 +155,82 @@ def test_a_simulated_deployment_prices_kv_on_the_link_its_layout_spans(
     assert json.loads((d / "run.json").read_text())["kv_link"] == link
 
 
+def test_a_one_node_deployment_whose_kv_crosses_the_network_prices_it_there(
+    tmp_path, planted  # noqa: F811
+):
+    """--kv-over-network: both instances on this node, the KV priced on the
+    network file's link (Mooncake through the NICs, never the GPUs' own
+    links), and run.json says the decode ran here."""
+    env, flags = planted
+    d = tmp_path / "d"
+    flags = ["--kv-over-network", *flags, *platforms.network(DOCUMENT, tmp_path)]
+    script = subprocess.Popen(
+        argv(tmp_path, flags), env=env, cwd=tmp_path, stdout=subprocess.PIPE
+    )
+    _until(d / "server.json", script)
+
+    assert json.loads((d / "run_file.json").read_text())["kv_link"] == "inter_node"
+    assert _on(tmp_path) == []
+
+    script.send_signal(signal.SIGTERM)
+    out, _ = script.communicate(timeout=60)
+
+    assert script.returncode == 0, out
+    written = json.loads((d / "run.json").read_text())
+    assert written["kv_link"] == "inter_node" and written["across_nodes"] is False
+
+
+def test_a_one_node_record_merges_kv_extra_into_each_mooncake_config(
+    tmp_path, planted  # noqa: F811
+):
+    env, _ = planted
+    d = tmp_path / "d"
+    words = argv(tmp_path, ["--gpu", "0,1", "--kv-over-network"])
+    words[3] = "record"
+    env = {**env, "KV_EXTRA": '{"protocol": "tcp", "kv_role": "ignored"}'}
+    script = subprocess.Popen(words, env=env, cwd=tmp_path, stdout=subprocess.PIPE)
+    _until(d / "server.json", script)
+
+    for side, role in (("prefill", "kv_producer"), ("decode", "kv_consumer")):
+        seen = json.loads((d / f"{side}.argv.json").read_text())
+        assert seen[:3] == ["record", "--gpu", "0,1"]
+        kv = json.loads(seen[-1])
+        assert kv["protocol"] == "tcp" and kv["kv_role"] == role
+        assert kv["kv_connector"] == "mooncake"
+
+    script.send_signal(signal.SIGTERM)
+    out, _ = script.communicate(timeout=60)
+
+    assert script.returncode == 0, out
+    written = json.loads((d / "run.json").read_text())
+    assert written["kv_link"] == "inter_node" and written["across_nodes"] is False
+
+
+@pytest.mark.parametrize(
+    "case, refusal",
+    [
+        ("on", "--kv-over-network keeps the decode on this node"),
+        ("extra", "KV_EXTRA is no JSON object"),
+    ],
+)
+def test_kv_over_network_with_on_or_a_bad_kv_extra_exits_2(
+    tmp_path, planted, on, case, refusal  # noqa: F811
+):
+    env, flags = planted
+    words = argv(tmp_path, ["--kv-over-network", *flags])
+    if case == "on":
+        at = words.index("--decode") + 1
+        words[at:at] = ["--on", on]
+    else:
+        env = {**env, "KV_EXTRA": "[1]"}
+
+    done = _run(words, env, tmp_path)
+
+    assert done.returncode == 2, done.stderr
+    assert refusal in done.stderr
+    assert not (tmp_path / "d" / "run_file.json").exists()
+
+
 def test_a_deployment_that_fails_stops_the_decode_through_its_prefix(
     tmp_path, planted, on  # noqa: F811
 ):

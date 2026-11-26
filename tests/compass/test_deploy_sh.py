@@ -31,6 +31,11 @@ from test_memory_readings import DOCUMENT
 
 from atom.compass import run as compass_run
 from atom.compass.backends.step_stub import Coefficients
+from atom.kv_transfer.offload.mooncake_store.config import parse_mooncake_store_config
+from atom.model_engine.arg_utils import (
+    compose_kv_offload_config,
+    kv_offload_connector_config,
+)
 
 TREE = Path(__file__).resolve().parents[2]
 SCRIPT = TREE / "scripts/compass/deploy.sh"
@@ -42,8 +47,15 @@ out = os.path.dirname(run_file)
 json.dump(argv, open(out + "/authority.argv.json", "w"))
 endpoint = argv[argv.index("--compass-clock-endpoint") + 1]
 s = socket.create_server(("127.0.0.1", int(endpoint.rsplit(":", 1)[1])))
+run = json.load(open(run_file))
+# Each instance's directory: its side's name, with its index above one.
+names = [
+    f"{side}{k}" if n > 1 else side
+    for side, n in (("prefill", run.get("prefill_instances", 1)), ("decode", run.get("decode_instances", 1)))
+    for k in range(n)
+]
 deadline = time.monotonic() + 60
-while not all(os.path.exists(f"{out}/{side}/run.json") for side in ("prefill", "decode")):
+while not all(os.path.exists(f"{out}/{name}/run.json") for name in names):
     if time.monotonic() > deadline:
         sys.exit(9)
     time.sleep(0.1)
@@ -52,10 +64,11 @@ time.sleep(2)
 open(out + "/summary.json", "w").write("{}")
 """
 INSTANCE = """\
-import http.server, json, os, signal, sys, threading
+import http.server, json, os, signal, sys, threading, time
 argv = sys.argv[1:]
 out = argv[argv.index("--out") + 1]
 json.dump(argv, open(out + ".argv.json", "w"))
+json.dump(dict(os.environ), open(out + ".env.json", "w"))
 if os.environ.get("PLANTED_FAIL") == os.path.basename(out):
     sys.exit(3)
 os.makedirs(out)
@@ -65,8 +78,18 @@ class Health(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
+def leave(name, path):
+    # Once `path` exists, `name` leaves with an error, as one that fails on its own.
+    if name == os.path.basename(out):
+        while not os.path.exists(path):
+            time.sleep(0.1)
+        os._exit(3)
+
+if "PLANTED_DIE" in os.environ:
+    threading.Thread(target=leave, args=os.environ["PLANTED_DIE"].split(), daemon=True).start()
 host = argv[argv.index("--host") + 1] if "--host" in argv else "127.0.0.1"
-server = http.server.HTTPServer((host, 0), Health)
+# One serving at another node's address serves here at PLANTED_BIND.
+server = http.server.HTTPServer((os.environ.get("PLANTED_BIND", host), 0), Health)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 
 def stop(*_):
@@ -88,7 +111,9 @@ if argv == ["--version-verbose"]:
     print(f"atomesh 0.1.0\\n  Git Commit: {commit}\\n  Git Status: {status}")
     sys.exit()
 lp = {k: v for k, v in os.environ.items() if k.startswith("ATOM_COMPASS_")}
-json.dump({"argv": argv, "pid": os.getpid(), "env": lp}, open(os.environ["PLANTED_ROUTER"], "w"))
+import resource
+nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+json.dump({"argv": argv, "pid": os.getpid(), "env": lp, "nofile": nofile}, open(os.environ["PLANTED_ROUTER"], "w"))
 def stop(*_):
     summary = os.path.exists(os.environ["PLANTED_SUMMARY"])
     open(os.environ["PLANTED_ROUTER"] + ".stop", "w").write(json.dumps(summary))
@@ -243,6 +268,9 @@ def test_a_deployment_joins_both_instances_to_its_authority_behind_the_router(
         urls[side] = json.loads((d / side / "server.json").read_text())["url"]
     router = json.loads((tmp_path / "router.json").read_text())
     port = router["argv"][router["argv"].index("--port") + 1]
+    # It starts at the hard open-file limit: a c=1228 router at 1024 ran out (#3720).
+    soft, hard = router["nofile"]
+    assert soft == hard
     assert router["argv"][-len(ROUTER_ARGS) - 5 :] == [
         "--pd-disaggregation", "--prefill", urls["prefill"], "--decode", urls["decode"],
         *ROUTER_ARGS,
@@ -265,6 +293,392 @@ def test_a_deployment_joins_both_instances_to_its_authority_behind_the_router(
     assert written["command"][1:] == argv(tmp_path, flags)[2:]
     assert written["run_file"] == run
     assert written["router"][1:] == router["argv"]
+
+
+def test_two_prefill_instances_join_by_index_behind_a_router_lp_choosing_among_them(
+    tmp_path, planted
+):
+    env, flags = planted
+    env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
+    d = tmp_path / "d"
+    model = ["--model", str(tmp_path)]
+    words = argv(tmp_path, flags + router_hop(tmp_path), router=ROUTER_LP_ARGS)
+    at = words.index("--decode")
+    words[at:at] = ["--prefill", "--", *model, *PREFILL]
+    script = subprocess.Popen(
+        words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
+    )
+    _until(d / "server.json", script)
+
+    run = json.loads((d / "run_file.json").read_text())
+    assert run["prefill_instances"] == 2 and "decode_instances" not in run
+    lps = {lp.name for lp in compass_run.channel_table(run).registry.ids()}
+    assert {"frontend-P0", "engine-P0", "frontend-P1", "engine-P1"} <= lps
+    assert {"frontend-D", "engine-D", compass_run.ROUTER.name} <= lps
+    kvs, urls = {}, {}
+    for name in ("prefill0", "prefill1", "decode"):
+        seen = json.loads((d / f"{name}.argv.json").read_text())
+        assert seen[seen.index("--out") + 1] == str(d / name)
+        kvs[name] = json.loads(seen[-1])
+        urls[name] = json.loads((d / name / "server.json").read_text())["url"]
+    assert [kvs[f"prefill{k}"]["compass_instance"] for k in (0, 1)] == [0, 1]
+    assert "compass_instance" not in kvs["decode"]
+    # One base every instance is given, one port a rank pair and instance pair.
+    assert len({kv["compass_kv_write_req"] for kv in kvs.values()}) == 1
+    router = json.loads((tmp_path / "router.json").read_text())
+    workers = router["argv"][router["argv"].index("--pd-disaggregation") :][:7]
+    assert workers == [
+        "--pd-disaggregation", "--prefill", urls["prefill0"], "--prefill", urls["prefill1"],
+        "--decode", urls["decode"],
+    ]  # fmt: skip
+    assert json.loads(router["env"]["ATOM_COMPASS_ROUTER_WORKERS"]) == {
+        urls["prefill0"]: "frontend-P0",
+        urls["prefill1"]: "frontend-P1",
+    }
+    # The run file names no worker_order: the router LP lists each side's
+    # workers by instance, then rank, whichever ports the instances drew.
+    dp = run["prefill_data_parallel_size"], run["decode_data_parallel_size"]
+    instances = ("prefill0", dp[0]), ("prefill1", dp[0]), ("decode", dp[1])
+    assert json.loads(router["env"]["ATOM_COMPASS_ROUTER_ORDER"]) == [
+        [urls[name], r] for name, width in instances for r in range(width)
+    ]
+
+    script.send_signal(signal.SIGTERM)
+    out, _ = script.communicate(timeout=60)
+
+    assert script.returncode == 0, out
+    written = json.loads((d / "run.json").read_text())
+    assert written["instances"] == [
+        {"name": "prefill0", "side": "P", "index": 0},
+        {"name": "prefill1", "side": "P", "index": 1},
+        {"name": "decode", "side": "D", "index": 0},
+    ]
+
+
+#: A prefill side's Mooncake Store as `pd_server_atom.sh`'s launcher names it to
+#: each worker: rdma, one pool a NIC, each its master and metadata server.
+STORE = (
+    '{"mooncake_store.local_hostname":"10.0.0.1","mooncake_store.protocol":"rdma",'
+    '"mooncake_store.pools":{'
+    '"ionic_0":{"master":"10.0.0.1:50051","metadata":"http://10.0.0.1:8080/metadata"},'
+    '"ionic_1":{"master":"10.0.0.1:50151","metadata":"http://10.0.0.1:8180/metadata"}}}'
+)
+PREFILL_ENV = {
+    "ATOM_KV_OFFLOAD": "mooncake_store",
+    "ATOM_KV_OFFLOAD_EXTRA_CONFIG": STORE,
+}
+DECODE_ENV = {"ATOM_HOST_IP": "10.0.0.2"}
+
+
+@pytest.mark.parametrize("cmd", ["run", "record"])
+def test_each_side_s_variables_reach_its_instances_alone_here_and_through_on(
+    tmp_path, planted, cmd
+):
+    """2P1D, the second prefill instance started through a prefix that, as
+    `ssh <node>` does, runs its words in a shell of its own: each prefill
+    instance runs under PREFILL_ENV's Store, byte for byte, the decode under
+    DECODE_ENV's variables, and neither side's command names the other's."""
+    env, flags = planted
+    prefix = tmp_path / "bin" / "on"
+    prefix.write_text('#!/bin/sh\nshift\necho "$*" >>"$PLANTED_ON"\nexec sh -c "$*"\n')
+    prefix.chmod(0o755)
+    for name in (*PREFILL_ENV, *DECODE_ENV):  # none from the caller
+        env.pop(name, None)
+    env |= {
+        "PLANTED_ON": str(tmp_path / "on.log"),
+        "PLANTED_BUILD": f"{_tree_commit()} clean",
+        "PREFILL_ENV": " ".join(f"{k}={v}" for k, v in PREFILL_ENV.items()),
+        "DECODE_ENV": " ".join(f"{k}={v}" for k, v in DECODE_ENV.items()),
+    }
+    if cmd == "run":  # an instance on another node prices the KV on the network
+        flags += [*router_hop(tmp_path), *platforms.network(DOCUMENT, tmp_path)]
+    else:
+        flags = ["--gpu", "0,1"]
+    words = argv(tmp_path, flags, router=ROUTER_LP_ARGS)
+    words[3] = cmd
+    at = words.index("--decode")
+    model = ["--model", str(tmp_path)]
+    words[at:at] = ["--prefill", "--on", f"{prefix} node-b", "--", *model, *PREFILL]
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, text=True
+    )
+    try:
+        _until(d / "server.json", script)
+    finally:
+        script.send_signal(signal.SIGTERM)
+        script.communicate(timeout=60)
+
+    assert (tmp_path / "on.log").read_text().splitlines()[0] == f"bash {d}/prefill1.sh"
+    for name in ("prefill0", "prefill1", "decode"):
+        own, other = PREFILL_ENV, DECODE_ENV
+        if name == "decode":
+            own, other = other, own
+        seen = json.loads((d / f"{name}.env.json").read_text())
+        assert {k: seen.get(k) for k in own} == own, name
+        assert not other.keys() & seen.keys(), name
+        assert not any(k in (d / f"{name}.sh").read_text() for k in other), name
+        if own is PREFILL_ENV:
+            # ATOM folds it in beside the P/D connector, a Store it can address.
+            kv = json.loads(json.loads((d / f"{name}.argv.json").read_text())[-1])
+            offload = kv_offload_connector_config(
+                seen["ATOM_KV_OFFLOAD"], seen["ATOM_KV_OFFLOAD_EXTRA_CONFIG"]
+            )
+            folded = json.loads(compose_kv_offload_config(json.dumps(kv), offload))
+            assert folded["connectors"] == [kv, offload]
+            pools = parse_mooncake_store_config(offload).pools
+            assert sorted(pools) == ["ionic_0", "ionic_1"]
+
+
+@pytest.mark.parametrize("node", ["10.0.0.2", None])
+def test_a_record_pairs_the_clock_of_each_other_node_it_starts_an_instance_on(
+    tmp_path, planted, node
+):
+    """2P1D recorded, the second prefill instance started through a prefix
+    that, as `ssh <node>` does, runs its words in a shell of its own, and
+    serving at `node`'s address: the deployment pairs that node's clock with
+    this one's over the prefix as it starts, every CLOCK_PAIR_S and once it
+    has stopped, each pair a line of OUT/clock_pairs.jsonl, which the router,
+    asking prefill0 alone, never reaches. Serving at its node's loopback,
+    None, it has no node the split tells apart from this one, so no pair."""
+    env, _ = planted
+    prefix = tmp_path / "bin" / "on"
+    prefix.write_text('#!/bin/sh\nshift\necho "$*" >>"$PLANTED_ON"\nexec sh -c "$*"\n')
+    prefix.chmod(0o755)
+    env |= {"PLANTED_ON": str(tmp_path / "on.log"), "PLANTED_BIND": "127.0.0.1"}
+    env |= {"CLOCK_PAIR_S": "1"}
+    words = argv(tmp_path, ["--gpu", "0,1"])
+    words[3] = "record"
+    at = words.index("--decode")
+    own = ["--on", f"{prefix} node-b", *(["--host", node] if node else [])]
+    words[at:at] = ["--prefill", *own, "--", "--model", str(tmp_path), *PREFILL]
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        words,
+        env=env,
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _until(d / "server.json", script)
+        ready = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        time.sleep(3)
+    finally:
+        stopping = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        script.send_signal(signal.SIGTERM)
+        _, err = script.communicate(timeout=60)
+
+    # No pair failed; and the run was written once all had stopped.
+    assert script.returncode == 0, err
+    assert "clock_pair" not in err, err
+    assert (d / "run.json").exists()
+    ran = (tmp_path / "on.log").read_text().splitlines()
+    assert ran[0] == f"bash {d}/prefill1.sh"
+    serve = f"python3 -I -u {TREE}/atom/compass/drive/clock_pair.py serve"
+    paired = d / "clock_pairs.jsonl"
+    if node is None:
+        assert not paired.exists() and serve not in ran
+        return
+    rows = [json.loads(line) for line in paired.read_text().splitlines()]
+    # As it started, once a second after while it served, and once stopped.
+    # A pair the stop cut short ran through the prefix and wrote no line.
+    assert len(rows) >= 3 and ran.count(serve) - len(rows) in (0, 1)
+    assert {r["node"] for r in rows} == {node}
+    times = [r["mono_ns"] for r in rows]
+    assert times == sorted(times) and times[0] < ready + 2e9
+    assert times[-1] > stopping
+    # That node is this one, so each offset is none within the error it states.
+    assert all(abs(r["offset_ns"]) <= r["error_ns"] for r in rows)
+
+
+#: A prefix as a relay that carries no stdin, c2_r2's relay_client.py: it runs
+#: its words in a shell of its own, as `ssh <node>` does, its stdin closed,
+#: and lives as long as they do.
+RELAY = (
+    '#!/bin/sh\nshift\necho "$*" >>"$PLANTED_ON"\nsh -c "$*" </dev/null &\nwait $!\n'
+)
+
+
+@pytest.mark.parametrize("override", [True, False])
+def test_a_node_whose_prefix_carries_no_stdin_is_paired_through_its_override(
+    tmp_path, planted, override
+):
+    """prefill1 on 10.0.0.2, started through a relay that carries no stdin:
+    with CLOCK_PAIR_PREFIX_10_0_0_2 naming a prefix that carries it, as `ssh`
+    does, that node is paired through that prefix alone; without, each pair
+    fails, so none is written, and nothing else does."""
+    env, _ = planted
+    bindir = tmp_path / "bin"
+    (bindir / "relay").write_text(RELAY)
+    (bindir / "ssh").write_text(
+        '#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\n'
+        'echo "$*" >>"$PLANTED_SSH"\nexec sh -c "$*"\n'
+    )
+    for tool in ("relay", "ssh"):
+        (bindir / tool).chmod(0o755)
+    env |= {"PLANTED_ON": str(tmp_path / "on.log"), "PLANTED_BIND": "127.0.0.1"}
+    env |= {"PLANTED_SSH": str(tmp_path / "ssh.log"), "CLOCK_PAIR_S": "1"}
+    if override:
+        env["CLOCK_PAIR_PREFIX_10_0_0_2"] = f"{bindir / 'ssh'} -o BatchMode=yes node-b"
+    words = argv(tmp_path, ["--gpu", "0,1"])
+    words[3] = "record"
+    at = words.index("--decode")
+    own = ["--on", f"{bindir / 'relay'} node-b", "--host", "10.0.0.2"]
+    words[at:at] = ["--prefill", *own, "--", "--model", str(tmp_path), *PREFILL]
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        words,
+        env=env,
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _until(d / "server.json", script)
+        time.sleep(2)
+    finally:
+        script.send_signal(signal.SIGTERM)
+        _, err = script.communicate(timeout=60)
+
+    assert script.returncode == 0, err
+    assert (d / "run.json").exists()
+    serve = f"python3 -I -u {TREE}/atom/compass/drive/clock_pair.py serve"
+    relayed = (tmp_path / "on.log").read_text().splitlines()
+    assert relayed[0] == f"bash {d}/prefill1.sh"
+    paired = d / "clock_pairs.jsonl"
+    if not override:
+        assert not paired.exists() and not (tmp_path / "ssh.log").exists()
+        closed = (
+            f"clock_pair: 10.0.0.2: `{bindir / 'relay'} node-b` closed with no answer"
+        )
+        # As it started and once it stopped at the least; one the stop cut
+        # short ran through the relay and said nothing.
+        assert err.count(closed) >= 2, err
+        assert relayed.count(serve) - err.count(closed) in (0, 1)
+        return
+    assert "clock_pair" not in err, err
+    rows = [json.loads(line) for line in paired.read_text().splitlines()]
+    assert len(rows) >= 2 and {r["node"] for r in rows} == {"10.0.0.2"}
+    ssh = (tmp_path / "ssh.log").read_text().splitlines()
+    assert set(ssh) == {serve} and len(ssh) - len(rows) in (0, 1)
+    assert serve not in relayed
+    assert all(abs(r["offset_ns"]) <= r["error_ns"] for r in rows)
+
+
+#: A prefix as `ssh <node>`: it runs its words in a shell of its own and ends
+#: with their status, or, signalled itself, with 255, as ssh does at SIGTERM.
+SSH = (
+    '#!/bin/sh\ntrap "exit 255" TERM\nshift\necho "$*" >>"$PLANTED_ON"\n'
+    'sh -c "$*" &\nwait $!\n'
+)
+
+
+@pytest.mark.parametrize("leaves", [False, True])
+def test_a_record_s_stop_reaches_an_instance_elsewhere_through_its_prefix(
+    tmp_path, planted, leaves
+):
+    """prefill1 started through a prefix that, as `ssh <node>` does, ends
+    with its command's status, or with 255 when signalled itself: the stop
+    reaches prefill1 through the prefix, never the prefix, so its status is
+    prefill1's, and the record exits 0. prefill1 leaving with an error before
+    any stop fails it."""
+    env, _ = planted
+    (tmp_path / "bin" / "ssh").write_text(SSH)
+    (tmp_path / "bin" / "ssh").chmod(0o755)
+    env |= {"PLANTED_ON": str(tmp_path / "on.log")}
+    env |= {"PLANTED_DIE": f"prefill1 {tmp_path / 'leave'}"}
+    words = argv(tmp_path, ["--gpu", "0,1"])
+    words[3] = "record"
+    at = words.index("--decode")
+    own = ["--on", f"{tmp_path / 'bin' / 'ssh'} node-b"]
+    words[at:at] = ["--prefill", *own, "--", "--model", str(tmp_path), *PREFILL]
+    d = tmp_path / "d"
+    script = subprocess.Popen(
+        words,
+        env=env,
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _until(d / "server.json", script)
+        time.sleep(1)
+        if leaves:
+            (tmp_path / "leave").touch()
+            script.wait(timeout=60)
+    finally:
+        script.send_signal(signal.SIGTERM)
+        _, err = script.communicate(timeout=60)
+
+    assert (d / "run.json").exists()
+    pid = int((d / "prefill1.pid").read_text())
+    ran = (tmp_path / "on.log").read_text().splitlines()
+    assert ran[0] == f"bash {d}/prefill1.sh"
+    if leaves:
+        assert script.returncode == 1
+        assert "deploy: a process of the deployment left before a stop" in err
+        return
+    assert script.returncode == 0, err
+    assert ran[1:] == [f"kill -TERM {pid}"]
+    assert (d / "prefill1" / "run.json").exists()
+
+
+def test_a_side_s_variable_that_is_no_name_value_word_exits_2(tmp_path, planted):
+    env, flags = planted
+    env["PREFILL_ENV"] = (
+        'ATOM_KV_OFFLOAD_EXTRA_CONFIG={"mooncake_store.protocol": "tcp"}'
+    )
+
+    done = subprocess.run(
+        argv(tmp_path, flags),
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert done.returncode == 2, done.stderr
+    assert 'take NAME=VALUE words, not "tcp"}' in done.stderr
+    assert not (tmp_path / "d" / "run_file.json").exists()
+
+
+@pytest.mark.parametrize(
+    "where, refusal",
+    [
+        ("after decode", "in that order"),
+        ("other args", "prefill1's ATOM arguments differ from prefill0's"),
+        (
+            "no retries",
+            "choose among a side's instances as LP router but not --disable-retries",
+        ),
+    ],
+)
+def test_a_second_prefill_instance_out_of_place_exits_2_before_anything_starts(
+    tmp_path, planted, where, refusal
+):
+    env, flags = planted
+    model = ["--model", str(tmp_path)]
+    retries = (
+        ROUTER_ARGS if where == "no retries" else [*ROUTER_ARGS, "--disable-retries"]
+    )
+    words = argv(tmp_path, flags, router=retries)
+    args = [] if where == "other args" else PREFILL
+    at = words.index("--router" if where == "after decode" else "--decode")
+    words[at:at] = ["--prefill", "--", *model, *args]
+
+    done = subprocess.run(
+        words, env=env, cwd=tmp_path, capture_output=True, text=True, check=False
+    )
+
+    assert done.returncode == 2, done.stderr
+    assert refusal in done.stderr
+    assert not (tmp_path / "d" / "run_file.json").exists()
 
 
 def test_an_instance_that_exits_before_it_answers_fails_the_deployment_naming_it(
@@ -492,15 +906,27 @@ def test_a_simulated_router_bounds_a_request_by_a_year_of_wall_time(tmp_path, pl
     out, _ = script.communicate(timeout=60)
 
     assert script.returncode == 0, out
-    assert router.count("--request-timeout-secs") == 1
-    bound = int(router[router.index("--request-timeout-secs") + 1])
-    assert bound >= 365 * 24 * 3600
+    # So are the prepare pool's wait and preparation, which a loaded host
+    # stretches on the wall clock.
+    for flag, scale in (
+        ("--request-timeout-secs", 1),
+        ("--prepare-queue-timeout-ms", 1000),
+        ("--prepare-timeout-ms", 1000),
+    ):
+        assert router.count(flag) == 1, flag
+        assert int(router[router.index(flag) + 1]) >= 365 * 24 * 3600 * scale, flag
 
 
 @pytest.mark.parametrize(
-    "words", [["--request-timeout-secs", "60"], ["--request-timeout-secs=60"]]
+    "words",
+    [
+        ["--request-timeout-secs", "60"],
+        ["--request-timeout-secs=60"],
+        ["--prepare-queue-timeout-ms", "5000"],
+        ["--prepare-timeout-ms=15000"],
+    ],
 )
-def test_a_simulated_router_refuses_the_caller_s_request_timeout(
+def test_a_simulated_router_refuses_the_caller_s_wall_clock_bounds(
     tmp_path, planted, words
 ):
     env, flags = planted
@@ -516,7 +942,8 @@ def test_a_simulated_router_refuses_the_caller_s_request_timeout(
     )
 
     assert done.returncode == 2, done.stderr
-    assert "the router's arguments carry --request-timeout-secs," in done.stderr
+    flag = words[0].split("=")[0]
+    assert f"the router's arguments carry {flag}," in done.stderr
     assert not (tmp_path / "d").exists()
 
 

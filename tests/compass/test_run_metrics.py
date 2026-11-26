@@ -397,10 +397,17 @@ def test_an_engine_that_ends_early_keeps_what_it_sampled(files, started, tmp_pat
     assert [r for r in said["refusals"] if "died" not in r] == []
 
 
-def _snapshot(running: int, used: int, cached: int, full: int) -> dict:
+def _snapshot(running: int, used: int, cached: int, full: int, hits: int) -> dict:
     """The engines' snapshot a frontend refresh takes: one DP rank's requests
-    and KV blocks, and the prefix cache's counters."""
+    and KV blocks, the prefix cache's counters, and the DP router's
+    `share_cache` hits, explicit routes and requests routed to rank 0, all
+    `hits`."""
     return {
+        "dp_router": {
+            "share_cache_hit_total": hits,
+            "explicit_total": hits,
+            "requests_per_rank": [hits],
+        },
         "enabled": True,
         "requests_running": running,
         "scheduler_metrics": [
@@ -449,14 +456,14 @@ def _frontend(started, side, stop=None):
         assert _no_gc(rendered) == _no_gc(plain.render().decode())
         held[t] = _held(rendered)
 
-    refresh(0.0, _snapshot(0, 0, 0, 0))
+    refresh(0.0, _snapshot(0, 0, 0, 0, 0))
     rt.now = 0.5
     requests.observe_time_to_first_token(0.5, True)
     streams.observe_inter_token_latency(0.25, 2)
-    refresh(1.0, _snapshot(1, 2, 64, 100))
+    refresh(1.0, _snapshot(1, 2, 64, 100, 1))
     rt.now = 1.75
     requests.observe_time_to_first_token(1.25, False)
-    refresh(2.0, _snapshot(0, 2, 64, 200))
+    refresh(2.0, _snapshot(0, 2, 64, 200, 1))
     rt.now = 2.25
     streams.observe_inter_token_latency(0.5, 1)
     rt.now = 2.5
@@ -474,10 +481,10 @@ def test_a_frontend_writes_what_it_held_at_each_refresh(
 ):
     """Each instant of the file is a refresh's, at the frontend's clock, and
     holds what ``/metrics`` held of the families just after it: the snapshot
-    families and the frontend's own latencies; ``/metrics`` itself is what
-    ATOM's own update gives. The last is the final sample's, at the clock the
-    frontend held before the finish, with the interval it observed after its
-    last refresh."""
+    families, the DP router's `share_cache` decisions among them, and the
+    frontend's own latencies; ``/metrics`` itself is what ATOM's own update
+    gives. The last is the final sample's, at the clock the frontend held
+    before the finish, with the interval it observed after its last refresh."""
     rt, held = _frontend(started, side)
     _, lp, role = SIDES[side]
     written = _instants(tmp_path / metrics.FILE.format(lp), role, lp)
@@ -496,9 +503,22 @@ def test_a_frontend_writes_what_it_held_at_each_refresh(
         "atom:prefix_cache_cached_tokens",
         "atom:prefix_cache_full_tokens",
         "atom:prefix_cache_offload_tokens",
+        "atom:dp_share_cache_hit",
+        "atom:dp_share_cache_source_rank",
+        "atom:dp_share_cache_cold",
+        "atom:dp_share_cache_stale",
+        "atom:dp_route_explicit",
+        "atom:dp_requests_routed",
         "atom:time_to_first_token_seconds",
         "atom:inter_token_latency_seconds",
     }
+    for family, labels in (
+        ("atom:dp_share_cache_hit", ()),
+        ("atom:dp_route_explicit", ()),
+        ("atom:dp_requests_routed", (("rank", "0"),)),
+    ):
+        key = family, family + "_total", labels
+        assert [at[key] for at in written.values()] == [0, 1, 1, 1], family
     _whole_before_hand_in(renames, tmp_path, lp)
     assert rt.refusals == []
 

@@ -10,12 +10,15 @@ of deployment; atomesh, built from this tree, between scripted frontends as in
 `test_router_lp_acceptance`, twice, under two hash seeds and random host delays.
 With one, `pd_sim.sh` runs 2P2D at TP1 under a constant stub, twice, and
 `check_run` holds the runs to the scenario checks and each engine LP's rows to
-the timeline the stub implies.
+the timeline the stub implies. With `ATOM_COMPASS_DSPARK_MODEL` and atomesh,
+and no driver, it runs DeepSeek-V4.1-Flash's 2P2D at DP 2 behind the 6P16D
+share-cache recipe's router (`RECIPE`, --dp-aware) the same way.
 """
 
 import json
 import os
 import random
+import shutil
 import signal
 import socket
 import subprocess
@@ -30,10 +33,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from test_dp_slice import MAX_TOKENS
+import test_dp_slice
+from test_dp_slice import DP_MACHINE, MAX_TOKENS
 from test_kv_remote_prefill import Script, connector
 from test_kv_simulated_connector import PEAKS, geometry, model_for  # noqa: F401
 from test_pd_dp import RouterLpRequests
+from test_pd_sim_router_args import RECIPE
 from test_pd_slice import NEEDS_A_PD_RUN, PD, publish_pd_entries
 from test_router_lp_acceptance import (
     WALL_S,
@@ -50,6 +55,8 @@ from test_vertical_slice import (
     TREE,
     _retry,
     _run_file,
+    publish_entry,
+    publish_entry_on_arch,
 )
 
 from atom.compass import run as compass_run
@@ -167,13 +174,28 @@ def test_a_worker_order_lists_each_deployment_rank_once_and_names_no_configurati
     run = XPYD | {"prefill_data_parallel_size": 2, "clock_endpoint": "tcp://x"}
     order = {"P": [[1, 0], [0, 0], [1, 1], [0, 1]], "D": [[1, 0], [0, 0]]}
     assert compass_run.worker_order(run | {"worker_order": order}) == order
-    assert compass_run.worker_order(run) == {}
+    assert compass_run.worker_order(run) == {
+        "P": [[0, 0], [0, 1], [1, 0], [1, 1]],
+        "D": [[0, 0], [1, 0]],
+    }
     assert compass_run.configuration(run | {"worker_order": order}) == XPYD | {
         "prefill_data_parallel_size": 2
     }
     for bad in ({"P": order["P"][:3]}, {"D": [[0, 0], [0, 0]]}, {"X": [[0, 0]]}):
         with pytest.raises(ValueError, match="list each of its deployments"):
             compass_run.worker_order(run | {"worker_order": bad})
+
+
+def test_a_side_the_run_file_does_not_order_is_listed_by_instance_then_rank():
+    """The router LP lists the side a recorded order leaves out by instance and
+    DP rank, not by its workers' URLs, whose ports deploy.sh draws afresh in
+    each run: two runs of one deployment place alike."""
+    run = XPYD | {"prefill_data_parallel_size": 2, "decode_data_parallel_size": 4}
+    prefill = [[1, 0], [0, 0], [1, 1], [0, 1]]
+    assert compass_run.worker_order(run | {"worker_order": {"P": prefill}}) == {
+        "P": prefill,
+        "D": [[0, 0], [0, 1], [0, 2], [0, 3], [1, 0], [1, 1], [1, 2], [1, 3]],
+    }
 
 
 # --- the connector -----------------------------------------------------------
@@ -216,6 +238,7 @@ def test_decode_sends_the_write_request_to_the_prefill_deployment_that_served_it
             num_cached_tokens=0,
         )
     )
+    d.device_done(None)  # the admission step's forward returns, its device done
     channel, seq_no, arrival = rt_d.send_log[-1]
     assert channel == "engine-D0->engine-P1:kv_write_req"
     rt_p1.conn.grants.append((1.0, {channel: [(seq_no, arrival)]}))
@@ -424,31 +447,48 @@ OFFSETS = {
     "PREFILL_DP_PORT": 11,
     "DECODE_DP_PORT": 12,
 }
+#: At DP 2 the write requests take 2 * 2 * 2 * 2 = 16 ports from
+#: KV_WRITE_REQ_PORT, and each server's DP port leaves its ranks room.
+DP2_OFFSETS = OFFSETS | {"PREFILL_DP_PORT": 32, "DECODE_DP_PORT": 40}
 
 
-def run_xpyd(out: Path, seed: str) -> dict:
-    """One 2P2D run under `pd_sim.sh`, round robin on each side."""
+def run_xpyd(
+    out: Path,
+    seed: str,
+    offsets=OFFSETS,
+    run: dict | None = None,
+    cell=None,
+    publish=publish_entry,
+) -> dict:
+    """One 2P2D run under `pd_sim.sh`, round robin on each side, or with the
+    run file keys `run` and the environment `cell` over those, its readings
+    published by `publish`."""
     out.mkdir()
-    with held_ports(1, lambda q: range(q[0] + 1, q[0] + 32)) as [base]:
-        ports = {name: base + k for name, k in OFFSETS.items()}
+    run, cell = run or {}, cell or {}
+    with held_ports(1, lambda q: range(q[0] + 1, q[0] + 72)) as [base]:
+        ports = {name: base + k for name, k in offsets.items()}
         run_file = _run_file(
             out,
             clock_endpoint=f"tcp://127.0.0.1:{ports['CLOCK_PORT']}",
             step_stub=CONSTANT,
             **XPYD,
             **PD,
+            **run,
         )
-        env = dict(
-            os.environ,
-            PYTHONHASHSEED=seed,
-            PYTHONPATH=str(TREE),
-            AITER_LOG_LEVEL="WARNING",
-            ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
-            MODEL=MODEL,
-            ROUTER_POLICY="round_robin",
-            **{name: str(port) for name, port in ports.items()},
+        env = (
+            dict(
+                os.environ,
+                PYTHONHASHSEED=seed,
+                PYTHONPATH=str(TREE),
+                AITER_LOG_LEVEL="WARNING",
+                ATOM_COMPASS_PARITY_RECORD=str(out / "parity"),
+                MODEL=MODEL,
+                ROUTER_POLICY="round_robin",
+                **{name: str(port) for name, port in ports.items()},
+            )
+            | cell
         )
-        publish_pd_entries(out / "store", DOCUMENT, env)
+        publish_pd_entries(out / "store", run.get("machine", DOCUMENT), env, publish)
         log = out / "pd_sim.log"
         with open(log, "w") as f:
             sim = subprocess.Popen(
@@ -489,17 +529,13 @@ def xpyd_runs(tmp_path_factory):
     return [run_xpyd(root / f"seed{s}", s) for s in ("1", "2")]
 
 
-@NEEDS_A_PD_RUN
-def test_2p2d_meets_every_scenario_check_with_requests_on_every_deployment(
-    xpyd_runs,
-):
-    run = xpyd_runs[0]
+def _every_check_with_requests_on_every_deployment(runs) -> list[str]:
+    """Both seeds' `runs` meet every scenario check, each request's KV moving
+    once, every deployment of each side taking one; the transfers' channels."""
+    run = runs[0]
     rows = [r.split() for r in run["table"].splitlines()[1:]]
-    pairs = Counter(
-        r[4].partition(":")[0]
-        for r in rows
-        if r[3] == "release" and ":kv_write_req" in r[4]
-    )
+    channels = [r[4] for r in rows if r[3] == "release" and ":kv_write_req" in r[4]]
+    pairs = Counter(c.partition(":")[0] for c in channels)
     print(
         "\nKV transfers per decode->prefill engine pair:", dict(sorted(pairs.items()))
     )
@@ -510,7 +546,7 @@ def test_2p2d_meets_every_scenario_check_with_requests_on_every_deployment(
         for k in (0, 1)
     }
     failed = check_run(
-        [r["out"] for r in xpyd_runs],
+        [r["out"] for r in runs],
         MAX_TOKENS,
         [line for _, line in run["events"]],
         records,
@@ -520,3 +556,66 @@ def test_2p2d_meets_every_scenario_check_with_requests_on_every_deployment(
     ends = [p.split("->") for p in pairs]
     assert {d for d, _ in ends} == {"engine-D0", "engine-D1"}
     assert {p for _, p in ends} == {"engine-P0", "engine-P1"}
+    return channels
+
+
+@NEEDS_A_PD_RUN
+def test_2p2d_meets_every_scenario_check_with_requests_on_every_deployment(
+    xpyd_runs,
+):
+    _every_check_with_requests_on_every_deployment(xpyd_runs)
+
+
+# --- the share-cache recipe's router, at DP 2, with no driver ------------------
+
+#: DeepSeek-V4.1-Flash's config and tokenizer, as `test_spec_scenario` takes it.
+DSV41 = os.environ.get("ATOM_COMPASS_DSPARK_MODEL")
+#: Each server at DP 2, eager, on the recipe's KV and index dtypes, block size
+#: and MoE path. No side here has a tier every DP rank shares, which
+#: `share_cache` needs, so the prefill side keeps its default policy: under the
+#: recipe's --dp-aware router, which names each request's rank, it chooses none.
+DSV41_ARGS = "--trust-remote-code -tp 2 --enable-dp-attention --enforce-eager"
+DSV41_ARGS += " --max-model-len 2048 --kv_cache_dtype bf16 --index-cache-dtype fp8"
+DSV41_ARGS += " --block-size 128 --moe-backend standard --all2all-backend none"
+NEEDS_A_RECIPE_RUN = pytest.mark.skipif(
+    not (DSV41 and shutil.which("atomesh")),
+    reason="a run needs ATOM_COMPASS_DSPARK_MODEL and atomesh on PATH",
+)
+
+
+@pytest.fixture(scope="module")
+def recipe_runs(tmp_path_factory):
+    """2P2D at DP 2 behind the recipe's router, on a gfx950 machine, so each
+    server starts under on_arch and needs no driver."""
+    root = tmp_path_factory.mktemp("xpyd_recipe")
+    run = {"data_parallel_size": 2, "machine": DP_MACHINE}
+    router = f"{RECIPE} --dp-aware --model-path {DSV41}"
+    cell = {"MODEL": DSV41, "SERVER_ARGS": DSV41_ARGS, "ROUTER_ARGS": router}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(test_dp_slice, "MODEL", DSV41)  # the traffic's model
+        return [
+            run_xpyd(
+                root / f"seed{s}", s, DP2_OFFSETS, run, cell, publish_entry_on_arch
+            )
+            for s in ("1", "2")
+        ]
+
+
+@NEEDS_A_RECIPE_RUN
+def test_2p2d_at_dp2_behind_the_recipe_s_router_meets_every_scenario_check(
+    recipe_runs,
+):
+    """The recipe's router chooses each request's deployment and DP rank on
+    the run's clock: both seeds' runs meet every scenario check with requests
+    on every deployment and both ranks of each side, and the router ran on
+    the recipe's flags, its wall-clock bounds a year, refusing no request."""
+    channels = _every_check_with_requests_on_every_deployment(recipe_runs)
+    ranks = [c.rpartition("#")[2].split(".") for c in channels]
+    assert {d for d, _ in ranks} == {p for _, p in ranks} == {"dp0", "dp1"}
+    for run in recipe_runs:
+        log = (run["out"] / "pd_sim.log").read_text()
+        [said] = [x for x in log.splitlines() if x.startswith("pd_sim: router ")]
+        print(f"\n{run['out'].name}: {said}")
+        assert all(word in said.split() for word in [*RECIPE.split(), "--dp-aware"])
+        router = (run["out"] / "router.log").read_text()
+        assert "prepare_timeout" not in router and "prepare_queue_timeout" not in router

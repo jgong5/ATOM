@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 """DeepSeek-V4.1's FP8 window write holds no `BatchStep` in its leaf.
 
-`write_packed_window` takes a step, whose `request_*` fields are numpy
-arrays, and passes the fields its kernel reads to a launcher, which is the
-leaf. Compass off, `_write_window` launches over the step's width with
-those fields and the window's scalars; under capture, a write on steps
-ATOM's own producer builds at both `CONTEXTS` is one leaf of tensors and
-scalars equal at both, replaying to that kernel.
+Since upstream b7b5ec3f2 an FP8 window lives on a data plane and a scale
+plane, and `write_window_planes` takes a step, whose `request_*` fields are
+numpy arrays, and passes the fields its kernel reads to a launcher, which is
+the leaf. Compass off, `_write_planes` launches over the step's width with
+those fields and the window's ring; under capture, a write on steps ATOM's
+own producer builds at both `CONTEXTS` is one leaf of tensors and scalars
+equal at both, replaying to that kernel.
 """
 
 import os
@@ -22,7 +23,7 @@ from atom.compass import ir
 from atom.compass.capture import driverless, forward
 from atom.compass.ir.nodes import Reduced
 
-LEAF = "atom.model_ops.attentions.deepseek_v41.packed_rows:_launch_write_window"
+LEAF = "atom.model_ops.attentions.deepseek_v41.planes:_launch_write_planes"
 WINDOW_PARAMS = "atom.model_ops.attentions.pool_layout.v4_pool_geometry:WindowParams"
 REQUESTS, PAGES, LAYER = 4, 64, 3
 
@@ -87,6 +88,22 @@ def _rows(geometry, width, device):
     return rows[:, :dim].view(FP8_DTYPE), rows[:, dim:].view(torch.float8_e8m0fnu)
 
 
+def _planes(geometry, device, cls=torch.Tensor):
+    """A window's data and scale planes for `REQUESTS` slots, as
+    `PagedAttentionCache.ring_view` splits them, as `cls`."""
+    rows, dim = REQUESTS * geometry.ring_slots, geometry.head_dim
+    return tuple(
+        torch.empty(rows, width, dtype=torch.uint8, device=device).as_subclass(cls)
+        for width in (dim, dim // 32)
+    )
+
+
+class _OnDevice(torch.Tensor):
+    """A host plane the write takes for the device's, so it launches."""
+
+    is_cuda = True
+
+
 def _same(launched, expected):
     """A tensor by its storage address, dtype, shape and stride; anything
     else by its type and value."""
@@ -107,10 +124,9 @@ def test_compass_off_the_fp8_window_write_launches_with_its_steps_fields(
     if _own_process(request):
         return
     driverless.install(str(tmp_path), "gfx950")
-    import triton
     from triton.runtime.jit import JITFunction
 
-    from atom.model_ops.attentions.deepseek_v41 import packed_rows
+    from atom.model_ops.attentions.deepseek_v41 import planes
     from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 
     launched = []
@@ -129,12 +145,12 @@ def test_compass_off_the_fp8_window_write_launches_with_its_steps_fields(
         RequestSpan(2, 7, 6, 3, 1),
     )
     step = _host_step(spans, is_prefill=True, running_bs=4, running_tokens=12)
-    values, scales = _rows(geometry, step.width, "cpu")
-    pool = torch.empty(4096, dtype=torch.uint8)
-    window = geometry.window_bytes(LAYER, PAGES)
+    values, scales = _rows(geometry, step.running_tokens, "cpu")
+    data, scale = _planes(geometry, "cpu", _OnDevice)
+    window = geometry.window(LAYER, PAGES)
     until = torch.tensor([0, 131, 8, 0], dtype=torch.int32) if cached else None
 
-    packed_rows.write_packed_window(values, scales, pool, step, window, dim, until)
+    planes.write_window_planes(values, scales, (data, scale), step, window, dim, until)
 
     # Each field read off the step and the window, in the kernel's order.
     expected = (
@@ -142,21 +158,19 @@ def test_compass_off_the_fp8_window_write_launches_with_its_steps_fields(
         scales.view(torch.uint8),
         values.stride(-2),
         scales.stride(-2),
-        pool,
+        data,
+        scale,
         step.positions,
         step.batch_ids,
         step.cu_seqlens_q,
         step.slots,
-        window.ring_start,
-        step.positions if until is None else until,
+        until,
         until is not None,
-        window.slot_rows,
         window.ring_slots,
         dim,
-        triton.next_power_of_2(dim),
     )
     [(kernel, grid, args, kwargs)] = launched
-    assert kernel is packed_rows._write_window
+    assert kernel is planes._write_planes
     assert grid == (12,) and not kwargs
     assert len(args) == len(expected)
     for slot, (arg, want) in enumerate(zip(args, expected)):
@@ -176,16 +190,14 @@ def _on_device(step):
     return step
 
 
-def _write(geometry, step, pool):
-    """The FP8 pool's window write of `step`'s rows, as `PagedAttentionCache.
+def _write(geometry, step, planes):
+    """The FP8 window's write of `step`'s rows, as `PagedAttentionCache.
     write_window` makes it on a step no request of which recomputes rows."""
-    from atom.model_ops.attentions.deepseek_v41.packed_rows import (
-        write_packed_window,
-    )
+    from atom.model_ops.attentions.deepseek_v41.planes import write_window_planes
 
-    values, scales = _rows(geometry, step.width, "cuda")
-    window = geometry.window_bytes(LAYER, PAGES)
-    write_packed_window(values, scales, pool, step, window, geometry.head_dim)
+    values, scales = _rows(geometry, step.running_tokens, "cuda")
+    window = geometry.window(LAYER, PAGES)
+    write_window_planes(values, scales, planes, step, window, geometry.head_dim)
 
 
 def _held(value):
@@ -214,12 +226,12 @@ def test_v41_s_fp8_window_write_is_one_leaf_holding_no_step(request, tmp_path):
             steps.append(_host_step(spans, max_q_len=1))
             with recorder.fake_mode, recorder:
                 step = _on_device(steps[-1])
-                pool = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
+                planes = _planes(geometry, "cuda")
                 for _ in range(2):  # the untraced steps find the launcher
-                    _write(geometry, step, pool)
+                    _write(geometry, step, planes)
                 recorder.start()
                 recorder.on = True
-                _write(geometry, step, pool)
+                _write(geometry, step, planes)
             recorder.on = False
             traces.append(recorder.items)
         items = forward._affine(f"decode B={REQUESTS}", *traces)
@@ -235,4 +247,4 @@ def test_v41_s_fp8_window_write_is_one_leaf_holding_no_step(request, tmp_path):
     [leaf] = leaves
     moving = [(slot, value) for slot, value in leaf.args if not _held(value)]
     assert not moving, moving
-    assert replays == {LEAF: ["triton._write_window"]}
+    assert replays == {LEAF: ["triton._write_planes"]}

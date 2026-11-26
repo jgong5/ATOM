@@ -32,6 +32,7 @@ adds a `+`.
 from __future__ import annotations
 
 import math
+import os
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -275,6 +276,37 @@ def eager_beside_peer(view: BatchView, source: str) -> StepCost | None:
         return None
     said = Provenance(Method.DECLARED, "0 s", source, note=note)
     return StepCost([CostTerm(name, 0.0, said)], (treatment,))
+
+
+#: The treatment of a decode-phase DP dummy whose whole group is idle, priced
+#: 0 s where the law holds no vector for its rung.
+IDLE_DP_GROUP = "idle DP group dummy"
+
+
+#: The environment variable that states these steps' seconds, 0 where unset: at 0 s a producer's idle group steps
+#: without the clock moving, while its sends wait on the clock for their own time, and the run never advances. A P/D run
+#: states the median of its record's all-idle dummy steps (cell B2 r1_c128: 7.5 ms, p10 7.4, p90 8.2, p99 10.7 ms, 3999 a rank).
+IDLE_DP_GROUP_S = "COMPASS_IDLE_DP_GROUP_S"
+
+
+def idle_group_dummy(view: BatchView, dp: int, source: str) -> StepCost | None:
+    """0 s, under its treatment, for a decode-phase DP dummy forward that every
+    rank of its group of `dp` runs (`group_dummies`), no rank holding a
+    request: a P/D producer's group stepping while its sends finish, whose
+    decodes are all such steps once its requests leave at their first token.
+    A record's dummies give no fit sample, so no law fitted on that side holds
+    a vector for their rung; None for any other step."""
+    if view.prefill or not view.dp_dummy or dp < 2 or view.group_dummies < dp:
+        return None
+    seconds = float(os.environ.get(IDLE_DP_GROUP_S, "0") or 0)
+    note = (
+        "no rank of the group holds a request; real records time these steps, "
+        "but a fit takes no sample from a dummy, so no rung vector prices them"
+    )
+    if seconds:
+        note += f"; {IDLE_DP_GROUP_S} states the record's measured time"
+    said = Provenance(Method.DECLARED, f"{seconds:g} s", source, note=note)
+    return StepCost([CostTerm("idle_dp_group", seconds, said)], (IDLE_DP_GROUP,))
 
 
 #: How a run summary groups seconds: a method each, estimated seconds split

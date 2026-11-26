@@ -74,6 +74,7 @@ class _Config:
     enable_tbo: bool = False
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
+    sequence_parallel_size: int = 1
     kv_cache_block_size: int = 16
     enable_rapidserve: bool = False
     kv_transfer_config: dict = dataclasses.field(default_factory=dict)

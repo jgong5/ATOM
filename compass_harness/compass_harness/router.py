@@ -2,7 +2,8 @@
 """aiperf's credit router with the traffic LP on both directions.
 
 Every credit leaves through ``send_credit`` (``CreditIssuer._issue_credit_internal``
-is its one call site), so the stamp is taken there; every return reaches the
+is its one call site), so the traffic LP takes it there, with its rank among
+the requests sent at its instant (`send_rank`); every return reaches the
 strategy only through the return callback, so the hold wraps it. aiperf's
 cancel of the requests in flight goes through the traffic LP first. The
 controller hears when the traffic LP is done, or the error that failed it.
@@ -21,6 +22,27 @@ from compass_harness.traffic_lp import TrafficLP
 from compass_harness.transport import credit_key
 
 
+def send_rank(credit) -> tuple:
+    """A credit's rank among the requests sent at its instant, the same in every run.
+
+    Its phase, its conversation (a trace id, which aiperf suffixes for a
+    subagent) and its turn, then its cache-bust marker, digested from the
+    benchmark id, which tells two replays of one trace apart where aiperf marks
+    them. Not its id: aiperf numbers credits in the order it sends them, the
+    order that varies from run to run; nor its correlation id, which
+    ``session_ids`` draws from the trace and branch ranked here. Two credits
+    that tie are one trace's turn replayed twice unmarked, the same body either
+    way round.
+    """
+    return (
+        -1 if credit.phase_index is None else credit.phase_index,
+        str(credit.phase),
+        credit.conversation_id,
+        credit.turn_index,
+        credit.cache_bust_marker or "",
+    )
+
+
 class CompassCreditRouter(StickyCreditRouter):
     def __init__(self, *args, service_id: str, **kwargs) -> None:
         super().__init__(*args, service_id=service_id, **kwargs)
@@ -32,7 +54,9 @@ class CompassCreditRouter(StickyCreditRouter):
         self.traffic.done.add_done_callback(self._on_finish)
 
     async def send_credit(self, credit) -> None:
-        self.traffic.send(credit_key(credit.phase, credit.phase_index, credit.id))
+        self.traffic.send(
+            credit_key(credit.phase, credit.phase_index, credit.id), send_rank(credit)
+        )
         await super().send_credit(credit)
 
     def set_return_callback(self, callback) -> None:

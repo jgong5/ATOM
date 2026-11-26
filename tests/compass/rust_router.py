@@ -78,6 +78,15 @@ _ID = "draws an id no policy reads"
 _EXT_PROC = "the Envoy ext_proc ingress, which a simulated launch does not start"
 _TOKENS = "the rate limiter, built only with --max-concurrent-requests"
 _PARSER = "tool-call parsing: what a response says"
+_PREPARE = (
+    "the request preparation pool's wall-clock queue and prepare deadlines, "
+    "which a simulated launch sets to a year"
+)
+_POOL_EXIT = "joins the preparation pool's threads at shutdown, after the last request"
+_KV_EVENTS = (
+    "the KV event monitor and its index, built only with --kv-events, which a "
+    "simulated launch does not pass"
+)
 
 # fmt: off
 _KEPT = (
@@ -138,6 +147,9 @@ _KEPT = (
     ("policies/power_of_two.rs", "rand::", LATENCY, "imports the trait the routed draws call", 1),
     ("policies/power_of_two.rs", "RandomState", LATENCY, _LOOKUP, 1),
     ("policies/random.rs", "rand::", LATENCY, "imports the trait the routed draw calls", 1),
+    ("policies/round_robin.rs", "rand::", LATENCY,
+     "imports the trait the routed draw calls", 1),
+    ("policies/round_robin.rs", "RandomState", LATENCY, "positions by candidate set; " + _LOOKUP, 1),
     ("policies/registry.rs", "RandomState", LATENCY, _LOOKUP, 2),
     ("policies/tree.rs", "RandomState", LATENCY,
      "per-tenant sizes read by key, and a debug dump", 2),
@@ -151,7 +163,8 @@ _KEPT = (
     ("routers/grpc/engine/worker_client_cache.rs", "RandomState", LATENCY, _LOOKUP, 1),
     ("routers/grpc/pipeline.rs", "Instant::now", LATENCY, _TIMING, 2),
     ("routers/http_pd_router.rs", "Instant::now", LATENCY, _TIMING, 1),
-    ("routers/http_pd_router.rs", "RandomState", LATENCY, "startup bootstrap tables; " + _LOOKUP, 6),
+    ("routers/http_pd_router.rs", "RandomState", LATENCY,
+     "startup bootstrap tables, and a warn-once set of prefills; " + _LOOKUP, 7),
     ("routers/http_pd_router.rs", "tokio::time", BOUND, (
         "aborts a prefill after 5 wall seconds and drops its load guard, on the "
         "vLLM backend only; pd_sim.sh passes --backend atom"), 1),
@@ -165,6 +178,30 @@ _KEPT = (
     ("tool_parser/parsers/common.rs", "RandomState", LATENCY, _PARSER, 1),
     ("tool_parser/parsers/minimax.rs", "RandomState", LATENCY, _PARSER, 2),
     ("tool_parser/registry.rs", "RandomState", LATENCY, _PARSER, 3),
+    ("core/prepare_pool/control.rs", "Instant::now", LATENCY, _POOL_EXIT, 2),
+    ("core/prepare_pool/control.rs", "thread::sleep", LATENCY, _POOL_EXIT, 1),
+    ("core/prepare_pool/job.rs", "Instant::now", BOUND,
+     _PREPARE + "; and a job's queue time, for a metric", 2),
+    ("core/prepare_pool/job.rs", "tokio::time", BOUND, _PREPARE, 2),
+    ("core/prepare_pool/mod.rs", "Instant::now", BOUND,
+     _PREPARE + "; their config check, and the pool's shutdown grace", 7),
+    ("core/prepare_pool/mod.rs", "tokio::time", BOUND,
+     _PREPARE + "; and the pool's shutdown grace", 2),
+    *((f"kv_{name}", pattern, OFF_LP, _KV_EVENTS, n) for name, pattern, n in (
+        ("events/monitor.rs", "Instant::now", 1), ("events/monitor.rs", "RandomState", 3),
+        ("events/monitor.rs", "SystemTime::now", 1), ("events/monitor.rs", "tokio::time", 4),
+        ("index/index.rs", "Instant::now", 1), ("index/index.rs", "RandomState", 1),
+        ("index/partition.rs", "Instant::now", 1), ("index/partition.rs", "RandomState", 2),
+        ("index/partition.rs", "tokio::time", 1))),
+    ("observability/route_trace.rs", "rand::", LATENCY,
+     "samples which requests log a route trace", 2),
+    ("routers/ingress.rs", "Instant::now", LATENCY, _TIMING, 3),
+    ("routers/ingress.rs", "RandomState", LATENCY,
+     "a warn-once set of models the KV event index cannot tokenize for", 1),
+    ("routers/prepare/thread_tokenizer.rs", "RandomState", LATENCY, _LOOKUP, 1),
+    *((f"routers/atom_bridge/{name}", "Instant::now", OFF_LP, (
+        "the Rust frontend (--frontend rust), which a simulated launch does not "
+        "start; it times a request's tokens"), 1) for name in ("events.rs", "py_bridge.rs")),
 )
 # fmt: on
 

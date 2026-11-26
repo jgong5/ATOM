@@ -14,6 +14,7 @@ import re
 import pytest
 from test_artifact_store import CONDITIONS, stanza
 from test_memory_readings import STACK
+from test_parity_record import _key, _prompt
 from test_parity_served import SAMPLING, client_run, recorded
 
 from atom.compass.artifacts import (
@@ -27,7 +28,13 @@ from atom.compass.artifacts import (
 )
 from atom.compass.backends.step_labels import digest, label
 from atom.compass.fit.publish import platform
-from atom.compass.fit.samples import MEMBER, load
+from atom.compass.fit.samples import (
+    GRADED_ONLY_ENV,
+    MEMBER,
+    client_spans,
+    graded_steps,
+    load,
+)
 from atom.compass.parity import ARRIVALS
 from atom.compass.parity.served import served
 from atom.compass.run.step_grid import keyed_of
@@ -97,6 +104,7 @@ def measured(store, config, sampling=SAMPLING, origin="replay"):
         view="sha256:5e1f",
     )
     member = {**LINE, "seconds": 1.5e-4, "origin": origin, "traces": ["trace-9"]}
+    member["sources"] = ["dp0.jsonl:0a1b2c3d4e5f"]
     ArtifactStore(store).publish(
         key,
         provenance=stanza("compass measure steps"),
@@ -244,6 +252,7 @@ def test_a_measurement_loads_beside_records_of_its_configuration_only(
         "requests": [],
         "config": None,
         "traces": ["trace-9"],
+        "inputs": ["dp0.jsonl:0a1b2c3d4e5f"],
         "profiled": False,
     }
 
@@ -311,4 +320,207 @@ def test_an_empty_rank_file_refuses_as_a_rank_whose_lines_never_reached_disk(
     (a / "steps/dp1.jsonl").write_text("")
 
     with pytest.raises(ValueError, match="dp1.jsonl has no timed steps"):
+        load({a: RUNS})
+
+
+def test_graded_only_drops_a_later_client_run_s_warmup_after_the_window_starts(
+    tmp_path, monkeypatch
+):
+    # Three groups served one after another, the client runs sending the first
+    # and the last: the middle group is the second client run's warmup, after
+    # the first graded step, which a cut at that step kept.
+    a = record(tmp_path, monkeypatch, groups=((0, 1), (2, 3), (4, 5)))
+    runs = [client_run([0, 1]), client_run([4, 5])]
+    every, config = load({a: runs})
+    split = served(a / "steps", runs)
+    warmup = {s["step"] for s in split[0] if s["client_run"] is None}
+    assert warmup and min(warmup) > min(graded_steps(split))
+
+    monkeypatch.setenv(GRADED_ONLY_ENV, "1")
+    graded, graded_config = load({a: runs})
+    assert [s.step for s in graded] == [
+        s.step for s in every if s.step in graded_steps(split)
+    ]
+    assert not {s.step for s in graded} & warmup
+    assert {s.step for s in every} & warmup
+    assert graded_config == config
+
+
+def test_graded_only_cuts_each_rank_s_dummy_forwards_to_the_graded_steps(
+    tmp_path, monkeypatch
+):
+    from atom.compass.fit import samples as fit_samples
+
+    a = record(tmp_path, monkeypatch, groups=((0, 1), (2, 3), (4, 5)))
+    runs = [client_run([0, 1]), client_run([4, 5])]
+    labelled = fit_samples.label_run
+    steps = tuple((n, None, {}, {}) for n in range(64))
+
+    def planted(*args):
+        return [
+            ([dataclasses.replace(s, dummy_host=steps) for s in got], table)
+            for got, table in labelled(*args)
+        ]
+
+    monkeypatch.setattr(fit_samples, "label_run", planted)
+    every = load({a: runs})[0]
+    assert all(s.dummy_host == steps for s in every)
+    monkeypatch.setenv(GRADED_ONLY_ENV, "1")
+    graded = load({a: runs})[0]
+    kept = graded_steps(served(a / "steps", runs))
+    assert graded and kept < {n for n, *_ in steps}
+    for s in graded:
+        assert [n for n, *_ in s.dummy_host] == sorted(kept)
+
+
+def test_graded_only_keeps_a_step_holding_warmup_and_sent_requests_together(
+    tmp_path, monkeypatch
+):
+    # Requests 1 and 3 are no client run's, and run beside 0 and 2.
+    a = record(tmp_path, monkeypatch)
+    runs = [client_run([0]), client_run([2])]
+    every, _ = load({a: runs})
+    unsent = {_key(_prompt(i)) for i in (1, 3)}
+    split = served(a / "steps", runs)
+    mixed = {
+        s["step"]
+        for s in split[0]
+        if s["client_run"] is not None and {r[0] for r in s["batch"]} & unsent
+    }
+    assert mixed & {s.step for s in every}
+
+    monkeypatch.setenv(GRADED_ONLY_ENV, "1")
+    graded, _ = load({a: runs})
+    assert mixed & {s.step for s in every} <= {s.step for s in graded}
+    assert [s.step for s in graded] == [
+        s.step for s in every if s.step in graded_steps(split)
+    ]
+
+
+def test_graded_only_keeps_every_step_of_one_client_run_sending_every_request(
+    tmp_path, monkeypatch
+):
+    a = record(tmp_path, monkeypatch)
+    runs = [client_run([0, 1, 2, 3])]
+    every, _ = load({a: runs})
+
+    monkeypatch.setenv(GRADED_ONLY_ENV, "1")
+    assert load({a: runs})[0] == every
+
+
+def test_the_graded_steps_are_each_client_run_s_span_whatever_its_steps_hold():
+    def line(step, client_run, *batch):
+        return {"step": step, "client_run": client_run, "batch": [[r] for r in batch]}
+
+    # Client run 0 sends a and c, client run 1 sends b, on rank 1 only; w and v
+    # are warmup requests, and x one in flight that run 0's export does not name.
+    record = {
+        0: [
+            line(0, None, "w"),
+            line(1, 0, "a", "w"),
+            line(2, None, "x"),
+            line(3, 0, "c"),
+            line(4, None, "v"),
+            line(5, None),
+            line(6, None),
+            line(7, None, "x"),
+        ],
+        1: [line(n, None) for n in range(6)] + [line(6, 1, "b"), line(7, None)],
+    }
+    assert graded_steps(record) == {1, 2, 3, 6}
+
+
+def test_a_ladder_client_run_s_samples_state_the_rungs_it_calibrates(
+    tmp_path, monkeypatch
+):
+    # Three groups served one after another; the second client run, sending the
+    # last group, is a calibration ladder of rungs 2 and 4.
+    a = record(tmp_path, monkeypatch, groups=((0, 1), (2, 3), (4, 5)))
+    runs = [client_run([0, 1]), client_run([4, 5])]
+    every, config = load({a: runs})
+    first, last = client_spans(served(a / "steps", runs))[1]
+
+    laddered, laddered_config = load({a: runs}, ladders={a: {1: (4, 2)}})
+    assert laddered_config == config
+    assert [dataclasses.replace(s, ladder=None) for s in laddered] == every
+    within = {s.step for s in every if first <= s.step <= last}
+    assert within and within < {s.step for s in every}
+    assert {s.step for s in laddered if s.ladder == (2, 4)} == within
+    assert all(s.ladder is None for s in laddered if s.step not in within)
+    assert all(s.ladder is None for s in every)
+
+
+def test_each_client_run_s_span_runs_from_its_first_step_to_its_last():
+    def line(step, client_run):
+        return {"step": step, "client_run": client_run, "batch": []}
+
+    record = {
+        0: [line(0, None), line(1, 0), line(2, None), line(3, 0), line(4, 1)],
+        1: [line(0, None), line(1, None), line(2, None), line(3, None), line(4, 1)],
+    }
+    assert client_spans(record) == {0: (1, 3), 1: (4, 4)}
+
+
+#: A two-stage pipeline's fields of `keyed`.
+PIPELINE = {"pipeline_parallel_size": 2, "pp_layers": [[0, 14], [14, 28]]}
+
+
+def staged(directory, engine=PIPELINE):
+    """`directory`, a record, as a pipeline's whose stage 1 ran stage 0's lines:
+    each file of rank 0 copied as stage 1's, and `engine` in its engine file."""
+    steps = directory / "steps"
+    for path in steps.glob("dp0.*"):
+        (steps / f"pp1.{path.name}").write_bytes(path.read_bytes())
+    edit(steps / "dp0.engine.json", lambda e: e.update(engine))
+    return directory
+
+
+def test_each_stage_s_samples_name_it_a_run_of_its_own_rank_files_its_decodes_cut(
+    tmp_path, monkeypatch
+):
+    a = record(tmp_path, monkeypatch)
+    alone, one = load({a: RUNS})
+    samples, config = load({staged(a): RUNS})
+
+    assert config == {**one, "engine_config": {**one["engine_config"], **PIPELINE}}
+    assert len(samples) == 2 * len(alone)
+    for stage, name in enumerate(("dp0.jsonl", "pp1.dp0.jsonl")):
+        mine = [s for s in samples if s.stage == stage]
+        assert [s.step for s in mine] == [s.step for s in alone]
+        run = digest(a / "steps" / name)
+        for s, plain in zip(mine, alone):
+            assert s.provenance == {**plain.provenance, "run": run}
+            assert s.host == plain.host
+            assert s.cut == (plain.cut if s.view.prefill else "pipelined")
+
+
+@pytest.mark.parametrize(
+    "engine, stages, stated",
+    [({}, "[0, 1]", "None"), ({**PIPELINE, "pipeline_parallel_size": 3}, "[0, 1]", 3)],
+    ids=["predating", "missing"],
+)
+def test_a_record_holding_other_stages_than_its_engine_file_states_refuses(
+    tmp_path, monkeypatch, engine, stages, stated
+):
+    a = staged(record(tmp_path, monkeypatch), engine)
+
+    named = (
+        f"{a / 'steps'} holds the rank records of pipeline stages {stages}, and "
+        f"its engine file states pipeline_parallel_size {stated}"
+    )
+    with pytest.raises(ValueError, match=re.escape(named)):
+        load({a: RUNS})
+
+
+def test_a_later_stage_s_step_holding_other_requests_than_stage_0_s_refuses(
+    tmp_path, monkeypatch
+):
+    a = staged(record(tmp_path, monkeypatch))
+    path = a / "steps/pp1.dp0.jsonl"
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    lines[1]["batch"][0][0] = 999
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+
+    named = f"{a} pipeline stage 1, DP rank 0, step {lines[1]['step']} holds requests"
+    with pytest.raises(ValueError, match=re.escape(named) + r" \[999"):
         load({a: RUNS})

@@ -161,6 +161,10 @@ class Engine:
         for conn in self.idle:
             conn.send(("NER", math.inf, [], math.inf))
         self.config = _config()
+        # As `Config` resolves it, from the environment set above.
+        self.config.offload_min_load_tokens = (
+            KVConnectorFactory.resolve_min_load_tokens(self.config)
+        )
         with compass_run.engine(self.config):
             self.shell = KVConnectorFactory.create_connector(self.config, "scheduler")
         self.rt = clock.installed()
@@ -190,8 +194,9 @@ def test_the_factory_builds_atom_s_scheduler_half_over_a_tier_per_rank(
     impl = shell._inner._impl
     assert type(impl) is M3OffloadScheduler
     assert impl.chunk_size == CHUNK
-    # LMCache's default lookup scope is every worker of the replica.
-    assert isinstance(impl._lookup_client, Lookup)
+    # LMCache's default lookup scope is every worker of the replica; ATOM
+    # binds the client behind its adapter (`as_lookup_client`).
+    assert isinstance(impl._lookup_client.client, Lookup)
     assert list(impl._lookup_client.ranks) == [0, 1]
     assert [type(r) for r in shell._ranks] == [M3OffloadConnector] * TP
     assert [t.free for t in shell._tiers] == [SLOTS] * TP
@@ -341,7 +346,7 @@ def test_the_compass_runner_builds_the_worker_half_that_moves_nothing(monkeypatc
     assert runner_.allocate_kv_cache(100) is True
     assert [type(w) for w in built] == [SimulatedKVConnector]
     runner_.config = _config({"kv_connector": "mooncake"})
-    with pytest.raises(RunnerRefusal, match="'lmcache_mp' and 'lmcache_offload'"):
+    with pytest.raises(RunnerRefusal, match="'lmcache_offload' and 'mooncake_store'"):
         runner_.allocate_kv_cache(100)
 
 

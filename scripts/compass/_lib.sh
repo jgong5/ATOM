@@ -403,10 +403,15 @@ compass_gpu_arch() {
     HIP_VISIBLE_DEVICES=$1 python -c 'import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])' 2>/dev/null
 }
 
+# This file's directory, resolved as it is sourced: a caller may cd elsewhere
+# before a function reads a list beside it, as regen_gpu_gate_baseline.sh cd's
+# into the base it measures, where a relative path names nothing.
+COMPASS_LIB_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 # compass_gpu_skip_lines TARGET: what gpu_gate_skip.txt names for GPU target
 # TARGET, one per line: a test file it leaves out there, or `driver-run`.
 compass_gpu_skip_lines() {
-    grep -vE '^[[:space:]]*(#|$)' "$(dirname -- "${BASH_SOURCE[0]}")/gpu_gate_skip.txt" |
+    grep -vE '^[[:space:]]*(#|$)' "$COMPASS_LIB_DIR/gpu_gate_skip.txt" |
         awk -v t="$1" '$1 == t { print $2 }'
 }
 
@@ -479,12 +484,55 @@ if not os.fork():
     select.select([os.pidfd_open(int(sys.argv[1]))], [], [])' $$ "${1:-1}"
 }
 
+# compass_dynamo_header: X-Dynamo-Session-ID, which aiperf then sends, where
+# AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID is true as aiperf reads it.
+compass_dynamo_header() {
+    local v=${AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID-}
+    [[ ${v,,} =~ ^(1|t|true|y|yes|on)$ ]] && echo X-Dynamo-Session-ID || :
+}
+
 # The router's bound on each request to a worker, its whole response
 # included, which `--request-timeout-secs` sets (default 1800 s) and the
 # clock cannot reach. A simulated stream lasts as much wall time as the run
 # takes to reach its end, past 1800 s at c=256, so a simulated launch sets
 # the bound to a year.
 COMPASS_SIM_REQUEST_TIMEOUT_S=31536000
+# Every wall-clock bound a simulated router gets, each at that year: the one
+# above, and the prepare pool's wait for a thread and its preparation of a
+# request (`--prepare-queue-timeout-ms`, `--prepare-timeout-ms`; atomesh's
+# defaults are 250 ms and 5 s). Those two start once the router LP releases a
+# request, so its hold runs neither out (atom/mesh/tests/compass_pd_router_test.rs),
+# but a loaded host stretches a preparation's wall time, which the run's clock
+# does not see.
+COMPASS_SIM_ROUTER_BOUNDS=(--request-timeout-secs "$COMPASS_SIM_REQUEST_TIMEOUT_S"
+    --prepare-queue-timeout-ms "${COMPASS_SIM_REQUEST_TIMEOUT_S}000"
+    --prepare-timeout-ms "${COMPASS_SIM_REQUEST_TIMEOUT_S}000")
+
+# compass_sim_router_refusal LP WORD...: why a simulated router refuses its
+# `atomesh launch` arguments WORD..., or nothing. LP is 1 where the router runs
+# as LP `router`, whose retry resends a request under its first seq.
+compass_sim_router_refusal() {
+    local lp=$1 word why
+    shift
+    for word; do
+        case ${word%%=*} in
+        --prefill | --decode)
+            echo "the router's arguments carry ${word%%=*}, a worker more for a simulated router to choose"
+            return ;;
+        --max-concurrent-requests | --rate-limit-tokens-per-second)
+            echo "the router's arguments carry ${word%%=*}, a limiter a simulated router leaves out"
+            return ;;
+        --request-timeout-secs | --prepare-queue-timeout-ms | --prepare-timeout-ms)
+            echo "the router's arguments carry ${word%%=*}, a wall-clock bound the script sets for a simulated router"
+            return ;;
+        esac
+    done
+    if ((lp)) && [[ " $* " != *" --disable-retries "* ]]; then
+        why="carry --dp-aware"
+        [[ " $* " == *" --dp-aware "* ]] || why="choose among a side's instances as LP router"
+        echo "the router's arguments $why but not --disable-retries: a router LP's retry resends a request under its first seq, which the frontend refuses as arrived twice"
+    fi
+}
 
 # compass_on_arch RUN_FILE: the words ahead of `-m MODULE` that start a simulated
 # server under on_arch on RUN_FILE's machine's arch, as `compass run` starts its
@@ -543,3 +591,18 @@ open(out, "w").write(json.dumps(spec.echo()))' \
         "${READINGS:?READINGS names a store holding their platform_readings}" \
         "${STACK:-}" "$1"
 }
+
+# aiperf as a real server's client runs it, `python -c "$COMPASS_REAL_AIPERF"
+# ROOT/compass_harness/compass_harness/session_ids.py profile ...`: as shipped,
+# but for what compass-harness also fixes in a simulated run, so both send the
+# same requests: the benchmark id, which the prompts carry, and each session's
+# id, drawn from its trace and branch (compass_harness/session_ids.py), which
+# aiperf's services inherit by fork (session_ids.bind_by_fork).
+COMPASS_REAL_AIPERF='import importlib.util as u, sys, uuid, aiperf.cli_runner as r
+r.uuid4 = lambda: uuid.UUID(int=0)
+spec = u.spec_from_file_location("session_ids", sys.argv.pop(1))
+ids = sys.modules["session_ids"] = u.module_from_spec(spec)
+spec.loader.exec_module(ids)
+ids.bind_by_fork()
+from aiperf.cli import app
+app()'

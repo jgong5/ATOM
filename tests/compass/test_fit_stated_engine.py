@@ -29,7 +29,7 @@ from test_step_linear_token_padding import BUCKETS
 from atom.compass.backends import step_linear_fit
 from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.step_labels import digest
-from atom.compass.fit.samples import load
+from atom.compass.fit.samples import GRADED_ONLY_ENV, load
 from atom.compass.run.step_grid import BOUNDS
 
 #: The engine config the records' server logs state, a field their engine
@@ -67,11 +67,13 @@ def test_both_fits_key_their_entries_by_the_stated_engine_as_step_linear_fit_doe
     graphs = json.loads((a / "steps/dp0.key.json").read_text())["engine"][GRAPHS]
     keyed = {**STATED, GRAPHS: graphs}
     assert written["host"]["key"]["engine"] == keyed
-    host_key = host_laws_key({**HOST, "engine": keyed})
+    host_key = host_laws_key({**HOST, "engine": keyed}, tmp_path)
     assert member(tmp_path / "store", host_key, "params")["key"]["engine"] == keyed
     report = member(tmp_path / "store", host_key, "report")
     assert report["stated_engine"] == json.loads(engine.read_text())
-    law = member(tmp_path / "store", law_key(engine=STATED), "params")
+    law = member(
+        tmp_path / "store", law_key(tmp_path / "store", engine=STATED), "params"
+    )
     assert law["engine_config"] == written["engine_config"] == STATED
     assert [(d / "steps/dp0.engine.json").read_bytes() for d in (a, b)] == owns
 
@@ -116,3 +118,17 @@ def test_a_record_stating_no_buckets_takes_the_file_s_and_one_stating_others_ref
     )
     with pytest.raises(ValueError, match=re.escape(named)):
         load(runs, engine=engine)
+
+
+def test_a_graded_window_loads_under_a_stated_engine(tmp_path, monkeypatch):
+    # Every step sends, so the graded window is the whole record; the record's
+    # own keyed fields, not its graded steps, are what the stated file is held to.
+    a = record(tmp_path / "a", 19)
+    runs = {a: [str(a / "client.json")]}
+    engine = _engine(tmp_path, prefill_buckets=[64, 128])
+    whole = load(runs, engine=engine)
+
+    monkeypatch.setenv(GRADED_ONLY_ENV, "1")
+    graded = load(runs, engine=engine)
+    assert graded[1] == whole[1]
+    assert [s.step for s in graded[0]] == [s.step for s in whole[0]]

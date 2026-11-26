@@ -148,6 +148,18 @@ def test_a_planted_column_is_adopted_where_it_lowers_the_held_out_error_and_pric
     assert np.abs(held).max() < 0.05
 
 
+def test_one_run_holds_out_spans_of_its_steps_and_adopts_the_column():
+    # A single record, as a calibration record serving every concurrency is,
+    # holds out RUN_BLOCKS spans of its own steps in place of runs.
+    host, report = fit_host(_samples(runs=("a",)))
+    adopted = report["prefill.W_launch"]["launch_columns"]
+    assert adopted["adopted"] == ["eager"]
+    none, eager = adopted["held_out"][0]["none"], adopted["held_out"][1]["eager"]
+    assert none > 0.1 and eager < 0.01
+    column = host["columns"]["prefill"]["W_launch"]
+    assert column == pytest.approx({"eager": EAGER_S}, rel=0.05)
+
+
 def _batch(tokens, **fields):
     return SimpleNamespace(
         total_seqs_num_prefill=1,

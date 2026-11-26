@@ -147,7 +147,7 @@ def test_the_readings_are_the_spec_s_whatever_order_run_json_lists_the_stack(
     a = record(tmp_path / "a", 19, stack=dict(reversed(STACK.items())))
     fit(tmp_path, "fit steps --backend step-linear", a, *clients(a))
 
-    entry = ArtifactStore(tmp_path / "store").read(law_key())
+    entry = ArtifactStore(tmp_path / "store").read(law_key(tmp_path / "store"))
     cells = dict(entry.fingerprints[Row.STEP_LINEAR_LAW].cells)
     stated = machine_platform(MachineSpec.from_mapping(DOCUMENT))
     assert cells[Axis.SOFTWARE_STACK].value == stated["software_stack"]

@@ -7,8 +7,9 @@ instance, with its readings and platform readings in the store; its laws are
 the checked-in DPA8 decode law re-keyed to that configuration, as a law file
 (`reuse.LAWS`) or a store entry beside host laws. The 1P1D sides whose config
 resolves for real are DeepSeek-V4-Pro's, judged by the shipped crs005 DPA8
-pair. The head is the tree's own digest, except where a test builds a
-repository for the tree.
+pair. A pipeline's law is that law with a part per stage, served to the
+configuration on pipeline stages as a producer. The head is the tree's own
+digest, except where a test builds a repository for the tree.
 """
 
 import functools
@@ -36,6 +37,10 @@ from test_run_check_side import (
     UNCOVERED,
 )
 from test_run_lacking import served
+
+#: The requirement each side's law in the crs005 pair is calibrated for at its
+#: own key: the decode side's coverage, the prefill side's accuracy.
+COVERAGE_REQUIREMENT = {"prefill": 4, "decode": 3}
 from test_run_lacking_rungs import DPA8
 from test_run_step_grid import DOCUMENT, PLATFORM, deployment, host_laws_key, readings
 
@@ -54,6 +59,7 @@ from atom.compass.artifacts import (
     keyed_platform,
     member_name,
 )
+from atom.compass.backends import step_linear_fit
 from atom.compass.backends.json_file import read_json
 from atom.compass.bench import ops
 from atom.compass.drive import reuse
@@ -242,14 +248,15 @@ def stored(
     records at `atom`, else at the head's digest, under `conditions`; with
     `host`, its host laws beside it, keyed to the CPU `held` states."""
     held = held or law(r)
+    step = {k: v for k, v in held.items() if k not in ("host", "host_fit")}
     key = {
         "model": compass_run._file_digest(r.config.model, "config.json"),
         "engine_config": json.dumps(keyed(r.config), sort_keys=True),
         "source_root": compass_run.source_root(atom),
         "form": held["form"],
+        "fit_src": step_linear_fit.fit_src(step),
         **keyed_platform(Kind.STEP_LINEAR_LAW, PLATFORM),
     }
-    step = {k: v for k, v in held.items() if k not in ("host", "host_fit")}
     entry = publish(tmp_path, r, Kind.STEP_LINEAR_LAW, key, step, conditions, store)
     if host:
         params = {"key": held["host"]["key"], "laws": HOST_LAWS}
@@ -406,6 +413,84 @@ def test_a_figure_past_5_percent_names_requirement_4(
     assert (found["verdict"], found["requirement"]) == (verdict, 4)
     figure = f"run {run}, decode, median +5.12% of source refitted, past 5%"
     assert figure in found["reason"] and named in found["reason"]
+
+
+#: A prefill-decode producer's transfer config, as the development template's
+#: PP4 prefill side runs: it schedules no decode rung.
+PRODUCER = {"kv_role": "kv_producer", "kv_connector": "compass"}
+
+
+def staged(tmp_path, r, *medians, eager=True) -> dict:
+    """`r`'s config on as many pipeline stages as `medians`, a producer as the
+    template's prefill side, eager unless `eager` is false, with its readings
+    in the store; and `law` re-keyed to it with a part per stage, as `fit
+    steps` and `fit host` write one: each stage's decode cut, its figures on
+    prefill within the gate but one run's median, `medians[k]` on stage k."""
+    stages = len(medians)
+    vars(r.config).update(
+        pipeline_parallel_size=stages, enforce_eager=eager, kv_transfer_config=PRODUCER
+    )
+    publish_readings(tmp_path / "store", r.config)
+    held = law(r)
+    top = {k: held.pop(k) for k in ("platform", "engine_config", "records_atom")}
+    host = held.pop("host")
+    del held["sources"]
+    parts = []
+    for median in medians:
+        figures = {run: {"prefill": dict(WITHIN)} for run in held["runs"]}
+        figures[held["runs"][1]]["prefill"]["median"] = median
+        parts.append(held | {"decode": {}, "figures": figures})
+    laws = {k: v for k, v in host.items() if k != "key"}
+    host = {"key": host["key"], "stages": [laws] * stages}
+    return top | {"provenance": "planted", "stages": parts, "host": host}
+
+
+@pytest.mark.parametrize(
+    "medians, verdict",
+    [
+        ((-0.02, -0.02), ("reuse", None)),
+        ((-0.02, 0.0512), ("refused", 4)),
+        ((0.0512, -0.02), ("refused", 4)),
+    ],
+    ids=["both within", "stage 1 past", "stage 0 past"],
+)
+def test_a_pipeline_s_law_holds_each_stage_s_figures_to_5_percent_the_stage_named(
+    tmp_path, searched, medians, verdict
+):
+    held = staged(tmp_path, searched, *medians)
+    where = law_file(tmp_path, held)
+
+    found = verdicts(advise(tmp_path), "law")
+
+    assert [(v["verdict"], v["requirement"]) for v in found] == [verdict] * 2
+    if verdict[0] == "reuse":
+        assert found[0]["reason"] == where
+        return
+    (stage,) = [k for k, median in enumerate(medians) if median > reuse.GATE]
+    figure = f"run {held['stages'][stage]['runs'][1]}, prefill, median +5.12%"
+    assert found[0]["reason"] == (
+        f"{where}: {figure} of pipeline stage {stage}, past 5%, on records run at "
+        "the head, which a calibration refits alike"
+    )
+
+
+@pytest.mark.parametrize("parts", ["laws", "stages"])
+def test_a_pipeline_s_host_laws_under_another_key_are_refused_as_one_stage_s_are(
+    tmp_path, searched, parts
+):
+    held = staged(tmp_path, searched, -0.02, -0.02)
+    if parts == "laws":
+        held["host"] = {"key": held["host"]["key"], **held["host"]["stages"][0]}
+    held["host"]["key"]["engine"]["tensor_parallel_size"] = 2
+    law_file(tmp_path, held)
+
+    found = verdicts(advise(tmp_path), "law")
+
+    assert [(v["verdict"], v["requirement"]) for v in found] == [("refused", None)] * 2
+    assert found[0]["reason"].startswith(
+        "the run file's host laws were fitted under another "
+        "['engine.tensor_parallel_size']; this run's key is "
+    )
 
 
 def test_a_law_with_a_source_stating_no_figures_names_requirement_4(tmp_path, searched):
@@ -674,14 +759,16 @@ def test_each_1p1d_side_resolves_as_deploy_sh_starts_it(
 
     judged = advise(tmp_path, MACHINE, model=str(v4_pro), common=common)
 
-    for side, rungs in UNCOVERED.items():
+    # The decode side lacks the rungs its ladder schedules (requirement 3); the
+    # prefill side, a producer, schedules none, so its law is held to accuracy
+    # (requirement 4), where a source of the pair's prefill law states none.
+    for side, requirement in COVERAGE_REQUIREMENT.items():
         found = verdicts(judged, "law", side)
         assert [(v["verdict"], v["requirement"]) for v in found] == [
-            ("calibrate", 3)
+            ("calibrate", requirement)
         ] * 2
-        assert f"{PAIR[side]} has no decode vector for rungs {rungs}, which" in (
-            found[0]["reason"]
-        )
+        uncovered = f"{PAIR[side]} has no decode vector for rungs {UNCOVERED}, which"
+        assert (uncovered in found[0]["reason"]) == (side == "decode")
         (reason,) = {v["reason"] for v in verdicts(judged, "readings", side)}
         assert '"index_cache_dtype": "fp8"' in reason
         assert '"AITER_LOG_LEVEL": "WARNING"' in reason
@@ -715,8 +802,8 @@ def test_a_1p1d_side_runs_under_the_aiter_log_level_deploy_sh_starts_it_with(
 
     # The pair's laws are keyed WARNING: each side finds its own there, else
     # none at its key.
-    requirement = 3 if level == "WARNING" else 1
-    for side in UNCOVERED:
+    for side, own in COVERAGE_REQUIREMENT.items():
+        requirement = own if level == "WARNING" else 1
         found = verdicts(judged, "law", side)
         assert [(v["verdict"], v["requirement"]) for v in found] == [
             ("calibrate", requirement)

@@ -4,8 +4,8 @@ device` published with its probes stood in for: two nodes' records fold into
 one `platform_readings` entry, rates kept as rates; records of two stacks and
 a second fit to one key refuse; `fold` takes each field's median over the
 records stating it; `--assume-from` states a measured entry's ratios for a
-device never run, takes the entry at the PTL state named, and refuses several
-entries to take from."""
+device never run, takes the entry at the PTL state named, and at the stack
+`--stack` names, and refuses several entries to take from."""
 
 import json
 
@@ -23,7 +23,7 @@ from atom.compass import cli
 from atom.compass.artifacts import ArtifactStore, Key, Kind
 from atom.compass.drive import device_probe, measure_device
 from atom.compass.fit import device
-from atom.compass.spec.layers import datasheet
+from atom.compass.spec.layers import datasheet, stack_of
 
 BF16 = "device.compute.attainable_flops.bf16"
 FP4 = "device.compute.attainable_flops.fp4"
@@ -261,3 +261,33 @@ def test_assume_from_takes_the_source_at_the_ptl_state_named(
     assert entry["key"]["ptl"] == "disabled"
     peak = datasheet("mi355x").values["device.compute.bf16_flops"]
     assert entry["device.compute.derate.bf16"] == source[BF16] / peak
+
+
+def test_assume_from_takes_the_source_at_the_stack_named_and_refuses_without_one(
+    nodes, tmp_path
+):
+    # Two MI355X entries at PTL disabled, one per stack.
+    other = STACK | {"aiter": "41d4d8d7e"}
+    records = [
+        nodes(h, "0,1", stack=s)[0]
+        for h, s in (("mi355-gpu-40", STACK), ("crs005", other))
+    ]
+    sources = [fit(tmp_path, token) for token in records]
+    b0 = ("--device", "mi455x-b0", "--assume-from", "MI355X", "--ptl", "disabled")
+    with pytest.raises(SystemExit) as refused:
+        fit(tmp_path, *b0)
+    held = str(refused.value)
+    assert "holds 2 platform_readings entries for MI355X gfx950 at PTL disabled" in held
+    for source in sources:
+        assert f"; {stack_of(source['key'])} as {source['token']}" in held
+    assert held.endswith("; --stack names one")
+    peak = datasheet("mi355x").values["device.compute.bf16_flops"]
+    for source in sources:
+        entry = fit(tmp_path, *b0, "--stack", stack_of(source["key"]))
+        assert entry["key"] == source["key"] | {"device": "MI455X B0 gfx1250"}
+        assert entry["device.compute.derate.bf16"] == source[BF16] / peak
+        assert f"as {source['token']} over" in entry["provenance"]["notes"]
+    # A fit of probe records takes no source, so names no stack.
+    with pytest.raises(SystemExit) as refused:
+        fit(tmp_path, records[0], "--stack", stack_of(sources[0]["key"]))
+    assert "name the probe records, or --assume-from a device" in str(refused.value)

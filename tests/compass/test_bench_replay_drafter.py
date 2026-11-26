@@ -127,7 +127,7 @@ def test_a_replayed_step_is_the_batch_atoms_scheduler_built_under_a_drafter(
             past |= tables != own
     assert kinds == {(False, False), (False, True), (True, True)}
     assert past == (drafter == "dspark5")
-    assert rebuilt.replay_rule == {"name": "fresh-contiguous", "version": 3}
+    assert rebuilt.replay_rule == {"name": "fresh-contiguous", "version": 4}
 
 
 def line_tokens(line):
@@ -192,7 +192,7 @@ def test_each_repeat_splits_where_a_real_steps_labels_split(output):
     bench = Bench(issue, iter(busy))
     batch = SimpleNamespace(req_ids=[7, 8], rows=[], produces_output=lambda: output)
 
-    result = bench.bench_step(batch)
+    result = bench.bench_step(batch, window.REPEATS)
 
     draft = PROPOSE if output else KV
     kept = busy[window.WARMUPS :]
@@ -210,8 +210,13 @@ def test_a_measurement_holds_the_drafters_value_and_fit_reads_it_as_a_draft_labe
     batch's token count in microseconds, the drafter's at half that."""
     reply = FakeBench.measure
 
-    def drafted(self, batch):
-        return reply(self, batch) | {"draft_median_ns": 500 * batch.total_tokens_num}
+    def drafted(self, batch, repeats):
+        got, draft = reply(self, batch, repeats), 500 * batch.total_tokens_num
+        whole = got["median_ns"] + draft
+        return got | {
+            "repeats": [[whole, 0, whole, draft]] * repeats,
+            "draft_median_ns": draft,
+        }
 
     monkeypatch.setattr(FakeBench, "measure", drafted)
     rec = str(run.record)
@@ -244,7 +249,8 @@ def test_each_ragged_verify_view_keeps_its_width_and_replays_in_the_pool(
         "rung": 4,
         "produces_output": True,
     }
-    blocks = sum(-(-(c + K + 1 + K - 1) // BLOCK) for c in cached)
+    # DSpark, a block drafter, writes its K draft positions past each row.
+    blocks = sum(-(-(c + K + 1 + K) // BLOCK) for c in cached)
     engine = {
         "kv_cache_block_size": BLOCK,
         "max_model_len": 2048,

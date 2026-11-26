@@ -198,6 +198,63 @@ def test_the_lm_head_pick_reads_its_logits_and_writes_a_packed_fp32_pair_a_row()
     assert work(op, ONE, 8, "bf16") == Work({}, 3 * 16160 * 2 + 3 * 2 * 4)
 
 
+def test_the_verify_head_s_pick_reads_its_logits_and_writes_a_packed_fp32_pair_a_row():
+    draw = {"object": "atom.model_ops.verify_ids:HeadDraw", "state": [["rq", 3]]}
+    op = leaf(
+        "atom.model_ops.lm_head_argmax:_pack",
+        logits=t([6, 16160]),
+        vocab_start_idx=16160,
+        draw=draw,
+        vocab_total=64640,
+    )
+
+    # The lifted leaf records no output: the pairs it writes are counted.
+    assert work(op, ONE, 8, "bf16") == Work({}, 6 * 16160 * 2 + 6 * 2 * 4)
+
+
+def test_a_verify_from_head_ids_reads_the_step_s_rows_not_its_whole_buffer():
+    verifier = {
+        "object": "atom.model_ops.verify_ids:IdVerifier",
+        "state": [
+            ["requests", 2],
+            ["rq", 3],
+            ["cond_rates", None],
+            ["out", t([2, 3], I32)],
+            ["spec_status", t([3, 2], I32)],
+            ["cu", t([2], I32)],
+            ["target", t([4], "torch.int64")],
+            ["bonus", t([2], "torch.int64")],
+        ],
+    }
+    op = leaf(
+        "atom.model_ops.verify_ids:IdVerifier.launch",
+        self=verifier,
+        head_ids=t([6], I32),
+        input_ids=t([16385], I32),
+    )
+
+    # 6 head ids and 6 of the step's ids, the row tables, then the verdicts
+    # and the status words.
+    tables = 2 * 4 + 4 * 8 + 2 * 8
+    assert work(op, ONE, 1, "bf16") == Work({}, 6 * 4 + 6 * 4 + tables + 6 * 4 + 6 * 4)
+
+
+def test_a_fused_mixed_sample_reads_logits_noise_and_temperatures_and_writes_ids():
+    op = leaf(
+        "aiter.ops.triton.fusions.fused_mixed_sample:fused_mixed_sample",
+        input=t([4, 248320]),
+        exponentials=t([4, 248320], F32, stride=[0, 1]),
+        temperatures=t([4], F32),
+        eps=1e-10,
+        greedy_eps=1e-10,
+        out=None,
+    )
+
+    # The noise is one broadcast row; each row's id is written as int32.
+    read = 4 * 248320 * 2 + 248320 * 4 + 4 * 4
+    assert work(op, ONE, 1, "bf16") == Work({}, read + 4 * 4)
+
+
 def test_an_in_place_leaf_writes_what_it_reads():
     q, k = t([2, 24, 256], stride=[14336, 256, 1]), t(
         [2, 4, 256], stride=[14336, 256, 1]

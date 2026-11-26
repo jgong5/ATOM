@@ -311,7 +311,7 @@ def main(out, argv) -> None:
     from atom.compass.capture.forward import decode, prefill
     from atom.config import set_current_atom_config
     from atom.model_engine.model_runner import DeviceMemoryReadings, ModelRunner
-    from atom.utils import h2d
+    from atom.utils import h2d, packed_h2d
 
     kinds, drafter, only = "--kinds" in argv, "--drafter" in argv, None
     argv = [a for a in argv if a not in ("--kinds", "--drafter")]
@@ -480,6 +480,14 @@ def main(out, argv) -> None:
             (torch, "bincount", uncounted),
             (torch, "equal", lambda a, b: False),
             (h2d, "_range", lambda t: (0, 0)),
+            # Packed H2D maps its pinned staging as numpy, which a fake host
+            # block has none of: each group keeps the direct transport, as in
+            # a capture (`forward._build_runner`).
+            (
+                packed_h2d.PackedCopy,
+                "create",
+                classmethod(lambda cls, members, device: (None, "no bytes")),
+            ),
             (PagedAttentionCache, "_report_stale_state", lambda *a: None),
         ):
             stack.enter_context(patch.object(owner, name, value))

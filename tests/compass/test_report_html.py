@@ -16,7 +16,7 @@ from html.parser import HTMLParser
 import pytest
 from test_client_sh import COMMAND, GOOD, _client, _setup
 from test_deploy_sh import _until, argv, planted  # noqa: F401  the planted fixture
-from test_report_split import _deployment
+from test_report_split import NODE_S, _deployment, _pairs, _two_nodes
 from test_run_refusal_summary import STAGE1, AnalyticalBelow, summary
 from test_validate_curves import _counted, _run
 
@@ -204,6 +204,41 @@ def test_a_real_deployment_s_report_shows_both_sides_and_its_split_and_changes_n
     assert page.parts["Trust"]["text"] == ["None: a real run is measured, not priced."]
     assert page.parts["Law sources"]["text"] == ["None: a real run prices nothing."]
     assert "A real run's per-request split" not in page.parts
+
+
+def test_a_two_node_deployment_s_report_states_the_offset_joining_its_second_node(
+    tmp_path,
+):
+    run = tmp_path / "run"
+    _two_nodes(run)
+    split.write(run)
+
+    page = _Page(html.write(run).parent)
+
+    joined = "10.0.0.2's instances joined to it at -1.0560 s, its bounds -1.2560 s"
+    joined += " to -1.0560 s; 0 not. Below, the 4 of them the headline metrics count."
+    assert page.parts["Per-request split"]["text"] == [
+        f"4 requests split, on the monotonic clock, {joined}"
+    ]
+
+
+def test_a_two_node_deployment_s_report_states_the_measured_clock_of_its_second_node(
+    tmp_path,
+):
+    run = tmp_path / "run"
+    _two_nodes(run)
+    _pairs(run, [(0.0, NODE_S), (4.0, NODE_S)])
+    split.write(run)
+
+    page = _Page(html.write(run).parent)
+
+    joined = "10.0.0.2's instances joined to it by 2 measured offsets, -1.0560 s"
+    joined += " to -1.0560 s, each within 0.020 ms, which put 0 requests out of"
+    joined += " order, its bounds -1.2560 s to -1.0560 s; 0 not. Below, the 4 of"
+    joined += " them the headline metrics count."
+    assert page.parts["Per-request split"]["text"] == [
+        f"4 requests split, on the monotonic clock, {joined}"
+    ]
 
 
 def test_client_sh_stop_writes_an_instances_report_after_its_split(tmp_path):

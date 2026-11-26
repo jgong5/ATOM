@@ -11,7 +11,7 @@ from atom.compass.backends.work import Work
 I64 = "torch.int64"
 TP = 4
 DSPARK = "atom.model_ops.deepseek_v41.dspark:"
-MARKOV = "atom.model_ops.dspark_markov_sample:"
+MARKOV = "atom.model_ops.dspark_markov_argmax:"
 STEP = rows((1, 9), (1, 9))
 
 
@@ -60,6 +60,31 @@ def test_the_block_indices_write_each_row_s_positions_and_its_queries_indices():
 
     each = (3 + 6) * 8 + 3 * (6 + 3) * 4
     assert work(op, STEP, TP, "bf16") == Work({}, 2 * 8 + 2 * each)
+
+
+def test_the_two_source_indices_write_each_query_s_ring_and_block_entries():
+    # 2 anchors, a block of 3 over a ring of 6: for each of a row's 3 queries
+    # an int32 index of the 6 ring slots and the 3 block rows, and an entry of
+    # each of the two indptrs; the anchors read once. Its buffers' slices, past
+    # what this step writes, are left out.
+    op = leaf(
+        DSPARK + "draft_src_indices",
+        positions=t([2], I64),
+        ring=6,
+        window=4,
+        width=3,
+        fp8=False,
+    )
+
+    assert work(op, STEP, TP, "bf16") == Work({}, 2 * 8 + 2 * 3 * (6 + 3 + 2) * 4)
+
+
+def test_the_context_taps_quantize_as_their_concatenation_would():
+    # 3 taps of 4 rows of width 1024 in bf16, each read once and written in
+    # fp8 with a scale byte per 32, as `quantize_fp8` writes their join.
+    op = leaf("atom.model_ops.blockscale:quantize_fp8_taps", taps=[t([4, 1024])] * 3)
+
+    assert work(op, STEP, TP, "bf16") == Work({}, 3 * 4096 * (2 + 1 + 1 / 32))
 
 
 def test_the_block_state_writes_its_copies_of_each_block_row_with_a_pre_mix():

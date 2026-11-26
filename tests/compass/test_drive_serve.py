@@ -9,6 +9,7 @@ at once, so a refusal that regresses fails the test rather than hanging it.
 import json
 import os
 import re
+import resource
 import shutil
 import signal
 import subprocess
@@ -23,6 +24,7 @@ import pytest
 from test_drive_gpu import FREE, GPU45, LISTING, _kfd, _plant
 from test_launcher_held_ports import HELD, _squat
 
+from atom.compass.backends.step_labels import CLOCK
 from atom.compass.drive import gpu as drive_gpu
 from atom.compass.drive import serve
 from atom.compass.drive.gpu import GpuRefusal
@@ -31,13 +33,14 @@ from atom.compass.run import ENV
 
 TREE = Path(__file__).resolve().parents[2]
 PLANTED = """\
-import http.server, json, os, subprocess, sys, time
+import http.server, json, os, resource, subprocess, sys, time
 d = os.environ["PLANTED_DIR"]
 when, _, rc = os.environ.get("PLANTED_EXIT", "never:0").partition(":")
 argv, keep = sys.argv[1:], ("HIP_VISIBLE_DEVICES", "PYTHONPATH", "ATOM_COMPASS_RUN")
 keep += ("ATOM_COMPASS_PARITY_RECORD",)
 with open(d + "/argv.json", "w") as f:
-    json.dump({"argv": argv, "env": {k: os.environ.get(k) for k in keep}}, f)
+    nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+    json.dump({"argv": argv, "env": {k: os.environ.get(k) for k in keep}, "nofile": nofile}, f)
 if os.environ.get("PLANTED_ENGINE", "1") == "1":
     record = os.environ["ATOM_COMPASS_PARITY_RECORD"]
     os.makedirs(record)
@@ -140,6 +143,13 @@ def _ready(out: Path, driver) -> dict:
     return json.loads((out / serve.READY_FILE).read_text())
 
 
+def _on_this_hosts_clocks(pair) -> bool:
+    """Does `pair`, wall and monotonic nanoseconds read together, place wall
+    time on the monotonic clock as this host does, to 1 ms?"""
+    wall, monotonic = pair
+    return abs(wall - monotonic - (time.time_ns() - time.monotonic_ns())) < 1_000_000
+
+
 def test_a_server_runs_atom_arguments_verbatim_on_its_gpus_between_the_checks(
     planted, monkeypatch
 ):
@@ -163,6 +173,7 @@ def test_a_server_runs_atom_arguments_verbatim_on_its_gpus_between_the_checks(
     assert (out / "gpu_before.txt").exists() and (out / "gpu_after.txt").exists()
     ready = json.loads((out / serve.READY_FILE).read_text())
     assert ready.pop("pid") > 0
+    assert _on_this_hosts_clocks(ready.pop(CLOCK))
     assert ready == {"url": f"http://127.0.0.1:{assigned['--server-port']}"}
     assert "planted server up" in (out / serve.LOG_FILE).read_text()
     engine = out / serve.STEPS / "dp0.engine.json"
@@ -309,12 +320,28 @@ def test_a_simulated_server_gets_its_run_file_and_clock_and_no_gpu_check(
     assert not (out / "gpu_before.txt").exists()
     ready = json.loads((out / serve.READY_FILE).read_text())
     assert ready.pop("pid") > 0
+    assert _on_this_hosts_clocks(ready.pop(CLOCK))
     assert ready == {
         "url": f"http://127.0.0.1:{assigned['--server-port']}",
         "clock_endpoint": run["clock_endpoint"],
         "run_file": str(run_file),
     }
     assert json.loads((out / serve.RUN_JSON).read_text())["args"][3] == "()"
+
+
+def test_the_server_starts_with_its_open_file_soft_limit_raised(planted, monkeypatch):
+    """A simulated client run opens a second connection for each request it
+    cancels while the request's own is open: at c=512, about 1,500 at the grace
+    deadline, past the usual soft 1024, where the server's accept failed."""
+    monkeypatch.setenv("PLANTED_EXIT", "late:0")
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(1024, hard), hard))
+    try:
+        serve.serve(ARGS, planted / "out", run={"bound_s": 1.0})
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    raised = 65535 if hard == resource.RLIM_INFINITY else min(65535, hard)
+    assert _seen(planted)["nofile"] == [raised, hard]
 
 
 def test_an_op_graph_run_file_holds_atom_s_arguments(planted, monkeypatch):

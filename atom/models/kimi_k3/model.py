@@ -68,6 +68,7 @@ from atom.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    pp_holds_embedding,
 )
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs, mark_spliting_op
@@ -176,7 +177,8 @@ def _is_e8m0_blockscale(
     quant_config: QuantizationConfig | None, quant_type: QuantType
 ) -> bool:
     """Whether a per_1x128 consumer runs E8M0 block scales (same test as
-    LinearBase). FP32-scale fused producers stand down for it."""
+    LinearBase). The MLA q/kv norm then emits E8M0 scales; the FP32-scale o_proj
+    producer stands down."""
     return (
         quant_config is not None
         and quant_type.value == QuantType.per_1x128.value
@@ -442,6 +444,8 @@ class KimiSparseMoeBlock(nn.Module):
         # shared branch exists and an alt_stream was threaded in. TBO already
         # provides its own overlap, so the two are mutually exclusive.
         self._use_dual_stream = False
+        self._dual_stream_token_threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+        self._dual_stream_decode_token_threshold = self._dual_stream_token_threshold
         if self.shared_experts is not None and self.alt_stream is not None:
             tbo_active = get_current_atom_config().enable_tbo
             if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
@@ -847,10 +851,8 @@ class KimiFullAttention(nn.Module):
         qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
-        self.fuse_qknorm_quant = qknorm_dtype in (
-            dtypes.fp8,
-            dtypes.fp4x2,
-        ) and not _is_e8m0_blockscale(quant_config, qknorm_type)
+        self.qknorm_e8m0_scale = _is_e8m0_blockscale(quant_config, qknorm_type)
+        self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
         self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
         self.qknorm_quant_type_value = (
             qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
@@ -928,6 +930,7 @@ class KimiFullAttention(nn.Module):
             quant_type=self.qknorm_quant_type_value,
             output_unquantized_inp1=False,
             transpose_scale=True,
+            e8m0_scale=self.qknorm_e8m0_scale,
         )
         if self.indexer is not None:
             # Projection weights retain checkpoint precision; the indexer owns
@@ -1365,11 +1368,12 @@ class KimiKDAAttention(nn.Module):
         # for exactly one forward: the prefix-cache hit that forks off a
         # checkpoint (BlockManager._attach_state_group reads `state_fork_src`
         # and writes a freshly popped group). Reading the write slot there
-        # resumes from whatever the recycled group still held. Only prefill can
-        # carry a fork -- prepare_state_indices asserts it, and min_fork_tokens
-        # keeps the chunk long enough -- so the decode branches below stay on
-        # `state_indices`. Falling back to the write slot leaves every non-fork
-        # forward bit-identical. Mirrors attention_gdn.py.
+        # resumes from whatever the recycled group still held. Under pp=1 only
+        # prefill carries a fork, since the checkpoint is taken between prompt
+        # chunks; under pp>1 it lands after the prompt, so the decode and
+        # spec-decode branches below read it too.
+        # Falling back to the write slot leaves every non-fork forward
+        # bit-identical. Mirrors attention_gdn.py.
         state_indices_in = kda_metadata.non_spec_state_indices_in_tensor
         if state_indices_in is None:
             state_indices_in = state_indices
@@ -1427,6 +1431,7 @@ class KimiKDAAttention(nn.Module):
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
+            decode_state_indices_in = state_indices_in[:num_actual_tokens]
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -1436,6 +1441,7 @@ class KimiKDAAttention(nn.Module):
                 None,
                 self.activation,
                 conv_state_indices=decode_state_indices,
+                conv_state_indices_in=decode_state_indices_in,
                 validate_data=False,
             )
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
@@ -1473,6 +1479,7 @@ class KimiKDAAttention(nn.Module):
                     o=out,
                     use_qk_l2norm_in_kernel=True,
                     lower_bound=self._kda_gate_lower_bound,
+                    fork_slots=kda_metadata.replayssm_fork_slots,
                 )
             else:
                 fused_sigmoid_gating_delta_rule_update(
@@ -1488,6 +1495,7 @@ class KimiKDAAttention(nn.Module):
                     inplace_final_state=True,
                     cu_seqlens=query_start_loc[: kda_metadata.num_decodes + 1],
                     ssm_state_indices=decode_state_indices,
+                    ssm_state_indices_in=decode_state_indices_in,
                     use_qk_l2norm_in_kernel=True,
                     is_kda=True,
                     lower_bound=self._kda_gate_lower_bound,
@@ -1497,6 +1505,10 @@ class KimiKDAAttention(nn.Module):
             spec_state_indices = kda_metadata.spec_state_indices_tensor
             spec_query_start_loc = kda_metadata.spec_query_start_loc
             num_accepted_tokens = kda_metadata.num_accepted_tokens
+            # Under pp>1 the first verify after the prompt can fork off a
+            # checkpoint: the builder then ships the source as the read side.
+            spec_state_indices_in = kda_metadata.spec_state_indices_in_tensor
+            nsd = kda_metadata.num_spec_decodes
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -1507,9 +1519,12 @@ class KimiKDAAttention(nn.Module):
                 self.activation,
                 # First reserved slot per seq holds the resume state; the kernel
                 # walks forward via num_accepted_tokens + query_start_loc.
-                conv_state_indices=spec_state_indices[:, 0][
-                    : kda_metadata.num_spec_decodes
-                ],
+                conv_state_indices=spec_state_indices[:nsd, 0],
+                conv_state_indices_in=(
+                    None
+                    if spec_state_indices_in is None
+                    else spec_state_indices_in[:nsd, 0]
+                ),
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
                 # Verify window: sizes the conv rollback window and hence the
@@ -1527,7 +1542,6 @@ class KimiKDAAttention(nn.Module):
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
             if getattr(kda_metadata, "replayssm", False):
-                nsd = kda_metadata.num_spec_decodes
                 replayssm_sigmoid_gating_delta_rule(
                     q,
                     k,
@@ -1547,6 +1561,7 @@ class KimiKDAAttention(nn.Module):
                     o=out,
                     use_qk_l2norm_in_kernel=True,
                     lower_bound=self._kda_gate_lower_bound,
+                    fork_slots=kda_metadata.replayssm_fork_slots,
                 )
             else:
                 fused_sigmoid_gating_delta_rule_update(
@@ -1567,6 +1582,7 @@ class KimiKDAAttention(nn.Module):
                     # num_accepted_tokens the kernel reads the resume state from
                     # slot[num_accepted-1] and writes a snapshot after each token.
                     ssm_state_indices=spec_state_indices,
+                    ssm_state_indices_in=spec_state_indices_in,
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
                     is_kda=True,
@@ -1761,10 +1777,12 @@ class KimiDecoderLayer(nn.Module):
         """Reconstruct this layer's post-layer hidden state from ``forward``'s
         return, for a drafter tapping it as an aux hidden state.
 
-        Every DSpark draft is trained on the HF reference's
-        ``output.hidden_states[layer_idx + 1]`` -- the plain residual stream
-        after this layer, which the reference forms as
-        ``prefix_sum = prefix_sum + hidden_states`` before returning. forward()
+        This is the HF reference's ``output.hidden_states[layer_idx + 1]`` --
+        the plain residual stream after this layer, which the reference forms as
+        ``prefix_sum = prefix_sum + hidden_states`` before returning. It is
+        what a draft trained on that stream reads (the MLA DSpark draft); a
+        draft trained on the attn-residual mixture over the bank (the DSpark GQA
+        draft) reads ``aggregate_hidden_state`` instead. forward()
         deliberately does not: it hands the FFN output back unapplied so the
         NEXT layer's attn_res kernel can fold it into its on-load, and an MoE
         layer defers its routed and shared outputs separately so that same fold
@@ -1773,8 +1791,7 @@ class KimiDecoderLayer(nn.Module):
 
         This lives on the layer rather than in the drafter because it is a
         property of THIS layer's return protocol -- it has to change in lockstep
-        with forward(), and any drafter trained against a Kimi-K3 target needs
-        the same reconstruction.
+        with forward().
         """
         prefix_sum, *pendings, _block_residual = output
         if prefix_sum is None:
@@ -1783,6 +1800,65 @@ class KimiDecoderLayer(nn.Module):
             if pending is not None:
                 prefix_sum = prefix_sum + pending
         return prefix_sum
+
+    def check_aggregate_source(self, next_layer: "KimiDecoderLayer") -> None:
+        """Refuse a ``next_layer`` that cannot score ``aggregate_hidden_state``,
+        and fold its score weight now, outside the traced forward the
+        aggregate runs in."""
+        own, res = self.self_attention_attn_res, next_layer.self_attention_attn_res
+        for layer, site in ((self, own), (next_layer, res)):
+            if not site.enabled or not site.block_size:
+                raise ValueError(
+                    f"aggregate of target layer {self.layer_idx}: target layer "
+                    f"{layer.layer_idx} has no enabled attn-residual"
+                )
+        if res.score_weight is None:
+            res.process_weights_after_loading()
+        if res.score_weight is None:
+            raise RuntimeError(
+                f"aggregate of target layer {self.layer_idx}: target layer "
+                f"{next_layer.layer_idx}'s attn-residual has no score weight"
+            )
+
+    def aggregate_hidden_state(
+        self, output: tuple, next_layer: "KimiDecoderLayer"
+    ) -> torch.Tensor | None:
+        """The attn-residual mixture ``next_layer`` forms over ``forward``'s
+        return, un-normed.
+
+        This is ``next_layer.self_attention_attn_res`` without its out_norm:
+        the same bank, the same prefix and pendings folded on-load, the same
+        score weight. ``check_aggregate_source`` must have accepted
+        ``next_layer`` first.
+
+        The bank holds one snapshot per ``maybe_close_block`` at or below this
+        layer. Only those are read: a caller may hand a fixed-size bank whose
+        later slots are not yet written this step.
+        """
+        prefix_sum, pending_add, pending_add2, block_residual = output
+        if prefix_sum is None:
+            return None
+        own, res = self.self_attention_attn_res, next_layer.self_attention_attn_res
+        num_blocks = own.layer_idx // own.block_size + 1
+        if block_residual is None or block_residual.shape[1] < num_blocks:
+            raise RuntimeError(
+                f"aggregate of target layer {self.layer_idx}: expected a bank "
+                f"of >= {num_blocks} blocks, got "
+                f"{None if block_residual is None else tuple(block_residual.shape)}"
+            )
+        from atom.model_ops.kimi_k3 import apply_attn_res
+
+        mixed, _ = apply_attn_res(
+            prefix_sum,
+            block_residual[:, :num_blocks],
+            res.score_weight,
+            res.eps,
+            pending_add,
+            None,
+            res.out_eps,
+            pending_add2,
+        )
+        return mixed
 
 
 @token_graph
@@ -1795,7 +1871,7 @@ class KimiLinearModel(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
 
-        if get_pp_group().is_first_rank:
+        if pp_holds_embedding(atom_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size, config.hidden_size
             )

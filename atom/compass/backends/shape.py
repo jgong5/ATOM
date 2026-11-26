@@ -52,6 +52,7 @@ replayed nothing.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -171,6 +172,55 @@ def sum_context(rows: Sequence[RequestShape]) -> int:
     return _per_request(rows, lambda r: r.context_tokens)
 
 
+#: The time constant, in seconds, `PrefillDuty` weights a rank's past forwards by.
+DUTY_TAU = 4.0
+
+
+class PrefillDuty:
+    """A rank's prefill duty over its forwards, as `BatchView.prefill_duty`
+    states it at each one's entry: the share of the time before `t` that the
+    rank spent in forwards of prefill steps, each instant weighted by
+    `exp(-(t - instant) / tau)` over `tau`, so a rank that has run nothing but
+    prefill forwards for long reads 1 and one that has run none for long reads
+    0. A forward runs from its entry to its exit on one clock, the worker's
+    `t_enter_ns` and `t_exit_ns` on a real record and the engine's clock on a
+    simulated run; forwards on a rank do not overlap. The time between them
+    counts as no prefill.
+
+    `at(t)` is the duty at `t`; `add` adds a forward from `enter` to `exit`,
+    `prefill` whether its step is a prefill step of its group, after every
+    forward that exited before it. A time before the last forward's exit
+    reads the duty at that exit, and a forward entered before it is taken to
+    start there: a clock that places a forward's entry a little before its
+    predecessor's exit moves no duty back.
+    """
+
+    def __init__(self, tau: float = DUTY_TAU) -> None:
+        if not tau > 0:
+            raise ValueError(f"a duty's time constant is positive, not {tau}")
+        self.tau = tau
+        self.duty = 0.0  # at `self.time`
+        self.time = None
+
+    def at(self, t: float) -> float:
+        if self.time is None:
+            return 0.0
+        return self.duty * math.exp(-max(t - self.time, 0.0) / self.tau)
+
+    def add(self, enter: float, exit_: float, prefill: bool) -> None:
+        if exit_ < enter:
+            raise ValueError(
+                f"a forward exits at {exit_} s, before its entry at {enter} s"
+            )
+        if self.time is not None:  # a forward starts no earlier than the last exit
+            enter = max(enter, self.time)
+            exit_ = max(exit_, enter)
+        start = self.at(enter)
+        decay = math.exp(-(exit_ - enter) / self.tau)
+        self.duty = start * decay + (1.0 - decay) * bool(prefill)
+        self.time = exit_
+
+
 #: The refusal of a backend with no vision encoder in what it prices from.
 IMAGES = "a step with image tokens, and no vision encoder in what this prices from"
 
@@ -223,13 +273,20 @@ class BatchView:
     and reaches the MoE gate, and every dummy runs the same rows, from token 0
     at position 0, so the group's dummies route alike.
     `group_prefills` says some rank of the data-parallel group
-    prefills at this step; False on one rank. `group_max_tokens` is the most
+    prefills at this step; False on one rank. `group_tail` says some rank of
+    the group finishes a prompt's prefill at this step, which runs the decoder
+    on that tail on every rank of the group, its MoE collectives being the
+    group's (DeepSeek-V4.1); False on one rank. `group_max_tokens` is the most
     tokens any rank of the group scheduled at this step, which ATOM picks the
     step's prefill token-graph bucket by (`ForwardMode._pad_to_token_graph`),
     never fewer than this rank's; None on one rank. `group_needs_eager` says
     the attention backend of some rank of the group, a group of one included,
     refuses a graph for this step (`DPSyncResult.any_rank_needs_eager`), so
     the group runs it eagerly and replays no token graph for its prefill.
+    `prefill_duty` is the share of the time before this step that its rank
+    spent in forwards of steps its data-parallel group prefilled at (on one
+    rank, its own), exponentially weighted with time constant `DUTY_TAU`
+    (`PrefillDuty`), at the step's entry; None when the caller did not say.
     `image_tokens` counts the
     scheduled tokens whose embedding the step's vision encoder supplies; a
     backend that has no basis for pricing that encoder refuses a step with any.
@@ -256,6 +313,8 @@ class BatchView:
     group_dummies: int = 0
     group_max_tokens: int | None = None
     group_needs_eager: bool = False
+    group_tail: bool = False
+    prefill_duty: float | None = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)

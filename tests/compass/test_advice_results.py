@@ -20,9 +20,10 @@ import sys
 
 import platforms
 import pytest
-from test_advice_check import starts
+from test_advice_check import resolved, starts
 from test_advice_simulate import simulating, stubbed  # noqa: F401  the fixtures
 from test_calibrate import _path, _tree
+from test_memory_readings import publish_readings
 from test_run_step_grid import DOCUMENT
 from test_validate_curves import INFERENCEX, _deployment, _run
 
@@ -561,3 +562,167 @@ def test_a_calibrated_candidate_s_coverage_command_resumes_it_or_says_why_none(
     assert why.startswith(
         f"no calibrate.sh command: the calibration in {out / 'cal' / 'b'} has ended"
     )
+
+
+def test_a_coverage_report_s_command_reads_the_candidate_s_latest_calibration(
+    tmp_path, simulating, monkeypatch  # noqa: F811
+):
+    """b's one point a coverage report under the suite's law file, with its
+    first calibration, ``cal/b``, and its next, ``cal/b+2``, both ended: why
+    no command serves names the latter, whose records the law was fitted on."""
+    for name, text in (("server", SERVER), ("client", CLIENT)):
+        (tmp_path / name).write_text(text.format(python=sys.executable))
+        (tmp_path / name).chmod(0o755)
+    monkeypatch.setattr(check, "COMPASS", tmp_path / "server")
+    monkeypatch.setattr(simulate, "CLIENT", tmp_path / "client")
+    monkeypatch.setenv("STUB_DIR", str(tmp_path))
+    (tmp_path / "summaries.json").write_text(json.dumps({"*": COVERAGE}))
+    (tmp_path / "run_file.json").write_text(json.dumps({"machine": DOCUMENT}))
+    made(tmp_path / "made" / "b-c1", 1, summary=None)
+    flags = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
+    space = {
+        "model": str(tmp_path),
+        "machine": {"device": flags[1], "ptl": flags[3]},
+        "store": str(tmp_path / "store"),
+        "workload": {"traces": str(tmp_path / "traces.jsonl"), "select": "agentx"},
+        "slo": {},
+        "common": {"basis": "a recipe"},
+        "dimensions": {"config": {"b": {"args": {"--max-num-seqs": 8}}}},
+    }
+    space["workload"]["concurrency"] = [1]
+    (tmp_path / "space.json").write_text(json.dumps(space))
+    out = tmp_path / "out"
+    for name in ("b", "b+2"):
+        (out / "cal" / name).mkdir(parents=True)
+        ended = "2026-11-24T07:00:00Z end calibration 0.20 node-hours\n"
+        (out / "cal" / name / "status").write_text(ended)
+
+    cli.main(["advice", str(tmp_path / "space.json"), str(out)])
+
+    (why,) = rows(json.loads((out / results.RESULTS).read_text()))["b-c1"]["made_by"]
+    assert why.startswith(
+        f"no calibrate.sh command: the calibration in {out / 'cal' / 'b+2'} has ended"
+    )
+
+
+#: Two candidates at one law key, as the DeepSeek-V4-Pro template's S2 and S5,
+#: whose LMCache no law key holds: the --max-model-len the stubbed resolution
+#: reads keys S5's readings, and no law.
+S2 = {"args": {"--max-num-seqs": 8}}
+S5 = {"args": S2["args"] | {"--max-model-len": 512}}
+
+
+@pytest.mark.parametrize(
+    "started, ended",
+    [(None, False), ("own", False), ("own", True), ("shared", False), ("shared", True)],
+    ids=[
+        "not started",
+        "started into its own store",
+        "ended into its own store",
+        "started into the shared store",
+        "ended into the shared store",
+    ],
+)
+def test_two_coverage_reports_at_one_law_key_print_one_calibration(
+    tmp_path, simulating, monkeypatch, capsys, started, ended  # noqa: F811
+):
+    """S2's and S5's one point each a coverage report under the suite's law
+    file, both looked up in the shared store, with S2's calibration in OUT as
+    `started` and `ended` say: S2's row gives its own answer, and S5's names
+    S2's calibration, with the command measuring S5's readings into the store
+    that calibration publishes into unless that is the shared one; there, once
+    that calibration has ended, S2's answer."""
+    for name, text in (("server", SERVER), ("client", CLIENT)):
+        (tmp_path / name).write_text(text.format(python=sys.executable))
+        (tmp_path / name).chmod(0o755)
+    monkeypatch.setattr(check, "COMPASS", tmp_path / "server")
+    monkeypatch.setattr(simulate, "CLIENT", tmp_path / "client")
+    monkeypatch.setenv("STUB_DIR", str(tmp_path))
+    (tmp_path / "summaries.json").write_text(json.dumps({"*": COVERAGE}))
+    (tmp_path / "run_file.json").write_text(json.dumps({"machine": DOCUMENT}))
+    for point in ("S2-c1", "S5-c1"):
+        made(tmp_path / "made" / point, 1, summary=None)
+    store, out = tmp_path / "store", tmp_path / "out"
+    flags = platforms.flags(store, DOCUMENT, tmp_path)
+    space = {
+        "model": str(tmp_path),
+        "machine": {"device": flags[1], "ptl": flags[3]},
+        "store": str(store),
+        "workload": {"traces": str(tmp_path / "traces.jsonl"), "select": "agentx"},
+        "slo": {},
+        "common": {"basis": "a recipe"},
+        "dimensions": {"config": {"S2": S2, "S5": S5}},
+    }
+    space["workload"]["concurrency"] = [1]
+    (tmp_path / "space.json").write_text(json.dumps(space))
+    args5 = ["--max-num-seqs", "8", "--max-model-len", "512"]
+    publish_readings(store, resolved(simulating.config, args5))
+    cal = out / "cal" / "S2"
+    if started:
+        cal.mkdir(parents=True)
+        named = f"store {store}\n" if started == "shared" else ""
+        (cal / "inputs").write_text(f"tree c0ffee\nrecord 1\n{named}")
+    if ended:
+        (cal / "status").write_text("2026-11-24T00:00:00Z end calibration 0.50\n")
+
+    cli.main(["advice", str(tmp_path / "space.json"), str(out)])
+
+    held = rows(json.loads((out / results.RESULTS).read_text()))
+    (answer,) = held["S2-c1"]["made_by"]
+    if ended:
+        why = f"no calibrate.sh command: the calibration in {cal} has ended"
+        assert answer.startswith(why)
+    else:
+        assert f"calibrate.sh {cal} " in answer
+        given = f" STORE={shlex.quote(str(store))} " in answer
+        assert given == (started == "shared")
+    into = str(store if started == "shared" else cal / "store")
+    borrowed = [check.BORROWED.format("S2", cal, into)]
+    if started == "shared":
+        # S5 was looked up in the store S2's calibration publishes into.
+        assert held["S5-c1"]["made_by"] == ([answer] if ended else borrowed)
+    else:
+        measure = f"compass measure memory --gpu G --out D --store {into} -- "
+        measure += " ".join(["--model", str(tmp_path), *args5])
+        measured = check.PENDING.format(into, "S2", cal) if not started else measure
+        assert held["S5-c1"]["made_by"] == [*borrowed, measured]
+    printed = capsys.readouterr().out
+    assert printed.count(f"{lacking.CALIBRATE} ") == (0 if ended else 1)
+    for line in held["S5-c1"]["made_by"]:
+        assert f"S5 at concurrency 1, made by: {line}\n" in printed
+
+
+def test_a_coverage_report_s_command_runs_under_the_candidate_s_own_variables(
+    tmp_path, simulating, monkeypatch  # noqa: F811
+):
+    """b's one point a coverage report under the suite's law file, b under a
+    variable no law key states: its calibrate.sh command sets that variable."""
+    for name, text in (("server", SERVER), ("client", CLIENT)):
+        (tmp_path / name).write_text(text.format(python=sys.executable))
+        (tmp_path / name).chmod(0o755)
+    monkeypatch.setattr(check, "COMPASS", tmp_path / "server")
+    monkeypatch.setattr(simulate, "CLIENT", tmp_path / "client")
+    monkeypatch.setenv("STUB_DIR", str(tmp_path))
+    (tmp_path / "summaries.json").write_text(json.dumps({"*": COVERAGE}))
+    (tmp_path / "run_file.json").write_text(json.dumps({"machine": DOCUMENT}))
+    made(tmp_path / "made" / "b-c1", 1, summary=None)
+    flags = platforms.flags(tmp_path / "store", DOCUMENT, tmp_path)
+    b = {"args": {"--max-num-seqs": 8}, "env": {"STUB_OWN": "1"}}
+    space = {
+        "model": str(tmp_path),
+        "machine": {"device": flags[1], "ptl": flags[3]},
+        "store": str(tmp_path / "store"),
+        "workload": {"traces": str(tmp_path / "traces.jsonl"), "select": "agentx"},
+        "slo": {},
+        "common": {"basis": "a recipe"},
+        "dimensions": {"config": {"b": b}},
+    }
+    space["workload"]["concurrency"] = [1]
+    (tmp_path / "space.json").write_text(json.dumps(space))
+
+    cli.main(["advice", str(tmp_path / "space.json"), str(tmp_path / "out")])
+
+    held = rows(json.loads((tmp_path / "out" / results.RESULTS).read_text()))
+    (command,) = held["b-c1"]["made_by"]
+    assert f" {lacking.CALIBRATE} " in command
+    assert "STUB_OWN=1" in shlex.split(command.split("\n")[0])
