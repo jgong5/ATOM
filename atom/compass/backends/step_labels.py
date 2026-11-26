@@ -206,6 +206,38 @@ def _prefill_label() -> str:
     return value
 
 
+#: The variable that, set to ``1``, labels and simulates a middle prefill chunk
+#: (a forward of prefill rows that produces no output) as one whose host waits
+#: for the PREVIOUS forward's device work before it launches, as ATOM's does
+#: (`middle_wait_ns`). Off, `W_pre` holds that wait and the simulation has none,
+#: as before. Read by the labels and by the simulated host
+#: (`runner.overrides.HostDeviceRecurrence`) alike, so a law fitted under it
+#: and a run priced under it agree.
+MIDDLE_WAIT_ENV = "COMPASS_MIDDLE_WAITS_PREVIOUS"
+
+
+def middle_waits() -> bool:
+    """Whether `MIDDLE_WAIT_ENV` is ``1``."""
+    return os.environ.get(MIDDLE_WAIT_ENV) == "1"
+
+
+def middle_wait_ns(prev: dict | None, s: dict) -> int:
+    """The part of a middle chunk `s`'s `W_pre` its host spent waiting for the
+    previous forward `prev`'s device work: from its staging gate's end to that
+    work's end, estimated as `prev`'s launch start plus its device busy time,
+    and none past `s`'s own launch. On Qwen3.8-Flash-Next (g40, 11-26) a middle
+    chunk's `W_pre` less this was 0.4-0.8 ms (p10-p90) on every record, where
+    `W_pre` itself ran 0.8 ms to 0.55 s: the host blocks until the previous
+    chunk's device work is done, so a full 16k chunk behind another shows it
+    and a short tail behind a short one does not. 0 without `prev`'s stamps."""
+    if prev is None or "t_launch_ns" not in prev or "d_busy_ns" not in prev:
+        return 0
+    l0 = s["t_launch_ns"][0]
+    g1 = s.get("t_gate_ns", (l0, l0))[1]
+    end = min(prev["t_launch_ns"][0] + prev["d_busy_ns"], l0)
+    return max(0, end - g1)
+
+
 #: The variable that, set to ``1``, takes a record whose run.json names
 #: `BUILDS` anyway, with a warning naming them: for a one-real-run fit whose
 #: server met kernel shapes no sweep had compiled (Triton specializes per
@@ -858,6 +890,8 @@ def _label(
             propose = s.get("b_propose_ns") if view.produces_output else None
         enter, blocked = s["t_enter_ns"], s.get("blocked_ns")
         host = _segments(s, host_kind(view) != "middle")
+        if middle_waits() and host_kind(view) == "middle":
+            host["W_pre"] = max(0, host["W_pre"] - middle_wait_ns(prev, s))
         if copy.get(s["step"], (0, False))[1]:
             host["L_mtp"] = copy[s["step"]][0]
         idle = prev is not None and not busy[i]

@@ -530,7 +530,13 @@ class HostDeviceRecurrence:
             * (s not in self.skip)
             for s in SEGMENTS
         }
-        host = max(called + seg["E"], self.ends[0]) + seg["W_pre"]
+        start = max(called + seg["E"], self.ends[0])
+        if kind == "middle" and _middle_waits():
+            # ATOM's middle chunk launches once the previous forward's device
+            # work is done (step_labels.middle_wait_ns), whose W_pre labels
+            # then hold only the host's own part
+            start = max(start, self.ends[-1])
+        host = start + seg["W_pre"]
         if self.mtp and kind != "middle":  # output_end stays -inf on a PP stage
             host = max(host, self.output_end + seg[MTP_COPY])
         return host + seg[MTP_SEGMENT], seg
@@ -564,6 +570,13 @@ class HostDeviceRecurrence:
             if self.own_draft:  # its own draft ids, read once its draft ends
                 return max(released + post, end)
         return released + post
+
+
+def _middle_waits() -> bool:
+    """`step_labels.middle_waits`, imported where it is read."""
+    from atom.compass.backends.step_labels import middle_waits
+
+    return middle_waits()
 
 
 def schedulable_bound(config: Any) -> int:
