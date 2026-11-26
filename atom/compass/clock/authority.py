@@ -768,7 +768,18 @@ class ClockAuthority:
         return term
 
     def _lbts(self, i: LpId) -> float:
-        return min((term for _, term in self._row(i)), default=math.inf)
+        """The least of `_row(i)`'s terms, summed in place without building
+        the row: the grant scan asks it of every waiting LP on every request.
+        A subclass that redefines `_row` gets its own rule."""
+        if type(self)._row is not ClockAuthority._row:
+            return min((term for _, term in self._row(i)), default=math.inf)
+        nv = self._nv
+        least = math.inf
+        for j, d in self._from[i]:
+            term = nv[j] + d
+            if term < least:  # noqa: PLR1730 - a min() call per term costs more
+                least = term
+        return least
 
     def _grant_due(self) -> list:
         replies = []
