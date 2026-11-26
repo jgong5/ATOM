@@ -65,6 +65,7 @@ streams and uvicorn's h11 body send with the same awaits and bytes, at less
 CPU per streamed message.
 """
 
+import array
 import asyncio
 import collections
 import contextlib
@@ -85,9 +86,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 
 from atom.compass.carriers import (
+    RELAYED_JSON,
     cancel_seq,
-    relay_carried,
-    stamp_events,
+    decode_relayed,
+    stamp_split_events,
     tracestate_jitter,
     with_relay_stamp,
 )
@@ -408,12 +410,26 @@ def wrap_segment(encode_cached, rate):
     return charged
 
 
+#: The most ids a decode `wrap_decode` remembers holds: a streaming frontend
+#: decodes each stream's last few ids, and a simulated stream repeats one
+#: filler id, so the same short spans come back.
+MEMO_IDS = 64
+#: How many decodes one `wrap_decode` remembers before it forgets them all.
+MEMO_DECODES = 1 << 14
+
+
 def wrap_decode(decode, rate):
     """`decode`, charging the current job `_price` of `rate`, a ``host`` entry's
     ``tokenizer.decode``. A decode of a token count outside the term's
     ``tokens`` is charged nothing and is a run-summary reason
-    ``tokenizer:decode ...`` naming them."""
+    ``tokenizer:decode ...`` naming them.
+
+    A decode is a pure function of its ids and arguments, so a call with at
+    most `MEMO_IDS` ids, in a list or an int array, takes the text an equal
+    call to this wrapper decoded before, if it is among the last
+    `MEMO_DECODES` it remembers; it is charged as any call is."""
     lo, hi = (rate or {}).get("tokens", (0, math.inf))
+    memo = {}
 
     def charged(ids, *args, **kwargs):
         if lo <= len(ids) <= hi:
@@ -423,9 +439,37 @@ def wrap_decode(decode, rate):
                 f"tokenizer:decode of {len(ids)} tokens, outside the {lo} to "
                 f"{hi} tokens its decode was fitted on"
             )
-        return decode(ids, *args, **kwargs)
+        key = _decode_key(ids, args, kwargs)
+        if key is None:
+            return decode(ids, *args, **kwargs)
+        try:
+            text = memo.get(key)
+        except TypeError:  # an argument with no hash
+            return decode(ids, *args, **kwargs)
+        if text is None:
+            text = decode(ids, *args, **kwargs)
+            if len(memo) >= MEMO_DECODES:
+                memo.clear()
+            memo[key] = text
+        return text
 
     return charged
+
+
+def _decode_key(ids, args, kwargs) -> tuple | None:
+    """The key `wrap_decode` remembers a decode of `ids` with `args` and
+    `kwargs` by; None for ids it does not remember: more than `MEMO_IDS` of
+    them, or in anything but a list or an array."""
+    if len(ids) > MEMO_IDS:
+        return None
+    kind = type(ids)
+    if kind is array.array:
+        held = (ids.typecode, ids.tobytes())
+    elif kind is list:
+        held = tuple(ids)
+    else:
+        return None
+    return kind, held, args, tuple(kwargs.items())
 
 
 #: Timers that do not keep the run alive, by the qualified name of their
@@ -855,7 +899,10 @@ class HttpChannel:
     stamped request reads; its socket closing is never handed on.
 
     An LP whose requests come in on a ``relay`` channel reads each one's stamp,
-    a cancel's too, from its body's ``kv_transfer_params`` instead. An LP that
+    a cancel's too, from its body's ``kv_transfer_params`` instead, decoding
+    the body once (`atom.compass.carriers.decode_relayed`): the app's
+    ``Request.json`` takes that decoding of the same bytes
+    (`atom.compass.run.handoff`), handed on in the scope. An LP that
     sends on one stamps a send on it for each JSON response whose
     ``kv_transfer_params`` is an object, and writes the stamp there; with a
     ``relay`` term in its host entry (`atom.compass.run.relay`), it also writes
@@ -872,9 +919,10 @@ class HttpChannel:
     before. A relayed request without the field is charged no relay.
 
     During the run, each event of a ``text/event-stream`` response body leaves
-    with a comment line carrying its stamp on the LP's stream channel
-    (`atom.compass.carriers.stamp_events`). Each body message is one frame the
-    app's stream yielded, so it must end in a blank line. With an
+    with a comment line carrying its stamp on the LP's stream channel, looked
+    up once a response (`atom.compass.carriers.stamp_split_events`). Each body
+    message is one frame the app's stream yielded, so it must end in a blank
+    line. With an
     ``http_stream`` term in its host entry (`atom.compass.run.http_stream`),
     the loop is charged ``per_event_s`` for each event but a ``[DONE]`` before
     it stamps them: a real decode server's loop spends ~50 us of CPU an
@@ -922,7 +970,9 @@ class HttpChannel:
         service = 0.0  # the seconds its relay serves it for, where stated
         if relay_in is not None:
             body, receive = await _read_body(receive)
-            got, service = relay_carried(body)
+            decoded, got, service = decode_relayed(body)
+            if decoded is not None:
+                scope[RELAYED_JSON] = (body, decoded)
         else:
             got = self.stamp(scope) if scope["type"] == "http" else None
         if (
@@ -1111,22 +1161,24 @@ def _stamping_events(send, rt, per_event=None):
     the traffic LP only asks for once the return is in, and the run hangs.
     """
     events = ended = False
+    stream = None  # the LP's stream channel, looked up at the first event
 
     async def stamping(message):
-        nonlocal events, ended
+        nonlocal events, ended, stream
         if ended:
             return
         if message["type"] == "http.response.start":
             content_type = dict(message.get("headers", [])).get(b"content-type", b"")
             events = content_type.startswith(b"text/event-stream")
         elif events and rt.in_run:
-            text = message.get("body", b"").decode()
+            *sent, tail = message.get("body", b"").decode().split("\n\n")
             if per_event:
-                sent = text.split("\n\n")[:-1]
                 n = sum(1 for e in sent if not e.endswith("data: [DONE]"))
                 if n:
                     charge(per_event * n)
-            text = stamp_events(text, rt)
+            if stream is None:
+                stream = clock.channel_of(rt, "stream")
+            text = stamp_split_events(sent, tail, rt, stream)
             message = {**message, "body": text.encode()}
             if text.endswith("\ndata: [DONE]\n\n"):
                 ended, message["more_body"] = True, False
