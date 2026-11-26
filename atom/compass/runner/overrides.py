@@ -361,7 +361,12 @@ class HostDeviceRecurrence:
     pipeline stage refuses them, as it does columns. `stalls`, a host entry's
     `step_labels.STALLS`, maps a launch path to ``first_s``, what a rank's
     first launch of a shape on it costs (`launch_stall`); `path` then names a
-    forward's path for them too.
+    forward's path for them too. `waits`, a host entry's `step_labels.WAITS`
+    from a host fit under `COMPASS_FIT_LAUNCH_WAIT=1`, names the kinds whose
+    launch starts no earlier than the device end of the forward before it,
+    `ends[-1]`, as their real launch waits for it there, which their
+    `W_launch` laws then leave out; empty, every launch starts at its prepare
+    end, as before.
     With `own_draft`, true unless it defers, an output forward that waits for its own
     target leaves no earlier than its device end, as one that reads its own draft ids does.
     A batch whose `compass_dummy` is true, a DP rank's dummy forward at a step
@@ -395,10 +400,12 @@ class HostDeviceRecurrence:
         defer=True,
         paths=None,
         stalls=None,
+        waits=(),
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
         self.admit, self.columns, self.launch = admit, columns or {}, launch
         self.paths, self.stalls = paths or {}, stalls or {}
+        self.waits = frozenset(waits or ())
         if self.paths and stage is not None:
             raise ValueError(
                 "the host laws state launch-path constants, and a pipeline stage "
@@ -490,6 +497,10 @@ class HostDeviceRecurrence:
         prepared, self.segments = self.prepare_end(
             called, kind, x, admit_s, features, path
         )
+        if kind in self.waits:
+            # `waits`: this kind's launch starts once the forward before it
+            # has left the device.
+            prepared = max(prepared, self.ends[-1])
         self.out_s = self.segments[OUT_SEGMENT] if out else None
         launch, post = self.segments["W_launch"], self.segments["W_post"]
         host = max(prepared, meta)

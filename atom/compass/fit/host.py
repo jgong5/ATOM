@@ -66,12 +66,15 @@ from pathlib import Path
 from atom.compass.artifacts import Key, Kind, keyed_platform
 from atom.compass.backends.step_labels import (
     STALLS,
+    WAITS,
     digest,
     group_prefills,
     launch_stall_on,
+    launch_wait_on,
     record_ranks,
     stall_entry,
     stall_prices,
+    wait_labels,
 )
 from atom.compass.backends.step_linear_fit import (
     fit_hops,
@@ -107,7 +110,13 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
     (`step_labels.STALL_ENV`) the entry also states `step_labels.STALLS`, per
     launch path what a rank's first launch of a shape costs
     (`step_labels.stall_prices`, which the report states with its counts),
-    which a run charges (`runner.overrides.launch_stall`)."""
+    which a run charges (`runner.overrides.launch_stall`). Under
+    ``COMPASS_FIT_LAUNCH_WAIT=1`` (`step_labels.WAIT_ENV`) each `W_launch`
+    label in a host kind whose launches wait for the device end of the
+    forward before them loses that wait (`step_labels.wait_labels`, which the
+    report states under `step_labels.WAITS`), and the entry states those kinds
+    under `step_labels.WAITS`, which a run's recurrence keeps
+    (`runner.overrides.HostDeviceRecurrence`)."""
     from scipy.spatial import QhullError
 
     bare = sorted(
@@ -127,7 +136,13 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
                     f"its lines; steps/{name + LOCAL} names the file that holds "
                     f"them, {named.read_text().strip()}"
                 )
+    waits = None
+    if launch_wait_on():
+        # `step_labels.WAIT_ENV`: launch labels less their wait on earlier work.
+        samples, waited, waits = wait_labels(samples, records)
     host, report = fit_host(samples)
+    if waits is not None:
+        host[WAITS], report[WAITS] = waits, waited
     if steady is not None:
         host_blocks.refit(samples, host, report)
     if launch_stall_on():
