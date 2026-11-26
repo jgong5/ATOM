@@ -918,6 +918,11 @@ class HttpChannel:
     with 8 others in flight, while a lone one takes the term's time as
     before. A relayed request without the field is charged no relay.
 
+    Each count of a body's bytes, for its relay's service, its intake and its
+    place in the order, includes the prompt token ids a hand-off reference in
+    it stands for, as if they were inline
+    (`atom.compass.run.handoff.inline_extra`).
+
     During the run, each event of a ``text/event-stream`` response body leaves
     with a comment line carrying its stamp on the LP's stream channel, looked
     up once a response (`atom.compass.carriers.stamp_split_events`). Each body
@@ -968,11 +973,13 @@ class HttpChannel:
         if relay_out is not None:
             send = _stamping(send, rt, relay_out, self.relay, taken)
         service = 0.0  # the seconds its relay serves it for, where stated
+        extra = 0  # the bytes its ids would add inline, less their reference's
         if relay_in is not None:
             body, receive = await _read_body(receive)
             decoded, got, service = decode_relayed(body)
             if decoded is not None:
                 scope[RELAYED_JSON] = (body, decoded)
+            extra = _inline_extra(body)
         else:
             got = self.stamp(scope) if scope["type"] == "http" else None
         if (
@@ -1003,7 +1010,7 @@ class HttpChannel:
             # Its body leaves the socket as it comes, not at its turn.
             reading = asyncio.ensure_future(_body_messages(receive))
             reading.add_done_callback(
-                partial(self._ready, ready, arrival, jitter, service)
+                partial(self._ready, ready, arrival, jitter, service, extra)
             )
             loop.held[ch, seq] = (arrival, wake, ready)
             try:
@@ -1013,7 +1020,8 @@ class HttpChannel:
                     # still waits on the socket.
                     body = await reading
                     cancelled = cancel_seq(body[0].get("body", b""))
-                    nbytes = taken[0] = sum(len(m.get("body", b"")) for m in body)
+                    nbytes = sum(len(m.get("body", b"")) for m in body) + extra
+                    taken[0] = nbytes
                     if service and cancelled is None:
                         # The relay serves it on this loop, behind those ahead.
                         charge(service)
@@ -1064,13 +1072,15 @@ class HttpChannel:
         arrival: float,
         jitter: float,
         service: float,
+        extra: int,
         reading,
     ) -> None:
         """Resolve `ready` with when the request's body, read at once with the
         others', is in: its arrival plus its relay's `service` and its own
-        intake, ``fixed_s + (body bytes + jitter) x per_byte_s``, which depends
-        on nothing the wall decides; a cancel's after every request it can
-        name. A body never read is in at once."""
+        intake, ``fixed_s + (body bytes + extra + jitter) x per_byte_s``, with
+        `extra` the bytes its ids would add inline, which depends on nothing
+        the wall decides; a cancel's after every request it can name. A body
+        never read is in at once."""
         if ready.done():
             return
         if reading.cancelled() or reading.exception() is not None:
@@ -1079,7 +1089,7 @@ class HttpChannel:
             ready.set_result(math.inf)
         else:
             fixed, per_byte, _ = self.intake or (0.0, 0.0, 0.0)
-            nbytes = sum(len(m.get("body", b"")) for m in reading.result())
+            nbytes = sum(len(m.get("body", b"")) for m in reading.result()) + extra
             ready.set_result(arrival + service + fixed + per_byte * (nbytes + jitter))
 
 
@@ -1187,6 +1197,14 @@ def _stamping_events(send, rt, per_event=None):
     return stamping
 
 
+def _inline_extra(body: bytes) -> int:
+    """`atom.compass.run.handoff.inline_extra`: the bytes the ids `body`'s
+    hand-off reference stands for would add to it inline, less its own."""
+    from atom.compass.run.handoff import inline_extra
+
+    return inline_extra(body)
+
+
 def _stamping(send, rt, ch: str, relay=None, taken=(0,)):
     """`send`, holding a JSON response back until its body is whole, to stamp it
     for `ch`, arriving at the channel's lookahead; with `relay`,
@@ -1196,7 +1214,7 @@ def _stamping(send, rt, ch: str, relay=None, taken=(0,)):
     `HttpChannel` charges on its loop. ``bytes`` are those of the request the
     router builds for decode from the client's request, whose body's bytes
     `taken` holds, and this response's prompt token ids: the two bodies'
-    bytes."""
+    bytes, the ids counted as if inline where a reference stands for them."""
     start, chunks = None, []
 
     async def stamping(message):
@@ -1215,7 +1233,8 @@ def _stamping(send, rt, ch: str, relay=None, taken=(0,)):
         raw, service = b"".join(chunks), None
         if relay is not None:
             fixed_s, per_byte_s, router_s = relay
-            extra = fixed_s + (taken[0] + len(raw)) * per_byte_s - router_s
+            size = taken[0] + len(raw) + _inline_extra(raw)
+            extra = fixed_s + size * per_byte_s - router_s
             service = extra if extra > 0 else None
         body = with_relay_stamp(raw, lambda: rt.stamp_send(ch), service)
         headers = [(k, v) for k, v in start["headers"] if k != b"content-length"]
