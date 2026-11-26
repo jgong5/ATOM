@@ -654,11 +654,11 @@ def test_the_reading_runner_writes_its_parameter_and_buffer_storages_apart(
         return SimpleNamespace(is_cuda=cuda, untyped_storage=lambda: held)
 
     class ModelRunner:
-        def _build_and_load_model(self, model_class):
+        def _build_and_load_model(self, config, model_class, device):
             # A tied head is the embedding's storage, and so is a buffer
             # that shares it; a host buffer holds no device bytes.
             embedding = storage(1, 100)
-            self.model = SimpleNamespace(
+            return SimpleNamespace(
                 parameters=lambda: [embedding, storage(2, 50), embedding],
                 buffers=lambda: [embedding, storage(3, 7), storage(4, 9, cuda=False)],
             )
@@ -667,7 +667,7 @@ def test_the_reading_runner_writes_its_parameter_and_buffer_storages_apart(
     monkeypatch.setattr(module, "_allocated", {"current": 1_000}.get)
     runner = module.MemoryReadingModelRunner()
     runner.config, runner.rank = tp2(tmp_path).config, 0
-    runner._build_and_load_model(None)
+    runner._build_and_load_model(runner.config, None, None)
     runner._read |= dict.fromkeys(["total", "non_torch", "current", "peak"], 1_000)
     runner._read |= {"warmup_tokens": 0, "num_kvcache_blocks": 1}
     monkeypatch.setenv(measure_memory.OUT_ENV, str(tmp_path))
@@ -765,6 +765,59 @@ def test_ranks_whose_reserves_spread_past_the_limit_publish_nothing(tmp_path):
     r = tp2(tmp_path)
     crowded = dict(READINGS[2], driver_and_collective_reserve_bytes=10_000_000_000)
     started(tmp_path / "out", r.config, [READINGS[2], crowded])
+
+    with pytest.raises(SpecRefusal, match="spread"):
+        measure_memory.publish(tmp_path / "out", PLATFORM, tmp_path / "store", "c")
+    assert not (tmp_path / "store").exists()
+
+
+def pipeline_wrote(tmp_path, pp, tp, readings):
+    """A PP x TP engine's ranks' files, as each stage's runners write them:
+    `readings[stage][rank]`; the suite's deployment at that layout."""
+    (tmp_path / "deployment").mkdir()
+    r = deployment(
+        tmp_path / "deployment",
+        pipeline_parallel_size=pp,
+        tensor_parallel_size=tp,
+        tp_world_size=tp,
+    )
+    out = tmp_path / "out"
+    (out / measure_memory.READINGS).mkdir(parents=True)
+    (out / measure_memory.LOG).write_text("Memory budget: ...\n")
+    for stage, held in enumerate(readings):
+        r.config.parallel_config.pipeline_parallel_rank = stage
+        ranks_wrote(out, r.config, held)
+    return r
+
+
+#: A PP4 x TP1 prefill's stages as the 1P2D AgentX G0 read them (MiniMax-M3.1,
+#: 16/16/16/12 layers): each stage's own non-torch reserve, the last holding
+#: the head, 45% above the first.
+STAGES = [5_209_325_568, 6_079_643_648, 6_650_068_992, 7_558_135_808]
+
+
+def test_a_pipeline_s_stages_publish_their_own_reserves_each_stage_read_by_its_own(
+    tmp_path,
+):
+    readings = [
+        [dict(READINGS[2], driver_and_collective_reserve_bytes=b)] for b in STAGES
+    ]
+    r = pipeline_wrote(tmp_path, 4, 1, readings)
+
+    measure_memory.publish(tmp_path / "out", PLATFORM, tmp_path / "store", "c")
+
+    for stage, reserve in enumerate(STAGES):
+        r.config.parallel_config.pipeline_parallel_rank = stage
+        read = memory.load(tmp_path / "store", r.config, MACHINE, 0)
+        assert read.values["driver_and_collective_reserve_bytes"] == reserve
+    copy_ = json.loads((tmp_path / "out" / "memory_readings.json").read_text())
+    assert (copy_["key"]["pp"], len(copy_["members"])) == (4, 4)
+
+
+def test_a_stage_whose_ranks_spread_past_the_limit_publishes_nothing(tmp_path):
+    crowded = dict(READINGS[2], driver_and_collective_reserve_bytes=10_000_000_000)
+    stage = dict(READINGS[2], driver_and_collective_reserve_bytes=STAGES[0])
+    pipeline_wrote(tmp_path, 2, 2, [[stage, stage], [READINGS[2], crowded]])
 
     with pytest.raises(SpecRefusal, match="spread"):
         measure_memory.publish(tmp_path / "out", PLATFORM, tmp_path / "store", "c")

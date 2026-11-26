@@ -238,6 +238,19 @@ def publish(out: Path, platform: dict, store: str, command: str) -> None:
             published |= keys
 
 
+def _stage_reserves(ranks: dict) -> dict[int, list]:
+    """Each pipeline stage's ranks' non-torch reserves, by stage: the ranks that
+    do identical work. A pipeline's stages differ (the first holds the
+    embedding, the last the head and a drafter, each its own neighbours'
+    communicators), so the spread that measures a crowded card is judged within
+    a stage; at one stage, across every rank, as it always was."""
+    stages = {}
+    for name, held in sorted(ranks.items()):
+        reserve = held["readings"]["driver_and_collective_reserve_bytes"]
+        stages.setdefault(read_back(name)[1].pp, []).append(reserve)
+    return stages
+
+
 def _publish(out: Path, ranks: dict, readable: str, platform, store, command) -> None:
     record = "sha256:" + hashlib.sha256((out / LOG).read_bytes()).hexdigest()
     for held in ranks.values():
@@ -249,10 +262,8 @@ def _publish(out: Path, ranks: dict, readable: str, platform, store, command) ->
         )
     first = ranks[min(ranks)]
     fields = first["key"]
-    reserve = [
-        r["readings"]["driver_and_collective_reserve_bytes"] for r in ranks.values()
-    ]
-    across_ranks("non_torch", reserve)
+    for reserve in _stage_reserves(ranks).values():
+        across_ranks("non_torch", reserve)
     key = Key.of(
         Kind.MEMORY_READINGS, **keyed_platform(Kind.MEMORY_READINGS, platform), **fields
     )
