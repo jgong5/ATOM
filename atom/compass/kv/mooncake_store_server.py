@@ -25,6 +25,12 @@ entry's ``chunk_bytes``, or under a pipelined prefill its rank's (`PER_RANK`).
 - The eviction thread wakes every 10 ms; a round runs at the first such
   boundary at or after the earliest lease deadline among filed groups, and none
   runs that would evict nothing.
+- With `LEASE_IN_PLACE` set (opt-in), a lease keeps a group where it was filed:
+  the walk passes a group whose lease runs, wherever a lookup has extended it,
+  and evicts it from its filed bucket at the first round after the lease has
+  run out, never filing it again at that deadline. A get then fails on an
+  object a lookup found and the master evicted before the load's renewal, as
+  the CAL's P loses them (`Master`).
 
 `MooncakeStoreLP` is the LP's loop (`StationLP`). It takes Compass's frames,
 since ATOM reaches the master over Mooncake's C++ client, which no wrapped
@@ -70,6 +76,7 @@ import collections
 import heapq
 import itertools
 import math
+import os
 import pickle
 import re
 from collections import deque
@@ -138,6 +145,22 @@ COUNTS = ("lookups", "hit_keys", "foreign_hit_keys", "renewals", "evicted")
 ENDPOINT_FILE = "mooncake_store_endpoint.txt"
 #: The eviction thread's wakes and the eviction index's buckets, a second.
 TICKS_PER_S, BUCKETS_PER_S = 100, 10
+#: Set to 1 (opt-in; unset or 0: off), a lease keeps a group in place in the
+#: eviction walk: a group whose lease runs is passed, and one whose lease has run
+#: out leaves from the bucket it was filed at when a member was last published,
+#: never filed again at the deadline a lookup gave it. Off, the walk files such a
+#: group again at that deadline (``moved``), so a prefix a lookup found outlives
+#: every object filed before its lease's end. The CAL's P (cal2 c120, 4 x 192
+#: GiB) lost loads 20-60 s after their request's arrival (15 of 21), and request
+#: 2919 lost all of rank 0's 1262 chunks 24 s after it while ranks 1-3 held them:
+#: at its pools' 0.4-1.9 GB/s of puts a refiled group outlives 90 s or more, a
+#: group kept in place leaves at the first round after its lease (#3720).
+LEASE_IN_PLACE = "COMPASS_STORE_LEASE_IN_PLACE"
+
+
+def lease_in_place() -> bool:
+    """Whether `LEASE_IN_PLACE` is set: a value other than empty or 0."""
+    return os.environ.get(LEASE_IN_PLACE, "0") not in ("", "0")
 
 
 class MooncakeStoreRefusal(ValueError):
@@ -365,7 +388,7 @@ class Round(NamedTuple):
     """One eviction round: its target ratio and object count, the objects and
     groups it evicted, and the groups it skipped, each with why: ``lease``
     while its lease runs, ``moved`` when it was filed again at the deadline a
-    lookup gave it."""
+    lookup gave it (never under `LEASE_IN_PLACE`)."""
 
     target: float
     goal: int
@@ -376,10 +399,12 @@ class Round(NamedTuple):
 
 class Master:
     """A Mooncake Store master's objects, groups, leases and eviction, holding
-    no bytes; every call passes the LP clock in."""
+    no bytes; every call passes the LP clock in. `in_place`, `LEASE_IN_PLACE`'s
+    at construction, keeps a leased group where it was filed (`evict`)."""
 
     def __init__(self, entry: dict) -> None:
         flags = check_entry(entry)
+        self.in_place = lease_in_place()
         self.ttl = flags.default_kv_lease_ttl
         self.mark, self.ratio = (
             flags.eviction_high_watermark_ratio,
@@ -476,7 +501,9 @@ class Master:
         return max(_wake(max(now, heap[0][0])), self._last_wake + 1) / TICKS_PER_S
 
     def evict(self, now: float) -> Round:
-        """One eviction round at `now`."""
+        """One eviction round at `now`. Under `in_place` a group a lookup
+        leased past its filed bucket is passed while the lease runs and evicted
+        from that bucket once it has run out, never filed again."""
         target = max(self.ratio, self.used / self.capacity - self.mark + self.ratio)
         goal = math.ceil(self.filed * min(target, 1.0))
         self._last_wake = _wake(now)
@@ -486,7 +513,7 @@ class Master:
             g = self.groups.get(gid)
             if g is None or (g.rank, g.order) != (rank, order):
                 continue
-            if (real := _bucket(g.deadline)) > rank:
+            if not self.in_place and (real := _bucket(g.deadline)) > rank:
                 self._file(gid, real)
                 skipped.append((gid, "moved"))
             elif now < g.deadline:
