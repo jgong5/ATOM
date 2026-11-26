@@ -328,6 +328,22 @@ def _stage_prefill(
         )
     if getattr(args, "stage_form", "fitted") == "scaled":
         return _scaled_stage(stage, first, samples, (law or {}).get("prefill"))
+    if getattr(args, "stage_form", "fitted") == "chained":
+        lines = {0: Path(prefill[0]) / "steps" / "dp0.jsonl"}
+        for k, r in args.stage_record or ():
+            lines[int(k)] = Path(r) / "steps" / "dp0.jsonl"
+        if int(stage) - 1 not in lines:
+            raise ValueError(
+                f"--stage-form chained: stage {stage}'s device work starts at stage "
+                f"{int(stage) - 1}'s device end, and no --stage-record names that stage"
+            )
+        return _chained_stage(
+            int(stage),
+            [_stage_lines(lines[k]) for k in (0, int(stage) - 1, int(stage))],
+            getattr(args, "stage_hop", None) or (0.0, 0.0),
+            getattr(args, "stage_idle_s", 1e-3),
+            (law or {}).get("prefill"),
+        )
     _, params, report = fit(samples, got, staged)
     if params.get("prefill") is None:
         raise ValueError(f"stage {stage}'s record gives no prefill vector")
@@ -367,6 +383,74 @@ def _scaled_stage(stage, first, samples, vector) -> tuple[dict, dict]:
         "p90": p90,
         "steps": len(long),
         "at_or_above_s": floor,
+    }
+    scaled["fit"] = dict(vector.get("fit", {}), stage=figures)
+    return scaled, figures
+
+
+#: The fields `_chained_stage` reads off a stage's step line.
+CHAINED_FIELDS = ("t_launch_event_ns", "d_busy_ns")
+
+
+def _stage_lines(path) -> dict[int, dict]:
+    """A stage record's step lines by step, those that time a device window
+    (`CHAINED_FIELDS`) and are no dummy run."""
+    out = {}
+    with open(path) as f:
+        for line in f:
+            s = json.loads(line)
+            if not s.get("is_dummy_run") and all(k in s for k in CHAINED_FIELDS):
+                out[s["step"]] = s
+    return out
+
+
+def _chained_stage(stage, lines, hop, idle_s, vector) -> tuple[dict, dict]:
+    """Stage 0's prefill `vector` times the median ratio of stage `stage`'s own
+    device work to stage 0's ``d_busy_ns``, on the steps whose line on this stage
+    and on the stage before both found the device idle (``d_gap_ns`` at least
+    `idle_s`), so that each launch event fired at its host stamp; and its figures.
+    `lines` are stage 0's, the stage before's and this stage's (`_stage_lines`).
+    A stage's device end is its launch event and ``d_busy_ns``; its own work
+    starts at the later of its launch event and the stage before's device end
+    plus the input's copy, ``hop = (fixed_s, per_token_s)`` on the step's
+    tokens, as the run prices it (`pp_send.PP_IPC`), and leaves out a drafter's
+    ``d_draft_kv_ns``, which the draft law prices. The ``d_busy_ns`` of a later
+    stage starts at its launch, before its input arrives: on MiniMax-M3.1's CAL
+    (#3720) stage 3, which waits on stage 2 for most of a long prefill's
+    chunks, labelled 1.0065 of stage 0 under ``scaled``, where its own work on
+    the idle steps was 0.81."""
+    import numpy as np
+
+    if vector is None:
+        raise ValueError("--stage-form chained scales stage 0's prefill vector, and it has none")
+    zero, before, mine = lines
+    floor = idle_s * 1e9
+    ratios = []
+    for n in sorted(set(mine) & set(before) & set(zero)):
+        a, b = before[n], mine[n]
+        if min(a.get("d_gap_ns") or 0, b.get("d_gap_ns") or 0) < floor:
+            continue
+        tokens = sum(row[1] for row in b["batch"])
+        ready = a["t_launch_event_ns"] + a["d_busy_ns"] + (hop[0] + hop[1] * tokens) * 1e9
+        start = max(b["t_launch_event_ns"], ready)
+        own = b["t_launch_event_ns"] + b["d_busy_ns"] - start - b.get("d_draft_kv_ns", 0)
+        if own > 0 and zero[n]["d_busy_ns"] > 0:
+            ratios.append(own / zero[n]["d_busy_ns"])
+    if not ratios:
+        raise ValueError(
+            f"stage {stage} and the stage before found the device idle at no common step"
+        )
+    scale = float(np.median(ratios))
+    p10, p90 = np.percentile(ratios, [10, 90]).tolist()
+    scaled = dict(vector, coefficients={k: v * scale for k, v in vector["coefficients"].items()})
+    figures = {
+        "form": "chained",
+        "scale": scale,
+        "p10": p10,
+        "p90": p90,
+        "steps": len(ratios),
+        "idle_s": idle_s,
+        "hop": list(hop),
     }
     scaled["fit"] = dict(vector.get("fit", {}), stage=figures)
     return scaled, figures
@@ -492,12 +576,31 @@ def main(argv: list[str]) -> None:
     )
     parser.add_argument(
         "--stage-form",
-        choices=("scaled", "fitted"),
+        choices=("scaled", "fitted", "chained"),
         default="scaled",
         help="a --stage-record's vector: stage 0's times the median ratio of the "
         "stage's device labels to stage 0's on the prefill steps both label at or "
         "above stage 0's median (scaled), or the stage's own fit (fitted), whose "
-        "short steps hold the wait on the stage before",
+        "short steps hold the wait on the stage before, or stage 0's times the "
+        "median ratio of the stage's own device work, from the stage before's "
+        "device end and --stage-hop, to stage 0's on the steps both found the "
+        "device idle at (chained)",
+    )
+    parser.add_argument(
+        "--stage-hop",
+        nargs=2,
+        type=float,
+        metavar=("FIXED_S", "PER_TOKEN_S"),
+        help="under --stage-form chained, the copy of a stage's input after the "
+        "stage before's device end, as the run prices it: a fixed part and one a "
+        "step's token (default 0 0)",
+    )
+    parser.add_argument(
+        "--stage-idle-s",
+        type=float,
+        default=1e-3,
+        help="under --stage-form chained, the device idle (d_gap_ns) before a "
+        "launch that places its event at its host stamp (default 0.001)",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
