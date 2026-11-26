@@ -176,6 +176,10 @@ _CHUNKED: weakref.WeakSet[SimulatedKVConnectorScheduler] = weakref.WeakSet()
 #: The producer stages built in this process that serve their own writes (the
 #: link's `ServeModel`), each told of every forward's launch and device run.
 _SERVING: weakref.WeakSet[SimulatedKVConnectorScheduler] = weakref.WeakSet()
+#: Anything else built in this process told of every forward's launch and
+#: device run (``device_forward(window)``): the Mooncake Store's shell under
+#: ``COMPASS_STORE_ON_STREAM=1`` (`atom.compass.kv.mooncake_store`).
+DEVICE_WATCHERS: weakref.WeakSet = weakref.WeakSet()
 
 
 def forward_returned(reply, batch=None) -> None:
@@ -195,6 +199,8 @@ def forward_returned(reply, batch=None) -> None:
             producer.prefill_done(end, batch)
     for stage in list(_SERVING):
         stage.served_forward(getattr(reply, "device_window", None))
+    for watcher in list(DEVICE_WATCHERS):
+        watcher.device_forward(getattr(reply, "device_window", None))
 
 
 class UnboundSeam(RuntimeError):

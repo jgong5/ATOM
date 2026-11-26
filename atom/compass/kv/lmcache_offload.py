@@ -357,10 +357,20 @@ class Lanes:
     `due` hands back, in end order, each copy whose end the clock has reached,
     for the caller to run as the rank's worker runs it. Rank 0's copies are
     counted and logged. `OffloadShell` and the Mooncake Store's shell
-    (`atom.compass.kv.mooncake_store`) price their copies here."""
+    (`atom.compass.kv.mooncake_store`) price their copies here.
 
-    def __init__(self, rt, ranks, terms: dict, name: str) -> None:
+    With `stream` (the Store's shell under ``COMPASS_STORE_ON_STREAM=1``), a
+    copy also waits on its stage's forward stream once a window that
+    enqueues a copy there: `stream` is ``(windows, wait)``, `windows(k, kind,
+    req, chunks)` the windows of the copy that do, and `wait(k, t)` the
+    seconds a window enqueued at `t` waits for the device work its stage's
+    host had enqueued by then. Each such window of a copy starting at `start`
+    waits ``wait(k, start)``: the backlog the copy meets, as ATOM's worker
+    meets it again at each window while its stage's host keeps enqueuing."""
+
+    def __init__(self, rt, ranks, terms: dict, name: str, stream=None) -> None:
         self._rt, self._name = rt, name
+        self._stream = stream
         # A term is ``[fixed, per chunk]``, or one such a rank (a pipelined
         # prefill's ranks copy other layers' chunks).
         self._terms = [
@@ -381,6 +391,9 @@ class Lanes:
             kind: collections.Counter(copies=0, chunks=0, seconds=0.0, waited=0.0)
             for kind in COPY_TERMS
         }
+        if stream is not None:
+            for kind in COPY_TERMS:
+                self._copied[kind].update(windows=0, stream_s=0.0)
 
     def __bool__(self) -> bool:
         return bool(self._due)
@@ -392,14 +405,23 @@ class Lanes:
         fixed, per_chunk = self._terms[k][kind]
         start = max(now, heapq.heappop(lanes))
         end = start + (fixed + per_chunk * chunks if chunks else 0.0)
+        windows = stream_s = 0
+        if self._stream is not None and chunks:
+            count, wait = self._stream
+            windows = count(k, kind, req, chunks)
+            stream_s = windows * wait(k, start) if windows else 0.0
+            end += stream_s
         heapq.heappush(lanes, end)
         heapq.heappush(self._due, (end, next(self._order), k, kind, req, extra))
         if k == 0:
             self._copied[kind].update(copies=1, chunks=chunks)
             self._copied[kind]["seconds"] += end - start
             self._copied[kind]["waited"] += start - now
+            if self._stream is not None:
+                self._copied[kind]["windows"] += windows
+                self._copied[kind]["stream_s"] += stream_s
             logger.info(
-                "compass: %s %s of %s, %d chunks: queued at %r, from %r to %r",
+                "compass: %s %s of %s, %d chunks: queued at %r, from %r to %r%s",
                 self._name,
                 kind,
                 req.req_id,
@@ -407,6 +429,9 @@ class Lanes:
                 now,
                 start,
                 end,
+                ""
+                if self._stream is None
+                else f", {windows} windows {stream_s!r} s on the stream",
             )
         return start, end
 
