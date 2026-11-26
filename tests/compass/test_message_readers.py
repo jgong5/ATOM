@@ -125,6 +125,7 @@ def _lookups(rt, wire):
 def _traffic(rt, wire):
     lp = traffic.Traffic.__new__(traffic.Traffic)
     lp.rt, lp.stream, lp.port, lp.cv = rt, STREAM, None, threading.Condition()
+    lp.streams = [STREAM]
     lp.frames, lp.errors, lp.done = {}, [], 0
     return lp._take
 
@@ -268,7 +269,7 @@ def test_the_traffic_lp_takes_each_released_event_read_before_or_after_its_relea
     later.start()
     take()
     later.join()
-    assert taken == [0, 1, 2] and list(lp.frames) == [3] and lp.done == 0
+    assert taken == [0, 1, 2] and list(lp.frames) == [(STREAM, 3)] and lp.done == 0
     rt.advance_to(2.0)
     take()
     assert taken == [0, 1, 2, 3] and not lp.frames and lp.done == 1
