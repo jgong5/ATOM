@@ -236,3 +236,42 @@ def test_a_trigger_reaching_an_idle_floored_lp_before_its_n_bounds_its_engine(mo
     eit = ca._refined_eit()
     assert eit[ca._index[e]] == pytest.approx(0.01 + 1.0 + 0.1)
     assert eit[ca._index[e]] >= ca._lbts(e) - 1e-12
+
+
+# --- answering outputs: the Store replies to an engine only on that engine's calls
+
+
+def _store_table():
+    registry = LpRegistry()
+    for lp in ("engine-P0", "engine-P1", "mooncake_store"):
+        registry.register(LpId(lp))
+    table = ChannelTable(registry)
+    for e in ("engine-P0", "engine-P1"):
+        for src, dst, kind in ((e, "mooncake_store", "lookup#dp0"), ("mooncake_store", e, "lookup#dp0"),
+                               (e, "mooncake_store", "transfer#dp0")):
+            table.declare(f"{src}->{dst}:{kind}", LpId(src), LpId(dst), 0.1, "inline")
+    return table
+
+
+@pytest.mark.parametrize("cut, granted", [("1", True), ("0", False)])
+def test_another_engines_call_does_not_bound_an_engine_through_the_store(monkeypatch, cut, granted):
+    monkeypatch.setenv("COMPASS_CA_TAR_CUT", cut)
+    p0, p1, s = LpId("engine-P0"), LpId("engine-P1"), LpId("mooncake_store")
+    ca = ClockAuthority(_store_table())
+    assert ca.on_request(s, NER, math.inf, []) == []
+    # engine-P1 runs at 0: its call reaches the Store at 0.1 and its reply comes back at 0.2, to it alone.
+    got = [(str(i), g) for i, g, _ in ca.on_request(p0, TAR, 5.0, [])]
+    assert (("engine-P0", 5.0) in got) is granted
+
+
+def test_an_engines_own_pending_call_bounds_it_through_the_store(monkeypatch):
+    monkeypatch.setenv("COMPASS_CA_TAR_CUT", "1")
+    p0, p1, s = LpId("engine-P0"), LpId("engine-P1"), LpId("mooncake_store")
+    ca = ClockAuthority(_store_table())
+    ca.on_request(s, NER, math.inf, [])
+    ca.on_request(p1, TAR, 9.0, [])
+    # engine-P0 at 0 calls the Store (arriving 1.0) and asks 5.0: the reply can come at 1.1.
+    replies = ca.on_request(p0, TAR, 5.0, [("engine-P0->mooncake_store:lookup#dp0", 0, 1.0)])
+    assert ("engine-P0", 5.0) not in [(str(i), g) for i, g, _ in replies]
+    eit = ca._refined_eit()
+    assert eit[ca._index[p0]] == pytest.approx(1.1)

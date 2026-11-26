@@ -302,28 +302,41 @@ class ClockAuthority:
         for i in self._ids:
             pairs = ((j, first_hop(j, i, True), first_hop(j, i, False)) for j, _ in self._from[i])
             self._floored[i] = {j: (dc, du) for j, dc, du in pairs if dc < du}
-        # The refined LBTS (`_refined_eit`): each LP's channels out, by
-        # whether they go into an engine, as (target index, lookahead,
-        # offering at the target, a trigger at the target), the least
-        # lookahead of each such kind.
+        # The refined LBTS (`_refined_eit`): each LP's input filters (0 every
+        # channel, 1 offering, 2 trigger, 3.. one per answered set), its output
+        # groups ((kind, filter): kind 0 any, 1 into an engine under a floor, 2
+        # answering that filter alone), and each group's channels out as
+        # (target index, lookahead, mask of the target's filters), the least
+        # lookahead of each.
         self._cut = os.environ.get("COMPASS_CA_TAR_CUT", "1") != "0"
         self._index = {i: k for k, i in enumerate(self._ids)}
-        self._edges = []
+        answers = _answer_maps(channels, self._ids)
+        self._filters, self._groups, group_of = [], [], {}
         for i in self._ids:
-            least = {}
+            amap = answers.get(i, {})
+            sets = sorted(set(amap.values()), key=sorted)
+            self._filters.append(sets)
+            self._groups.append([(0, 0), (1, 2), *((2, 3 + f) for f in range(len(sets)))])
+            for c in channels.channels_from(i):
+                if c.name in amap:
+                    group_of[c.name] = 2 + sets.index(amap[c.name])
+                else:
+                    group_of[c.name] = 1 if c.name in self._covered[i] else 0
+        self._edges = []
+        for x, i in enumerate(self._ids):
+            least = [{} for _ in self._groups[x]]
             for c in channels.channels_from(i):
                 t = c.target
-                key = (
-                    c.name in self._covered[i],
-                    self._index[t],
-                    c.name in self._offering[t],
-                    c.name in self._triggers[t],
-                )
-                least[key] = min(least.get(key, math.inf), c.lookahead_s)
-            by = ([], [])
-            for (covered, t, off, trig), la in sorted(least.items()):
-                by[covered].append((t, la, off, trig))
-            self._edges.append((tuple(by[0]), tuple(by[1])))
+                y = self._index[t]
+                mask = 1 | (2 if c.name in self._offering[t] else 0)
+                mask |= 4 if c.name in self._triggers[t] else 0
+                for f, names in enumerate(self._filters[y]):
+                    mask |= (1 << (3 + f)) if c.name in names else 0
+                d = least[group_of[c.name]]
+                d[y, mask] = min(d.get((y, mask), math.inf), c.lookahead_s)
+            self._edges.append(
+                [tuple((y, la, m) for (y, m), la in sorted(d.items())) for d in least]
+            )
         self._hint = None  # (LP, its refined EIT) for the grant being made
         self.timeline = timeline
         self._sent = {i: [] for i in self._ids}  # logged since its last reply
@@ -773,63 +786,74 @@ class ClockAuthority:
         return max(lbts, hint[1]) if hint is not None and hint[0] == i else lbts
 
     def _refined_eit(self) -> list:
-        """EIT of each LP, by index: see `tarcut.py`'s rule."""
+        """EIT of each LP, by index: see `tarcut.py`'s and `tarcut2.py`'s rule."""
         ids, state, nv, floor = self._ids, self._state, self._nv, self._floor
+        target, daemon, und = self._target, self._daemon, self._undelivered
         inf = math.inf
         k = len(ids)
-        e_all, e_off, e_trig = [inf] * k, [inf] * k, [inf] * k
-        pending = {}
+        e = [[inf] * (3 + len(self._filters[x])) for x in range(k)]
+        cache = {}
+
+        def pend(x, f):
+            """The earliest unreleased message on filter f's channels into x."""
+            p = cache.get((x, f))
+            if p is None:
+                j = ids[x]
+                names = self._triggers[j] if f == 2 else self._filters[x][f - 3]
+                p = min((a for n in names for a in und[n].values()), default=inf)
+                cache[x, f] = p
+            return p
 
         def labels(x):
             j = ids[x]
-            n = nv[j]
-            base = min(n, e_off[x] if state[j] == TAR else e_all[x])
-            h = floor.get(j)
-            if h is None:
-                return base, base
-            p = pending.get(x)
-            if p is None:
-                p = pending[x] = self._trigger_pending(j)
-            # A trigger may land before N (an NER's N bounds no future
-            # arrival): only the floor stands under the max.
-            return base, min(max(n, h), p, e_trig[x])
+            n, st, ex = nv[j], state[j], e[x]
+            base = min(n, ex[1] if st == TAR else ex[0])
+            out = []
+            for kind, f in self._groups[x]:
+                if kind == 0:
+                    out.append(base)
+                elif kind == 1:
+                    h = floor.get(j)
+                    # A trigger may land before N (an NER's N bounds no future
+                    # arrival): only the floor stands under the max.
+                    out.append(base if h is None else min(max(n, h), pend(x, 2), ex[2]))
+                elif st != NER:  # running, its work in hand may answer any
+                    out.append(base)
+                else:
+                    t = target[j]
+                    out.append(min(inf if t is None else t, daemon[j], pend(x, f), ex[f]))
+            return out
 
         eot, heap = [], []
         for x in range(k):
-            u, c = labels(x)
-            eot.append([u, c])
-            heap.append((u, 0, x))
-            heap.append((c, 1, x))
+            lab = labels(x)
+            eot.append(lab)
+            heap += [(v, x, g) for g, v in enumerate(lab)]
         heapq.heapify(heap)
         edges = self._edges
         while heap:
-            v, cls, x = heapq.heappop(heap)
+            v, x, g = heapq.heappop(heap)
             if v == inf:
                 break
-            if v != eot[x][cls]:
+            if v != eot[x][g]:
                 continue
-            for y, la, off, trig in edges[x][cls]:
+            for y, la, mask in edges[x][g]:
                 a = v + la
-                changed = False
-                if a < e_all[y]:
-                    e_all[y] = a
-                    changed = True
-                if off and a < e_off[y]:
-                    e_off[y] = a
-                    changed = True
-                if trig and a < e_trig[y]:
-                    e_trig[y] = a
-                    changed = True
+                ey = e[y]
+                changed, f = False, 0
+                while mask:
+                    if mask & 1 and a < ey[f]:
+                        ey[f] = a
+                        changed = True
+                    mask >>= 1
+                    f += 1
                 if changed:
-                    u, c = labels(y)
                     old = eot[y]
-                    if u < old[0]:
-                        old[0] = u
-                        heapq.heappush(heap, (u, 0, y))
-                    if c < old[1]:
-                        old[1] = c
-                        heapq.heappush(heap, (c, 1, y))
-        return e_all
+                    for g2, u in enumerate(labels(y)):
+                        if u < old[g2]:
+                            old[g2] = u
+                            heapq.heappush(heap, (u, y, g2))
+        return [ex[0] for ex in e]
 
     def _grant_due(self) -> list:
         replies = []
@@ -1132,3 +1156,35 @@ class ClockAuthority:
         """Hand the timeline `i`'s reply, with what it sent since its last one."""
         sent, self._sent[i] = tuple(self._sent[i]), []
         self.timeline.record(i, self._now[i], g, kind, recovered, released, sent)
+
+
+def _answer_maps(channels: ChannelTable, ids) -> dict:
+    """Each LP's outputs that answer certain inputs alone, {LP: {channel out:
+    frozenset of channels in}}: LP mooncake_store's reply on lookup#dp<r> to an
+    engine answers that engine's calls on its lookup#dp<r> (its puts and
+    eviction send nothing); with COMPASS_CA_ROUTER_CAUSE=1, the router's stream
+    sends answer the stream in, its requests to a prefill frontend traffic's
+    requests, its relays to a decode frontend the relays and traffic's
+    cancels (its timers send nothing)."""
+    out = {}
+    for i in ids:
+        into = [c.name for c in channels.channels_into(i)]
+        if i.name == "mooncake_store":
+            m = {}
+            for c in channels.channels_from(i):
+                back = f"{c.target.name}->{i.name}:{c.name.partition(':')[2]}"
+                if back in into:
+                    m[c.name] = frozenset([back])
+            out[i] = m
+        elif i.name == "router" and os.environ.get("COMPASS_CA_ROUTER_CAUSE", "0") == "1":
+            by = {
+                kind: frozenset(n for n in into if n.endswith(":" + kind))
+                for kind in ("stream", "http", "relay")
+            }
+            by["relay"] |= by["http"]
+            out[i] = {
+                c.name: by[kind]
+                for c in channels.channels_from(i)
+                if (kind := c.name.rpartition(":")[2]) in by
+            }
+    return out
