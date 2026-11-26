@@ -80,14 +80,15 @@ def served():
         server.close()
 
 
-def _seen(box):
-    """A reply, or a refusal as its type, reason and LP table."""
+def _seen(box, endpoint):
+    """A reply, or a refusal as its type, reason, with `endpoint`'s port
+    left out, and LP table."""
     try:
         return _result(box)
     except Exception as refused:  # noqa: BLE001 - compared across the sides
         return (
             type(refused).__name__,
-            getattr(refused, "reason", str(refused)),
+            getattr(refused, "reason", str(refused)).replace(endpoint, "<endpoint>"),
             getattr(refused, "table", None),
         )
 
@@ -129,8 +130,9 @@ def _a_connection_ends_inside_a_frame(served, select):
     pending = [_later(conns[name].recv) for name in waiting if name != "engine-P"]
     conns["engine-P"]._server._sock.sendall(b"\x00\x00\x00\x40{")
     conns["engine-P"].close()
-    seen = [_seen(box) for box in pending]
-    return seen + [_seen(_later(_ask, conns["traffic"], (NER, INF, [], INF)))]
+    seen = [_seen(box, endpoint) for box in pending]
+    asked = _later(_ask, conns["traffic"], (NER, INF, [], INF))
+    return seen + [_seen(asked, endpoint)]
 
 
 def _an_abort_and_refusals(served, select):
@@ -141,13 +143,14 @@ def _an_abort_and_refusals(served, select):
     endpoint = served(ca, select)
     a, b = _connect(A, endpoint), _connect(B, endpoint)
     a.send((GRANT, 1.0, {}))
-    seen = [_seen(_later(a.recv)), _seen(_later(_connect, LpId("x"), endpoint))]
+    seen = [_seen(_later(a.recv), endpoint)]
+    seen.append(_seen(_later(_connect, LpId("x"), endpoint), endpoint))
     for k, (target, arrival) in enumerate([(1.0, 0.7), (2.0, 1.2)]):
         _result(_later(b.send, (NER, INF, [], INF)))
         _until_served(ca, 1 + 2 * k)
         parked = _later(b.recv)
-        seen.append(_seen(_later(_ask, a, (TAR, target, [(AB, k, arrival)], INF))))
-        seen.append(_seen(parked))
+        asked = _later(_ask, a, (TAR, target, [(AB, k, arrival)], INF))
+        seen += [_seen(asked, endpoint), _seen(parked, endpoint)]
     return seen
 
 
