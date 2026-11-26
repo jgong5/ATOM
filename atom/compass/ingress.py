@@ -47,6 +47,16 @@ import os
 KEY = "ingress"
 #: The variable naming a simulated run's run file (`atom.compass.run.ENV`).
 RUN_ENV = "ATOM_COMPASS_RUN"
+#: A diagnostic ingress for a simulated run whose run file states none: an
+#: ``ingress`` entry as JSON (`stated`). It stands for the client's own
+#: preparation of each request before its head reaches the frontend, as the
+#: #752 DeepSeek-V4.1 Cell A v2 records show it: a burst whose heads arrive
+#: within ~0.3 s is read smallest body first (engine receipt against input
+#: size +0.42..+0.89, every target c8-c512 and M3.1's), and one the client
+#: spreads over seconds (DEPA2 c=512's 300 s burst: 287 MB over 15 s) in the
+#: order its heads arrive (-0.24..+0.27). Its terms are read off target
+#: records, so a run under it is a diagnostic, never a graded candidate.
+DIAG_ENV = "COMPASS_DIAG_CLIENT_INGRESS"
 #: The terms an ``ingress`` entry requires, and those it may state.
 REQUIRED = ("fixed_s", "per_byte_s", "workers")
 OPTIONAL = ("router_per_byte_s", "bytes")
@@ -84,9 +94,13 @@ def _number(v) -> bool:
 
 def stated(run: dict | None) -> dict | None:
     """The ``ingress`` entry the run file `run` states, checked; None for a
-    real run or a run file with none."""
-    if run is None or run.get(KEY) is None:
+    real run or a run file with none, unless `DIAG_ENV` names one as JSON,
+    which a run file with none then takes (its traffic LP and workers alike)."""
+    if run is None:
         return None
+    if run.get(KEY) is None:
+        diag = os.environ.get(DIAG_ENV)
+        return check(json.loads(diag), DIAG_ENV) if diag else None
     return check(run[KEY], f"the run file's {KEY}")
 
 

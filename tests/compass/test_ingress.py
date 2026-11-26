@@ -347,3 +347,17 @@ def test_compass_fit_ingress_writes_the_term_a_host_entry_states(tmp_path, capsy
     (tmp_path / "other.json").write_text(json.dumps({"host": {}}))
     with pytest.raises(ValueError, match="holds no ingress term"):
         stated_ingress(str(tmp_path / "other.json"))
+
+
+def test_a_diagnostic_client_ingress_stands_in_for_a_run_file_with_none(monkeypatch):
+    # COMPASS_DIAG_CLIENT_INGRESS: a run file with no ``ingress`` takes it,
+    # checked; one that states its own keeps that; a real run has none.
+    monkeypatch.setenv(compass_ingress.DIAG_ENV, json.dumps(TERM))
+    assert compass_ingress.stated({"bound_s": 1.0}) == TERM
+    assert compass_ingress.stated({"ingress": ROUTED}) == ROUTED
+    assert compass_ingress.stated(None) is None
+    monkeypatch.setenv(compass_ingress.DIAG_ENV, json.dumps({**TERM, "workers": 0}))
+    with pytest.raises(ValueError, match=compass_ingress.DIAG_ENV):
+        compass_ingress.stated({"bound_s": 1.0})
+    monkeypatch.setenv(compass_ingress.DIAG_ENV, "")
+    assert compass_ingress.stated({"bound_s": 1.0}) is None
