@@ -311,7 +311,8 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
     predicts under the host key's graph sets, and the constants its launch
     path takes where the host laws state `paths`, a launch in a kind their
     `step_labels.WAITS` names starting no earlier than the device end of the
-    forward before it, graded against the same measured period. After each forward the engine
+    forward before it, a paced forward's device running the host laws'
+    `step_labels.TAILS` past its launch, graded against the same measured period. After each forward the engine
     runs its `E_out` before the next call. An idle forward's `E`, the first's
     too, stays measured from the last pull or exit, admissions and all: it
     holds the wait for an arrival, which no law or column prices. Steps in `warm` are charged and not graded,
@@ -346,6 +347,7 @@ def priced(steps: list[dict], samples, law: dict, warm=(), jit=()) -> dict:
         defer=defer,
         paths=law["host"].get(launch_features.PATHS),
         waits=law["host"].get(step_labels.WAITS, ()),
+        tails=law["host"].get(step_labels.TAILS),
     )
     rec.own_draft = any("t_draft_read_ns" in s for s in steps)
     kinds = [_kind(s, b) for s, b in zip(steps, step_labels.busy_gaps(steps))]

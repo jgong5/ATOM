@@ -67,11 +67,14 @@ from atom.compass.artifacts import Key, Kind, keyed_platform
 from atom.compass.backends import launch_features
 from atom.compass.backends.step_labels import (
     STALLS,
+    TAILS,
     WAITS,
     digest,
     group_prefills,
     launch_stall_on,
     launch_wait_on,
+    paced_tail_on,
+    paced_tails,
     record_ranks,
     stall_entry,
     stall_prices,
@@ -117,7 +120,11 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
     forward before them loses that wait (`step_labels.wait_labels`, which the
     report states under `step_labels.WAITS`), and the entry states those kinds
     under `step_labels.WAITS`, which a run's recurrence keeps
-    (`runner.overrides.HostDeviceRecurrence`)."""
+    (`runner.overrides.HostDeviceRecurrence`). Under
+    ``COMPASS_FIT_PACED_TAIL=1`` (`step_labels.TAIL_ENV`) the entry also
+    states `step_labels.TAILS`, per host kind how long a host-paced forward's
+    device runs past its launch's end (`step_labels.paced_tails`, which the
+    report states with its counts), which a run's recurrence charges."""
     from scipy.spatial import QhullError
 
     bare = sorted(
@@ -152,6 +159,9 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
         host[WAITS], report[WAITS] = waits, waited
     if steady is not None:
         host_blocks.refit(samples, host, report)
+    if paced_tail_on():
+        # `step_labels.TAIL_ENV`: a host-paced forward's device past its launch.
+        host[TAILS], report[TAILS] = paced_tails(map(record_ranks, records))
     if launch_stall_on():
         # `step_labels.STALL_ENV`: the records' launch stalls, per launch path.
         report[STALLS] = stall_prices(map(record_ranks, records))

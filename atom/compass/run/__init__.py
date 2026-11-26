@@ -742,12 +742,12 @@ def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time, or
     whose ``tokenizer`` or ``http_intake`` term the frontend would misread."""
     from atom.compass.backends.launch_features import LONG_TOKENS, PATHS, SMALL_TOKENS
-    from atom.compass.backends.step_labels import FIRST_LAUNCH_KEY, STALLS, WAITS
+    from atom.compass.backends.step_labels import FIRST_LAUNCH_KEY, STALLS, TAILS, WAITS
     from atom.compass.runner.overrides import ADMISSION_IN_E, HOST_LAW_KINDS, SEGMENTS
 
     laws, columns = host.get("laws", {}), host.get("columns", {})
     paths, stalls = host.get(PATHS, {}), host.get(STALLS, {})
-    waits = host.get(WAITS, [])
+    waits, tails = host.get(WAITS, []), host.get(TAILS, {})
     if (
         set(host)
         - {
@@ -762,6 +762,7 @@ def _check_host(path, host: dict) -> None:
             WAITS,
             LONG_TOKENS,
             SMALL_TOKENS,
+            TAILS,
             *HOST_TERMS,
             INGRESS,
             RELAY_TERM,
@@ -794,6 +795,9 @@ def _check_host(path, host: dict) -> None:
             isinstance(host.get(k, 1), int) and host.get(k, 1) > 0
             for k in (LONG_TOKENS, SMALL_TOKENS)
         )
+        or not isinstance(tails, dict)
+        or set(tails) - set(HOST_LAW_KINDS)
+        or not all(isinstance(v, (int, float)) and v >= 0 for v in tails.values())
     ):
         raise ValueError(
             f"{path}: host is {host!r}; it takes skip, a list of {SEGMENTS}, "
@@ -806,6 +810,8 @@ def _check_host(path, host: dict) -> None:
             "whose launch waits for the device end of the forward before it, "
             f"{LONG_TOKENS}, the positive context bound of the long_context feature, "
             f"{SMALL_TOKENS}, the positive token bound of the small_chunk feature, "
+            f"{TAILS}, mapping kinds to the non-negative seconds a paced forward's "
+            "device runs past its launch, "
             "admit, three coefficients on a forward's admissions or null, "
             "key, the host key the laws were fitted under, hops, the terms "
             f"{' and '.join(HOST_TERMS)}, {RELAY_TERM}, {STREAM_TERM}, and {INGRESS}, "
@@ -2290,7 +2296,7 @@ def runner(model_runner, tree) -> None:
         SMALL_TOKENS,
         stated,
     )
-    from atom.compass.backends.step_labels import STALLS, WAITS
+    from atom.compass.backends.step_labels import STALLS, TAILS, WAITS
     from atom.compass.backends.step_linear import StepLinearBackend, StepLinearLaw
     from atom.compass.backends.step_roofline import (
         StepFallbackBackend,
@@ -2477,6 +2483,7 @@ def runner(model_runner, tree) -> None:
             paths=host.get(PATHS),
             stalls=host.get(STALLS),
             waits=host.get(WAITS, ()),
+            tails=host.get(TAILS),
         )
         if replay is not None:
             replay.now = lambda: float(slot[0])

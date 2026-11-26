@@ -277,6 +277,22 @@ WAITS = "launch_waits"
 #: finished the forward before it, and that outlasted that end, for the kind's
 #: launches to wait for it (`wait_kinds`).
 WAIT_SHARE = 0.5
+#: The variable that, set to ``1``, has a host fit state per host kind how long
+#: a host-paced prefill's or middle chunk's device runs past its launch's end
+#: (`paced_tails`), which a run then charges (`TAILS`); unset or ``0``, no host
+#: entry states it, and a fit is as before.
+TAIL_ENV = "COMPASS_FIT_PACED_TAIL"
+#: A host entry's paced tails under `TAIL_ENV`: per host kind, the seconds a
+#: host-paced forward's device runs past its launch's end, which a run's
+#: recurrence charges (`runner.overrides.HostDeviceRecurrence`).
+TAILS = "paced_tails"
+#: How far past its launch's end a forward's device may end and the forward
+#: still count as host-paced (`device_tails`), in seconds. On #752's Kimi-K3.1
+#: a prefill or middle chunk of fewer than 2048 new tokens runs 6-8 ms past
+#: it (median, calibration record and c=8 target alike); one of 2048-8192
+#: tokens, device-bound, 34-45 ms or more, and the median of the paced ones
+#: moves 6.7 -> 7.0 -> 7.5 ms (prefill) as this bound goes 20 -> 30 -> 50 ms.
+TAIL_MAX_S = 0.02
 
 
 def _prefill_label() -> str:
@@ -505,6 +521,56 @@ def launch_waits(
                     waits[s["step"]] = (kind, end - l0)
         end = start + s["d_busy_ns"] + lead
     return waits, began, outlasted
+
+
+def paced_tail_on() -> bool:
+    """Whether `TAIL_ENV` is on: ``1`` on, ``0`` or unset off, any other refused."""
+    value = os.environ.get(TAIL_ENV) or "0"
+    if value not in ("0", "1"):
+        raise ValueError(f"{TAIL_ENV}={value!r} is not 0 or 1")
+    return value == "1"
+
+
+def device_tails(lines: list[dict]) -> dict[str, list[int]]:
+    """One rank's `lines`: per host kind of a prefill forward (``prefill``,
+    ``middle``), the ns each of its forwards' device ran past its launch's end
+    (`t_launch_ns`), its device end placed on the host clock by `_timed`'s
+    lead, where that is under `TAIL_MAX_S`: a host-paced forward, whose device
+    waited on each kernel the host launched, runs only its last kernels past
+    the launch; a device-bound one runs on by its own work. Not a dummy run,
+    and with a launch stamped."""
+    tails = defaultdict(list)
+    for s, start, lead, _ in _timed(lines):
+        if s["is_dummy_run"] or "t_launch_ns" not in s:
+            continue
+        kind = _line_kind(s)
+        if kind == "decode":
+            continue
+        tail = start + s["d_busy_ns"] + lead - s["t_launch_ns"][1]
+        if 0 <= tail < TAIL_MAX_S * 1e9:
+            tails[kind].append(tail)
+    return dict(tails)
+
+
+def paced_tails(runs: Iterable[Iterable[list[dict]]]) -> tuple[dict, dict]:
+    """The host entry's `TAILS` over `runs`, each a run's DP ranks' `lines`:
+    per host kind, the median of `device_tails` in seconds; and the report,
+    per kind, the forwards that gave one and the median and p90."""
+    got = defaultdict(list)
+    for ranks in runs:
+        for lines in ranks:
+            for kind, tails in device_tails(lines).items():
+                got[kind] += tails
+    entry, report = {}, {}
+    for kind in sorted(got):
+        v = sorted(got[kind])
+        entry[kind] = statistics.median(v) / 1e9
+        report[kind] = {
+            "forwards": len(v),
+            "tail_s": entry[kind],
+            "p90_s": v[min(len(v) - 1, int(0.9 * len(v)))] / 1e9,
+        }
+    return entry, report
 
 
 def wait_kinds(began: Counter, outlasted: Counter) -> list[str]:

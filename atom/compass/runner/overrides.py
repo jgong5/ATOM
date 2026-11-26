@@ -366,7 +366,12 @@ class HostDeviceRecurrence:
     launch starts no earlier than the device end of the forward before it,
     `ends[-1]`, as their real launch waits for it there, which their
     `W_launch` laws then leave out; empty, every launch starts at its prepare
-    end, as before.
+    end, as before. `tails`, a host entry's `step_labels.TAILS` from a host fit
+    under `COMPASS_FIT_PACED_TAIL=1`, maps a kind to the seconds its device
+    runs past its launch's end where the launch paced it: such a forward's
+    target ends no earlier than its launch end plus that; a device-bound one,
+    whose target ends later anyway, does not move. Empty, a paced forward's
+    device ends with its launch, as before.
     With `own_draft`, true unless it defers, an output forward that waits for its own
     target leaves no earlier than its device end, as one that reads its own draft ids does.
     A batch whose `compass_dummy` is true, a DP rank's dummy forward at a step
@@ -401,11 +406,13 @@ class HostDeviceRecurrence:
         paths=None,
         stalls=None,
         waits=(),
+        tails=None,
     ) -> None:
         self.laws, self.skip, self.now, self.sync = laws, frozenset(skip), now, sync
         self.admit, self.columns, self.launch = admit, columns or {}, launch
         self.paths, self.stalls = paths or {}, stalls or {}
         self.waits = frozenset(waits or ())
+        self.tails = dict(tails or {})
         if self.paths and stage is not None:
             raise ValueError(
                 "the host laws state launch-path constants, and a pipeline stage "
@@ -511,6 +518,10 @@ class HostDeviceRecurrence:
         release = getattr(batch, "compass_pp_release", -math.inf)
         queued_end = self.ends[-1] + getattr(batch, "compass_queued_s", 0.0)
         self.target_end = max(queued_end, host, release) + device_s
+        if kind in self.tails:
+            # `tails`: a host-paced forward's device runs its last kernels past
+            # its launch's end.
+            self.target_end = max(self.target_end, launch_end + self.tails[kind])
         self._held = now, launch_end, output, post
         if not draft_s:
             return max(self.target_end, launch_end)
