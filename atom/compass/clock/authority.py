@@ -764,7 +764,8 @@ class ClockAuthority:
             return self._nv[j] + d
         term = min(self._target[j], self._daemon[j]) + d
         for first, back in zip(self._cfirst[j], reach):
-            term = min(term, first + back)
+            if first + back < term:  # noqa: PLR1730 - as in `_lbts`
+                term = first + back
         return term
 
     def _lbts(self, i: LpId) -> float:
@@ -778,6 +779,10 @@ class ClockAuthority:
         for j, d in self._from[i]:
             term = nv[j] + d
             if term < least:  # noqa: PLR1730 - a min() call per term costs more
+                least = term
+        for j, d, reach in self._from_declared[i]:
+            term = self._declared_term(j, d, reach)
+            if term < least:  # noqa: PLR1730
                 least = term
         return least
 
