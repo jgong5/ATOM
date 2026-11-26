@@ -172,6 +172,16 @@ class DeviceQueue:
     ran them: each forward's launch ``[l0, l1]``, over which its host enqueues
     its work, and its device's ``[d0, d1]``, added in launch order.
 
+    The queue holds the device's work, not its waits: a forward runs its
+    ``d1 - d0`` from the later of its launch's start and the previous
+    forward's end in the queue, as a record's chained device runs do (a
+    forward's launch event, then its busy time). A simulated window's device
+    start also waits for the stage before's tensors (`pp_send`'s release),
+    while the device runs nothing a gather would queue behind: counted, it
+    reads as a backlog of the pipeline's lag, which on MiniMax-M3.1's CAL
+    c120 sim made the transfers over 2 GB take 1.9 s at p50 for the
+    record's 0.97 (#3720).
+
     `reached(e)` is when the device has run the work the host had enqueued by
     `e`: the last forward launched by then, all of it once its launch has
     ended, inside its launch the share enqueued so far; `e` itself where the
@@ -187,8 +197,9 @@ class DeviceQueue:
                 f"a forward launched at {l0}, before one launched at "
                 f"{self._starts[-1]}: a stage launches its forwards in order"
             )
+        start = max(l0, self._windows[-1][3]) if self._windows else l0
         self._starts.append(l0)
-        self._windows.append((l0, l1, d0, d1))
+        self._windows.append((l0, l1, start, start + max(0.0, d1 - d0)))
 
     def reached(self, e: float) -> float:
         i = bisect.bisect_right(self._starts, e) - 1
