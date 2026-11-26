@@ -256,7 +256,10 @@ done
 probe_args=()
 for i in "${!HOSTS[@]}"; do probe_args+=(--probe "${HOSTS[i]}=${RUN}/probe-${NODE_SHORT[i]}.json"); done
 IFS=/ read -r CAP_P CAP_D CAP_FREE <<< "${STORE_CAPS}"
-python3 "${H}/bin/store_plan.py" --topo "${TOPO}" --pools "${STORE_POOLS}" "${probe_args[@]}" --cap-p "${CAP_P}" --cap-d "${CAP_D}" --cap-free "${CAP_FREE}" > "${RUN}/store_plan.json"
+# AGX_STORE_POOL_GIB: each per_nic pool's exact GiB, spread over both nodes as their huge-page memory allows (in
+# place of a fixed owner overlay); a plan the nodes cannot hold refuses here, before anything starts.
+python3 "${H}/bin/store_plan.py" --topo "${TOPO}" --pools "${STORE_POOLS}" "${probe_args[@]}" --cap-p "${CAP_P}" --cap-d "${CAP_D}" --cap-free "${CAP_FREE}" \
+  ${AGX_STORE_POOL_GIB:+--pool-gib "${AGX_STORE_POOL_GIB}"} > "${RUN}/store_plan.json" || { say "store plan refused (AGX_STORE_POOL_GIB=${AGX_STORE_POOL_GIB:-})"; exit 4; }
 say "store plan: $(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d["total_gib"],"GiB | A:",d["owners"],"| B:",d["decode_owners"] or "-")' "${RUN}/store_plan.json")"
 python3 "${H}/bin/cellgen.py" --snap "${SNAP}" --run "${RUN}" --topo "${TOPO}" --nodes "$(IFS=,; echo "${HOSTS[*]}")" \
   --image "${IMAGE}" --conc "${CONC}" --mode "${MODE}" --duration "${DURATION}" --warmup-per-lane "${WARMUP}" --al "${AL}" \

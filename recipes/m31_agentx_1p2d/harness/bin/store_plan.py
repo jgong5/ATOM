@@ -54,6 +54,42 @@ def numa_total(probe_numa, role, args):
     return max(0, math.floor(usable / unit) * unit)
 
 
+def _fixed_pools(args, per_node, roles):
+    """Each pool's `args.pool_gib` over the NUMA nodes of every node, one owner
+    a NUMA node on the pool's NIC, each at most what `numa_total` gives that
+    NUMA node over its NICs (and `MAX_OWNER_GIB`): sizes proportional to that
+    headroom in `args.step` multiples, the remainder to the most headroom. The
+    same sizes for every pool (each NUMA node holds one owner of each)."""
+    if args.pools != "per_nic":
+        raise SystemExit("--pool-gib spreads per_nic pools")
+    slots = [(node, numa, plan["per_owner_gib"]) for node, nplan in per_node.items() for numa, plan in nplan.items()]
+    room = sum(c for *_, c in slots)
+    if room < args.pool_gib:
+        raise SystemExit(
+            f"--pool-gib {args.pool_gib}: the nodes hold at most {room} GiB a pool "
+            + ", ".join(f"{n} NUMA{u} {c}" for n, u, c in slots)
+        )
+    step = args.step
+    size = {(n, u): min(c, step * math.floor(args.pool_gib * c / room / step)) for n, u, c in slots}
+    left = args.pool_gib - sum(size.values())
+    for n, u, c in sorted(slots, key=lambda s: size[s[:2]] - s[2]):
+        give = min(left, c - size[(n, u)]) // step * step
+        size[(n, u)] += give
+        left -= give
+    if left:
+        raise SystemExit(f"--pool-gib {args.pool_gib}: {left} GiB a pool left over at step {step}")
+    specs, total = [], 0
+    for node, nplan in per_node.items():
+        entries = []
+        for numa in sorted(nplan, key=int):
+            each = size[(node, numa)]
+            nplan[numa]["per_owner_gib"], nplan[numa]["owners_gib"] = each, each * len(NICS_BY_POOLS["per_nic"][numa])
+            entries += [f"{numa}:{each}:{nic}" for nic in NICS_BY_POOLS["per_nic"][numa]] if each else []
+            total += nplan[numa]["owners_gib"]
+        specs.append(";".join(entries))
+    return specs, total
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--topo", required=True, choices=sorted(ROLE_NUMA))
@@ -68,6 +104,8 @@ def main():
                     help="plan at most this fraction of the free >= 2 MiB blocks a NUMA node has")
     ap.add_argument("--step", type=int, default=16)
     ap.add_argument("--pools", default="per_nic", choices=sorted(NICS_BY_POOLS))
+    ap.add_argument("--pool-gib", type=int, default=0,
+                    help="per_nic: each pool's exact GiB, spread over every node's NUMA nodes as their memory allows")
     args = ap.parse_args()
 
     roles = ROLE_NUMA[args.topo]
@@ -91,6 +129,8 @@ def main():
             total += each * len(nics)
         per_node[node] = node_plan
         specs.append(";".join(entries))
+    if args.pool_gib:
+        specs, total = _fixed_pools(args, per_node, roles)
     out = {
         "pools": args.pools,
         "owners": specs[0],
