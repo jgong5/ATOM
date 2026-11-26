@@ -163,8 +163,9 @@ def test_a_streaming_hand_offs_held_ids_are_untracked_and_reach_the_engine_as_be
 
     assert after == before
     assert before[0][:2] == ("http.response.start", 200)
-    # The app decoded the body itself only where no channel handed it one.
-    assert decodes == ([] if relayed else [BODY])
+    # The app decoded the body itself, inside one list (`handoff._read`), only
+    # where no channel handed it one.
+    assert decodes == ([] if relayed else [b"[" + BODY + b"]"])
     # The request held the decoding's ids all along the stream: a list the
     # collector walks on every full collection; now a tuple it stops
     # tracking, and the server holds no other container of them.

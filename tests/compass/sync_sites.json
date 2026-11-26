@@ -295,6 +295,42 @@
    "mechanism_why": "a wait inside the engine's LP on the engine's own trace process: never reported to the clock authority and carries no cost; the step is priced from the traced graph, and the run summary reports the wait as lazy_trace_wall_seconds"
   },
   {
+   "id": "atom/compass/run/fe_fastpaths.py::_memory_stream_paths.receive::receive_event.wait()::event_wait#0",
+   "file": "atom/compass/run/fe_fastpaths.py",
+   "symbol": "_memory_stream_paths.receive",
+   "call": "receive_event.wait",
+   "expr": "receive_event.wait()",
+   "shape": "event_wait",
+   "peer": "none",
+   "why": "a simulated frontend's anyio memory object stream receive, with nothing buffered, parks its task on an event until a task on the same event loop sends it an item or closes the stream; Starlette's BaseHTTPMiddleware takes each response message from the request's app task this way",
+   "mechanism": "K6",
+   "mechanism_why": "a wait between two tasks on the frontend's event loop, the LP's clock owner, so inside one LP and never reported to the clock authority; the loop runs its other tasks meanwhile, and the sending task's own wait for the engine is listed at its site"
+  },
+  {
+   "id": "atom/compass/run/fe_fastpaths.py::_memory_stream_paths.send::send_event.wait()::event_wait#0",
+   "file": "atom/compass/run/fe_fastpaths.py",
+   "symbol": "_memory_stream_paths.send",
+   "call": "send_event.wait",
+   "expr": "send_event.wait()",
+   "shape": "event_wait",
+   "peer": "none",
+   "why": "a simulated frontend's anyio memory object stream send, with no receiver waiting and its buffer full, parks its task on an event until a task on the same event loop takes the item or closes the stream; Starlette's BaseHTTPMiddleware stream buffers nothing, so the request's app task waits here for the task writing the response",
+   "mechanism": "K6",
+   "mechanism_why": "a wait between two tasks on the frontend's event loop, the LP's clock owner, so inside one LP and never reported to the clock authority; the loop runs its other tasks meanwhile, the receiving one among them"
+  },
+  {
+   "id": "atom/compass/run/fe_fastpaths.py::_with_chunk_fast_path.send_chunk_fast::send(cycle, message)::p2p#0",
+   "file": "atom/compass/run/fe_fastpaths.py",
+   "symbol": "_with_chunk_fast_path.send_chunk_fast",
+   "call": "send",
+   "expr": "send(cycle, message)",
+   "shape": "p2p",
+   "peer": "process",
+   "why": "a simulated frontend hands every ASGI message its chunk fast path does not write itself to uvicorn's own H11 send: a response's head and last body message, a body of a response that is not chunked, and any message while writing is paused, where uvicorn first awaits the transport's drain until the HTTP client reads",
+   "mechanism": "K9",
+   "mechanism_why": "the HTTP write every response already makes inside the web framework, run for its effect; the simulated time a response carries is stamped into it above this call by HttpChannel, a comment line before each SSE event or a held-back JSON body's stamp, not at this call"
+  },
+  {
    "id": "atom/compass/runner/overrides.py::gathers_by_shape.by_shape::gather(group, input_, use_custom, dim)::collective#0",
    "file": "atom/compass/runner/overrides.py",
    "symbol": "gathers_by_shape.by_shape",
@@ -343,14 +379,14 @@
    "mechanism_why": "the stage-to-stage pp_data channel: the stage loop, its LP's clock owner, stamps the send at the later of the forward's device end and its previous send's completion; the TP-rank-0 worker posts the frame on the PP CPU group and never waits on it"
   },
   {
-   "id": "atom/compass/runner/projection.py::dummy_ranks::torch.distributed.all_reduce(flag, group=dp_group())::collective#0",
+   "id": "atom/compass/runner/projection.py::dummy_ranks::torch.distributed.all_reduce(flag, group=group)::collective#0",
    "file": "atom/compass/runner/projection.py",
    "symbol": "dummy_ranks",
    "call": "torch.distributed.all_reduce",
-   "expr": "torch.distributed.all_reduce(flag, group=dp_group())",
+   "expr": "torch.distributed.all_reduce(flag, group=group)",
    "shape": "collective",
    "peer": "process",
-   "why": "every data-parallel rank's worker sums the group's dummy forwards, on the group's CPU group, once per simulated step before pricing it, since ATOM's DP sync carries no dummy flag",
+   "why": "every data-parallel rank's worker sums the group's dummy forwards, on the group's CPU group where no shared-memory segment takes the exchange, once per simulated step before pricing it, since ATOM's DP sync carries no dummy flag",
    "mechanism": "K6",
    "mechanism_why": "a wait inside the data-parallel group's LP: every rank is a member of that one LP, the exchange is never reported to the clock authority and carries no cost; the summed count only sets each rank's view of its step"
   },
