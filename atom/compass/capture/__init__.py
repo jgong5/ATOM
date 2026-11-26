@@ -186,8 +186,8 @@ def population_steps(names, tbo=False, drafters=False, stage=0, drafted=False):
     or a DP middle chunk's with `draft_bs` as its `width`. A target that
     replays no graph yet pads past its rows takes `target_bs` as its `width`.
     Under a drafter (`drafted`), which ATOM runs past both micro-batches on
-    the step's whole rows, a split step's micro-batches are followed by its
-    shapes as an unsplit step's, where its drafter is read."""
+    the step's whole rows, a split step's shapes as an unsplit step's, where
+    its drafter is read, come before its micro-batches."""
     from atom.compass.backends import BatchView, RequestShape
     from atom.compass.backends.op_graph import step_shape
     from atom.compass.backends.step_labels import group_dummies, group_peaks
@@ -235,20 +235,19 @@ def population_steps(names, tbo=False, drafters=False, stage=0, drafted=False):
                 draft = decode(width or tokens, line.get("draft_moe_rows"), len(rows))
                 if drafters and drafts and (draft := draft.at(dp, drafts)) != target:
                     yield draft, line
-                continue
-            if split:
-                for half, each in zip(halves, split):
-                    rows = [(r.query_tokens, r.decode) for r in half.requests]
-                    _, ran, b = step_shape(rows, None)
-                    own = {"rows": [dataclasses.astuple(r) for r in half.requests]}
-                    own |= {"group_max_tokens": max(each)} if dp > 1 else {}
-                    shape = prefill(ran, b, half.moe_rows).at(dp)
-                    yield shape._replace(micro_batch=True), line | own
-            if not split or drafted:
+            elif not split or drafted:
                 yield prefill(tokens, seqs, line.get("moe_rows"), padded).at(dp), line
                 draft = prefill(tokens, seqs, line.get("draft_moe_rows"), width)
                 if drafters and (line.get("produces_output") or dp > 1) and draft.width:
                     yield draft.at(dp), line
+            if split and phase == "prefill":
+                for half, each in zip(halves, split):
+                    rows = [(r.query_tokens, r.decode) for r in half.requests]
+                    _, tokens, seqs = step_shape(rows, None)
+                    own = {"rows": [dataclasses.astuple(r) for r in half.requests]}
+                    own |= {"group_max_tokens": max(each)} if dp > 1 else {}
+                    shape = prefill(tokens, seqs, half.moe_rows).at(dp)
+                    yield shape._replace(micro_batch=True), line | own
 
 
 @functools.cache

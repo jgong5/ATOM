@@ -526,20 +526,32 @@ class OpGraphBackend(CostBackend):
     def price(self, batch_view: BatchView) -> StepCost:
         refused: list[Refusal] = []
         self._step, self._passes, self._read = {}, {}, set()
-        if batch_view.tbo_tokens is not None and not batch_view.image_tokens:
-            at, priced = self._overlapped(batch_view, refused)
-            terms = {priced[0][0]: _term(priced[0][0], priced, at)}
-            if self.drafts:
-                terms |= self._drafted(batch_view, refused)
-            if refused:
-                raise CostRefused(batch_view, list(dict.fromkeys(refused)))
-            return _cost(terms)
-        at, region = self._region(batch_view)
+        if batch_view.tbo_tokens is None or batch_view.image_tokens:
+            return self._graphs(batch_view, *self._region(batch_view))
+        at, priced = self._overlapped(batch_view, refused)
+        if refused:
+            raise CostRefused(batch_view, list(dict.fromkeys(refused)))
+        tbo = _term(priced[0][0], priced, at)
+        if not self.drafts:
+            return StepCost([tbo])
+        # ATOM runs the drafter past both micro-batches, on the step's whole
+        # rows (`ModelRunner` wraps the target alone in `UBatchWrapper`).
+        cost = self._graphs(batch_view, None, None)
+        return StepCost((tbo, *cost.terms), cost.treatments, cost.draft_terms)
+
+    def _graphs(self, batch_view: BatchView, at, region) -> StepCost:
+        """A step at its target's graph `region`, from the graph at `at`, and
+        its drafter's graphs; with no `region`, its drafter's alone."""
         drafted_at, drafted = (
             self._region(batch_view, draft=True) if self.drafts else (None, None)
         )
         samples = batch_view.decode or batch_view.produces_output
-        kv = self.block and samples and self._region(batch_view, draft=KV)[1]
+        kv_at, kv = (
+            self._region(batch_view, draft=KV)
+            if self.block and samples
+            else (None, None)
+        )
+        at = at or kv_at  # a split step's draft-KV pass, at its whole shape
         graph = (at, id(region), drafted_at, id(drafted), id(kv))
         # A graph's first step keeps only the graphs, whose ids `graph` names,
         # and prices them whole: a graph a run reads once, as most prefill
@@ -880,34 +892,6 @@ class OpGraphBackend(CostBackend):
         name = TBO + ".price_list" if listed else TBO
         price = (name, overlap([zip(*runs)]), notes, Work(), False, (origins, why), {})
         return " and ".join(at), [price]
-
-    def _drafted(self, view: BatchView, refused: list) -> dict:
-        """A split step's drafter's terms: ATOM runs a block drafter's
-        draft-KV pass and its drafter's propose after both micro-batches, on
-        the step's whole rows (`ModelRunner` wraps the target alone in
-        `UBatchWrapper`), so each prices from its graph at the step's shape,
-        as on a step that does not split."""
-        drafted_at, drafted = self._region(view, draft=True)
-        samples = view.decode or view.produces_output
-        kv_at, kv = (
-            self._region(view, draft=KV) if self.block and samples else (None, None)
-        )
-        if samples and view.moe_rows is None:
-            self._passes = self._pass_views(drafted, view)
-        bound = self.resolver and self._bound(view)
-        draft = self.resolver and self._bound(view, draft=True)
-        priced = []
-        for part, region, at in ((1, kv, bound), (2, drafted, draft)):
-            if region:
-                got = self._priced(region, view, refused, at)
-                priced += [(PREFIXES[part] + p[0], *p[1:]) for p in got]
-        names: dict[str, list] = {}
-        for p in priced:
-            names.setdefault(p[0], []).append(p)
-        return {
-            n: _term(n, ps, drafted_at if n.startswith(DRAFT) else kv_at)
-            for n, ps in names.items()
-        }
 
     def _priced(
         self, region: dict, view: BatchView, refused: list, bound, pooled=False

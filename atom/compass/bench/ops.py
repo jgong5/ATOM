@@ -4415,8 +4415,8 @@ def parts(names, config) -> list:
     drafter its drafter's at the shape `trace ops --population` traces it, of
     a step that samples or not; and a block drafter's draft-KV pass's on a
     step that samples, at the step's shape. A two-batch-overlap micro-batch
-    reads its target alone; under a drafter its step, listed past both, reads
-    no target, only the drafter's parts at the whole step."""
+    reads its target alone; under a drafter its step, listed before both,
+    reads no target, only the drafter's parts at the whole step."""
     from atom.compass.capture import population_steps
 
     spec, steps = getattr(config, "speculative_config", None), []
@@ -4424,11 +4424,12 @@ def parts(names, config) -> list:
     for shape, line in population_steps(names, tbo, drafters=True, drafted=bool(spec)):
         if steps and line is steps[-1][0]:  # the drafter's own shape, past its step's
             reads = steps[-1][1]
-            reads[:] = [(DRAFT, shape, *r[2:]) if r[0] == DRAFT else r for r in reads]
+            reads[1:2] = [(DRAFT, shape, *reads[1][2:])] if spec else []
             continue
         samples = shape.phase == "decode" or bool(line.get("produces_output"))
-        split = spec and steps and steps[-1][1][0][1].micro_batch
-        reads = [] if split and not shape.micro_batch else [("", shape, True, False)]
+        if spec and shape.micro_batch and not steps[-1][1][0][1].micro_batch:
+            del steps[-1][1][0]  # the whole step, listed before it
+        reads = [("", shape, True, False)]
         if spec and not shape.micro_batch:
             reads.append((DRAFT, shape, samples, True))
             reads += [(DRAFT_KV, shape, True, KV)] * (samples and spec.use_dspark())
