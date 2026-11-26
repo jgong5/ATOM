@@ -40,3 +40,33 @@ def test_a_law_with_no_draft_at_all_is_still_refused(tmp_path):
     plain = _speculative(runner(StepLinearBackend(StepLinearLaw(law))))
     assert plain.forward(prefill(8)).predicted_s == 0.0
     assert plain.refused_commands() == ("cost:StepLinearBackend: prices no draft",)
+
+
+def test_a_pipelined_producer_prices_its_draft_on_the_drafter_stage_alone(tmp_path):
+    # M3.1's P PP4 (#3720): the drafter writes draft K/V on the last stage only; cal2's P law, fitted on stage 0,
+    # held no draft law, and every step on every stage was refused ("prices no draft") and charged 0 s.
+    law = _producer_law(tmp_path)
+    law["draft_stage"] = 3
+    staged = StepLinearLaw(law)
+    last, first = staged.at_stage(3), staged.at_stage(0)
+    assert last.draft is not None and not last.no_drafter
+    assert first.draft is None and first.no_drafter and staged.at_stage(1).no_drafter
+    priced = StepLinearBackend(first).price(_output([(8, 8, False)]))
+    assert not any(t.name.startswith("draft.") for t in priced.terms)
+    for law_at in (first, last):
+        tagged = _speculative(runner(StepLinearBackend(law_at)))
+        got = tagged.forward(prefill(8)).predicted_s
+        assert tagged.refused_commands() == ()
+        assert got == pytest.approx(StepLinearBackend(law_at).price(_output([(8, 8, False)])).seconds)
+        assert got > 0
+    # The drafter stage's price holds its draft-K/V pass on top of the same target.
+    assert StepLinearBackend(last).price(_output([(8, 8, False)])).seconds > priced.seconds
+
+
+def test_a_draft_stage_needs_a_draft_law_and_a_stage_past_0(tmp_path):
+    law = _producer_law(tmp_path)
+    for bad in (0, -1, "3", 2.0):
+        with pytest.raises(ValueError, match="states draft_stage"):
+            StepLinearLaw(dict(law, draft_stage=bad))
+    with pytest.raises(ValueError, match="states draft_stage"):
+        StepLinearLaw({k: v for k, v in law.items() if k != "draft"} | {"draft_stage": 3})

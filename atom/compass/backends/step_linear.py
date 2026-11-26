@@ -771,6 +771,17 @@ class StepLinearLaw:
                 "moe_routing, the experts and top-k it is counted over"
             )
         self.draft = StepLinearLaw(law["draft"]) if "draft" in law else None
+        # A pipelined producer's draft law prices its drafter's draft-K/V pass on the stage that runs it, the last
+        # (`draft_stage`, fit steps --stage-draft); any other stage runs no drafter (`no_drafter`, `at_stage`).
+        self.draft_stage = law.get("draft_stage")
+        if self.draft_stage is not None and (
+            type(self.draft_stage) is not int or self.draft_stage < 1 or self.draft is None
+        ):
+            raise ValueError(
+                f"the law states draft_stage {self.draft_stage!r}; a pipeline stage past 0 "
+                "whose drafter its draft law prices, beside a draft law"
+            )
+        self.no_drafter = False
         self.propose = law.get("propose") and _Vector(
             "propose", PROPOSE, law["propose"]
         )
@@ -797,12 +808,17 @@ class StepLinearLaw:
 
 def _at_stage(self, stage: int) -> "StepLinearLaw":
     """This law at pipeline stage `stage`: that stage's prefill vector where the
-    law states one (`stage_prefill`), else this law as it stands."""
+    law states one (`stage_prefill`), else this law's; under a `draft_stage`,
+    any other stage with no draft law and `no_drafter` set: it runs no drafter."""
     vector = self.stage_prefill.get(int(stage or 0))
-    if vector is None:
+    elsewhere = self.draft_stage is not None and int(stage or 0) != self.draft_stage
+    if vector is None and not elsewhere:
         return self
     staged = copy.copy(self)
-    staged.prefill = vector
+    if vector is not None:
+        staged.prefill = vector
+    if elsewhere:
+        staged.draft, staged.no_drafter = None, True
     return staged
 
 

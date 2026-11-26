@@ -256,6 +256,48 @@ def _step_grid(samples, config, args) -> tuple[dict, dict, dict]:
     return {**grid_key, "grid": grid["grid"]}, bundle, report
 
 
+def _stage_draft(args, sources, fit, config, stage, record) -> tuple[dict, dict]:
+    """The draft law of stage `stage`'s own fit on `record` (as `_stage_prefill`
+    swaps it in), which, a producer's drafter writing draft K/V on that stage,
+    prices it with output_prefill_kv; and its report. Refused when that fit
+    gives no draft law or one without output_prefill_kv."""
+    samples, got, staged = _stage_samples(args, sources, config, stage, record, "--stage-draft")
+    _, params, report = fit(samples, got, staged)
+    draft = params.get("draft")
+    if not draft or not draft.get("output_prefill_kv"):
+        raise ValueError(
+            f"--stage-draft {stage} {record}: its fit gives no draft law pricing a "
+            "draft-K/V pass (output_prefill_kv): the record's prefill steps time no "
+            "drafter window"
+        )
+    return draft, report.get("draft", {})
+
+
+def _stage_samples(args, sources, config, stage, record, flag="--stage-record"):
+    """The prefill inputs of `args` with `record` in place of the first prefill
+    RECORD, its client runs the same: (samples, config, args); refused unless
+    that stage ran stage 0's engine config."""
+    prefill = [i for i in args.inputs if Path(i).name == "prefill"]
+    if not prefill:
+        raise ValueError(f"{flag} replaces a prefill RECORD, and no RECORD is one")
+    if Path(record).name != "prefill":
+        raise ValueError(
+            f"{flag} {stage} {record}: a stage's record is a prefill/ "
+            "directory, beside the decode/ its client runs were served with"
+        )
+    swap = {Path(prefill[0]): str(record)}
+    staged = copy.copy(args)
+    staged.inputs = [swap.get(Path(i), i) for i in args.inputs if Path(i) in swap]
+    staged.client_run = [(swap[Path(r)], e) for r, e in args.client_run if Path(r) in swap]
+    staged.ladder_run = None
+    samples, got = publish.inputs(staged, sources)
+    if got["engine_config"] != config["engine_config"]:
+        raise ValueError(
+            f"stage {stage}'s record ran another engine config than stage 0's"
+        )
+    return samples, got, staged
+
+
 def _stage_prefill(
     args, sources, fit, config, stage, record, first=(), law=None
 ) -> tuple[dict, dict]:
@@ -440,6 +482,15 @@ def main(argv: list[str]) -> None:
         "named for the first prefill RECORD, and stated under stage_prefill",
     )
     parser.add_argument(
+        "--stage-draft",
+        nargs=2,
+        metavar=("STAGE", "RECORD"),
+        help="a pipelined producer's drafter stage STAGE (the last), its record a "
+        "prefill/ directory of that stage's step file: the draft law fitted on it "
+        "(output_prefill_kv, the draft-K/V pass) is the law's, stated with "
+        "draft_stage STAGE; the other stages run no drafter",
+    )
+    parser.add_argument(
         "--stage-form",
         choices=("scaled", "fitted"),
         default="scaled",
@@ -497,6 +548,16 @@ def main(argv: list[str]) -> None:
         )[str(int(stage))] = _stage_prefill(
             target_args, sources, fit, config, stage, record, samples, params
         )
+    if getattr(args, "stage_draft", None):
+        stage, record = args.stage_draft
+        if params.get("draft"):
+            raise ValueError(
+                "--stage-draft: the first prefill RECORD's fit has a draft law of its own"
+            )
+        params["draft"], report["draft"] = _stage_draft(
+            target_args, sources, fit, config, stage, record
+        )
+        params["draft_stage"] = int(stage)
     if args.ops:
         refused = [
             f"{f}: {w}" for s in samples for f, ws in s.floor.items() for w in ws

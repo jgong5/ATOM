@@ -2422,7 +2422,10 @@ def _group_step_seconds(
         # with output_prefill_kv, step_linear's module text) is priced among the target's terms, as `draft.` terms,
         # and states no draft_terms: that is a priced draft, not a missing one.
         in_kv = any(t.name.startswith("draft.") for t in cost.terms)
-        if spec and not cost.draft_terms and not in_kv and not dummy:
+        # A pipeline stage that runs no drafter (`StepLinearLaw.no_drafter`, under the law's draft_stage) prices
+        # no draft, and none is missing.
+        bare = getattr(getattr(backend, "law", None), "no_drafter", False)
+        if spec and not cost.draft_terms and not in_kv and not dummy and not bare:
             name = type(backend).__name__
             raise CostRefused(batch, [Refusal(name, "prices no draft")])
     except CostRefused as refusal:
