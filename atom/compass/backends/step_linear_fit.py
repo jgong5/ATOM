@@ -231,7 +231,9 @@ column `gather_pad_rows` in its place, the gather's pad rows alone, and
 `MOE_IMBALANCE_ENV`, `UNEVEN_ROWS_ENV`, `MOE_MIN_SPREAD_ENV`); `graph_tokens` and
 `graph_query_cached` add those prefill columns (`GRAPH_COLUMNS`) after
 `padding`, at any `dp`, to records stating their prefill buckets
-(`GRAPH_TOKENS_ENV`, `GRAPH_QUERY_CACHED_ENV`); `moe_select` ``insample`` makes each
+(`GRAPH_TOKENS_ENV`, `GRAPH_QUERY_CACHED_ENV`); `short_hinge` at a knee K adds
+the prefill column of that name, max(0, K - Sum N_Q), after the form's columns,
+the vector stating K as `short_knee` (`SHORT_HINGE_ENV`); `moe_select` ``insample`` makes each
 target decode rung adopt the MoE column its fit on all its steps prices nearest
 (`_moe_column`, `MOE_SELECT_ENV`), and ``fallback`` only each rung its records
 cannot hold out, which adopts none under the default rule; `moe_both` adds to
@@ -426,6 +428,10 @@ UNEVEN_ROWS_ENV = "COMPASS_FIT_UNEVEN_ROWS"
 #: prefill token graph.
 GRAPH_TOKENS_ENV = "COMPASS_FIT_GRAPH_TOKENS"
 GRAPH_QUERY_CACHED_ENV = "COMPASS_FIT_GRAPH_QUERY_CACHED"
+#: The prefill column `short_hinge` at this knee, in tokens (a positive whole
+#: number; unset or 0, none): a MoE prefill's floor below the chunk whose
+#: experts' rows fill a tile, its knee set from that roofline, not fitted.
+SHORT_HINGE_ENV = "COMPASS_FIT_SHORT_HINGE"
 #: `moe_imbalance`'s and `uneven_rows`' `min_spread`, `MOE_MIN_SPREAD` when unset.
 MOE_MIN_SPREAD_ENV = "COMPASS_FIT_MOE_MIN_SPREAD"
 MOE_MIN_SPREAD = 0.2
@@ -472,7 +478,7 @@ DRAFT_PEER_TOKENS_ENV = "COMPASS_FIT_DRAFT_PEER_TOKENS"
 #: group's tokens.
 SATURATED = 0.9
 #: The opt-in columns whose variance inflation factor a vector states (`_vif`).
-OPT_IN = ("row_padding", "peer_tokens", *GATHER_COLUMNS, *GRAPH_COLUMNS)
+OPT_IN = ("row_padding", "peer_tokens", *GATHER_COLUMNS, *GRAPH_COLUMNS, "short_hinge")
 
 
 def _rung_key(rung: int | None) -> str:
@@ -504,6 +510,8 @@ def _prefill_counts(
         counts += (sum_context(r) - sum_tokens(r),)
     if form == "cached_seqs":
         counts += (cached_seqs(r),)
+    if cols and cols.get("short_hinge"):
+        counts += (max(0, cols["short_hinge"] - sum_tokens(r)),)
     if dp > 1:
         if view.moe_rows is None:
             raise ValueError(
@@ -643,7 +651,11 @@ def _columns(options, draft: bool = False) -> dict:
         "moe_imbalance": options.get("moe_imbalance"),
         "uneven_rows": options.get("uneven_rows"),
         **{f: bool(options.get(f)) for f in GRAPH_COLUMNS},
+        "short_hinge": options.get("short_hinge"),
     }
+    knee = cols["short_hinge"]
+    if knee is not None and (type(knee) is not int or knee < 1):
+        raise ValueError(f"short_hinge's knee is {knee!r}, not a positive token count")
     if draft:
         return {f: None for f in cols} | {
             "row_padding": False,
@@ -713,6 +725,10 @@ def env_options(environ=None) -> dict:
     out = {}
     if _switch(env, ROW_PADDING_ENV):
         out["row_padding"] = True
+    if (knee := env.get(SHORT_HINGE_ENV) or "0") != "0":
+        if not knee.isdigit():
+            raise ValueError(f"{SHORT_HINGE_ENV}={knee} is not a whole number of tokens")
+        out["short_hinge"] = int(knee)
     if (gather := env.get(GATHER_ROWS_ENV)) == "pad":
         out["gather_rows"] = "pad"
     elif gather not in (None, "", "0", "1"):
@@ -2950,7 +2966,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
         for k, v in c.items():
             cut[k] = cut.get(k, 0) + v
     prefill = list(HISTORY if form == "history" else PREFILL)
-    prefill += ["cached_seqs"] * (form == "cached_seqs") + ["moe_rows"] * (dp > 1)
+    prefill += ["cached_seqs"] * (form == "cached_seqs")
+    prefill += ["short_hinge"] * bool(cols["short_hinge"]) + ["moe_rows"] * (dp > 1)
     prefill += ["serial_moe_rows"] * serial + ["cold_peer_rows"] * cold
     gathered = _gathered(cols)
     prefill += gathered
@@ -3118,6 +3135,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     vector["fit"]["peer_tail"] = int((solved["keep"] & past).sum())
                 if kda:
                     vector["kda_chunk"] = KDA_CHUNK
+                if cols["short_hinge"]:
+                    vector["short_knee"] = cols["short_hinge"]
                 if gathered:
                     vector["ranks"] = dp
                 if (spread := _min_spread(cols)) is not None:

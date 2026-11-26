@@ -13,6 +13,10 @@ A prefill vector may add `history`, Sum (N_KV - N_Q): the KV a chunk reads
 on its cached history, which a short chunk on a deep history pays apart from
 its attention arithmetic; then `cached_seqs`, its rows with cached context
 (N_KV above N_Q), each of which adds a cost whatever its history's length;
+then `short_hinge`, max(0, K - Sum N_Q), the tokens the chunk falls short of
+the vector's `short_knee` K: a MoE prefill reads every routed expert's weights
+until each expert's rows fill a tile, a floor a short chunk pays that the
+tokens term does not (`step_linear_fit.SHORT_HINGE_ENV`);
 and then `moe_rows`, the rows the data-parallel group's MoE gather carries
 (`BatchView.moe_rows`), which every rank's MoE runs on.
 After `moe_rows` it may add `serial_moe_rows`: `moe_rows` on a step the group did
@@ -286,6 +290,7 @@ KDA_CHUNK = 32
 PREFILL_EXTRA = (
     "history",
     "cached_seqs",
+    "short_hinge",
     "moe_rows",
     "serial_moe_rows",
     "cold_peer_rows",
@@ -375,6 +380,14 @@ class _Vector:
                 f"{spec.get('kda_chunk')!r} tokens; a view states its padding at "
                 f"{KDA_CHUNK}"
             )
+        self.knee = None
+        if "short_hinge" in features:
+            self.knee = spec.get("short_knee")
+            if not isinstance(self.knee, int) or self.knee < 1:
+                raise ValueError(
+                    f"the {name} vector carries short_hinge and states its "
+                    f"short_knee as {self.knee!r}, not a positive token count"
+                )
         self.buckets = None
         if "padding" in features:
             self.buckets = tuple(sorted(int(b) for b in spec.get("buckets") or ()))
@@ -858,6 +871,8 @@ class StepLinearBackend(CostBackend):
                 counts += (sum_context(prefill) - sum_tokens(prefill),)
             if "cached_seqs" in vector.features:
                 counts += (cached_seqs(prefill),)
+            if "short_hinge" in vector.features:
+                counts += (max(0, vector.knee - sum_tokens(prefill)),)
             if "moe_rows" in vector.features:
                 if batch_view.moe_rows is None:
                     raise self._refuse(batch_view, "no MoE gather rows on this step")
