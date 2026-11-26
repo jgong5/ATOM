@@ -401,6 +401,12 @@ LOOP_KINDS = frozenset(("app", "body", "send", "recv", "wait", "head"))
 #: What a lone tokenizer call costs: per call, per token, and for a segment
 #: tokenizer call per character its stored-prefix search compared.
 TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
+#: The `admit` form (opt-in; unset: the solver's fit): ``median``, the median
+#: of the admitting forwards' `E` past their kind's law, a fixed cost per
+#: admitting forward with no token terms (`_admit_median`).
+ADMIT_FORM_ENV = "COMPASS_FIT_ADMIT"
+
+
 #: What a forward that admits requests spends once, per prompt token past the
 #: prefix-cache hit and per token within it (`step_labels.admit_x`).
 ADMIT_FEATURES = ("admits", "uncached", "cached")
@@ -959,6 +965,17 @@ def _host_price(host, kind, segment, x, launch) -> float | None:
     return None if c is None else float(np.dot(c, x)) + priced
 
 
+def _admit_median(base, labels) -> tuple[list, dict]:
+    """`admit` as the median of `labels` (the admitting forwards' `E`) less
+    `base` (what their kind's `E` law prices), 0 or more, per admitting forward,
+    no token terms; and its report. Raises on no sample."""
+    extra = np.maximum(np.array(labels, float) - np.array(base, float), 0.0)
+    if not len(extra):
+        raise ValueError("no forward that admits a request has an E label")
+    p10, p50, p90 = np.percentile(extra, (10, 50, 90)).tolist()
+    return [p50, 0.0, 0.0], {"form": "median", "samples": len(extra), "p10": p10, "p50": p50, "p90": p90}
+
+
 def _admit_rows(samples, host) -> list[tuple]:
     """(`admit_x` of admitted, `E` its kind's law prices, `E`) per sample
     that admits requests, has a positive `E` and a kind with an `E` law."""
@@ -1087,7 +1104,12 @@ def fit_host(samples) -> tuple[dict, dict]:
     _fit_dummy(samples, launch, graphs, host, report)
     a, base, labels = list(zip(*_admit_rows(kept, host))) or [(), (), ()]
     try:
-        host["admit"], report["admit"] = _host_law(a, labels, ADMIT_FEATURES, base)
+        if (form := os.environ.get(ADMIT_FORM_ENV, "")) not in ("", "median"):
+            raise ValueError(f"{ADMIT_FORM_ENV}={form} is not median")
+        if form == "median":
+            host["admit"], report["admit"] = _admit_median(base, labels)
+        else:
+            host["admit"], report["admit"] = _host_law(a, labels, ADMIT_FEATURES, base)
     except (ValueError, QhullError) as e:
         host["admit"] = None  # a run refuses a forward that admits a request
         report["unfitted"]["admit"] = str(e).splitlines()[0]
