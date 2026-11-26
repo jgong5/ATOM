@@ -215,7 +215,10 @@ class Shape(NamedTuple):
     micro-batch, which its structure names (`structure`), not its text.
     `real` is how many of a padded decode's MoE rows are real, the rest pad
     rows that route to no expert, None at all of them: a `measure ops` point
-    states it, and a graph is read at its shape without it."""
+    states it, and a graph is read at its shape without it. `verifies` is
+    the drafts each row of a decode under a drafter verifies where fewer
+    than its drafter's, None at its drafter's: a P/D producer's decode step
+    decodes one token a row (`op_graph.verified`)."""
 
     phase: str  # "decode" or "prefill"
     tokens: int
@@ -224,6 +227,7 @@ class Shape(NamedTuple):
     width: int | None = None
     micro_batch: bool = False
     real: int | None = None
+    verifies: int | None = None
 
     def __str__(self) -> str:
         text = f"{self.phase} T={self.tokens} B={self.seqs}"
@@ -231,11 +235,14 @@ class Shape(NamedTuple):
             text = f"decode B={self.seqs}"
         text += f" W={self.width}" * bool(self.width)
         text += "" if self.gathered is None else f" G={self.gathered}"
+        text += "" if self.verifies is None else f" V={self.verifies}"
         return text + ("" if self.real is None else f" R={self.real}")
 
     def at(self, dp: int, drafts: int = 0) -> "Shape":
         """This shape in a DP group of `dp` under a drafter of `drafts`:
-        `gathered` only off its default (`gathered_off_default`)."""
+        `gathered` only off its default (`gathered_off_default`), its rows
+        verifying `verifies` drafts where it states them."""
+        drafts = drafts if self.verifies is None else self.verifies
         padded = self.phase == "decode" and self.width or self.tokens
         g = gathered_off_default(self.phase, padded, self.gathered, dp, drafts)
         return self._replace(gathered=g)
@@ -1663,7 +1670,8 @@ def _batch(
     first `tokens % seqs` one longer, each in blocks of its own; and the
     blocks they take. A decode sequence holds `context` tokens, and under a
     drafter of `drafts` tokens verifies that many more, as ATOM's scheduler
-    schedules it. Unless `output`, every prefill sequence is a middle chunk,
+    schedules it, or the `verifies` its shape states. Unless `output`,
+    every prefill sequence is a middle chunk,
     so the step samples nothing. Under a drafter a prefill row states its next
     token, -1 where the step samples it, as ATOM's scheduler states it. A
     `stateful` model's sequence holds a state slot of its own, as ATOM's block
@@ -1673,7 +1681,7 @@ def _batch(
     from atom.model_engine.scheduler import ScheduledBatch
 
     drafter, prefill = bool(drafts), shape.phase == "prefill"
-    drafts = 0 if prefill else drafts
+    drafts = 0 if prefill else drafts if shape.verifies is None else shape.verifies
     shape = shape if prefill else shape._replace(seqs=shape.tokens)
     per, extra = divmod(shape.tokens, shape.seqs)
     counts = [per + (i < extra) + drafts for i in range(shape.seqs)]
@@ -1806,13 +1814,15 @@ def capture(
     whole step, where its drafter runs; each of their prefills
     runs as one forward, as it ran, this rank answering that it cannot split
     it; with `whole`, each prefill of
-    `shapes` too. With `symbolic`, each prefill's (T, B) of a DP group with no
+    `shapes` too. Under a P/D producer's drafter each decode of `shapes`
+    verifies none, as its decode does. With `symbolic`, each prefill's (T, B) of a DP group with no
     drafter, at its width, is then traced with G a symbol, as a run's lookup
     traces it (`Tracer.symbolic`); one whose two ends differ is named on
     stderr. Without DP, or under a drafter, `symbolic` is refused before any
     trace.
     """
     from atom.compass.capture import population_shapes
+    from atom.kv_transfer.disaggregation.types import kv_config_has_producer
 
     tracer = Tracer(model, tp, tmpdir, atom_args, arch, read)
     config = tracer.config
@@ -1820,8 +1830,12 @@ def capture(
         config.parallel_config.data_parallel_size == 1 or config.speculative_config
     ):
         raise ValueError("--symbolic: only a DP prefill with no drafter holds G")
-    drafted = bool(config.speculative_config)
-    ran = population_shapes(population, config.enable_tbo, drafted)
+    spec = config.speculative_config
+    drafts = spec.num_speculative_tokens if spec else 0
+    if drafts and kv_config_has_producer(config.kv_transfer_config):
+        # a P/D producer's decode verifies no draft (`Tracer.trace`)
+        shapes = [s._replace(verifies=0) if s.phase == "decode" else s for s in shapes]
+    ran = population_shapes(population, config.enable_tbo, drafts)
     shapes = list(dict.fromkeys([*shapes, *ran]))
     if not shapes:
         raise ValueError(f"{', '.join(population)} hold no step to trace")
@@ -2002,7 +2016,9 @@ class Tracer:
         it; per prefill shape, the middle chunk's and then the final one's.
         Under a drafter each step is two graphs, its target's and then its
         drafter's (`_drafter`), and a decode step verifies the drafter's tokens
-        in each row. A prefill of `unsplit` runs as one forward, this rank
+        in each row, or the `verifies` its shape states, which only a P/D
+        producer's decode does, so only a producer traces such a shape. A
+        prefill of `unsplit` runs as one forward, this rank
         answering that it cannot split it. The KV pool is the one a capture of
         `shapes` alone allocates: the blocks the widest of them takes,
         `KV_BLOCKS` at the fewest.
@@ -2012,12 +2028,20 @@ class Tracer:
         keyed by `symbolic_shape` and holds the guards the trace installed on
         G (`_guards`). Unless `warm`, no step runs before a traced one: the
         caller has just stepped the runner at that shape."""
+        from atom.kv_transfer.disaggregation.types import kv_config_has_producer
+
         config = self.config
         dp = config.parallel_config.data_parallel_size
         if dp == 1 and (gathering := [s for s in shapes if s.gathered is not None]):
             raise ValueError(f"{gathering[0]} gathers a DP group's rows on one rank")
         if symbolic and (dp == 1 or any(s.phase != "prefill" for s in shapes)):
             raise ValueError("only a DP prefill's graph holds the rows it gathers")
+        fewer = [s for s in shapes if s.verifies is not None]
+        if fewer and not kv_config_has_producer(config.kv_transfer_config):
+            raise ValueError(
+                f"{fewer[0]} verifies fewer drafts than its drafter's, as only a P/D "
+                "producer's decode does: trace it under its --kv-transfer-config"
+            )
         if self.runner is None:
             self._build()
         declared, drafts = self.declared, self.drafts

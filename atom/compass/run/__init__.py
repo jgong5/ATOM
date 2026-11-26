@@ -2654,8 +2654,10 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         draft=False,
         width=None,
         micro_batch=False,
+        verifies=None,
     ) -> dict | str | None:
-        shape = Shape(phase, tokens, seqs, gathered, width, micro_batch).at(dp, drafts)
+        shape = Shape(phase, tokens, seqs, gathered, width, micro_batch)
+        shape = shape._replace(verifies=verifies).at(dp, drafts)
         at = structure(config, phase, True, arch, output, draft, env, micro_batch)
         key = lookup(store, at, str(shape))
         missing = key is None

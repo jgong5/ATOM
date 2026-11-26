@@ -217,7 +217,9 @@ group split as its two micro-batches, as `trace ops --population` traces it
 (`population_steps`), capturing each `op_graph` S lacks on the run's first GPU
 as it reads, a prefill as one forward (`_capture`), or, before any point,
 refusing one only that call traces:
-every leaf at every rung of ATOM's decode ladder, and under a speculative
+every leaf at every rung of ATOM's decode ladder, at the drafts the steps'
+decode rows verify, none for a P/D producer's (`forward.Shape.verifies`), a
+producer's width captured at none too, and under a speculative
 drafter each leaf of its own decode shape past a step's (`parts`) that the
 graphs at its width, its B, do not hold, at its rows padded to that width,
 and under DP each leaf of a decode's drafter's graphs a run asks at its
@@ -4066,7 +4068,10 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     ragged = any(
         _mean(line, s.seqs) < PERMILLE for s, line in steps if s.phase == "decode"
     )
-    rungs = [decode(r) for r in schedulable_ladder(config)]
+    # the ladder at the drafts each decode step verifies: a producer's, none
+    verifies = dict.fromkeys(s.verifies for s, _ in steps if s.phase == "decode")
+    ladder = schedulable_ladder(config)
+    rungs = [decode(r)._replace(verifies=v) for v in verifies for r in ladder]
     graphs, done, tried = {}, {}, set()
     prefills, cached, step_tokens = set(), defaultdict(list), defaultdict(set)
     for s, line in steps:
@@ -4078,14 +4083,16 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
     own = {s: outputs for s, outputs in own.items() if s not in prefills}
     # first, so a graph only `trace ops --population` traces refuses before any
     # point; the rungs too, which a decode's drafter's leaf below may join
-    widths = {decode(s.seqs) for s in own if s.phase == "decode"}
+    widths = {
+        decode(s.seqs)._replace(verifies=s.verifies) for s in own if s.phase == "decode"
+    }
     shapes = prefills | set(own) | widths | set(rungs)
     _load(store, config, args.store, shapes, graphs, None, atom_args, args.plan, own)
     for s in own:
         if s.phase == "prefill":
             prefills.add(s)
             continue
-        width = graphs[decode(s.seqs)]
+        width = graphs[decode(s.seqs)._replace(verifies=s.verifies)]
         graphs[s] = {sig: leaf for sig, leaf in graphs[s].items() if sig not in width}
     # a leaf of a drafter's graphs is a point at each shape a run asks it at
     # (`_drafter_at`), its later passes' under DP among them: a prefill's at
@@ -4182,13 +4189,14 @@ def plan(store, key, config, run, args, command: str, out: Path, atom_args=()) -
                 real[s].add(n)
         for (text, context, sig), r in routed:
             shape = _shape(text)
-            full = dp * shape.tokens * row
+            tokens = row if shape.verifies is None else shape.verifies + 1
+            full = dp * shape.tokens * tokens
             op = shape in real and graphs[shape][sig][0]
             if not op or routed_rows(op) != full or op.get("drafted"):
                 continue
             if context != min(contexts) and not dependent.get(r["op"], True):
                 continue
-            for n in sorted({row, *real[shape]}):
+            for n in sorted({tokens, *real[shape]}):
                 if n < full:
                     at = shape._replace(real=n)
                     graphs.setdefault(at, {})[sig] = graphs[shape][sig]
@@ -4327,7 +4335,7 @@ def coverage(store, root, config, names, records, arch, atom_args=()) -> dict:
             region = graph(store, config, shape, arch, *which)["region"]
             width, held = shape, {}
             if own:  # a drafter's own decode shape, past its step's
-                width = decode(shape.seqs)
+                width = decode(shape.seqs)._replace(verifies=shape.verifies)
                 held = leaves_at(store, config, width, arch)
         except ArtifactRefusal as refused:
             return refused.what
@@ -4420,8 +4428,9 @@ def parts(names, config) -> list:
     from atom.compass.capture import population_steps
 
     spec, steps = getattr(config, "speculative_config", None), []
-    tbo = config.enable_tbo
-    for shape, line in population_steps(names, tbo, drafters=True, drafted=bool(spec)):
+    drafts = spec.num_speculative_tokens if spec else 0
+    held = population_steps(names, config.enable_tbo, drafters=True, run_drafts=drafts)
+    for shape, line in held:
         if steps and line is steps[-1][0]:  # the drafter's own shape, past its step's
             reads = steps[-1][1]
             reads[1:2] = [(DRAFT, shape, *reads[1][2:])] if spec else []
@@ -4467,10 +4476,12 @@ def _drafter_at(shape, op: dict, line: dict, config) -> list:
     dp = config.parallel_config.data_parallel_size
     later = rows or dp * width
     t, wide, counts = shape.tokens, shape._replace(gathered=later), {shape.tokens, n}
+    # a decode of one token a row under the drafter verifies none (`verifies`)
+    verifies = drafts if shape.verifies is None else shape.verifies
     if shape.phase == "decode":
-        t, wide = n, decode(width, later)
-        counts = {n} if width == n else {n * j for j in range(1, drafts + 2)}
-    low = gathered_off_default(shape.phase, t, min(gathered, later), dp, drafts)
+        t, wide = n, decode(width, later)._replace(verifies=shape.verifies)
+        counts = {n} if width == n else {n * j for j in range(1, verifies + 2)}
+    low = gathered_off_default(shape.phase, t, min(gathered, later), dp, verifies)
     sets = frozenset(counts | {gathered}), frozenset({width, dp * width, later})
     both = shape._replace(tokens=t, gathered=low)
     # a prefill's later passes run on its own shape, asked at their batch
@@ -4559,7 +4570,7 @@ def _shape(text: str):
     if text.startswith("prefill"):
         return prefill(n["T"], n["B"], None, n.get("W"))._replace(gathered=n.get("G"))
     shape = decode(n["B"], n.get("G"), n.get("T"))
-    return shape._replace(width=n.get("W"), real=n.get("R"))
+    return shape._replace(width=n.get("W"), real=n.get("R"), verifies=n.get("V"))
 
 
 #: Leaf kinds that exchange rows between ranks (`exchange`).
@@ -5056,12 +5067,14 @@ def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
     stepping and compute units pick kernels as they do on the card. A shape
     its `--prefill` and `--width` cannot name, a DP group's gathered rows or a
     padded width, refuses before any is traced, naming the `trace ops
-    --population` of the record directories `records` that traces it. Under
+    --population` of the record directories `records` that traces it; under a
+    P/D producer's drafter, `--width` names a decode verifying none. Under
     `--enable-tbo` a prefill is traced as one forward (`--whole`), where ATOM
     would split a step of its tokens: a point times a leaf at its own shape."""
     from atom.compass import capture
     from atom.compass.artifacts import ArtifactRefusal, Rule
     from atom.compass.capture.forward import decode, device_arch, prefill
+    from atom.kv_transfer.disaggregation.types import kv_config_has_producer
     from atom.model_engine.arg_utils import EngineArgs
 
     engine = EngineArgs.add_cli_args(FlexibleArgumentParser()).parse_args(atom_args)
@@ -5069,8 +5082,12 @@ def _capture(config, shapes, root, arch=None, atom_args=(), records=()) -> None:
     argv += ["--arch", arch or device_arch()]
     if not arch:  # the card read by its HIP ordinal, which ROCm indexes alike
         argv += ["--gpu", os.environ.get("HIP_VISIBLE_DEVICES", "0").split(",")[0]]
+    # under a P/D producer's drafter `--width` traces a decode verifying none
+    producer = kv_config_has_producer(json.loads(engine.kv_transfer_config or "{}"))
+    verifies = 0 if producer and getattr(config, "speculative_config", None) else None
     for s in shapes:
-        if s != (prefill(s.tokens, s.seqs) if s.phase == "prefill" else decode(s.seqs)):
+        width = decode(s.seqs)._replace(verifies=verifies)
+        if s != (prefill(s.tokens, s.seqs) if s.phase == "prefill" else width):
             population = [a for r in records for a in ("--population", r)]
             call = ["compass", "trace", "ops", *argv, *population, "--store", str(root)]
             raise ArtifactRefusal(

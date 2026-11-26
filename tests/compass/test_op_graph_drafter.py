@@ -279,7 +279,11 @@ def test_a_step_reads_its_drafter_s_graph_as_draft_terms(batch, shape):
 @pytest.mark.parametrize(
     "batch,drafted,named",
     [
-        (view((1, 9, True)), g(1, 8, 8), "a step that decodes a row of other than 2"),
+        (
+            view((1, 9, True), (2, 9, True)),
+            g(1, 8, 8),
+            "a step that decodes a row of other than 2",
+        ),
         (VERIFY, None, "over 2 sequences for its drafter"),
     ],
     ids=["unverified-row", "uncaptured-drafter"],
@@ -719,11 +723,11 @@ def test_a_split_step_s_listed_shapes_hold_every_graph_its_drafter_is_priced_fro
     )
     OpGraphBackend(SPEC, graph, kv="bf16", drafts=1, block=True).price(split)
 
-    spec = SimpleNamespace(use_dspark=lambda: True)
+    spec = SimpleNamespace(use_dspark=lambda: True, num_speculative_tokens=1)
     config = SimpleNamespace(enable_tbo=True, speculative_config=spec)
     read = {r for _, reads in parts([str(tmp_path)], config) for r in reads}
     assert asked == read
     whole = Shape("prefill", 9000, 2)
     assert (DRAFT, whole, True, True) in asked
-    listed = population_shapes([str(tmp_path)], tbo=True, drafted=True)
+    listed = population_shapes([str(tmp_path)], tbo=True, run_drafts=1)
     assert {shape for _, shape, *_ in asked} == set(listed)

@@ -155,16 +155,16 @@ def main(argv: list[str]) -> None:
             began = time.perf_counter()
 
 
-def population_shapes(names, tbo=False, drafted=False):
+def population_shapes(names, tbo=False, run_drafts=0):
     """The shape of each step the record directories `names` hold, DP's dummy
     runs aside; under two-batch overlap (`tbo`) a split step's two
     micro-batches' (`population_steps`), and its whole step's under a drafter
-    (`drafted`); each drafter's too."""
-    steps = population_steps(names, tbo, drafters=True, drafted=drafted)
+    of `run_drafts` tokens; each drafter's too."""
+    steps = population_steps(names, tbo, drafters=True, run_drafts=run_drafts)
     return [shape for shape, _ in steps]
 
 
-def population_steps(names, tbo=False, drafters=False, stage=0, drafted=False):
+def population_steps(names, tbo=False, drafters=False, stage=0, run_drafts=0):
     """Each step the record directories `names` hold, DP's dummy runs aside,
     of pipeline stage `stage` (above 0, its records ``pp<k>.dp<r>.jsonl``),
     as its shape, the one the op-level backend prices it at
@@ -185,11 +185,14 @@ def population_steps(names, tbo=False, drafters=False, stage=0, drafted=False):
     at its rows padded to `draft_bs`, else to its rung, a sampling prefill's
     or a DP middle chunk's with `draft_bs` as its `width`. A target that
     replays no graph yet pads past its rows takes `target_bs` as its `width`.
-    Under a drafter (`drafted`), which ATOM runs past both micro-batches on
-    the step's whole rows, a split step's shapes as an unsplit step's, where
-    its drafter is read, come before its micro-batches."""
+    Under a drafter of `run_drafts` tokens, which ATOM runs past both
+    micro-batches on the step's whole rows, a split step's shapes as an
+    unsplit step's, where its drafter is read, come before its micro-batches;
+    and a decode step whose rows each decode one token verifies none
+    (`op_graph.verified`), its shapes and its drafter's marked so
+    (`forward.Shape.verifies`)."""
     from atom.compass.backends import BatchView, RequestShape
-    from atom.compass.backends.op_graph import step_shape
+    from atom.compass.backends.op_graph import step_shape, verified
     from atom.compass.backends.step_labels import group_dummies, group_peaks
     from atom.compass.backends.step_roofline import micro_batches
     from atom.compass.validate.bound import _split
@@ -229,13 +232,16 @@ def population_steps(names, tbo=False, drafters=False, stage=0, drafted=False):
                 raise ValueError(f"{name} step {line['step']} {exc}") from None
             width, padded = line.get("draft_bs"), line.get("target_bs")
             if phase == "decode":
-                target = decode(tokens, line.get("moe_rows"))._replace(width=padded)
-                target = target.at(dp, drafts)
+                # under a drafter a decode of one token a row verifies none
+                verifies = 0 if run_drafts and not verified(rows, run_drafts) else None
+                target = decode(tokens, line.get("moe_rows"))
+                target = target._replace(width=padded, verifies=verifies).at(dp, drafts)
                 yield target, line
                 draft = decode(width or tokens, line.get("draft_moe_rows"), len(rows))
-                if drafters and drafts and (draft := draft.at(dp, drafts)) != target:
+                draft = draft._replace(verifies=verifies).at(dp, drafts)
+                if drafters and (drafts or run_drafts) and draft != target:
                     yield draft, line
-            elif not split or drafted:
+            elif not split or run_drafts:
                 yield prefill(tokens, seqs, line.get("moe_rows"), padded).at(dp), line
                 draft = prefill(tokens, seqs, line.get("draft_moe_rows"), width)
                 if drafters and (line.get("produces_output") or dp > 1) and draft.width:

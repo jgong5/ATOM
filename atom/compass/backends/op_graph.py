@@ -17,7 +17,9 @@ row does, and a prefill step when the view says so, which it does when any row
 is a final chunk.
 
 Under a drafter of `drafts` tokens a decode step verifies `drafts` and one in
-each row, and a step also reads its drafter's graph, `graph(..., draft=True)`,
+each row, or decodes one token in each, as a prefill instance's does, read at
+its shape verifying no draft (`verifies`, ``V=0``), and a step also reads its
+drafter's graph, `graph(..., draft=True)`,
 the work ATOM queues after `forward_done_event` on a step that samples, else
 from its first draft pass on: its prices are its `draft_terms`, named
 ``draft op.<kind>``. Sampling is the target's. A decode's drafter is read at its
@@ -96,7 +98,7 @@ whose transfer in flight lies on no stream, whose split names no pair for
 this rank, whose micro-batches' graphs exchange a different number of times
 or run an exchange beside a second stream (the dual-stream MoE, which ATOM
 turns off under overlap); a decode step whose rows do not each
-verify the drafter's tokens and one; a step that samples on one rank whose
+verify the drafter's tokens and one, or each decode one token; a step that samples on one rank whose
 MTP drafter's graph does not run its routed leaves as its passes alike, each
 its own; a prefill step whose view
 does not say whether it produces output; a shape with no graph, a
@@ -398,6 +400,14 @@ def band(rows, decode: bool) -> tuple[int, int]:
     return sum(c) // len(c), max(c)
 
 
+def verified(rows: Sequence[tuple[int, bool]], drafts: int) -> int:
+    """The drafts each row of a decode step of `rows`, each its query tokens
+    and whether it decodes, verifies under a drafter of `drafts`: none where
+    every row decodes one token, as a prefill instance's decode step under an
+    MTP drafter does, else `drafts`."""
+    return 0 if drafts and all(q == 1 for q, _ in rows) else drafts
+
+
 def step_shape(
     rows: Sequence[tuple[int, bool]], rung: int | None, drafts: int = 0
 ) -> tuple[str, int, int]:
@@ -405,10 +415,11 @@ def step_shape(
     decodes, runs at, ``(phase, tokens, seqs)``: a decode step at `rung` when it
     replayed one, else at its width, and any other step as a prefill of its
     query tokens over its rows. A decode step whose rows do not each verify a
-    drafter's `drafts` tokens and one is refused."""
+    drafter's `drafts` tokens and one, or each decode one token (`verified`),
+    is refused."""
     if not all(decode for _, decode in rows):
         return "prefill", sum(q for q, _ in rows), len(rows)
-    if any(q != drafts + 1 for q, _ in rows):
+    if any(q != verified(rows, drafts) + 1 for q, _ in rows):
         raise ValueError(
             f"decodes a row of other than {drafts + 1} tokens, which a drafter "
             f"of {drafts} verifies"
@@ -734,6 +745,7 @@ class OpGraphBackend(CostBackend):
         rung = view.capture_rung if self.padded and not draft else None
         rows = [(r.query_tokens, r.decode) for r in view.requests]
         phase, t, b = step_shape(rows, rung, self.drafts)
+        drafts = verified(rows, self.drafts) if phase == "decode" else self.drafts
         width = self.padded and (view.draft_bs if draft else view.target_bs)
         block = draft and self.block and phase == "decode"
         if block:
@@ -743,7 +755,7 @@ class OpGraphBackend(CostBackend):
         ran = phase == "decode" and width or t
         gathered = view.draft_moe_rows if draft else view.moe_rows
         at = t if draft else ran
-        g = gathered_off_default(phase, at, gathered, self.dp, self.drafts)
+        g = gathered_off_default(phase, at, gathered, self.dp, drafts)
         rows = [(r.query_tokens, r.context_tokens) for r in view.requests]
         mean, top = band(rows, phase == "decode")
         bound = (phase, t, b, g, mean, top)
@@ -759,7 +771,7 @@ class OpGraphBackend(CostBackend):
         if ran == t:
             counts, wides = {t, b}, {width}
         else:
-            k = range(1, self.drafts + 2)
+            k = range(1, drafts + 2)
             counts = {b * j for j in k}
             wides = {width * j for j in k} | {self.dp * width * k[-1]}
         wide, both = (phase, ran, width, *bound[3:]), bound
@@ -772,7 +784,7 @@ class OpGraphBackend(CostBackend):
             counts, wides = counts | {gathered}, {width, padded, later}
             wide = (phase, ran, width, gathered and later, *bound[4:])
             low = gathered and min(gathered, later)
-            g = gathered_off_default(phase, t, low, self.dp, self.drafts)
+            g = gathered_off_default(phase, t, low, self.dp, drafts)
             both = (phase, t, b, g, *bound[4:])
         if phase == "decode":
             wide = (*wide[:5], wide[5] * b / width, *wide[6:])
@@ -807,12 +819,17 @@ class OpGraphBackend(CostBackend):
                 gathered = view.draft_moe_rows if own else view.moe_rows
                 g = () if gathered is None else (gathered,)
                 drafted = {"draft": draft} if draft else {}
+                # A decode whose rows verify fewer drafts than its drafter's.
+                drafts = verified(rows, self.drafts)
+                if shape[0] == "decode" and drafts != self.drafts:
+                    drafted["verifies"] = drafts
                 micro = {"micro_batch": True} if micro_batch else {}
                 # A DP middle chunk runs its drafter's propose too.
                 if (output or self.dp > 1) and width and width != shape[2]:
                     drafted["width"] = width
                 at = f" W={width}" * ("width" in drafted)
                 at += "".join(f" G={n}" for n in g)
+                at += f" V={drafts}" * ("verifies" in drafted)
                 if output is None:
                     reason = (
                         "a prefill step whose view does not say whether it "
@@ -826,9 +843,11 @@ class OpGraphBackend(CostBackend):
                 else:
                     reason = (
                         "no op_graph holds a {} step of {} tokens over {} sequences"
-                        "{}{}{}{}; compass trace ops captures one".format(
+                        "{}{}{}{}{}; compass trace ops captures one".format(
                             *shape,
                             "".join(f" gathering {n} rows" for n in g),
+                            f" verifying {drafts} drafts a row"
+                            * ("verifies" in drafted),
                             none,
                             " as a two-batch-overlap micro-batch" * micro_batch
                             + " for its drafter" * bool(draft)
