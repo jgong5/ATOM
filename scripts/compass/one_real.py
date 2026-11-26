@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """One real run against its simulated runs, metric by metric, with each error.
 
-    PYTHONPATH=$T python3 scripts/compass/one_real.py REAL SIM [SIM...]
+    PYTHONPATH=$T python3 scripts/compass/one_real.py [--loose-arguments] REAL SIM [SIM...]
 
 `python -m atom.compass.validate` grades a cell against the spread of two or
 more real runs and refuses one. When the budget is one real GPU run, as for a
@@ -88,14 +88,24 @@ def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__.split("\n\n")[1], file=sys.stderr)
         return 2
+    # --loose-arguments: REAL's client is another launcher's (a recipe harness's
+    # agentx run, CI's flags) over the same traces: name each argument the two
+    # were given differently, then compare anyway.
+    loose = "--loose-arguments" in argv
+    argv = [a for a in argv if a != "--loose-arguments"]
     real, *sims = map(Path, argv)
     given = arguments(real)
     for sim in sims:
-        if arguments(sim) != given:
-            print(
-                f"{sim} was given other client arguments than {real}", file=sys.stderr
-            )
-            return 2
+        if (theirs := arguments(sim)) != given:
+            if not loose:
+                print(
+                    f"{sim} was given other client arguments than {real}",
+                    file=sys.stderr,
+                )
+                return 2
+            for k in sorted(given.keys() | theirs.keys()):
+                if given.get(k) != theirs.get(k):
+                    print(f"arguments differ: {k}: real {given.get(k)!r}, {sim.name} {theirs.get(k)!r}")
     rows = {"real": run_metrics(real, False)}
     rows |= {sim.name: run_metrics(sim, True) for sim in sims}
     names = list(rows["real"])
