@@ -125,6 +125,11 @@ run with ``false`` records ``ARRIVAL`` and ``TAR``),
 needs local grants: a ceiling's cycle term counts only the LPs that can react
 to the LP's sends before their own next grant, and a TAR's grant sends the
 messages below its ceiling ahead, `ClockAuthority`'s ``wide_ceilings``),
+``select_serve`` (optional, ``false``, the default, or ``true``: the authority's
+``tcp`` serve side reads every LP's connection on one selector thread, in place
+of a reader thread a connection, `clock_transport.serve`'s ``select``; it
+serves the same frames, each connection's in their order, so the schedule and
+the sends are the same),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -383,6 +388,8 @@ WORKER_ORDER = "worker_order"
 LOCAL_GRANTS = "local_grants"
 #: The run-file key that widens those ceilings.
 WIDE_LOCAL_GRANTS = "wide_local_grants"
+#: The run-file key that serves the authority's connections on one thread.
+SELECT_SERVE = "select_serve"
 ATOM_RUNNER = "atom.model_engine.model_runner.ModelRunner"
 RAPIDSERVE_RUNNER = "atom.model_engine.model_runner.RapidServeModelRunner"
 #: The run-file key that says the deployment runs RapidServe.
@@ -400,6 +407,7 @@ PER_RUN = (
     WORKER_ORDER,
     LOCAL_GRANTS,
     WIDE_LOCAL_GRANTS,
+    SELECT_SERVE,
 )
 LP_FILE, STEP_TABLE_FILE, SUMMARY_FILE = (
     "lp-{}.json",  # by LP name, or <lp>.<member> for a member
@@ -1611,7 +1619,12 @@ class _RecordingAuthority(ClockAuthority):
         count = run.get("client_runs", 1)
         local = run.get(LOCAL_GRANTS, True)
         wide = run.get(WIDE_LOCAL_GRANTS, False)
-        for key, value in ((LOCAL_GRANTS, local), (WIDE_LOCAL_GRANTS, wide)):
+        select = run.get(SELECT_SERVE, False)
+        for key, value in (
+            (LOCAL_GRANTS, local),
+            (WIDE_LOCAL_GRANTS, wide),
+            (SELECT_SERVE, select),
+        ):
             if not isinstance(value, bool):
                 raise TypeError(
                     f"the run file's {key} is {value!r}; it is true or false"
@@ -1865,7 +1878,7 @@ def frontend(config):
     authority = None
     if not standalone:
         _authority = authority = _RecordingAuthority(run)
-        serve(_authority, run["clock_endpoint"])
+        serve(_authority, run["clock_endpoint"], run.get(SELECT_SERVE, False))
         # Not a daemon: the API server's main thread may die of the early end
         # before this thread has written the summary.
         _early_end = threading.Thread(
@@ -4109,5 +4122,5 @@ def authority(endpoint: str) -> None:
     run = spec()
     a = _RecordingAuthority(run)
     _write_whole(Path(run["out_dir"]) / AUTHORITY_FILE, endpoint)
-    serve(a, endpoint)
+    serve(a, endpoint, run.get(SELECT_SERVE, False))
     _write_summary(run, a, _until_end(run, a))
