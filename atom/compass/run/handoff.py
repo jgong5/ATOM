@@ -20,24 +20,31 @@ on its wall time: the standard library's JSON and pydantic held 14.4% of the
   the first reading of the same bytes takes it. A list of ids msgspec takes as
   non-negative ints is those ints, as pydantic returns them; pydantic coerces
   or refuses any other.
+- That decoding holds a ``kv_transfer_params["prompt_token_ids"]`` list as a
+  tuple of its items. Starlette keeps a request's decoding until its response
+  ends, so an in-flight stream holds its prompt's ids all along, and every
+  full collection of the cyclic garbage collector walked each id of a list;
+  a tuple of ints leaves the collector's tracking at the first collection
+  that meets it. No reader of the decoding mutates the ids, and only
+  `resolve_prompt_token_ids` tells a tuple from a list, in its check, which
+  takes the tuple as the list it was; JSON writes a tuple as that list.
 - A prefill frontend's response whose top-level ``prompt_token_ids`` holds
   ints alone is the original rendering of the rest with msgspec's text of
   them in their place; the original renders any other.
 
 What a run is charged is unchanged: no charge reads the wall time these take.
 
-With `DIR_ENV` naming a directory, the prefill side hands ids that are
-non-negative ints within 64 bits to decode by reference: it writes them to a
-file there in msgpack, which writes and reads them faster than JSON, and puts
-``[REF, pid, n, bytes]`` in their place, the file's name and the bytes of the
-ids' text, which the router carries as it carries the ids. The decode side
-puts the same ids back, removes the file and skips their check, so a
-reference is read once. Every count of a body's bytes adds what its reference
-stands for (`inline_extra`): a run is charged as with the ids inline, and only
-the wall time of writing, carrying and reading them goes. The run's prefill
-and decode frontends share the directory, so they run on one host; it is the
-run's own, on tmpfs, and whoever starts the run removes it afterwards. Unset,
-every id goes inline, and a decode side without it refuses a reference.
+In a run whose run file sets ``ids_by_ref``, the prefill side hands ids that
+are non-negative ints within 64 bits to decode by reference: it writes them
+to a file in the run's directory (`atom.compass.run.ids_dir`) in msgpack,
+which writes and reads them faster than JSON, and puts ``[REF, pid, n,
+bytes]`` in their place, the file's name and the bytes of the ids' text,
+which the router carries as it carries the ids. The decode side puts the same
+ids back, as the tuple it holds ids in, removes the file and skips their
+check, so a reference is read once. Every count of a body's bytes adds what
+its reference stands for (`inline_extra`): a run is charged as with the ids
+inline, and only the wall time of writing, carrying and reading them goes.
+Without the key every id goes inline, and a decode side refuses a reference.
 """
 
 import collections
@@ -60,13 +67,14 @@ _INSTALLED = "compass_handoff"
 _IDS = list[Annotated[int, msgspec.Meta(ge=0)]]
 _ENCODE = msgspec.json.Encoder()
 
-#: Names the directory through which ids go by reference; unset or empty, none do.
-DIR_ENV = "COMPASS_IDS_BY_REF_DIR"
-_DIR = os.environ.get(DIR_ENV) or None
+#: The run's directory through which ids go by reference, which `install`
+#: sets (`atom.compass.run.ids_dir`); None for none.
+_DIR: str | None = None
 #: A reference's first item: no id, so a decode side reading ids inline refuses it.
 REF = "compass:ids"
 _PACK = msgspec.msgpack.Encoder()
-_UNPACK = msgspec.msgpack.Decoder()
+#: Reads them back as the tuple `_held` holds ids in.
+_UNPACK = msgspec.msgpack.Decoder(tuple[int, ...])
 _FILES = itertools.count()
 _KEY_TEXT = b'"' + KEY.encode() + b'":'
 #: A reference's start, as msgspec and the router write it.
@@ -112,7 +120,8 @@ def _keep(ids: list, nbytes: int) -> bytes | None:
 
 def _take(doc, body: bytes) -> None:
     """Put back in `doc`, `body`'s decoding, the ids its hand-off reference
-    stands for, and remove their file."""
+    stands for, as the tuple `_held` makes of ids inline, and remove their
+    file."""
     kv = doc.get("kv_transfer_params") if type(doc) is dict else None
     ref = kv.get(KEY) if type(kv) is dict else None
     if type(ref) is not list or not ref or ref[0] != REF:
@@ -136,10 +145,19 @@ def _take(doc, body: bytes) -> None:
         _READ_BACK.popitem(last=False)
 
 
-def install(side: str | None) -> None:
+def install(side: str | None, ids_dir: str | None = None) -> None:
     """Install the decode side's reading of the hand-off (``D``) or the
     prefill side's writing of it (``P``), once a process; nothing for any
-    other side."""
+    other side. With `ids_dir`, the run's directory, which its authority
+    made, ids go by reference through it."""
+    global _DIR
+    if ids_dir is not None and not os.path.isdir(ids_dir):
+        raise ValueError(
+            f"the run's ids directory {ids_dir} is missing: the run's authority "
+            "makes it on its own host, and a prefill or decode frontend of the "
+            "run with ids_by_ref runs on that host"
+        )
+    _DIR = ids_dir
     if side == "D":
         from starlette.requests import Request
 
@@ -153,8 +171,6 @@ def install(side: str | None) -> None:
     elif side == "P":
         from starlette.responses import JSONResponse
 
-        if _DIR is not None:
-            os.makedirs(_DIR, exist_ok=True)
         _once(JSONResponse, "render", _writing)
 
 
@@ -171,7 +187,8 @@ def _reading(json_of):
     """`json_of`, Starlette's ``Request.json``, with a body msgspec decodes
     taken as that decoding: for a relayed body, the one its scope hands on
     under `RELAYED_JSON`, taken once and for the same bytes. The ids a hand-off
-    reference in it stands for take its place."""
+    reference in it stands for take its place, and its ids are held as
+    `_held` holds them."""
 
     @functools.wraps(json_of)
     async def json(request):
@@ -186,28 +203,46 @@ def _reading(json_of):
                     msgspec.DecodeError, ValueError, RecursionError
                 ):
                     request._json = JSON_DECODER.decode(body)
-            if _DIR is not None and hasattr(request, "_json"):
-                _take(request._json, body)
+            if hasattr(request, "_json"):
+                if _DIR is not None:
+                    _take(request._json, body)
+                _held(request._json)
         return await json_of(request)
 
     return json
 
 
+def _held(doc):
+    """`doc` with the list its ``kv_transfer_params`` holds under `KEY`, where
+    it holds one, as a tuple of the same items: a request holds its decoding
+    while its response streams, and the collector walks a list on every full
+    collection but stops tracking a tuple of ints. In place, as `HttpChannel`
+    holds a relayed body's decoding while it serves the request."""
+    params = doc.get("kv_transfer_params") if type(doc) is dict else None
+    ids = params.get(KEY) if type(params) is dict else None
+    if type(ids) is list:
+        params[KEY] = tuple(ids)
+    return doc
+
+
 class CheckedIds:
     """`adapter`, a pydantic ``TypeAdapter`` of a list of non-negative ints,
     taking a list that msgspec checks as one: strict, so a bool, a float or a
-    string goes to `adapter`, which coerces or refuses it as before. Ids read
-    back from a hand-off reference's file are taken as they are."""
+    string goes to `adapter`, which coerces or refuses it as before. A tuple
+    is the list `_held` made one of, and is taken as that list; ids read back
+    from a hand-off reference's file are that list, not checked again."""
 
     def __init__(self, adapter) -> None:
         self.adapter = adapter
 
     def validate_python(self, ids, *args, **kwargs):
-        if type(ids) is list and not args and not kwargs:
+        if type(ids) in (list, tuple) and not args and not kwargs:
             if _READ_BACK.pop(id(ids), None) is ids:
-                return ids
+                return list(ids)
             with contextlib.suppress(msgspec.ValidationError):
                 return msgspec.convert(ids, _IDS)
+            if type(ids) is tuple:
+                ids = list(ids)
         return self.adapter.validate_python(ids, *args, **kwargs)
 
 
@@ -220,15 +255,15 @@ def _writing(render):
     def write(response, content):
         ids = content.get(KEY) if type(content) is dict else None
         if type(ids) is list:
-            held = None  # the ids checked once as `_IDS`, to go by reference
+            checked = None  # the ids checked once as `_IDS`, to go by reference
             if _DIR is not None:
                 with contextlib.suppress(msgspec.ValidationError):
-                    held = msgspec.convert(ids, _IDS)
+                    checked = msgspec.convert(ids, _IDS)
             # Ints alone are written alike; anything else, render writes or
             # refuses as it always has.
             try:
                 text = _ENCODE.encode(
-                    held if held is not None else msgspec.convert(ids, list[int])
+                    checked if checked is not None else msgspec.convert(ids, list[int])
                 )
             except (msgspec.ValidationError, ValueError):
                 text = None
@@ -236,7 +271,7 @@ def _writing(render):
                 stand_in = render(response, _STAND_IN)
                 rest = render(response, {**content, KEY: _STAND_IN})
                 if rest.count(stand_in) == 1:
-                    if held and (ref := _keep(held, len(text))) is not None:
+                    if checked and (ref := _keep(checked, len(text))) is not None:
                         text = ref
                     return rest.replace(stand_in, text)
         return render(response, content)
