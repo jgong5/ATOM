@@ -724,6 +724,11 @@ class ClockAuthority:
         ceiling, replies = self._ceiling_of(i, self._now[i]), []
         while joined and (t := next(iter(joined.values()))[1]) < ceiling:
             if self._offered(i) <= t:  # its member gets that arrival's grant
+                # No member steps on its own past the rounds granted ahead:
+                # a held reply's ceiling stops at this one.
+                for _, held, _ in self._held[i].values():
+                    if held.ceiling is not None and held.ceiling > t:
+                        held.ceiling = t
                 break
             for m in self._members[i]:
                 if m not in joined:
