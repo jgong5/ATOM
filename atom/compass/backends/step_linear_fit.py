@@ -492,6 +492,14 @@ GRAPH_QUERY_CACHED_ENV = "COMPASS_FIT_GRAPH_QUERY_CACHED"
 #: number; unset or 0, none): a MoE prefill's floor below the chunk whose
 #: experts' rows fill a tile, its knee set from that roofline, not fitted.
 SHORT_HINGE_ENV = "COMPASS_FIT_SHORT_HINGE"
+#: Decode rungs from this one up (a positive whole number; unset or 0, none)
+#: share one `context` coefficient, each keeping its own `step`, and price no
+#: `graph_padding` (`_pool_decode`): MiniMax-M3.1's CAL (#3720) reached its
+#: rungs past 40 on the sd and ladder points only, at a narrow context, where
+#: each rung's own solve put its context into `graph_padding` (rung 96:
+#: context 0, `graph_padding` 3.8e-10 s); at Cell B's c128, one long request
+#: in a full rung then priced 23-340 ms of padding a step.
+DECODE_POOL_ENV = "COMPASS_FIT_DECODE_POOL"
 #: `moe_imbalance`'s and `uneven_rows`' `min_spread`, `MOE_MIN_SPREAD` when unset.
 MOE_MIN_SPREAD_ENV = "COMPASS_FIT_MOE_MIN_SPREAD"
 MOE_MIN_SPREAD = 0.2
@@ -762,6 +770,57 @@ def _gathered(cols) -> list[str]:
     return [f for f in GATHER_COLUMNS if cols and cols[f] is not None]
 
 
+def _pool_decode(law: dict, rows: dict, pool_from: int) -> None:
+    """`DECODE_POOL_ENV`: refit the decode rungs of `law` from `pool_from` up
+    as one solve, over each rung's kept steps `rows` (``rung: [(features,
+    label)]``, its own solve's `DECODE` features): one `context` coefficient
+    for them all and a `step` each, non-negative, on relative error, with
+    `graph_padding` 0. A rung whose vector adopted any column but `DECODE`'s,
+    or that its own solve left unfitted, keeps its own vector. Each pooled
+    vector keeps its hull, and its `fit` states the pool under ``pooled``: the
+    rungs, the shared context and its own residuals' centre and scaled MAD
+    (price less label, over price, as `_fit_form` states them)."""
+    from scipy.optimize import nnls
+
+    keys = [
+        k
+        for k in sorted(rows, key=int)
+        if rows[k]
+        and k in law["decode"]
+        and set(law["decode"][k]["coefficients"]) == set(DECODE)
+    ]
+    if not keys:
+        return
+    ctx = DECODE.index("context")
+    x, y, which = [], [], []
+    for j, k in enumerate(keys):
+        for features, label in rows[k]:
+            x.append([features[ctx]] + [float(i == j) for i in range(len(keys))])
+            y.append(label)
+            which.append(j)
+    x, y, which = np.array(x), np.array(y, dtype=np.float64), np.array(which)
+    coef = nnls(x / y[:, None], np.ones_like(y))[0]
+    price = x @ coef
+    residual = (price - y) / np.maximum(price, 1e-12)
+    for j, k in enumerate(keys):
+        mine = residual[which == j]
+        centre = float(np.median(mine))
+        vector = law["decode"][k]
+        vector["coefficients"] = {
+            "step": float(coef[1 + j]),
+            "context": float(coef[0]),
+            "graph_padding": 0.0,
+        }
+        vector["fit"]["pooled"] = {
+            "from": pool_from,
+            "rungs": [int(r) for r in keys],
+            "context": float(coef[0]),
+            "samples": int(mine.size),
+            "centre": centre,
+            "mad": float(1.4826 * np.median(np.abs(mine - centre))),
+        }
+
+
 def _switch(env, name: str) -> bool:
     """Whether the switch `name` in `env` is on: ``1`` on, ``0`` or unset
     off, and any other value refused."""
@@ -789,6 +848,10 @@ def env_options(environ=None) -> dict:
         if not knee.isdigit():
             raise ValueError(f"{SHORT_HINGE_ENV}={knee} is not a whole number of tokens")
         out["short_hinge"] = int(knee)
+    if (pool := env.get(DECODE_POOL_ENV) or "0") != "0":
+        if not pool.isdigit():
+            raise ValueError(f"{DECODE_POOL_ENV}={pool} is not a whole number (a rung)")
+        out["decode_pool"] = int(pool)
     if (gather := env.get(GATHER_ROWS_ENV)) == "pad":
         out["gather_rows"] = "pad"
     elif gather not in (None, "", "0", "1"):
@@ -3056,6 +3119,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     both = not draft and bool((options or {}).get("moe_both"))
     gated = bool((options or {}).get("rowmod_vif"))
     moe_folds = (options or {}).get("moe_folds") or MOE_FOLDS[0]
+    pool_from = not draft and (options or {}).get("decode_pool") or 0
+    pool_rows = {}
     peers = (options or {}).get("draft_peer_tokens" if draft else "peer_tokens")
     if peers and dp == 1:
         raise ValueError(
@@ -3251,6 +3316,10 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                 vector["fit"]["rowmod"] = evidence
             if rowmod_vif:
                 vector["fit"]["rowmod_vif"] = rowmod_vif
+            if pool_from and k.isdigit() and int(k) >= pool_from:
+                pool_rows[k] = [
+                    (r[2], r[3]) for r, keep in zip(members, kept) if keep
+                ]
             if k == "prefill":
                 if buckets:
                     vector["buckets"] = list(buckets)
@@ -3271,6 +3340,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                 law["prefill"] = vector
             else:
                 law["decode"][k] = vector
+    if pool_from:
+        _pool_decode(law, pool_rows, pool_from)
     vectors = [("prefill", law.get("prefill")), *law["decode"].items()]
     report = {
         "provenance": [
