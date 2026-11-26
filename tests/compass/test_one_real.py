@@ -323,3 +323,118 @@ def test_a_warmup_switch_other_than_0_or_1_exits_2(tmp_path):
 
     assert done.returncode == 2
     assert one_real.WARMUP_HITS_ENV in done.stderr
+
+
+def _timed(d, sends):
+    """A run at c=8 of profiling requests `sends`, each (send s, TTFT ms)."""
+    run = _run(d, 8, server=False)
+    records = [
+        {
+            "metadata": {
+                "benchmark_phase": "profiling",
+                "conversation_id": f"c{i}",
+                "turn_index": 0,
+                "request_start_ns": B + round(start * 1e9),
+                "request_end_ns": B + round((start + 20.0) * 1e9),
+            },
+            "metrics": {
+                "time_to_first_token": {"value": ttft, "unit": "ms"},
+                "inter_token_latency": {"value": 5.0, "unit": "ms"},
+                "request_latency": {"value": 20000.0, "unit": "ms"},
+                "input_sequence_length": {"value": 1000, "unit": "tokens"},
+                "output_sequence_length": {"value": 10, "unit": "tokens"},
+            },
+        }
+        for i, (start, ttft) in enumerate(sends)
+    ]
+    (run / curves.RECORDS).write_text("".join(json.dumps(r) + "\n" for r in records))
+    return run
+
+
+def _transient_runs(tmp_path):
+    # before 300 s: real 3 of 4 under 10 s (TTFT 1, 2, 3 s and 50 s), the
+    # simulated run 2 of 4 (2, 4 s; 30, 60 s); from 300 s on: 500 s / 550 s
+    real = _timed(
+        tmp_path / "real1",
+        [
+            (0.0, 1000.0),
+            (10.0, 2000.0),
+            (20.0, 3000.0),
+            (30.0, 50000.0),
+            (300.0, 500000.0),
+            (310.0, 500000.0),
+        ],
+    )
+    sim = _timed(
+        tmp_path / "step_linear",
+        [
+            (0.0, 2000.0),
+            (10.0, 4000.0),
+            (20.0, 30000.0),
+            (30.0, 60000.0),
+            (300.0, 550000.0),
+            (310.0, 550000.0),
+        ],
+    )
+    return real, sim
+
+
+def test_transient_splits_ttft_at_w_into_the_early_fast_share_and_each_mode_s_median(
+    tmp_path,
+):
+    real, sim = _transient_runs(tmp_path)
+
+    done = _one_real_env({one_real.TRANSIENT_ENV: "300:10"}, real, sim)
+
+    assert done.returncode == 0, done.stderr
+    (line,) = [
+        x for x in done.stdout.splitlines() if x.startswith("step_linear: transient")
+    ]
+    # early fast medians: real 2 s of (1, 2, 3), sim 3 s of (2, 4): +50%;
+    # late medians 500 s and 550 s: +10%
+    assert line == (
+        "step_linear: transient at 300 s: of the requests sent before it (4 against "
+        "the real run's 4), 50.0% under 10 s against 75.0% (-25.0 pt), their TTFT "
+        "median +50.0%; TTFT median of those sent from 300 s on +10.0%"
+    )
+    json.loads(done.stdout.splitlines()[-1])  # the table's JSON stays last
+
+
+def test_without_the_transient_switch_the_output_is_unchanged(tmp_path):
+    real, sim = _transient_runs(tmp_path)
+
+    off = _one_real_env({}, real, sim)
+    empty = _one_real_env({one_real.TRANSIENT_ENV: ""}, real, sim)
+    on = _one_real_env({one_real.TRANSIENT_ENV: "300:10"}, real, sim)
+
+    assert off.returncode == empty.returncode == on.returncode == 0, off.stderr
+    assert off.stdout == empty.stdout
+    assert "step_linear: transient" not in off.stdout
+    extra = [x for x in on.stdout.splitlines() if x not in off.stdout.splitlines()]
+    assert len(extra) == 1 and extra[0].startswith("step_linear: transient at 300 s")
+
+
+def test_transient_names_none_where_a_run_holds_no_profiled_request(tmp_path):
+    real = _timed(tmp_path / "real1", [(0.0, 1000.0)])
+    sim = _timed(tmp_path / "step_linear", [(0.0, 1000.0)])
+
+    assert one_real.transient(real, sim, 300.0, 10.0).startswith(
+        "step_linear: transient at 300 s: of the requests sent before it (1 against"
+    )
+    assert one_real._modes(tmp_path / "real1", 300.0, 10.0)["late"] is None
+    empty = _timed(tmp_path / "empty", [])
+    assert one_real.transient(real, empty, 300.0, 10.0) == (
+        "empty: transient at 300 s: a run holds no profiled request"
+    )
+
+
+@pytest.mark.parametrize(
+    "value", ["300", "a:b", "0:10", "300:-1", "300:10:5", "inf:10"]
+)
+def test_a_transient_switch_other_than_two_positive_seconds_exits_2(tmp_path, value):
+    real, sim = _transient_runs(tmp_path)
+
+    done = _one_real_env({one_real.TRANSIENT_ENV: value}, real, sim)
+
+    assert done.returncode == 2
+    assert one_real.TRANSIENT_ENV in done.stderr

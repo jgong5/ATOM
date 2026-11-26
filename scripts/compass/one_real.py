@@ -36,7 +36,13 @@ REAL's (`hits`): which DP rank a follow-up lands on, and so whether it finds
 its conversation's prefix, is a draw of the schedule. With
 COMPASS_ONE_REAL_WARMUP_HITS=1 (`WARMUP_HITS_ENV`), then per SIM its prefix
 hits over the warmup requests both runs sent and the warmup's share of REAL's
-prompt tokens (`warmup_hits`): the GPU hit rate counts the warmup too.
+prompt tokens (`warmup_hits`): the GPU hit rate counts the warmup too. With
+COMPASS_ONE_REAL_TRANSIENT=W:FAST (`TRANSIENT_ENV`), last, per SIM its TTFT
+split at W seconds after the profiling phase's first send (`transient`): the
+share of the requests sent before W whose TTFT is under FAST seconds, their
+median TTFT, and the median TTFT of those sent from W on, each against REAL's:
+where a burst at W (the client's idle cap) queues every later request, TTFT
+p50 is a mixture of the two modes and moves with their weights.
 """
 
 import json
@@ -98,6 +104,11 @@ def main(argv: list[str]) -> int:
         print(f"{WARMUP_HITS_ENV} is {switch!r}: 1 on, 0 or unset off", file=sys.stderr)
         return 2
     warmup = switch == "1"
+    try:
+        split = transient_split(os.environ.get(TRANSIENT_ENV))
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
     given = arguments(real)
     for sim in sims:
         if arguments(sim) != given:
@@ -129,6 +140,9 @@ def main(argv: list[str]) -> int:
     if warmup:
         for sim in sims:
             print(warmup_hits(real, sim))
+    if split:
+        for sim in sims:
+            print(transient(real, sim, *split))
     print(json.dumps(rows))
     return 0
 
@@ -385,6 +399,84 @@ def warmup_hits(real: Path, sim: Path) -> str:
         f"both ran {cb / ib:.1%} against the real run's {ca / ia:.1%} "
         f"({gap:+.1f} pt); the warmup holds {share:.0%} of the real run's prompt "
         f"tokens, so it moves the GPU hit rate by about {share * gap:+.1f} pt"
+    )
+
+
+#: Set to W:FAST (seconds, both positive), `main` also prints each SIM's
+#: `transient` split at W with fast TTFT under FAST; unset or empty, nothing
+#: more (the output is unchanged); any other value is refused.
+TRANSIENT_ENV = "COMPASS_ONE_REAL_TRANSIENT"
+
+
+def transient_split(value: str | None) -> tuple[float, float] | None:
+    """`TRANSIENT_ENV`'s (W, FAST) in seconds, None when unset or empty;
+    ValueError for any other value than two positive numbers."""
+    if not value:
+        return None
+    try:
+        w, fast = (float(x) for x in value.split(":"))
+    except ValueError:
+        w = fast = -1.0
+    if not (0 < w < float("inf") and 0 < fast < float("inf")):
+        raise ValueError(
+            f"{TRANSIENT_ENV} is {value!r}: W:FAST, two positive numbers of seconds"
+        )
+    return w, fast
+
+
+def _sent_ttft(run: Path) -> list[tuple[int, float]]:
+    """Each profiled request of `run` stating its send and a positive TTFT:
+    (send ns, TTFT ms)."""
+    out = []
+    for r in profiled(read_jsonl(run / RECORDS)):
+        sent = r.get("metadata", {}).get("request_start_ns")
+        ttft = _metric(r, "time_to_first_token")
+        if sent is not None and ttft and ttft > 0:
+            out.append((int(sent), float(ttft)))
+    return out
+
+
+def _modes(run: Path, w: float, fast: float) -> dict | None:
+    """`run`'s TTFT split at `w` s after its first profiled send: the share
+    of the requests sent before it whose TTFT is under `fast` s, their median
+    TTFT and the median TTFT of those sent from `w` on (ms); None for a run
+    with no profiled request (any other has its first one before `w`)."""
+    got = _sent_ttft(run)
+    if not got:
+        return None
+    first = min(s for s, _ in got)
+    early = [t for s, t in got if s - first < w * 1e9]
+    late = [t for s, t in got if s - first >= w * 1e9]
+    quick = [t for t in early if t < fast * 1e3]
+    return {
+        "share": len(quick) / len(early),
+        "fast": percentile(quick, 50) if quick else None,
+        "late": percentile(late, 50) if late else None,
+        "early": len(early),
+    }
+
+
+def transient(real: Path, sim: Path, w: float, fast: float) -> str:
+    """`sim`'s TTFT modes against `real`'s (`_modes`): the requests sent in
+    the first `w` s of the profiling phase, their share under `fast` s and
+    the median TTFT of those, and the median TTFT of the requests sent from
+    `w` on. Where the client's idle cap releases a burst at `w` that queues
+    every later request, TTFT p50 sits between the two modes and moves with
+    their weights: #752 DEPA2 c=256, 0-300 s held 870 requests, 93% under
+    10 s in the real run; past 300 s each waited 500-680 s; one point of the
+    fast share moved p50 about 7.6%, and six simulated runs of each of two
+    laws put p50 at -18..+101% and -16..+55%, their fast share at -12..-1 pt,
+    while the late mode's median stayed within -1..+5% (seed sd about 2%)."""
+    a, b = _modes(real, w, fast), _modes(sim, w, fast)
+    if a is None or b is None:
+        return f"{sim.name}: transient at {w:g} s: a run holds no profiled request"
+    return (
+        f"{sim.name}: transient at {w:g} s: of the requests sent before it "
+        f"({b['early']} against the real run's {a['early']}), "
+        f"{b['share']:.1%} under {fast:g} s against {a['share']:.1%} "
+        f"({100 * (b['share'] - a['share']):+.1f} pt), their TTFT median "
+        f"{error(a['fast'], b['fast'])}; TTFT median of those sent from {w:g} s "
+        f"on {error(a['late'], b['late'])}"
     )
 
 
