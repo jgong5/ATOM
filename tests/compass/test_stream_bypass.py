@@ -272,36 +272,28 @@ def test_behind_a_bypass_the_traffic_lp_takes_each_report_on_its_channel(
 
 
 class _Grants:
-    """A Clock Authority connection whose grant ``k``, at ``k + 1``, releases
-    ``script[k]``; then ``+inf`` ends the run."""
+    """A Clock Authority connection that grants each event of `reported` in
+    arrival order, at its arrival; then ``+inf`` ends the run."""
 
-    def __init__(self, script: list) -> None:
-        self.script, self.k = script, 0
+    def __init__(self, reported: list) -> None:
+        order = sorted(reported, key=lambda r: r[2])
+        self.script = [(at, {ch: [(seq, at)]}) for ch, seq, at, _ in order]
 
     def send(self, msg) -> None:
         pass
 
     def recv(self):
-        if self.k == len(self.script):
-            return math.inf, {}
-        self.k += 1
-        return float(self.k), self.script[self.k - 1]
+        return self.script.pop(0) if self.script else (math.inf, {})
 
 
-def test_behind_a_bypass_a_settle_whose_released_events_are_reported_reads_no_socket(
-    harness, tmp_path
-):
-    """Request 0's two events on decode's own channel and its last through the
-    router are all reported before the first grant, and each grant releases
-    one: the return passes at the last's release, and no settle reads the
-    report socket."""
-    h = harness
-    reported = [(STRAIGHT, 0, 1.0, False), (STRAIGHT, 1, 2.0, False)]
-    reported += [(FINAL, 0, 3.0, True)]
+def _settled(h, tmp_path, reported: list):
+    """Request 0's stream events `reported`, ``(channel, seq, arrival,
+    final)`` in its worker's order, all reported before the first grant and
+    each released by a grant of its own: the time each return passes, the
+    clock at each read of the report socket, and the runtime."""
 
     async def main():
-        script = [{ch: [(seq, at)]} for ch, seq, at, _ in reported]
-        rt = LPRuntime(TRAFFIC, _table(True, decode=1), _Grants(script))
+        rt = LPRuntime(TRAFFIC, _table(True, decode=1), _Grants(reported))
         prefix = str(tmp_path / "lp")
         http = "traffic->router:http"
         traffic = h.TrafficLP(rt, prefix, http, FINAL, bypass=(STRAIGHT,))
@@ -315,7 +307,7 @@ def test_behind_a_bypass_a_settle_whose_released_events_are_reported_reads_no_so
         passed = []
 
         async def on_return(worker_id, ret):
-            passed.append(ret.credit.id)
+            passed.append((ret.credit.id, rt.now))
 
         push = h.zmq.Context.instance().socket(h.zmq.PUSH)
         push.connect(h.addresses(prefix)[1])
@@ -335,6 +327,30 @@ def test_behind_a_bypass_a_settle_whose_released_events_are_reported_reads_no_so
             push.close(linger=0)
         return passed, reads, rt
 
-    passed, reads, rt = h._run(main())
-    assert passed == [0] and rt.now == math.inf
+    return h._run(main())
+
+
+def test_behind_a_bypass_a_settle_whose_released_events_are_reported_reads_no_socket(
+    harness, tmp_path
+):
+    """Two events on decode's own channel, then the last through the router:
+    the return passes at the last's release, and no settle reads the report
+    socket."""
+    reported = [(STRAIGHT, 0, 1.0, False), (STRAIGHT, 1, 2.0, False)]
+    passed, reads, rt = _settled(harness, tmp_path, reported + [(FINAL, 0, 3.0, True)])
+    assert passed == [(0, 3.0)] and rt.now == math.inf
+    assert reads == []
+
+
+def test_a_final_released_before_its_stream_s_last_event_passes_its_return_once(
+    harness, tmp_path
+):
+    """The router's two hops round a ``[DONE]`` an ulp below the event written
+    with it on decode's own channel, so traffic is released the ``[DONE]``
+    first: its return passes once, at the ``[DONE]``, no settle reads the
+    report socket, and the event released after it ends nothing."""
+    last = math.nextafter(2.0, math.inf)
+    reported = [(STRAIGHT, 0, 1.0, False), (STRAIGHT, 1, last, False)]
+    passed, reads, rt = _settled(harness, tmp_path, reported + [(FINAL, 0, 2.0, True)])
+    assert passed == [(0, 2.0)] and rt.now == math.inf
     assert reads == []

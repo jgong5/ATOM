@@ -128,8 +128,9 @@ messages below its ceiling ahead, `ClockAuthority`'s ``wide_ceilings``),
 ``stream_bypass`` (optional, ``false``, the default, or ``true``, which needs
 LP ``router``: a decode stream's events but its last go straight to traffic,
 and its last through the router, `prefill_decode_table`; each event arrives
-at the lookahead the router's hops sum to, but the channel table, and so the
-step table, differ, so the key is part of the configuration),
+at the path's lookahead, within a rounding of the router's two hops, and the
+channel table, and so the step table, differ, so the key is part of the
+configuration),
 ``ids_by_ref`` (optional, ``false``, the default, or ``true`` in a
 prefill-decode run: its prefill frontends hand a prompt's ids to its decode
 frontends by reference, through `ids_dir`, which the run's authority makes

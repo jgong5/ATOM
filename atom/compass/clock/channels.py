@@ -422,7 +422,8 @@ def prefill_decode_table(
     but its last go straight to traffic, on ``stream`` at the path's whole
     lookahead, since the router does no work on them; its last, ``[DONE]``,
     which ends the request in the router, takes the path's two hops as
-    ``final``. Decode posts the KV write request to prefill engine to engine,
+    ``final``. The one sum and the two round apart by an ulp or two, so a
+    ``[DONE]`` can reach traffic just before or after its stream's events. Decode posts the KV write request to prefill engine to engine,
     above width one on either side on a channel per decode and prefill rank
     pair, ``kv_write_req#dp<decode rank>.dp<prefill rank>``.
 

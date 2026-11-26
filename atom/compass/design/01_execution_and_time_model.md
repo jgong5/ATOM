@@ -3470,9 +3470,16 @@ own process with the policy code untouched. It is (owner ruling on
   naming that channel in its stamp (`c=`), and the router passes them on as they are. The
   last, `[DONE]`, whose turn drops decode's load, takes the router's two hops as `final`
   (`channels.py::prefill_decode_table`); the router reads the bypass off its lookaheads,
-  which then name `router->traffic:final`. Each event arrives when it would through the
-  router, but the channel table differs, so the key is part of the configuration the step
-  table names. A run file with the key and no `router_in_s` refuses.
+  which then name `router->traffic:final`. Each event arrives within a rounding of when it
+  would through the router: `t + (stream_s + router_s)` and the two hops'
+  `(t + router_in_s) + (stream_s + router_s - router_in_s)` round apart by an ulp or two,
+  so a `[DONE]` can reach traffic a grant before or after the events written with it
+  ([#4238's review](https://github.com/jgong5/ATOM/pull/4238#issuecomment-7191663937)
+  counts them), and the traffic LP takes either order. A straight event is not stamped
+  with the two hops' sum: for some `t` it rounds below `t` plus the channel's lookahead,
+  which the authority refuses as backdated. The channel table differs, so the key is part
+  of the configuration the step table names. A run file with the key and no `router_in_s`
+  refuses.
 - **Unchanged.** A clock error ends the router process.
 - **Periodic tasks.** Under the LP, `PeriodicTask` (cache_aware's tree eviction) starts
   no thread: the task's next deadline is the daemon deadline of each NER, and it runs
