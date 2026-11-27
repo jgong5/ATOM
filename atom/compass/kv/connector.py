@@ -78,6 +78,11 @@ write and the handoff, ``c``, and it sends decode a write-done notice on
 ``kv_write_done`` (prefill to decode, the address at
 ``kv_transfer_config[WRITE_DONE_KEY]``), arriving at ``c + notify``, when
 decode is ready. Decode takes the handoff's first token as the prompt's last.
+A request prefill drops before allocating, at its admission timeout or
+aborted, retires its transfer: decode's write request for it, in or still to
+come, fails, prefill sending a failure notice in place of the write-done, as it
+does for a send aborted midway. Decode reports the failed receive
+``ATOM_PD_FAILED_WRITE_HOLD_S`` after the notice, and the scheduler aborts it.
 
 Above one prefill stage each stage writes its own layers, as each of
 Mooncake's stage workers serves its own reads: the head relays each admitted
@@ -115,6 +120,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+from atom.utils import envs
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +137,10 @@ WRITE_DONE_KEY = "compass_kv_write_done"
 
 #: Mooncake's default for ``chunked_admission_timeout_s``.
 CHUNKED_ADMISSION_TIMEOUT_S = 300.0
+
+#: How many retired chunked transfer ids a producer remembers, as Mooncake's
+#: ``CHUNKED_RETIRED_TRANSFER_LIMIT`` bounds its own.
+RETIRED_LIMIT = 1 << 16
 
 
 def engine_id(lp: str) -> str:
@@ -302,6 +312,13 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         self._released: dict = (
             {}
         )  # prefill head: request -> its send, done, awaiting release
+        # Prefill head: the transfer ids of chunked requests that left before
+        # allocating (`_retire`); a write request for one fails at once.
+        self._retired: collections.OrderedDict = collections.OrderedDict()
+        # Decode: request -> when its failed receive is reported (`_heard`),
+        # and the ones reported at the next poll.
+        self._failed: dict = {}
+        self._failed_snapshot: list = []
         if self._stage:
             # Mooncake reports a send on the head stage only; under a chunked
             # transfer a later stage writes its own layers (`relayed`).
@@ -706,11 +723,48 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         if held is not None and not aborted:
             held[0].finish(self._rt.read_clock())
         elif held is not None:
-            # Its reads stop at once; what is written stays written.
+            # Its reads stop at once; what is written stays written, and
+            # decode hears that its writer failed.
             del self._sends[seq.id]
             self._due[seq.id] = self._rt.read_clock()
+            self._fail(held[1], held[2], self._rt.read_clock())
+        elif aborted and not self._stage:
+            # It left before allocating, at its admission timeout or aborted.
+            self._retire((seq.kv_transfer_params or {}).get("transfer_id"))
         self._waiting.pop(seq.id, None)
         seq.kv_transfer_params_output = None
+
+    def _retire(self, transfer_id) -> None:
+        """Prefill head: a chunked request left before allocating, so no
+        source will serve its transfer: decode's write request for it, in now
+        or still to come, fails, as Mooncake's dispatcher fails a retired
+        transfer's reader (`_dispatch_ready_chunked_requests`). Without the
+        failure decode keeps the request parked, its reservation charged to
+        ``pd_admission``, for good."""
+        if transfer_id is None:
+            return
+        self._retired[transfer_id] = None
+        if len(self._retired) > RETIRED_LIMIT:
+            self._retired.popitem(last=False)
+        if (read := self._reads.pop(transfer_id, None)) is not None:
+            pair, _, a = read
+            self._fail(pair, transfer_id, a)
+
+    def _fail(self, pair, transfer_id, c: float) -> None:
+        """Prefill: tell decode that its chunked receive of `transfer_id`
+        failed, the notice leaving at `c`, no earlier than now
+        (`_notify_transfer_result` with ``success=False``)."""
+        sock = self._done_socks.get(pair)
+        if sock is None:
+            raise UnboundSeam(
+                f"no kv_write_done channel to {pair}: the run declares none, "
+                "so a chunked transfer cannot tell decode its write failed"
+            )
+        at = max(c, self._rt.now) + self._latency_s
+        sock.send(pickle.dumps((transfer_id, at, False)), at=at)
+        logger.info(
+            "compass: chunked KV transfer %s failed, told at %r", transfer_id, at
+        )
 
     def _settle_chunked(self, now: float) -> None:
         """Prefill: decide the chunked sends up to `now`; each one done is
@@ -765,11 +819,19 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         ready at the notice's arrival, its first token the prompt's last."""
         for sock in self._done_socks.values() if not self.is_producer else ():
             while sock.poll(0):
-                transfer_id, at = pickle.loads(sock.recv())
+                transfer_id, at, *ok = pickle.loads(sock.recv())
                 held = self._listening.get(transfer_id)
                 if held is None:
                     continue
                 seq, left, latest = held
+                if ok and not ok[0]:
+                    # Its writer failed: no stage writes it any more. Mooncake's
+                    # consumer reports the failure once a write that may still
+                    # land cannot (``ATOM_PD_FAILED_WRITE_HOLD_S``), and the
+                    # scheduler aborts the request (`_abort_failed_remote_receive`).
+                    del self._listening[transfer_id]
+                    self._failed[seq.id] = at + envs.ATOM_PD_FAILED_WRITE_HOLD_S
+                    continue
                 latest = max(latest, at)
                 if left > 1:
                     self._listening[transfer_id] = [seq, left - 1, latest]
@@ -864,6 +926,10 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                         f"a chunked write request for {req_id!r} reached a "
                         "producer without enable_chunked_transfer"
                     )
+                if req_id in self._retired:
+                    # Its request left before allocating (`_retire`).
+                    self._fail(other, req_id, a)
+                    continue
                 self._reads[req_id] = (other, blocks, a)
                 continue
             if rank != self._dp_rank:
@@ -933,6 +999,12 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             output.finished_sending.update(done)
         else:
             output.finished_recving.update(done)
+            failed, self._failed_snapshot = self._failed_snapshot, [
+                req_id for req_id, t in self._failed.items() if t <= now
+            ]
+            for req_id in self._failed_snapshot:
+                del self._failed[req_id]
+            output.failed_recving.update(failed)
         return output
 
     def has_pending_work(self) -> bool:
@@ -944,6 +1016,8 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             or self._sends
             or self._notices
             or self._listening
+            or self._failed
+            or self._failed_snapshot
             or self._released
             # A chunked request's write request is in: its admission is due.
             or bool(self._reads)

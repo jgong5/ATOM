@@ -336,6 +336,103 @@ def test_prefill_aborts_a_request_decode_never_admits_at_its_timeout(chunked):
     assert x.kv_transfer_params_output is None, "nothing is relayed"
 
 
+def test_a_write_request_after_prefill_s_timeout_fails_decode_s_receive(
+    chunked, seq_factory, monkeypatch
+):
+    """Decode, which deferred the request past prefill's admission timeout,
+    admits it later; prefill fails the write request, as Mooncake fails a
+    retired transfer's reader, and decode aborts the request once its failed
+    write hold elapses. Before, decode kept it parked for good, its
+    reservation charged to pd_admission, and both engines polled forever."""
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "5")
+    pd, tid = chunked, "late"
+    x = Sequence(
+        PROMPT,
+        4,
+        sampling_params=SamplingParams(max_tokens=1),
+        kv_transfer_params={
+            "do_remote_decode": True, "chunked_transfer": True, "transfer_id": tid
+        },
+    )  # fmt: skip
+    pd.p.add(x)
+    _forward(pd.p, pd.rt_p, 1.0)
+    _at(pd.rt_p, 51.0 + 1e-6)
+    _forward(pd.p, pd.rt_p, 52.0)
+    assert x.status is SequenceStatus.ABORTED, "prefill's admission timeout"
+
+    y = seq_factory(
+        PROMPT,
+        kv_transfer_params={
+            **TEMPLATE, "do_remote_prefill": True, "do_remote_decode": False,
+            "chunked_transfer": True, "transfer_id": tid, "remote_dp_rank": 0,
+        },
+    )  # fmt: skip
+    _at(pd.rt_d, 60.0)
+    pd.d.add(y)
+    pd.d.schedule()
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    a = 60.0 + L
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+    _at(pd.rt_p, a, **{REQ: [(0, a)]})
+    _forward(pd.p, pd.rt_p, a + 0.5)
+    assert not pd.p.kv_connector._reads, "no read waits for a retired transfer"
+    assert not pd.p.kv_connector.has_pending_work()
+    [(_, _, arrival)] = [e for e in pd.rt_p.send_log if e[0] == DONE]
+    assert arrival == pytest.approx(a + 0.5 + L), "read at the step's KV poll"
+
+    _at(pd.rt_d, arrival, **{DONE: [(0, arrival)]})
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS, "the hold"
+    assert pd.d.kv_connector.has_pending_work()
+    for t in (arrival + 5.0, arrival + 5.5):  # the poll after the one that saw it
+        _at(pd.rt_d, t)
+        pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    # `_abort_failed_remote_receive` ends it as a rejected waiter.
+    assert y.status is SequenceStatus.FINISHED
+    assert y not in pd.d.waiting and y not in pd.d.running
+    assert not pd.d.kv_connector.has_pending_work()
+
+
+def test_an_aborted_send_tells_decode_its_writer_failed(chunked, seq_factory):
+    """A chunked request aborted after allocating stops its reads, and decode,
+    which would otherwise wait for a write-done that never comes, hears of it."""
+    pd, tid = chunked, "cut"
+    x = Sequence(
+        PROMPT,
+        4,
+        sampling_params=SamplingParams(max_tokens=1),
+        kv_transfer_params={
+            "do_remote_decode": True, "chunked_transfer": True, "transfer_id": tid
+        },
+    )  # fmt: skip
+    pd.p.add(x)
+    y = seq_factory(
+        PROMPT,
+        kv_transfer_params={
+            **TEMPLATE, "do_remote_prefill": True, "do_remote_decode": False,
+            "chunked_transfer": True, "transfer_id": tid, "remote_dp_rank": 0,
+        },
+    )  # fmt: skip
+    _at(pd.rt_d, 1.0)
+    pd.d.add(y)
+    pd.d.schedule()
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    a = 1.0 + L
+    _at(pd.rt_p, a, **{REQ: [(0, a)]})
+    _forward(pd.p, pd.rt_p, 2.0)
+    assert x.id in pd.p.kv_connector._sends, "allocated and sending"
+
+    x.status, x.leave_reason = SequenceStatus.ABORTED, "aborted"
+    pd.p.kv_connector.request_finished(x)
+    assert x.id not in pd.p.kv_connector._sends
+    [(_, _, arrival)] = [e for e in pd.rt_p.send_log if e[0] == DONE]
+    _at(pd.rt_d, arrival, **{DONE: [(0, arrival)]})
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert tid not in pd.d.kv_connector._listening
+    assert y.id in pd.d.kv_connector._failed
+
+
 def test_a_later_stage_writes_its_layers_from_the_relay_and_frees_nothing(
     geometry, monkeypatch  # noqa: F811
 ):
