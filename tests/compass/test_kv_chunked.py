@@ -517,7 +517,9 @@ def test_a_later_stage_writes_its_layers_from_the_relay_and_frees_nothing(
     forward(1.0, 8, relay={"r": ("t", pair, 0.5, 3, 10)})
     send = stage._sends["r"][0]
     assert send.writes and send.writes[0][0] == 1.0 and send.writes[0][2] == 2
-    assert send.done is None and stage.has_pending_work()
+    # Its forwards move it and wake the stage: an idle poll would not, and
+    # one aborted midway would keep the stage polling for good.
+    assert send.done is None and not stage.has_pending_work()
     forward(2.0, 10)
     assert "r" not in stage._sends and send.done is not None
     assert [w[2] for w in send.writes] == [2, 1]

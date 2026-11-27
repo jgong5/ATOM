@@ -1025,12 +1025,17 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         return output
 
     def has_pending_work(self) -> bool:
-        """Keeps an idle decode engine polling until its parked requests are ready."""
+        """Keeps an idle decode engine polling until its parked requests are
+        ready. A later prefill stage's sends keep none: each moves only at the
+        stage's forwards, which wake it, and is settled to its end at its last
+        one (`prefill_done`); a send whose request the head aborted midway gets
+        no forward again, and polling for it kept the stage, and the run, from
+        ever going idle."""
         return bool(
             self._due
             or self._snapshot
             or self._queued
-            or self._sends
+            or (self._sends and not self._stage)
             or self._notices
             or self._listening
             or self._failed
