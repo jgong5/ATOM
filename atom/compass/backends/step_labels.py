@@ -141,8 +141,11 @@ the sampler's launch included, or to the launch's end on a forward with no
 such wait, less the time its line's `blocked_ns` states the launch thread
 spent in HIP's blocking calls, there waiting on the device; a line without
 `blocked_ns` gives its wall time; `W_post` from that wait's end to the exit,
-less the draft copy wait, and a middle chunk has none. With an MTP status wait,
-`W_pre` ends at it and `W_inputs` runs from it to the launch. On a later
+less the draft copy wait, and a middle chunk has none. With an MTP status wait
+before the launch, `W_pre` ends at it and `W_inputs` runs from it to the launch;
+one stamped after the launch (MiniMax-M3.1's and DeepSeek-V4.1's DSpark prefill
+forward with output waits on it after its launch) is no part of the window
+before it: `W_pre` then runs to the launch, and `W_inputs` is 0. On a later
 pipeline stage, `W_recv` runs from the launch to the receive of its input, and
 `W_launch` leaves out that receive, a wait for the stage before's send.
 Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the
@@ -882,11 +885,13 @@ def _segments(s: dict, output: bool) -> dict:
     g0, g1 = s.get("t_gate_ns", (l0, l0))
     r0, r1 = s.get("t_recv_ns", s.get("t_read_ns", (l1, l1)))
     m0, m1 = s.get("t_mtp_ns", (l0, l0))
+    # an MTP status wait after the launch is no part of the pre-launch window
+    late = m0 >= l0
     blocked = s.get("blocked_ns")
-    host = {"W_pre": g0 - enter + m0 - g1}
+    host = {"W_pre": g0 - enter + (l0 if late else m0) - g1}
     host["W_launch"] = r0 - l0 - sum((blocked or {}).values())
     if "t_mtp_ns" in s:
-        host["W_inputs"] = l0 - m1
+        host["W_inputs"] = 0 if late else l0 - m1
     if "t_pp_recv_ns" in s:  # the receive waits for the stage before's send
         p0, p1 = s["t_pp_recv_ns"]
         host["W_recv"], host["W_launch"] = p0 - l0, host["W_launch"] - (p1 - p0)

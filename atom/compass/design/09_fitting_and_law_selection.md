@@ -338,7 +338,11 @@ before `postprocess`: no sampler launch, no output and no R1 wait, so a prefill 
 mixed the two would misprice both. Its `W_post` is zero and not fitted. On a record
 that stamps the MTP status wait, an output forward's `W_pre` ends at that wait and a
 further law, `W_inputs`, is fitted from it to the launch
-([#829](https://github.com/jgong5/ATOM/issues/829)). `L_mtp`, `01` D4's status copy
+([#829](https://github.com/jgong5/ATOM/issues/829)). A forward that waits after its
+launch, as MiniMax-M3.1's and DeepSeek-V4.1's DSpark output prefills do, has its `W_pre`
+run to the launch and its `W_inputs` labelled 0; a segment whose every label is 0 fits a
+zero law, so a run prices it at no time rather than refusing the forward
+([#4253](https://github.com/jgong5/ATOM/issues/4253)). `L_mtp`, `01` D4's status copy
 latency, is fitted from the previous output forward's `forward_done_event`, placed on
 the host clock by the lead, to the wait's return, on each forward whose wait began
 before the event. The lead places the event no later than it ran, so the label bounds
