@@ -60,6 +60,22 @@ latency hold the hop. A cancel arrives no earlier than its request: in the real
 ingress a request whose client has left is still encoded and sent on. With no
 ``ingress`` nothing of this runs and no worker reports a size.
 
+With ``CONN_POOL_ENV`` set to 1, the traffic LP also keeps aiperf's pooled
+HTTP connections on the clock (`ConnPool`): one pool per aiperf worker, as each
+worker's aiohttp connector is one, which a request takes its connection from
+when its stamp is made, the oldest idle one first, kept alive for aiperf's
+``AIPERF_HTTP_KEEPALIVE_TIMEOUT`` (300 s by default), and which a request
+gives its connection back to at its final event's arrival; a cancelled
+request's connection is closed. A request with no idle connection left opens a
+new one, and its stamp ends ``"new", True``, which its worker writes into its
+``tracestate`` (`atom.compass.carriers`): the frontend takes new connections
+in one at a time, in their seqs' order, and only kept-alive ones' bodies at
+once (`atom.utils.compass_loop.HttpChannel`). #752 DeepSeek-V4.1 Cell A v2:
+replayed on the records' own client timelines, this pool gives aiperf's own
+reuse of every request in 99.6-100% of the 16 target records' requests, at
+c1-c512 in both configs; DEPA2 c512's 300 s burst comes 91-93% on new
+connections, DPA4 c512's 7-13%.
+
 When aiperf cancels the requests in flight at its grace deadline, the traffic
 LP closes them at that time (`cancel`): each one's cancel is a stamped request
 of its own, which its worker sends and the frontend answers by hanging the
@@ -86,6 +102,7 @@ errored request is still open, the hold fails, naming those requests.
 """
 
 import asyncio
+import collections
 import hashlib
 import logging
 import math
@@ -128,11 +145,56 @@ INTAKE_JITTER_BYTES = 48_000.0
 #: The log-normal sigma of the intake jitter: the real burst's send offsets
 #: from its first send, p10 / p50 / p90 2.8 / 12.2 / 67 ms, ln(67 / 12.2) / 1.2816.
 INTAKE_JITTER_SIGMA = 1.33
+#: ``1``: the traffic LP keeps aiperf's pooled connections (`ConnPool`) and
+#: marks each request sent on a new one; unset or empty, no pool.
+CONN_POOL_ENV = "COMPASS_HARNESS_CONN_POOL"
 #: Loop turns the hold waits for aiperf to block before it says so in the log.
 SPIN_DIAG = 100_000
 _NORMAL = NormalDist()
 
 logger = logging.getLogger(__name__)
+
+
+def conn_pool_on() -> bool:
+    """Whether `CONN_POOL_ENV` asks for the pool: ``1``; unset or empty, no;
+    any other value is refused."""
+    value = os.environ.get(CONN_POOL_ENV) or ""
+    if value not in ("", "1"):
+        raise ValueError(f"{CONN_POOL_ENV}={value!r}; it takes 1, or unset")
+    return value == "1"
+
+
+class ConnPool:
+    """aiperf's pooled HTTP connections on the clock, one pool per worker.
+
+    Each aiperf worker sends on its own aiohttp connector (aiperf's default
+    ``POOLED`` reuse). A request takes the oldest idle connection, closing on
+    the way those idle past `keepalive_s` (aiohttp 3.13 ``BaseConnector._get``,
+    its ``popleft`` and ``<=``), or opens a new one; a request that ends gives its
+    connection back at its end. With `force_close` every request opens one.
+    """
+
+    def __init__(self, keepalive_s: float, force_close: bool = False) -> None:
+        if not (keepalive_s > 0 and math.isfinite(keepalive_s)):
+            raise ValueError(
+                f"keepalive {keepalive_s!r} s: the pool models a finite keepalive > 0"
+            )
+        self.keepalive_s, self.force_close = float(keepalive_s), force_close
+        self.idle: dict[str, collections.deque[float]] = {}
+
+    def release(self, worker: str | None, t: float) -> None:
+        """A request on `worker` ended at `t`: its connection goes back idle."""
+        if worker is not None and not self.force_close:
+            self.idle.setdefault(worker, collections.deque()).append(t)
+
+    def take(self, worker: str | None, t: float) -> bool:
+        """A request on `worker` takes a connection at `t`: whether it is a
+        kept-alive one (else a new one)."""
+        idle = self.idle.get(worker)
+        while idle:
+            if t - idle.popleft() <= self.keepalive_s:
+                return True
+        return False
 
 
 class UnansweredRequests(RuntimeError):
@@ -206,6 +268,11 @@ class TrafficLP:
             asyncio.ensure_future(self._read_reports()),
             asyncio.ensure_future(self._pass_returns()),
         ]
+        # With `CONN_POOL_ENV`: aiperf's connections (`ConnPool`), set by the
+        # router; each open request's worker, and each ended one's final arrival.
+        self.conn_pool: ConnPool | None = None
+        self._workers: dict[tuple, str] = {}
+        self._finals: dict[tuple, float] = {}
         self.done = asyncio.ensure_future(self._own())
 
     @classmethod
@@ -289,6 +356,12 @@ class TrafficLP:
         self._unstamped.append((key if rank is None else rank, key))
         self._changed.set()
 
+    def route(self, key: tuple, worker: str) -> None:
+        """aiperf's router gave request `key` to `worker`, whose connections
+        it takes (`conn_pool`); without a pool, nothing."""
+        if self.conn_pool is not None:
+            self._workers[key] = worker
+
     def _stamp_sends(self) -> None:
         """Stamp the requests sent at this instant and publish their stamps.
 
@@ -299,7 +372,9 @@ class TrafficLP:
         ``(key, arrival, seq)``, then ``"jitter", <bytes>`` with a seed
         (`jitter`), then, behind an ingress, ``"start", <time>``, its arrival
         at the ingress, which takes them in that order (`Ingress.admit`), each
-        with the body size its worker reported.
+        with the body size its worker reported, then with a connection pool
+        ``"new", True`` for one that takes no kept-alive connection, which
+        they take in seq order, as aiperf's tasks take them in send order.
         """
         for rank, key in sorted(self._unstamped, key=lambda sent: self._place(sent[0])):
             if self.ingress is None:
@@ -311,6 +386,10 @@ class TrafficLP:
             self.open[key] = None
             jitter = self.jitter(rank)
             more = () if jitter is None else ("jitter", jitter)
+            if self.conn_pool is not None and not self.conn_pool.take(
+                self._workers.get(key), self.rt.now
+            ):
+                more += ("new", True)
             if self.ingress is not None:
                 more += ("start", start)
             self._pub.send_pyobj((key, arrival, seq, *more))
@@ -364,6 +443,8 @@ class TrafficLP:
         keys = list(self.open)
         self.open.clear()
         self.cancelled.update(keys)
+        for key in keys:  # a cancelled request's connection is closed
+            self._workers.pop(key, None)
         self.closed.update(dict.fromkeys(keys))
         to = (self.cancel_url,) if self.cancel_url else ()
         for key in keys:
@@ -448,6 +529,8 @@ class TrafficLP:
         if key not in self.cancelled:
             self.rt.check_arrival(self.stream, arrival, seq)
         self._reports[seq] = (key, final)
+        if final and self.conn_pool is not None:
+            self._finals[key] = arrival
 
     async def _pass_returns(self) -> None:
         while True:
@@ -516,6 +599,11 @@ class TrafficLP:
                         break
                     self.open.pop(key, None)
                     self._arrivals.pop(key, None)
+                    if self.conn_pool is not None:  # finals pass in stream order
+                        self.conn_pool.release(
+                            self._workers.pop(key, None),
+                            self._finals.pop(key, self.rt.now),
+                        )
                     if (ret := self._held.pop(key)) is not None:
                         self._returns.put_nowait(ret)
                 self.rt.released[self.stream].discard(seq)

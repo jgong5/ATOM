@@ -103,6 +103,7 @@ from atom.compass.carriers import (
     relay_stamp,
     stamp_events,
     tracestate_jitter,
+    tracestate_new_conn,
     with_relay_stamp,
 )
 from atom.utils import clock
@@ -560,6 +561,10 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
         self.held: dict[
             tuple[str, int], tuple[float, asyncio.Future, asyncio.Future]
         ] = {}
+        # Called by `hand_over` before it orders the released requests: an
+        # `HttpChannel` whose requests come on new connections resolves when
+        # their bodies are in there, in their seqs' order (`HttpChannel._accept`).
+        self.accepts: list = []
         # Requests woken and waiting for their turn, a heap of (order, turn);
         # `_give_turns` gives one turn at a time, and the request holds it
         # until it is counted handled, so the app gets them in that order.
@@ -710,6 +715,8 @@ class CompassEventLoop(asyncio.SelectorEventLoop):
                 for (ch, seq), (a, _, ready) in self.held.items()
                 if rt.is_released(ch, seq)
             ]
+        for accept in self.accepts:
+            accept(self)
         if not all(ready.done() for ready, *_ in out):
             return False
         for *_, seq, ch in sorted((r.result(), a, s, c) for r, a, s, c in out):
@@ -938,6 +945,22 @@ class HttpChannel:
     smallest-first gives about +0.94. Each request is still charged its own
     body's intake, at its turn.
 
+    A request whose ``tracestate`` entry ends ``;n:1`` came on a new connection
+    (the traffic LP's ``COMPASS_HARNESS_CONN_POOL``, which keeps aiperf's
+    pooled connections on the clock): the frontend takes new connections in
+    one at a time, in ``(arrival, seq)`` order, each one's body to its end
+    before the next, so such a request's body is in at ``max(its arrival plus
+    its relay's service, the previous new connection's) + fixed_s + body bytes
+    x per_byte_s``, whatever its jitter; a request on a kept-alive connection
+    is read at once with the others, as above. #752 DeepSeek-V4.1 Cell A v2: on
+    a kept-alive connection the real frontend starts reading a 300 s burst's
+    body 0.01-0.14 s (p50) after its send, all of them together, and they end
+    in about their sizes' order; on a new one 5.2-5.5 s after, the heads
+    reaching the app 20-30 a second, each body ending in the order its read
+    began (Spearman +0.99). DEPA2 c512's burst comes 91-93% on new
+    connections, so it is taken in about as sent; DPA4 c512's 87-93% on
+    kept-alive ones, so smallest body first.
+
     A stamped request whose body is a cancel
     (`atom.compass.carriers.cancel_seq`) goes to no app: it is answered 204,
     and the request it names, if the app is still serving it, reads
@@ -998,6 +1021,11 @@ class HttpChannel:
         self.by_body = intake_order() == "body"
         self.relay, self.per_event = relay(), http_stream()
         self.intake_end = -math.inf  # the LP time the last intake ended
+        # New connections (`_accept`): when the last one taken in had its body
+        # in, and each one read or reading, (channel, seq) -> [arrival, relay
+        # service, when its body is in, its bytes once read].
+        self.accept_end = -math.inf
+        self.accepting: dict[tuple[str, int], list] = {}
         # http seq -> its hang-up, for each stamped request the app is serving
         self.hangups: dict[int, asyncio.Event] = {}
 
@@ -1044,9 +1072,15 @@ class HttpChannel:
             wake, ready = loop.create_future(), loop.create_future()
             # Its body leaves the socket as it comes, not at its turn.
             reading = asyncio.ensure_future(_body_messages(receive))
-            reading.add_done_callback(
-                partial(self._ready, ready, arrival, jitter, service)
-            )
+            if relay_in is None and _new_conn(scope):
+                if self._accept not in loop.accepts:
+                    loop.accepts.append(self._accept)
+                self.accepting[ch, seq] = [arrival, service, ready, None]
+                reading.add_done_callback(partial(self._read_new, (ch, seq)))
+            else:
+                reading.add_done_callback(
+                    partial(self._ready, ready, arrival, jitter, service)
+                )
             loop.held[ch, seq] = (arrival, wake, ready)
             try:
                 await wake
@@ -1126,6 +1160,63 @@ class HttpChannel:
                 fixed = per_byte = 0.0
             nbytes = sum(len(m.get("body", b"")) for m in reading.result())
             ready.set_result(arrival + service + fixed + per_byte * (nbytes + jitter))
+
+    def _read_new(self, key: tuple[str, int], reading) -> None:
+        """A request on a new connection has its body read: note its bytes for
+        `_accept`; one never read, or a cancel, is in at its arrival, as
+        `_ready` has it."""
+        entry = self.accepting.get(key)
+        if entry is None:
+            return
+        if reading.cancelled() or reading.exception() is not None:
+            del self.accepting[key]
+            if not entry[2].done():
+                entry[2].set_result(entry[0])
+            return
+        body = reading.result()
+        if cancel_seq(body[0].get("body", b"")) is not None:
+            del self.accepting[key]
+            if not entry[2].done():
+                entry[2].set_result(math.inf)
+            return
+        entry[3] = sum(len(m.get("body", b"")) for m in body)
+
+    def _accept(self, loop: "CompassEventLoop") -> None:
+        """Take in the released requests on new connections one at a time, in
+        ``(arrival, seq)`` order, up to the first whose body is not read yet:
+        each one's body is in at ``max(arrival + service, the previous one's) +
+        fixed_s + body bytes x per_byte_s``, which depends on nothing the wall
+        decides."""
+        rt = loop.rt
+        with rt.lock:
+            released = sorted(
+                (entry[0], seq, ch)
+                for (ch, seq), entry in self.accepting.items()
+                if rt.is_released(ch, seq)
+            )
+        fixed, per_byte, _ = self.intake or (0.0, 0.0, 0.0)
+        for _, seq, ch in released:
+            arrival, service, ready, nbytes = self.accepting[ch, seq]
+            if nbytes is None:
+                return
+            del self.accepting[ch, seq]
+            self.accept_end = (
+                max(arrival + service, self.accept_end) + fixed + per_byte * nbytes
+            )
+            if not ready.done():
+                ready.set_result(self.accept_end)
+
+
+def _new_conn(scope) -> bool:
+    """Whether a request's ``tracestate`` header lines say it came on a new
+    connection (`atom.compass.carriers.tracestate_new_conn`)."""
+    return tracestate_new_conn(
+        ",".join(
+            v.decode("latin-1")
+            for k, v in scope.get("headers", ())
+            if k.lower() == b"tracestate"
+        )
+    )
 
 
 def _intake_jitter(scope) -> float:

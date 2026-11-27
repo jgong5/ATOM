@@ -3,8 +3,9 @@
 
 Every credit leaves through ``send_credit`` (``CreditIssuer._issue_credit_internal``
 is its one call site), so the traffic LP takes it there, with its rank among
-the requests sent at its instant (`send_rank`); every return reaches the
-strategy only through the return callback, so the hold wraps it. aiperf's
+the requests sent at its instant (`send_rank`) and the worker upstream gives
+it, whose connections it takes one from (`TrafficLP.route`); every return
+reaches the strategy only through the return callback, so the hold wraps it. aiperf's
 cancel of the requests in flight goes through the traffic LP first. The
 controller hears when the traffic LP is done, or the error that failed it.
 """
@@ -18,7 +19,7 @@ from aiperf.credit.sticky_router import StickyCreditRouter
 
 from compass_harness.controller import TrafficDone
 from compass_harness.scheduler import ClockPacedLoopScheduler
-from compass_harness.traffic_lp import TrafficLP
+from compass_harness.traffic_lp import ConnPool, TrafficLP, conn_pool_on
 from compass_harness.transport import credit_key
 
 
@@ -50,14 +51,29 @@ class CompassCreditRouter(StickyCreditRouter):
         # Tells the controller when the traffic LP is done or fails.
         self._bus = self.comms.create_pub_client(CommAddress.EVENT_BUS_PROXY_FRONTEND)
         self.traffic = TrafficLP.from_env()
+        if conn_pool_on():
+            # aiperf's own connector settings, as its workers' transports read them.
+            from aiperf.common.environment import Environment
+
+            self.traffic.conn_pool = ConnPool(
+                Environment.HTTP.KEEPALIVE_TIMEOUT, Environment.HTTP.FORCE_CLOSE
+            )
+        self._routing = None  # the key send_credit is routing, for the pool
         ClockPacedLoopScheduler.clock = self.traffic
         self.traffic.done.add_done_callback(self._on_finish)
 
     async def send_credit(self, credit) -> None:
-        self.traffic.send(
-            credit_key(credit.phase, credit.phase_index, credit.id), send_rank(credit)
-        )
+        key = credit_key(credit.phase, credit.phase_index, credit.id)
+        self.traffic.send(key, send_rank(credit))
+        # Upstream picks the worker and tracks it before its first await.
+        self._routing = key
         await super().send_credit(credit)
+
+    def _track_credit_sent(self, worker_id: str, credit_id: int) -> None:
+        if self._routing is not None:
+            self.traffic.route(self._routing, worker_id)
+            self._routing = None
+        super()._track_credit_sent(worker_id, credit_id)
 
     def set_return_callback(self, callback) -> None:
         super().set_return_callback(self.traffic.hold(callback))
