@@ -6,8 +6,9 @@
 #   run.sh stage     on g27: stages under g53's W the r8 laws and inputs, b5/bin's runner with W's paths,
 #                    b5/fe-engine 98aed973e exported twice (W/tree/ATOM; W/tree_des/ATOM with as_designed.patch)
 #                    and an atomesh built at 98aed973e, whose router source is atomesh_c3c54d3cf's
-#   run.sh round K   on g53: round K (1-3) under both lane locks: off, as measured and as designed at once in
-#                    xingjche_simspeed_g53, one 16-CPU share (two CCDs) each, rotated by K; then ab.py, err.py
+#   run.sh round K [N]  on g53: round K (1-3) under both lane locks: off, as measured and as designed at once
+#                    in xingjche_simspeed_g53, N CPUs a cell from 64 (16, two CCDs, by default; 8, one CCD, as the
+#                    prototype's g27 short pairs ran), the shares rotated by K; then ab.py, walls.py, err.py
 #   run.sh clean     on g53: removes W, root-owned files included
 # A cell is b5/bin/sim_b5.sh's short cell: C1228, 120 simulated seconds of profiling, warmup 1 a lane, no railwarm.
 set -u
@@ -27,7 +28,7 @@ stage)
     cp -a $D/venv-sim $X/; cp -a $D/models/dsv41 $X/models/; cp $D/inputs/cc/traces.jsonl $X/inputs/cc/
     cp $D/fits/x8_c1228_r8/{link.json,mooncake_store_entry.json} $X/fits/x8_c1228_r8/
     cp $D/$r8/railwarm/client/aiperf.log $X/$r8/railwarm/client/; cp $D/$r8/logs/driver.log $X/$r8/logs/
-    cp $D/b5/bin/{ab.py,err.py,phases.py} $X/b5/bin/
+    cp $D/b5/bin/{ab.py,err.py,phases.py} $HERE/walls.py $X/b5/bin/
     for f in x8.env fits/x8_c1228_r8/laws.env b5/bin/sim_b5.sh; do sed 's#$D#$X#g' $D/\$f > $X/\$f; done" || exit 1
   # The r8 law directories are root's alone: read them, and the warm token ids, through the b5 container.
   docker exec xingjche_b5_sim tar -C $D -cf - laws_r8 | $G53 "tar -C $X -xf -" || exit 1
@@ -47,23 +48,26 @@ stage)
         \$MODEL/config.json $X/inputs/cc/traces.jsonl $X/venv-sim/bin/python $W/tok_warm'"
   ;;
 round)
-  K=${2:?round 1, 2 or 3} S=(64-79 80-95 96-111)
+  K=${2:?round 1, 2 or 3} N=${3:-16} P=r$K
+  ((N == 16)) || P=c${N}r$K  # the cells' tag prefix
+  S=($(for i in 0 1 2; do echo $((64 + i * N))-$((63 + (i + 1) * N)); done))
   exec 8>$L/laneC.lock 9>$L/laneD.lock; flock 8; flock 9
-  echo "$(date -u +%FT%TZ) s4262 round $K: lanes C and D taken" >> $L/out/pairs.log
+  echo "$(date -u +%FT%TZ) s4262 round $P: lanes C and D taken" >> $L/out/pairs.log
   cell() {  # TAG TREE CPUS EXTRA_ENV
     docker exec $C bash -c "export $(echo $OFF) COMPASS_B5_IDS_DIR=$W/ids/$1 $4
       nice -n 10 taskset -c $3 bash $X/b5/bin/sim_b5.sh $1 $2 120 1 0 > $R/$1.out 2>&1" &
   }
-  cell r${K}_off $W/tree/ATOM ${S[(K - 1) % 3]} ""
-  cell r${K}_meas $W/tree/ATOM ${S[K % 3]} "$LEAD COMPASS_B5_DELAY_FD_S=0.0018"
-  cell r${K}_des $W/tree_des/ATOM ${S[(K + 1) % 3]} "$LEAD COMPASS_B5_DELAY_FD_S=0"
+  cell ${P}_off $W/tree/ATOM ${S[(K - 1) % 3]} ""
+  cell ${P}_meas $W/tree/ATOM ${S[K % 3]} "$LEAD COMPASS_B5_DELAY_FD_S=0.0018"
+  cell ${P}_des $W/tree_des/ATOM ${S[(K + 1) % 3]} "$LEAD COMPASS_B5_DELAY_FD_S=0"
   wait
-  echo "$(date -u +%FT%TZ) s4262 round $K: lanes C and D released" >> $L/out/pairs.log
-  docker exec -w $R $C bash -c "grep -h 'CPUs' r${K}_*.logs/sim.log | sed 's/.*b5 \(r[^:]*\):.*CPUs/\1 CPUs/'
-    grep -hE 'EXIT|PHASES' r${K}_*.out; python3 $X/b5/bin/ab.py r${K}_off r${K}_meas r${K}_des
-    python3 $X/b5/bin/err.py r${K}_off r${K}_meas r${K}_des | grep -E '^==|matched'
-    grep -lE '$ERR' r${K}_*/*.log r${K}_*.logs/*.log || echo 'no clock error in the logs'"
+  echo "$(date -u +%FT%TZ) s4262 round $P: lanes C and D released" >> $L/out/pairs.log
+  docker exec -w $R $C bash -c "grep -h 'CPUs' ${P}_*.logs/sim.log | sed 's/.*b5 \([^ :]*\):.*CPUs/\1 CPUs/'
+    grep -hE 'EXIT|PHASES' ${P}_*.out; python3 $X/b5/bin/ab.py ${P}_off ${P}_meas ${P}_des
+    python3 $X/b5/bin/walls.py ${P}_off ${P}_meas ${P}_des
+    python3 $X/b5/bin/err.py ${P}_off ${P}_meas ${P}_des | grep -E '^==|matched'
+    grep -lE '$ERR' ${P}_*/*.log ${P}_*.logs/*.log || echo 'no clock error in the logs'"
   ;;
 clean) docker exec $C rm -rf $W ;;
-*) sed -n '5,11p' "$0"; exit 2 ;;
+*) sed -n '5,12p' "$0"; exit 2 ;;
 esac
