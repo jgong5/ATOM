@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Stand-in for iproute2, absent from the recipe's image (#4164): the two forms env.sh reads, answered from NODE_IP/NODE_IF.
+case "$*" in
+  "route get"*) echo "1.1.1.1 via 10.19.0.1 dev ${NODE_IF:-eno0} src ${NODE_IP:?set NODE_IP} uid 0" ;;
+  *"addr show"*) echo "2: ${NODE_IF:-eno0}    inet ${NODE_IP:?set NODE_IP}/21 brd 10.19.7.255 scope global ${NODE_IF:-eno0}" ;;
+  *) echo "ip stand-in: $* unsupported" >&2; exit 1 ;;
+esac
