@@ -24,6 +24,10 @@ and Triton's and Inductor's, in their cache directories; each named by its
 file, FlyDSL's by its directory. ATOM's compile cache, ``~/.cache/atom``, is
 left out: each start derives a directory of its own there, points Triton and
 Inductor into it, and the stop removes it, so every process pays its compiles.
+Under ``COMPASS_KEEP_COMPILED=1`` a start reuses a kept directory there
+(`compass.run.kept_cache_dir`), still left out: what it holds is what every
+process paid before; a record's listing of compile-cache writes (the kit's)
+places a new write in its windows for the stall gate.
 
     python -m atom.compass.drive.aiter_jit RUN_JSON SINCE_NS
 
@@ -95,7 +99,10 @@ def builds_since(since_ns: int) -> dict:
     file written at or after `since_ns`, wall clock nanoseconds; {} when none
     was."""
     built = set()
+    atom_cache = Path(os.path.expanduser("~/.cache/atom"))
     for root, compiler in _roots().items():
+        if root.is_relative_to(atom_cache):
+            continue  # ATOM's compiled-graph cache: never a build (module text)
         for top, _, files in os.walk(root):
             for path in (Path(top, f) for f in files):
                 with suppress(FileNotFoundError):  # a temporary since renamed

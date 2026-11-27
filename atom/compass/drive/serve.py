@@ -125,6 +125,15 @@ CACHE_LINE = re.compile(r"Using cache directory: (\S+) for vLLM's torch\.compile
 #: ATOM's `atom.utils.backends.VLLM_CACHE_ROOT`, stated here because importing
 #: that module opens a HIP context on every GPU the calling process can see.
 CACHE_ROOT = os.path.expanduser("~/.cache/atom")
+#: Keep a real server's compiled-graph cache across starts (opt-in, ``1``; unset:
+#: each start derives its own directory and the stop removes it, as before): the
+#: engine names one directory per configuration, ``kept-<k>`` under
+#: ``torch_compile_cache`` (`run.kept_cache_dir`), which `drop_compiled` leaves, so
+#: the next start of the same configuration reuses its Triton, Inductor and
+#: compiled graphs. A line keeps ``~/.cache/atom`` on its host, keyed by image,
+#: atom digest and arch (the kit's keep_compiled.sh).
+KEEP_ENV = "COMPASS_KEEP_COMPILED"
+KEPT_PREFIX = "kept-"
 #: ATOM's switch that heads each log line with its process, `<name>:<pid>`, so
 #: `memory.check` can pair a DP x TP log's Memory budget lines with DP ranks.
 LOG_MORE = {"ATOM_LOG_MORE": "1"}
@@ -285,12 +294,16 @@ def serve(
 def drop_compiled(log) -> None:
     """Remove each directory ATOM derived in its compiled-graph cache that the
     stopped server's log `log` names. A directory configured outside the cache
-    root stays."""
+    root stays, and under `KEEP_ENV` so does a kept one."""
     root = Path(CACHE_ROOT, "torch_compile_cache")
     text = Path(log).read_text("utf-8", "replace")
+    keep = os.environ.get(KEEP_ENV) == "1"
     for used in map(Path, CACHE_LINE.findall(text)):
         if used.is_relative_to(root) and used != root:
-            shutil.rmtree(root / used.relative_to(root).parts[0], ignore_errors=True)
+            top = used.relative_to(root).parts[0]
+            if keep and top.startswith(KEPT_PREFIX):
+                continue  # `KEEP_ENV`: the next start reuses it
+            shutil.rmtree(root / top, ignore_errors=True)
 
 
 def _model(atom_args) -> str:

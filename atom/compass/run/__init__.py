@@ -2097,6 +2097,52 @@ def _price_images(price: float | None) -> None:
     MediaLoader.load_image = priced
 
 
+#: `atom.compass.drive.serve.KEEP_ENV`, stated here as that module's import is
+#: not this one's to make.
+KEEP_ENV = "COMPASS_KEEP_COMPILED"
+
+
+def kept_cache_dir(config) -> tuple[str, dict]:
+    """The compiled-graph cache directory a real server of `config` keeps under
+    `KEEP_ENV`, ``~/.cache/atom/torch_compile_cache/kept-<k>``, and its key's
+    inputs: ``k`` is ATOM's own `Config.compute_hash` with the DP master's
+    address and port blank (they change at every start, which is why ATOM's own
+    directory is never found again), so every other configuration ATOM keys its
+    graphs by still keys this one."""
+    pc = config.parallel_config
+    held = pc.data_parallel_master_ip, pc.data_parallel_master_port
+    pc.data_parallel_master_ip, pc.data_parallel_master_port = "", 0
+    try:
+        k = config.compute_hash()[:16]
+    finally:
+        pc.data_parallel_master_ip, pc.data_parallel_master_port = held
+    path = os.path.join(
+        os.path.expanduser("~/.cache/atom"), "torch_compile_cache", f"kept-{k}"
+    )
+    inputs = {
+        "key": k,
+        "dir": path,
+        "model": str(getattr(config, "model", "")),
+        "tensor_parallel_size": getattr(config, "tensor_parallel_size", None),
+        "pipeline_parallel": [
+            getattr(pc, "pipeline_parallel_rank", None),
+            getattr(config, "pipeline_parallel_size", None),
+        ],
+        "blanked": {"data_parallel_master_ip": held[0], "data_parallel_master_port": held[1]},
+    }
+    return path, inputs
+
+
+def _keep_compiled(config, record) -> None:
+    """`KEEP_ENV`: point `config`'s compiled-graph cache at its kept directory
+    (`kept_cache_dir`) before the engine builds its workers, and state the key's
+    inputs beside the record (``kept_cache.<pid>.json``) when one is kept."""
+    path, inputs = kept_cache_dir(config)
+    config.compilation_config.cache_dir = path
+    if record:
+        _write_whole(Path(record) / f"kept_cache.{os.getpid()}.json", json.dumps(inputs))
+
+
 def engine(config):
     """Around the engine's construction in its process; a no-op context on a real run.
 
@@ -2117,6 +2163,8 @@ def engine(config):
     if run is None:
         from atom.compass import parity
 
+        if os.environ.get(KEEP_ENV) == "1":
+            _keep_compiled(config, os.environ.get(parity.ENV))
         record = os.environ.get(parity.ENV)
         if record and getattr(config, "pipeline_parallel_size", 1) == 1:
             record = parity.record_dir(record, config)
