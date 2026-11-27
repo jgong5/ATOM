@@ -405,6 +405,12 @@ TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
 #: of the admitting forwards' `E` past their kind's law, a fixed cost per
 #: admitting forward with no token terms (`_admit_median`).
 ADMIT_FORM_ENV = "COMPASS_FIT_ADMIT"
+#: The host segments fitted median-centred (opt-in; unset: none), a comma list
+#: of ``kind.segment`` (e.g. ``middle.E,middle.W_launch``): the solver's law
+#: (which prices a tailed class at its mean) scaled so the median of label over
+#: price is 1, for a latency that follows the typical forward, not one that
+#: spreads a rare long one over every forward (`_median_centred`).
+HOST_MEDIAN_ENV = "COMPASS_FIT_HOST_MEDIAN"
 
 
 #: What a forward that admits requests spends once, per prompt token past the
@@ -965,6 +971,19 @@ def _host_price(host, kind, segment, x, launch) -> float | None:
     return None if c is None else float(np.dot(c, x)) + priced
 
 
+def _median_centred(coef, fitted) -> tuple[list, dict]:
+    """`coef` (a host segment's law, its columns' coefficients too) scaled by
+    1 - `fitted`'s centre, the median of 1 - label / price over its samples, so
+    that median is 0; and `fitted` with the scale and the solver's centre."""
+    scale = 1.0 - fitted["centre"]
+    if not scale > 0:
+        raise ValueError(f"centre {fitted['centre']} leaves no positive scale")
+    return [v * scale for v in coef], fitted | {
+        "median_centred": {"scale": scale, "solver_centre": fitted["centre"]},
+        "centre": 0.0,
+    }
+
+
 def _admit_median(base, labels) -> tuple[list, dict]:
     """`admit` as the median of `labels` (the admitting forwards' `E`) less
     `base` (what their kind's `E` law prices), 0 or more, per admitting forward,
@@ -1080,6 +1099,7 @@ def fit_host(samples) -> tuple[dict, dict]:
     report["jit_steps"] = {}
     for run, _, n in sorted(jit):
         report["jit_steps"].setdefault(run, []).append(n)
+    centred = {x for x in os.environ.get(HOST_MEDIAN_ENV, "").split(",") if x}
     for kind in HOST_KINDS:
         extra = sorted({r[1] for r in rows if r[0] == kind} - set(HOST_SEGMENTS))
         for segment in HOST_SEGMENTS[: 3 if kind == "middle" else 4] + tuple(extra):
@@ -1093,6 +1113,8 @@ def fit_host(samples) -> tuple[dict, dict]:
                     HOST_FEATURES,
                     columns=columns,
                 )
+                if f"{kind}.{segment}" in centred:
+                    coef, fitted = _median_centred(list(coef), fitted)
             except (ValueError, QhullError) as e:
                 report["unfitted"][f"{kind}.{segment}"] = str(e).splitlines()[0]
                 continue
