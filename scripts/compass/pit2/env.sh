@@ -2,8 +2,8 @@
 #
 # Sourced in a pit2 container, the search's CPU one or a calibration's GPU one,
 # before any step of a `compass advice` search on pit2 (the compass-advice
-# skill). It sets what a search, a calibration and a real run read, and defines
-# `compass`, the tree's own console script.
+# skill). It sets what a search, a calibration and a real run read, and puts
+# `compass`, the tree's own console script, on PATH.
 #
 # Each of these may be set before sourcing; the default otherwise:
 #   PIT2_TREE    the ATOM clone this file belongs to
@@ -39,7 +39,8 @@ export COMPASS_INTEGRATION_REF=${COMPASS_INTEGRATION_REF:-origin/pit2/m31pd}
 for v in OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS; do
     [[ -z ${!v-} ]] || echo "env.sh: $v is set; unset it, a law's key holds it" >&2
 done
-compass() { "$PIT2_TREE/scripts/compass/compass" "$@"; }
+# On PATH, not a shell function, so `taskset` and `nice` can run it.
+export PATH="$PIT2_TREE/scripts/compass:$PATH"
 # git runs as root on your files in a container: the reuse check reads the head.
 git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$PIT2_TREE" ||
     git config --global --add safe.directory "$PIT2_TREE" 2>/dev/null || true
