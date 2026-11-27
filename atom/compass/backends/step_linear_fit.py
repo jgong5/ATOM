@@ -497,6 +497,19 @@ def jit_over_s() -> float | None:
 #: charges itself (P's head on the CAL at c120: W_launch p50 22 ms ungated,
 #: 50 ms gated).
 RING_CUT_ENV = "COMPASS_FIT_RING_CUT"
+#: The Mooncake Store laws fitted median-centred (opt-in; unset: none), a comma
+#: list of `STORE_LAWS` names (e.g. ``load_s``): each law, a rank's too, by
+#: least absolute log error, ``|log(label / price)|`` summed, so the median of
+#: label over price is 1 in every range of the count, not only overall
+#: (`_store_median`). The solver's relative least squares prices a copy with a
+#: one-sided tail above its typical cost: P's loads on the CAL, whose unpack
+#: waits behind the stage's forwards on its stream (median 86 ms, mean 232 ms on
+#: rank 0), at 1.32-1.69x their median. A run's lanes queue the copies
+#: themselves: the label, the worker's time from its start, holds no lane wait.
+STORE_MEDIAN_ENV = "COMPASS_FIT_STORE_MEDIAN"
+#: The most copies whose pairs `_store_median` takes as candidate laws; more are
+#: thinned evenly in count order (every copy is still scored).
+STORE_MEDIAN_PAIRS = 400
 
 
 def ring_cut_s() -> float | None:
@@ -2056,7 +2069,10 @@ def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
     the fields `mooncake_store_server.PER_RANK` names, as each stage holds
     other layers: where they do, the entry states each such field a rank, in
     rank order, and ``store_s`` and ``load_s`` each rank's own, fitted on its
-    copies' lines (``rank=``). Ranks that agree give the entry as before."""
+    copies' lines (``rank=``). Ranks that agree give the entry as before.
+
+    Under `STORE_MEDIAN_ENV` the laws it lists are fitted median-centred
+    (`_store_median`), the solver's law kept in the report."""
     if master is None or capacity_bytes is None:
         raise ValueError(
             "no log states the Store master's flags or its owners' bytes: give "
@@ -2113,6 +2129,9 @@ def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
     entry = {f: next(iter(v)) for f, v in common.items() if f not in apart}
     for f in apart:  # a pipelined prefill's: one a rank
         entry[f] = [dict(next(iter(by_rank[r])))[f] for r in ranks]
+    centred = {x for x in os.environ.get(STORE_MEDIAN_ENV, "").split(",") if x}
+    if unknown := sorted(centred - {law for law, *_ in STORE_LAWS.values()}):
+        raise ValueError(f"{STORE_MEDIAN_ENV} names {unknown}, not a Store law")
     report = {}
     for line, (law, count, _, kept) in STORE_LAWS.items():
         x = np.array(rows.get(law, []), dtype=np.float64).reshape(-1, 3)
@@ -2123,6 +2142,8 @@ def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
             report[law] = {"samples": 0, "missing": f"no [OFFLOAD-{line}] line in the logs"}
             continue
         entry[law], report[law] = _host_law(x[:, :2], x[:, 2], ["fixed", count])
+        if law in centred:
+            entry[law], report[law] = _store_median(x, entry[law], report[law])
         if apart and law in PER_RANK:
             each = [
                 _host_law(
@@ -2136,6 +2157,14 @@ def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
                 )
                 for r in ranks
             ]
+            if law in centred:
+                each = [
+                    _store_median(
+                        np.array(ranked.get((law, r), []), dtype=np.float64).reshape(-1, 3),
+                        *fitted,
+                    )
+                    for r, fitted in zip(ranks, each)
+                ]
             entry[law] = [term for term, _ in each]
             report[law]["ranks"] = [rep for _, rep in each]
         for part in kept:
@@ -2144,6 +2173,69 @@ def _fit_store(logs, master, capacity_bytes) -> tuple[dict, dict]:
     entry |= {"master": master, "capacity_bytes": capacity_bytes}
     entry["fit"] = {"logs": [str(log) for log in logs], **report}
     return entry, report
+
+
+def _store_median(rows, coef, fitted) -> tuple[list, dict]:
+    """A Store law ``[fixed, per count]`` on `rows` (``(1, count, seconds)`` a
+    copy) median-centred: the one of least absolute log error, both terms 0 or
+    more, in place of the solver's `coef`; and `fitted` with its ``centre`` and
+    ``mad`` (of ``1 - label / price``) the new law's, the solver's law and
+    centre kept under ``median_centred``.
+
+    The sum of ``|log(label / price)|`` is least on a law through two copies,
+    or through one with the other term 0, as least absolute deviations is; each
+    is scored on every copy and the least taken, the first of equals. Its
+    median label over price is 1, and, as a copy priced a factor over counts as
+    much as one a factor under, it stays near 1 at every count, where a law
+    scaled to centre (`_median_centred`) keeps the solver's ratio of fixed to
+    per count. Copies of a non-positive label are left out. Pairs come from at
+    most `STORE_MEDIAN_PAIRS` copies, thinned evenly in count order."""
+    rows = np.asarray(rows, dtype=np.float64).reshape(-1, 3)
+    rows = rows[rows[:, 2] > 0]
+    count, label = rows[:, 1], rows[:, 2]
+    if len(rows) < 2:
+        raise ValueError(f"{len(rows)} copies for a median-centred law")
+    order = np.lexsort((label, count))
+    pick = order[np.unique(np.linspace(0, len(order) - 1, STORE_MEDIAN_PAIRS).round().astype(int))]
+    i, j = np.triu_indices(len(pick), 1)
+    i, j = pick[i], pick[j]
+    apart = count[i] != count[j]
+    i, j = i[apart], j[apart]
+    per = (label[j] - label[i]) / (count[j] - count[i])
+    lone = np.flatnonzero(count > 0)
+    candidates = np.concatenate(
+        [
+            np.column_stack([label[i] - per * count[i], per]),
+            np.column_stack([label, np.zeros_like(label)]),
+            np.column_stack([np.zeros(len(lone)), label[lone] / count[lone]]),
+        ]
+    )
+    candidates = candidates[(candidates >= 0).all(axis=1)]
+    log_label, best, least = np.log(label), None, np.inf
+    for start in range(0, len(candidates), 2048):
+        laws = candidates[start : start + 2048]
+        price = laws[:, :1] + laws[:, 1:] * count[None, :]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            error = np.where(price > 0, np.abs(log_label - np.log(price)), np.inf).sum(1)
+        k = int(np.argmin(error))
+        if error[k] < least:
+            least, best = float(error[k]), laws[k]
+    if best is None:
+        raise ValueError("no law prices every copy above 0")
+    law = [float(best[0]), float(best[1])]
+    ratio = 1.0 - label / (law[0] + law[1] * count)
+    centre = float(np.median(ratio))
+    return law, fitted | {
+        "centre": centre,
+        "mad": float(1.4826 * np.median(np.abs(ratio - centre))),
+        "median_centred": {
+            "form": "least absolute log error",
+            "solver": list(coef),
+            "solver_centre": fitted.get("centre"),
+            "copies": len(rows),
+            "mean_abs_log_error": least / len(rows),
+        },
+    }
 
 
 def _alone(sent, got, returned=None) -> tuple[np.ndarray, np.ndarray]:
