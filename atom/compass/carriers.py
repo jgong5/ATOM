@@ -6,7 +6,9 @@ A request carries its ``(arrival, seq)`` as a ``compass`` entry of the W3C
 entries already there, as W3C Trace Context adds a new entry. A request the
 traffic LP sends with a send-order seed adds its intake jitter, the bytes its
 body is read as if it were longer, ``compass=a:<arrival>;s:<seq>;j:<bytes>``
-(`compass_harness.traffic_lp`). A streamed response carries one comment line before
+(`compass_harness.traffic_lp`). A request the traffic LP's connection pool
+(``COMPASS_HARNESS_CONN_POOL``) sends on a new connection ends its entry in
+``;n:1``, and the frontend takes it in as one (`atom.utils.compass_loop.HttpChannel`). A streamed response carries one comment line before
 each SSE event, ``: compass a=<arrival> s=<seq>``; SSE clients skip lines that
 start with a colon. Both pass a router that forwards headers and the stream
 unchanged. A prefill response the router relays to decode carries its stamp as
@@ -39,7 +41,7 @@ _NUM = r"(inf|\d[\d.e+-]*)"
 #: its relay serves it on decode's API server loop.
 RELAY_SERVICE = "compass_relay_s"
 _ENTRY = re.compile(rf"a:{_NUM};s:(\d+)")
-_TRACE_ENTRY = re.compile(rf"a:{_NUM};s:(\d+)(?:;j:{_NUM})?")
+_TRACE_ENTRY = re.compile(rf"a:{_NUM};s:(\d+)(?:;j:{_NUM})?(;n:1)?")
 _COMMENT = re.compile(rf": compass a={_NUM} s=(\d+)")
 _MAX_ENTRIES = 32
 #: Added to every simulated ns stamp a client records. Simulated time starts at
@@ -90,11 +92,26 @@ def tracestate_jitter(header: str | None) -> float:
     return 0.0 if jitter is None else float(jitter)
 
 
+def tracestate_new_conn(header: str | None) -> bool:
+    """Whether the ``compass`` entry in `header` says its request comes on a new
+    connection, ``;n:1``; False without an entry."""
+    entry = _tracestate_entry(header)
+    if entry is None:
+        return False
+    _parse(_TRACE_ENTRY, entry, "tracestate entry")
+    return _TRACE_ENTRY.fullmatch(entry)[4] is not None
+
+
 def tracestate_with(
-    header: str | None, arrival: float, seq: int, jitter: float | None = None
+    header: str | None,
+    arrival: float,
+    seq: int,
+    jitter: float | None = None,
+    new_conn: bool = False,
 ) -> str:
     """`header` with the ``compass`` entry for ``(arrival, seq)`` first, and
-    `jitter`, the request's intake jitter in bytes, in it when given.
+    `jitter`, the request's intake jitter in bytes, in it when given, and
+    ``;n:1`` when the request comes on a new connection (`new_conn`).
 
     The other entries keep their order; empty ones are dropped, and so are
     entries from the end past W3C Trace Context's limit of 32.
@@ -106,6 +123,8 @@ def tracestate_with(
     entry = f"compass=a:{arrival!r};s:{seq}"
     if jitter is not None:
         entry += f";j:{float(jitter)!r}"
+    if new_conn:
+        entry += ";n:1"
     others = [e.strip() for e in (header or "").split(",") if e.strip()]
     return ",".join([entry, *others][:_MAX_ENTRIES])
 

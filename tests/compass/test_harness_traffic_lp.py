@@ -74,14 +74,17 @@ from compass_harness.scheduler import ClockPacedLoopScheduler
 from compass_harness.strategy import ClockPhaseRunner
 from compass_harness.timesource import ClockTimer
 from compass_harness.traffic_lp import (
+    CONN_POOL_ENV,
     HTTP,
     INTAKE_JITTER_BYTES,
     INTAKE_JITTER_SIGMA,
     PREFILL_URL_ENV,
     STREAM,
+    ConnPool,
     SendAfterCancel,
     TrafficLP,
     UnansweredRequests,
+    conn_pool_on,
 )
 from compass_harness.transport import addresses, credit_key
 
@@ -2155,3 +2158,132 @@ def test_a_failing_traffic_lp_still_fails_aiperf_s_run(tmp_path, monkeypatch):
     (error,) = ctl._exit_errors
     assert error.error_details.type == "UnansweredRequests"
     assert str(_key(0)) in error.error_details.message
+
+
+def test_a_conn_pool_hands_out_its_oldest_kept_alive_connection_per_worker():
+    """As aiohttp's connector does: the oldest idle connection first, those
+    idle past the keepalive closed on the way, one pool per worker; with
+    force_close every request opens a new one."""
+    pool = ConnPool(300.0)
+    assert pool.take("w0", 0.0) is False  # nothing idle yet
+    pool.release("w0", 10.0)
+    pool.release("w0", 20.0)
+    pool.release("w1", 15.0)
+    assert pool.take("w0", 310.0) is True  # idle 300 s: kept, takes 10.0's
+    assert pool.take("w0", 320.5) is False  # 20.0's idle 300.5 s: closed
+    assert pool.take("w1", 315.0) is True and pool.take("w1", 315.0) is False
+    pool.release(None, 1.0)  # a request with no worker routed gives nothing back
+    assert pool.idle.keys() == {"w0", "w1"}
+    shut = ConnPool(300.0, force_close=True)
+    shut.release("w0", 1.0)
+    assert shut.take("w0", 2.0) is False
+    for bad in (0.0, -1.0, math.inf, math.nan):
+        with pytest.raises(ValueError, match="keepalive"):
+            ConnPool(bad)
+
+
+@pytest.mark.parametrize("value, on", [(None, False), ("", False), ("1", True)])
+def test_the_conn_pool_is_on_only_for_1(monkeypatch, value, on):
+    if value is None:
+        monkeypatch.delenv(CONN_POOL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(CONN_POOL_ENV, value)
+    assert conn_pool_on() is on
+
+
+@pytest.mark.parametrize("value", ["0", "yes", "300"])
+def test_any_other_conn_pool_value_is_refused(monkeypatch, value):
+    monkeypatch.setenv(CONN_POOL_ENV, value)
+    with pytest.raises(ValueError, match=CONN_POOL_ENV):
+        conn_pool_on()
+
+
+def test_a_send_with_no_kept_alive_connection_on_its_worker_is_stamped_new(tmp_path):
+    """Credit 0 goes to worker w at 0 s and ends at 1.0 s (stream seq 0); at
+    2 s credits 1 and 2 go to w and credit 3 to v: 1, first in seq order, takes
+    0's connection; 2 and 3 open new ones, as 0 did. Without a pool no stamp
+    names a connection."""
+
+    async def main(pooled):
+        prefix = str(tmp_path / f"lp-{uuid.uuid4().hex[:8]}")
+        # Stream seq 1, released at 100 s and never reported, holds the
+        # traffic LP there while the stamps are read.
+        rt = ScriptedRuntime([(1.0, {0}), (100.0, {1})])
+        traffic = TrafficLP(rt, prefix)
+        if pooled:
+            traffic.conn_pool = ConnPool(300.0)
+
+        async def on_return(worker_id, ret):
+            pass
+
+        held = traffic.hold(on_return)
+        sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+        sub.connect(addresses(prefix)[0])
+        sub.subscribe(b"")
+        push = zmq.Context.instance().socket(zmq.PUSH)
+        push.connect(addresses(prefix)[1])
+        await traffic.subscribed(1)
+        traffic.send(_key(0))
+        traffic.route(_key(0), "w")
+        stamps = [await sub.recv_pyobj()]
+        push.send_pyobj((_key(0), 0, 1.0, True))
+        await held("w", SimpleNamespace(credit=_credit(0), error=None))
+        while traffic.now() < 2.0:
+            await traffic.wait(2.0)
+        for num, worker in ((2, "w"), (1, "w"), (3, "v")):
+            traffic.send(_key(num))
+            traffic.route(_key(num), worker)
+        stamps += [await sub.recv_pyobj() for _ in range(3)]
+        traffic.done.cancel()
+        sub.close(linger=0)
+        push.close(linger=0)
+        return {key[2]: (seq, *more) for key, _, seq, *more in stamps}
+
+    assert _run(main(True)) == {
+        0: (0, "new", True),
+        1: (1,),
+        2: (2, "new", True),
+        3: (3, "new", True),
+    }
+    assert _run(main(False)) == {0: (0,), 1: (1,), 2: (2,), 3: (3,)}
+
+
+def test_the_router_hands_the_traffic_lp_each_credit_s_worker(ca, monkeypatch):
+    """With the pool on, the router builds it from aiperf's own keepalive and
+    tells the traffic LP the worker upstream tracks each credit it sends on."""
+    from aiperf.common.environment import Environment
+
+    monkeypatch.setenv(CONN_POOL_ENV, "1")
+    comms = SimpleNamespace(create_pub_client=lambda address: None)
+    monkeypatch.setattr(
+        StickyCreditRouter, "__init__", lambda s, **kw: setattr(s, "comms", comms)
+    )
+    tracked = []
+    monkeypatch.setattr(
+        StickyCreditRouter,
+        "_track_credit_sent",
+        lambda self, worker_id, credit_id: tracked.append((worker_id, credit_id)),
+    )
+
+    async def upstream(self, credit):
+        self._track_credit_sent(f"worker_{credit.id % 2}", credit.id)
+
+    monkeypatch.setattr(StickyCreditRouter, "send_credit", upstream)
+
+    async def main():
+        router = CompassCreditRouter(run=None, service_id="timing_manager")
+        assert (
+            router.traffic.conn_pool.keepalive_s == Environment.HTTP.KEEPALIVE_TIMEOUT
+        )
+        for num in range(3):
+            await router.send_credit(_credit(num))
+        workers = dict(router.traffic._workers)
+        router.traffic.done.cancel()
+        return workers
+
+    assert _run(main()) == {
+        _key(0): "worker_0",
+        _key(1): "worker_1",
+        _key(2): "worker_0",
+    }
+    assert tracked == [("worker_0", 0), ("worker_1", 1), ("worker_0", 2)]

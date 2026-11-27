@@ -5,7 +5,8 @@ Runs in each aiperf worker. The traffic LP in ``timing_manager`` stamps every
 request it sends with an ``(arrival, seq)`` on the HTTP channel and publishes it
 on the adapter's stamp socket, keyed by credit; the stamp and the credit reach
 the worker in either order. The request carries its stamp in ``tracestate``,
-with its intake jitter when the traffic LP drew one (a seeded run).
+with its intake jitter when the traffic LP drew one (a seeded run), and its
+new-connection mark when the traffic LP's connection pool gave it one.
 Each SSE event ATOM streams back carries its own stamp in a comment line; the
 transport reports each one to the traffic LP as it arrives, ``[DONE]`` marked
 final, and rewrites the record's times from the stamps, so aiperf's TTFT, ITL
@@ -57,7 +58,8 @@ class CompassTransport(AioHttpTransport):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._stamps: dict[tuple, asyncio.Future] = {}
-        # key -> (arrival, seq, its intake jitter or None, its record's start)
+        # key -> (arrival, seq, its intake jitter or None, its record's start,
+        # whether it goes on a new connection)
         self._sending: dict[tuple, tuple] = {}
         self._sent: dict[tuple, tuple[str, int]] = {}  # key -> (url, seq)
         self._cancels: list[asyncio.Task] = []
@@ -102,12 +104,14 @@ class CompassTransport(AioHttpTransport):
                         asyncio.create_task(self._cancel(key, arrival, seq, *more[1:]))
                     )
             # A request that timed out waiting cancelled its future. A seeded
-            # one's stamp goes on "jitter", <bytes>, and one behind an ingress
-            # "start", <its arrival there>.
+            # one's stamp goes on "jitter", <bytes>, one behind an ingress
+            # "start", <its arrival there>, and one the traffic LP's connection
+            # pool sends on a new connection "new", True.
             elif not (fut := self._stamp(key)).done():
                 named = dict(zip(more[::2], more[1::2]))
                 start = named.get("start", arrival)
-                fut.set_result((arrival, seq, named.get("jitter"), start))
+                new = bool(named.get("new"))
+                fut.set_result((arrival, seq, named.get("jitter"), start, new))
 
     async def _cancel(self, key: tuple, arrival: float, seq: int, to=None) -> None:
         """Write `key`'s stamped cancel, to its request's URL or on that URL's
@@ -135,10 +139,10 @@ class CompassTransport(AioHttpTransport):
 
     def build_headers(self, request_info) -> dict[str, str]:
         headers = super().build_headers(request_info)
-        arrival, seq, jitter, _ = self._sending[self._key(request_info)]
+        arrival, seq, jitter, _, new = self._sending[self._key(request_info)]
         old = [k for k in headers if k.lower() == "tracestate"]
         headers["tracestate"] = tracestate_with(
-            ",".join(headers.pop(k) for k in old) or None, arrival, seq, jitter
+            ",".join(headers.pop(k) for k in old) or None, arrival, seq, jitter, new
         )
         return headers
 
@@ -155,7 +159,7 @@ class CompassTransport(AioHttpTransport):
             body = payload if isinstance(payload, bytes) else orjson.dumps(payload)
             await self._push.send_pyobj((key, len(body)))
         try:
-            _, seq, _, sent = self._sending[key] = await asyncio.wait_for(
+            _, seq, _, sent, _ = self._sending[key] = await asyncio.wait_for(
                 self._stamp(key), self.model_endpoint.endpoint.timeout
             )
         except TimeoutError:

@@ -293,3 +293,31 @@ class TestTheStreamWriter:
             ("frontend-D->router:stream", s, 2.001) for s in range(len(stamps))
         ]
         assert stamps == [(a, s) for _, s, a in rt.send_log]
+
+
+def test_a_new_connection_mark_rides_last_in_the_compass_entry():
+    """A request sent on a new connection ends its compass entry in ``;n:1``,
+    after any jitter; the stamp and the jitter read as before, and a request
+    with no mark, or no entry, is on a kept-alive connection."""
+    from atom.compass.carriers import (
+        tracestate_jitter,
+        tracestate_new_conn,
+        tracestate_stamp,
+        tracestate_with,
+    )
+
+    plain = tracestate_with("vendor=x", 1.25, 7)
+    new = tracestate_with("vendor=x", 1.25, 7, new_conn=True)
+    both = tracestate_with(None, 1.25, 7, 4800.5, True)
+    assert plain == "compass=a:1.25;s:7,vendor=x"
+    assert new == "compass=a:1.25;s:7;n:1,vendor=x"
+    assert both == "compass=a:1.25;s:7;j:4800.5;n:1"
+    assert [tracestate_stamp(h) for h in (plain, new, both)] == [(1.25, 7)] * 3
+    assert tracestate_jitter(both) == 4800.5 and tracestate_jitter(new) == 0.0
+    assert [tracestate_new_conn(h) for h in (plain, new, both, None, "v=1")] == [
+        False,
+        True,
+        True,
+        False,
+        False,
+    ]

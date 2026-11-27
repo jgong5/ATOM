@@ -1194,11 +1194,12 @@ def _intake_run_file(monkeypatch, tmp_path, intake) -> None:
     monkeypatch.setenv(compass_run.ENV, str(path))
 
 
-def _burst(run, monkeypatch, n, app, sizes=None, receives=None, jitters=None):
+def _burst(run, monkeypatch, n, app, sizes=None, receives=None, jitters=None, news=()):
     """`n` stamped requests at one arrival, through the served app, each with a
     body of ``sizes[seq]`` bytes, or read from ``receives(seq)``, and the
-    intake jitter ``jitters[seq]`` in its stamp, if given; returns the arrival
-    once the loop has finished."""
+    intake jitter ``jitters[seq]`` in its stamp, if given, and the seqs in
+    `news` marked as sent on new connections; returns the arrival once the loop
+    has finished."""
     stamps = queue.Queue()
     traffic = _traffic(run, stamps, before_ner=lambda: None, n=n)
     arrival = stamps.get(timeout=10)[0]
@@ -1213,7 +1214,9 @@ def _burst(run, monkeypatch, n, app, sizes=None, receives=None, jitters=None):
             return {"type": "http.request", "body": body}
 
         jitter = None if jitters is None else jitters[seq]
-        tracestate = carriers.tracestate_with(None, arrival, seq, jitter).encode()
+        tracestate = carriers.tracestate_with(
+            None, arrival, seq, jitter, seq in news
+        ).encode()
         scope = {"type": "http", "headers": [(b"tracestate", tracestate)]}
         return served(scope, receives(seq) if receives else receive, None)
 
@@ -1328,7 +1331,7 @@ def test_an_intake_jitter_orders_a_burst_as_if_each_body_were_that_much_longer(
     assert [t for _, t in entered] == pytest.approx(at)
 
 
-def _entered_in_turns(run, monkeypatch, tmp_path, sizes, jitters=None):
+def _entered_in_turns(run, monkeypatch, tmp_path, sizes, jitters=None, news=()):
     """The (seq, LP time) each request of a same-instant burst of bodies of
     `sizes` bytes enters the app at, its larger bodies read first on the wall,
     under an intake of 2 ms + 1 us a byte; and that arrival."""
@@ -1348,7 +1351,7 @@ def _entered_in_turns(run, monkeypatch, tmp_path, sizes, jitters=None):
         return receive
 
     arrival = _burst(
-        run, monkeypatch, len(sizes), app, receives=receives, jitters=jitters
+        run, monkeypatch, len(sizes), app, receives=receives, jitters=jitters, news=news
     )
     return entered, arrival
 
@@ -1373,6 +1376,68 @@ def test_under_send_order_a_burst_reaches_the_app_as_sent_whatever_its_bodies(
     print(f"\n  {draw}: app entered {entered}")
     assert [seq for seq, _ in entered] == [0, 1, 2, 3]
     assert [t for _, t in entered] == pytest.approx(at)
+
+
+@pytest.mark.parametrize(
+    "news, draw, order",
+    [
+        # Every request on a new connection: taken in as sent, bodies and
+        # jitters ordering nothing.
+        ({0, 1, 2, 3}, "no seed", [0, 1, 2, 3]),
+        ({0, 1, 2, 3}, "seed a", [0, 1, 2, 3]),
+        # 1 and 3 kept alive, in at 3.0 and 3.5 ms; 0 and 2 new, taken in one
+        # after the other, in at 5.0 and 9.0 ms.
+        ({0, 2}, "no seed", [1, 3, 0, 2]),
+        # 0 and 2 kept alive, in at 5.0 and 4.0 ms; 1 and 3 new, in at 3.0
+        # and 6.5 ms.
+        ({1, 3}, "no seed", [1, 2, 0, 3]),
+        # Seed a's jitters (0, 2500, 0, 100 bytes) order the kept-alive ones
+        # only: 0 in at 5.0, 2 at 4.0; new 1 at 3.0, new 3 at 6.5 ms.
+        ({1, 3}, "seed a", [1, 2, 0, 3]),
+        ((), "no seed", [1, 3, 2, 0]),
+    ],
+)
+def test_new_connections_are_taken_in_one_at_a_time_in_seq_order(
+    run, monkeypatch, tmp_path, news, draw, order
+):
+    # Bodies of 3000, 1000, 2000 and 1500 bytes, the larger read first on the
+    # wall, under an intake of 2 ms + 1 us a byte: a kept-alive request's body
+    # is in at its arrival plus its own intake, read at once with the others;
+    # a new connection's at the previous new one's plus its own, in seq order.
+    sizes = [3000, 1000, 2000, 1500]
+    entered, arrival = _entered_in_turns(
+        run, monkeypatch, tmp_path, sizes, JITTERS[draw], news
+    )
+    at, t = [], arrival
+    for seq in order:
+        t += 2e-3 + 1e-6 * sizes[seq]
+        at.append(t)
+    print(f"\n  new {sorted(news)}, {draw}: app entered {entered}")
+    assert [seq for seq, _ in entered] == order
+    assert [t for _, t in entered] == pytest.approx(at)
+
+
+def test_a_new_connection_s_wall_read_order_does_not_move_its_turn(
+    run, monkeypatch, tmp_path
+):
+    # All four on new connections, the smaller bodies read first on the wall
+    # this time: still taken in seq order.
+    _intake_run_file(monkeypatch, tmp_path, (2e-3, 1e-6))
+    sizes, entered = [3000, 1000, 2000, 1500], []
+
+    async def app(scope, receive, send):
+        entered.append(api_server._tracestate_stamp(scope)[1])
+
+    def receives(seq):
+        async def receive():
+            for _ in range(sizes[seq] // 500):  # a larger body, more reads
+                await asyncio.sleep(0)
+            return {"type": "http.request", "body": b"x" * sizes[seq]}
+
+        return receive
+
+    _burst(run, monkeypatch, 4, app, receives=receives, news={0, 1, 2, 3})
+    assert entered == [0, 1, 2, 3]
 
 
 @pytest.mark.parametrize("value", [None, "", "body"])

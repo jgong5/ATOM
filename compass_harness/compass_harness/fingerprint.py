@@ -41,6 +41,11 @@ PINNED = {
     "aiperf.credit.sticky_router:StickyCreditRouter._handle_router_message": "0fbe77fb29177ae21af763546c60f08383d02adc2a4c95056f7d4780866497f3",
     "aiperf.credit.sticky_router:StickyCreditRouter.wait_for_workers": "c4caa24397e021c49299899cef718e6038f2dc838c1217d68198a8cb2d0665ed",
     "aiperf.credit.sticky_router:StickyCreditRouter.mark_credits_complete": "65c1844f45499a4d94207e446f5fc58919c9ff8341295d9f0fe46134f913b119",
+    # The connection pool (traffic_lp.ConnPool): the worker send_credit tracks
+    # before its first await, and the keepalive and force-close settings each
+    # worker's connector takes.
+    "aiperf.credit.sticky_router:StickyCreditRouter._track_credit_sent": "d6949f97f03c9e173c9c88615ac675775f5ac810886ef77c62c2f926c0a2f137",
+    "aiperf.common.environment:_HTTPSettings": "d3ee293ebbc01a9567039f947145f352f81589e1c498038af9357ca5d341492e",
     "aiperf.credit.issuer:CreditIssuer._issue_credit_internal": "11e0184be4fc3af1ef5b4e5d71035f97623c05f0c8d1e9047e67967efdd13964",
     "aiperf.timing.phase_orchestrator:PhaseOrchestrator._start_orchestrator": "2f84c93d885c6e68b77d0de540043dc84e62ff996e5b587f39c8722b350b8b30",
     "aiperf.timing.manager:TimingManager.__init__": "fb1667460f69c2f48a8c04a0610cd64c59cf3ff48aba734f183f8c0d5885548a",
