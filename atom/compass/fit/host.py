@@ -65,6 +65,7 @@ host fit is held to. Unset, the fit is as it was.
 import dataclasses
 import gzip
 import json
+import os
 import math
 from collections import Counter
 from pathlib import Path
@@ -85,7 +86,9 @@ from atom.compass.backends.step_linear_fit import (
     fit_hops,
     fit_host,
     fit_intake,
+    HOST_STAGES_ENV,
     host_queue_spec,
+    jit_over_s,
     ring_cut_s,
     fit_relay,
     fit_stream,
@@ -144,6 +147,43 @@ def record_ring_gated(records, within_s: float) -> dict[str, set[int]]:
     return out
 
 
+def record_stage_launches(records, within_s, over_s) -> dict[str, dict[int, list]]:
+    """Per pipeline head record (``dp<r>.jsonl``, by `digest`) of each record
+    directory in `records`, its later stages' (``pp<k>.dp<r>.jsonl``) launch
+    spans by step, seconds: a stage before the last ring-cut against the stage
+    after it (`ring_gated`, `within_s`; none when None), the last uncut, a span
+    over `over_s` (a first-use compile; none when None) left out."""
+    from atom.compass.runner.pp_send import SLOTS
+
+    def read(path):
+        return [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
+
+    out = {}
+    for r in records:
+        steps = Path(r) / "steps"
+        for head in sorted(steps.glob("dp*[0-9].jsonl")):
+            later = sorted(
+                steps.glob(f"pp*.{head.name}"), key=lambda p: int(p.name[2:].split(".")[0])
+            )
+            if not later:
+                continue
+            lines = [read(p) for p in later]
+            spans: dict[int, list] = {}
+            for i, mine in enumerate(lines):
+                cut = set()
+                if within_s is not None and i + 1 < len(lines):
+                    cut = ring_gated(mine, lines[i + 1], SLOTS, within_s)
+                for s in mine:
+                    la = s.get("t_launch_ns")
+                    if s["is_dummy_run"] or not la or s["step"] in cut:
+                        continue
+                    span = (la[-1] - la[0]) * 1e-9
+                    if over_s is None or span <= over_s:
+                        spans.setdefault(s["step"], []).append(span)
+            out[digest(head)] = spans
+    return out
+
+
 def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, dict]:
     """The host laws over `samples`, with the tokenizer, HTTP intake and hop
     terms of the record directories `records`, each served the client runs
@@ -182,7 +222,13 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
         extra["queue"] = record_queue_depths(records)
     if (within := ring_cut_s()) is not None:
         extra["gated"] = record_ring_gated(records, within)
+    if os.environ.get(HOST_STAGES_ENV) == "all":
+        extra["stages"] = record_stage_launches(records, within, jit_over_s())
     host, report = fit_host(samples, **extra)
+    if "stages" in extra:
+        report["host_stages"] = {
+            run: sum(len(v) for v in steps.values()) for run, steps in extra["stages"].items()
+        }
     if "gated" in extra:
         report["ring_cut"] = {
             "within_s": within,

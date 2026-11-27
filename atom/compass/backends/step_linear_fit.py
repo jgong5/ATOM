@@ -446,6 +446,17 @@ def _host_lsq(ys, columns) -> tuple[list, dict]:
     }
 
 
+#: Fit the `W_launch` laws on every pipeline stage's forwards (opt-in, ``all``;
+#: unset: the head's record only, as the host fit labels): the later stages'
+#: launch spans (`fit.host.record_stage_launches`, each stage ring-cut against
+#: the stage after it under `RING_CUT_ENV`, the last uncut) join the head's rows
+#: with every queue column at 0, so a queue column is the head's extra on a base
+#: all stages share; a run prices a later stage at the base (its queue columns
+#: dropped). P's later stages on the CAL: launch p50 20 ms, mean 31-40 ms at
+#: every queue, a tail the head-only fit leaves unpriced.
+HOST_STAGES_ENV = "COMPASS_FIT_HOST_STAGES"
+
+
 #: What a host fit takes for a first-use compile and leaves out (opt-in; unset:
 #: every forward whose W_launch the robust fit drops above its law, `_jit`):
 #: ``<seconds>``, a forward whose W_launch is over that only, as the stall gate
@@ -1225,12 +1236,14 @@ def _runs(samples, dp: int) -> dict[str, list[list]]:
     return {run: [ranks[r] for r in sorted(ranks)] for run, ranks in runs.items()}
 
 
-def fit_host(samples, queue=None, gated=None) -> tuple[dict, dict]:
+def fit_host(samples, queue=None, gated=None, stages=None) -> tuple[dict, dict]:
     """The host laws over `samples`, as a run file's `host` entry, and their
     report. Under `HOST_QUEUE_ENV`, `queue` holds each sample's queue depth by
     run and step (`step_labels.queue_depths`), the listed segments' column.
     Under `RING_CUT_ENV`, `gated` holds each run's ring-held steps, whose
-    `W_launch` is left out."""
+    `W_launch` is left out. Under `HOST_STAGES_ENV`, `stages` holds each run's
+    later-stage launch spans by step, each a `W_launch` row of the step's kind
+    and shape with its queue columns at 0."""
     from scipy.spatial import QhullError
 
     held = {json.dumps(s.provenance["config"], sort_keys=True) for s in samples}
@@ -1285,6 +1298,20 @@ def fit_host(samples, queue=None, gated=None) -> tuple[dict, dict]:
     # One run holds out spans of its own steps to choose its launch columns.
     one = len({s.provenance["run"] for s in kept}) == 1
     rows = _host_rows(kept, RUN_BLOCKS if one else 0, launch_of, gated)
+    if stages:
+        for s in kept:
+            spans = stages.get(s.provenance["run"], {}).get(s.step, ())
+            if not spans:
+                continue
+            launch = launch_of(s) if launch_of is not None else s.launch
+            launch = {
+                f: (0 if f in step_labels.queue_columns([f]) else v) for f, v in launch.items()
+            }
+            run = s.provenance["run"]
+            if one:
+                last = max(x.step for x in kept) + 1
+                run = (run, s.step * RUN_BLOCKS // last)
+            rows += [(host_kind(s.view), "W_launch", _host_x(s), v, run, launch) for v in spans]
     host = {"key": json.loads(keys[0]), "laws": {}}
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
     report["blocked"], report["unstamped"] = _blocked(samples)

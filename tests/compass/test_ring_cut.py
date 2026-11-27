@@ -41,3 +41,30 @@ def test_the_jit_cut_takes_a_threshold_in_seconds(monkeypatch):
     monkeypatch.setenv(JIT_OVER_ENV, "one")
     with pytest.raises(ValueError, match="seconds"):
         jit_over_s()
+
+
+def test_the_later_stages_launch_spans_are_read_ring_cut_and_stall_cut(tmp_path):
+    import json as _json
+
+    from atom.compass.backends.step_labels import digest
+    from atom.compass.fit.host import record_stage_launches
+
+    steps = tmp_path / "rec" / "steps"
+    steps.mkdir(parents=True)
+
+    def write(name, lasts):
+        steps.joinpath(name).write_text(
+            "".join(_json.dumps(_line(s, ms)) + "\n" for s, ms in enumerate(lasts))
+        )
+
+    write("dp0.jsonl", [0, 10, 20, 30, 40])
+    write("pp1.dp0.jsonl", [0, 100, 200, 300, 2500])  # step 4's span 2.5 s: a compile
+    write("pp2.dp0.jsonl", [0, 10, 20, 105, 120])  # step 3 at 105 ms: 5 ms past stage 3's step 0 (100): held
+    write("pp3.dp0.jsonl", [100, 110, 120, 130, 140])
+    got = record_stage_launches([tmp_path / "rec"], 0.020, 1.0)
+    spans = got[digest(steps / "dp0.jsonl")]
+    # Stage 1 (vs stage 2): step 3 at 300 is 300 ms past stage 2's step 0 (0): free; stage 2 step 3: held;
+    # stage 3 uncut; stage 1's step 4 over 1 s: left out; stage 2's step 4 at 120, 10 ms past stage 3's step 1: held.
+    assert sorted(spans[3]) == pytest.approx([0.130, 0.300])
+    assert spans[4] == pytest.approx([0.140])
+    assert len(spans[0]) == 3
