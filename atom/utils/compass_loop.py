@@ -33,12 +33,17 @@ With ``COMPASS_TOKENIZER_BATCH_LONGEST=1`` (`BATCH_LONGEST_ENV`) a
 several-item ``encode_batch`` is charged its term over its longest encoding's
 ids instead of all of them: the fast tokenizer encodes a batch's items in
 parallel (``tokenizers``' rayon pool), so its wall time follows its longest
-item. The term (fixed_s, tokens_per_s) is the host law's, fitted on
-calibration calls whose new turn is one item and dominates them. #752
-DeepSeek-V4.1 Cell A DEPA2: in the calibration record (cal/real), lone
-several-item calls of 7-29 items (a cold prompt split at its added tokens) run
-at 0.19-0.54 of the term over all their ids, 2-item calls at 0.86-1.00; the
-c1 targets' cold 3-5-item calls of 60-70k ids at 0.59-0.68.
+item. The term (fixed_s, tokens_per_s) is the host law's, unchanged: it is
+fitted on calibration calls that are mostly 2-item, the new turn one item
+that dominates the call. #752 DeepSeek-V4.1 Cell A DEPA2, its two calibration
+records' 1199 encode_batch calls, each call's items from a CPU replay of the
+records' client against ATOM's API server: the law's price / wall - 1 has a
+mean absolute value of 33.4% in the old form and 30.4% in this one (2 items
+36.2 -> 34.8%, 3-9 items 163 -> 25%, 10+ items 232 -> 12%, one item the same),
+and refitting the term over the longest items moves fixed_s by 4% and
+tokens_per_s by 1.3%. A server under ``TOKENIZERS_PARALLELISM=false`` encodes
+a batch serially (Cell B's prefill records: 3+-item calls at 0.97-1.11 of the
+price over all ids), and the old form is the one that fits it.
 
 `CompassEventLoop` is the frontend's event loop in a simulated run: its
 ``time()`` is the installed `LPRuntime`'s clock, so every timer is on LP time,
