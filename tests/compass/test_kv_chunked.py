@@ -221,6 +221,26 @@ def chunked(geometry, monkeypatch):  # noqa: F811
     )
 
 
+def _free_ports(n):
+    """The first of `n` consecutive free local ports: decode binds a notice
+    socket a stage, at the configured port plus the stage's index, and a socket
+    an earlier test bound stays bound."""
+    import socket
+
+    for _ in range(100):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        try:
+            for k in range(1, n):
+                with socket.socket() as other:
+                    other.bind(("127.0.0.1", port + k))
+        except OSError:
+            continue
+        return port
+    raise RuntimeError(f"no {n} consecutive free ports")
+
+
 def _forward(engine, rt, t):
     """`EngineCore`'s step: schedule, the forward ending at `t` on the device,
     whose batch the producer is told of, the KV poll, postprocess."""
@@ -440,7 +460,6 @@ def test_a_later_stage_writes_its_layers_from_the_relay_and_frees_nothing(
     forward publishes its layers' blocks, and its last forward hands off; the
     stage tells decode on its own notice channel and holds nothing after, as
     the head's scheduler frees the blocks on decode's release."""
-    import socket
 
     table = prefill_decode_table(
         admission_s=0.54e-3, ipc_s=L, stream_s=L, router_s=L, kv_write_req_s=L,
@@ -450,9 +469,7 @@ def test_a_later_stage_writes_its_layers_from_the_relay_and_frees_nothing(
     for lp in ("engine-D", "engine-P-pp1"):
         rts[lp] = LPRuntime(clock.LpId(lp), table, Script())
         rts[lp].start_run()
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    port = _free_ports(2)
     model = model_for(geometry, PEAKS[0])
     kv = {
         "kv_connector": "compass",
@@ -509,3 +526,76 @@ def test_a_later_stage_writes_its_layers_from_the_relay_and_frees_nothing(
     assert notice[0] == "engine-P-pp1->engine-D:kv_write_done"
     assert notice[2] == send.done + L
     assert not stage._released and not stage.has_pending_work()
+    # The head repeats its relay in every metadata until its own send is
+    # done: a relay seen again opens no second send.
+    forward(3.0, 10, relay={"r": ("t", pair, 0.5, 3, 10)})
+    assert "r" not in stage._sends and not stage.has_pending_work()
+    assert (
+        len([e for e in rts["engine-P-pp1"].send_log if ":kv_write_done" in e[0]]) == 1
+    )
+
+
+def test_the_head_relays_a_send_in_every_metadata_until_its_own_is_done(
+    geometry, monkeypatch  # noqa: F811
+):
+    """A chunked send the head admitted rides every connector metadata it
+    builds, not the first alone: a request parked for a tier load is admitted
+    under connector-only batches, which run no forward on the stages and so
+    reach no stage's `relayed` (M3.1 B c=64: request 195's three later stages
+    never opened their sends, decode never heard them, and its reservation
+    held pd_admission for good). An abort ends the relay."""
+
+    table = prefill_decode_table(
+        admission_s=0.54e-3, ipc_s=L, stream_s=L, router_s=L, kv_write_req_s=L,
+        prefill_pp=2, chunked=True,
+    )  # fmt: skip
+    rts = {}
+    for lp in ("engine-D", "engine-P-pp0"):
+        rts[lp] = LPRuntime(clock.LpId(lp), table, Script())
+        rts[lp].start_run()
+    port = _free_ports(2)
+    model = model_for(geometry, PEAKS[0])
+    kv = {
+        "kv_connector": "compass",
+        TRANSFER_KEY: (model, model),
+        WRITE_REQ_KEY: f"inproc://chunked-head-req-{port}",
+        WRITE_DONE_KEY: f"tcp://127.0.0.1:{port}",
+    }
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    halves = {}
+    for lp, role, extra, parallel in (
+        ("engine-D", "kv_consumer", {},
+         SimpleNamespace(data_parallel_rank=0, data_parallel_size=1)),
+        ("engine-P-pp0", "kv_producer", {"enable_chunked_transfer": True},
+         SimpleNamespace(data_parallel_rank=0, data_parallel_size=1,
+                         pipeline_parallel_rank=0)),
+    ):  # fmt: skip
+        monkeypatch.setattr(clock, "_installed", rts[lp])
+        halves[lp] = KVConnectorFactory.create_connector(
+            atom_config_double(
+                kv_transfer_config={**kv, "kv_role": role, **extra},
+                kv_cache_block_size=4,
+                pipeline_parallel_size=2,
+                parallel_config=parallel,
+            ),
+            role="scheduler",
+        )
+    monkeypatch.setattr(clock, "_installed", None)
+    head = halves["engine-P-pp0"]
+    x = Sequence(
+        PROMPT,
+        4,
+        sampling_params=SamplingParams(max_tokens=1),
+        kv_transfer_params={
+            "do_remote_decode": True, "chunked_transfer": True, "transfer_id": "t"
+        },
+    )  # fmt: skip
+    head._reads["t"] = (("engine-D", 0), 3, 0.5)  # decode's write request is in
+    assert head.admission_ready(x)
+    head.update_state_after_alloc(x)
+    for _ in range(3):  # connector-only batches, then the first forward's
+        assert set(head.build_connector_meta().compass_chunked) == {x.id}
+    x.status, x.leave_reason = SequenceStatus.ABORTED, "aborted"
+    head.request_finished(x)
+    assert getattr(head.build_connector_meta(), "compass_chunked", None) is None

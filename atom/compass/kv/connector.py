@@ -87,8 +87,9 @@ does for a send aborted midway. Decode reports the failed receive
 Above one prefill stage each stage writes its own layers, as each of
 Mooncake's stage workers serves its own reads: the head relays each admitted
 chunked request (its transfer id, the write request's arrival and the blocks
-to write) in its connector metadata, which the scheduled batch carries to every
-stage (`relayed`); a stage's `ChunkedSend` reads its forwards' publications onto
+to write) in every connector metadata it builds until its own send is done,
+which the scheduled batches carry to every stage (`relayed`), a stage opening
+each once: a connector-only batch, which runs no forward there, carries none; a stage's `ChunkedSend` reads its forwards' publications onto
 its own stage link and sends its own notice on its ``kv_write_done``. Decode is
 ready once every stage's notice is in, and tells the head (a release on the
 write-request channel), whose blocks are freed then, as Mooncake's head frees
@@ -308,7 +309,12 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             {}
         )  # decode: transfer id -> [request, notices due, latest]
         self._stage = int(getattr(parallel, "pipeline_parallel_rank", 0) or 0)
-        self._relay: dict = {}  # prefill head: what the stages are told of new sends
+        # Prefill head: each chunked send it admitted, told to the stages in
+        # every connector metadata until its own send is done or aborted.
+        self._relay: dict = {}
+        # A later stage: the chunked sends it opened from a relay, so a
+        # relay repeated in a later metadata opens none again.
+        self._relayed: collections.OrderedDict = collections.OrderedDict()
         self._released: dict = (
             {}
         )  # prefill head: request -> its send, done, awaiting release
@@ -470,8 +476,12 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
     def build_connector_meta(self) -> ConnectorMetadata:
         meta = ConnectorMetadata()
         if self._relay:
-            # The stages' share of each chunked send admitted since (`relayed`).
-            meta.compass_chunked, self._relay = self._relay, {}
+            # Each chunked send the stages write their share of (`relayed`),
+            # in every metadata until the head's own is done: a connector-only
+            # batch, which runs no forward on the stages, does not carry it to
+            # their `relayed`, and the batch of the request's first forward
+            # does.
+            meta.compass_chunked = dict(self._relay)
         return meta
 
     def _pages_line_up(self, params) -> bool:
@@ -680,6 +690,11 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             for req_id, (tid, pair, a, blocks, prompt) in (
                 getattr(m, "compass_chunked", None) or {}
             ).items():
+                if req_id in self._relayed:
+                    continue  # repeated in a later metadata
+                self._relayed[req_id] = None
+                if len(self._relayed) > RETIRED_LIMIT:
+                    self._relayed.popitem(last=False)
                 total = -(-prompt // page)
                 link = self._links[pair][self._stage]
                 send = ChunkedSend(link, a, max(0, total - blocks), total)
@@ -726,6 +741,7 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             # Its reads stop at once; what is written stays written, and
             # decode hears that its writer failed.
             del self._sends[seq.id]
+            self._relay.pop(seq.id, None)
             self._due[seq.id] = self._rt.read_clock()
             self._fail(held[1], held[2], self._rt.read_clock())
         elif aborted and not self._stage:
@@ -786,6 +802,7 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
             elif self._pp_size > 1:
                 # Freed on decode's release, once every stage's write is done.
                 self._released[transfer_id] = req_id
+                self._relay.pop(req_id, None)
             else:
                 self._due[req_id] = send.done
             self._notices.append((send.done, pair, transfer_id))
