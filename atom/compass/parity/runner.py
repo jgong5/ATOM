@@ -5,14 +5,17 @@ with the parity record's variable set.
 Kept apart from the package because importing `ModelRunner` needs a driver.
 """
 
+import os
 import time
 
 import torch
 
 from atom.compass.parity import (
+    ENV,
     StepRecording,
     blocked,
     key_memory_formats_by_name,
+    moe_keys,
     record_step,
 )
 from atom.compass.run import host_key
@@ -26,6 +29,8 @@ class _Recording(StepRecording):
     startup, and the blocking-call tool where HIP's initialization loaded it."""
 
     def __init__(self, *args, **kwargs) -> None:
+        # Under `moe_keys.ENV`, aiter's MoE tuning lookups are logged from the model's load on.
+        moe_keys.install(self, os.environ[ENV])
         super().__init__(*args, **kwargs)
         # Read once at startup, so no forward pays for it.
         self.host_key = host_key(self.config)
