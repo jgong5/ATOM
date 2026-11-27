@@ -48,7 +48,7 @@ def test_a_member_that_wakes_its_idle_group_takes_the_wake_once(monkeypatch):
     assert len(rt.asked) == 1
     member._sync_dp_state(False)
     member._sync_dp_state(True)
-    assert rt.asked[-1] == pytest.approx(10.004) and rt.wakes == rt.asked
+    assert rt.asked[-1] == pytest.approx(10.004) and rt.dp_wakes == rt.asked
 
 
 def test_a_peer_woken_by_another_member_takes_none(monkeypatch):

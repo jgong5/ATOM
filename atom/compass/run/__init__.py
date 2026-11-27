@@ -2277,7 +2277,7 @@ def _wake_before_sync(seconds: float) -> None:
         idle = getattr(self, "_compass_group_idle", True)
         if idle and local_has_unfinished and rt is not None and rt.in_run:
             rt.advance_to(rt.now + seconds)
-            rt.__dict__.setdefault("wakes", []).append(rt.now)
+            rt.__dict__.setdefault("dp_wakes", []).append(rt.now)
         out = sync(self, local_has_unfinished, *args, **kwargs)
         self._compass_group_idle = not out[0]
         return out
@@ -3653,7 +3653,7 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     if parks := getattr(rt, "parks", None):
         cpu_s, at = sum(p[2] for p in parks), [p[:2] for p in parks]
         sections = sections | {"parks": {"count": len(parks), "cpu_s": cpu_s, "at": at}}
-    if wakes := getattr(rt, "wakes", None):
+    if wakes := rt.__dict__.get("dp_wakes"):
         sections = sections | {"wakes": {"count": len(wakes), "at": wakes}}
     if rt.member is not None:
         sections = sections | {"owed": dict(rt.paid)}
