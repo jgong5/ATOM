@@ -306,6 +306,7 @@ PREFILL_EXTRA = (
     "uneven_rows",
     "tail_peers",
     "seqs",
+    "seqs_over",
     "out",
     "peer_small",
     "peer_large",
@@ -393,6 +394,20 @@ class _Vector:
                 f"{spec.get('kda_chunk')!r} tokens; a view states its padding at "
                 f"{KDA_CHUNK}"
             )
+        self.seqs_hinge = None
+        if "seqs_over" in features:
+            self.seqs_hinge = spec.get("seqs_hinge")
+            if not isinstance(self.seqs_hinge, int) or self.seqs_hinge < 1:
+                raise ValueError(
+                    f"the {name} vector carries seqs_over over a seqs_hinge of "
+                    f"{self.seqs_hinge!r}; it states the sequences a rank counts "
+                    "under seqs, 1 or more, under seqs_hinge"
+                )
+            if "seqs" not in features:
+                raise ValueError(
+                    f"the {name} vector carries seqs_over and no seqs, the "
+                    "sequences up to its seqs_hinge"
+                )
         self.buckets = None
         if "padding" in features:
             self.buckets = tuple(sorted(int(b) for b in spec.get("buckets") or ()))
@@ -901,8 +916,11 @@ class StepLinearBackend(CostBackend):
                     )
                 counts += (got,)
             output = batch_view.produces_output
+            seqs = len(prefill) if output else 0
+            hinge = vector.seqs_hinge
             by_output = {
-                "seqs": len(prefill) if output else 0,
+                "seqs": seqs if hinge is None else min(seqs, hinge),
+                "seqs_over": 0 if hinge is None else max(seqs - hinge, 0),
                 "out": int(bool(output)),
             }
             mine = [f for f in by_output if f in vector.features]

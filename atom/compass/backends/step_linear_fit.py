@@ -426,6 +426,11 @@ UNEVEN_ROWS_ENV = "COMPASS_FIT_UNEVEN_ROWS"
 #: Prefill `tail_peers` (`step_linear.tail_peers`): a rank's real-row peers at a
 #: step its group runs a finishing prompt's tail at.
 TAIL_PEERS_ENV = "COMPASS_FIT_TAIL_PEERS"
+#: Prefill `seqs` counted up to `H` sequences a rank and `seqs_over` past them,
+#: each its own coefficient (`StepLinearLaw`'s `seqs_hinge`): a positive integer
+#: `H`, unset or 0 off. A rank's many short prompts cost less each than its
+#: few long ones; one column over both prices a burst of short ones high.
+SEQS_HINGE_ENV = "COMPASS_FIT_PREFILL_SEQS_HINGE"
 #: The target prefill vector fitted under the runner's phase-wise group rule
 #: (`COMPASS_PREFILL_PHASE_MAX`, `runner.overrides.history_phase_wait`): a
 #: positive blend `k`, unset or 0 off. A step then costs the max over its ranks
@@ -543,7 +548,11 @@ def _prefill_counts(
             counts += (got,)
     if out:
         output = bool(view.produces_output)
-        counts += (len(r) if output else 0, int(output))
+        seqs = len(r) if output else 0
+        if hinge := cols and cols.get("seqs_hinge"):
+            counts += (min(seqs, hinge), max(seqs - hinge, 0), int(output))
+        else:
+            counts += (seqs, int(output))
     if share:
         counts += peer_share(view)
     if kda:
@@ -656,6 +665,7 @@ def _columns(options, draft: bool = False) -> dict:
         "moe_imbalance": options.get("moe_imbalance"),
         "uneven_rows": options.get("uneven_rows"),
         "tail_peers": True if options.get("tail_peers") else None,
+        "seqs_hinge": options.get("seqs_hinge") or None,
         **{f: bool(options.get(f)) for f in GRAPH_COLUMNS},
     }
     if draft:
@@ -748,6 +758,10 @@ def env_options(environ=None) -> dict:
             out[key] = MOE_MIN_SPREAD if spread is None else float(spread)
     if _switch(env, TAIL_PEERS_ENV):
         out["tail_peers"] = True
+    if (hinge := env.get(SEQS_HINGE_ENV)) not in (None, "", "0"):
+        if not hinge.isdigit():
+            raise ValueError(f"{SEQS_HINGE_ENV}={hinge} is not a positive integer")
+        out["seqs_hinge"] = int(hinge)
     if (phase := env.get(PREFILL_PHASE_MAX_ENV)) not in (None, "", "0"):
         try:
             k = float(phase)
@@ -3071,7 +3085,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
     prefill += ["serial_moe_rows"] * serial + ["cold_peer_rows"] * cold
     gathered = _gathered(cols)
     prefill += gathered
-    prefill += ["seqs", "out"] * (draft or any(s.draft_s is not None for s in samples))
+    if draft or any(s.draft_s is not None for s in samples):
+        prefill += ["seqs", *["seqs_over"] * bool(cols.get("seqs_hinge")), "out"]
     prefill += list(PEER_SHARE) * share
     prefill += list(KDA) * kda
     prefill += ["padding"] * bool(buckets)
@@ -3234,6 +3249,8 @@ def fit(samples, options=None, seed: int = 0, draft: bool = False) -> tuple[dict
                     vector["fit"]["phase_max"] = blend
                 if buckets:
                     vector["buckets"] = list(buckets)
+                if "seqs_over" in features:
+                    vector["seqs_hinge"] = cols["seqs_hinge"]
                 if cold:
                     vector["duty_tau"] = DUTY_TAU
                 if keep_tail:
