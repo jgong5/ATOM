@@ -414,6 +414,31 @@ ADMIT_FEATURES = ("admits", "uncached", "cached")
 #: at a queue of 0-1, 17.6 ms at 16-63), which a law without it prices at its
 #: mean at every load.
 HOST_QUEUE_ENV = "COMPASS_FIT_HOST_QUEUE"
+#: The host segments fitted with every run weighing the same (opt-in; unset:
+#: none), ``kind.segment,...``: each listed segment's forwards are weighted so
+#: that each run's (record's) rows weigh the same in all, in place of each
+#: forward the same, whose fit follows the record with the most forwards
+#: (#734's cell B P: hi 7495 prefill forwards against cal's 3020, hi's load
+#: at a given engine queue heavier than cal's). The launch columns are chosen
+#: as before, unweighted.
+HOST_EQUAL_RUNS_ENV = "COMPASS_FIT_HOST_EQUAL_RUNS"
+
+
+def host_equal_runs() -> frozenset:
+    """`HOST_EQUAL_RUNS_ENV`'s ``kind.segment`` names; empty unset. Raises on a
+    name that is not ``kind.segment``."""
+    value = os.environ.get(HOST_EQUAL_RUNS_ENV, "")
+    names = frozenset(x for x in value.split(",") if x)
+    if bad := sorted(x for x in names if x.count(".") != 1):
+        raise ValueError(f"{HOST_EQUAL_RUNS_ENV}={value}: {bad} is not kind.segment")
+    return names
+
+
+def equal_run_weights(runs) -> np.ndarray:
+    """Per row of `runs` (each row's run), its weight: each run's rows weigh
+    the same in all, the weights averaging 1."""
+    names, index, counts = np.unique([repr(r) for r in runs], return_inverse=True, return_counts=True)
+    return len(index) / (len(names) * counts[index])
 
 
 def host_queue_spec() -> dict[str, int] | None:
@@ -1084,7 +1109,9 @@ def _runs(samples, dp: int) -> dict[str, list[list]]:
 def fit_host(samples, queue=None) -> tuple[dict, dict]:
     """The host laws over `samples`, as a run file's `host` entry, and their
     report. Under `HOST_QUEUE_ENV`, `queue` holds each sample's queue depth by
-    run and step (`step_labels.queue_depths`), the listed segments' column."""
+    run and step (`step_labels.queue_depths`), the listed segments' column.
+    Under `HOST_EQUAL_RUNS_ENV` the listed segments weigh each run the same
+    (`equal_run_weights`)."""
     from scipy.spatial import QhullError
 
     held = {json.dumps(s.provenance["config"], sort_keys=True) for s in samples}
@@ -1113,6 +1140,7 @@ def fit_host(samples, queue=None) -> tuple[dict, dict]:
         s for s in samples if (s.provenance["run"], s.rank, s.step) not in jit | after
     ]
     queued = host_queue_spec()
+    equal = host_equal_runs()
     launch_of = None
     if queued is not None:
         saturations = sorted(set(queued.values()))
@@ -1149,11 +1177,17 @@ def fit_host(samples, queue=None) -> tuple[dict, dict]:
                     adopted = [*adopted, column]
                     figures = figures | {"queue": {"column": column, "Q0": n}}
                 columns = [(f, [r[5][f] for r in members]) for f in adopted]
+                weighed = {}
+                if f"{kind}.{segment}" in equal:
+                    runs = [r[4][0] if isinstance(r[4], tuple) else r[4] for r in members]
+                    weighed = {"weight": equal_run_weights(runs)}
+                    figures = figures | {"equal_runs": len(set(runs))}
                 coef, fitted = _host_law(
                     [r[2] for r in members],
                     [r[3] for r in members],
                     HOST_FEATURES,
                     columns=columns,
+                    **weighed,
                 )
             except (ValueError, QhullError) as e:
                 report["unfitted"][f"{kind}.{segment}"] = str(e).splitlines()[0]
@@ -2086,13 +2120,14 @@ def _hop_messages(intake: Path, client) -> dict:
     }
 
 
-def _host_law(x, y, names, offset=0.0, columns=()) -> tuple[list, dict]:
+def _host_law(x, y, names, offset=0.0, columns=(), weight=None) -> tuple[list, dict]:
     """The host law on `names` over the forwards `x` labelled `y`, the part
     `offset` of each label fixed, and its report. Every forward stays in the
     fit: one slowed by an idle CPU is no outlier, and a MAD test cannot tell it
     from scatter. Raises on too few forwards or no hull; with the last of
     `names` in a fixed proportion to the one before on every forward, it gets
-    zero. Each of `columns`, (feature, values), follows."""
+    zero. Each of `columns`, (feature, values), follows. `weight`, one per
+    forward, weights its equation (`_fit_form`); None, each the same."""
     x = np.array(x, dtype=np.float64).reshape(-1, len(names))
     if len(x) <= (k := len(names) + len(columns)):
         raise ValueError(f"{len(x)} forwards for {k} coefficients")
@@ -2102,7 +2137,9 @@ def _host_law(x, y, names, offset=0.0, columns=()) -> tuple[list, dict]:
         x[:, width] = 0.0
     wide = np.column_stack([x, *(v for _, v in columns)])
     names = [*names, *(f for f, _ in columns)]
-    s = _solve(wide, np.array(y), names, np.array(offset), names[0], drops=False)
+    s = _solve(
+        wide, np.array(y), names, np.array(offset), names[0], drops=False, weight=weight
+    )
     hull = _hull(x[s["keep"]][:, 1:width], names[1:width])
     return s["coef"].tolist(), {
         "hull": hull,
@@ -2186,12 +2223,24 @@ def _solve(
     offset=0.0,
     kept: str = "step",
     drops: bool = True,
+    weight=None,
 ) -> dict:
     """Non-negative least squares on relative error, MAD-dropped until settled
     unless `drops` is false; `offset` is a fixed part of each label's price,
-    outside the coefficients: `_fit_form` on one row per step."""
+    outside the coefficients: `_fit_form` on one row per step, `weight` its."""
+    if weight is None:
+        return _fit_form(
+            x[:, None], np.ones((len(y), 1), dtype=bool), y, names, offset, kept, drops
+        )
     return _fit_form(
-        x[:, None], np.ones((len(y), 1), dtype=bool), y, names, offset, kept, drops
+        x[:, None],
+        np.ones((len(y), 1), dtype=bool),
+        y,
+        names,
+        offset,
+        kept,
+        drops,
+        weight=weight,
     )
 
 
@@ -2205,6 +2254,7 @@ def _fit_form(
     drops: bool = True,
     protect: np.ndarray | None = None,
     phase: tuple | None = None,
+    weight=None,
 ) -> dict:
     """One form fitted by max-affine regression: step `i`'s label `y[i]` is the
     max over its ranks' rows `x[i, r]`, those `real[i, r]` holds, of their
@@ -2237,6 +2287,9 @@ def _fit_form(
     priced at no time, which no equation can be divided by, ends the
     reweighting, and a MAD round drops it.
 
+    With `weight`, one per step, each step's term of `F` is multiplied by its
+    weight (its equation by the weight's square root): a weighted Gamma fit.
+
     With `phase`, (`k`, a mask over `names`), a rank's price is its row's plus
     `k` x (the step's largest masked part over its ranks less its own), the
     runner's phase-wise group rule (`PREFILL_PHASE_MAX_ENV`): each pass solves
@@ -2253,6 +2306,11 @@ def _fit_form(
     n, width, k = x.shape
     flat = x.reshape(-1, k)
     scale = np.array(y, dtype=np.float64)
+    root = None if weight is None else np.sqrt(np.asarray(weight, dtype=np.float64))
+
+    def per(s):
+        """An equation's divisor: its scale, over its weight's root."""
+        return s if root is None else s / (root if s.shape == root.shape else root[keep])
     # An intercept, a column whose name starts with `kept`, is kept whatever
     # its variance; any other constant column is not.
     vary = [
@@ -2297,12 +2355,12 @@ def _fit_form(
             return 1.0 - y / priced(c)
 
     def cost(c):
-        return float((((priced(c) - y) / scale)[keep] ** 2).sum())
+        return float((((priced(c) - y) / per(scale))[keep] ** 2).sum())
 
     keep = np.ones(n, dtype=bool)
     c, cols = solve(
-        (x / scale[:, None, None])[real],
-        np.broadcast_to(((y - offset) / scale)[:, None], real.shape)[real],
+        (x / per(scale)[:, None, None])[real],
+        np.broadcast_to(((y - offset) / per(scale))[:, None], real.shape)[real],
     )
     start = relative(c)
 
@@ -2322,8 +2380,8 @@ def _fit_form(
             if phase is not None:
                 held = apart(c).argmax(axis=1)
                 rows = rows + blend * mask * (x[steps, held] - rows)
-            rows = rows[keep] / scale[keep, None]
-            full, solved = solve(rows, ((y - offset) / scale)[keep])
+            rows = rows[keep] / per(scale[keep])[:, None]
+            full, solved = solve(rows, ((y - offset) / per(scale))[keep])
             same = (price(full).argmax(axis=1)[keep] == pick[keep]).all()
             if phase is not None:
                 same = same and (apart(full).argmax(axis=1)[keep] == held[keep]).all()
