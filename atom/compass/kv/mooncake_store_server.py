@@ -13,7 +13,9 @@ entry's ``chunk_bytes``, or under a pipelined prefill its rank's (`PER_RANK`).
   it the same way; a published object's lease reaches at least its
   publication.
 - A put takes its new objects' bytes at its start and publishes them at its
-  end. A put the capacity left cannot hold is refused.
+  end. A put of a key an earlier put holds in flight takes no bytes and grants
+  no lease, and the object stays the earlier put's. A put the capacity left
+  cannot hold is refused.
 - Eviction runs while used bytes over capacity exceed
   ``--eviction_high_watermark_ratio``: a round evicts ``ceil(filed x
   max(eviction_ratio, used_ratio - mark + eviction_ratio))`` objects, `filed`
@@ -55,9 +57,12 @@ What it does not model: contention at the owners, a get's own master call,
 failures, soft pins, tenants, the owners' allocator and its fragmentation, and
 the eviction thread's phase. The master flags it reads are
 ``--default_kv_lease_ttl``, ``--eviction_high_watermark_ratio``,
-``--eviction_ratio`` and ``--rpc_thread_num``; it accepts `ACCEPTED` and
-refuses any other, and flags that set no positive ``--rpc_thread_num``, since
-the master then runs as many handler threads as its host has cores, up to 16.
+``--eviction_ratio`` and ``--rpc_thread_num``. It accepts `ACCEPTED`: the
+endpoint and client-death flags, which change nothing a requester is told, and
+``--allocation_strategy`` and ``--memory_allocator``, which it does not model
+(`ACCEPTED` says what they change). It refuses any other flag, and flags that
+set no positive ``--rpc_thread_num``, since the master then runs as many
+handler threads as its host has cores, up to 16.
 
 Importing this module loads lmcache's server module, which imports only the
 standard library.
@@ -109,9 +114,12 @@ MATCHED = (
     "save_workers",
     "load_workers",
 )
-#: Master flags that change nothing a requester is told: endpoints, a client's
-#: death, which no simulated client dies of, and the allocator, which is one
-#: pool of the owners' summed bytes here.
+#: Master flags accepted. Endpoints and a client's death, which no simulated
+#: client dies of, change nothing a requester is told. The allocator's strategy
+#: and kind are not modelled: the Store is one pool of the owners' summed bytes
+#: here, where the master places each object on one owner's segment, so a put
+#: can fail below the summed capacity and start an eviction round below the
+#: mark.
 ACCEPTED = (
     "--rpc_port",
     "--enable_http_metadata_server",

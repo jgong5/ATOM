@@ -477,12 +477,16 @@ class ScriptedRuntime:
 
     def __init__(self, script, stream=STREAM) -> None:
         self.now, self.script, self.seq = 0.0, list(script), 0
+        self.seqs = {}
         self.stream, self.released = stream, {stream: set()}
         self.calls = []
 
     def stamp_send(self, ch, at=None):
-        self.seq += 1
-        return self.now + ADMIT if at is None else at, self.seq - 1
+        # Each channel numbers its own sends, as `LPRuntime.stamp_send` does.
+        seq = self.seqs.get(ch, 0)
+        self.seqs[ch] = seq + 1
+        self.seq = max(self.seq, seq + 1)
+        return self.now + ADMIT if at is None else at, seq
 
     def check_arrival(self, ch, arrival, seq) -> None:
         pass
@@ -673,6 +677,70 @@ def test_a_grant_resolves_only_the_clock_waits_it_makes_due(tmp_path):
     resolved, calls = _run(main())
     assert resolved == {2.0: 2.0, 5.0: 5.0}
     assert calls == [2.0, 2.0, 5.0]
+
+
+def test_due_waits_resolve_in_the_order_asked_and_a_withdrawn_one_asks_nothing(
+    tmp_path,
+):
+    """At 5, waits are asked for 4, then 3, then 2, the last withdrawn: the
+    first two are due at once and resolve in the order asked, not by time.
+    Then waits for 7 and 6, the 6 withdrawn: the clock is asked for 7 alone."""
+
+    async def main():
+        rt = ScriptedRuntime([])
+        rt.now = 5.0
+        traffic = TrafficLP(rt, str(tmp_path / "lp"))
+        order = []
+        first, second, dropped = traffic.wait(4.0), traffic.wait(3.0), traffic.wait(2.0)
+        for name, fut in (("4.0", first), ("3.0", second)):
+            fut.add_done_callback(lambda _, name=name: order.append(name))
+        traffic.withdraw(dropped)
+        await asyncio.wait_for(asyncio.gather(first, second), 5)
+        later, sooner = traffic.wait(7.0), traffic.wait(6.0)
+        traffic.withdraw(sooner)
+        await asyncio.wait_for(later, 5)
+        traffic.done.cancel()
+        return order, rt.calls, dict(traffic._waiters)
+
+    order, calls, left = _run(main())
+    assert order == ["4.0", "3.0"] and calls == [7.0] and left == {}
+
+
+def test_the_hold_s_look_finds_the_tasks_asyncio_all_tasks_finds():
+    """`_look` reads the loop's tasks in one pass; what it returns is what the
+    same look over `asyncio.all_tasks` returns: the ready tasks, those not
+    done, and whether one it saw last time has ended."""
+    from compass_harness.traffic_lp import _look
+
+    def reference(alive):
+        me = asyncio.current_task()
+        tasks = {t for t in asyncio.all_tasks() if t is not me and not t.done()}
+        ready = sorted(
+            t.get_name() for t in tasks if t._fut_waiter is None or t._fut_waiter.done()
+        )
+        return ready, tasks, alive is None or any(t.done() for t in alive)
+
+    async def main():
+        gate = asyncio.Event()
+        blocked = [asyncio.ensure_future(gate.wait()) for _ in range(50)]
+        await asyncio.sleep(0)
+        looks = []
+        ready, alive, ended = _look(None)
+        looks.append(((sorted(ready), alive, ended), reference(None)))
+        blocked[3].cancel()  # ends at its next step
+        fresh = asyncio.ensure_future(asyncio.sleep(0))  # ready, not yet run
+        ready, now_alive, ended = _look(alive)
+        looks.append(((sorted(ready), now_alive, ended), reference(alive)))
+        await asyncio.sleep(0)
+        ready, later, ended = _look(now_alive)
+        looks.append(((sorted(ready), later, ended), reference(now_alive)))
+        gate.set()
+        await asyncio.gather(*blocked, fresh, return_exceptions=True)
+        return looks
+
+    looks = _run(main())
+    assert [ours for ours, _ in looks] == [theirs for _, theirs in looks]
+    assert looks[1][0][2] is False and looks[2][0][2] is True  # the cancel ended one
 
 
 def test_a_task_ending_while_the_hold_waits_on_a_return_has_its_callbacks_run_first(
@@ -1017,39 +1085,55 @@ def test_behind_the_router_lp_requests_cancels_and_the_stream_cross_it(
     assert published[1] == (_key(0), 2.0 + ADMIT, 1, "cancel")
 
 
-#: frontend-P's URL, as a launcher names it.
-PREFILL_URL = "http://127.0.0.1:8010"
+#: frontend-P's URL, as a launcher names it; frontend-D's, as deploy.sh's
+#: decode instance states it in its server.json.
+PREFILL_URL, DECODE_URL = "http://127.0.0.1:8010", "http://127.0.0.1:8020"
 
 
 @pytest.mark.parametrize(
-    "router_in_s, channels, to",
+    "router_in_s, chunked, channels, to",
     [
         (
             None,
+            False,
             ("traffic->frontend-P:http", "frontend-D->traffic:stream"),
             (PREFILL_URL,),
         ),
-        (2.0**-14, ("traffic->router:http", "router->traffic:stream"), ()),
+        (
+            None,
+            True,
+            ("traffic->frontend-P:http", "frontend-D->traffic:stream"),
+            (PREFILL_URL, DECODE_URL),
+        ),
+        (2.0**-14, False, ("traffic->router:http", "router->traffic:stream"), ()),
     ],
-    ids=["plain-router", "router-lp"],
+    ids=["plain-router", "plain-router-chunked", "router-lp"],
 )
 def test_only_behind_a_plain_router_a_cancel_carries_frontend_p_s_url(
-    router_in_s, channels, to, tmp_path, monkeypatch
+    router_in_s, chunked, channels, to, tmp_path, monkeypatch
 ):
     """With frontend-P's URL named, aiperf's cancel of a request open at the
     grace deadline, 2.0, is stamped on the request's channel and published with
     that URL behind a PD router that is no LP, which answers a cancel 400, and
-    without it behind the router LP, which hands it on."""
+    without it behind the router LP, which hands it on. Under a chunked
+    transfer the request was stamped on frontend-D's channel too, and its
+    cancel names frontend-D's URL beside frontend-P's."""
     pd = {"router_s": 2.0**-12, "kv_write_req_s": 2.0**-10}
     if router_in_s is not None:
         pd["router_in_s"] = router_in_s
+    more = {}
+    if chunked:
+        more = {compass_run.KV_CHUNKED: True, "out_dir": str(tmp_path)}
+        (tmp_path / "decode").mkdir()
+        server = {"url": DECODE_URL}
+        (tmp_path / "decode" / "server.json").write_text(json.dumps(server))
     endpoint = f"inproc:test-traffic-lp-{uuid.uuid4().hex}"
     server = clock_transport.serve(
-        ClockAuthority(prefill_decode_table(**RUN, **pd)), endpoint
+        ClockAuthority(prefill_decode_table(**RUN, **pd, chunked=chunked)), endpoint
     )
     run_file = tmp_path / "run.json"
     run_file.write_text(
-        json.dumps({"clock_endpoint": endpoint, "bound_s": 1e6, **RUN, **pd})
+        json.dumps({"clock_endpoint": endpoint, "bound_s": 1e6, **RUN, **pd, **more})
     )
     monkeypatch.setenv(RUN_ENV, str(run_file))
     monkeypatch.setenv(ADDRESS_ENV, str(tmp_path / "lp"))

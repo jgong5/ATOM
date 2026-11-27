@@ -177,8 +177,16 @@ def run_accuracy(run, backend, steps=None, dummies=None, cards=None) -> dict:
             _count(fell, band, seconds, dict.fromkeys(costs[top].refusals))
         labels = [drafts[i][step] for i in group if step in drafts[i]]
         draft = None
-        if None not in labels:
-            mine = costs[real].draft_terms
+        # A draft priced among the target's terms (`draft.` ones, no draft
+        # terms) is graded with the target: an output prefill's draft-KV pass
+        # under `output_prefill_kv`, whose draft label holds only the drafter's
+        # rest, which no vector prices (step_linear's module text). A law that
+        # prices no draft at all grades its label against 0 s.
+        mine = costs[real].draft_terms
+        in_target = not mine and any(
+            t.name.startswith("draft.") for t in costs[real].terms
+        )
+        if None not in labels and not in_target:
             draft = (min(labels), costs[real].draft_seconds, _group(mine))
         target = _group(costs[top].terms)
         priced.append((key, band, step, seconds, price, target, draft, costs[top], top))

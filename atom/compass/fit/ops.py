@@ -47,7 +47,13 @@ row's, after its rows' mean context in `PERMILLE` of it (``mean``) where some
 point of the family has ragged rows, leaving out each uniform point whose rows
 the KV pool cut, or a prefill point's rows' mean cached
 tokens (`band`); and a prefill's B for a kind its rows move (``("rows",
-op)``). A collective's
+op)``). A decode leaf of such a kind that takes a compress ``ratio``, a
+compressor, is read before its context at ``completes``, whether its point's
+rows complete a compressed entry, then at ``past``, whether most rows that do
+run past it (`completion`): the entry's attention runs only then, and costs
+more where its rows go on into the next entry, so the cost alternates with
+every row's context against the ratio, and each answer is read from points
+alike. A collective's
 points name their family themselves, `measure ops`'s `exchange`, and its one
 dimension is their message bytes; one apart along it is one row's bytes
 (``row_bytes``, a decode's B or a prefill's T being its rows), when every point
@@ -111,8 +117,10 @@ LIMIT = 0.05
 #: The leaves a `PriceList` keeps the signatures of; past it, it forgets them.
 SIGNED = 1 << 14
 #: The dimensions a bound states by place, as `op_graph.OpGraphBackend._bound`
-#: lays them out: (phase, T, B, G, context, last, real[, largest]).
+#: lays them out: (phase, T, B, G, context, last, real, largest, rows).
 BOUND = (None, "T", "B", "G", "context")
+#: Where a bound states its rows, `op_graph.counted_rows`.
+ROWS = 8
 
 
 class Declined(ValueError):
@@ -308,6 +316,15 @@ def _context(p) -> int:
     return band(p["rows"], False)[0] if "rows" in p else p["context"] or 0
 
 
+def completion(rows, ratio: int) -> tuple[int, int]:
+    """Whether some row of `rows`, each its query and context tokens, completes
+    a compressed entry at `ratio`, its query tokens crossing a multiple of it,
+    and whether more than half of the rows that do run past it, their context
+    no multiple of it: 1 or 0 each."""
+    done = [c % ratio for q, c, *_ in rows if c // ratio > (c - q) // ratio]
+    return int(bool(done)), int(2 * sum(map(bool, done)) > len(done))
+
+
 def fit(points) -> dict:
     """The price list's params: per skeleton, the integer positions that follow
     the shape, and per family, its dimensions and its points, each its
@@ -317,8 +334,9 @@ def fit(points) -> dict:
     dispatch and combine), so a step may hold between two points' rows;
     ``all_gather_with_padding`` and ``reduce_scatter_with_unpadding`` pad
     every rank to the same rows and keep it; and ``left_out``, each point
-    whose leaf may have run at two places in its family (`ran_counts`), by
-    its shape, operator and why; and ``tokens`` (`_tokens_at`)."""
+    whose leaf may have run at two places in its family (`ran_counts`) or a
+    compressor's stating no rows, by its shape, operator and why; and
+    ``tokens`` (`_tokens_at`)."""
     from atom.compass.bench.ops import (
         DP_GROUP,
         _dependent,
@@ -400,7 +418,7 @@ def fit(points) -> dict:
             for p in members
             if "R" in shape_counts(p["shape"])
         }
-        for p, ns in zip(members, ran):
+        for p, sig, ns in zip(members, sigs, ran):
             name = family(p["shape"], p["leaf"], free_of[skel], tokens)
             at_p = ns[0] | {"context": _context(p)}
             if p["shape"].startswith("decode") and "T" in at_p:
@@ -428,6 +446,15 @@ def fit(points) -> dict:
                     continue
                 dims.append("mean")
                 at_p["mean"] = mean or PERMILLE
+                if ratio := sig["args"].get("ratio"):  # a compressor
+                    if "rows" not in p:  # measured before points stated them
+                        why = "a compressor's point states no rows to read it at"
+                        left_out.append(
+                            {"shape": p["shape"], "op": p["op"], "why": why}
+                        )
+                        continue
+                    dims += ["completes", "past"]
+                    at_p["completes"], at_p["past"] = completion(p["rows"], ratio)
             dims += ["context"] if moves else []
             if len({tuple(n.get(d) for d in dims) for n in ns}) > 1:
                 left_out.append(
@@ -578,8 +605,10 @@ class PriceList(CostSource):
     a decode step's rows' max, a prefill's rows' mean cached tokens; ``mean``
     a decode step's rows' mean context over its B in `PERMILLE` of their max,
     where the family was measured on ragged rows; ``pad`` the rows a decode's
-    MoE leaf routes less the real ones the bound states last, 0 where it
-    states none; a collective's family
+    MoE leaf routes less the real ones the bound states, 0 where it
+    states none; ``completes`` and ``past`` whether the rows the bound states
+    last complete a compressed entry at the leaf's ratio and whether most that
+    do run past it (`completion`); a collective's family
     (`bench.ops.exchange`) at its message bytes, MORI's at a step stating G
     its family apart, over EP times the rows its largest rank sends: the most
     tokens a rank of its DP group scheduled, where the bound states them after
@@ -620,7 +649,7 @@ class PriceList(CostSource):
                 return got[0]
             ran = _either(dict(zip("TBG", b[1:4])) for b in bounds)
             return self.refuse(f"{leaf['op']}: {ran}")
-        leaf, bound, _ = request  # (phase, T, B, G, context, last, real[, largest])
+        leaf, bound, _ = request  # as `BOUND` lays it out
         kind, phase = leaf["op"], bound[0]
         ex, sig = self._sign(leaf)
         if ex and kind.startswith(MORI) and bound[3] is not None:
@@ -644,6 +673,9 @@ class PriceList(CostSource):
             real = bound[6:7]
             stated = real[0] if real else None
             at["pad"] = 0 if stated is None else routed_rows(leaf) - stated
+        if "completes" in dims:  # a compressor, at how the step's rows complete
+            rows = [row for row, n in bound[ROWS] for _ in range(n)]
+            at["completes"], at["past"] = completion(rows, leaf["args"]["ratio"])
         if phase == "decode":
             if "mean" in dims:
                 at["mean"] = PERMILLE * bound[5] / bound[4]

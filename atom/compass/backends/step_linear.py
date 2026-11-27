@@ -126,6 +126,10 @@ segment is priced as if routing spread tokens evenly over the experts, which
 no feature carries. A run refuses a law whose `platform` differs from the one
 its spec states in any field, naming each and both values.
 
+A pipeline's law is one part per stage, each a law of its own, which prices
+that stage's work alone (`run.stage_part`): a backend built from a part states
+its `stage`, ``(rank, stages)``, which the runner holds to its own.
+
 A decode vector may add one MoE column over `n`, the real tokens the step's
 MoE runs on: a data-parallel group's gathered tokens (`BatchView.moe_tokens`),
 or on one rank, which has no `moe_rows`, the step's own; a data-parallel step
@@ -774,9 +778,12 @@ class StepLinearLaw:
 class StepLinearBackend(CostBackend):
     """Prices a step as its features times the law's coefficients, one term each."""
 
-    def __init__(self, law: StepLinearLaw, dp: int = 1) -> None:
+    def __init__(
+        self, law: StepLinearLaw, dp: int = 1, stage: tuple[int, int] | None = None
+    ) -> None:
         self.law = law
         self.dp = dp
+        self.stage = stage
         self.treatments = (UNIFORM_ROUTING,) if dp > 1 else ()
 
     @property

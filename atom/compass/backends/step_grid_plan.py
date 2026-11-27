@@ -91,19 +91,20 @@ DEFERS_OUTPUT = "deferred_output"
 #: (`Config.min_final_prefill_rows`), stated only above 0 and beside `keyed`'s:
 #: a JIT sweep's plan reads it (`atom/compass/drive/sweep_plan.py`).
 MIN_FINAL_ROWS = "min_final_prefill_rows"
+#: Whether a prefix hit rebuilds the engine's per-request state rather than
+#: restoring it (`StateTransfer.replays`), stated only when true and beside
+#: `keyed`'s: a JIT sweep's plan reads it (`atom/compass/drive/sweep_plan.py`).
+REPLAYS_STATE = "replays_state"
 #: The grid definition's own fields.
 DEFINITION = ("prefill", "decode", "margin")
 
 
 def keyed_of(engine: dict) -> dict:
     """`run.step_grid.keyed`'s fields of an engine file's mapping `engine`, which
-    adds `UNKEYED`, `PREFILL_BUCKETS`, `DEFERS_OUTPUT` and `MIN_FINAL_ROWS` to
-    them."""
-    return {
-        k: v
-        for k, v in engine.items()
-        if k not in (*UNKEYED, PREFILL_BUCKETS, DEFERS_OUTPUT, MIN_FINAL_ROWS)
-    }
+    adds `UNKEYED`, `PREFILL_BUCKETS`, `DEFERS_OUTPUT`, `MIN_FINAL_ROWS` and
+    `REPLAYS_STATE` to them."""
+    beside = (*UNKEYED, PREFILL_BUCKETS, DEFERS_OUTPUT, MIN_FINAL_ROWS, REPLAYS_STATE)
+    return {k: v for k, v in engine.items() if k not in beside}
 
 
 def at_ladder(here: dict, there) -> dict:

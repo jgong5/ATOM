@@ -85,7 +85,9 @@ and its ``engine_config``, `step_grid.keyed` as it was fitted, refuse a run unde
 any other, a run whose ladder is a prefix of the law's read at the law's, and a
 law missing either refuses; a runner that records prefill token-graph buckets
 refuses a law whose prefill vector, or else engine config, states none or others, and keeps
-one with no prefill vector, which prices no prefill step (`refuse_other_buckets`); a list of them is one per engine config, a process taking its own), ``step_grid`` (an artifact store's root and a
+one with no prefill vector, which prices no prefill step (`refuse_other_buckets`); a list of them is one per engine config, a process taking its own;
+above one pipeline stage, a law of one part per stage under ``stages``, each
+stage priced by its own (`stage_part`)), ``step_grid`` (an artifact store's root and a
 bundle's key, priced by `StepGridBackend`; see `step_grid`), ``op_graph``
 (``true``: `OpGraphBackend` prices each step from the `op_graph` ``store``
 holds at its shape and output, traced under this process's torch, each file it
@@ -116,7 +118,9 @@ essential work is left, and the last one's end finishes the run),
 ``local_grants`` (optional, ``true``, the default, or ``false``: with ``true``
 the authority gives each grant a ceiling, below which the LP answers its own
 clock calls and reports them with its next one, a DP member at its settle,
-`ClockAuthority`; the step table is the same),
+`ClockAuthority`; the sends are the same, and so is the step table but for an
+own step walking an arrival on an offering channel: one ``TAR`` row where a
+run with ``false`` records ``ARRIVAL`` and ``TAR``),
 ``image_preprocess_s`` (optional: seconds the frontend takes to prepare one
 image of a chat request; without it a request with an image is refused),
 ``host`` (optional: ``laws``, per forward kind and host segment, coefficients
@@ -156,7 +160,9 @@ prefill-decode run with no entry stating it names under
 charged 0 s and the run summary names it, a kind of tokenizer call as
 ``tokenizer.<kind>`` and a ``segment`` without ``chars_per_s`` as
 ``tokenizer.segment.chars_per_s``, under ``uncharged_host_terms``; ``hops``, the
-`HOPS` `runfile` writes to the run file; a list of them as ``step_linear``'s),
+`HOPS` `runfile` writes to the run file; a list of them as ``step_linear``'s;
+an entry with laws above one pipeline stage holds each stage's `STAGE_HOST` as
+a part under ``stages``, which that stage reads (`host_part`)),
 or in its place ``replay`` (a real run's parity record directory, or for a
 prefill-decode run one holding each deployment's as ``prefill/`` and
 ``decode/``, ``prefill<k>/`` and ``decode<k>/`` above one of a side, and for a
@@ -228,8 +234,8 @@ its ``kv_transfer_config`` as ``compass_instance``; above one, its LPs carry
 the index (``engine-P1``), and the router is the ``router`` LP, which chooses
 among them. An optional ``worker_order`` gives, by side (``P`` or ``D``), the
 (instance, DP rank) pairs in the order that LP's policies list the side's
-workers, each once (`worker_order`); a side it does not name is sorted by URL
-and rank. `frontend(config)` refuses such a
+workers, each once (`worker_order`); a side it does not name lists them by
+instance, then rank. `frontend(config)` refuses such a
 deployment unless the authority is standalone: a prefill-decode run spans two
 API servers that must share one.
 
@@ -453,6 +459,13 @@ COMPASS_ONLY = {
     },
     "utils/zmq_shim.py": {"_Socket", "_ChannelSocket", "_Context"},
 }
+#: A simulated server's tokenizer environment. The segment tokenizer encodes a
+#: long prompt's uncached segments in one ``encode_batch`` call, and while its
+#: station job is open the frontend's clock stands still, so every other LP
+#: waits on its wall time; the C1228 recipe's environment turns the backend's
+#: parallelism off, which jgong5/ATOM#3992 measured. In parallel the ids are
+#: the same.
+_PARALLEL_TOKENIZER = {"TOKENIZERS_PARALLELISM": "true"}
 #: The module `pip install -e .` writes (setuptools_scm) and git ignores: no
 #: commit holds it, so the host-law key leaves it out.
 INSTALL_WRITTEN = Path("_version.py")
@@ -541,6 +554,35 @@ def pick_fitted(run: dict, name: str, config) -> None:
     run[name] = _fitted_here(run[name], keyed(config), engines[name], name)
 
 
+def stage_part(entry: dict, config, what: str) -> dict:
+    """The run file's step linear law or host laws `entry`, named `what`, as
+    `config`'s pipeline stage reads them: above one stage, its part under
+    ``stages`` at the stage's rank, beside what the entry states once for
+    every stage; on one stage, `entry` itself. Refused where its parts are not
+    one per stage of `config`'s pipeline."""
+    pp = getattr(config, "pipeline_parallel_size", 1)
+    parts = entry.get("stages")
+    if parts is None and pp == 1:
+        return entry
+    if parts is None or len(parts) != pp:
+        held = "no part per stage" if parts is None else f"{len(parts)} stages' parts"
+        raise ValueError(
+            f"the run file's {what} holds {held}, and this run has {pp} pipeline "
+            f"stage{'s' * (pp > 1)}, each priced by its own part of one entry, as "
+            "compass fit steps and fit host fit a pipeline"
+        )
+    rank = config.parallel_config.pipeline_parallel_rank
+    return {k: v for k, v in entry.items() if k != "stages"} | parts[rank]
+
+
+def host_part(host: dict, config) -> dict:
+    """`stage_part` of the run file's host entry `host`; an entry with neither
+    laws nor parts prices no forward on any stage, and is read as it is."""
+    if "laws" not in host and "stages" not in host:
+        return host
+    return stage_part(host, config, "host laws")
+
+
 def refuse_unfitted_law(run: dict, config) -> None:
     """Refuse the run file's step linear law where `config` is not what it was
     fitted under: its engine config, at its ladder where this run's is a prefix
@@ -591,6 +633,13 @@ def refuse_unfitted_law(run: dict, config) -> None:
         )
 
 
+def _holds_laws(host: dict) -> bool:
+    """Whether the host laws `host` hold laws that price a step: at their top,
+    or, above one pipeline stage, in a stage's part under ``stages``
+    (`fit.host`), all under the one key at their top."""
+    return any(part.get("laws") for part in [host, *(host.get("stages") or ())])
+
+
 def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     """Refuse the run file's step linear law on a runner that records the
     prefill token-graph buckets `buckets`, ascending, where the law states none
@@ -600,8 +649,10 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
     between a fit and a run, so one stating none says nothing of them; one
     stating them states ATOM's list, which a runner records only up to
     `warmup_max_tokens`, a bound no engine config keys, so a prefill vector's
-    are held to `buckets` either way. A law with no prefill vector is kept:
-    the buckets pad prefill steps alone, and it prices none (`StepLinearBackend`
+    are held to `buckets` either way. Above one pipeline stage, each stage's
+    part under ``stages`` (`fit.steps`) is held so, the first that fails
+    named. A law, or a stage's part, with no prefill vector is kept: the
+    buckets pad prefill steps alone, and it prices none (`StepLinearBackend`
     refuses each where it meets one), so no bucket set misprices a step of
     it. A prefill-decode deployment's decode side fits one: its records run no
     prefill step a client run times, yet its runner records ATOM's buckets up
@@ -614,7 +665,7 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
 
     pick_fitted(run, "host", config)
     host = run.get("host") or {}
-    graphs = host.get("laws") and launch_features.stated(host.get("key"))[1]
+    graphs = _holds_laws(host) and launch_features.stated(host.get("key"))[1]
     if graphs and (theirs := graphs["token"]["prefill"]) != list(buckets):
         raise ValueError(
             f"the host laws' key states the prefill token-graph buckets {theirs}, "
@@ -624,17 +675,20 @@ def refuse_other_buckets(config, buckets: tuple[int, ...], run=None) -> None:
         return
     pick_fitted(run, STEP_LINEAR, config)
     law = run[STEP_LINEAR]
-    if not law.get("prefill"):
-        return
-    stated = sorted(law["prefill"].get("buckets") or ())
     env = law["engine_config"]["env"]
-    if (stated or BUCKETS not in env) and stated != list(buckets):
-        said = f"{BUCKETS}={env[BUCKETS]}" if BUCKETS in env else f"no {BUCKETS}"
-        raise ValueError(
-            f"the step linear law states {said} in its engine config and "
-            f"{stated or 'none'} as its prefill vector's buckets, and this run's "
-            f"runner records the prefill token-graph buckets {list(buckets)}"
-        )
+    stages = law.get("stages")
+    for k, part in enumerate(stages) if stages else [(None, law)]:
+        if not part.get("prefill"):
+            continue
+        stated = sorted(part["prefill"].get("buckets") or ())
+        if (stated or BUCKETS not in env) and stated != list(buckets):
+            said = f"{BUCKETS}={env[BUCKETS]}" if BUCKETS in env else f"no {BUCKETS}"
+            whose = "its" if k is None else f"pipeline stage {k}'s"
+            raise ValueError(
+                f"the step linear law states {said} in its engine config and "
+                f"{stated or 'none'} as {whose} prefill vector's buckets, and this "
+                f"run's runner records the prefill token-graph buckets {list(buckets)}"
+            )
 
 
 #: The context-parallel widths, each a config field.
@@ -660,15 +714,16 @@ def refuse_context_parallel(name: str, config, widths=CONTEXT_PARALLEL) -> None:
 
 
 def refuse_unfitted_host(host: dict, config, platform: dict) -> None:
-    """Refuse the run file's host laws `host` when fitted under another host
-    key than this run's, on `platform` (`machine_platform`), the host CPU and
-    graph sets their key states taken as this run's, which records none, and
-    its engine config read at their ladder where this run's is a prefix of it."""
+    """Refuse the run file's host laws `host`, a pipeline's with a part per
+    stage among them, when fitted under another host key than this run's, on
+    `platform` (`machine_platform`), the host CPU and graph sets their key
+    states taken as this run's, which records none, and its engine config read
+    at their ladder where this run's is a prefix of it."""
     from atom.compass.artifacts import Kind, keyed_platform
     from atom.compass.backends.launch_features import GRAPHS, stated
     from atom.compass.backends.step_grid_plan import at_ladder
 
-    ours = host.get("laws") and {
+    ours = _holds_laws(host) and {
         **host_key(config),
         **keyed_platform(Kind.HOST_LAWS, platform),
     }
@@ -711,6 +766,9 @@ TOKENIZER_RECORD, INTAKE_RECORD = "tokenizer.jsonl", "intake.stamps"
 LOCAL = ".local"
 #: This server's ``host`` entry among several, which `tokenizer` resolves.
 _frontend_host: dict | None = None
+#: The laws a pipeline's ``host`` entry holds per stage, in its parts under
+#: ``stages``, and never beside them (with `launch_features.PATHS`).
+STAGE_HOST = ("laws", "admit", "columns")
 
 
 def spec() -> dict | None:
@@ -745,10 +803,28 @@ def spec() -> dict | None:
 
 def _check_host(path, host: dict) -> None:
     """Refuse a ``host`` entry the runner would read as zero host time, or
-    whose ``tokenizer`` or ``http_intake`` term the frontend would misread."""
+    whose ``tokenizer`` or ``http_intake`` term the frontend would misread; a
+    pipeline's holds each stage's part under ``stages``, each checked as an
+    entry is with no key or parts of its own, and none of `STAGE_HOST` beside
+    them."""
     from atom.compass.backends.launch_features import PATHS
     from atom.compass.runner.overrides import ADMISSION_IN_E, HOST_LAW_KINDS, SEGMENTS
 
+    stages = host.get("stages")
+    if stages is not None and not (
+        isinstance(stages, list)
+        and stages
+        and all(isinstance(p, dict) and not {"key", "stages"} & set(p) for p in stages)
+        and not {*STAGE_HOST, PATHS} & set(host)
+    ):
+        raise ValueError(
+            f"{path}: host's stages is {stages!r}; a pipeline's entry holds there "
+            "a part per stage, in stage order, each an entry with no key or parts "
+            f"of its own, and states none of {', '.join((*STAGE_HOST, PATHS))} "
+            "beside them"
+        )
+    for part in stages or ():
+        _check_host(path, part)
     laws, columns = host.get("laws", {}), host.get("columns", {})
     paths = host.get(PATHS, {})
     if (
@@ -761,6 +837,7 @@ def _check_host(path, host: dict) -> None:
             "hops",
             "columns",
             PATHS,
+            "stages",
             *HOST_TERMS,
             INGRESS,
             RELAY_TERM,
@@ -896,19 +973,24 @@ def _dp(run: dict, side: str | None = None) -> int:
 
 
 def worker_order(run: dict) -> dict:
-    """The run file's ``worker_order``, ``{}`` when absent. Refuses a side
-    other than ``P`` and ``D``, and a list that is not each of the side's
-    (instance, DP rank) pairs once."""
-    order = run.get(WORKER_ORDER, {})
-    for side, pairs in order.items():
-        known = side in INSTANCES
-        n, dp = (run.get(INSTANCES[side], 1), _dp(run, side)) if known else (0, 0)
-        if not n or sorted(pairs) != [[k, r] for k in range(n) for r in range(dp)]:
+    """Each side's (instance, DP rank) pairs, ``P`` then ``D``, in the order
+    the router LP lists that side's workers: the run file's ``worker_order``
+    where it names the side, else by instance, then rank, never by the
+    workers' URLs, whose ports deploy.sh draws afresh each run. Refuses a
+    side other than ``P`` and ``D``, and a list that is not each of the
+    side's (instance, DP rank) pairs once."""
+    named = run.get(WORKER_ORDER, {})
+    order = {
+        side: [[k, r] for k in range(run.get(key, 1)) for r in range(_dp(run, side))]
+        for side, key in INSTANCES.items()
+    }
+    for side, pairs in named.items():
+        if not order.get(side) or sorted(pairs) != order[side]:
             raise ValueError(
                 f"{WORKER_ORDER}[{side!r}] is {pairs}: name side P or D, and list "
                 "each of its deployments' (instance, DP rank) pairs once"
             )
-    return order
+    return order | named
 
 
 def _widths(run: dict) -> int | tuple[int, int]:
@@ -1130,14 +1212,18 @@ def publish_transfer(
     staging_bytes: int = 0,
     slot_after_blocks: bool = False,
     image_bytes: int = 0,
+    heads_tp: int | None = None,
 ) -> None:
     """Write one paged KV block's bytes, the state slot a transfer moves beside
     a request's blocks, or after them, the staging row it moves in a second
     write, and the state image an lmcache save carries, as a runner at TP `tp`
-    planned them, where `_planned_transfer` and `_lmcache_plan` read them."""
+    planned them, where `_planned_transfer` and `_lmcache_plan` read them.
+    `heads_tp`, `tp` when None, is the width its attention splits KV heads
+    over: 1 under DP attention."""
     planned = {
         "block_bytes": int(block_bytes),
         "tp": tp,
+        "heads_tp": tp if heads_tp is None else int(heads_tp),
         "slot_bytes": int(slot_bytes),
         "staging_bytes": int(staging_bytes),
         "slot_after_blocks": bool(slot_after_blocks),
@@ -1163,6 +1249,33 @@ def _published_plans(run: dict, names: list[str]) -> dict:
     return {n: json.loads(f.read_text()) for n, f in files.items()}
 
 
+def _head_cut(planned: dict, prefill: list[str]) -> dict:
+    """By decode deployment member whose KV heads Mooncake cuts out of a TP1
+    prefill's (`MooncakeConnectorWorker._unit_plan`), what its ``h`` heads-TP
+    ranks receive a block between them: each its own planned block, its heads
+    of each region split by head and the whole of every other. So its block
+    is at least the prefill's ``1/h`` (every region split) and short of all
+    of it (none split), and it moves no state slot or staging row, which no
+    head cut carries."""
+    sides = [s for u in prefill for s in planned[u].values()]
+    whole = sum(s["block_bytes"] for s in planned[prefill[0]].values())
+    if any(s.get("heads_tp", s["tp"]) != 1 for s in sides) or any(
+        s["slot_bytes"] or s["staging_bytes"] for s in sides
+    ):
+        return {}
+    out = {}
+    for u, stages in planned.items():
+        if u in prefill or len(stages) != 1:
+            continue
+        (s,) = stages.values()
+        heads = s.get("heads_tp", s["tp"])
+        block = s["block_bytes"]
+        moves_state = s["slot_bytes"] or s["staging_bytes"]
+        if heads > 1 and whole <= heads * block < heads * whole and not moves_state:
+            out[u] = heads * block
+    return out
+
+
 def _planned_transfer() -> tuple:
     """One transfer model per prefill stage, each pricing the block, the state
     slot and the staging row that stage's runner planned, once every engine of
@@ -1171,7 +1284,12 @@ def _planned_transfer() -> tuple:
 
     Refused unless every deployment plans one block, one slot and one row,
     each summed over its stages, and every prefill deployment splits them
-    alike: both ends of a write price it, each from its own copy."""
+    alike: both ends of a write price it, each from its own copy. The one
+    exception is Mooncake's head cut (`_head_cut`): a TP1 prefill writes each
+    decode TP rank its own KV heads and a whole copy of every region not split
+    by head, so a decode at heads TP ``h`` plans a block between the prefill's
+    ``1/h`` and all of it, and the ``h`` ranks receive ``h`` of its blocks,
+    which the stages' writes carry in proportion to their blocks."""
     from atom.compass.kv import Scope, TransferModel
 
     run = spec()
@@ -1187,6 +1305,7 @@ def _planned_transfer() -> tuple:
         stages = planned.setdefault(deployment + dot + member, {})
         stages[int(stage or 0)] = published
     prefill = [u for u in planned if u.startswith(f"{ENGINE.name}-P")]
+    received = _head_cut(planned, prefill)
     for key, what in (
         ("block_bytes", "KV block"),
         ("slot_bytes", "state slot"),
@@ -1195,6 +1314,8 @@ def _planned_transfer() -> tuple:
         sizes = {u: [s[k][key] for k in sorted(s)] for u, s in planned.items()}
         first = sizes[prefill[0]]
         for u, b in sizes.items():
+            if key == "block_bytes" and u in received:
+                continue
             if b != first if u in prefill else sum(b) != sum(first):
                 (a, x), (c, y) = (
                     (f"{v} at TP {planned[v][0]['tp']}", " + ".join(map(str, sizes[v])))
@@ -1207,10 +1328,22 @@ def _planned_transfer() -> tuple:
                 )
     machine, scope = _machine(run), Scope(run["kv_link"])
     stages = planned[prefill[0]]
+    whole = sum(s["block_bytes"] for s in stages.values())
+    wire = {received.get(u, whole) for u in planned if u not in prefill}
+    if len(wire) > 1:
+        raise ValueError(
+            f"the decode deployments receive {' and '.join(map(str, sorted(wire)))} "
+            "B a block between their ranks: one prefill write prices one"
+        )
+    wire = wire.pop()
     return tuple(
         TransferModel.from_spec(
             machine,
-            s["block_bytes"],
+            # Under a head cut each stage's write carries its block's share of
+            # what the decode ranks receive (`_head_cut`): a stage whose split
+            # and whole regions stand in another ratio than the others' is
+            # priced at the mean. Its whole block otherwise.
+            s["block_bytes"] * wire // whole,
             scope,
             s["slot_bytes"],
             s["staging_bytes"],
@@ -2307,6 +2440,8 @@ def runner(model_runner, tree) -> None:
 
     config = model_runner.config
     tp = config.tensor_parallel_size
+    pp = getattr(config, "pipeline_parallel_size", 1)
+    stage = (config.parallel_config.pipeline_parallel_rank, pp) if pp > 1 else None
     refuse_renamed_keys(run, "the run file")
     for name in (STEP_LINEAR, "host"):
         pick_fitted(run, name, config)
@@ -2327,30 +2462,31 @@ def runner(model_runner, tree) -> None:
         from atom.compass.parity.replay import ReplayHost
 
         dp_rank = config.parallel_config.data_parallel_rank
-        stage = config.parallel_config.pipeline_parallel_rank
+        pp_rank = config.parallel_config.pipeline_parallel_rank
         # This engine's record: prefill/, or prefill1/ for engine-P1.
         name = _engine_name(config, run) or ""
         side = {"P": "prefill", "D": "decode"}.get(name[:1], "") + name[1:]
-        replay = ReplayHost(Path(run["replay"]) / side, dp_rank, stage)
+        replay = ReplayHost(Path(run["replay"]) / side, dp_rank, pp_rank)
     if STEP_LINEAR in run:
         # A law prices a rank at the tensor-parallel width its engine config states.
         refuse_unfitted_law(run, config)
         # Under DP-attention every rank runs at TP 1, and experts shard over the group.
         dpa = config.enable_dp_attention
         dp = config.parallel_config.data_parallel_size if dpa else 1
-        backend = StepLinearBackend(StepLinearLaw(run[STEP_LINEAR]), dp)
+        # A pipeline stage is priced by its own part of the law.
+        law = StepLinearLaw(stage_part(run[STEP_LINEAR], config, "step linear law"))
+        backend = StepLinearBackend(law, dp, stage)
     elif STEP_STUB in run:
         # A pipeline stage is priced for its own span of the stack, the span
         # ATOM's `make_layers` builds it from.
-        hf, pp = config.hf_config, getattr(config, "pipeline_parallel_size", 1)
+        hf = config.hf_config
         depth, share = hf.num_hidden_layers, None
         start, end = 0, depth
         if pp > 1:
             from atom.compass.backends.geometry import paged_layers
             from atom.models.utils import get_pp_indices
 
-            pp_rank = config.parallel_config.pipeline_parallel_rank
-            start, end = get_pp_indices(depth, pp_rank, pp)
+            start, end = get_pp_indices(depth, stage[0], pp)
             text = getattr(hf, "text_config", hf)
             paged = paged_layers(text, 0, depth)
             if not paged:
@@ -2426,7 +2562,6 @@ def runner(model_runner, tree) -> None:
         modules = walk(tree, drafter(config))
         roofline = StepRooflineBackend(machine, modules, padded=padding != "none")
         backend = StepFallbackBackend(backend, roofline)
-    pp = getattr(config, "pipeline_parallel_size", 1)
     if pp > 1 and tp > 1 and not hasattr(backend, "all_gather_s"):
         from atom.utils import envs
 
@@ -2449,11 +2584,9 @@ def runner(model_runner, tree) -> None:
         if planned and model_runner.rank == 0:
             model_runner.compass_block_file = _block_file(now)
         slot = np.memmap(now, np.float64, "r", shape=(1,))
-        host = run.get("host", {})
+        host = host_part(run.get("host", {}), config)
         refuse_unfitted_host(host, config, platform)
         launch = stated(host.get("key"))
-        pp = getattr(config, "pipeline_parallel_size", 1)
-        stage = (config.parallel_config.pipeline_parallel_rank, pp) if pp > 1 else None
         # A drafter's runner waits for the last output's MTP status when it
         # defers its output.
         mtp = bool(getattr(config, "speculative_config", None)) and (
@@ -2593,20 +2726,9 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
     files each read here as they did in its trace (`capture.lookup`), so one
     traced under another torch, or that ran a file since edited, is a miss
     like any other. One the store holds, at a shape or holding G, is
-    loaded through `ArtifactStore.load` under this process's `graph_readings`,
-    its files' reading here (`capture.source_of`),
-    and its engine config as it records it: that cell holds the tracer's own
-    ATOM arguments, which no reader restates, and the key's structure names
-    the engine config in their place."""
-    from atom.compass.artifacts import (
-        ArtifactStore,
-        Axis,
-        Conditions,
-        GateState,
-        Row,
-        Topology,
-    )
-    from atom.compass.capture import graph_key, lookup, peers, source_of
+    loaded under this process's `graph_readings` (`load_graph`)."""
+    from atom.compass.artifacts import ArtifactStore, Topology
+    from atom.compass.capture import graph_key, lookup, peers
     from atom.compass.capture.forward import (
         PerG,
         Shape,
@@ -2648,16 +2770,13 @@ def _op_graphs(root: str, config, arch: str, atom_args=None, lazy=None, env=None
         return graph_readings(config.model)
 
     def parsed(key) -> dict:
-        """The graph the store holds at `key`, loaded under `here` and the
-        engine config it records, parsed and frozen with the rest of the live
-        heap, a collection first so no garbage is kept, as
-        `gc_utils.freeze_gc_heap` freezes the startup heap and under the same
-        `ATOM_GC_FREEZE`: this lookup's caches keep what it parses alive, and
-        every full collection walked all of it."""
-        cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
-        readings = here() | {"atom_src": source_of(store, key)}
-        conditions = Conditions.of(**readings, engine_config=cells[Axis.ENGINE_CONFIG])
-        entry = store.load(key, conditions=conditions, gates=GateState.of())
+        """The graph the store holds at `key`, loaded under `here`
+        (`load_graph`), parsed and frozen with the rest of the live heap, a
+        collection first so no garbage is kept, as `gc_utils.freeze_gc_heap`
+        freezes the startup heap and under the same `ATOM_GC_FREEZE`: this
+        lookup's caches keep what it parses alive, and every full collection
+        walked all of it."""
+        entry = load_graph(store, key, here())
         graph = json.loads(entry.read_member("graph", rank, "json"))
         if envs.ATOM_GC_FREEZE:
             gc.collect()
@@ -2747,6 +2866,23 @@ def graph_readings(model: str) -> dict:
         **traced_under(),
         "model": _file_digest(model, "config.json"),
     }
+
+
+def load_graph(store, key, readings: dict):
+    """The `op_graph` entry at `key` in `store`, loaded through
+    `ArtifactStore.load` under `readings` (`graph_readings`), its files'
+    reading here (`capture.source_of`), and its engine config as it records
+    it: that cell holds the tracer's own ATOM arguments, which no reader
+    restates, and the key's structure names the engine config in their place.
+    An entry whose row states another torch, ATOM source or model refuses,
+    naming the axis."""
+    from atom.compass.artifacts import Axis, Conditions, GateState, Row
+    from atom.compass.capture import source_of
+
+    cells = dict(store.read(key).fingerprints[Row.OP_GRAPH].cells)
+    readings = readings | {"atom_src": source_of(store, key)}
+    conditions = Conditions.of(**readings, engine_config=cells[Axis.ENGINE_CONFIG])
+    return store.load(key, conditions=conditions, gates=GateState.of())
 
 
 def _trace_process():
@@ -2877,11 +3013,19 @@ def tokenizer(tok, config) -> None:
     entry, its engine config's among several: a term fitted on another backend
     is refused, and one fitted on another ``tokenizer.json`` warns. A refusal
     ends the run before the server serves (`_end_before_serving`). With no
-    term, `tok` is left as it is, charging 0 s; ``segment`` wraps the segment tokenizer,
+    term, `tok` is charged 0 s; ``segment`` wraps the segment tokenizer,
     and its ``chars_per_s`` charges each comparison of its stored-prefix search.
+    Beneath those charges, a segment text any frontend of the deployment has
+    encoded is read back rather than encoded again (`token_ids`), charged the
+    same.
 
     On a real run recording its steps (`parity.ENV`), it records instead
-    (`_record_host`); with neither, `tok` is left as it is."""
+    (`_record_host`); with neither, `tok` is left as it is.
+
+    A simulated server's Rust backend encodes a batch's texts in parallel
+    (`_PARALLEL_TOKENIZER`), whatever ``TOKENIZERS_PARALLELISM`` its
+    environment sets: what tokenization costs is the term's charge, never its
+    wall time, and the ids are the same either way."""
     global _frontend_host
     run = spec()
     if run is None:
@@ -2890,6 +3034,8 @@ def tokenizer(tok, config) -> None:
         if record := os.environ.get(parity.ENV):
             _record_host(tok, Path(record))
         return
+    # Read by the tokenizers library at each call, so it holds from here on.
+    os.environ.update(_PARALLEL_TOKENIZER)
     from tokenizers import Tokenizer
 
     from atom.compass.spec.rules import FingerprintMismatch
@@ -2902,6 +3048,11 @@ def tokenizer(tok, config) -> None:
         raise
     if isinstance(run.get("host"), list):
         _frontend_host = host
+    from atom.compass.run import token_ids
+
+    backend = getattr(tok, "_tokenizer", None)
+    if isinstance(backend, Tokenizer) and (where := token_ids.directory(run)):
+        token_ids.install(backend, where)
     if term is None:
         return
     if (loaded := _fingerprint(tok)) not in (None, term["fingerprint"]):
@@ -3603,7 +3754,8 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     An engine whose ``lmcache_offload`` or ``mooncake_store`` is simulated
     hands in ``offload``: `OffloadShell.offload_statistics` or
     `StoreShell.offload_statistics`, and under ``cache`` its prefix cache's
-    counters (`EngineStats.cache_statistics`)."""
+    counters (`EngineStats.cache_statistics`); a later pipeline stage's Store
+    shell states none, and its engine hands in no ``offload``."""
     said = _workers_say(engine_core)
     rt = clock.installed()
     lp = rt.me.name if _member is None else f"{rt.me.name}.{_member}"
@@ -3621,9 +3773,12 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     if getattr(getattr(scheduler, "engine_stats", None), "spec_enabled", False):
         sections = sections | {"speculative": _acceptance(scheduler, run)}
     for half in getattr(kv, "_connectors", None) or [kv]:
-        if callable(tier := getattr(half, "offload_statistics", None)):
+        tier = getattr(half, "offload_statistics", None)
+        # A later pipeline stage's Store shell is inert and states nothing:
+        # the head's keeps the ranks and their counters.
+        if callable(tier) and (stated := tier()):
             cache = scheduler.engine_stats.cache_statistics()
-            sections = sections | {"offload": tier() | {"cache": cache}}
+            sections = sections | {"offload": stated | {"cache": cache}}
     _hand_in(run, lp, reasons, client_run, **said, **sections)
 
 

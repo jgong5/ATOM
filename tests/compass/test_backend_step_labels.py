@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from test_backend_step_linear_fit import (
     GAP_NS,
+    HOST_ADMIT,
     SPEC,
     _record,
     _rowmod_steps,
@@ -26,6 +27,7 @@ from test_backend_step_linear_fit import (
     platform_arg,
     traced,
 )
+from test_backend_step_linear_fit import HOST as LAWS
 from test_memory_readings import DOCUMENT, META_8B
 from test_parity_device_window import BUSY, GAP, _recorded
 from test_parity_record import _config, _drive
@@ -37,8 +39,10 @@ from atom.compass.backends import (
     StepLinearLaw,
 )
 from atom.compass.backends.step_labels import (
+    PREFILL_LABEL_ENV,
     TABLE_VERSION,
     digest,
+    host_kind,
     label,
     label_run,
     write_table,
@@ -527,3 +531,208 @@ def test_a_dp_view_counts_its_step_s_dummy_forwards_from_every_rank_s_line(tmp_p
     (single / "dp1.jsonl").write_text("not a record\n")
     one = _record(single / "dp0.jsonl", _steps(5, n=12))
     assert {s.view.group_dummies for s in label(one)[0]} == {0}
+
+
+#: Stage 1's segments in `pp2`: the head's laws at a quarter, and `W_recv`, the
+#: start of its `W_launch`, after which its receive waits for the head's send.
+QUARTER, RECV = 0.25, [2e-5, 2e-9, 5e-6]
+
+
+def pp2(steps, seed, key=KEY, later=QUARTER) -> tuple[list[dict], list[dict]]:
+    """Each stage's lines of a two-stage pipeline's record in `steps`, under
+    `key`, of `_steps(seed)`'s prefills, every fourth a middle chunk, one
+    request's chunk in each beside those it admits, written by the wait rules:
+    the head called at the later of its last exit and stage 1's exit of the
+    forward two back, which acks it, and stage 1 at the later of its own last
+    exit and the head's call, each entering its `E` after.
+    The head runs `LAWS`' segments and its admissions' `HOST_ADMIT`, and reads
+    no token; stage 1 runs `LAWS`' at `later`, its launch waiting after `RECV`
+    for the head's launch end, and reads an output forward's token at its
+    device end, after the head's. A device runs a hundredth of every fourth
+    forward's price, from the fourth, and a millionth of the others': the head
+    waits for stage 1 after the slow ones, and stage 1 for the head after the
+    rest."""
+    stages, ends = ([], []), [0, 0]
+    prefills = [s for s in _steps(seed, n=480) if not s[0][0][2]]
+    for n, (rows, rung, seconds) in enumerate(prefills):
+        head, last = stages
+        output, x = bool(n % 4), (1, sum(r[0] for r in rows), len(rows))
+        new = [(q, c - q) for q, c, _ in rows[1:]]
+        admit = (min(len(new), 1), sum(q for q, _ in new), sum(c for _, c in new))
+        ack = n > 1 and last[n - 2]["t_exit_ns"]
+        call = max(head[-1]["t_exit_ns"] if n else 0, ack or 0)
+        ids = [0] + [10_000 + n * 10 + j for j in range(len(rows) - 1)]
+        for k, (lines, scale) in enumerate(zip(stages, (1, later))):
+            law = LAWS["prefill" if output else "middle"]
+            ns = {g: round(scale * np.dot(c, x) * 1e9) for g, c in law.items()}
+            if k:
+                enter = max(call, last[-1]["t_exit_ns"] if n else 0) + ns["E"]
+            else:
+                enter = call + ns["E"] + round(np.dot(HOST_ADMIT, admit) * 1e9)
+            g0 = enter + ns["W_pre"] // 2
+            l0 = g0 + 1000 + ns["W_pre"] - ns["W_pre"] // 2
+            r0 = l0 + ns["W_launch"]
+            line = {"step": n, "dp_rank": 0, "is_dummy_run": False}
+            line |= {"produces_output": output, "rows": [list(r) for r in rows]}
+            line |= {"batch": [[i, q, c] for i, (q, c, _) in zip(ids, rows)]}
+            line |= {"named": [], "rung": rung, "t_enter_ns": enter}
+            if k:  # its receive waits for the head's send
+                p0 = l0 + round(np.dot(RECV, x) * 1e9)
+                p1 = max(p0, head[n]["t_launch_ns"][1])
+                line["t_pp_recv_ns"], r0 = [p0, p1], r0 + p1 - p0
+            busy = round(seconds * (1e7 if n % 4 == 3 else 1e3))
+            ends[k] = max(ends[k], l0, ends[0]) + busy
+            line |= {"t_gate_ns": [g0, g0 + 1000], "t_launch_ns": [l0, r0]}
+            line |= {"d_busy_ns": busy, "t_exit_ns": r0}
+            if output and k:
+                line["t_recv_ns"] = [r0, max(r0, ends[k])]
+            if output:
+                line["t_exit_ns"] = max(r0, ends[k] if k else 0) + ns["W_post"]
+            lines.append(line)
+    for name, lines in zip(("dp0", "pp1.dp0"), stages):
+        path = steps / f"{name}.jsonl"
+        path.write_text("".join(json.dumps(s) + "\n" for s in lines))
+        path.with_suffix(".key.json").write_text(json.dumps(key))
+    return stages
+
+
+def test_each_pipeline_stage_s_segments_are_its_own_its_e_from_its_release(
+    tmp_path,
+):
+    """Labelled as its stage, each forward's segments on `pp2`'s record are
+    those planted: the head's `E` from stage 1's exit of the forward whose
+    ack it waits for, its admissions aside, and stage 1's from the head's
+    call; stage 1's `W_recv`, and its `W_launch` less its receive's wait. The
+    head reads no token, and still labels."""
+    stages = pp2(tmp_path, 19)
+    for k, (lines, scale) in enumerate(zip(stages, (1, QUARTER))):
+        [(samples, _)] = label_run([tmp_path / f"{'pp1.' * k}dp0.jsonl"], stage=k)
+        assert [s.step for s in samples] == [s["step"] for s in lines]
+        for s, line in zip(samples[1:], lines[1:]):
+            x = (1, sum(r[0] for r in line["rows"]), len(line["rows"]))
+            law = LAWS[host_kind(s.view)]
+            planted = {g: scale * np.dot(c, x) for g, c in law.items()}
+            planted |= {"W_recv": np.dot(RECV, x)} if k else {}
+            got = dict(s.host)
+            if s.admitted[0] and not k:
+                del got["E"], planted["E"]
+            assert got == pytest.approx(planted, abs=2e-9), s.step
+
+
+def test_under_the_record_label_no_stage_s_prefill_takes_its_window(
+    tmp_path, monkeypatch
+):
+    """`pp2`'s record with a drafter on its last stage, a quarter of each step
+    its draft's, and no busy lines, labelled under `COMPASS_PREFILL_LABEL=record`
+    as its stages: each stage's prefill steps are cut `untraced`, a stage's
+    window holding its receive's wait for the stage before. The last stage's
+    lines as a one-stage record take their windows' labels."""
+    monkeypatch.setenv(PREFILL_LABEL_ENV, "record")
+    _, last = pp2(tmp_path, 19)
+    for s in last:
+        s["d_target_ns"] = s["d_busy_ns"] * 3 // 4
+    text = "".join(json.dumps(s) + "\n" for s in last)
+    (tmp_path / "pp1.dp0.jsonl").write_text(text)
+    (tmp_path / "one").mkdir()
+    (tmp_path / "one" / "dp0.jsonl").write_text(text)
+
+    for k in (0, 1):
+        [(samples, _)] = label_run([tmp_path / f"{'pp1.' * k}dp0.jsonl"], stage=k)
+        assert [s.cut for s in samples] == ["untraced"] * len(last), k
+    [(alone, _)] = label_run([tmp_path / "one" / "dp0.jsonl"])
+    windowed = {s.step: s.device_s for s in alone if s.cut is None}
+    assert windowed and {s.cut for s in alone} <= {None, "paced"}
+    assert windowed == pytest.approx(
+        {s["step"]: s["d_target_ns"] * 1e-9 for s in last if s["step"] in windowed}
+    )
+    assert {s.provenance.get("prefill_label") for s in alone if not s.cut} == {"record"}
+
+
+@pytest.mark.parametrize("stage", [0, 1])
+def test_a_stage_entered_before_its_release_refuses(tmp_path, stage):
+    """Step 5 waits for stage 1's exit of step 3 on the head, and on stage 1
+    for the head's call: entered 1 ms before either, it refuses."""
+    stages = pp2(tmp_path, 19)
+    head, last = stages
+    call = max(head[4]["t_exit_ns"], last[3]["t_exit_ns"])
+    stages[stage][5]["t_enter_ns"] = (last[3]["t_exit_ns"], call)[stage] - 1_000_000
+    path = tmp_path / f"{'pp1.' * stage}dp0.jsonl"
+    path.write_text("".join(json.dumps(s) + "\n" for s in stages[stage]))
+
+    named = f"{path} step 5 enters 1.000 ms before the release it waits for"
+    with pytest.raises(ValueError, match=re.escape(named)):
+        label_run([path], stage=stage)
+
+
+def test_a_pipeline_whose_stages_ran_other_forwards_refuses(tmp_path):
+    head, _ = pp2(tmp_path, 19)
+    path = tmp_path / "pp1.dp0.jsonl"
+    path.write_text("".join(path.read_text().splitlines(keepends=True)[:-1]))
+
+    named = f"{path}'s pipeline stages hold [{len(head)}, {len(head) - 1}] lines"
+    with pytest.raises(ValueError, match=re.escape(named)):
+        label_run([path], stage=1)
+
+
+def _producer(out) -> list[dict]:
+    """`pp2`'s record as a stopped producer server's directory `out`: stage
+    0's `dp0.jsonl`, every forward a prefill and none reading a token, with its
+    engine file, and an empty run.json. Returns stage 0's lines."""
+    from test_drive_record import ENGINE
+
+    (out / "steps").mkdir()
+    head, _ = pp2(out / "steps", 19)
+    (out / "steps/dp0.engine.json").write_text(json.dumps(ENGINE))
+    (out / "run.json").write_text("{}")
+    return head
+
+
+def _rewrite(path, lines) -> None:
+    path.write_text("".join(json.dumps(s) + "\n" for s in lines))
+
+
+@pytest.mark.parametrize("dummy", [False, True])
+def test_a_pipeline_producer_s_head_gets_its_cost_lines_and_engine_entry(
+    tmp_path, dummy
+):
+    """The named result: a pipeline producer's stage 0 reads no token, and with
+    no decode step its labels need no token read exit, so its record gets its
+    cost lines and run.json its `engine` entry. A dummy forward holding a decode
+    row is no decode step: it gives no sample."""
+    from test_drive_record import ENGINE
+
+    from atom.compass.drive.record import write_engine_and_costs
+
+    head = _producer(tmp_path)
+    assert not any("t_recv_ns" in s or "t_read_ns" in s for s in head)
+    if dummy:
+        head[5] |= {"is_dummy_run": True, "rows": [[1, 1, True]], "batch": []}
+        _rewrite(tmp_path / "steps/dp0.jsonl", head)
+    write_engine_and_costs(tmp_path)
+
+    assert json.loads((tmp_path / "run.json").read_text()) == {"engine": ENGINE}
+    version, *table = map(json.loads, (tmp_path / "steps/dp0.cost.jsonl").open())
+    assert version == {"version": TABLE_VERSION}
+    steps = [s["step"] for s in head if not s["is_dummy_run"]]
+    assert [row["step"] for row in table] == steps
+    assert {(row["cut"], row["launch_exposed"]) for row in table} == {
+        ("untraced", False)
+    }
+    assert all(row["W_launch"] > 0 for row in table)
+
+
+def test_a_head_with_a_decode_step_and_no_token_read_exit_refuses(tmp_path):
+    """A decode step is cut by where its device started on the host clock, which
+    only a token read exit places: `pp2`'s head with one refuses, writing no
+    cost lines and no `engine` entry."""
+    from atom.compass.drive.record import write_engine_and_costs
+
+    head = _producer(tmp_path)
+    head[5] |= {"rows": [[1, 4096, True]], "batch": [[0, 1, 4096]]}
+    _rewrite(tmp_path / "steps/dp0.jsonl", head)
+
+    refusal = "no token read exit (`t_recv_ns` or `t_read_ns`) ties the record's"
+    with pytest.raises(ValueError, match=re.escape(refusal)):
+        write_engine_and_costs(tmp_path)
+    assert not (tmp_path / "steps/dp0.cost.jsonl").exists()
+    assert json.loads((tmp_path / "run.json").read_text()) == {}

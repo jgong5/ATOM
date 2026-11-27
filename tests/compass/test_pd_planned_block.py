@@ -82,12 +82,14 @@ print(json.dumps({"entry_bytes": plan.entry_bytes[plan.paged_class],
 """
 
 
-def publish(out_dir, name: str, block: int, tp: int = 1, image: int = 0) -> None:
+def publish(
+    out_dir, name: str, block: int, tp: int = 1, image: int = 0, **more
+) -> None:
     """Publish engine `name`'s planned block, and the state image its lmcache
     saves carry, as its runner does."""
     now = pathlib.Path(out_dir) / compass_run.NOW_FILE.format(name)
     path = compass_run._block_file(now)
-    compass_run.publish_transfer(path, block, tp, image_bytes=image)
+    compass_run.publish_transfer(path, block, tp, image_bytes=image, **more)
 
 
 @pytest.fixture
@@ -198,7 +200,7 @@ def test_a_transferred_block_is_the_paged_entry_atom_planned(
 def test_sides_that_plan_different_blocks_refuse_naming_both(served, tmp_path, role):
     served()
     publish(tmp_path, "engine-P", 1835008, tp=1)
-    publish(tmp_path, "engine-D", 917504, tp=2)
+    publish(tmp_path, "engine-D", 917504, tp=2, heads_tp=1)
     with pytest.raises(
         ValueError,
         match="engine-D at TP 2 plans a KV block of 917504 B and engine-P at TP 1 "
@@ -207,20 +209,53 @@ def test_sides_that_plan_different_blocks_refuse_naming_both(served, tmp_path, r
         _connector(role)
 
 
-@pytest.mark.parametrize("decode, refused", [(1000, None), (900, "900 B and ")])
-def test_decode_prices_each_prefill_stage_at_the_block_that_stage_planned(
-    served, tmp_path, decode, refused
+#: A TP1 prefill's four stages, 600 + 600 + 600 + 1200 B a block, of which a
+#: decode at heads TP 4 holds its heads of the 2400 B split by head and all
+#: 600 B of the rest: 1200 B a rank, 4800 B over its four, which the stages'
+#: writes carry in proportion to their blocks.
+CUT_STAGES = [600, 600, 600, 1200]
+CUT_WRITES = [960, 960, 960, 1920]
+
+
+@pytest.mark.parametrize(
+    "decode, outcome",
+    [
+        ({"block": 1200}, CUT_WRITES),
+        # Under DP attention every rank holds every head: no cut.
+        ({"block": 1200, "heads_tp": 1}, "1200 B and "),
+        # Below a quarter of the prefill's block, or above all of it.
+        ({"block": 749}, "749 B and "),
+        ({"block": 3001}, "3001 B and "),
+        # All of it: no region is split by head, and each write is its own.
+        ({"block": 3000}, CUT_STAGES),
+    ],
+    ids=["cut", "dp-attention", "below-a-quarter", "above-the-whole", "uncut"],
+)
+def test_a_decode_that_cuts_kv_heads_out_of_a_tp1_prefill_receives_its_ranks_blocks(
+    served, tmp_path, decode, outcome
 ):
-    served(machine=DP_MACHINE, **{compass_run.PREFILL_PP: 2})
-    publish(tmp_path, "engine-P-pp0", 600)
-    publish(tmp_path, "engine-P-pp1", 400)
-    publish(tmp_path, "engine-D", decode)
-    if refused:
-        with pytest.raises(ValueError, match=f"engine-D at TP 1 .* {refused}engine-P"):
+    """Mooncake writes each decode rank its heads of a TP1 prefill's regions
+    split by head, and the whole of each other region
+    (`MooncakeConnectorWorker._unit_plan`)."""
+    served(machine=DP_MACHINE, **{compass_run.PREFILL_PP: 4})
+    for k, block in enumerate(CUT_STAGES):
+        publish(tmp_path, f"engine-P-pp{k}", block)
+    publish(tmp_path, "engine-D", tp=4, **decode)
+    if isinstance(outcome, str):
+        with pytest.raises(ValueError, match=f"engine-D at TP 4 .* {outcome}engine-P"):
             _connector("kv_consumer")
         return
-    stages = _connector("kv_consumer")._transfer
-    assert [m.bytes_per_block for m in stages] == [600, 400]
+    assert [m.bytes_per_block for m in _connector("kv_consumer")._transfer] == outcome
+
+
+def test_a_head_cut_refuses_decodes_that_receive_different_blocks(served, tmp_path):
+    """One prefill write prices every decode deployment's transfer."""
+    served(decode_instances=2, router_in_s=2.0**-14)
+    publish(tmp_path, "engine-P", 3000)
+    publish(tmp_path, "engine-D0", 1200, tp=4)
+    publish(tmp_path, "engine-D1", 3000, tp=4)
+    with pytest.raises(ValueError, match="receive 3000 and 4800 B a block"):
+        _connector("kv_producer")
 
 
 def test_an_engine_waits_a_bounded_time_for_the_others_blocks(

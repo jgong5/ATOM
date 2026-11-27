@@ -12,13 +12,20 @@ record names with no response id (`read`) is named by its key instead.
 requests it holds, a step holding none to no client run, and a step holding two
 client runs' requests refuses the split, and so does a client run whose
 requests no step holds.
+
+A deployment's prefill side names each request by its own response id, and its
+client saw the decode's: where the record's directory holds the prefill's
+`TRANSFERS` and its deployment's decode sides theirs (``deploy.sh``'s
+``OUT/prefill/steps`` beside ``OUT/decode*/steps``), each request is named by
+the decode response id its transfer id joins it to (`decode_names`).
 """
 
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from atom.compass.parity import read
+from atom.compass.backends.json_file import read_jsonl
+from atom.compass.parity import TRANSFERS, read
 
 
 def requests(client_run) -> dict[str, dict]:
@@ -43,8 +50,13 @@ def served(directory, client_runs: Sequence = ()) -> dict[int, list[dict]]:
                     "a request is sent by one client run"
                 )
     record = read(directory)
+    seen = decode_names(Path(directory))
     for rank, steps in record.items():
-        ids = {k: v for s in steps for k, v in s.get("response_ids", {}).items()}
+        ids = {
+            k: seen.get(v, v)
+            for s in steps
+            for k, v in s.get("response_ids", {}).items()
+        }
         for step in steps:
             names = [n for r in step["batch"] if (n := ids.get(r[0], r[0])) in owner]
             ks = sorted({owner[n] for n in names})
@@ -64,3 +76,26 @@ def served(directory, client_runs: Sequence = ()) -> dict[int, list[dict]]:
     if idle:
         raise ValueError(f"client runs {idle} name no request this record's steps hold")
     return record
+
+
+def decode_names(directory: Path) -> dict[str, str]:
+    """A deployment's prefill side's response ids at `directory`, each the
+    response id the decode that took its transfer answered with, which the
+    client saw: joined on the transfer id each side's `TRANSFERS` line names.
+    Empty where `directory` holds no `TRANSFERS` or no decode side beside it
+    does; a transfer id two decode requests name joins neither."""
+    own = directory / TRANSFERS
+    decodes = sorted(
+        directory.parent.parent.glob(f"decode*/{directory.name}/{TRANSFERS}")
+    )
+    if not own.exists() or not decodes:
+        return {}
+    taken: dict[str, set] = {}
+    for path in decodes:
+        for t in read_jsonl(path):
+            taken.setdefault(t["transfer_id"], set()).add(t["response_id"])
+    return {
+        t["response_id"]: next(iter(names))
+        for t in read_jsonl(own)
+        if len(names := taken.get(t["transfer_id"], ())) == 1
+    }

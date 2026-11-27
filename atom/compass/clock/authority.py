@@ -775,10 +775,17 @@ class ClockAuthority:
     def _ceiling_of(self, i: LpId, g: float, released: Released | None = None) -> float:
         """The ceiling of `i`'s grant to `g`: `released` takes every message
         below it when `i` asked for them ahead. An LP with members takes none:
-        the rounds granted below it release them."""
+        the rounds granted below it release them. No message on an offering
+        channel goes ahead: its handler offers a send stamped at its arrival,
+        and a message gone ahead is no longer unreleased, so a TAR past it
+        would be granted past that arrival (`_offered`) and the send refused
+        as backdated. The ceiling stops at the first such arrival instead,
+        where the TAR that reaches it is granted first."""
         ceiling = min(self._lbts(i), g + self._cycle[i], self._bound)
         if i in self._members:
             return ceiling
+        if self._asks.get(i):
+            ceiling = min(ceiling, self._offered(i))
         for name in self._into[i] if self._asks.get(i) else ():
             pending = self._undelivered[name]
             early = [(seq, a) for seq, a in pending.items() if a < ceiling]

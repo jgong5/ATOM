@@ -65,8 +65,13 @@ cancelled request up at the cancel's arrival. Behind a PD router the router LP
 answers it and hands it on to the frontend that holds the request. A PD router
 that is no LP answers a cancel 400, as a chat request it cannot read, so behind
 one, where the HTTP channel leads to frontend-P, each cancel goes to
-frontend-P's own URL, from ``PREFILL_URL_ENV``. A cancel its worker has not
-reported written after ``DIAG_S`` wall seconds is named in the log.
+frontend-P's own URL, from ``PREFILL_URL_ENV``. Under a chunked transfer the
+router sends each request to frontend-D at once too, stamped alike there
+(`also`), so its cancel goes to frontend-D's URL as well, from the run's
+``decode/server.json`` (`frontend_url`): a cancel stamped on a channel no
+worker writes leaves that frontend waiting for it, and the run with it. A
+cancel its worker has not reported written after ``DIAG_S`` wall seconds is
+named in the log.
 
 Every stamp, a send's or a cancel's, goes to every worker, and none may be
 lost: a worker that never gets its request's stamp never sends it, and one that
@@ -85,10 +90,15 @@ errored request is still open, the hold fails, naming those requests.
 
 import asyncio
 import hashlib
+import heapq
+import itertools
+import json
 import logging
 import math
 import os
 import pickle
+import sys
+import weakref
 from statistics import NormalDist
 
 import zmq
@@ -141,6 +151,27 @@ class SendAfterCancel(RuntimeError):
     """A request sent after `TrafficLP.cancel` closed others."""
 
 
+def frontend_url(run: dict, channel: str) -> str:
+    """The URL of the frontend LP `channel` leads to, ``traffic->frontend-D:http``
+    or ``traffic->frontend-D<i>:http``, as the `deploy.sh` instance in the run
+    file's ``out_dir`` that serves it states it: ``decode/`` or ``decode<i>/``'s
+    ``server.json``. Refused, naming it, where it states none."""
+    lp = channel.split("->", 1)[1].split(":", 1)[0]
+    if not lp.startswith("frontend-D"):
+        raise ValueError(f"{channel} leads to {lp}, no decode frontend")
+    path = os.path.join(
+        run["out_dir"], "decode" + lp[len("frontend-D") :], "server.json"
+    )
+    try:
+        with open(path) as f:
+            return json.load(f)["url"]
+    except (OSError, ValueError, KeyError) as e:
+        raise RuntimeError(
+            f"{path} states no URL for {lp}: under a chunked transfer each cancel "
+            f"goes to every frontend its request reached ({e})"
+        ) from e
+
+
 class TrafficLP:
     def __init__(
         self,
@@ -161,6 +192,9 @@ class TrafficLP:
         # The other frontends each request goes to at once (`from_env`).
         self.also: tuple[str, ...] = ()
         self.cancel_url, self.seed = cancel_url, seed
+        # Where each cancel is posted, if not to its request's URL: `cancel_url`,
+        # and under a chunked transfer each `also` frontend's too (`from_env`).
+        self.cancel_to: tuple[str, ...] = (cancel_url,) if cancel_url else ()
         self.ingress = ingress
         # Behind an ingress: each sent request's body bytes, None for none, as
         # its worker reported it; and each open one's arrival past the ingress.
@@ -194,7 +228,16 @@ class TrafficLP:
         # key -> its return, for aiperf; None once passed
         self._held: dict[tuple, object] = {}
         self._returns: asyncio.Queue = asyncio.Queue()  # passed in order, as upstream
-        self._waiters: list[tuple[float, asyncio.Future, bool]] = []
+        # Each clock wait neither resolved nor withdrawn, future -> (t, phase
+        # deadline), in the order asked, which is the order due waits resolve
+        # in; and the same waits by (t, that order) in two heaps, plain waits
+        # and phase deadlines, where a resolved or withdrawn one is skipped
+        # when it comes to the top. One clock call reads the earliest of each
+        # and resolves the due ones without a pass over every open session's.
+        self._waiters: dict[asyncio.Future, tuple[float, bool]] = {}
+        self._plain: list[tuple[float, int, asyncio.Future]] = []
+        self._deadlines: list[tuple[float, int, asyncio.Future]] = []
+        self._asked = itertools.count()
         self._passing = False  # a return is inside aiperf's callback
         # The tasks not done at the hold's last look. The loop does not turn while
         # the owner is in a clock call, so the next hold starts from them; None
@@ -245,6 +288,10 @@ class TrafficLP:
             ),
         )
         lp.also = tuple(c.name for c in also)
+        if lp.cancel_to and lp.also:
+            # Each cancel is stamped on every channel its request was (`_stamp`),
+            # so each frontend that took the request reads its own.
+            lp.cancel_to += tuple(frontend_url(run, ch) for ch in lp.also)
         return lp
 
     def _stamp(self, at: float | None = None) -> tuple[float, int]:
@@ -271,13 +318,15 @@ class TrafficLP:
         is open, and a wait due at or past it only once it has fired.
         """
         fut = asyncio.get_running_loop().create_future()
-        self._waiters.append((t, fut, phase_deadline))
+        self._waiters[fut] = (t, phase_deadline)
+        heap = self._deadlines if phase_deadline else self._plain
+        heapq.heappush(heap, (t, next(self._asked), fut))
         self._changed.set()
         return fut
 
     def withdraw(self, fut: asyncio.Future) -> None:
         """Drop a wait, so it asks the clock for nothing, and resolve it now."""
-        self._waiters = [w for w in self._waiters if w[1] is not fut]
+        self._waiters.pop(fut, None)
         if not fut.done():
             fut.set_result(None)
         self._changed.set()
@@ -383,7 +432,7 @@ class TrafficLP:
         self.open.clear()
         self.cancelled.update(keys)
         self.closed.update(dict.fromkeys(keys))
-        to = (self.cancel_url,) if self.cancel_url else ()
+        to = self.cancel_to
         for key in keys:
             if self.ingress is None:
                 arrival, seq = self._stamp()
@@ -487,12 +536,7 @@ class TrafficLP:
                 self._alive = None
                 await self._changed.wait()
                 continue
-            t, deadline = math.inf, math.inf
-            for at, _, phase_deadline in self._waiters:
-                if phase_deadline:
-                    deadline = min(deadline, at)
-                else:
-                    t = min(t, at)
+            t, deadline = self._earliest(self._plain), self._earliest(self._deadlines)
             if not self.open:
                 t, deadline = min(t, deadline), math.inf
             elif t >= deadline:  # asked for once the deadline has fired
@@ -503,13 +547,15 @@ class TrafficLP:
 
     async def _settle(self) -> None:
         """Hold until every released event is reported and aiperf has caught up."""
-        waiting = []
-        for wait in self._waiters:  # resolve the waits this grant made due
-            if wait[0] <= self.rt.now:
-                wait[1].set_result(None)
-            else:
-                waiting.append(wait)
-        self._waiters = waiting
+        # Resolve the waits this grant made due, in the order they were asked.
+        due = []
+        for heap in (self._plain, self._deadlines):
+            while heap and heap[0][0] <= self.rt.now:
+                _, asked, fut = heapq.heappop(heap)
+                if self._waiters.pop(fut, None) is not None:
+                    due.append((asked, fut))
+        for _, fut in sorted(due, key=lambda wait: wait[0]):
+            fut.set_result(None)
         spins = 0
         while True:
             # A reader that raised fails the run instead of leaving the hold waiting.
@@ -592,6 +638,13 @@ class TrafficLP:
                 logger.warning("traffic: tasks %s never block; still waiting", ready)
             await asyncio.sleep(0)
 
+    def _earliest(self, heap: list) -> float:
+        """The earliest wait open in `heap`, dropping those above it that are
+        not; ``+inf`` for none."""
+        while heap and heap[0][2] not in self._waiters:
+            heapq.heappop(heap)
+        return heap[0][0] if heap else math.inf
+
     def _close(self) -> None:
         self.rt.close()
         for task in self._tasks:
@@ -616,12 +669,36 @@ def _look(alive: set | None) -> tuple[list[str], set, bool]:
     one.
     """
     me = asyncio.current_task()
-    tasks = {task for task in asyncio.all_tasks() if task is not me and not task.done()}
+    tasks = {task for task in _tasks_of(me.get_loop()) if not task.done()}
+    tasks.discard(me)
     # ponytail: Task._fut_waiter is private; a loop-level idle hook would not be.
     ready = [
         task.get_name()
         for task in tasks
-        if task._fut_waiter is None or task._fut_waiter.done()
+        if (waiter := task._fut_waiter) is None or waiter.done()
     ]
-    ended = alive is None or any(task.done() for task in alive)
+    # A task of `alive` still in `tasks` is not done; one not in it may be.
+    ended = alive is None or any(task.done() for task in alive - tasks)
     return ready, tasks, ended
+
+
+def _tasks_of(loop) -> list:
+    """The tasks of `loop`, some perhaps done, in one pass: `asyncio.all_tasks`
+    walks a `WeakSet` item by item in Python and checks each task's loop
+    through a Python helper, over every open session's task once a clock call
+    (jgong5/ATOM#3992 measured it). Before 3.14 every task is in
+    ``asyncio.tasks._scheduled_tasks`` (or ``_eager_tasks`` while it runs
+    eagerly), whose weak references are read here directly; 3.14 keeps
+    native tasks elsewhere, so there it asks `asyncio.all_tasks`."""
+    scheduled = getattr(asyncio.tasks, "_scheduled_tasks", None)
+    eager = getattr(asyncio.tasks, "_eager_tasks", ())
+    if sys.version_info >= (3, 14) or not isinstance(scheduled, weakref.WeakSet):
+        return list(asyncio.all_tasks(loop))
+    while True:
+        try:  # a collection can drop a reference mid-copy, as all_tasks retries
+            refs = list(scheduled.data)
+            break
+        except RuntimeError:
+            continue
+    tasks = [*map(weakref.ref.__call__, refs), *eager]
+    return [task for task in tasks if task is not None and task.get_loop() is loop]

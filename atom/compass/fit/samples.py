@@ -12,8 +12,16 @@ Under `floored`, a trace run's drafter labels lose the profiler's floor
 (`parity.busy.floored`). A DP rank no request reached writes a line per dummy forward it runs, and gives
 no sample; its file still counts in the run's digest. An empty
 rank file lost its lines, and refuses.
-A record whose run.json names `aiter_jit_builds` or `ptl_changes` refuses,
-naming them, and so does one whose `source` counts uncommitted files.
+A pipeline's record holds each stage's rank records, stage k's above 0 as
+`pp<k>.dp<r>.jsonl`, for as many stages as its engine config states (`keyed`);
+other stages' refuse. Each stage's ranks are labelled together as that stage
+(`label_run`'s `stage`), a run named by their own files' digests, and each
+sample names its stage (`Sample.stage`). A later stage runs stage 0's batches
+in turn, so its step takes the traces, graded window and ladder of stage 0's
+step of that number, and one holding other requests refuses.
+A record whose run.json names `ptl_changes` refuses, naming them, and so does
+one whose `source` counts uncommitted files, or one whose `aiter_jit_builds`
+`step_labels.cut_refusal` refuses; a step that overlaps a timed compile is cut.
 With `GRADED_ONLY_ENV` set to ``1``, a record's samples are its graded steps
 (`graded_steps`): those within some client run's graded span, from the first
 step in which a rank holds one of the requests it names as sent (its export's
@@ -87,7 +95,7 @@ from atom.compass.artifacts import ArtifactStore, Topology
 from atom.compass.backends.launch_features import GRAPHS
 from atom.compass.backends.shape import BatchView, RequestShape
 from atom.compass.backends.step_grid_plan import PREFILL_BUCKETS, pooled
-from atom.compass.backends.step_labels import Sample, digest, label_run
+from atom.compass.backends.step_labels import Sample, cut_spans, digest, label_run
 from atom.compass.backends.step_linear_fit import (
     recorded_buckets,
     recorded_level,
@@ -185,8 +193,6 @@ def _record(
             f"{directory} was profiled, and profiling splits the steps it times, "
             "so no fit takes them"
         )
-    if built := aiter_jit.refusal(run):
-        raise ValueError(f"{directory} is not fitted: {built}")
     if changes := run.get(PTL_CHANGES):
         named = ", ".join(f"{c['from']} to {c['to']} at {c['at']}" for c in changes)
         raise ValueError(
@@ -201,6 +207,8 @@ def _record(
             f"{steps} holds {ARRIVALS}, so its steps are not numbered as its lines"
         )
     record = served(steps, client_runs)
+    if built := aiter_jit.cut_refusal(run, record.values()):
+        raise ValueError(f"{directory} is not fitted: {built}")
     spans = client_spans(record)
     # Each step within a calibration ladder's span, to the rungs it calibrates.
     laddered = {
@@ -236,37 +244,33 @@ def _record(
     engine = level | keyed_of(json.loads(own.read_text()))
     if stated is not None:
         engine, buckets = _stated(own, level | held, buckets, stated)
-    files = sorted(steps.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
-    name, samples = ", ".join(map(digest, files)), []
-    for got, _ in label_run(files, name, _split, floored):
-        dummies = None
-        for s in got:
-            if graded is not None and s.step not in graded:
-                continue
-            if graded_to is not None and s.step >= graded_to:
-                continue
-            if dummies is None:  # the rank's dummy forwards, cut alike
-                dummies = tuple(
-                    d
-                    for d in s.dummy_host
-                    if (graded is None or d[0] in graded)
-                    and (graded_to is None or d[0] < graded_to)
-                )
-            at = traces[s.rank, s.step]
-            traced = {**s.provenance, "traces": at, "profiled": run["profiled"]}
-            if stated is not None and (key := traced["config"]) is not None:
-                graphs = {k: v for k, v in key["engine"].items() if k == GRAPHS}
-                traced["config"] = {**key, "engine": engine | graphs}
-            elif level and (key := traced["config"]) is not None:
-                traced["config"] = {**key, "engine": level | key["engine"]}
-            samples.append(
-                dataclasses.replace(
-                    s,
-                    provenance=traced,
-                    dummy_host=dummies,
-                    ladder=laddered.get(s.step),
-                )
-            )
+    stages, heads, samples = _stages(steps, engine), {}, []
+    for k, files in enumerate(stages):
+        stage = k if len(stages) > 1 else None
+        name = ", ".join(map(digest, files))
+        for got, _ in label_run(files, name, _split, floored, cut_spans(run), stage):
+            for s in got:
+                if k == 0:
+                    heads[s.rank, s.step] = s.provenance["requests"]
+                elif heads.get((s.rank, s.step)) != s.provenance["requests"]:
+                    raise ValueError(
+                        f"{directory} pipeline stage {k}, DP rank {s.rank}, step "
+                        f"{s.step} holds requests {s.provenance['requests']}, and "
+                        f"stage 0's {heads.get((s.rank, s.step))}: a pipeline's "
+                        "stages run each batch in turn"
+                    )
+            samples += _graded(got, graded, graded_to)
+    for i, s in enumerate(samples):
+        traced = {**s.provenance, "traces": traces[s.rank, s.step]}
+        traced["profiled"] = run["profiled"]
+        if stated is not None and (key := traced["config"]) is not None:
+            graphs = {k: v for k, v in key["engine"].items() if k == GRAPHS}
+            traced["config"] = {**key, "engine": engine | graphs}
+        elif level and (key := traced["config"]) is not None:
+            traced["config"] = {**key, "engine": level | key["engine"]}
+        samples[i] = dataclasses.replace(
+            s, provenance=traced, ladder=laddered.get(s.step)
+        )
     host = run["host_key"]
     return samples, {
         **fields,
@@ -277,6 +281,43 @@ def _record(
         "sampling": json.loads(sampling[0]) if sampling else None,
         "host_key": {k: v for k, v in host.items() if k not in ("model", "engine")},
     }
+
+
+def _stages(steps: Path, engine: dict) -> list[list[Path]]:
+    """Each pipeline stage's rank records in `steps`, in rank order: stage 0's
+    `dp<r>.jsonl`, stage k's `pp<k>.dp<r>.jsonl`, for the stages `engine`, the
+    record's `keyed` engine config, states. Records of other stages refuse: a
+    pipeline's whose engine file predates `keyed` stating its stages, unless
+    `--engine` states them."""
+    pp = engine.get("pipeline_parallel_size", 1)
+    held = {int(p.name.split(".")[0][2:]) for p in steps.glob("pp*.dp*[0-9].jsonl")}
+    if held != set(range(1, pp)):
+        raise ValueError(
+            f"{steps} holds the rank records of pipeline stages "
+            f"{sorted({0, *held})}, and its engine file states "
+            f"pipeline_parallel_size {engine.get('pipeline_parallel_size')}"
+        )
+    return [
+        sorted(
+            steps.glob(f"{prefix}dp*[0-9].jsonl"),
+            key=lambda p: int(p.stem.rsplit("dp", 1)[1]),
+        )
+        for prefix in ["", *(f"pp{k}." for k in range(1, pp))]
+    ]
+
+
+def _graded(got: list[Sample], graded, graded_to) -> list[Sample]:
+    """One rank's samples `got` at the steps `graded` holds, every step when
+    it is None, before `graded_to`, when it is not, with the rank's dummy
+    forwards cut alike."""
+
+    def kept(step: int) -> bool:
+        return (graded is None or step in graded) and (
+            graded_to is None or step < graded_to
+        )
+
+    dummies = tuple(d for d in got[0].dummy_host if kept(d[0])) if got else ()
+    return [dataclasses.replace(s, dummy_host=dummies) for s in got if kept(s.step)]
 
 
 def _stated(own: Path, held: dict, buckets, stated) -> tuple[dict, list | None]:

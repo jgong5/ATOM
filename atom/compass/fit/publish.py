@@ -7,8 +7,9 @@ fit taking replayed batches reads step measurements too, each named by the
 token `Key.token` prints; it loads their samples under one configuration
 (`samples.load`). A record no `--client-run` names refuses: its steps would
 name no trace they served. A deployment's export names decode's response ids,
-so a RECORD that is its `prefill/`, `decode/` beside it, has its export's
-requests renamed as prefill's record names them, as grading renames them.
+so a RECORD that is one of its prefill instances, `prefill/` or `prefill<k>/`
+with a decode side beside it, has its export's requests renamed as its record
+names them, as grading renames them (`validate.runs.prefill_join`).
 A fit that reads them (`compass fit steps --ladder-run RECORD EXPORT RUNGS`)
 takes a client run as a calibration ladder: one more client run of RECORD,
 after its `--client-run`s, whose samples state the decode rungs it calibrates
@@ -60,7 +61,7 @@ from atom.compass.fit.samples import UNRECORDED, load, run_fields
 from atom.compass.parity import busy
 from atom.compass.run import step_grid
 from atom.compass.spec.layers import stack_of
-from atom.compass.validate.runs import SIDES, named_by_prefill
+from atom.compass.validate.runs import named_by_prefill, prefill_join
 
 #: What a trace run's profiler adds to a kernel shorter than it.
 FLOOR = "device.profiler_floor_s"
@@ -147,9 +148,8 @@ def inputs(args, sources, ops=()) -> tuple[list, dict]:
         flag = "--client-run" if rungs is None else "--ladder-run"
         if Path(record) not in runs:
             raise ValueError(f"{flag} names {record}, which is not a RECORD")
-        decode = Path(record).parent / SIDES[1]
-        if Path(record).name == SIDES[0] and decode.is_dir():
-            export = named_by_prefill(read_json(export), record, decode)["requests"]
+        if (joined := prefill_join(record)) is not None:
+            export = named_by_prefill(read_json(export), record, *joined)["requests"]
         if rungs is not None:
             ladders.setdefault(Path(record), {})[len(runs[Path(record)])] = rungs
         runs[Path(record)].append(export)

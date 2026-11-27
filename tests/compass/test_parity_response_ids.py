@@ -196,6 +196,39 @@ def test_a_record_written_before_response_ids_reads_as_it_did(tmp_path):
     assert _requests(steps) == {(8, 0): 8}
 
 
+@pytest.mark.parametrize("taken_twice", [False, True])
+def test_a_prefill_side_s_requests_are_named_by_the_decode_ids_their_client_saw(
+    tmp_path, taken_twice
+):
+    """A deployment's prefill names each request by its own response id, which
+    its transfer id joins to the decode's, the one the client exported."""
+    prefill, decode = tmp_path / "prefill" / "steps", tmp_path / "decode" / "steps"
+    prefill.mkdir(parents=True)
+    decode.mkdir(parents=True)
+    step = {"step": 0, "batch": [[1, 8, 8]], "rows": [[8, 0, False]]}
+    named = [[1, "k1", "chatcmpl-P1"]]
+    (prefill / "dp0.jsonl").write_text(json.dumps(step | {"named": named}) + "\n")
+    lines = {
+        prefill: [("chatcmpl-P1", "xfer-1")],
+        decode: [("chatcmpl-D1", "xfer-1")] + [("chatcmpl-D2", "xfer-1")] * taken_twice,
+    }
+    for side, said in lines.items():
+        text = "".join(
+            json.dumps({"response_id": r, "remote_dp_rank": 0, "transfer_id": t}) + "\n"
+            for r, t in said
+        )
+        (side / TRANSFERS).write_text(text)
+    export = {"chatcmpl-D1": {"trace": "t0", "sampling": SAMPLING}}
+
+    if taken_twice:
+        with pytest.raises(ValueError, match=r"client runs \[0\] name no request"):
+            served(prefill, [export])
+        return
+    (split,) = served(prefill, [export])[0]
+
+    assert split["client_run"] == 0 and split["traces"] == ["t0"]
+
+
 def _complete_decode(tokens, transfer_id, remote_dp_rank) -> str:
     """Send one completion request as the router sends decode its half; its response `id`."""
     params = {"transfer_id": transfer_id, "remote_dp_rank": remote_dp_rank}

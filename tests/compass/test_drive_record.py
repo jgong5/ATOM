@@ -27,7 +27,7 @@ from test_parity_served import recorded
 from test_validate_runs import _aiter
 
 from atom.compass import cli
-from atom.compass.backends.step_labels import TABLE_VERSION, label
+from atom.compass.backends.step_labels import CLOCK, TABLE_VERSION, label
 from atom.compass.drive import aiter_jit, gpu, identity, record, serve
 from atom.compass.fit.samples import load
 from atom.compass.parity import WRITE_THROUGH
@@ -182,12 +182,10 @@ def test_ops_profiling_dummy_weights_and_owned_flags_refuse_before_a_server_star
     [
         ["-dp", "2"],
         ["--enable-dp-attention", "-tp", "2"],
-        ["--pipeline-parallel-size=2"],
+        ["--pipeline-parallel-size=2", "-dp", "2"],
     ],
 )
-def test_a_dp_or_pipeline_trace_run_refuses_before_a_server_starts(
-    tmp_path, monkeypatch, atoms
-):
+def test_a_dp_trace_run_refuses_before_a_server_starts(tmp_path, monkeypatch, atoms):
     monkeypatch.setattr(serve, "SERVER", (sys.executable, "-c", "pass"))
     out = tmp_path / "out"
     argv = ["record", "--gpu", "7", "--out", str(out), "--trace", "--", "--model", "m"]
@@ -195,6 +193,12 @@ def test_a_dp_or_pipeline_trace_run_refuses_before_a_server_starts(
     with pytest.raises(SystemExit, match="^compass record: --trace reduces each TP"):
         cli.main([*argv, *atoms])
     assert not out.exists()
+
+
+@pytest.mark.parametrize("pp", ["2", "4"])
+def test_a_pipeline_trace_run_is_taken(pp):
+    """Each stage's ranks are reduced against its own record (`parity.busy`)."""
+    record.refuse_trace(["--model", "m", "--pipeline-parallel-size", pp])
 
 
 @pytest.fixture
@@ -413,7 +417,8 @@ def test_a_record_names_each_compile_its_server_ran_while_it_served(
     """In Inductor's cache, Triton's, FlyDSL's under the installed aiter's JIT
     directory, and `compile_hsaco`'s under ``AITER_ROOT_DIR``'s build
     directory, named by its kernel or file; the record is refused naming it.
-    Not one in ATOM's compile cache, a directory every start derives afresh."""
+    Not one in ATOM's compile cache, a directory every start derives afresh.
+    Each is timed, with server.json's clocks to place it among the steps."""
     _aiter(tmp_path, monkeypatch)
     for var, root in (
         ("AITER_ROOT_DIR", "aiter_root"),
@@ -433,6 +438,8 @@ def test_a_record_names_each_compile_its_server_ran_while_it_served(
     assert run.get(aiter_jit.BUILDS, []) == names
     if names:
         assert f"JIT compile of {names}" in aiter_jit.refusal(run)
+        assert [c["name"] for c in run[aiter_jit.COMPILES]] == names
+        assert run[CLOCK] == json.loads((out / "server.json").read_text())[CLOCK]
 
 
 #: Put after the planted server: once `compass record` has read its card's PTL

@@ -221,6 +221,26 @@ def chunked(geometry, monkeypatch):  # noqa: F811
     )
 
 
+def _free_ports(n):
+    """The first of `n` consecutive free local ports: decode binds a notice
+    socket a stage, at the configured port plus the stage's index, and a socket
+    an earlier test bound stays bound."""
+    import socket
+
+    for _ in range(100):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        try:
+            for k in range(1, n):
+                with socket.socket() as other:
+                    other.bind(("127.0.0.1", port + k))
+        except OSError:
+            continue
+        return port
+    raise RuntimeError(f"no {n} consecutive free ports")
+
+
 def _forward(engine, rt, t):
     """`EngineCore`'s step: schedule, the forward ending at `t` on the device,
     whose batch the producer is told of, the KV poll, postprocess."""
@@ -336,6 +356,103 @@ def test_prefill_aborts_a_request_decode_never_admits_at_its_timeout(chunked):
     assert x.kv_transfer_params_output is None, "nothing is relayed"
 
 
+def test_a_write_request_after_prefill_s_timeout_fails_decode_s_receive(
+    chunked, seq_factory, monkeypatch
+):
+    """Decode, which deferred the request past prefill's admission timeout,
+    admits it later; prefill fails the write request, as Mooncake fails a
+    retired transfer's reader, and decode aborts the request once its failed
+    write hold elapses. Before, decode kept it parked for good, its
+    reservation charged to pd_admission, and both engines polled forever."""
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "5")
+    pd, tid = chunked, "late"
+    x = Sequence(
+        PROMPT,
+        4,
+        sampling_params=SamplingParams(max_tokens=1),
+        kv_transfer_params={
+            "do_remote_decode": True, "chunked_transfer": True, "transfer_id": tid
+        },
+    )  # fmt: skip
+    pd.p.add(x)
+    _forward(pd.p, pd.rt_p, 1.0)
+    _at(pd.rt_p, 51.0 + 1e-6)
+    _forward(pd.p, pd.rt_p, 52.0)
+    assert x.status is SequenceStatus.ABORTED, "prefill's admission timeout"
+
+    y = seq_factory(
+        PROMPT,
+        kv_transfer_params={
+            **TEMPLATE, "do_remote_prefill": True, "do_remote_decode": False,
+            "chunked_transfer": True, "transfer_id": tid, "remote_dp_rank": 0,
+        },
+    )  # fmt: skip
+    _at(pd.rt_d, 60.0)
+    pd.d.add(y)
+    pd.d.schedule()
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    a = 60.0 + L
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+    _at(pd.rt_p, a, **{REQ: [(0, a)]})
+    _forward(pd.p, pd.rt_p, a + 0.5)
+    assert not pd.p.kv_connector._reads, "no read waits for a retired transfer"
+    assert not pd.p.kv_connector.has_pending_work()
+    [(_, _, arrival)] = [e for e in pd.rt_p.send_log if e[0] == DONE]
+    assert arrival == pytest.approx(a + 0.5 + L), "read at the step's KV poll"
+
+    _at(pd.rt_d, arrival, **{DONE: [(0, arrival)]})
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert y.status is SequenceStatus.WAITING_FOR_REMOTE_KVS, "the hold"
+    assert pd.d.kv_connector.has_pending_work()
+    for t in (arrival + 5.0, arrival + 5.5):  # the poll after the one that saw it
+        _at(pd.rt_d, t)
+        pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    # `_abort_failed_remote_receive` ends it as a rejected waiter.
+    assert y.status is SequenceStatus.FINISHED
+    assert y not in pd.d.waiting and y not in pd.d.running
+    assert not pd.d.kv_connector.has_pending_work()
+
+
+def test_an_aborted_send_tells_decode_its_writer_failed(chunked, seq_factory):
+    """A chunked request aborted after allocating stops its reads, and decode,
+    which would otherwise wait for a write-done that never comes, hears of it."""
+    pd, tid = chunked, "cut"
+    x = Sequence(
+        PROMPT,
+        4,
+        sampling_params=SamplingParams(max_tokens=1),
+        kv_transfer_params={
+            "do_remote_decode": True, "chunked_transfer": True, "transfer_id": tid
+        },
+    )  # fmt: skip
+    pd.p.add(x)
+    y = seq_factory(
+        PROMPT,
+        kv_transfer_params={
+            **TEMPLATE, "do_remote_prefill": True, "do_remote_decode": False,
+            "chunked_transfer": True, "transfer_id": tid, "remote_dp_rank": 0,
+        },
+    )  # fmt: skip
+    _at(pd.rt_d, 1.0)
+    pd.d.add(y)
+    pd.d.schedule()
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    a = 1.0 + L
+    _at(pd.rt_p, a, **{REQ: [(0, a)]})
+    _forward(pd.p, pd.rt_p, 2.0)
+    assert x.id in pd.p.kv_connector._sends, "allocated and sending"
+
+    x.status, x.leave_reason = SequenceStatus.ABORTED, "aborted"
+    pd.p.kv_connector.request_finished(x)
+    assert x.id not in pd.p.kv_connector._sends
+    [(_, _, arrival)] = [e for e in pd.rt_p.send_log if e[0] == DONE]
+    _at(pd.rt_d, arrival, **{DONE: [(0, arrival)]})
+    pd.d._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert tid not in pd.d.kv_connector._listening
+    assert y.id in pd.d.kv_connector._failed
+
+
 def test_a_later_stage_writes_its_layers_from_the_relay_and_frees_nothing(
     geometry, monkeypatch  # noqa: F811
 ):
@@ -343,7 +460,6 @@ def test_a_later_stage_writes_its_layers_from_the_relay_and_frees_nothing(
     forward publishes its layers' blocks, and its last forward hands off; the
     stage tells decode on its own notice channel and holds nothing after, as
     the head's scheduler frees the blocks on decode's release."""
-    import socket
 
     table = prefill_decode_table(
         admission_s=0.54e-3, ipc_s=L, stream_s=L, router_s=L, kv_write_req_s=L,
@@ -353,9 +469,7 @@ def test_a_later_stage_writes_its_layers_from_the_relay_and_frees_nothing(
     for lp in ("engine-D", "engine-P-pp1"):
         rts[lp] = LPRuntime(clock.LpId(lp), table, Script())
         rts[lp].start_run()
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    port = _free_ports(2)
     model = model_for(geometry, PEAKS[0])
     kv = {
         "kv_connector": "compass",
@@ -403,7 +517,9 @@ def test_a_later_stage_writes_its_layers_from_the_relay_and_frees_nothing(
     forward(1.0, 8, relay={"r": ("t", pair, 0.5, 3, 10)})
     send = stage._sends["r"][0]
     assert send.writes and send.writes[0][0] == 1.0 and send.writes[0][2] == 2
-    assert send.done is None and stage.has_pending_work()
+    # Its forwards move it and wake the stage: an idle poll would not, and
+    # one aborted midway would keep the stage polling for good.
+    assert send.done is None and not stage.has_pending_work()
     forward(2.0, 10)
     assert "r" not in stage._sends and send.done is not None
     assert [w[2] for w in send.writes] == [2, 1]
@@ -412,3 +528,76 @@ def test_a_later_stage_writes_its_layers_from_the_relay_and_frees_nothing(
     assert notice[0] == "engine-P-pp1->engine-D:kv_write_done"
     assert notice[2] == send.done + L
     assert not stage._released and not stage.has_pending_work()
+    # The head repeats its relay in every metadata until its own send is
+    # done: a relay seen again opens no second send.
+    forward(3.0, 10, relay={"r": ("t", pair, 0.5, 3, 10)})
+    assert "r" not in stage._sends and not stage.has_pending_work()
+    assert (
+        len([e for e in rts["engine-P-pp1"].send_log if ":kv_write_done" in e[0]]) == 1
+    )
+
+
+def test_the_head_relays_a_send_in_every_metadata_until_its_own_is_done(
+    geometry, monkeypatch  # noqa: F811
+):
+    """A chunked send the head admitted rides every connector metadata it
+    builds, not the first alone: a request parked for a tier load is admitted
+    under connector-only batches, which run no forward on the stages and so
+    reach no stage's `relayed` (M3.1 B c=64: request 195's three later stages
+    never opened their sends, decode never heard them, and its reservation
+    held pd_admission for good). An abort ends the relay."""
+
+    table = prefill_decode_table(
+        admission_s=0.54e-3, ipc_s=L, stream_s=L, router_s=L, kv_write_req_s=L,
+        prefill_pp=2, chunked=True,
+    )  # fmt: skip
+    rts = {}
+    for lp in ("engine-D", "engine-P-pp0"):
+        rts[lp] = LPRuntime(clock.LpId(lp), table, Script())
+        rts[lp].start_run()
+    port = _free_ports(2)
+    model = model_for(geometry, PEAKS[0])
+    kv = {
+        "kv_connector": "compass",
+        TRANSFER_KEY: (model, model),
+        WRITE_REQ_KEY: f"inproc://chunked-head-req-{port}",
+        WRITE_DONE_KEY: f"tcp://127.0.0.1:{port}",
+    }
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    halves = {}
+    for lp, role, extra, parallel in (
+        ("engine-D", "kv_consumer", {},
+         SimpleNamespace(data_parallel_rank=0, data_parallel_size=1)),
+        ("engine-P-pp0", "kv_producer", {"enable_chunked_transfer": True},
+         SimpleNamespace(data_parallel_rank=0, data_parallel_size=1,
+                         pipeline_parallel_rank=0)),
+    ):  # fmt: skip
+        monkeypatch.setattr(clock, "_installed", rts[lp])
+        halves[lp] = KVConnectorFactory.create_connector(
+            atom_config_double(
+                kv_transfer_config={**kv, "kv_role": role, **extra},
+                kv_cache_block_size=4,
+                pipeline_parallel_size=2,
+                parallel_config=parallel,
+            ),
+            role="scheduler",
+        )
+    monkeypatch.setattr(clock, "_installed", None)
+    head = halves["engine-P-pp0"]
+    x = Sequence(
+        PROMPT,
+        4,
+        sampling_params=SamplingParams(max_tokens=1),
+        kv_transfer_params={
+            "do_remote_decode": True, "chunked_transfer": True, "transfer_id": "t"
+        },
+    )  # fmt: skip
+    head._reads["t"] = (("engine-D", 0), 3, 0.5)  # decode's write request is in
+    assert head.admission_ready(x)
+    head.update_state_after_alloc(x)
+    for _ in range(3):  # connector-only batches, then the first forward's
+        assert set(head.build_connector_meta().compass_chunked) == {x.id}
+    x.status, x.leave_reason = SequenceStatus.ABORTED, "aborted"
+    head.request_finished(x)
+    assert getattr(head.build_connector_meta(), "compass_chunked", None) is None

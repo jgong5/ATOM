@@ -4,9 +4,9 @@ judged requirement by requirement, the first that fails named.
 
 Only the head is supported. `head` takes it from the git repository of the tree
 `atom` resolves under (`TREE`): the commit a space file freezes, which must be
-one of the integration branch's (`INTEGRATION`), else that branch's tip at its
-remote-tracking ref, as last fetched; and the ATOM digest of the ``atom/`` it
-holds (`run.committed_atom_digest`). A tree that is not its repository's root,
+one of the integration branch's (`INTEGRATION`, or the line `INTEGRATION_REF`
+names), else that branch's tip at its remote-tracking ref, as last fetched;
+and the ATOM digest of the ``atom/`` it holds (`run.committed_atom_digest`). A tree that is not its repository's root,
 a repository with no such ref, or with two remotes' refs at two commits,
 refuses by name. `refuse_another_tree` refuses a tree whose ATOM digest
 (`run.atom_digest`) is not the head's, naming both and the commit taken as the
@@ -35,7 +35,9 @@ first, then refused, then calibrate. The requirement a verdict names:
    (calibrate); a figure on totals, holding out the costliest step or per step
    at the median past `GATE`, on some held-out run and kind, refused when the
    law's records ran at the head's ATOM digest (`records_atom`), since a
-   calibration refits the same miss, else calibrate.
+   calibration refits the same miss, else calibrate. A law above one pipeline
+   stage is judged on each stage's part under ``stages`` as a law is, the
+   stage named.
 
 A verdict on a law found names, as ``run``, the ``--step-linear`` and
 ``--host-laws`` values a run of it takes, and one on a store's own step linear
@@ -55,6 +57,7 @@ orders the stores a candidate is looked up in.
 """
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -85,6 +88,10 @@ TREE = Path(atom.__file__).resolve().parents[1]
 LAWS = TREE / "scripts" / "compass" / "laws"
 #: The integration branch, whose tip at its remote-tracking ref is the head.
 INTEGRATION = "feature/atomcompass_new"
+#: The variable naming another line's branch as the integration branch, as the
+#: gate scripts read it (`scripts/compass/_lib.sh`): a branch name, which each
+#: remote's same-named ref resolves, or one remote's ref, ``<remote>/<name>``.
+INTEGRATION_REF = "COMPASS_INTEGRATION_REF"
 #: The cost-accuracy gate, and the figures of a held-out run's kind it holds.
 GATE, GATED = 0.05, ("on_totals", "held_out", "median")
 #: A configuration's verdicts on its laws, the first preferred.
@@ -111,16 +118,19 @@ def head(commit: str | None = None) -> dict:
             f"the tree atom resolves under, {TREE}, is not a git repository's "
             f"root, so the head's ATOM digest cannot be read: {top.strip()}"
         )
+    line = os.environ.get(INTEGRATION_REF) or INTEGRATION
+    remotes = git("remote")[1].split()
+    # One remote's ref, named whole, is taken alone; a branch name, each remote's.
+    named = [line] if line.split("/", 1)[0] in remotes else []
     tips = {}
-    for remote in git("remote")[1].split():
-        ref = f"{remote}/{INTEGRATION}"
+    for ref in named or [f"{remote}/{line}" for remote in remotes]:
         code, tip = git("rev-parse", "--verify", f"refs/remotes/{ref}^{{commit}}")
         if not code:
             tips[ref] = tip.strip()
     if len(set(tips.values())) != 1:
         raise ValueError(
             f"{TREE}'s repository has {len(set(tips.values()))} commits at a "
-            f"remote-tracking ref of {INTEGRATION}, and the head is one: "
+            f"remote-tracking ref of {line}, and the head is one: "
             + ("; ".join(f"{r} at {t}" for r, t in tips.items()) or "fetch it")
         )
     ref, tip = next(iter(tips.items()))
@@ -149,8 +159,10 @@ def refuse_another_tree(taken: dict) -> None:
 
 
 def stores(shared: str, out: Path) -> list[ArtifactStore]:
-    """The stores a candidate is looked up in, in order: each calibration's own
-    under `out`'s ``cal/``, the latest published into first, then `shared`."""
+    """The stores a candidate is looked up in, in order: each under `out`'s
+    ``cal/``, a calibration's own or the one readings meeting a stale entry are
+    measured into (`check.READINGS`), the latest published into first, then
+    `shared`."""
 
     def latest(root: Path) -> float:
         entries = root.glob(f"*/*/{ENTRY_FILE}")
@@ -266,8 +278,7 @@ def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> di
         )
         return _verdict("calibrate", 3, why, law=where, rungs=rungs)
     past = []
-    for name, held in _folded(law).items():
-        of = f" of source {name}" if name else ""
+    for of, held in _folded(law):
         if not held.get("figures"):
             why = f"{where} states no cost-accuracy figures{of}"
             return _verdict("calibrate", 4, why, law=where)
@@ -288,18 +299,27 @@ def _judged(where: str, law: dict, host: dict, config, machine, atom: str) -> di
     return _verdict("calibrate", 4, f"{worst}, on records re-keyed {ran}", law=where)
 
 
-def _folded(law: dict) -> dict:
-    """What of `law` states cost-accuracy figures, by source name: each of its
-    `sources` with a vector that prices a step, the prefill one or a decode one
-    (`step_linear_fit._vector_of`), as ``step_linear_fit figures`` folds no
-    other, such as one of host laws alone; else the law itself, named ``""``."""
+def _folded(law: dict) -> list[tuple[str, dict]]:
+    """What of `law` states cost-accuracy figures, each with the words naming
+    it: above one pipeline stage, what of each stage's part under ``stages``
+    does, as of a law, ``of pipeline stage <k>`` added (`fit.steps`); of a
+    law, each of its `sources` with a vector that prices a step, the prefill
+    one or a decode one (`step_linear_fit._vector_of`), as ``step_linear_fit
+    figures`` folds no other, such as one of host laws alone, ``of source
+    <name>``; else the law itself, named by nothing."""
+    if stages := law.get("stages"):
+        return [
+            (f"{of} of pipeline stage {k}", held)
+            for k, part in enumerate(stages)
+            for of, held in _folded(part)
+        ]
     sources = (law.get("sources") or {}).items()
-    priced = {
-        name: source
+    priced = [
+        (f" of source {name}", source)
         for name, source in sources
         if any(v == "prefill" or v.startswith("decode ") for v in source["vectors"])
-    }
-    return priced or {"": law}
+    ]
+    return priced or [("", law)]
 
 
 def _keyed(store: ArtifactStore, kind: Kind, engine: dict, **fields) -> list[Key]:
@@ -308,11 +328,17 @@ def _keyed(store: ArtifactStore, kind: Kind, engine: dict, **fields) -> list[Key
     keys = []
     for path in sorted((store.root / kind.value).glob(f"*/{ENTRY_FILE}")):
         key = json.loads(path.read_text())["key"]
-        theirs = json.loads(key["engine_config"])
-        theirs.pop(GRAPHS, None)
-        if all(key.get(f) == v for f, v in fields.items()) and _same(theirs, engine):
+        if at_key(key, engine, **fields):
             keys.append(Key.of(kind, **key))
     return keys
+
+
+def at_key(key: dict, engine: dict, **fields) -> bool:
+    """Whether `key`, a key's values, states each of `fields` as given, and
+    `engine` as its engine config, less its graph sets."""
+    theirs = json.loads(key["engine_config"])
+    theirs.pop(GRAPHS, None)
+    return all(key.get(f) == v for f, v in fields.items()) and _same(theirs, engine)
 
 
 def _same(there, here: dict) -> bool:

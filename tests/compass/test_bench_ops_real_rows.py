@@ -77,8 +77,12 @@ def test_a_shape_states_its_real_rows_and_its_graph_is_its_rung_s(monkeypatch):
         directory_for=lambda key: pathlib.Path("/"),
         read=lambda key: SimpleNamespace(read_member=lambda *a: '{"region": {}}'),
     )
+    monkeypatch.setattr("atom.compass.run.graph_readings", lambda model: {})
+    monkeypatch.setattr(
+        "atom.compass.run.load_graph", lambda store, key, readings: store.read(key)
+    )
 
-    ops.graph(store, None, shape)
+    ops.graph(store, SimpleNamespace(model=None), shape)
 
     assert str(shape) == "decode B=4 G=64 R=13"
     assert ops._shape(str(shape)) == shape
@@ -232,7 +236,7 @@ def test_a_step_is_asked_at_the_real_rows_its_moe_runs(view, dp, real):
 
     backend.price(view)
 
-    assert [b[-1] for b in asked.bounds] == [real]
+    assert [b[6] for b in asked.bounds] == [real]
 
 
 def _moe(dp, shape):
