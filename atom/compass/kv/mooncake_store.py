@@ -114,6 +114,10 @@ COUNTS = (
 )
 #: The refusal a load whose lane starts past its lease hands in.
 PAST_LEASE = "mooncake_store:a load starts past its lease"
+#: Under ``COMPASS_STORE_ON_STREAM=1``: the weight of each forward's backlog in
+#: the moving mean a copy's later windows wait (`StoreShell._stream_backlog`),
+#: and how long after the head stage's last launch the stage counts as busy.
+BUSY_ALPHA, BUSY_GAP_S = 0.1, 1.0
 #: Wall seconds a shell waits for LP mooncake_store to name its endpoint, and
 #: how often it looks.
 ENDPOINT_WAIT_S, ENDPOINT_LOOK_S = 300.0, 0.05
@@ -474,6 +478,7 @@ class StoreShell:
             terms |= {"store_s": stated["store_s"], "load_s": stated["load_s"]}
             self._stream_wait = stated["stream_wait"]
             self._device = DeviceQueue()
+            self._busy_backlog, self._last_launch = 0.0, -math.inf
             connector.DEVICE_WATCHERS.add(self)
             stream = (self._stream_windows, self._stream_backlog)
         self._lanes = Lanes(rt, self._ranks, terms, ENTRY, stream)
@@ -729,11 +734,23 @@ class StoreShell:
         if window is not None:
             self._device.add(*window)
             self._device.forget_before(window[0])
+            # The backlog the host leaves as this forward's launch ends: what a
+            # copy's later windows meet while the stage keeps running.
+            left = self._device.reached(window[1]) - window[1]
+            self._busy_backlog += BUSY_ALPHA * (left - self._busy_backlog)
+            self._last_launch = window[1]
 
-    def _stream_backlog(self, k: int, t: float) -> float:
-        """The seconds rank `k`'s window enqueued at `t` waits on its stage's
-        stream: its ``stream_wait`` x the head stage's backlog."""
-        return self._stream_wait[k] * (self._device.reached(t) - t)
+    def _stream_backlog(self, k: int, t: float, windows: int = 1) -> float:
+        """The seconds `windows` windows of rank `k`'s copy starting at `t`
+        wait on its stage's stream, its ``stream_wait`` x the head stage's
+        backlog: the first the backlog at `t`, each later one the backlog its
+        stage's host keeps (a moving mean of what each forward leaves as its
+        launch ends, `BUSY_ALPHA`) while the stage has launched a forward within
+        `BUSY_GAP_S` of now, else none."""
+        first = self._device.reached(t) - t
+        busy = self._rt.read_clock() - self._last_launch <= BUSY_GAP_S
+        later = self._busy_backlog if busy else 0.0
+        return self._stream_wait[k] * (first + (windows - 1) * later)
 
     def _stream_windows(self, k: int, kind: str, req, chunks: int) -> int:
         """The windows of rank `k`'s copy of `req` that enqueue a copy on its

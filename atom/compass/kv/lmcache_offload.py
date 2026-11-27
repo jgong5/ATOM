@@ -362,11 +362,10 @@ class Lanes:
     With `stream` (the Store's shell under ``COMPASS_STORE_ON_STREAM=1``), a
     copy also waits on its stage's forward stream once a window that
     enqueues a copy there: `stream` is ``(windows, wait)``, `windows(k, kind,
-    req, chunks)` the windows of the copy that do, and `wait(k, t)` the
-    seconds a window enqueued at `t` waits for the device work its stage's
-    host had enqueued by then. Each such window of a copy starting at `start`
-    waits ``wait(k, start)``: the backlog the copy meets, as ATOM's worker
-    meets it again at each window while its stage's host keeps enqueuing."""
+    req, chunks)` the windows of the copy that do, and `wait(k, t, n)` the
+    seconds `n` such windows of a copy starting at `t` wait in all for the
+    device work their stage's host had enqueued by each. Every rank's copy is
+    logged, its rank named, and rank 0's counted."""
 
     def __init__(self, rt, ranks, terms: dict, name: str, stream=None) -> None:
         self._rt, self._name = rt, name
@@ -409,10 +408,15 @@ class Lanes:
         if self._stream is not None and chunks:
             count, wait = self._stream
             windows = count(k, kind, req, chunks)
-            stream_s = windows * wait(k, start) if windows else 0.0
+            stream_s = wait(k, start, windows) if windows else 0.0
             end += stream_s
         heapq.heappush(lanes, end)
         heapq.heappush(self._due, (end, next(self._order), k, kind, req, extra))
+        if k == 0 or self._stream is not None:
+            self._log(k, kind, req, chunks, now, start, end, windows, stream_s)
+        return start, end
+
+    def _log(self, k, kind, req, chunks, now, start, end, windows, stream_s) -> None:
         if k == 0:
             self._copied[kind].update(copies=1, chunks=chunks)
             self._copied[kind]["seconds"] += end - start
@@ -420,20 +424,19 @@ class Lanes:
             if self._stream is not None:
                 self._copied[kind]["windows"] += windows
                 self._copied[kind]["stream_s"] += stream_s
-            logger.info(
-                "compass: %s %s of %s, %d chunks: queued at %r, from %r to %r%s",
-                self._name,
-                kind,
-                req.req_id,
-                chunks,
-                now,
-                start,
-                end,
-                ""
-                if self._stream is None
-                else f", {windows} windows {stream_s!r} s on the stream",
-            )
-        return start, end
+        logger.info(
+            "compass: %s %s of %s, %d chunks: queued at %r, from %r to %r%s",
+            self._name,
+            kind,
+            req.req_id,
+            chunks,
+            now,
+            start,
+            end,
+            ""
+            if self._stream is None
+            else f", {windows} windows {stream_s!r} s on the stream, rank {k}",
+        )
 
     def due(self):
         """``(rank, kind, request, extra)`` of each copy whose priced end the

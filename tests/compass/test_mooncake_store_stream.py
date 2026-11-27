@@ -99,9 +99,9 @@ def test_each_window_of_a_copy_waits_its_stage_s_backlog_at_the_copy_s_start():
     def windows(k, kind, req, chunks):
         return -(-chunks // 4)
 
-    def wait(k, t):
-        asked.append((k, t))
-        return 0.25
+    def wait(k, t, n):
+        asked.append((k, t, n))
+        return 0.25 * n
 
     lanes = Lanes(
         rt, [_rank()], {"store_s": [1.0, 0.5], "load_s": [0.0, 1.0]}, "s", (windows, wait)
@@ -111,7 +111,7 @@ def test_each_window_of_a_copy_waits_its_stage_s_backlog_at_the_copy_s_start():
     assert lanes.queue(0, "save", req, 9) == (0.0, 5.5 + 0.75)
     # The next save waits for the lane, then meets the backlog at its start.
     assert lanes.queue(0, "save", req, 1) == (6.25, 6.25 + 1.5 + 0.25)
-    assert asked == [(0, 0.0), (0, 6.25)]
+    assert asked == [(0, 0.0, 3), (0, 6.25, 1)]
     assert lanes.queue(0, "load", req, 0) == (0.0, 0.0)  # no chunk, no window
     got = lanes.copies()["save"]
     assert (got["windows"], got["stream_s"]) == (4, 1.0)
@@ -133,6 +133,9 @@ def _shell(present=None, *, chunk=256, slots=8):
         chunk=chunk,
         _device=DeviceQueue(),
         _stream_wait=[1.0],
+        _busy_backlog=0.0,
+        _last_launch=float("-inf"),
+        _rt=SimpleNamespace(read_clock=lambda: 1.0),
     )
     fake._chunks = functools.partial(StoreShell._chunks, fake)
     req = SimpleNamespace(
@@ -172,6 +175,13 @@ def test_the_backlog_is_the_head_stage_s_device_reach_of_what_it_enqueued():
     assert backlog(0, 5.0) == 0.0  # the device caught up
     fake._stream_wait = [0.5]
     assert backlog(0, 1.0) == pytest.approx(1.0)
+    # Later windows meet the backlog the busy stage keeps (each forward's, as
+    # its launch ends, in a moving mean), and none once it has gone idle.
+    fake._stream_wait = [1.0]
+    assert fake._busy_backlog == pytest.approx(0.1 * 2.0)  # 3 - 1, weight 0.1
+    assert backlog(0, 1.0, 3) == pytest.approx(2.0 + 2 * 0.2)
+    fake._rt = SimpleNamespace(read_clock=lambda: 9.0)
+    assert backlog(0, 1.0, 3) == pytest.approx(2.0)
 
 
 def test_a_returned_forward_reaches_each_device_watcher():
