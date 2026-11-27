@@ -183,7 +183,10 @@ pull after the previous exit, and `E_out` from the exit to the pull after it.
 the event it waits for.
 `label_run` labels a run's DP ranks together: there `E` runs from the latest
 pull, else exit, over the ranks before the same forward, where the group's
-`_sync_dp_state` releases each of them.
+`_sync_dp_state` releases each of them. Under `DP_PEER_CUT_ENV` set to ``1``
+its `W_pre`, a dummy forward's too, leaves out the wait for a later peer at
+the forward's DP collective (`dp_peer_cuts`), which a run's group makes itself;
+unset or ``0``, every label is as before.
 
 A DP rank's dummy forward at a step some rank of its group prefills, its line
 holding the one prefill row `ModelRunner.dummy_execution` runs, gives no
@@ -271,6 +274,12 @@ STALLS = "stalls"
 #: The shape `first_launch_key` reads: a forward's prefill tokens, up to the
 #: next power of 2.
 FIRST_LAUNCH_KEY = "pow2_prefill_tokens"
+#: The variable that, set to ``1``, cuts from each DP rank's `W_pre` (a dummy
+#: forward's too) the wait for its group's latest member at the forward's DP
+#: collective (`dp_peer_cuts`): a run's group waits for its latest member on
+#: its own (`runner.overrides`' all_reduce of the device ends), so a law fitted
+#: on the uncut labels charges that wait twice. Unset or ``0``, no label is cut.
+DP_PEER_CUT_ENV = "COMPASS_FIT_DP_PEER_CUT"
 
 
 def _prefill_label() -> str:
@@ -286,6 +295,15 @@ def launch_stall_on() -> bool:
     value = os.environ.get(STALL_ENV) or "0"
     if value not in ("0", "1"):
         raise ValueError(f"{STALL_ENV}={value!r} is not 0 or 1")
+    return value == "1"
+
+
+def dp_peer_cut_on() -> bool:
+    """Whether `DP_PEER_CUT_ENV` is on: ``1`` on, ``0`` or unset off, any other
+    refused."""
+    value = os.environ.get(DP_PEER_CUT_ENV) or "0"
+    if value not in ("0", "1"):
+        raise ValueError(f"{DP_PEER_CUT_ENV}={value!r} is not 0 or 1")
     return value == "1"
 
 
@@ -561,6 +579,104 @@ def admissions(lines: list[dict]) -> list[tuple[int, int, int]]:
         hits = [c - q for _, q, c in new]
         out.append((len(new), sum(prompt[r] for r, *_ in new) - sum(hits), sum(hits)))
     return out
+
+
+def dp_peer_cuts(ranks) -> list[dict[int, int]]:
+    """Per DP rank record of a run (`ranks`, each its lines in order), the ns
+    each step's `W_pre` holds waiting for a peer at the forward's DP
+    collective: `ForwardMode.decide`, which `prepare_model` runs right after
+    the staging gate, returns on every rank once the group's latest member
+    reaches it. A line's wait is the latest peer's arrival there (the end of
+    its gate, `t_gate_ns`, else its entry) less its own, at most the part of
+    `W_pre` after its gate; a line with no gate or launch stamp, or no later
+    peer, has none. Dummy lines count as peers and are cut alike (their
+    `dummy_host`). On #734's cell B (P at DP2) prefill forwards at a queue of
+    64 and more held 2.8 ms of it in a 5.4 ms mean `W_pre` (hi), 1.0 of 3.4 (cal)."""
+    at = [{s["step"]: s for s in lines} for lines in ranks]
+
+    def arrival(s):
+        return s["t_gate_ns"][1] if "t_gate_ns" in s else s["t_enter_ns"]
+
+    out = []
+    for r, lines in enumerate(ranks):
+        cuts = {}
+        for s in lines:
+            if "t_gate_ns" not in s or "t_launch_ns" not in s:
+                continue
+            peers = [p[s["step"]] for i, p in enumerate(at) if i != r and s["step"] in p]
+            if not peers:
+                continue
+            g1, l0 = s["t_gate_ns"][1], s["t_launch_ns"][0]
+            m0 = s.get("t_mtp_ns", (l0,))[0]
+            after = (l0 if m0 >= l0 else m0) - g1
+            wait = max(arrival(p) for p in peers) - g1
+            if (cut := min(wait, after)) > 0:
+                cuts[s["step"]] = cut
+        out.append(cuts)
+    return out
+
+
+#: The host-law column of a prefill engine's queue (opt-in,
+#: `step_linear_fit.HOST_QUEUE_ENV`), named with its saturation: ``queue_sat<Q0>``
+#: holds min(queue, Q0) (`queue_depths`, `QueueDepth`).
+QUEUE_COLUMN = "queue_sat"
+
+
+def queue_columns(names) -> dict[str, int]:
+    """The queue columns among `names`, each to its saturation Q0."""
+    return {
+        n: int(n[len(QUEUE_COLUMN) :])
+        for n in names
+        if n.startswith(QUEUE_COLUMN) and n[len(QUEUE_COLUMN) :].isdigit()
+    }
+
+
+def queue_depths(sends_ns, ranks) -> dict[int, int]:
+    """Per step of a run's DP rank records `ranks` (each its lines, in order;
+    one record off DP) at which some rank runs a request, the engine's queue as
+    the step's forwards entered: the requests handed to the engine before its
+    first rank entered (`sends_ns`, the intake stamps' ``send`` ends, sorted),
+    less those any rank's line at an earlier step named (each named once, at
+    its prompt's final chunk). The queue is the engine's, over every DP rank:
+    the API server hands each request to one of them. A dummy line names none.
+    `QueueDepth` counts the same in a run."""
+    steps: dict[int, list] = defaultdict(list)
+    for lines in ranks:
+        for s in lines:
+            steps[s["step"]].append(s)
+    done, out = 0, {}
+    for n in sorted(steps):
+        group = steps[n]
+        if not all(s["is_dummy_run"] for s in group):
+            enter = min(s["t_enter_ns"] for s in group)
+            out[n] = bisect.bisect_left(sends_ns, enter) - done
+        done += sum(len(s.get("named") or ()) for s in group if not s["is_dummy_run"])
+    return out
+
+
+class QueueDepth:
+    """One DP rank's part of `queue_depths` as a run counts it, a batch at a
+    time: the requests its engine had taken (its scheduler's arrivals as it
+    scheduled the batch; a dummy's, as at its last batch) less those an earlier
+    batch named, a row at its prompt's final chunk named once as the record's
+    lines name it (`parity`). The ranks' parts summed are the engine's queue."""
+
+    def __init__(self) -> None:
+        self.named: set = set()
+        self.arrived = 0
+
+    def at(self, arrived: int | None, req_ids=(), final=None) -> int:
+        """This rank's part of the queue before a batch of `req_ids`, whose row
+        i is at its prompt's final chunk when `final[i]` (None: every row, as
+        `parity` names a batch marking no final chunk), `arrived` requests in
+        (None: as at the last batch, a dummy's, which runs no request); it then
+        counts the batch's."""
+        if arrived is not None:
+            self.arrived = arrived
+        q = self.arrived - len(self.named)
+        final = [True] * len(req_ids) if final is None else final
+        self.named.update(r for r, f in zip(req_ids, final) if f)
+        return q
 
 
 def admit_x(admitted: tuple) -> tuple[int, int, int]:
@@ -867,7 +983,8 @@ def label_run(
     """`label` of each of `records`, one run's DP ranks, with each `E` from the
     latest pull over the ranks before the same forward, a trace run's drafter
     labels under `floored`, its busy lines less the profiler's floor
-    (`parity.busy.floored`). A rank that ran only DP's dummy forwards gives no
+    (`parity.busy.floored`), and under `DP_PEER_CUT_ENV` each `W_pre` less its
+    wait for a peer (`dp_peer_cuts`). A rank that ran only DP's dummy forwards gives no
     sample and no row. Ranks whose line counts differ by more than the forward
     a stopped server leaves on some refuse."""
     ranks = [_read(r, floored) for r in records]
@@ -882,6 +999,7 @@ def label_run(
     dummy_ranks, peaks = group_dummies(ranks), group_peaks(ranks)
     tails, prefills = group_tails(ranks), group_prefills(ranks)
     stalled = launch_stalls(ranks) if launch_stall_on() else None
+    cuts = dp_peer_cuts(ranks) if len(ranks) > 1 and dp_peer_cut_on() else None
     return [
         (
             ([], [])
@@ -897,9 +1015,10 @@ def label_run(
                 tails,
                 prefills,
                 stalled=stalled,
+                peer_cut=None if cuts is None else cuts[i],
             )
         )
-        for r, x in zip(records, ranks)
+        for i, (r, x) in enumerate(zip(records, ranks))
     ]
 
 
@@ -932,11 +1051,12 @@ def _segments(s: dict, output: bool) -> dict:
 DUMMY_SEGMENTS = ("W_pre", "W_inputs", "W_launch", "W_post")
 
 
-def _dummy_hosts(lines, peaks, tails) -> tuple:
+def _dummy_hosts(lines, peaks, tails, peer_cut=None) -> tuple:
     """`Sample.dummy_host` of a rank's `lines`: each dummy forward at a step
     its group prefills, its line holding a prefill row, with its view, the
     group's fields from `peaks` and `tails` (`group_peaks`, `group_tails`), its
-    `DUMMY_SEGMENTS` in seconds and its line's launch features."""
+    `DUMMY_SEGMENTS` in seconds, `W_pre` less its `peer_cut` (`dp_peer_cuts`)
+    where one is given, and its line's launch features."""
     from atom.compass.backends.step_linear import dummy_view
 
     out = []
@@ -956,6 +1076,8 @@ def _dummy_hosts(lines, peaks, tails) -> tuple:
         )
         view = dataclasses.replace(view, produces_output=s["produces_output"])
         host = _segments(s, s["produces_output"])
+        if peer_cut:
+            host["W_pre"] -= peer_cut.get(s["step"], 0)
         host = {k: host[k] * 1e-9 for k in DUMMY_SEGMENTS if k in host}
         out.append((s["step"], view, host, s.get("launch", {})))
     return tuple(out)
@@ -972,11 +1094,13 @@ def _label(
     tails=None,
     prefills=None,
     stalled=None,
+    peer_cut=None,
 ) -> tuple[list[Sample], list[dict]]:
     """`label` of `record`'s `lines`, each `E` from `starts` at the line before;
     `prefills` the steps its group prefills at (`group_prefills`), read from
     the rank records beside it when None; `stalled` the steps cut as `STALLED`
-    (`launch_stalls`), none when None."""
+    (`launch_stalls`), none when None; `peer_cut` by step the ns each `W_pre`
+    leaves out (`dp_peer_cuts`), none when None."""
     path = Path(record)
     steps = [s for s in lines if not s["is_dummy_run"]]
     dummies = frozenset(s["step"] for s in lines if s["is_dummy_run"])
@@ -1012,7 +1136,7 @@ def _label(
             peers = [read_jsonl(p) for p in _peers(path)]
             dummy_ranks, peaks = group_dummies(peers), group_peaks(peers)
             tails = group_tails(peers)
-        dummy_host = _dummy_hosts(lines, peaks, tails or frozenset())
+        dummy_host = _dummy_hosts(lines, peaks, tails or frozenset(), peer_cut)
     for i, s in enumerate(lines):
         if s["is_dummy_run"]:
             prev = s
@@ -1108,6 +1232,8 @@ def _label(
             propose = s.get("b_propose_ns") if view.produces_output else None
         enter, blocked = s["t_enter_ns"], s.get("blocked_ns")
         host = _segments(s, host_kind(view) != "middle")
+        if peer_cut:
+            host["W_pre"] -= peer_cut.get(s["step"], 0)
         if copy.get(s["step"], (0, False))[1]:
             host["L_mtp"] = copy[s["step"]][0]
         idle = prev is not None and not busy[i]

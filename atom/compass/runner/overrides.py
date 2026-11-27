@@ -406,6 +406,15 @@ class HostDeviceRecurrence:
                 "without its forward's path"
             )
         named = {f for v in self.columns.values() for c in v.values() for f in c}
+        # A queue column (`step_labels.QUEUE_COLUMN`, fitted under
+        # `step_linear_fit.HOST_QUEUE_ENV`) is no launch feature: a run's batch
+        # states it (`_group_step_seconds`, from `compass_arrived`).
+        from atom.compass.backends.step_labels import queue_columns
+
+        self._queue = queue_columns(named)
+        named -= set(self._queue)
+        # Without a queue column, as before it: any column predicts the launch features.
+        self._launch_columns = bool(named) if self._queue else bool(self.columns)
         if lacks := sorted(named - set(getattr(launch[0], "features", ()))):
             raise ValueError(
                 f"the host laws adopt launch features {lacks}, which this model's "
@@ -524,11 +533,16 @@ class HostDeviceRecurrence:
             return {**self.paths.get("decode", {}), **self.paths.get(kind, {})}
         return self.paths.get(kind, {})
 
+    def queue_columns(self) -> dict[str, int]:
+        """The queue columns (`step_labels.queue_columns`) any law names, each to
+        its saturation; none on laws fitted without the queue."""
+        return self._queue
+
     def predicted(self, view: Any) -> dict:
         """A step's launch features by `launch`'s provider, from its
-        `BatchView` `view`; none where no law adopts a column."""
+        `BatchView` `view`; none where no law adopts a launch column."""
         provider, graphs = self.launch
-        return provider.predict(view, graphs) if self.columns else {}
+        return provider.predict(view, graphs) if self._launch_columns else {}
 
     def path(self, view: Any) -> str | None:
         """A step's launch path (`launch_features.path`) from its `BatchView`
@@ -2234,6 +2248,35 @@ def history_phase_wait(terms: Any, group: Any) -> float:
     return k * (top.item() - own)
 
 
+def _engine_queue(runner: Any, batch: Any, mode: Any, host: Any) -> int | None:
+    """The engine's queue before `batch` (`step_labels.queue_depths`), which a
+    `HostDeviceRecurrence` law's queue column prices; None when no law names
+    one, or when some batch of the step carries no ``compass_arrived`` (a run
+    without ``COMPASS_HOST_QUEUE=1``, `run.engine_loop`), whose forwards a
+    queue column then refuses. Each rank counts its own part
+    (`step_labels.QueueDepth`: the arrivals its scheduler had taken less the
+    requests its earlier batches named; a dummy's, as at its last batch);
+    under DP the group sums them, every rank in one all_reduce, since the
+    queue is the engine's: the API server hands each request to one rank."""
+    if not isinstance(host, HostDeviceRecurrence) or not host.queue_columns():
+        return None
+    from atom.compass.backends.step_labels import QueueDepth
+    from atom.compass.runner.projection import dp_group, is_dummy
+
+    depth = vars(runner).setdefault("_queue_depth", QueueDepth())
+    arrived = getattr(batch, "compass_arrived", None)
+    if is_dummy(batch):
+        own, unstamped = depth.at(None), 0
+    else:
+        own = depth.at(arrived, batch.req_ids, batch.is_final_chunk)
+        unstamped = int(arrived is None)
+    if mode.sync is not None and len(mode.sync.scheduled_tokens_per_dp_rank) > 1:
+        t = torch.tensor([own, unstamped], dtype=torch.float64)
+        torch.distributed.all_reduce(t, torch.distributed.ReduceOp.SUM, dp_group())
+        own, unstamped = (int(round(v)) for v in t.tolist())
+    return None if unstamped else own
+
+
 def _group_step_seconds(
     runner: Any,
     batch: Any,
@@ -2362,6 +2405,7 @@ def _group_step_seconds(
         seen = vars(runner).setdefault("_admitted", set())
         batch.compass_admitted = admitted(batch, seen, entry)
     dummies = dummy_ranks(batch, mode)
+    queue = _engine_queue(runner, batch, mode, host)
     clock = getattr(host, "now", None)
     entered = None if clock is None else clock()
     duty = vars(runner).setdefault("_prefill_duty", PrefillDuty())
@@ -2376,6 +2420,15 @@ def _group_step_seconds(
             view = dataclasses.replace(view, prefill_duty=duty.at(entered))
         if isinstance(host, HostDeviceRecurrence):
             batch.compass_launch = host.predicted(view)
+            if queue is not None:
+                # The engine's queue before this batch (`_engine_queue`) at
+                # each queue column's saturation; none stamped, the column
+                # stays missing and the forward is refused.
+                batch.compass_queue = queue
+                batch.compass_launch = {
+                    **batch.compass_launch,
+                    **{c: min(queue, n) for c, n in host.queue_columns().items()},
+                }
             batch.compass_path = host.path(view)
             batch.compass_dummy = bool(view.dp_dummy and view.prefill)
         cost = backend.price(view)
@@ -2495,6 +2548,8 @@ def _group_step_seconds(
         **({"replayed_stall_s": stall_s} if stall_s else {}),
         **({"phase_wait_s": phase_s} if phase_s else {}),
         **({"launch_stall_s": first_s} if first_s else {}),
+        # The engine queue a law's queue column priced it at (`_engine_queue`).
+        **({"queue": queue} if queue is not None else {}),
         "charge_s": charge_s,
         "group_s": group_s,
         "terms": [

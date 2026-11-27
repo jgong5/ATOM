@@ -3771,6 +3771,44 @@ def _raised_file(now: Path, rank) -> Path:
     return now.with_suffix(f".{rank}.raised")
 
 
+#: A run's switch (``1``) for stamping each scheduled batch with the requests its
+#: engine's scheduler had taken (`_stamp_arrivals`), which a host law's queue
+#: column prices from (`step_labels.QueueDepth`, `runner.overrides`): a law
+#: fitted under ``COMPASS_FIT_HOST_QUEUE`` refuses a forward without it.
+QUEUE_ENV = "COMPASS_HOST_QUEUE"
+
+
+def _stamp_arrivals(engine_core) -> None:
+    """Each batch `engine_core`'s scheduler schedules carries
+    ``compass_arrived``, the requests the scheduler had taken (every `add`, and
+    each of an `extend`'s, counted here: ATOM's own ``_arrived_requests``
+    restarts at each schedule) as it began scheduling it; an engine with no
+    scheduler stamps none."""
+    scheduler = getattr(engine_core, "scheduler", None)
+    if scheduler is None or not hasattr(scheduler, "schedule"):
+        return
+    taken = [0]
+    schedule, add, extend = scheduler.schedule, scheduler.add, scheduler.extend
+
+    def counted_add(seq, *args, **kwargs):
+        taken[0] += 1
+        return add(seq, *args, **kwargs)
+
+    def counted_extend(seqs, *args, **kwargs):
+        seqs = list(seqs)
+        taken[0] += len(seqs)
+        return extend(seqs, *args, **kwargs)
+
+    def stamped(*args, **kwargs):
+        arrived = taken[0]
+        result = schedule(*args, **kwargs)
+        if result is not None and result[0] is not None:
+            result[0].compass_arrived = arrived
+        return result
+
+    scheduler.add, scheduler.extend, scheduler.schedule = counted_add, counted_extend, stamped
+
+
 @contextlib.contextmanager
 def engine_loop(engine_core):
     """Around the engine's loop: `engine_done` once it leaves, which raises if
@@ -3809,6 +3847,8 @@ def engine_loop(engine_core):
             from atom.compass.runner import pp_send
 
             pp_send.install(engine_core, _machine(run))
+        if run is not None and os.environ.get(QUEUE_ENV) == "1":
+            _stamp_arrivals(engine_core)
         if run is not None and STEP_GRID in run:
             workers = engine_core.runner_mgr
             bundle = workers.call_func("step_grid_bundle", wait_out=True)

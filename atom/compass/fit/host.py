@@ -77,8 +77,11 @@ from atom.compass.artifacts import Key, Kind, keyed_platform
 from atom.compass.backends.step_labels import (
     STALLS,
     digest,
+    dp_peer_cut_on,
+    dp_peer_cuts,
     group_prefills,
     launch_stall_on,
+    queue_depths,
     record_ranks,
     stall_entry,
     stall_prices,
@@ -87,6 +90,7 @@ from atom.compass.backends.step_linear_fit import (
     fit_hops,
     fit_host,
     fit_intake,
+    host_queue_spec,
     fit_relay,
     fit_stream,
     fit_tokenizer,
@@ -102,6 +106,52 @@ from atom.compass.run import INTAKE_RECORD, LOCAL, TOKENIZER_RECORD
 from atom.compass.validate.runs import SIDES
 
 PROG = "compass fit host"
+
+
+def _rank_files(record) -> list[Path]:
+    """The DP rank records of the record directory `record`, in rank order, as
+    `fit.samples` names its run."""
+    steps = Path(record) / "steps"
+    return sorted(steps.glob("dp*[0-9].jsonl"), key=lambda p: int(p.stem[2:]))
+
+
+def record_queue_depths(records) -> dict[str, dict[int, int]]:
+    """Per run (its rank records' digests, as `fit.samples` names it) of each
+    record directory in `records` that stamped its intake, its steps' queue
+    depths over every DP rank (`queue_depths` over its ``send`` stamps)."""
+    out = {}
+    for r in records:
+        stamps = Path(r) / "steps" / INTAKE_RECORD
+        files = _rank_files(r)
+        if not stamps.is_file() or not files:
+            continue
+        sends = sorted(
+            int(w[0])
+            for w in (line.split() for line in stamps.read_text().splitlines())
+            if len(w) > 2 and w[2] == "send"
+        )
+        ranks = [[json.loads(x) for x in f.read_text().splitlines() if x.strip()] for f in files]
+        out[", ".join(map(digest, files))] = queue_depths(sends, ranks)
+    return out
+
+
+def record_peer_cuts(records) -> dict[str, dict]:
+    """Per DP run of `records` (named as `record_queue_depths` names it), what
+    `step_labels.DP_PEER_CUT_ENV` cut from its lines' `W_pre`
+    (`dp_peer_cuts`): the lines cut, their seconds summed and the median cut."""
+    out = {}
+    for r in records:
+        files = _rank_files(r)
+        if len(files) < 2:
+            continue
+        ranks = [[json.loads(x) for x in f.read_text().splitlines() if x.strip()] for f in files]
+        cuts = sorted(ns for c in dp_peer_cuts(ranks) for ns in c.values())
+        out[", ".join(map(digest, files))] = {
+            "lines": len(cuts),
+            "seconds": sum(cuts) * 1e-9,
+            "p50_s": cuts[len(cuts) // 2] * 1e-9 if cuts else None,
+        }
+    return out
 
 
 def host_laws(
@@ -122,7 +172,12 @@ def host_laws(
     which a run charges (`runner.overrides.launch_stall`). With `busy`, per
     record directory the host-clock spans of its `--intake-burst-run`s
     (`burst_spans`), the ``http_intake`` term's ``fixed_s`` is fitted on the
-    loop's busy periods within them (`step_linear_fit.fit_intake`)."""
+    loop's busy periods within them (`step_linear_fit.fit_intake`). Under
+    ``COMPASS_FIT_HOST_QUEUE`` (`step_linear_fit.HOST_QUEUE_ENV`) the listed
+    segments take the records' engine queue (`record_queue_depths`); under
+    ``COMPASS_FIT_DP_PEER_CUT=1`` (`step_labels.DP_PEER_CUT_ENV`), which the
+    samples' labels took, the report's ``dp_peer_cut`` states the cut
+    (`record_peer_cuts`)."""
     from scipy.spatial import QhullError
 
     bare = sorted(
@@ -142,7 +197,12 @@ def host_laws(
                     f"its lines; steps/{name + LOCAL} names the file that holds "
                     f"them, {named.read_text().strip()}"
                 )
-    host, report = fit_host(samples)
+    if host_queue_spec() is None:
+        host, report = fit_host(samples)
+    else:
+        host, report = fit_host(samples, queue=record_queue_depths(records))
+    if dp_peer_cut_on():
+        report["dp_peer_cut"] = record_peer_cuts(records)
     if steady is not None:
         host_blocks.refit(samples, host, report)
     if launch_stall_on():

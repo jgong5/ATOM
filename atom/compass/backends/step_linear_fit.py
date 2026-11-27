@@ -403,6 +403,36 @@ TOKENIZER_FEATURES = ("fixed", "tokens", "chars")
 #: What a forward that admits requests spends once, per prompt token past the
 #: prefix-cache hit and per token within it (`step_labels.admit_x`).
 ADMIT_FEATURES = ("admits", "uncached", "cached")
+#: The host segments that take a queue column (opt-in; unset: none),
+#: ``Q0:kind.segment,...`` (e.g. ``16:prefill.E,prefill.W_pre``), groups with
+#: their own Q0 joined by ``;`` (``16:prefill.E;64:prefill.E_out``): each
+#: listed segment's law gains ``queue_sat<Q0>`` (`step_labels.QUEUE_COLUMN`),
+#: what each request in the engine's queue adds, up to Q0 of them
+#: (`step_labels.queue_depths` from the records' intake stamps, over every DP
+#: rank; a run's `step_labels.QueueDepth` under ``COMPASS_HOST_QUEUE=1``), a host
+#: cost that grows with the queue (#734's cell B P on hi: prefill E 1.3 ms mean
+#: at a queue of 0-1, 17.6 ms at 16-63), which a law without it prices at its
+#: mean at every load.
+HOST_QUEUE_ENV = "COMPASS_FIT_HOST_QUEUE"
+
+
+def host_queue_spec() -> dict[str, int] | None:
+    """`HOST_QUEUE_ENV`'s segments, each to its Q0; None unset. Raises when
+    malformed or when a segment is listed twice."""
+    value = os.environ.get(HOST_QUEUE_ENV, "")
+    if not value:
+        return None
+    out = {}
+    for group in value.split(";"):
+        q0, _, segments = group.partition(":")
+        segments = [x for x in segments.split(",") if x]
+        if not q0.isdigit() or int(q0) < 1 or not segments:
+            raise ValueError(f"{HOST_QUEUE_ENV}={value} is not Q0:kind.segment,...[;...]")
+        for x in segments:
+            if x in out:
+                raise ValueError(f"{HOST_QUEUE_ENV}={value} lists {x} twice")
+            out[x] = int(q0)
+    return out
 #: The figures `validate.cost` grades a kind by that a held-out run's are written
 #: under: the steps graded, the error on their totals, the step that contributes
 #: most to it and the error holding that step out, and the median per step.
@@ -951,11 +981,12 @@ def _host_x(s) -> tuple[int, int, int]:
 RUN_BLOCKS = 5
 
 
-def _host_rows(samples, blocks: int = 0) -> list[tuple]:
+def _host_rows(samples, blocks: int = 0, launch_of=None) -> list[tuple]:
     """(kind, segment, (1, tokens, seqs), seconds, run, launch) per host label
     of each sample, but the `E` of one that admits requests. With `blocks`,
     `run` is ``(run, block)``, the sample's step's block of `blocks` contiguous
-    spans of its run's steps."""
+    spans of its run's steps. `launch_of` (default: its `launch`) gives a
+    sample's launch features."""
     rows, last = [], {}
     for s in samples:
         run = s.provenance["run"]
@@ -964,8 +995,9 @@ def _host_rows(samples, blocks: int = 0) -> list[tuple]:
         run = s.provenance["run"]
         if blocks:
             run = (run, s.step * blocks // last[run])
+        launch = s.launch if launch_of is None else launch_of(s)
         rows += [
-            (host_kind(s.view), k, _host_x(s), v, run, s.launch)
+            (host_kind(s.view), k, _host_x(s), v, run, launch)
             for k, v in s.host.items()
             if k != "E" or not s.admitted[0]
         ]
@@ -981,15 +1013,17 @@ def _host_price(host, kind, segment, x, launch) -> float | None:
     return None if c is None else float(np.dot(c, x)) + priced
 
 
-def _admit_rows(samples, host) -> list[tuple]:
+def _admit_rows(samples, host, launch_of=None) -> list[tuple]:
     """(`admit_x` of admitted, `E` its kind's law prices, `E`) per sample
-    that admits requests, has a positive `E` and a kind with an `E` law."""
+    that admits requests, has a positive `E` and a kind with an `E` law;
+    `launch_of` as `_host_rows` takes it."""
+    of = launch_of or (lambda s: s.launch)
     return [
         (step_labels.admit_x(s.admitted), base, s.host["E"])
         for s in samples
         if s.admitted[0]
         and s.host.get("E", 0) > 0
-        and (base := _host_price(host, host_kind(s.view), "E", _host_x(s), s.launch))
+        and (base := _host_price(host, host_kind(s.view), "E", _host_x(s), of(s)))
         is not None
     ]
 
@@ -1047,8 +1081,10 @@ def _runs(samples, dp: int) -> dict[str, list[list]]:
     return {run: [ranks[r] for r in sorted(ranks)] for run, ranks in runs.items()}
 
 
-def fit_host(samples) -> tuple[dict, dict]:
-    """The host laws over `samples`, as a run file's `host` entry, and their report."""
+def fit_host(samples, queue=None) -> tuple[dict, dict]:
+    """The host laws over `samples`, as a run file's `host` entry, and their
+    report. Under `HOST_QUEUE_ENV`, `queue` holds each sample's queue depth by
+    run and step (`step_labels.queue_depths`), the listed segments' column."""
     from scipy.spatial import QhullError
 
     held = {json.dumps(s.provenance["config"], sort_keys=True) for s in samples}
@@ -1076,9 +1112,26 @@ def fit_host(samples) -> tuple[dict, dict]:
     kept = [
         s for s in samples if (s.provenance["run"], s.rank, s.step) not in jit | after
     ]
+    queued = host_queue_spec()
+    launch_of = None
+    if queued is not None:
+        saturations = sorted(set(queued.values()))
+
+        def launch_of(s):
+            depth = (queue or {}).get(s.provenance["run"], {}).get(s.step)
+            if depth is None:
+                raise ValueError(
+                    f"{HOST_QUEUE_ENV}: {s.provenance['run']} step {s.step} has no "
+                    "queue depth (its record's intake stamps)"
+                )
+            return {
+                **s.launch,
+                **{f"{step_labels.QUEUE_COLUMN}{n}": min(depth, n) for n in saturations},
+            }
+
     # One run holds out spans of its own steps to choose its launch columns.
     one = len({s.provenance["run"] for s in kept}) == 1
-    rows = _host_rows(kept, RUN_BLOCKS if one else 0)
+    rows = _host_rows(kept, RUN_BLOCKS if one else 0, launch_of)
     host = {"key": json.loads(keys[0]), "laws": {}}
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
     report["blocked"], report["unstamped"] = _blocked(samples)
@@ -1091,6 +1144,10 @@ def fit_host(samples) -> tuple[dict, dict]:
             members = [r for r in rows if r[:2] == (kind, segment) and r[3] > 0]
             try:
                 adopted, figures = _launch_columns(members, launch.features)
+                if queued is not None and (n := queued.get(f"{kind}.{segment}")):
+                    column = f"{step_labels.QUEUE_COLUMN}{n}"
+                    adopted = [*adopted, column]
+                    figures = figures | {"queue": {"column": column, "Q0": n}}
                 columns = [(f, [r[5][f] for r in members]) for f in adopted]
                 coef, fitted = _host_law(
                     [r[2] for r in members],
@@ -1107,7 +1164,7 @@ def fit_host(samples) -> tuple[dict, dict]:
                 host.setdefault("columns", {}).setdefault(kind, {})[segment] = c
             report[f"{kind}.{segment}"] = fitted | figures
     _fit_dummy(samples, launch, graphs, host, report)
-    a, base, labels = list(zip(*_admit_rows(kept, host))) or [(), (), ()]
+    a, base, labels = list(zip(*_admit_rows(kept, host, launch_of))) or [(), (), ()]
     try:
         host["admit"], report["admit"] = _host_law(a, labels, ADMIT_FEATURES, base)
     except (ValueError, QhullError) as e:
