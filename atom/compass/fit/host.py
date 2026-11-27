@@ -77,6 +77,7 @@ from atom.compass.backends.step_labels import (
     launch_stall_on,
     queue_depths,
     record_ranks,
+    ring_gated,
     stall_entry,
     stall_prices,
 )
@@ -85,6 +86,7 @@ from atom.compass.backends.step_linear_fit import (
     fit_host,
     fit_intake,
     host_queue_spec,
+    ring_cut_s,
     fit_relay,
     fit_stream,
     fit_tokenizer,
@@ -123,6 +125,25 @@ def record_queue_depths(records) -> dict[str, dict[int, int]]:
     return out
 
 
+def record_ring_gated(records, within_s: float) -> dict[str, set[int]]:
+    """Per pipeline head record (``dp<r>.jsonl`` beside a stage-1
+    ``pp1.dp<r>.jsonl``) of each record directory in `records`, its ring-held
+    steps (`ring_gated`, the IPC ring's `SLOTS`)."""
+    from atom.compass.runner.pp_send import SLOTS
+
+    out = {}
+    for r in records:
+        steps = Path(r) / "steps"
+        for head in sorted(steps.glob("dp*[0-9].jsonl")):
+            after = steps / f"pp1.{head.name}"
+            if not after.is_file():
+                continue
+            lines = [json.loads(x) for x in head.read_text().splitlines() if x.strip()]
+            nxt = [json.loads(x) for x in after.read_text().splitlines() if x.strip()]
+            out[digest(head)] = ring_gated(lines, nxt, SLOTS, within_s)
+    return out
+
+
 def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, dict]:
     """The host laws over `samples`, with the tokenizer, HTTP intake and hop
     terms of the record directories `records`, each served the client runs
@@ -156,10 +177,17 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
                     f"its lines; steps/{name + LOCAL} names the file that holds "
                     f"them, {named.read_text().strip()}"
                 )
-    if host_queue_spec() is None:
-        host, report = fit_host(samples)
-    else:
-        host, report = fit_host(samples, queue=record_queue_depths(records))
+    extra = {}
+    if host_queue_spec() is not None:
+        extra["queue"] = record_queue_depths(records)
+    if (within := ring_cut_s()) is not None:
+        extra["gated"] = record_ring_gated(records, within)
+    host, report = fit_host(samples, **extra)
+    if "gated" in extra:
+        report["ring_cut"] = {
+            "within_s": within,
+            "gated": {run: len(steps) for run, steps in extra["gated"].items()},
+        }
     if steady is not None:
         host_blocks.refit(samples, host, report)
     if launch_stall_on():

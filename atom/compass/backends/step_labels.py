@@ -548,6 +548,26 @@ def queue_depths(sends_ns, lines) -> dict[int, int]:
     return out
 
 
+def ring_gated(head, after, slots: int, within_s: float) -> set[int]:
+    """The steps of `head` (a pipeline head's record lines, in order) whose last
+    launch is at most `within_s` past (or before) stage 1's (`after`, its lines)
+    last launch of the forward `slots` back: those whose send may have waited
+    for that forward's ring slot (`atom.distributed.pp_ipc.PPIpcSender.send`
+    reads the slot's ack before it copies), a wait a run charges on its own
+    (`runner.pp_send`); their `W_launch` holds it. A forward with no stage-1
+    line or launch counts as gated."""
+    seq = [s for s in head if not s["is_dummy_run"] and s.get("t_launch_ns")]
+    nxt = {s["step"]: s for s in after if not s["is_dummy_run"] and s.get("t_launch_ns")}
+    gated = set()
+    for i, s in enumerate(seq):
+        if i < slots:
+            continue
+        back = nxt.get(seq[i - slots]["step"])
+        if back is None or (s["t_launch_ns"][-1] - back["t_launch_ns"][-1]) * 1e-9 <= within_s:
+            gated.add(s["step"])
+    return gated
+
+
 class QueueDepth:
     """`queue_depths` as a run counts it, one batch at a time, from what the
     engine had taken (its scheduler's arrivals as it scheduled the batch) and

@@ -422,6 +422,26 @@ HOST_MEDIAN_ENV = "COMPASS_FIT_HOST_MEDIAN"
 HOST_QUEUE_ENV = "COMPASS_FIT_HOST_QUEUE"
 
 
+#: Fit a pipeline head's `W_launch` on its forwards the IPC ring did not hold
+#: (opt-in; unset: every forward): ``<ms>``, a head forward whose last launch is
+#: at most that past stage 1's of the forward `SLOTS` back is left out
+#: (`step_labels.ring_gated`): its send waited for a ring slot, which a run
+#: charges itself (P's head on the CAL at c120: W_launch p50 22 ms ungated,
+#: 50 ms gated).
+RING_CUT_ENV = "COMPASS_FIT_RING_CUT"
+
+
+def ring_cut_s() -> float | None:
+    """`RING_CUT_ENV` in seconds; None unset. Raises when not a number of ms."""
+    value = os.environ.get(RING_CUT_ENV, "")
+    if not value:
+        return None
+    try:
+        return float(value) * 1e-3
+    except ValueError:
+        raise ValueError(f"{RING_CUT_ENV}={value} is not milliseconds") from None
+
+
 def host_queue_spec() -> dict[str, int] | None:
     """`HOST_QUEUE_ENV`'s segments, each to its Q0; None unset. Raises when
     malformed or when a segment is listed twice."""
@@ -969,12 +989,13 @@ def _host_x(s) -> tuple[int, int, int]:
 RUN_BLOCKS = 5
 
 
-def _host_rows(samples, blocks: int = 0, launch_of=None) -> list[tuple]:
+def _host_rows(samples, blocks: int = 0, launch_of=None, gated=None) -> list[tuple]:
     """(kind, segment, (1, tokens, seqs), seconds, run, launch) per host label
     of each sample, but the `E` of one that admits requests. With `blocks`,
     `run` is ``(run, block)``, the sample's step's block of `blocks` contiguous
     spans of its run's steps. `launch_of` (default: its `launch`) gives a
-    sample's launch features."""
+    sample's launch features. `gated` (run to steps) leaves out those steps'
+    `W_launch` (`RING_CUT_ENV`)."""
     rows, last = [], {}
     for s in samples:
         run = s.provenance["run"]
@@ -987,7 +1008,12 @@ def _host_rows(samples, blocks: int = 0, launch_of=None) -> list[tuple]:
         rows += [
             (host_kind(s.view), k, _host_x(s), v, run, launch)
             for k, v in s.host.items()
-            if k != "E" or not s.admitted[0]
+            if (k != "E" or not s.admitted[0])
+            and not (
+                gated is not None
+                and k == "W_launch"
+                and s.step in gated.get(s.provenance["run"], ())
+            )
         ]
     return rows
 
@@ -1093,10 +1119,12 @@ def _runs(samples, dp: int) -> dict[str, list[list]]:
     return {run: [ranks[r] for r in sorted(ranks)] for run, ranks in runs.items()}
 
 
-def fit_host(samples, queue=None) -> tuple[dict, dict]:
+def fit_host(samples, queue=None, gated=None) -> tuple[dict, dict]:
     """The host laws over `samples`, as a run file's `host` entry, and their
     report. Under `HOST_QUEUE_ENV`, `queue` holds each sample's queue depth by
-    run and step (`step_labels.queue_depths`), the listed segments' column."""
+    run and step (`step_labels.queue_depths`), the listed segments' column.
+    Under `RING_CUT_ENV`, `gated` holds each run's ring-held steps, whose
+    `W_launch` is left out."""
     from scipy.spatial import QhullError
 
     held = {json.dumps(s.provenance["config"], sort_keys=True) for s in samples}
@@ -1143,7 +1171,7 @@ def fit_host(samples, queue=None) -> tuple[dict, dict]:
 
     # One run holds out spans of its own steps to choose its launch columns.
     one = len({s.provenance["run"] for s in kept}) == 1
-    rows = _host_rows(kept, RUN_BLOCKS if one else 0, launch_of)
+    rows = _host_rows(kept, RUN_BLOCKS if one else 0, launch_of, gated)
     host = {"key": json.loads(keys[0]), "laws": {}}
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
     report["blocked"], report["unstamped"] = _blocked(samples)
