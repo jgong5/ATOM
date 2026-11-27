@@ -29,6 +29,17 @@ final decode of a non-streaming completion, advances the LP clock instead, once
 every open service job is placed: a job's result due inside the call runs when
 it ends, whatever wall time the job's thread takes.
 
+With ``COMPASS_TOKENIZER_BATCH_LONGEST=1`` (`BATCH_LONGEST_ENV`) a
+several-item ``encode_batch`` is charged its term over its longest encoding's
+ids instead of all of them: the fast tokenizer encodes a batch's items in
+parallel (``tokenizers``' rayon pool), so its wall time follows its longest
+item. The term (fixed_s, tokens_per_s) is the host law's, fitted on
+calibration calls whose new turn is one item and dominates them. #752
+DeepSeek-V4.1 Cell A DEPA2: in the calibration record (cal/real), lone
+several-item calls of 7-29 items (a cold prompt split at its added tokens) run
+at 0.19-0.54 of the term over all their ids, 2-item calls at 0.86-1.00; the
+c1 targets' cold 3-5-item calls of 60-70k ids at 0.59-0.68.
+
 `CompassEventLoop` is the frontend's event loop in a simulated run: its
 ``time()`` is the installed `LPRuntime`'s clock, so every timer is on LP time,
 timers due at one instant fire in the order they were set, and its selector is
@@ -70,6 +81,7 @@ import itertools
 import json
 import logging
 import math
+import os
 import queue
 import select
 import selectors
@@ -333,6 +345,9 @@ def charge(d: float) -> None:
         rt.advance_to(rt.now + d)
 
 
+#: ``1``: a several-item ``encode_batch`` is charged over its longest
+#: encoding's ids (`wrap_encode_batch`); unset, empty or ``0``: over all of them.
+BATCH_LONGEST_ENV = "COMPASS_TOKENIZER_BATCH_LONGEST"
 #: Whether this thread is inside a `wrap_encode` call, which charges the backend
 #: calls its ``encode`` makes.
 _in_encode = threading.local()
@@ -371,15 +386,24 @@ def wrap_encode_batch(encode_batch, one, several):
     """A fast tokenizer backend's ``encode_batch``, charging the current job
     `_price` over the ids of all the encodings it returns, of `one`, the
     ``tokenizer.encode`` term, for one encoding, and of `several`, the
-    ``tokenizer.encode_batch`` term, for more; a call made inside a
-    `wrap_encode` call is that call's to charge."""
+    ``tokenizer.encode_batch`` term, for more; with `BATCH_LONGEST_ENV` set,
+    `several` over the ids of the longest encoding alone, the batch's items
+    being encoded in parallel. A call made inside a `wrap_encode` call is that
+    call's to charge. The segment tokenizer's own work is charged over all the
+    ids either way (`wrap_segment`)."""
+    longest = (os.environ.get(BATCH_LONGEST_ENV) or "0") == "1"
 
     def charged(*args, **kwargs):
         encodings = encode_batch(*args, **kwargs)
         if not getattr(_in_encode, "on", False):
             tokens = sum(len(e.ids) for e in encodings)
             _encoded.ids = getattr(_encoded, "ids", 0) + tokens
-            charge(_price(one if len(encodings) == 1 else several, tokens))
+            if len(encodings) == 1:
+                charge(_price(one, tokens))
+            elif longest:
+                charge(_price(several, max((len(e.ids) for e in encodings), default=0)))
+            else:
+                charge(_price(several, tokens))
         return encodings
 
     return charged
