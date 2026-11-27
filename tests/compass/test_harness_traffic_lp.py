@@ -2317,3 +2317,25 @@ def test_any_other_send_order_value_is_refused(monkeypatch, value):
     monkeypatch.setenv(SEND_ORDER_ENV, value)
     with pytest.raises(ValueError, match=SEND_ORDER_ENV):
         send_order_aiperf()
+
+
+def test_in_aiperf_order_the_scheduler_s_fire_order_comes_before_credit_order(tmp_path):
+    """aiperf issues credits 0..3 at one instant, but its scheduler fired the
+    timers of 2, 0 and 3 in that order (its tasks' awaits then reordered the
+    issue), and no timer fired credit 1's: seqs go 2, 0, 3, then 1."""
+
+    async def main():
+        prefix = str(tmp_path / "lp")
+        traffic = TrafficLP(ScriptedRuntime([(100.0, {0})]), prefix, aiperf_order=True)
+        sub = zmq.asyncio.Context.instance().socket(zmq.SUB)
+        sub.connect(addresses(prefix)[0])
+        sub.subscribe(b"")
+        await traffic.subscribed(1)
+        for num, fired in ((0, 7), (1, None), (2, 5), (3, 9)):
+            traffic.send(_key(num), None, fired)
+        stamps = [await sub.recv_pyobj() for _ in range(4)]
+        traffic.done.cancel()
+        sub.close(linger=0)
+        return [key[2] for key, _, seq, *_ in sorted(stamps, key=lambda s: s[2])]
+
+    assert _run(main()) == [2, 0, 3, 1]
