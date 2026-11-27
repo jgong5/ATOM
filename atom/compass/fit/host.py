@@ -2,7 +2,7 @@
 """`compass fit host`: the host laws, fitted on real runs' records and published.
 
     compass fit host RECORD... --client-run RECORD EXPORT... --store ROOT
-        [--decode-client-run RECORD EXPORT...]
+        [--decode-client-run RECORD EXPORT...] [--intake-burst-run RECORD EXPORT...]
         [--stated-hop NAME=SECONDS...] [--ingress FILE] --out DIR
 
 `host_laws` fits the samples' host labels by `step_linear_fit.fit_host`, under
@@ -47,6 +47,16 @@ token ids, so it rendered and tokenized nothing, and read larger bodies.
 as `--client-run` does, whose host samples are its decode drains alone
 (`drain_cut`); the report's ``decode_client_runs`` says what each kept and
 left out. Without it, the fit is as it was.
+
+`--intake-burst-run RECORD EXPORT` names a client run of RECORD whose span,
+from its first send to its last response's end by the aiperf raw records
+beside EXPORT, holds bursts of requests: the ``http_intake`` term's
+``fixed_s``, what a request costs the API loop while a queue stands, is then
+fitted on the loop's busy periods that begin within those spans
+(`step_linear_fit.fit_intake`'s ``busy``) in place of its bursts, which a
+server that renders its templates off the loop never shows, so that its
+``fixed_s`` was its ``idle_s``; the report's ``intake_burst_runs`` names each
+span. ``idle_s``, ``per_byte_s`` and every other term are as without it.
 
 With `host_blocks.KIND_BLOCKS_ENV` set to ``1``, the kind-block host fit
 (`host_blocks`): the decode, prefill and middle launch laws take one constant
@@ -94,7 +104,9 @@ from atom.compass.validate.runs import SIDES
 PROG = "compass fit host"
 
 
-def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, dict]:
+def host_laws(
+    samples, records=(), client_runs=(), steady=None, busy=None
+) -> tuple[dict, dict]:
     """The host laws over `samples`, with the tokenizer, HTTP intake and hop
     terms of the record directories `records`, each served the client runs
     `client_runs` pairs it with by their exports, as a run file's `host` entry,
@@ -107,7 +119,10 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
     (`step_labels.STALL_ENV`) the entry also states `step_labels.STALLS`, per
     launch path what a rank's first launch of a shape costs
     (`step_labels.stall_prices`, which the report states with its counts),
-    which a run charges (`runner.overrides.launch_stall`)."""
+    which a run charges (`runner.overrides.launch_stall`). With `busy`, per
+    record directory the host-clock spans of its `--intake-burst-run`s
+    (`burst_spans`), the ``http_intake`` term's ``fixed_s`` is fitted on the
+    loop's busy periods within them (`step_linear_fit.fit_intake`)."""
     from scipy.spatial import QhullError
 
     bare = sorted(
@@ -136,6 +151,7 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
         host[STALLS] = stall_entry(report[STALLS])
     stamped = [r for r in records if (Path(r) / "steps" / INTAKE_RECORD).is_file()]
     windows = None if steady is None else [steady.get(Path(r), []) for r in stamped]
+    queued = None if busy is None else [busy.get(Path(r), []) for r in stamped]
     steps = [Path(r) / "steps" / INTAKE_RECORD for r in stamped]
     calls = [d.with_name(TOKENIZER_RECORD) for d in steps]
     clients = [
@@ -153,7 +169,7 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
     streamed = any(streams(d) for d in steps)
     for term, fit in (
         ("tokenizer", lambda: fit_tokenizer(calls, steps, windows)),
-        ("http_intake", lambda: fit_intake(steps, calls, windows)),
+        ("http_intake", lambda: fit_intake(steps, calls, windows, queued)),
         ("hops", lambda: fit_hops(steps, clients)),
         *([("http_stream", lambda: fit_stream(steps))] if streamed else []),
         *([("relay", lambda: fit_relay(relayed))] if relayed else []),
@@ -199,6 +215,34 @@ def _client(record, exports) -> dict:
                         start + meta["request_ack_ns"] - meta["request_start_ns"]
                     )
     return {"sent": sent, "acked": acked}
+
+
+def burst_spans(runs) -> list[tuple[str, str, tuple[int, int]]]:
+    """``(record, export, span)`` for each client run `runs` names as
+    ``(record, export)``, its span on the host clock: from its first send to
+    its last response's end, by the aiperf raw records beside the export
+    (`client_run.RAW`, gzipped or not), on CLOCK_MONOTONIC, the clock the
+    intake stamps are on. Raises on an export with no raw records beside it."""
+    out = []
+    for record, export in runs:
+        raw = Path(export).with_name(RAW)
+        if not raw.is_file():
+            raw = raw.with_name(f"{RAW}.gz")
+        if not raw.is_file():
+            raise ValueError(
+                f"--intake-burst-run {record} {export}: no {RAW} beside it"
+            )
+        lo, hi = math.inf, -math.inf
+        with (gzip.open if raw.suffix == ".gz" else open)(raw, "rb") as lines:
+            for r in map(json.loads, lines):
+                meta, start = r["metadata"], r["start_perf_ns"]
+                end = meta.get("request_end_ns")
+                lo = min(lo, start)
+                hi = max(hi, start + end - meta["request_start_ns"] if end else start)
+        if lo > hi:
+            raise ValueError(f"--intake-burst-run {record} {export}: no request")
+        out.append((record, export, (int(lo), int(hi))))
+    return out
 
 
 def drain_cut(samples, decode) -> tuple[list, list]:
@@ -317,6 +361,15 @@ def main(argv: list[str]) -> None:
         "prefills",
     )
     parser.add_argument(
+        "--intake-burst-run",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("RECORD", "EXPORT"),
+        help="a client run of RECORD, by its export, whose span holds bursts: "
+        "http_intake's fixed_s is fitted on the API loop's busy periods there",
+    )
+    parser.add_argument(
         "--ingress",
         metavar="FILE",
         help="the encoding ingress in front of the deployment, compass fit "
@@ -331,6 +384,17 @@ def main(argv: list[str]) -> None:
             raise ValueError(
                 f"--decode-client-run names {record}, which is not a RECORD"
             )
+    for record, _ in args.intake_burst_run:
+        if Path(record) not in records:
+            raise ValueError(
+                f"--intake-burst-run names {record}, which is not a RECORD"
+            )
+    queued = burst_spans(args.intake_burst_run)
+    busy = None
+    if queued:
+        busy = {}
+        for record, _, span in queued:
+            busy.setdefault(Path(record), []).append(span)
     steady_runs = args.client_run
     args.client_run = [*args.client_run, *args.decode_client_run]
     samples, config = publish.inputs(args, ("record",))
@@ -339,7 +403,9 @@ def main(argv: list[str]) -> None:
     drained = []
     if args.decode_client_run:
         samples, drained = drain_cut(samples, args.decode_client_run)
-    host, report = host_laws(samples, args.inputs, args.client_run, steady)
+    host, report = host_laws(samples, args.inputs, args.client_run, steady, busy)
+    if busy is not None:
+        report["intake_burst_runs"] = [[r, e, list(span)] for r, e, span in queued]
     if args.decode_client_run:
         report["decode_client_runs"] = drained
     if steady is not None:

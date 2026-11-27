@@ -131,10 +131,11 @@ The same solver fits the host entry's ``tokenizer`` term on a recorded
 server's tokenizer calls (`fit_tokenizer`), and its ``http_intake`` term on its
 HTTP intake stamps (`fit_intake`): ``per_byte_s`` and ``idle_s`` on the lone
 requests, ``fixed_s`` from the bursts or else ``idle_s``, and ``bytes`` over every
-request's body. On a prefill-decode deployment's two sides' stamps it fits the
-prefill host entry's ``relay`` term (`fit_relay`): what carrying a prefill's
-response through the router to decode's app call costs per request and per
-byte. On a streaming server's stamps it fits the ``http_stream`` term
+request's body; given spans to read them in, ``fixed_s`` from the loop's busy
+periods there instead (`_busy`). On a prefill-decode deployment's two sides'
+stamps it fits the prefill host entry's ``relay`` term (`fit_relay`): what
+carrying a prefill's response through the router to decode's app call costs per
+request and per byte. On a streaming server's stamps it fits the ``http_stream`` term
 (`fit_stream`): its API loop's CPU per SSE event its streamed responses send,
 from the loop thread's CPU clock over windows of the record.
 
@@ -1453,7 +1454,7 @@ def _intakes(path, calls=None, windows=None) -> tuple[list, list, list]:
     return lone, bursts, sizes
 
 
-def fit_intake(paths, calls=None, windows=None) -> tuple[dict, dict]:
+def fit_intake(paths, calls=None, windows=None, busy=None) -> tuple[dict, dict]:
     """The ``http_intake`` term over the intake stamps each record in `paths`
     holds (`_intakes`), each beside the tokenizer record `calls` names in the
     same order (none where `calls` is None), and its report: ``idle_s`` and ``per_byte_s`` by the
@@ -1465,7 +1466,20 @@ def fit_intake(paths, calls=None, windows=None) -> tuple[dict, dict]:
     or ``idle_s`` where that mean is negative or there is no burst, the
     report's ``fixed_s_is_idle_s`` saying which. Raises on too few lone
     requests. With `windows`, per record its host-clock spans or None, each
-    record's requests within them (`_intakes`)."""
+    record's requests within them (`_intakes`).
+
+    With `busy`, per record its host-clock spans, an empty list for none or
+    None for all of it, ``fixed_s`` is fitted on the loop's busy periods that
+    begin within them (`_busy`) in place of the bursts above, which a server
+    that renders its templates off the loop, as a chat prefill server does,
+    shows none of: what each period's later requests cost the loop while a
+    queue stood, ``sum(seconds - idle_s - per_byte_s x bytes) / sum(requests -
+    1)`` over the periods, a period's first request taking ``idle_s``, as
+    `atom.utils.compass_loop.HttpChannel` charges a request that finds no intake
+    under way; the report's ``busy`` gives the periods, their requests and the
+    p10, p50 and p90 of each one's value; ``idle_s`` where that is not positive
+    or there is no period, the report's ``fixed_s_is_idle_s`` saying which.
+    ``idle_s``, ``per_byte_s`` and ``bytes`` are as without it."""
     lone, bursts, bodies = [], [], []
     spans = windows or [None] * len(paths)
     for path, made, span in zip(paths, calls or [None] * len(paths), spans):
@@ -1477,6 +1491,8 @@ def fit_intake(paths, calls=None, windows=None) -> tuple[dict, dict]:
     x = np.column_stack([np.ones(len(nbytes)), nbytes])
     (idle, per_byte), report = _host_law(x, seconds, INTAKE_FEATURES)
     term = {"per_byte_s": per_byte, "idle_s": idle, "bytes": [min(bodies), max(bodies)]}
+    if busy is not None:
+        return _busy_fixed(paths, calls, busy, term, report)
     if not bursts:
         report["fixed_s_is_idle_s"] = f"no burst among {len(lone)} lone requests"
         return {"fixed_s": idle, **term}, report
@@ -1501,6 +1517,97 @@ def fit_intake(paths, calls=None, windows=None) -> tuple[dict, dict]:
         "p10_s": p10,
         "p90_s": p90,
     }
+    return {"fixed_s": fixed, **term}, report
+
+
+def _busy(path, calls=None, windows=None) -> list[tuple[int, int, float]]:
+    """The loop's busy periods among the HTTP intake stamps `path` holds
+    (`atom.compass.run.INTAKE_RECORD`) that took in two requests or more, each
+    as ``(requests, body bytes, seconds)``, in order.
+
+    A request is in the loop's hands from its body's first read to its engine
+    send's end, counted by its body as `_intakes` counts it; a period opens at
+    the app call before a body read that finds none in hand and closes at the
+    send that leaves none. Its seconds are the loop thread's CPU from that app
+    call to that send, every request's work on the loop with whatever else
+    the loop did meanwhile, plus what a lone request's seconds take in beside
+    the loop's (`_intakes`): the CPU of each template render another thread
+    started in the period, and of each pool job started there whose thread
+    made no tokenizer call other than a decode by the tokenizer record at
+    `calls`, which no tokenizer law prices. A period still open at the
+    record's end is not given. With `windows`, host-clock spans (`within`),
+    only the periods whose app call is within one are given."""
+    ev = _stamps(path)
+    tokenized = _tokenizing(calls)
+    loops = {e[6] for e in ev if e[2] == "app"}
+    apps = np.array([e[0] for e in ev if e[2] == "app"], dtype=np.int64)
+    cpu = {e[0]: e[4] for e in ev if e[2] == "app"}
+    marks = []
+    for e in ev:
+        if e[2] == "body" and (k := int(np.searchsorted(apps, e[0]))) > 0:
+            marks.append((e[0], 1, e[3], int(apps[k - 1])))
+        elif e[2] == "send":
+            marks.append((e[1], -1, 0, e[5]))
+    # Work another thread does that a lone request's seconds hold (`_intakes`).
+    aside = []
+    for e in ev:
+        if e[6] in loops:
+            continue
+        if e[2] == "prep":
+            starts = np.asarray(tokenized.get(e[6], ((), ()))[0])
+            if np.any((e[0] <= starts) & (starts <= e[1])):
+                continue
+        elif e[2] != "tmpl":
+            continue
+        aside.append((e[0], e[5] - e[4]))
+    aside.sort()
+    at = np.array([a for a, _ in aside], dtype=np.int64)
+    spent = np.concatenate([[0], np.cumsum([c for _, c in aside])])
+    out, held, start = [], 0, None
+    for t, step, size, x in sorted(marks):
+        if step > 0:
+            if held == 0:
+                start, n, nbytes = x, 0, 0
+            held, n, nbytes = held + 1, n + 1, nbytes + size
+        elif held > 0:
+            held -= 1
+            if held == 0 and n > 1 and within(start, windows):
+                a, b = np.searchsorted(at, start), np.searchsorted(at, t)
+                out.append((n, nbytes, (x - cpu[start] + spent[b] - spent[a]) * 1e-9))
+    return out
+
+
+def _busy_fixed(paths, calls, busy, term: dict, report: dict) -> tuple[dict, dict]:
+    """`fit_intake`'s term `term` and report `report`, its ``fixed_s`` fitted on
+    the loop's busy periods (`_busy`) of each record in `paths` within its
+    spans in `busy` (None: all of it; an empty list: none)."""
+    periods = []
+    for path, made, span in zip(paths, calls or [None] * len(paths), busy):
+        if span is None or span:
+            periods += _busy(path, made, span)
+    idle, per_byte = term["idle_s"], term["per_byte_s"]
+    if not periods:
+        report["fixed_s_is_idle_s"] = "no busy period of two requests or more"
+        return {"fixed_s": idle, **term}, report
+    n, nbytes, seconds = np.array(periods, dtype=np.float64).T
+    rest = seconds - idle - per_byte * nbytes
+    fixed = rest.sum() / (n - 1).sum()
+    values = rest / (n - 1)
+    p10, p50, p90 = np.percentile(values, [10, 50, 90]).tolist()
+    report["busy"] = {
+        "periods": len(periods),
+        "requests": int(n.sum()),
+        "p10_s": p10,
+        "p50_s": p50,
+        "p90_s": p90,
+    }
+    if fixed <= 0:
+        report["fixed_s_is_idle_s"] = (
+            f"the {len(periods)} busy periods' later requests take {fixed:.3g} s "
+            "of the loop each, less idle_s for their first and per_byte_s times "
+            "their bodies"
+        )
+        return {"fixed_s": idle, **term}, report
     return {"fixed_s": fixed, **term}, report
 
 
