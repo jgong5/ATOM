@@ -117,6 +117,22 @@ cd / && taskset -c 0-11 nice -n 19 compass advice SPACE OUT > OUT.log 2>&1
 python3 -c "import json; s = json.load(open('OUT/states.json')); [print(c, v['state'], {p: q['state'] for p, q in v.get('points', {}).items()}) for c, v in s.items()]"
 ```
 
+A worked run, the variant above (A and B at c=16 and 32, 300 s, SLO 150
+tok/s/user and 3 s, `taskset -c 0-11`):
+- The check took 6 minutes and the 4 points 18 more, 2797 CPU s.
+- It printed, in order:
+  - `the reuse check at f1230b51a... (origin/pit2/m31pd-advice)`;
+  - for each candidate, `law prefill: reuse: step_linear_law 61eb9c870c2e in
+    /share_nfs/xingjche/m31pd/store` and `state: searchable, 2 of 2 points
+    searchable`;
+  - `A-c16: finished in OUT/runs/A-c16, 493 CPU s`;
+  - the table;
+  - `Recommended: A at concurrency 32: 17030.4 tok/s/GPU ...`;
+  - `Runner-up: B at concurrency 32: 15224.3 tok/s/GPU ...`.
+- Compare figures only between runs of the same duration: the client's warmup
+  is a larger share of a short run, so the same point's throughput is lower at
+  300 s than at 900 s (A c=32: 17,030 against 28,551 tok/s/GPU).
+
 | state | next |
 |---|---|
 | `searchable` | it simulates; read the results (5) |
