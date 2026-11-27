@@ -60,8 +60,8 @@ export PIT2_DATA=/share_nfs/<you>/compass-pit2
   `SKIP_ATOMESH=1 ATOMESH=<binary>`.
 - Source `env.sh` in every shell a step runs from. It sets `HARNESS_PYTHON`,
   `AIPERF_PYTHON`, `ATOMESH`, `AITER_LOG_LEVEL=WARNING` and
-  `COMPASS_INTEGRATION_REF` (default `origin/pit2/m31pd`; Traps), and defines
-  `compass`.
+  `COMPASS_INTEGRATION_REF` (default `origin/pit2/m31pd`; Traps), and puts
+  the tree's `compass` on PATH, where `taskset` and `nice` find it.
 
 ## 2. The space file
 
