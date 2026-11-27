@@ -11,16 +11,16 @@ rank can register after the wait. The router then places requests on that
 rank and fails each once its prefill has answered, its relay already stamped,
 for want of the rank's TP size. So `deploy.sh` and `pd_sim.sh` serve a router
 only once it has counted every worker of the run file's deployments, each
-instance's DP ranks (`worker_order`), in the `Workers initialized: <n> total`
-line it logs just before it builds its routes. Otherwise this exits 1, naming
-the count, or the missing line.
+instance's DP ranks, in the `Workers initialized: <n> total` line it logs just
+before it builds its routes. Otherwise this exits 1, naming the count, or the
+missing line.
 """
 
 import json
 import re
 import sys
 
-from atom.compass.run import worker_order
+from atom.compass.run import INSTANCES, _dp
 
 #: atomesh's count of the workers it registered, logged before it builds its routes.
 _COUNT = re.compile(r"Workers initialized: (\d+) total")
@@ -29,7 +29,7 @@ _COUNT = re.compile(r"Workers initialized: (\d+) total")
 def refusal(run: dict, log: str) -> str | None:
     """Why the router that wrote `log` may not serve the deployments of run
     file `run`, or None when it counted each of their workers."""
-    workers = sum(len(pairs) for pairs in worker_order(run).values())
+    workers = sum(run.get(n, 1) * _dp(run, side) for side, n in INSTANCES.items())
     counts = _COUNT.findall(log)
     if not counts:
         return (
