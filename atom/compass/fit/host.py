@@ -86,8 +86,8 @@ from atom.compass.backends.step_linear_fit import (
     fit_hops,
     fit_host,
     fit_intake,
-    HOST_STAGES_ENV,
     host_queue_spec,
+    host_stage_kinds,
     jit_over_s,
     ring_cut_s,
     fit_relay,
@@ -222,7 +222,7 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
         extra["queue"] = record_queue_depths(records)
     if (within := ring_cut_s()) is not None:
         extra["gated"] = record_ring_gated(records, within)
-    if os.environ.get(HOST_STAGES_ENV) == "all":
+    if host_stage_kinds() is not None:
         extra["stages"] = record_stage_launches(records, within, jit_over_s())
     host, report = fit_host(samples, **extra)
     if "stages" in extra:

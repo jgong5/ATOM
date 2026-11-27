@@ -453,8 +453,22 @@ def _host_lsq(ys, columns) -> tuple[list, dict]:
 #: with every queue column at 0, so a queue column is the head's extra on a base
 #: all stages share; a run prices a later stage at the base (its queue columns
 #: dropped). P's later stages on the CAL: launch p50 20 ms, mean 31-40 ms at
-#: every queue, a tail the head-only fit leaves unpriced.
+#: every queue, a tail the head-only fit leaves unpriced. The value names the
+#: kinds pooled, ``all`` or a comma list (``middle``): a later stage's output
+#: forward carries what the head's does not (DSpark's aux relay and draft, which a
+#: run prices apart: P's CAL c24, p50 45-86 ms on stages 1-3 against 22 ms).
 HOST_STAGES_ENV = "COMPASS_FIT_HOST_STAGES"
+
+
+def host_stage_kinds() -> frozenset | None:
+    """`HOST_STAGES_ENV`'s kinds; None unset."""
+    value = os.environ.get(HOST_STAGES_ENV, "")
+    if not value:
+        return None
+    kinds = frozenset(HOST_KINDS if value == "all" else (x for x in value.split(",") if x))
+    if not kinds <= set(HOST_KINDS):
+        raise ValueError(f"{HOST_STAGES_ENV}={value} is not all or kinds of {HOST_KINDS}")
+    return kinds
 
 
 #: What a host fit takes for a first-use compile and leaves out (opt-in; unset:
@@ -1299,9 +1313,10 @@ def fit_host(samples, queue=None, gated=None, stages=None) -> tuple[dict, dict]:
     one = len({s.provenance["run"] for s in kept}) == 1
     rows = _host_rows(kept, RUN_BLOCKS if one else 0, launch_of, gated)
     if stages:
+        pooled_kinds = host_stage_kinds() or frozenset(HOST_KINDS)
         for s in kept:
             spans = stages.get(s.provenance["run"], {}).get(s.step, ())
-            if not spans:
+            if not spans or host_kind(s.view) not in pooled_kinds:
                 continue
             feats = launch_of(s) if launch_of is not None else s.launch
             feats = {
