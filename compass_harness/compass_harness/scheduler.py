@@ -12,6 +12,7 @@ import contextvars
 import heapq
 import itertools
 import math
+import os
 
 from aiperf.common.loop_scheduler import LoopScheduler
 from aiperf.timing.replay_dependencies import ReplayBarrierCoordinator
@@ -75,6 +76,10 @@ class ClockPacedLoopScheduler(LoopScheduler):
         # (at, arming order, timer) of every timer armed, a heap.
         self._queue: list[tuple[float, int, _Timer]] = []
         self._armed = itertools.count()
+        # Re-arm a timer `_advance` moves, as aiperf does, under the aiperf send
+        # order (`compass_harness.traffic_lp.SEND_ORDER_ENV`, which validates it;
+        # read here by name, as this module is imported mid aiperf's own import).
+        self._rearm = os.environ.get("COMPASS_HARNESS_SEND_ORDER") == "aiperf"
 
     def schedule_later(self, delay_sec, coro, *, group_id=None):
         if delay_sec <= 0:
@@ -123,9 +128,17 @@ class ClockPacedLoopScheduler(LoopScheduler):
         shift = min(t.at for t in timers) - self._clock.now() - max_delay_sec
         if shift <= 0:
             return 0.0
+        # aiperf's LoopScheduler cancels each moved handle and makes it again
+        # (call_soon, or call_at), so timers moved together fire in the order
+        # they were moved, after those already due: under the aiperf send order
+        # (`compass_harness.traffic_lp.SEND_ORDER_ENV`) a moved timer is armed
+        # again here, in its group's order. Without it, its first arming stands.
+        moved = {id(t): next(self._armed) for t in timers} if self._rearm else {}
         for t in timers:
             t.at -= shift
-        self._queue = [(t.at, armed, t) for _, armed, t in self._queue]
+        self._queue = [
+            (t.at, moved.get(id(t), armed), t) for _, armed, t in self._queue
+        ]
         heapq.heapify(self._queue)
         self._wake(self._clock.now() + max_delay_sec)
         return shift

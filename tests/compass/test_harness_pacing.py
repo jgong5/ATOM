@@ -676,3 +676,42 @@ def test_a_fired_timer_s_task_reads_its_fire_order_even_after_awaits_reorder_it(
     assert orders == sorted(orders) and len(set(orders)) == 5
     assert [seen[f"child{k}"] for k in range(5)] == orders
     assert outside is None
+
+
+@pytest.mark.parametrize("aiperf_order", [False, True])
+def test_under_the_aiperf_order_timers_capped_together_fire_in_cap_order(
+    monkeypatch, aiperf_order
+):
+    """Turns a, b, c armed in that order (groups g1, g2, g1). Group g2 is capped
+    first, then g1, both to now: aiperf's own scheduler makes the moved handles
+    again in that order, so b fires first, then a and c. Without the aiperf send
+    order the first arming stands: a, b, c."""
+    if aiperf_order:
+        monkeypatch.setenv("COMPASS_HARNESS_SEND_ORDER", "aiperf")
+    else:
+        monkeypatch.delenv("COMPASS_HARNESS_SEND_ORDER", raising=False)
+
+    async def main():
+        clock = GrantingClock()
+        monkeypatch.setattr(ClockPacedLoopScheduler, "clock", clock)
+        scheduler = ClockPacedLoopScheduler()
+        fired = []
+
+        async def turn(k):
+            fired.append(k)
+
+        scheduler.schedule_later(100.0, turn("a"), group_id="g1")
+        scheduler.schedule_later(50.0, turn("b"), group_id="g2")
+        scheduler.schedule_later(200.0, turn("c"), group_id="g1")
+        scheduler.cap_pending_delay_for_group("g2", 0.0)
+        scheduler.cap_pending_delay_for_group("g1", 0.0)
+        for _ in range(200):
+            if len(fired) == 3:
+                break
+            await asyncio.sleep(0)
+            if clock.waits:
+                clock.grant()
+        return fired
+
+    want = ["b", "a", "c"] if aiperf_order else ["a", "b", "c"]
+    assert asyncio.run(main()) == want
