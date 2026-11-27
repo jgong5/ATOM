@@ -1303,15 +1303,15 @@ def fit_host(samples, queue=None, gated=None, stages=None) -> tuple[dict, dict]:
             spans = stages.get(s.provenance["run"], {}).get(s.step, ())
             if not spans:
                 continue
-            launch = launch_of(s) if launch_of is not None else s.launch
-            launch = {
-                f: (0 if f in step_labels.queue_columns([f]) else v) for f, v in launch.items()
+            feats = launch_of(s) if launch_of is not None else s.launch
+            feats = {
+                f: (0 if f in step_labels.queue_columns([f]) else v) for f, v in feats.items()
             }
             run = s.provenance["run"]
             if one:
                 last = max(x.step for x in kept) + 1
                 run = (run, s.step * RUN_BLOCKS // last)
-            rows += [(host_kind(s.view), "W_launch", _host_x(s), v, run, launch) for v in spans]
+            rows += [(host_kind(s.view), "W_launch", _host_x(s), v, run, feats) for v in spans]
     host = {"key": json.loads(keys[0]), "laws": {}}
     report = {"cut": {"idle": sum(s.idle for s in samples)}, "unfitted": {}}
     report["blocked"], report["unstamped"] = _blocked(samples)
