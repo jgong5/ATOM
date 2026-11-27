@@ -63,8 +63,13 @@ def test_the_switch_names_a_saturation_and_segments(monkeypatch):
     monkeypatch.delenv(HOST_QUEUE_ENV, raising=False)
     assert host_queue_spec() is None
     monkeypatch.setenv(HOST_QUEUE_ENV, "4:middle.E,prefill.E")
-    assert host_queue_spec() == (4, frozenset({"middle.E", "prefill.E"}))
-    for bad in ("middle.E", "0:middle.E", "4:"):
+    assert host_queue_spec() == {"middle.E": 4, "prefill.E": 4}
+    monkeypatch.setenv(HOST_QUEUE_ENV, "4:middle.E;128:middle.W_launch")
+    assert host_queue_spec() == {"middle.E": 4, "middle.W_launch": 128}
+    monkeypatch.setenv(HOST_QUEUE_ENV, "4:middle.E;8:middle.E")
+    with pytest.raises(ValueError, match="twice"):
+        host_queue_spec()
+    for bad in ("middle.E", "0:middle.E", "4:", "4:middle.E;"):
         monkeypatch.setenv(HOST_QUEUE_ENV, bad)
         with pytest.raises(ValueError, match="Q0:kind.segment"):
             host_queue_spec()

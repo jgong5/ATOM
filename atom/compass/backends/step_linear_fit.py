@@ -412,7 +412,8 @@ ADMIT_FORM_ENV = "COMPASS_FIT_ADMIT"
 #: spreads a rare long one over every forward (`_median_centred`).
 HOST_MEDIAN_ENV = "COMPASS_FIT_HOST_MEDIAN"
 #: The host segments that take a queue column (opt-in; unset: none),
-#: ``Q0:kind.segment,...`` (e.g. ``4:middle.E,middle.W_launch``): each listed
+#: ``Q0:kind.segment,...`` (e.g. ``4:middle.E,middle.W_launch``), groups with
+#: their own Q0 joined by ``;`` (``4:middle.E;128:middle.W_launch``): each listed
 #: segment's law gains ``queue_sat<Q0>`` (`step_labels.QUEUE_COLUMN`), what each
 #: request in the prefill engine's queue past none adds, up to Q0 of them
 #: (`step_labels.queue_depths` from the records' intake stamps; a run's
@@ -421,16 +422,23 @@ HOST_MEDIAN_ENV = "COMPASS_FIT_HOST_MEDIAN"
 HOST_QUEUE_ENV = "COMPASS_FIT_HOST_QUEUE"
 
 
-def host_queue_spec() -> tuple[int, frozenset] | None:
-    """`HOST_QUEUE_ENV`'s ``(Q0, segments)``; None unset. Raises when malformed."""
+def host_queue_spec() -> dict[str, int] | None:
+    """`HOST_QUEUE_ENV`'s segments, each to its Q0; None unset. Raises when
+    malformed or when a segment is listed twice."""
     value = os.environ.get(HOST_QUEUE_ENV, "")
     if not value:
         return None
-    q0, _, segments = value.partition(":")
-    segments = frozenset(x for x in segments.split(",") if x)
-    if not q0.isdigit() or int(q0) < 1 or not segments:
-        raise ValueError(f"{HOST_QUEUE_ENV}={value} is not Q0:kind.segment,...")
-    return int(q0), segments
+    out = {}
+    for group in value.split(";"):
+        q0, _, segments = group.partition(":")
+        segments = [x for x in segments.split(",") if x]
+        if not q0.isdigit() or int(q0) < 1 or not segments:
+            raise ValueError(f"{HOST_QUEUE_ENV}={value} is not Q0:kind.segment,...[;...]")
+        for x in segments:
+            if x in out:
+                raise ValueError(f"{HOST_QUEUE_ENV}={value} lists {x} twice")
+            out[x] = int(q0)
+    return out
 
 
 #: What a forward that admits requests spends once, per prompt token past the
@@ -1117,10 +1125,9 @@ def fit_host(samples, queue=None) -> tuple[dict, dict]:
         s for s in samples if (s.provenance["run"], s.rank, s.step) not in jit | after
     ]
     queued = host_queue_spec()
-    launch_of = column = None
+    launch_of = None
     if queued is not None:
-        q0, _ = queued
-        column = f"{step_labels.QUEUE_COLUMN}{q0}"
+        saturations = sorted(set(queued.values()))
 
         def launch_of(s):
             depth = (queue or {}).get(s.provenance["run"], {}).get(s.step)
@@ -1129,7 +1136,10 @@ def fit_host(samples, queue=None) -> tuple[dict, dict]:
                     f"{HOST_QUEUE_ENV}: {s.provenance['run']} step {s.step} has no "
                     "queue depth (its record's intake stamps)"
                 )
-            return {**s.launch, column: min(depth, q0)}
+            return {
+                **s.launch,
+                **{f"{step_labels.QUEUE_COLUMN}{n}": min(depth, n) for n in saturations},
+            }
 
     # One run holds out spans of its own steps to choose its launch columns.
     one = len({s.provenance["run"] for s in kept}) == 1
@@ -1147,9 +1157,10 @@ def fit_host(samples, queue=None) -> tuple[dict, dict]:
             members = [r for r in rows if r[:2] == (kind, segment) and r[3] > 0]
             try:
                 adopted, figures = _launch_columns(members, launch.features)
-                if column is not None and f"{kind}.{segment}" in queued[1]:
+                if queued is not None and (n := queued.get(f"{kind}.{segment}")):
+                    column = f"{step_labels.QUEUE_COLUMN}{n}"
                     adopted = [*adopted, column]
-                    figures = figures | {"queue": {"column": column, "Q0": queued[0]}}
+                    figures = figures | {"queue": {"column": column, "Q0": n}}
                 columns = [(f, [r[5][f] for r in members]) for f in adopted]
                 coef, fitted = _host_law(
                     [r[2] for r in members],
