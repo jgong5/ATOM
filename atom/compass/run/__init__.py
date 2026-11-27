@@ -2077,7 +2077,7 @@ def engine(config):
     ):
         _park_before_dispatch()
         if wake := dp_wake_s():
-            _wake_before_sync(wake)
+            _wake_before_pull(wake)
     rt = _runtime(lp, run, _member, _PublishedClock)
     rt.sampler = metrics.Sampler(
         rt, "engine", metrics.ROLES[side], _frontend_lp(config, run).name
@@ -2230,9 +2230,10 @@ def _park_before_dispatch() -> None:
     DPEngineCoreProc._sync_dp_state = synced
 
 
-#: The seconds a DP member of an engine offloading to a tier it looks requests
-#: up in takes, once its group was idle, from the input pull that brings it
-#: work to its DP state sync (`_wake_before_sync`); unset, empty or 0, none.
+#: The seconds each DP member of an engine offloading to a tier it looks
+#: requests up in waits back from its idle point, while its group was idle at
+#: its last DP state sync, before its input pull (`_wake_before_pull`); unset,
+#: empty or 0, none.
 DP_WAKE_ENV = "COMPASS_DP_WAKE_S"
 
 
@@ -2251,37 +2252,50 @@ def dp_wake_s() -> float:
     return seconds
 
 
-def _wake_before_sync(seconds: float) -> None:
-    """A DP member whose group was idle at its last DP state sync (none ran a
-    request) and that now holds work takes `seconds` before its next sync,
-    the time a real loop takes from the receive that wakes its group to the
-    step's entry. The tier lookup the engine's input thread offered at that
-    receive answers within it, so the member schedules the request at once,
-    its peers a DP dummy beside it, as the records' wakes mostly do; with
-    none, it schedules at the receive itself, the lookup still out, and the
-    whole group first runs an idle dummy (`COMPASS_IDLE_DP_GROUP_S`).
+def _wake_before_pull(seconds: float) -> None:
+    """While its DP group was idle at its last DP state sync (no rank ran a
+    request), a member back from its idle point waits `seconds` more there
+    before it pulls its input, the time a real loop takes from the receive
+    that wakes its group to the step's entry. The tier lookup the engine's
+    input thread offered at that receive answers within it, so the member
+    holding the request schedules it at once, its peers a DP dummy beside it,
+    as the records' wakes mostly do; with none it schedules at the receive
+    itself, the lookup still out, and the whole group first runs an idle
+    dummy (`COMPASS_IDLE_DP_GROUP_S`). Every member waits, each idle pass, at
+    the same rounds: the authority joins a group's rounds of one kind, so a
+    lone TAR before the sync's collective, where its peers make no call, would
+    never be granted. The wait counts as the pass's idle (`clock.idle`), so an
+    idle group still waits for its next event before the next one.
 
     #734 DeepSeek-V4.1 Cell B P (DP2, Mooncake Store): the calibration
     records' wakes on a short request, which no lookup holds, entered their
     step a median 1.34 ms after the receive (cal and addp, 233 wakes); on a
     request with a lookup, 12% of cal's and 15% of addp's wakes first ran a
     whole-group dummy, and the simulated wakes 85-100%. A member hands in the
-    clock of each wake under ``wakes``."""
+    clock each wait ended at under ``wakes``."""
     from atom.model_engine.engine_core import DPEngineCoreProc
 
     sync = DPEngineCoreProc._sync_dp_state
+    pull = DPEngineCoreProc.pull_and_process_input_queue
+
+    @functools.wraps(pull)
+    def pulled(self, *args, **kwargs):
+        rt = clock.installed()
+        if getattr(self, "_compass_group_idle", True) and rt is not None and rt.in_run:
+            until = rt.now + seconds
+            while rt.in_run and rt.now < until:
+                rt.next_event(until)
+            rt.idle_calls = rt.calls
+            rt.__dict__.setdefault("dp_wakes", []).append(rt.now)
+        return pull(self, *args, **kwargs)
 
     @functools.wraps(sync)
-    def synced(self, local_has_unfinished, *args, **kwargs):
-        rt = clock.installed()
-        idle = getattr(self, "_compass_group_idle", True)
-        if idle and local_has_unfinished and rt is not None and rt.in_run:
-            rt.advance_to(rt.now + seconds)
-            rt.__dict__.setdefault("dp_wakes", []).append(rt.now)
-        out = sync(self, local_has_unfinished, *args, **kwargs)
+    def synced(self, *args, **kwargs):
+        out = sync(self, *args, **kwargs)
         self._compass_group_idle = not out[0]
         return out
 
+    DPEngineCoreProc.pull_and_process_input_queue = pulled
     DPEngineCoreProc._sync_dp_state = synced
 
 
@@ -3636,7 +3650,7 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     """Hand in what the worker's steps cost and the memory it predicts, with
     `sections`, its command refusals and the engine's refused clock calls; a
     DP member that parked also hands in ``parks``: their count, CPU seconds, and
-    each park's clock and the clock it left at, and one that woke (`_wake_before_sync`)
+    each park's clock and the clock it left at, and one that woke (`_wake_before_pull`)
     ``wakes``, their count and clocks; a DP member hands in ``owed``,
     `LPRuntime.paid`. An engine whose offload
     scheduler keeps lookup counters hands in ``lookups``: its tier lookups,

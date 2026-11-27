@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""COMPASS_DP_WAKE_S (#734 Cell B): a DP member whose group was idle at its
-last DP state sync takes the wake's seconds before the sync that first
-carries its work, once a wake, and hands in their clocks; a member with
-none, or a group already busy, takes none; the variable is unset by default
+"""COMPASS_DP_WAKE_S (#734 Cell B): while its group was idle at its last DP
+state sync, a DP member back from its idle point waits the wake's seconds
+there (next_event, the rounds every member asks alike) before its input
+pull, and its next idle point waits as before; a busy group's member pulls
+at once; the waits' clocks are handed in. The variable is unset by default
 and refuses a negative or non-numeric value. No device."""
 
 import pytest
@@ -13,49 +14,58 @@ from atom.utils import clock
 
 
 class _Clock:
-    def __init__(self):
-        self.now, self.in_run, self.asked = 10.0, True, []
+    """An LP clock whose next_event grants an arrival at `arrivals` first."""
 
-    def advance_to(self, t):
+    def __init__(self, arrivals=()):
+        self.now, self.in_run, self.calls, self.idle_calls = 10.0, True, 0, 0
+        self.arrivals, self.asked = list(arrivals), []
+
+    def next_event(self, t):
+        self.calls += 1
         self.asked.append(t)
-        self.now = t
+        early = [a for a in self.arrivals if self.now < a < t]
+        self.now = min(early) if early else t
+        return self.now
 
 
-def _member(monkeypatch, peers_busy=()):
-    """A member under `_wake_before_sync(0.002)`, its sync answering the
-    group's state as MAX over its own and each of `peers_busy` in turn."""
-    busy = iter(peers_busy)
+def _member(monkeypatch, rt, group_busy):
+    """A member under `_wake_before_pull(0.002)`, its sync answering whether
+    the group is busy from `group_busy` in turn, its pull a no-op."""
+    busy = iter(group_busy)
+    pulls = []
 
     def sync(self, local, shutdown=False, held=False):
-        return (local or next(busy, False), shutdown, held)
+        return (next(busy), shutdown, held)
+
+    def pull(self):
+        pulls.append(rt.now)
+        return False
 
     monkeypatch.setattr(DPEngineCoreProc, "_sync_dp_state", sync)
-    rt = _Clock()
+    monkeypatch.setattr(DPEngineCoreProc, "pull_and_process_input_queue", pull)
     monkeypatch.setattr(clock, "installed", lambda: rt)
-    compass_run._wake_before_sync(0.002)
-    return DPEngineCoreProc.__new__(DPEngineCoreProc), rt
+    compass_run._wake_before_pull(0.002)
+    return DPEngineCoreProc.__new__(DPEngineCoreProc), pulls
 
 
-def test_a_member_that_wakes_its_idle_group_takes_the_wake_once(monkeypatch):
-    member, rt = _member(monkeypatch)
-    assert member._sync_dp_state(False) == (False, False, False)
-    assert rt.asked == []
-    # Its first sync with work after an idle one: the wake, then the sync.
-    assert member._sync_dp_state(True)[0] is True
-    assert rt.asked == [pytest.approx(10.002)]
-    # The group is busy now: no wake until it idles again.
-    member._sync_dp_state(True)
-    assert len(rt.asked) == 1
+def test_an_idle_group_s_member_waits_the_wake_before_its_pull(monkeypatch):
+    # An arrival (a lookup's reply) inside the wait: it is taken, and the
+    # wait goes on to its end.
+    rt = _Clock(arrivals=[10.0005])
+    member, pulls = _member(monkeypatch, rt, [False, True, False])
+    member.pull_and_process_input_queue()  # before any sync: idle
+    assert rt.asked == [pytest.approx(10.002), pytest.approx(10.002)]
+    assert pulls == [pytest.approx(10.002)] and rt.idle_calls == rt.calls
+    member._sync_dp_state(False)  # the group is idle: the next pull waits
+    member.pull_and_process_input_queue()
+    assert pulls[-1] == pytest.approx(10.004)
+    member._sync_dp_state(True)  # busy: the next pull does not wait
+    member.pull_and_process_input_queue()
+    assert pulls[-1] == pytest.approx(10.004) and len(rt.asked) == 3
+    assert rt.dp_wakes == [pytest.approx(10.002), pytest.approx(10.004)]
     member._sync_dp_state(False)
-    member._sync_dp_state(True)
-    assert rt.asked[-1] == pytest.approx(10.004) and rt.dp_wakes == rt.asked
-
-
-def test_a_peer_woken_by_another_member_takes_none(monkeypatch):
-    member, rt = _member(monkeypatch, peers_busy=(True, True))
-    member._sync_dp_state(False)  # a peer holds work: the group is busy
-    member._sync_dp_state(True)
-    assert rt.asked == []
+    member.pull_and_process_input_queue()
+    assert pulls[-1] == pytest.approx(10.006)
 
 
 def test_the_variable_is_off_by_default_and_refuses_bad_values(monkeypatch):
