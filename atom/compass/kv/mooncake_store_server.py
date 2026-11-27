@@ -97,6 +97,11 @@ CLIENT_RUN_FIELDS = ("clear_between_client_runs", "capacity_by_client_run")
 #: copy's seconds are its floor, ``store_floor_s`` or ``load_floor_s``
 #: (``[fixed, per chunk]``, one a rank where `PER_RANK`), plus, a window,
 #: ``stream_wait`` x the stage device's backlog when the window is enqueued.
+#: The simulated backlog is the head stage's (`mooncake_store.StoreShell`):
+#: ``stream_wait`` is a non-negative factor on it, or one a rank (`PER_RANK`)
+#: for the ranks of a pipelined prefill, whose later stages' hosts run further
+#: ahead of their devices than the head's (MiniMax-M3.1's CAL: stages 1 and 2
+#: wait 1.7-1.8 times stage 0's a window, stage 3 as long).
 #: Under the switch they price the copies in place of ``store_s`` and
 #: ``load_s``, whose fits hold the record's mean wait.
 STREAM_FIELDS = ("store_floor_s", "load_floor_s", "stream_wait")
@@ -116,6 +121,7 @@ PER_RANK = (
     "load_s",
     "store_floor_s",
     "load_floor_s",
+    "stream_wait",
     # Per-NIC pools (`mooncake_store.pools`): a master a pool, the writer
     # rank on the pool's NIC putting there (`Pools`).
     "capacity_bytes",
@@ -251,13 +257,15 @@ def check_entry(entry) -> argparse.Namespace:
                 f"{ENTRY}.{name} is {entry[name]!r}, not [fixed, per item] "
                 f"seconds, or one such a rank of world {world!r}"
             )
+    def factor(value) -> bool:
+        return isinstance(value, (int, float)) and 0.0 <= value < math.inf
+
     if stated and not (
-        isinstance(entry["stream_wait"], (int, float))
-        and 0.0 <= entry["stream_wait"] <= 1.0
+        factor(entry["stream_wait"]) or _ranked(entry, "stream_wait", factor)
     ):
         raise MooncakeStoreRefusal(
-            f"{ENTRY}.stream_wait is {entry['stream_wait']!r}, not a fraction of "
-            "the stage device's backlog"
+            f"{ENTRY}.stream_wait is {entry['stream_wait']!r}, not a non-negative "
+            f"factor on the head stage's backlog, or one a rank of world {world!r}"
         )
     if not entry["lookup_s"][0] > 0:
         raise MooncakeStoreRefusal(
@@ -344,7 +352,9 @@ def stream_terms(entry: dict) -> dict:
     return {
         "store_s": entry["store_floor_s"],
         "load_s": entry["load_floor_s"],
-        "stream_wait": float(entry["stream_wait"]),
+        "stream_wait": [
+            float(of_rank(entry, "stream_wait", k)) for k in range(entry["world"])
+        ],
     }
 
 

@@ -56,7 +56,7 @@ window there and waits for it (`fence_submitted_work`), so each window waits
 for the device work its stage's host had enqueued, then copies and puts or
 gets. A copy then takes the entry's floor, ``store_floor_s`` or
 ``load_floor_s`` over its chunks, in place of ``store_s`` or ``load_s``, whose
-fits hold the record's mean wait, plus ``stream_wait`` x the backlog
+fits hold the record's mean wait, plus the rank's ``stream_wait`` x the backlog
 (`DeviceQueue.reached`) once a window, over the windows ATOM cuts
 (`pool.window`): a load's every window, a save's those holding a chunk its
 request's last reply did not find. The backlog is the head stage's queue, its
@@ -731,8 +731,9 @@ class StoreShell:
             self._device.forget_before(window[0])
 
     def _stream_backlog(self, k: int, t: float) -> float:
-        """The seconds a window enqueued at `t` waits on its stage's stream."""
-        return self._stream_wait * (self._device.reached(t) - t)
+        """The seconds rank `k`'s window enqueued at `t` waits on its stage's
+        stream: its ``stream_wait`` x the head stage's backlog."""
+        return self._stream_wait[k] * (self._device.reached(t) - t)
 
     def _stream_windows(self, k: int, kind: str, req, chunks: int) -> int:
         """The windows of rank `k`'s copy of `req` that enqueue a copy on its

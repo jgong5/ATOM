@@ -1927,10 +1927,15 @@ def fit_stream_floors(logs, ranks, stream_wait: float = 1.0) -> tuple[dict, dict
     their windows; a line's floor seconds are its ``total_ms`` with its copy
     replaced by that floor times its windows, fitted by the host-law solver on
     ``(1, chunks)`` as ``store_s`` and ``load_s`` are. ``stream_wait``, the
-    share of a stage's backlog a window waits for, is stated, not fitted: all
-    of it, as the copy is ordered after every kernel its host enqueued."""
-    if not 0.0 <= stream_wait <= 1.0:
-        raise ValueError(f"stream_wait is a fraction, got {stream_wait}")
+    factor on the head stage's backlog a window waits for, is `stream_wait`
+    (stated: all of the backlog, as the copy is ordered after every kernel its
+    host enqueued) for the first of `ranks`, and for each other rank that times
+    its window-weighted mean wait over the first's (the copy milliseconds over
+    each line's floor, summed over saves and loads, over their windows): the
+    simulated backlog is the head stage's, and a later stage's host runs
+    further ahead of its device."""
+    if not 0.0 <= stream_wait:
+        raise ValueError(f"stream_wait is a non-negative factor, got {stream_wait}")
     lines: dict = {}
     for log in logs:
         for line in Path(log).read_text(errors="replace").splitlines():
@@ -1946,6 +1951,7 @@ def fit_stream_floors(logs, ranks, stream_wait: float = 1.0) -> tuple[dict, dict
                 (int(said[count]), n, float(said[copy]), float(said["total_ms"]))
             )
     entry, report = {}, {}
+    waited = {r: [0.0, 0.0] for r in ranks}  # rank -> [wait ms, windows]
     for law in ("store_floor_s", "load_floor_s"):
         each = []
         for r in ranks:
@@ -1954,6 +1960,8 @@ def fit_stream_floors(logs, ranks, stream_wait: float = 1.0) -> tuple[dict, dict
             if not len(staged):
                 raise ValueError(f"no copy line of rank {r} stages a window for {law}")
             floor = float(np.percentile(staged[:, 2] / staged[:, 1], 10))
+            waited[r][0] += float(np.maximum(staged[:, 2] - floor * staged[:, 1], 0).sum())
+            waited[r][1] += float(staged[:, 1].sum())
             seconds = (rows[:, 3] - rows[:, 2] + floor * rows[:, 1]) * 1e-3
             x = np.column_stack([np.ones(len(rows)), rows[:, 0]])
             term, rep = _host_law(x, seconds, ["fixed", "chunks"])
@@ -1961,7 +1969,11 @@ def fit_stream_floors(logs, ranks, stream_wait: float = 1.0) -> tuple[dict, dict
             each.append((term, rep))
         entry[law] = [t for t, _ in each] if len(ranks) > 1 else each[0][0]
         report[law] = {"ranks": [rep for _, rep in each]}
-    entry["stream_wait"] = float(stream_wait)
+    mean = {r: w / n for r, (w, n) in waited.items()}
+    first = mean[ranks[0]]
+    factors = [float(stream_wait) * (mean[r] / first if first > 0 else 1.0) for r in ranks]
+    entry["stream_wait"] = factors if len(ranks) > 1 else float(stream_wait)
+    report["stream_wait"] = {"mean_wait_ms_a_window": [mean[r] for r in ranks]}
     return entry, report
 
 
