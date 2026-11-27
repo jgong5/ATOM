@@ -79,12 +79,14 @@ from compass_harness.traffic_lp import (
     INTAKE_JITTER_BYTES,
     INTAKE_JITTER_SIGMA,
     PREFILL_URL_ENV,
+    SEND_ORDER_ENV,
     STREAM,
     ConnPool,
     SendAfterCancel,
     TrafficLP,
     UnansweredRequests,
     conn_pool_on,
+    send_order_aiperf,
 )
 from compass_harness.transport import addresses, credit_key
 
@@ -2287,3 +2289,31 @@ def test_the_router_hands_the_traffic_lp_each_credit_s_worker(ca, monkeypatch):
         _key(2): "worker_0",
     }
     assert tracked == [("worker_0", 0), ("worker_1", 1), ("worker_0", 2)]
+
+
+def test_in_aiperf_order_one_instant_s_turns_take_seqs_as_aiperf_sent_them(tmp_path):
+    """With aiperf_order the burst's turns take their seqs in the order aiperf
+    sent them, its credit issue order, whatever their ranks or a seed say; the
+    seqs and their arrival stay as they were, and a seed still draws jitters."""
+    for sends in (BURST, BURST[::-1], BURST[2:] + BURST[:2]):
+        for seed in (None, "1"):
+            got = _stamped(tmp_path, [sends], seed, aiperf_order=True)
+            assert [s[2:4] for s in got] == list(sends)
+            assert [s[:2] for s in got] == [(ADMIT, k) for k in range(len(BURST))]
+            assert all(len(s) == (6 if seed else 4) for s in got)
+
+
+@pytest.mark.parametrize("value, on", [(None, False), ("", False), ("aiperf", True)])
+def test_aiperf_send_order_is_on_only_for_aiperf(monkeypatch, value, on):
+    if value is None:
+        monkeypatch.delenv(SEND_ORDER_ENV, raising=False)
+    else:
+        monkeypatch.setenv(SEND_ORDER_ENV, value)
+    assert send_order_aiperf() is on
+
+
+@pytest.mark.parametrize("value", ["credit", "rank", "AIPERF"])
+def test_any_other_send_order_value_is_refused(monkeypatch, value):
+    monkeypatch.setenv(SEND_ORDER_ENV, value)
+    with pytest.raises(ValueError, match=SEND_ORDER_ENV):
+        send_order_aiperf()
