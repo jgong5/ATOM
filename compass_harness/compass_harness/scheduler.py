@@ -8,6 +8,7 @@ from the package ``__init__``.
 """
 
 import asyncio
+import contextvars
 import heapq
 import itertools
 import math
@@ -16,6 +17,15 @@ from aiperf.common.loop_scheduler import LoopScheduler
 from aiperf.timing.replay_dependencies import ReplayBarrierCoordinator
 
 from compass_harness.timesource import ClockTimer
+
+#: The order the scheduler fired the timer whose task is running, across every
+#: scheduler: a fired timer's task, and the tasks it starts, read it. The
+#: traffic LP under ``COMPASS_HARNESS_SEND_ORDER=aiperf`` stamps one instant's
+#: sends in it (`compass_harness.traffic_lp.TrafficLP.send`).
+FIRE_ORDER: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "compass_fire_order", default=None
+)
+_FIRED = itertools.count()
 
 
 class _Timer:
@@ -139,7 +149,12 @@ class ClockPacedLoopScheduler(LoopScheduler):
                 await self._wait[1]
                 self._wait = None
             else:
-                self._safe_callback([timer], coro)
+                # Its task copies the context here, so it reads its fire order.
+                token = FIRE_ORDER.set(next(_FIRED))
+                try:
+                    self._safe_callback([timer], coro)
+                finally:
+                    FIRE_ORDER.reset(token)
             await asyncio.sleep(0)
         self._queue.clear()
 

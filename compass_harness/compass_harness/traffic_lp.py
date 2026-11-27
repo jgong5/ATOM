@@ -132,9 +132,10 @@ PREFILL_URL_ENV = "COMPASS_HARNESS_PREFILL_URL"
 #: The seed of the order the requests sent at one instant are stamped in; unset
 #: or empty, they follow their ranks.
 SEND_ORDER_SEED_ENV = "COMPASS_HARNESS_SEND_ORDER_SEED"
-#: ``aiperf``: the requests sent at one instant take their seqs in the order
-#: aiperf sent them, its credit issue order, as the real client's sends go out;
-#: unset or empty, by rank or seed (`TrafficLP._place`).
+#: ``aiperf``: the requests sent at one instant take their seqs in aiperf's
+#: order, its scheduler's fire order of the timers that issued them, then credit
+#: order (`TrafficLP._aiperf_place`), as the real client's sends go out; unset or
+#: empty, by rank or seed (`TrafficLP._place`).
 SEND_ORDER_ENV = "COMPASS_HARNESS_SEND_ORDER"
 #: The median, in body bytes, of a seeded run's intake jitter (`TrafficLP.jitter`);
 #: unset or empty, `INTAKE_JITTER_BYTES`; 0, none.
@@ -237,8 +238,10 @@ class TrafficLP:
         # ingress: the encoding ingress in front of the HTTP channel, or None.
         self.rt, self.http, self.stream = rt, http, stream
         self.cancel_url, self.seed = cancel_url, seed
-        # aiperf_order: one instant's sends take seqs in aiperf's send order.
+        # aiperf_order: one instant's sends take seqs in aiperf's send order;
+        # each one's scheduler fire order, None for one no timer fired.
         self.aiperf_order = aiperf_order
+        self._fired: dict[tuple, int | None] = {}
         self.ingress = ingress
         # Behind an ingress: each sent request's body bytes, None for none, as
         # its worker reported it; and each open one's arrival past the ingress.
@@ -350,7 +353,9 @@ class TrafficLP:
 
     # ---- the router's side ----
 
-    def send(self, key: tuple, rank: tuple | None = None) -> None:
+    def send(
+        self, key: tuple, rank: tuple | None = None, fired: int | None = None
+    ) -> None:
         """Take one request for the HTTP channel, ranked `rank` among those
         sent at this instant (by default by `key`); the hold stamps it and
         publishes the stamp (`_stamp_sends`).
@@ -371,6 +376,8 @@ class TrafficLP:
             self._changed.set()
             raise refused
         self._unstamped.append((key if rank is None else rank, key))
+        if self.aiperf_order:  # the scheduler's fire order of its timer, if one
+            self._fired[key] = fired
         self._changed.set()
 
     def route(self, key: tuple, worker: str) -> None:
@@ -393,14 +400,14 @@ class TrafficLP:
         ``"new", True`` for one that takes no kept-alive connection, which
         they take in seq order, as aiperf's tasks take them in send order.
         With `aiperf_order` (`SEND_ORDER_ENV`) they take their seqs in the
-        order aiperf sent them instead, its credit issue order: #752 DeepSeek-V4.1
+        order aiperf sent them instead (`_aiperf_place`): #752 DeepSeek-V4.1
         Cell A v2's real client sends a 300 s burst in its credit issue order
         (Spearman +0.73..+0.77 with it in DEPA2 c512's three records, which
         agree with each other at +0.84..+0.89), and that order carries the
         trace: output length -0.21 in all three.
         """
         if self.aiperf_order:
-            ordered = self._unstamped
+            ordered = sorted(self._unstamped, key=self._aiperf_place)
         else:
             ordered = sorted(self._unstamped, key=lambda sent: self._place(sent[0]))
         for rank, key in ordered:
@@ -421,6 +428,16 @@ class TrafficLP:
                 more += ("start", start)
             self._pub.send_pyobj((key, arrival, seq, *more))
         self._unstamped.clear()
+
+    def _aiperf_place(self, sent: tuple) -> tuple:
+        """Where a send goes among one instant's in aiperf's order: by the order
+        aiperf's scheduler fired the timer that issued it, the order the real
+        client's due timers fire in (the order they were armed), then those no
+        timer fired, by credit number, the order aiperf issued them in. Its
+        tasks' later awaits, which wall time orders, move nothing."""
+        key = sent[1]
+        fired = self._fired.pop(key, None)
+        return (fired is None, fired or 0, key[2])
 
     def _unsized(self) -> list[tuple]:
         """Behind an ingress, the requests sent at this instant whose body

@@ -18,7 +18,7 @@ from aiperf.common.models.error_models import ErrorDetails
 from aiperf.credit.sticky_router import StickyCreditRouter
 
 from compass_harness.controller import TrafficDone
-from compass_harness.scheduler import ClockPacedLoopScheduler
+from compass_harness.scheduler import FIRE_ORDER, ClockPacedLoopScheduler
 from compass_harness.traffic_lp import ConnPool, TrafficLP, conn_pool_on
 from compass_harness.transport import credit_key
 
@@ -64,7 +64,7 @@ class CompassCreditRouter(StickyCreditRouter):
 
     async def send_credit(self, credit) -> None:
         key = credit_key(credit.phase, credit.phase_index, credit.id)
-        self.traffic.send(key, send_rank(credit))
+        self.traffic.send(key, send_rank(credit), FIRE_ORDER.get())
         # Upstream picks the worker and tracks it before its first await.
         self._routing = key
         await super().send_credit(credit)

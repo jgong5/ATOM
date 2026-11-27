@@ -637,3 +637,42 @@ def test_a_wake_with_nothing_due_reads_as_many_timers_with_2000_pending_as_with_
         return reads
 
     assert asyncio.run(reads_a_wake(2000)) == asyncio.run(reads_a_wake(10))
+
+
+def test_a_fired_timer_s_task_reads_its_fire_order_even_after_awaits_reorder_it(
+    monkeypatch,
+):
+    """Five turns armed at once fire together in arming order; each turn's task,
+    and a task it starts, reads its timer's fire order, whatever order their
+    awaits end in; a task no timer started reads none."""
+
+    async def main():
+        clock = GrantingClock()
+        monkeypatch.setattr(ClockPacedLoopScheduler, "clock", clock)
+        scheduler = ClockPacedLoopScheduler()
+        seen = {}
+
+        async def child(k):
+            seen[f"child{k}"] = scheduler_module.FIRE_ORDER.get()
+
+        async def turn(k):
+            for _ in range(5 - k):  # later-armed turns finish their awaits first
+                await asyncio.sleep(0)
+            seen[k] = scheduler_module.FIRE_ORDER.get()
+            await scheduler.execute_async(child(k))
+
+        for k in range(5):
+            scheduler.schedule_later(1.0, turn(k))
+        for _ in range(200):
+            if len(seen) == 10:
+                break
+            await asyncio.sleep(0)
+            if clock.waits:
+                clock.grant()
+        return seen, scheduler_module.FIRE_ORDER.get()
+
+    seen, outside = asyncio.run(main())
+    orders = [seen[k] for k in range(5)]
+    assert orders == sorted(orders) and len(set(orders)) == 5
+    assert [seen[f"child{k}"] for k in range(5)] == orders
+    assert outside is None
