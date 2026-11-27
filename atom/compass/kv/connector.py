@@ -121,7 +121,6 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata
-from atom.utils import envs
 
 logger = logging.getLogger(__name__)
 
@@ -842,6 +841,10 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                     continue
                 seq, left, latest = held
                 if ok and not ok[0]:
+                    # Not at the top: `atom.utils` loads torch, and importing
+                    # this package loads no device runtime.
+                    from atom.utils import envs
+
                     # Its writer failed: no stage writes it any more. Mooncake's
                     # consumer reports the failure once a write that may still
                     # land cannot (``ATOM_PD_FAILED_WRITE_HOLD_S``), and the
