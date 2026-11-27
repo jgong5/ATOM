@@ -446,6 +446,25 @@ def _host_lsq(ys, columns) -> tuple[list, dict]:
     }
 
 
+#: What a host fit takes for a first-use compile and leaves out (opt-in; unset:
+#: every forward whose W_launch the robust fit drops above its law, `_jit`):
+#: ``<seconds>``, a forward whose W_launch is over that only, as the stall gate
+#: takes a stall (1 s). P's CAL had 1560 forwards above the band, its host tail
+#: (W_launch p50 20 ms, mean 39), against a handful of compiles of seconds.
+JIT_OVER_ENV = "COMPASS_FIT_JIT_OVER"
+
+
+def jit_over_s() -> float | None:
+    """`JIT_OVER_ENV` in seconds; None unset. Raises when not a number."""
+    value = os.environ.get(JIT_OVER_ENV, "")
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        raise ValueError(f"{JIT_OVER_ENV}={value} is not seconds") from None
+
+
 #: Fit a pipeline head's `W_launch` on its forwards the IPC ring did not hold
 #: (opt-in; unset: every forward): ``<ms>``, a head forward whose last launch is
 #: at most that past stage 1's of the forward `SLOTS` back is left out
@@ -1234,7 +1253,14 @@ def fit_host(samples, queue=None, gated=None) -> tuple[dict, dict]:
                 f"{s.provenance['run']} step {s.step} launched {s.launch}, and "
                 f"its launch provider predicts {predicted}"
             )
-    jit = _jit(samples, launch.features)
+    if (over := jit_over_s()) is None:
+        jit = _jit(samples, launch.features)
+    else:
+        jit = {
+            (s.provenance["run"], s.rank, s.step)
+            for s in samples
+            if s.host.get("W_launch", 0) > over
+        }
     after = {(run, rank, n + 1) for run, rank, n in sorted(jit)}
     kept = [
         s for s in samples if (s.provenance["run"], s.rank, s.step) not in jit | after

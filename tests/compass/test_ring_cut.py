@@ -29,3 +29,15 @@ def test_the_switch_is_milliseconds(monkeypatch):
     monkeypatch.setenv(RING_CUT_ENV, "twenty")
     with pytest.raises(ValueError, match="milliseconds"):
         ring_cut_s()
+
+
+def test_the_jit_cut_takes_a_threshold_in_seconds(monkeypatch):
+    from atom.compass.backends.step_linear_fit import JIT_OVER_ENV, jit_over_s
+
+    monkeypatch.delenv(JIT_OVER_ENV, raising=False)
+    assert jit_over_s() is None
+    monkeypatch.setenv(JIT_OVER_ENV, "1.0")
+    assert jit_over_s() == 1.0
+    monkeypatch.setenv(JIT_OVER_ENV, "one")
+    with pytest.raises(ValueError, match="seconds"):
+        jit_over_s()
