@@ -53,15 +53,20 @@ def test_an_entry_may_state_its_stream_fields_and_a_rank_s_floors():
     assert stream_terms(e) == {
         "store_s": [1e-3, 1e-5],
         "load_s": [[1e-3, 1e-5], [3e-3, 3e-5]],
-        "stream_wait": 1.0,
+        "stream_wait": [1.0, 1.0],
     }
+    # A factor on the head stage's backlog, one a rank: a later stage waits longer.
+    ranked = _entry(world=2, **STREAM | {"stream_wait": [1.0, 1.75]})
+    check_entry(ranked)
+    assert stream_terms(ranked)["stream_wait"] == [1.0, 1.75]
 
 
 @pytest.mark.parametrize(
     "changed, match",
     [
         ({"store_floor_s": [1e-3, 1e-5]}, "and not all of"),
-        ({**STREAM, "stream_wait": 1.5}, "stream_wait is"),
+        ({**STREAM, "stream_wait": -0.5}, "stream_wait is"),
+        ({**STREAM, "stream_wait": [1.0, 2.0]}, "stream_wait is"),  # world 1
         ({**STREAM, "load_floor_s": [1e-3]}, "load_floor_s is"),
     ],
 )
@@ -127,7 +132,7 @@ def _shell(present=None, *, chunk=256, slots=8):
         _world=1,
         chunk=chunk,
         _device=DeviceQueue(),
-        _stream_wait=1.0,
+        _stream_wait=[1.0],
     )
     fake._chunks = functools.partial(StoreShell._chunks, fake)
     req = SimpleNamespace(
@@ -165,7 +170,7 @@ def test_the_backlog_is_the_head_stage_s_device_reach_of_what_it_enqueued():
     assert backlog(0, 1.0) == pytest.approx(2.0)
     assert backlog(0, 0.5) == pytest.approx(1.0)  # half launched: half its run
     assert backlog(0, 5.0) == 0.0  # the device caught up
-    fake._stream_wait = 0.5
+    fake._stream_wait = [0.5]
     assert backlog(0, 1.0) == pytest.approx(1.0)
 
 
@@ -225,3 +230,26 @@ def test_the_floors_take_each_copy_s_stream_wait_off_its_seconds(tmp_path):
         assert report[law]["ranks"][0]["copy_floor_ms_a_window"] == pytest.approx(0.5)
     assert floors["stream_wait"] == 1.0
     check_entry(_entry(**floors))
+
+
+def test_a_later_rank_s_factor_is_its_mean_wait_over_the_first_rank_s(tmp_path):
+    from atom.compass.backends.step_linear_fit import fit_stream_floors
+
+    lines = []
+    for r, wait in ((0, 10.0), (1, 25.0)):
+        for n in range(1, 9):
+            w = n * (n % 2)  # every other copy waits, a window at a time
+            lines.append(
+                copy_line("[OFFLOAD-SAVE-PROF]", n, rank=r, segments=n,
+                          pack_ms=0.5 * n + wait * w, total_ms=1.0 + 2.0 * n + 0.5 * n + wait * w)
+            )
+            lines.append(
+                copy_line("[OFFLOAD-LOAD-PROF]", n, rank=r, in_place_windows=n,
+                          unpack_ms=0.5 * n + wait * w, total_ms=3.0 + 1.0 * n + 0.5 * n + wait * w)
+            )
+    log = tmp_path / "p.log"
+    log.write_text("\n".join(lines) + "\n")
+    floors, report = fit_stream_floors([log], [0, 1])
+    assert floors["stream_wait"][0] == 1.0
+    assert floors["stream_wait"][1] == pytest.approx(2.5, rel=0.05)
+    check_entry(_entry(world=2, **floors))
