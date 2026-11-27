@@ -91,8 +91,14 @@ json.dump(d, open("/share_nfs/<you>/compass-pit2/space.json", "w"), indent=1)
 EOF
 ```
 
-Keep the shared files read-only: a new store, entry or network file goes in
-your own directory, named in your space file.
+Keep the shared files read-only.
+- Put the space file and OUT under `PIT2_DATA`: both containers mount it, and a
+  calibration writes into `OUT/cal/`.
+- A calibration publishes into the space file's `store`. Before calibrating a
+  new configuration, copy the store, 56 MB, and name the copy in your space file:
+  `cp -a /share_nfs/xingjche/m31pd/store $PIT2_DATA/store`. The copy keeps the
+  M3.1 laws and pit2's readings.
+- Likewise a new Store entry or network file goes in your own directory.
 
 ## 3. Run the search
 

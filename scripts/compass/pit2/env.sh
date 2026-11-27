@@ -41,7 +41,8 @@ for v in OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS; do
 done
 compass() { "$PIT2_TREE/scripts/compass/compass" "$@"; }
 # git runs as root on your files in a container: the reuse check reads the head.
-git config --global --add safe.directory "$PIT2_TREE" 2>/dev/null || true
+git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$PIT2_TREE" ||
+    git config --global --add safe.directory "$PIT2_TREE" 2>/dev/null || true
 # The address on the interface of the default route (eno0 on pit2-p03): a
 # calibration's Store and a real run's endpoints are this node's.
 pit2_node_ip() {
