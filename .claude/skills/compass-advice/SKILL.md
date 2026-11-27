@@ -252,8 +252,9 @@ What a row's state means:
 
 - **`the reuse check refuses: the frozen commit ... is not one of <ref>'s`**:
   `COMPASS_INTEGRATION_REF` must name a branch holding the space file's `commit`.
-  Until #4256 lands, that is `origin/pit2/m31pd-advice`, not `origin/pit2/m31pd`.
-  At the default `origin/feature/atomcompass_new`, the pit2 tree's digest is
+  `env.sh` sets `origin/pit2/m31pd`, which holds f1230b51a since #4256 merged;
+  `git fetch origin` first, as the check reads the ref as last fetched. Left at
+  `compass`'s default `origin/feature/atomcompass_new`, the pit2 tree's digest is
   refused.
 - **`OMP_NUM_THREADS`, `MKL_NUM_THREADS` or `OPENBLAS_NUM_THREADS` set in a
   search's or calibration's shell:** a law's key holds the performance
