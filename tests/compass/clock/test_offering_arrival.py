@@ -248,6 +248,27 @@ class FakeConn:
         return self.replies.pop(0)
 
 
+def test_no_offering_message_goes_ahead_of_an_lp_without_members():
+    """An NER asking ahead takes no message on an offering channel past its
+    grant: its handler offers a send stamped at its arrival, and a TAR granted
+    past a message gone ahead backdated that send (M3.1 A c=64, seed 1:
+    engine-P-pp0's Store lookup at 1921.1360, behind its clock 1921.1604). The
+    ceiling stops at the arrival, and the TAR reaching it is granted it first."""
+    ca = _ca(ceilings=True)
+    ctl = "frontend->engine:control#dp0"
+    assert ca.on_request(ENGINE, NER, INF, [], ahead=True) == []
+    log = [(ctl, 0, 0.3), (req(), 0, 0.3001)]
+    [(lp, g, released)] = ca.on_request(FRONTEND, NER, INF, log)
+    assert (lp, g) == (ENGINE, 0.3)
+    assert released[ctl] == [(0, 0.3)] and not released[req()]
+    assert released.ceiling == 0.3001
+    [(lp, g, released)] = ca.on_request(ENGINE, TAR, 1.0, [])
+    assert (lp, g, released[req()]) == (ENGINE, 0.3001, [(0, 0.3001)])
+    # The lookup its handler offered there registers; the TAR asks again.
+    replies = ca.on_request(ENGINE, TAR, 1.0, [(look(), 0, 0.3001 + IPC)])
+    assert _grants(replies) == [("lmcache", 0.3001 + IPC)]
+
+
 def _runtime(*replies, member=None):
     """An engine runtime on a scripted authority, its owner a thread, and
     `call(fn, *args)`, which runs fn there."""
