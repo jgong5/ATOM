@@ -17,6 +17,7 @@ from atom.compass.parity import (
     key_memory_formats_by_name,
     moe_keys,
     record_step,
+    save_stamps,
 )
 from atom.compass.run import host_key
 from atom.model_engine.model_runner import ModelRunner, RapidServeModelRunner
@@ -31,6 +32,8 @@ class _Recording(StepRecording):
     def __init__(self, *args, **kwargs) -> None:
         # Under `moe_keys.ENV`, aiter's MoE tuning lookups are logged from the model's load on.
         moe_keys.install(self, os.environ[ENV])
+        # Under `save_stamps.ENV`, each KV offload copy is stamped at its submit, start and end.
+        save_stamps.install(os.environ[ENV])
         super().__init__(*args, **kwargs)
         # Read once at startup, so no forward pays for it.
         self.host_key = host_key(self.config)
