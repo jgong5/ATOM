@@ -422,6 +422,30 @@ HOST_MEDIAN_ENV = "COMPASS_FIT_HOST_MEDIAN"
 HOST_QUEUE_ENV = "COMPASS_FIT_HOST_QUEUE"
 
 
+#: The host segments priced at their samples' mean (opt-in; unset: none), a
+#: comma list of ``kind.segment``: a non-negative least squares of the labels on
+#: the constant and the segment's columns (a queue column among them), with no
+#: relative weighting and no MAD round, so the tail a robust centre leaves out
+#: is priced (P's head W_launch on the CAL, ring-held forwards cut: p50 20 ms at
+#: every queue, mean 27 ms at a queue of 1 and 51 at 64 and more), the token and
+#: sequence terms 0 (`_host_lsq`).
+HOST_LSQ_ENV = "COMPASS_FIT_HOST_LSQ"
+
+
+def _host_lsq(ys, columns) -> tuple[list, dict]:
+    """`HOST_LSQ_ENV`'s law of a segment's labels `ys` on the constant and its
+    `columns` (name, values per label): ``[c, 0, 0, *column coefficients]`` and
+    its report."""
+    from scipy.optimize import nnls
+
+    y = np.asarray(ys, float)
+    x = np.column_stack([np.ones(len(y)), *(np.asarray(v, float) for _, v in columns)])
+    c = nnls(x, y)[0]
+    return [float(c[0]), 0.0, 0.0, *map(float, c[1:])], {
+        "lsq": {"samples": len(y), "mean": float(y.mean()), "priced_mean": float((x @ c).mean())}
+    }
+
+
 #: Fit a pipeline head's `W_launch` on its forwards the IPC ring did not hold
 #: (opt-in; unset: every forward): ``<ms>``, a head forward whose last launch is
 #: at most that past stage 1's of the forward `SLOTS` back is left out
@@ -1242,6 +1266,7 @@ def fit_host(samples, queue=None, gated=None) -> tuple[dict, dict]:
     for run, _, n in sorted(jit):
         report["jit_steps"].setdefault(run, []).append(n)
     centred = {x for x in os.environ.get(HOST_MEDIAN_ENV, "").split(",") if x}
+    meaned = {x for x in os.environ.get(HOST_LSQ_ENV, "").split(",") if x}
     for kind in HOST_KINDS:
         extra = sorted({r[1] for r in rows if r[0] == kind} - set(HOST_SEGMENTS))
         for segment in HOST_SEGMENTS[: 3 if kind == "middle" else 4] + tuple(extra):
@@ -1261,6 +1286,9 @@ def fit_host(samples, queue=None, gated=None) -> tuple[dict, dict]:
                 )
                 if f"{kind}.{segment}" in centred:
                     coef, fitted = _median_centred(list(coef), fitted)
+                if f"{kind}.{segment}" in meaned:
+                    coef, lsq = _host_lsq([r[3] for r in members], columns)
+                    fitted = fitted | lsq
             except (ValueError, QhullError) as e:
                 report["unfitted"][f"{kind}.{segment}"] = str(e).splitlines()[0]
                 continue

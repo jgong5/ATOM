@@ -129,3 +129,14 @@ def test_the_head_prices_a_queue_column_and_a_later_stage_takes_none():
             columns={"middle": {"E": {"graphs": 0.001}}},
             launch=(types.SimpleNamespace(features=("graphs",)), None),
         )
+
+
+def test_a_segment_on_its_mean_prices_its_tail():
+    from atom.compass.backends.step_linear_fit import _host_lsq
+
+    ys = [0.020] * 9 + [0.200]  # a robust centre prices 20 ms; the mean is 38 ms
+    coef, report = _host_lsq(ys, [])
+    assert coef == pytest.approx([0.038, 0.0, 0.0]) and report["lsq"]["samples"] == 10
+    # With a queue column: the conditional mean at each queue.
+    coef, _ = _host_lsq([0.02, 0.02, 0.05, 0.05], [("queue_sat8", [1, 1, 8, 8])])
+    assert coef[0] + coef[3] * 1 == pytest.approx(0.02) and coef[0] + coef[3] * 8 == pytest.approx(0.05)
