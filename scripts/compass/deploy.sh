@@ -93,6 +93,9 @@
 # among it, with its command's log beside it; router.log; and, once the router
 # answers, server.json as `compass run` writes one: the router's URL, the
 # process id of a child of this script, the run file and the clock endpoint.
+# Simulated, a --dp-aware router must also have counted every DP rank of the
+# instances (atom/compass/drive/router_workers.py), or the script exits 1,
+# naming its count, before server.json.
 # The authority writes the step table, the run summaries and the hand-ins in
 # OUT. A client drives the deployment through server.json as it drives one
 # server (client.sh); no client starts here. It serves until SIGTERM or SIGINT,
@@ -476,6 +479,12 @@ fi
 (ulimit -n "$(ulimit -Hn)" 2>/dev/null || true; exec env "${router_env[@]}" "${ROUTER[@]}") >"$OUT/router.log" 2>&1 &
 R=$!
 compass_wait_up router $R "http://127.0.0.1:$ROUTER_PORT/v1/models"
+# Simulated, a --dp-aware router serves only once it has counted every worker
+# its routes need, each instance's DP ranks: one that counted fewer fails each
+# request on a rank registered later after its relay is stamped.
+if [[ -n $RUN_FILE && " ${router[*]} " == *" --dp-aware "* ]]; then
+    why=$(python3 -m atom.compass.drive.router_workers "$RUN_FILE" "$OUT/router.log" 2>&1) || fail "$why"
+fi
 # A stop from here on, one server.json's reader sends included, also stops the
 # prefill instances, so the wait below ends even when the stop comes before it:
 # each here by a SIGTERM, each elsewhere through its prefix, as the stop below

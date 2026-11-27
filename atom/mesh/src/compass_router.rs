@@ -29,7 +29,9 @@
 //! ([`ingress`]). A request is handled apart from its client's connection, so
 //! a hang-up drops only the response; a prefill response read after its
 //! request's cancel sends nothing on. The cancel drops the loads its request
-//! still holds, as a hang-up drops them in a router outside a run.
+//! still holds, as a hang-up drops them in a router outside a run. A request
+//! answered with a failure once its relay has gone to decode ends the run,
+//! naming the failure: decode would wait on the clock for it.
 
 use std::{
     cell::RefCell,
@@ -368,6 +370,28 @@ impl Lp {
         }
         StatusCode::NO_CONTENT.into_response()
     }
+
+    /// `response`, the answer to the request with seq `seq` on
+    /// `traffic->router:http`, unless it fails a request whose relay went to
+    /// decode: decode then waits on the clock for the request that relay
+    /// names, which never comes, so the run ends here, naming the failure.
+    async fn answered(&self, seq: u64, response: Response) -> Response {
+        if response.status().is_success() {
+            return response;
+        }
+        let relayed = (self.requests.lock().get(&seq))
+            .filter(|at| kind(&at.channel) == "relay")
+            .map(|at| (at.channel.clone(), at.seq));
+        let Some((channel, relay)) = relayed else {
+            return response;
+        };
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16).await;
+        fail(format!(
+            "request {seq} failed {status} after its relay went on {channel} as seq {relay}: {}",
+            String::from_utf8_lossy(&body.unwrap_or_default())
+        ))
+    }
 }
 
 /// The seq a cancel's body `{"compass_cancel": <seq>}` names; None for any other body.
@@ -424,9 +448,10 @@ pub async fn ingress(request: Request, next: Next) -> Response {
             ..Default::default()
         };
         let request = Request::from_parts(parts, Body::from(body));
-        REQUEST
+        let response = REQUEST
             .scope(RefCell::new(handling), next.run(request))
-            .await
+            .await;
+        lp.answered(seq, response).await
     });
     handled
         .await
