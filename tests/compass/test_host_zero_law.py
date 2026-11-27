@@ -13,10 +13,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from test_backend_step_linear_fit import HOST
-from test_dummy_host import _samples, planted  # noqa: F401
+from test_dummy_host import SETS, _dummy_batch, _samples, planted  # noqa: F401
 from test_mtp_prepare_split import INPUTS, _mtp_record
 
 from atom.compass import run as compass_run
+from atom.compass.backends.launch_features import GRAPHS, stated
 from atom.compass.backends.step_linear_fit import (
     DUMMY,
     HOST_FEATURES,
@@ -78,9 +79,27 @@ def test_a_dummy_segment_whose_every_label_is_0_fits_a_zero_law():
     host, report = fit_host(samples)
 
     assert host["laws"][DUMMY][MTP_SEGMENT] == [0.0] * len(HOST_FEATURES)
-    assert MTP_SEGMENT not in host["columns"][DUMMY]
     assert report[f"{DUMMY}.{MTP_SEGMENT}"] == {
         "samples": 80,
         "zero": list(HOST_FEATURES),
+        "forwards": 0,
     }
     assert host["laws"][DUMMY]["W_pre"] == pytest.approx([1e-3, 0, 0], rel=0.02)
+
+    # Beside a decode `W_inputs` law that adopts the eager column, an eager
+    # dummy is charged no `W_inputs`, and an eager decode its column.
+    host["laws"]["decode"][MTP_SEGMENT] = [1e-3, 0.0, 0.0]
+    host["columns"].setdefault("decode", {})[MTP_SEGMENT] = {"eager": 0.02}
+    launch = stated({"engine": {GRAPHS: SETS}})
+    rec = HostDeviceRecurrence(
+        host["laws"],
+        [MTP_COPY],
+        lambda: 0.0,
+        mtp=True,
+        columns=host["columns"],
+        launch=launch,
+    )
+    rec.charge(_dummy_batch(True, 1.0), 0.01, 0.0)
+    assert rec.segments[MTP_SEGMENT] == 0.0
+    rec.charge(_dummy_batch(False, 1.0), 0.01, 0.0)
+    assert rec.segments[MTP_SEGMENT] == pytest.approx(0.021)

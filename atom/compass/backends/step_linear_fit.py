@@ -717,8 +717,9 @@ def _fit_dummy(samples, launch, graphs, host, report) -> None:
     about 2 ms replayed, 27 ms past the largest prefill token graph or on an
     eager tail, 51 ms on both), so no held-out choice is made. A dummy whose
     features `launch` predicts otherwise than its line states refuses, as a
-    sample does; a segment whose every label is 0 fits a zero law
-    (`_zero_law`), and one too few dummies give is named under `unfitted`."""
+    sample does; a segment whose every label is 0 fits a zero law, its
+    columns 0 too (`_zero_law`), and one too few dummies give is named under
+    `unfitted`."""
     from scipy.spatial import QhullError
 
     held = {}
@@ -735,10 +736,6 @@ def _fit_dummy(samples, launch, graphs, host, report) -> None:
             )
     for segment in step_labels.DUMMY_SEGMENTS:
         labels = [h[segment] for _, _, h, _ in rows if segment in h]
-        if zero := _zero_law(labels):
-            law, report[f"{DUMMY}.{segment}"] = zero
-            host["laws"].setdefault(DUMMY, {})[segment] = law
-            continue
         members = [
             (_host_x_view(view), h[segment], observed)
             for _, view, h, observed in rows
@@ -746,7 +743,7 @@ def _fit_dummy(samples, launch, graphs, host, report) -> None:
         ]
         columns = [(f, [m[2][f] for m in members]) for f in launch.features]
         try:
-            coef, fitted = _host_law(
+            coef, fitted = _zero_law(labels, columns) or _host_law(
                 [m[0] for m in members],
                 [m[1] for m in members],
                 HOST_FEATURES,
@@ -762,12 +759,13 @@ def _fit_dummy(samples, launch, graphs, host, report) -> None:
         report[f"{DUMMY}.{segment}"] = fitted | {"forwards": len(members)}
 
 
-def _zero_law(labels) -> tuple[list, dict] | None:
-    """A segment's law, every coefficient 0, and its report, where its forwards'
-    `labels` are all 0; None where it has none or some label is not 0."""
+def _zero_law(labels, columns=()) -> tuple[list, dict] | None:
+    """A segment's law, every coefficient 0, each of `columns` following as
+    `_host_law`'s do, and its report, where its forwards' `labels` are all 0;
+    None where it has none or some label is not 0."""
     if labels and not any(labels):
         report = {"samples": len(labels), "zero": list(HOST_FEATURES)}
-        return [0.0] * len(HOST_FEATURES), report
+        return [0.0] * (len(HOST_FEATURES) + len(columns)), report
     return None
 
 
