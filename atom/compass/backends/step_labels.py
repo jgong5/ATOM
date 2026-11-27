@@ -143,9 +143,9 @@ spent in HIP's blocking calls, there waiting on the device; a line without
 `blocked_ns` gives its wall time; `W_post` from that wait's end to the exit,
 less the draft copy wait, and a middle chunk has none. With an MTP status wait
 before the launch, `W_pre` ends at it and `W_inputs` runs from it to the launch;
-one stamped after the launch (MiniMax-M3.1's DSpark prefill forward waits on it
-after its launch) is no part of the window before it: `W_pre` then runs to the
-launch, and `W_inputs` is 0. On a later
+one stamped after the launch (MiniMax-M3.1's and DeepSeek-V4.1's DSpark prefill
+forward with output waits on it after its launch) is no part of the window
+before it: `W_pre` then runs to the launch, and `W_inputs` is 0. On a later
 pipeline stage, `W_recv` runs from the launch to the receive of its input, and
 `W_launch` leaves out that receive, a wait for the stage before's send.
 Where the record stamps input pulls (`dp<r>.pulls.jsonl`), `E` runs from the

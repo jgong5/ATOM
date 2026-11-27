@@ -99,7 +99,8 @@ and the host key's `engine` is the law's `engine_config`; the host key's
 ``fit_src`` is the laws' own digest (`fit_src`), as `compass fit host` keys
 them. A segment outside `HOST_SEGMENTS` is
 fitted for a kind whose samples carry it: `W_inputs` and `L_mtp`, on an MTP
-record, and `W_recv`, on a later pipeline stage's. A forward whose `W_launch` its kind's
+record, and `W_recv`, on a later pipeline stage's. Any segment whose every
+label is 0 fits a zero law (`_zero_law`). A forward whose `W_launch` its kind's
 solve drops above the law paid a first-use JIT compile (`_jit`): it and the
 forward after it, whose period takes up the stall, are left out of every host
 law; the report lists the JIT forwards per run under `jit_steps`. A `W_launch`
@@ -669,6 +670,11 @@ def fit_host(samples) -> tuple[dict, dict]:
     for kind in HOST_KINDS:
         extra = sorted({r[1] for r in rows if r[0] == kind} - set(HOST_SEGMENTS))
         for segment in HOST_SEGMENTS[: 3 if kind == "middle" else 4] + tuple(extra):
+            labels = [r[3] for r in rows if r[:2] == (kind, segment)]
+            if zero := _zero_law(labels):
+                law, report[f"{kind}.{segment}"] = zero
+                host["laws"].setdefault(kind, {})[segment] = law
+                continue
             members = [r for r in rows if r[:2] == (kind, segment) and r[3] > 0]
             try:
                 adopted, figures = _launch_columns(members, launch.features)
@@ -711,7 +717,8 @@ def _fit_dummy(samples, launch, graphs, host, report) -> None:
     about 2 ms replayed, 27 ms past the largest prefill token graph or on an
     eager tail, 51 ms on both), so no held-out choice is made. A dummy whose
     features `launch` predicts otherwise than its line states refuses, as a
-    sample does; a segment too few dummies give is named under `unfitted`."""
+    sample does; a segment whose every label is 0 fits a zero law
+    (`_zero_law`), and one too few dummies give is named under `unfitted`."""
     from scipy.spatial import QhullError
 
     held = {}
@@ -727,6 +734,11 @@ def _fit_dummy(samples, launch, graphs, host, report) -> None:
                 f"launch provider predicts {predicted}"
             )
     for segment in step_labels.DUMMY_SEGMENTS:
+        labels = [h[segment] for _, _, h, _ in rows if segment in h]
+        if zero := _zero_law(labels):
+            law, report[f"{DUMMY}.{segment}"] = zero
+            host["laws"].setdefault(DUMMY, {})[segment] = law
+            continue
         members = [
             (_host_x_view(view), h[segment], observed)
             for _, view, h, observed in rows
@@ -748,6 +760,15 @@ def _fit_dummy(samples, launch, graphs, host, report) -> None:
             c = dict(zip(launch.features, coef[len(HOST_FEATURES) :]))
             host.setdefault("columns", {}).setdefault(DUMMY, {})[segment] = c
         report[f"{DUMMY}.{segment}"] = fitted | {"forwards": len(members)}
+
+
+def _zero_law(labels) -> tuple[list, dict] | None:
+    """A segment's law, every coefficient 0, and its report, where its forwards'
+    `labels` are all 0; None where it has none or some label is not 0."""
+    if labels and not any(labels):
+        report = {"samples": len(labels), "zero": list(HOST_FEATURES)}
+        return [0.0] * len(HOST_FEATURES), report
+    return None
 
 
 def _host_x_view(view) -> tuple[int, int, int]:
