@@ -518,6 +518,55 @@ def admissions(lines: list[dict]) -> list[tuple[int, int, int]]:
     return out
 
 
+#: The host-law column of a prefill engine's queue (opt-in,
+#: `step_linear_fit.HOST_QUEUE_ENV`), named with its saturation: ``queue_sat<Q0>``
+#: holds min(queue, Q0) (`queue_depths`, `QueueDepth`).
+QUEUE_COLUMN = "queue_sat"
+
+
+def queue_columns(names) -> dict[str, int]:
+    """The queue columns among `names`, each to its saturation Q0."""
+    return {
+        n: int(n[len(QUEUE_COLUMN) :])
+        for n in names
+        if n.startswith(QUEUE_COLUMN) and n[len(QUEUE_COLUMN) :].isdigit()
+    }
+
+
+def queue_depths(sends_ns, lines) -> dict[int, int]:
+    """Per step of `lines` (one rank record's lines, in order), its queue: the
+    requests handed to the engine before the step entered (`sends_ns`, the
+    intake stamps' ``send`` ends, sorted) less those a line before it named
+    (each named once, at its prompt's final chunk), the requests it runs among
+    them. A dummy line has none. `QueueDepth` counts the same in a run."""
+    done, out = 0, {}
+    for s in lines:
+        if s["is_dummy_run"]:
+            continue
+        out[s["step"]] = bisect.bisect_left(sends_ns, s["t_enter_ns"]) - done
+        done += len(s.get("named") or ())
+    return out
+
+
+class QueueDepth:
+    """`queue_depths` as a run counts it, one batch at a time, from what the
+    engine had taken (its scheduler's arrivals as it scheduled the batch) and
+    the batches before: `at` is the queue before a batch, the arrivals less the
+    requests an earlier batch finished, a row at its prompt's final chunk named
+    once as the record's lines name it (`parity`); it then counts the batch's."""
+
+    def __init__(self) -> None:
+        self.named: set = set()
+
+    def at(self, arrived: int, req_ids, final) -> int:
+        """The queue before a batch of `req_ids`, whose row i is at its prompt's
+        final chunk when `final[i]` (None: no row is), `arrived` requests in."""
+        q = arrived - len(self.named)
+        if final is not None:
+            self.named.update(r for r, f in zip(req_ids, final) if f)
+        return q
+
+
 def admit_x(admitted: tuple) -> tuple[int, int, int]:
     """The `admit` law's features of a forward's `admitted`: 1 if it admits a
     request, then the prompt tokens past the hits and within them, summed over

@@ -405,13 +405,39 @@ class HostDeviceRecurrence:
                 "posts its receive at a prepare end `pp_recv_posted` prices "
                 "without its forward's path"
             )
+        # A queue column (`step_labels.QUEUE_COLUMN`, fitted under
+        # `HOST_QUEUE_ENV`) is no launch feature: a run's batch states it
+        # (`compass_arrived`). The head prices it; a later stage, which posts
+        # its receive at a prepare end `pp_recv_posted` prices without columns
+        # and whose host cost on the CAL does not follow the queue, takes none.
+        from atom.compass.backends.step_labels import queue_columns
+
+        queued = bool(
+            queue_columns({f for v in self.columns.values() for c in v.values() for f in c})
+        )
+        if queued and stage is not None and stage[0] > 0:
+            kept = {
+                k: {
+                    s: {f: c for f, c in cols.items() if f not in queue_columns(cols)}
+                    for s, cols in v.items()
+                }
+                for k, v in self.columns.items()
+            }
+            self.columns = {
+                k: {s: cols for s, cols in v.items() if cols}
+                for k, v in kept.items()
+                if any(v.values())
+            }
         named = {f for v in self.columns.values() for c in v.values() for f in c}
+        named -= set(queue_columns(named))
+        # Without a queue column, as before it: any column predicts the launch features.
+        self._launch_columns = bool(named) if queued else bool(self.columns)
         if lacks := sorted(named - set(getattr(launch[0], "features", ()))):
             raise ValueError(
                 f"the host laws adopt launch features {lacks}, which this model's "
                 f"launch provider, {type(launch[0]).__name__}, does not declare"
             )
-        if self.columns and stage is not None:
+        if (named if queued else self.columns) and stage is not None:
             raise ValueError(
                 "the host laws adopt launch columns, and a pipeline stage posts "
                 "its receive at a prepare end `pp_recv_posted` prices without them"
@@ -532,11 +558,20 @@ class HostDeviceRecurrence:
             return {**self.paths.get("decode", {}), **self.paths.get(kind, {})}
         return self.paths.get(kind, {})
 
+    def queue_columns(self) -> dict[str, int]:
+        """The queue columns (`step_labels.queue_columns`) any law names, each to
+        its saturation; none on a law fitted without `HOST_QUEUE_ENV`."""
+        from atom.compass.backends.step_labels import queue_columns
+
+        return queue_columns(
+            {f for kind in self.columns.values() for cols in kind.values() for f in cols}
+        )
+
     def predicted(self, view: Any) -> dict:
         """A step's launch features by `launch`'s provider, from its
         `BatchView` `view`; none where no law adopts a column."""
         provider, graphs = self.launch
-        return provider.predict(view, graphs) if self.columns else {}
+        return provider.predict(view, graphs) if self._launch_columns else {}
 
     def path(self, view: Any) -> str | None:
         """A step's launch path (`launch_features.path`) from its `BatchView`
@@ -2440,6 +2475,23 @@ def _group_step_seconds(
             view = dataclasses.replace(view, prefill_duty=duty.at(entered))
         if isinstance(host, HostDeviceRecurrence):
             batch.compass_launch = host.predicted(view)
+            if queued := host.queue_columns():
+                # `step_labels.QueueDepth`: the queue before this batch, from the
+                # requests the engine had taken as it scheduled it
+                # (`compass_arrived`, `run.engine_loop` under QUEUE_ENV); with
+                # none stamped the column stays missing and the forward refused.
+                from atom.compass.backends.step_labels import QueueDepth
+                from atom.compass.runner.projection import is_dummy
+
+                depth = vars(runner).setdefault("_queue_depth", QueueDepth())
+                arrived = getattr(batch, "compass_arrived", None)
+                if arrived is not None and not is_dummy(batch):
+                    q = depth.at(arrived, batch.req_ids, batch.is_final_chunk)
+                    batch.compass_queue = q
+                    batch.compass_launch = {
+                        **batch.compass_launch,
+                        **{c: min(q, n) for c, n in queued.items()},
+                    }
             batch.compass_path = host.path(view)
             batch.compass_dummy = bool(view.dp_dummy and view.prefill)
         cost = backend.price(view)
@@ -2561,6 +2613,8 @@ def _group_step_seconds(
         "draft_s": draft_s,
         **({"replayed_stall_s": stall_s} if stall_s else {}),
         **({"launch_stall_s": first_s} if first_s else {}),
+        # The queue a law's queue column priced it at (`step_labels.QueueDepth`).
+        **({"queue": batch.compass_queue} if hasattr(batch, "compass_queue") else {}),
         "charge_s": charge_s,
         "group_s": group_s,
         "terms": [

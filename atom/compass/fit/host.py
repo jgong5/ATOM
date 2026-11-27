@@ -75,6 +75,7 @@ from atom.compass.backends.step_labels import (
     digest,
     group_prefills,
     launch_stall_on,
+    queue_depths,
     record_ranks,
     stall_entry,
     stall_prices,
@@ -83,6 +84,7 @@ from atom.compass.backends.step_linear_fit import (
     fit_hops,
     fit_host,
     fit_intake,
+    host_queue_spec,
     fit_relay,
     fit_stream,
     fit_tokenizer,
@@ -98,6 +100,27 @@ from atom.compass.run import INTAKE_RECORD, LOCAL, TOKENIZER_RECORD
 from atom.compass.validate.runs import SIDES
 
 PROG = "compass fit host"
+
+
+def record_queue_depths(records) -> dict[str, dict[int, int]]:
+    """Per rank record (`digest`) of each record directory in
+    `records` that stamped its intake, its steps' queue depths
+    (`queue_depths` over its ``send`` stamps)."""
+    out = {}
+    for r in records:
+        steps = Path(r) / "steps"
+        stamps = steps / INTAKE_RECORD
+        if not stamps.is_file():
+            continue
+        sends = sorted(
+            int(w[0])
+            for w in (line.split() for line in stamps.read_text().splitlines())
+            if len(w) > 2 and w[2] == "send"
+        )
+        for rank in sorted(steps.glob("*dp*[0-9].jsonl")):
+            lines = [json.loads(x) for x in rank.read_text().splitlines() if x.strip()]
+            out[digest(rank)] = queue_depths(sends, lines)
+    return out
 
 
 def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, dict]:
@@ -133,7 +156,10 @@ def host_laws(samples, records=(), client_runs=(), steady=None) -> tuple[dict, d
                     f"its lines; steps/{name + LOCAL} names the file that holds "
                     f"them, {named.read_text().strip()}"
                 )
-    host, report = fit_host(samples)
+    if host_queue_spec() is None:
+        host, report = fit_host(samples)
+    else:
+        host, report = fit_host(samples, queue=record_queue_depths(records))
     if steady is not None:
         host_blocks.refit(samples, host, report)
     if launch_stall_on():
