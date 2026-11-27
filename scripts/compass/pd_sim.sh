@@ -63,8 +63,10 @@
 # the router has one worker per side, and ATOM's own DP dispatch picks the rank.
 #
 # It runs its own tree, as the gates do. Logs go beside RUN_FILE. It prints
-# `pd_sim: ready` once the router answers; start the traffic LP then. It exits
-# once every server has, 0 when each exited 0.
+# `pd_sim: ready` once the router answers, and, --dp-aware, once it has counted
+# every DP rank of RUN_FILE's servers (atom/compass/drive/router_workers.py);
+# start the traffic LP then. A router that counted fewer exits 1, naming its
+# count. It exits once every server has, 0 when each exited 0.
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
@@ -224,6 +226,13 @@ launch=("$ATOMESH" launch --host 127.0.0.1 --port "$ROUTER_PORT" --pd-disaggrega
 echo "pd_sim: router ${launch[*]}"
 env "${router_env[@]}" "${launch[@]}" >"$OUT/router.log" 2>&1 &
 compass_wait_up router $! "http://127.0.0.1:$ROUTER_PORT/v1/models"
+# As deploy.sh serves it: a --dp-aware router that counted every worker.
+if ((${#dp_aware[@]})); then
+    why=$(python3 -m atom.compass.drive.router_workers "$RUN_FILE" "$OUT/router.log" 2>&1) || {
+        echo "pd_sim: $why" >&2
+        exit 1
+    }
+fi
 echo "pd_sim: ready"
 
 rc=0

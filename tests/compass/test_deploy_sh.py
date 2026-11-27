@@ -133,6 +133,15 @@ if "PLANTED_LEAVE" in os.environ:
 # As atomesh does, it asks each instance first, through any proxy the environment names.
 for flag in ("--prefill", "--decode"):
     urllib.request.urlopen(argv[argv.index(flag) + 1] + "/health", timeout=10)
+# Then it logs how many workers it registered: PLANTED_WORKERS ("none": no
+# line), else each DP rank of the instances, read off the run file beside its log.
+count = os.environ.get("PLANTED_WORKERS")
+run_file = os.path.join(os.path.dirname(os.readlink("/proc/self/fd/1")), "run_file.json")
+if count is None and os.path.exists(run_file):
+    from atom.compass.run import worker_order
+    count = sum(map(len, worker_order(json.load(open(run_file))).values()))
+if count not in (None, "none"):
+    print(f"Workers initialized: {count} total, {count} healthy", flush=True)
 
 class Models(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -808,6 +817,52 @@ def test_a_dp_aware_run_refuses_a_router_built_dirty_before_anything_starts(
     assert "built from an uncommitted tree" in done.stderr
     assert not (tmp_path / "d" / "run_file.json").exists()
     assert not (tmp_path / "d" / "authority.argv.json").exists()
+
+
+@pytest.mark.parametrize(
+    "logged, refusal",
+    [
+        (
+            "4",
+            "the router counted 4 of the deployment's 5 workers as it built its routes",
+        ),
+        ("none", "the router logged no 'Workers initialized: <n> total' line"),
+    ],
+)
+def test_a_router_lp_that_counted_fewer_workers_than_the_dp_ranks_ends_the_run_unserved(
+    tmp_path, planted, logged, refusal
+):
+    # Two prefill instances at DP 2 and a decode at DP 1: five workers. A router
+    # that counted four registered one after it read the prefills' TP sizes,
+    # as an 8P16D start's did (#4258).
+    env, flags = planted
+    env["PLANTED_BUILD"] = f"{_tree_commit()} clean"
+    env["PLANTED_WORKERS"] = logged
+    d = tmp_path / "d"
+    words = argv(tmp_path, flags + router_hop(tmp_path), router=ROUTER_LP_ARGS)
+    at = words.index("--decode")
+    words[at:at] = ["--prefill", "--", "--model", str(tmp_path), *PREFILL]
+    script = subprocess.Popen(
+        words, env=env, cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )  # fmt: skip
+    try:
+        deadline = time.monotonic() + UNTIL_S
+        while script.poll() is None and not (d / "server.json").exists():
+            assert time.monotonic() < deadline, "no exit and no server.json"
+            time.sleep(0.1)
+        served = (d / "server.json").exists()
+    finally:
+        script.terminate()  # a deployment serving on stops with its test
+    _, err = script.communicate(timeout=60)
+
+    assert not served, err
+    assert script.returncode == 1, err
+    assert f"deploy: {refusal}" in err
+    # Its exit stops the router it started, as every process of the deployment.
+    while not (tmp_path / "router.json.stop").exists():
+        assert time.monotonic() < deadline, "the router was not stopped"
+        time.sleep(0.1)
 
 
 @pytest.mark.parametrize(
