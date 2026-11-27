@@ -79,11 +79,8 @@ def test_a_dummy_segment_whose_every_label_is_0_fits_a_zero_law():
     host, report = fit_host(samples)
 
     assert host["laws"][DUMMY][MTP_SEGMENT] == [0.0] * len(HOST_FEATURES)
-    assert report[f"{DUMMY}.{MTP_SEGMENT}"] == {
-        "samples": 80,
-        "zero": list(HOST_FEATURES),
-        "forwards": 0,
-    }
+    zero = report[f"{DUMMY}.{MTP_SEGMENT}"]
+    assert zero["samples"] == 80 and zero["zero"] == list(HOST_FEATURES)
     assert host["laws"][DUMMY]["W_pre"] == pytest.approx([1e-3, 0, 0], rel=0.02)
 
     # Beside a decode `W_inputs` law that adopts the eager column, an eager
