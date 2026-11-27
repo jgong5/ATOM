@@ -65,8 +65,8 @@
 # It runs its own tree, as the gates do. Logs go beside RUN_FILE. It prints
 # `pd_sim: ready` once the router answers, and, --dp-aware, once it has counted
 # every DP rank of RUN_FILE's servers (atom/compass/drive/router_workers.py);
-# start the traffic LP then. A router that counted fewer exits 1, naming its
-# count. It exits once every server has, 0 when each exited 0.
+# start the traffic LP then. Short of that count it exits 1, naming the
+# router's. It exits once every server has, 0 when each exited 0.
 set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
 
