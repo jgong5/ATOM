@@ -2076,6 +2076,8 @@ def engine(config):
         _offloads(config.kv_transfer_config, c) for c in ("lmcache_mp", ENTRY_STORE)
     ):
         _park_before_dispatch()
+        if wake := dp_wake_s():
+            _wake_before_sync(wake)
     rt = _runtime(lp, run, _member, _PublishedClock)
     rt.sampler = metrics.Sampler(
         rt, "engine", metrics.ROLES[side], _frontend_lp(config, run).name
@@ -2225,6 +2227,61 @@ def _park_before_dispatch() -> None:
         return out
 
     AsyncIOProcManager.call_func = parking
+    DPEngineCoreProc._sync_dp_state = synced
+
+
+#: The seconds a DP member of an engine offloading to a tier it looks requests
+#: up in takes, once its group was idle, from the input pull that brings it
+#: work to its DP state sync (`_wake_before_sync`); unset, empty or 0, none.
+DP_WAKE_ENV = "COMPASS_DP_WAKE_S"
+
+
+def dp_wake_s() -> float:
+    """`DP_WAKE_ENV`'s seconds, 0.0 when unset or empty; a negative or
+    non-numeric value is refused."""
+    value = os.environ.get(DP_WAKE_ENV) or "0"
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = -1.0
+    if not 0.0 <= seconds < math.inf:
+        raise ValueError(
+            f"{DP_WAKE_ENV}={value} is not a non-negative number of seconds"
+        )
+    return seconds
+
+
+def _wake_before_sync(seconds: float) -> None:
+    """A DP member whose group was idle at its last DP state sync (none ran a
+    request) and that now holds work takes `seconds` before its next sync,
+    the time a real loop takes from the receive that wakes its group to the
+    step's entry. The tier lookup the engine's input thread offered at that
+    receive answers within it, so the member schedules the request at once,
+    its peers a DP dummy beside it, as the records' wakes mostly do; with
+    none, it schedules at the receive itself, the lookup still out, and the
+    whole group first runs an idle dummy (`COMPASS_IDLE_DP_GROUP_S`).
+
+    #734 DeepSeek-V4.1 Cell B P (DP2, Mooncake Store): the calibration
+    records' wakes on a short request, which no lookup holds, entered their
+    step a median 1.34 ms after the receive (cal and addp, 233 wakes); on a
+    request with a lookup, 12% of cal's and 15% of addp's wakes first ran a
+    whole-group dummy, and the simulated wakes 85-100%. A member hands in the
+    clock of each wake under ``wakes``."""
+    from atom.model_engine.engine_core import DPEngineCoreProc
+
+    sync = DPEngineCoreProc._sync_dp_state
+
+    @functools.wraps(sync)
+    def synced(self, local_has_unfinished, *args, **kwargs):
+        rt = clock.installed()
+        idle = getattr(self, "_compass_group_idle", True)
+        if idle and local_has_unfinished and rt is not None and rt.in_run:
+            rt.advance_to(rt.now + seconds)
+            rt.__dict__.setdefault("wakes", []).append(rt.now)
+        out = sync(self, local_has_unfinished, *args, **kwargs)
+        self._compass_group_idle = not out[0]
+        return out
+
     DPEngineCoreProc._sync_dp_state = synced
 
 
@@ -3579,7 +3636,8 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     """Hand in what the worker's steps cost and the memory it predicts, with
     `sections`, its command refusals and the engine's refused clock calls; a
     DP member that parked also hands in ``parks``: their count, CPU seconds, and
-    each park's clock and the clock it left at; a DP member hands in ``owed``,
+    each park's clock and the clock it left at, and one that woke (`_wake_before_sync`)
+    ``wakes``, their count and clocks; a DP member hands in ``owed``,
     `LPRuntime.paid`. An engine whose offload
     scheduler keeps lookup counters hands in ``lookups``: its tier lookups,
     the prefetches among them, and the deferred prefetches it stopped
@@ -3595,6 +3653,8 @@ def _engine_hand_in(run: dict, engine_core, sections: dict, client_run=None) -> 
     if parks := getattr(rt, "parks", None):
         cpu_s, at = sum(p[2] for p in parks), [p[:2] for p in parks]
         sections = sections | {"parks": {"count": len(parks), "cpu_s": cpu_s, "at": at}}
+    if wakes := getattr(rt, "wakes", None):
+        sections = sections | {"wakes": {"count": len(wakes), "at": wakes}}
     if rt.member is not None:
         sections = sections | {"owed": dict(rt.paid)}
     kv = getattr(getattr(engine_core, "scheduler", None), "kv_connector", None)
