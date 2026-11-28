@@ -78,6 +78,7 @@ from compass_harness.traffic_lp import (
     HTTP,
     INTAKE_JITTER_BYTES,
     INTAKE_JITTER_SIGMA,
+    KEEPALIVE_SLACK_S,
     PREFILL_URL_ENV,
     SEND_ORDER_ENV,
     STREAM,
@@ -2171,9 +2172,9 @@ def test_a_conn_pool_hands_out_its_oldest_kept_alive_connection_per_worker():
     pool.release("w0", 10.0)
     pool.release("w0", 20.0)
     pool.release("w1", 15.0)
-    assert pool.take("w0", 310.0) is True  # idle 300 s: kept, takes 10.0's
+    assert pool.take("w0", 309.9) is True  # idle 299.9 s: kept, takes 10.0's
     assert pool.take("w0", 320.5) is False  # 20.0's idle 300.5 s: closed
-    assert pool.take("w1", 315.0) is True and pool.take("w1", 315.0) is False
+    assert pool.take("w1", 314.5) is True and pool.take("w1", 314.5) is False
     pool.release(None, 1.0)  # a request with no worker routed gives nothing back
     assert pool.idle.keys() == {"w0", "w1"}
     shut = ConnPool(300.0, force_close=True)
@@ -2182,6 +2183,19 @@ def test_a_conn_pool_hands_out_its_oldest_kept_alive_connection_per_worker():
     for bad in (0.0, -1.0, math.inf, math.nan):
         with pytest.raises(ValueError, match="keepalive"):
             ConnPool(bad)
+
+
+def test_a_send_at_exactly_the_keepalive_opens_a_new_connection():
+    """aiperf's idle cap resends a turn at its previous request's end plus the
+    keepalive: that connection counts as closed however the clock rounds the
+    sum, as the real client's do (#752 DPA4 c8: 7 of 7 such sends opened a new
+    one); one idle a little less than the keepalive is still kept."""
+    for end in (0.1, 7.3, 1234.5678, 299.9999999):
+        pool = ConnPool(300.0)
+        pool.release("w0", end)
+        assert pool.take("w0", end + 300.0) is False
+        pool.release("w0", end)
+        assert pool.take("w0", end + 300.0 - 10 * KEEPALIVE_SLACK_S) is True
 
 
 @pytest.mark.parametrize("value, on", [(None, False), ("", False), ("1", True)])

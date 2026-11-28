@@ -178,14 +178,20 @@ def send_order_aiperf() -> bool:
     return value == "aiperf"
 
 
+#: How close to aiperf's keepalive a pooled connection's idle time may come and
+#: still count as closed (`ConnPool.take`): the clock's rounding, no more.
+KEEPALIVE_SLACK_S = 1e-3
+
+
 class ConnPool:
     """aiperf's pooled HTTP connections on the clock, one pool per worker.
 
     Each aiperf worker sends on its own aiohttp connector (aiperf's default
     ``POOLED`` reuse). A request takes the oldest idle connection, closing on
     the way those idle past `keepalive_s` (aiohttp 3.13 ``BaseConnector._get``,
-    its ``popleft`` and ``<=``), or opens a new one; a request that ends gives its
-    connection back at its end. With `force_close` every request opens one.
+    its ``popleft``; a connection idle the keepalive itself counts as closed,
+    see `take`), or opens a new one; a request that ends gives its connection
+    back at its end. With `force_close` every request opens one.
     """
 
     def __init__(self, keepalive_s: float, force_close: bool = False) -> None:
@@ -203,10 +209,21 @@ class ConnPool:
 
     def take(self, worker: str | None, t: float) -> bool:
         """A request on `worker` takes a connection at `t`: whether it is a
-        kept-alive one (else a new one)."""
+        kept-alive one (else a new one).
+
+        A connection idle `keepalive_s` - `KEEPALIVE_SLACK_S` or longer counts as
+        closed. aiperf's idle cap resends a turn at exactly its previous request's
+        end plus the keepalive, and on the clock that request's connection came
+        back at the same end, so its idle time is the keepalive itself up to float
+        rounding, and aiohttp's ``<=`` would decide the reuse by that rounding. In
+        the real client the connection goes back to the pool as the response
+        ends, before aiperf stamps the end, so the resend finds it just past the
+        keepalive and opens a new one: #752 DPA4 c8, both real records opened a
+        new connection for every one of their 7 sends at that boundary.
+        """
         idle = self.idle.get(worker)
         while idle:
-            if t - idle.popleft() <= self.keepalive_s:
+            if t - idle.popleft() < self.keepalive_s - KEEPALIVE_SLACK_S:
                 return True
         return False
 
