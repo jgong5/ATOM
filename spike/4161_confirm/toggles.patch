@@ -1,0 +1,111 @@
+--- a/atom/utils/clock.py
++++ b/atom/utils/clock.py
+@@ -205,6 +205,9 @@
+         # b5 decode lead: whether the last step's reply said a finished prefill
+         # may surface soon (`promise_step`); so until a step says otherwise.
+         self.finish_soon = True
++        # #4267: #4262's step promise, or its no-idle-promise, reverted alone.
++        self._revert_step = os.environ.get("COMPASS_4267_REVERT_STEP", "") == "1"
++        self._revert_idle = os.environ.get("COMPASS_4267_REVERT_IDLE", "") == "1"
+         self.horizon_pending: float | None = None  # `tell_horizon`'s, not yet sent
+         # b5 prototype (bounded slack): a frame read behind the clock is late,
+         # not a straggler; the authority delivers it at the clock.
+@@ -295,7 +298,9 @@
+             return self.now
+         if os.environ.get("COMPASS_B5_FE_ENGINE", "") == "1":
+             # #4262 as designed: no idle promise; only a step's own promises
+-            # its pull (`promise_step`).
++            # its pull (`promise_step`). #4267 reverted: the prototype's.
++            if self._revert_idle and not self.finish_soon:
++                return self.now + self._promise_s
+             return self.now
+         local = frame.f_locals
+         bound = min(self.now + self._promise_s, local.get("t_daemon", math.inf))
+@@ -318,6 +323,9 @@
+         if not (self._promise_s and self.in_run) or not pull < math.inf:
+             return False
+         # #4262 as designed: the pull, whether or not the step finishes one.
++        # #4267 reverted: the prototype's, a forward past it if it finishes none.
++        if self._revert_step and not finishes:
++            return self.promise(pull + self._promise_s)
+         return self.promise(pull)
+ 
+     def promise(self, t: float) -> bool:
+--- a/atom/compass/clock/authority.py
++++ b/atom/compass/clock/authority.py
+@@ -148,6 +148,16 @@
+ #: b5 decode lead: the simulated time before which traffic sends no cancel,
+ #: aiperf's grace deadline (``COMPASS_B5_CANCEL_AT``).
+ CANCEL_AT_ENV = "COMPASS_B5_CANCEL_AT"
++#: #4267: #4262's busy-term timer, or its TAR hop, reverted alone (read at import).
++REVERT_TIMER = os.environ.get("COMPASS_4267_REVERT_TIMER", "") == "1"
++REVERT_HOP = os.environ.get("COMPASS_4267_REVERT_HOP", "") == "1"
++#: #4267's open case: an idle prefill engine finishes no sooner than its earliest
++#: pending arrival plus the step delay (``COMPASS_B5_DELAY_P_S``); None for off.
++OPEN_CASE_S = (
++    float(os.environ.get("COMPASS_B5_DELAY_P_S", "") or 0.05)
++    if os.environ.get("COMPASS_4267_OPEN_CASE", "") == "1"
++    else None
++)
+ #: The step-table event of a TAR's grant short of its target, at an arrival on
+ #: an offering channel.
+ ARRIVAL = "ARRIVAL"
+@@ -564,7 +574,8 @@
+         if kind == NER and lp in self._live:
+             self._live[lp] = set()
+             self._woke_timer[lp] = False
+-            self._ner_wake[lp] = min(t, daemon)  # #4262: a timer set before it idled
++            # #4262: a timer set before it idled; #4267 reverted: none counted.
++            self._ner_wake[lp] = math.inf if REVERT_TIMER else min(t, daemon)
+         self._wait(lp, kind, t, daemon)
+         return self._address(self._grant_due())
+ 
+@@ -882,7 +893,7 @@
+                 (i, c.name): self._first_hops(c.target, c.name, i)
+                 for i in self._ids
+                 for c in channels.channels_from(i)
+-                if c.target in self._classes
++                if c.target in self._classes and not REVERT_HOP  # #4267: the drop
+             }
+             self._from_declared = {
+                 i: tuple(
+@@ -1046,7 +1057,13 @@
+         prom = self._prom.get(i)
+         if prom:
+             row += tuple(
+-                (j, min(nv[j] + d_rest, max(nv[j], self._promised(j)) + d_out))
++                (
++                    j,
++                    min(
++                        nv[j] + d_rest,
++                        max(self._finish_from(j, nv[j]), self._promised(j)) + d_out,
++                    ),
++                )
+                 for j, d_rest, d_out in prom
+             )
+         if not self._from_declared[i]:
+@@ -1056,6 +1073,14 @@
+             for j, d, back, now in self._from_declared[i]
+         )
+ 
++    def _finish_from(self, j: LpId, n: float) -> float:
++        """#4267's open case: from `N[j]` = `n`, the earliest an idle `j` can
++        send a finish: no sooner than its earliest pending arrival plus the step
++        delay, unless a timer comes first; `n` itself while it runs or off."""
++        if OPEN_CASE_S is None or self._state[j] != NER:
++            return n
++        return min(self._target[j], self._daemon[j], n + OPEN_CASE_S)
++
+     def _declared_term(self, j: LpId, d: float, back: tuple, now: tuple) -> float:
+         """LP `j`'s term in another LP's LBTS, `j` having declared its
+         reactions: its own events' plus `d`, and in NER each class's earliest
+@@ -1102,7 +1127,8 @@
+             for j, d_rest, d_out in prom:
+                 n = nv[j]
+                 p = pmin.get(j, -math.inf)
+-                t = min(n + d_rest, (n if n > p else p) + d_out)
++                f = n if OPEN_CASE_S is None else self._finish_from(j, n)
++                t = min(n + d_rest, (f if f > p else p) + d_out)
+                 if t < best:
+                     best = t
+         for j, d, back, now in self._from_declared[i]:

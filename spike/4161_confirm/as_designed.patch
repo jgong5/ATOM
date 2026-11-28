@@ -1,0 +1,92 @@
+--- a/atom/utils/clock.py
++++ b/atom/utils/clock.py
+@@ -294,11 +294,9 @@
+         if frame.f_code.co_name != "idle":
+             return self.now
+         if os.environ.get("COMPASS_B5_FE_ENGINE", "") == "1":
+-            # b5 decode lead: only a forward finishes a prefill, not the
+-            # metrics push, a KV completion or a backlog report; and none while
+-            # the last step held rows back for the next output step, which a
+-            # DP dummy can be (`promise_step`).
+-            return self.now if self.finish_soon else self.now + self._promise_s
++            # #4262 as designed: no idle promise; only a step's own promises
++            # its pull (`promise_step`).
++            return self.now
+         local = frame.f_locals
+         bound = min(self.now + self._promise_s, local.get("t_daemon", math.inf))
+         deadline = local.get("deadline")
+@@ -315,13 +313,12 @@
+ 
+     def promise_step(self, pull: float, finishes: bool) -> bool:
+         """b5 decode lead: at a step's schedule, before its clock call, promise
+-        no finished prefill before its pull, or, when the step finishes none,
+-        before the next forward's least price past it. Returns whether it
+-        promised."""
++        no finished prefill before its pull. Returns whether it promised."""
+         self.finish_soon = finishes
+         if not (self._promise_s and self.in_run) or not pull < math.inf:
+             return False
+-        return self.promise(pull if finishes else pull + self._promise_s)
++        # #4262 as designed: the pull, whether or not the step finishes one.
++        return self.promise(pull)
+ 
+     def promise(self, t: float) -> bool:
+         """b5: tell the authority this LP, or member, sends nothing on its
+--- a/atom/compass/clock/authority.py
++++ b/atom/compass/clock/authority.py
+@@ -564,6 +564,7 @@
+         if kind == NER and lp in self._live:
+             self._live[lp] = set()
+             self._woke_timer[lp] = False
++            self._ner_wake[lp] = min(t, daemon)  # #4262: a timer set before it idled
+         self._wait(lp, kind, t, daemon)
+         return self._address(self._grant_due())
+ 
+@@ -837,6 +838,7 @@
+         # LP -> class -> its channels; i -> [(j, D(j->i), [reach per class])].
+         self._classes = {}
+         self._class_of, self._live, self._woke_timer, self._cfirst = {}, {}, {}, {}
++        self._ner_wake, self._tar_hop = {}, {}
+         self._from_declared = {i: () for i in self._ids}
+         # The earliest undelivered arrival on each channel into such an LP.
+         self._first = {}
+@@ -873,6 +875,15 @@
+             # b5: each class's earliest undelivered arrival, kept with `_first`
+             self._cfirst = {j: [math.inf] * len(c) for j, c in self._classes.items()}
+             self._woke_timer = dict.fromkeys(self._classes, True)
++            self._ner_wake = dict.fromkeys(self._classes, -math.inf)
++            # #4262: i's first hop on a channel into a declared LP, which may
++            # wait in TAR, back to i with no delay there (`_cycle_now`).
++            self._tar_hop = {
++                (i, c.name): self._first_hops(c.target, c.name, i)
++                for i in self._ids
++                for c in channels.channels_from(i)
++                if c.target in self._classes
++            }
+             self._from_declared = {
+                 i: tuple(
+                     (
+@@ -1056,7 +1067,10 @@
+             # b5: while it runs or waits in TAR, it sends now only what its
+             # live classes, or its own events if they woke it, provoke.
+             nv = self._nv[j]
+-            term = nv + d if self._woke_timer[j] else math.inf
++            # #4262 as designed: the last NER's timer, no earlier than N, on
++            # every channel; N itself if an own event woke it since.
++            wake = self._ner_wake[j]
++            term = (nv if self._woke_timer[j] or wake < nv else wake) + d
+             live = self._live[j]
+             for k, reach in enumerate(back):
+                 t = nv + now[k] if k in live else cfirst[k] + reach
+@@ -1311,6 +1325,11 @@
+                     hop = self._channels.lookahead(name)
+                     term = max(term, min(hop + d_rest, max(hop, p - g) + d_out))
+                 best = min(best, term)
++            elif (i, name) in self._tar_hop:
++                # #4262 as designed: a declared LP in TAR answers the hop no
++                # sooner than its N, with no delay there; kept no shorter than
++                # the plain term, also a bound, so the scan's order holds.
++                best = min(best, max(term, self._nv[j] - g + self._tar_hop[i, name]))
+         return best
+ 
+     def _catch_up(self, lp: LpId, steps, log, member) -> list:
