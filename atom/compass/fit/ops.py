@@ -351,10 +351,7 @@ def fit(points) -> dict:
     )
     from atom.compass.capture.peers import MORI
 
-    # a prefill kind's points at one T compared across B by their leaves as
-    # their family reads them: ATOM's runner sizes a kernel's metadata from B,
-    # so B=1 and B=2 hold unlike leaves of one family
-    dependent = _dependent(points, lambda r: _text(_read(r["shape"], r["leaf"])[0]))
+    dependent = _dependent(points)
     groups: dict[str, list] = {}
     free_of, families, left_out = {}, {}, []
     for p in points:
