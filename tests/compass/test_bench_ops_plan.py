@@ -25,7 +25,7 @@ from test_op_graph_arch import config as model_config  # noqa: F401  a fixture
 from test_op_graph_arch import run_readings
 
 from atom.compass import capture, cli, ir
-from atom.compass.artifacts import ArtifactStore, GateState, Topology, member_name
+from atom.compass.artifacts import ArtifactStore, GateState, Kind, Topology, member_name
 from atom.compass.bench import ops
 from atom.compass.capture import driverless, forward, graph_key
 from atom.compass.capture.forward import decode, prefill, structure
@@ -1534,3 +1534,41 @@ def test_a_plan_fills_prefill_families_at_one_and_four_rows_on_one_skeleton(
     # B = 4 fills T = 150, B = 1's between its own 40 and 200, and nothing under 4.
     assert {t for b, t in attn if b == 4} == {40, 150, 200}
     assert {t for b, t in attn if b == 1} == {1, 40, 150}
+
+
+def test_a_round_holds_a_point_another_process_published_after_planning_it(
+    bench, tmp_path, monkeypatch, capsys
+):
+    # Units whose ladders share a rung run at once: the other one publishes a
+    # point of this round while this one measures it. The round keeps the
+    # other's entry and names it, and publishes every other point.
+    store, _, key, run = bench
+    elsewhere, planned = tmp_path / "elsewhere", []
+    elsewhere.mkdir()
+
+    def raced(fn, config, todo, llc):
+        got = _bench(fn, config, todo, llc)
+        if not planned:
+            planned.append(len(got))
+            first = [got[0] | {"cold_ns": 7.0}]
+            ops.publish(store, key, CONFIG, run, "another unit", first, elsewhere)
+        return got
+
+    monkeypatch.setattr(ops, "_child", raced)
+    plan = _records(tmp_path / "plan", ([[1, 1000, True]], 1))
+
+    records = _plan(bench, tmp_path, plan)
+
+    other = json.loads((elsewhere / "ops.jsonl").read_text())
+    lines = (tmp_path / "out" / "round0" / "ops.jsonl").read_text().splitlines()
+    lines = [json.loads(x) for x in lines]
+    assert len(lines) == planned[0] > 1
+    for line in lines:  # each published or held, listed as the store holds it
+        entry = store.read(store.key_from_token(Kind.OP_MEASUREMENT, line["token"]))
+        point = entry.read_member("point", entry.topology.ranks()[0], "json")
+        assert json.loads(point) | {k: line[k] for k in ("token", "layout")} == line
+    held = [x for x in lines if x["cold_ns"] == 7.0]
+    assert [x["token"] for x in held] == [other["token"]]
+    assert other["token"] in capsys.readouterr().out
+    kept = [r for r in records if ops._point(r) == ops._point(other)]
+    assert [r["cold_ns"] for r in kept] == [7.0]  # plan.jsonl lists it as stored

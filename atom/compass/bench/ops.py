@@ -209,7 +209,8 @@ layout. S gets each
 measured point as an `op_measurement`, keyed by the model, the device, stack,
 PTL state and torch run.json reads, the source root and the point, the layout
 only for a leaf on a process group (`point_key`): a point of any other leaf answers at
-every layout, and one S holds is not measured again.
+every layout, and one S holds is not measured again; one another run
+publishes to S while this one measures it is listed as S holds it, and named.
 
 `--plan` measures, in rounds, the points the steps of record directories call
 for (`record`'s or `trace steps`' output), under `--enable-tbo` a step its DP
@@ -303,11 +304,13 @@ import torch
 
 from atom.compass import ir
 from atom.compass.artifacts import (
+    ArtifactRefusal,
     ArtifactStore,
     GateState,
     Key,
     Kind,
     Provenance,
+    Rule,
     Topology,
     member_name,
     roots_for,
@@ -3983,7 +3986,9 @@ def _stored(store, at, shape) -> dict:
 def publish(store, key, config, run: dict, command: str, results, out: Path, held=()):
     """Write `held`, points `store` held, and `results` to ``ops.jsonl`` in
     `out`, each with its store token and `config`'s layout, and each measured
-    one of `results` to `store` at its `key`."""
+    one of `results` to `store` at its `key`; one another process published
+    after it was planned is held as `store` holds it, in its place in
+    `results` too, and named."""
     from atom.compass.fit.publish import conditions, ranks
     from atom.compass.fit.samples import run_fields
     from atom.compass.run.step_grid import keyed
@@ -3999,18 +4004,32 @@ def publish(store, key, config, run: dict, command: str, results, out: Path, hel
         for n, record in enumerate([*held, *results]):
             point = record["shape"], record["context"], record["leaf"]
             at = key(*point, "exchange" in record)
-            line = record | {"token": at.token(), "layout": layout}
-            lines.write(json.dumps(line) + "\n")
             if n >= len(held) and "refused" not in record:
                 body, every = json.dumps(record).encode(), ranks(at)
-                store.publish(
-                    at,
-                    provenance=Provenance(command, now, roots),
-                    topology=every[0].topology,
-                    conditions=readings,
-                    gates=GateState.of(),
-                    members={member_name("point", r, "json"): body for r in every},
-                )
+                try:
+                    store.publish(
+                        at,
+                        provenance=Provenance(command, now, roots),
+                        topology=every[0].topology,
+                        conditions=readings,
+                        gates=GateState.of(),
+                        members={member_name("point", r, "json"): body for r in every},
+                    )
+                except ArtifactRefusal as refusal:
+                    if refusal.rule is not Rule.IMMUTABLE:
+                        raise
+                    if not store.directory_for(at).exists():
+                        raise
+                    record = _stored(store, at, _marked(record))
+                    results[n - len(held)] = record
+                    print(
+                        f"{record['op']} at {record['shape']}, context "
+                        f"{record['context']}: held, another process published "
+                        f"it first ({at.token()})",
+                        flush=True,
+                    )
+            line = record | {"token": at.token(), "layout": layout}
+            lines.write(json.dumps(line) + "\n")
 
 
 #: A ladder keeps a value only this many times the last it kept, and the largest.
