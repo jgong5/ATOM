@@ -1742,7 +1742,10 @@ CA: no LP's clock or ceiling past its term from D2, the router's about 10 us pas
    `LPRuntime.stamp_send` refuses a send before its channel's promise, and the authority
    refuses one at registration. Raising a promise is always sound. Lowering or withdrawing
    one the LP's clock has not reached is accepted only if no LP's clock reaches, and no
-   ceiling passes, the terms the lower promise gives; otherwise the run aborts. Basis: D3's
+   ceiling passes, the terms the lower promise gives; otherwise the run aborts. Traffic
+   lowers its promise when a phase starts with an earlier deadline, and a prefill engine its
+   step or idle promise when its backend refuses an output step under `--on-refusal mark`
+   and so charges it no device time (decision 10): the same check covers both. Basis: D3's
    grant guarantee, every message at or below a grant delivered, and a ceiling's, none below
    it: a grant or ceiling past the lowered term rested on the old promise, one short of it
    did not. The check is new here; the prototype (`b5/fe-engine` 98aed973e) made it for
@@ -1757,8 +1760,6 @@ CA: no LP's clock or ceiling past its term from D2, the router's about 10 us pas
    return as at least `N[j] + D(j->i)`, a term of `LBTS(i)`, which a declaring LP's term can
    exceed while `c`'s kind is not released to it; both terms bound the return. Rejected:
    the prototype's drop for every TAR receiver.
-6. **The declarations**, computed in `channels.py::prefill_decode_table` under the key from
-
 6. **A prefill engine's step and idle promises** ([the amendment](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7237452108), item 2). At each
    step's clock call (`LPRuntime.advance_group`) a member promises `finish#dpN` no earlier
    than its pull when its batch produces output or its deferred stream holds rows back for
@@ -1787,11 +1788,17 @@ CA: no LP's clock or ceiling past its term from D2, the router's about 10 us pas
    `request` and `control` after the least intake. This is a stated exception: ATOM's decode
    frontend aborts at once, and `HttpChannel` today charges a cancel nothing. Its cost: a
    cancelled request aborts at least one least intake late, 1.8 ms on C1228's decode law,
-   and its engine may decode it that long more. Cancels sit off the main path, and a run's
-   performance is rarely read where they fire, so simplicity wins over fidelity here. It
-   holds only while traffic promises `cancel`, so under the key traffic refuses per-request
-   cancels at its bind. Rejected: marking each cancel promised or not, with a reach for the
-   unpromised ones, a second table (the first Ruling's item 6).
+   and its engine may decode it that long more; and the charge advances the frontend's
+   loop, so a burst of `k` relayed cancels holds that frontend's other streams and intakes
+   for up to `k` least intakes. Cancels sit off the main path, and a run's performance is
+   rarely read where they fire, so simplicity wins over fidelity here. The rule holds only
+   while traffic promises `cancel` (the amendment), and with per-request cancels traffic
+   promises nothing ([the first Ruling](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7219859822), item 4): such
+   a cancel is taken at once, as ATOM takes it. The harness refuses per-request
+   cancellation today (`compass_harness/strategy.py::CompassAgenticReplay`), so every
+   cancel a run makes is promised; a task that paces them must take a decode frontend's
+   `relay` to `control` at 0 wherever such a cancel can come. Rejected: the intake on every cancel, promised or not, against both
+   Rulings.
 9. **The declarations**, computed in `channels.py::prefill_decode_table` under the key from
    the laws its caller reads in the run file, alike in every process (D3.6 decision 4),
    never from the environment (the first Ruling's item 4). Decode engines and
@@ -1808,9 +1815,10 @@ CA: no LP's clock or ceiling past its term from D2, the router's about 10 us pas
 
 10. **A refused step or intake** (the first Ruling's item 5). Under `--on-refusal mark` a
     step outside its law's hull charges no device time and an intake outside its bytes
-    nothing, so a send can beat its delay. Where a grant rested on the delay the message
-    lands behind its receiver's clock or ceiling, which `ClockAuthority._register` or the
-    local-step check aborts; elsewhere it changes nothing. Rejected: no delays under `mark`,
+    nothing, so a send can beat its delay; a prefill engine lowers its promise first,
+    through decision 4's check. Where a grant rested on the delay the message lands behind
+    its receiver's clock or ceiling, which `ClockAuthority._register` or the local-step
+    check aborts; elsewhere it changes nothing. Rejected: no delays under `mark`,
     how C1228 runs.
 11. **One key**, `decode_lead`, needing `wide_local_grants` and LP `router`; it adds
     channels, so it is part of the configuration, as `stream_bypass` is. Basis: principle,
@@ -1837,8 +1845,6 @@ The first Ruling's design: promises at the pull, no idle promise, and a cancel t
   at one instant are released by name, `finish` first, though its socket delivered them in
   the order put; so is a cancel before a request traffic sent at one instant. A client
   metric that moves, past decision 8, points here.
-- **Per-request cancels refused under the key** (decision 8), read from the amendment's
-  "not with per-request cancels".
 - **The key's shape** (decision 11), cheap to change.
 
 ### Dependencies
@@ -1859,9 +1865,8 @@ No sync issue: the clock is Compass's own. #4196 closed by #4201. Built on D3.6 
 
 ### Summary
 
-The deliverable: the lead under `decode_lead`. Out of scope: message classes, per-request
-cancels under the key, a ceiling for an LP with members, input points, every per-step
-cost. One code task:
+The deliverable: the lead under `decode_lead`. Out of scope: message classes, pacing
+per-request cancels, a ceiling for an LP with members, input points, every per-step cost. One code task:
 
 - `clock/channels.py`: the two channels, delays in `mark_reactions` and `reach`, the
   declarations in `prefill_decode_table`.
@@ -1870,10 +1875,11 @@ cost. One code task:
   promises, `finish` in `RelayQueue.put`; `compass_loop.py`: `HttpChannel`'s relayed cancel.
 - `backends/base.py`, `step_linear.py`, `step_roofline.py`: the least output step, and the
   roofline's property test.
-- `compass_harness` (`transport.py`, and beyond the brief's file set `traffic_lp.py` and
-  `strategy.py`): the cancel channel, traffic's promise, its refusal of per-request cancels.
-- Beyond the file set, `runner/overrides.py`: the reply saying whether a batch produced
-  output or holds rows back.
+- `compass_harness/compass_harness/transport.py`: the cancel channel.
+- Beside the brief's file set, as the prototype changed them:
+  `atom/compass/runner/overrides.py`, the reply saying whether a batch produced output or
+  holds rows back; `compass_harness/compass_harness/traffic_lp.py` and `strategy.py`,
+  traffic's promise to its phases' grace deadlines.
 - `atom/mesh/src/compass_router.rs`: a cancel held on `cancel`. The run file and
   `compass run`: `decode_lead`.
 - `tests/compass/`: on the 8P16D table, the distances with delays; a decode frontend that
