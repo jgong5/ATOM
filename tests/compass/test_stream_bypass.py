@@ -19,7 +19,10 @@ What each group defends:
 * **The client.** aiperf's transport reports each event on the channel its
   stamp names, with the TTFT and latency of the stamps; the traffic LP takes
   each report on that channel, passes a return at its final's release, and
-  a settle whose released events are all reported reads no socket.
+  a settle whose released events are all reported reads no socket. It takes
+  a worker's reports in the order the worker sent them, so a stream's last
+  event released with the final that closes the last open request is no
+  straggler.
 """
 
 import asyncio
@@ -354,3 +357,76 @@ def test_a_final_released_before_its_stream_s_last_event_passes_its_return_once(
     passed, reads, rt = _settled(harness, tmp_path, reported + [(FINAL, 0, 2.0, True)])
     assert passed == [(0, 2.0)] and rt.now == math.inf
     assert reads == []
+
+
+class _Script:
+    """A Clock Authority connection that answers each clock call with the next
+    grant of `script`, ``(G, released)``; then ``+inf`` ends the run."""
+
+    def __init__(self, script: list) -> None:
+        self.script = list(script)
+
+    def send(self, msg) -> None:
+        pass
+
+    def recv(self):
+        return self.script.pop(0) if self.script else (math.inf, {})
+
+
+def _inproc(prefix: str) -> tuple[str, str]:
+    """`compass_harness.transport.addresses` over inproc, where a report is in
+    the traffic LP's socket the moment its worker sends it."""
+    return f"inproc://{prefix}.stamps", f"inproc://{prefix}.reports"
+
+
+def test_a_last_event_released_with_the_final_closing_the_last_request_is_no_straggler(
+    harness, tmp_path, monkeypatch
+):
+    """Request 0, the only one open, streams an event at 1.0 on decode's own
+    channel, then its last event there and its ``[DONE]`` on ``final``, both
+    at 2.0, which one grant releases. The hold waits for the first event's
+    report; the worker then sends all three reports at once, in its order.
+    The ``[DONE]`` closes the run's last open request in the pass that takes
+    it, before the hold reaches the last event on decode's channel: that event
+    is still reported, and the grant past it finds no straggler, where an
+    8P16D cell's traffic LP raised one (#4268)."""
+    h = harness
+    monkeypatch.setattr(h.traffic_lp, "addresses", _inproc)
+    reported = [(STRAIGHT, 0, 1.0, False), (STRAIGHT, 1, 2.0, False)]
+    reported.append((FINAL, 0, 2.0, True))
+    script = [(1.0, {STRAIGHT: [(0, 1.0)]})]
+    script.append((2.0, {STRAIGHT: [(1, 2.0)], FINAL: [(0, 2.0)]}))
+    script.append((3.0, {}))  # the finish's first call, past the stream's end
+
+    async def main():
+        rt = LPRuntime(TRAFFIC, _table(True, decode=1), _Script(script))
+        prefix = str(tmp_path / "lp")
+        http = "traffic->router:http"
+        traffic = h.TrafficLP(rt, prefix, http, FINAL, bypass=(STRAIGHT,))
+        passed = []
+
+        async def on_return(worker_id, ret):
+            passed.append((ret.credit.id, rt.now))
+
+        ctx = h.zmq.Context.shadow(h.zmq.asyncio.Context.instance().underlying)
+        push = ctx.socket(h.zmq.PUSH)
+        push.connect(_inproc(prefix)[1])
+        traffic.send(h._key(0))
+        await traffic.hold(on_return)(
+            "worker_0", SimpleNamespace(credit=h._credit(0), error=None)
+        )
+        traffic.finish()
+        while rt.now < 1.0:  # the hold then waits for the first event's report
+            await asyncio.sleep(0.001)
+        for ch, seq, at, final in reported:
+            named = () if ch == FINAL else (ch,)
+            push.send_pyobj((h._key(0), seq, at, final, *named))
+        try:
+            await asyncio.wait_for(traffic.done, 10)
+        finally:
+            push.close(linger=0)
+        return passed, rt
+
+    passed, rt = h._run(main())
+    assert passed == [(0, 2.0)] and rt.now == math.inf
+    assert rt.arrived[STRAIGHT] == {0, 1} and rt.unreleased == {}
