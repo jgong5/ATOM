@@ -366,6 +366,21 @@ def test_a_fused_all_reduce_norm_reduces_its_input_and_moves_each_tensor_once():
     assert work(op, ONE, 1, "bf16").comm == ()
 
 
+def test_the_tbo_all_reduce_is_priced_as_aiter_s_all_reduce_over_its_x():
+    # ATOM's TP all-reduce under two-batch overlap, out of place: `x` reduced
+    # over the group, read once, and the sum written once.
+    x = t([64, 7168])
+    tbo = leaf("aiter.tbo_all_reduce.default", [[64, 7168]], x=x)
+    reduce = leaf("aiter.all_reduce_.default", [[64, 7168]], tensor=x)
+    buffer = 64 * 7168 * 2
+
+    assert work(tbo, ONE, 8, "bf16") == work(reduce, ONE, 8, "bf16")
+    assert work(tbo, ONE, 8, "bf16") == Work(
+        {}, 2 * buffer, (Collective(8, 2 * 7 / 8 * buffer),)
+    )
+    assert work(tbo, ONE, 1, "bf16").comm == ()
+
+
 def test_a_kind_with_no_extractor_is_refused_by_name():
     op = leaf("aiter.gemm_a8w8.default", [[4, 6]], XQ=t([4, 8], "torch.float8_e4m3fn"))
 
