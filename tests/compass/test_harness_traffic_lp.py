@@ -1034,7 +1034,8 @@ def test_a_settle_whose_released_events_are_all_reported_reads_no_socket(tmp_pat
         reads, take_queued = [], traffic._take_queued
 
         def counted():
-            reads.append(len(rt.released[STREAM]))
+            if asyncio.current_task() is traffic.done:  # a settle's, not the reader's
+                reads.append(len(rt.released[STREAM]))
             take_queued()
 
         traffic._take_queued = counted

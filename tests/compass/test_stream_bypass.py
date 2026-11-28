@@ -293,7 +293,7 @@ def _settled(h, tmp_path, reported: list):
     """Request 0's stream events `reported`, ``(channel, seq, arrival,
     final)`` in its worker's order, all reported before the first grant and
     each released by a grant of its own: the time each return passes, the
-    clock at each read of the report socket, and the runtime."""
+    clock at each settle's read of the report socket, and the runtime."""
 
     async def main():
         rt = LPRuntime(TRAFFIC, _table(True, decode=1), _Grants(reported))
@@ -303,7 +303,8 @@ def _settled(h, tmp_path, reported: list):
         reads, take_queued = [], traffic._take_queued
 
         def counted():
-            reads.append(rt.now)
+            if asyncio.current_task() is traffic.done:  # a settle's, not the reader's
+                reads.append(rt.now)
             take_queued()
 
         traffic._take_queued = counted

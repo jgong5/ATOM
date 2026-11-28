@@ -448,20 +448,20 @@ class TrafficLP:
     # ---- the owner ----
 
     async def _read_reports(self) -> None:
-        # Waits for a report, then takes every queued one as the hold does: a
-        # report received here would be taken only turns of the loop later, and
-        # a hold reading the socket meanwhile would take those queued behind it
-        # first. A worker sends a request's events in stream order, and the
-        # hold, which takes the final's channel first, relies on that order to
-        # know that an event unreported once no request is open is a closed
-        # request's.
+        # Once the socket holds a report, takes every queued one as the hold
+        # does: a report this task received itself would be taken only turns of
+        # the loop later, after those the hold read behind it meanwhile. The
+        # hold relies on each worker's order: it takes the final's channel
+        # first, and an event unreported once no request is open is then a
+        # closed request's.
         while True:
             await self._pull.poll()
             self._take_queued()
 
     def _take_queued(self) -> None:
-        """Take the reports already queued without a turn of the event loop:
-        most reach the socket while the owner is blocked in a clock call."""
+        """Take the reports already queued, in the order they came, without a
+        turn of the event loop: the hold's read, as most reach the socket while
+        the owner is blocked in a clock call, and the reader's."""
         recv = self._pull_queued.recv
         while True:
             try:
