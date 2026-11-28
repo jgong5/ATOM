@@ -43,6 +43,20 @@ cycle follow the router's declared reactions.
 **Revised 2026-11-26 by [#4144](https://github.com/jgong5/ATOM/issues/4144):** D3.6 is
 built, under D3's wide local grants.
 
+**Revised 2026-11-27 by the owner's
+[ruling on #4161](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7219859822):**
+under the key `decode_lead`, D3.7 adds declared delays and promises, from which a running
+LP's term takes its channels and, on a promised one, its time.
+
+**Revised 2026-11-28 by the owner's [ruling on #4161](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7232626576):**
+the channels a running LP's term takes are D3's second departure from `now[j]`, beside
+the promise.
+
+**Revised 2026-11-28 by the owner's [amending ruling on #4161](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7237452108):**
+channels stay the PDES model's, with no message classes; D3.7 adds two channels, step and
+idle promises past the pull by each cost backend's least output step, and a relayed cancel
+taking the decode intake, a stated fidelity exception.
+
 **Scope of this document.** The execution architecture: what a simulated run *is*,
 which processes exist, how virtual time advances, and what contract the rest of the
 system must honour. It does **not** cover the cost model, the memory model, model
@@ -597,7 +611,14 @@ PDES term: Ayani's distance-between-objects LBTS (Fujimoto, ch. 3). Each part ma
 - **A running LP contributes `now[j]`, not its next event.** It can produce a message at
   any moment from `now[j]` on. With `next[j]`, LP A can be behind LP B (A had the minimum,
   B ran ahead earlier), and an event A generates at `A.now + 0` lands in `[A.now, B.now)`
-  — B's past.
+  — B's past. Under D3.7's key the rule has two departures ([the owner's ruling](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7232626576)).
+  First, an LP that declares contributes `now[j]` only on the channels that its own events
+  and the messages released to it since its last NER can provoke, a timer pending at that
+  NER on every channel from its deadline. This is the argument D3.6 makes for an idle LP
+  that declares: each send answers an own event or a message the LP takes, and a
+  declaration bounds what a message provokes. Second, on a channel it has promised it
+  contributes the later of `now[j]` and the promise, which its runtime refuses any send to
+  break (D3.7, decisions 3 and 4).
 - **An LP waiting in TAR contributes its target, or an earlier arrival on an offering
   channel.** Its owner is inside the CA call and produces nothing (I1, below). A message
   released to it meanwhile is handled by a receiver or handler thread, which sends nothing
@@ -775,7 +796,10 @@ with local grants;
   (`channels.py::prefill_decode_table`), has its term in `LBTS(i)` split by the kind of its
   undelivered messages while it waits in NER (`ClockAuthority._declared_term`). A stream
   event pending at the router then holds a decode frontend at the event's way back through
-  traffic, not at the router's relay hop.
+  traffic, not at the router's relay hop. Under the key `decode_lead` the distances add
+  declared delays, an LP that declares or promises takes one term per channel out in every
+  state, and the cycle drops a first hop into an LP waiting in TAR only where that LP's
+  term is the plain one (D3.7).
 
 #### Invariants
 
@@ -929,7 +953,9 @@ and one LP can span several processes. A channel is one real communication path 
 sending endpoint to a receiving endpoint, named `src->dst:kind#inst`. Only channels the
 real deployment already has: the simulation adds none, and stamps ride in existing
 headers or fields. A component the simulation replaces reproduces the real component's
-channel — same endpoints, message and trigger. The table is the channel list: wrapping an
+channel — same endpoints, message and trigger. D3.7's key adds two where a declaration
+needs one, each a link with its own lookahead and seqs on an existing path: traffic's
+cancels and a prefill engine's finishing outputs. The table is the channel list: wrapping an
 unknown channel name raises.
 
 Receive mode: **thread** — a transport or handler thread receives, and the owner releases
@@ -1461,7 +1487,10 @@ LBTS, which a ceiling never passes.
    declaration would be every reaction. A frontend sends to its engine on an output: the
    output thread re-feeds held requests
    (`engine_core_mgr.py::CoreManager._bp_dispatch_or_refill`). Rejected: a decode
-   frontend's `output` to `stream` only, which that send breaks.
+   frontend's `output` to `stream` only, which that send breaks. Under D3.7's key traffic
+   also sends `cancel`, and the frontends declare too: that re-feed runs on the output
+   thread, which `LPRuntime.stamp_send` refuses as no clock owner (I4), so no run that
+   completes makes it.
 4. **Declared in the channel table**, by `ChannelTable.mark_reactions`, which
    `channels.py::prefill_decode_table` calls where it declares LP `router`. Basis:
    principle, follow the project's conventions: `mark_offering` declares offering
@@ -1576,6 +1605,290 @@ Acceptance, on a short cell of the recipe, the flag on against off: client metri
 identical; `atom.compass.detect.scenario` raises no `BackdatedEvent`; the decode
 frontends' CA calls, the window's critical-path hops and wall per simulated second, as the
 prototype's short cell measures them.
+
+---
+
+## D3.7. The decode lead: delays and promises
+
+**Status:** designed 2026-11-27 for [#4161](https://github.com/jgong5/ATOM/issues/4161), as
+[the owner's ruling](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7219859822) sets it and [its amendment](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7237452108) of 2026-11-28 changes it, under
+the run-file key `decode_lead` (`13`), off by default.
+
+### Problem
+
+Under wide local grants a decode engine and its frontend still advance in turn. The engine
+waits in TAR for its next step, about 19 ms on, behind the frontend's term, which while it
+streams the last step's outputs, 2.7 to 3.2 ms of simulated time
+([#4161](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7157538978)), is its clock
+plus `request`'s lookahead. So in wall time each waits for the other. Past the pair, a
+traffic request reaches a decode engine through a prefill frontend's relay in about 3 ms of
+C1228's lookaheads, and aiperf's cancel in 1.5 ms. #4161's prototype (`b5/fe-engine` at
+98aed973e) declared what each LP can send and when, and cut the 8P16D C1228 full window's
+profiling wall by 24%, client metrics identical
+([its measurement](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7211218591)).
+This section builds that lead from declared delays and promises.
+
+### Scenarios
+
+**A decode engine runs its next step while its frontend streams.** `r` and `T'` are pulls:
+
+```text
+engine-D0              frontend-D0                 frontend-D0's term in LBTS(engine-D0)
+pull r: outputs --->   streams e1..en as own       took only `output` since its NER, so:
+TAR(T')                steps                       stream -> traffic -> http -> frontend-P
+                                                   -> engine-P -> finish, 29 ms on -> ...
+granted T' while e_k streams, once the other LPs' terms are past T' as well
+```
+
+**A prefill engine's promises.** The least output step is 29 ms on C1228's law:
+
+```text
+engine-P0: TAR(.., pull p), batch with output     promise finish#dp0 >= p
+engine-P0: TAR(.., pull p), batch without         promise finish#dp0 >= p + 29 ms
+engine-P0 idle after that step                    promise finish#dp0 >= its clock + 29 ms
+engine-P0 at p: finish#dp0 --> frontend-P0 relays; a rejected seq on output#dp0 --> no relay
+```
+
+**aiperf's grace deadline, and a relayed cancel.**
+
+```text
+traffic: grace deadline D, promise cancel >= D     a decode engine's term: about D + 3.3 ms
+traffic granted D: cancel of r on cancel --> router (D + 10 us) --> relay --> frontend-D0
+frontend-D0 at about D + 1.5 ms: after r's own intake, charges the least intake, 1.8 ms,
+  then hangs r up --> control to engine-D0 at about D + 3.3 ms; ATOM's at D + 1.5 ms
+or every credit back before D: next deadline D2 >= D, promise raised, lead resumes
+```
+
+**A send before its promise** (decision 4):
+
+```text
+engine-P0: TAR(.., pull p), promise finish#dp0 >= p    CA grants others on finish's term p + ...
+engine-P0 stamps finish#dp0 at s < p                   LPRuntime.stamp_send refuses it there:
+                                                       nothing is sent, the run ends refused
+```
+
+**A delay set too high** (decision 10). The least output step is 29 ms, but a step outside
+the law's hull charges no device time under `mark`:
+
+```text
+engine-P0: request at a, a refused step: finish at a + 5 ms --> frontend-P0 --> relay -->
+  frontend-D0 --> request into engine-D0 at about a + 10 ms
+engine-D0 already granted a + 20 ms (LBTS held a + 29 ms + ...) --> ClockAuthority._register:
+  behind its clock, BackdatedEvent, the run aborts
+engine-D0 not yet past a + 10 ms --> registered in time, the run goes on exact
+```
+
+**A promise lowered when a phase starts** (decision 4):
+
+```text
+traffic: promise cancel >= D1, warmup's grace deadline; warmup's credits all back early
+profiling starts, grace deadline D2 < D1: traffic lowers its promise to D2
+CA: no LP's clock or ceiling past its term from D2, the router's about 10 us past D2 --> accepted
+    a grant or ceiling past one already --> the run aborts with the LP table
+```
+
+### Decisions
+
+1. **Two channels where a declaration needs one** ([the amendment](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7237452108), item 1). A
+   channel stays one link with its own lookahead and seqs (*Lookahead sources*). Under the
+   key, `traffic->router:cancel` carries traffic's cancels at `traffic->router:http`'s
+   lookahead (`carriers.py::cancel_body`), and `engine-P<k>->frontend-P<k>:finish#dpN` a
+   prefill engine's finishing outputs at `output#dpN`'s, each through the same socket as
+   before. One instant's arrivals keep the tie-break `(arrival, channel, seq)`. Rejected:
+   channels by message class on a shared carrier, which the amendment overturned.
+   - `RelayQueue.put` puts on `finish#dpN` a `("STREAM", outputs)` batch holding an output
+     whose `finished` is set, which only `Scheduler.postprocess` builds, after a forward.
+     All else goes on `output#dpN`: backlog reports, metrics, and the lists of finished
+     seqs from `postprocess` and `take_rejected` (`EngineCore._process_engine_step_inner`).
+     An aborted request leaves in such a list, a waiting one through `take_rejected` and a
+     running one through `postprocess` with no stream output; its frontend answers it in
+     `CoreManager._deliver_terminal_output`, with no `kv_transfer_params`, so with no relay.
+
+2. **Delays** (the first Ruling's item 2). An LP declares, per inbound kind, the outbound
+   kinds a message there can provoke, each with its least delay from arrival to send; a kind
+   not listed is never provoked, and an inbound kind left out provokes every kind at 0.
+   D3.6's reactions are delays of 0. `reach(c, i)` is the least, over chains the
+   declarations allow, of their lookaheads plus each intermediate receiver's delay;
+   `D(j->i)` is the least `L(c) + reach(c, i)` over `j`'s channels out, with no delay at
+   `j`. Basis: code, `ChannelTable.mark_reactions` and `_reach_into`'s shortest path, each
+   step adding its delay. Rejected: the prototype's delay table beside the reactions, two
+   sources for one fact.
+3. **One term for an LP that declares or promises** (the first Ruling's items 3 and 6),
+   generalising `ClockAuthority._declared_term`; an LP that does neither keeps `N[j] +
+   D(j->i)`. The term in `LBTS(i)` is the least, over its channels out `c`, of `max(P_c,
+   s_c) + L(c) + reach(c, i)`, `P_c` its promise on `c` (`-inf` without one) and `s_c` its
+   earliest send on `c`:
+   - in NER, the least of `t_j`, `t_daemon_j` and, per inbound kind, its earliest unreleased
+     arrival plus its delay to `c`: D3.6's split;
+   - running or in TAR, `N[j]` if an own event woke it since its last NER or a kind released
+     to it since then provokes `c`; the later of `N[j]` and that NER's `min(t_j, t_daemon_j)`,
+     a timer set before it went idle, which fires once a TAR moves its clock past it
+     (`compass_loop.py::CompassSelector.select`); and per kind its earliest unreleased
+     arrival plus its delay to `c`.
+
+   At an NER its owner is idle and its handlers back at their wait points (I4), so nothing
+   it took is unanswered but through its timed events. Each later send answers an own event,
+   one that woke it or a timer pending at that NER, or a message released to it, a timer
+   its handling sets included: at `N[j]` or later, no sooner than the timer, and no sooner
+   than an unreleased message's arrival plus its delay. Basis: [the owner's ruling](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7232626576),
+   1(a): the second departure from "a running LP contributes `now[j]`", on D3.6 decision 5's
+   argument for an idle LP that declares, here over the messages released since its last
+   NER; code, `_declared_term`; the prototype's busy-state term, among its measured flags.
+   Rejected: running or TAR at `N[j] + D(j->i)` (D3.6 decision 5), which holds a decode
+   engine at its streaming frontend's clock plus `request`'s lookahead: the serial chain
+   itself.
+4. **Promises** (the first Ruling's items 3 and 5). An LP promises, per channel out, no send
+   before a time; the promise rides its clock call and binds the sends logged after it.
+   `LPRuntime.stamp_send` refuses a send before its channel's promise, and the authority
+   refuses one at registration. Raising a promise is always sound. Lowering or withdrawing
+   one the LP's clock has not reached is accepted only if no LP's clock reaches, and no
+   ceiling passes, the terms the lower promise gives; otherwise the run aborts. Traffic
+   lowers its promise when a phase starts with an earlier deadline, and a prefill engine its
+   step or idle promise when its backend refuses an output step under `--on-refusal mark`
+   and so charges it no device time (decision 10): the same check covers both. Basis: D3's
+   grant guarantee, every message at or below a grant delivered, and a ceiling's, none below
+   it: a grant or ceiling past the lowered term rested on the old promise, one short of it
+   did not. The check is new here; the prototype (`b5/fe-engine` 98aed973e) made it for
+   traffic's falling cancel horizon. Rejected: lowering freely, past grants resting on it;
+   never lowering, though a phase can start with an earlier deadline than the promise.
+5. **The local-grant cycle** (*Wide local grants*) takes `reach` with delays; a return
+   through `i`'s own promised channel `c` starts at `max(G, P_c)`. A first hop `c` into an
+   LP `j` in TAR, which #3968 drops, is dropped only where `j`'s term is the plain one;
+   into a `j` that declares it counts the later of its own term, `L(c) + reach(c, i)`, and
+   `N[j] - G` plus the distance, no delay at `j`, over what `c`'s kind provokes there: the
+   later term #4262's cell measured in the prototype's `_cycle_now`. Basis: #3968 takes the
+   return as at least `N[j] + D(j->i)`, a term of `LBTS(i)`, which a declaring LP's term can
+   exceed while `c`'s kind is not released to it; both terms bound the return. Rejected:
+   the prototype's drop for every TAR receiver.
+6. **A prefill engine's step and idle promises** ([the amendment](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7237452108), item 2). At each
+   step's clock call (`LPRuntime.advance_group`) a member promises `finish#dpN` no earlier
+   than its pull when its batch produces output or its deferred stream holds rows back for
+   the next output step (`runner/step_output.py::DeferredTokenStream`), and no earlier than
+   its pull plus the least output step otherwise. At its step loop's idle point, after a pass
+   that made clock calls and a last step that promised past its pull, it promises from its
+   clock plus the least output step, gated as the prototype gated it (`LPRuntime.promise`
+   and `_promise_bound` at 98aed973e): not while an NER is out, a park is due, messages sent
+   ahead are unreached or rounds granted ahead are unreported. The runner's reply says which
+   (the prototype's `compass_finish_soon`, from `NonAllocatingRunner`). Basis: a finish
+   leaves only an output step's `Scheduler.postprocess`; the next step is scheduled no
+   sooner than the pull, or the idle point, and charged at least the least output step;
+   rows held back can surface at the next step, which a DP dummy can be. Rejected: the first
+   Ruling's promise at the pull alone, about 60% of the gap #4267 measured.
+7. **The least output step is the cost backend's own bound** (the amendment, item 3).
+   `CostBackend` (`backends/base.py`) states the least device time it charges an output
+   step, 0 by default. A step linear law states its `step`, `seqs` and `out` at one
+   sequence when none of its coefficients is negative, else 0: 29.0 ms on C1228's prefill
+   law (`step_linear.py` prices `seqs` and `out` only on a step with output). The step
+   roofline states its smallest output batch's price, once a property test shows that price
+   never falls as the batch grows; `StepFallbackBackend` the lesser of its two; any other
+   backend 0.
+8. **A relayed cancel takes the decode intake** (the amendment, items 4 and 5). Under the
+   key a decode frontend's `HttpChannel` takes a relayed cancel only after the request it
+   names, and charges it the least intake before the hang-up, so its `relay` provokes
+   `request` and `control` after the least intake. This is a stated exception: ATOM's decode
+   frontend aborts at once, and `HttpChannel` today charges a cancel nothing. Its cost: a
+   cancelled request aborts at least one least intake late, 1.8 ms on C1228's decode law,
+   and its engine may decode it that long more; and the charge advances the frontend's
+   loop, so a burst of `k` relayed cancels holds that frontend's other streams and intakes
+   for up to `k` least intakes. Cancels sit off the main path, and a run's performance is
+   rarely read where they fire, so simplicity wins over fidelity here. The rule holds only
+   while traffic promises `cancel` (the amendment), and with per-request cancels traffic
+   promises nothing ([the first Ruling](https://github.com/jgong5/ATOM/issues/4161#issuecomment-7219859822), item 4): such
+   a cancel is taken at once, as ATOM takes it. The harness refuses per-request
+   cancellation today (`compass_harness/strategy.py::CompassAgenticReplay`), so every
+   cancel a run makes is promised; a task that paces them must take a decode frontend's
+   `relay` to `control` at 0 wherever such a cancel can come. Rejected: the intake on every cancel, promised or not, against both
+   Rulings.
+9. **The declarations**, computed in `channels.py::prefill_decode_table` under the key from
+   the laws its caller reads in the run file, alike in every process (D3.6 decision 4),
+   never from the environment (the first Ruling's item 4). Decode engines and
+   `mooncake_store` declare nothing. The least intake is the lesser of the decode host
+   entry's `http_intake` `fixed_s` and `idle_s` (`atom.compass.run.http_intake`).
+
+   | LP | provokes, at delay 0 unless named | promise | basis |
+   |---|---|---|---|
+   | traffic | `stream`, `final`: `http` | `cancel`, to the earliest grace deadline of its running phases, kept while none runs; ends at its `+inf` grant | `compass_harness/strategy.py::ClockPhaseRunner._wait_for_event_with_timeout` cancels only when a phase's grace deadline fires, a timed event |
+   | `router` | `http`: `http`; `cancel`: `http`, `relay`; `relay`, `stream`, `final`: their own | none | first Ruling; `compass_router.rs` |
+   | `frontend-P<k>` | `http`, `output`: `request`, `control`; `finish`: `relay`, `request`, `control` | none | a relay is stamped only on a body with `kv_transfer_params` (`carriers.py::with_relay_stamp`), set at a request's finish (`kv/connector.py::request_finished`), absent from a rejected seq's output (`CoreManager._deliver_terminal_output`) |
+   | `frontend-D<k>` | `relay`: `request` and `control` after the least intake, `stream`, `final`; `output`: `stream`, `final` | none | `HttpChannel` charges a relayed request its service and intake before the app runs, and a cancel as decision 8 says; the output thread's engine sends are refused off the clock owner (`LPRuntime._require_owner`); the loop aborts only a stream that did not reach its end (`api_server.py::cleanup_stream`) |
+   | `engine-P<k>` | every kind: `finish` after the least output step | decision 6 | a finish leaves only `postprocess`, after an output step's pull |
+
+10. **A refused step or intake** (the first Ruling's item 5). Under `--on-refusal mark` a
+    step outside its law's hull charges no device time and an intake outside its bytes
+    nothing, so a send can beat its delay; a prefill engine lowers its promise first,
+    through decision 4's check. Where a grant rested on the delay the message lands behind
+    its receiver's clock or ceiling, which `ClockAuthority._register` or the local-step
+    check aborts; elsewhere it changes nothing. Rejected: no delays under `mark`,
+    how C1228 runs.
+11. **One key**, `decode_lead`, needing `wide_local_grants` and LP `router`; it adds
+    channels, so it is part of the configuration, as `stream_bypass` is. Basis: principle,
+    follow the project's conventions: `13`'s run switches are flat keys, and "needs" is how
+    one hangs under another. Rejected: a key per concept, none gaining alone; sub-keys inside
+    `wide_local_grants`, giving that switch two shapes.
+
+The soundness argument is D3.6's, with two more bounds on a link. A message not yet
+registered into `i` ends a chain of sends that starts at an LP's own event or a registered
+message. Each later link answers the one before, no sooner than its arrival plus the
+sender's declared delay, nor than the sender's promise on that channel, so the chain
+arrives no sooner than its start's term. A broken promise is refused where it is made. A
+delay longer than the fact reaches a receiver behind a grant resting on it, which
+`BackdatedEvent` or the straggler check aborts, or reaches none and changes nothing.
+
+### Simpler alternative
+
+The first Ruling's design: promises at the pull, no idle promise, and a cancel taken at once.
+#4262 measured it at 13.9% to 15.4% against off, short of the 18% acceptance.
+
+### Low confidence
+
+- **One instant across an added channel.** A finishing batch and an output an engine put
+  at one instant are released by name, `finish` first, though its socket delivered them in
+  the order put; so is a cancel before a request traffic sent at one instant. A client
+  metric that moves, past decision 8, points here.
+- **The key's shape** (decision 11), cheap to change.
+
+### Dependencies
+
+- Spike [#4262](https://github.com/jgong5/ATOM/issues/4262), PR #4266 at 6c551c435,
+  closed unmerged ([handoff](https://github.com/jgong5/ATOM/issues/4262#issuecomment-7226112332)):
+  the first Ruling's design gains 13.9% to 15.4% against off on paired short cells at 8
+  CPUs a cell, the prototype 19.2% to 20.2%. Client records identical in every cell.
+- Spike [#4267](https://github.com/jgong5/ATOM/issues/4267), PR #4269 at 88c42c905,
+  closed unmerged ([handoff](https://github.com/jgong5/ATOM/issues/4267#issuecomment-7235339333)):
+  leave-one-out shares of that gap, medians: the step promise 61.5%, the relay's intake
+  30%, the idle promise 22.6%, the pending timer 10.8%, the TAR hop 2.9%, each give or
+  take about 10 points; the two soundness fixes stayed exact.
+- The code task depends on [#4268](https://github.com/jgong5/ATOM/issues/4268). #4259
+  confirms on paired cells before it lands (the amendment).
+
+No sync issue: the clock is Compass's own. #4196 closed by #4201. Built on D3.6 (#4144).
+
+### Summary
+
+The deliverable: the lead under `decode_lead`. Out of scope: message classes, pacing
+per-request cancels, a ceiling for an LP with members, input points, every per-step cost. One code task:
+
+- `clock/channels.py`: the two channels, delays in `mark_reactions` and `reach`, the
+  declarations in `prefill_decode_table`.
+- `clock/authority.py`: decision 3's term, the cycle, promises and their checks.
+- `atom/utils/clock.py`: a promise and its refusal in `stamp_send`, the step and idle
+  promises, `finish` in `RelayQueue.put`; `compass_loop.py`: `HttpChannel`'s relayed cancel.
+- `backends/base.py`, `step_linear.py`, `step_roofline.py`: the least output step, and the
+  roofline's property test.
+- `compass_harness/compass_harness/transport.py`: the cancel channel.
+- Beside the brief's file set, as the prototype changed them:
+  `atom/compass/runner/overrides.py`, the reply saying whether a batch produced output or
+  holds rows back; `compass_harness/compass_harness/traffic_lp.py` and `strategy.py`,
+  traffic's promise to its phases' grace deadlines.
+- `atom/mesh/src/compass_router.rs`: a cancel held on `cancel`. The run file and
+  `compass run`: `decode_lead`.
+- `tests/compass/`: on the 8P16D table, the distances with delays; a decode frontend that
+  took only outputs leaving its engine's LBTS at the long return; a send before its promise
+  refused where it is made; a lowered promise refused where a grant rests on it.
+
+Acceptance: paired short cells at 8 CPUs a cell, the key on against off, client metrics
+identical and a wall gain of at least 18%; wall per simulated second and the LPs'
+parallelism each way. A client metric that moves points at decision 8 first.
 
 ---
 
@@ -3463,7 +3776,8 @@ own process with the policy code untouched. It is (owner ruling on
 - **Cancels** (#1966). aiperf's hang-up at the end of its duration takes the
   single-server cancel's path (#884), hop by hop. The traffic LP stamps it on
   `traffic->router:http` as a request whose body names the cancelled request's seq
-  (`carriers.py::cancel_body`). The router LP answers it 204 at its arrival and sends it
+  (`carriers.py::cancel_body`), on a channel of its own, `traffic->router:cancel`, under
+  D3.7's key, where a decode frontend takes a relayed cancel after its intake. The router LP answers it 204 at its arrival and sends it
   on to where the request is then, naming the request's seq on that channel: on
   `router->frontend-P:http` before the request's relay is handled, on
   `router->frontend-D:relay` after, its stamp in the body's `kv_transfer_params`. A
@@ -3782,6 +4096,7 @@ Ordered by how much they could cost.
 | D3.4 | Wall-clock interleaving may vary between runs; the `(LP, virtual time, event)` sequence may not. Thread scheduling inside an LP is irrelevant only under in-transit counting and TSO delivery; ties break by **(time, LP id, channel, sequence number), never arrival order**; the cost backend is a pure function of its batch view; **no `set` iteration on the simulated path** - string ids are hashed under `PYTHONHASHSEED` randomisation, so a set of request ids iterates differently in every process. Test is a byte-diff of two step tables, CPU-only, in CI. | 2026-09-20; revised 2026-09-28 |
 | D3.5 | The CA owns three outputs: an opt-in timeline log, a stall diagnostic (a stall the CA can see is resolved by deadlock detection and recovery; one it cannot see gets a diagnostic, never an abort), and a run summary written always, an early end included, carrying grants, speed ratio, lazy-trace cost, detector state, the refusals with their reasons, the predicted seconds by method, and `coverage_report` (`08` D50.1). Each quantity is counted in one place, which the summary, the step table and the timeline read; the simulated system's latency and throughput (TTFT, ITL, request counts) stay in the benchmark's output and ATOM's metrics, not the summary. | 2026-09-20; revised 2026-09-28, 2026-10-11 and 2026-10-14 (#952) |
 | D3.6 | On #3968's flag, an LP may declare which outbound channel kinds a message on each inbound kind can provoke; LBTS and the local-grant cycle follow the declarations, and the router declares its own kind, and a cancel's relay; an LP with members takes no ceiling past its rounds, and no round passes without LBTS | 2026-11-25 (#4135) |
+| D3.7 | Under the key `decode_lead`, an LP may declare a least delay per inbound and outbound kind, and promise per channel out no send before a time, with `traffic->router:cancel` and `finish#dpN` added where a declaration needs one; one term per declaring or promising LP generalises the router's, a running LP's at its clock on the channels what woke it can provoke, the second departure from `now[j]`, and at the promise on a promised one; a prefill engine promises past its pull, or from its idle clock, by its cost backend's least output step; a decode frontend takes a relayed cancel after its intake, a stated fidelity exception; the declarations come from the run's laws | 2026-11-27 (#4161); revised 2026-11-28 twice (the second departure; no message classes, step and idle promises, the cancel's intake) |
 | D4 | Every synchronization site maps to one of the PDES mechanisms K1-K9, none undecided; the boundary is the LP, not the process; a DP member's step is one TAR at its own release from the group's device end, the `max` over ranks by an `all_reduce(MAX)` (with no host time, an output rank's at the `max` of the step seconds), exchanged inside the forward by K6 waits with no cost, and the lockstep `all_reduce` is K1 for its own cost; handler threads stay and TSO delivery runs them at their message's timestamp. A forward's K1 charge is one recurrence per runner over the backend's device busy time and host segments (`E`, `W_pre`, `W_launch`, `W_post`, and under MTP `W_inputs` after R1), with wait rules R1, R4 and R6 to R8; after the return the engine LP advances the host's `out_s` (`E_out`) to its input pull, a DP member's pull joining the group rounds; `host.skip` makes a what-if; ATOM's bugs, its sync stalls included, are fixed in ATOM and listed under the `atom-issue` label | 2026-09-18; revised 2026-09-28, 2026-10-01, 2026-10-11 (#815), 2026-10-16 (#829, #1267), 2026-10-18 (#1345), 2026-10-19 (#1409) and 2026-10-21 (#1859) |
 | D5 | Every timer and clock read the CA can reach runs on the LP clock, except the out-of-band control-command reply deadline; only what it cannot reach is configured or left real; metric cadence is virtual time (revising `11` D72); the profiler and RL control commands are refused by the simulated runner with a reply, counted, and make the run a coverage report; a synchronous command from the frontend's clock owner is refused by the frontend | 2026-09-18; revised 2026-09-28, 2026-10-09, 2026-10-14, 2026-10-15 |
 | D5.1 | The simulated run uses stdlib asyncio, not uvloop: only a Python event loop can host virtual time | 2026-09-28 |

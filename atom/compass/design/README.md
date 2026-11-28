@@ -221,7 +221,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 
 | Layer | Component | Document | Decisions |
 |---|---|---|---|
-| L1 | Clock Authority, grant rule, LP collapse | [`01_execution_and_time_model.md`](01_execution_and_time_model.md) | D3, D3.1, D3.6 |
+| L1 | Clock Authority, grant rule, LP collapse | [`01_execution_and_time_model.md`](01_execution_and_time_model.md) | D3, D3.1, D3.6, D3.7 |
 | L1 | Causality detectors | [`01`](01_execution_and_time_model.md) | D3.2 |
 | L1 | CA deployment (co-hosted / standalone) | [`01`](01_execution_and_time_model.md) | D3.3 |
 | L1 | Wait interception contract (K1–K9 mechanisms) | [`01`](01_execution_and_time_model.md) | D4, D5 |
@@ -612,7 +612,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Decisions | Document |
 |---|---|
-| D0 – D9 (+ D3.1–D3.6, D5.1, D6.1, D6.2) | `01` Execution and Time Model |
+| D0 – D9 (+ D3.1–D3.7, D5.1, D6.1, D6.2) | `01` Execution and Time Model |
 | D10 – D12 (+ D10.1) | `02` Model Runner Seam and Cost Backend |
 | D13 – D16 (+ D13.1) | `03` Memory Model and the KV Pool |
 | D17 – D23 (+ D18.1) | `04` Model Capture and the Cost IR |
