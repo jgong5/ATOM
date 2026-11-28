@@ -193,7 +193,7 @@ class TrafficLP:
         self._pull = ctx.socket(zmq.PULL)
         self._pull.bind(reports)
         # The same socket, whose queued reports `_take_queued` reads with no
-        # future each.
+        # future each; every report is taken there, in the order it came.
         self._pull_queued = zmq.Socket.shadow(self._pull.underlying)
         self._subscribers = 0
         # sent at this instant, not yet stamped: (rank, key), in aiperf's order
@@ -448,12 +448,20 @@ class TrafficLP:
     # ---- the owner ----
 
     async def _read_reports(self) -> None:
+        # Once the socket holds a report, takes every queued one as the hold
+        # does: a report this task received itself would be taken only turns of
+        # the loop later, after those the hold read behind it meanwhile. The
+        # hold relies on each worker's order: it takes the final's channel
+        # first, and an event unreported once no request is open is then a
+        # closed request's.
         while True:
-            self._take(await self._pull.recv_pyobj())
+            await self._pull.poll()
+            self._take_queued()
 
     def _take_queued(self) -> None:
-        """Take the reports already queued without a turn of the event loop:
-        most reach the socket while the owner is blocked in a clock call."""
+        """Take the reports already queued, in the order they came, without a
+        turn of the event loop: the hold's read, as most reach the socket while
+        the owner is blocked in a clock call, and the reader's."""
         recv = self._pull_queued.recv
         while True:
             try:
