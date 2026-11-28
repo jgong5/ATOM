@@ -1133,6 +1133,35 @@ def test_a_split_step_the_list_prices_in_part_is_a_roofline_carrying_why(
     )
 
 
+def test_a_tp8_split_step_whose_list_declines_its_tbo_all_reduce_is_its_roofline():
+    # One rank's 7 tokens split 3 then 4. Each micro-batch runs its GEMM, then
+    # ATOM's TP all-reduce under two-batch overlap; the list holds the GEMMs
+    # at a second each, their roofline.
+    tbo = "aiter.tbo_all_reduce.default"
+    split = replace(SPLIT, moe_rows=None, tbo_tokens=((3,), (4,)))
+    params = listed(
+        *[
+            pt(g(n, 8, 8), f"prefill T={n} B={b}", 1e9, c)
+            for n, b in ((3, 1), (4, 2))
+            for c in (0, 8)
+        ]
+    )
+
+    def graph(phase, tokens, seqs, output, gathered, **_):
+        return {"seq": [g(tokens, 8, 8), leaf(tbo, [[tokens, 8]], x=t([tokens, 8]))]}
+
+    def priced(**kwargs):
+        return OpGraphBackend(SECOND, graph, kv="bf16", tp=8, **kwargs).price(split)
+
+    cost = priced(price_list=params)
+
+    assert by_name(cost) == by_name(priced()) == {"op.tbo": by_name(cost)["op.tbo"]}
+    assert cost.fell_back
+    assert cost.refusals == (
+        Refusal("price-list", f"{tbo}: no point of its signature was measured"),
+    )
+
+
 def flat(n, *bs):
     """Decode points of a GEMM into `n` outputs, B microseconds at B, flat in
     context, so its family runs over B alone."""

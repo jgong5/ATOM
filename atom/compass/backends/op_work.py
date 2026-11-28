@@ -228,14 +228,12 @@ def _in_place(*slots):
     return lambda op, view, tp, kv: _boundary(op, slots)
 
 
-def _all_reduce(op, view, tp, kv) -> Work:
-    return _boundary(op) + allreduce(tp, _bytes(op["args"]["tensor"]))
-
-
-def _fused_all_reduce_norm(op, view, tp, kv) -> Work:
-    """An all-reduce of `inp` fused with the residual add and RMSNorm after
-    it: the all-reduce's bytes, and each tensor read and written once."""
-    return _boundary(op) + allreduce(tp, _bytes(op["args"]["inp"]))
+def _all_reduce(slot):
+    """An all-reduce of the `slot` tensor over the TP group: its bytes, and
+    each tensor read and written once."""
+    return lambda op, view, tp, kv: _boundary(op) + allreduce(
+        tp, _bytes(op["args"][slot])
+    )
 
 
 def _all_gather(op, view, tp, kv) -> Work:
@@ -958,10 +956,13 @@ EXTRACTORS = {
     "aiter.masked_embedding.default": _gather("weight"),
     "aten.embedding.default": _gather("weight"),
     "aten.index.Tensor": _gather("self"),
-    "aiter.all_reduce_.default": _all_reduce,
+    "aiter.all_reduce_.default": _all_reduce("tensor"),
     # the all-reduce with the residual add after it, `other` read once
-    "aiter.all_reduce_add_.default": _all_reduce,
-    "aiter.fused_allreduce_rmsnorm_.default": _fused_all_reduce_norm,
+    "aiter.all_reduce_add_.default": _all_reduce("tensor"),
+    # the all-reduce with the residual add and RMSNorm after it
+    "aiter.fused_allreduce_rmsnorm_.default": _all_reduce("inp"),
+    # ATOM's TP all-reduce under two-batch overlap
+    "aiter.tbo_all_reduce.default": _all_reduce("x"),
     "_c10d_functional.all_gather_into_tensor.default": _all_gather,
     "_c10d_functional.broadcast.default": _broadcast,
     "_c10d_functional.wait_tensor.default": lambda op, view, tp, kv: None,
