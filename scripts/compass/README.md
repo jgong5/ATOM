@@ -1102,7 +1102,13 @@ is the crs005 DPA8 law's of that side, copied without a refit; `provenance` name
 Each prefill law's `prefill.L_mtp` is its own `decode.L_mtp`, copied the same way: the status
 copy it prices is the previous output forward's, whatever this forward's kind, and the prefill
 forwards waited on it too rarely to fit one. Each host key's `atom` is re-keyed without a refit
-from the digest its records ran at; `provenance` says why.
+from the digest its records ran at; `provenance` says why. Each side's `http_intake` is refitted
+by `compass fit host` on that side of twelve records, as the TP8 laws' is: those three cells and
+the cell's nine graded rounds, c=1, 4 and 16 three each over traces 0 to 255 for 3600 s at ATOM
+2753926ba, whose decode sides ran on crsuse2-m2m-v3-004 or -034 in place of -013, the same EPYC
+9575F host CPU the laws' key states ([refit](https://github.com/jgong5/ATOM/issues/1499#issuecomment-7231351386)). The
+prefill side's spans bodies of 1,547 to 971,174 bytes and the decode side's relayed bodies of
+3,593 to 2,195,990, in both cells; a body outside its side's range is refused and charged nothing.
 
 `scripts/compass/laws/deepseek-v4.1-flash-tp4-dspark5-mi455-a0.json.xz` is DeepSeek-V4.1-Flash's
 law for cell B of [#2138](https://github.com/jgong5/ATOM/issues/2138), TP4 with the routed
@@ -1491,9 +1497,9 @@ list, Runs and Grading steps, with these differences:
   so check each real record with `compass run --op-graph --coverage` against the fitted price
   list and measure only the points that alone leave steps out ([Ruling on #3567](https://github.com/jgong5/ATOM/issues/3567#issuecomment-6951471078)):
   `trace ops --prefill T B --whole`, then `measure ops --prefill T B --context C`. Such a run
-  names a whole step's graph, whose leaves key the same points its micro-batches' do. A step
-  whose `aiter.tbo_all_reduce` the price list declines is refused
-  ([#3672](https://github.com/jgong5/ATOM/issues/3672)).
+  names a whole step's graph, whose leaves key the same points its micro-batches' do. Where
+  the price list declines a step's `aiter.tbo_all_reduce`, that leaf takes its roofline, as
+  `aiter.all_reduce_` does ([#3672](https://github.com/jgong5/ATOM/issues/3672)).
 - **The decode side's points at 0.6.** At 0.70 the decode side's `measure ops` runs out of
   device memory on its MoE points ([#3632](https://github.com/jgong5/ATOM/issues/3632)).
   No graph or point key holds the utilization, so the decode side's simulated run stays at 0.70.
@@ -1504,6 +1510,54 @@ list, Runs and Grading steps, with these differences:
   (above). A simulated relayed body runs 50 to 54 bytes over the real one, so a decode-side
   intake above 2,195,990 bytes stays refused, and `validate` grades no run that refused one
   ([#3919](https://github.com/jgong5/ATOM/issues/3919)).
+
+### The MTP cells under the op-level backend
+
+The TP MTP3 cell is the TP8 cell, and the DPA MTP1 cell the DPA-TP8 cell, each with the recipe's
+drafter flags on both sides, `--method mtp --num-speculative-tokens 3` and `1`, and otherwise its
+base cell's arguments, environment and `--gpu-memory-utilization`, which one 300 s c=16 run of
+the cell served on both sides ([registration](https://github.com/jgong5/ATOM/issues/1499#issuecomment-6870031685)).
+A real run is `deploy.sh record` as its base cell's, the graded rounds' decode on
+crsuse2-m2m-v3-004 or -034 in place of -013 as the registrations below state; a speculative
+engine's stop writes each DP rank's accepted-draft histogram, `steps/dp<r>.acceptance.json`. A
+simulated run follows its base cell's steps, with these differences:
+
+- **The drafter apart.** Under the drafter flags `trace ops` publishes each step's drafter graph
+  beside its target's, `measure ops --plan` plans the drafter's leaves at the shapes its passes
+  run (`atom/compass/bench/ops.py`), and the op-level backend prices the drafter's graph into
+  terms of its own, `draft op.<kind>` (`atom/compass/backends/op_graph.py`). A step that
+  `--enable-tbo` splits runs its drafter after both micro-batches, at the whole step
+  ([#4209](https://github.com/jgong5/ATOM/issues/4209)): `trace ops --population` traces that
+  shape too (`atom/compass/capture/__init__.py::population_shapes`), and `measure ops --drafter`
+  times a drafter's leaves alone. A prefill instance's one-token decode steps verify no draft
+  (`V=0`, [#4210](https://github.com/jgong5/ATOM/issues/4210)): trace their graphs under the
+  side's Mooncake producer config and measure their points over the calibration records' own.
+- **Points.** An `op_measurement` key holds no engine config, so the base cell's points at the same
+  source root and platform are linked into the cell's store; `measure ops --plan` runs over
+  [#3344](https://github.com/jgong5/ATOM/issues/3344)'s calibration records, never a graded run.
+- **Acceptance.** `deploy.sh run --acceptance-record CELL/c<C>/real1/decode` gives both instances
+  round 1's measured per-position rates at that concurrency as `--spec-decode-acceptance-rates`,
+  and the summary names the input `measured`. No grade reads acceptance
+  ([Ruling on #3345](https://github.com/jgong5/ATOM/issues/3345#issuecomment-6849660042)).
+- **Host laws.** `P` and `D` are the cell's MTP laws (above), keyed by the drafter; each side's
+  `http_intake` spans the bodies the cell's real rounds sent, as the TP8 cell's does.
+- **Run files.** `deploy.sh run` builds one run file per deployment, `OUT/run_file.json`, and its
+  hash is registered as #975's are: the sha256 of `json.dumps(sort_keys=True)` over the run file
+  less `out_dir` and `clock_endpoint`. Each names its concurrency's acceptance record, so each
+  concurrency has its own. Before a node's first run, a probe deployment there must serve from
+  both instances and hash alike; a run whose run file hashes otherwise stops its node's runs.
+- **Registered runs.** [DPA MTP1](https://github.com/jgong5/ATOM/issues/1499#issuecomment-7235391134)
+  and [TP MTP3](https://github.com/jgong5/ATOM/issues/1499#issuecomment-7235391305) register
+  their runs at c=1, 4 and 16: `deploy.sh run` in a node's GPU container with no card used, then
+  the real rounds' client at the run's concurrency on traces 0 to 255 for 3600 s, one run at a
+  time per host, never beside a real run or a measurement; `validate` grades each on a view cell
+  holding it and `real1` to `real3`. TP MTP3's registered runs refused steps whose
+  `aiter.tbo_all_reduce` the price list declined ([#3672](https://github.com/jgong5/ATOM/issues/3672),
+  priced by its roofline since [#4279](https://github.com/jgong5/ATOM/pull/4279)), and DPA MTP1's
+  c=16 run refused a relayed body above the decode range ([#4288](https://github.com/jgong5/ATOM/issues/4288)),
+  so those stand as coverage reports ([Ruling](https://github.com/jgong5/ATOM/issues/1499#issuecomment-7239794648));
+  [#4274](https://github.com/jgong5/ATOM/issues/4274) grades TP MTP3. The results and the ranking
+  are in [#1499's summary](https://github.com/jgong5/ATOM/issues/1499#issuecomment-7238075434).
 
 ### The EP8 cell under the op-level backend
 
