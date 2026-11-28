@@ -1105,7 +1105,8 @@ forwards waited on it too rarely to fit one. Each host key's `atom` is re-keyed 
 from the digest its records ran at; `provenance` says why. Each side's `http_intake` is refitted
 by `compass fit host` on that side of twelve records, as the TP8 laws' is: those three cells and
 the cell's nine graded rounds, c=1, 4 and 16 three each over traces 0 to 255 for 3600 s at ATOM
-2753926ba ([refit](https://github.com/jgong5/ATOM/issues/1499#issuecomment-7231351386)). The
+2753926ba, whose decode sides ran on crsuse2-m2m-v3-004 or -034 in place of -013, the same EPYC
+9575F host CPU the laws' key states ([refit](https://github.com/jgong5/ATOM/issues/1499#issuecomment-7231351386)). The
 prefill side's spans bodies of 1,547 to 971,174 bytes and the decode side's relayed bodies of
 3,593 to 2,195,990, in both cells; a body outside its side's range is refused and charged nothing.
 
@@ -1496,9 +1497,9 @@ list, Runs and Grading steps, with these differences:
   so check each real record with `compass run --op-graph --coverage` against the fitted price
   list and measure only the points that alone leave steps out ([Ruling on #3567](https://github.com/jgong5/ATOM/issues/3567#issuecomment-6951471078)):
   `trace ops --prefill T B --whole`, then `measure ops --prefill T B --context C`. Such a run
-  names a whole step's graph, whose leaves key the same points its micro-batches' do. A step
-  whose `aiter.tbo_all_reduce` the price list declines is refused
-  ([#3672](https://github.com/jgong5/ATOM/issues/3672)).
+  names a whole step's graph, whose leaves key the same points its micro-batches' do. Where
+  the price list declines a step's `aiter.tbo_all_reduce`, that leaf takes its roofline, as
+  `aiter.all_reduce_` does ([#3672](https://github.com/jgong5/ATOM/issues/3672)).
 - **The decode side's points at 0.6.** At 0.70 the decode side's `measure ops` runs out of
   device memory on its MoE points ([#3632](https://github.com/jgong5/ATOM/issues/3632)).
   No graph or point key holds the utilization, so the decode side's simulated run stays at 0.70.
@@ -1550,9 +1551,10 @@ simulated run follows its base cell's steps, with these differences:
   their runs at c=1, 4 and 16: `deploy.sh run` in a node's GPU container with no card used, then
   the real rounds' client at the run's concurrency on traces 0 to 255 for 3600 s, one run at a
   time per host, never beside a real run or a measurement; `validate` grades each on a view cell
-  holding it and `real1` to `real3`. TP MTP3's runs refuse steps whose `aiter.tbo_all_reduce`
-  the price list declines ([#3672](https://github.com/jgong5/ATOM/issues/3672)), and DPA MTP1's
-  c=16 run a relayed body above the decode range ([#4288](https://github.com/jgong5/ATOM/issues/4288)),
+  holding it and `real1` to `real3`. TP MTP3's registered runs refused steps whose
+  `aiter.tbo_all_reduce` the price list declined ([#3672](https://github.com/jgong5/ATOM/issues/3672),
+  priced by its roofline since [#4279](https://github.com/jgong5/ATOM/pull/4279)), and DPA MTP1's
+  c=16 run refused a relayed body above the decode range ([#4288](https://github.com/jgong5/ATOM/issues/4288)),
   so those stand as coverage reports ([Ruling](https://github.com/jgong5/ATOM/issues/1499#issuecomment-7239794648));
   [#4274](https://github.com/jgong5/ATOM/issues/4274) grades TP MTP3. The results and the ranking
   are in [#1499's summary](https://github.com/jgong5/ATOM/issues/1499#issuecomment-7238075434).
