@@ -3,7 +3,8 @@
 # Copyright (c) 2026 ATOM Project Contributors
 """walls.py DESIGNED MEASURED CELL...: each short cell's profiling wall, from its aiperf log's
 `profiling started` to `sending complete` at ms, per simulated second (120 s); the gap, designed less
-measured; and what each other cell's change costs, designed less that cell, and its share of the gap."""
+measured; and what each other cell's change costs, designed less that cell, and its share of the gap.
+A cell whose profiling did not complete has no wall and is left out."""
 import datetime as dt
 import re
 import sys
@@ -12,18 +13,22 @@ from pathlib import Path
 PHASE = re.compile(r"(\d\d:\d\d:\d\d\.\d+) +\w+ +Phase profiling \(profiling\) (started|sending complete)")
 
 
-def wall(run: str) -> float:
+def wall(run: str) -> float | None:
     at = {}
     for line in open(Path(run) / "client/aiperf.log", errors="replace"):
         m = PHASE.match(line)
         if m:
             at.setdefault(m[2], dt.datetime.strptime(m[1], "%H:%M:%S.%f"))
+    if len(at) < 2:
+        return None
     s = (at["sending complete"] - at["started"]).total_seconds()
     return (s + 86400 if s < 0 else s) / 120
 
 
-runs = sys.argv[1:]
-w = {run: wall(run) for run in runs}
+w = {run: wall(run) for run in sys.argv[1:]}
+for run in [run for run, x in w.items() if x is None]:
+    print(f"{run:12s} no profiling wall: the cell did not complete")
+runs = [run for run in w if w[run] is not None]
 designed, measured = w[runs[0]], w[runs[1]]
 gap = designed - measured
 for run in runs:

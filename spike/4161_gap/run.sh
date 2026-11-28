@@ -67,9 +67,11 @@ round)
   wait
   echo "$(date -u +%FT%TZ) s4267 round $K: lanes C and D released" >> $L/out/pairs.log
   T=$(for t in des meas relay step idle timer hop open; do printf ' %s' ${P}_$t; done)
+  E=$(for t in des meas relay step idle timer hop open; do  # the cells that completed
+    [ -s $R/${P}_$t/artifacts/profile_export_aiperf.json ] && printf ' %s' ${P}_$t; done)
   docker exec -w $R $C bash -c "grep -h 'CPUs' ${P}_*.logs/sim.log | sed 's/.*b5 \([^ :]*\):.*CPUs/\1 CPUs/'
     grep -hE 'EXIT|PHASES' ${P}_*.out; python3 $X/b5/bin/ab.py$T; python3 $X/b5/bin/walls.py$T
-    python3 $X/b5/bin/err.py$T | grep -E '^==|matched'
+    python3 $X/b5/bin/err.py$E | grep -E '^==|matched'
     grep -lE '$ERR' ${P}_*/*.log ${P}_*.logs/*.log || echo 'no clock error in the logs'"
   ;;
 clean) docker exec $C rm -rf $W ;;
