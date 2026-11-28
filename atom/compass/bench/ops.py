@@ -4677,14 +4677,15 @@ def _cut(fam: str):
     return (json.dumps(base, sort_keys=True), cached) if len(base) == 3 else None
 
 
-def _dependent(records) -> dict:
+def _dependent(records, rows_leaf=None) -> dict:
     """Whether each leaf kind timed at two contexts of one shape depends on
     context: its kernels differ there, or its cold times by more than
     `CONTEXT_MOVES` of the largest and `CONTEXT_FLOOR_NS`. A decode kind, read
     at two row contexts, is keyed by its name; a prefill kind, read fresh and
     over cached tokens, by ``("prefill", name)``. Keyed ``("rows", name)``,
     whether a prefill kind timed at two row counts of one token count and
-    cached tokens moves with its rows."""
+    cached tokens moves with its rows, its points there compared by leaf, or
+    by what `rows_leaf` reads of each record where given."""
     by = defaultdict(list)
     for r in records:
         if "refused" in r:
@@ -4694,7 +4695,8 @@ def _dependent(records) -> dict:
         else:
             by[("prefill", r["op"]), r["shape"], r["leaf"]].append(r)
             at = _shape(r["shape"]).tokens, r["context"]
-            by[("rows", r["op"]), at, r["leaf"]].append(r)
+            leaf = r["leaf"] if rows_leaf is None else rows_leaf(r)
+            by[("rows", r["op"]), at, leaf].append(r)
     kinds = {}
     for (kind, *_), points in by.items():
         if len(points) > 1:

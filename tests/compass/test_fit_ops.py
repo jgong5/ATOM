@@ -16,7 +16,7 @@ from atom.compass import cli, run
 from atom.compass.artifacts import ArtifactRefusal, ArtifactStore, GateState, Key, Kind
 from atom.compass.backends import BatchView, RequestShape
 from atom.compass.backends.op_graph import LISTED, OpGraphBackend
-from atom.compass.backends.provenance import Refusal
+from atom.compass.backends.provenance import Method, Refusal
 from atom.compass.backends.resolver import CostRefused
 from atom.compass.bench import ops as bench
 from atom.compass.capture.peers import MORI
@@ -405,6 +405,37 @@ def test_a_prefill_kind_its_rows_move_runs_over_its_rows():
     points += [_prefill(64, 2, 6e5, context=0)]
 
     assert _families(points) == [(["B"], [[[1], 300e3], [[2], 6e5]])]
+
+
+def _compress(tokens, b):
+    """A prefill kernel over `tokens` tokens and a block table, metadata ATOM's
+    runner sizes from the batch: a row for each of `b` sequences."""
+    table = t([b, 4096], "torch.int32", role="metadata")
+    return leaf("compress_attn", kv_in=t([tokens, 1024]), block_tables=table)
+
+
+def _compressed(tokens, b, ns, kernel, context=0):
+    point = {"shape": f"prefill T={tokens} B={b}", "context": context, "cold_ns": ns}
+    sig = bench.signature(_compress(tokens, b))
+    return point | {"op": "compress_attn", "leaf": sig, "kernels": [kernel]}
+
+
+def test_a_prefill_kind_whose_kernel_moves_with_its_rows_at_one_t_prices_each_b():
+    # flat in cached tokens; at one T two rows take a split-K kernel, 3.7x
+    # faster, on a block table one row longer than one row's
+    points = [_compressed(4096, 1, 24e3, "plain"), _compressed(5125, 1, 30e3, "plain")]
+    points += [_compressed(5125, 1, 30e3, "plain", context=1024)]
+    points += [_compressed(5125, 2, 8e3, "plain_KS2")]
+    params = ops.fit(points)
+
+    assert _families(points) == [
+        (["T", "B"], [[[4096, 1], 24e3], [[5125, 1], 30e3], [[5125, 2], 8e3]])
+    ]
+    for b, ns in ((1, 30e3), (2, 8e3)):
+        at = ("prefill", 5125, b, None, 0, 0)
+        got = ops.PriceList(params).price((_compress(5125, b), at, 0))
+        assert got.seconds == pytest.approx(ns * 1e-9)
+        assert got.provenance.method is Method.MEASURED
 
 
 def test_a_stated_gathered_count_is_a_dimension_its_points_kept_apart():
