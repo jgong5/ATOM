@@ -10,9 +10,10 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = (
-    Path(__file__).resolve().parents[2] / "scripts" / "compass" / "compare_dashboard.py"
-)
+from atom.compass.backends.step_labels import ACCEPT_BUILDS_ENV, BUILDS
+
+TREE = Path(__file__).resolve().parents[2]
+SCRIPT = TREE / "scripts" / "compass" / "compare_dashboard.py"
 _spec = importlib.util.spec_from_file_location("compare_dashboard", SCRIPT)
 dash = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dash)
@@ -255,6 +256,39 @@ def test_the_ttft_p90_follows_the_p50_and_the_p99_is_not_shown(tmp_path):
     assert data["request_names"]["p90 TTFT"] == "TTFT p90 ms"
     labels = [c["label"] for c in data["request_cols"]]
     assert labels[:3] == ["TTFT p50", "TTFT p90", "TPOT p50"]
+
+
+def test_a_cell_whose_real_run_one_real_refuses_is_listed_as_not_shown(
+    tmp_path, monkeypatch, capsys
+):
+    """With ``--one-real-tree``, a cell with no one_real file has that tree's
+    one_real.py run over its runs. One whose real run's server compiled a JIT
+    kernel while it served is refused there: the page lists it under Not
+    shown with the refusal, adds none of its panels, and shows the others."""
+    monkeypatch.delenv(ACCEPT_BUILDS_ENV, raising=False)
+    root = (tmp_path / "root").resolve()
+    shown, refused = root / "M1/pd/1P1D/c8", root / "M1/aggregated/TP8/c8"
+    _cell(shown, "pd")
+    rows = {"TTFT p50 ms": 1000.0, "requests": 1}
+    line = json.dumps({"real": rows, "sim_a": rows})
+    (shown / dash.SCAN_ONE_REAL).write_text(line + "\n")
+    _cell(refused, "aggregated")
+    real = refused / dash.SCAN_REAL
+    for run in (real, refused / dash.SCAN_SIMS / "sim_a"):
+        (run / "artifacts/client_run.json").write_text('{"arguments": {}}')
+    (real / "run.json").write_text(json.dumps({BUILDS: ["_k"]}))
+    out = tmp_path / "dash.html"
+
+    argv = ("--scan", root, "--out", out, "--window", WINDOW, "--one-real-tree", TREE)
+    assert _main(*argv) == 0
+
+    data = _page(out)
+    assert [c["parallel"] for c in data["cells"]] == ["1P1D"]
+    assert "api_ttft" not in {p["id"] for p in data["panels"]}
+    named = "its server ran a JIT compile of ['_k'] while it served"
+    refusal = f"{real} is not graded: {named}, so a step may have waited on it"
+    assert data["meta"]["skipped"] == [f"M1 Aggregated TP8 c=8: one_real.py: {refusal}"]
+    assert "skipped: M1 Aggregated TP8 c=8: one_real.py: " in capsys.readouterr().err
 
 
 def test_no_manifest_and_no_scan_is_a_usage_error(tmp_path):

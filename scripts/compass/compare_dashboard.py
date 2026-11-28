@@ -89,7 +89,9 @@ it. A simulated run's ``key`` is its column in ``one_real.py``'s output, by
 default its run directory's name. Several ``one_real`` files merge, a later
 file's column replacing an earlier one's. With ``--one-real-tree``, a cell
 whose ``one_real`` files are all missing has ``one_real.py`` run from that
-tree over its runs, its output kept beside the page.
+tree over its runs, its output kept beside the page. A cell whose real run
+``one_real.py`` refuses as not graded is listed under "Not shown" with the
+refusal.
 """
 
 from __future__ import annotations
@@ -598,7 +600,15 @@ def merge_one_real(parsed: list[dict]) -> dict | None:
     return out
 
 
-def run_one_real(tree: Path, cell: dict, out: Path) -> Path:
+#: one_real.py's refusal of its real run, its whole output when it exits 1:
+#: the server directory and why that run is not graded.
+_REFUSED = re.compile(r"\S.* is not graded: .+")
+
+
+def run_one_real(tree: Path, cell: dict, out: Path) -> str | None:
+    """Run `tree`'s one_real.py over `cell`'s runs, its output into `out`.
+    Returns its refusal of the real run, else None; any other failure ends
+    the page."""
     runs = [cell["real"]["run"], *(s["run"] for s in cell["sims"])]
     env = dict(os.environ, PYTHONPATH=str(tree))
     with out.open("w") as f:
@@ -614,9 +624,11 @@ def run_one_real(tree: Path, cell: dict, out: Path) -> Path:
             cwd="/",
             check=False,
         )
+    if done.returncode == 1 and _REFUSED.fullmatch(text := out.read_text().strip()):
+        return text
     if done.returncode:
         raise SystemExit(f"one_real.py exited {done.returncode}; see {out}")
-    return out
+    return None
 
 
 def short(panel: dict) -> str:
@@ -628,7 +640,7 @@ def short(panel: dict) -> str:
 
 def build(cells: list[dict], window: float, args) -> dict:
     panels, order = {}, []
-    out_cells = []
+    out_cells, not_shown = [], []
     for cell in cells:
         runs = [dict(cell["real"], sim=False)] + [
             dict(s, sim=True) for s in cell["sims"]
@@ -660,6 +672,16 @@ def build(cells: list[dict], window: float, args) -> dict:
             raise SystemExit(
                 f"{where(cell)}: window_s {cell_window:g} is not whole minutes"
             )
+        files = [f for f in cell["one_real"] if f.is_file()]
+        missing = [str(f) for f in cell["one_real"] if not f.is_file()]
+        if not files and args.one_real_tree and all(r["run"] for r in runs):
+            name = re.sub(r"[^\w.-]+", "_", where(cell).replace("c=", "c"))
+            target = args.out.parent / f"one_real_{name}.txt"
+            # A refused cell adds no panel: the page holds its shown cells' panels.
+            if refusal := run_one_real(args.one_real_tree, cell, target):
+                not_shown.append(f"{where(cell)}: one_real.py: {refusal}")
+                continue
+            files, missing = [target], []
         n = int(cell_window // step) + 1
         per_minute = int(60 // step)
         for run, rep in zip(runs, reports):
@@ -729,12 +751,6 @@ def build(cells: list[dict], window: float, args) -> dict:
         keep = common_minutes([r["minutes"] for r in out_runs])
         for run in out_runs[1:]:
             run["pairs"] = paired_means(out_runs[0]["minutes"], run["minutes"], keep)
-        files = [f for f in cell["one_real"] if f.is_file()]
-        missing = [str(f) for f in cell["one_real"] if not f.is_file()]
-        if not files and args.one_real_tree and all(r["run"] for r in runs):
-            name = re.sub(r"[^\w.-]+", "_", where(cell).replace("c=", "c"))
-            target = args.out.parent / f"one_real_{name}.txt"
-            files, missing = [run_one_real(args.one_real_tree, cell, target)], []
         one_real = merge_one_real([parse_one_real(f) for f in files])
         warnings = []
         if missing:
@@ -827,6 +843,7 @@ def build(cells: list[dict], window: float, args) -> dict:
             "window": window,
             "thresholds": THRESHOLDS,
             "deployments": DEPLOYMENTS,
+            "skipped": not_shown,
         },
         "panels": panel_list,
         "matrix_cols": matrix_cols,
@@ -923,7 +940,11 @@ def main(argv=None) -> int:
     args.sources = [str(args.manifest)] if args.manifest else []
     args.sources += [f"--scan {r}" for r in args.scan]
     data = build(normalize(manifest, where_from), window, args)
-    data["meta"]["skipped"] = skipped
+    for line in data["meta"]["skipped"]:
+        print(f"skipped: {line}", file=sys.stderr)
+    data["meta"]["skipped"] = skipped + data["meta"]["skipped"]
+    if not data["cells"]:
+        parser.error("no cell to show")
     render(data, args.out)
     print(summary(data))
     print(f"{args.out.resolve()} ({args.out.stat().st_size / 1e6:.1f} MB)")
@@ -1117,7 +1138,7 @@ dl.defs dd { margin: 0; color: var(--ink2); }
   </section>
   <section class="card" id="skippedCard" hidden>
     <h3>Not shown</h3>
-    <div class="caption small">Directories the scan found that are not a complete cell (a run still going, a report not written yet).</div>
+    <div class="caption small">Directories the scan found that are not a complete cell (a run still going, a report not written yet), and cells whose real run <code>one_real.py</code> refuses, with its reason.</div>
     <ul class="warnings small" id="skipped"></ul>
   </section>
   <p class="small muted" id="footer" style="margin:18px 0 30px"></p>
