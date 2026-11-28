@@ -6,10 +6,11 @@
 #   run.sh stage     on g27: stages under g53's W the r8 laws and inputs, b5/bin's runner with W's paths,
 #                    b5/fe-engine 98aed973e exported twice (W/tree/ATOM; W/tree_des/ATOM with #4262's
 #                    as_designed.patch and toggles.patch) and an atomesh built at 98aed973e
-#   run.sh round K   on g53: round K (1-3) under both lane locks: eight cells at once in xingjche_simspeed_g53,
-#                    one CCD (8 CPUs) each, lane C's four and lane D's four, rotated by 3 CCDs a round: as
-#                    measured, as designed, as designed with one of #4262's changes reverted (relay, step, idle,
-#                    timer, hop) and with the open case; then ab.py, err.py and walls.py against as designed
+#   run.sh round K   on g53: round K under both lane locks: eight cells at once in xingjche_simspeed_g53, one
+#                    CCD (8 CPUs) each, lane C's four and lane D's four, rotated by 3 CCDs a round: as measured,
+#                    as designed twice, as designed with one of #4262's changes reverted (relay, step, idle, timer,
+#                    hop); ccdload.py logs outside load per CCD; then ab.py, err.py and walls.py, whose verdict
+#                    says whether the round counts, against the two designed cells' mean
 #   run.sh clean     on g53: removes W, root-owned files included
 # A cell is b5/bin/sim_b5.sh's short cell: C1228, 120 simulated seconds of profiling, warmup 1 a lane, no railwarm.
 set -u
@@ -52,6 +53,8 @@ round)
   K=${2:?round 1, 2 or 3} P=g$2
   exec 8>$L/laneC.lock 9>$L/laneD.lock; flock 8; flock 9
   echo "$(date -u +%FT%TZ) s4267 round $K: lanes C and D taken" >> $L/out/pairs.log
+  cid=$(docker inspect $C --format '{{.Id}}')
+  nice -n 19 taskset -c 64-127 python3 -I $HERE/ccdload.py $R/${P}_load.txt ${cid:0:12} & LOAD=$!
   cell() {  # TAG TREE CPUS EXTRA_ENV
     docker exec $C bash -c "export $(echo $OFF) COMPASS_B5_IDS_DIR=$W/ids/$1 $4
       nice -n 10 taskset -c $3 bash $X/b5/bin/sim_b5.sh $1 $2 120 1 0 > $R/$1.out 2>&1" &
@@ -60,20 +63,22 @@ round)
   for v in "meas $W/tree/ATOM $LEAD COMPASS_B5_DELAY_FD_S=0.0018" "des $W/tree_des/ATOM $DES" \
     "relay $W/tree_des/ATOM $LEAD COMPASS_B5_DELAY_FD_S=0.0018" "step $W/tree_des/ATOM $DES COMPASS_4267_REVERT_STEP=1" \
     "idle $W/tree_des/ATOM $DES COMPASS_4267_REVERT_IDLE=1" "timer $W/tree_des/ATOM $DES COMPASS_4267_REVERT_TIMER=1" \
-    "hop $W/tree_des/ATOM $DES COMPASS_4267_REVERT_HOP=1" "open $W/tree_des/ATOM $DES COMPASS_4267_OPEN_CASE=1"; do
+    "hop $W/tree_des/ATOM $DES COMPASS_4267_REVERT_HOP=1" "des2 $W/tree_des/ATOM $DES"; do
     read -r tag tree env <<<"$v"; s=$(((c + 3 * (K - 1)) % 8)) c=$((c + 1))
     cell ${P}_$tag $tree $((64 + 8 * s))-$((71 + 8 * s)) "$env"
   done
-  wait
+  wait $(jobs -p | grep -vx $LOAD); kill $LOAD
   echo "$(date -u +%FT%TZ) s4267 round $K: lanes C and D released" >> $L/out/pairs.log
-  T=$(for t in des meas relay step idle timer hop open; do printf ' %s' ${P}_$t; done)
-  E=$(for t in des meas relay step idle timer hop open; do  # the cells that completed
+  T=$(for t in des meas relay step idle timer hop des2; do printf ' %s' ${P}_$t; done)
+  E=$(for t in des meas relay step idle timer hop des2; do  # the cells that completed
     [ -s $R/${P}_$t/artifacts/profile_export_aiperf.json ] && printf ' %s' ${P}_$t; done)
   docker exec -w $R $C bash -c "grep -h 'CPUs' ${P}_*.logs/sim.log | sed 's/.*b5 \([^ :]*\):.*CPUs/\1 CPUs/'
-    grep -hE 'EXIT|PHASES' ${P}_*.out; python3 $X/b5/bin/ab.py$T; python3 $X/b5/bin/walls.py$T
+    grep -hE 'EXIT|PHASES' ${P}_*.out; python3 $X/b5/bin/ab.py$T
+    python3 $X/b5/bin/walls.py ${P}_des,${P}_des2 ${P}_meas ${P}_relay ${P}_step ${P}_idle ${P}_timer ${P}_hop
     python3 $X/b5/bin/err.py$E | grep -E '^==|matched'
     grep -lE '$ERR' ${P}_*/*.log ${P}_*.logs/*.log || echo 'no clock error in the logs'"
+  python3 -I $HERE/ccdload.py --mean $R/${P}_load.txt
   ;;
 clean) docker exec $C rm -rf $W ;;
-*) sed -n '5,13p' "$0"; exit 2 ;;
+*) sed -n '5,14p' "$0"; exit 2 ;;
 esac
