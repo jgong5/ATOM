@@ -47,8 +47,10 @@ row's, after its rows' mean context in `PERMILLE` of it (``mean``) where some
 point of the family has ragged rows, leaving out each uniform point whose rows
 the KV pool cut, or a prefill point's rows' mean cached
 tokens (`band`); and a prefill's B for a kind its rows move (``("rows",
-op)``). A decode leaf of such a kind that takes a compress ``ratio``, a
-compressor, is read before its context at ``completes``, whether its point's
+op)``), its points of one T read across B as their family reads their
+leaves (`prefill_leaf`). A decode leaf of such a kind that takes a
+compress ``ratio``, a compressor, is read before its context at
+``completes``, whether its point's
 rows complete a compressed entry, then at ``past``, whether most rows that do
 run past it (`completion`): the entry's attention runs only then, and costs
 more where its rows go on into the next entry, so the cost alternates with

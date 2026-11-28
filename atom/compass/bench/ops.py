@@ -252,7 +252,7 @@ leaf's kind steps under one kernel between two adjacent contexts at some width
 cached-token count only where they launched different kernels at each count both
 hold and halving placed that count at neither; a collective's message bytes bend
 as a decode width does; and then, at the rows of each prefill family of a kind
-that depends on context, each token count its leaf's families at other rows hold
+that depends on context or moves with its rows, each token count its leaf's families at other rows hold
 between its own least and most, at each of its cached-token counts but those
 halving over cached tokens placed on one token count's line (`_filled`),
 densifying again after. A family whose shapes state the rows a DP group gathers
@@ -4703,7 +4703,12 @@ def _dependent(records) -> dict:
     at two row contexts, is keyed by its name; a prefill kind, read fresh and
     over cached tokens, by ``("prefill", name)``. Keyed ``("rows", name)``,
     whether a prefill kind timed at two row counts of one token count and
-    cached tokens moves with its rows."""
+    cached tokens moves with its rows, its points there compared by their
+    leaves as their family reads them (`fit.ops.prefill_leaf`): ATOM's runner
+    sizes a kernel's metadata from the rows, so one family's leaves differ by
+    B."""
+    from atom.compass.fit.ops import prefill_leaf
+
     by = defaultdict(list)
     for r in records:
         if "refused" in r:
@@ -4713,7 +4718,8 @@ def _dependent(records) -> dict:
         else:
             by[("prefill", r["op"]), r["shape"], r["leaf"]].append(r)
             at = _shape(r["shape"]).tokens, r["context"]
-            by[("rows", r["op"]), at, r["leaf"]].append(r)
+            leaf = prefill_leaf(json.loads(r["leaf"]), at[0])[0]
+            by[("rows", r["op"]), at, json.dumps(leaf, sort_keys=True)].append(r)
     kinds = {}
     for (kind, *_), points in by.items():
         if len(points) > 1:
